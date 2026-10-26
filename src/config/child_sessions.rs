@@ -84,16 +84,19 @@ impl ChildSessionRoot {
     /// Takes the root directory's lock for one read-modify-write of
     /// `root.yaml` or a sidecar, or for one delete decision. Opening the
     /// lock creates the directory, so a caller that must leave an absent
-    /// directory absent checks for it first.
+    /// directory absent checks for it first. A crash between that check
+    /// and the lock can leave a directory holding only `.lock`, which the
+    /// orphan sweep's arm 0 reclaims once its grace has passed.
     pub(crate) fn lock(&self) -> Result<ExclusiveLock> {
         acquire_root_lock(&self.lock_file())
     }
 
     /// Creates the root directory, writes `root.yaml` when it is missing or
     /// does not parse, then creates `children/`, in that order: a crash between
-    /// the steps leaves a directory that already identifies itself rather
-    /// than an anonymous one. A `root.yaml` that parses is left untouched so
-    /// a second spawn under the same root cannot erase the parent paths and
+    /// the steps never leaves children without an identity, at worst a
+    /// directory holding only `.lock`, which the orphan sweep's arm 0
+    /// reclaims after its grace. A `root.yaml` that parses is left untouched
+    /// so a second spawn under the same root cannot erase the parent paths and
     /// save time recorded by the first; one that does not parse is replaced
     /// from `root` with a warning, since nothing in it could be kept.
     /// Anything other than a regular file in its place is an error that
@@ -193,7 +196,37 @@ fn root_lock(dir: &Path) -> Result<ExclusiveLock> {
 }
 
 fn acquire_root_lock(lock_file: &Path) -> Result<ExclusiveLock> {
-    ExclusiveLock::acquire(lock_file, "child session root", EXCLUSIVE_LOCK_WAIT)
+    ExclusiveLock::acquire(lock_file, "child session root", root_lock_wait())
+}
+
+#[cfg(not(test))]
+fn root_lock_wait() -> std::time::Duration {
+    EXCLUSIVE_LOCK_WAIT
+}
+
+#[cfg(test)]
+fn root_lock_wait() -> std::time::Duration {
+    ROOT_LOCK_WAIT_OVERRIDE
+        .with(|wait| wait.get())
+        .unwrap_or(EXCLUSIVE_LOCK_WAIT)
+}
+
+#[cfg(test)]
+thread_local! {
+    static ROOT_LOCK_WAIT_OVERRIDE: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` with the root lock's wait cut to a few retries on this thread,
+/// so a test that expects the held-lock refusal does not sit out the full
+/// bound.
+#[cfg(test)]
+pub(crate) fn with_short_root_lock_wait<T>(f: impl FnOnce() -> T) -> T {
+    use crate::utils::fs::EXCLUSIVE_LOCK_RETRY;
+    ROOT_LOCK_WAIT_OVERRIDE.with(|wait| wait.set(Some(EXCLUSIVE_LOCK_RETRY * 3)));
+    let result = f();
+    ROOT_LOCK_WAIT_OVERRIDE.with(|wait| wait.set(None));
+    result
 }
 
 /// Whether `ensure_dir` has to write `path`: it is absent, or a regular
@@ -2590,13 +2623,15 @@ updated_at: 2026-01-02T03:04:05Z
         root.ensure_dir(&record).unwrap();
         let held = hold_root_lock(&root);
 
-        settle_parent_exit(&root, None);
+        with_short_root_lock_wait(|| settle_parent_exit(&root, None));
 
         assert!(root.dir().is_dir());
         assert!(
-            warn_snapshot().iter().any(|message| message
-                .contains("holds the child session root lock")
-                && message.contains(&root.dir().display().to_string())),
+            warn_snapshot()
+                .iter()
+                .any(|message| message.contains("child session root lock")
+                    && message.contains("is held")
+                    && message.contains(&root.dir().display().to_string())),
             "{:?}",
             warn_snapshot()
         );
@@ -2707,7 +2742,7 @@ updated_at: 2026-01-02T03:04:05Z
             *held.borrow_mut() = Some(lock);
         };
 
-        sweep_orphans_with_before_remove(&hold);
+        with_short_root_lock_wait(|| sweep_orphans_with_before_remove(&hold));
 
         assert!(
             held.borrow().is_some(),
@@ -2715,9 +2750,11 @@ updated_at: 2026-01-02T03:04:05Z
         );
         assert!(dir.is_dir());
         assert!(
-            warn_snapshot().iter().any(|message| message
-                .contains("holds the child session root lock")
-                && message.contains("orphan sweep arm 2")),
+            warn_snapshot()
+                .iter()
+                .any(|message| message.contains("child session root lock")
+                    && message.contains("is held")
+                    && message.contains("orphan sweep arm 2")),
             "{:?}",
             warn_snapshot()
         );

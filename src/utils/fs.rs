@@ -140,6 +140,7 @@ pub(crate) const EXCLUSIVE_LOCK_RETRY: Duration = Duration::from_millis(10);
 #[derive(Debug)]
 pub(crate) struct ExclusiveLock {
     file: File,
+    path: PathBuf,
 }
 
 impl ExclusiveLock {
@@ -156,7 +157,7 @@ impl ExclusiveLock {
                     thread::sleep(EXCLUSIVE_LOCK_RETRY);
                 }
                 Err(TryLockError::WouldBlock) => bail!(
-                    "Another Coyote process holds the {what} lock '{}'{}; try again.",
+                    "The {what} lock '{}' is held{}; try again.",
                     lock_path.display(),
                     holder_suffix(read_holder_pid(&mut file))
                 ),
@@ -169,18 +170,24 @@ impl ExclusiveLock {
         }
         if let Err(error) = write_holder_pid(&mut file) {
             debug!(
-                "{what} lock '{}' holds no pid: {error}",
+                "The {what} lock '{}' holds no pid: {error}",
                 lock_path.display()
             );
         }
-        Ok(Self { file })
+        Ok(Self {
+            file,
+            path: lock_path.to_path_buf(),
+        })
     }
 }
 
 impl Drop for ExclusiveLock {
     fn drop(&mut self) {
         if let Err(error) = self.file.unlock() {
-            warn!("Failed to release a file lock: {error}");
+            warn!(
+                "Failed to release the lock '{}': {error}",
+                self.path.display()
+            );
         }
     }
 }
@@ -200,16 +207,33 @@ fn open_lock_file(lock_path: &Path) -> Result<File> {
             .with_context(|| format!("Failed to create {}", parent.display()))?;
     }
     refuse_symlinked_file(lock_path)?;
+    open_lock_file_unchecked(lock_path)
+}
+
+/// The open behind `open_lock_file`. On unix the kernel refuses to follow
+/// a symlink too, so a link planted between the lstat check and the open
+/// is still refused, with the same wording as the check.
+fn open_lock_file_unchecked(lock_path: &Path) -> Result<File> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    options
-        .open(lock_path)
-        .with_context(|| format!("Failed to open lock file {}", lock_path.display()))
+    match options.open(lock_path) {
+        Ok(file) => Ok(file),
+        #[cfg(unix)]
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            bail!(
+                "{} is a symlink; expected a regular file",
+                lock_path.display()
+            )
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("Failed to open lock file {}", lock_path.display()))
+        }
+    }
 }
 
 /// For `read_holder_pid` in a process that finds the lock taken.
@@ -334,7 +358,8 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert!(error.contains("holds the test record lock"), "{error}");
+        assert!(error.contains("The test record lock"), "{error}");
+        assert!(error.contains("is held"), "{error}");
         assert!(error.contains(&path.display().to_string()), "{error}");
         assert!(error.ends_with("; try again."), "{error}");
         // The lock is mandatory on Windows, so the refused opener cannot
@@ -406,7 +431,30 @@ mod tests {
             .to_string();
 
         assert!(error.contains("is a symlink"), "{error}");
-        assert_eq!(fs::read_to_string(&target).unwrap(), "");
+        assert_symlink_target_untouched(&path, &target);
+    }
+
+    /// Goes straight to the open, skipping the lstat check, the way a
+    /// link planted between the check and the open would be met.
+    #[cfg(unix)]
+    #[test]
+    fn exclusive_lock_refuses_a_symlinked_lock_file_even_without_the_lstat_check() {
+        let dir = TempDir::new("lock-symlink-open");
+        let target = dir.0.join("elsewhere");
+        fs::write(&target, "").unwrap();
+        let path = dir.0.join("record.lock");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        let error = open_lock_file_unchecked(&path).unwrap_err().to_string();
+
+        assert!(error.contains("is a symlink"), "{error}");
+        assert_symlink_target_untouched(&path, &target);
+    }
+
+    #[cfg(unix)]
+    fn assert_symlink_target_untouched(link: &Path, target: &Path) {
+        assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+        assert_eq!(fs::metadata(target).unwrap().len(), 0);
     }
 
     #[cfg(unix)]
