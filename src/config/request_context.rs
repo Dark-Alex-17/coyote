@@ -21710,7 +21710,8 @@ mod tests {
                 [
                     vec![
                         "-: carry: is declared but the graph has no session: block; nothing is \
-                         carried until one exists"
+                         carried between REPL turns until one exists (a child resumed by \
+                         session_id still carries)"
                             .to_string(),
                     ],
                     shadowed(&["project_dir"]),

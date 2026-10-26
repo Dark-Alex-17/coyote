@@ -687,7 +687,7 @@ async fn start_directive_inner(
     if graph::active_agent_graph_name(ctx).is_some() {
         ctx.before_chat_completion(&input)?;
         let graph::dispatch::ChildGraphRun { result, last_run } =
-            graph::run_active_agent_graph(ctx, &input.text(), abort_signal.clone()).await?;
+            graph::run_active_agent_graph(ctx, &input, abort_signal.clone()).await?;
         app.print_markdown(&result.output)?;
         ctx.record_graph_run(app.as_ref(), &input, &result.output, last_run)?;
         ctx.exit_session()?;

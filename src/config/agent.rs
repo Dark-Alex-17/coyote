@@ -698,6 +698,16 @@ impl Agent {
         self.interpolate_text(&output)
     }
 
+    /// Appends `text` to the configured instructions, behind a blank line
+    /// when they are not empty. Dynamic instructions, once rendered,
+    /// replace the configured text and so do not carry the appendix.
+    pub fn append_to_instructions(&mut self, text: &str) {
+        if !self.config.instructions.is_empty() {
+            self.config.instructions.push_str("\n\n");
+        }
+        self.config.instructions.push_str(text);
+    }
+
     fn push_builtin_tool_guidance(&self, output: &mut String) {
         if self.config.auto_continue && self.config.inject_todo_instructions {
             output.push_str(DEFAULT_TODO_INSTRUCTIONS);

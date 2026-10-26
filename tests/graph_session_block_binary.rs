@@ -123,6 +123,12 @@ fn run_echo(dir: &Path) -> Output {
 
 /// The real binary over `dir` with `args`, from a scrubbed env and no TTY.
 fn run_with(dir: &Path, args: &[&str]) -> Output {
+    run_with_env(dir, args, &[])
+}
+
+/// `run_with` plus extra environment pairs applied after the scrub, for
+/// cases that pin a host knob (the log level) rather than inherit it.
+fn run_with_env(dir: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
     let home = dir.join("home");
     Command::new(env!("CARGO_BIN_EXE_coyote"))
         .args(args)
@@ -137,6 +143,7 @@ fn run_with(dir: &Path, args: &[&str]) -> Output {
         .env_remove("IS_SANDBOX")
         .env_remove("COYOTE_PROVIDER")
         .env_remove("COYOTE_PLATFORM")
+        .envs(extra_env.iter().copied())
         .stdin(Stdio::null())
         .output()
         .unwrap()
@@ -1261,12 +1268,14 @@ fn usage_probe_carry_list_rules_hold_from_a_cold_start() {
     }
 }
 
-/// A `carry:` list with no `session:` block loads and runs, but the agent is
-/// told at engage that nothing is carried until a block exists: one warning
-/// line on stderr, and the run still completes.
+/// A `carry:` list with no `session:` block loads, but the agent is told at
+/// engage that nothing is carried between REPL turns until a block exists:
+/// one warning line on stderr. `-e hello` is shell-execute mode, so this
+/// pins only the engage half; the run-time copy in the log is pinned by
+/// `usage_probe_carry_without_a_session_block_is_warned_in_the_run_log_too`.
 #[test]
-fn usage_probe_carry_without_a_session_block_warns_once_at_engage_and_runs() {
-    const WARNING: &str = "Warning: carry: is declared but the graph has no session: block; nothing is carried until one exists";
+fn usage_probe_carry_without_a_session_block_warns_once_at_engage() {
+    const WARNING: &str = "Warning: carry: is declared but the graph has no session: block; nothing is carried between REPL turns until one exists (a child resumed by session_id still carries)";
     let dir = fresh_config_dir("carry-warn");
     let _guard = TempDirGuard(dir.clone());
     write_fixture(&dir, "carry: [said]\n");
@@ -1379,6 +1388,289 @@ fn usage_probe_a_one_shot_run_under_a_session_is_read_back_by_the_next_turn() {
     assert!(
         stdout.contains("prev=[user: hello\nassistant: prev=[] now=hello] now=again"),
         "the next turn reads the one-shot exchange back:\n{second_text}"
+    );
+}
+
+/// The engage-time stderr line is only half of the carry warning: a graph
+/// RUN re-validates the graph and sends the same sentence to the log file
+/// (the executor's validation warnings go to the logger, not the terminal).
+/// `-e hello` is shell-execute mode and never runs the graph, so this
+/// drives a real run with a positional prompt; an operator reading
+/// `<cache>/coyote.log` afterwards sees the engage copy and exactly one
+/// run-time copy at WARN under the graph's own prefix, in the same words.
+/// A graph with a session block logs nothing about `carry:`.
+#[test]
+fn usage_probe_carry_without_a_session_block_is_warned_in_the_run_log_too() {
+    const SENTENCE: &str = "carry: is declared but the graph has no session: block; nothing is carried between REPL turns until one exists (a child resumed by session_id still carries)";
+    let dir = fresh_config_dir("carry-log");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, "carry: [said]\n");
+
+    let output = run_with_env(
+        &dir,
+        &["-a", AGENT, "hello"],
+        &[("COYOTE_LOG_LEVEL", "warn")],
+    );
+    let text = format!("{}\n{}", stderr_of(&output), stdout_of(&output));
+    assert!(
+        output.status.success()
+            && !text.contains("panicked")
+            && stdout_of(&output).lines().any(|l| l == "hello"),
+        "the graph run completes and the end node echoes the prompt: exit {:?}\n{text}",
+        output.status
+    );
+    let stderr = stderr_of(&output);
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|l| *l == format!("Warning: {SENTENCE}"))
+            .count(),
+        1,
+        "the engage line is printed once:\n{stderr}"
+    );
+
+    let log_path = dir.join("cache").join("coyote.log");
+    let log = fs::read_to_string(&log_path).unwrap_or_else(|e| {
+        panic!(
+            "the run writes {} ({e}); stderr:\n{}",
+            log_path.display(),
+            stderr_of(&output)
+        )
+    });
+    let run_time: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains(&format!("[graph:{AGENT}] {SENTENCE}")))
+        .collect();
+    assert_eq!(
+        run_time.len(),
+        1,
+        "one graph run logs the run-time carry warning exactly once:\n{log}"
+    );
+    assert!(
+        run_time[0].contains("[WARN]") && run_time[0].is_ascii(),
+        "the run-time copy is a WARN line in ASCII:\n{}",
+        run_time[0]
+    );
+    assert!(
+        log.lines()
+            .any(|l| l.contains("[WARN]") && l.contains(&format!("Warning: {SENTENCE}"))),
+        "the engage copy is logged at WARN as well:\n{log}"
+    );
+
+    let dir = fresh_config_dir("carry-log-block");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(
+        &dir,
+        "carry: [said]\nsession:\n  chat:\n    instructions: Answer.\n",
+    );
+    let output = run_with_env(
+        &dir,
+        &["-a", AGENT, "hello"],
+        &[("COYOTE_LOG_LEVEL", "warn")],
+    );
+    assert!(
+        output.status.success() && stdout_of(&output).lines().any(|l| l == "hello"),
+        "carry with a session block runs: exit {:?}\n{}",
+        output.status,
+        stderr_of(&output)
+    );
+    let log = fs::read_to_string(dir.join("cache").join("coyote.log")).unwrap_or_default();
+    assert!(
+        !log.contains("carry:"),
+        "a graph with a session block carries, so the run logs nothing about carry:\n{log}"
+    );
+}
+
+/// `previous_turns` has a byte budget. Once a session holds more one-shot
+/// exchanges than fit, the next turn sees the newest ones whole, oldest
+/// first, behind one `[N earlier turn(s) omitted]` line whose count equals
+/// the exchanges that fell off; no dropped prompt leaks into the text. The
+/// one-shots run a graph whose end node prints a fixed word, so each
+/// exchange has a known size; the graph is rewritten before the reading
+/// turn (the session file is keyed by agent, not by graph content).
+#[test]
+fn usage_probe_a_session_past_the_turn_budget_drops_the_oldest_exchanges_whole() {
+    let dir = fresh_config_dir("turn-budget");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, "");
+    let config = dir.join("config.yaml");
+    let text = fs::read_to_string(&config).unwrap();
+    fs::write(
+        &config,
+        text.replace("dry_run: true\n", "dry_run: false\nsave_session: true\n"),
+    )
+    .unwrap();
+    let agent_dir = dir.join("agents").join(AGENT);
+    let graph = |output: &str| {
+        format!(
+            "name: echo-graph\n\
+             version: \"1.0\"\n\
+             initial_state: {{ said: \"\" }}\n\
+             start: done\n\
+             nodes:\n\
+             \x20 done: {{ type: end, output: \"{output}\" }}\n\
+             session:\n\
+             \x20 chat:\n\
+             \x20   instructions: Answer.\n"
+        )
+    };
+    fs::write(agent_dir.join("graph.yaml"), graph("ok")).unwrap();
+
+    // Four exchanges of roughly 8 KiB each: more than the 24 KiB budget, so
+    // at least one must fall off and at least one must stay whole.
+    let markers = ["one", "two", "three", "four"];
+    let pad = "a".repeat(8 * 1024);
+    for marker in markers {
+        let prompt = format!("{marker} {pad}");
+        let output = run_with(&dir, &["-a", AGENT, "--session", "s", &prompt]);
+        assert!(
+            output.status.success() && stdout_of(&output).lines().any(|l| l == "ok"),
+            "one-shot {marker}: exit {:?}\n{}",
+            output.status,
+            stderr_of(&output)
+        );
+    }
+
+    fs::write(
+        agent_dir.join("graph.yaml"),
+        graph("prev=[{{previous_turns}}] now={{initial_prompt}}"),
+    )
+    .unwrap();
+    fs::create_dir_all(dir.join("macros")).unwrap();
+    fs::write(
+        dir.join("macros/resume.yaml"),
+        "isolated: false\nsteps:\n  - \".run tail\"\n",
+    )
+    .unwrap();
+    let output = run_with(&dir, &["-a", AGENT, "--session", "s", "--macro", "resume"]);
+    let text = format!("{}\n{}", stderr_of(&output), stdout_of(&output));
+    assert!(
+        output.status.success() && !text.contains("panicked"),
+        "reading turn: exit {:?}\n{text}",
+        output.status
+    );
+    let stdout = stdout_of(&output);
+    let start = stdout
+        .find("prev=[")
+        .unwrap_or_else(|| panic!("the reading turn rendered previous_turns:\n{text}"));
+    let end = stdout[start..]
+        .find("] now=tail")
+        .map(|i| start + i)
+        .unwrap_or_else(|| panic!("the rendered turns close before `now=tail`:\n{text}"));
+    let rendered = &stdout[start + "prev=[".len()..end];
+
+    let omitted_line = rendered
+        .lines()
+        .next()
+        .unwrap_or_else(|| panic!("previous_turns is not empty:\n{text}"));
+    let dropped: usize = omitted_line
+        .strip_prefix('[')
+        .and_then(|l| l.strip_suffix(" earlier turn(s) omitted]"))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("the first line counts the dropped turns, got {omitted_line:?}"));
+    assert!(
+        dropped >= 1 && dropped < markers.len(),
+        "some but not all exchanges fell off the budget (dropped {dropped})"
+    );
+    let kept: Vec<usize> = markers
+        .iter()
+        .filter_map(|m| rendered.find(&format!("user: {m} ")))
+        .collect();
+    assert_eq!(
+        kept.len(),
+        markers.len() - dropped,
+        "the kept exchanges plus the omitted count add up to every one-shot:\n{rendered}"
+    );
+    assert!(
+        kept.windows(2).all(|w| w[0] < w[1]),
+        "kept exchanges render oldest first:\n{rendered}"
+    );
+    for dropped_marker in &markers[..dropped] {
+        assert!(
+            !rendered.contains(&format!("user: {dropped_marker} ")),
+            "the oldest exchange `{dropped_marker}` is dropped whole, not cut:\n{rendered}"
+        );
+    }
+    assert_eq!(
+        rendered.matches("assistant: ok").count(),
+        markers.len() - dropped,
+        "every kept exchange carries its whole reply:\n{rendered}"
+    );
+}
+
+/// A state too large for the environment is handed to a script node as a
+/// temp file named by `GRAPH_STATE_FILE`. From the script's point of view
+/// that file is owner-only (0600): nothing else on the host reads the graph
+/// state while the node runs, and the file is gone once the run ends. The
+/// script reports the mode and the path back through its JSON stdout, the
+/// end node echoes the mode, and the test checks the path after exit. A
+/// positional prompt drives the graph (`-e` is shell-execute mode).
+#[cfg(unix)]
+#[test]
+fn usage_probe_the_graph_state_spill_file_is_owner_only_and_removed_after_the_run() {
+    let dir = fresh_config_dir("spill-mode");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, "");
+    let agent_dir = dir.join("agents").join(AGENT);
+    let scripts = agent_dir.join("scripts");
+    fs::create_dir_all(&scripts).unwrap();
+    // `stat -c` is GNU, `stat -f` is BSD/macOS; whichever answers wins.
+    fs::write(
+        scripts.join("probe.sh"),
+        "#!/usr/bin/env bash\n\
+         if [ -z \"${GRAPH_STATE_FILE:-}\" ]; then\n\
+         \x20 printf '{\"mode\":\"inline\",\"spill\":\"\"}'\n\
+         \x20 exit 0\n\
+         fi\n\
+         m=$(stat -c %a \"$GRAPH_STATE_FILE\" 2>/dev/null || stat -f %Lp \"$GRAPH_STATE_FILE\")\n\
+         printf '{\"mode\":\"%s\",\"spill\":\"%s\"}' \"$m\" \"$GRAPH_STATE_FILE\"\n",
+    )
+    .unwrap();
+    // 48 KiB of payload: past the 32 KiB inline ceiling by a margin that
+    // does not depend on the JSON framing around it.
+    let blob = "x".repeat(48 * 1024);
+    fs::write(
+        agent_dir.join("graph.yaml"),
+        format!(
+            "name: echo-graph\n\
+             version: \"1.0\"\n\
+             initial_state: {{ said: \"\", mode: \"\", spill: \"\", blob: \"{blob}\" }}\n\
+             start: probe\n\
+             nodes:\n\
+             \x20 probe: {{ type: script, script: scripts/probe.sh, next: done }}\n\
+             \x20 done: {{ type: end, output: \"mode={{{{mode}}}} spill={{{{spill}}}}\" }}\n"
+        ),
+    )
+    .unwrap();
+
+    let output = run_with(&dir, &["-a", AGENT, "hello"]);
+    let text = format!("{}\n{}", stderr_of(&output), stdout_of(&output));
+    assert!(
+        output.status.success() && !text.contains("panicked"),
+        "spill run: exit {:?}\n{text}",
+        output.status
+    );
+    let line = stdout_of(&output)
+        .lines()
+        .rev()
+        .find(|l| l.starts_with("mode="))
+        .unwrap_or_else(|| panic!("the end node reports the probe's findings:\n{text}"))
+        .to_string();
+    let spill = line
+        .split_once(" spill=")
+        .map(|(_, p)| p.trim().to_string())
+        .unwrap_or_default();
+    assert!(
+        line.starts_with("mode=600 "),
+        "the spill file is owner-only while the script runs (got {line:?}):\n{text}"
+    );
+    assert!(
+        !spill.is_empty() && spill.ends_with(".json"),
+        "the script saw a real spill path (got {spill:?}):\n{text}"
+    );
+    assert!(
+        !Path::new(&spill).exists(),
+        "the spill file {spill} is removed once the run ends"
     );
 }
 

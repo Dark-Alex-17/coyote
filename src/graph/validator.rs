@@ -261,15 +261,19 @@ impl GraphValidator {
         result
     }
 
-    /// Carried keys only flow between turns of a session, and a graph agent
-    /// opens one only when it has a `session:` block.
+    /// Carried keys flow between REPL turns only through a session, and a
+    /// graph agent without a `session:` block is refused a `--session`, so
+    /// its REPL turns never carry. A child does: its caller seats it on its
+    /// own session, `last_run_for(.., child = true)` records `carried`
+    /// regardless of a block, and `carried_for` re-seeds it on a `session_id`
+    /// resume, which is why the warning names that case.
     fn validate_carry_without_session(&self, graph: &Graph, result: &mut ValidationResult) {
         if graph.carry.is_empty() || graph.session.is_some() {
             return;
         }
         result.warning(ValidationError::new(
             "carry: is declared but the graph has no session: block; nothing is carried \
-             until one exists",
+             between REPL turns until one exists (a child resumed by session_id still carries)",
         ));
     }
 
@@ -2452,7 +2456,7 @@ mod tests {
         );
     }
 
-    const CARRY_WITHOUT_SESSION: &str = "carry: is declared but the graph has no session: block; nothing is carried until one exists";
+    const CARRY_WITHOUT_SESSION: &str = "carry: is declared but the graph has no session: block; nothing is carried between REPL turns until one exists (a child resumed by session_id still carries)";
 
     #[test]
     fn carry_without_a_session_block_warns_once_with_no_node() {

@@ -27,21 +27,51 @@ pub struct ChildGraphRun {
     pub last_run: Option<LastRun>,
 }
 
+/// The one-shot run of the active agent's graph: `input` is seeded the way
+/// a REPL `.run` turn is (its patched text under `initial_prompt`) and the
+/// record, when the input is attached to the engaged session, names the
+/// bare typed text.
 pub async fn run_active_agent_graph(
     ctx: &mut RequestContext,
-    prompt: &str,
+    input: &Input,
     abort_signal: AbortSignal,
 ) -> Result<ChildGraphRun> {
-    run_active_agent_graph_with_inputs(ctx, prompt, abort_signal, None).await
+    run_seeded_graph(
+        ctx,
+        &input.text(),
+        input.bare_text(),
+        false,
+        input.session(&ctx.session).is_some(),
+        abort_signal,
+        None,
+    )
+    .await
 }
 
-/// Runs the active agent's graph with `inputs` overlaid on its
-/// `initial_state` before the executor starts. `None` seeds exactly what
-/// `run_active_agent_graph` does: the prompt under `initial_prompt` and the
-/// session transcript under `previous_turns`.
+/// Runs the active agent's graph for a child context, with `inputs`
+/// overlaid on its `initial_state` before the executor starts. The prompt
+/// is seeded under `initial_prompt` and the session transcript under
+/// `previous_turns`; the record always names the prompt as given.
 pub async fn run_active_agent_graph_with_inputs(
     ctx: &mut RequestContext,
     prompt: &str,
+    abort_signal: AbortSignal,
+    inputs: Option<HashMap<String, Value>>,
+) -> Result<ChildGraphRun> {
+    let has_session = ctx.session.is_some();
+    run_seeded_graph(ctx, prompt, prompt, true, has_session, abort_signal, inputs).await
+}
+
+/// Loads, seeds and runs the active agent's graph without routing.
+/// `seed_prompt` lands under `initial_prompt`; `record_prompt` is what the
+/// record names, which differs from the seed when the one-shot input
+/// carries a request-only patch.
+async fn run_seeded_graph(
+    ctx: &mut RequestContext,
+    seed_prompt: &str,
+    record_prompt: &str,
+    child: bool,
+    has_session: bool,
     abort_signal: AbortSignal,
     inputs: Option<HashMap<String, Value>>,
 ) -> Result<ChildGraphRun> {
@@ -62,7 +92,7 @@ pub async fn run_active_agent_graph_with_inputs(
     let carried = carried_for(ctx, &graph.carry);
     seed_initial_state(
         &mut graph.initial_state,
-        prompt,
+        seed_prompt,
         inputs,
         &previous_turns,
         &carried,
@@ -75,19 +105,19 @@ pub async fn run_active_agent_graph_with_inputs(
         expose.as_deref(),
         &carry,
         &result,
-        prompt,
-        true,
-        ctx.session.is_some(),
+        record_prompt,
+        child,
+        has_session,
     );
     Ok(ChildGraphRun { result, last_run })
 }
 
 /// The record a finished run leaves behind, or `None` when there is
 /// nothing to store it on. A child always records: its caller seats it on
-/// its own session. A REPL turn records only when a session is engaged and
-/// the graph gives the record a home: a `session:` block (`expose` is
-/// `Some`, possibly empty) or a non-empty `carry:` list whose values the
-/// next run reads back.
+/// its own session. A REPL turn or a one-shot run records only when its
+/// input is attached to the engaged session and the graph gives the record
+/// a home: a `session:` block (`expose` is `Some`, possibly empty) or a
+/// non-empty `carry:` list whose values the next run reads back.
 pub fn last_run_for(
     expose: Option<&[String]>,
     carry: &[String],
@@ -1109,6 +1139,59 @@ mod tests {
         assert_eq!(ctx.current_depth, 1);
         assert!(ctx.session.as_ref().unwrap().last_run().is_none());
         assert_eq!(ctx.last_graph_branch, None);
+    }
+
+    /// A one-shot run seeds the request-only patch the way a REPL `.run`
+    /// does, but its record names the typed text: the patch is for the
+    /// model, not for the session.
+    #[tokio::test]
+    #[serial]
+    async fn run_active_agent_graph_seeds_the_patched_text_and_records_the_bare_prompt() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("one_shot");
+        write_graph_agent(&name, SESSION_BLOCK);
+        let mut ctx = ctx_with_agent(&name).await;
+        ctx.session = Some(chat_session());
+        let mut input = Input::from_str(&ctx, "hello", None).unwrap();
+        input.set_patched_text("hello (retrieved)");
+
+        let run = run_active_agent_graph(&mut ctx, &input, create_abort_signal())
+            .await
+            .unwrap();
+
+        assert_eq!(run.result.output, "hello (retrieved)");
+        assert_eq!(run.last_run.unwrap().prompt, "hello");
+        assert!(ctx.session.as_ref().unwrap().last_run().is_none());
+    }
+
+    /// Without an engaged session a one-shot run has nowhere to be
+    /// recorded, block graph or not.
+    #[tokio::test]
+    #[serial]
+    async fn run_active_agent_graph_records_nothing_without_a_session() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("one_shot_no_session");
+        write_graph_agent(&name, SESSION_BLOCK);
+        let mut ctx = ctx_with_agent(&name).await;
+        let input = Input::from_str(&ctx, "hello", None).unwrap();
+
+        let run = run_active_agent_graph(&mut ctx, &input, create_abort_signal())
+            .await
+            .unwrap();
+
+        assert_eq!(run.result.output, "hello");
+        assert!(run.last_run.is_none());
+    }
+
+    /// `execute_graph` boxes the executor future and says why where the
+    /// box is; the explanation is not deferred to another comment.
+    #[test]
+    fn execute_graph_carries_its_own_stack_rationale() {
+        let source = include_str!("dispatch.rs").replace("\r\n", "\n");
+        let production = &source[..source.find("\n#[cfg(test)]").unwrap()];
+        assert_eq!(production.matches("overflows the 2 MiB stack").count(), 1);
+        assert_eq!(production.matches("GraphExecutor::execute`").count(), 0);
+        assert_eq!(production.matches("see the comment on").count(), 0);
     }
 
     /// A child run on a `carry:` graph starts from the values the session's
