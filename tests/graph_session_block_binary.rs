@@ -294,6 +294,11 @@ fn every_documented_session_block_mistake_fails_at_graph_load() {
             &["session.expose entry #0 is blank"],
         ),
         (
+            "reserved expose key",
+            "session:\n  expose: [previous_turns]\n  chat:\n    instructions: Answer.\n",
+            &["session.expose key 'previous_turns' is reserved (the dispatcher seeds it)"],
+        ),
+        (
             "session is a scalar",
             "session: yes\n",
             &["session: invalid type"],
@@ -1254,6 +1259,127 @@ fn usage_probe_carry_list_rules_hold_from_a_cold_start() {
             );
         }
     }
+}
+
+/// A `carry:` list with no `session:` block loads and runs, but the agent is
+/// told at engage that nothing is carried until a block exists: one warning
+/// line on stderr, and the run still completes.
+#[test]
+fn usage_probe_carry_without_a_session_block_warns_once_at_engage_and_runs() {
+    const WARNING: &str = "Warning: carry: is declared but the graph has no session: block; nothing is carried until one exists";
+    let dir = fresh_config_dir("carry-warn");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, "carry: [said]\n");
+
+    let output = run_echo(&dir);
+
+    assert_echoes_hello("carry without a session block", &output);
+    let stderr = stderr_of(&output);
+    assert_eq!(
+        stderr.lines().filter(|line| *line == WARNING).count(),
+        1,
+        "expected exactly one carry warning:\n{stderr}"
+    );
+    assert!(stderr.is_ascii(), "non-ASCII warning text:\n{stderr}");
+
+    let dir = fresh_config_dir("carry-block");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(
+        &dir,
+        "carry: [said]\nsession:\n  chat:\n    instructions: Answer.\n",
+    );
+    let output = run_echo(&dir);
+    assert_echoes_hello("carry with a session block", &output);
+    assert!(
+        !stderr_of(&output).contains("carry:"),
+        "a graph with a session block carries, so no warning:\n{}",
+        stderr_of(&output)
+    );
+}
+
+/// A one-shot run under `--session` records the exchange and the run on the
+/// session the way a REPL turn does, so the next turn on that session reads
+/// the one-shot back through `previous_turns`. The graph is end-only, so no
+/// model is called and the fixture can leave dry run (which records nothing
+/// by contract); `save_session: true` saves the one-shot's session without a
+/// prompt.
+#[test]
+fn usage_probe_a_one_shot_run_under_a_session_is_read_back_by_the_next_turn() {
+    let dir = fresh_config_dir("one-shot");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, "");
+    let config = dir.join("config.yaml");
+    let text = fs::read_to_string(&config).unwrap();
+    assert!(
+        text.contains("dry_run: true\n"),
+        "the shared fixture is expected to opt into dry run:\n{text}"
+    );
+    fs::write(
+        &config,
+        text.replace("dry_run: true\n", "dry_run: false\nsave_session: true\n"),
+    )
+    .unwrap();
+    let agent_dir = dir.join("agents").join(AGENT);
+    fs::write(
+        agent_dir.join("graph.yaml"),
+        "name: echo-graph\n\
+         version: \"1.0\"\n\
+         initial_state: { said: \"\" }\n\
+         start: done\n\
+         nodes:\n\
+         \x20 done: { type: end, output: \"prev=[{{previous_turns}}] now={{initial_prompt}}\" }\n\
+         session:\n\
+         \x20 chat:\n\
+         \x20   instructions: Answer.\n",
+    )
+    .unwrap();
+
+    let first = run_with(&dir, &["-a", AGENT, "--session", "s", "hello"]);
+    let first_text = format!("{}\n{}", stderr_of(&first), stdout_of(&first));
+    assert!(
+        first.status.success() && !first_text.contains("panicked"),
+        "one-shot: exit {:?}\n{first_text}",
+        first.status
+    );
+    assert!(
+        stdout_of(&first)
+            .lines()
+            .any(|line| line == "prev=[] now=hello"),
+        "the first run sees no earlier turns:\n{first_text}"
+    );
+    let saved = agent_dir.join("sessions").join("s.yaml");
+    let yaml = fs::read_to_string(&saved)
+        .unwrap_or_else(|e| panic!("the session file was not written ({e}):\n{first_text}"));
+    let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+    assert_eq!(
+        doc["last_run"]["prompt"].as_str(),
+        Some("hello"),
+        "last_run.prompt is the one-shot prompt:\n{yaml}"
+    );
+    assert_eq!(
+        doc["last_run"]["output"].as_str(),
+        Some("prev=[] now=hello"),
+        "last_run.output is the one-shot output:\n{yaml}"
+    );
+
+    fs::create_dir_all(dir.join("macros")).unwrap();
+    fs::write(
+        dir.join("macros/resume.yaml"),
+        "isolated: false\nsteps:\n  - \".run again\"\n",
+    )
+    .unwrap();
+    let second = run_with(&dir, &["-a", AGENT, "--session", "s", "--macro", "resume"]);
+    let second_text = format!("{}\n{}", stderr_of(&second), stdout_of(&second));
+    assert!(
+        second.status.success() && !second_text.contains("panicked"),
+        "resume: exit {:?}\n{second_text}",
+        second.status
+    );
+    let stdout = stdout_of(&second);
+    assert!(
+        stdout.contains("prev=[user: hello\nassistant: prev=[] now=hello] now=again"),
+        "the next turn reads the one-shot exchange back:\n{second_text}"
+    );
 }
 
 /// `graph.example.yaml` enables the `ddg-search` MCP server, which the

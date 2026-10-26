@@ -162,7 +162,7 @@ pub async fn run_graph_turn(
                 &result,
                 input.bare_text(),
                 false,
-                ctx.session.is_some(),
+                input.session(&ctx.session).is_some(),
             );
             return Ok(GraphTurn::Run {
                 output: result.output,
@@ -195,7 +195,7 @@ pub async fn run_graph_turn(
                 &result,
                 input.bare_text(),
                 false,
-                ctx.session.is_some(),
+                input.session(&ctx.session).is_some(),
             );
             Ok(GraphTurn::Run {
                 output: result.output,
@@ -277,9 +277,11 @@ fn delegated_chat_input(
 }
 
 /// Runs a seeded graph and cancels whatever jobs it left in the supervisor,
-/// the same way `run_active_agent_graph_with_inputs` finishes. Boxed so the
-/// executor's large future is not reserved on this frame too; see the
-/// comment on `GraphExecutor::execute`.
+/// the same way `run_active_agent_graph_with_inputs` finishes. The executor
+/// future is boxed because it is large and, in debug builds, every async
+/// layer reserves room for the child future it constructs; left inline it
+/// would be reserved on this frame too, and one such frame per nested graph
+/// overflows the 2 MiB stack of a test thread.
 async fn execute_graph(
     ctx: &mut RequestContext,
     agent_name: &str,
@@ -355,7 +357,7 @@ pub fn carried_for(ctx: &RequestContext, carry: &[String]) -> IndexMap<String, V
 mod tests {
     use super::*;
     use crate::client::{Model, ModelData};
-    use crate::config::{AppState, LastMessage, RoleLike, WorkingMode};
+    use crate::config::{AppState, LastMessage, Role, RoleLike, WorkingMode};
     use crate::graph::llm::test_support::{boxed_completion, completion_runner};
     use crate::graph::route::ROUTE_ROLE_NAME;
     use crate::supervisor::mailbox::Inbox;
@@ -1739,6 +1741,42 @@ mod tests {
             last_run.carried.get("said"),
             Some(&json!("from the first run"))
         );
+    }
+
+    /// A detached input is not attached to the session even when one is
+    /// engaged, so neither run arm computes a record for it.
+    #[tokio::test]
+    #[serial]
+    async fn run_graph_turn_records_nothing_for_an_input_detached_from_the_session() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let role = Role::new(ROUTE_ROLE_NAME, "p");
+
+        let name = unique("detached_block");
+        write_graph_agent(&name, SESSION_BLOCK);
+        let mut ctx = ctx_with_agent(&name).await;
+        ctx.session = Some(chat_session());
+        let input = Input::detached_with_role(&ctx, "typed", role.clone());
+        let (turn, roles) = turn_with_reply(&mut ctx, &input, Some(Branch::Run), "unused").await;
+        let GraphTurn::Run { output, last_run } = turn.unwrap() else {
+            panic!("expected a run");
+        };
+        assert!(roles.is_empty());
+        assert_eq!(output, "typed");
+        assert!(last_run.is_none(), "{:?}", last_run.map(|run| run.prompt));
+
+        let name = unique("detached_carry");
+        write_agent(&name, "", CARRY_ECHO_GRAPH);
+        let mut ctx = ctx_with_agent(&name).await;
+        let mut session = chat_session();
+        session.set_last_run(Some(first_run_that_said("from the first run")));
+        ctx.session = Some(session);
+        let input = Input::detached_with_role(&ctx, "typed", role);
+        let (turn, _) = turn_with_reply(&mut ctx, &input, None, "unused").await;
+        let GraphTurn::Run { output, last_run } = turn.unwrap() else {
+            panic!("expected a run");
+        };
+        assert_eq!(output, "from the first run");
+        assert!(last_run.is_none(), "{:?}", last_run.map(|run| run.prompt));
     }
 
     /// The bundled coder carries its plan between runs and tells both model

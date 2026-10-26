@@ -178,6 +178,7 @@ pub struct Agent {
     vault: GlobalVault,
     is_graph: bool,
     graph_session: Option<Box<SessionBlock>>,
+    graph_carries: bool,
     enabled_tools: Option<Vec<String>>,
 }
 
@@ -323,6 +324,7 @@ impl Agent {
         let graph_path = paths::agent_graph_file(name);
         let mut graph_for_rag: Option<Graph> = None;
         let mut graph_session: Option<Box<SessionBlock>> = None;
+        let mut graph_carries = false;
         let mut agent_config = match (config_path.exists(), graph_path.exists()) {
             (true, true) => bail!(
                 "Agent '{name}' has both config.yaml and graph.yaml. A graph agent \
@@ -337,6 +339,7 @@ impl Agent {
                     .with_context(|| format!("Failed to load graph.yaml for agent '{name}'"))?;
                 let config = AgentConfig::from_graph(name, &graph);
                 graph_session = graph.session.clone().map(Box::new);
+                graph_carries = !graph.carry.is_empty();
                 graph_for_rag = Some(graph);
                 config
             }
@@ -506,6 +509,7 @@ impl Agent {
             vault: app_state.vault.clone(),
             is_graph: graph_for_rag.is_some(),
             graph_session,
+            graph_carries,
             enabled_tools: None,
         })
     }
@@ -610,6 +614,11 @@ impl Agent {
 
     pub fn graph_session(&self) -> Option<&SessionBlock> {
         self.graph_session.as_deref()
+    }
+
+    /// Whether the graph declares `carry:` keys, session block or not.
+    pub fn graph_carries(&self) -> bool {
+        self.graph_carries
     }
 
     pub fn functions(&self) -> &Functions {
@@ -911,6 +920,7 @@ impl Agent {
             vault: std::sync::Arc::new(Vault::default()),
             is_graph: false,
             graph_session: None,
+            graph_carries: false,
             enabled_tools: None,
         }
     }

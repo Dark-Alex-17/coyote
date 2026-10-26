@@ -6100,7 +6100,7 @@ impl RequestContext {
         ensure_reasoning_effort_supported(&agent)?;
 
         let mut validator_warned_about_memory = false;
-        if agent.graph_session().is_some() {
+        if agent.graph_session().is_some() || agent.graph_carries() {
             let graph = graph::GraphParser::new(paths::agent_data_dir(agent_name))
                 .load_from_file(paths::agent_graph_file(agent_name))
                 .with_context(|| format!("Failed to load graph.yaml for agent '{agent_name}'"))?;
@@ -21697,8 +21697,10 @@ mod tests {
 
         // Warning baseline for the shipped graphs: `_next`-routed unreachable
         // nodes, plus variable-shadowing on `coder` and `step-runner` (they
-        // declare variables whose names are also `initial_state` keys). A new
-        // rule that fires on a shipped asset (or a new bundled graph) must be
+        // declare variables whose names are also `initial_state` keys) and
+        // the carry-without-session notice on `coder` (it carries its plan
+        // but declares no session block of its own). A new rule that fires
+        // on a shipped asset (or a new bundled graph) must be
         // recorded here deliberately.
         let expected_warnings = BTreeMap::from([
             ("adversary".to_string(), Vec::new()),
@@ -21706,6 +21708,11 @@ mod tests {
             (
                 "coder".to_string(),
                 [
+                    vec![
+                        "-: carry: is declared but the graph has no session: block; nothing is \
+                         carried until one exists"
+                            .to_string(),
+                    ],
                     shadowed(&["project_dir"]),
                     unreachable(&[
                         "analyze_request",
