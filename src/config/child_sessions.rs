@@ -2695,8 +2695,8 @@ updated_at: 2026-01-02T03:04:05Z
         for (dir, lock) in [
             (settled.dir(), settled_lock),
             (unlinked.dir(), unlinked_lock),
-            (swept_dir.clone(), swept_dir.join(".lock")),
-            (proc_dir.clone(), proc_dir.join(".lock")),
+            (swept_dir.clone(), swept_dir.join(LOCK_FILE_NAME)),
+            (proc_dir.clone(), proc_dir.join(LOCK_FILE_NAME)),
         ] {
             assert!(!dir.exists(), "{}", dir.display());
             assert!(!lock.exists(), "{}", lock.display());
@@ -2734,7 +2734,7 @@ updated_at: 2026-01-02T03:04:05Z
         let held = std::cell::RefCell::new(None);
         let hold = |about_to_go: &Path| {
             let lock = ExclusiveLock::acquire(
-                &about_to_go.join(".lock"),
+                &about_to_go.join(LOCK_FILE_NAME),
                 "test",
                 std::time::Duration::ZERO,
             )
