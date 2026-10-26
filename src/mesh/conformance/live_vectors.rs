@@ -477,9 +477,9 @@ mod loopback {
     };
 
     use futures_util::FutureExt;
-    use rand_core::OsRng;
     use rmpv::Value;
     use rns_transport::identity::PrivateIdentity as TransportIdentity;
+    use rns_transport::rand_core::OsRng;
     use sha2::{Digest, Sha256};
     use std::fs;
     use std::panic::AssertUnwindSafe;

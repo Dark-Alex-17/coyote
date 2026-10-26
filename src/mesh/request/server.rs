@@ -261,7 +261,7 @@ impl RequestServer {
                     cancel,
                 )
             }
-            LinkEvent::Activated | LinkEvent::Data(_) => None,
+            _ => None,
         }
     }
 

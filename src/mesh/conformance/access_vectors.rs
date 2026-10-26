@@ -43,11 +43,11 @@ use crate::mesh::test_support::{
 use crate::mesh::{destination_address, hex_lower, rfc3339_utc};
 
 use lxmf_core::constants::{FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE};
-use rand_core::OsRng;
 use rmpv::Value;
 use rns_transport::destination::link::LinkId;
 use rns_transport::hash::AddressHash;
 use rns_transport::identity::PrivateIdentity;
+use rns_transport::rand_core::OsRng;
 use serde_json::json;
 use std::fmt::Debug;
 use std::fs;

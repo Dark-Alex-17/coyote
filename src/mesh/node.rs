@@ -67,7 +67,6 @@ use crate::supervisor::notification::{SystemNotification, mesh_notification};
 use anyhow::{Context, Result, anyhow, bail};
 use arc_swap::ArcSwapOption;
 use parking_lot::RwLock;
-use rand_core::OsRng;
 use rns_transport::destination::DestinationDesc;
 use rns_transport::destination::{DestinationName, SingleInputDestination};
 use rns_transport::hash::AddressHash;
@@ -1664,17 +1663,15 @@ async fn announce_destination(
     app_data: &[u8],
     last_announce_at: &ArcSwapOption<SystemTime>,
 ) -> Result<Instant> {
-    let packet = dest
-        .lock()
+    transport
+        .try_send_announce(dest, Some(app_data))
         .await
-        .announce(OsRng, Some(app_data))
         .map_err(|err| {
             anyhow!(
                 "Failed to build the mesh announce for destination {}: {err}",
                 hash.to_hex_string()
             )
         })?;
-    transport.send_packet(packet).await;
     last_announce_at.store(Some(Arc::new(SystemTime::now())));
     debug!(
         "Sent mesh announce for destination {}",
@@ -4590,6 +4587,7 @@ mod tests {
     use rns_transport::destination::link::LinkId;
     #[cfg(unix)]
     use rns_transport::iface::tcp_server::TcpServer;
+    use rns_transport::rand_core::OsRng;
     #[cfg(unix)]
     use std::sync::atomic::AtomicBool;
     #[cfg(unix)]

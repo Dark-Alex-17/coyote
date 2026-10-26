@@ -909,8 +909,8 @@ mod tests {
     use crate::mesh::test_support::{TempDir, TrustList};
     use crate::testing::{debug_snapshot, install_log_collector};
 
-    use rand_core::OsRng;
     use rns_transport::destination::link::LinkId;
+    use rns_transport::rand_core::OsRng;
     use std::io::Cursor;
 
     /// A gate over `list` with a fresh peer table and cache, surfacing into the returned

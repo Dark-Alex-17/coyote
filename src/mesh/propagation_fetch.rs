@@ -1514,8 +1514,8 @@ mod tests {
     use lxmf_core::message::Payload;
     use lxmf_core::stamp::generate_stamp;
     use parking_lot::Mutex;
-    use rand_core::OsRng;
     use rns_transport::identity_bridge::to_transport_identity;
+    use rns_transport::rand_core::OsRng;
     use rns_transport::transport::TransportConfig;
     use std::sync::{Arc, Weak};
 

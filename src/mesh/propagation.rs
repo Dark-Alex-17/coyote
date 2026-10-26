@@ -20,13 +20,13 @@ use lxmf_core::message::{Payload, WireMessage};
 use lxmf_core::stamp::{
     PROPAGATION_STAMP_SIZE, generate_propagation_stamp_with_value_until_cancelled,
 };
-use rand_core::OsRng;
 use rns_transport::PacketContext;
 use rns_transport::destination::link::{Link, LinkEvent, LinkEventData, LinkId};
 use rns_transport::destination::{DestinationDesc, DestinationName, SingleOutputDestination};
 use rns_transport::hash::{AddressHash, Hash};
 use rns_transport::identity::Identity;
 use rns_transport::identity_bridge::{to_core_identity, to_transport_identity};
+use rns_transport::rand_core::OsRng;
 use rns_transport::resource::{ResourceEvent, ResourceEventKind};
 use rns_transport::transport::{SendPacketOutcome, Transport};
 use std::fmt;
@@ -672,7 +672,7 @@ async fn watch_verdict(
                         until = Instant::now() + reject_window;
                     }
                     ResourceEventKind::OutboundFailed
-                    | ResourceEventKind::OutboundRejected
+                    | ResourceEventKind::OutboundRejected { .. }
                     | ResourceEventKind::OutboundCancelled => {
                         return Err(PropagationError::TransferFailed);
                     }
@@ -699,7 +699,7 @@ async fn watch_verdict(
                         return Err(PropagationError::ClosedAfterTransfer);
                     }
                     LinkEvent::Closed => return Err(RequestError::LinkClosed.into()),
-                    LinkEvent::Activated | LinkEvent::Data(_) | LinkEvent::PeerIdentified(_) => {}
+                    _ => {}
                 },
                 Ok(_) => {}
                 // While a resource is in flight its outcome is re-derivable from later
@@ -1622,6 +1622,7 @@ mod tests {
     mod verdict {
         use super::*;
         use rns_transport::destination::link::LinkPayload;
+        use rns_transport::resource::RejectReason;
 
         const WINDOW: Duration = Duration::from_millis(100);
         /// A bound no test is meant to reach.
@@ -1731,7 +1732,9 @@ mod tests {
         async fn a_failed_rejected_or_cancelled_transfer_fails() {
             for kind in [
                 ResourceEventKind::OutboundFailed,
-                ResourceEventKind::OutboundRejected,
+                ResourceEventKind::OutboundRejected {
+                    reason: RejectReason::PeerCancelled,
+                },
                 ResourceEventKind::OutboundCancelled,
             ] {
                 let watch = Watch::new();
@@ -2338,7 +2341,7 @@ mod tests {
                             kind:
                                 kind @ (ResourceEventKind::OutboundComplete
                                 | ResourceEventKind::OutboundFailed
-                                | ResourceEventKind::OutboundRejected),
+                                | ResourceEventKind::OutboundRejected { .. }),
                             ..
                         }) => panic!("the client transport ended the transfer with {kind:?}"),
                         Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}

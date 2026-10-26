@@ -1445,10 +1445,10 @@ mod tests {
     use crate::mesh::{destination_address, hex_lower};
     use crate::supervisor::mailbox::EnvelopePayload;
     use crate::testing::{TestConfigDirGuard, install_log_collector, warn_snapshot};
-    use rand_core::OsRng;
     use rns_transport::destination::link::LinkId;
     use rns_transport::hash::AddressHash;
     use rns_transport::identity::PrivateIdentity;
+    use rns_transport::rand_core::OsRng;
     use serde_json::json;
     use serial_test::serial;
     use std::sync::Weak;

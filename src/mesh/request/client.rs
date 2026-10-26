@@ -440,7 +440,7 @@ impl RequestClient {
                     let _ = entry.reply.send(Err(RequestError::LinkClosed));
                 }
             }
-            LinkEvent::Activated | LinkEvent::Data(_) | LinkEvent::PeerIdentified(_) => {}
+            _ => {}
         }
     }
 
@@ -482,7 +482,7 @@ impl RequestClient {
             }
             // Not fast-failed: a peer that rejects the advertisement waits out the request
             // deadline. The arm is named so it cannot hide in `_`.
-            ResourceEventKind::OutboundRejected => {}
+            ResourceEventKind::OutboundRejected { .. } => {}
             _ => {}
         }
     }
@@ -612,7 +612,12 @@ pub(crate) async fn open_link(
             "no known path to destination {destination_hex}"
         )));
     }
-    let link = deadline.bound(path, transport.link(*destination)).await?;
+    let link = deadline
+        .bound(path, transport.link(*destination))
+        .await?
+        .map_err(|err| {
+            RequestError::LinkFailed(format!("no link to destination {destination_hex}: {err}"))
+        })?;
     let activation = deadline
         .bound(
             path,

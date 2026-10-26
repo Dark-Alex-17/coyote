@@ -411,8 +411,6 @@ pub(crate) mod test_support {
     #[cfg(unix)]
     use parking_lot::Mutex;
     #[cfg(unix)]
-    use rand_core::OsRng;
-    #[cfg(unix)]
     use rmpv::Value;
     #[cfg(unix)]
     use rns_transport::destination::link::LinkId;
@@ -426,6 +424,8 @@ pub(crate) mod test_support {
     use rns_transport::iface::tcp_client::TcpClient;
     #[cfg(unix)]
     use rns_transport::iface::tcp_server::TcpServer;
+    #[cfg(unix)]
+    use rns_transport::rand_core::OsRng;
     #[cfg(unix)]
     use rns_transport::transport::{AnnounceEvent, Transport, TransportConfig};
     #[cfg(unix)]

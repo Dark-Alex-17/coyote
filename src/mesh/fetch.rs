@@ -1689,10 +1689,10 @@ mod tests {
     use crate::mesh::wire_path::WIRE_PATH_MAX_BYTES;
     #[cfg(unix)]
     use crate::testing::{debug_snapshot, install_log_collector, warn_snapshot};
-    use rand_core::OsRng;
     use rns_transport::destination::link::LinkId;
     use rns_transport::hash::AddressHash;
     use rns_transport::identity::PrivateIdentity as TransportIdentity;
+    use rns_transport::rand_core::OsRng;
     use std::fs;
 
     const GRANT_ID: &str = "0123456789abcdef";

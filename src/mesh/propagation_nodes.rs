@@ -146,9 +146,9 @@ mod tests {
     use crate::mesh::session_destination_name;
     use crate::testing::{debug_snapshot, install_log_collector};
 
-    use rand_core::OsRng;
     use rns_transport::destination::{DestinationName, SingleOutputDestination};
     use rns_transport::identity::PrivateIdentity as TransportIdentity;
+    use rns_transport::rand_core::OsRng;
     use std::time::Duration;
 
     fn desc(aspect: &str) -> DestinationDesc {

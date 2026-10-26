@@ -615,7 +615,6 @@ pub(crate) mod network {
 
     use async_trait::async_trait;
     use parking_lot::Mutex;
-    use rand_core::OsRng;
     use rmpv::Value;
     use rns_transport::PacketContext;
     use rns_transport::destination::link::{Link, LinkEvent, LinkEventData, LinkId};
@@ -627,6 +626,7 @@ pub(crate) mod network {
     use rns_transport::iface::InterfaceSharedConfig;
     use rns_transport::iface::tcp_client::TcpClient;
     use rns_transport::iface::tcp_server::TcpServer;
+    use rns_transport::rand_core::{OsRng, RngCore};
     use rns_transport::resource::{LINK_PACKET_MDU, ResourceEvent, ResourceEventKind};
     use rns_transport::transport::{AnnounceEvent, Transport};
     use sha2::{Digest as _, Sha256};
@@ -1313,7 +1313,7 @@ pub(crate) mod network {
     /// random body reaches a limit set at that layer.
     fn incompressible_response_body() -> Vec<u8> {
         let mut random = vec![0u8; MAX_REQUEST_PAYLOAD_BYTES + 1 - RESPONSE_FRAME_OVERHEAD];
-        rand_core::RngCore::fill_bytes(&mut OsRng, &mut random);
+        RngCore::fill_bytes(&mut OsRng, &mut random);
         random
     }
 
@@ -1333,7 +1333,7 @@ pub(crate) mod network {
     /// the same reason as `incompressible_response_body`.
     fn oversize_request() -> Vec<u8> {
         let mut random = vec![0u8; MAX_REQUEST_PAYLOAD_BYTES + 1 - REQUEST_FRAME_OVERHEAD];
-        rand_core::RngCore::fill_bytes(&mut OsRng, &mut random);
+        RngCore::fill_bytes(&mut OsRng, &mut random);
         let packed = RequestFrame::new("/big", Value::Binary(random)).encode();
         assert_eq!(packed.len(), MAX_REQUEST_PAYLOAD_BYTES + 1);
         packed
@@ -1352,7 +1352,7 @@ pub(crate) mod network {
                 .expect("the receiver must refuse the oversize advertisement")
                 .unwrap();
             if event.hash == resource_hash
-                && matches!(event.kind, ResourceEventKind::OutboundRejected)
+                && matches!(event.kind, ResourceEventKind::OutboundRejected { .. })
             {
                 return;
             }
@@ -10311,7 +10311,7 @@ pub(crate) mod network {
         let (slot, _idle) = installed_slot(&pair);
         let workspace = share_docs_from_a(&pair, &slot, "request-fetch-big-root");
         let mut bytes = vec![0u8; usize::try_from(SINGLE_SEGMENT_FETCH_CEILING).unwrap()];
-        rand_core::RngCore::fill_bytes(&mut OsRng, &mut bytes);
+        RngCore::fill_bytes(&mut OsRng, &mut bytes);
         fs::write(workspace.path.join("docs").join("big.bin"), &bytes).unwrap();
 
         let outcome = pair

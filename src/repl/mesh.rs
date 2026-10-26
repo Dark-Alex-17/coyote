@@ -7312,9 +7312,9 @@ mod tests {
     };
     use crate::mesh::request::RemoteRefusal;
     use crate::mesh::test_support::{Compatibility, PropagationNode};
-    use rand_core::OsRng;
     use rns_transport::destination::{DestinationName, SingleOutputDestination};
     use rns_transport::identity::PrivateIdentity as TransportIdentity;
+    use rns_transport::rand_core::OsRng;
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -13390,9 +13390,9 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             /// identity + name hash -> destination, so the destination is derived for real.
             fn announced_peer() -> (String, String, String) {
                 use crate::mesh::session_destination_name;
-                use rand_core::OsRng;
                 use rns_transport::destination::SingleInputDestination;
                 use rns_transport::identity::PrivateIdentity;
+                use rns_transport::rand_core::OsRng;
 
                 let name = session_destination_name("probe");
                 let announced =
@@ -13681,9 +13681,9 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             #[serial]
             fn info_marks_a_stale_row_superseded_by_its_identitys_newer_destination() {
                 use crate::mesh::session_destination_name;
-                use rand_core::OsRng;
                 use rns_transport::destination::SingleInputDestination;
                 use rns_transport::identity::PrivateIdentity;
+                use rns_transport::rand_core::OsRng;
 
                 let _guard = TestConfigDirGuard::new("repl-mesh-info-superseded");
                 let _capture = capture::install();
@@ -13753,9 +13753,9 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             fn a_second_instance_of_a_trusted_identity_is_known_not_untrusted() {
                 use crate::function::mesh::handle_mesh_tool;
                 use crate::mesh::session_destination_name;
-                use rand_core::OsRng;
                 use rns_transport::destination::SingleInputDestination;
                 use rns_transport::identity::PrivateIdentity;
+                use rns_transport::rand_core::OsRng;
 
                 let _guard = TestConfigDirGuard::new("repl-mesh-known-instance");
                 let _capture = capture::install();
@@ -16099,8 +16099,8 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         decode_name_hash(&runtime.peers().get(&old_dest).unwrap().name_hash)
                             .unwrap();
                     let new_key = {
-                        use rand_core::OsRng;
                         use rns_transport::identity::PrivateIdentity;
+                        use rns_transport::rand_core::OsRng;
                         PrivateIdentity::new_from_rand(OsRng)
                     };
                     let new_identity = new_key.address_hash().to_hex_string();
@@ -16276,9 +16276,9 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 at: SystemTime,
             ) -> (String, String) {
                 use crate::mesh::session_destination_name;
-                use rand_core::OsRng;
                 use rns_transport::destination::SingleInputDestination;
                 use rns_transport::identity::PrivateIdentity;
+                use rns_transport::rand_core::OsRng;
 
                 let dest_name = session_destination_name(aspect);
                 let announced =
@@ -18009,9 +18009,9 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 use crate::mesh::session_destination_name;
                 use crate::mesh::test_support::PeerSighting;
                 use crate::mesh::trust::{LiveMesh, TrustOptions};
-                use rand_core::OsRng;
                 use rns_transport::destination::SingleInputDestination;
                 use rns_transport::identity::PrivateIdentity;
+                use rns_transport::rand_core::OsRng;
 
                 let _guard = TestConfigDirGuard::new("repl-mesh-status-unresolvable");
                 let _capture = capture::install();
@@ -18133,9 +18133,9 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 use crate::mesh::test_support::PeerSighting;
                 use crate::mesh::trust::{LiveMesh, TrustOptions};
                 use crate::utils::create_abort_signal;
-                use rand_core::OsRng;
                 use rns_transport::destination::SingleInputDestination;
                 use rns_transport::identity::PrivateIdentity;
+                use rns_transport::rand_core::OsRng;
                 use std::time::Instant;
 
                 let _guard = TestConfigDirGuard::new("repl-mesh-route-wait-ctrl-c");
@@ -18738,9 +18738,9 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 use crate::mesh::session_destination_name;
                 use crate::mesh::test_support::PeerSighting;
                 use crate::mesh::trust::{LiveMesh, TrustOptions};
-                use rand_core::OsRng;
                 use rns_transport::destination::SingleInputDestination;
                 use rns_transport::identity::PrivateIdentity;
+                use rns_transport::rand_core::OsRng;
 
                 let _guard = TestConfigDirGuard::new("repl-mesh-message-standing");
                 let _script = prompt_script::install(&[false, false, false, false, false]);
@@ -25364,9 +25364,9 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             #[serial]
             fn usage_probe_a_known_instance_is_refused_with_the_known_word_at_every_contact_verb() {
                 use crate::mesh::session_destination_name;
-                use rand_core::OsRng;
                 use rns_transport::destination::SingleInputDestination;
                 use rns_transport::identity::PrivateIdentity;
+                use rns_transport::rand_core::OsRng;
 
                 let _guard = TestConfigDirGuard::new("repl-mesh-known-refusals");
                 let _script = prompt_script::install(&[]);
@@ -34485,8 +34485,8 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         FETCH_PATH, LIST_PATH, NodePair, ResponderScript as Script, fetch_body,
                         short_options, trusting_b, wire_field, wire_status,
                     };
-                    use rand_core::OsRng;
                     use rns_transport::identity::PrivateIdentity as TransportIdentity;
+                    use rns_transport::rand_core::OsRng;
 
                     let _guard = TestConfigDirGuard::new("repl-mesh-grant-standing-live");
                     let _capture = capture::install();

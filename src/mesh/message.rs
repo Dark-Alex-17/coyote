@@ -2409,9 +2409,9 @@ mod tests {
     use crate::mesh::test_support::{TempDir, TrustList};
     use crate::supervisor::notification::MESH_EVENTS_DROPPED_EVENT;
 
-    use rand_core::OsRng;
     use rns_transport::destination::link::LinkId;
     use rns_transport::identity::PrivateIdentity;
+    use rns_transport::rand_core::OsRng;
     use std::io::Cursor;
 
     fn hash_of(seed: &str) -> String {

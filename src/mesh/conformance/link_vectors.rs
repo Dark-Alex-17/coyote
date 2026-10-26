@@ -460,13 +460,13 @@ mod loopback {
     use crate::mesh::trust::TrustOptions;
     use crate::testing::{debug_snapshot, install_log_collector, warn_snapshot};
 
-    use rand_core::OsRng;
     use rmpv::Value;
     use rns_transport::destination::{DestinationDesc, SingleInputDestination};
     use rns_transport::identity::PrivateIdentity as TransportIdentity;
     use rns_transport::iface::InterfaceSharedConfig;
     use rns_transport::iface::tcp_client::TcpClient;
     use rns_transport::iface::tcp_server::TcpServer;
+    use rns_transport::rand_core::OsRng;
     use rns_transport::resource::LINK_PACKET_MDU;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;

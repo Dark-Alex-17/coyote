@@ -49,11 +49,11 @@ use crate::mesh::wire_path::{
 use crate::mesh::{hex_lower, mesh_config_dir, rfc3339_utc};
 use crate::testing::{debug_snapshot, install_log_collector, warn_snapshot};
 
-use rand_core::OsRng;
 use rmpv::Value;
 use rns_transport::destination::link::LinkId;
 use rns_transport::hash::AddressHash;
 use rns_transport::identity::PrivateIdentity;
+use rns_transport::rand_core::OsRng;
 use sha2::{Digest, Sha256};
 use std::fmt::Debug;
 use std::fs;

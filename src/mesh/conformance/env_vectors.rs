@@ -25,11 +25,11 @@ use crate::mesh::trust::{Decision, InstancePresence, KeyChangeOutcome, Rule, Tru
 use crate::mesh::{destination_address, hex_lower};
 
 use async_trait::async_trait;
-use rand_core::OsRng;
 use rmpv::Value;
 use rns_transport::destination::link::LinkId;
 use rns_transport::hash::AddressHash;
 use rns_transport::identity::PrivateIdentity;
+use rns_transport::rand_core::OsRng;
 use std::fmt::Debug;
 use std::future::Future;
 use std::io::Cursor;

@@ -38,7 +38,7 @@
 mod oracles;
 
 use arbitrary::{Arbitrary, Unstructured};
-use rand_core::{CryptoRng, RngCore};
+use rns_transport::rand_core::{CryptoRng, RngCore};
 use std::cell::RefCell;
 use std::ffi::OsStr;
 use std::fs;
@@ -95,10 +95,10 @@ impl RngCore for SplitMix {
     }
 
     fn fill_bytes(&mut self, dest: &mut [u8]) {
-        rand_core::impls::fill_bytes_via_next(self, dest)
+        rns_transport::rand_core::impls::fill_bytes_via_next(self, dest)
     }
 
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rns_transport::rand_core::Error> {
         self.fill_bytes(dest);
         Ok(())
     }

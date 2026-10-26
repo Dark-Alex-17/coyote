@@ -3373,9 +3373,9 @@ mod tests {
     use crate::mesh::session_destination_name;
     use crate::testing::{install_log_collector, warn_snapshot};
 
-    use rand_core::OsRng;
     use rns_transport::destination::SingleInputDestination;
     use rns_transport::identity::PrivateIdentity;
+    use rns_transport::rand_core::OsRng;
     use std::sync::atomic::AtomicUsize;
 
     struct MeshOff;

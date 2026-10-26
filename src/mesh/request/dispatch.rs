@@ -508,8 +508,8 @@ mod tests {
     use crate::mesh::destination_address;
     use crate::mesh::request::frame::{NAME_HASH_LEN, OriginName};
     use crate::mesh::test_support::TrustList;
-    use rand_core::OsRng;
     use rns_transport::identity::PrivateIdentity;
+    use rns_transport::rand_core::OsRng;
     use std::sync::Mutex;
 
     #[test]
