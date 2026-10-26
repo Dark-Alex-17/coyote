@@ -588,8 +588,7 @@ pub(crate) mod network {
         received_reply, to_request_body,
     };
     use crate::mesh::node::{
-        FullEnvoy, KnockOptions, MeshRuntime, MeshSlot, NodeOptions, REKEY_GRACE, RecordingEnvoy,
-        SHUTDOWN_GRACE,
+        FullEnvoy, KnockOptions, MeshRuntime, MeshSlot, NodeOptions, RecordingEnvoy, SHUTDOWN_GRACE,
     };
     use crate::mesh::notify::Source;
     use crate::mesh::peers::{PEER_TTL, PeerSighting, PeerTable};
@@ -627,7 +626,7 @@ pub(crate) mod network {
     use rns_transport::iface::tcp_client::TcpClient;
     use rns_transport::iface::tcp_server::TcpServer;
     use rns_transport::rand_core::{OsRng, RngCore};
-    use rns_transport::resource::{LINK_PACKET_MDU, ResourceEvent, ResourceEventKind};
+    use rns_transport::resource::LINK_PACKET_MDU;
     use rns_transport::transport::{AnnounceEvent, Transport};
     use sha2::{Digest as _, Sha256};
     use std::collections::VecDeque;
@@ -1034,8 +1033,7 @@ pub(crate) mod network {
 
         pub(crate) async fn stop(self) {
             self.cancel.cancel();
-            // Bounded because a requester the test has wedged with a response-size limit has
-            // its transport's handler lock held for good.
+            // Bounded so a transport that stalls on the stop cannot hang the test.
             let _ = timeout(SHUTDOWN_GRACE, self.transport.stop_interface(self.iface)).await;
             self.iface_task.abort();
         }
@@ -1329,36 +1327,6 @@ pub(crate) mod network {
             .collect()
     }
 
-    /// A request frame for `/big` that encodes one byte over the cap, with a random body for
-    /// the same reason as `incompressible_response_body`.
-    fn oversize_request() -> Vec<u8> {
-        let mut random = vec![0u8; MAX_REQUEST_PAYLOAD_BYTES + 1 - REQUEST_FRAME_OVERHEAD];
-        RngCore::fill_bytes(&mut OsRng, &mut random);
-        let packed = RequestFrame::new("/big", Value::Binary(random)).encode();
-        assert_eq!(packed.len(), MAX_REQUEST_PAYLOAD_BYTES + 1);
-        packed
-    }
-
-    /// Waits for the receiver to answer the advertisement of `resource_hash` with a cancel,
-    /// which the sender reports as `OutboundRejected`.
-    async fn await_outbound_rejected(
-        events: &mut broadcast::Receiver<ResourceEvent>,
-        resource_hash: Hash,
-    ) {
-        let deadline = tokio::time::Instant::now() + INTEROP_TIMEOUT;
-        loop {
-            let event = tokio::time::timeout_at(deadline, events.recv())
-                .await
-                .expect("the receiver must refuse the oversize advertisement")
-                .unwrap();
-            if event.hash == resource_hash
-                && matches!(event.kind, ResourceEventKind::OutboundRejected { .. })
-            {
-                return;
-            }
-        }
-    }
-
     /// A started `MeshRuntime` (node A) connected to a bare responder (node B) whose
     /// transport also runs an `RequestClient`, so either side can request from the other.
     pub(crate) struct NodePair {
@@ -1516,37 +1484,6 @@ pub(crate) mod network {
                 )
                 .await
                 .unwrap()
-        }
-
-        /// Arms node A's advertisement-time request cap, which production code leaves off,
-        /// and trips it with an oversize request from B. The reject deadlocks A's transport
-        /// (coyote-rns-transport 0.14.0), which is what the bounded-wait tests need.
-        async fn wedge_node_a(&self) {
-            self.node_a
-                .arm_request_cap_for_test(MAX_REQUEST_PAYLOAD_BYTES)
-                .await;
-            let transport_b = &self.responder.transport;
-            let link = open_link(transport_b, &self.a_desc, "/big", link_deadline())
-                .await
-                .unwrap();
-            let link_id = *link.lock().await.id();
-            let mut resource_events = transport_b.resource_events();
-            let packed = oversize_request();
-            let resource_hash = transport_b
-                .send_request_resource(
-                    &link_id,
-                    RequestId::of_packed(&packed).to_vec(),
-                    packed,
-                    None,
-                )
-                .await
-                .unwrap();
-            await_outbound_rejected(&mut resource_events, resource_hash).await;
-            assert_eq!(
-                self.recorder_a.seen_count(),
-                0,
-                "nothing reached the handler"
-            );
         }
 
         /// Stops node A through a slot, the way the REPL does, and returns how long it took.
@@ -1956,72 +1893,6 @@ pub(crate) mod network {
         responder.stop().await;
     }
 
-    /// Refusing an oversize response advertisement leaves the requester's transport with its
-    /// handler lock held by a parked upstream task, so every transport call after it blocks.
-    /// A request made then must fail on its own deadlines rather than hang. The limit that
-    /// triggers the refusal is set by the test only; production code does not arm that
-    /// path, because of this deadlock.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn request_gives_up_on_a_wedged_transport() {
-        let recorder = Arc::new(Recorder::default());
-        let responder = Responder::listen(recorder.clone(), TcpServer::DEFAULT_CLIENT_MTU).await;
-        let mut requester = Requester::connect(responder.port, TcpClient::DEFAULT_MTU).await;
-        responder.announce(None).await;
-        let desc = requester.learn(&responder.desc.address_hash).await;
-        let (in_flight, seen) = hanging_request(&requester, &recorder, &desc).await;
-        let out_link = requester
-            .transport
-            .find_out_link(&seen.link_id)
-            .await
-            .expect("the requester holds the out-link the request went on");
-        out_link
-            .lock()
-            .await
-            .set_response_size_limit(seen.request_id.as_bytes(), MAX_REQUEST_PAYLOAD_BYTES);
-
-        let mut resource_events = responder.transport.resource_events();
-        let resource_hash = responder
-            .transport
-            .send_response_resource(
-                &seen.link_id,
-                seen.request_id.to_vec(),
-                oversize_response(seen.request_id, incompressible_response_body()),
-                None,
-            )
-            .await
-            .unwrap();
-        await_outbound_rejected(&mut resource_events, resource_hash).await;
-        let result = timeout(INTEROP_TIMEOUT, in_flight).await.unwrap().unwrap();
-        assert_eq!(result.unwrap_err(), timed_out_slow_request());
-
-        let options = RequestOptions {
-            link_timeout: Duration::from_secs(2),
-            request_timeout: Duration::from_secs(2),
-        };
-        let started = Instant::now();
-        let result = timeout(
-            Duration::from_secs(8),
-            requester.client.request(
-                &requester.transport,
-                &requester.identity,
-                &desc,
-                "/after",
-                requester.envelope(Value::Nil),
-                options,
-            ),
-        )
-        .await
-        .expect("a request on a wedged transport must give up on its own deadlines");
-        assert!(
-            matches!(result, Err(RequestError::Timeout { .. })),
-            "{result:?} after {:?}",
-            started.elapsed()
-        );
-        assert_eq!(requester.client.pending_len(), 0);
-        requester.stop().await;
-        responder.stop().await;
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn oversized_response_is_dropped_before_decode() {
         install_log_collector();
@@ -2420,113 +2291,26 @@ pub(crate) mod network {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn mesh_runtime_does_not_arm_the_inbound_request_cap() {
-        install_log_collector();
-        let pair = NodePair::start("request-runtime-uncapped").await;
+    async fn mesh_runtime_arms_the_inbound_request_cap_on_start_and_rekey() {
+        let pair = NodePair::start("request-runtime-capped").await;
         assert_eq!(
             pair.node_a.max_request_size().await,
-            None,
-            "the destination must not carry a max_request_size: rejecting an advertisement on it deadlocks the transport (coyote-rns-transport 0.14.0)"
+            Some(MAX_REQUEST_PAYLOAD_BYTES),
+            "the destination registered at start must carry the request cap"
         );
-
-        let transport_b = &pair.responder.transport;
-        let link = open_link(transport_b, &pair.a_desc, "/big", link_deadline())
-            .await
-            .unwrap();
-        let link_id = *link.lock().await.id();
-        let packed = oversize_request();
-        transport_b
-            .send_request_resource(
-                &link_id,
-                RequestId::of_packed(&packed).to_vec(),
-                packed,
-                None,
-            )
-            .await
-            .unwrap();
-
-        let dropped = format!(
-            "Dropped an oversize mesh request on link {} ({} bytes, max {MAX_REQUEST_PAYLOAD_BYTES})",
-            link_id.to_hex_string(),
-            MAX_REQUEST_PAYLOAD_BYTES + 1
-        );
-        wait_until("node A to drop the oversize request", || {
-            debug_snapshot().contains(&dropped)
-        })
-        .await;
-        assert_eq!(
-            pair.recorder_a.seen_count(),
-            0,
-            "nothing reached the handler"
-        );
-
-        let outcome = pair
-            .client_b
-            .request(
-                transport_b,
-                &TransportIdentity::new_from_rand(OsRng),
-                &pair.a_desc,
-                "/echo",
-                pair.responder.envelope(Value::from("after")),
-                RequestOptions::default(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            outcome.value,
-            Value::from("after"),
-            "an oversize request must not wedge the node's transport"
-        );
-        assert_eq!(pair.recorder_a.seen_count(), 1);
-        pair.stop_node_a().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn mesh_runtime_stop_is_bounded_when_the_transport_is_wedged() {
-        let pair = NodePair::start("request-runtime-wedged-stop").await;
-        pair.wedge_node_a().await;
-
-        // The interface stop and the deregistration in `shutdown` both wait on the held
-        // handler lock, so only the deadlines bring `stop` back.
-        let stopped_in = pair.stop_node_a().await;
-        assert!(
-            stopped_in < SHUTDOWN_GRACE * 2,
-            "stop must stay bounded even with the transport wedged; took {stopped_in:?}"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn rekey_gives_up_within_grace_when_the_transport_is_wedged() {
-        let pair = NodePair::start("request-runtime-wedged-rekey").await;
-        let original_id = pair.node_a.instance_id().await;
-        let original_hash = pair.node_a.destination_hash().await;
-        pair.wedge_node_a().await;
-
-        let rekeying = Instant::now();
-        let err = timeout(
-            REKEY_GRACE * 2,
-            pair.node_a.rekey(ForkRekey {
-                original_instance_id: Some(original_id.clone()),
+        pair.node_a
+            .rekey(ForkRekey {
+                original_instance_id: Some(pair.node_a.instance_id().await),
                 fork_instance_id: Session::default().ensure_mesh_instance_id().to_string(),
-            }),
-        )
-        .await
-        .expect("rekey must give up on a wedged transport within its grace")
-        .unwrap_err()
-        .to_string();
-        let gave_up_in = rekeying.elapsed();
-
-        assert!(
-            err.contains(&original_hash),
-            "the error must name the destination the node still serves: {err}"
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            pair.node_a.max_request_size().await,
+            Some(MAX_REQUEST_PAYLOAD_BYTES),
+            "the destination registered by a rekey must carry the request cap too"
         );
-        assert_eq!(pair.node_a.instance_id().await, original_id);
-        assert_eq!(pair.node_a.destination_hash().await, original_hash);
-        let stopped_in = pair.stop_node_a().await;
-        assert!(
-            gave_up_in < REKEY_GRACE * 2 && stopped_in < SHUTDOWN_GRACE * 2,
-            "rekey took {gave_up_in:?} and stop took {stopped_in:?} on a wedged transport"
-        );
+        pair.stop_node_a().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -11,9 +11,8 @@ use std::io::Cursor;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Frames above this are refused: outbound before anything touches the wire, inbound after
-/// assembly and before decoding. The bound is enforced on our side only; the upstream
-/// 64 MiB advertisement cap (`advertisement_limits.rs`) is the only pre-assembly bound,
-/// because the reject path in coyote-rns-transport 0.14.0 deadlocks the transport.
+/// assembly and before decoding. The node's destination is armed with it too, so the
+/// library refuses an oversize request at advertisement time before any of it transfers.
 pub(crate) const MAX_REQUEST_PAYLOAD_BYTES: usize = 256 * 1024;
 
 /// The bound on a `/fetch` RESPONSE alone: the largest file a node serves plus room for the

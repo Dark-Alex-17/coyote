@@ -1343,8 +1343,7 @@ pub(crate) mod test_support {
 
         pub(crate) async fn stop(self) {
             self.cancel.cancel();
-            // Bounded because a connector a test has wedged with a response-size limit has
-            // its transport's handler lock held for good.
+            // Bounded so a transport that stalls on the stop cannot hang the test.
             let _ = timeout(
                 super::node::SHUTDOWN_GRACE,
                 self.transport.stop_interface(self.iface),

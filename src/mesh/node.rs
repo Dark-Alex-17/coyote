@@ -50,9 +50,9 @@ use crate::mesh::protocol::{Compatibility, MESH_PROTOCOL_MIN_SUPPORTED, MESH_PRO
 #[cfg(all(test, unix))]
 use crate::mesh::request::RequestHandler;
 use crate::mesh::request::{
-    ACCESS_PATH, Dispatcher, Envelope, FETCH_PATH, KNOCK_PATH, LIST_PATH, MESSAGE_PATH, OriginName,
-    RefusalCode, RemoteRefusal, RequestClient, RequestError, RequestOptions, RequestOutcome,
-    RequestServer, STATUS_PATH, redact_hashes, short,
+    ACCESS_PATH, Dispatcher, Envelope, FETCH_PATH, KNOCK_PATH, LIST_PATH,
+    MAX_REQUEST_PAYLOAD_BYTES, MESSAGE_PATH, OriginName, RefusalCode, RemoteRefusal, RequestClient,
+    RequestError, RequestOptions, RequestOutcome, RequestServer, STATUS_PATH, redact_hashes, short,
 };
 use crate::mesh::shares::ShareLocations;
 use crate::mesh::snapshot::MeshSnapshot;
@@ -97,9 +97,9 @@ use tokio_util::sync::CancellationToken;
 /// the `join_lan` failure cleanup spend one unwinding. The request-layer tests bound their
 /// own teardown with it too.
 pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
-/// How long `rekey` and `announce_now` wait on the transport for each of their steps. The
-/// transport takes its handler lock for every one, and a peer that trips its resource-reject
-/// path can leave that lock held for good.
+/// How long `rekey` and `announce_now` wait on the transport for each of their steps
+/// (registering and releasing a destination, attaching announce data, announcing), so a
+/// slow transport cannot hold the `destination` lock indefinitely.
 pub(crate) const REKEY_GRACE: Duration = Duration::from_secs(5);
 /// Poll interval while waiting for a TCP relay to report itself connected.
 const CONNECT_POLL: Duration = Duration::from_millis(50);
@@ -1072,20 +1072,6 @@ impl MeshRuntime {
         to_core_private_identity(&self.transport_identity).to_hex_string()
     }
 
-    /// Arms the upstream advertisement-time request cap, which production code leaves off
-    /// because coyote-rns-transport 0.14.0 deadlocks when it rejects on it. Tests use it to
-    /// wedge a node on purpose and prove the node's waits stay bounded.
-    #[cfg(all(test, unix))]
-    pub(crate) async fn arm_request_cap_for_test(&self, cap: usize) {
-        let state = self.destination.lock().await;
-        state
-            .dest
-            .lock()
-            .await
-            .set_max_request_size(cap)
-            .expect("the upstream cap setter is infallible");
-    }
-
     /// A token cancelled when the node stops; every task the node owns should watch it.
     pub(crate) fn cancellation_token(&self) -> CancellationToken {
         self.cancel.child_token()
@@ -1465,7 +1451,7 @@ impl MeshRuntime {
     /// hashes differ (`session.{instance_id}`), so both may be registered at once; a release of
     /// the original that does not finish within `REKEY_GRACE` is logged and the swap goes
     /// ahead, leaving the original registered until the node stops. Each transport wait is
-    /// bounded because a wedged handler lock would otherwise hold `destination` for good.
+    /// bounded because a stalled one would otherwise hold `destination` for good.
     pub(crate) async fn rekey(&self, rekey: ForkRekey) -> Result<()> {
         let mut state = self.destination.lock().await;
         if rekey.original_instance_id.as_deref() != Some(state.instance_id.as_str()) {
@@ -1566,9 +1552,8 @@ impl MeshRuntime {
         let Some(transport) = self.transport.lock().await.take() else {
             return Ok(());
         };
-        // The transport takes its handler lock for each of these, and a peer that trips its
-        // resource-reject path can leave that lock held for good; the deadline is shared so
-        // a wedged transport costs one grace window, not one per step.
+        // The deadline is shared so a stalled transport costs one grace window, not one
+        // per step.
         let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
         for iface in interfaces {
             stop_interface(&transport, iface, deadline).await;
@@ -1614,9 +1599,8 @@ pub(crate) fn session_destination_name(instance_id: &str) -> DestinationName {
 /// Registers the destination for `instance_id` and attaches `app_data` to its announces;
 /// each transport wait gives up at `deadline`. A destination registered but left without
 /// its announce data is deregistered again, best effort, and the error says whether that
-/// worked. The destination carries no `max_request_size`: coyote-rns-transport 0.14.0
-/// deadlocks when an advertisement is rejected on it, so oversize requests are dropped
-/// after assembly by `RequestServer` instead.
+/// worked. The destination is armed with `MAX_REQUEST_PAYLOAD_BYTES`, so the library
+/// rejects an oversize request at advertisement time, before any of it is transferred.
 async fn register_destination(
     transport: &Transport,
     identity: &TransportIdentity,
@@ -1636,6 +1620,10 @@ async fn register_destination(
                 hash.to_hex_string()
             )
         })?;
+    dest.lock()
+        .await
+        .set_max_request_size(MAX_REQUEST_PAYLOAD_BYTES)
+        .expect("the cap setter is infallible");
     let app_data = transport.set_destination_announce_app_data(&dest, Some(app_data.to_vec()));
     if timeout_at(deadline, app_data).await.is_err() {
         let released = timeout_at(deadline, transport.deregister_destination(&hash))
