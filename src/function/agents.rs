@@ -6188,6 +6188,53 @@ mod tests {
         assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
+    /// Two threads running `finish_child_meta` itself against one sidecar,
+    /// released together, leave one whole record: whichever write landed
+    /// last, its status and error belong together, the identity fields are
+    /// untouched and no temp file is left behind. The `bump_under_lock`
+    /// test beside this one is the discriminating twin (a lost update shows
+    /// up as a short string); this one pins the named function.
+    #[test]
+    #[serial]
+    fn finish_child_meta_from_two_threads_leaves_one_whole_sidecar() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let root = ctx.ensure_child_session_root().unwrap();
+        let meta = running_sidecar_for(&root, "test_finish_two_threads");
+        let sid = meta.session_id.clone();
+        let outcomes: [(ChildStatus, Option<&str>); 2] = [
+            (ChildStatus::Completed, None),
+            (ChildStatus::Failed, Some("x")),
+        ];
+
+        let barrier = std::sync::Barrier::new(outcomes.len());
+        std::thread::scope(|scope| {
+            for (status, error) in outcomes {
+                let barrier = &barrier;
+                let root = root.as_ref();
+                let sid = sid.as_str();
+                scope.spawn(move || {
+                    barrier.wait();
+                    finish_child_meta(Some(root), Some(sid), status, error.map(str::to_string));
+                });
+            }
+        });
+
+        let finished: ChildMeta = read_yaml(&root.child_meta_file(&sid));
+        let landed = (finished.status, finished.error.as_deref());
+        assert!(outcomes.contains(&landed), "{finished:?}");
+        assert_eq!(finished.session_id, sid);
+        assert_eq!(finished.agent, meta.agent);
+        assert_eq!(finished.created_at, meta.created_at);
+        assert!(finished.updated_at >= meta.updated_at, "{finished:?}");
+        let leftovers: Vec<String> = std::fs::read_dir(root.children_dir())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
     #[test]
     #[serial]
     fn finish_child_meta_waits_for_the_root_lock_before_writing() {
