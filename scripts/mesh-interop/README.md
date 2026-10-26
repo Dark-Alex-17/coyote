@@ -17,9 +17,9 @@ rules, in `src/repl/mesh_share_vectors.rs`).
 
 ### Verification record
 
-Last verified 2026-10-14, on macOS (the netns rows do not exist on this host; they and the
+Last verified 2026-10-26, on macOS (the netns rows do not exist on this host; they and the
 Linux run of row 1 are covered by the `Mesh Interop` CI job), with the Rust side at
-[`coyote-rns-transport`](https://github.com/Dark-Alex-17/coyote-rns-transport) `0.14.0`
+[`coyote-rns-transport`](https://github.com/Dark-Alex-17/coyote-rns-transport) `0.16.0`
 (Coyote's fork of `reticulum-rs-transport`), `lxmf-wire` `0.14.0` and `reticulum-rs-core`
 `0.14.0`, and the Python side at RNS `1.5.2` / LXMF `0.9.6` (the two commits pinned above):
 
@@ -27,12 +27,7 @@ Linux run of row 1 are covered by the `Mesh Interop` CI job), with the Rust side
 |---|---|
 | `COYOTE_MESH_INTEROP=1 cargo test --all mesh::conformance -- --include-ignored` (vectors + interop) | 76 passed, 0 ignored |
 | `cargo test --all mesh::fuzz` | 21 passed |
-| `cargo test --all --no-fail-fast` | 6143 passed, 1 failed, 11 ignored in the unit binary; 280 passed across the integration binaries |
-
-The one unit failure, `config::envoy_tools_tests::the_exec_probe_is_not_fooled_by_concurrent_process_spawns`,
-is not a mesh test: this host kills the probe binary it spawns with SIGKILL, and the test fails
-the same way with the previous pin checked out, so the failure is the host's and not the bump's.
-`--no-fail-fast` is what carries the run past it to the integration binaries.
+| `cargo test --all --no-fail-fast` | 7115 passed, 0 failed, 14 ignored in the unit binary; 530 passed, 1 ignored across the integration binaries |
 
 Rows 2 and 3 also run on all three legs of the CI matrix, and row 1 runs only in the Linux
 `Mesh Interop` job; none of those runs is part of this record.
