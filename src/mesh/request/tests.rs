@@ -2357,10 +2357,13 @@ pub(crate) mod network {
             0,
             "nothing reached the handler"
         );
+        let dropped_by_server_cap = format!(
+            "Dropped an oversize mesh request on link {} ({} bytes, max {MAX_REQUEST_PAYLOAD_BYTES})",
+            link_id.to_hex_string(),
+            MAX_REQUEST_PAYLOAD_BYTES + 1
+        );
         assert!(
-            !debug_snapshot()
-                .iter()
-                .any(|message| message.starts_with("Dropped an oversize mesh request")),
+            !debug_snapshot().contains(&dropped_by_server_cap),
             "the library refused the request at its advertisement; the server's own cap never saw it"
         );
 
