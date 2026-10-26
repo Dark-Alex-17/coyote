@@ -1356,7 +1356,9 @@ fn differing_variables(provided: &AgentVariables, stored: &AgentVariables) -> Ve
 /// back, so a refused resume leaves the sidecar exactly as it was. A root
 /// that has no directory yet has no children either, and is refused before
 /// the lock would create one; a root replaced by a symlink is refused
-/// without listing ids through the link.
+/// without listing ids through the link. The same two checks guard the
+/// second lock, so a root that vanished or became a symlink between the
+/// two steps is neither recreated nor followed for the restore.
 fn resume_child_session(
     child_ctx: &mut RequestContext,
     root: &ChildSessionRoot,
@@ -1377,14 +1379,16 @@ fn resume_child_session(
     };
     let dir = root.dir();
     if refuse_symlinked_dir(&dir, "child session resumed") {
-        bail!("no child session '{id}' under this session; its root directory is a symlink");
+        bail!(
+            "no child session '{id}' under this session; its root directory is a symlink or could not be inspected"
+        );
     }
     if !dir.is_dir() {
         return Err(no_child());
     }
+    let sidecar = root.child_meta_file(id);
     let saved_bytes = {
         let _lock = root.lock()?;
-        let sidecar = root.child_meta_file(id);
         let mut meta = root
             .load_child_meta(id)
             .with_context(|| format!("Failed to read the sidecar of child session '{id}'"))?
@@ -1443,11 +1447,22 @@ fn resume_child_session(
     let mut session = match load_and_gate() {
         Ok(session) => session,
         Err(error) => {
-            let sidecar = root.child_meta_file(id);
-            let restored = root.lock().and_then(|_lock| {
-                write_private_atomic(&sidecar, &saved_bytes)
-                    .with_context(|| format!("Failed to write {}", sidecar.display()))
-            });
+            let restored = if refuse_symlinked_dir(&dir, "child session restored") {
+                Err(anyhow!(
+                    "the child session root {} is a symlink or could not be inspected, so the sidecar was not restored",
+                    dir.display()
+                ))
+            } else if !dir.is_dir() {
+                Err(anyhow!(
+                    "the child session root {} is gone, so the sidecar was not restored",
+                    dir.display()
+                ))
+            } else {
+                root.lock().and_then(|_lock| {
+                    write_private_atomic(&sidecar, &saved_bytes)
+                        .with_context(|| format!("Failed to write {}", sidecar.display()))
+                })
+            };
             return Err(match restored {
                 Ok(()) => error,
                 Err(restore_error) => error.context(format!(
@@ -6468,8 +6483,9 @@ mod tests {
     /// gate; and once more only to write the bytes read under the first lock
     /// back after a later gate refuses. The session file is loaded between
     /// the two, outside any lock, and the test seam sits there too. The
-    /// first lock is taken only once the root is known to have a directory,
-    /// and `finish_child_meta` locks the same way around its own
+    /// first lock is taken only once the root is known to have a directory
+    /// that is not a symlink, the second lock repeats both checks, and
+    /// `finish_child_meta` locks the same way around its own
     /// read-modify-write.
     #[test]
     fn resume_locks_twice_and_never_loads_the_session_under_a_lock() {
@@ -6511,9 +6527,18 @@ mod tests {
             !first_scope.contains("between_resume_phases"),
             "{first_scope}"
         );
-        let restore_at = resume.find("let restored = root").unwrap();
-        let restore_scope =
-            &resume[restore_at..restore_at + resume[restore_at..].find(";\n").unwrap()];
+        let restore_at = resume.find("let restored = if ").unwrap();
+        let restore_scope = &resume
+            [restore_at..restore_at + resume[restore_at..].find("\n            };\n").unwrap()];
+        let second_lock_at = restore_scope.find("root.lock()").unwrap();
+        assert!(
+            restore_scope.find("refuse_symlinked_dir(&dir").unwrap() < second_lock_at,
+            "{restore_scope}"
+        );
+        assert!(
+            restore_scope.find("} else if !dir.is_dir()").unwrap() < second_lock_at,
+            "{restore_scope}"
+        );
         assert!(
             restore_scope.contains("write_private_atomic(&sidecar, &saved_bytes)"),
             "{restore_scope}"
