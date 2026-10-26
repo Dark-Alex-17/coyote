@@ -1796,7 +1796,6 @@ dependencies = [
  "pretty_assertions",
  "qrcode",
  "rand 0.10.3",
- "rand_core 0.6.4",
  "reedline",
  "reqwest 0.13.5",
  "rmcp",
@@ -1834,9 +1833,9 @@ dependencies = [
 
 [[package]]
 name = "coyote-rns-transport"
-version = "0.14.0"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "304c67a5797973a53c11c80cd80be76dc0e1d0f9609b6af24a828a2cbf5faa32"
+checksum = "ba9481b04c2f4084c279c25700d0fe0eecd363ba2863fee32f71ba5020cf41c2"
 dependencies = [
  "aes",
  "base64 0.22.1",
