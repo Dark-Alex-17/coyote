@@ -1759,32 +1759,26 @@ fn rust_files(dir: &Path, into: &mut Vec<PathBuf>) {
     }
 }
 
-/// The two mesh crates share `reticulum-rs-core`, so they are pinned on one upstream line
-/// (the same `major.minor`; the fork's patch number moves on its own when a Coyote-only
-/// patch is published, while `lxmf-wire` stays at the upstream release), the lockfile
-/// carries each at exactly the version `Cargo.toml` pins for it and resolves exactly one
-/// core, and all three come from crates.io, which rules out a patch table or a path
-/// replacement wherever `Cargo.toml` or `Cargo.lock` might declare it (a source
-/// replacement in a cargo config file is outside what these two files show). The upstream
-/// transport crate is gone from the graph, and the pin block names the fork and the one
-/// thing it changes.
+/// The fork and `lxmf-wire` are on versions of their own (the fork moves ahead of upstream
+/// on its own semver line), and what ties them is `reticulum-rs-core`: the lockfile
+/// resolves exactly one core and both depend on that one entry, carries each mesh crate at
+/// exactly the version `Cargo.toml` pins for it, and takes all three from crates.io, which
+/// rules out a patch table or a path replacement wherever `Cargo.toml` or `Cargo.lock`
+/// might declare it (a source replacement in a cargo config file is outside what these two
+/// files show). The upstream transport crate is gone from the graph, and the pin block
+/// names the fork and the one thing it changes.
 #[test]
-fn the_mesh_crates_move_together_and_resolve_one_core() {
+fn the_mesh_crates_resolve_one_core_from_crates_io() {
     let cargo_toml = read(repo_root().join("Cargo.toml"));
     let transport = cargo_toml_dependency_version(&cargo_toml, TRANSPORT_CRATE);
     let wire = cargo_toml_dependency_version(&cargo_toml, "lxmf-wire");
-    let line = |version: &str| -> String {
-        let mut parts = version.split('.');
-        match (parts.next(), parts.next(), parts.next(), parts.next()) {
-            (Some(major), Some(minor), Some(_), None) => format!("{major}.{minor}"),
-            _ => panic!("the mesh crates are pinned as exact `major.minor.patch`, not `{version}`"),
-        }
-    };
-    assert_eq!(
-        line(&transport),
-        line(&wire),
-        "`{TRANSPORT_CRATE}` {transport} and `lxmf-wire` {wire} must track one upstream line (same major.minor): the fork's patch number may differ, the line may not"
-    );
+    for (crate_name, version) in [(TRANSPORT_CRATE, &transport), ("lxmf-wire", &wire)] {
+        assert_eq!(
+            version.split('.').count(),
+            3,
+            "`{crate_name}` is pinned as exact `major.minor.patch`, not `{version}`"
+        );
+    }
     let lock = read(repo_root().join("Cargo.lock"));
     for crate_name in MESH_CRATES {
         let packages = lock_packages(&lock, crate_name);
@@ -1810,6 +1804,22 @@ fn the_mesh_crates_move_together_and_resolve_one_core() {
         lock_packages(&lock, UPSTREAM_TRANSPORT_CRATE).is_empty(),
         "the upstream `{UPSTREAM_TRANSPORT_CRATE}` must not be in the graph beside the fork"
     );
+    let entries = lock_entries(&lock);
+    let core = &lock_packages(&lock, "reticulum-rs-core")[0];
+    for crate_name in [TRANSPORT_CRATE, "lxmf-wire"] {
+        let entry = entries
+            .iter()
+            .find(|entry| entry.name == crate_name)
+            .unwrap_or_else(|| panic!("Cargo.lock has an entry for `{crate_name}`"));
+        assert!(
+            entry.dependencies.iter().any(|dep| {
+                dep == "reticulum-rs-core" || *dep == format!("reticulum-rs-core {}", core.version)
+            }),
+            "`{crate_name}` must depend on the one `reticulum-rs-core` {} in the graph, or the two mesh crates would carry two cores: {:?}",
+            core.version,
+            entry.dependencies
+        );
+    }
     let manifest_code: String = cargo_toml
         .lines()
         .filter(|line| !line.trim_start().starts_with('#'))
@@ -2185,13 +2195,14 @@ fn every_lock_entry_but_the_crate_itself_resolves_from_crates_io_and_nothing_red
     }
 }
 
-/// The pin comments say `rand_core` and `rmpv` "move together" with the transport. That is
-/// a fact about the graph, not a sentence: the generation `Cargo.toml` pins for each is the
-/// one the fork package itself depends on, both resolve to the same lock entry on the crate
-/// and on the fork, and `rmpv` (whose `Value` sits in the transport's request signatures)
-/// exists exactly once in the graph at the 1.3 line the fork pins.
+/// The RNG the transport's constructors take is named through the fork's `rand_core`
+/// re-export, so `Cargo.toml` has no `rand_core` entry and the lockfile shows no direct
+/// edge from this crate to it, only the fork's one edge. `rmpv` still "moves together"
+/// with the transport as the pin comment says, and that is a fact about the graph: its
+/// `Value` sits in the transport's request signatures, so it exists exactly once in the
+/// graph at the 1.3 line the fork pins, as a dependency of both the crate and the fork.
 #[test]
-fn the_rand_core_and_rmpv_pins_follow_the_transports_own_generations() {
+fn rand_core_comes_through_the_fork_and_rmpv_follows_its_generation() {
     let cargo_toml = read(repo_root().join("Cargo.toml"));
     let own = workspace_package_name(&cargo_toml);
     let entries = lock_entries(&read(repo_root().join("Cargo.lock")));
@@ -2203,34 +2214,30 @@ fn the_rand_core_and_rmpv_pins_follow_the_transports_own_generations() {
     let transport = find(TRANSPORT_CRATE);
     let coyote = find(&own);
 
-    let rand_core_req = cargo_toml_dependency_requirement(&cargo_toml, "rand_core");
-    let rand_core_edge = |entry: &LockEntry| -> String {
-        let edges: Vec<&String> = entry
+    assert!(
+        !cargo_toml
+            .lines()
+            .any(|line| line.starts_with("rand_core =") || line == "[dependencies.rand_core]"),
+        "Cargo.toml must not depend on rand_core directly: the RNG is named through `rns_transport::rand_core`"
+    );
+    let rand_core_edges = |entry: &LockEntry| -> Vec<String> {
+        entry
             .dependencies
             .iter()
             .filter(|dep| *dep == "rand_core" || dep.starts_with("rand_core "))
-            .collect();
-        assert_eq!(
-            edges.len(),
-            1,
-            "`{}` depends on exactly one rand_core generation: {edges:?}",
-            entry.name
-        );
-        edges[0].clone()
+            .cloned()
+            .collect()
     };
-    let on_transport = rand_core_edge(transport);
-    let on_coyote = rand_core_edge(coyote);
     assert_eq!(
-        on_transport, on_coyote,
-        "`{TRANSPORT_CRATE}` and `{own}` must share one rand_core entry or the transport's `CryptoRngCore` cannot be fed from here"
+        rand_core_edges(transport).len(),
+        1,
+        "`{TRANSPORT_CRATE}` depends on exactly one rand_core generation, the one it re-exports: {:?}",
+        rand_core_edges(transport)
     );
-    let resolved = on_coyote
-        .strip_prefix("rand_core ")
-        .map(str::to_string)
-        .unwrap_or_else(|| find("rand_core").version.clone());
     assert!(
-        resolved.starts_with(&format!("{rand_core_req}.")) || resolved == rand_core_req,
-        "Cargo.toml pins rand_core `{rand_core_req}` but the shared lock entry is `{resolved}`"
+        rand_core_edges(coyote).is_empty(),
+        "`{own}` must reach rand_core only through the fork's re-export, not a direct edge: {:?}",
+        rand_core_edges(coyote)
     );
 
     let rmpv_req = cargo_toml_dependency_requirement(&cargo_toml, "rmpv");
