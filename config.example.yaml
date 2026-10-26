@@ -255,6 +255,16 @@ memory_cap_with_tools: null      # Char cap for injected memory when function ca
 memory_cap_without_tools: null   # Char cap when function calling is unavailable (default: 12000).
                                  # Indexes plus drill file bodies are injected up to this cap.
 
+# ---- Child Sessions ----
+# Every agent spawned with `agent__spawn` or `agent__task_create` gets a persisted session of its
+# own under the cache dir, so a finished child can be resumed by its `session_id`. Set
+# `child_sessions: false` to turn that off everywhere: children then run exactly as before and no
+# file is written. An agent can also opt itself out with `child_sessions: false` in its own
+# config.yaml: when spawned as a child it gets no session (its own children still consult their own
+# config), but an agent can never re-enable what this app-level knob turned off. Nothing is
+# persisted under `dry_run: true`.
+child_sessions: null             # null = enabled; false = never persist child sessions (a spawn-time knob, not settable with .set)
+
 # ---- Workspace Instructions ----
 # Human-curated project instructions injected read-only into the system prompt, in full.
 # Coyote walks up from the current directory and injects the first match from the file

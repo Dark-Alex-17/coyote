@@ -59,6 +59,11 @@ initial_state:
   design_notes: ''
   design_trail: ''
 
+carry:
+  - plan_summary
+  - files_to_modify
+  - files_to_create
+
 start: resolve_paths
 
 nodes:
@@ -102,7 +107,24 @@ nodes:
       orchestrator see. Omit it when the approach only follows precedent.
 
       Project directory: {{project_dir}}
-    prompt: '{{initial_prompt}}'
+    prompt: |
+      ## Earlier turns with this agent (empty on a first run)
+      {{previous_turns}}
+
+      ## Plan carried from the earlier run (empty on a first run)
+      {{plan_summary}}
+
+      - Modified so far: {{files_to_modify}}
+      - Created so far: {{files_to_create}}
+
+      When earlier turns exist, the carried plan is the earlier run's plan,
+      which may not have been applied (a rejected or failed run carries it
+      too): check the tree before building on it, then plan only the change
+      the new request asks for on top of what actually landed; keep the
+      file lists cumulative.
+
+      ## New request from the orchestrator
+      {{initial_prompt}}
     tools: []
     timeout: 300
     output_schema:
@@ -352,6 +374,9 @@ nodes:
       ## Files involved
       - Modify: {{files_to_modify}}
       - Create: {{files_to_create}}
+
+      ## Earlier turns with this agent (empty on a first run)
+      {{previous_turns}}
 
       ## Original request from the orchestrator
       {{initial_prompt}}

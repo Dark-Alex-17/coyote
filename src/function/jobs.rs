@@ -1545,6 +1545,7 @@ mod tests {
                 agent_name: "explore".into(),
                 output: String::new(),
                 exit_status: AgentExitStatus::Completed,
+                session_id: None,
             })
         });
         mem::forget(rt);
@@ -1556,6 +1557,7 @@ mod tests {
             abort_signal: create_abort_signal(),
             join_handle,
             child_supervisor: None,
+            session_id: None,
         };
         let mut sup = Supervisor::new(4, 3);
         sup.register(handle).unwrap();

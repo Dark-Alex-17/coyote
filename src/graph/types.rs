@@ -83,6 +83,12 @@ pub struct Graph {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<SessionBlock>,
 
+    /// State keys whose final values are remembered in the session's
+    /// last-run record and seeded back into `initial_state` on the next
+    /// run.
+    #[serde(default)]
+    pub carry: Vec<String>,
+
     #[serde(default)]
     pub reducers: HashMap<String, Reducer>,
 
