@@ -24,10 +24,10 @@ impl ProcessStamp {
     /// matches. An unknown pid is dead because sysinfo positively reports no
     /// such process; a start-time mismatch is dead by design, since it means
     /// the pid was reused by an unrelated process. A stamp recorded with
-    /// `start` 0 (sysinfo could not list the own process at spawn) is dead
-    /// unless sysinfo later lists that pid with a start time of 0 as well,
-    /// so in practice such a child reads as crashed and stays resumable:
-    /// fail-closed by design.
+    /// `start` 0 (sysinfo could not list the own process at spawn) reads as
+    /// dead unless sysinfo later lists that pid with a start time of 0 as
+    /// well, so such a child is listed as crashed; callers that would act
+    /// on the stamp treat a `start` of 0 as unknown rather than dead.
     pub(crate) fn is_alive(&self) -> bool {
         lookup_start_time(self.pid) == Some(self.start)
     }

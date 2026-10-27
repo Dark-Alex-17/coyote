@@ -49,17 +49,29 @@ pub async fn run_active_agent_graph(
 }
 
 /// Runs the active agent's graph for a child context, with `inputs`
-/// overlaid on its `initial_state` before the executor starts. The prompt
-/// is seeded under `initial_prompt` and the session transcript under
-/// `previous_turns`; the record always names the prompt as given.
+/// overlaid on its `initial_state` before the executor starts.
+/// `seed_prompt` lands under `initial_prompt` and the session transcript
+/// under `previous_turns`; the record always names `record_prompt`, which
+/// differs from the seed when the caller appends run-only context (a
+/// teammate roster) that must not be stored as the child's prompt.
 pub async fn run_active_agent_graph_with_inputs(
     ctx: &mut RequestContext,
-    prompt: &str,
+    seed_prompt: &str,
+    record_prompt: &str,
     abort_signal: AbortSignal,
     inputs: Option<HashMap<String, Value>>,
 ) -> Result<ChildGraphRun> {
     let has_session = ctx.session.is_some();
-    run_seeded_graph(ctx, prompt, prompt, true, has_session, abort_signal, inputs).await
+    run_seeded_graph(
+        ctx,
+        seed_prompt,
+        record_prompt,
+        true,
+        has_session,
+        abort_signal,
+        inputs,
+    )
+    .await
 }
 
 /// Loads, seeds and runs the active agent's graph without routing.
@@ -1098,7 +1110,8 @@ mod tests {
     /// A child agent context (as `use_agent` from a graph node builds it)
     /// runs a block graph straight through the child entry point, with no
     /// classification, even with a session engaged. The run's record comes
-    /// back to the caller; nothing is stored on the session here.
+    /// back to the caller naming the record prompt, not the seed the graph
+    /// read; nothing is stored on the session here.
     #[tokio::test]
     #[serial]
     async fn run_active_agent_graph_with_inputs_bypasses_routing_for_a_child_context() {
@@ -1122,6 +1135,7 @@ mod tests {
 
         let run = run_active_agent_graph_with_inputs(
             &mut ctx,
+            "from a node\n\nrun-only context",
             "from a node",
             create_abort_signal(),
             None,
@@ -1129,11 +1143,11 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(run.result.output, "from a node");
+        assert_eq!(run.result.output, "from a node\n\nrun-only context");
         assert!(!run.result.trace.is_empty());
         let last_run = run.last_run.as_ref().expect("a child run is recorded");
         assert_eq!(last_run.prompt, "from a node");
-        assert_eq!(last_run.output, "from a node");
+        assert_eq!(last_run.output, "from a node\n\nrun-only context");
         assert!(last_run.exposed.is_empty());
         assert_eq!(last_run.trace, run.result.trace);
         assert_eq!(ctx.current_depth, 1);
@@ -1223,6 +1237,7 @@ mod tests {
         let run = run_active_agent_graph_with_inputs(
             &mut ctx,
             "from a node",
+            "from a node",
             create_abort_signal(),
             None,
         )
@@ -1266,6 +1281,7 @@ mod tests {
 
         let run = run_active_agent_graph_with_inputs(
             &mut ctx,
+            "from a node",
             "from a node",
             create_abort_signal(),
             None,

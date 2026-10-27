@@ -698,9 +698,26 @@ fn run_child_agent_with_graph_inputs(
     Box::pin(async move {
         let mut cancel_on_drop = CancelOnDrop(child_ctx.supervisor.clone());
         if graph::active_agent_graph_name(&child_ctx).is_some() {
+            // A graph child has no system prompt to carry the roster, so a
+            // teammate gets it appended to the seed its graph reads as
+            // `initial_prompt`. The record names the bare prompt and the
+            // exchange is stored from the bare input below, so the roster
+            // reaches the graph and nothing else.
+            let seed = match child_ctx.peer_registry.as_deref() {
+                Some(registry) => format!(
+                    "{}\n\n{}",
+                    initial_input.bare_text(),
+                    render_teammate_roster(
+                        child_ctx.self_agent_id.as_deref().unwrap_or_default(),
+                        registry
+                    )
+                ),
+                None => initial_input.bare_text().to_string(),
+            };
             let run = graph::run_active_agent_graph_with_inputs(
                 &mut child_ctx,
-                &initial_input.text(),
+                &seed,
+                initial_input.bare_text(),
                 abort_signal,
                 graph_inputs,
             )
@@ -1187,15 +1204,16 @@ impl SpawnResultHooks {
         }
     }
 
-    fn fire(self, error: Option<&str>, child_abort: &AbortSignal) {
+    /// `interrupted` is the verdict the caller already reached for the
+    /// sidecar, so the hooks and the sidecar never disagree about a
+    /// ctrl-c'd child, whatever its run returned.
+    fn fire(self, error: Option<&str>, interrupted: bool) {
         let mut extras =
             spawned_agent_hook_extras(&self.agent_id, &self.agent_name, self.session_id.as_deref());
-        let (event, resolved) = match error {
-            None => (HookEvent::AgentCompleted, self.completed),
-            Some(_) if child_abort.aborted_ctrlc() => {
-                (HookEvent::AgentInterrupted, self.interrupted)
-            }
-            Some(error) => {
+        let (event, resolved) = match (interrupted, error) {
+            (true, _) => (HookEvent::AgentInterrupted, self.interrupted),
+            (false, None) => (HookEvent::AgentCompleted, self.completed),
+            (false, Some(error)) => {
                 extras.push(("COYOTE_AGENT_ERROR", error.to_string()));
                 (HookEvent::AgentFailed, self.failed)
             }
@@ -1280,6 +1298,7 @@ fn seat_child_session(
     // is as fatal as the sidecar's: a child must not start behind a sidecar
     // that says running with no session file next to it.
     session.mark_dirty();
+    before_seat_flush();
     if let Err(error) = session
         .flush()
         .with_context(|| format!("Failed to write child session {}", path.display()))
@@ -1296,6 +1315,34 @@ fn seat_child_session(
     }
     child_ctx.session = Some(session);
     Ok(())
+}
+
+/// The point in a fresh seat after the sidecar says running and before the
+/// session file is written. A no-op outside tests.
+#[cfg(not(test))]
+fn before_seat_flush() {}
+
+#[cfg(test)]
+fn before_seat_flush() {
+    if let Some(hook) = BEFORE_SEAT_FLUSH.with(|slot| slot.take()) {
+        hook();
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_SEAT_FLUSH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` with `hook` armed to run once on this thread at
+/// `before_seat_flush`, so a test can make the session write fail.
+#[cfg(test)]
+fn with_hook_before_seat_flush<T>(hook: impl FnOnce() + 'static, f: impl FnOnce() -> T) -> T {
+    BEFORE_SEAT_FLUSH.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    let result = f();
+    BEFORE_SEAT_FLUSH.with(|slot| slot.borrow_mut().take());
+    result
 }
 
 /// Names the setting that turned child sessions off for a spawn, so the
@@ -1321,25 +1368,21 @@ fn knob_source(spawned: Option<&Agent>, app: &AppConfig) -> String {
 /// The recent child ids an unknown-id refusal lists, newest first, each
 /// marked `(crashed)` when its sidecar still says running but the
 /// recording process is gone. A stamp recorded with `start` 0 (sysinfo
-/// could not list the own process at spawn) is dead unless sysinfo later
-/// lists that pid with a start time of 0 as well, so in practice such a
-/// child is listed as crashed and stays resumable: fail-closed by design.
+/// could not list the own process at spawn) reads as dead, so such a
+/// child is listed as crashed; a resume still refuses it until it is
+/// collected or cancelled, since it may in fact be running.
 fn recent_child_ids_hint(root: &ChildSessionRoot) -> String {
-    let (ids, more) = root.recent_child_ids(10);
-    if ids.is_empty() {
+    let (children, more) = root.recent_children(10);
+    if children.is_empty() {
         return "none".to_string();
     }
-    let mut hint = ids
+    let mut hint = children
         .iter()
-        .map(|id| {
-            let crashed = matches!(
-                root.load_child_meta(id),
-                Ok(Some(meta)) if meta.effective_status() == EffectiveStatus::Crashed
-            );
-            if crashed {
-                format!("{id} (crashed)")
+        .map(|meta| {
+            if meta.effective_status() == EffectiveStatus::Crashed {
+                format!("{} (crashed)", meta.session_id)
             } else {
-                id.clone()
+                meta.session_id.clone()
             }
         })
         .collect::<Vec<_>>()
@@ -1433,8 +1476,18 @@ fn resume_child_session(
                 meta.agent
             );
         }
-        if meta.status == ChildStatus::Running && meta.stamp().is_alive() {
-            bail!("'{id}' is still running; collect or cancel it first");
+        // A stamp with no start time cannot be told apart from a live
+        // process, so it is refused like one rather than resumed over a
+        // child that may still be writing the session.
+        if meta.status == ChildStatus::Running {
+            if meta.pid_start == 0 {
+                bail!(
+                    "'{id}' may still be running (its process start time is unknown); collect or cancel it first"
+                );
+            }
+            if meta.stamp().is_alive() {
+                bail!("'{id}' is still running; collect or cancel it first");
+            }
         }
         let saved_bytes = std::fs::read_to_string(&sidecar)
             .with_context(|| format!("Failed to read {}", sidecar.display()))?;
@@ -1666,6 +1719,13 @@ async fn build_child_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Spa
     let agent_mcp_servers = agent.mcp_server_names().to_vec();
     let resolved_model = agent.model().clone();
     let seat_session = child_sessions_enabled(Some(&agent), app_config.as_ref());
+    // The name becomes a segment of the child's session id, which has to
+    // parse back; refused before anything is seated under it.
+    if seat_session && !child_sessions::agent_name_fits_session_id(&agent_name) {
+        bail!(
+            "agent '{agent_name}' cannot run under a child session: the name must match [A-Za-z0-9_.-]+ and may not contain '..' (set child_sessions: false for it or rename the agent directory)"
+        );
+    }
     if requested_session_id.is_some() && !seat_session {
         bail!(
             "child sessions are off ({}); spawn fresh with the context in the prompt",
@@ -1865,8 +1925,10 @@ fn launch_child_spawn(ctx: &mut RequestContext, spawn: Box<ChildSpawn>) -> Resul
         let result = run_child_agent(child_ctx, input, spawn_abort).await;
 
         // A ctrl-c'd child reports cancelled whatever its run returned, so
-        // the sidecar agrees with the cancel path that signalled it.
-        let (status, error) = if hook_abort.aborted_ctrlc() {
+        // the sidecar agrees with the cancel path that signalled it; the
+        // result hooks are fired on the same verdict.
+        let interrupted = hook_abort.aborted_ctrlc();
+        let (status, error) = if interrupted {
             (ChildStatus::Cancelled, None)
         } else {
             match &result {
@@ -1893,14 +1955,14 @@ fn launch_child_spawn(ctx: &mut RequestContext, spawn: Box<ChildSpawn>) -> Resul
                 id: spawn_agent_id,
                 agent_name: spawn_agent_name,
                 output: String::new(),
-                exit_status: AgentExitStatus::Failed(e.to_string()),
+                exit_status: AgentExitStatus::Failed(format!("{e:#}")),
                 session_id: spawn_session_id,
             },
         };
         let success = agent_result.exit_status == AgentExitStatus::Completed;
         match &agent_result.exit_status {
-            AgentExitStatus::Completed => result_hooks.fire(None, &hook_abort),
-            AgentExitStatus::Failed(e) => result_hooks.fire(Some(e), &hook_abort),
+            AgentExitStatus::Completed => result_hooks.fire(None, interrupted),
+            AgentExitStatus::Failed(e) => result_hooks.fire(Some(e), interrupted),
         }
         spawn_notifications.push(agent_notification(
             &agent_result.id,
@@ -1921,6 +1983,7 @@ fn launch_child_spawn(ctx: &mut RequestContext, spawn: Box<ChildSpawn>) -> Resul
         join_handle,
         child_supervisor,
         session_id: session_id.clone(),
+        child_session_root: root.clone(),
     };
 
     let registered = match ctx.supervisor.as_ref() {
@@ -1940,7 +2003,7 @@ fn launch_child_spawn(ctx: &mut RequestContext, spawn: Box<ChildSpawn>) -> Resul
             ChildStatus::Failed,
             Some(format!("{error:#}")),
         );
-        refused_hooks.fire(Some(&format!("{error:#}")), &refused_abort);
+        refused_hooks.fire(Some(&format!("{error:#}")), refused_abort.aborted_ctrlc());
         return Err(error);
     }
 
@@ -2121,11 +2184,26 @@ async fn handle_collect(ctx: &mut RequestContext, args: &Value) -> Result<Value>
 
     match handle {
         Some(handle) => {
-            let result = handle
-                .join_handle
-                .await
-                .map_err(|e| anyhow!("Agent task panicked: {e}"))?
-                .map_err(|e| anyhow!("Agent failed: {e}"))?;
+            let AgentHandle {
+                join_handle,
+                session_id,
+                child_session_root,
+                ..
+            } = handle;
+            let result = match join_handle.await {
+                Ok(result) => result.map_err(|e| anyhow!("Agent failed: {e}"))?,
+                // A panicked task never reached its own exit write, so the
+                // sidecar would otherwise keep saying running.
+                Err(e) => {
+                    finish_child_meta(
+                        child_session_root.as_deref(),
+                        session_id.as_deref(),
+                        ChildStatus::Failed,
+                        Some(format!("agent task panicked: {e}")),
+                    );
+                    return Err(anyhow!("Agent task panicked: {e}"));
+                }
+            };
 
             let output = summarize_output(ctx, &result.agent_name, &result.output).await?;
             ctx.pending_tasks_guardrail_count = 0;
@@ -2287,11 +2365,12 @@ async fn handle_cancel(ctx: &mut RequestContext, args: &Value) -> Result<Value> 
             // sidecar reads cancelled even when the child outlives the
             // cleanup wait below. A child that had already finished keeps
             // the status its own exit recorded: cancelling an uncollected
-            // result is not what ended it. The children live under the
-            // spawner's root.
+            // result is not what ended it. The root is the one captured at
+            // spawn: the spawner may since have left the session the child
+            // was seated under.
             if was_running {
                 finish_child_meta(
-                    ctx.child_session_root.as_deref(),
+                    handle.child_session_root.as_deref(),
                     session_id.as_deref(),
                     ChildStatus::Cancelled,
                     None,
@@ -3179,10 +3258,14 @@ mod tests {
         assert_eq!(failed[0].envs["COYOTE_EVENT"], "agent.failed");
         assert_eq!(failed[0].envs["COYOTE_AGENT_ID"], id);
         assert_session_envs(&failed[0], session_id);
+        // The failing graph wraps the script error with its node: the env
+        // carries the whole chain, outer context and cause joined.
+        let error = &failed[0].envs["COYOTE_AGENT_ERROR"];
         assert!(
-            !failed[0].envs["COYOTE_AGENT_ERROR"].is_empty(),
-            "a failed spawn must carry its error"
+            error.contains("at node 'work': Script file not found"),
+            "{error}"
         );
+        assert!(error.contains("missing.sh"), "{error}");
 
         assert!(hook_captures_named("t037_spawn_fail_completed").is_empty());
     }
@@ -3241,6 +3324,9 @@ mod tests {
 
         assert!(hook_captures_named("t049_spawn_cancel_failed").is_empty());
         assert!(hook_captures_named("t049_spawn_cancel_completed").is_empty());
+        let meta = child_meta_of(&ctx, session_id);
+        assert_eq!(meta.status, ChildStatus::Cancelled);
+        assert!(meta.error.is_none(), "{meta:?}");
     }
 
     /// With the app knob off no child is seated, so neither session key
@@ -3565,6 +3651,47 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "{mode:o}");
         }
+    }
+
+    /// An agent whose directory name cannot be a session id segment is
+    /// refused before anything is seated: the id minted from the name would
+    /// never parse back, so no resume could ever find the child.
+    #[test]
+    #[serial]
+    fn a_spawn_refuses_to_seat_an_agent_whose_name_does_not_fit_a_session_id() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test bad+name");
+        assert!(!child_sessions::agent_name_fits_session_id(&agent_name));
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+
+        let error = resume_error(&mut ctx, json!({"agent": agent_name, "prompt": "hi"}));
+
+        assert_eq!(
+            error,
+            format!(
+                "agent '{agent_name}' cannot run under a child session: the name must match [A-Za-z0-9_.-]+ and may not contain '..' (set child_sessions: false for it or rename the agent directory)"
+            )
+        );
+        assert!(
+            ctx.child_session_root.is_none(),
+            "the refusal lands before a root is resolved"
+        );
+    }
+
+    /// The same name runs unseated once the agent turns child sessions off.
+    #[test]
+    #[serial]
+    fn an_agent_whose_name_does_not_fit_a_session_id_still_spawns_unseated() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test bad+name unseated");
+        write_config_agent_with_setting(&agent_name, "child_sessions: false");
+        let mut ctx = ctx_with_supervisor(4, 3);
+
+        let spawn = build_ready_spawn(&mut ctx, json!({"agent": agent_name, "prompt": "hi"}));
+
+        assert_eq!(spawn.session_id, None);
+        assert!(spawn.child_ctx.session.is_none());
     }
 
     #[test]
@@ -3909,16 +4036,205 @@ mod tests {
 
         let meta = child_meta_of(&ctx, payload["session_id"].as_str().unwrap());
         assert_eq!(meta.status, ChildStatus::Failed);
-        assert!(
-            meta.error.as_deref().is_some_and(|error| !error.is_empty()),
-            "{meta:?}"
-        );
+        // The sidecar and the hook carry the same rendering of the error:
+        // the node that failed and the cause behind it, not the node alone.
+        let chained = "at node 'work': Script file not found";
+        let recorded = meta.error.as_deref().unwrap_or_default();
+        assert!(recorded.contains(chained), "{meta:?}");
         let failed = hook_captures_named("sidecar_run_failed_failed");
         assert_eq!(failed.len(), 1, "{failed:?}");
-        assert!(
-            !failed[0].envs["COYOTE_AGENT_ERROR"].is_empty(),
-            "{failed:?}"
+        assert_eq!(failed[0].envs["COYOTE_AGENT_ERROR"], recorded, "{failed:?}");
+    }
+
+    /// A spawner whose one client, `openai`, is the one its model names, so
+    /// a child seated from it has a client to echo through.
+    fn echoing_spawner() -> RequestContext {
+        let mut client_config = crate::client::ClientConfig::default();
+        if let crate::client::ClientConfig::OpenAIConfig(config) = &mut client_config {
+            config.name = Some("openai".to_string());
+        }
+        let app = Arc::new(AppState {
+            config: Arc::new(AppConfig {
+                clients: vec![client_config],
+                ..AppConfig::default()
+            }),
+            ..AppState::test_default()
+        });
+        let mut ctx = RequestContext::new(app, WorkingMode::Cmd);
+        ctx.supervisor = Some(Arc::new(RwLock::new(Supervisor::new(4, 3))));
+        ctx.model = Model::new("openai", "test-chat");
+        ctx
+    }
+
+    /// An input whose model call echoes the request instead of reaching a
+    /// provider: built while `ctx` is briefly dry-run, which the client
+    /// reads off the input. The context itself keeps dry-run off, so the
+    /// turn still records the exchange and flushes the session.
+    fn echoing_input(ctx: &mut RequestContext, prompt: &str) -> Input {
+        let live = Arc::clone(&ctx.app);
+        ctx.app = Arc::new(AppState {
+            config: Arc::new(AppConfig {
+                dry_run: true,
+                ..(*live.config).clone()
+            }),
+            ..(*live).clone()
+        });
+        let input = Input::from_str(ctx, prompt, None).unwrap();
+        ctx.app = live;
+        input
+    }
+
+    /// A config agent whose config.yaml wires the three `agent.*` result
+    /// hooks, each named `<marker>_<arm>`.
+    fn write_config_agent_with_result_hooks(agent_name: &str, marker: &str) {
+        write_config_agent_with_setting(
+            agent_name,
+            &format!(
+                "hooks:\n\
+                 \x20 agent.completed:\n\
+                 \x20   - name: {marker}_completed\n\
+                 \x20     command: \"true\"\n\
+                 \x20 agent.interrupted:\n\
+                 \x20   - name: {marker}_interrupted\n\
+                 \x20     command: \"true\"\n\
+                 \x20 agent.failed:\n\
+                 \x20   - name: {marker}_failed\n\
+                 \x20     command: \"true\""
+            ),
         );
+    }
+
+    /// Launches a built child on `ctx`, awaits its spawn task and returns
+    /// the result it produced.
+    async fn launch_and_reclaim(ctx: &mut RequestContext, spawn: Box<ChildSpawn>) -> AgentResult {
+        let launched = launch_child_spawn(ctx, spawn).unwrap();
+        assert_eq!(launched["status"], "ok", "{launched}");
+        let id = launched["id"].as_str().unwrap().to_string();
+        let handle = ctx
+            .supervisor
+            .as_ref()
+            .unwrap()
+            .write()
+            .take(&id)
+            .expect("spawned agent must be registered");
+        handle
+            .join_handle
+            .await
+            .expect("spawn task must not panic")
+            .expect("spawn task must return an AgentResult")
+    }
+
+    /// A ctrl-c that lands after the model answered but before the task
+    /// records its verdict is an interruption even though the run came
+    /// back `Ok`: the hooks fire `agent.interrupted`, not
+    /// `agent.completed`. Nothing in a run ignores its abort signal, so
+    /// the verdict is driven directly, with hooks resolved from a seated
+    /// child, and the spawn task is held to passing that one verdict to
+    /// both the sidecar and the hooks.
+    #[test]
+    #[serial]
+    fn a_ctrlc_verdict_fires_interrupted_even_when_the_run_returned_ok() {
+        let _guard = TestConfigDirGuard::new();
+        let _sink = hooks::test_sink::install();
+        let agent_name = unique_agent_name("test_ctrlc_ok_verdict");
+        write_config_agent_with_result_hooks(&agent_name, "ctrlc_ok_verdict");
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let spawn = build_ready_spawn(&mut ctx, json!({"agent": agent_name, "prompt": "hi"}));
+        let sid = spawn
+            .session_id
+            .as_deref()
+            .expect("a seated child has a session id");
+        let hooks =
+            SpawnResultHooks::resolve(&spawn.child_ctx, &spawn.agent_id, &agent_name, Some(sid));
+
+        hooks.fire(None, true);
+
+        let interrupted = hook_captures_named("ctrlc_ok_verdict_interrupted");
+        assert_eq!(interrupted.len(), 1, "{interrupted:?}");
+        assert_eq!(interrupted[0].envs["COYOTE_EVENT"], "agent.interrupted");
+        assert_eq!(interrupted[0].envs["COYOTE_AGENT_ID"], spawn.agent_id);
+        assert_session_envs(&interrupted[0], sid);
+        assert!(
+            !interrupted[0].envs.contains_key("COYOTE_AGENT_ERROR"),
+            "{interrupted:?}"
+        );
+        assert!(hook_captures_named("ctrlc_ok_verdict_completed").is_empty());
+        assert!(hook_captures_named("ctrlc_ok_verdict_failed").is_empty());
+
+        let source = include_str!("agents.rs").replace("\r\n", "\n");
+        let fn_body = |head: &str| {
+            let start = source.find(head).unwrap();
+            let body = &source[start..];
+            let end = body.find("\n}\n").unwrap();
+            &source[start..start + end]
+        };
+        let launch = fn_body("\nfn launch_child_spawn(");
+        let verdict_at = launch
+            .find("let interrupted = hook_abort.aborted_ctrlc();")
+            .unwrap();
+        let sidecar_at = launch.find("if interrupted {").unwrap();
+        let hooks_at = launch.find("result_hooks.fire(None, interrupted)").unwrap();
+        assert!(verdict_at < sidecar_at && sidecar_at < hooks_at);
+        assert!(launch.contains("result_hooks.fire(Some(e), interrupted)"));
+        assert_eq!(launch.matches("hook_abort.aborted_ctrlc()").count(), 1);
+        assert!(
+            !fn_body("\n    fn fire(self, error: Option<&str>, interrupted: bool)")
+                .contains("aborted_ctrlc"),
+            "the hooks take the verdict; they do not re-derive it"
+        );
+    }
+
+    /// A seated child whose turn completes but whose session cannot be
+    /// written has no stored transcript to resume from, so its run ends
+    /// failed with the flush error, on the sidecar and the hook alike, and
+    /// the write failure is still logged.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn a_child_whose_final_session_flush_fails_ends_failed_with_that_error() {
+        crate::testing::install_log_collector();
+        let _guard = TestConfigDirGuard::new();
+        let _sink = hooks::test_sink::install();
+        let agent_name = unique_agent_name("test_child_flush_failed");
+        write_config_agent_with_result_hooks(&agent_name, "child_flush_failed");
+        let mut ctx = echoing_spawner();
+        let mut spawn = build_ready_spawn(&mut ctx, json!({"agent": agent_name, "prompt": "hi"}));
+        let sid = spawn
+            .session_id
+            .clone()
+            .expect("a seated child has a session id");
+        spawn.input = echoing_input(&mut spawn.child_ctx, "hi");
+        // The session file is replaced by a directory, so the rename that
+        // completes its save fails while the sidecar next to it still writes.
+        let session_file = spawner_root(&ctx).child_session_file(&sid);
+        std::fs::remove_file(&session_file).unwrap();
+        create_dir_all(&session_file).unwrap();
+
+        let result = run_async(launch_and_reclaim(&mut ctx, spawn));
+
+        let AgentExitStatus::Failed(error) = &result.exit_status else {
+            panic!("the run must fail on the flush: {:?}", result.exit_status);
+        };
+        assert!(error.contains("final session flush failed: "), "{error}");
+        let meta = child_meta_of(&ctx, &sid);
+        assert_eq!(meta.status, ChildStatus::Failed);
+        let recorded = meta.error.as_deref().unwrap_or_default();
+        assert!(
+            recorded.contains(&format!(
+                "final session flush failed: Failed to write session '{sid}'"
+            )),
+            "{meta:?}"
+        );
+        let failed = hook_captures_named("child_flush_failed_failed");
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert_eq!(failed[0].envs["COYOTE_AGENT_ERROR"], recorded, "{failed:?}");
+        assert!(hook_captures_named("child_flush_failed_completed").is_empty());
+        let marker = format!("Failed to checkpoint session '{sid}'");
+        let warns: Vec<String> = crate::testing::warn_snapshot()
+            .into_iter()
+            .filter(|m| m.contains(&marker))
+            .collect();
+        assert_eq!(warns.len(), 1, "{warns:?}");
     }
 
     fn spawn_declaration() -> FunctionDeclaration {
@@ -4580,6 +4896,20 @@ mod tests {
         );
     }
 
+    /// The hint labels each child from the listing it already holds; it
+    /// does not read every sidecar a second time.
+    #[test]
+    fn recent_child_ids_hint_labels_children_from_one_listing() {
+        let source = include_str!("agents.rs").replace("\r\n", "\n");
+        let start = source.find("\nfn recent_child_ids_hint(").unwrap();
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert_eq!(body.matches("recent_children(").count(), 1);
+        assert!(body.contains("meta.effective_status()"));
+        assert!(!body.contains("load_child_meta("));
+        assert!(!body.contains("recent_child_ids("));
+    }
+
     #[test]
     #[serial]
     fn resume_of_an_unknown_id_under_an_empty_root_says_so() {
@@ -4700,8 +5030,10 @@ mod tests {
             "{error}"
         );
 
+        // A dead pid under a known start time is a crash; a start of 0
+        // would be unknown and refused instead.
         meta.pid = u32::MAX - 1;
-        meta.pid_start = 0;
+        meta.pid_start = 1;
         root.save_child_meta(&meta).unwrap();
         assert_eq!(meta.effective_status(), EffectiveStatus::Crashed);
 
@@ -4844,7 +5176,7 @@ mod tests {
         let mut meta = root.load_child_meta(&sid).unwrap().unwrap();
         meta.status = ChildStatus::Running;
         meta.pid = u32::MAX - 1;
-        meta.pid_start = 0;
+        meta.pid_start = 1;
         root.save_child_meta(&meta).unwrap();
         assert_eq!(meta.effective_status(), EffectiveStatus::Crashed);
 
@@ -5096,16 +5428,17 @@ mod tests {
 
     /// A sidecar whose stamp recorded `start` 0 (sysinfo could not read the
     /// own start time at spawn) under a pid that is still alive reads as
-    /// dead: the recent-ids list labels it crashed and the id resumes,
-    /// re-stamped with the real start time.
+    /// dead to the recent-ids list, which labels it crashed; a resume
+    /// cannot tell it from a live child and refuses it, leaving the sidecar
+    /// as it was, until the child is collected or cancelled.
     #[test]
     #[serial]
-    fn usage_probe_a_running_child_stamped_with_start_zero_reads_crashed_and_resumes() {
+    fn usage_probe_a_running_child_stamped_with_start_zero_reads_crashed_but_resume_refuses() {
         let _guard = TestConfigDirGuard::new();
         let agent_name = unique_agent_name("test_resume_start_zero");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
-        let (sid, stored_count) = seed_completed_config_child(&mut ctx, &agent_name, json!({}));
+        let (sid, _) = seed_completed_config_child(&mut ctx, &agent_name, json!({}));
         let live = ProcessStamp::current();
         assert_ne!(
             live.start, 0,
@@ -5129,21 +5462,21 @@ mod tests {
             "{error}"
         );
 
-        let spawn = build_ready_spawn(
+        let error = resume_error(
             &mut ctx,
             json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
         );
 
-        assert_eq!(spawn.session_id.as_deref(), Some(sid.as_str()));
-        assert_eq!(
-            spawn.child_ctx.session.as_ref().unwrap().messages().len(),
-            stored_count
+        assert!(
+            error.contains(&format!(
+                "'{sid}' may still be running (its process start time is unknown); collect or cancel it first"
+            )),
+            "{error}"
         );
         let meta = child_meta_of(&ctx, &sid);
         assert_eq!(meta.status, ChildStatus::Running);
-        assert_eq!(meta.agent_id, spawn.agent_id);
         assert_eq!(meta.pid, live.pid);
-        assert_eq!(meta.pid_start, live.start);
+        assert_eq!(meta.pid_start, 0);
     }
 
     /// Resuming is not a one-shot: the transcript a resumed child adds is
@@ -5799,6 +6132,98 @@ mod tests {
         assert!(meta.error.is_none(), "{meta:?}");
     }
 
+    /// The cancel writes through the root the handle captured at spawn,
+    /// not the spawner's current one: a spawner that has since left the
+    /// session its children were seated under still records the cancel
+    /// on their sidecars.
+    #[test]
+    #[serial]
+    fn handle_cancel_records_cancelled_on_the_root_captured_at_spawn() {
+        let _guard = TestConfigDirGuard::new();
+        let _sink = hooks::test_sink::install();
+        let agent_name = unique_agent_name("test_sidecar_cancel_root");
+        write_graph_agent_with_hooks(&agent_name, "sidecar_cancel_root", true);
+        let mut ctx = ctx_with_supervisor(4, 3);
+
+        let (spawned, cancelled, root) = run_async(async {
+            let spawned = handle_spawn(&mut ctx, &json!({"agent": agent_name, "prompt": "hi"}))
+                .await
+                .unwrap();
+            assert_eq!(spawned["status"], "ok", "{spawned}");
+            let root = spawner_root(&ctx);
+            ctx.child_session_root = None;
+            let cancelled = handle_cancel(&mut ctx, &json!({"id": spawned["id"]}))
+                .await
+                .unwrap();
+            (spawned, cancelled, root)
+        });
+
+        assert_eq!(cancelled["status"], "ok", "{cancelled}");
+        let sid = spawned["session_id"]
+            .as_str()
+            .expect("a seated child reports its session id");
+        let meta: ChildMeta = read_yaml(&root.child_meta_file(sid));
+        assert_eq!(meta.status, ChildStatus::Cancelled);
+        assert!(meta.error.is_none(), "{meta:?}");
+    }
+
+    /// A child whose task panics never reaches its own exit write, so the
+    /// collect that observes the panic records the failure on the sidecar
+    /// the handle carries, and the error names the panic.
+    #[test]
+    #[serial]
+    fn handle_collect_of_a_panicked_task_marks_the_sidecar_failed() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_sidecar_panic");
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let spawn = build_ready_spawn(&mut ctx, json!({"agent": agent_name, "prompt": "hi"}));
+        let ChildSpawn {
+            child_ctx,
+            agent_id,
+            session_id,
+            ..
+        } = *spawn;
+        let sid = session_id.expect("a seated child has a session id");
+        let root = child_ctx
+            .child_session_root
+            .clone()
+            .expect("the child carries the spawner's root");
+        drop(child_ctx);
+        assert_eq!(child_meta_of(&ctx, &sid).status, ChildStatus::Running);
+
+        let error = run_async(async {
+            let join_handle = tokio::spawn(async { panic!("boom") });
+            let handle = AgentHandle {
+                id: agent_id.clone(),
+                agent_name: agent_name.clone(),
+                depth: 1,
+                inbox: Arc::new(Inbox::new()),
+                abort_signal: create_abort_signal(),
+                join_handle,
+                child_supervisor: None,
+                session_id: Some(sid.clone()),
+                child_session_root: Some(root),
+            };
+            ctx.supervisor
+                .as_ref()
+                .unwrap()
+                .write()
+                .register(handle)
+                .unwrap();
+            handle_collect(&mut ctx, &json!({"id": agent_id}))
+                .await
+                .expect_err("a panicked task is a failed collect")
+        });
+
+        assert!(format!("{error:#}").contains("panicked"), "{error:#}");
+        let meta = child_meta_of(&ctx, &sid);
+        assert_eq!(meta.status, ChildStatus::Failed);
+        let recorded = meta.error.as_deref().unwrap_or_default();
+        assert!(recorded.contains("panicked"), "{meta:?}");
+        assert!(recorded.contains("boom"), "{meta:?}");
+    }
+
     /// Spawns `agent_name`, latches a user interrupt on the spawner and
     /// collects the child before its spawn task has run, so the collect
     /// loop's interrupt check fires first. The child is then reclaimed so
@@ -5977,7 +6402,9 @@ mod tests {
     }
 
     /// The terminal sidecar write is bookkeeping: when it cannot land, the
-    /// child's result still reaches the collector untouched.
+    /// child's result still reaches the collector untouched. Under a
+    /// read-only `children/` that result is the failed final flush of the
+    /// session next to the sidecar, and it arrives as such.
     #[cfg(unix)]
     #[test]
     #[serial]
@@ -6009,7 +6436,11 @@ mod tests {
         });
 
         assert_eq!(collected["status"], "completed", "{collected}");
-        assert_eq!(collected["exit_status"], "Completed");
+        let exit_status = collected["exit_status"].as_str().unwrap();
+        assert!(
+            exit_status.starts_with("Failed(\"final session flush failed: "),
+            "{exit_status}"
+        );
         assert_eq!(collected["session_id"], spawned["session_id"]);
         let meta = child_meta_of(&ctx, spawned["session_id"].as_str().unwrap());
         assert_eq!(
@@ -6818,12 +7249,12 @@ mod tests {
         assert_warned_about_the_sidecar(&spawned);
     }
 
-    /// Neither the seat-time flush nor `Input::from_str` can be made to
-    /// fail from here without a seam elsewhere, so both arms are pinned by
-    /// source scrape: each marks the sidecar failed after it was written
-    /// and before handing the error back. The runtime preparation between
-    /// the resume arm and the fresh seat is pinned the same way, since a
-    /// resume has re-stamped the sidecar running by then.
+    /// `Input::from_str` cannot be made to fail from here without a seam
+    /// elsewhere, so that arm is pinned by source scrape, and the seat-time
+    /// flush arm with it: each marks the sidecar failed after it was
+    /// written and before handing the error back. The runtime preparation
+    /// between the resume arm and the fresh seat is pinned the same way,
+    /// since a resume has re-stamped the sidecar running by then.
     #[test]
     fn failures_after_the_sidecar_is_written_mark_it_failed() {
         let source = include_str!("agents.rs").replace("\r\n", "\n");
@@ -6866,6 +7297,57 @@ mod tests {
         assert!(build[prepare_marked_at..seated_at].contains("return Err(error);"));
         assert!(build[input_marked_at..].contains("return Err(error);"));
         assert!(build[prepare_marked_at..seated_at].contains("resumed_session_id.as_deref(),"));
+    }
+
+    /// The behavioural twin of the seat-flush arm above: with the sidecar
+    /// written and the session file's path taken by a directory, the seat
+    /// fails on its flush, the spawn hands that error back, and the sidecar
+    /// reads failed with it rather than running for a child that never
+    /// started.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn a_seat_whose_session_flush_fails_marks_the_sidecar_failed() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_seat_flush_failed");
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let root = ctx.ensure_child_session_root().unwrap();
+        let children = root.children_dir();
+        // The hook runs before the sid is known to the test, so the child
+        // is found through its sidecar, the only one under this root.
+        let occupy_session_path = move || {
+            let sidecars: Vec<PathBuf> = std::fs::read_dir(&children)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.to_string_lossy().ends_with(".meta.yaml"))
+                .collect();
+            assert_eq!(sidecars.len(), 1, "{sidecars:?}");
+            let sid = sidecars[0]
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .trim_end_matches(".meta.yaml")
+                .to_string();
+            create_dir_all(children.join(format!("{sid}.yaml"))).unwrap();
+        };
+
+        let error = with_hook_before_seat_flush(occupy_session_path, || {
+            resume_error(&mut ctx, json!({"agent": agent_name, "prompt": "hi"}))
+        });
+
+        assert!(error.contains("Failed to write child session "), "{error}");
+        let (children, more) = root.recent_children(2);
+        assert_eq!((children.len(), more), (1, 0), "{children:?}");
+        let meta = &children[0];
+        assert_eq!(meta.agent, agent_name);
+        assert_eq!(meta.status, ChildStatus::Failed);
+        assert_eq!(meta.error.as_deref(), Some(error.as_str()));
+        assert!(
+            root.child_session_file(&meta.session_id).is_dir(),
+            "the seat must not have replaced the directory"
+        );
     }
 
     fn read_yaml_value(path: &Path) -> serde_yaml::Value {
@@ -7763,6 +8245,7 @@ mod tests {
             join_handle,
             child_supervisor: None,
             session_id: None,
+            child_session_root: None,
         };
         ctx.supervisor
             .as_ref()
@@ -7803,6 +8286,7 @@ mod tests {
             join_handle,
             child_supervisor: None,
             session_id: None,
+            child_session_root: None,
         };
         ctx.supervisor
             .as_ref()
@@ -8312,6 +8796,7 @@ mod tests {
                 join_handle,
                 child_supervisor: None,
                 session_id: None,
+                child_session_root: None,
             };
             ctx.supervisor
                 .as_ref()
@@ -8572,11 +9057,12 @@ mod tests {
         })
     }
 
-    /// A graph teammate seated on an agent session records the bare spawn
-    /// prompt: the stored exchange and `last_run` both name `hi`, and the
-    /// roster is nowhere in the session file (a graph child's instructions
-    /// reach no model, so none is seated). The file is seeded first: a
-    /// child flushes a session only to the path it was loaded from.
+    /// A graph teammate has no system prompt to carry the roster, so it
+    /// reads the roster appended to its `initial_prompt`; the session still
+    /// records the bare spawn prompt: the stored exchange and `last_run`
+    /// both name `hi`, and the roster reaches neither the instructions nor
+    /// the System row. The file is seeded first: a child flushes a session
+    /// only to the path it was loaded from.
     #[test]
     #[serial]
     fn a_graph_teammate_records_the_bare_spawn_prompt() {
@@ -8607,11 +9093,22 @@ mod tests {
         });
         let mut ctx = parent_seating_a_teammate(app);
 
-        run_async(run_agent_for_graph(&mut ctx, &agent_name, "hi", None)).unwrap();
+        let output = run_async(run_agent_for_graph(&mut ctx, &agent_name, "hi", None)).unwrap();
 
+        assert!(output.starts_with("<hi\n\n"), "{output}");
+        assert!(output.contains(TEAMMATE_ROSTER_HEADING), "{output}");
+        assert!(output.contains("You are `p1` (shards[0])"), "{output}");
         let stored = read_to_string(&path).unwrap();
-        assert!(!stored.contains("Teammate roster"), "{stored}");
         let on_disk: Session = serde_yaml::from_str(&stored).unwrap();
+        // The graph echoes its seed, so the roster is in the stored
+        // assistant reply by the fixture's design; the prompt side of the
+        // record and the instructions stay bare.
+        assert!(
+            !on_disk
+                .agent_instructions()
+                .contains(TEAMMATE_ROSTER_HEADING),
+            "{stored}"
+        );
         let users: Vec<_> = on_disk
             .messages()
             .iter()
@@ -8620,6 +9117,18 @@ mod tests {
         assert_eq!(users.len(), 1, "{users:?}");
         assert_eq!(users[0].content.to_text(), "hi");
         assert_eq!(on_disk.last_run().unwrap().prompt, "hi");
+        let system: Vec<_> = on_disk
+            .messages()
+            .iter()
+            .filter(|message| message.role.is_system())
+            .collect();
+        assert_eq!(system.len(), 1, "{system:?}");
+        assert!(
+            !system[0]
+                .content
+                .to_text()
+                .contains(TEAMMATE_ROSTER_HEADING)
+        );
     }
 
     /// Under `dry_run` the model call echoes the request it would have
@@ -9245,6 +9754,7 @@ mod tests {
                 join_handle,
                 child_supervisor: None,
                 session_id: None,
+                child_session_root: None,
             };
             ctx.supervisor
                 .as_ref()
@@ -9302,6 +9812,7 @@ mod tests {
                 join_handle,
                 child_supervisor: None,
                 session_id: None,
+                child_session_root: None,
             };
             ctx.supervisor
                 .as_ref()
@@ -9363,6 +9874,7 @@ mod tests {
                 join_handle,
                 child_supervisor: None,
                 session_id: None,
+                child_session_root: None,
             };
             ctx.supervisor
                 .as_ref()
@@ -9436,6 +9948,7 @@ mod tests {
                 join_handle,
                 child_supervisor: None,
                 session_id: None,
+                child_session_root: None,
             };
             ctx.supervisor
                 .as_ref()
@@ -9484,6 +9997,7 @@ mod tests {
                 join_handle,
                 child_supervisor: None,
                 session_id: None,
+                child_session_root: None,
             };
             ctx.supervisor
                 .as_ref()
@@ -9549,6 +10063,7 @@ mod tests {
                 join_handle,
                 child_supervisor: None,
                 session_id: None,
+                child_session_root: None,
             };
             ctx.supervisor
                 .as_ref()
@@ -10146,6 +10661,7 @@ mod tests {
                 join_handle,
                 child_supervisor: None,
                 session_id: None,
+                child_session_root: None,
             };
             ctx.supervisor
                 .as_ref()

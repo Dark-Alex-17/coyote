@@ -5500,6 +5500,7 @@ local_hello() {\n\
                 join_handle,
                 child_supervisor: None,
                 session_id: None,
+                child_session_root: None,
             })
             .unwrap();
     }
@@ -9061,6 +9062,7 @@ local_hello() {\n\
             join_handle,
             child_supervisor: None,
             session_id: None,
+            child_session_root: None,
         })
         .unwrap();
         let supervisor = RwLock::new(sup);
@@ -9160,6 +9162,7 @@ local_hello() {\n\
                 join_handle,
                 child_supervisor: None,
                 session_id: None,
+                child_session_root: None,
             })
             .unwrap();
         abort
@@ -9448,6 +9451,7 @@ local_hello() {\n\
                     join_handle: grandchild,
                     child_supervisor: None,
                     session_id: None,
+                    child_session_root: None,
                 })
                 .unwrap();
             // The parent's own task is already finished, so the only live
@@ -9477,6 +9481,7 @@ local_hello() {\n\
                     join_handle: parent_task,
                     child_supervisor: Some(Arc::new(RwLock::new(child_sup))),
                     session_id: None,
+                    child_session_root: None,
                 })
                 .unwrap();
             assert_eq!(
@@ -9774,6 +9779,7 @@ local_hello() {\n\
             join_handle,
             child_supervisor: None,
             session_id: None,
+            child_session_root: None,
         })
         .unwrap();
         (Arc::new(RwLock::new(sup)), child_signal)

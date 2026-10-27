@@ -1784,22 +1784,33 @@ impl RequestContext {
         if let Some(session) = i.session_mut(&mut self.session) {
             let _ = session.add_message(&i, INTERRUPTED_RESPONSE_TEXT);
         }
-        self.checkpoint_session_to_disk(app.dry_run);
+        // The turn is already reporting an error; `Session::save` leaves
+        // the session dirty, so the final flush reports this one.
+        let _ = self.checkpoint_session_to_disk(app.dry_run);
     }
 
-    pub(crate) fn checkpoint_session_to_disk(&mut self, dry_run: bool) {
+    /// Writes a dirty, auto-saving session to disk. A failed write is
+    /// logged; it is also returned for a child context, whose session file
+    /// is the record its spawner resumes from, so the child's run ends
+    /// failed instead of completing on a transcript that was never stored.
+    /// A root context keeps the warn-only behaviour its turn relies on.
+    pub(crate) fn checkpoint_session_to_disk(&mut self, dry_run: bool) -> Result<()> {
         if dry_run || !self.persists_session {
-            return;
+            return Ok(());
         }
         let Some(session) = self.session.as_mut() else {
-            return;
+            return Ok(());
         };
         if session.effective_save_session() != Some(true) {
-            return;
+            return Ok(());
         }
         if let Err(err) = session.flush() {
             warn!("Failed to checkpoint session '{}': {err:#}", session.name());
+            if self.self_agent_id.is_some() {
+                return Err(err).context("final session flush failed");
+            }
         }
+        Ok(())
     }
 
     /// Resolves, once, the directory identity this context's child sessions
@@ -2856,7 +2867,7 @@ impl RequestContext {
         }
         self.record_chat_completion(app, input, output, tool_results)?;
         if input.session(&self.session).is_some() {
-            self.checkpoint_session_to_disk(app.dry_run);
+            self.checkpoint_session_to_disk(app.dry_run)?;
         }
         Ok(())
     }
@@ -2895,7 +2906,7 @@ impl RequestContext {
             session.set_last_run(last_run);
         }
         if input.session(&self.session).is_some() {
-            self.checkpoint_session_to_disk(app.dry_run);
+            self.checkpoint_session_to_disk(app.dry_run)?;
         }
         Ok(())
     }
@@ -2967,7 +2978,9 @@ impl RequestContext {
         if trigger == CheckpointTrigger::SafetyValve {
             self.valve_checkpoint_floor = Some(session.tokens());
         }
-        self.checkpoint_session_to_disk(self.app.config.dry_run);
+        // A mid-loop checkpoint; `Session::save` leaves the session dirty,
+        // so the final flush at the end of the turn reports the failure.
+        let _ = self.checkpoint_session_to_disk(self.app.config.dry_run);
         self.last_message = Some(LastMessage::new(
             committed,
             TOOL_LOOP_CHECKPOINT_TEXT.to_string(),
@@ -10771,6 +10784,7 @@ mod tests {
                     join_handle,
                     child_supervisor: None,
                     session_id: None,
+                    child_session_root: None,
                 };
                 let old_sup = Arc::new(RwLock::new(Supervisor::new(4, 3)));
                 old_sup.write().register(handle).unwrap();
@@ -13419,7 +13433,7 @@ mod tests {
 
         complete_turn(&mut ctx, "hello", "reply");
         let dry_run = ctx.app.config.dry_run;
-        ctx.checkpoint_session_to_disk(dry_run);
+        ctx.checkpoint_session_to_disk(dry_run).unwrap();
 
         assert_eq!(read_to_string(&path).unwrap(), before);
         assert!(ctx.session.as_ref().unwrap().dirty());
@@ -13471,12 +13485,51 @@ mod tests {
         assert!(!ctx.session.as_ref().unwrap().dirty());
     }
 
+    /// A root context's session is the user's own: a write failure is
+    /// logged and the turn goes on, the session staying dirty for the next
+    /// attempt. Only a child context turns the failure into an error.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn a_root_context_only_warns_when_its_session_cannot_be_written() {
+        use std::os::unix::fs::PermissionsExt;
+        let _config = TestConfigDirGuard::new();
+        install_log_collector();
+        let (mut ctx, path) = loaded_session_ctx("per-turn-root-readonly");
+        ctx.session.as_mut().unwrap().set_save_session(Some(true));
+        assert!(ctx.self_agent_id.is_none());
+        let input = Input::from_str(&ctx, "hello", None).unwrap();
+        ctx.session
+            .as_mut()
+            .unwrap()
+            .add_message(&input, "reply")
+            .unwrap();
+        let sessions_dir = path.parent().unwrap().to_path_buf();
+        let before = read_to_string(&path).unwrap();
+        let warns_before = warn_snapshot().len();
+        std::fs::set_permissions(&sessions_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let result = ctx.checkpoint_session_to_disk(false);
+
+        std::fs::set_permissions(&sessions_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        result.unwrap();
+        assert_eq!(read_to_string(&path).unwrap(), before);
+        assert!(ctx.session.as_ref().unwrap().dirty());
+        let new_warns: Vec<String> = warn_snapshot().into_iter().skip(warns_before).collect();
+        assert!(
+            new_warns.iter().any(|line| {
+                line.starts_with("Failed to checkpoint session 'per-turn-root-readonly': ")
+            }),
+            "{new_warns:?}"
+        );
+    }
+
     /// A REPL-root ctx whose loaded, auto-saving workspace session has just
     /// been written to disk, so any later dirtying is the test's own doing.
     fn clean_loaded_session_ctx(name: &str) -> RequestContext {
         let (mut ctx, _) = loaded_session_ctx(name);
         ctx.session.as_mut().unwrap().set_save_session(Some(true));
-        ctx.checkpoint_session_to_disk(false);
+        ctx.checkpoint_session_to_disk(false).unwrap();
         assert!(!ctx.session.as_ref().unwrap().dirty());
         ctx
     }
@@ -13515,7 +13568,7 @@ mod tests {
         let mut ctx = clean_loaded_session_ctx("child-root-keep");
         let fixed = Uuid::new_v4();
         ctx.session.as_mut().unwrap().set_uid(Some(fixed));
-        ctx.checkpoint_session_to_disk(false);
+        ctx.checkpoint_session_to_disk(false).unwrap();
         assert!(!session_dirty(&ctx));
 
         let root = ctx.ensure_child_session_root().unwrap();
@@ -14634,6 +14687,7 @@ mod tests {
             join_handle,
             child_supervisor: None,
             session_id: None,
+            child_session_root: None,
         }
     }
 
@@ -15526,7 +15580,7 @@ mod tests {
         let mut ctx = create_test_ctx();
         assert!(ctx.session.is_none());
 
-        ctx.checkpoint_session_to_disk(false);
+        ctx.checkpoint_session_to_disk(false).unwrap();
         complete_turn(&mut ctx, "hello", "reply");
 
         assert!(ctx.session.is_none());
@@ -30504,6 +30558,7 @@ mod tests {
             join_handle,
             child_supervisor: None,
             session_id: None,
+            child_session_root: None,
         })
         .unwrap();
         sup.register(make_running_job(job_sig.clone())).unwrap();

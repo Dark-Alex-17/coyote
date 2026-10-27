@@ -152,9 +152,9 @@ impl ChildSessionRoot {
         Ok(children)
     }
 
-    /// The newest `max` child session ids plus how many more exist. Meant for
+    /// The newest `max` children plus how many more exist. Meant for
     /// status lines, so a listing failure degrades to an empty answer.
-    pub(crate) fn recent_child_ids(&self, max: usize) -> (Vec<String>, usize) {
+    pub(crate) fn recent_children(&self, max: usize) -> (Vec<ChildMeta>, usize) {
         let children = match self.list_children() {
             Ok(children) => children,
             Err(error) => {
@@ -166,12 +166,8 @@ impl ChildSessionRoot {
             }
         };
         let more = children.len().saturating_sub(max);
-        let ids = children
-            .into_iter()
-            .take(max)
-            .map(|meta| meta.session_id)
-            .collect();
-        (ids, more)
+        let newest = children.into_iter().take(max).collect();
+        (newest, more)
     }
 
     pub(crate) fn load_child_meta(&self, session_id: &str) -> Result<Option<ChildMeta>> {
@@ -448,8 +444,9 @@ pub(crate) fn settle_parent_exit(root: &ChildSessionRoot, session: Option<&Sessi
 }
 
 /// The sidecar's `session_id` is file content, so it is checked against the
-/// id grammar before it becomes a path component. The grammar leaves the
-/// agent segment free-form, so separators and `..` are refused on top.
+/// id grammar before it becomes a path component; the grammar already
+/// holds the agent segment to a charset with no separator and no `..`, so
+/// the extra check below is belt and braces.
 fn remove_child(root: &ChildSessionRoot, session_id: &str, reason: &str) {
     let agent_is_plain = parse_session_id(session_id).is_some_and(|(agent, _)| {
         !agent.chars().any(std::path::is_separator) && !agent.contains("..")
@@ -986,18 +983,24 @@ pub(crate) fn new_session_id(agent: &str) -> String {
     format!("{SESSION_ID_PREFIX}{agent}_{hex}")
 }
 
+/// Whether an agent name can be the agent segment of a session id: the
+/// characters an agent name can contain, never spelling a parent directory.
+/// Ids arrive from tool arguments and are joined into file names, so the
+/// same rule gates both minting an id and parsing one.
+pub(crate) fn agent_name_fits_session_id(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains("..")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+}
+
 /// Splits a `new_session_id` result back into `(agent, hex)`; `None` for
-/// anything not in that shape. Ids arrive from tool arguments and are
-/// joined into file names, so the agent segment is held to the characters
-/// an agent name can contain and may never spell a parent directory.
+/// anything not in that shape.
 pub(crate) fn parse_session_id(id: &str) -> Option<(&str, &str)> {
     let rest = id.strip_prefix(SESSION_ID_PREFIX)?;
     let (agent, hex) = rest.rsplit_once('_')?;
-    let agent_ok = !agent.is_empty()
-        && !agent.contains("..")
-        && agent
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
+    let agent_ok = agent_name_fits_session_id(agent);
     let hex_ok = hex.len() == SESSION_ID_HEX_LEN
         && hex
             .chars()
@@ -1156,6 +1159,28 @@ mod tests {
         for agent in ["my_agent", "agent-x", "v1.2", "A_b-C.d"] {
             let id = new_session_id(agent);
             assert_eq!(parse_session_id(&id).map(|(a, _)| a), Some(agent), "{id}");
+        }
+    }
+
+    /// The name gate agrees with the parser: every name it accepts mints an
+    /// id that parses back to it, and every name it refuses would not.
+    #[test]
+    fn agent_name_fits_session_id_mirrors_the_parser() {
+        for agent in ["coder", "my_agent", "agent-x", "v1.2", "A_b-C.d", "a.b"] {
+            assert!(agent_name_fits_session_id(agent), "{agent}");
+            assert_eq!(
+                parse_session_id(&new_session_id(agent)).map(|(a, _)| a),
+                Some(agent),
+                "{agent}"
+            );
+        }
+        for agent in ["", "..", "a..b", "a/b", "a\\b", "a b", "a+b", "caf\u{e9}"] {
+            assert!(!agent_name_fits_session_id(agent), "{agent:?}");
+            assert_eq!(
+                parse_session_id(&format!("sess_{agent}_0123456789ab")),
+                None,
+                "{agent:?}"
+            );
         }
     }
 
@@ -1532,7 +1557,7 @@ updated_at: 2026-01-02T03:04:05Z
 
     #[test]
     #[serial]
-    fn recent_child_ids_returns_newest_and_counts_the_rest() {
+    fn recent_children_returns_newest_and_counts_the_rest() {
         let _cache = CacheDirGuard::new("child-sessions-recent");
         let root = ChildSessionRoot::Uid(Uuid::new_v4());
         root.ensure_dir(&fixture_root()).unwrap();
@@ -1543,14 +1568,20 @@ updated_at: 2026-01-02T03:04:05Z
         ] {
             root.save_child_meta(&fixture_meta_at(sid, offset)).unwrap();
         }
+        let ids_of = |children: Vec<ChildMeta>| -> Vec<String> {
+            children.into_iter().map(|meta| meta.session_id).collect()
+        };
 
-        let (ids, more) = root.recent_child_ids(2);
-        assert_eq!(ids, vec!["sess_c_0123456789ab", "sess_b_0123456789ab"]);
+        let (children, more) = root.recent_children(2);
+        assert_eq!(
+            ids_of(children),
+            vec!["sess_c_0123456789ab", "sess_b_0123456789ab"]
+        );
         assert_eq!(more, 1);
 
-        let (ids, more) = root.recent_child_ids(5);
+        let (children, more) = root.recent_children(5);
         assert_eq!(
-            ids,
+            ids_of(children),
             vec![
                 "sess_c_0123456789ab",
                 "sess_b_0123456789ab",
@@ -1560,7 +1591,7 @@ updated_at: 2026-01-02T03:04:05Z
         assert_eq!(more, 0);
 
         let absent = ChildSessionRoot::Uid(Uuid::new_v4());
-        assert_eq!(absent.recent_child_ids(2), (Vec::new(), 0));
+        assert_eq!(absent.recent_children(2), (Vec::new(), 0));
     }
 
     #[test]
