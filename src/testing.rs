@@ -275,6 +275,33 @@ impl Drop for CacheDirGuard {
     }
 }
 
+/// Puts the mode back on a path when dropped, so a failing assertion
+/// cannot leave a directory the next run cannot clean up.
+#[cfg(unix)]
+pub(crate) struct RestoreMode(pub(crate) PathBuf, pub(crate) u32);
+
+#[cfg(unix)]
+impl Drop for RestoreMode {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
+    }
+}
+
+/// True when a write inside `dir` succeeds despite its mode bits, i.e.
+/// the process runs with privileges (root, CAP_DAC_OVERRIDE) that make a
+/// read-only directory unstageable; callers skip the scenario. The probe
+/// file is removed again.
+#[cfg(unix)]
+pub(crate) fn mode_bits_are_ignored_in(dir: &Path) -> bool {
+    let probe = dir.join("probe");
+    if std::fs::write(&probe, "").is_err() {
+        return false;
+    }
+    let _ = std::fs::remove_file(&probe);
+    true
+}
+
 /// The first bash on PATH outside System32, for tests that drive the shipped
 /// shell scripts. The one Windows puts in System32 is the WSL launcher, not
 /// a shell: it prints a banner about missing distributions and exits 1, and

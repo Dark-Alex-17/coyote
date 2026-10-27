@@ -2233,7 +2233,7 @@ fn agents_page_quotes_the_spawn_session_id_contract() {
         "up to {} recent ids",
         number_after(
             &fn_body(&agents, "fn recent_child_ids_hint("),
-            "root.recent_child_ids(",
+            "root.recent_children(",
             ')',
         )
     );
