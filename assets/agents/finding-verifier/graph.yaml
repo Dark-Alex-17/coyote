@@ -48,11 +48,12 @@ nodes:
       (unparseable JSON, missing/mistyped fields, unclassifiable severity)
       routes _next to the legacy LLM parse node instead - fail-open, byte-for-
       byte today's behavior - and a crash in this script falls forward to the
-      same LLM parse via the declared next edge. Runs once, forward edges
+      same LLM parse via the node's fallback edge. Runs once, forward edges
       only: no loops introduced.
     script: scripts/parse_findings.py
     timeout: 30
     next: parse
+    fallback: parse
 
   parse:
     id: parse

@@ -29182,6 +29182,120 @@ mod tests {
         );
     }
 
+    fn fv_findings_prompt(findings_json: &str) -> String {
+        format!(
+            "Verify these code-review findings against the working tree.\n\n\
+             Project: /tmp/p\n\n\
+             Findings (JSON; one object per finding):\n{findings_json}"
+        )
+    }
+
+    #[test]
+    fn finding_verifier_parse_findings_routes_structured_findings_to_verify_each() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let findings = json!([
+            {"id": "f1", "severity": "CRITICAL", "marker": "\u{1F534}", "file": "src/a.rs",
+             "lines": "1-2", "title": "t", "block": "b"},
+            {"id": "f2", "severity": "SUGGESTION", "marker": "", "file": "src/b.rs",
+             "lines": "", "title": "t2", "block": "b2"},
+        ]);
+        let out = run_fv_script(
+            "parse_findings.py",
+            &json!({"initial_prompt": fv_findings_prompt(&findings.to_string())}),
+        );
+        assert_eq!(out["_next"], "verify_each", "{out}");
+        assert_eq!(out["project_dir"], "/tmp/p", "{out}");
+        let list = out["findings_list"].as_array().unwrap();
+        assert_eq!(
+            list.len(),
+            1,
+            "only the CRITICAL finding is verified: {out}"
+        );
+        assert_eq!(list[0]["id"], "f1", "{out}");
+        assert_eq!(list[0]["path"], "src/a.rs", "{out}");
+        assert_eq!(list[0]["claim"], "t\n\nb", "{out}");
+    }
+
+    #[test]
+    fn finding_verifier_parse_findings_non_list_falls_back_to_llm_parse() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // The script slices the first `[`..last `]`, so a bare object has no
+        // array to parse; that is the anomaly the note must name.
+        let out = run_fv_script(
+            "parse_findings.py",
+            &json!({"initial_prompt": fv_findings_prompt("{\"id\": \"f1\"}")}),
+        );
+        assert_eq!(out["_next"], "parse", "{out}");
+        assert!(
+            out["parse_script_note"]
+                .as_str()
+                .is_some_and(|n| n.contains("no JSON array found")),
+            "the anomaly must be named: {out}"
+        );
+    }
+
+    #[test]
+    fn finding_verifier_parse_findings_unclassifiable_severity_falls_back() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let findings = json!([
+            {"id": "f1", "severity": "MAYBE", "marker": "", "file": "src/a.rs",
+             "lines": "1", "title": "t", "block": "b"},
+        ]);
+        let out = run_fv_script(
+            "parse_findings.py",
+            &json!({"initial_prompt": fv_findings_prompt(&findings.to_string())}),
+        );
+        assert_eq!(out["_next"], "parse", "{out}");
+        assert!(
+            out["parse_script_note"]
+                .as_str()
+                .is_some_and(|n| n.contains("unclassifiable")),
+            "the anomaly must be named: {out}"
+        );
+    }
+
+    #[test]
+    fn finding_verifier_parse_findings_crash_falls_forward() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // A numeric prompt makes main raise on `.strip()`; the entry-point
+        // guard must still emit the fallback routing instead of dying.
+        let out = run_fv_script("parse_findings.py", &json!({"initial_prompt": 7}));
+        assert_eq!(out["_next"], "parse", "{out}");
+        assert!(
+            out["parse_script_note"]
+                .as_str()
+                .is_some_and(|n| n.starts_with("parser crashed:")),
+            "the crash must be named: {out}"
+        );
+    }
+
+    #[test]
+    fn finding_verifier_parse_script_declares_fallback_to_llm_parse() {
+        let graph = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("assets/agents/finding-verifier/graph.yaml"),
+        )
+        .unwrap();
+        assert!(
+            graph.contains(
+                "script: scripts/parse_findings.py\n    timeout: 30\n    next: parse\n    fallback: parse"
+            ),
+            "a parse_script crash must fall forward to the LLM parse node"
+        );
+    }
+
     #[test]
     fn finding_verifier_verify_fault_normalizes_failure_text() {
         if !cmd_available("python3") {

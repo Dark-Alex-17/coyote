@@ -16,7 +16,7 @@ Paying an LLM call to re-extract JSON that is already JSON is pure overhead,
 so this script handles the structured case and routes to the legacy LLM
 `parse` node on ANY anomaly (fail-open: unparseable JSON, missing/mistyped
 fields, unclassifiable severity, absent prompt). A crash in this script falls
-forward to the same LLM node via the declared `next:` edge. Runs exactly
+forward to the same LLM node via the node's `fallback:` edge. Runs exactly
 once; forward edges only - no loops introduced.
 
 Deliberate divergence from the LLM parse, judged safe: the LLM instructions
@@ -148,5 +148,7 @@ def main():
     )
 
 
-if __name__ == "__main__":
+try:
     main()
+except Exception as e:  # noqa: BLE001 - a parser crash must fall forward, never kill the run
+    fall_back(f"parser crashed: {e}")
