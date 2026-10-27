@@ -641,6 +641,7 @@ pub(crate) mod network {
     use rmpv::Value;
     use rns_transport::PacketContext;
     use rns_transport::destination::link::{Link, LinkEvent, LinkEventData, LinkId};
+    use rns_transport::destination::request::RequestOptions as LibraryRequestOptions;
     use rns_transport::destination::{DestinationDesc, DestinationName, SingleInputDestination};
     use rns_transport::hash::{AddressHash, Hash};
     use rns_transport::identity::Identity;
@@ -2499,6 +2500,59 @@ pub(crate) mod network {
         })
         .await;
         in_flight.abort();
+
+        // A requester that takes no reply over its own size limit refuses the resource at
+        // its advertisement; the transfer ends rejected on this side and the settlement is
+        // dropped unsent. The library's own request is used because Coyote's client has
+        // no such limit. The requester's side of the link closed above is still active and
+        // would be reused, so it is closed first and a fresh link opened.
+        let (reply, sent, dropped) = settled(card.clone());
+        *handler.reply.lock() = Some(reply);
+        requester
+            .transport
+            .find_out_link(&link_id)
+            .await
+            .expect("the requester still holds its side of the closed link")
+            .lock()
+            .await
+            .close();
+        let link = open_link(&requester.transport, &desc, "/echo", link_deadline())
+            .await
+            .unwrap();
+        let link_id = *link.lock().await.id();
+        let entered = handler.entered.load(Ordering::SeqCst);
+        let refusing = LibraryRequestOptions::default()
+            .with_timeout(SHORT_REQUEST_TIMEOUT)
+            .with_max_response_size(64);
+        requester
+            .transport
+            .request(
+                &link_id,
+                "/echo",
+                requester.envelope(Value::Nil).into_value(),
+                refusing,
+            )
+            .await
+            .unwrap();
+        wait_until("the handler to hold the reply", || {
+            handler.entered.load(Ordering::SeqCst) > entered
+        })
+        .await;
+        let (_, request_id) = handler.last.lock().unwrap();
+        handler.release.notify_one();
+        let warned = format!(
+            "Mesh response {request_id} on link {} did not complete: Rejected(PeerCancelled)",
+            link_id.to_hex_string()
+        );
+        wait_until("the rejected transfer to give up on the reply", || {
+            warn_snapshot().iter().any(|message| message == &warned)
+        })
+        .await;
+        assert!(!sent.load(Ordering::SeqCst));
+        wait_until("the unsent settlement to be dropped", || {
+            dropped.load(Ordering::SeqCst)
+        })
+        .await;
 
         requester.stop().await;
         responder.stop().await;
