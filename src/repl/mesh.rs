@@ -34429,6 +34429,68 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     });
                 }
 
+                /// `mesh.fetch.max_bytes` is the only size the grant pre-flight holds a
+                /// requested file to. Under the default configuration a file above one
+                /// Resource segment but under `max_bytes` is granted one-off and standing
+                /// alike, with the peer told yes, a grant written for the one-off and the
+                /// request cleared; no segment-sized bound sits in front of the setting.
+                #[test]
+                #[serial]
+                fn usage_probe_grant_serves_a_file_above_one_segment_under_the_default_max_bytes() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-grant-under-max-bytes");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-grant-under-max-bytes").await;
+                        assert_eq!(fx.ctx.app.config.mesh.fetch.max_bytes, 4_194_304);
+                        let above_one_segment =
+                            rns_transport::resource::MAX_EFFICIENT_SIZE + 512 * 1024;
+                        assert!(
+                            (above_one_segment as u64) < fx.ctx.app.config.mesh.fetch.max_bytes,
+                            "the file under test sits between one segment and max_bytes"
+                        );
+                        let root = fx.root.path.clone();
+                        fs::create_dir_all(root.join("docs")).unwrap();
+                        fs::write(root.join("docs/big.bin"), vec![0x5A; above_one_segment])
+                            .unwrap();
+                        fx.file("a-1", InboundKind::Access, &["docs/big.bin"]);
+                        fx.file("a-2", InboundKind::Access, &["docs/big.bin"]);
+
+                        let out = out_of(&mut fx.ctx, ".mesh grant a-1").await.unwrap();
+
+                        assert!(out.contains("Granted a-1: 1 path"), "{out}");
+                        assert!(
+                            !out.contains("would not be served"),
+                            "no size refusal under max_bytes: {out}"
+                        );
+                        assert_eq!(fx.grants().len(), 1, "{:?}", fx.grants());
+                        assert_eq!(fx.pending_ids(), ["a-2"]);
+                        assert!(
+                            fx.stub
+                                .seen()
+                                .iter()
+                                .any(|seen| seen.content.contains("granted")),
+                            "the peer hears yes: {:?}",
+                            fx.stub.seen()
+                        );
+
+                        let out = out_of(&mut fx.ctx, ".mesh grant a-2 --standing")
+                            .await
+                            .unwrap();
+
+                        assert!(out.contains("Granted a-2: 1 path"), "{out}");
+                        assert!(out.contains("standing"), "{out}");
+                        assert!(fx.pending_ids().is_empty(), "{:?}", fx.pending_ids());
+                        for line in stdout_lines() {
+                            assert!(
+                                !line.contains("segment") && !line.contains("ceiling"),
+                                "nothing names a per-segment bound: {line}"
+                            );
+                        }
+                        fx.stop().await;
+                    });
+                }
+
                 /// The whole human-to-peer round trip over a real link. `--workspace` lands
                 /// in the workspace share file with `peer:` set to the requester's identity.
                 /// The peer hears the decision as a reply with one `data` part
@@ -38125,6 +38187,59 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             out.lines()
                                 .any(|line| line == reference_line("fits.bin", 2048, &to)),
                             "{out}"
+                        );
+                        assert_eq!(fx.grants().len(), 1, "{:?}", fx.grants());
+                        fx.stop().await;
+                    });
+                }
+
+                /// The reference form is bounded by `mesh.fetch.max_bytes` alone: under the
+                /// default configuration a file above one Resource segment is lent by
+                /// reference with a one-off grant written, and the line names the file's
+                /// own size. A file one byte past `max_bytes` is refused naming that very
+                /// number, nothing in between.
+                #[test]
+                #[serial]
+                fn usage_probe_an_attached_reference_above_one_segment_is_lent_under_the_default_max_bytes()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-attach-under-max-bytes");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-attach-under-max-bytes").await;
+                        let max_bytes = fx.ctx.app.config.mesh.fetch.max_bytes;
+                        assert_eq!(max_bytes, 4_194_304);
+                        let above_one_segment =
+                            rns_transport::resource::MAX_EFFICIENT_SIZE + 512 * 1024;
+                        write(&fx.root.path, "big.bin", &vec![0x5A; above_one_segment]);
+                        write(
+                            &fx.root.path,
+                            "past.bin",
+                            &vec![0x5A; max_bytes as usize + 1],
+                        );
+                        let to = fx.stub.destination_hex();
+
+                        let out = out_of(
+                            &mut fx.ctx,
+                            &format!(".mesh message {to} --yes \"x\" --attach big.bin"),
+                        )
+                        .await
+                        .unwrap();
+
+                        assert!(
+                            out.lines().any(|line| {
+                                line == reference_line("big.bin", above_one_segment as u64, &to)
+                            }),
+                            "{out}"
+                        );
+                        assert_eq!(fx.grants().len(), 1, "{:?}", fx.grants());
+
+                        let line = format!(".mesh message {to} --yes \"x\" --attach past.bin");
+                        assert_eq!(
+                            refusal(&mut fx.ctx, &line).await,
+                            format!(
+                                "`past.bin` is 4.2 MB and this node serves at most {max_bytes} bytes by reference; nothing was sent."
+                            )
                         );
                         assert_eq!(fx.grants().len(), 1, "{:?}", fx.grants());
                         fx.stop().await;
