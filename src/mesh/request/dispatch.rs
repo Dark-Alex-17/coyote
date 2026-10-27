@@ -182,10 +182,10 @@ enum Route {
     NoProvider(&'static str),
 }
 
-/// The trust gate in front of every handler. Identity comes first and before decoding: a
-/// peer the trust list does not name gets no reply and its bytes are never parsed, and
-/// `handle` reads the identity's standing again so a peer untrusted or blocked after
-/// `admit` let it through still gets no reply.
+/// The trust gate in front of every handler. Identity comes first: a peer the trust list
+/// does not name gets no reply and the envelope is never read, and `handle` reads the
+/// identity's standing again so a peer untrusted or blocked after `admit` let it through
+/// still gets no reply.
 ///
 /// The protocol version comes next, before the body is read: an envelope naming a version
 /// this node does not speak is answered with the version refusal and nothing else is
