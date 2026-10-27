@@ -1167,6 +1167,12 @@ fn finish_child_meta(
     }
 }
 
+/// The one wording for a child whose task panicked, shared by the sidecar
+/// record and the error handed to the caller.
+fn panicked_task_error(error: &tokio::task::JoinError) -> String {
+    format!("agent task panicked: {error}")
+}
+
 /// Pre-resolved `agent.completed`/`agent.interrupted`/`agent.failed`
 /// snapshots for a spawned agent's result arms, captured from the child
 /// context before the spawn task takes ownership of it. Resolving against
@@ -1915,7 +1921,6 @@ fn launch_child_spawn(ctx: &mut RequestContext, spawn: Box<ChildSpawn>) -> Resul
     let spawn_session_id = session_id.clone();
     let spawn_abort = child_abort.clone();
     let hook_abort = child_abort.clone();
-    let refused_abort = child_abort.clone();
     let spawn_notifications = Arc::clone(&ctx.notification_queue);
     let child_supervisor = child_ctx.supervisor.clone();
     let root = child_ctx.child_session_root.clone();
@@ -2003,7 +2008,7 @@ fn launch_child_spawn(ctx: &mut RequestContext, spawn: Box<ChildSpawn>) -> Resul
             ChildStatus::Failed,
             Some(format!("{error:#}")),
         );
-        refused_hooks.fire(Some(&format!("{error:#}")), refused_abort.aborted_ctrlc());
+        refused_hooks.fire(Some(&format!("{error:#}")), false);
         return Err(error);
     }
 
@@ -2195,13 +2200,14 @@ async fn handle_collect(ctx: &mut RequestContext, args: &Value) -> Result<Value>
                 // A panicked task never reached its own exit write, so the
                 // sidecar would otherwise keep saying running.
                 Err(e) => {
+                    let error = panicked_task_error(&e);
                     finish_child_meta(
                         child_session_root.as_deref(),
                         session_id.as_deref(),
                         ChildStatus::Failed,
-                        Some(format!("agent task panicked: {e}")),
+                        Some(error.clone()),
                     );
-                    return Err(anyhow!("Agent task panicked: {e}"));
+                    return Err(anyhow!(error));
                 }
             };
 
@@ -2354,13 +2360,20 @@ async fn handle_cancel(ctx: &mut RequestContext, args: &Value) -> Result<Value> 
 
     match handle {
         Some(handle) => {
-            let agent_name = handle.agent_name.clone();
-            let session_id = handle.session_id.clone();
-            if let Some(child_sup) = handle.child_supervisor.as_ref() {
+            let AgentHandle {
+                agent_name,
+                session_id,
+                child_supervisor,
+                join_handle,
+                abort_signal,
+                child_session_root,
+                ..
+            } = handle;
+            if let Some(child_sup) = child_supervisor.as_ref() {
                 child_sup.read().cancel_recursive();
             }
-            let was_running = !handle.join_handle.is_finished();
-            handle.abort_signal.set_ctrlc();
+            let was_running = !join_handle.is_finished();
+            abort_signal.set_ctrlc();
             // Written here as well as by the child's own exit, so the
             // sidecar reads cancelled even when the child outlives the
             // cleanup wait below. A child that had already finished keeps
@@ -2370,14 +2383,26 @@ async fn handle_cancel(ctx: &mut RequestContext, args: &Value) -> Result<Value> 
             // was seated under.
             if was_running {
                 finish_child_meta(
-                    handle.child_session_root.as_deref(),
+                    child_session_root.as_deref(),
                     session_id.as_deref(),
                     ChildStatus::Cancelled,
                     None,
                 );
             }
 
-            let cleanup = tokio::time::timeout(Duration::from_secs(5), handle.join_handle).await;
+            let cleanup = tokio::time::timeout(Duration::from_secs(5), join_handle).await;
+
+            // A finished task that panicked never reached its own exit
+            // write, and this cancel consumes the handle, so the sidecar
+            // would otherwise say running for as long as this process lives.
+            if let (false, Ok(Err(join_error))) = (was_running, &cleanup) {
+                finish_child_meta(
+                    child_session_root.as_deref(),
+                    session_id.as_deref(),
+                    ChildStatus::Failed,
+                    Some(panicked_task_error(join_error)),
+                );
+            }
 
             ctx.pending_tasks_guardrail_count = 0;
 
@@ -4181,6 +4206,34 @@ mod tests {
             !fn_body("\n    fn fire(self, error: Option<&str>, interrupted: bool)")
                 .contains("aborted_ctrlc"),
             "the hooks take the verdict; they do not re-derive it"
+        );
+        let production = &source[..source.find("\n#[cfg(test)]\nmod tests").unwrap()];
+        let fire_calls: Vec<&str> = production
+            .match_indices(".fire(")
+            .map(|(at, needle)| {
+                let args = &production[at + needle.len()..];
+                let mut depth = 1usize;
+                let end = args
+                    .char_indices()
+                    .find(|(_, c)| {
+                        match c {
+                            '(' => depth += 1,
+                            ')' => depth -= 1,
+                            _ => {}
+                        }
+                        depth == 0
+                    })
+                    .map(|(end, _)| end)
+                    .unwrap();
+                &args[..end]
+            })
+            .collect();
+        assert_eq!(fire_calls.len(), 3, "{fire_calls:?}");
+        assert!(
+            fire_calls
+                .iter()
+                .all(|call| !call.contains("aborted_ctrlc()")),
+            "every call site passes the verdict it already reached: {fire_calls:?}"
         );
     }
 
@@ -6135,49 +6188,109 @@ mod tests {
     /// The cancel writes through the root the handle captured at spawn,
     /// not the spawner's current one: a spawner that has since left the
     /// session its children were seated under still records the cancel
-    /// on their sidecars.
+    /// on their sidecars. The task behind the handle writes no sidecar of
+    /// its own and ends on the cancel's signal, so the only way the sidecar
+    /// can read cancelled is through the handle's root.
     #[test]
     #[serial]
     fn handle_cancel_records_cancelled_on_the_root_captured_at_spawn() {
         let _guard = TestConfigDirGuard::new();
-        let _sink = hooks::test_sink::install();
         let agent_name = unique_agent_name("test_sidecar_cancel_root");
-        write_graph_agent_with_hooks(&agent_name, "sidecar_cancel_root", true);
+        write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
+        let (agent_id, sid, root) = seat_for_a_hand_built_handle(&mut ctx, &agent_name);
+        let spawn_root = root.clone();
 
-        let (spawned, cancelled, root) = run_async(async {
-            let spawned = handle_spawn(&mut ctx, &json!({"agent": agent_name, "prompt": "hi"}))
-                .await
-                .unwrap();
-            assert_eq!(spawned["status"], "ok", "{spawned}");
-            let root = spawner_root(&ctx);
+        let cancelled = run_async(async {
+            let abort_signal = create_abort_signal();
+            let task_abort = abort_signal.clone();
+            let task_id = agent_id.clone();
+            let task_name = agent_name.clone();
+            let task_sid = sid.clone();
+            let join_handle = tokio::spawn(async move {
+                wait_user_interrupt(Some(&task_abort)).await;
+                Ok(AgentResult {
+                    id: task_id,
+                    agent_name: task_name,
+                    output: String::new(),
+                    exit_status: AgentExitStatus::Completed,
+                    session_id: Some(task_sid),
+                })
+            });
+            register_hand_built_handle(
+                &mut ctx,
+                &agent_id,
+                &agent_name,
+                &sid,
+                root,
+                abort_signal,
+                join_handle,
+            );
             ctx.child_session_root = None;
-            let cancelled = handle_cancel(&mut ctx, &json!({"id": spawned["id"]}))
+            handle_cancel(&mut ctx, &json!({"id": agent_id}))
                 .await
-                .unwrap();
-            (spawned, cancelled, root)
+                .unwrap()
         });
 
         assert_eq!(cancelled["status"], "ok", "{cancelled}");
-        let sid = spawned["session_id"]
-            .as_str()
-            .expect("a seated child reports its session id");
-        let meta: ChildMeta = read_yaml(&root.child_meta_file(sid));
+        assert!(
+            cancelled["message"]
+                .as_str()
+                .unwrap()
+                .ends_with("and waited for cleanup."),
+            "{cancelled}"
+        );
+        let meta: ChildMeta = read_yaml(&spawn_root.child_meta_file(&sid));
         assert_eq!(meta.status, ChildStatus::Cancelled);
         assert!(meta.error.is_none(), "{meta:?}");
     }
 
-    /// A child whose task panics never reaches its own exit write, so the
-    /// collect that observes the panic records the failure on the sidecar
-    /// the handle carries, and the error names the panic.
+    /// A finished task that panicked never wrote its own exit, and the
+    /// cancel consumes the handle, so the cancel is the last chance to
+    /// record the failure on the sidecar.
     #[test]
     #[serial]
-    fn handle_collect_of_a_panicked_task_marks_the_sidecar_failed() {
+    fn handle_cancel_of_a_panicked_task_marks_the_sidecar_failed() {
         let _guard = TestConfigDirGuard::new();
-        let agent_name = unique_agent_name("test_sidecar_panic");
+        let agent_name = unique_agent_name("test_sidecar_cancel_panic");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
-        let spawn = build_ready_spawn(&mut ctx, json!({"agent": agent_name, "prompt": "hi"}));
+        let (agent_id, sid, root) = seat_for_a_hand_built_handle(&mut ctx, &agent_name);
+
+        let cancelled = run_async(async {
+            let join_handle = tokio::spawn(async { panic!("boom") });
+            while !join_handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            register_hand_built_handle(
+                &mut ctx,
+                &agent_id,
+                &agent_name,
+                &sid,
+                root,
+                create_abort_signal(),
+                join_handle,
+            );
+            handle_cancel(&mut ctx, &json!({"id": agent_id}))
+                .await
+                .unwrap()
+        });
+
+        assert_eq!(cancelled["status"], "ok", "{cancelled}");
+        let meta = child_meta_of(&ctx, &sid);
+        assert_eq!(meta.status, ChildStatus::Failed);
+        let recorded = meta.error.as_deref().unwrap_or_default();
+        assert!(recorded.contains("panicked"), "{meta:?}");
+        assert!(recorded.contains("boom"), "{meta:?}");
+    }
+
+    /// Seats a child of `agent_name` and drops its context, leaving a
+    /// `Running` sidecar for a test to put its own task behind.
+    fn seat_for_a_hand_built_handle(
+        ctx: &mut RequestContext,
+        agent_name: &str,
+    ) -> (String, String, Arc<ChildSessionRoot>) {
+        let spawn = build_ready_spawn(ctx, json!({"agent": agent_name, "prompt": "hi"}));
         let ChildSpawn {
             child_ctx,
             agent_id,
@@ -6190,27 +6303,61 @@ mod tests {
             .clone()
             .expect("the child carries the spawner's root");
         drop(child_ctx);
-        assert_eq!(child_meta_of(&ctx, &sid).status, ChildStatus::Running);
+        assert_eq!(child_meta_of(ctx, &sid).status, ChildStatus::Running);
+        (agent_id, sid, root)
+    }
+
+    fn register_hand_built_handle(
+        ctx: &mut RequestContext,
+        agent_id: &str,
+        agent_name: &str,
+        sid: &str,
+        root: Arc<ChildSessionRoot>,
+        abort_signal: AbortSignal,
+        join_handle: tokio::task::JoinHandle<Result<AgentResult>>,
+    ) {
+        let handle = AgentHandle {
+            id: agent_id.to_string(),
+            agent_name: agent_name.to_string(),
+            depth: 1,
+            inbox: Arc::new(Inbox::new()),
+            abort_signal,
+            join_handle,
+            child_supervisor: None,
+            session_id: Some(sid.to_string()),
+            child_session_root: Some(root),
+        };
+        ctx.supervisor
+            .as_ref()
+            .unwrap()
+            .write()
+            .register(handle)
+            .unwrap();
+    }
+
+    /// A child whose task panics never reaches its own exit write, so the
+    /// collect that observes the panic records the failure on the sidecar
+    /// the handle carries, and the error names the panic.
+    #[test]
+    #[serial]
+    fn handle_collect_of_a_panicked_task_marks_the_sidecar_failed() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_sidecar_panic");
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let (agent_id, sid, root) = seat_for_a_hand_built_handle(&mut ctx, &agent_name);
 
         let error = run_async(async {
             let join_handle = tokio::spawn(async { panic!("boom") });
-            let handle = AgentHandle {
-                id: agent_id.clone(),
-                agent_name: agent_name.clone(),
-                depth: 1,
-                inbox: Arc::new(Inbox::new()),
-                abort_signal: create_abort_signal(),
+            register_hand_built_handle(
+                &mut ctx,
+                &agent_id,
+                &agent_name,
+                &sid,
+                root,
+                create_abort_signal(),
                 join_handle,
-                child_supervisor: None,
-                session_id: Some(sid.clone()),
-                child_session_root: Some(root),
-            };
-            ctx.supervisor
-                .as_ref()
-                .unwrap()
-                .write()
-                .register(handle)
-                .unwrap();
+            );
             handle_collect(&mut ctx, &json!({"id": agent_id}))
                 .await
                 .expect_err("a panicked task is a failed collect")
@@ -6401,22 +6548,15 @@ mod tests {
         assert!(!_guard.cache_root.join("sessions").exists());
     }
 
-    /// The terminal sidecar write is bookkeeping: when it cannot land, the
-    /// child's result still reaches the collector untouched. Under a
-    /// read-only `children/` that result is the failed final flush of the
-    /// session next to the sidecar, and it arrives as such.
+    /// Under a read-only `children/` the child's final session flush fails,
+    /// so the result the collector receives is that failure; the terminal
+    /// sidecar write next to it is bookkeeping that cannot land, and the
+    /// result still arrives unchanged by that.
     #[cfg(unix)]
     #[test]
     #[serial]
-    fn a_failed_terminal_sidecar_write_leaves_the_collect_result_unchanged() {
+    fn a_failed_final_flush_turns_the_collect_result_failed() {
         use std::os::unix::fs::PermissionsExt;
-
-        struct RestoreWritable(PathBuf);
-        impl Drop for RestoreWritable {
-            fn drop(&mut self) {
-                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
-            }
-        }
 
         let _guard = TestConfigDirGuard::new();
         let agent_name = unique_agent_name("test_sidecar_unwritable");
@@ -6430,7 +6570,7 @@ mod tests {
             assert_eq!(spawned["status"], "ok", "{spawned}");
             let children = ctx.child_session_root.as_ref().unwrap().children_dir();
             std::fs::set_permissions(&children, std::fs::Permissions::from_mode(0o500)).unwrap();
-            let _restore = RestoreWritable(children);
+            let _restore = RestoreMode(children, 0o700);
             let collected = handle_collect(&mut ctx, &json!({"id": spawned["id"]})).await;
             (spawned, collected.unwrap())
         });
@@ -7350,6 +7490,54 @@ mod tests {
         );
     }
 
+    /// When `children/` turns read-only between the sidecar write and the
+    /// session write, the seat fails on the flush and the spawn hands that
+    /// error back; the Failed mark for the sidecar cannot land either, so
+    /// the sidecar still reads running and the failed record is logged.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn a_seat_whose_children_dir_turns_read_only_fails_and_leaves_the_sidecar_running() {
+        use std::os::unix::fs::PermissionsExt;
+
+        crate::testing::install_log_collector();
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_seat_children_readonly");
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let root = ctx.ensure_child_session_root().unwrap();
+        let children = root.children_dir();
+        let _restore = RestoreMode(children.clone(), 0o700);
+        let make_read_only = move || {
+            std::fs::set_permissions(&children, std::fs::Permissions::from_mode(0o500)).unwrap();
+        };
+
+        let error = with_hook_before_seat_flush(make_read_only, || {
+            resume_error(&mut ctx, json!({"agent": agent_name, "prompt": "hi"}))
+        });
+
+        assert!(error.contains("Failed to write child session "), "{error}");
+        let (children, more) = root.recent_children(2);
+        assert_eq!((children.len(), more), (1, 0), "{children:?}");
+        let meta = &children[0];
+        assert_eq!(meta.agent, agent_name);
+        assert_eq!(
+            meta.status,
+            ChildStatus::Running,
+            "the write could not land"
+        );
+        assert!(meta.error.is_none(), "{meta:?}");
+        let marker = format!(
+            "Failed to record child session {} as Failed",
+            meta.session_id
+        );
+        let warns: Vec<String> = crate::testing::warn_snapshot()
+            .into_iter()
+            .filter(|m| m.contains(&marker))
+            .collect();
+        assert_eq!(warns.len(), 1, "{warns:?}");
+    }
+
     fn read_yaml_value(path: &Path) -> serde_yaml::Value {
         read_yaml(path)
     }
@@ -7358,6 +7546,19 @@ mod tests {
     fn mode_of(path: &Path) -> u32 {
         use std::os::unix::fs::PermissionsExt;
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// Puts the mode back on a path when dropped, so a failing assertion
+    /// cannot leave a directory the next run cannot clean up.
+    #[cfg(unix)]
+    struct RestoreMode(PathBuf, u32);
+
+    #[cfg(unix)]
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
+        }
     }
 
     /// The spawn payload names the session slot on every spawn: a caller
