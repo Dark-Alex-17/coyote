@@ -1056,6 +1056,23 @@ pub(crate) mod network {
         .await
     }
 
+    /// The response payloads `events` carries once at least `n` have arrived. The receipt
+    /// resolves on the library's dispatch worker; the `LinkEvent::Data` for the same packet
+    /// is published a tick later on a broadcast channel, so a snapshot taken right after the
+    /// receipt can run ahead of it under load.
+    pub(crate) async fn awaited_response_payloads(
+        events: &mut broadcast::Receiver<LinkEventData>,
+        n: usize,
+    ) -> Vec<Vec<u8>> {
+        let mut payloads = response_payloads(events);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while payloads.len() < n && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            payloads.extend(response_payloads(events));
+        }
+        payloads
+    }
+
     /// The response payloads `events` has carried so far, as the requester's transport
     /// received them.
     pub(crate) fn response_payloads(
@@ -4110,7 +4127,7 @@ pub(crate) mod network {
             };
             let err = result.unwrap_err();
             assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
-            let payloads = response_payloads(&mut events);
+            let payloads = awaited_response_payloads(&mut events, 1).await;
             assert_eq!(payloads.len(), 1, "one response per request");
             let payload = &payloads[0];
             assert_eq!(&payload[..3], &[0x92, 0xc4, 0x10], "array(2), bin8(16)");
@@ -5156,7 +5173,7 @@ pub(crate) mod network {
                     RequestError::Refused(RefusalCode::NoAccess),
                     "{path} under list {n}"
                 );
-                let payloads = response_payloads(&mut events);
+                let payloads = awaited_response_payloads(&mut events, 1).await;
                 assert_eq!(payloads.len(), 1, "one response to {path} under list {n}");
                 tails.push(payloads[0][19..].to_vec());
             }
@@ -8699,7 +8716,7 @@ pub(crate) mod network {
             0,
             "an untrusted instance never reaches the provider"
         );
-        let payloads = response_payloads(&mut events);
+        let payloads = awaited_response_payloads(&mut events, 1).await;
         assert_eq!(payloads.len(), 1, "one refusal per request");
         let payload = &payloads[0];
         assert_eq!(&payload[payload.len() - 2..], &[0xcc, 0xf1]);
@@ -8728,7 +8745,7 @@ pub(crate) mod network {
             Some("REPO-SECRET-8")
         );
         assert!(card.served_at_secs > 0);
-        let payloads = response_payloads(&mut events);
+        let payloads = awaited_response_payloads(&mut events, 1).await;
         assert!(!payloads.is_empty(), "the served card crossed the wire");
         for payload in &payloads {
             assert!(
