@@ -141,7 +141,8 @@ impl AgentValidationContext {
 /// calling, must refuse the agent before a session is ever opened on it.
 /// The chat-agent pass runs too, so a `chat.agent` that names a graph
 /// agent, has no config.yaml, or is handed variables it does not declare
-/// is refused at the same point.
+/// is refused at the same point, and a `carry:` list with no block to
+/// carry under warns before the first run rather than silently forgetting.
 pub fn validate_session_block_for_agent(
     graph: &Graph,
     agent: &Agent,
@@ -152,6 +153,7 @@ pub fn validate_session_block_for_agent(
     let mut result = ValidationResult::default();
     validator.validate_session_block(graph, &mut result);
     validator.validate_session_chat_agent(graph, &mut result);
+    validator.validate_carry_without_session(graph, &mut result);
     result
 }
 
@@ -254,8 +256,25 @@ impl GraphValidator {
         self.validate_parallel_reads(graph, &mut result);
         self.validate_session_block(graph, &mut result);
         self.validate_session_chat_agent(graph, &mut result);
+        self.validate_carry_without_session(graph, &mut result);
 
         result
+    }
+
+    /// Carried keys flow between REPL turns only through a session, and a
+    /// graph agent without a `session:` block is refused a `--session`, so
+    /// its REPL turns never carry. A child does: its caller seats it on its
+    /// own session, `last_run_for(.., child = true)` records `carried`
+    /// regardless of a block, and `carried_for` re-seeds it on a `session_id`
+    /// resume, which is why the warning names that case.
+    fn validate_carry_without_session(&self, graph: &Graph, result: &mut ValidationResult) {
+        if graph.carry.is_empty() || graph.session.is_some() {
+            return;
+        }
+        result.warning(ValidationError::new(
+            "carry: is declared but the graph has no session: block; nothing is carried \
+             between REPL turns until one exists (a child resumed by session_id still carries)",
+        ));
     }
 
     fn validate_session_chat_agent(&self, graph: &Graph, result: &mut ValidationResult) {
@@ -2242,8 +2261,8 @@ mod tests {
     }
 
     #[test]
-    fn validate_runs_exactly_twenty_six_passes() {
-        assert_eq!(validate_pass_count(include_str!("validator.rs")), Some(26));
+    fn validate_runs_exactly_twenty_seven_passes() {
+        assert_eq!(validate_pass_count(include_str!("validator.rs")), Some(27));
     }
 
     #[test]
@@ -2259,8 +2278,8 @@ mod tests {
             "CRLF fixture must present the pin's end needle with CRLF bytes"
         );
 
-        assert_eq!(validate_pass_count(&lf), Some(26));
-        assert_eq!(validate_pass_count(&crlf), Some(26));
+        assert_eq!(validate_pass_count(&lf), Some(27));
+        assert_eq!(validate_pass_count(&crlf), Some(27));
         assert_eq!(validate_pass_count(&crlf), validate_pass_count(&lf));
     }
 
@@ -2435,6 +2454,49 @@ mod tests {
                 "session.chat.variables names 'verbose', which agent 'helper' does not declare (declared: tone)"
             ]
         );
+    }
+
+    const CARRY_WITHOUT_SESSION: &str = "carry: is declared but the graph has no session: block; nothing is carried between REPL turns until one exists (a child resumed by session_id still carries)";
+
+    #[test]
+    fn carry_without_a_session_block_warns_once_with_no_node() {
+        let mut graph = graph_with(vec![("end", end_node("end"))], "end");
+        graph.carry = vec!["said".into()];
+
+        let result = validator().validate(&graph);
+
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(messages(&result.warnings), [CARRY_WITHOUT_SESSION]);
+        assert!(result.warnings[0].node_id.is_none());
+        assert!(result.warnings[0].message.is_ascii());
+    }
+
+    #[test]
+    fn carry_beside_a_session_block_or_an_empty_carry_does_not_warn() {
+        let mut with_session = session_graph(session_block(None, None, &[], false));
+        with_session.carry = vec!["said".into()];
+        let no_carry = graph_with(vec![("end", end_node("end"))], "end");
+
+        for graph in [with_session, no_carry] {
+            let result = validator().validate(&graph);
+            assert!(result.is_valid(), "{:?}", result.errors);
+            assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn the_engage_pass_reports_carry_without_a_session_block() {
+        let _guard = TestConfigDirGuard::new();
+        let agent = Agent::test_new(AgentConfig::default());
+        let mut graph = graph_with(vec![("end", end_node("end"))], "end");
+        graph.carry = vec!["said".into()];
+
+        let result =
+            validate_session_block_for_agent(&graph, &agent, Arc::new(AppConfig::default()));
+
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert_eq!(messages(&result.warnings), [CARRY_WITHOUT_SESSION]);
     }
 
     #[test]

@@ -920,6 +920,47 @@ impl Session {
         self.chat_agent_instructions.clear();
     }
 
+    /// `sync_agent`, then the stored System row follows too. A session with
+    /// messages speaks with the System row it was saved under, not with
+    /// `role_prompt`, so re-adopting the prompt alone leaves a resumed
+    /// session on the text of the run that stored it; a teammate's roster
+    /// names per-run peer ids, so that text must follow the agent. A
+    /// compressed session keeps its summary: only the original prompt at
+    /// the head of the summary row is replaced. `compress` is what keeps
+    /// that row and `compressed_system_prompt` in step; a row that does not
+    /// start with the stored prompt is left as it is and logged.
+    pub fn readopt_agent_prompt(&mut self, agent: &Agent) {
+        self.sync_agent(agent);
+        let prompt = self.role_prompt.clone();
+        let Some(first) = self
+            .messages
+            .first_mut()
+            .filter(|message| message.role == MessageRole::System)
+        else {
+            return;
+        };
+        let text = match self.compressed_system_prompt.as_deref() {
+            Some(stored) => {
+                let current = first.content.to_text();
+                let Some(summary) = current.strip_prefix(stored) else {
+                    log::warn!(
+                        "Session '{}' keeps its summary row: it does not start with the stored prompt",
+                        self.name
+                    );
+                    return;
+                };
+                format!("{prompt}{summary}")
+            }
+            None => prompt.clone(),
+        };
+        first.content = MessageContent::Text(text);
+        if self.compressed_system_prompt.is_some() {
+            self.compressed_system_prompt = Some(prompt);
+        }
+        self.dirty = true;
+        self.update_tokens();
+    }
+
     pub fn sync_chat_agent(&mut self, agent: &Agent) {
         self.adopt_agent_prompt(agent);
         self.chat_agent = Some(agent.name().to_string());
@@ -1997,6 +2038,133 @@ mod tests {
             session.agent_instructions(),
             graph_agent.interpolated_instructions()
         );
+    }
+
+    fn stored_agent_session(system: &str) -> Session {
+        Session {
+            role_prompt: system.to_string(),
+            agent_instructions: system.to_string(),
+            messages: vec![
+                Message::new(
+                    MessageRole::System,
+                    MessageContent::Text(system.to_string()),
+                ),
+                Message::new(
+                    MessageRole::User,
+                    MessageContent::Text("earlier".to_string()),
+                ),
+                Message::new(
+                    MessageRole::Assistant,
+                    MessageContent::Text("noted".to_string()),
+                ),
+            ],
+            ..Session::default()
+        }
+    }
+
+    #[test]
+    fn readopt_agent_prompt_rewrites_the_stored_system_row() {
+        let mut session = stored_agent_session("Say loud\n\n## Teammate roster\nold seat");
+        let mut agent = Agent::test_new(AgentConfig {
+            name: "helper".to_string(),
+            instructions: "Say loud".to_string(),
+            ..AgentConfig::default()
+        });
+        agent.set_instructions_appendix("## Teammate roster\nnew seat");
+
+        session.readopt_agent_prompt(&agent);
+
+        let fresh = agent.interpolated_instructions();
+        assert!(fresh.contains("new seat"), "{fresh}");
+        assert_eq!(session.messages[0].content.to_text(), fresh);
+        assert_eq!(session.role_prompt, fresh);
+        assert_eq!(session.agent_instructions, fresh);
+        assert_eq!(session.messages[1].content.to_text(), "earlier");
+        assert_eq!(session.messages[2].content.to_text(), "noted");
+        assert!(session.dirty);
+    }
+
+    #[test]
+    fn readopt_agent_prompt_keeps_a_compressed_summary_behind_the_fresh_prompt() {
+        let stored = "Say loud\n\n## Teammate roster\nold seat";
+        let mut session = stored_agent_session(stored);
+        session.messages[0] = Message::new(
+            MessageRole::System,
+            MessageContent::Text(format!("{stored}\n\nSummary of what came before.")),
+        );
+        session.compressed_system_prompt = Some(stored.to_string());
+        let mut agent = Agent::test_new(AgentConfig {
+            name: "helper".to_string(),
+            instructions: "Say loud".to_string(),
+            ..AgentConfig::default()
+        });
+        agent.set_instructions_appendix("## Teammate roster\nnew seat");
+
+        session.readopt_agent_prompt(&agent);
+
+        let fresh = agent.interpolated_instructions();
+        assert_eq!(
+            session.messages[0].content.to_text(),
+            format!("{fresh}\n\nSummary of what came before.")
+        );
+        assert_eq!(
+            session.compressed_system_prompt.as_deref(),
+            Some(fresh.as_str())
+        );
+        assert!(!session.messages[0].content.to_text().contains("old seat"));
+    }
+
+    #[test]
+    fn readopt_agent_prompt_leaves_a_summary_row_that_drifted_from_the_stored_prompt() {
+        let mut session = stored_agent_session("Say loud");
+        session.messages[0] = Message::new(
+            MessageRole::System,
+            MessageContent::Text("Something else\n\nSummary.".to_string()),
+        );
+        session.compressed_system_prompt = Some("Say loud".to_string());
+        let mut agent = Agent::test_new(AgentConfig {
+            name: "helper".to_string(),
+            instructions: "Say loud".to_string(),
+            ..AgentConfig::default()
+        });
+        agent.set_instructions_appendix("## Teammate roster\nnew seat");
+
+        session.readopt_agent_prompt(&agent);
+
+        assert_eq!(
+            session.messages[0].content.to_text(),
+            "Something else\n\nSummary."
+        );
+        assert_eq!(
+            session.compressed_system_prompt.as_deref(),
+            Some("Say loud")
+        );
+        assert_eq!(session.role_prompt, agent.interpolated_instructions());
+    }
+
+    #[test]
+    fn readopt_agent_prompt_leaves_a_session_without_a_system_row_to_role_prompt() {
+        let agent = Agent::test_new(AgentConfig {
+            name: "helper".to_string(),
+            instructions: "Say loud".to_string(),
+            ..AgentConfig::default()
+        });
+        let mut empty = Session::default();
+        empty.readopt_agent_prompt(&agent);
+        assert!(empty.messages.is_empty());
+        assert_eq!(empty.role_prompt, agent.interpolated_instructions());
+
+        let mut headless = Session {
+            messages: vec![Message::new(
+                MessageRole::User,
+                MessageContent::Text("hello".to_string()),
+            )],
+            ..Session::default()
+        };
+        headless.readopt_agent_prompt(&agent);
+        assert_eq!(headless.messages.len(), 1);
+        assert_eq!(headless.messages[0].content.to_text(), "hello");
+        assert_eq!(headless.role_prompt, agent.interpolated_instructions());
     }
 
     #[test]

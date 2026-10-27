@@ -27,21 +27,51 @@ pub struct ChildGraphRun {
     pub last_run: Option<LastRun>,
 }
 
+/// The one-shot run of the active agent's graph: `input` is seeded the way
+/// a REPL `.run` turn is (its patched text under `initial_prompt`) and the
+/// record, when the input is attached to the engaged session, names the
+/// bare typed text.
 pub async fn run_active_agent_graph(
     ctx: &mut RequestContext,
-    prompt: &str,
+    input: &Input,
     abort_signal: AbortSignal,
 ) -> Result<ChildGraphRun> {
-    run_active_agent_graph_with_inputs(ctx, prompt, abort_signal, None).await
+    run_seeded_graph(
+        ctx,
+        &input.text(),
+        input.bare_text(),
+        false,
+        input.session(&ctx.session).is_some(),
+        abort_signal,
+        None,
+    )
+    .await
 }
 
-/// Runs the active agent's graph with `inputs` overlaid on its
-/// `initial_state` before the executor starts. `None` seeds exactly what
-/// `run_active_agent_graph` does: the prompt under `initial_prompt` and the
-/// session transcript under `previous_turns`.
+/// Runs the active agent's graph for a child context, with `inputs`
+/// overlaid on its `initial_state` before the executor starts. The prompt
+/// is seeded under `initial_prompt` and the session transcript under
+/// `previous_turns`; the record always names the prompt as given.
 pub async fn run_active_agent_graph_with_inputs(
     ctx: &mut RequestContext,
     prompt: &str,
+    abort_signal: AbortSignal,
+    inputs: Option<HashMap<String, Value>>,
+) -> Result<ChildGraphRun> {
+    let has_session = ctx.session.is_some();
+    run_seeded_graph(ctx, prompt, prompt, true, has_session, abort_signal, inputs).await
+}
+
+/// Loads, seeds and runs the active agent's graph without routing.
+/// `seed_prompt` lands under `initial_prompt`; `record_prompt` is what the
+/// record names, which differs from the seed when the one-shot input
+/// carries a request-only patch.
+async fn run_seeded_graph(
+    ctx: &mut RequestContext,
+    seed_prompt: &str,
+    record_prompt: &str,
+    child: bool,
+    has_session: bool,
     abort_signal: AbortSignal,
     inputs: Option<HashMap<String, Value>>,
 ) -> Result<ChildGraphRun> {
@@ -62,7 +92,7 @@ pub async fn run_active_agent_graph_with_inputs(
     let carried = carried_for(ctx, &graph.carry);
     seed_initial_state(
         &mut graph.initial_state,
-        prompt,
+        seed_prompt,
         inputs,
         &previous_turns,
         &carried,
@@ -75,19 +105,19 @@ pub async fn run_active_agent_graph_with_inputs(
         expose.as_deref(),
         &carry,
         &result,
-        prompt,
-        true,
-        ctx.session.is_some(),
+        record_prompt,
+        child,
+        has_session,
     );
     Ok(ChildGraphRun { result, last_run })
 }
 
 /// The record a finished run leaves behind, or `None` when there is
 /// nothing to store it on. A child always records: its caller seats it on
-/// its own session. A REPL turn records only when a session is engaged and
-/// the graph gives the record a home: a `session:` block (`expose` is
-/// `Some`, possibly empty) or a non-empty `carry:` list whose values the
-/// next run reads back.
+/// its own session. A REPL turn or a one-shot run records only when its
+/// input is attached to the engaged session and the graph gives the record
+/// a home: a `session:` block (`expose` is `Some`, possibly empty) or a
+/// non-empty `carry:` list whose values the next run reads back.
 pub fn last_run_for(
     expose: Option<&[String]>,
     carry: &[String],
@@ -162,7 +192,7 @@ pub async fn run_graph_turn(
                 &result,
                 input.bare_text(),
                 false,
-                ctx.session.is_some(),
+                input.session(&ctx.session).is_some(),
             );
             return Ok(GraphTurn::Run {
                 output: result.output,
@@ -195,7 +225,7 @@ pub async fn run_graph_turn(
                 &result,
                 input.bare_text(),
                 false,
-                ctx.session.is_some(),
+                input.session(&ctx.session).is_some(),
             );
             Ok(GraphTurn::Run {
                 output: result.output,
@@ -276,10 +306,12 @@ fn delegated_chat_input(
     Ok(attached)
 }
 
-/// Runs a seeded graph and cancels whatever jobs it left in the supervisor,
-/// the same way `run_active_agent_graph_with_inputs` finishes. Boxed so the
-/// executor's large future is not reserved on this frame too; see the
-/// comment on `GraphExecutor::execute`.
+/// Runs a seeded graph and cancels whatever jobs it left in the supervisor;
+/// every run arm (`run_seeded_graph` and both `run_graph_turn` arms) finishes
+/// through here. The executor future is boxed because it is large and, in
+/// debug builds, every async layer reserves room for the child future it
+/// constructs; left inline it would be reserved on this frame too, and one
+/// such frame per nested graph overflows the 2 MiB stack of a test thread.
 async fn execute_graph(
     ctx: &mut RequestContext,
     agent_name: &str,
@@ -355,7 +387,7 @@ pub fn carried_for(ctx: &RequestContext, carry: &[String]) -> IndexMap<String, V
 mod tests {
     use super::*;
     use crate::client::{Model, ModelData};
-    use crate::config::{AppState, LastMessage, RoleLike, WorkingMode};
+    use crate::config::{AppState, LastMessage, Role, RoleLike, WorkingMode};
     use crate::graph::llm::test_support::{boxed_completion, completion_runner};
     use crate::graph::route::ROUTE_ROLE_NAME;
     use crate::supervisor::mailbox::Inbox;
@@ -1109,6 +1141,59 @@ mod tests {
         assert_eq!(ctx.last_graph_branch, None);
     }
 
+    /// A one-shot run seeds the request-only patch the way a REPL `.run`
+    /// does, but its record names the typed text: the patch is for the
+    /// model, not for the session.
+    #[tokio::test]
+    #[serial]
+    async fn run_active_agent_graph_seeds_the_patched_text_and_records_the_bare_prompt() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("one_shot");
+        write_graph_agent(&name, SESSION_BLOCK);
+        let mut ctx = ctx_with_agent(&name).await;
+        ctx.session = Some(chat_session());
+        let mut input = Input::from_str(&ctx, "hello", None).unwrap();
+        input.set_patched_text("hello (retrieved)");
+
+        let run = run_active_agent_graph(&mut ctx, &input, create_abort_signal())
+            .await
+            .unwrap();
+
+        assert_eq!(run.result.output, "hello (retrieved)");
+        assert_eq!(run.last_run.unwrap().prompt, "hello");
+        assert!(ctx.session.as_ref().unwrap().last_run().is_none());
+    }
+
+    /// Without an engaged session a one-shot run has nowhere to be
+    /// recorded, block graph or not.
+    #[tokio::test]
+    #[serial]
+    async fn run_active_agent_graph_records_nothing_without_a_session() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("one_shot_no_session");
+        write_graph_agent(&name, SESSION_BLOCK);
+        let mut ctx = ctx_with_agent(&name).await;
+        let input = Input::from_str(&ctx, "hello", None).unwrap();
+
+        let run = run_active_agent_graph(&mut ctx, &input, create_abort_signal())
+            .await
+            .unwrap();
+
+        assert_eq!(run.result.output, "hello");
+        assert!(run.last_run.is_none());
+    }
+
+    /// `execute_graph` boxes the executor future and says why where the
+    /// box is; the explanation is not deferred to another comment.
+    #[test]
+    fn execute_graph_carries_its_own_stack_rationale() {
+        let source = include_str!("dispatch.rs").replace("\r\n", "\n");
+        let production = &source[..source.find("\n#[cfg(test)]").unwrap()];
+        assert_eq!(production.matches("overflows the 2 MiB stack").count(), 1);
+        assert_eq!(production.matches("GraphExecutor::execute`").count(), 0);
+        assert_eq!(production.matches("see the comment on").count(), 0);
+    }
+
     /// A child run on a `carry:` graph starts from the values the session's
     /// last run left behind and carries the run's own values forward in the
     /// record it hands back.
@@ -1739,6 +1824,42 @@ mod tests {
             last_run.carried.get("said"),
             Some(&json!("from the first run"))
         );
+    }
+
+    /// A detached input is not attached to the session even when one is
+    /// engaged, so neither run arm computes a record for it.
+    #[tokio::test]
+    #[serial]
+    async fn run_graph_turn_records_nothing_for_an_input_detached_from_the_session() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let role = Role::new(ROUTE_ROLE_NAME, "p");
+
+        let name = unique("detached_block");
+        write_graph_agent(&name, SESSION_BLOCK);
+        let mut ctx = ctx_with_agent(&name).await;
+        ctx.session = Some(chat_session());
+        let input = Input::detached_with_role(&ctx, "typed", role.clone());
+        let (turn, roles) = turn_with_reply(&mut ctx, &input, Some(Branch::Run), "unused").await;
+        let GraphTurn::Run { output, last_run } = turn.unwrap() else {
+            panic!("expected a run");
+        };
+        assert!(roles.is_empty());
+        assert_eq!(output, "typed");
+        assert!(last_run.is_none(), "{:?}", last_run.map(|run| run.prompt));
+
+        let name = unique("detached_carry");
+        write_agent(&name, "", CARRY_ECHO_GRAPH);
+        let mut ctx = ctx_with_agent(&name).await;
+        let mut session = chat_session();
+        session.set_last_run(Some(first_run_that_said("from the first run")));
+        ctx.session = Some(session);
+        let input = Input::detached_with_role(&ctx, "typed", role);
+        let (turn, _) = turn_with_reply(&mut ctx, &input, None, "unused").await;
+        let GraphTurn::Run { output, last_run } = turn.unwrap() else {
+            panic!("expected a run");
+        };
+        assert_eq!(output, "from the first run");
+        assert!(last_run.is_none(), "{:?}", last_run.map(|run| run.prompt));
     }
 
     /// The bundled coder carries its plan between runs and tells both model
