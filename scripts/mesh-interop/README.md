@@ -27,7 +27,7 @@ Linux run of row 1 are covered by the `Mesh Interop` CI job), with the Rust side
 |---|---|
 | `COYOTE_MESH_INTEROP=1 cargo test --all mesh::conformance -- --include-ignored` (vectors + interop) | 77 passed, 0 ignored |
 | `cargo test --all mesh::fuzz` | 21 passed |
-| `cargo test --all --no-fail-fast` | 7115 passed, 0 failed, 14 ignored in the unit binary; 530 passed, 1 ignored across the integration binaries |
+| `cargo test --all --no-fail-fast` | 7118 passed, 0 failed, 15 ignored in the unit binary; 531 passed, 1 ignored across the integration binaries |
 
 Rows 2 and 3 also run on all three legs of the CI matrix, and row 1 runs only in the Linux
 `Mesh Interop` job; none of those runs is part of this record.
