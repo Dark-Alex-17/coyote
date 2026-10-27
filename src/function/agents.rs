@@ -6590,6 +6590,56 @@ mod tests {
         );
     }
 
+    /// When only the terminal sidecar write fails, the child's `Completed`
+    /// result reaches the collector untouched and its session file still
+    /// holds the exchange: the sidecar is bookkeeping about the child, not
+    /// part of its result.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn a_failed_terminal_sidecar_write_alone_leaves_the_collect_result_completed() {
+        crate::testing::install_log_collector();
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_sidecar_alone_unwritable");
+        write_graph_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+
+        let (spawned, collected) = run_async(async {
+            let spawned = handle_spawn(&mut ctx, &json!({"agent": agent_name, "prompt": "hi"}))
+                .await
+                .unwrap();
+            assert_eq!(spawned["status"], "ok", "{spawned}");
+            let sid = spawned["session_id"].as_str().unwrap();
+            // A directory in the sidecar's place fails its load and save
+            // while `children/` and the session file next to it stay
+            // writable, so the final session flush still lands.
+            let root = ctx.child_session_root.clone().unwrap();
+            let sidecar = root.child_meta_file(sid);
+            std::fs::remove_file(&sidecar).unwrap();
+            create_dir_all(&sidecar).unwrap();
+            let collected = handle_collect(&mut ctx, &json!({"id": spawned["id"]}))
+                .await
+                .unwrap();
+            (spawned, collected)
+        });
+
+        assert_eq!(collected["status"], "completed", "{collected}");
+        assert_eq!(collected["exit_status"], "Completed", "{collected}");
+        assert_eq!(collected["session_id"], spawned["session_id"]);
+        let sid = spawned["session_id"].as_str().unwrap();
+        let root = ctx.child_session_root.clone().unwrap();
+        assert!(
+            root.child_meta_file(sid).is_dir(),
+            "nothing may write through the sidecar path"
+        );
+        let on_disk: Session = read_yaml(&root.child_session_file(sid));
+        assert_eq!(
+            last_exchange_of(&on_disk),
+            ("hi".to_string(), "done".to_string())
+        );
+        assert_warned_about_the_sidecar(&spawned);
+    }
+
     #[test]
     #[serial]
     fn auto_dispatched_children_carry_the_queue_task_id_into_the_sidecar() {
