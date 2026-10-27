@@ -292,6 +292,10 @@ fn write_sessioned_config_agent(dir: &Path, name: &str) {
 /// node's markdown is rendered.
 #[test]
 fn usage_probe_config_teammates_in_a_fan_out_get_the_roster_in_the_system_prompt_only() {
+    if cfg!(windows) {
+        eprintln!("skipping: the fan-out joins through a bash script");
+        return;
+    }
     for teammates in [true, false] {
         let dir = fresh_config_dir("teammate-roster");
         let _guard = TempDirGuard(dir.clone());
@@ -393,6 +397,232 @@ fn usage_probe_config_teammates_in_a_fan_out_get_the_roster_in_the_system_prompt
             }
         }
     }
+}
+
+/// The fan-out graph the roster probes share: `fan` splits into two
+/// `teammates: true` agent nodes on config agents `alpha` / `beta`, `join`
+/// dumps the raw state (each teammate's echoed request) to `dump`.
+fn write_roster_fan_out(dir: &Path, dump: &Path) {
+    let agent_dir = dir.join("agents").join(AGENT);
+    let scripts = agent_dir.join("scripts");
+    fs::create_dir_all(&scripts).unwrap();
+    fs::write(scripts.join("fan.sh"), "#!/usr/bin/env bash\nprintf '{}'\n").unwrap();
+    fs::write(
+        scripts.join("dump.sh"),
+        format!(
+            "#!/usr/bin/env bash\n\
+             out='{}'\n\
+             if [ -n \"${{GRAPH_STATE_FILE:-}}\" ]; then cp \"$GRAPH_STATE_FILE\" \"$out\"; \
+             else printf '%s' \"$GRAPH_STATE\" > \"$out\"; fi\n\
+             printf '{{}}'\n",
+            dump.display()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        agent_dir.join("graph.yaml"),
+        "name: echo-graph\n\
+         version: \"1.0\"\n\
+         initial_state: { a: \"\", b: \"\" }\n\
+         start: fan\n\
+         nodes:\n\
+         \x20 fan: { type: script, script: scripts/fan.sh, next: [worker_a, worker_b] }\n\
+         \x20 worker_a: { type: agent, agent: alpha, prompt: \"hi from a\", teammates: true, state_updates: { a: \"{{output}}\" }, next: join }\n\
+         \x20 worker_b: { type: agent, agent: beta, prompt: \"hi from b\", teammates: true, state_updates: { b: \"{{output}}\" }, next: join }\n\
+         \x20 join: { type: script, script: scripts/dump.sh, next: done }\n\
+         \x20 done: { type: end, output: \"done\" }\n",
+    )
+    .unwrap();
+}
+
+/// Runs the roster fan-out and returns the echoed requests keyed `a` / `b`.
+fn run_roster_fan_out(label: &str, dir: &Path, dump: &Path) -> serde_json::Value {
+    let output = run_with(dir, &["-a", AGENT, "go"]);
+    let text = format!("{}\n{}", stderr_of(&output), stdout_of(&output));
+    assert!(
+        output.status.success()
+            && !text.contains("panicked")
+            && stdout_of(&output).lines().any(|l| l == "done"),
+        "{label}: the fan-out completes: exit {:?}\n{text}",
+        output.status
+    );
+    let state = fs::read_to_string(dump)
+        .unwrap_or_else(|e| panic!("{label}: the join dumped no state ({e}):\n{text}"));
+    serde_json::from_str(&state).unwrap()
+}
+
+/// A teammate that keeps an `agent_session` is RESUMED on the next run:
+/// the model sees the stored message list, including the System row saved
+/// under the previous run. That row carried the previous run's roster, whose
+/// seat ids are minted per run, so a resumed teammate must be re-told the
+/// current roster: exactly one `## Teammate roster`, naming this run's node
+/// ids, with the stale seat gone, while the earlier exchange survives in
+/// order and the new User message is still the bare node prompt. From a cold
+/// start the previous run is a hand-written session file: the stored System
+/// row is the agent's instructions plus a roster for a seat that no longer
+/// exists.
+#[test]
+fn usage_probe_a_resumed_agent_session_teammate_is_re_told_the_current_roster() {
+    if cfg!(windows) {
+        eprintln!("skipping: the fan-out joins through a bash script");
+        return;
+    }
+    const STALE_SEAT: &str = "graph_agent_alpha_deadbeef";
+    let dir = fresh_config_dir("teammate-resumed-roster");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, "");
+    write_sessioned_config_agent(&dir, "alpha");
+    write_sessioned_config_agent(&dir, "beta");
+    let dump = dir.join("state.json");
+    write_roster_fan_out(&dir, &dump);
+
+    // alpha's `agent_session: t` from an earlier run: the stored System row
+    // is the instructions plus that run's roster, followed by one exchange.
+    let stale_system = format!(
+        "Be brief.\n\n## Teammate roster\nYou are `{STALE_SEAT}` (worker_a). Peers: `graph_agent_beta_cafef00d` (worker_b)."
+    );
+    let sessions = dir.join("agents").join("alpha").join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(
+        sessions.join("t.yaml"),
+        format!(
+            "model: dryrun:dry-model\n\
+             agent_instructions: {system:?}\n\
+             messages:\n\
+             \x20 - role: system\n\
+             \x20   content: {system:?}\n\
+             \x20 - role: user\n\
+             \x20   content: earlier\n\
+             \x20 - role: assistant\n\
+             \x20   content: noted\n",
+            system = stale_system
+        ),
+    )
+    .unwrap();
+
+    let state = run_roster_fan_out("resumed", &dir, &dump);
+    let echo = state["a"]
+        .as_str()
+        .unwrap_or_else(|| panic!("state.a is not the echo:\n{state}"));
+    let messages = echoed_messages(echo);
+    let (first_role, system) = &messages[0];
+    assert_eq!(first_role, "system", "{echo}");
+    assert!(
+        system.starts_with("Be brief.\n\n## Teammate roster\n"),
+        "the resumed System row is the instructions plus a roster:\n{system}"
+    );
+    assert!(
+        system.contains("(worker_a)") && system.contains("worker_b"),
+        "the roster names this run's own seat and peer:\n{system}"
+    );
+    assert!(
+        !echo.contains(STALE_SEAT) && !echo.contains("cafef00d"),
+        "the previous run's seat ids are gone from the whole request:\n{echo}"
+    );
+    assert_eq!(
+        echo.matches("## Teammate roster").count(),
+        1,
+        "exactly one roster after the re-adoption:\n{echo}"
+    );
+    let roles: Vec<&str> = messages.iter().map(|(role, _)| role.as_str()).collect();
+    assert_eq!(
+        roles,
+        ["system", "user", "assistant", "user"],
+        "the earlier exchange survives in order ahead of the new prompt:\n{echo}"
+    );
+    let users: Vec<&String> = messages
+        .iter()
+        .filter(|(role, _)| role == "user")
+        .map(|(_, content)| content)
+        .collect();
+    assert_eq!(
+        users,
+        vec!["earlier", "hi from a"],
+        "the stored User text is untouched and the new one is the bare prompt:\n{echo}"
+    );
+
+    // The fresh teammate in the same run is unaffected by its peer's resume.
+    let echo_b = state["b"].as_str().unwrap();
+    assert_eq!(echo_b.matches("## Teammate roster").count(), 1, "{echo_b}");
+    assert!(!echo_b.contains(STALE_SEAT), "{echo_b}");
+}
+
+/// A teammate whose instructions come from its `_instructions` hook every
+/// turn (`dynamic_instructions: true`) still carries the roster: the roster
+/// is appended after whatever text the hook produced, so the System row
+/// starts with the hook's text and ends with exactly one roster naming this
+/// run's seats. The hook's text differs from the static `instructions:`
+/// line on purpose, proving the roster rode the dynamic branch and not a
+/// stale static copy.
+#[test]
+fn usage_probe_a_dynamic_instructions_teammate_carries_the_roster_after_the_rendered_text() {
+    if cfg!(windows) {
+        eprintln!("skipping: the fan-out joins through a bash script");
+        return;
+    }
+    let dir = fresh_config_dir("teammate-dynamic-roster");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, "");
+    write_sessioned_config_agent(&dir, "beta");
+    let alpha_dir = dir.join("agents").join("alpha");
+    fs::create_dir_all(&alpha_dir).unwrap();
+    fs::write(
+        alpha_dir.join("config.yaml"),
+        "name: alpha\n\
+         description: A helper.\n\
+         instructions: Be brief.\n\
+         dynamic_instructions: true\n\
+         agent_session: t\n",
+    )
+    .unwrap();
+    fs::write(
+        alpha_dir.join("tools.sh"),
+        "#!/usr/bin/env bash\n\
+         set -eo pipefail\n\
+         # @env LLM_OUTPUT=/dev/stdout\n\
+         # @describe alpha tools\n\
+         \n\
+         # @cmd Dynamic instructions hook.\n\
+         _instructions() { printf 'Be brief about cats.' >> \"$LLM_OUTPUT\"; }\n",
+    )
+    .unwrap();
+    let dump = dir.join("state.json");
+    write_roster_fan_out(&dir, &dump);
+
+    let state = run_roster_fan_out("dynamic", &dir, &dump);
+    let echo = state["a"]
+        .as_str()
+        .unwrap_or_else(|| panic!("state.a is not the echo:\n{state}"));
+    let messages = echoed_messages(echo);
+    let (first_role, system) = &messages[0];
+    assert_eq!(first_role, "system", "{echo}");
+    assert!(
+        system.starts_with("Be brief about cats.\n\n## Teammate roster\n"),
+        "the roster follows the hook's dynamic instructions:\n{system}"
+    );
+    assert!(
+        !system.starts_with("Be brief.\n"),
+        "the static `instructions:` line did not win over the dynamic hook:\n{system}"
+    );
+    assert!(
+        system.contains("(worker_a)") && system.contains("worker_b"),
+        "the roster names this run's own seat and peer:\n{system}"
+    );
+    assert_eq!(
+        echo.matches("## Teammate roster").count(),
+        1,
+        "exactly one roster in the whole request:\n{echo}"
+    );
+    let users: Vec<&String> = messages
+        .iter()
+        .filter(|(role, _)| role == "user")
+        .map(|(_, content)| content)
+        .collect();
+    assert_eq!(
+        users,
+        vec!["hi from a"],
+        "the User message is the bare node prompt:\n{echo}"
+    );
 }
 
 /// Declaring `carry:` lifts the engage-time validator pass onto a block-less

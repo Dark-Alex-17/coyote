@@ -202,6 +202,7 @@ fn text_len(content: &MessageContent) -> usize {
             }
             len + "\n\n".len() * parts.saturating_sub(1)
         }
+        // Unreachable from `Exchange::len`: `speaker` filters tool calls.
         MessageContent::ToolCalls(_) => 0,
     }
 }

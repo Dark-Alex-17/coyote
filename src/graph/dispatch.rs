@@ -306,12 +306,12 @@ fn delegated_chat_input(
     Ok(attached)
 }
 
-/// Runs a seeded graph and cancels whatever jobs it left in the supervisor,
-/// the same way `run_active_agent_graph_with_inputs` finishes. The executor
-/// future is boxed because it is large and, in debug builds, every async
-/// layer reserves room for the child future it constructs; left inline it
-/// would be reserved on this frame too, and one such frame per nested graph
-/// overflows the 2 MiB stack of a test thread.
+/// Runs a seeded graph and cancels whatever jobs it left in the supervisor;
+/// every run arm (`run_seeded_graph` and both `run_graph_turn` arms) finishes
+/// through here. The executor future is boxed because it is large and, in
+/// debug builds, every async layer reserves room for the child future it
+/// constructs; left inline it would be reserved on this frame too, and one
+/// such frame per nested graph overflows the 2 MiB stack of a test thread.
 async fn execute_graph(
     ctx: &mut RequestContext,
     agent_name: &str,

@@ -688,16 +688,21 @@ impl Agent {
     /// else the shared one, else the configured text, followed by the
     /// appendix when one is set. A teammate's roster is that appendix, so
     /// it rides the system prompt whatever instruction source the agent
-    /// uses. A prompt resumed from an `agent_session` still carries the
-    /// previous run's roster, and peer ids are minted per run, so a roster
-    /// section already at the tail of the base is cut before the current
-    /// one is appended.
+    /// uses. A prompt resumed from an `agent_session` re-enters as the
+    /// session's dynamic text and still carries the previous run's roster;
+    /// peer ids are minted per run, so a roster section at the tail of that
+    /// text is cut whether or not this run appends a fresh one. The
+    /// configured text is the operator's own and is only cut when an
+    /// appendix replaces the section.
     pub fn interpolated_instructions(&self) -> String {
-        let mut output = self
-            .session_dynamic_instructions
-            .clone()
-            .or_else(|| self.shared_dynamic_instructions.clone())
-            .unwrap_or_else(|| self.config.instructions.clone());
+        let mut output = match (
+            &self.session_dynamic_instructions,
+            &self.shared_dynamic_instructions,
+        ) {
+            (Some(session), _) => without_roster(session).to_string(),
+            (None, Some(shared)) => shared.clone(),
+            (None, None) => self.config.instructions.clone(),
+        };
         if let Some(appendix) = &self.instructions_appendix {
             output = append_replacing_roster(&output, appendix);
         }
@@ -1330,16 +1335,27 @@ fn render_tools_placeholder(text: &str, declarations: &[FunctionDeclaration]) ->
 /// section, so the cut runs from its heading (at the start of the text or
 /// behind a blank line) to the end.
 fn append_replacing_roster(base: &str, appendix: &str) -> String {
-    let roster_start = base
-        .match_indices(TEAMMATE_ROSTER_HEADING)
-        .map(|(start, _)| start)
-        .find(|&start| start == 0 || base[..start].ends_with("\n\n"));
-    let base = roster_start.map_or(base, |start| &base[..start]).trim_end();
+    let base = without_roster(base);
     if base.is_empty() {
         appendix.to_string()
     } else {
         format!("{base}\n\n{appendix}")
     }
+}
+
+/// `text` up to its trailing roster section, trailing whitespace trimmed.
+/// The heading counts only as a whole line: at the start of the text or
+/// behind a blank line, and ending the line.
+fn without_roster(text: &str) -> &str {
+    let roster_start = text
+        .match_indices(TEAMMATE_ROSTER_HEADING)
+        .map(|(start, _)| start)
+        .find(|&start| {
+            let tail = &text[start + TEAMMATE_ROSTER_HEADING.len()..];
+            (start == 0 || text[..start].ends_with("\n\n"))
+                && (tail.is_empty() || tail.starts_with('\n'))
+        });
+    roster_start.map_or(text, |start| &text[..start]).trim_end()
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

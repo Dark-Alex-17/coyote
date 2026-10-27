@@ -980,10 +980,16 @@ pub async fn run_agent_for_graph(
         sync_agent_functions_to_ctx(&mut child_ctx)?;
         // A resumed session speaks with the System row it was stored under,
         // and that row carries the roster of the run that stored it. Peer
-        // ids are minted per run, so the prompt and the row are re-adopted
-        // from the agent, whose appendix is this run's roster; the session
-        // keeps the variables it was resumed with.
-        if seats_a_teammate
+        // ids are minted per run, so whenever this run seats a teammate or
+        // the stored row names one, the prompt and the row are re-adopted
+        // from the agent, whose appendix is this run's roster or nothing;
+        // the session keeps the variables it was resumed with.
+        let stored_roster = child_ctx.session.as_ref().is_some_and(|session| {
+            session
+                .agent_instructions()
+                .contains(TEAMMATE_ROSTER_HEADING)
+        });
+        if (seats_a_teammate || stored_roster)
             && let (Some(session), Some(agent)) =
                 (child_ctx.session.as_mut(), child_ctx.agent.as_ref())
         {
@@ -7968,28 +7974,22 @@ mod tests {
         assert_eq!(user.content.to_text(), "hi");
     }
 
-    /// A teammate resumed on a stored `agent_session` would otherwise speak
-    /// with the prompt the earlier run stored, roster and all. Peer ids are
-    /// minted per run, so the resumed session is sent this run's roster in
-    /// place of the stale one, over the variables it was stored with: the
-    /// config default is `tone: calm`, so a prompt saying `loud` is the
-    /// session's own value. The stored model id must resolve on load, so it
-    /// names the client the test process registers.
-    #[test]
-    #[serial]
-    fn a_resumed_agent_session_teammate_gets_a_fresh_roster() {
-        let _guard = TestConfigDirGuard::new();
-        let agent_name = unique_agent_name("test_teammate_resumed_roster");
-        write_config_agent_with_variables(&agent_name);
+    /// A config agent with variables on `agent_session: teammate` whose
+    /// stored session carries a previous run's roster for a seat that no
+    /// longer exists, in both the System row and `agent_instructions`. The
+    /// stored model id must resolve on load, so it names the client the
+    /// test process registers.
+    fn write_agent_with_a_stale_roster_session(agent_name: &str) {
+        write_config_agent_with_variables(agent_name);
         write(
-            paths::agent_data_dir(&agent_name).join("config.yaml"),
+            paths::agent_data_dir(agent_name).join("config.yaml"),
             format!(
                 "{}agent_session: teammate\n",
-                read_to_string(paths::agent_data_dir(&agent_name).join("config.yaml")).unwrap()
+                read_to_string(paths::agent_data_dir(agent_name).join("config.yaml")).unwrap()
             ),
         )
         .unwrap();
-        let path = paths::agent_sessions_dir(&agent_name).join("teammate.yaml");
+        let path = paths::agent_sessions_dir(agent_name).join("teammate.yaml");
         create_dir_all(path.parent().unwrap()).unwrap();
         write(
             &path,
@@ -8007,25 +8007,65 @@ mod tests {
              \x20   content: noted\n",
         )
         .unwrap();
+    }
+
+    /// The echoed request's System row and the User texts, in order.
+    fn system_and_users(output: &str) -> (String, Vec<String>) {
+        let request: Vec<crate::client::Message> = serde_yaml::from_str(output).unwrap();
+        assert!(request[0].role.is_system(), "{request:?}");
+        let users = request
+            .iter()
+            .filter(|message| message.role.is_user())
+            .map(|message| message.content.to_text())
+            .collect();
+        (request[0].content.to_text(), users)
+    }
+
+    /// A teammate resumed on a stored `agent_session` would otherwise speak
+    /// with the prompt the earlier run stored, roster and all. Peer ids are
+    /// minted per run, so the resumed session is sent this run's roster in
+    /// place of the stale one, over the variables it was stored with: the
+    /// config default is `tone: calm`, so a prompt saying `loud` is the
+    /// session's own value.
+    #[test]
+    #[serial]
+    fn a_resumed_agent_session_teammate_gets_a_fresh_roster() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_teammate_resumed_roster");
+        write_agent_with_a_stale_roster_session(&agent_name);
         let mut ctx = parent_seating_a_teammate(echoing_app_state("test-seeded"));
         ctx.model = Model::new("test-seeded", "test-chat");
 
         let output = run_async(run_agent_for_graph(&mut ctx, &agent_name, "hi", None)).unwrap();
 
-        let request: Vec<crate::client::Message> = serde_yaml::from_str(&output).unwrap();
-        assert!(request[0].role.is_system(), "{request:?}");
-        let system = request[0].content.to_text();
+        let (system, users) = system_and_users(&output);
         assert!(
             system.starts_with("Say loud to them\n\n## Teammate roster\nYou are `p1` (shards[0])"),
             "{system}"
         );
         assert!(!system.contains("deadbeef"), "{system}");
         assert_eq!(output.matches("## Teammate roster").count(), 1, "{output}");
-        let users: Vec<String> = request
-            .iter()
-            .filter(|message| message.role.is_user())
-            .map(|message| message.content.to_text())
-            .collect();
+        assert_eq!(users, ["earlier", "hi"], "{output}");
+    }
+
+    /// The same stored session resumed by a run that seats no teammate (a
+    /// plain agent node): the previous run's roster is dropped from the
+    /// System row rather than left standing with peers that no longer exist.
+    #[test]
+    #[serial]
+    fn an_unseated_resume_drops_the_previous_runs_roster() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_teammate_unseated_resume");
+        write_agent_with_a_stale_roster_session(&agent_name);
+        let mut ctx = RequestContext::new(echoing_app_state("test-seeded"), WorkingMode::Cmd);
+        ctx.model = Model::new("test-seeded", "test-chat");
+
+        let output = run_async(run_agent_for_graph(&mut ctx, &agent_name, "hi", None)).unwrap();
+
+        let (system, users) = system_and_users(&output);
+        assert!(system.starts_with("Say loud to them"), "{system}");
+        assert!(!output.contains("Teammate roster"), "{output}");
+        assert!(!output.contains("deadbeef"), "{output}");
         assert_eq!(users, ["earlier", "hi"], "{output}");
     }
 
