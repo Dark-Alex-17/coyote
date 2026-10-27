@@ -1097,6 +1097,19 @@ pub(crate) mod network {
             Envelope::new(self.origin, body)
         }
 
+        /// Turns announce ingress control off on this requester's interface, which on an
+        /// interface this young would otherwise hold a second announce for minutes.
+        pub(crate) async fn hear_every_announce(&self) {
+            let manager = self.transport.iface_manager();
+            let mut manager = manager.lock().await;
+            let mut config = manager
+                .shared_config(&self.iface)
+                .cloned()
+                .unwrap_or_default();
+            config.ingress_control = Some(false);
+            manager.set_shared_config(self.iface, config);
+        }
+
         pub(crate) async fn request(
             &self,
             desc: &DestinationDesc,

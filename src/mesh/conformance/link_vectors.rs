@@ -65,6 +65,9 @@ enum Case {
     Identified,
     /// Bytes that are not a request frame are dropped in silence.
     UndecodableFrame,
+    /// A response carrying a pending request's id is dropped when it arrives on another
+    /// link; the request waits on its own link as if nothing had come.
+    WrongLink,
     /// A request resource over `MAX_REQUEST_PAYLOAD_BYTES` is refused at its advertisement,
     /// before any part is transferred.
     InboundCap,
@@ -103,6 +106,7 @@ impl Case {
             Self::OutboundCap => "OutboundCap",
             Self::Identified => "Identified",
             Self::UndecodableFrame => "UndecodableFrame",
+            Self::WrongLink => "WrongLink",
             Self::InboundCap => "InboundCap",
             Self::HandlerSlots => "HandlerSlots",
             Self::HandlerTimeout => "HandlerTimeout",
@@ -130,6 +134,12 @@ const VECTORS: &[Vector] = &[
         case: Case::Correlation {
             len: Len::MduPlusOne,
         },
+        known_divergence: None,
+    },
+    Vector {
+        name: "response-forged-onto-another-link-is-ignored",
+        kind: Kind::Invalid,
+        case: Case::WrongLink,
         known_divergence: None,
     },
     Vector {
@@ -411,8 +421,8 @@ mod loopback {
     };
     use crate::mesh::request::{
         DEFAULT_REQUEST_TIMEOUT, MAX_CONCURRENT_INBOUND_REQUESTS, MAX_REQUEST_PAYLOAD_BYTES,
-        RefusalCode, Reply, RequestError, RequestFrame, RequestId, RequestOptions, STATUS_PATH,
-        SizeBranch, open_link, request, request_on_link, short,
+        RefusalCode, Reply, RequestError, RequestFrame, RequestId, RequestOptions, ResponseFrame,
+        STATUS_PATH, SizeBranch, open_link, request, request_on_link, short,
     };
     use crate::mesh::session_destination_name;
     use crate::mesh::test_support::{
@@ -422,6 +432,7 @@ mod loopback {
     use crate::testing::{debug_snapshot, install_log_collector, warn_snapshot};
 
     use rmpv::Value;
+    use rns_transport::destination::request::RequestAllow;
     use rns_transport::destination::{DestinationDesc, SingleInputDestination};
     use rns_transport::identity::PrivateIdentity as TransportIdentity;
     use rns_transport::iface::tcp_client::TcpClient;
@@ -452,7 +463,9 @@ mod loopback {
     fn group(case: &Case) -> Group {
         match case {
             Case::Correlation { .. } | Case::SizeBranch { .. } | Case::Identified => Group::Sizes,
-            Case::UndecodableFrame | Case::InboundCap | Case::HandlerSlots => Group::Drops,
+            Case::UndecodableFrame | Case::WrongLink | Case::InboundCap | Case::HandlerSlots => {
+                Group::Drops
+            }
             Case::OutboundCap
             | Case::HandlerTimeout
             | Case::RequestTimeout
@@ -530,6 +543,7 @@ mod loopback {
             Case::OutboundCap => outbound_cap().await,
             Case::Identified => identified().await,
             Case::UndecodableFrame => undecodable_frame().await,
+            Case::WrongLink => wrong_link().await,
             Case::InboundCap => inbound_cap().await,
             Case::HandlerSlots => handler_slots().await,
             Case::HandlerTimeout => handler_timeout().await,
@@ -703,6 +717,81 @@ mod loopback {
             "only the well-formed request was answered"
         );
         pair.stop().await;
+    }
+
+    /// The responder serves a second destination on the same transport, so the requester
+    /// holds two links to one peer and the forged response can come over the one the
+    /// request did not. The library's pending-request table is per link, which is the
+    /// guard this pins.
+    async fn wrong_link() {
+        let recorder = Arc::new(Recorder::default());
+        let (responder, mut requester, desc) = pair(recorder.clone()).await;
+        requester.hear_every_announce().await;
+        let mut decoy = SingleInputDestination::new(
+            TransportIdentity::new_from_rand(OsRng),
+            session_destination_name("decoy"),
+        );
+        for path in [ECHO_PATH, SLOW_PATH] {
+            decoy
+                .register_request_handler(path, responder.adapter.clone(), RequestAllow::All, true)
+                .unwrap();
+        }
+        let decoy = responder.transport.register_destination(decoy).await;
+        let decoy_hash = decoy.lock().await.desc.address_hash;
+        let packet = decoy.lock().await.announce(OsRng, None).unwrap();
+        responder.transport.send_packet(packet).await;
+        let decoy_desc = requester.learn(&decoy_hash).await;
+        let decoy_link = open_link(
+            &requester.transport,
+            &decoy_desc,
+            SLOW_PATH,
+            link_deadline(),
+        )
+        .await
+        .unwrap();
+        let decoy_link_id = *decoy_link.lock().await.id();
+        let (in_flight, seen) = hanging_request(&requester, &recorder, &desc).await;
+        assert_ne!(seen.link_id, decoy_link_id);
+
+        let decoy_in_link = responder
+            .transport
+            .find_in_link(&decoy_link_id)
+            .await
+            .expect("the responder holds the decoy in-link");
+        let forged = ResponseFrame {
+            request_id: seen.request_id,
+            data: Value::from("forged"),
+        }
+        .encode();
+        let packet = decoy_in_link.lock().await.response_packet(&forged).unwrap();
+        responder
+            .transport
+            .send_link_packet_on_bound_iface(&decoy_in_link, packet)
+            .await;
+
+        let outcome = request_on(
+            &requester,
+            &decoy_link,
+            ECHO_PATH,
+            Value::from("after"),
+            SHORT_REQUEST_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            Value::from("after"),
+            "the decoy link serves its own requests under the forged response"
+        );
+        assert!(
+            !in_flight.is_finished(),
+            "the forged response settled nothing"
+        );
+        let result = timeout(INTEROP_TIMEOUT, in_flight).await.unwrap().unwrap();
+        assert_eq!(result.unwrap_err(), timed_out_slow_request());
+        assert_eq!(recorder.seen_count(), 2, "the hung request and the echo");
+        requester.stop().await;
+        responder.stop().await;
     }
 
     async fn inbound_cap() {
