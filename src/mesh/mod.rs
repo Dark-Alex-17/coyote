@@ -986,6 +986,7 @@ pub(crate) mod test_support {
     #[cfg(unix)]
     #[derive(Clone)]
     pub(crate) struct Seen {
+        pub(crate) request_id: String,
         pub(crate) identity: Option<AddressHash>,
         pub(crate) data: Value,
     }
@@ -1019,6 +1020,7 @@ pub(crate) mod test_support {
 
         async fn handle(&self, request: InboundRequest) -> Reply {
             self.seen.lock().push(Seen {
+                request_id: request.request_id.to_string(),
                 identity: request.identity.map(|identity| identity.address_hash),
                 data: request.data,
             });

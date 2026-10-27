@@ -3139,6 +3139,16 @@ mod tests {
             )
         }
 
+        /// The fetcher's own record of which branch `request_id`'s response arrived on.
+        /// The fake node answers through the library, which logs nothing the collector
+        /// reads, so the requester's correlation line is the one witness.
+        fn response_arrived_as(request_id: &str, branch: SizeBranch) -> bool {
+            let line = format!("Correlated mesh response {request_id} ({branch:?}, ");
+            debug_snapshot()
+                .iter()
+                .any(|entry| entry.starts_with(&line))
+        }
+
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn three_rounds_identify_first_and_put_the_reference_bytes_on_the_wire() {
             install_log_collector();
@@ -3189,6 +3199,12 @@ mod tests {
                 expected_ack(&[transient_id_of(&small), transient_id_of(&large)])
             );
             assert_eq!(&round3[..5], &[0x92, 0xc0, 0x92, 0xc4, 0x20]);
+            assert!(response_arrived_as(&seen[0].request_id, SizeBranch::Packet));
+            assert!(response_arrived_as(
+                &seen[1].request_id,
+                SizeBranch::Resource
+            ));
+            assert!(response_arrived_as(&seen[2].request_id, SizeBranch::Packet));
 
             // Every round transition is logged with its counts, under the node's short hash.
             let prefix = format!("Propagation fetch from {}: ", short(&fake.hex()));
