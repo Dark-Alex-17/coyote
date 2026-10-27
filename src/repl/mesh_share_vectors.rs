@@ -10,9 +10,9 @@
 //! The rows read the config dir from the process env, so the executor serialises and holds
 //! a config-dir guard.
 
+use crate::config::mesh_config::MAX_FETCH_FILE_BYTES;
 use crate::config::{AppState, RequestContext, WorkingMode};
 use crate::mesh::conformance::{Kind, Listed};
-use crate::mesh::fetch::SINGLE_SEGMENT_FETCH_CEILING;
 use crate::mesh::message::{PartLimits, RawPart};
 use crate::mesh::shares::SHARES_FILE_VERSION;
 use crate::mesh::test_support::{TempDir, snapshot_fixture};
@@ -126,14 +126,8 @@ impl AttachRoot {
         let limits = PartLimits {
             inline_max_bytes: inline_max,
         };
-        attachment(
-            &self.ctx,
-            path,
-            force,
-            &limits,
-            SINGLE_SEGMENT_FETCH_CEILING,
-        )
-        .map_err(|err| err.to_string())
+        attachment(&self.ctx, path, force, &limits, MAX_FETCH_FILE_BYTES)
+            .map_err(|err| err.to_string())
     }
 }
 

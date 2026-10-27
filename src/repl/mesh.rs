@@ -7,7 +7,7 @@ use crate::mesh::card::{CardSource, DISPLAY_NAME_MAX_CHARS, StatusHandler, rende
 use crate::mesh::envoy_sessions::{EnvoyMemoryError, EnvoySessions, RememberedOf};
 use crate::mesh::fetch::{
     FILE_FETCH_REQUEST_TIMEOUT, FetchError as FileFetchError, Fetched, GONE_COPY_TAIL,
-    NotSharedReason, SINGLE_SEGMENT_FETCH_CEILING, not_shared_reason, not_shared_sentence,
+    NotSharedReason, not_shared_reason, not_shared_sentence,
 };
 use crate::mesh::grants::DEFAULT_GRANT_TTL;
 use crate::mesh::identity::{self, Predecessor, fingerprint};
@@ -2131,19 +2131,12 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
                 "`{shown}` is not a path the mesh carries (rule `{rule}`); pass the path exactly as `.mesh shares --peer {peer}` or mesh__list shows it."
             ))
         ),
-        Ok(Fetched::TooLarge { limit }) => {
-            let mut next_step = ceiling_note(limit, CeilingSide::Fetch);
-            if next_step.is_empty() {
-                next_step =
-                    format!(" Ask {peer}'s human for a smaller copy, or for the file another way.");
-            }
-            bail!(
-                "{}",
-                ctx.render_hints(&format!(
-                    "{peer} serves files of at most {limit} bytes and `{shown}` is larger.{next_step}"
-                ))
-            );
-        }
+        Ok(Fetched::TooLarge { limit }) => bail!(
+            "{}",
+            ctx.render_hints(&format!(
+                "{peer} serves files of at most {limit} bytes and `{shown}` is larger. Ask {peer}'s human for a smaller copy, or for the file another way."
+            ))
+        ),
         Err(FileFetchError::NotServed) => bail!(not_shared_sentence(
             peer,
             &shown,
@@ -2167,30 +2160,6 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
         Err(err) => bail!(err.to_string()),
     }
     Ok(())
-}
-
-/// Whose `max_bytes` a size refusal would otherwise seem to blame: the peer's when this
-/// node fetches, this node's own `mesh.fetch.max_bytes` when it decides a grant.
-#[derive(Clone, Copy)]
-enum CeilingSide {
-    Fetch,
-    Grant,
-}
-
-/// Appended to a size refusal when `limit` is `SINGLE_SEGMENT_FETCH_CEILING`, the most
-/// this build carries per file whatever the setting allows, so the reader knows the
-/// setting on `side` is not the bound and a larger file has to travel another way.
-fn ceiling_note(limit: u64, side: CeilingSide) -> String {
-    if limit != SINGLE_SEGMENT_FETCH_CEILING {
-        return String::new();
-    }
-    let setting = match side {
-        CeilingSide::Fetch => "the peer's max_bytes",
-        CeilingSide::Grant => "this node's mesh.fetch.max_bytes",
-    };
-    format!(
-        " This build carries at most {SINGLE_SEGMENT_FETCH_CEILING} bytes (about 1 MiB) per file over the mesh, whatever {setting} allows; a larger file has to travel another way."
-    )
 }
 
 struct FetchArgs {
@@ -4215,9 +4184,8 @@ fn refuse_unservable(
         let size = metadata.len();
         if size > limit {
             bail!(
-                "{shown} would not be served even once granted (it is {} and this node serves at most {limit} bytes); refuse the request with `.mesh refuse {id}`, or lift the rule first.{}",
+                "{shown} would not be served even once granted (it is {} and this node serves at most {limit} bytes); refuse the request with `.mesh refuse {id}`, or lift the rule first.",
                 human_size(size),
-                ceiling_note(limit, CeilingSide::Grant)
             );
         }
     }
@@ -33598,31 +33566,24 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
 
                 /// A requested file above what this node serves per file is refused
                 /// before the peer hears yes. The bound is this node's own
-                /// `mesh.fetch.max_bytes` capped by the build's one-segment ceiling, so at
-                /// the default setting the appended note names this node's setting, not
-                /// the peer's, as the one the ceiling overrides.
+                /// `mesh.fetch.max_bytes` and the sentence names it as this node's limit,
+                /// not the peer's.
                 #[test]
                 #[serial]
-                fn grant_refuses_a_file_above_this_nodes_ceiling_and_names_this_nodes_setting() {
+                fn grant_refuses_a_file_above_this_nodes_max_bytes() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-grant-too-large");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
                     run_async(async {
                         let mut fx = PeerFixture::new("repl-mesh-grant-too-large").await;
                         assert_eq!(fx.ctx.app.config.mesh.fetch.max_bytes, 4_194_304);
-                        assert_eq!(
-                            fx.started.runtime.serving().serving_limit(),
-                            SINGLE_SEGMENT_FETCH_CEILING
-                        );
+                        assert_eq!(fx.started.runtime.serving().serving_limit(), 4_194_304);
                         let root = fx.root.path.clone();
                         fs::create_dir_all(root.join("docs")).unwrap();
-                        let size = SINGLE_SEGMENT_FETCH_CEILING + 1;
-                        fs::write(root.join("docs/big.bin"), vec![0u8; size as usize]).unwrap();
+                        fs::write(root.join("docs/big.bin"), vec![0u8; 4_194_305]).unwrap();
                         fx.file("a-1", InboundKind::Access, &["docs/big.bin"]);
 
-                        let expected = format!(
-                            "`docs/big.bin` would not be served even once granted (it is 1 MB and this node serves at most {SINGLE_SEGMENT_FETCH_CEILING} bytes); refuse the request with `.mesh refuse a-1`, or lift the rule first. This build carries at most {SINGLE_SEGMENT_FETCH_CEILING} bytes (about 1 MiB) per file over the mesh, whatever this node's mesh.fetch.max_bytes allows; a larger file has to travel another way."
-                        );
+                        let expected = "`docs/big.bin` would not be served even once granted (it is 4.2 MB and this node serves at most 4194304 bytes); refuse the request with `.mesh refuse a-1`, or lift the rule first.";
                         let printed = stdout_lines().len();
                         assert_eq!(refusal(&mut fx.ctx, ".mesh grant a-1").await, expected);
                         assert_eq!(stdout_lines().len(), printed, "the refusal prints nothing");
@@ -39561,14 +39522,11 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             )
                         );
 
-                        fx.queue(
-                            "too_large",
-                            vec![("limit", Value::from(SINGLE_SEGMENT_FETCH_CEILING))],
-                        );
+                        fx.queue("too_large", vec![("limit", Value::from(4_194_304u64))]);
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
-                                "{} serves files of at most {SINGLE_SEGMENT_FETCH_CEILING} bytes and `docs/a.md` is larger. This build carries at most {SINGLE_SEGMENT_FETCH_CEILING} bytes (about 1 MiB) per file over the mesh, whatever the peer's max_bytes allows; a larger file has to travel another way.",
+                                "{0} serves files of at most 4194304 bytes and `docs/a.md` is larger. Ask {0}'s human for a smaller copy, or for the file another way.",
                                 fx.dest()
                             )
                         );
