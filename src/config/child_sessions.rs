@@ -27,7 +27,7 @@ pub(crate) const PROMPT_HEAD_CHARS: usize = 200;
 
 /// How many runs a child's sidecar remembers; the first spawn is run 0
 /// and every resume adds one, dropping the oldest past this many.
-const CHILD_RUN_HISTORY: usize = 50;
+pub(crate) const CHILD_RUN_HISTORY: usize = 50;
 
 const META_SUFFIX: &str = ".meta.yaml";
 

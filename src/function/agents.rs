@@ -2,7 +2,7 @@ use super::todo::TODO_FUNCTION_PREFIX;
 use super::{FunctionDeclaration, JsonSchema};
 use crate::client::{Model, ModelType, call_chat_completions};
 use crate::config::child_sessions::{
-    self, ChildMeta, ChildSessionRoot, ChildStatus, EffectiveStatus, RootFile,
+    self, CHILD_RUN_HISTORY, ChildMeta, ChildSessionRoot, ChildStatus, EffectiveStatus, RootFile,
 };
 use crate::config::{
     Agent, AgentVariable, AgentVariables, AppConfig, AppState, Input, RequestContext, Role,
@@ -446,13 +446,14 @@ pub fn agent_function_declarations() -> Vec<FunctionDeclaration> {
         },
         FunctionDeclaration {
             name: format!("{AGENT_FUNCTION_PREFIX}list_sessions"),
-            description: "List the child sessions recorded under this context, newest first, whether or not the \
+            description: format!("List the child sessions recorded under this context, newest first, whether or not the \
                           child is still running. Each row carries the resumable `session_id` (pass it to \
                           `agent__spawn`), the agent, its effective status (`running`, `completed`, `failed`, \
                           `cancelled` or `crashed`), timestamps, the head of its prompt and how many runs it has \
-                          had (`runs`; 0 for a child recorded before run history was kept). Page with `page_size` \
-                          and `cursor`; `next_cursor` is null on the last page. For the \
-                          agents the supervisor is tracking right now, use `agent__list_running`.".to_string(),
+                          had (`runs`: at most {CHILD_RUN_HISTORY}, older runs are dropped; 0 for a child recorded \
+                          before run history was kept). Page with `page_size` and `cursor`; `next_cursor` is null \
+                          on the last page. For the agents the supervisor is tracking right now, use \
+                          `agent__list_running`."),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
                 properties: Some(IndexMap::from([
@@ -7633,6 +7634,116 @@ mod tests {
             );
         }
         assert!(decl.description.contains("`next_cursor`"));
+        assert!(
+            decl.description
+                .contains(&format!("at most {CHILD_RUN_HISTORY}")),
+            "{}",
+            decl.description
+        );
+    }
+
+    /// Liveness is decided per requested page, against that page's own
+    /// `running` stamps: a running child reached only through a cursor still
+    /// reads `running` when its process is alive and `crashed` when the pid
+    /// is gone or was reused with another start time, a page without a
+    /// running row asks the process table nothing, and a page that holds
+    /// every child exactly fills without a `next_cursor`.
+    #[test]
+    #[serial]
+    fn usage_probe_list_sessions_decides_liveness_against_the_requested_page_only() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let root = ctx.ensure_child_session_root().unwrap();
+        root.ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
+            .unwrap();
+        let live = ProcessStamp::current();
+        let dead = ProcessStamp {
+            pid: u32::MAX - 1,
+            start: 0,
+        };
+        let reused_pid = ProcessStamp {
+            pid: live.pid,
+            start: live.start.wrapping_add(1),
+        };
+        let gone = seed_sidecar(&root, "gone", 0, ChildStatus::Running, dead);
+        let reused = seed_sidecar(&root, "reused", 1, ChildStatus::Running, reused_pid);
+        let alive = seed_sidecar(&root, "alive", 2, ChildStatus::Running, live);
+        let total = LIST_SESSIONS_PAGE_SIZE as u32 + 5;
+        for minute in 3..total {
+            seed_sidecar(&root, "done", minute, ChildStatus::Completed, dead);
+        }
+        let calls =
+            || crate::utils::process::ALIVE_SET_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+
+        let before = calls();
+        let first = list_sessions(&mut ctx, json!({})).unwrap();
+        assert_eq!(
+            calls() - before,
+            0,
+            "a page without a running row asks nothing"
+        );
+        let rows = first["sessions"].as_array().unwrap();
+        assert_eq!(rows.len(), LIST_SESSIONS_PAGE_SIZE);
+        assert!(
+            rows.iter().all(|row| row["status"] == json!("completed")),
+            "{first}"
+        );
+        assert_eq!(first["total"], json!(total));
+
+        let before = calls();
+        let second = list_sessions(&mut ctx, json!({"cursor": first["next_cursor"]})).unwrap();
+        assert_eq!(
+            calls() - before,
+            1,
+            "one lookup for the page that holds running rows"
+        );
+        assert_eq!(
+            session_ids_of(&second)[2..],
+            [alive.clone(), reused.clone(), gone.clone()]
+        );
+        let rows = second["sessions"].as_array().unwrap();
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[0]["status"], json!("completed"));
+        assert_eq!(rows[1]["status"], json!("completed"));
+        assert_eq!(rows[2]["status"], json!("running"), "{second}");
+        assert_eq!(
+            rows[3]["status"],
+            json!("crashed"),
+            "a reused pid is not this child"
+        );
+        assert_eq!(rows[4]["status"], json!("crashed"));
+        assert!(second["next_cursor"].is_null());
+
+        let before = calls();
+        let whole = list_sessions(&mut ctx, json!({"page_size": total})).unwrap();
+        assert_eq!(
+            calls() - before,
+            1,
+            "one lookup covers every running row on the page"
+        );
+        let rows = whole["sessions"].as_array().unwrap();
+        assert_eq!(rows.len(), total as usize);
+        assert!(
+            whole["next_cursor"].is_null(),
+            "an exactly full page is the last page: {whole}"
+        );
+        let tail: Vec<(&str, &str)> = rows[rows.len() - 3..]
+            .iter()
+            .map(|row| {
+                (
+                    row["session_id"].as_str().unwrap(),
+                    row["status"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            tail,
+            [
+                (alive.as_str(), "running"),
+                (reused.as_str(), "crashed"),
+                (gone.as_str(), "crashed")
+            ]
+        );
     }
 
     #[test]
