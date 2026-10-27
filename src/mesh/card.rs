@@ -587,7 +587,7 @@ impl MeshRuntime {
         destination: &DestinationDesc,
         options: RequestOptions,
     ) -> Result<StatusCard, StatusError> {
-        let outcome = self
+        let reply = self
             .request(destination, STATUS_PATH, Value::Nil, options)
             .await
             .map_err(|err| {
@@ -599,10 +599,10 @@ impl MeshRuntime {
                     StatusError::Transport(err)
                 }
             })?;
-        if let Some(error) = DispatchError::from_value(&outcome.value) {
+        if let Some(error) = DispatchError::from_value(&reply) {
             return Err(StatusError::NotServed(error));
         }
-        let card = StatusCard::from_value(&outcome.value)?;
+        let card = StatusCard::from_value(&reply)?;
         self.memory()
             .remember_card(&destination.address_hash.to_hex_string(), card.clone());
         Ok(card)

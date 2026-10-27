@@ -52,8 +52,8 @@ use crate::mesh::request::RequestHandler;
 use crate::mesh::request::{
     ACCESS_PATH, Dispatcher, Envelope, FETCH_PATH, KNOCK_PATH, KNOWN_PATHS, LIST_PATH,
     LibraryHandler, MAX_REQUEST_PAYLOAD_BYTES, MESSAGE_PATH, OriginName, RefusalCode,
-    RemoteRefusal, RequestClient, RequestError, RequestOptions, RequestOutcome, STATUS_PATH,
-    redact_hashes, short,
+    RemoteRefusal, RequestError, RequestOptions, STATUS_PATH, redact_hashes,
+    request as link_request, short,
 };
 use crate::mesh::shares::ShareLocations;
 use crate::mesh::snapshot::MeshSnapshot;
@@ -463,7 +463,6 @@ pub(crate) struct MeshRuntime {
     peers: Arc<PeerTable>,
     propagation_nodes: Arc<PropagationNodeTable>,
     trust: Arc<TrustStore>,
-    request_client: Arc<RequestClient>,
     request_handler: Arc<LibraryHandler>,
     dispatcher: Arc<Dispatcher>,
     knock_gate: Arc<KnockGate>,
@@ -561,8 +560,6 @@ impl MeshRuntime {
         ));
         // Every stream is subscribed before an interface is joined so nothing is missed.
         let announces = transport.recv_announces().await;
-        let out_link_events = transport.out_link_events();
-        let client_resource_events = transport.resource_events();
         let mut joined = Vec::with_capacity(plans.len());
         let mut states = Vec::with_capacity(plans.len());
         let mut watched = Vec::new();
@@ -709,7 +706,6 @@ impl MeshRuntime {
             peers,
             propagation_nodes: Arc::new(PropagationNodeTable::new()),
             trust,
-            request_client: Arc::new(RequestClient::new()),
             request_handler,
             dispatcher,
             knock_gate,
@@ -724,11 +720,6 @@ impl MeshRuntime {
             #[cfg(all(test, unix))]
             requests_made: parking_lot::Mutex::new(Vec::new()),
         });
-        runtime.register_task(tokio::spawn(runtime.request_client.clone().run(
-            out_link_events,
-            client_resource_events,
-            runtime.cancellation_token(),
-        )));
         runtime.register_task(tokio::spawn(receive_announces(
             announces,
             runtime.peers.clone(),
@@ -1134,7 +1125,7 @@ impl MeshRuntime {
         path: &str,
         data: rmpv::Value,
         options: RequestOptions,
-    ) -> Result<RequestOutcome, RequestError> {
+    ) -> Result<rmpv::Value, RequestError> {
         let envelope = self.envelope(data).await;
         self.request_envelope(destination, path, envelope, options)
             .await
@@ -1150,7 +1141,7 @@ impl MeshRuntime {
         path: &str,
         envelope: Envelope,
         options: RequestOptions,
-    ) -> Result<RequestOutcome, RequestError> {
+    ) -> Result<rmpv::Value, RequestError> {
         #[cfg(all(test, unix))]
         self.requests_made.lock().push((path.to_string(), options));
         let dest_hex = destination.address_hash.to_hex_string();
@@ -1162,7 +1153,7 @@ impl MeshRuntime {
             .clone()
             .ok_or(RequestError::NotRunning)?;
         let sent = envelope.version;
-        let request = self.request_client.request(
+        let request = link_request(
             &transport,
             &self.transport_identity,
             destination,
@@ -1336,7 +1327,6 @@ impl MeshRuntime {
         };
         propagation_fetch::fetch(
             &transport,
-            &self.request_client,
             &self.transport_identity,
             &node,
             &self.peers,
@@ -2306,7 +2296,7 @@ fn note_version_refusal(
     dest_hex: &str,
     path: &str,
     sent: u16,
-    outcome: &Result<RequestOutcome, RequestError>,
+    outcome: &Result<rmpv::Value, RequestError>,
 ) {
     let Err(RequestError::UnsupportedVersion { min, max, .. }) = outcome else {
         return;

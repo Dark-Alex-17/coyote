@@ -3,7 +3,6 @@
 //! correlation, a handler seam for whatever answers requests, and the dispatcher that
 //! decides, from the trust list alone, who gets an answer at all.
 
-mod client;
 mod dispatch;
 mod error;
 mod frame;
@@ -12,7 +11,6 @@ mod link;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use client::{RequestClient, RequestOutcome};
 #[cfg(all(test, unix))]
 pub(crate) use dispatch::LoggingKnockSink;
 pub(crate) use dispatch::{
@@ -34,7 +32,8 @@ pub(crate) use handler::{LibraryHandler, Reply, Settlement};
 #[cfg(test)]
 pub(crate) use link::DEFAULT_REQUEST_TIMEOUT;
 pub(crate) use link::{
-    DEFAULT_LINK_TIMEOUT, Deadline, RequestOptions, SizeBranch, link_to, open_link,
+    DEFAULT_LINK_TIMEOUT, Deadline, RequestOptions, SizeBranch, link_to, open_link, request,
+    request_on_link,
 };
 #[cfg(all(test, unix))]
 pub(crate) use tests::network;

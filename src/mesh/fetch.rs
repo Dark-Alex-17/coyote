@@ -1541,15 +1541,15 @@ impl MeshRuntime {
             request_timeout: PEER_REQUEST_TIMEOUT,
             link_timeout: PEER_LINK_TIMEOUT,
         });
-        let outcome = self
+        let reply = self
             .request(destination, LIST_PATH, body, options)
             .await
             .map_err(|err| self.fetch_failure(destination, err))?;
-        if DispatchError::from_value(&outcome.value).is_some() {
+        if DispatchError::from_value(&reply).is_some() {
             return Err(FetchError::NotServed);
         }
         let destination_hex = destination.address_hash.to_hex_string();
-        let page = SharesPage::from_value(&outcome.value, short(&destination_hex))?;
+        let page = SharesPage::from_value(&reply, short(&destination_hex))?;
         self.memory().remember_list(
             &destination_hex,
             Listing {
@@ -1596,11 +1596,11 @@ impl MeshRuntime {
             request_timeout: FILE_FETCH_REQUEST_TIMEOUT,
             link_timeout: PEER_LINK_TIMEOUT,
         };
-        let outcome = self
+        let reply = self
             .request(destination, FETCH_PATH, body, options)
             .await
             .map_err(|err| self.fetch_failure(destination, err))?;
-        match read_fetch_reply(&outcome.value)? {
+        match read_fetch_reply(&reply)? {
             FetchReply::Ok {
                 bytes,
                 size,

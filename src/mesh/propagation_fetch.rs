@@ -13,8 +13,8 @@ use crate::mesh::lock::{read_holder_pid, write_holder_pid};
 use crate::mesh::peers::PeerTable;
 use crate::mesh::propagation::{PropagationNode, lxmf_delivery_hash};
 use crate::mesh::request::{
-    DEFAULT_LINK_TIMEOUT, Deadline, MAX_REQUEST_PAYLOAD_BYTES, RefusalCode, RequestClient,
-    RequestError, SizeBranch, link_to, redact_hashes, short,
+    DEFAULT_LINK_TIMEOUT, Deadline, MAX_REQUEST_PAYLOAD_BYTES, RefusalCode, RequestError, link_to,
+    redact_hashes, request_on_link, short,
 };
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_cause, version_refusal};
 use crate::mesh::trust::{IdentityStanding, TrustStore};
@@ -363,7 +363,6 @@ pub(crate) struct FetchReport {
     pub discarded: usize,
     pub deferred: usize,
     pub acknowledged: usize,
-    pub response_branch: Option<SizeBranch>,
 }
 
 impl FetchReport {
@@ -378,7 +377,6 @@ impl FetchReport {
             discarded: 0,
             deferred: 0,
             acknowledged: 0,
-            response_branch: None,
         }
     }
 }
@@ -1291,7 +1289,6 @@ async fn unless_cancelled<T>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn fetch(
     transport: &Transport,
-    client: &RequestClient,
     identity: &TransportIdentity,
     node: &PropagationNode,
     peers: &PeerTable,
@@ -1335,17 +1332,17 @@ pub(crate) async fn fetch(
     );
     let listed = unless_cancelled(
         &cancel,
-        client.request_on_link(
+        request_on_link(
             transport,
             &link,
             GET_PATH,
             list_request(),
-            Deadline::after(options.request_timeout),
+            options.request_timeout,
         ),
         failed,
     )
     .await?;
-    let ids = parse_listed_ids(listed.value)?;
+    let ids = parse_listed_ids(listed)?;
     report.listed = ids.len();
     if ids.is_empty() {
         debug!("Propagation fetch from {node_short}: listed 0, nothing to fetch");
@@ -1376,24 +1373,22 @@ pub(crate) async fn fetch(
     );
     let served = unless_cancelled(
         &cancel,
-        client.request_on_link(
+        request_on_link(
             transport,
             &link,
             GET_PATH,
             get_request(&wants, &haves),
-            Deadline::after(options.request_timeout),
+            options.request_timeout,
         ),
         failed,
     )
     .await?;
-    report.response_branch = Some(served.response_branch);
-    let bodies = parse_bodies(served.value)?;
+    let bodies = parse_bodies(served)?;
     report.received = bodies.len();
     debug!(
-        "Propagation fetch from {node_short}: received {} bodies ({} bytes, {:?})",
+        "Propagation fetch from {node_short}: received {} bodies ({} bytes)",
         bodies.len(),
-        bodies.iter().map(Vec::len).sum::<usize>(),
-        served.response_branch
+        bodies.iter().map(Vec::len).sum::<usize>()
     );
     if bodies.is_empty() {
         store.record_sync(&node_hex, SystemTime::now(), 0);
@@ -1423,12 +1418,12 @@ pub(crate) async fn fetch(
     );
     unless_cancelled(
         &cancel,
-        client.request_on_link(
+        request_on_link(
             transport,
             &link,
             GET_PATH,
             ack_request(&acks),
-            Deadline::after(options.request_timeout),
+            options.request_timeout,
         ),
         failed,
     )

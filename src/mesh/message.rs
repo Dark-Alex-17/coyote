@@ -1750,7 +1750,7 @@ impl MeshRuntime {
             )
             .await
         {
-            Ok(outcome) if is_received_reply(&outcome.value, id) => {
+            Ok(reply) if is_received_reply(&reply, id) => {
                 debug!("Mesh {kind} {id} to {dest8} was delivered over a link");
                 return Ok(SendOutcome {
                     id: message.id.clone(),

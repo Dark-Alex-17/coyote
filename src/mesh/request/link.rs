@@ -1,9 +1,19 @@
-use crate::mesh::request::error::RequestError;
+use crate::mesh::protocol::VersionRefusal;
+use crate::mesh::request::dispatch::FETCH_PATH;
+use crate::mesh::request::error::{RefusalCode, RequestError};
+use crate::mesh::request::frame::{
+    Envelope, MAX_FETCH_RESPONSE_BYTES, MAX_REQUEST_PAYLOAD_BYTES, now_secs,
+};
 use crate::mesh::request::short;
 
+use rmpv::Value;
 use rns_transport::delivery::await_link_activation;
 use rns_transport::destination::DestinationDesc;
 use rns_transport::destination::link::Link;
+use rns_transport::destination::request::{
+    PathHash, RequestError as LibraryRequestError, RequestFrame as LibraryRequestFrame,
+    RequestOptions as LibraryRequestOptions,
+};
 use rns_transport::error::RnsError;
 use rns_transport::identity::PrivateIdentity as TransportIdentity;
 use rns_transport::transport::{SendPacketOutcome, Transport};
@@ -78,6 +88,124 @@ impl Deadline {
 pub(crate) enum SizeBranch {
     Packet,
     Resource,
+}
+
+/// `link_timeout` covers opening the link and identifying on it; `request_timeout` starts
+/// once that is done and covers sending the request as well as waiting for the response.
+///
+/// Links are reused per destination for as long as upstream keeps them: its watchdog closes
+/// an idle link and nothing here closes one sooner. The identity is proven on every request
+/// regardless; it is one packet, and it also heals a responder that missed the first proof.
+pub(crate) async fn request(
+    transport: &Transport,
+    identity: &TransportIdentity,
+    destination: &DestinationDesc,
+    path: &str,
+    envelope: Envelope,
+    options: RequestOptions,
+) -> Result<Value, RequestError> {
+    let link = link_to(transport, identity, destination, path, options.link_timeout).await?;
+    request_on_link(
+        transport,
+        &link,
+        path,
+        envelope.into_value(),
+        options.request_timeout,
+    )
+    .await
+}
+
+/// Sends `data` as the request body verbatim, with no envelope, over an already active
+/// link. Coyote-to-Coyote requests wrap the envelope first. The LXMF `/get` conversation
+/// does not: a propagation node reads the body as the bare `[wants, haves, limit]` arrays
+/// of `LXMRouter.message_get_request` (`LXMRouter.py:1436-1475`), so wrapping it in the
+/// envelope would make every round unreadable to it. Tests use the same path to put a body
+/// of their own choosing, malformed ones included, in front of a responder.
+///
+/// The request is capped before anything touches the wire; the response cap is the
+/// library's, armed per path. Sending counts against `request_timeout` as much as waiting
+/// for the response does.
+pub(crate) async fn request_on_link(
+    transport: &Transport,
+    link: &Arc<tokio::sync::Mutex<Link>>,
+    path: &str,
+    data: Value,
+    request_timeout: Duration,
+) -> Result<Value, RequestError> {
+    let packed = LibraryRequestFrame::new(now_secs(), PathHash::of(path), data.clone()).encode();
+    if packed.len() > MAX_REQUEST_PAYLOAD_BYTES {
+        return Err(RequestError::Oversize {
+            len: packed.len(),
+            max: MAX_REQUEST_PAYLOAD_BYTES,
+        });
+    }
+    let deadline = Deadline::after(request_timeout);
+    let (link_id, mdu) = deadline
+        .bound(path, async {
+            let link = link.lock().await;
+            (*link.id(), link.link_mdu())
+        })
+        .await?;
+    let max = if path == FETCH_PATH {
+        MAX_FETCH_RESPONSE_BYTES
+    } else {
+        MAX_REQUEST_PAYLOAD_BYTES
+    };
+    let opts = LibraryRequestOptions::default()
+        .with_timeout(request_timeout)
+        .with_max_response_size(max);
+    let receipt = deadline
+        .bound(path, transport.request(&link_id, path, data, opts))
+        .await?
+        .map_err(|err| RequestError::LinkFailed(format!("request not sent: {err}")))?;
+    debug!(
+        "Sending mesh request {} for {path} as a {} ({} bytes, link MDU {mdu})",
+        receipt.request_id(),
+        if packed.len() <= mdu {
+            "packet"
+        } else {
+            "resource"
+        },
+        packed.len()
+    );
+    let response = match receipt.response().await {
+        Ok(response) => response,
+        Err(LibraryRequestError::Timeout) => {
+            return Err(RequestError::Timeout {
+                path: path.to_string(),
+                after: request_timeout,
+            });
+        }
+        Err(LibraryRequestError::LinkClosed) => return Err(RequestError::LinkClosed),
+        Err(err @ LibraryRequestError::Rejected) => {
+            return Err(RequestError::Send(err.to_string()));
+        }
+        Err(LibraryRequestError::Oversize) => {
+            return Err(RequestError::Oversize {
+                len: receipt.response_size().unwrap_or(max + 1),
+                max,
+            });
+        }
+        Err(LibraryRequestError::Decode) => {
+            return Err(RequestError::Decode("response frame".to_string()));
+        }
+        Err(err @ LibraryRequestError::Send) => return Err(RequestError::Send(err.to_string())),
+        Err(err) => return Err(RequestError::LinkFailed(err.to_string())),
+    };
+    let value = response.into_value().ok_or_else(|| {
+        RequestError::Decode("response carried a file body, not a value".to_string())
+    })?;
+    if let Some(code) = RefusalCode::from_wire(&value) {
+        return Err(RequestError::Refused(code));
+    }
+    if let Some(refusal) = VersionRefusal::from_value(&value) {
+        return Err(RequestError::UnsupportedVersion {
+            found: refusal.found,
+            min: refusal.min,
+            max: refusal.max,
+        });
+    }
+    Ok(value)
 }
 
 /// Opens (or reuses) the link to `destination` and proves `identity` on it, both within

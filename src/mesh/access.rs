@@ -581,8 +581,8 @@ impl MeshRuntime {
             )
             .await
         {
-            Ok(outcome) => {
-                let status = read_access_reply(&outcome.value, id)?;
+            Ok(reply) => {
+                let status = read_access_reply(&reply, id)?;
                 debug!(
                     "Mesh access request {id} to {dest8} was answered {} over a link",
                     status.status()

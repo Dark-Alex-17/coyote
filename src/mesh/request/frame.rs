@@ -1,11 +1,15 @@
 use crate::mesh::protocol::{MESH_PROTOCOL_VERSION, protocol_supported};
+#[cfg(test)]
 use crate::mesh::request::error::RequestError;
+#[cfg(test)]
 use crate::mesh::request::redact_hashes;
 
 use rmpv::Value;
 pub(crate) use rns_transport::destination::request::{PathHash, RequestId};
 use rns_transport::destination::{DestinationName, NAME_HASH_LENGTH};
+#[cfg(test)]
 use rns_transport::hash::ADDRESS_HASH_SIZE;
+#[cfg(test)]
 use std::io::Cursor;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -31,6 +35,7 @@ pub(crate) const MAX_FETCH_RESPONSE_BYTES: usize =
 /// (`read_str_data` charges one before it reaches `read_bin_data`), so about 60 nested
 /// containers fit. `rmpv`'s own default (1024) lets ~400 nested arrays exhaust a 2 MiB
 /// thread stack in a debug build before the limit is reached.
+#[cfg(test)]
 pub(crate) const MAX_REQUEST_NESTING_DEPTH: usize = 128;
 
 /// Bytes of a destination name hash, the prefix of the full name hash Reticulum uses to
@@ -40,6 +45,7 @@ pub(crate) const NAME_HASH_LEN: usize = NAME_HASH_LENGTH;
 /// The fixed opening of every encoded `ResponseFrame`: a 2-element array header and the
 /// `bin 8` header of its 16-byte request id. The requester reads a response's id straight
 /// off these bytes before it decodes anything.
+#[cfg(test)]
 pub(crate) const RESPONSE_FRAME_PREFIX: [u8; 3] = [0x92, 0xc4, 0x10];
 
 const NAME_HASH_KEY: &str = "name_hash";
@@ -55,6 +61,7 @@ const VERSION_KEY: &str = "v";
 /// when there is no body, never an empty bin. The frame is the whole payload; decoding
 /// refuses trailing bytes, any other arity, and a hash that is not a 16-byte bin. This is
 /// what RNS `Link.request` packs as `umsgpack.packb([time.time(), request_path_hash, data])`.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RequestFrame {
     pub time: f64,
@@ -62,6 +69,7 @@ pub(crate) struct RequestFrame {
     pub data: Value,
 }
 
+#[cfg(test)]
 impl RequestFrame {
     pub(crate) fn new(path: &str, data: Value) -> Self {
         Self {
@@ -79,7 +87,6 @@ impl RequestFrame {
         ]))
     }
 
-    #[cfg(test)]
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, RequestError> {
         let Value::Array(elements) = decode_whole(bytes)? else {
             return Err(RequestError::Decode("request frame is not an array".into()));
@@ -108,14 +115,15 @@ impl RequestFrame {
 /// msgpack value, nil for no body. Decoding refuses trailing bytes, any other arity, and an
 /// id that is not a 16-byte bin. This is what RNS `Link.handle_request` packs as
 /// `umsgpack.packb([request_id, response])`.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ResponseFrame {
     pub request_id: RequestId,
     pub data: Value,
 }
 
+#[cfg(test)]
 impl ResponseFrame {
-    #[cfg(test)]
     pub(crate) fn encode(&self) -> Vec<u8> {
         encode_value(Value::Array(vec![
             Value::Binary(self.request_id.to_bytes().to_vec()),
@@ -237,13 +245,14 @@ impl Envelope {
     }
 }
 
-fn now_secs() -> f64 {
+pub(super) fn now_secs() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs_f64())
         .unwrap_or(0.0)
 }
 
+#[cfg(test)]
 fn encode_value(value: Value) -> Vec<u8> {
     let mut bytes = Vec::new();
     // The only error source is the writer, and a `Vec` never fails to grow.
@@ -256,6 +265,7 @@ fn encode_value(value: Value) -> Vec<u8> {
     bytes
 }
 
+#[cfg(test)]
 fn decode_whole(bytes: &[u8]) -> Result<Value, RequestError> {
     let mut cursor = Cursor::new(bytes);
     let value = rmpv::decode::read_value_with_max_depth(&mut cursor, MAX_REQUEST_NESTING_DEPTH)
@@ -270,6 +280,7 @@ fn decode_whole(bytes: &[u8]) -> Result<Value, RequestError> {
     Ok(value)
 }
 
+#[cfg(test)]
 fn hash_bytes(value: &Value, what: &str) -> Result<[u8; ADDRESS_HASH_SIZE], RequestError> {
     let Value::Binary(bytes) = value else {
         return Err(RequestError::Decode(format!("{what} is not a bin")));
