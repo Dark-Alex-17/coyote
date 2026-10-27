@@ -4150,10 +4150,11 @@ pub(crate) mod network {
         responder.stop().await;
     }
 
-    /// Two requests to the same destination share one link, which the responder sees as
-    /// one identified peer: the second request arrives on the first's link already proven.
+    /// Two requests to the same destination share one link, and the second arrives on it
+    /// already proven: the handler sees the same link id and the same identity both times,
+    /// with no second link and no second identify.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn sequential_requests_reuse_the_link_and_stay_one_identified_peer() {
+    async fn sequential_requests_reuse_one_link_and_arrive_under_the_same_identity() {
         let recorder = Arc::new(Recorder::default());
         let (responder, requester, desc) = pair(recorder.clone()).await;
 
