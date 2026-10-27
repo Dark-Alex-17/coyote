@@ -51,7 +51,7 @@ def main():
                     # The rejection is a FORMAT violation; the rejected report is
                     # the leader's own same-tree analysis. Hand it back so the
                     # retry reuses it instead of re-reviewing the slice from
-                    # scratch (a full opus lane re-run to recover a header).
+                    # scratch (a full leader-lane re-run to recover a header).
                     "gate_prior_report": (
                         "## YOUR PREVIOUS REPORT (rejected by the completeness gate "
                         "for the missing sections named in MUST DO - it is your own "
