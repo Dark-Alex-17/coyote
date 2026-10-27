@@ -2621,7 +2621,7 @@ fn version_refusal_vectors() -> Vec<Vector> {
             with(
                 refusal_value(Value::from(3u64)),
                 "error",
-                Value::from("unknown_path"),
+                Value::from("something_else"),
             ),
             refusal(Some(3)),
         ),
@@ -2684,15 +2684,6 @@ fn version_refusal_vectors() -> Vec<Vector> {
             "no-access-byte-is-not-a-version-refusal",
             Kind::Invalid,
             Value::from(0xf1u8),
-            None,
-        ),
-        version(
-            "unknown-path-error-is-not-a-version-refusal",
-            Kind::Invalid,
-            DispatchError::UnknownPath {
-                path_hash: PathHash::of(UNKNOWN_PATH).to_string(),
-            }
-            .to_value(),
             None,
         ),
         version(
@@ -2980,15 +2971,6 @@ fn refusal_code_vectors() -> Vec<Vector> {
             "version-refusal-with-found-2-is-not-a-refusal-code",
             Kind::Invalid,
             VersionRefusal::current(Some(2)).to_value(),
-            None,
-        ),
-        code(
-            "unknown-path-error-is-not-a-refusal-code",
-            Kind::Invalid,
-            DispatchError::UnknownPath {
-                path_hash: HEX_32.to_string(),
-            }
-            .to_value(),
             None,
         ),
         code(

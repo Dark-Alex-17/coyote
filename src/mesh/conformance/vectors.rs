@@ -3584,6 +3584,11 @@ fn ext_vectors() -> Vec<Vector> {
                     DispatchError::from_value(&value),
                     Some(DispatchError::UnknownPath { path_hash }),
                 )?;
+                same(
+                    "not a version refusal",
+                    VersionRefusal::from_value(&value),
+                    None,
+                )?;
                 same("not a refusal code", RefusalCode::from_wire(&value), None)
             }),
         ),
