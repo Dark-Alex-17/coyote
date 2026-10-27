@@ -1412,26 +1412,26 @@ pub(crate) mod network {
         hash
     }
 
-    /// A response frame for `request_id` that encodes to one byte over the cap.
-    fn oversize_response(request_id: RequestId, body: Vec<u8>) -> Vec<u8> {
+    /// A response frame for `request_id` that encodes to one byte over `max`.
+    fn oversize_response(request_id: RequestId, body: Vec<u8>, max: usize) -> Vec<u8> {
         let bytes = ResponseFrame {
             request_id,
             data: Value::Binary(body),
         }
         .encode();
-        assert_eq!(bytes.len(), MAX_REQUEST_PAYLOAD_BYTES + 1);
+        assert_eq!(bytes.len(), max + 1);
         bytes
     }
 
-    /// A response body that encodes one byte over the cap and compresses to a single
+    /// A response body that encodes one byte over `max` and compresses to a single
     /// part: a repeating byte sequence rather than a constant, so a body reassembled out
     /// of order would not compare equal. For the per-path bound only the assembled length
     /// matters, and a one-part transfer keeps the window ladder, and the time it takes to
     /// climb on a loaded machine, out of a test about that bound.
-    fn compressible_response_body() -> Vec<u8> {
+    fn compressible_response_body(max: usize) -> Vec<u8> {
         (0..=u8::MAX)
             .cycle()
-            .take(MAX_REQUEST_PAYLOAD_BYTES + 1 - RESPONSE_FRAME_OVERHEAD)
+            .take(max + 1 - RESPONSE_FRAME_OVERHEAD)
             .collect()
     }
 
@@ -1937,7 +1937,11 @@ pub(crate) mod network {
             &responder,
             &requester,
             &seen,
-            oversize_response(seen.request_id, compressible_response_body()),
+            oversize_response(
+                seen.request_id,
+                compressible_response_body(MAX_REQUEST_PAYLOAD_BYTES),
+                MAX_REQUEST_PAYLOAD_BYTES,
+            ),
         )
         .await;
         let result = timeout(INTEROP_TIMEOUT, in_flight).await.unwrap().unwrap();
@@ -1957,12 +1961,12 @@ pub(crate) mod network {
             TRANSFER_REQUEST_TIMEOUT,
         )
         .await;
-        let body = compressible_response_body();
+        let body = compressible_response_body(MAX_REQUEST_PAYLOAD_BYTES);
         answer_as_resource(
             &responder,
             &requester,
             &seen,
-            oversize_response(seen.request_id, body.clone()),
+            oversize_response(seen.request_id, body.clone(), MAX_REQUEST_PAYLOAD_BYTES),
         )
         .await;
         let reply = timeout(INTEROP_TIMEOUT, in_flight)
@@ -9557,7 +9561,7 @@ pub(crate) mod network {
     /// its client are the one-year ones on both governed paths, and the link opened,
     /// identified and answered under them with no clock arithmetic giving out. The
     /// unit-level `timers_at_the_cap_still_make_a_deadline` only builds the `Deadline`;
-    /// this drives it through `link_to` and `request_on_link_with`.
+    /// this drives it through `link_to` and `request_on_link`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn timers_at_the_cap_carry_a_live_request_to_its_reply() {
         use crate::config::mesh_config::MAX_TIMEOUT_SECS;

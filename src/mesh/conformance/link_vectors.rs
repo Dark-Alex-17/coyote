@@ -24,12 +24,6 @@ enum Len {
     MduPlusOne,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum Direction {
-    Request,
-    Response,
-}
-
 /// How the peer came to be marked incompatible before the outbound request.
 #[derive(Clone, Copy, Debug)]
 enum Mark {
@@ -62,11 +56,9 @@ enum OtherReply {
 enum Case {
     /// The responder answers under the request id the requester computed.
     Correlation { len: Len },
-    SizeBranch {
-        direction: Direction,
-        len: Len,
-        branch: SizeBranch,
-    },
+    /// How a request frame of this length travels. The request direction is the one Coyote
+    /// decides and logs; the response branch is the library's.
+    SizeBranch { len: Len, branch: SizeBranch },
     /// A frame over `MAX_REQUEST_PAYLOAD_BYTES` is refused locally and never seen by the responder.
     OutboundCap,
     /// The responder sees the identity the requester proved on the link.
@@ -144,7 +136,6 @@ const VECTORS: &[Vector] = &[
         name: "request-under-the-mdu-goes-as-a-packet",
         kind: Kind::Valid,
         case: Case::SizeBranch {
-            direction: Direction::Request,
             len: Len::MduMinusOne,
             branch: SizeBranch::Packet,
         },
@@ -154,7 +145,6 @@ const VECTORS: &[Vector] = &[
         name: "request-at-the-mdu-still-goes-as-a-packet",
         kind: Kind::Boundary,
         case: Case::SizeBranch {
-            direction: Direction::Request,
             len: Len::Mdu,
             branch: SizeBranch::Packet,
         },
@@ -164,27 +154,6 @@ const VECTORS: &[Vector] = &[
         name: "request-one-over-the-mdu-goes-as-a-resource",
         kind: Kind::Boundary,
         case: Case::SizeBranch {
-            direction: Direction::Request,
-            len: Len::MduPlusOne,
-            branch: SizeBranch::Resource,
-        },
-        known_divergence: None,
-    },
-    Vector {
-        name: "response-at-the-mdu-still-goes-as-a-packet",
-        kind: Kind::Boundary,
-        case: Case::SizeBranch {
-            direction: Direction::Response,
-            len: Len::Mdu,
-            branch: SizeBranch::Packet,
-        },
-        known_divergence: None,
-    },
-    Vector {
-        name: "response-one-over-the-mdu-goes-as-a-resource",
-        kind: Kind::Boundary,
-        case: Case::SizeBranch {
-            direction: Direction::Response,
             len: Len::MduPlusOne,
             branch: SizeBranch::Resource,
         },
@@ -426,7 +395,7 @@ mod tests {
 
 #[cfg(unix)]
 mod loopback {
-    use super::{Case, Direction, KnockRefusal, Len, Mark, OtherReply, VECTORS, Vector};
+    use super::{Case, KnockRefusal, Len, Mark, OtherReply, VECTORS, Vector};
     use crate::mesh::announce::AnnounceAppData;
     use crate::mesh::knock::{KnockError, KnockIntro};
     use crate::mesh::message::{OutboundPeer, PeerKind, SendError, received_reply};
@@ -437,8 +406,8 @@ mod loopback {
     use crate::mesh::request::network::{
         REQUEST_FRAME_OVERHEAD, Recorder, Requester, Responder, SHORT_REQUEST_TIMEOUT, Script,
         Stall, hanging_request, library_refused_oversize_request, link_deadline, pair,
-        request_body_of_encoded_len, request_on, request_sent_as, response_body_of_encoded_len,
-        response_payloads, short_options, timed_out, timed_out_slow_request,
+        request_body_of_encoded_len, request_on, request_sent_as, response_payloads, short_options,
+        timed_out, timed_out_slow_request,
     };
     use crate::mesh::request::{
         DEFAULT_REQUEST_TIMEOUT, MAX_CONCURRENT_INBOUND_REQUESTS, MAX_REQUEST_PAYLOAD_BYTES,
@@ -557,11 +526,7 @@ mod loopback {
     async fn drive(case: Case) {
         match case {
             Case::Correlation { len } => correlation(len).await,
-            Case::SizeBranch {
-                direction,
-                len,
-                branch,
-            } => size_branch(direction, len, branch).await,
+            Case::SizeBranch { len, branch } => size_branch(len, branch).await,
             Case::OutboundCap => outbound_cap().await,
             Case::Identified => identified().await,
             Case::UndecodableFrame => undecodable_frame().await,
@@ -628,44 +593,21 @@ mod loopback {
         pair.stop().await;
     }
 
-    async fn size_branch(direction: Direction, len: Len, expected: SizeBranch) {
+    async fn size_branch(len: Len, expected: SizeBranch) {
         install_log_collector();
         let pair = echo_pair().await;
         let target = len.target(pair.mdu);
-        match direction {
-            Direction::Request => {
-                let body = request_body_of_encoded_len(pair.requester.origin, target);
-                let outcome = pair
-                    .requester
-                    .request(&pair.desc, ECHO_PATH, body.clone())
-                    .await
-                    .unwrap();
-                assert_eq!(outcome, body, "a {target}-byte request frame echoes");
-                assert!(
-                    request_sent_as(pair.recorder.last().request_id, ECHO_PATH, expected),
-                    "a {target}-byte request frame goes as a {expected:?}"
-                );
-            }
-            Direction::Response => {
-                let body = response_body_of_encoded_len(target);
-                pair.recorder
-                    .queue(Script::Reply(Reply::Value(body.clone())));
-                let outcome = pair
-                    .requester
-                    .request(&pair.desc, ECHO_PATH, Value::Nil)
-                    .await
-                    .unwrap();
-                assert_eq!(outcome, body, "a {target}-byte response frame");
-                assert!(
-                    request_sent_as(
-                        pair.recorder.last().request_id,
-                        ECHO_PATH,
-                        SizeBranch::Packet
-                    ),
-                    "the Nil-bodied request goes as a packet whatever the response's size"
-                );
-            }
-        }
+        let body = request_body_of_encoded_len(pair.requester.origin, target);
+        let outcome = pair
+            .requester
+            .request(&pair.desc, ECHO_PATH, body.clone())
+            .await
+            .unwrap();
+        assert_eq!(outcome, body, "a {target}-byte request frame echoes");
+        assert!(
+            request_sent_as(pair.recorder.last().request_id, ECHO_PATH, expected),
+            "a {target}-byte request frame goes as a {expected:?}"
+        );
         pair.stop().await;
     }
 
