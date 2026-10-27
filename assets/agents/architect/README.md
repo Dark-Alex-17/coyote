@@ -168,6 +168,19 @@ ladder, a single-PR run never carries the PR-group stacking mechanics — which 
 removes inapplicable-mode hallucination bait. The static `instructions:` field in `config.yaml` is
 a placeholder; edit `instructions.md`.
 
+### Bookkeeping tools (tools.sh)
+
+The mechanical, ground-truth-on-disk Phase F steps are tool calls; judgment stays with the
+model (the Problem/Approach summary, acceptance verdicts):
+
+| Tool | Replaces |
+|---|---|
+| `collect_ledger_lines --tag ... --dir ...` | re-reading every `log.md` for `rejected-finding:` / `design-decision` / `debris-exempt` / `Follow-ups:` / `(deferred by quality bar)` rollups - grep-complete instead of attention-complete |
+| `assemble_pr_body --plan ... --tasks-dir ... --summary-file ... [--followups] [--quality-note ...]` | hand-assembling the draft PR body (Quality bar from plan `rigor:`, task checklist with `completed`-entry SHAs, ledger sections); `assemble_pr_body.py` does the derivation and prints `NOTE` lines for anything it could not derive |
+
+Both fail open to the manual path they replace: a non-zero return or a `NOTE` leaves the
+architect exactly where the prose would have had it, and says what to fix.
+
 ## Autonomy
 
 Fully autonomous end-to-end by default — it halts only for genuine blockers: scope-changing

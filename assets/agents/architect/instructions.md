@@ -708,7 +708,8 @@ At the current group's close-out (and, for steps 5-8, after the last group's):
    invalid and must not be sent. Also
    collect every `debris-exempt` line from the completed tasks' `log.md` files into a
    starting ledger the brief carries verbatim (those are the exemptions earlier tasks already
-   justified). The brief:
+   justified) - use `collect_ledger_lines --tag debris-exempt --dir {{plans_dir}}/tasks`; it is
+   grep-complete. The brief:
    - Sweep the RUN's whole diff -- `git -C {{project_dir}} diff --no-color --no-ext-diff $base..HEAD -- :/ ":(top,literal,exclude)<plans rel>"`
      (the plan files name tasks and premises by design; same `..` rule for the exclude) -- for:
      the debt markers named in the code-review skill (every owning task is complete by the time
@@ -769,8 +770,10 @@ At the current group's close-out (and, for steps 5-8, after the last group's):
 3. **Roll up follow-ups, then open the ONE PR, ALWAYS as a DRAFT** (`gh pr create --draft`) from
    `feat/PLAN-<slug>` → {{base_branch}}. First collect every "Follow-ups:" line from the completed
    tasks' `log.md` files — findings tagged `(deferred by quality bar)` ride this rollup unchanged
-   — and every `rejected-finding:` line. Title: `PLAN-<slug>: <design doc title>`. Body MUST
-   contain, in order:
+   -- and every `rejected-finding:` line, with `collect_ledger_lines --tag <tag> --dir
+   {{plans_dir}}/tasks` (one call per tag; the tool is grep-complete, an attention pass is not,
+   and a dropped ledger line is a silent report defect). Title: `PLAN-<slug>: <design doc
+   title>`. Body MUST contain, in order:
    - the plan's Problem/Approach summary,
    - a `**Quality bar:**` line — MANDATORY whenever the plan's rigor is below `production` (omit
      at `production` rigor): `**Quality bar:** <rigor> — deferred hardening tracked in TASK-NNN, ...`,
@@ -792,6 +795,15 @@ At the current group's close-out (and, for steps 5-8, after the last group's):
    - a **`## Follow-up / manual actions`** section: one checkbox line per follow-up (WHAT, WHERE,
      WHY, WHEN — pre-merge items FIRST and clearly marked), or "None." if there are none. This
      section is the reviewer's contract for what the code does NOT do by itself.
+   Build the body with `assemble_pr_body --plan {{plans_dir}}/PLAN-<slug>.md --tasks-dir
+   {{plans_dir}}/tasks --summary-file <file holding the Problem/Approach summary you wrote>
+   --followups --out <body file>` (`--quality-note` carries the deferred-hardening task ids once
+   step 5 creates them): you write ONLY the summary; the tool derives every other section from
+   the plan frontmatter and the tasks' `index.md`/`log.md` (grep-complete - the ledger sections
+   cannot drop a line) and prints `NOTE` lines for anything it could not derive (a task without
+   SHAs in its `completed` entry, a plan without `rigor:`). Read the body, fix what the NOTEs
+   name, add any section the tool does not produce (the autonomous-decisions digest when it
+   applies), then `gh pr create --draft --body-file <body file>`.
    Report the PR URL. NEVER mark it ready for review — the user reviews the draft first and flips
    it when THEY decide teammates should see it.
 4. **Watch the PR checks until green.** Poll `gh pr checks <number>` (re-run every few minutes, or
