@@ -1979,6 +1979,264 @@ pub(crate) mod network {
         responder.stop().await;
     }
 
+    /// The request cap is Coyote's own and sits before the wire: a request frame over
+    /// `MAX_REQUEST_PAYLOAD_BYTES` fails as `Oversize` naming its length and the cap, the
+    /// responder never sees it, the library never has to refuse it, nothing is logged as
+    /// sent, and the link goes on serving.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_an_over_cap_request_never_touches_the_wire_and_the_link_goes_on_serving() {
+        install_log_collector();
+        let recorder = Arc::new(Recorder::default());
+        let (responder, requester, desc) = pair(recorder.clone()).await;
+        let link = open_link(&requester.transport, &desc, "/big", link_deadline())
+            .await
+            .unwrap();
+        let link_id = *link.lock().await.id();
+
+        let body = Value::Binary(vec![0xab; MAX_REQUEST_PAYLOAD_BYTES]);
+        let expected_len =
+            Link::request_payload("/big", requester.envelope(body.clone()).into_value())
+                .unwrap()
+                .packed
+                .len();
+        assert!(expected_len > MAX_REQUEST_PAYLOAD_BYTES);
+        let err = request_on(&requester, &link, "/big", body, DEFAULT_REQUEST_TIMEOUT)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            RequestError::Oversize {
+                len: expected_len,
+                max: MAX_REQUEST_PAYLOAD_BYTES,
+            }
+        );
+        assert_eq!(recorder.seen_count(), 0, "the responder never saw it");
+        assert_eq!(responder.adapter.admitted_count(), 0);
+        assert!(
+            library_request_refusal_on(link_id).is_none(),
+            "the library never had an advertisement to refuse"
+        );
+        assert!(
+            !debug_snapshot()
+                .iter()
+                .any(|line| line.starts_with("Sending mesh request") && line.contains(" for /big ")),
+            "nothing was logged as sent for /big"
+        );
+
+        let reply = request_on(
+            &requester,
+            &link,
+            "/echo",
+            Value::from("after"),
+            DEFAULT_REQUEST_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply, Value::from("after"));
+        assert_eq!(recorder.seen_count(), 1);
+        requester.stop().await;
+        responder.stop().await;
+    }
+
+    /// A `/fetch` response past that path's own bound fails as `Oversize` naming the fetch
+    /// cap, not the general one, with a length above it. The library records no size for an
+    /// advertisement it refuses, so the length is the requester's own floor rather than the
+    /// two bytes over the peer advertised; the test fixes the cap, not that floor.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_fetch_response_past_its_own_bound_is_oversize_naming_the_fetch_cap() {
+        let recorder = Arc::new(Recorder::default());
+        let responder = Responder::listen(recorder.clone(), TcpServer::DEFAULT_CLIENT_MTU).await;
+        let mut requester = Requester::connect(responder.port, TcpClient::DEFAULT_MTU).await;
+        responder.announce(None).await;
+        let desc = requester.learn(&responder.desc.address_hash).await;
+
+        let (in_flight, seen) = hanging_request_on(
+            &requester,
+            &recorder,
+            &desc,
+            FETCH_PATH,
+            TRANSFER_REQUEST_TIMEOUT,
+        )
+        .await;
+        let bytes = ResponseFrame {
+            request_id: seen.request_id,
+            data: Value::Binary(compressible_response_body(MAX_FETCH_RESPONSE_BYTES + 1)),
+        }
+        .encode();
+        assert_eq!(bytes.len(), MAX_FETCH_RESPONSE_BYTES + 2);
+        answer_as_resource(&responder, &requester, &seen, bytes).await;
+        let result = timeout(INTEROP_TIMEOUT, in_flight).await.unwrap().unwrap();
+        match result.unwrap_err() {
+            RequestError::Oversize { len, max } => {
+                assert_eq!(max, MAX_FETCH_RESPONSE_BYTES, "the fetch cap is named");
+                assert!(len > MAX_FETCH_RESPONSE_BYTES, "{len} is over the cap");
+            }
+            other => panic!("expected an oversize response, got {other:?}"),
+        }
+
+        let reply = requester
+            .request(&desc, "/echo", Value::from("after"))
+            .await
+            .unwrap();
+        assert_eq!(reply, Value::from("after"), "the link goes on serving");
+        requester.stop().await;
+        responder.stop().await;
+    }
+
+    /// Two requests in flight on one link, answered in the opposite order to the one they
+    /// were sent in, each resolve with their own answer: correlation is by request id,
+    /// never by arrival order or by link.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_two_requests_in_flight_on_one_link_each_get_their_own_answer_whatever_the_order()
+     {
+        let recorder = Arc::new(Recorder::default());
+        let (responder, requester, desc) = pair(recorder.clone()).await;
+        let link = open_link(&requester.transport, &desc, "/slow", link_deadline())
+            .await
+            .unwrap();
+        recorder.queue(Script::Hang);
+        recorder.queue(Script::Hang);
+        let before = recorder.seen_count();
+
+        let in_flight: Vec<_> = ["first", "second"]
+            .into_iter()
+            .map(|body| {
+                let transport = requester.transport.clone();
+                let link = link.clone();
+                let data = requester.envelope(Value::from(body)).into_value();
+                tokio::spawn(async move {
+                    request_on_link(&transport, &link, "/slow", data, TRANSFER_REQUEST_TIMEOUT)
+                        .await
+                })
+            })
+            .collect();
+        wait_until("the responder to hold both requests", || {
+            recorder.seen_count() == before + 2
+        })
+        .await;
+        let seen: Vec<Seen> = recorder.seen.lock().clone();
+        let bodies: Vec<Value> = recorder.bodies.lock().clone();
+        assert_eq!(seen[0].link_id, seen[1].link_id, "one link carried both");
+        assert_ne!(seen[0].request_id, seen[1].request_id);
+        let index_of = |body: &str| {
+            bodies
+                .iter()
+                .position(|seen_body| seen_body == &Value::from(body))
+                .unwrap_or_else(|| panic!("the responder saw {body:?}"))
+        };
+        let (first, second) = (index_of("first"), index_of("second"));
+
+        // The later request is answered first.
+        for (index, answer) in [(second, "second-answer"), (first, "first-answer")] {
+            let bytes = ResponseFrame {
+                request_id: seen[index].request_id,
+                data: Value::from(answer),
+            }
+            .encode();
+            answer_as_resource(&responder, &requester, &seen[index], bytes).await;
+        }
+        let mut replies = Vec::new();
+        for task in in_flight {
+            replies.push(
+                timeout(INTEROP_TIMEOUT, task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            replies,
+            vec![Value::from("first-answer"), Value::from("second-answer")]
+        );
+        requester.stop().await;
+        responder.stop().await;
+    }
+
+    /// A request whose future is dropped mid-flight leaves nothing behind on the link: the
+    /// next request on the same link is served at once, and when the responder later
+    /// answers the dropped request its answer reaches nobody, least of all a request that
+    /// is still waiting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_request_dropped_mid_flight_leaves_its_link_serving_and_its_late_answer_reaches_nobody()
+     {
+        let recorder = Arc::new(Recorder::default());
+        let (responder, requester, desc) = pair(recorder.clone()).await;
+        let link = open_link(&requester.transport, &desc, "/slow", link_deadline())
+            .await
+            .unwrap();
+        let spawn_on_link = |body: &str| {
+            let transport = requester.transport.clone();
+            let link = link.clone();
+            let data = requester.envelope(Value::from(body)).into_value();
+            tokio::spawn(async move {
+                request_on_link(&transport, &link, "/slow", data, TRANSFER_REQUEST_TIMEOUT).await
+            })
+        };
+
+        recorder.queue(Script::Hang);
+        let before = recorder.seen_count();
+        let dropped = spawn_on_link("dropped");
+        wait_until(
+            "the responder to hold the request about to be dropped",
+            || recorder.seen_count() > before,
+        )
+        .await;
+        let dropped_seen = recorder.last();
+        dropped.abort();
+        assert!(dropped.await.unwrap_err().is_cancelled());
+
+        let reply = request_on(
+            &requester,
+            &link,
+            "/echo",
+            Value::from("next"),
+            DEFAULT_REQUEST_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply, Value::from("next"), "the same link serves at once");
+        assert_eq!(recorder.last().link_id, dropped_seen.link_id);
+
+        recorder.queue(Script::Hang);
+        let before = recorder.seen_count();
+        let waiting = spawn_on_link("waiting");
+        wait_until("the responder to hold the waiting request", || {
+            recorder.seen_count() > before
+        })
+        .await;
+        let waiting_seen = recorder.last();
+        assert_ne!(waiting_seen.request_id, dropped_seen.request_id);
+
+        // The late answer to the dropped request goes out while another request waits on
+        // the same link; only then is the waiting one answered.
+        let late = ResponseFrame {
+            request_id: dropped_seen.request_id,
+            data: Value::from("late"),
+        }
+        .encode();
+        answer_as_resource(&responder, &requester, &dropped_seen, late).await;
+        sleep(Duration::from_millis(500)).await;
+        assert!(
+            !waiting.is_finished(),
+            "the late answer must not resolve the waiting request"
+        );
+        let own = ResponseFrame {
+            request_id: waiting_seen.request_id,
+            data: Value::from("own"),
+        }
+        .encode();
+        answer_as_resource(&responder, &requester, &waiting_seen, own).await;
+        let reply = timeout(INTEROP_TIMEOUT, waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply, Value::from("own"));
+        requester.stop().await;
+        responder.stop().await;
+    }
+
     /// Every way a settled reply can fail to go out ends the same: the settlement is
     /// dropped unsent and the adapter says why, under the request's id.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
