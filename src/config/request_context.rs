@@ -1784,8 +1784,10 @@ impl RequestContext {
         if let Some(session) = i.session_mut(&mut self.session) {
             let _ = session.add_message(&i, INTERRUPTED_RESPONSE_TEXT);
         }
-        // The turn is already reporting an error; `Session::save` leaves
-        // the session dirty, so the final flush reports this one.
+        // The turn is already reporting an error, so this write's own
+        // failure is only logged. The session stays dirty: a root context
+        // retries it on its next flush, while a child's run ends here with
+        // no later flush.
         let _ = self.checkpoint_session_to_disk(app.dry_run);
     }
 

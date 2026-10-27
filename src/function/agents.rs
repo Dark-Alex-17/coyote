@@ -1167,10 +1167,16 @@ fn finish_child_meta(
     }
 }
 
-/// The one wording for a child whose task panicked, shared by the sidecar
-/// record and the error handed to the caller.
-fn panicked_task_error(error: &tokio::task::JoinError) -> String {
-    format!("agent task panicked: {error}")
+/// The one wording for a child whose task never returned a result, shared
+/// by the sidecar record and the error handed to the caller. A join error
+/// is either a panic or an abort of the task itself; the two are told apart
+/// so a sidecar does not report a panic that never happened.
+fn task_join_error(error: &tokio::task::JoinError) -> String {
+    if error.is_panic() {
+        format!("agent task panicked: {error}")
+    } else {
+        format!("agent task was aborted before it finished: {error}")
+    }
 }
 
 /// Pre-resolved `agent.completed`/`agent.interrupted`/`agent.failed`
@@ -1994,7 +2000,8 @@ fn launch_child_spawn(ctx: &mut RequestContext, spawn: Box<ChildSpawn>) -> Resul
     let registered = match ctx.supervisor.as_ref() {
         Some(supervisor) => supervisor.write().register(handle),
         None => Err(anyhow!("No supervisor active")),
-    };
+    }
+    .context("spawn refused");
     if let Err(error) = registered {
         // Aborted before the failed write so the orphan's own exit can
         // never overwrite it with completed/failed, fire result hooks, or
@@ -2200,7 +2207,7 @@ async fn handle_collect(ctx: &mut RequestContext, args: &Value) -> Result<Value>
                 // A panicked task never reached its own exit write, so the
                 // sidecar would otherwise keep saying running.
                 Err(e) => {
-                    let error = panicked_task_error(&e);
+                    let error = task_join_error(&e);
                     finish_child_meta(
                         child_session_root.as_deref(),
                         session_id.as_deref(),
@@ -2392,15 +2399,17 @@ async fn handle_cancel(ctx: &mut RequestContext, args: &Value) -> Result<Value> 
 
             let cleanup = tokio::time::timeout(Duration::from_secs(5), join_handle).await;
 
-            // A finished task that panicked never reached its own exit
-            // write, and this cancel consumes the handle, so the sidecar
-            // would otherwise say running for as long as this process lives.
-            if let (false, Ok(Err(join_error))) = (was_running, &cleanup) {
+            // A task that panicked, whether before this cancel or while
+            // tearing down after it, never reached its own exit write, and
+            // this cancel consumes the handle, so the panic is recorded here
+            // or nowhere. This overrides the cancelled record written above
+            // for a task that was still running.
+            if let Ok(Err(join_error)) = &cleanup {
                 finish_child_meta(
                     child_session_root.as_deref(),
                     session_id.as_deref(),
                     ChildStatus::Failed,
-                    Some(panicked_task_error(join_error)),
+                    Some(task_join_error(join_error)),
                 );
             }
 
