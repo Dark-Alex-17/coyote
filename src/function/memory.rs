@@ -86,11 +86,11 @@ pub fn memory_function_declarations() -> Vec<FunctionDeclaration> {
                         "type".to_string(),
                         JsonSchema {
                             type_value: Some("string".to_string()),
-                            description: Some(
-                                "Optional memory type: user | feedback | project | reference | \
-                                 run-state (run-state defaults `expires` to today + memory_run_state_ttl_days)"
-                                    .into(),
-                            ),
+                            description: Some(format!(
+                                "Optional memory type: {} (run-state defaults `expires` to \
+                                 today + memory_run_state_ttl_days)",
+                                MemoryKind::NAMES.join(" | ")
+                            )),
                             ..Default::default()
                         },
                     ),
@@ -347,35 +347,9 @@ pub fn handle_memory_tool(ctx: &mut RequestContext, cmd_name: &str, args: &Value
                 .get("include_stale")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let retention = if include_stale {
-                Retention::all()
-            } else {
-                Retention::live()
-            };
-            let files = store.list_files(retention)?;
-            let today = today_string();
-            let entries = files
-                .iter()
-                .map(|f| {
-                    let mut entry = json!({
-                        "name": f.frontmatter.name,
-                        "description": f.frontmatter.description,
-                        "type": f.frontmatter.kind.kind().name(),
-                        "char_len": f.char_len(),
-                        "path": f.path.display().to_string(),
-                    });
-                    if !f.frontmatter.kind.is_known() {
-                        entry["raw_type"] = serde_json::to_value(f.frontmatter.kind.raw_kind())?;
-                    }
-                    if include_stale && f.is_stale(&today) {
-                        entry["stale"] = Value::Bool(true);
-                    }
-                    Ok(entry)
-                })
-                .collect::<Result<Vec<_>>>()?;
 
             Ok(json!({
-                "files": entries,
+                "files": list_entries(&store, include_stale)?,
                 "global_index_exists": paths::global_memory_index_file().exists(),
                 "workspace": store.workspace.as_ref().map(workspace_label),
             }))
@@ -397,6 +371,36 @@ pub fn handle_memory_tool(ctx: &mut RequestContext, cmd_name: &str, args: &Value
         "lint" => lint_memory(&store),
         _ => bail!("unknown memory action: {action}"),
     }
+}
+
+fn list_entries(store: &MemoryStore, include_stale: bool) -> Result<Vec<Value>> {
+    let retention = if include_stale {
+        Retention::all()
+    } else {
+        Retention::live()
+    };
+    let today = today_string();
+    store
+        .list_files(retention)?
+        .iter()
+        .map(|f| {
+            let kind = &f.frontmatter.kind;
+            let mut entry = json!({
+                "name": f.frontmatter.name,
+                "description": f.frontmatter.description,
+                "type": kind.kind().name(),
+                "char_len": f.char_len(),
+                "path": f.path.display().to_string(),
+            });
+            if !kind.raw_kind().is_null() && !kind.is_known() {
+                entry["raw_type"] = serde_json::to_value(kind.raw_kind())?;
+            }
+            if include_stale && f.is_stale(&today) {
+                entry["stale"] = Value::Bool(true);
+            }
+            Ok(entry)
+        })
+        .collect()
 }
 
 fn write_memory(
@@ -433,7 +437,7 @@ fn write_memory(
         .map(String::from);
     let today = today_string();
     let expires = match (kind.kind(), expires) {
-        (MemoryKind::RunState, None) => Some(date_after_days(run_state_ttl_days)),
+        (MemoryKind::RunState, None) => Some(date_after_days(run_state_ttl_days)?),
         (_, expires) => expires,
     };
 
@@ -605,10 +609,16 @@ fn scope_dir(store: &MemoryStore, cwd: &Path, scope: &str) -> Result<PathBuf> {
     }
 }
 
-fn date_after_days(days: u32) -> String {
-    (Local::now().date_naive() + Days::new(u64::from(days)))
-        .format("%Y-%m-%d")
-        .to_string()
+fn date_after_days(days: u32) -> Result<String> {
+    Local::now()
+        .date_naive()
+        .checked_add_days(Days::new(u64::from(days)))
+        .map(|date| date.format("%Y-%m-%d").to_string())
+        .ok_or_else(|| {
+            anyhow!(
+                "memory_run_state_ttl_days {days} puts the expiry out of the supported date range"
+            )
+        })
 }
 
 fn other_index_paths(store: &MemoryStore, own_dir: &Path) -> Vec<PathBuf> {
@@ -639,7 +649,7 @@ fn write_memory_index(target_dir: &Path, content: &str) -> Result<PathBuf> {
 
 fn ensure_index_entry(index_path: &Path, name: &str, description: &str) -> Result<bool> {
     let existing = fs::read_to_string(index_path).unwrap_or_default();
-    if index_references(&existing, name) {
+    if existing.lines().any(|l| catalogue_slug(l) == Some(name)) {
         return Ok(false);
     }
 
@@ -665,10 +675,6 @@ fn line_references(line: &str, name: &str) -> bool {
     let file_name = format!("{name}.md");
     line.split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_' || c == '.'))
         .any(|token| token == file_name || token.trim_matches('.') == name)
-}
-
-fn index_references(index: &str, name: &str) -> bool {
-    index.lines().any(|line| line_references(line, name))
 }
 
 fn remove_index_entry(index_path: &Path, name: &str) -> Result<bool> {
@@ -1784,7 +1790,7 @@ mod tests {
         assert_eq!(saved.frontmatter.kind.kind(), MemoryKind::RunState);
         assert_eq!(
             saved.frontmatter.expires.as_deref(),
-            Some(date_after_days(3).as_str())
+            Some(date_after_days(3).unwrap().as_str())
         );
         assert!(saved.frontmatter.expires.as_deref() > Some(today_string().as_str()));
         let raw = fs::read_to_string(structured.join("scratch.md")).unwrap();
@@ -1843,6 +1849,119 @@ mod tests {
             assert!(text.contains(name), "{text} should list {name}");
         }
         assert!(!structured.join("fact.md").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn date_after_days_rejects_ttl_past_the_date_range() {
+        assert!(date_after_days(3).unwrap().as_str() > today_string().as_str());
+
+        let err = date_after_days(u32::MAX).unwrap_err().to_string();
+        assert!(
+            err.contains("memory_run_state_ttl_days 4294967295")
+                && err.contains("out of the supported date range"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn write_declaration_lists_every_memory_kind() {
+        let declarations = memory_function_declarations();
+        let write = declarations
+            .iter()
+            .find(|d| d.name == "memory__write")
+            .unwrap();
+        let description = write.parameters.properties.as_ref().unwrap()["type"]
+            .description
+            .as_deref()
+            .unwrap();
+
+        for name in MemoryKind::NAMES {
+            assert!(description.contains(name), "{description}");
+        }
+        assert!(
+            description.contains("user | feedback | project | reference | run-state"),
+            "{description}"
+        );
+    }
+
+    #[test]
+    fn write_memory_catalogues_a_slug_only_cited_mid_sentence() {
+        let root = temp_root("write_cited_slug");
+        let (store, workspace, structured) = workspace_store(
+            &root,
+            "# Index\n\n## FACTS\n- Always run tests before [[cited]] lands\n",
+        );
+
+        let args = json!({
+            "name": "cited",
+            "description": "what cited means",
+            "content": "x",
+            "scope": "workspace",
+        });
+        let result = write_memory(&store, &workspace, &args, 3).unwrap();
+        assert_eq!(result["index_updated"], true);
+        let index = fs::read_to_string(structured.join("MEMORY.md")).unwrap();
+        assert!(index.contains("- Always run tests before [[cited]] lands\n"));
+        assert!(index.contains("- [[cited]]: what cited means\n"), "{index}");
+
+        let report = lint_memory(&store).unwrap();
+        assert!(report["orphans"].as_array().unwrap().is_empty(), "{report}");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn list_entries_reports_types_and_hides_stale_by_default() {
+        let root = temp_root("list_entries");
+        let (store, _, structured) = workspace_store(
+            &root,
+            "- [[known]]: k\n- [[odd]]: o\n- [[untyped]]: u\n- [[bygone]]: b\n",
+        );
+        fs::write(
+            structured.join("known.md"),
+            "---\nname: known\ntype: user\n---\nx\n",
+        )
+        .unwrap();
+        fs::write(
+            structured.join("odd.md"),
+            "---\nname: odd\ntype: gotcha\n---\nx\n",
+        )
+        .unwrap();
+        fs::write(
+            structured.join("untyped.md"),
+            "---\nname: untyped\n---\nx\n",
+        )
+        .unwrap();
+        fs::write(
+            structured.join("bygone.md"),
+            "---\nname: bygone\nexpires: 2000-01-01\n---\nx\n",
+        )
+        .unwrap();
+
+        let by_name = |entries: Vec<Value>| -> IndexMap<String, Value> {
+            entries
+                .into_iter()
+                .map(|e| (e["name"].as_str().unwrap().to_string(), e))
+                .collect()
+        };
+
+        let live = by_name(list_entries(&store, false).unwrap());
+        assert_eq!(live.len(), 3, "{live:?}");
+        assert!(!live.contains_key("bygone"));
+        assert_eq!(live["known"]["type"], "user");
+        assert!(live["known"].get("raw_type").is_none());
+        assert_eq!(live["odd"]["type"], "reference");
+        assert_eq!(live["odd"]["raw_type"], "gotcha");
+        assert_eq!(live["untyped"]["type"], "reference");
+        assert!(live["untyped"].get("raw_type").is_none());
+        assert!(live.values().all(|e| e.get("stale").is_none()));
+
+        let all = by_name(list_entries(&store, true).unwrap());
+        assert_eq!(all.len(), 4, "{all:?}");
+        assert_eq!(all["bygone"]["stale"], true);
+        assert!(all["known"].get("stale").is_none());
 
         let _ = fs::remove_dir_all(&root);
     }
