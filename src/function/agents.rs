@@ -11065,4 +11065,204 @@ mod tests {
         assert_eq!(ctx.pending_tasks_guardrail_count, 0);
         assert!(!ctx.supervisor.as_ref().unwrap().read().has_job("job_1"));
     }
+
+    /// Masks every digit so two panic records differing only in tokio's
+    /// task id compare as one wording.
+    fn digits_masked(text: &str) -> String {
+        text.chars()
+            .map(|c| if c.is_ascii_digit() { '#' } else { c })
+            .collect()
+    }
+
+    /// Both reclaim paths that can observe a panic agree: the sidecar a
+    /// collect writes, the error that collect hands back, and the sidecar
+    /// a cancel of the already-finished task writes carry one wording for
+    /// one panic, and both land on the root captured at spawn after the
+    /// spawner has left its session, where no other writer can reach.
+    #[test]
+    #[serial]
+    fn usage_probe_both_reclaim_paths_record_one_panic_wording_on_the_spawn_root() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_probe_panic_wording");
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let (collect_id, collect_sid, collect_root) =
+            seat_for_a_hand_built_handle(&mut ctx, &agent_name);
+        let (cancel_id, cancel_sid, cancel_root) =
+            seat_for_a_hand_built_handle(&mut ctx, &agent_name);
+        assert_eq!(*collect_root, *cancel_root, "one spawner, one root");
+        let spawn_root = Arc::clone(&collect_root);
+
+        let (collect_error, cancelled) = run_async(async {
+            let collect_task = tokio::spawn(async { panic!("probe payload 42") });
+            let cancel_task = tokio::spawn(async { panic!("probe payload 42") });
+            while !(collect_task.is_finished() && cancel_task.is_finished()) {
+                tokio::task::yield_now().await;
+            }
+            register_hand_built_handle(
+                &mut ctx,
+                &collect_id,
+                &agent_name,
+                &collect_sid,
+                collect_root,
+                create_abort_signal(),
+                collect_task,
+            );
+            register_hand_built_handle(
+                &mut ctx,
+                &cancel_id,
+                &agent_name,
+                &cancel_sid,
+                cancel_root,
+                create_abort_signal(),
+                cancel_task,
+            );
+            // The spawner leaves the session its children were seated
+            // under before either is reclaimed.
+            ctx.child_session_root = None;
+            let collect_error = handle_collect(&mut ctx, &json!({"id": collect_id}))
+                .await
+                .expect_err("a panicked task is a failed collect");
+            let cancelled = handle_cancel(&mut ctx, &json!({"id": cancel_id}))
+                .await
+                .unwrap();
+            (format!("{collect_error:#}"), cancelled)
+        });
+
+        assert!(ctx.child_session_root.is_none());
+        assert_eq!(cancelled["status"], "ok", "{cancelled}");
+        let collected: ChildMeta = read_yaml(&spawn_root.child_meta_file(&collect_sid));
+        let cancelled_meta: ChildMeta = read_yaml(&spawn_root.child_meta_file(&cancel_sid));
+        assert_eq!(collected.status, ChildStatus::Failed, "{collected:?}");
+        assert_eq!(
+            cancelled_meta.status,
+            ChildStatus::Failed,
+            "{cancelled_meta:?}"
+        );
+        let collect_wording = collected
+            .error
+            .clone()
+            .expect("the collect records the panic");
+        let cancel_wording = cancelled_meta
+            .error
+            .clone()
+            .expect("the cancel records the panic");
+        assert!(
+            collect_wording.contains("probe payload 42"),
+            "{collect_wording}"
+        );
+        assert_eq!(
+            collect_error, collect_wording,
+            "the collect hands back the words it recorded"
+        );
+        assert_eq!(
+            digits_masked(&collect_wording),
+            digits_masked(&cancel_wording),
+            "one wording across both reclaim paths"
+        );
+    }
+
+    /// An agent whose name spells a parent directory is refused with the
+    /// one sentence before anything is minted: the cache holds no session
+    /// root at all afterwards. The same name runs once the agent turns
+    /// child sessions off, and still seats nothing.
+    #[test]
+    #[serial]
+    fn usage_probe_a_dotted_agent_name_is_refused_before_any_root_is_minted() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("probe..dots");
+        assert!(
+            agent_name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')),
+            "every character is legal on its own; only the '..' rule fires: {agent_name}"
+        );
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+
+        let error = resume_error(&mut ctx, json!({"agent": agent_name, "prompt": "hi"}));
+
+        assert_eq!(
+            error,
+            format!(
+                "agent '{agent_name}' cannot run under a child session: the name must match [A-Za-z0-9_.-]+ and may not contain '..' (set child_sessions: false for it or rename the agent directory)"
+            )
+        );
+        assert!(ctx.child_session_root.is_none());
+        let sessions = _guard.cache_root.join("sessions");
+        assert!(
+            !sessions.exists(),
+            "a refused spawn mints no root: {}",
+            sessions.display()
+        );
+
+        let off_name = unique_agent_name("probe..off");
+        write_config_agent_with_setting(&off_name, "child_sessions: false");
+        let spawn = build_ready_spawn(&mut ctx, json!({"agent": off_name, "prompt": "hi"}));
+        assert_eq!(spawn.session_id, None);
+        assert!(spawn.child_ctx.session.is_none());
+        let mut pending = vec![sessions.clone()];
+        let mut seated = Vec::new();
+        while let Some(dir) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("sess_"))
+                {
+                    seated.push(path);
+                }
+            }
+        }
+        assert!(
+            seated.is_empty(),
+            "an unseated spawn writes no child file: {seated:?}"
+        );
+    }
+
+    /// Through the real launch path: a child whose abort already reads
+    /// ctrl-c when its task runs ends with the sidecar saying cancelled and
+    /// exactly one `agent.interrupted`, never `agent.completed` or
+    /// `agent.failed`, whatever its run returned.
+    #[test]
+    #[serial]
+    fn usage_probe_a_ctrlc_child_lands_cancelled_and_interrupted_through_the_launch_path() {
+        let _guard = TestConfigDirGuard::new();
+        let _sink = hooks::test_sink::install();
+        let agent_name = unique_agent_name("test_probe_ctrlc_launch");
+        write_config_agent_with_result_hooks(&agent_name, "probe_ctrlc_launch");
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let spawn = build_ready_spawn(&mut ctx, json!({"agent": agent_name, "prompt": "hi"}));
+        let sid = spawn
+            .session_id
+            .clone()
+            .expect("a seated child has a session id");
+        let agent_id = spawn.agent_id.clone();
+        spawn.child_abort.set_ctrlc();
+
+        let result = run_async(launch_and_reclaim(&mut ctx, spawn));
+
+        assert_eq!(result.id, agent_id);
+        assert_eq!(result.session_id.as_deref(), Some(sid.as_str()));
+        let meta = child_meta_of(&ctx, &sid);
+        assert_eq!(meta.status, ChildStatus::Cancelled, "{meta:?}");
+        assert!(meta.error.is_none(), "{meta:?}");
+        let interrupted = hook_captures_named("probe_ctrlc_launch_interrupted");
+        assert_eq!(interrupted.len(), 1, "{interrupted:?}");
+        assert_eq!(interrupted[0].envs["COYOTE_EVENT"], "agent.interrupted");
+        assert_eq!(interrupted[0].envs["COYOTE_AGENT_ID"], agent_id);
+        assert_session_envs(&interrupted[0], &sid);
+        assert!(
+            !interrupted[0].envs.contains_key("COYOTE_AGENT_ERROR"),
+            "{interrupted:?}"
+        );
+        assert!(hook_captures_named("probe_ctrlc_launch_completed").is_empty());
+        assert!(hook_captures_named("probe_ctrlc_launch_failed").is_empty());
+    }
 }

@@ -26,8 +26,9 @@ impl ProcessStamp {
     /// the pid was reused by an unrelated process. A stamp recorded with
     /// `start` 0 (sysinfo could not list the own process at spawn) reads as
     /// dead unless sysinfo later lists that pid with a start time of 0 as
-    /// well, so such a child is listed as crashed; callers that would act
-    /// on the stamp treat a `start` of 0 as unknown rather than dead.
+    /// well, so such a child is listed as crashed. Resuming a child treats
+    /// a `start` of 0 as unknown and refuses; the orphan sweep still reads
+    /// it as dead.
     pub(crate) fn is_alive(&self) -> bool {
         lookup_start_time(self.pid) == Some(self.start)
     }
