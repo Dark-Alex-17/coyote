@@ -354,7 +354,9 @@ const VERIFY_SCRIPTS: [VerifyScript; 4] = [
         cmd_env: "TEST_CMD",
         ok_key: "tests_ok",
         output_key: "tests_output",
-        success_next: "edge_case_sweep",
+        // A green test run routes through the deterministic debt_scan node, which
+        // then falls through to edge_case_sweep.
+        success_next: "debt_scan",
     },
 ];
 

@@ -77,12 +77,13 @@ fn sisyphus_prompt_pins_debris_rules() {
         &[
             "### Debt and decisions after a coder returns",
             "- Leave a same-line owning-task comment on every debt marker",
-            "derive the list from its diff:",
+            "derive the list with the `debt_scan` tool",
+            "`DEBT_SCAN_FAILED`, run the manual fallback it quotes",
+            "with the `fs_grep` tool as it describes",
             "A `debris` lane blocker",
             "the lint's `debris-exempt` token",
             "under a `Debt left behind:` heading",
             "a `Debris exemptions:` heading",
-            "grep -nE '^\\+.*(#!?\\[(allow|expect)\\(|cfg_attr\\(|todo!|unimplemented!|#\\[ignore)'",
         ],
     );
     assert!(
@@ -485,17 +486,58 @@ fn every_banned_glyph_sentence_names_every_glyph_family_the_debris_lint_reports(
 /// with is one regex, byte for byte, and the shared lint's `DEBT_MARKERS`
 /// spares task ids on the same markers it names.
 #[test]
-fn debt_grep_regex_is_byte_identical_in_sisyphus_step_runner_and_debris_markers() {
-    const DEBT_GREP: &str =
+/// The debt-marker regex has ONE home: `MARKER_RE` in the shared `debt_scan.py`.
+/// Its two fallback copies - the manual pipeline the scanner quotes on
+/// `DEBT_SCAN_FAILED` and the step-runner graph's initial-state default (what
+/// the sweep node sees if the scan node crash-forwards) - must carry the same
+/// alternation after their own escaping is undone, no prompt may keep a third
+/// copy, and every `DEBT_MARKERS` entry of the debris lint must be matched.
+fn debt_grep_regex_has_one_home_in_debt_scan_and_its_fallbacks_match_the_debris_markers() {
+    const ALTERNATION: &str = r"(#!?\[(allow|expect)\(|cfg_attr\(|todo!|unimplemented!|#\[ignore)";
+    const GREP_TAIL: &str =
         r"grep -nE '^\+.*(#!?\[(allow|expect)\(|cfg_attr\(|todo!|unimplemented!|#\[ignore)'";
-    for rel in ["sisyphus/instructions.md", "step-runner/graph.yaml"] {
-        let text = agent_file(rel);
-        assert_eq!(
-            text.matches(DEBT_GREP).count(),
-            1,
-            "{rel} must carry the debt grep exactly once, byte-identical"
-        );
-    }
+
+    let scanner = agent_file(".shared/debt_scan.py");
+    let marker_re = scanner
+        .split("MARKER_RE = re.compile(r\"")
+        .nth(1)
+        .and_then(|rest| rest.split("\")").next())
+        .expect("debt_scan.py compiles MARKER_RE from a raw string");
+    assert_eq!(marker_re, ALTERNATION, "MARKER_RE drifted");
+
+    // The quoted manual pipeline is a tuple of adjacent normal Python string
+    // literals: join the quoted segments, then `\\` in source is `\`.
+    let pipeline: String = scanner
+        .split("MANUAL_PIPELINE = (")
+        .nth(1)
+        .and_then(|rest| rest.split("\n)\n").next())
+        .expect("debt_scan.py defines MANUAL_PIPELINE")
+        .split('"')
+        .enumerate()
+        .filter_map(|(i, seg)| (i % 2 == 1).then_some(seg))
+        .collect::<String>()
+        .replace("\\\\", "\\");
+    assert!(
+        pipeline.contains(GREP_TAIL),
+        "the quoted manual pipeline lost the grep: {pipeline}"
+    );
+    assert!(
+        pipeline.contains("ls-files --others --exclude-standard -z | xargs -0 -r git add -N -- ")
+            && pipeline.contains("git diff --no-color --no-ext-diff <base> | "),
+        "the quoted manual pipeline lost its add -N feed or diff flags: {pipeline}"
+    );
+
+    // The graph default is a YAML single-quoted scalar: `''` in source is `'`.
+    let graph = agent_file("step-runner/graph.yaml").replace("''", "'");
+    assert_eq!(
+        graph.matches(GREP_TAIL).count(),
+        1,
+        "step-runner graph must carry the fallback grep exactly once (the initial-state default)"
+    );
+    assert!(
+        !agent_file("sisyphus/instructions.md").contains("grep -nE"),
+        "sisyphus prose must not keep its own copy of the debt grep - the tool owns it"
+    );
 
     let shared = agent_file(".shared/debris.py");
     let markers = shared
@@ -781,6 +823,38 @@ fn git(repo: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+/// Runs the shared debt scanner the way both sweep twins do (`--dir <repo>
+/// --base <base>`), from `cwd`, with git's global/system config disabled so
+/// only the scratch repo's own config shapes the diff. Returns (exit code,
+/// stdout, stderr).
+#[cfg(unix)]
+fn debt_scan_full(cwd: &Path, repo: &Path, base: &str) -> (Option<i32>, String, String) {
+    let scanner =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared/debt_scan.py");
+    let out = Command::new("python3")
+        .arg(&scanner)
+        .arg("--dir")
+        .arg(repo)
+        .arg("--base")
+        .arg(base)
+        .current_dir(cwd)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+#[cfg(unix)]
+fn debt_scan(cwd: &Path, repo: &Path, base: &str) -> (Option<i32>, String) {
+    let (code, out, _) = debt_scan_full(cwd, repo, base);
+    (code, out)
+}
+
 /// The architect's Phase F recipes are pinned as text above; this runs them.
 /// The `<plans rel>` one-liner must answer relative to the repo top (not the
 /// project dir), through symlinked prefixes, and yield `.`/`..` exactly when
@@ -1003,13 +1077,14 @@ fn usage_probe_architect_plans_rel_recipe_and_anchored_sweeps_hold_on_a_scratch_
 /// Sisyphus twin must read the same hits from the same tree.
 #[cfg(unix)]
 #[test]
-fn usage_probe_step_runner_debt_grep_recipe_reads_the_coders_new_files_on_a_scratch_repo() {
+fn usage_probe_step_runner_debt_scan_reads_the_coders_new_files_on_a_scratch_repo() {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root = std::env::temp_dir().join(format!("coyote-debris-debt-grep-{unique}"));
+    let root = std::env::temp_dir().join(format!("coyote-debris-debt-scan-{unique}"));
     let _guard = ScratchDir(root.clone());
+    fs::create_dir_all(&root).unwrap();
 
     let markers: Vec<String> = agent_file(".shared/debris.py")
         .split("DEBT_MARKERS = (")
@@ -1026,25 +1101,18 @@ fn usage_probe_step_runner_debt_grep_recipe_reads_the_coders_new_files_on_a_scra
         .collect();
     assert_eq!(markers.len(), 8, "{markers:?}");
 
-    let recipe = agent_quoted_command(
-        "step-runner/graph.yaml",
-        "ls-files --others --exclude-standard -z | xargs -0 -r git -C {{project_dir}} add -N --",
-    );
-    for token in [
-        "git -C {{project_dir}} ls-files --others --exclude-standard -z | xargs -0 -r git -C {{project_dir}} add -N -- && ",
-        "git -C {{project_dir}} diff --no-color --no-ext-diff <base, normally HEAD> | grep -nE '",
-    ] {
-        assert!(recipe.contains(token), "recipe lost {token:?}: {recipe}");
-    }
-    let twin = agent_quoted_command(
-        "sisyphus/instructions.md",
-        "ls-files --others --exclude-standard -z | xargs -0 -r git add -N --",
-    );
+    // Both sweep twins call the same shared scanner: the step-runner graph
+    // through its script node (a shim over the shared module), Sisyphus
+    // through its `debt_scan` tool. Pin the wiring, then run the module.
+    let shim = agent_file("step-runner/scripts/debt_scan.py");
     assert!(
-        twin.starts_with(
-            "git ls-files --others --exclude-standard -z | xargs -0 -r git add -N -- && git diff --no-color --no-ext-diff <base> | grep -nE '"
-        ),
-        "{twin}"
+        shim.contains(".shared") && shim.contains("debt_scan"),
+        "the step-runner shim must load the shared scanner: {shim}"
+    );
+    let tools = agent_file("sisyphus/tools.sh");
+    assert!(
+        tools.contains("agents/.shared/debt_scan.py"),
+        "sisyphus tools.sh must invoke the shared scanner: {tools}"
     );
 
     let make_repo = |name: &str| -> (std::path::PathBuf, String) {
@@ -1062,20 +1130,26 @@ fn usage_probe_step_runner_debt_grep_recipe_reads_the_coders_new_files_on_a_scra
         let base = git(&repo, &["rev-parse", "HEAD"]);
         (repo, base)
     };
-    let step_runner = |repo: &Path, base: &str| -> std::process::Output {
-        let cmd = recipe
-            .replace("{{project_dir}}", &repo.display().to_string())
-            .replace("<base, normally HEAD>", base);
-        sh(&root, &cmd)
-    };
 
     // --- a step that created three files and edited a tracked one ---
     let (repo, base) = make_repo("hits");
     fs::write(repo.join("src/new.rs"), "#[allow(dead_code)]\nfn a() {}\n").unwrap();
-    let planted: Vec<String> = markers.iter().map(|m| format!("{m}x")).collect();
+    // One line per DEBT_MARKERS entry. `cfg_attr(` is debt only when it carries
+    // allow/expect, so its planted line is the predicate form; a BARE one goes
+    // in as the final line and must NOT be a hit.
+    let planted: Vec<String> = markers
+        .iter()
+        .map(|m| match m.as_str() {
+            "cfg_attr(" => "#[cfg_attr(not(test), allow(x".to_string(),
+            other => format!("{other}x"),
+        })
+        .collect();
     fs::write(
         repo.join("src/more.rs"),
-        format!("{}\nfn clean() {{}}\n", planted.join("\n")),
+        format!(
+            "{}\nfn clean() {{}}\n#[cfg_attr(test, derive(Debug))] // bare, not debt\n",
+            planted.join("\n")
+        ),
     )
     .unwrap();
     fs::write(repo.join("src/lib.rs"), "fn tracked() {}\nfn edited() {}\n").unwrap();
@@ -1086,34 +1160,32 @@ fn usage_probe_step_runner_debt_grep_recipe_reads_the_coders_new_files_on_a_scra
     .unwrap();
     fs::write(repo.join("scratch.log"), "todo!() left by a tool\n").unwrap();
 
-    // Without the `ls-files | xargs add -N` prefix the untracked files are
-    // invisible to the diff.
-    let bare = recipe
-        .split(" && ")
-        .nth(1)
-        .unwrap()
-        .replace("{{project_dir}}", &repo.display().to_string())
-        .replace("<base, normally HEAD>", &base);
-    let blind = sh(&root, &bare);
-    assert_eq!(blind.status.code(), Some(1), "{blind:?}");
+    let (code, text) = debt_scan(&root, &repo, &base);
+    assert_eq!(code, Some(0), "{text}");
     assert!(
-        blind.stdout.is_empty(),
-        "`git diff <base>` alone never sees untracked files, so `add -N` is load-bearing: {blind:?}"
+        text.starts_with(&format!("Debt scan (diff base: {base}): ")),
+        "{text}"
     );
-
-    let out = step_runner(&repo, &base);
-    assert_eq!(out.status.code(), Some(0), "{out:?}");
-    let text = String::from_utf8_lossy(&out.stdout).to_string();
-    assert!(text.contains(":+#[allow(dead_code)]"), "{text}");
-    for line in &planted {
+    let hits: Vec<&str> = text.lines().skip(1).collect();
+    assert!(
+        hits.iter()
+            .any(|h| h.starts_with("src/new.rs:1 -- #[allow(dead_code)]")),
+        "a created file is swept with its REAL position: {text}"
+    );
+    for (i, line) in planted.iter().enumerate() {
         assert!(
-            text.contains(&format!(":+{line}")),
-            "DEBT_MARKERS entry {line:?} is not matched by the grep: {text}"
+            hits.iter()
+                .any(|h| *h == format!("src/more.rs:{} -- {line}", i + 1)),
+            "DEBT_MARKERS entry {line:?} is not matched by the scanner at its real line: {text}"
         );
     }
     assert!(
         !text.contains("fn clean"),
         "a clean added line is not a hit: {text}"
+    );
+    assert!(
+        !text.contains("bare, not debt"),
+        "a bare cfg_attr( without allow|expect is not debt: {text}"
     );
     assert!(!text.contains("fn edited"), "{text}");
     assert!(
@@ -1121,20 +1193,21 @@ fn usage_probe_step_runner_debt_grep_recipe_reads_the_coders_new_files_on_a_scra
         "only ADDED lines are debt; a marker the step removed is not a hit: {text}"
     );
     assert!(
-        text.contains("the coder never mentioned"),
-        "a created file the coder did not list is still swept: {text}"
+        text.contains("src/stray.rs:1 -- todo!() // in a file the coder never mentioned"),
+        "a created file the coder did not list is still swept (the add -N feed is load-bearing): {text}"
     );
     assert_eq!(
-        text.lines().count(),
+        hits.len(),
         2 + planted.len(),
         "one hit per marker line, nothing else: {text}"
     );
     assert!(
-        text.lines().all(|l| l
-            .split(':')
-            .next()
-            .is_some_and(|n| n.parse::<u32>().is_ok())),
-        "`-n` numbers every hit: {text}"
+        hits.iter().all(|h| {
+            let (loc, _) = h.split_once(" -- ").unwrap_or(("", ""));
+            loc.rsplit_once(':')
+                .is_some_and(|(_, n)| n.parse::<u32>().is_ok())
+        }),
+        "every hit is `<file>:<line> -- <text>` with a numeric line: {text}"
     );
     // The .gitignore'd artefact stays ignored and its marker unseen.
     assert!(!text.contains("left by a tool"), "{text}");
@@ -1152,32 +1225,27 @@ fn usage_probe_step_runner_debt_grep_recipe_reads_the_coders_new_files_on_a_scra
         "every created file carries an intent-to-add entry: {status}"
     );
 
-    // Sisyphus runs its twin from inside the repo: same hits, same order.
-    let twin_cmd = twin.replace("<base>", &base);
-    let twin_out = sh(&repo, &twin_cmd);
-    assert_eq!(twin_out.status.code(), Some(0), "{twin_out:?}");
-    assert_eq!(
-        String::from_utf8_lossy(&twin_out.stdout),
-        text,
-        "sisyphus twin diverges"
-    );
+    // Sisyphus runs the same scanner from inside the repo (`--dir .`): same
+    // hits, same order, and a second run is idempotent.
+    let (twin_code, twin_text) = debt_scan(&repo, Path::new("."), &base);
+    assert_eq!(twin_code, Some(0), "{twin_text}");
+    assert_eq!(twin_text, text, "in-repo invocation diverges");
 
     // A repo whose local config forces colour: `--no-color` keeps the escape
-    // sequences out of the stream the grep anchors on, so the hit is found.
+    // sequences out of the stream the scanner parses, so the hits are found.
     git(&repo, &["config", "color.diff", "always"]);
-    let out = step_runner(&repo, &base);
-    assert_eq!(out.status.code(), Some(0), "{out:?}");
-    let coloured_repo_text = String::from_utf8_lossy(&out.stdout).to_string();
+    let (code, coloured_repo_text) = debt_scan(&root, &repo, &base);
+    assert_eq!(code, Some(0), "{coloured_repo_text}");
     assert!(
         !coloured_repo_text.contains("\x1b["),
-        "colour escapes reached the grep: {coloured_repo_text:?}"
+        "colour escapes reached the scanner: {coloured_repo_text:?}"
     );
     assert_eq!(
         coloured_repo_text, text,
         "`color.diff always` must not change the hits"
     );
 
-    // --- a clean step: no created files, one clean edit -> silence, exit 1 ---
+    // --- a clean step: no created files, one clean edit -> the clean sentinel ---
     let (clean_repo, clean_base) = make_repo("clean");
     fs::write(
         clean_repo.join("src/lib.rs"),
@@ -1189,13 +1257,13 @@ fn usage_probe_step_runner_debt_grep_recipe_reads_the_coders_new_files_on_a_scra
         "// a new file with nothing to own\nfn fresh() {}\n",
     )
     .unwrap();
-    let out = step_runner(&clean_repo, &clean_base);
+    let (code, text) = debt_scan(&root, &clean_repo, &clean_base);
+    assert_eq!(code, Some(0), "{text}");
     assert_eq!(
-        out.status.code(),
-        Some(1),
-        "grep's no-match exit is the clean signal: {out:?}"
+        text.trim(),
+        format!("Debt scan (diff base: {clean_base}): no hits (clean)"),
+        "the clean sentinel is the whole report: {text}"
     );
-    assert!(out.stdout.is_empty(), "no output means no debt: {out:?}");
 }
 
 /// The debt grep's `ls-files --others --exclude-standard -z | xargs -0 -r
@@ -1209,22 +1277,15 @@ fn usage_probe_step_runner_debt_grep_recipe_reads_the_coders_new_files_on_a_scra
 /// in the index, so in `git diff <base>` without `add -N`).
 #[cfg(unix)]
 #[test]
-fn usage_probe_step_runner_debt_grep_recipe_edges_new_dirs_odd_names_no_new_files_and_ignore_sources()
- {
+fn usage_probe_step_runner_debt_scan_edges_new_dirs_odd_names_no_new_files_and_ignore_sources() {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root = std::env::temp_dir().join(format!("coyote-debris-debt-grep-edges-{unique}"));
+    let root = std::env::temp_dir().join(format!("coyote-debris-debt-scan-edges-{unique}"));
     let _guard = ScratchDir(root.clone());
+    fs::create_dir_all(&root).unwrap();
 
-    let recipe = agent_quoted_command(
-        "step-runner/graph.yaml",
-        // Anchored on the diff half so a drift in the `ls-files | xargs add -N`
-        // feed is caught by the scenarios below rather than by the scrape.
-        "git -C {{project_dir}} diff --no-color --no-ext-diff <base, normally HEAD> | grep -nE '",
-    );
-    assert!(recipe.contains("add -N"), "{recipe}");
     let make_repo = |name: &str| -> (std::path::PathBuf, String) {
         let repo = root.join(name);
         fs::create_dir_all(repo.join("src")).unwrap();
@@ -1236,19 +1297,13 @@ fn usage_probe_step_runner_debt_grep_recipe_edges_new_dirs_odd_names_no_new_file
         let base = git(&repo, &["rev-parse", "HEAD"]);
         (repo, base)
     };
-    let sweep = |repo: &Path, base: &str| -> (Option<i32>, String) {
-        let cmd = recipe
-            .replace("{{project_dir}}", &repo.display().to_string())
-            .replace("<base, normally HEAD>", base);
-        let out = sh(&root, &cmd);
-        (
-            out.status.code(),
-            String::from_utf8_lossy(&out.stdout).to_string(),
-        )
+    let sweep = |repo: &Path, base: &str| -> (Option<i32>, String, String) {
+        debt_scan_full(&root, repo, base)
     };
 
     // A new file two directories deep, one with a space in its name and one
-    // with non-ASCII bytes: all three are swept, each exactly once.
+    // with non-ASCII bytes: all three are swept, each exactly once, and the
+    // hit names the LITERAL path (no octal-escaped quoting).
     let (repo, base) = make_repo("names");
     fs::create_dir_all(repo.join("src/deep/er")).unwrap();
     fs::write(
@@ -1262,13 +1317,21 @@ fn usage_probe_step_runner_debt_grep_recipe_edges_new_dirs_odd_names_no_new_file
         "unimplemented!() // unicode name\n",
     )
     .unwrap();
-    let (code, text) = sweep(&repo, &base);
+    let (code, text, _) = sweep(&repo, &base);
     assert_eq!(code, Some(0), "{text}");
-    for hit in ["// deep", "// spaced", "// unicode name"] {
+    for (path, hit) in [
+        ("src/deep/er/x.rs:1", "// deep"),
+        ("src/my file.rs:1", "// spaced"),
+        ("src/\u{fc}n\u{ef}code.rs:1", "// unicode name"),
+    ] {
         assert_eq!(
             text.matches(hit).count(),
             1,
             "a created file is swept once whatever its path looks like ({hit}): {text}"
+        );
+        assert!(
+            text.contains(&format!("{path} -- ")),
+            "the hit names the literal path {path:?}: {text}"
         );
     }
     let status = git(&repo, &["status", "--porcelain"]);
@@ -1281,39 +1344,40 @@ fn usage_probe_step_runner_debt_grep_recipe_edges_new_dirs_odd_names_no_new_file
         "every created file carries exactly one intent-to-add entry: {status}"
     );
 
-    // A step that created no file but edited a tracked one: the `-r` leaves
-    // `git add -N --` unrun (no "Nothing specified" noise, no failure) and
-    // the diff still carries the tracked edit's marker.
+    // A step that created no file but edited a tracked one: no `add -N` runs
+    // (nothing untracked, no noise on stderr) and the tracked edit's marker is
+    // still swept.
     let (repo, base) = make_repo("no-new-files");
     fs::write(
         repo.join("src/lib.rs"),
         "fn tracked() {}\n#![allow(unused)] // tracked edit\n",
     )
     .unwrap();
-    let cmd = recipe
-        .replace("{{project_dir}}", &repo.display().to_string())
-        .replace("<base, normally HEAD>", &base);
-    let out = sh(&root, &cmd);
-    let text = String::from_utf8_lossy(&out.stdout).to_string();
-    let err = String::from_utf8_lossy(&out.stderr).to_string();
-    assert_eq!(out.status.code(), Some(0), "{out:?}");
-    assert!(text.contains("// tracked edit"), "{text}");
+    let (code, text, err) = sweep(&repo, &base);
+    assert_eq!(code, Some(0), "{text}");
+    assert!(
+        text.contains("src/lib.rs:2 -- #![allow(unused)] // tracked edit"),
+        "{text}"
+    );
     assert!(
         err.is_empty(),
-        "with nothing untracked the add -N half must stay silent: {err}"
+        "with nothing untracked the scanner must stay silent on stderr: {err}"
     );
 
     // Artefacts ignored through `.git/info/exclude` and through an ignored
-    // directory are neither added nor swept; the step reads clean (exit 1).
+    // directory are neither added nor swept; the step reads clean.
     let (repo, base) = make_repo("ignore-sources");
     fs::write(repo.join(".git/info/exclude"), "scratch.rs\n").unwrap();
     fs::write(repo.join("scratch.rs"), "todo!() // info/exclude\n").unwrap();
     fs::create_dir_all(repo.join("target")).unwrap();
     fs::write(repo.join("target/gen.rs"), "todo!() // ignored dir\n").unwrap();
     fs::write(repo.join("src/fresh.rs"), "fn fresh() {}\n").unwrap();
-    let (code, text) = sweep(&repo, &base);
-    assert_eq!(code, Some(1), "{text}");
-    assert!(text.is_empty(), "ignored artefacts are not debt: {text}");
+    let (code, text, _) = sweep(&repo, &base);
+    assert_eq!(code, Some(0), "{text}");
+    assert!(
+        text.trim().ends_with("no hits (clean)"),
+        "ignored artefacts are not debt: {text}"
+    );
     let status = git(&repo, &["status", "--porcelain", "--ignored"]);
     let rows: Vec<&str> = status.lines().map(str::trim_start).collect();
     assert!(rows.contains(&"!! scratch.rs"), "{status}");
@@ -1329,9 +1393,46 @@ fn usage_probe_step_runner_debt_grep_recipe_edges_new_dirs_odd_names_no_new_file
     )
     .unwrap();
     git(&repo, &["add", "src/staged.rs"]);
-    let (code, text) = sweep(&repo, &base);
+    let (code, text, _) = sweep(&repo, &base);
     assert_eq!(code, Some(0), "{text}");
-    assert!(text.contains("// staged"), "{text}");
+    assert!(
+        text.contains("src/staged.rs:1 -- #[ignore] // staged"),
+        "{text}"
+    );
+
+    // A bare `cfg_attr(` with neither allow nor expect is not debt; the
+    // predicate form carrying allow is.
+    let (repo, base) = make_repo("cfg-attr");
+    fs::write(
+        repo.join("src/lib.rs"),
+        "fn tracked() {}\n#[cfg_attr(test, derive(Debug))] // bare\n#[cfg_attr(not(test), allow(dead_code))] // predicate allow\n",
+    )
+    .unwrap();
+    let (code, text, _) = sweep(&repo, &base);
+    assert_eq!(code, Some(0), "{text}");
+    assert!(
+        !text.contains("// bare"),
+        "a bare cfg_attr is not debt: {text}"
+    );
+    assert!(text.contains("// predicate allow"), "{text}");
+
+    // A repo that is not a git checkout fails OPEN: the report starts with the
+    // sentinel and quotes the manual pipeline for the model to run itself.
+    let plain = root.join("not-a-repo");
+    fs::create_dir_all(&plain).unwrap();
+    let (code, text, _) = sweep(&plain, "HEAD");
+    assert_eq!(
+        code,
+        Some(0),
+        "fail-open means exit 0 with a sentinel report: {text}"
+    );
+    assert!(text.starts_with("DEBT_SCAN_FAILED:"), "{text}");
+    assert!(
+        text.contains("git ls-files --others --exclude-standard -z | xargs -0 -r git add -N --")
+            && text.contains("with the fs_grep tool")
+            && text.contains("never paste diff text into a shell string"),
+        "the sentinel report must quote the manual pipeline and the fs_grep rule: {text}"
+    );
 }
 
 /// The review-gauntlet README's debris bullet is the operator-facing twin
@@ -1408,34 +1509,20 @@ fn verdict_gate_debris_fault_arms_share_one_never_a_pass_blocker_shape() {
 /// the same kind of stream and must hold under the same config.
 #[cfg(unix)]
 #[test]
-fn usage_probe_debt_sweep_twins_and_architect_token_grep_hold_under_colour_and_an_external_differ()
-{
+fn usage_probe_debt_scan_and_architect_token_grep_hold_under_colour_and_an_external_differ() {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root = std::env::temp_dir().join(format!("coyote-debris-debt-grep-hostile-{unique}"));
+    let root = std::env::temp_dir().join(format!("coyote-debris-debt-scan-hostile-{unique}"));
     let _guard = ScratchDir(root.clone());
     fs::create_dir_all(&root).unwrap();
 
-    // Anchored on the `add -N` feed, not on the diff flags: a dropped flag
-    // must reach the scenarios below as a behavioural failure, not as a
-    // scrape panic.
-    let recipe = agent_quoted_command(
-        "step-runner/graph.yaml",
-        "xargs -0 -r git -C {{project_dir}} add -N -- && git -C {{project_dir}} diff",
-    );
-    let twin = agent_quoted_command(
-        "sisyphus/instructions.md",
-        "xargs -0 -r git add -N -- && git diff",
-    );
     let token_grep = architect_quoted_command("| grep -n 'debris-exempt'");
-    assert!(recipe.contains("<base, normally HEAD>"), "{recipe}");
-    assert!(twin.contains("<base>"), "{twin}");
 
     // An external differ whose output is itself a forged `+todo!()` line: with
-    // `--no-ext-diff` dropped the sweep would print this line and none of the
-    // real markers, so the probe is RED-capable in both directions.
+    // `--no-ext-diff` dropped the scanner would report this line and none of
+    // the real markers, so the probe is RED-capable in both directions.
     let differ = root.join("ext-diff.sh");
     fs::write(
         &differ,
@@ -1466,7 +1553,7 @@ fn usage_probe_debt_sweep_twins_and_architect_token_grep_hold_under_colour_and_a
     };
     let text_of = |out: &std::process::Output| String::from_utf8_lossy(&out.stdout).to_string();
 
-    // --- the debt sweep: a tracked edit and a created file, both with markers ---
+    // --- the debt scan: a tracked edit and a created file, both with markers ---
     let (repo, base) = make_repo("debt");
     fs::write(
         repo.join("src/lib.rs"),
@@ -1478,18 +1565,15 @@ fn usage_probe_debt_sweep_twins_and_architect_token_grep_hold_under_colour_and_a
         "unimplemented!() // created file\n",
     )
     .unwrap();
-    let step_cmd = recipe
-        .replace("{{project_dir}}", &repo.display().to_string())
-        .replace("<base, normally HEAD>", &base);
-    let twin_cmd = twin.replace("<base>", &base);
-    let plain = text_of(&sh(&root, &step_cmd));
+    let (_, plain) = debt_scan(&root, &repo, &base);
     assert!(
-        plain.contains("// tracked edit") && plain.contains("// created file"),
+        plain.contains("src/lib.rs:2 -- #[allow(dead_code)] // tracked edit")
+            && plain.contains("src/new.rs:1 -- unimplemented!() // created file"),
         "control: a plain repo yields both hits: {plain}"
     );
 
     hostile(&repo);
-    // Without the flags git would hand the grep a coloured, driver-written
+    // Without the flags git would hand the scanner a coloured, driver-written
     // stream: pin that this repo's config really does both, so the asserts
     // below are load-bearing.
     let raw = sh(&repo, &format!("git diff {base}"));
@@ -1505,19 +1589,21 @@ fn usage_probe_debt_sweep_twins_and_architect_token_grep_hold_under_colour_and_a
         text_of(&coloured)
     );
 
-    for (name, out) in [
-        ("step-runner", sh(&root, &step_cmd)),
-        ("sisyphus twin", sh(&repo, &twin_cmd)),
+    for (name, (code, text)) in [
+        ("from outside the repo", debt_scan(&root, &repo, &base)),
+        (
+            "from inside the repo",
+            debt_scan(&repo, Path::new("."), &base),
+        ),
     ] {
-        let text = text_of(&out);
-        assert_eq!(out.status.code(), Some(0), "{name}: {out:?}");
+        assert_eq!(code, Some(0), "{name}: {text}");
         assert!(
             !text.contains("\x1b["),
-            "{name}: colour escapes reached the grep: {text:?}"
+            "{name}: colour escapes reached the scanner: {text:?}"
         );
         assert!(
             !text.contains("EXTERNAL DIFFER RAN"),
-            "{name}: the external differ's output reached the grep: {text}"
+            "{name}: the external differ's output reached the scanner: {text}"
         );
         assert_eq!(
             text, plain,
@@ -1564,7 +1650,34 @@ fn usage_probe_debt_sweep_twins_and_architect_token_grep_hold_under_colour_and_a
 /// a shell string. Both sweep twins say so, and no prompt in the chain keeps
 /// a `git grep`/`grep -F` recipe that would take the pasted text instead.
 #[test]
-fn debt_sweep_twins_resolve_hits_with_the_fs_grep_tool_and_no_prompt_keeps_a_shell_grep_recipe() {
+fn debt_sweep_twins_resolve_fallback_hits_with_the_fs_grep_tool_and_no_prompt_keeps_a_shell_grep_recipe()
+ {
+    // The common path needs no resolution: the scanner reports real
+    // `<file>:<line>` positions. The MANUAL fallback (quoted by the scanner on
+    // DEBT_SCAN_FAILED and seeded as the step-runner's initial-state default)
+    // numbers the DIFF, so there the rule still holds: resolve through the
+    // `fs_grep` tool with the hit text as the pattern, never a shell string.
+    let scanner_fallback = agent_file(".shared/debt_scan.py");
+    let graph = agent_file("step-runner/graph.yaml");
+    let graph_default = graph
+        .split("debt_hits: 'DEBT_SCAN_FAILED")
+        .nth(1)
+        .and_then(|rest| rest.split("\n  needs_independent_review").next())
+        .expect("step-runner graph seeds the DEBT_SCAN_FAILED default");
+    for (what, text) in [
+        ("debt_scan.py fallback", scanner_fallback.as_str()),
+        ("step-runner initial-state default", graph_default),
+    ] {
+        for needle in [
+            "with the fs_grep tool",
+            "is its pattern",
+            "never paste diff text into a shell string",
+            "keep only matches in files the diff touched",
+        ] {
+            assert!(text.contains(needle), "{what} lost {needle:?}: {text}");
+        }
+    }
+    // Both sweep twins point the model at that tool for the fallback.
     for (rel, span_start) in [
         ("step-runner/graph.yaml", "5. Debt sweep."),
         (
@@ -1577,18 +1690,15 @@ fn debt_sweep_twins_resolve_hits_with_the_fs_grep_tool_and_no_prompt_keeps_a_she
             .find(span_start)
             .unwrap_or_else(|| panic!("{rel} lost its debt sweep span {span_start:?}"));
         let span = &text[start..];
-        let span = &span[..span.find("plus any env-gated").unwrap_or(span.len())];
-        for needle in [
-            "with the `fs_grep` tool",
-            "is its pattern",
-            "never paste diff text",
-            "keep only matches in",
-        ] {
-            assert!(
-                span.contains(needle),
-                "{rel} debt sweep lost {needle:?}: {span}"
-            );
-        }
+        let span = &span[..span.find("env-gated or opt-in test").unwrap_or(span.len())];
+        assert!(
+            span.contains("with the `fs_grep` tool"),
+            "{rel} debt sweep lost its fs_grep pointer: {span}"
+        );
+        assert!(
+            span.contains("DEBT_SCAN_FAILED"),
+            "{rel} debt sweep must name the fail-open sentinel: {span}"
+        );
         assert!(
             !span.contains("git grep") && !span.contains("grep -nF") && !span.contains("grep -F"),
             "{rel} debt sweep still carries a shell grep over pasted hit text: {span}"
@@ -1600,6 +1710,7 @@ fn debt_sweep_twins_resolve_hits_with_the_fs_grep_tool_and_no_prompt_keeps_a_she
         "sisyphus/instructions.md",
         "architect/instructions.md",
         "coder/graph.yaml",
+        ".shared/debt_scan.py",
     ] {
         let text = agent_file(rel);
         assert!(

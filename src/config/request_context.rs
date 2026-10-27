@@ -21737,6 +21737,7 @@ mod tests {
                     shadowed(&["plans_dir", "project_dir"]),
                     unreachable(&[
                         "check_handoff",
+                        "debt_scan",
                         "edge_case_sweep",
                         "end_blocked",
                         "end_rejected",
