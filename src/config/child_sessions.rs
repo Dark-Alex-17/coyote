@@ -5,7 +5,10 @@
 //! sidecar describing the child's agent, status and owning process.
 
 use crate::config::{Session, paths};
-use crate::utils::fs::{create_private_dir_all, write_private_atomic};
+use crate::utils::fs::{
+    EXCLUSIVE_LOCK_WAIT, ExclusiveLock, create_private_dir_all, refuse_symlinked_dir,
+    write_private_atomic,
+};
 use crate::utils::process::ProcessStamp;
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
@@ -21,6 +24,11 @@ use uuid::Uuid;
 pub(crate) const PROMPT_HEAD_CHARS: usize = 200;
 
 const META_SUFFIX: &str = ".meta.yaml";
+
+/// Sibling of `root.yaml` whose kernel lock serialises every
+/// read-modify-write of a root directory and every decision to delete it,
+/// across processes sharing the directory. See `root_lock`.
+const LOCK_FILE_NAME: &str = ".lock";
 
 pub(crate) fn sessions_root() -> PathBuf {
     paths::cache_dir().join("sessions")
@@ -69,22 +77,40 @@ impl ChildSessionRoot {
             .join(format!("{session_id}{META_SUFFIX}"))
     }
 
+    pub(crate) fn lock_file(&self) -> PathBuf {
+        self.dir().join(LOCK_FILE_NAME)
+    }
+
+    /// Takes the root directory's lock for one read-modify-write of
+    /// `root.yaml` or a sidecar, or for one delete decision. The lock never
+    /// creates the directory, so a caller that must leave an absent
+    /// directory absent only has to check for it; a directory removed
+    /// between that check and the lock is reported, not resurrected.
+    pub(crate) fn lock(&self) -> Result<ExclusiveLock> {
+        acquire_root_lock(&self.lock_file())
+    }
+
     /// Creates the root directory, writes `root.yaml` when it is missing or
     /// does not parse, then creates `children/`, in that order: a crash between
-    /// the steps leaves a directory that already identifies itself rather
-    /// than an anonymous one. A `root.yaml` that parses is left untouched so
-    /// a second spawn under the same root cannot erase the parent paths and
-    /// save time recorded by the first; one that does not parse is replaced
-    /// from `root` with a warning, since nothing in it could be kept.
+    /// the steps never leaves children without an identity. A `root.yaml`
+    /// that parses is left untouched so a second spawn under the same root
+    /// cannot erase the parent paths and save time recorded by the first;
+    /// one that does not parse is replaced from `root` with a warning,
+    /// since nothing in it could be kept.
     /// Anything other than a regular file in its place is an error that
-    /// leaves it as found.
+    /// leaves it as found. The check and the write happen under the root
+    /// lock, so a second spawner, or a parent save, cannot slip a record
+    /// in between them.
     pub(crate) fn ensure_dir(&self, root: &RootFile) -> Result<()> {
         let dir = self.dir();
         create_private_dir_all(&dir)
             .with_context(|| format!("Failed to create {}", dir.display()))?;
         let root_file = self.root_file();
-        if root_file_needs_writing(&root_file)? {
-            root.save(&root_file)?;
+        {
+            let _lock = self.lock()?;
+            if root_file_needs_writing(&root_file)? {
+                root.save(&root_file)?;
+            }
         }
         let children = self.children_dir();
         create_private_dir_all(&children)
@@ -159,6 +185,46 @@ impl ChildSessionRoot {
 
 fn default_version() -> u32 {
     1
+}
+
+/// The lock every writer and every deleter of the root directory at `dir`
+/// takes, waiting the standard bound. `dir` must already exist.
+fn root_lock(dir: &Path) -> Result<ExclusiveLock> {
+    acquire_root_lock(&dir.join(LOCK_FILE_NAME))
+}
+
+fn acquire_root_lock(lock_file: &Path) -> Result<ExclusiveLock> {
+    ExclusiveLock::acquire(lock_file, "child session root", root_lock_wait())
+}
+
+#[cfg(not(test))]
+fn root_lock_wait() -> std::time::Duration {
+    EXCLUSIVE_LOCK_WAIT
+}
+
+#[cfg(test)]
+fn root_lock_wait() -> std::time::Duration {
+    ROOT_LOCK_WAIT_OVERRIDE
+        .with(|wait| wait.get())
+        .unwrap_or(EXCLUSIVE_LOCK_WAIT)
+}
+
+#[cfg(test)]
+thread_local! {
+    static ROOT_LOCK_WAIT_OVERRIDE: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` with the root lock's wait cut to a few retries on this thread,
+/// so a test that expects the held-lock refusal does not sit out the full
+/// bound.
+#[cfg(test)]
+pub(crate) fn with_short_root_lock_wait<T>(f: impl FnOnce() -> T) -> T {
+    use crate::utils::fs::EXCLUSIVE_LOCK_RETRY;
+    ROOT_LOCK_WAIT_OVERRIDE.with(|wait| wait.set(Some(EXCLUSIVE_LOCK_RETRY * 3)));
+    let result = f();
+    ROOT_LOCK_WAIT_OVERRIDE.with(|wait| wait.set(None));
+    result
 }
 
 /// Whether `ensure_dir` has to write `path`: it is absent, or a regular
@@ -272,9 +338,9 @@ fn saved_parent(path: &Path) -> io::Result<Option<(PathBuf, DateTime<Utc>)>> {
 /// Records that the parent session `uid` was just written to `path`, so an
 /// exit can tell which children were created after the last save. A uid
 /// without a directory gets no bookkeeping: a parent that never spawned a
-/// child leaves nothing behind. The read-modify-write of `root.yaml` takes
-/// no lock, so two processes saving parents of one root at the same time
-/// leave the last writer's record.
+/// child leaves nothing behind. The read-modify-write of `root.yaml` runs
+/// under the root lock, so two processes saving parents of one root keep
+/// both records.
 pub(crate) fn note_parent_saved(uid: Uuid, path: &Path) -> Result<()> {
     note_parent_saved_at(Utc::now(), ProcessStamp::current(), uid, path)
 }
@@ -291,6 +357,7 @@ pub(crate) fn note_parent_saved_at(
         return Ok(());
     }
     let root_file = root.root_file();
+    let _lock = root.lock()?;
     let mut record = load_yaml_if_present::<RootFile>(&root_file)?
         .unwrap_or_else(|| RootFile::seed_at(now, stamp, None));
     let canonical = std::fs::canonicalize(path)
@@ -310,7 +377,9 @@ pub(crate) fn note_parent_saved_at(
 /// remains; otherwise it stays and only the children created after the
 /// parent's last save go, since the saved parent has never heard of them.
 /// A session whose uid is not the root's says nothing about the root. A
-/// root whose identity file cannot be read is kept whole.
+/// root whose identity file cannot be read is kept whole. The decision is
+/// made under the root lock and the lock is let go before the directory
+/// is removed, since the lock file lives inside it.
 pub(crate) fn settle_parent_exit(root: &ChildSessionRoot, session: Option<&Session>) {
     let dir = root.dir();
     let uid = match root {
@@ -331,6 +400,13 @@ pub(crate) fn settle_parent_exit(root: &ChildSessionRoot, session: Option<&Sessi
     if !dir.exists() {
         return;
     }
+    let lock = match root.lock() {
+        Ok(lock) => lock,
+        Err(error) => {
+            warn!("Keeping {}: {error:#}", dir.display());
+            return;
+        }
+    };
     let root_file = match RootFile::load(&root.root_file()) {
         Ok(root_file) => root_file,
         Err(error) => {
@@ -347,6 +423,7 @@ pub(crate) fn settle_parent_exit(root: &ChildSessionRoot, session: Option<&Sessi
                 Err(error) => error.kind() != io::ErrorKind::NotFound,
             });
     if !any_parent_exists {
+        drop(lock);
         remove_dir(&dir, "no parent session file remains");
         return;
     }
@@ -407,7 +484,9 @@ fn remove_child(root: &ChildSessionRoot, session_id: &str, reason: &str) {
 /// its `uid` names, removing that root once no parent file refers to it
 /// any more. Only the delete itself can fail; the bookkeeping degrades to
 /// warnings. A file without a `uid` has no root to update, and a symlink
-/// is only unlinked: the saved copy a root knows about is its target.
+/// is only unlinked: the saved copy a root knows about is its target. The
+/// bookkeeping runs under the root lock, released before the directory
+/// itself is removed.
 pub(crate) fn unlink_parent_yaml(path: &Path) -> Result<()> {
     #[derive(Deserialize)]
     struct UidProbe {
@@ -435,6 +514,17 @@ pub(crate) fn unlink_parent_yaml(path: &Path) -> Result<()> {
         return Ok(());
     }
     let root_file = root.root_file();
+    let lock = match root.lock() {
+        Ok(lock) => lock,
+        Err(error) => {
+            warn!(
+                "Keeping {} after deleting {}: {error:#}",
+                dir.display(),
+                path.display()
+            );
+            return Ok(());
+        }
+    };
     let mut record = match RootFile::load(&root_file) {
         Ok(record) => record,
         Err(error) => {
@@ -459,34 +549,17 @@ pub(crate) fn unlink_parent_yaml(path: &Path) -> Result<()> {
         );
     }
     if record.parent_paths.is_empty() {
+        drop(lock);
         remove_dir(&dir, "its last parent session file was deleted");
     }
     Ok(())
 }
 
-/// True when retention must leave `dir` alone: it is a symlink, whose
-/// target could be anything, or it cannot be inspected at all. A missing
-/// directory is not refused.
-fn refuse_symlinked_dir(dir: &Path, reason: &str) -> bool {
-    match std::fs::symlink_metadata(dir) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            warn!(
-                "Refusing to touch {} ({reason}): it is a symlink",
-                dir.display()
-            );
-            true
-        }
-        Ok(_) => false,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-        Err(error) => {
-            warn!("Failed to inspect {} ({reason}): {error}", dir.display());
-            true
-        }
-    }
-}
-
 /// Removes a root directory, refusing to follow a symlink planted at its
 /// path. Retention must never fail an exit, so every error is a warning.
+/// The caller decides under the root lock and drops it before calling:
+/// the lock file is inside the directory, and Windows refuses to remove a
+/// directory holding an open handle.
 pub(crate) fn remove_dir(path: &Path, reason: &str) {
     if refuse_symlinked_dir(path, reason) {
         return;
@@ -691,9 +764,18 @@ fn parse_process_root_name(name: &str) -> Option<ProcessStamp> {
 /// Removes `dir` unless its `root.yaml` now names a live process: between
 /// the sweep's decision and the delete a second REPL may have adopted the
 /// uid and written itself in. An identity that cannot be read is not
-/// evidence either way, so the directory stays.
+/// evidence either way, so the directory stays. The re-read happens under
+/// the root lock, so an adopter mid-write is seen whole or not at all; the
+/// lock is released before the delete because its file is inside `dir`.
 fn remove_unless_adopted(dir: &Path, reason: &str, before_remove: &dyn Fn(&Path)) {
     before_remove(dir);
+    let lock = match root_lock(dir) {
+        Ok(lock) => lock,
+        Err(error) => {
+            warn!("Keeping {} ({reason}): {error:#}", dir.display());
+            return;
+        }
+    };
     let adopted = match read_root_identity(dir) {
         Ok(root) => root.is_some_and(|root| last_process(&root).is_alive()),
         Err(error) => {
@@ -711,6 +793,7 @@ fn remove_unless_adopted(dir: &Path, reason: &str, before_remove: &dyn Fn(&Path)
         );
         return;
     }
+    drop(lock);
     remove_dir(dir, reason);
 }
 
@@ -2442,5 +2525,309 @@ updated_at: 2026-01-02T03:04:05Z
         let start = main.find("start_interactive(ctx).await").unwrap();
         assert!(tty_check < sweep);
         assert!(refresh < sweep && sweep < start);
+    }
+
+    /// Twice the retry interval, so a paced writer never starves a peer
+    /// out of the lock's wait.
+    fn pace() {
+        std::thread::sleep(crate::utils::fs::EXCLUSIVE_LOCK_RETRY * 2);
+    }
+
+    fn hold_root_lock(root: &ChildSessionRoot) -> ExclusiveLock {
+        ExclusiveLock::acquire(&root.lock_file(), "test", std::time::Duration::ZERO).unwrap()
+    }
+
+    #[test]
+    #[serial]
+    fn root_lock_file_sits_beside_root_yaml_and_is_owner_only() {
+        let _cache = CacheDirGuard::new("child-sessions-lock-layout");
+        let root = ChildSessionRoot::Uid(Uuid::new_v4());
+        root.ensure_dir(&fixture_root()).unwrap();
+
+        assert_eq!(root.lock_file(), root.dir().join(".lock"));
+        assert!(root.lock_file().is_file());
+        #[cfg(unix)]
+        assert_eq!(mode_of(&root.lock_file()), 0o600);
+        assert!(root.list_children().unwrap().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn concurrent_ensure_dir_and_note_parent_saved_at_writers_lose_no_parent_path() {
+        let cache = CacheDirGuard::new("child-sessions-lock-writers");
+        let uid = Uuid::new_v4();
+        let root = ChildSessionRoot::Uid(uid);
+        const WRITERS: usize = 4;
+        const SAVES: usize = 5;
+        let parents: Vec<Vec<PathBuf>> = (0..WRITERS)
+            .map(|writer| {
+                (0..SAVES)
+                    .map(|save| parent_file(&cache, &format!("w{writer}-s{save}.yaml")))
+                    .collect()
+            })
+            .collect();
+        let seeded = RootFile::seed_at(fixture_time(), fixture_stamp(), None);
+
+        let barrier = std::sync::Barrier::new(WRITERS);
+        std::thread::scope(|scope| {
+            for (writer, paths) in parents.iter().enumerate() {
+                let barrier = &barrier;
+                let root = &root;
+                let seeded = &seeded;
+                scope.spawn(move || {
+                    let stamp = ProcessStamp {
+                        pid: 100 + writer as u32,
+                        start: 1_700_000_000,
+                    };
+                    barrier.wait();
+                    for (save, path) in paths.iter().enumerate() {
+                        root.ensure_dir(seeded).unwrap();
+                        pace();
+                        let now = fixture_time() + Duration::seconds(save as i64);
+                        note_parent_saved_at(now, stamp, uid, path).unwrap();
+                        pace();
+                    }
+                });
+            }
+        });
+
+        let record = RootFile::load(&root.root_file()).unwrap();
+        let mut recorded = record.parent_paths.clone();
+        recorded.sort();
+        let mut expected: Vec<PathBuf> = parents
+            .iter()
+            .flatten()
+            .map(|path| fs::canonicalize(path).unwrap())
+            .collect();
+        expected.sort();
+        assert_eq!(recorded, expected);
+        assert_eq!(record.created_at, fixture_time());
+        let leftovers: Vec<_> = fs::read_dir(root.dir())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    #[serial]
+    fn settle_parent_exit_keeps_a_root_whose_lock_another_holder_keeps() {
+        install_log_collector();
+        let cache = CacheDirGuard::new("child-sessions-lock-settle");
+        let root = ChildSessionRoot::Uid(Uuid::new_v4());
+        let mut record = fixture_root();
+        record.parent_paths = vec![cache.root.join("gone.yaml")];
+        root.ensure_dir(&record).unwrap();
+        let held = hold_root_lock(&root);
+
+        with_short_root_lock_wait(|| settle_parent_exit(&root, None));
+
+        assert!(root.dir().is_dir());
+        assert!(
+            warn_snapshot()
+                .iter()
+                .any(|message| message.contains("child session root lock")
+                    && message.contains("is held")
+                    && message.contains(&root.dir().display().to_string())),
+            "{:?}",
+            warn_snapshot()
+        );
+        drop(held);
+        settle_parent_exit(&root, None);
+        assert!(!root.dir().exists());
+    }
+
+    /// The locked bookkeeping sites all check for the directory before
+    /// taking the lock: the lock does not create it, and an absent root
+    /// means no children.
+    #[test]
+    #[serial]
+    fn retention_on_an_absent_uid_root_creates_nothing() {
+        let cache = CacheDirGuard::new("child-sessions-lock-absent");
+        let uid = Uuid::new_v4();
+        let root = ChildSessionRoot::Uid(uid);
+        let parent = uid_yaml(&cache, "parent.yaml", uid);
+
+        settle_parent_exit(&root, None);
+        unlink_parent_yaml(&parent).unwrap();
+
+        assert!(!parent.exists());
+        assert!(!root.dir().exists());
+        assert!(!sessions_root().exists());
+    }
+
+    /// Every deleter decides under the lock and lets go of it before the
+    /// delete, so the lock file goes with its directory. On Windows the
+    /// lock is mandatory and an open handle pins the directory, so the
+    /// order is what makes the delete possible there at all.
+    fn removed_roots_leave_no_lock_file() {
+        install_log_collector();
+        let cache = CacheDirGuard::new("child-sessions-lock-removed");
+        let settled = ChildSessionRoot::Uid(Uuid::new_v4());
+        let mut record = fixture_root();
+        record.parent_paths = vec![cache.root.join("gone.yaml")];
+        settled.ensure_dir(&record).unwrap();
+        let settled_lock = settled.lock_file();
+
+        let unlinked_uid = Uuid::new_v4();
+        let unlinked = ChildSessionRoot::Uid(unlinked_uid);
+        let parent = uid_yaml(&cache, "parent.yaml", unlinked_uid);
+        unlinked
+            .ensure_dir(&RootFile::seed_at(
+                fixture_time(),
+                fixture_stamp(),
+                Some(&parent),
+            ))
+            .unwrap();
+        let unlinked_lock = unlinked.lock_file();
+
+        let (swept_dir, _) = uid_dir_with(&sweep_record(Vec::new(), dead_stamp()));
+        let dead = dead_stamp();
+        let proc_dir = ChildSessionRoot::from_stamp(dead).dir();
+        fs::create_dir_all(&proc_dir).unwrap();
+
+        settle_parent_exit(&settled, None);
+        unlink_parent_yaml(&parent).unwrap();
+        sweep_orphans();
+
+        for (dir, lock) in [
+            (settled.dir(), settled_lock),
+            (unlinked.dir(), unlinked_lock),
+            (swept_dir.clone(), swept_dir.join(LOCK_FILE_NAME)),
+            (proc_dir.clone(), proc_dir.join(LOCK_FILE_NAME)),
+        ] {
+            assert!(!dir.exists(), "{}", dir.display());
+            assert!(!lock.exists(), "{}", lock.display());
+        }
+        assert!(
+            removal_logged(
+                &format!("{}-{}", dead.pid, dead.start),
+                "orphan sweep arm 3"
+            ),
+            "{:?}",
+            info_snapshot()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn removed_roots_leave_no_lock_file_on_unix() {
+        removed_roots_leave_no_lock_file();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[serial]
+    fn removed_roots_leave_no_lock_file_on_windows() {
+        removed_roots_leave_no_lock_file();
+    }
+
+    #[test]
+    #[serial]
+    fn sweep_keeps_a_root_whose_lock_another_holder_keeps_at_the_delete() {
+        install_log_collector();
+        let _guard = TestConfigDirGuard::new("child-sessions-lock-sweep");
+        let (dir, _) = uid_dir_with(&sweep_record(Vec::new(), dead_stamp()));
+        let held = std::cell::RefCell::new(None);
+        let hold = |about_to_go: &Path| {
+            let lock = ExclusiveLock::acquire(
+                &about_to_go.join(LOCK_FILE_NAME),
+                "test",
+                std::time::Duration::ZERO,
+            )
+            .unwrap();
+            *held.borrow_mut() = Some(lock);
+        };
+
+        with_short_root_lock_wait(|| sweep_orphans_with_before_remove(&hold));
+
+        assert!(
+            held.borrow().is_some(),
+            "the hook runs before the sweep locks"
+        );
+        assert!(dir.is_dir());
+        assert!(
+            warn_snapshot()
+                .iter()
+                .any(|message| message.contains("child session root lock")
+                    && message.contains("is held")
+                    && message.contains("orphan sweep arm 2")),
+            "{:?}",
+            warn_snapshot()
+        );
+
+        held.borrow_mut().take();
+        sweep_orphans();
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    #[serial]
+    fn sweep_leaves_nothing_behind_when_the_root_vanishes_before_its_lock() {
+        install_log_collector();
+        let _guard = TestConfigDirGuard::new("child-sessions-vanished-sweep");
+        let (dir, _) = uid_dir_with(&sweep_record(Vec::new(), dead_stamp()));
+        let vanish = |about_to_go: &Path| fs::remove_dir_all(about_to_go).unwrap();
+
+        sweep_orphans_with_before_remove(&vanish);
+
+        assert!(!dir.exists(), "the lock must not recreate a removed root");
+        let dir_text = dir.display().to_string();
+        assert!(
+            warn_snapshot()
+                .iter()
+                .any(|message| message.starts_with("Keeping ")
+                    && message.contains(&dir_text)
+                    && message.contains("Failed to open lock file")),
+            "{:?}",
+            warn_snapshot()
+        );
+    }
+
+    /// Every read-modify-write of `root.yaml` and every delete decision
+    /// takes the root lock, and no deleter still holds it when it calls
+    /// `remove_dir`.
+    #[test]
+    fn every_root_writer_and_deleter_takes_the_lock_and_drops_it_before_removing() {
+        let source = include_str!("child_sessions.rs").replace("\r\n", "\n");
+        let production = &source[..source.find("\n#[cfg(test)]\nmod tests").unwrap()];
+        let fn_body = |head: &str, end: &str| {
+            let start = production.find(head).unwrap();
+            let body = &production[start..];
+            &body[..body.find(end).unwrap()]
+        };
+        for (head, end, remover) in [
+            ("\n    pub(crate) fn ensure_dir(", "\n    }\n", false),
+            ("\npub(crate) fn note_parent_saved_at(", "\n}\n", false),
+            ("\npub(crate) fn settle_parent_exit(", "\n}\n", true),
+            ("\npub(crate) fn unlink_parent_yaml(", "\n}\n", true),
+            ("\nfn remove_unless_adopted(", "\n}\n", true),
+        ] {
+            let body = fn_body(head, end);
+            let lock_at = match (body.find("root.lock()"), body.find("self.lock()")) {
+                (Some(at), None) | (None, Some(at)) => at,
+                _ => body.find("root_lock(dir)").unwrap(),
+            };
+            assert_eq!(
+                body.matches(".lock()").count() + body.matches("root_lock(").count(),
+                1,
+                "{head}"
+            );
+            if remover {
+                let locked = &body[lock_at..];
+                assert_eq!(locked.matches("remove_dir(").count(), 1, "{head}");
+                assert_eq!(locked.matches("drop(lock);").count(), 1, "{head}");
+                assert!(
+                    locked.find("drop(lock);").unwrap() < locked.find("remove_dir(").unwrap(),
+                    "{head}"
+                );
+            } else {
+                assert!(!body.contains("remove_dir("), "{head}");
+            }
+        }
+        let remove_dir_body = fn_body("\npub(crate) fn remove_dir(", "\n}\n");
+        assert!(!remove_dir_body.contains("lock"));
     }
 }
