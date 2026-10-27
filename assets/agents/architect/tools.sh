@@ -11,7 +11,7 @@ _instructions() {
   render_instructions "$LLM_AGENT_ROOT_DIR/instructions.md" >> "$LLM_OUTPUT"
 }
 
-# @cmd Collect tagged ledger lines from task log.md files - the grep-complete rollup for Phase F reports, hygiene briefs, and PR bodies (rejected-finding: / design-decision / debris-exempt / "(deferred by quality bar)"). Prints one "<task>: <line>" per hit grouped by task, or "(none)" - a missed line is a tool bug, not an attention slip.
+# @cmd Collect tagged ledger lines from task log.md files - the grep-complete rollup for Phase F reports, hygiene briefs, and PR bodies (rejected-finding: / design-decision / Follow-ups: / debris-exempt / "(deferred by quality bar)"). Prints one "<task> (log.md:NN): <line>" per hit grouped by task, with the block under a tag line (its bullets, up to a blank line, the next ## heading, or the next tag line) indented beneath it, or "(none)" - a missed line is a tool bug, not an attention slip.
 # @option --tag! Literal tag text to collect (fixed string, not a regex)
 # @option --dir! Directory searched recursively for log.md files (the plans tasks dir)
 collect_ledger_lines() {
@@ -29,14 +29,26 @@ collect_ledger_lines() {
     echo "(none)" >> "$LLM_OUTPUT"
     return 0
   fi
-  # <dir>/<task>/log.md:NN:line  ->  <task> log.md:NN: line
-  local line path rest rel task
+  # <dir>/<task>/log.md:NN:line  ->  <task> (log.md:NN): line, then the block
+  # under line NN indented (bullets and their indented wraps, verbatim), so a
+  # bare "Follow-ups:" line brings its bullets along. A column-0 line that is
+  # not a bullet is wrapped prose, not part of the block.
+  local line path rest rel task lineno
   while IFS= read -r line; do
     path="${line%%:*}"
     rest="${line#*:}"
     rel="${path#"${dir}"/}"
     task="${rel%/log.md}"
-    echo "${task} (log.md:${rest%%:*}): ${rest#*:}" >> "$LLM_OUTPUT"
+    lineno="${rest%%:*}"
+    echo "${task} (log.md:${lineno}): ${rest#*:}" >> "$LLM_OUTPUT"
+    awk -v start="${lineno}" '
+      NR <= start { next }
+      /^[[:space:]]*$/ || /^## / { exit }
+      !/^[[:space:]]/ && !/^[-*][[:space:]]/ { exit }
+      { head = $0; sub(/^[[:space:]]*([-*][[:space:]]+)?/, "", head) }
+      head ~ /^(rejected-finding:|design-decision|Follow-ups:|HYGIENE:)/ { exit }
+      { print "  " $0 }
+    ' "${path}" >> "$LLM_OUTPUT"
   done <<< "${hits}"
 }
 

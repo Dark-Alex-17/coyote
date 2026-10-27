@@ -1089,6 +1089,179 @@ fn adversary_verdict_names_the_prefix_a_verification_run_was_under() {
     );
 }
 
+/// A plan with one complete and one pending task; the complete task's log
+/// holds `completed` SHAs and the ledger block `log` under its entry.
+#[cfg(unix)]
+fn pr_body_fixture(label: &str, log: &str) -> TempDirGuard {
+    let dir = fixture_dir(label);
+    fs::write(
+        dir.0.join("PLAN-x.md"),
+        "---\nrigor: prototype\n---\n# Plan\n",
+    )
+    .unwrap();
+    fs::write(dir.0.join("summary.md"), "Summary prose.\n").unwrap();
+    let done = dir.0.join("tasks/TASK-1-a");
+    let pending = dir.0.join("tasks/TASK-2-b");
+    fs::create_dir_all(&done).unwrap();
+    fs::create_dir_all(&pending).unwrap();
+    fs::write(
+        done.join("index.md"),
+        "---\nplan: PLAN-x.md\nstatus: complete\ntitle: \"A\"\n---\n",
+    )
+    .unwrap();
+    fs::write(
+        done.join("log.md"),
+        format!("## 2026-10-27 - completed\nCommits abc1234, deadbee1 on feat/x.\n\n{log}"),
+    )
+    .unwrap();
+    fs::write(
+        pending.join("index.md"),
+        "---\nplan: PLAN-x.md\nstatus: pending\ntitle: \"B\"\n---\n",
+    )
+    .unwrap();
+    dir
+}
+
+#[cfg(unix)]
+fn assemble_pr_body(dir: &Path) -> (i32, String, String) {
+    run(Command::new("python3")
+        .arg(asset("architect/assemble_pr_body.py"))
+        .arg("--plan")
+        .arg(dir.join("PLAN-x.md"))
+        .arg("--tasks-dir")
+        .arg(dir.join("tasks"))
+        .arg("--summary-file")
+        .arg(dir.join("summary.md"))
+        .arg("--followups")
+        .output()
+        .expect("spawn python3"))
+}
+
+/// assemble_pr_body.py reads a tag line together with the block under it
+/// (bullets up to a blank line, heading, column-0 prose, or next entry tag),
+/// one entry per bullet with an indented wrap joined onto its bullet, and a
+/// `(deferred by quality bar)` qualifier never cuts an entry short; a wrapped
+/// prose paragraph after a mid-line tag is not a run of entries; a tag line
+/// with nothing on it or under it is a NOTE, not a silent `None.`.
+#[cfg(unix)]
+#[test]
+fn assemble_pr_body_reads_ledger_blocks_whole() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = pr_body_fixture(
+        "assemble-pr-body",
+        "Follow-ups:\n\
+         - first item (deferred by quality bar)\n\
+         - second item (deferred by quality bar) and third item\n  \
+           (deferred by quality bar)\n\
+         rejected-finding: finding one - evidence src/x.rs:3\n\n\
+         Some narrative. rejected-finding: finding two - evidence src/y.rs:9\n\
+         which continues the narrative and is not a finding.\n\n",
+    );
+    let (code, stdout, stderr) = assemble_pr_body(&dir.0);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("**Quality bar:** prototype"), "{stdout}");
+    assert!(stdout.contains("## Tasks\n- [x] TASK-1 - A ("), "{stdout}");
+    assert!(
+        stdout.contains("`abc1234`") && stdout.contains("`deadbee1`"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("TASK-2"), "{stdout}");
+    let decisions: Vec<&str> = stdout
+        .lines()
+        .skip_while(|l| *l != "## Review decisions")
+        .skip(1)
+        .take_while(|l| !l.is_empty())
+        .collect();
+    assert_eq!(
+        decisions,
+        [
+            "- (TASK-1) finding one - evidence src/x.rs:3",
+            "- (TASK-1) finding two - evidence src/y.rs:9",
+        ],
+        "{stdout}"
+    );
+    assert!(!stdout.contains("continues the narrative"), "{stdout}");
+    let followups: Vec<&str> = stdout
+        .lines()
+        .filter(|l| l.starts_with("- [ ] (TASK-1) "))
+        .collect();
+    assert_eq!(
+        followups,
+        [
+            "- [ ] (TASK-1) first item (deferred by quality bar)",
+            "- [ ] (TASK-1) second item (deferred by quality bar) and third item (deferred by quality bar)",
+        ],
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains("NOTE") && stderr.contains("TASK-2-b (status: pending)"),
+        "{stderr}"
+    );
+
+    let dir = pr_body_fixture("assemble-pr-body-empty-tag", "Follow-ups:\n");
+    let (code, stdout, stderr) = assemble_pr_body(&dir.0);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("## Follow-up / manual actions\nNone.\n"),
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains("NOTE TASK-1: Follow-ups: tag with nothing under it"),
+        "{stderr}"
+    );
+}
+
+/// collect_ledger_lines prints the block under each hit indented beneath
+/// the `<task> (log.md:NN): <line>` line, stopping at the next entry tag, so
+/// a bare `Follow-ups:` line arrives with its bullets and a wrapped bullet
+/// keeps its indented wrap line.
+#[cfg(unix)]
+#[test]
+fn collect_ledger_lines_prints_the_block_under_a_hit() {
+    if tools_missing() {
+        return;
+    }
+    let dir = pr_body_fixture(
+        "collect-ledger-lines",
+        "Follow-ups:\n\
+         - first item (deferred by quality bar)\n\
+         - second item\n  \
+           that wraps\n\
+         rejected-finding: finding one - evidence src/x.rs:3\n",
+    );
+    let script = format!(
+        "source '{}'; collect_ledger_lines",
+        asset("architect/tools.sh").display()
+    );
+    let (code, stdout, stderr) = run(bash()
+        .arg("-c")
+        .arg(&script)
+        .env(
+            "LLM_ROOT_DIR",
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("assets"),
+        )
+        .env("LLM_OUTPUT", "/dev/stdout")
+        .env("argc_dir", dir.0.join("tasks"))
+        .env("argc_tag", "Follow-ups:")
+        .output()
+        .expect("spawn bash"));
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        stdout,
+        [
+            "TASK-1-a (log.md:4): Follow-ups:",
+            "  - first item (deferred by quality bar)",
+            "  - second item",
+            "    that wraps",
+            "",
+        ]
+        .join("\n")
+    );
+}
+
 #[test]
 fn verify_format_lint_bounds_300kb_formatter_transcript() {
     if tools_missing() {

@@ -348,9 +348,10 @@ For each task, respecting `blocked_by` ordering (a blocked task waits for its bl
 2. **Delegate the CODE work to ONE Sisyphus.** Load `delegation-protocol`, then spawn with a
    self-contained prompt — Sisyphus has NOT seen this conversation:
 <!-- when:task_granularity=micro -->
-   Micro mode: spawn with `--variables {"review_cadence": "batch"}` - Sisyphus then runs coder
-   verification only (build + tests green) and NO review gauntlet of its own; the panel runs once
-   per batch (step 4). Replace "one-engineer-day slice" below with "one micro-task (one seam)".
+   Micro mode: add `"review_cadence": "batch"` to the spawn's `--variables` object beside
+   `build_lock` - Sisyphus then runs coder verification only (build + tests green) and NO review
+   gauntlet of its own; the panel runs once per batch (step 4). Replace "one-engineer-day slice"
+   below with "one micro-task (one seam)".
 <!-- end -->
 
    ```
@@ -687,6 +688,9 @@ every batch member belongs to the group in flight.
   teamwork protocol into that Sisyphus's instructions (roster contract, scope-breach stop,
   worktree-removable discipline). A sequential or standalone Sisyphus is spawned WITHOUT it and
   never sees that protocol.
+<!-- when:task_granularity=micro -->
+  In micro mode add `"review_cadence": "batch"` to that same object.
+<!-- end -->
 - Run the adversary check (and, for consumer-facing tasks, the probe check) in the worktree:
   `get_diff --base <BASE SHA>` — identical semantics to sequential mode.
 

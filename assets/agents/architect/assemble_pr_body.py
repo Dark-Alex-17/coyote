@@ -15,10 +15,16 @@ Grep-complete where the ground truth is on disk; verbatim where it is judgment:
   Follow-ups       `Follow-ups:` ledger lines as checkboxes (only with --followups)
 
 Ledger lines in log.md are prose, often several tags on one line: an entry runs from its
-tag to the next ledger tag of any kind on the line, or the end of the line, so an entry
-can carry a trailing clause - the body is a draft the caller reviews before `gh pr
-create`, never posted blind. Anything that cannot be derived is reported as a NOTE and left
-visible in the body (never silently omitted) so a hand fix is a local edit, not a rewrite.
+tag to the next entry-opening tag on the line, or the end of the line, so an entry can
+carry a trailing clause; markers that qualify an entry (`(deferred by quality bar)`,
+`debris-exempt`, `debt-assigned`) stay in its text. A tag line also owns the block under
+it: each bullet under it is one more entry, an indented non-bullet line continues the
+bullet above it, and the block ends at a blank line, the next `## ` heading, a column-0
+line that is not a bullet (a wrapped prose paragraph), or the next entry-opening line.
+That is how a bare `Follow-ups:` line with its bullets below is read. The body is a draft
+the caller reviews before `gh pr create`, never posted blind. Anything that cannot be
+derived is reported as a NOTE and left visible in the body (never silently omitted) so a
+hand fix is a local edit, not a rewrite.
 """
 import argparse
 import os
@@ -27,9 +33,10 @@ import sys
 
 TASK_DIR_RE = re.compile(r"^(TASK-\d+)")
 SHA_RE = re.compile(r"\b(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b")
-HEX_WORDS = {"deadbeef", "cafebabe", "decade", "facade", "accede"}
-# Every tag the ledger vocabulary knows; an entry for one tag stops at the next of any.
-LEDGER_TAGS = ("rejected-finding:", "design-decision", "Follow-ups:", "HYGIENE:", "debris-exempt", "debt-assigned", "(deferred by quality bar)")
+HEX_WORDS = {"deadbeef", "cafebabe"}
+# Tags that open an entry; an entry stops at the next of these on its line or below it.
+ENTRY_TAGS = ("rejected-finding:", "design-decision", "Follow-ups:", "HYGIENE:")
+BULLET_RE = re.compile(r"^\s*[-*]\s+")
 
 
 def note(msg):
@@ -85,8 +92,7 @@ def find_tasks(tasks_dir, plan_base):
         if not title:
             m = re.search(r"^#\s+(.+?)\s*$", read(os.path.join(root, "index.md")), re.M)
             title = m.group(1) if m else "(untitled - index.md has no title)"
-            if not fm.get("title"):
-                note(f"{base}: no `title:` frontmatter; used {'the H1' if m else 'a placeholder'}")
+            note(f"{base}: no `title:` frontmatter; used {'the H1' if m else 'a placeholder'}")
         found.append((TASK_DIR_RE.match(base).group(1), title, root))
     if skipped:
         note("excluded from the checklist (not `status: complete`): " + ", ".join(skipped))
@@ -120,25 +126,57 @@ def completed_shas(log_text):
     return out
 
 
+def is_bullet(line):
+    return BULLET_RE.match(line) is not None
+
+
+def ends_block(line):
+    if not line.strip() or line.startswith("## "):
+        return True
+    if not is_bullet(line) and not line[0].isspace():
+        return True
+    head = BULLET_RE.sub("", line).lstrip()
+    return any(head.startswith(t) for t in ENTRY_TAGS)
+
+
 def ledger_entries(tasks, tag):
-    """[(task_id, text)] - one entry per tag occurrence across the tasks' log.md files."""
-    others = [t for t in LEDGER_TAGS if t != tag]
+    """[(task_id, text)] - one entry per tag occurrence across the tasks' log.md files,
+    plus one per bullet of the block under a tag line; an indented non-bullet line is
+    a wrapped continuation of the entry above it."""
+    others = [t for t in ENTRY_TAGS if t != tag]
     entries = []
     for task_id, _title, root in tasks:
         path = os.path.join(root, "log.md")
         if not os.path.isfile(path):
             continue
-        for line in read(path).splitlines():
+        lines = read(path).splitlines()
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            i += 1
             if tag not in line:
                 continue
-            parts = line.split(tag)[1:]
-            for part in parts:
+            found = []
+            for part in line.split(tag)[1:]:
                 cuts = [part.find(o) for o in others if part.find(o) >= 0]
                 if cuts:
                     part = part[: min(cuts)]
                 text = re.sub(r"^[\s:\u2014\u2013-]+", "", part).strip()
                 if text:
-                    entries.append((task_id, text))
+                    found.append(text)
+            while i < len(lines) and not ends_block(lines[i]):
+                if is_bullet(lines[i]):
+                    text = BULLET_RE.sub("", lines[i]).strip()
+                    if text:
+                        found.append(text)
+                elif found:
+                    found[-1] = f"{found[-1]} {lines[i].strip()}"
+                else:
+                    found.append(lines[i].strip())
+                i += 1
+            if not found:
+                note(f"{task_id}: {tag} tag with nothing under it")
+            entries.extend((task_id, text) for text in found)
     return entries
 
 
