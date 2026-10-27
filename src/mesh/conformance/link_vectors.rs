@@ -674,6 +674,14 @@ mod loopback {
                     "a {target}-byte response frame"
                 );
                 assert_eq!(outcome.value, body);
+                assert!(
+                    request_sent_as(
+                        pair.recorder.last().request_id,
+                        ECHO_PATH,
+                        SizeBranch::Packet
+                    ),
+                    "the Nil-bodied request goes as a packet whatever the response's size"
+                );
             }
         }
         pair.stop().await;

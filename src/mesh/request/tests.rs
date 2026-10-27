@@ -11012,8 +11012,8 @@ pub(crate) mod network {
     }
 
     /// A file of `MAX_EFFICIENT_SIZE` plus 512 KiB spans two Resource segments, and
-    /// coyote-rns-transport 0.16.0 carries every segment on the link's interface, so the
-    /// requester gets the whole file back over a live link in one `ok` reply.
+    /// the transport carries every segment on the link's interface, so the requester gets
+    /// the whole file back over a live link in one `ok` reply.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_fetch_response_above_one_segment_arrives_whole_over_a_live_link() {
         install_log_collector();

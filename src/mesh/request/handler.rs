@@ -172,6 +172,7 @@ impl LibraryHandler {
         permit: OwnedSemaphorePermit,
         request: LibraryInboundRequest,
     ) -> Option<RequestResponse> {
+        // Bound first so it drops last, after everything the request does.
         let _permit = permit;
         let handler = self.handler.read().clone();
         let (link_id, request_id) = (request.link_id(), request.request_id());

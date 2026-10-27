@@ -1192,6 +1192,16 @@ async fn reference_requests_hear_the_specified_replies() {
     assert_eq!(unknown["status"], json!("failed"), "{unknown}");
     assert_eq!(unknown["response"], Value::Null, "{unknown}");
 
+    // The dropped path left the node serving.
+    let card = reference
+        .request(&node, "/status", reference.envelope(Value::Null))
+        .await;
+    assert_eq!(
+        card["v"],
+        json!(1),
+        "a status request after the dropped path is answered: {card}"
+    );
+
     node.stop().await;
     drop(reference);
 }

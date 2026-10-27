@@ -1548,8 +1548,11 @@ impl MeshRuntime {
     /// Cancels and joins the node's tasks, stops the interfaces, drops the transport,
     /// waits for the request handlers it aborted to be gone and releases the instance and
     /// identity locks, in that order so nothing outlives what it depends on: a handler
-    /// still winding down may settle a reply against files the locks guard. The task
-    /// joins share one grace window and the transport teardown another.
+    /// still winding down may settle a reply against files the locks guard. A settled
+    /// resource reply's transfer confirmation runs on a detached task outside the handler
+    /// slot, so the drain does not cover it; it only touches the settlement, whose store
+    /// has its own lock. The task joins share one grace window and the transport teardown
+    /// another.
     async fn shutdown(&self) -> Result<()> {
         self.cancel.cancel();
         let tasks = std::mem::take(&mut *self.tasks.lock());
