@@ -247,7 +247,7 @@ impl LibraryHandler {
             let link = link.lock().await;
             if link.status() != LinkStatus::Active {
                 warn!(
-                    "Failed to send mesh response {request_id} on link {}: the link is gone",
+                    "Failed to send mesh response {request_id} on link {}: the link has closed",
                     link_id.to_hex_string()
                 );
                 drop_unsent(settlement);

@@ -2461,7 +2461,7 @@ pub(crate) mod network {
         );
         handler.release.notify_one();
         let warned = format!(
-            "Failed to send mesh response {request_id} on link {}: the link is gone",
+            "Failed to send mesh response {request_id} on link {}: the link has closed",
             link_id.to_hex_string()
         );
         wait_until("the adapter to give up on the closed link", || {
