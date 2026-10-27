@@ -1001,7 +1001,7 @@ pub(crate) mod test_support {
 
         async fn handle(&self, request: InboundRequest) -> Reply {
             self.seen.lock().push(Seen {
-                request_id: request.request_id.to_hex_string(),
+                request_id: request.request_id.to_string(),
                 identity: request.identity.map(|identity| identity.address_hash),
                 branch: request.branch,
                 data: request.data,

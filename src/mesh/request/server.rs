@@ -316,7 +316,7 @@ impl RequestServer {
         let Some(handler) = self.handler.read().clone() else {
             debug!(
                 "Dropped mesh request {} on link {}: no request handler installed",
-                request_id.to_hex_string(),
+                request_id,
                 link_id.to_hex_string()
             );
             return None;
@@ -324,14 +324,14 @@ impl RequestServer {
         let Ok(permit) = self.permits.clone().try_acquire_owned() else {
             debug!(
                 "Dropped mesh request {} on link {}: all {MAX_CONCURRENT_INBOUND_REQUESTS} handler slots are busy",
-                request_id.to_hex_string(),
+                request_id,
                 link_id.to_hex_string()
             );
             return None;
         };
         debug!(
             "Received mesh request {} on link {} ({branch:?}, {} bytes)",
-            request_id.to_hex_string(),
+            request_id,
             link_id.to_hex_string(),
             packed.len()
         );
@@ -345,7 +345,7 @@ impl RequestServer {
                 let Some(identity) = server.resolve_peer(&transport, link_id).await else {
                     debug!(
                         "Dropped mesh request {} on link {}: the link is gone",
-                        request_id.to_hex_string(),
+                        request_id,
                         link_id.to_hex_string()
                     );
                     return;
@@ -364,7 +364,7 @@ impl RequestServer {
                         );
                         debug!(
                             "Dropped an undecodable mesh request {} from {id8} on link {}: {}",
-                            request_id.to_hex_string(),
+                            request_id,
                             link_id.to_hex_string(),
                             redact_hashes(&err.to_string())
                         );
@@ -389,7 +389,7 @@ impl RequestServer {
                 else {
                     warn!(
                         "Mesh request {} on link {} was not handled within {:?}; sent nothing",
-                        request_id.to_hex_string(),
+                        request_id,
                         link_id.to_hex_string(),
                         server.handler_timeout
                     );
@@ -417,7 +417,7 @@ impl RequestServer {
                     Ok(Err(err)) => {
                         warn!(
                             "Failed to send mesh response {} on link {}: {}",
-                            request_id.to_hex_string(),
+                            request_id,
                             link_id.to_hex_string(),
                             redact_hashes(&err.to_string())
                         );
@@ -428,7 +428,7 @@ impl RequestServer {
                     Err(_) => {
                         warn!(
                             "Mesh response {} on link {} was not sent within {}s; gave up on it",
-                            request_id.to_hex_string(),
+                            request_id,
                             link_id.to_hex_string(),
                             DEFAULT_RESPONSE_SEND_TIMEOUT.as_secs()
                         );
@@ -475,14 +475,13 @@ impl RequestServer {
 /// The id of a request that arrived as a resource: recomputed from the assembled bytes the
 /// way RNS `Link.request_resource_concluded` does, rather than trusted from the advertisement.
 fn resource_request_id(complete: &ResourceComplete) -> RequestId {
-    let request_id = RequestId::of_packed(&complete.data);
+    let request_id = RequestId::of_packed_request(&complete.data);
     if let Some(advertised) = &complete.request_id
         && advertised.as_slice() != request_id.as_bytes()
     {
         let advertised_request_id = hex_lower(advertised);
         debug!(
-            "Mesh request resource advertised id {advertised_request_id} but its bytes hash to {}",
-            request_id.to_hex_string()
+            "Mesh request resource advertised id {advertised_request_id} but its bytes hash to {request_id}"
         );
     }
     request_id
@@ -516,7 +515,7 @@ async fn respond(
     if bytes.len() <= mdu {
         debug!(
             "Sending mesh response {} as a packet ({} bytes, link MDU {mdu})",
-            request_id.to_hex_string(),
+            request_id,
             bytes.len()
         );
         let packet = link
@@ -536,11 +535,11 @@ async fn respond(
     } else {
         debug!(
             "Sending mesh response {} as a resource ({} bytes, link MDU {mdu})",
-            request_id.to_hex_string(),
+            request_id,
             bytes.len()
         );
         transport
-            .send_response_resource(&link_id, request_id.to_vec(), bytes, None)
+            .send_response_resource(&link_id, request_id.to_bytes().to_vec(), bytes, None)
             .await
             .map_err(|err| RequestError::Send(format!("response resource: {err}")))?;
         Ok(())

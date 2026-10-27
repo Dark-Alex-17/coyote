@@ -266,10 +266,10 @@ impl RequestClient {
                 .await?
                 .request_packet(&packed)
                 .map_err(|err| RequestError::Send(format!("request packet: {err}")))?;
-            let request_id = RequestId::from_packet(&packet);
+            let request_id = RequestId::from_packet_hash(&packet.hash());
             debug!(
                 "Sending mesh request {} for {path} as a packet ({} bytes, link MDU {mdu})",
-                request_id.to_hex_string(),
+                request_id,
                 packed.len()
             );
             let receiver = self.insert_pending(request_id, link_id, path)?;
@@ -293,10 +293,10 @@ impl RequestClient {
             }
             (receiver, guard)
         } else {
-            let request_id = RequestId::of_packed(&packed);
+            let request_id = RequestId::of_packed_request(&packed);
             debug!(
                 "Sending mesh request {} for {path} as a resource ({} bytes, link MDU {mdu})",
-                request_id.to_hex_string(),
+                request_id,
                 packed.len()
             );
             let receiver = self.insert_pending(request_id, link_id, path)?;
@@ -307,7 +307,12 @@ impl RequestClient {
             let resource_hash = deadline
                 .bound(
                     path,
-                    transport.send_request_resource(&link_id, request_id.to_vec(), packed, None),
+                    transport.send_request_resource(
+                        &link_id,
+                        request_id.to_bytes().to_vec(),
+                        packed,
+                        None,
+                    ),
                 )
                 .await?
                 .map_err(|err| RequestError::Send(format!("request resource: {err}")))?;
@@ -452,10 +457,7 @@ impl RequestClient {
                     request_id.filter(|request_id| pending.by_request.contains_key(request_id))
                 };
                 if let Some(request_id) = delivered {
-                    debug!(
-                        "Mesh request {} was delivered as a resource",
-                        request_id.to_hex_string()
-                    );
+                    debug!("Mesh request {request_id} was delivered as a resource");
                 }
             }
             ResourceEventKind::OutboundFailed => {
@@ -468,7 +470,7 @@ impl RequestClient {
                 if let Some((request_id, entry)) = failed {
                     debug!(
                         "Mesh request {} failed in transfer as a resource on link {}",
-                        request_id.to_hex_string(),
+                        request_id,
                         event.link_id.to_hex_string()
                     );
                     let _ = entry.reply.send(Err(RequestError::Send(
@@ -527,14 +529,14 @@ impl RequestClient {
             let Some(entry) = pending.by_request.get(&frame.request_id) else {
                 debug!(
                     "Unmatched mesh response {} ({branch:?}); the request timed out or was never ours",
-                    frame.request_id.to_hex_string()
+                    frame.request_id
                 );
                 return;
             };
             if entry.link_id != link_id {
                 debug!(
                     "Ignored a mesh response for {} that arrived on link {} instead of {}",
-                    frame.request_id.to_hex_string(),
+                    frame.request_id,
                     link_id.to_hex_string(),
                     entry.link_id.to_hex_string()
                 );
@@ -556,7 +558,7 @@ impl RequestClient {
         };
         debug!(
             "Correlated mesh response {} ({branch:?}, {} bytes)",
-            frame.request_id.to_hex_string(),
+            frame.request_id,
             bytes.len()
         );
         let _ = pending.reply.send(Ok((frame.data, branch)));

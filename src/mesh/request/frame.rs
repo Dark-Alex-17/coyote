@@ -1,12 +1,11 @@
-use crate::mesh::hex_lower;
 use crate::mesh::protocol::{MESH_PROTOCOL_VERSION, protocol_supported};
 use crate::mesh::request::error::RequestError;
 use crate::mesh::request::redact_hashes;
 
 use rmpv::Value;
-use rns_transport::Packet;
+pub(crate) use rns_transport::destination::request::{PathHash, RequestId};
 use rns_transport::destination::{DestinationName, NAME_HASH_LENGTH};
-use rns_transport::hash::{ADDRESS_HASH_SIZE, address_hash};
+use rns_transport::hash::ADDRESS_HASH_SIZE;
 use std::io::Cursor;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -43,71 +42,6 @@ const NAME_HASH_KEY: &str = "name_hash";
 const BODY_KEY: &str = "body";
 const VERSION_KEY: &str = "v";
 
-/// `truncated_hash(path)`: SHA-256 of the UTF-8 path, first 16 bytes. Requests carry this,
-/// never the path itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct PathHash([u8; ADDRESS_HASH_SIZE]);
-
-impl PathHash {
-    pub(crate) fn of(path: &str) -> Self {
-        Self(address_hash(path.as_bytes()))
-    }
-
-    pub(crate) fn to_hex_string(self) -> String {
-        hex_lower(&self.0)
-    }
-}
-
-impl From<[u8; ADDRESS_HASH_SIZE]> for PathHash {
-    fn from(bytes: [u8; ADDRESS_HASH_SIZE]) -> Self {
-        Self(bytes)
-    }
-}
-
-/// What a response is correlated with. How it is derived depends on how the request
-/// travelled, and the two sides must agree without the id ever being on the wire in the
-/// request itself:
-///
-/// - Sent as a single packet, the id is the first 16 bytes of that packet's hash. The
-///   responder derives it from the packet it received (RNS `Link.handle_request` is handed
-///   `packet.getTruncatedHash()`), so the requester must take it from the packet it built.
-/// - Sent as a resource, the id is `truncated_hash(packed_request)`, the SHA-256 of the
-///   encoded frame truncated to 16 bytes. RNS `Link.request` records it on that branch and
-///   the responder recomputes it from the assembled resource bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct RequestId([u8; ADDRESS_HASH_SIZE]);
-
-impl RequestId {
-    pub(crate) fn from_packet(packet: &Packet) -> Self {
-        let hash = packet.hash().to_bytes();
-        let mut id = [0u8; ADDRESS_HASH_SIZE];
-        id.copy_from_slice(&hash[..ADDRESS_HASH_SIZE]);
-        Self(id)
-    }
-
-    pub(crate) fn of_packed(packed: &[u8]) -> Self {
-        Self(address_hash(packed))
-    }
-
-    pub(crate) fn as_bytes(&self) -> &[u8; ADDRESS_HASH_SIZE] {
-        &self.0
-    }
-
-    pub(crate) fn to_vec(self) -> Vec<u8> {
-        self.0.to_vec()
-    }
-
-    pub(crate) fn to_hex_string(self) -> String {
-        hex_lower(&self.0)
-    }
-}
-
-impl From<[u8; ADDRESS_HASH_SIZE]> for RequestId {
-    fn from(bytes: [u8; ADDRESS_HASH_SIZE]) -> Self {
-        Self(bytes)
-    }
-}
-
 /// One request as it travels over a link, in either direction.
 ///
 /// Wire form: a msgpack array of exactly 3 elements. Element 0 is a msgpack float64
@@ -136,7 +70,7 @@ impl RequestFrame {
     pub(crate) fn encode(&self) -> Vec<u8> {
         encode_value(Value::Array(vec![
             Value::F64(self.time),
-            Value::Binary(self.path_hash.0.to_vec()),
+            Value::Binary(self.path_hash.to_bytes().to_vec()),
             self.data.clone(),
         ]))
     }
@@ -156,7 +90,7 @@ impl RequestFrame {
         };
         Ok(Self {
             time,
-            path_hash: PathHash(hash_bytes(&path_hash, "request path hash")?),
+            path_hash: PathHash::from(hash_bytes(&path_hash, "request path hash")?),
             data,
         })
     }
@@ -178,7 +112,7 @@ pub(crate) struct ResponseFrame {
 impl ResponseFrame {
     pub(crate) fn encode(&self) -> Vec<u8> {
         encode_value(Value::Array(vec![
-            Value::Binary(self.request_id.to_vec()),
+            Value::Binary(self.request_id.to_bytes().to_vec()),
             self.data.clone(),
         ]))
     }
@@ -196,7 +130,7 @@ impl ResponseFrame {
             ))
         })?;
         Ok(Self {
-            request_id: RequestId(hash_bytes(&request_id, "response request id")?),
+            request_id: RequestId::from(hash_bytes(&request_id, "response request id")?),
             data,
         })
     }

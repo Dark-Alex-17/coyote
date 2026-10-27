@@ -2998,7 +2998,7 @@ fn the_bound_is_found_from_the_frame_prefix_before_the_frame_is_decoded() -> Res
             &frame_of(stray_id, MAX_REQUEST_PAYLOAD_BYTES + 1)?,
             SizeBranch::Resource,
         );
-        let unmatched = format!("Unmatched mesh response {}", stray_id.to_hex_string());
+        let unmatched = format!("Unmatched mesh response {stray_id}");
         ensure(
             debug_snapshot()
                 .iter()

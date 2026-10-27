@@ -317,8 +317,7 @@ impl Dispatcher {
         let (request_id, link_id) = (request.request_id, request.link_id);
         let log = |id8: &str, outcome: &str| {
             debug!(
-                "Mesh request {} for {path} from {id8} on link {}: {outcome}",
-                request_id.to_hex_string(),
+                "Mesh request {request_id} for {path} from {id8} on link {}: {outcome}",
                 link_id.to_hex_string()
             );
         };
@@ -406,7 +405,7 @@ impl Dispatcher {
                         log(short(&identity_hex), &format!("unknown path: {rule:?}"));
                         Reply::Value(
                             DispatchError::UnknownPath {
-                                path_hash: request.path_hash.to_hex_string(),
+                                path_hash: request.path_hash.to_string(),
                             }
                             .to_value(),
                         )
@@ -478,7 +477,7 @@ impl RequestHandler for Dispatcher {
 pub(crate) fn describe_path(path_hash: PathHash) -> String {
     match path_name(path_hash) {
         Some(name) => name.to_string(),
-        None => format!("hash {}", path_hash.to_hex_string()),
+        None => format!("hash {path_hash}"),
     }
 }
 
@@ -537,7 +536,7 @@ mod tests {
                 path: STATUS_PATH.to_string(),
             },
             DispatchError::UnknownPath {
-                path_hash: PathHash::of(STATUS_PATH).to_hex_string(),
+                path_hash: PathHash::of(STATUS_PATH).to_string(),
             },
         ] {
             assert_eq!(DispatchError::from_value(&error.to_value()), Some(error));
@@ -575,7 +574,7 @@ mod tests {
         let unknown = "/shares";
         assert_eq!(
             describe_path(PathHash::of(unknown)),
-            format!("hash {}", PathHash::of(unknown).to_hex_string())
+            format!("hash {}", PathHash::of(unknown))
         );
         let error = DispatchError::NoProvider {
             path: unknown.to_string(),

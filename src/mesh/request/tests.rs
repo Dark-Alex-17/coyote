@@ -35,7 +35,7 @@ fn request_frame_matches_upstream_link_request_byte_for_byte() {
     assert_eq!(frame.data, data);
     assert_eq!(frame.encode(), upstream.packed);
     assert_eq!(
-        RequestId::of_packed(&upstream.packed),
+        RequestId::of_packed_request(&upstream.packed),
         RequestId::from(upstream.resource_request_id)
     );
 }
@@ -297,7 +297,7 @@ fn every_request_error_has_a_next_step() {
 fn dispatch_errors_round_trip_as_maps_and_never_read_as_refusal_codes() {
     let errors = [
         DispatchError::UnknownPath {
-            path_hash: PathHash::of("/nope").to_hex_string(),
+            path_hash: PathHash::of("/nope").to_string(),
         },
         DispatchError::NoProvider {
             path: "/status".to_string(),
@@ -1288,7 +1288,12 @@ pub(crate) mod network {
         let held = manager.lock().await;
         let hash = responder
             .transport
-            .send_response_resource(&seen.link_id, seen.request_id.to_vec(), bytes, None)
+            .send_response_resource(
+                &seen.link_id,
+                seen.request_id.to_bytes().to_vec(),
+                bytes,
+                None,
+            )
             .await
             .unwrap();
         drop(held);
@@ -1592,7 +1597,7 @@ pub(crate) mod network {
         // moment; the id binds the line to this request and no other.
         let delivered = format!(
             "Mesh request {} was delivered as a resource",
-            seen.request_id.to_hex_string()
+            seen.request_id
         );
         wait_until("the requester to log the resource delivery", || {
             debug_snapshot()
@@ -1832,7 +1837,7 @@ pub(crate) mod network {
         transport
             .send_request_resource(
                 &link_id,
-                RequestId::of_packed(&packed).to_vec(),
+                RequestId::of_packed_request(&packed).to_bytes().to_vec(),
                 packed,
                 None,
             )
@@ -2092,7 +2097,7 @@ pub(crate) mod network {
         )));
         assert!(snapshot.contains(&format!(
             "Unmatched mesh response {} (Resource); the request timed out or was never ours",
-            request_id.to_hex_string()
+            request_id
         )));
     }
 
@@ -2227,7 +2232,7 @@ pub(crate) mod network {
         let seen = recorder.last();
         let warned = format!(
             "Failed to send mesh response {} on link {}: {}",
-            seen.request_id.to_hex_string(),
+            seen.request_id,
             seen.link_id.to_hex_string(),
             RequestError::Oversize {
                 len: MAX_REQUEST_PAYLOAD_BYTES + 1,
@@ -2305,7 +2310,7 @@ pub(crate) mod network {
 
         let ignored = format!(
             "Ignored a mesh response for {} that arrived on link {} instead of {}",
-            seen.request_id.to_hex_string(),
+            seen.request_id,
             decoy_link_id.to_hex_string(),
             seen.link_id.to_hex_string()
         );
@@ -2345,7 +2350,7 @@ pub(crate) mod network {
         let resource_hash = transport_b
             .send_request_resource(
                 &link_id,
-                RequestId::of_packed(&packed).to_vec(),
+                RequestId::of_packed_request(&packed).to_bytes().to_vec(),
                 packed,
                 None,
             )
@@ -2675,7 +2680,7 @@ pub(crate) mod network {
             .await
             .request_packet(&two_element_request)
             .unwrap();
-        let request_id = RequestId::from_packet(&packet);
+        let request_id = RequestId::from_packet_hash(&packet.hash());
         requester
             .transport
             .send_link_packet_on_bound_iface(&link, packet)
@@ -2683,7 +2688,7 @@ pub(crate) mod network {
 
         let dropped = format!(
             "Dropped an undecodable mesh request {} from {} on link {}: ",
-            request_id.to_hex_string(),
+            request_id,
             &identity_hex(&requester)[..8],
             link_id.to_hex_string()
         );
@@ -2757,7 +2762,7 @@ pub(crate) mod network {
         assert_eq!(
             DispatchError::from_value(&outcome.value),
             Some(DispatchError::UnknownPath {
-                path_hash: PathHash::of("/nope").to_hex_string(),
+                path_hash: PathHash::of("/nope").to_string(),
             })
         );
         assert_eq!(responder.server.decoded_count(), 1);
@@ -2765,7 +2770,7 @@ pub(crate) mod network {
         assert_eq!(gate.sink.count(), 0);
         assert_debug_logged(&format!(
             " for hash {} from {} on link {}: unknown path: IdentityTrusted",
-            PathHash::of("/nope").to_hex_string(),
+            PathHash::of("/nope"),
             &identity_hex(&requester)[..8],
             link_id.to_hex_string()
         ));
@@ -3858,8 +3863,8 @@ pub(crate) mod network {
         assert_eq!(seen.path_hash, PathHash::of(TEST_PATH));
         assert_debug_logged(&format!(
             "Mesh request {} for hash {} from {} on link {}: served: DestinationTrusted",
-            seen.request_id.to_hex_string(),
-            PathHash::of(TEST_PATH).to_hex_string(),
+            seen.request_id,
+            PathHash::of(TEST_PATH),
             &identity_hex(&requester)[..8],
             seen.link_id.to_hex_string()
         ));
@@ -4017,7 +4022,7 @@ pub(crate) mod network {
         let seen = recorder.last();
         let warned = format!(
             "Mesh request {} on link {} was not handled within 300ms; sent nothing",
-            seen.request_id.to_hex_string(),
+            seen.request_id,
             seen.link_id.to_hex_string()
         );
         assert!(
@@ -10775,7 +10780,7 @@ pub(crate) mod network {
 
         pair.recorder_b.queue(Script::Reply(Reply::Value(
             DispatchError::UnknownPath {
-                path_hash: PathHash::of(FETCH_PATH).to_hex_string(),
+                path_hash: PathHash::of(FETCH_PATH).to_string(),
             }
             .to_value(),
         )));
@@ -10789,7 +10794,7 @@ pub(crate) mod network {
 
         for refusal in [
             DispatchError::UnknownPath {
-                path_hash: PathHash::of(LIST_PATH).to_hex_string(),
+                path_hash: PathHash::of(LIST_PATH).to_string(),
             },
             DispatchError::NoProvider {
                 path: LIST_PATH.to_string(),

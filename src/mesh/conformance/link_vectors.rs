@@ -825,7 +825,7 @@ mod loopback {
 
         let ignored = format!(
             "Ignored a mesh response for {} that arrived on link {} instead of {}",
-            seen.request_id.to_hex_string(),
+            seen.request_id,
             decoy_link_id.to_hex_string(),
             seen.link_id.to_hex_string()
         );
@@ -862,7 +862,7 @@ mod loopback {
         transport
             .send_request_resource(
                 &link_id,
-                RequestId::of_packed(&packed).to_vec(),
+                RequestId::of_packed_request(&packed).to_bytes().to_vec(),
                 packed,
                 None,
             )
@@ -976,7 +976,7 @@ mod loopback {
         let seen = recorder.last();
         let warned = format!(
             "Mesh request {} on link {} was not handled within {}ms; sent nothing",
-            seen.request_id.to_hex_string(),
+            seen.request_id,
             seen.link_id.to_hex_string(),
             SHORT_HANDLER_TIMEOUT.as_millis()
         );

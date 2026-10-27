@@ -1146,7 +1146,7 @@ fn check_tier(
                         ensure(
                             DispatchError::from_value(value)
                                 == Some(DispatchError::UnknownPath {
-                                    path_hash: path_hash.to_hex_string(),
+                                    path_hash: path_hash.to_string(),
                                 }),
                             || {
                                 format!(

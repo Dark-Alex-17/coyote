@@ -620,7 +620,7 @@ fn request_frame_vectors() -> Vec<Vector> {
             Kind::Invalid,
             packed(&request_value(
                 Value::F64(0.0),
-                Value::from(PathHash::of(STATUS_PATH).to_hex_string()),
+                Value::from(PathHash::of(STATUS_PATH).to_string()),
                 Value::Nil,
             )),
             FrameAction::Rejected(PATH_NOT_BIN),
@@ -831,7 +831,7 @@ fn response_frame_vectors() -> Vec<Vector> {
             "response-frame-id-as-hex-string-is-rejected",
             Kind::Invalid,
             packed(&response_value(
-                Value::from(RequestId::from(REQUEST_ID).to_hex_string()),
+                Value::from(RequestId::from(REQUEST_ID).to_string()),
                 Value::Nil,
             )),
             FrameAction::Rejected(ID_NOT_BIN),
@@ -1451,7 +1451,7 @@ fn version_refused(found: Option<u16>) -> Answer {
 fn unknown_path_answer(path: &str) -> Answer {
     Answer::Value(
         DispatchError::UnknownPath {
-            path_hash: PathHash::of(path).to_hex_string(),
+            path_hash: PathHash::of(path).to_string(),
         }
         .to_value(),
     )
@@ -3205,7 +3205,7 @@ fn version_refusal_vectors() -> Vec<Vector> {
             "unknown-path-error-is-not-a-version-refusal",
             Kind::Invalid,
             DispatchError::UnknownPath {
-                path_hash: PathHash::of(UNKNOWN_PATH).to_hex_string(),
+                path_hash: PathHash::of(UNKNOWN_PATH).to_string(),
             }
             .to_value(),
             None,
@@ -3378,8 +3378,8 @@ fn dispatch_error_vectors() -> Vec<Vector> {
         dispatch_error(
             "dispatch-error-derived-path-hash-is-read",
             Kind::Valid,
-            unknown_path_value(Value::from(PathHash::of(UNKNOWN_PATH).to_hex_string())),
-            unknown_path(&PathHash::of(UNKNOWN_PATH).to_hex_string()),
+            unknown_path_value(Value::from(PathHash::of(UNKNOWN_PATH).to_string())),
+            unknown_path(&PathHash::of(UNKNOWN_PATH).to_string()),
         ),
         dispatch_error(
             "dispatch-error-path-hash-of-31-chars-is-malformed",
