@@ -451,9 +451,9 @@ mod loopback {
     };
     use crate::mesh::request::network::{
         REQUEST_FRAME_OVERHEAD, Recorder, Requester, Responder, SHORT_REQUEST_TIMEOUT, Script,
-        Stall, hanging_request, library_refused_oversize_request, link_deadline, pair,
-        request_body_of_encoded_len, request_on, request_sent_as, request_went_as,
-        response_body_of_encoded_len, response_payloads, short_options, timed_out,
+        Stall, awaited_response_payloads, hanging_request, library_refused_oversize_request,
+        link_deadline, pair, request_body_of_encoded_len, request_on, request_sent_as,
+        request_went_as, response_body_of_encoded_len, response_payloads, short_options, timed_out,
         timed_out_slow_request,
     };
     use crate::mesh::request::{
@@ -686,8 +686,19 @@ mod loopback {
                     .await
                     .unwrap();
                 assert_eq!(outcome, body, "a {target}-byte response frame round-trips");
-                let packets = response_payloads(&mut events).len();
-                let resources = responses_as_resources(&mut inbound);
+                // The receipt resolves before the library publishes the matching event, so
+                // the side the row expects is awaited and the other side read as a snapshot
+                // after it.
+                let (packets, resources) = match expected {
+                    SizeBranch::Packet => (
+                        awaited_response_payloads(&mut events, 1).await.len(),
+                        responses_as_resources(&mut inbound),
+                    ),
+                    SizeBranch::Resource => {
+                        let resources = awaited_responses_as_resources(&mut inbound, 1).await;
+                        (response_payloads(&mut events).len(), resources)
+                    }
+                };
                 match expected {
                     SizeBranch::Packet => {
                         assert_eq!(
@@ -707,6 +718,22 @@ mod loopback {
             }
         }
         pair.stop().await;
+    }
+
+    /// `responses_as_resources` once at least `n` have arrived, waiting the same bounded
+    /// way `awaited_response_payloads` does: the resource `Complete` event is published
+    /// after the receipt it completes resolves.
+    async fn awaited_responses_as_resources(
+        events: &mut broadcast::Receiver<ResourceEvent>,
+        n: usize,
+    ) -> usize {
+        let mut count = responses_as_resources(events);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while count < n && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            count += responses_as_resources(events);
+        }
+        count
     }
 
     /// How many responses have arrived as assembled resources since `events` was
@@ -804,7 +831,7 @@ mod loopback {
         );
         assert_eq!(pair.recorder.seen_count(), 1);
         assert_eq!(
-            response_payloads(&mut events).len(),
+            awaited_response_payloads(&mut events, 1).await.len(),
             1,
             "only the well-formed request was answered"
         );
