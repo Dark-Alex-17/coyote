@@ -1191,6 +1191,14 @@ pub(crate) mod network {
         );
     }
 
+    pub(crate) fn assert_debug_logged_exactly(line: &str) {
+        let debugs = debug_snapshot();
+        assert!(
+            debugs.iter().any(|message| message == line),
+            "no debug message is {line:?}"
+        );
+    }
+
     /// Whether the requester logged sending `request_id` for `path` on `branch`: its own
     /// record of the packet-or-resource choice, which the responder's handler never sees.
     pub(crate) fn request_sent_as(request_id: RequestId, path: &str, branch: SizeBranch) -> bool {
@@ -2863,9 +2871,9 @@ pub(crate) mod network {
             "the request was never admitted"
         );
         assert_eq!(gate.sink.count(), 0);
-        assert_debug_logged(&format!(
-            "from {} on link {}: dropped: unknown identity",
-            &identity_hex(&requester)[..8],
+        assert_debug_logged_exactly(&format!(
+            "Mesh request (envelope not yet read) from {} on link {}: dropped: unknown identity",
+            short(&identity_hex(&requester)),
             link_id.to_hex_string()
         ));
         requester.stop().await;
@@ -3022,8 +3030,9 @@ pub(crate) mod network {
         assert_eq!(responder.adapter.admitted_count(), 0);
         assert_eq!(recorder.seen_count(), 0);
         assert_eq!(gate.sink.count(), 0, "a blocked identity never knocks");
-        assert_debug_logged(&format!(
-            "on link {}: dropped: blocked identity",
+        assert_debug_logged_exactly(&format!(
+            "Mesh request (envelope not yet read) from {} on link {}: dropped: blocked identity",
+            short(&identity_hex(&requester)),
             link_id.to_hex_string()
         ));
         requester.stop().await;
