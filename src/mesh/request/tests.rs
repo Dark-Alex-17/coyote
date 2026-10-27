@@ -680,13 +680,16 @@ pub(crate) mod network {
     /// How long a request these tests never answer waits before it gives up.
     pub(crate) const SHORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
     /// How long a request these tests answer with a `MAX_REQUEST_PAYLOAD_BYTES` resource waits.
-    /// The per-path bound is judged against the pending table once the resource has
-    /// assembled, so the request has to outlive the transfer: a response that assembles
-    /// after its request timed out gets the coarse bound and `Unmatched`, never `Dropped`.
-    /// The 525-part random body takes under a second over loopback on an idle machine and
-    /// closer to two at a third of one core, and the receiver's window shrinks on every
-    /// part it judges late, so the budget is several times the slowest transfer measured.
+    /// The budget covers the whole Resource transfer the library assembles before the
+    /// receipt resolves. The 525-part random body takes under a second over loopback on an
+    /// idle machine and closer to two at a third of one core, and the receiver's window
+    /// shrinks on every part it judges late, so the budget is several times the slowest
+    /// transfer measured.
     const TRANSFER_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+    /// How long a request answered with a `MAX_FETCH_RESPONSE_BYTES` resource waits: the
+    /// body compresses to a few parts, but the receiver still decompresses and assembles
+    /// 4 MiB, and a loaded CI worker is given several times what idle loopback needs.
+    const FETCH_TRANSFER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
     /// Bytes of array header, request id and bin32 header around a response frame's body.
     const RESPONSE_FRAME_OVERHEAD: usize = 24;
     /// Bytes of array header, time, path hash and bin32 header around a request frame's body.
@@ -1414,12 +1417,17 @@ pub(crate) mod network {
 
     /// A response frame for `request_id` that encodes to one byte over `max`.
     fn oversize_response(request_id: RequestId, body: Vec<u8>, max: usize) -> Vec<u8> {
+        response_frame_of(request_id, body, max + 1)
+    }
+
+    /// A response frame for `request_id` that encodes to exactly `len` bytes.
+    fn response_frame_of(request_id: RequestId, body: Vec<u8>, len: usize) -> Vec<u8> {
         let bytes = ResponseFrame {
             request_id,
             data: Value::Binary(body),
         }
         .encode();
-        assert_eq!(bytes.len(), max + 1);
+        assert_eq!(bytes.len(), len);
         bytes
     }
 
@@ -1429,9 +1437,14 @@ pub(crate) mod network {
     /// matters, and a one-part transfer keeps the window ladder, and the time it takes to
     /// climb on a loaded machine, out of a test about that bound.
     fn compressible_response_body(max: usize) -> Vec<u8> {
+        compressible_body_framing_to(max + 1)
+    }
+
+    /// `compressible_response_body` for a response frame of exactly `len` bytes.
+    fn compressible_body_framing_to(len: usize) -> Vec<u8> {
         (0..=u8::MAX)
             .cycle()
-            .take(max + 1 - RESPONSE_FRAME_OVERHEAD)
+            .take(len - RESPONSE_FRAME_OVERHEAD)
             .collect()
     }
 
@@ -1914,9 +1927,10 @@ pub(crate) mod network {
     }
 
     /// The response cap is the library's, armed per path when the request is sent: a
-    /// `/status` response one byte over `MAX_REQUEST_PAYLOAD_BYTES` fails the request as
-    /// oversize at its advertisement, and a `/fetch` response of the same size, under that
-    /// path's own bound, is delivered.
+    /// `/status` response well over `MAX_REQUEST_PAYLOAD_BYTES` fails the request as
+    /// oversize at its advertisement, naming one over the cap rather than the advertised
+    /// size, which the library never reports for a response it refuses; a `/fetch`
+    /// response one byte over that cap, under that path's own bound, is delivered.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_response_cap_is_armed_per_path_and_held_by_the_library() {
         let recorder = Arc::new(Recorder::default());
@@ -1933,14 +1947,15 @@ pub(crate) mod network {
             TRANSFER_REQUEST_TIMEOUT,
         )
         .await;
+        let well_over = MAX_REQUEST_PAYLOAD_BYTES + 500;
         answer_as_resource(
             &responder,
             &requester,
             &seen,
-            oversize_response(
+            response_frame_of(
                 seen.request_id,
-                compressible_response_body(MAX_REQUEST_PAYLOAD_BYTES),
-                MAX_REQUEST_PAYLOAD_BYTES,
+                compressible_body_framing_to(well_over),
+                well_over,
             ),
         )
         .await;
@@ -2237,6 +2252,158 @@ pub(crate) mod network {
         responder.stop().await;
     }
 
+    /// A request the responder refuses at its advertisement fails as `Send` when the
+    /// refusal lands, not when the request would have timed out. The responder's
+    /// destination is armed with a request cap under Coyote's, so a frame under Coyote's
+    /// pre-send cap but over the responder's travels as a resource and is refused there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_the_responder_refuses_fails_as_send_at_once() {
+        install_log_collector();
+        let recorder = Arc::new(Recorder::default());
+        let (responder, requester, desc) = pair(recorder.clone()).await;
+        responder
+            .dest
+            .lock()
+            .await
+            .set_max_request_size(64)
+            .unwrap();
+        let link = open_link(&requester.transport, &desc, "/echo", link_deadline())
+            .await
+            .unwrap();
+        let link_id = *link.lock().await.id();
+
+        let asked = Instant::now();
+        let err = request_on(
+            &requester,
+            &link,
+            "/echo",
+            Value::Binary(vec![0xab; 2048]),
+            SHORT_REQUEST_TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+        let refused_in = asked.elapsed();
+        assert!(matches!(err, RequestError::Send(_)), "{err:?}");
+        assert!(
+            refused_in < SHORT_REQUEST_TIMEOUT / 2,
+            "the refusal took {refused_in:?}"
+        );
+        assert_eq!(recorder.seen_count(), 0, "no handler ran");
+        assert!(
+            library_request_refusal_on(link_id).is_some(),
+            "the library refused the request at its advertisement"
+        );
+        requester.stop().await;
+        responder.stop().await;
+    }
+
+    /// A link that closes under a request in flight fails it as `LinkClosed` and nothing
+    /// else: the budget is long enough that a timeout cannot stand in for it. The
+    /// requester's side of the link is closed the way the library's watchdog or the peer's
+    /// teardown closes it, with the pending request still on it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_link_closed_under_a_request_in_flight_fails_it_as_link_closed() {
+        let recorder = Arc::new(Recorder::default());
+        let (responder, requester, desc) = pair(recorder.clone()).await;
+        let link = open_link(&requester.transport, &desc, "/slow", link_deadline())
+            .await
+            .unwrap();
+        recorder.queue(Script::Hang);
+        let before = recorder.seen_count();
+        let in_flight = {
+            let transport = requester.transport.clone();
+            let link = link.clone();
+            let data = requester.envelope(Value::Nil).into_value();
+            tokio::spawn(async move {
+                request_on_link(&transport, &link, "/slow", data, DEFAULT_REQUEST_TIMEOUT).await
+            })
+        };
+        wait_until("the responder to hold the request", || {
+            recorder.seen_count() > before
+        })
+        .await;
+
+        let closing = Instant::now();
+        link.lock().await.close();
+        let result = timeout(INTEROP_TIMEOUT, in_flight).await.unwrap().unwrap();
+        let failed_in = closing.elapsed();
+        assert_eq!(result.unwrap_err(), RequestError::LinkClosed);
+        assert!(
+            failed_in < SHORT_REQUEST_TIMEOUT,
+            "the request outlived its link by {failed_in:?}"
+        );
+        requester.stop().await;
+        responder.stop().await;
+    }
+
+    /// The `/fetch` bound is inclusive on the requester's side: a response frame of
+    /// exactly `MAX_FETCH_RESPONSE_BYTES` is delivered byte for byte, and one of a byte
+    /// more fails as `Oversize` naming that cap and one over it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fetch_response_at_its_bound_is_delivered_and_one_byte_over_is_oversize() {
+        let recorder = Arc::new(Recorder::default());
+        let responder = Responder::listen(recorder.clone(), TcpServer::DEFAULT_CLIENT_MTU).await;
+        let mut requester = Requester::connect(responder.port, TcpClient::DEFAULT_MTU).await;
+        responder.announce(None).await;
+        let desc = requester.learn(&responder.desc.address_hash).await;
+
+        let (in_flight, seen) = hanging_request_on(
+            &requester,
+            &recorder,
+            &desc,
+            FETCH_PATH,
+            FETCH_TRANSFER_REQUEST_TIMEOUT,
+        )
+        .await;
+        let body = compressible_body_framing_to(MAX_FETCH_RESPONSE_BYTES);
+        answer_as_resource(
+            &responder,
+            &requester,
+            &seen,
+            response_frame_of(seen.request_id, body.clone(), MAX_FETCH_RESPONSE_BYTES),
+        )
+        .await;
+        let reply = timeout(FETCH_TRANSFER_REQUEST_TIMEOUT, in_flight)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            reply == Value::Binary(body),
+            "a response on the bound arrives byte for byte"
+        );
+
+        let (in_flight, seen) = hanging_request_on(
+            &requester,
+            &recorder,
+            &desc,
+            FETCH_PATH,
+            FETCH_TRANSFER_REQUEST_TIMEOUT,
+        )
+        .await;
+        answer_as_resource(
+            &responder,
+            &requester,
+            &seen,
+            oversize_response(
+                seen.request_id,
+                compressible_response_body(MAX_FETCH_RESPONSE_BYTES),
+                MAX_FETCH_RESPONSE_BYTES,
+            ),
+        )
+        .await;
+        let result = timeout(INTEROP_TIMEOUT, in_flight).await.unwrap().unwrap();
+        assert_eq!(
+            result.unwrap_err(),
+            RequestError::Oversize {
+                len: MAX_FETCH_RESPONSE_BYTES + 1,
+                max: MAX_FETCH_RESPONSE_BYTES,
+            }
+        );
+        requester.stop().await;
+        responder.stop().await;
+    }
+
     /// Every way a settled reply can fail to go out ends the same: the settlement is
     /// dropped unsent and the adapter says why, under the request's id.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2474,9 +2641,10 @@ pub(crate) mod network {
 
         // A requester that takes no reply over its own size limit refuses the resource at
         // its advertisement; the transfer ends rejected on this side and the settlement is
-        // dropped unsent. The library's own request is used because Coyote's client has
-        // no such limit. The requester's side of the link closed above is still active and
-        // would be reused, so it is closed first and a fresh link opened.
+        // dropped unsent. The library's own request is used because Coyote's helper fixes
+        // the cap per path; this one picks a 64-byte cap the card is well over. The
+        // requester's side of the link closed above is still active and would be reused,
+        // so it is closed first and a fresh link opened.
         let (reply, sent, dropped) = settled(card.clone());
         *handler.reply.lock() = Some(reply);
         requester
@@ -2662,8 +2830,10 @@ pub(crate) mod network {
     /// handling goes with the transport, whose dispatch worker aborts its handler tasks,
     /// and the stop waits for the hung handler to be gone, with its slot back, before it
     /// releases the node's locks: a handler's drop never runs against a lock another
-    /// process may by then hold. The peer's request to the stopped node fails with the
-    /// link.
+    /// process may by then hold. The peer's request to the stopped node runs out its own
+    /// budget: a stopping transport sends no teardown, so the peer's link stays tabled
+    /// until its watchdog, minutes past the request timeout, and the request is a
+    /// `Timeout`, never a `LinkClosed`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mesh_runtime_requests_and_serves_and_stop_aborts_and_drains_in_flight_requests() {
         let recorder_b = Arc::new(Recorder::default());
@@ -2797,13 +2967,7 @@ pub(crate) mod network {
             .await
             .unwrap()
             .unwrap();
-        assert!(
-            matches!(
-                result,
-                Err(RequestError::LinkClosed | RequestError::Timeout { .. })
-            ),
-            "{result:?}"
-        );
+        assert_eq!(result.unwrap_err(), timed_out(MESSAGE_PATH));
         responder.stop().await;
     }
 
