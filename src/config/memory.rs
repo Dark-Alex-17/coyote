@@ -1,9 +1,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::sync::LazyLock;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
+use chrono::Local;
+use fancy_regex::Regex;
 use log::warn;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::config::{
     GIT_DIR_NAME, GITIGNORE_FILE_NAME, MEMORY_DIR_NAME, MEMORY_INDEX_FILE_NAME,
@@ -12,6 +16,21 @@ use crate::config::{
 
 pub const DEFAULT_MEMORY_CAP_WITH_TOOLS: usize = 6_000;
 pub const DEFAULT_MEMORY_CAP_WITHOUT_TOOLS: usize = 12_000;
+pub const DEFAULT_MEMORY_RUN_STATE_TTL_DAYS: u32 = 14;
+
+/// A MEMORY.md line that catalogues a drill file. Only lines of this exact shape
+/// count as indexing a file; a wikilink cited mid-sentence in a FACTS line does not.
+pub static CATALOGUE_LINE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^- \[\[(?P<slug>[A-Za-z0-9_.-]+)\]\]:\s*(?P<desc>.*)$").unwrap());
+
+pub fn catalogue_slug(line: &str) -> Option<&str> {
+    CATALOGUE_LINE_RE
+        .captures(line)
+        .ok()
+        .flatten()
+        .and_then(|caps| caps.name("slug"))
+        .map(|m| m.as_str())
+}
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceMemory {
@@ -96,6 +115,112 @@ pub fn append_gitignore_entry(git_root: &Path) -> Result<bool> {
     Ok(true)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MemoryKind {
+    User,
+    Feedback,
+    Project,
+    #[default]
+    Reference,
+    RunState,
+}
+
+impl MemoryKind {
+    pub const NAMES: [&'static str; 5] = ["user", "feedback", "project", "reference", "run-state"];
+
+    const ALL: [MemoryKind; 5] = [
+        Self::User,
+        Self::Feedback,
+        Self::Project,
+        Self::Reference,
+        Self::RunState,
+    ];
+
+    pub fn name(self) -> &'static str {
+        Self::NAMES[self as usize]
+    }
+}
+
+impl FromStr for MemoryKind {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::NAMES
+            .iter()
+            .position(|name| *name == value)
+            .map(|i| Self::ALL[i])
+            .ok_or_else(|| {
+                anyhow!(
+                    "Invalid value '{value}', expected one of: {}",
+                    Self::NAMES.join(", ")
+                )
+            })
+    }
+}
+
+/// The `type:` front-matter field as both the kind Coyote acts on and the scalar
+/// actually on disk. Unknown or missing values act as `Reference` but are written
+/// back unchanged, so loading and re-saving a file never rewrites its `type:` line.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KindField {
+    parsed: MemoryKind,
+    raw: serde_yaml::Value,
+}
+
+impl KindField {
+    pub fn kind(&self) -> MemoryKind {
+        self.parsed
+    }
+
+    pub fn raw_kind(&self) -> &serde_yaml::Value {
+        &self.raw
+    }
+
+    pub fn is_known(&self) -> bool {
+        self.raw
+            .as_str()
+            .is_some_and(|s| MemoryKind::from_str(s).is_ok())
+    }
+}
+
+impl Default for KindField {
+    fn default() -> Self {
+        Self {
+            parsed: MemoryKind::default(),
+            raw: serde_yaml::Value::Null,
+        }
+    }
+}
+
+impl From<MemoryKind> for KindField {
+    fn from(kind: MemoryKind) -> Self {
+        Self {
+            parsed: kind,
+            raw: serde_yaml::Value::String(kind.name().to_string()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for KindField {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = serde_yaml::Value::deserialize(deserializer)?;
+        if raw.is_mapping() || raw.is_sequence() {
+            return Err(de::Error::custom("`type` must be a scalar"));
+        }
+        let parsed = raw
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_default();
+        Ok(Self { parsed, raw })
+    }
+}
+
+impl Serialize for KindField {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.raw.serialize(serializer)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct MemoryFrontmatter {
     #[serde(default)]
@@ -103,7 +228,7 @@ pub struct MemoryFrontmatter {
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default, rename = "type")]
-    pub kind: Option<String>,
+    pub kind: KindField,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -151,6 +276,15 @@ impl MemoryFile {
     pub fn char_len(&self) -> usize {
         self.body.chars().count()
     }
+
+    pub fn is_stale(&self, today: &str) -> bool {
+        self.frontmatter.superseded_by.is_some()
+            || self
+                .frontmatter
+                .expires
+                .as_deref()
+                .is_some_and(|expires| expires < today)
+    }
 }
 
 fn parse_frontmatter(raw: &str) -> Result<(MemoryFrontmatter, String)> {
@@ -169,6 +303,29 @@ fn parse_frontmatter(raw: &str) -> Result<(MemoryFrontmatter, String)> {
         serde_yaml::from_str(yaml.trim()).context("parse YAML frontmatter")?;
 
     Ok((frontmatter, body))
+}
+
+pub fn today_string() -> String {
+    Local::now().format("%Y-%m-%d").to_string()
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Retention {
+    pub include_stale: bool,
+}
+
+impl Retention {
+    pub fn live() -> Self {
+        Self {
+            include_stale: false,
+        }
+    }
+
+    pub fn all() -> Self {
+        Self {
+            include_stale: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -209,7 +366,7 @@ impl MemoryStore {
         }
     }
 
-    pub fn list_files(&self) -> Result<Vec<MemoryFile>> {
+    pub fn list_files(&self, retention: Retention) -> Result<Vec<MemoryFile>> {
         let mut out = Vec::new();
 
         if self.global_dir.exists() {
@@ -218,6 +375,11 @@ impl MemoryStore {
 
         if let Some(ws) = &self.workspace {
             collect_md_files(&ws.dir, &mut out)?;
+        }
+
+        if !retention.include_stale {
+            let today = today_string();
+            out.retain(|f| !f.is_stale(&today));
         }
 
         Ok(out)
@@ -263,7 +425,8 @@ pub fn build_memory_section(
 
     if !with_tools {
         let mut budget = cap.saturating_sub(consumed);
-        let mut files = store.list_files()?;
+        let mut files = store.list_files(Retention::live())?;
+        files.retain(|f| f.frontmatter.kind.kind() != MemoryKind::RunState);
         files.sort_by(|a, b| a.frontmatter.name.cmp(&b.frontmatter.name));
         let mut omitted = 0usize;
         for f in files {
@@ -498,7 +661,7 @@ mod tests {
 
         assert_eq!(fm.name, "foo");
         assert_eq!(fm.description.as_deref(), Some("a thing"));
-        assert_eq!(fm.kind.as_deref(), Some("user"));
+        assert_eq!(fm.kind.kind(), MemoryKind::User);
         assert_eq!(body, "Body text\n");
     }
 
@@ -509,7 +672,8 @@ mod tests {
         let (fm, body) = parse_frontmatter(raw).unwrap();
 
         assert_eq!(fm.name, "");
-        assert!(fm.kind.is_none());
+        assert_eq!(fm.kind.kind(), MemoryKind::Reference);
+        assert!(fm.kind.raw_kind().is_null());
         assert_eq!(body, raw);
     }
 
@@ -532,7 +696,7 @@ mod tests {
             frontmatter: MemoryFrontmatter {
                 name: "test".into(),
                 description: Some("a test".into()),
-                kind: Some("user".into()),
+                kind: MemoryKind::User.into(),
                 ..Default::default()
             },
             body: "Hello world\nmore text".into(),
@@ -541,11 +705,165 @@ mod tests {
         let loaded = MemoryFile::load(&path).unwrap();
         assert_eq!(loaded.frontmatter.name, "test");
         assert_eq!(loaded.frontmatter.description.as_deref(), Some("a test"));
-        assert_eq!(loaded.frontmatter.kind.as_deref(), Some("user"));
+        assert_eq!(loaded.frontmatter.kind.kind(), MemoryKind::User);
         assert_eq!(loaded.body, "Hello world\nmore text");
 
         let raw = fs::read_to_string(&path).unwrap();
         assert!(raw.contains("type: user"), "kind must serialize as 'type:'");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn memory_kind_parses_its_names_and_teaches_on_bad_input() {
+        for name in MemoryKind::NAMES {
+            assert_eq!(name.parse::<MemoryKind>().unwrap().name(), name);
+        }
+        assert_eq!(
+            "run-state".parse::<MemoryKind>().unwrap(),
+            MemoryKind::RunState
+        );
+
+        let err = "bogus".parse::<MemoryKind>().unwrap_err().to_string();
+        assert!(err.starts_with("Invalid value 'bogus'"), "{err}");
+        for name in MemoryKind::NAMES {
+            assert!(err.contains(name), "{err} should list {name}");
+        }
+    }
+
+    #[test]
+    fn kind_field_reads_null_and_unknown_scalars_as_reference_keeping_raw() {
+        let (null_fm, _) = parse_frontmatter("---\nname: n\ntype: null\n---\nx\n").unwrap();
+        assert_eq!(null_fm.kind.kind(), MemoryKind::Reference);
+        assert!(null_fm.kind.raw_kind().is_null());
+        assert!(!null_fm.kind.is_known());
+
+        let (absent_fm, _) = parse_frontmatter("---\nname: n\n---\nx\n").unwrap();
+        assert!(absent_fm.kind.raw_kind().is_null());
+
+        let (gotcha_fm, _) = parse_frontmatter("---\nname: n\ntype: gotcha\n---\nx\n").unwrap();
+        assert_eq!(gotcha_fm.kind.kind(), MemoryKind::Reference);
+        assert_eq!(gotcha_fm.kind.raw_kind().as_str(), Some("gotcha"));
+        assert!(!gotcha_fm.kind.is_known());
+
+        let (known_fm, _) = parse_frontmatter("---\nname: n\ntype: run-state\n---\nx\n").unwrap();
+        assert_eq!(known_fm.kind.kind(), MemoryKind::RunState);
+        assert!(known_fm.kind.is_known());
+
+        let (number_fm, _) = parse_frontmatter("---\nname: n\ntype: 7\n---\nx\n").unwrap();
+        assert_eq!(number_fm.kind.kind(), MemoryKind::Reference);
+        assert_eq!(number_fm.kind.raw_kind().as_u64(), Some(7));
+
+        assert!(parse_frontmatter("---\nname: n\ntype: [a, b]\n---\nx\n").is_err());
+    }
+
+    #[test]
+    fn resaving_a_loaded_file_keeps_its_type_line_byte_identical() {
+        let root = temp_root("type_roundtrip");
+        for scalar in ["null", "gotcha", "user"] {
+            let path = root.join(format!("{scalar}.md"));
+            fs::write(
+                &path,
+                format!("---\nname: f\ndescription: d\ntype: {scalar}\n---\n\nbody\n"),
+            )
+            .unwrap();
+
+            MemoryFile::load(&path).unwrap().save().unwrap();
+
+            let saved = fs::read_to_string(&path).unwrap();
+            let type_line = format!("\ntype: {scalar}\n");
+            assert!(saved.contains(&type_line), "{scalar}: {saved}");
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn catalogue_slug_accepts_only_catalogue_lines() {
+        assert_eq!(
+            catalogue_slug("- [[auth-flow]]: how auth works"),
+            Some("auth-flow")
+        );
+        assert_eq!(catalogue_slug("- [[a.b_c]]:"), Some("a.b_c"));
+        assert_eq!(
+            catalogue_slug("- Prefer [[auth-flow]] over passwords"),
+            None
+        );
+        assert_eq!(catalogue_slug("  - [[auth-flow]]: indented"), None);
+        assert_eq!(catalogue_slug("- [[auth-flow]] no colon"), None);
+        assert_eq!(catalogue_slug("- auth-flow"), None);
+    }
+
+    fn write_store_file(dir: &Path, name: &str, extra_frontmatter: &str) {
+        fs::write(
+            dir.join(format!("{name}.md")),
+            format!("---\nname: {name}\n{extra_frontmatter}---\n{name} body\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn list_files_live_hides_stale_files_while_all_keeps_them() {
+        let root = temp_root("retention");
+        let global = root.join("global");
+        fs::create_dir_all(&global).unwrap();
+        fs::write(global.join(MEMORY_INDEX_FILE_NAME), "idx").unwrap();
+        write_store_file(&global, "fresh", "");
+        write_store_file(&global, "future", "expires: 2999-01-01\n");
+        write_store_file(&global, "bygone", "expires: 2000-01-01\n");
+        write_store_file(&global, "replaced", "superseded_by: fresh\n");
+
+        let store = MemoryStore {
+            global_dir: global,
+            workspace: None,
+        };
+
+        let mut live: Vec<String> = store
+            .list_files(Retention::live())
+            .unwrap()
+            .into_iter()
+            .map(|f| f.frontmatter.name)
+            .collect();
+        live.sort();
+        assert_eq!(live, vec!["fresh", "future"]);
+
+        let mut all: Vec<String> = store
+            .list_files(Retention::all())
+            .unwrap()
+            .into_iter()
+            .map(|f| f.frontmatter.name)
+            .collect();
+        all.sort();
+        assert_eq!(all, vec!["bygone", "fresh", "future", "replaced"]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn build_memory_section_without_tools_skips_run_state_and_stale_files() {
+        let root = temp_root("drill_skips");
+        let workspace = root.join("ws");
+        let structured = workspace
+            .join(WORKSPACE_COYOTE_DIR_NAME)
+            .join(MEMORY_DIR_NAME);
+        fs::create_dir_all(&structured).unwrap();
+        fs::write(structured.join(MEMORY_INDEX_FILE_NAME), "idx").unwrap();
+        write_store_file(&structured, "durable", "type: user\n");
+        write_store_file(&structured, "scratch", "type: run-state\n");
+        write_store_file(&structured, "bygone", "expires: 2000-01-01\n");
+
+        let store = MemoryStore {
+            global_dir: root.join("global"),
+            workspace: discover_workspace_memory(&workspace),
+        };
+
+        let section = build_memory_section(&store, false, 6_000)
+            .unwrap()
+            .expect("memory section should exist");
+        assert!(section.contains("durable body"));
+        assert!(!section.contains("scratch body"));
+        assert!(!section.contains("bygone body"));
+        assert!(!section.contains("memory file(s) omitted"));
 
         let _ = fs::remove_dir_all(&root);
     }

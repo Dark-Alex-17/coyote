@@ -1,9 +1,10 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::{env, fs};
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::Local;
+use chrono::{Days, Local};
 use indexmap::IndexMap;
 use log::warn;
 use serde_json::{Value, json};
@@ -11,8 +12,9 @@ use serde_json::{Value, json};
 use super::{FunctionDeclaration, JsonSchema};
 use crate::config::RequestContext;
 use crate::config::memory::{
-    MemoryFile, MemoryFrontmatter, MemoryStore, WorkspaceMemory, bootstrap_workspace_memory,
-    find_git_root,
+    DEFAULT_MEMORY_RUN_STATE_TTL_DAYS, KindField, MemoryFile, MemoryFrontmatter, MemoryKind,
+    MemoryStore, Retention, WorkspaceMemory, bootstrap_workspace_memory, catalogue_slug,
+    find_git_root, today_string,
 };
 use crate::config::paths;
 
@@ -85,7 +87,9 @@ pub fn memory_function_declarations() -> Vec<FunctionDeclaration> {
                         JsonSchema {
                             type_value: Some("string".to_string()),
                             description: Some(
-                                "Optional memory type: user | feedback | project | reference".into(),
+                                "Optional memory type: user | feedback | project | reference | \
+                                 run-state (run-state defaults `expires` to today + memory_run_state_ttl_days)"
+                                    .into(),
                             ),
                             ..Default::default()
                         },
@@ -154,10 +158,22 @@ pub fn memory_function_declarations() -> Vec<FunctionDeclaration> {
         },
         FunctionDeclaration {
             name: format!("{MEMORY_FUNCTION_PREFIX}list"),
-            description: "List all known drill files with metadata (size, type, scope).".to_string(),
+            description: "List all live drill files with metadata (size, type, scope). Superseded \
+                          and expired files are hidden unless include_stale is true."
+                .to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
-                properties: Some(IndexMap::new()),
+                properties: Some(IndexMap::from([(
+                    "include_stale".to_string(),
+                    JsonSchema {
+                        type_value: Some("boolean".to_string()),
+                        description: Some(
+                            "Also list superseded and expired files, marked `stale: true` (default false)"
+                                .into(),
+                        ),
+                        ..Default::default()
+                    },
+                )])),
                 ..Default::default()
             },
             agent: false,
@@ -305,6 +321,11 @@ pub fn handle_memory_tool(ctx: &mut RequestContext, cmd_name: &str, args: &Value
         .unwrap_or(cmd_name);
     let cwd = env::current_dir().context("get cwd")?;
     let store = MemoryStore::new(&cwd);
+    let run_state_ttl_days = ctx
+        .app
+        .config
+        .memory_run_state_ttl_days
+        .unwrap_or(DEFAULT_MEMORY_RUN_STATE_TTL_DAYS);
 
     match action {
         "read" => {
@@ -317,24 +338,41 @@ pub fn handle_memory_tool(ctx: &mut RequestContext, cmd_name: &str, args: &Value
 
             Ok(json!({
                 "name": file.frontmatter.name,
-                "type": file.frontmatter.kind,
+                "type": file.frontmatter.kind.kind().name(),
                 "content": file.body,
             }))
         }
         "list" => {
-            let files = store.list_files()?;
-            let entries: Vec<_> = files
+            let include_stale = args
+                .get("include_stale")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let retention = if include_stale {
+                Retention::all()
+            } else {
+                Retention::live()
+            };
+            let files = store.list_files(retention)?;
+            let today = today_string();
+            let entries = files
                 .iter()
                 .map(|f| {
-                    json!({
+                    let mut entry = json!({
                         "name": f.frontmatter.name,
                         "description": f.frontmatter.description,
-                        "type": f.frontmatter.kind,
+                        "type": f.frontmatter.kind.kind().name(),
                         "char_len": f.char_len(),
                         "path": f.path.display().to_string(),
-                    })
+                    });
+                    if !f.frontmatter.kind.is_known() {
+                        entry["raw_type"] = serde_json::to_value(f.frontmatter.kind.raw_kind())?;
+                    }
+                    if include_stale && f.is_stale(&today) {
+                        entry["stale"] = Value::Bool(true);
+                    }
+                    Ok(entry)
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
 
             Ok(json!({
                 "files": entries,
@@ -342,7 +380,7 @@ pub fn handle_memory_tool(ctx: &mut RequestContext, cmd_name: &str, args: &Value
                 "workspace": store.workspace.as_ref().map(workspace_label),
             }))
         }
-        "write" => write_memory(&store, &cwd, args),
+        "write" => write_memory(&store, &cwd, args, run_state_ttl_days),
         "rename" => rename_memory(&store, &cwd, args),
         "delete" => delete_memory(&store, &cwd, args),
         "edit_index" => {
@@ -361,7 +399,12 @@ pub fn handle_memory_tool(ctx: &mut RequestContext, cmd_name: &str, args: &Value
     }
 }
 
-fn write_memory(store: &MemoryStore, cwd: &Path, args: &Value) -> Result<Value> {
+fn write_memory(
+    store: &MemoryStore,
+    cwd: &Path,
+    args: &Value,
+    run_state_ttl_days: u32,
+) -> Result<Value> {
     if let Some(report) = missing_write_args(args) {
         warn!("memory__write refused: {report}");
         bail!("{report}");
@@ -376,7 +419,10 @@ fn write_memory(store: &MemoryStore, cwd: &Path, args: &Value) -> Result<Value> 
              Remove the block from `content` and pass those values as arguments instead."
         );
     }
-    let kind = args.get("type").and_then(Value::as_str).map(String::from);
+    let kind = match args.get("type").and_then(Value::as_str) {
+        Some(value) => MemoryKind::from_str(value)?.into(),
+        None => KindField::default(),
+    };
     let superseded_by = args
         .get("superseded_by")
         .and_then(Value::as_str)
@@ -385,6 +431,11 @@ fn write_memory(store: &MemoryStore, cwd: &Path, args: &Value) -> Result<Value> 
         .get("expires")
         .and_then(Value::as_str)
         .map(String::from);
+    let today = today_string();
+    let expires = match (kind.kind(), expires) {
+        (MemoryKind::RunState, None) => Some(date_after_days(run_state_ttl_days)),
+        (_, expires) => expires,
+    };
 
     let target_dir = scope_dir(store, cwd, &scope)?;
     let path = target_dir.join(format!("{name}.md"));
@@ -393,7 +444,6 @@ fn write_memory(store: &MemoryStore, cwd: &Path, args: &Value) -> Result<Value> 
     } else {
         None
     };
-    let today = today_string();
     let created = previous
         .as_ref()
         .and_then(|p| p.frontmatter.created.clone())
@@ -447,7 +497,7 @@ fn rename_memory(store: &MemoryStore, cwd: &Path, args: &Value) -> Result<Value>
     }
 
     let target_dir = scope_dir(store, cwd, &scope)?;
-    let files = store.list_files()?;
+    let files = store.list_files(Retention::all())?;
     let file = files
         .iter()
         .find(|f| f.path.starts_with(&target_dir) && f.frontmatter.name == name)
@@ -522,7 +572,7 @@ fn delete_memory(store: &MemoryStore, cwd: &Path, args: &Value) -> Result<Value>
     let name = arg_str(args, "name")?;
     let scope = arg_str(args, "scope")?;
     let target_dir = scope_dir(store, cwd, &scope)?;
-    let files = store.list_files()?;
+    let files = store.list_files(Retention::all())?;
     let file = files
         .iter()
         .find(|f| f.path.starts_with(&target_dir) && f.frontmatter.name == name)
@@ -555,8 +605,10 @@ fn scope_dir(store: &MemoryStore, cwd: &Path, scope: &str) -> Result<PathBuf> {
     }
 }
 
-fn today_string() -> String {
-    Local::now().format("%Y-%m-%d").to_string()
+fn date_after_days(days: u32) -> String {
+    (Local::now().date_naive() + Days::new(u64::from(days)))
+        .format("%Y-%m-%d")
+        .to_string()
 }
 
 fn other_index_paths(store: &MemoryStore, own_dir: &Path) -> Vec<PathBuf> {
@@ -722,7 +774,7 @@ fn json_kind(value: &Value) -> &'static str {
 
 fn find_file(store: &MemoryStore, name: &str) -> Result<Option<MemoryFile>> {
     Ok(store
-        .list_files()?
+        .list_files(Retention::all())?
         .into_iter()
         .find(|f| f.frontmatter.name == name))
 }
@@ -748,13 +800,15 @@ fn workspace_label(w: &WorkspaceMemory) -> Value {
 }
 
 fn lint_memory(store: &MemoryStore) -> Result<Value> {
-    let files = store.list_files()?;
+    let files = store.list_files(Retention::all())?;
     let names: HashSet<&str> = files.iter().map(|f| f.frontmatter.name.as_str()).collect();
     let today = today_string();
 
     let mut oversized = Vec::new();
     let mut broken_links = Vec::new();
     let mut stale = Vec::new();
+    let mut unknown_type = Vec::new();
+    let mut missing_expires_on_run_state = Vec::new();
     for f in &files {
         if f.char_len() > PER_FILE_SOFT_CAP {
             oversized.push(json!({"name": &f.frontmatter.name, "chars": f.char_len()}));
@@ -782,6 +836,18 @@ fn lint_memory(store: &MemoryStore) -> Result<Value> {
                 "expires": expires,
             }));
         }
+
+        let kind = &f.frontmatter.kind;
+        if !kind.raw_kind().is_null() && !kind.is_known() {
+            unknown_type.push(json!({
+                "name": &f.frontmatter.name,
+                "value": serde_json::to_value(kind.raw_kind())?,
+            }));
+        }
+
+        if kind.kind() == MemoryKind::RunState && f.frontmatter.expires.is_none() {
+            missing_expires_on_run_state.push(f.frontmatter.name.clone());
+        }
     }
 
     let global_index = store.load_global_index()?.unwrap_or_default();
@@ -800,7 +866,10 @@ fn lint_memory(store: &MemoryStore) -> Result<Value> {
             &workspace_index
         };
 
-        if !index_references(index, &f.frontmatter.name) {
+        let catalogued = index
+            .lines()
+            .any(|line| catalogue_slug(line) == Some(f.frontmatter.name.as_str()));
+        if !catalogued {
             orphans.push(f.frontmatter.name.clone());
         } else if let (Some(index_desc), Some(file_desc)) = (
             index_description(index, &f.frontmatter.name),
@@ -822,6 +891,8 @@ fn lint_memory(store: &MemoryStore) -> Result<Value> {
         "orphans": orphans,
         "stale": stale,
         "description_drift": description_drift,
+        "unknown_type": unknown_type,
+        "missing_expires_on_run_state": missing_expires_on_run_state,
     }))
 }
 
@@ -1088,7 +1159,7 @@ mod tests {
         let structured = workspace.join(".coyote").join("memory");
         fs::create_dir_all(&structured).unwrap();
 
-        fs::write(structured.join("MEMORY.md"), "- referenced\n").unwrap();
+        fs::write(structured.join("MEMORY.md"), "- [[referenced]]: r\n").unwrap();
         fs::write(
             structured.join("referenced.md"),
             "---\nname: referenced\n---\nlinks to [[missing]] and [[also_missing]]\n",
@@ -1399,7 +1470,13 @@ mod tests {
             "expires": "2099-01-01",
         });
         let before = today_string();
-        let result = write_memory(&store, &workspace, &first).unwrap();
+        let result = write_memory(
+            &store,
+            &workspace,
+            &first,
+            DEFAULT_MEMORY_RUN_STATE_TTL_DAYS,
+        )
+        .unwrap();
         let after = today_string();
         assert_eq!(result["replaced"], false);
         assert_eq!(result["previous_description"], Value::Null);
@@ -1420,7 +1497,13 @@ mod tests {
             "content": "body v2",
             "scope": "workspace",
         });
-        let result = write_memory(&store, &workspace, &second).unwrap();
+        let result = write_memory(
+            &store,
+            &workspace,
+            &second,
+            DEFAULT_MEMORY_RUN_STATE_TTL_DAYS,
+        )
+        .unwrap();
         assert_eq!(result["replaced"], true);
         assert_eq!(result["previous_description"], "first version");
 
@@ -1453,7 +1536,13 @@ mod tests {
             "content": "body",
             "scope": "workspace",
         });
-        let err = write_memory(&store, &workspace, &missing_description).unwrap_err();
+        let err = write_memory(
+            &store,
+            &workspace,
+            &missing_description,
+            DEFAULT_MEMORY_RUN_STATE_TTL_DAYS,
+        )
+        .unwrap_err();
         let text = err.to_string();
         assert!(
             text.starts_with("missing required argument(s): description."),
@@ -1476,7 +1565,13 @@ mod tests {
             "content": "# Fact\n\nscope: workspace\ntype: reference\n\nbody",
             "expires": 20991231,
         });
-        let err = write_memory(&store, &workspace, &scope_buried_in_content).unwrap_err();
+        let err = write_memory(
+            &store,
+            &workspace,
+            &scope_buried_in_content,
+            DEFAULT_MEMORY_RUN_STATE_TTL_DAYS,
+        )
+        .unwrap_err();
         let text = err.to_string();
         assert!(
             text.starts_with("missing required argument(s): scope."),
@@ -1490,7 +1585,13 @@ mod tests {
         assert!(!text.contains("`type:`"), "type is optional: {text}");
 
         let everything_missing = json!("not even an object");
-        let err = write_memory(&store, &workspace, &everything_missing).unwrap_err();
+        let err = write_memory(
+            &store,
+            &workspace,
+            &everything_missing,
+            DEFAULT_MEMORY_RUN_STATE_TTL_DAYS,
+        )
+        .unwrap_err();
         let text = err.to_string();
         assert!(
             text.starts_with(
@@ -1506,7 +1607,13 @@ mod tests {
             "content": "---\nname: fact\ndescription: a fact\nscope: workspace\n---\n\nbody",
             "scope": "workspace",
         });
-        let err = write_memory(&store, &workspace, &front_matter_in_content).unwrap_err();
+        let err = write_memory(
+            &store,
+            &workspace,
+            &front_matter_in_content,
+            DEFAULT_MEMORY_RUN_STATE_TTL_DAYS,
+        )
+        .unwrap_err();
         let text = err.to_string();
         assert!(
             text.starts_with("`content` starts with a YAML front-matter block."),
@@ -1524,9 +1631,218 @@ mod tests {
             "content": "# Fact\n\nA line with --- inside it is fine.",
             "scope": "workspace",
         });
-        write_memory(&store, &workspace, &body_only).unwrap();
+        write_memory(
+            &store,
+            &workspace,
+            &body_only,
+            DEFAULT_MEMORY_RUN_STATE_TTL_DAYS,
+        )
+        .unwrap();
         let saved = MemoryFile::load(&structured.join("fact.md")).unwrap();
         assert_eq!(saved.body, "# Fact\n\nA line with --- inside it is fine.");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn workspace_store(root: &Path, index: &str) -> (MemoryStore, PathBuf, PathBuf) {
+        let workspace = root.join("ws");
+        let structured = workspace.join(".coyote").join("memory");
+        fs::create_dir_all(&structured).unwrap();
+        fs::write(structured.join("MEMORY.md"), index).unwrap();
+        let store = MemoryStore {
+            global_dir: root.join("g"),
+            workspace: discover_workspace_memory(&workspace),
+        };
+        (store, workspace, structured)
+    }
+
+    #[test]
+    fn lint_orphan_check_only_counts_catalogue_lines() {
+        let root = temp_root("lint_strict_orphans");
+        let (store, _, structured) = workspace_store(
+            &root,
+            "# Index\n\n## FACTS\n- Always run tests before [[cited]] lands\n\n## FILES\n- [[catalogued]]: proper entry\n",
+        );
+        fs::write(structured.join("cited.md"), "---\nname: cited\n---\nx\n").unwrap();
+        fs::write(
+            structured.join("catalogued.md"),
+            "---\nname: catalogued\n---\nx\n",
+        )
+        .unwrap();
+
+        let report = lint_memory(&store).unwrap();
+        let orphans: Vec<&str> = report["orphans"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(orphans, vec!["cited"], "{report}");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn lint_reports_unknown_types_and_run_state_without_expires() {
+        let root = temp_root("lint_types");
+        let (store, _, structured) = workspace_store(
+            &root,
+            "- [[untyped]]: u\n- [[gotcha]]: g\n- [[scratch]]: s\n- [[scratch-dated]]: d\n",
+        );
+        fs::write(
+            structured.join("untyped.md"),
+            "---\nname: untyped\ntype: null\n---\nx\n",
+        )
+        .unwrap();
+        fs::write(
+            structured.join("gotcha.md"),
+            "---\nname: gotcha\ntype: gotcha\n---\nx\n",
+        )
+        .unwrap();
+        fs::write(
+            structured.join("scratch.md"),
+            "---\nname: scratch\ntype: run-state\n---\nx\n",
+        )
+        .unwrap();
+        fs::write(
+            structured.join("scratch-dated.md"),
+            "---\nname: scratch-dated\ntype: run-state\nexpires: 2999-01-01\n---\nx\n",
+        )
+        .unwrap();
+
+        let report = lint_memory(&store).unwrap();
+        assert_eq!(
+            report["unknown_type"],
+            json!([{"name": "gotcha", "value": "gotcha"}]),
+            "{report}"
+        );
+        assert_eq!(
+            report["missing_expires_on_run_state"],
+            json!(["scratch"]),
+            "{report}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stale_files_stay_readable_renamable_and_deletable() {
+        let root = temp_root("stale_ops");
+        let (store, workspace, structured) =
+            workspace_store(&root, "- [[bygone]]: b\n- [[replaced]]: r\n");
+        fs::write(
+            structured.join("bygone.md"),
+            "---\nname: bygone\nexpires: 2000-01-01\n---\nold\n",
+        )
+        .unwrap();
+        fs::write(
+            structured.join("replaced.md"),
+            "---\nname: replaced\nsuperseded_by: bygone\n---\nolder\n",
+        )
+        .unwrap();
+
+        assert!(store.list_files(Retention::live()).unwrap().is_empty());
+        assert_eq!(
+            find_file(&store, "bygone").unwrap().unwrap().body.trim(),
+            "old"
+        );
+
+        let rename = json!({"name": "bygone", "new_name": "bygone-v1", "scope": "workspace"});
+        rename_memory(&store, &workspace, &rename).unwrap();
+        assert!(structured.join("bygone-v1.md").exists());
+
+        let delete = json!({"name": "replaced", "scope": "workspace"});
+        delete_memory(&store, &workspace, &delete).unwrap();
+        assert!(!structured.join("replaced.md").exists());
+
+        let report = lint_memory(&store).unwrap();
+        let stale: Vec<&str> = report["stale"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v["name"].as_str())
+            .collect();
+        assert_eq!(stale, vec!["bygone-v1"], "{report}");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_memory_defaults_expires_for_run_state_only() {
+        let root = temp_root("write_run_state");
+        let (store, workspace, structured) = workspace_store(&root, "# Memory Index\n");
+
+        let scratch = json!({
+            "name": "scratch",
+            "description": "in-flight state",
+            "content": "step 3 of 5",
+            "scope": "workspace",
+            "type": "run-state",
+        });
+        write_memory(&store, &workspace, &scratch, 3).unwrap();
+        let saved = MemoryFile::load(&structured.join("scratch.md")).unwrap();
+        assert_eq!(saved.frontmatter.kind.kind(), MemoryKind::RunState);
+        assert_eq!(
+            saved.frontmatter.expires.as_deref(),
+            Some(date_after_days(3).as_str())
+        );
+        assert!(saved.frontmatter.expires.as_deref() > Some(today_string().as_str()));
+        let raw = fs::read_to_string(structured.join("scratch.md")).unwrap();
+        assert!(raw.contains("\ntype: run-state\n"), "{raw}");
+
+        let pinned = json!({
+            "name": "pinned",
+            "description": "explicit expiry wins",
+            "content": "x",
+            "scope": "workspace",
+            "type": "run-state",
+            "expires": "2999-01-01",
+        });
+        write_memory(&store, &workspace, &pinned, 3).unwrap();
+        let saved = MemoryFile::load(&structured.join("pinned.md")).unwrap();
+        assert_eq!(saved.frontmatter.expires.as_deref(), Some("2999-01-01"));
+
+        let durable = json!({
+            "name": "durable",
+            "description": "no type",
+            "content": "x",
+            "scope": "workspace",
+        });
+        write_memory(&store, &workspace, &durable, 3).unwrap();
+        let saved = MemoryFile::load(&structured.join("durable.md")).unwrap();
+        assert_eq!(saved.frontmatter.expires, None);
+        assert!(saved.frontmatter.kind.raw_kind().is_null());
+        let raw = fs::read_to_string(structured.join("durable.md")).unwrap();
+        assert!(raw.contains("\ntype: null\n"), "{raw}");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_memory_rejects_unknown_type_naming_the_valid_ones() {
+        let root = temp_root("write_bad_type");
+        let (store, workspace, structured) = workspace_store(&root, "# Memory Index\n");
+
+        let bogus = json!({
+            "name": "fact",
+            "description": "a fact",
+            "content": "x",
+            "scope": "workspace",
+            "type": "bogus",
+        });
+        let err = write_memory(
+            &store,
+            &workspace,
+            &bogus,
+            DEFAULT_MEMORY_RUN_STATE_TTL_DAYS,
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("Invalid value 'bogus'"), "{text}");
+        for name in MemoryKind::NAMES {
+            assert!(text.contains(name), "{text} should list {name}");
+        }
+        assert!(!structured.join("fact.md").exists());
 
         let _ = fs::remove_dir_all(&root);
     }
