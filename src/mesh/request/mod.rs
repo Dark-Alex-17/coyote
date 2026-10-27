@@ -21,8 +21,7 @@ pub(crate) use error::{RefusalCode, RemoteRefusal, RequestError, refusal_remedy,
 pub(crate) use frame::{Envelope, MAX_REQUEST_PAYLOAD_BYTES, NAME_HASH_LEN, OriginName};
 #[cfg(test)]
 pub(crate) use frame::{
-    EnvelopeError, MAX_FETCH_RESPONSE_BYTES, MAX_REQUEST_NESTING_DEPTH, PathHash,
-    RESPONSE_FRAME_PREFIX, RequestFrame, RequestId, ResponseFrame,
+    EnvelopeError, MAX_FETCH_RESPONSE_BYTES, PathHash, RequestFrame, RequestId, ResponseFrame,
 };
 #[cfg(test)]
 pub(crate) use handler::{
