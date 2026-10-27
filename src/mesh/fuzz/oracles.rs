@@ -641,7 +641,10 @@ fn frame_around(data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// One corpus file or one encoded generator output: an envelope value on the wire.
+/// One corpus file or one encoded generator output: an envelope value on the wire. Bytes
+/// that are not one whole value go through Coyote's test-side frame decoder, which pins the
+/// requester-side round trip; a responder's inbound frame rule, depth included, is the
+/// library's.
 pub(super) fn check_envelope_bytes(bytes: &[u8]) -> Result<(), String> {
     match unpack_whole(bytes) {
         Some(value) => check_envelope_value(&value).map(drop),
@@ -925,8 +928,10 @@ fn is_no_access(reply: &Reply) -> bool {
     matches!(reply, Reply::Code(code) if code.to_wire() == Value::from(0xf1u8))
 }
 
-/// The same frame bytes against every tier: decode by the request-frame rule, then the reply,
-/// the knock and the handler count each tier's stage mandates.
+/// The same frame bytes against every tier: decoded by Coyote's test-side request-frame
+/// rule, which pins the requester-side round trip (a responder's inbound decode, depth
+/// bound included, is the library's), then the reply, the knock and the handler count each
+/// tier's stage mandates.
 pub(super) fn check_dispatch_bytes(fx: &DispatchFixture, bytes: &[u8]) -> Result<(), String> {
     let frame = match (RequestFrame::decode(bytes), expect_frame(bytes)) {
         (Err(_), None) => return Ok(()),

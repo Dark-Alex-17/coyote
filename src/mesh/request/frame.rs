@@ -23,11 +23,14 @@ pub(crate) const MAX_REQUEST_PAYLOAD_BYTES: usize = 256 * 1024;
 pub(crate) const MAX_FETCH_RESPONSE_BYTES: usize =
     (crate::config::mesh_config::MAX_FETCH_FILE_BYTES as usize) + 4096;
 
-/// The `rmpv` depth budget a frame may spend before it is refused as undecodable. Each
-/// container costs two, a `bin` leaf two and a `str` leaf three (`read_str_data` charges
-/// one before it reaches `read_bin_data`), so about 60 nested containers fit. `rmpv`'s own
-/// default (1024) lets ~400 nested arrays exhaust a 2 MiB thread stack in a debug build
-/// before the limit is reached.
+/// The `rmpv` depth budget Coyote's own decoder spends before it refuses a frame as
+/// undecodable: on the responses a requester reads, and in tests on the round trip of the
+/// request frames the requester builds. Inbound request frames never meet it; their
+/// rejection is the library's rule, 128 nested containers counted before any value is
+/// built. Each container here costs two, a `bin` leaf two and a `str` leaf three
+/// (`read_str_data` charges one before it reaches `read_bin_data`), so about 60 nested
+/// containers fit. `rmpv`'s own default (1024) lets ~400 nested arrays exhaust a 2 MiB
+/// thread stack in a debug build before the limit is reached.
 pub(crate) const MAX_REQUEST_NESTING_DEPTH: usize = 128;
 
 /// Bytes of a destination name hash, the prefix of the full name hash Reticulum uses to

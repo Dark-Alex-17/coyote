@@ -169,6 +169,10 @@ fn nested_arrays(depth: usize, leaf: Value) -> Value {
     (0..depth).fold(leaf, |inner, _| Value::Array(vec![inner]))
 }
 
+/// Coyote's own decoder, which a requester reads responses with and this round-trips the
+/// requester's request frames through, refuses nesting past `MAX_REQUEST_NESTING_DEPTH`
+/// and takes the deepest frame inside it. A responder's inbound request frames are read
+/// by the library, whose own bound of 128 nested containers the network tests pin live.
 #[test]
 fn frames_refuse_nesting_past_the_depth_budget_and_accept_the_deepest_legal_frame() {
     assert_eq!(MAX_REQUEST_NESTING_DEPTH, 128);
@@ -3149,6 +3153,75 @@ pub(crate) mod network {
             recorder.seen_count(),
             1,
             "only the well-formed request was handled"
+        );
+        requester.stop().await;
+        responder.stop().await;
+    }
+
+    /// The inbound depth bound is the library's: a trusted peer's request frame whose
+    /// containers nest past 128 levels (the frame's own array is level one) is dropped
+    /// before Coyote's handler is asked anything, while one at exactly 128 levels, far
+    /// past the budget Coyote's own test-side decoder would spend on it, is served and
+    /// arrives whole.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_nested_past_the_librarys_depth_bound_is_dropped_before_admission() {
+        install_log_collector();
+        let recorder = Arc::new(Recorder::default());
+        let (responder, requester, desc) = pair(recorder.clone()).await;
+        let _gate = gate(
+            &responder,
+            recorder.clone(),
+            &TrustList::default().identity(&identity_hex(&requester), true),
+            "request-gate-too-deep",
+        );
+        let link = identified_link(&requester, &responder, &desc).await;
+
+        // The frame's array is level one and the envelope map level two, so 127
+        // one-element arrays under the body reach level 129.
+        let err = request_on(
+            &requester,
+            &link,
+            TEST_PATH,
+            super::nested_arrays(127, Value::Nil),
+            Deadline::after(SHORT_REQUEST_TIMEOUT),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, timed_out(TEST_PATH));
+        assert_eq!(
+            responder.adapter.admitted_count(),
+            0,
+            "a frame past the depth bound never reaches admission"
+        );
+        assert_eq!(recorder.seen_count(), 0, "the handler was never entered");
+
+        // One level fewer sits exactly on the bound and is served. The reply is scripted:
+        // echoing 126 nested arrays back would exceed the requester's own decode budget.
+        recorder.queue(Script::Reply(Reply::Value(Value::from("served"))));
+        let outcome = request_on(
+            &requester,
+            &link,
+            TEST_PATH,
+            super::nested_arrays(126, Value::Nil),
+            request_deadline(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.value, Value::from("served"));
+        assert_eq!(
+            responder.adapter.admitted_count(),
+            1,
+            "only the frame on the bound was admitted"
+        );
+        assert_eq!(
+            recorder.seen_count(),
+            1,
+            "only the frame on the bound was handled"
+        );
+        assert_eq!(
+            recorder.last_body(),
+            super::nested_arrays(126, Value::Nil),
+            "the frame on the bound arrives whole"
         );
         requester.stop().await;
         responder.stop().await;

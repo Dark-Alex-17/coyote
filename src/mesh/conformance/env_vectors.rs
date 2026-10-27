@@ -516,8 +516,10 @@ const PATH_NOT_BIN: &str = "path hash is not a bin";
 const ID_NOT_BIN: &str = "request id is not a bin";
 const TRAILING: &str = "trailing bytes after the frame";
 const TOO_DEEP: &str = "depth limit exceeded";
-/// Nested one-element arrays under `data` that fit the decode budget once
-/// the frame's own array has spent two units of `MAX_REQUEST_NESTING_DEPTH`.
+/// Nested one-element arrays under `data` that fit Coyote's own decode budget once the
+/// frame's own array has spent two units of `MAX_REQUEST_NESTING_DEPTH`. The rows built on
+/// it pin the requester-side round trip; a responder's inbound depth bound is the
+/// library's 128 nested containers.
 const DEEPEST_DATA_ARRAYS: usize = 62;
 
 fn request_frame() -> RequestFrame {
@@ -545,6 +547,9 @@ fn request(
     row(name, kind, Case::RequestFrameDecode { bytes, expect })
 }
 
+/// Request frames through Coyote's test-side decoder, the one that round-trips what the
+/// requester's builder emits. A responder reads no request frame with it: inbound
+/// rejection, depth included, is the library's rule.
 fn request_frame_vectors() -> Vec<Vector> {
     let encoded = request_frame().encode();
     let Value::Array(parts) = unpacked(&encoded) else {
