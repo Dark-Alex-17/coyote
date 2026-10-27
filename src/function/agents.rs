@@ -5221,7 +5221,8 @@ mod tests {
         );
 
         // A dead pid under a known start time is a crash; a start of 0
-        // would be unknown and refused instead.
+        // under a dead pid would resume the same way. Only a start of 0
+        // under a pid that still exists is refused.
         meta.pid = u32::MAX - 1;
         meta.pid_start = 1;
         root.save_child_meta(&meta).unwrap();
@@ -5619,8 +5620,9 @@ mod tests {
     /// A sidecar whose stamp recorded `start` 0 (sysinfo could not read the
     /// own start time at spawn) under a pid that is still alive reads as
     /// dead to the recent-ids list, which labels it crashed; a resume
-    /// cannot tell it from a live child and refuses it, leaving the sidecar
-    /// as it was, until the child is collected or cancelled.
+    /// cannot tell it from a live child while that pid still exists and
+    /// refuses it, leaving the sidecar as it was, until the child is
+    /// collected or cancelled.
     #[test]
     #[serial]
     fn usage_probe_a_running_child_stamped_with_start_zero_reads_crashed_but_resume_refuses() {
@@ -5667,6 +5669,53 @@ mod tests {
         assert_eq!(meta.status, ChildStatus::Running);
         assert_eq!(meta.pid, live.pid);
         assert_eq!(meta.pid_start, 0);
+    }
+
+    /// A stamp with `start` 0 under a pid sysinfo no longer lists is a
+    /// crash: the recent-ids list labels it crashed and the resume agrees,
+    /// re-stamping the sidecar with the resuming process.
+    #[test]
+    #[serial]
+    fn a_child_stamped_with_start_zero_under_a_dead_pid_reads_crashed_and_resumes() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_start_zero_dead");
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let (sid, _) = seed_completed_config_child(&mut ctx, &agent_name, json!({}));
+        let live = ProcessStamp::current();
+        assert_ne!(
+            live.start, 0,
+            "this host reports no start time for its own process; the pin cannot discriminate"
+        );
+        let root = spawner_root(&ctx);
+        let mut meta = root.load_child_meta(&sid).unwrap().unwrap();
+        meta.status = ChildStatus::Running;
+        meta.pid = u32::MAX - 1;
+        meta.pid_start = 0;
+        root.save_child_meta(&meta).unwrap();
+        assert_eq!(meta.effective_status(), EffectiveStatus::Crashed);
+
+        let unknown = child_sessions::new_session_id(&agent_name);
+        let error = resume_error(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": unknown}),
+        );
+        assert!(
+            error.contains(&format!("recent ids: {sid} (crashed)")),
+            "{error}"
+        );
+
+        let spawn = build_ready_spawn(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+
+        assert_eq!(spawn.session_id.as_deref(), Some(sid.as_str()));
+        let meta = child_meta_of(&ctx, &sid);
+        assert_eq!(meta.status, ChildStatus::Running);
+        assert_eq!(meta.agent_id, spawn.agent_id);
+        assert_eq!(meta.pid, live.pid);
+        assert_eq!(meta.pid_start, live.start);
     }
 
     /// Resuming is not a one-shot: the transcript a resumed child adds is
