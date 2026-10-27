@@ -2438,6 +2438,35 @@ pub(crate) mod network {
             dropped.load(Ordering::SeqCst)
         })
         .await;
+
+        // The peer's side of the link is closed but not yet swept from the transport's
+        // table: the link is still found, and the reply is still not sent on it. The
+        // requester's own link is closed by the teardown above, so this opens a fresh one.
+        let (reply, sent, dropped) = settled(Value::from("closed"));
+        *handler.reply.lock() = Some(reply);
+        let (in_flight, link_id, request_id) = handler.hold(&requester, &desc).await;
+        let closed = responder.transport.find_in_link(&link_id).await.unwrap();
+        closed.lock().await.close();
+        assert!(
+            responder.transport.find_in_link(&link_id).await.is_some(),
+            "the closed link stays tabled until the library's sweep"
+        );
+        handler.release.notify_one();
+        let warned = format!(
+            "Failed to send mesh response {request_id} on link {}: the link is gone",
+            link_id.to_hex_string()
+        );
+        wait_until("the adapter to give up on the closed link", || {
+            warn_snapshot().iter().any(|message| message == &warned)
+        })
+        .await;
+        assert!(!sent.load(Ordering::SeqCst));
+        wait_until("the unsent settlement to be dropped", || {
+            dropped.load(Ordering::SeqCst)
+        })
+        .await;
+        in_flight.abort();
+
         requester.stop().await;
         responder.stop().await;
     }

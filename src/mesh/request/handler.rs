@@ -5,7 +5,7 @@ use crate::mesh::request::redact_hashes;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use rmpv::Value;
-use rns_transport::destination::link::LinkId;
+use rns_transport::destination::link::{LinkId, LinkStatus};
 use rns_transport::destination::request::{
     InboundRequest as LibraryInboundRequest, RequestHandler as LibraryRequestHandler,
     RequestResponse, ResponseFrame as LibraryResponseFrame,
@@ -180,6 +180,9 @@ impl LibraryHandler {
     /// bound any requester accepts, so a reply no peer could take is dropped before it
     /// costs a transfer. A `Reply::Value` is not measured on this side: the library
     /// encodes and sends it, and the requester's bound for the path drops what is over.
+    /// A link the peer has already closed is still found until the library sweeps it, so
+    /// the status is checked under the same lock the packet is built under; a settlement
+    /// is never confirmed for a packet the peer cannot read.
     async fn send_settled(
         &self,
         link_id: LinkId,
@@ -213,13 +216,26 @@ impl LibraryHandler {
             drop_unsent(settlement);
             return;
         };
-        let mdu = link.lock().await.link_mdu();
-        if bytes.len() <= mdu {
+        let (mdu, packet) = {
+            let link = link.lock().await;
+            if link.status() != LinkStatus::Active {
+                warn!(
+                    "Failed to send mesh response {request_id} on link {}: the link is gone",
+                    link_id.to_hex_string()
+                );
+                drop_unsent(settlement);
+                return;
+            }
+            let mdu = link.link_mdu();
+            let packet = (bytes.len() <= mdu).then(|| link.response_packet(&bytes));
+            (mdu, packet)
+        };
+        if let Some(packet) = packet {
             debug!(
                 "Sending mesh response {request_id} as a packet ({} bytes, link MDU {mdu})",
                 bytes.len()
             );
-            let packet = match link.lock().await.response_packet(&bytes) {
+            let packet = match packet {
                 Ok(packet) => packet,
                 Err(err) => {
                     warn!(
