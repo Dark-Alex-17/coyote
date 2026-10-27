@@ -1546,8 +1546,8 @@ fn assemble_pr_body_tasks_filter_scopes_checklist_and_rollups_to_the_group() {
 }
 
 /// Plan identity strips only a trailing `.md`: a dotted slug keeps its dots,
-/// so `PLAN-a.b.md` owns a task saying `plan: PLAN-a.b` and not one saying
-/// `plan: PLAN-a`.
+/// so the dotted plan owns the task whose `plan:` names it whole and not the
+/// task whose `plan:` names only the part before the dot.
 #[cfg(unix)]
 #[test]
 fn assemble_pr_body_keeps_the_dots_of_a_dotted_plan_slug() {
