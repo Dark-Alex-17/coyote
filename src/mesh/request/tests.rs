@@ -3227,6 +3227,95 @@ pub(crate) mod network {
         responder.stop().await;
     }
 
+    /// The library reads a request frame with the same decoder whether it came as a packet
+    /// or was assembled from a Resource, so the depth bound holds on the Resource branch
+    /// too: a trusted peer's frame nested past 128 levels with a leaf too large for one
+    /// packet travels as a resource, is assembled, and is still dropped before Coyote's
+    /// handler is asked anything, while the same leaf one level fewer is served whole.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_resource_request_nested_past_the_depth_bound_is_dropped_after_assembly() {
+        install_log_collector();
+        let recorder = Arc::new(Recorder::default());
+        let (responder, requester, desc) = pair(recorder.clone()).await;
+        let _gate = gate(
+            &responder,
+            recorder.clone(),
+            &TrustList::default().identity(&identity_hex(&requester), true),
+            "request-gate-too-deep-resource",
+        );
+        let link = identified_link(&requester, &responder, &desc).await;
+        // A leaf past the link's packet MDU forces the Resource branch on its own.
+        let leaf = Value::Binary(vec![0x5a; 4 * LINK_PACKET_MDU]);
+        let resource_sends = || {
+            debug_snapshot()
+                .iter()
+                .filter(|line| {
+                    line.starts_with("Sending mesh request ")
+                        && line.contains(&format!(" for {TEST_PATH} as a resource ("))
+                })
+                .count()
+        };
+        let sends_before = resource_sends();
+
+        // The frame's array is level one and the envelope map level two, so 127
+        // one-element arrays under the body reach level 129.
+        let err = request_on(
+            &requester,
+            &link,
+            TEST_PATH,
+            super::nested_arrays(127, leaf.clone()),
+            Deadline::after(SHORT_REQUEST_TIMEOUT),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, timed_out(TEST_PATH));
+        assert_eq!(
+            resource_sends(),
+            sends_before + 1,
+            "the deep frame must have gone as a resource, not a packet"
+        );
+        assert_eq!(
+            responder.adapter.admitted_count(),
+            0,
+            "an assembled frame past the depth bound never reaches admission"
+        );
+        assert_eq!(recorder.seen_count(), 0, "the handler was never entered");
+
+        recorder.queue(Script::Reply(Reply::Value(Value::from("served"))));
+        let outcome = request_on(
+            &requester,
+            &link,
+            TEST_PATH,
+            super::nested_arrays(126, leaf.clone()),
+            request_deadline(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.value, Value::from("served"));
+        assert_eq!(
+            resource_sends(),
+            sends_before + 2,
+            "the frame on the bound went as a resource too"
+        );
+        assert_eq!(
+            responder.adapter.admitted_count(),
+            1,
+            "only the assembled frame on the bound was admitted"
+        );
+        assert_eq!(
+            recorder.seen_count(),
+            1,
+            "only the assembled frame on the bound was handled"
+        );
+        assert_eq!(
+            recorder.last_body(),
+            super::nested_arrays(126, leaf),
+            "the assembled frame on the bound arrives whole"
+        );
+        requester.stop().await;
+        responder.stop().await;
+    }
+
     /// A path no handler is registered for is dropped by the library before Coyote's
     /// handler is asked anything, for a stranger and a trusted peer alike: neither hears
     /// back, and the trusted peer's request files no knock.
@@ -4917,6 +5006,79 @@ pub(crate) mod network {
             pair.recorder_a.seen_count(),
             seen_before + 1,
             "the fork's destination must hand the request to node A's handler"
+        );
+        pair.stop_node_a().await;
+    }
+
+    /// Registration after a rekey is judged where a peer feels it: node B, having learned
+    /// the fork's announce, asks the fork's destination every known path in turn and each
+    /// one reaches node A's handler, while a path the node never registers is dropped by
+    /// the library on that same destination with no handler entered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_known_path_on_the_fork_destination_is_served_and_an_unknown_one_is_silence() {
+        let pair = NodePair::start("request-runtime-fork-every-path").await;
+        pair.responder.hear_every_announce().await;
+        let mut b_announces = pair.responder.transport.recv_announces().await;
+        pair.node_a
+            .rekey(ForkRekey {
+                original_instance_id: Some(pair.node_a.instance_id().await),
+                fork_instance_id: Session::default().ensure_mesh_instance_id().to_string(),
+            })
+            .await
+            .unwrap();
+        let fork_hash = pair.node_a.destination_hash().await;
+        let fork_desc = loop {
+            let event = timeout(INTEROP_TIMEOUT, b_announces.recv())
+                .await
+                .expect("node B must hear the fork's announce")
+                .unwrap();
+            let desc = event.destination.lock().await.desc;
+            if desc.address_hash.to_hex_string() == fork_hash {
+                break desc;
+            }
+        };
+
+        let seen_before = pair.recorder_a.seen_count();
+        for (served, path) in KNOWN_PATHS.iter().enumerate() {
+            pair.recorder_a
+                .queue(Script::Reply(Reply::Value(Value::from(*path))));
+            let outcome = pair
+                .b_asks_destination(&fork_desc, path, Value::Nil, RequestOptions::default())
+                .await;
+            assert_eq!(
+                outcome.value,
+                Value::from(*path),
+                "the fork's destination must serve {path}"
+            );
+            assert_eq!(
+                pair.recorder_a.seen_count(),
+                seen_before + served + 1,
+                "{path} must reach node A's handler on the fork's destination"
+            );
+        }
+
+        // A path with no handler on the fork is the library's to drop: nothing is heard
+        // and the handler count does not move.
+        let err = pair
+            .client_b
+            .request(
+                &pair.responder.transport,
+                &pair.responder.identity,
+                &fork_desc,
+                TEST_PATH,
+                pair.responder.envelope(Value::Nil),
+                RequestOptions {
+                    request_timeout: SHORT_REQUEST_TIMEOUT,
+                    ..RequestOptions::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err, timed_out(TEST_PATH));
+        assert_eq!(
+            pair.recorder_a.seen_count(),
+            seen_before + KNOWN_PATHS.len(),
+            "an unregistered path on the fork must not enter the handler"
         );
         pair.stop_node_a().await;
     }
