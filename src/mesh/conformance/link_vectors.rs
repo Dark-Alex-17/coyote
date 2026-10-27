@@ -24,6 +24,13 @@ enum Len {
     MduPlusOne,
 }
 
+/// Which frame the row sizes against the MDU.
+#[derive(Clone, Copy, Debug)]
+enum Direction {
+    Request,
+    Response,
+}
+
 /// How the peer came to be marked incompatible before the outbound request.
 #[derive(Clone, Copy, Debug)]
 enum Mark {
@@ -56,9 +63,15 @@ enum OtherReply {
 enum Case {
     /// The responder answers under the request id the requester computed.
     Correlation { len: Len },
-    /// How a request frame of this length travels. The request direction is the one Coyote
-    /// decides and logs; the response branch is the library's.
-    SizeBranch { len: Len, branch: SizeBranch },
+    /// How a frame of this length travels. Both directions are decided inside the library
+    /// and observed at its seam: a request by the sender-side resource events and Coyote's
+    /// own log line, a response by the response packets and inbound resources the
+    /// requester's transport reports.
+    SizeBranch {
+        direction: Direction,
+        len: Len,
+        branch: SizeBranch,
+    },
     /// A frame over `MAX_REQUEST_PAYLOAD_BYTES` is refused locally and never seen by the responder.
     OutboundCap,
     /// The responder sees the identity the requester proved on the link.
@@ -146,6 +159,7 @@ const VECTORS: &[Vector] = &[
         name: "request-under-the-mdu-goes-as-a-packet",
         kind: Kind::Valid,
         case: Case::SizeBranch {
+            direction: Direction::Request,
             len: Len::MduMinusOne,
             branch: SizeBranch::Packet,
         },
@@ -155,6 +169,7 @@ const VECTORS: &[Vector] = &[
         name: "request-at-the-mdu-still-goes-as-a-packet",
         kind: Kind::Boundary,
         case: Case::SizeBranch {
+            direction: Direction::Request,
             len: Len::Mdu,
             branch: SizeBranch::Packet,
         },
@@ -164,6 +179,27 @@ const VECTORS: &[Vector] = &[
         name: "request-one-over-the-mdu-goes-as-a-resource",
         kind: Kind::Boundary,
         case: Case::SizeBranch {
+            direction: Direction::Request,
+            len: Len::MduPlusOne,
+            branch: SizeBranch::Resource,
+        },
+        known_divergence: None,
+    },
+    Vector {
+        name: "response-at-the-mdu-still-goes-as-a-packet",
+        kind: Kind::Boundary,
+        case: Case::SizeBranch {
+            direction: Direction::Response,
+            len: Len::Mdu,
+            branch: SizeBranch::Packet,
+        },
+        known_divergence: None,
+    },
+    Vector {
+        name: "response-one-over-the-mdu-goes-as-a-resource",
+        kind: Kind::Boundary,
+        case: Case::SizeBranch {
+            direction: Direction::Response,
             len: Len::MduPlusOne,
             branch: SizeBranch::Resource,
         },
@@ -405,7 +441,7 @@ mod tests {
 
 #[cfg(unix)]
 mod loopback {
-    use super::{Case, KnockRefusal, Len, Mark, OtherReply, VECTORS, Vector};
+    use super::{Case, Direction, KnockRefusal, Len, Mark, OtherReply, VECTORS, Vector};
     use crate::mesh::announce::AnnounceAppData;
     use crate::mesh::knock::{KnockError, KnockIntro};
     use crate::mesh::message::{OutboundPeer, PeerKind, SendError, received_reply};
@@ -417,7 +453,8 @@ mod loopback {
         REQUEST_FRAME_OVERHEAD, Recorder, Requester, Responder, SHORT_REQUEST_TIMEOUT, Script,
         Stall, hanging_request, library_refused_oversize_request, link_deadline, pair,
         request_body_of_encoded_len, request_on, request_sent_as, request_went_as,
-        response_payloads, short_options, timed_out, timed_out_slow_request,
+        response_body_of_encoded_len, response_payloads, short_options, timed_out,
+        timed_out_slow_request,
     };
     use crate::mesh::request::{
         DEFAULT_REQUEST_TIMEOUT, MAX_CONCURRENT_INBOUND_REQUESTS, MAX_REQUEST_PAYLOAD_BYTES,
@@ -438,10 +475,12 @@ mod loopback {
     use rns_transport::iface::tcp_client::TcpClient;
     use rns_transport::iface::tcp_server::TcpServer;
     use rns_transport::rand_core::OsRng;
-    use rns_transport::resource::LINK_PACKET_MDU;
+    use rns_transport::resource::{LINK_PACKET_MDU, ResourceEvent, ResourceEventKind};
+    use rns_transport::transport::SendPacketOutcome;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant, SystemTime};
+    use tokio::sync::broadcast;
     use tokio::time::timeout;
 
     const ECHO_PATH: &str = "/echo";
@@ -539,7 +578,11 @@ mod loopback {
     async fn drive(case: Case) {
         match case {
             Case::Correlation { len } => correlation(len).await,
-            Case::SizeBranch { len, branch } => size_branch(len, branch).await,
+            Case::SizeBranch {
+                direction,
+                len,
+                branch,
+            } => size_branch(direction, len, branch).await,
             Case::OutboundCap => outbound_cap().await,
             Case::Identified => identified().await,
             Case::UndecodableFrame => undecodable_frame().await,
@@ -607,28 +650,77 @@ mod loopback {
         pair.stop().await;
     }
 
-    async fn size_branch(len: Len, expected: SizeBranch) {
+    async fn size_branch(direction: Direction, len: Len, expected: SizeBranch) {
         install_log_collector();
         let pair = echo_pair().await;
         let target = len.target(pair.mdu);
-        let body = request_body_of_encoded_len(pair.requester.origin, target);
-        let mut resources = pair.requester.transport.resource_events();
-        let outcome = pair
-            .requester
-            .request(&pair.desc, ECHO_PATH, body.clone())
-            .await
-            .unwrap();
-        assert_eq!(outcome, body, "a {target}-byte request frame echoes");
-        assert_eq!(
-            request_went_as(&mut resources),
-            expected,
-            "the library sends a {target}-byte request frame as a {expected:?}"
-        );
-        assert!(
-            request_sent_as(pair.recorder.last().request_id, ECHO_PATH, expected),
-            "a {target}-byte request frame goes as a {expected:?}"
-        );
+        match direction {
+            Direction::Request => {
+                let body = request_body_of_encoded_len(pair.requester.origin, target);
+                let mut resources = pair.requester.transport.resource_events();
+                let outcome = pair
+                    .requester
+                    .request(&pair.desc, ECHO_PATH, body.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(outcome, body, "a {target}-byte request frame echoes");
+                assert_eq!(
+                    request_went_as(&mut resources),
+                    expected,
+                    "the library sends a {target}-byte request frame as a {expected:?}"
+                );
+                assert!(
+                    request_sent_as(pair.recorder.last().request_id, ECHO_PATH, expected),
+                    "a {target}-byte request frame goes as a {expected:?}"
+                );
+            }
+            Direction::Response => {
+                let body = response_body_of_encoded_len(target);
+                pair.recorder
+                    .queue(Script::Reply(Reply::Value(body.clone())));
+                let mut events = pair.requester.transport.out_link_events();
+                let mut inbound = pair.requester.transport.resource_events();
+                let outcome = pair
+                    .requester
+                    .request(&pair.desc, ECHO_PATH, Value::Nil)
+                    .await
+                    .unwrap();
+                assert_eq!(outcome, body, "a {target}-byte response frame round-trips");
+                let packets = response_payloads(&mut events).len();
+                let resources = responses_as_resources(&mut inbound);
+                match expected {
+                    SizeBranch::Packet => {
+                        assert_eq!(
+                            (packets, resources),
+                            (1, 0),
+                            "the library sends a {target}-byte response frame as one packet"
+                        );
+                    }
+                    SizeBranch::Resource => {
+                        assert_eq!(
+                            (packets, resources),
+                            (0, 1),
+                            "the library sends a {target}-byte response frame as one resource"
+                        );
+                    }
+                }
+            }
+        }
         pair.stop().await;
+    }
+
+    /// How many responses have arrived as assembled resources since `events` was
+    /// subscribed, as the requester's transport reports them.
+    fn responses_as_resources(events: &mut broadcast::Receiver<ResourceEvent>) -> usize {
+        let mut count = 0;
+        while let Ok(event) = events.try_recv() {
+            if let ResourceEventKind::Complete(complete) = event.kind
+                && complete.is_response
+            {
+                count += 1;
+            }
+        }
+        count
     }
 
     async fn identified() {
@@ -722,7 +814,9 @@ mod loopback {
     /// The responder serves a second destination on the same transport, so the requester
     /// holds two links to one peer and the forged response can come over the one the
     /// request did not. The library's pending-request table is per link, which is the
-    /// guard this pins.
+    /// guard this pins. The forged payload and the echo that follows it travel the same
+    /// link event stream, so reading the stream after the echo returns is enough to know
+    /// the forged bytes arrived before the pending request was judged untouched.
     async fn wrong_link() {
         let recorder = Arc::new(Recorder::default());
         let (responder, mut requester, desc) = pair(recorder.clone()).await;
@@ -758,16 +852,18 @@ mod loopback {
             .find_in_link(&decoy_link_id)
             .await
             .expect("the responder holds the decoy in-link");
+        let mut events = requester.transport.out_link_events();
         let forged = ResponseFrame {
             request_id: seen.request_id,
             data: Value::from("forged"),
         }
         .encode();
         let packet = decoy_in_link.lock().await.response_packet(&forged).unwrap();
-        responder
+        let outcome = responder
             .transport
             .send_link_packet_on_bound_iface(&decoy_in_link, packet)
             .await;
+        assert_eq!(outcome, SendPacketOutcome::SentDirect);
 
         let outcome = request_on(
             &requester,
@@ -782,6 +878,12 @@ mod loopback {
             outcome,
             Value::from("after"),
             "the decoy link serves its own requests under the forged response"
+        );
+        assert!(
+            response_payloads(&mut events)
+                .iter()
+                .any(|payload| payload == &forged),
+            "the forged response reached the requester on the decoy link"
         );
         assert!(
             !in_flight.is_finished(),
