@@ -372,12 +372,15 @@ nodes:
       Deterministic debt-marker scan over the step's uncommitted diff (shared
       scanner at agents/.shared/debt_scan.py via a local shim). Replaces the
       shell pipeline edge_case_sweep previously ran by hand; emits debt_hits
-      with real file:line positions parsed from the diff hunk headers. Fail-
-      open: scan failures emit a DEBT_SCAN_FAILED report quoting the manual
-      pipeline (exit 0), and a shim crash falls forward on this node's
-      fallback edge to the same sweep, with the initial_state
-      DEBT_SCAN_FAILED default still in debt_hits. Runs once, forward edges
-      only: no loops.
+      with real file:line positions parsed from the diff hunk headers.
+      Fail-open: scan failures emit a DEBT_SCAN_FAILED report quoting the
+      manual pipeline (exit 0), and a shim crash falls forward on this
+      node's fallback edge to the same sweep: on the first pass with the
+      initial_state DEBT_SCAN_FAILED default still in debt_hits, on a later
+      pass with the previous pass's report there and the engine's
+      last_script_error naming the crash (the sweep prompt renders it as
+      the scan status). Forward edges only; re-run on every implement
+      re-entry from the review loop.
     script: scripts/debt_scan.py
     timeout: 120
     next: edge_case_sweep
@@ -419,7 +422,12 @@ nodes:
          `cfg_attr(` without allow|expect already dropped, "no hits (clean)"
          = no debt. If the section starts with DEBT_SCAN_FAILED, run the
          manual fallback it quotes (resolving each hit to its real `<file:line>`
-         with the `fs_grep` tool, as it describes) and use that result instead. To the
+         with the `fs_grep` tool, as it describes) and use that result instead. If
+         the "## Debt scan status" line starts with `script 'debt_scan'`, the
+         scan did not run THIS pass and the section holds the PREVIOUS pass's
+         report: treat the section as DEBT_SCAN_FAILED and run the manual
+         fallback the initial-state default quotes (the same text the scanner
+         prints when it fails), then use that result instead. To the
          scan's list, add any env-gated or opt-in test the coder added
          (read the changed test files the coder result names). A marker
          with no same-line comment naming its owning task is a finding. This
@@ -438,6 +446,9 @@ nodes:
 
       ## Staleness report from orientation
       {{staleness_report}}
+
+      ## Debt scan status
+      {{last_script_error}}
 
       ## Debt scan
       {{debt_hits}}

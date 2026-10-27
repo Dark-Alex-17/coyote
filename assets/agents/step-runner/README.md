@@ -120,10 +120,14 @@ and reports one `<file>:<line> -- <added line>` per `#[allow(`, `#![allow(`,
 `cfg_attr(` hit carrying neither `allow` nor `expect` is dropped). The scan
 fails open: on any error the sweep sees a `DEBT_SCAN_FAILED` report quoting
 the manual pipeline to run by hand, and a crash of the shim itself falls
-forward on the node's `fallback:` edge to that same sweep with the
-initial-state `DEBT_SCAN_FAILED` default still in `debt_hits`, so the step
-never fails after build and tests went green. The edge-case sweep adds any env-gated or
-opt-in test the coder introduced. A marker
+forward on the node's `fallback:` edge to that same sweep: on the FIRST pass
+with the initial-state `DEBT_SCAN_FAILED` default still in `debt_hits`, and
+on a later pass (the review loop re-enters `implement`, so the scan re-runs)
+with the previous pass's report still there plus the engine's
+`last_script_error` rendered as the prompt's `## Debt scan status` line,
+which tells the sweep to treat that report as `DEBT_SCAN_FAILED`. Either
+way the step never fails after build and tests went green. The edge-case
+sweep adds any env-gated or opt-in test the coder introduced. A marker
 with no same-line comment naming its owning task is a finding; since the
 sweep has no edge back to the coder, it lists each one under
 `Debt left behind:` in the handoff's Notes for next step and in the

@@ -30105,6 +30105,80 @@ mod tests {
         }
     }
 
+    /// The step-runner's debt scan fails open onto the sweep, and the review
+    /// loop re-enters `implement`, so a scan crash on a LATER pass lands on a
+    /// sweep whose `debt_hits` still holds the previous pass's (clean)
+    /// report. The sweep prompt therefore renders the engine's
+    /// `last_script_error` as the scan status beside the report, and its
+    /// instructions tell the model that a `script 'debt_scan'` status means
+    /// the section is stale and is to be treated as `DEBT_SCAN_FAILED`. A
+    /// clean run renders an empty status and no fallback talk beyond that
+    /// standing instruction.
+    #[test]
+    fn step_runner_sweep_renders_the_debt_scan_status_beside_a_stale_report() {
+        use crate::graph::{GraphParser, NodeType, state::StateManager};
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/step-runner");
+        let graph = GraphParser::new(&dir)
+            .load_from_file(dir.join("graph.yaml"))
+            .unwrap();
+        let NodeType::Llm(sweep) = &graph.get_node("edge_case_sweep").unwrap().node_type else {
+            panic!("edge_case_sweep must be an llm node")
+        };
+        let instructions = sweep.instructions.as_deref().unwrap_or_default();
+        assert!(
+            instructions.contains("\"## Debt scan status\" line starts with `script 'debt_scan'`")
+                && instructions
+                    .contains("treat the section as DEBT_SCAN_FAILED and run the manual")
+                && instructions.contains("fallback the initial-state default quotes"),
+            "the sweep instructions must name the stale-report rule: {instructions}"
+        );
+        assert_eq!(
+            graph.initial_state.get("last_script_error"),
+            Some(&serde_json::Value::String(String::new())),
+            "a clean run must render an empty status, so the key is seeded empty"
+        );
+
+        let clean_report = "no hits (clean)";
+        let mut state: HashMap<String, serde_json::Value> = graph
+            .initial_state
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        state.insert("debt_hits".into(), serde_json::json!(clean_report));
+        let stale_error = "script 'debt_scan' failed: exit status 1";
+        for (last_script_error, expect_status) in [("", false), (stale_error, true)] {
+            state.insert(
+                "last_script_error".into(),
+                serde_json::json!(last_script_error),
+            );
+            let prompt = StateManager::new(state.clone())
+                .interpolate(&sweep.prompt)
+                .unwrap();
+            let status = prompt
+                .split("## Debt scan status\n")
+                .nth(1)
+                .and_then(|rest| rest.split("\n## Debt scan\n").next())
+                .unwrap_or_else(|| {
+                    panic!("prompt must carry the status line above the report:\n{prompt}")
+                });
+            assert_eq!(status.trim(), last_script_error, "{prompt}");
+            assert_eq!(
+                status.trim().starts_with("script 'debt_scan'"),
+                expect_status,
+                "{prompt}"
+            );
+            assert!(
+                prompt.contains(&format!("## Debt scan\n{clean_report}")),
+                "the stale report is still rendered, the status is what flags it: {prompt}"
+            );
+            assert!(
+                !prompt.contains("DEBT_SCAN_FAILED"),
+                "the prompt body carries the status, not a second fallback copy: {prompt}"
+            );
+        }
+    }
+
     // The fail-closed change is scoped to script routing gates. The two
     // agent/LLM fallbacks that hand a dead review to write_handoff and the
     // librarian's formatting crash that ships the untrimmed report stay
