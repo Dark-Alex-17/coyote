@@ -62,6 +62,8 @@ const SETUP_SH_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/mesh-i
 const LINK_TIMEOUT: Duration = Duration::from_secs(15);
 /// One request to us, answered or timed out, on the reference's side.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+/// A request to us that nothing answers, so the reference's own wait is the whole cost.
+const UNANSWERED_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// A command that has to wait for a request to us to time out before it can fall back.
 const STORE_AND_FORWARD_TIMEOUT: Duration = Duration::from_secs(90);
 const POLL: Duration = Duration::from_millis(50);
@@ -359,21 +361,32 @@ impl Reference {
         envelope: Value,
         timeout: Duration,
     ) -> Value {
-        let reply = self
-            .send(
-                "request",
-                json!({
-                    "destination_hash": node.runtime.current_destination_hash(),
-                    "instance_id": node.instance_id,
-                    "path": path,
-                    "envelope": envelope,
-                    "timeout_secs": timeout.as_secs(),
-                }),
-                timeout + LINK_TIMEOUT,
-            )
-            .await;
+        let reply = self.request_receipt(node, path, envelope, timeout).await;
         assert_eq!(reply["status"], json!("ready"), "{path}: {reply}");
         reply["response"].clone()
+    }
+
+    /// The reference's receipt for a request to `node`, however it ended: `status` is
+    /// `ready` with the unpacked `response`, or `failed` with none once `timeout` passed.
+    async fn request_receipt(
+        &mut self,
+        node: &Node,
+        path: &str,
+        envelope: Value,
+        timeout: Duration,
+    ) -> Value {
+        self.send(
+            "request",
+            json!({
+                "destination_hash": node.runtime.current_destination_hash(),
+                "instance_id": node.instance_id,
+                "path": path,
+                "envelope": envelope,
+                "timeout_secs": timeout.as_secs(),
+            }),
+            timeout + LINK_TIMEOUT,
+        )
+        .await
     }
 
     /// The Envelope a well-behaved requester sends: this reference's own name hash.
@@ -1166,14 +1179,18 @@ async fn reference_requests_hear_the_specified_replies() {
         .await;
     assert_eq!(nameless, json!(NO_ACCESS));
 
+    // A path no handler is registered for is dropped by the library at the node, so the
+    // reference's request runs out its own wait with nothing to show.
     let unknown = reference
-        .request(&node, "/nope", reference.envelope(Value::Null))
+        .request_receipt(
+            &node,
+            "/nope",
+            reference.envelope(Value::Null),
+            UNANSWERED_REQUEST_TIMEOUT,
+        )
         .await;
-    assert_eq!(unknown["error"], json!("unknown_path"), "{unknown}");
-    let path_hash = unknown["path_hash"]
-        .as_str()
-        .unwrap_or_else(|| panic!("{unknown}"));
-    assert!(is_hex_of_len(path_hash, 32), "{unknown}");
+    assert_eq!(unknown["status"], json!("failed"), "{unknown}");
+    assert_eq!(unknown["response"], Value::Null, "{unknown}");
 
     node.stop().await;
     drop(reference);
