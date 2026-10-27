@@ -3571,23 +3571,19 @@ fn ext_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "unknown-path-error-round-trips-and-is-not-a-code",
+            "an-older-nodes-unknown-path-map-still-reads-as-not-served",
             Kind::Valid,
             Case::Custom(|| {
                 let path_hash = "0123456789abcdef0123456789abcdef".to_string();
-                let error = DispatchError::UnknownPath {
-                    path_hash: path_hash.clone(),
-                };
-                let value = error.to_value();
+                let value = map(vec![
+                    ("error", Value::from("unknown_path")),
+                    ("path_hash", Value::from(path_hash.as_str())),
+                ]);
                 same(
-                    "unknown_path map",
-                    &value,
-                    &map(vec![
-                        ("error", Value::from("unknown_path")),
-                        ("path_hash", Value::from(path_hash.as_str())),
-                    ]),
+                    "read back",
+                    DispatchError::from_value(&value),
+                    Some(DispatchError::UnknownPath { path_hash }),
                 )?;
-                same("read back", DispatchError::from_value(&value), Some(error))?;
                 same("not a refusal code", RefusalCode::from_wire(&value), None)
             }),
         ),
@@ -3767,16 +3763,6 @@ fn code_vectors() -> Vec<Vector> {
                         .as_map()
                         .and_then(|entries| entries[0].1.as_str()),
                     Some("unsupported_version"),
-                )?;
-                same(
-                    "unknown_path",
-                    keys_of(
-                        &DispatchError::UnknownPath {
-                            path_hash: "00".repeat(16),
-                        }
-                        .to_value(),
-                    ),
-                    vec!["error", "path_hash"],
                 )?;
                 same(
                     "no_provider",

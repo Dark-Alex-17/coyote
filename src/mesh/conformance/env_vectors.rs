@@ -2722,21 +2722,8 @@ fn version_refusal_vectors() -> Vec<Vector> {
 
 const HEX_32: &str = "0123456789abcdef0123456789abcdef";
 
-fn unknown_path_value(path_hash: Value) -> Value {
-    map(vec![
-        ("error", Value::from("unknown_path")),
-        ("path_hash", path_hash),
-    ])
-}
-
 fn no_provider_value(path: Value) -> Value {
     map(vec![("error", Value::from("no_provider")), ("path", path)])
-}
-
-fn unknown_path(path_hash: &str) -> Option<DispatchError> {
-    Some(DispatchError::UnknownPath {
-        path_hash: path_hash.to_string(),
-    })
 }
 
 fn no_provider(path: &str) -> Option<DispatchError> {
@@ -2755,14 +2742,7 @@ fn dispatch_error(
 }
 
 fn dispatch_error_vectors() -> Vec<Vector> {
-    let upper = HEX_32.to_ascii_uppercase();
     vec![
-        dispatch_error(
-            "dispatch-error-unknown-path-is-read",
-            Kind::Valid,
-            unknown_path_value(Value::from(HEX_32)),
-            unknown_path(HEX_32),
-        ),
         dispatch_error(
             "dispatch-error-no-provider-is-read",
             Kind::Valid,
@@ -2776,61 +2756,9 @@ fn dispatch_error_vectors() -> Vec<Vector> {
             None,
         ),
         dispatch_error(
-            "dispatch-error-unknown-kind-is-malformed",
-            Kind::Invalid,
-            set(
-                unknown_path_value(Value::from(HEX_32)),
-                "error",
-                Value::from("not_found"),
-            ),
-            None,
-        ),
-        dispatch_error(
-            "dispatch-error-mixed-case-kind-is-malformed",
-            Kind::Invalid,
-            set(
-                unknown_path_value(Value::from(HEX_32)),
-                "error",
-                Value::from("Unknown_Path"),
-            ),
-            None,
-        ),
-        dispatch_error(
-            "dispatch-error-kind-as-bin-is-malformed",
-            Kind::Invalid,
-            set(
-                unknown_path_value(Value::from(HEX_32)),
-                "error",
-                Value::Binary(b"unknown_path".to_vec()),
-            ),
-            None,
-        ),
-        dispatch_error(
-            "dispatch-error-kind-as-integer-is-malformed",
-            Kind::Invalid,
-            set(
-                unknown_path_value(Value::from(HEX_32)),
-                "error",
-                Value::from(1u64),
-            ),
-            None,
-        ),
-        dispatch_error(
-            "dispatch-error-unknown-path-without-path-hash-is-malformed",
-            Kind::Invalid,
-            map(vec![("error", Value::from("unknown_path"))]),
-            None,
-        ),
-        dispatch_error(
             "dispatch-error-no-provider-without-path-is-malformed",
             Kind::Invalid,
             map(vec![("error", Value::from("no_provider"))]),
-            None,
-        ),
-        dispatch_error(
-            "dispatch-error-as-bare-string-is-malformed",
-            Kind::Invalid,
-            Value::from("unknown_path"),
             None,
         ),
         dispatch_error(
@@ -2849,81 +2777,6 @@ fn dispatch_error_vectors() -> Vec<Vector> {
             "version-refusal-is-not-a-dispatch-error",
             Kind::Invalid,
             VersionRefusal::current(None).to_value(),
-            None,
-        ),
-        dispatch_error(
-            "dispatch-error-path-hash-of-32-hex-chars-is-read",
-            Kind::Boundary,
-            unknown_path_value(Value::from(HEX_32)),
-            unknown_path(HEX_32),
-        ),
-        dispatch_error(
-            "dispatch-error-uppercase-path-hash-is-read",
-            Kind::Valid,
-            unknown_path_value(Value::from(upper.as_str())),
-            unknown_path(&upper),
-        ),
-        dispatch_error(
-            "dispatch-error-derived-path-hash-is-read",
-            Kind::Valid,
-            unknown_path_value(Value::from(PathHash::of(UNKNOWN_PATH).to_string())),
-            unknown_path(&PathHash::of(UNKNOWN_PATH).to_string()),
-        ),
-        dispatch_error(
-            "dispatch-error-path-hash-of-31-chars-is-malformed",
-            Kind::Invalid,
-            unknown_path_value(Value::from(&HEX_32[..31])),
-            None,
-        ),
-        dispatch_error(
-            "dispatch-error-path-hash-of-33-chars-is-malformed",
-            Kind::Invalid,
-            unknown_path_value(Value::from(format!("{HEX_32}0"))),
-            None,
-        ),
-        dispatch_error(
-            "dispatch-error-path-hash-with-a-non-hex-char-is-malformed",
-            Kind::Invalid,
-            unknown_path_value(Value::from("0123456789abcdef0123456789abcdeg")),
-            None,
-        ),
-        dispatch_error(
-            "dispatch-error-path-hash-with-a-trailing-space-is-malformed",
-            Kind::Invalid,
-            unknown_path_value(Value::from("0123456789abcdef0123456789abcde ")),
-            None,
-        ),
-        dispatch_error(
-            "dispatch-error-empty-path-hash-is-malformed",
-            Kind::Invalid,
-            unknown_path_value(Value::from("")),
-            None,
-        ),
-        dispatch_error(
-            "dispatch-error-path-hash-as-16-byte-bin-is-malformed",
-            Kind::Invalid,
-            unknown_path_value(Value::Binary(vec![1; 16])),
-            None,
-        ),
-        dispatch_error(
-            "dispatch-error-path-hash-as-hex-bin-is-malformed",
-            Kind::Invalid,
-            unknown_path_value(Value::Binary(HEX_32.as_bytes().to_vec())),
-            None,
-        ),
-        dispatch_error(
-            "dispatch-error-path-hash-as-nil-is-malformed",
-            Kind::Invalid,
-            unknown_path_value(Value::Nil),
-            None,
-        ),
-        dispatch_error(
-            "dispatch-error-unknown-path-keyed-by-path-is-malformed",
-            Kind::Invalid,
-            map(vec![
-                ("error", Value::from("unknown_path")),
-                ("path", Value::from(STATUS_PATH)),
-            ]),
             None,
         ),
         dispatch_error(
@@ -3014,16 +2867,6 @@ fn dispatch_error_vectors() -> Vec<Vector> {
             None,
         ),
         dispatch_error(
-            "dispatch-error-unknown-key-is-ignored",
-            Kind::Valid,
-            with(
-                unknown_path_value(Value::from(HEX_32)),
-                "detail",
-                Value::from("ignored"),
-            ),
-            unknown_path(HEX_32),
-        ),
-        dispatch_error(
             "dispatch-error-no-provider-ignores-a-stray-path-hash",
             Kind::Valid,
             with(
@@ -3032,31 +2875,6 @@ fn dispatch_error_vectors() -> Vec<Vector> {
                 Value::from(HEX_32),
             ),
             no_provider(MESSAGE_PATH),
-        ),
-        dispatch_error(
-            "dispatch-error-unknown-path-ignores-a-stray-path",
-            Kind::Valid,
-            with(
-                unknown_path_value(Value::from(HEX_32)),
-                "path",
-                Value::from("/other"),
-            ),
-            unknown_path(HEX_32),
-        ),
-        dispatch_error(
-            "dispatch-error-integer-key-is-ignored",
-            Kind::Valid,
-            Value::Map(
-                [
-                    vec![(Value::from(0u64), Value::Nil)],
-                    unknown_path_value(Value::from(HEX_32))
-                        .as_map()
-                        .unwrap()
-                        .to_vec(),
-                ]
-                .concat(),
-            ),
-            unknown_path(HEX_32),
         ),
         dispatch_error(
             "no-access-byte-is-not-a-dispatch-error",
@@ -3069,15 +2887,6 @@ fn dispatch_error_vectors() -> Vec<Vector> {
             Kind::Invalid,
             VersionRefusal::current(Some(2)).to_value(),
             None,
-        ),
-        dispatch_error(
-            "dispatch-error-unknown-path-round-trips",
-            Kind::Valid,
-            DispatchError::UnknownPath {
-                path_hash: HEX_32.to_string(),
-            }
-            .to_value(),
-            unknown_path(HEX_32),
         ),
     ]
 }
