@@ -105,14 +105,19 @@ End nodes emit sentinel outcomes for the caller:
   routing gate (`route_staleness`/`route_sweep`/`route_review`) crashed
   (rendered as `Last script error:`).
 
-The edge-case sweep also derives the step's debt list mechanically rather
-than trusting the coder's summary: after `git ls-files --others
---exclude-standard -z | xargs -0 -r git add -N --` (so every file the coder
-created counts, listed or not, while `.gitignore` keeps build artefacts out)
-it greps the step diff's added lines for `#[allow(`, `#![allow(`, `#[expect(`,
-`#![expect(`, `cfg_attr(`, `todo!`, `unimplemented!` and `#[ignore` (a
-`cfg_attr(` hit carrying neither `allow` nor `expect` is dropped), plus any
-env-gated or opt-in test. A marker
+The step's debt list is derived mechanically rather than trusted from the
+coder's summary: a deterministic `debt_scan` script node (a thin shim over
+the shared `agents/.shared/debt_scan.py`, the same scanner Sisyphus's
+`debt_scan` tool runs) intent-to-adds the coder's untracked files (so every
+file the coder created counts, listed or not, while `.gitignore` keeps build
+artefacts out), diffs against the step base with `--no-color --no-ext-diff`,
+and reports one `<file>:<line> -- <added line>` per `#[allow(`, `#![allow(`,
+`#[expect(`, `#![expect(`, `cfg_attr(`, `todo!`, `unimplemented!` or
+`#[ignore` on an ADDED line, with real positions already resolved (a
+`cfg_attr(` hit carrying neither `allow` nor `expect` is dropped). The scan
+fails open: on any error the sweep sees a `DEBT_SCAN_FAILED` report quoting
+the manual pipeline to run by hand. The edge-case sweep adds any env-gated or
+opt-in test the coder introduced. A marker
 with no same-line comment naming its owning task is a finding; since the
 sweep has no edge back to the coder, it lists each one under
 `Debt left behind:` in the handoff's Notes for next step and in the

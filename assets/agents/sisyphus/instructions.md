@@ -261,19 +261,16 @@ Evidence required:
 
 ### Debt and decisions after a coder returns
 
-- The coder does not report debt; derive the list from its diff:
-  `git ls-files --others --exclude-standard -z | xargs -0 -r git add -N -- && git diff --no-color --no-ext-diff <base> | grep -nE '^\+.*(#!?\[(allow|expect)\(|cfg_attr\(|todo!|unimplemented!|#\[ignore)'`
-  (bare `cfg_attr(` on purpose: the predicate form `#[cfg_attr(not(test), allow(dead_code))]`
-  is the common one, and the lint spares a task id beside any `cfg_attr(`; the `add -N` puts
-  the coder's new files into the diff; ls-files --others --exclude-standard covers every file
-  the coder created, listed or not, while .gitignore keeps build artefacts out; grep exiting 1
-  with no lines is the no-debt result (the command runs under pipefail, so the tool reports a
-  non-zero exit; that is not an error); `-n` numbers the diff output, so resolve each hit to
-  its `<file:line>` with the `fs_grep` tool: the hit text after the `+`, regex metacharacters
-  escaped, is its pattern (never paste diff text into a shell string); keep only matches in
-  files the diff touched)
-  plus any env-gated or opt-in test it added. A `cfg_attr(` hit that carries neither `allow`
-  nor `expect` is not debt; drop it. Per the `task-tracking` skill, assign each marker to its
+- The coder does not report debt; derive the list with the `debt_scan` tool (pass
+  `--base <the task's base commit>`; default HEAD). It runs the sanctioned pipeline
+  deterministically - intent-to-add for the coder's new files (.gitignore keeps artefacts
+  out), diff vs base, ADDED-line marker grep - and prints one `<file>:<line> -- <line text>`
+  per hit with REAL positions already resolved; a bare `cfg_attr(` carrying neither `allow`
+  nor `expect` is already dropped ("no hits (clean)" = no debt; the predicate form
+  `#[cfg_attr(not(test), allow(dead_code))]` is kept). If the output starts with
+  `DEBT_SCAN_FAILED`, run the manual fallback it quotes and resolve hits to `<file:line>`
+  with the `fs_grep` tool as it describes. To the tool's list, add any env-gated or opt-in test the
+  coder added. Per the `task-tracking` skill, assign each marker to its
   owning task: append the removal to that task's acceptance criteria and log
   `debt-assigned` in both the current task's and the owning task's `log.md`.
 - When your brief forbids editing task files (you are the architect's child and its plans

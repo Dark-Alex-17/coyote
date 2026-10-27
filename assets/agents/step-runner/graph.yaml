@@ -109,6 +109,11 @@ initial_state:
   edge_case_report: ''
   downstream_updates: ''
   sweep_failure: ''
+  # Overwritten by the debt_scan node; this default is what edge_case_sweep
+  # sees if that script crash-forwards, so it must carry the manual fallback.
+  debt_hits: 'DEBT_SCAN_FAILED: the debt_scan node did not run. Manual fallback (<base> normally HEAD):
+    git ls-files --others --exclude-standard -z | xargs -0 -r git add -N -- && git diff --no-color --no-ext-diff <base> | grep -nE ''^\+.*(#!?\[(allow|expect)\(|cfg_attr\(|todo!|unimplemented!|#\[ignore)'' ;
+    grep exit 1 with no lines = no debt; -n numbers the DIFF, so resolve each hit to its real <file:line> with the fs_grep tool: the hit text after the + is its pattern (regex metacharacters escaped) -- never paste diff text into a shell string -- and keep only matches in files the diff touched; bare cfg_attr( without allow|expect is not debt.'
   needs_independent_review: false
   review_report: ''
   review_attempts: 0
@@ -360,6 +365,22 @@ nodes:
     timeout: 5
     fallback: end_failure
 
+  debt_scan:
+    id: debt_scan
+    type: script
+    description: >-
+      Deterministic debt-marker scan over the step's uncommitted diff (shared
+      scanner at agents/.shared/debt_scan.py via a local shim). Replaces the
+      shell pipeline edge_case_sweep previously ran by hand; emits debt_hits
+      with real file:line positions parsed from the diff hunk headers. Fail-
+      open: scan failures emit a DEBT_SCAN_FAILED report quoting the manual
+      pipeline (exit 0), and a shim crash falls forward on this node's
+      declared next edge with the initial_state DEBT_SCAN_FAILED default
+      still in debt_hits. Runs once, forward edge only: no loops.
+    script: scripts/debt_scan.py
+    timeout: 120
+    next: edge_case_sweep
+
   edge_case_sweep:
     id: edge_case_sweep
     type: llm
@@ -390,20 +411,15 @@ nodes:
       4. Set needs_independent_review=true when the change touched 5+ files
          or crosses architectural boundaries (auth, public APIs, schema,
          security-sensitive paths).
-      5. Debt sweep. The coder does not report debt; derive it from the
-         step's diff (the coder leaves its edits uncommitted):
-         `git -C {{project_dir}} ls-files --others --exclude-standard -z | xargs -0 -r git -C {{project_dir}} add -N -- && git -C {{project_dir}} diff --no-color --no-ext-diff <base, normally HEAD> | grep -nE '^\+.*(#!?\[(allow|expect)\(|cfg_attr\(|todo!|unimplemented!|#\[ignore)'`
-         (the `add -N` puts the coder's new files into the diff; ls-files
-         --others --exclude-standard covers every file the coder created,
-         listed or not, while .gitignore keeps build artefacts out; grep
-         exiting 1 with no lines is the no-debt result (the command runs
-         under pipefail, so the tool reports a non-zero exit; that is not
-         an error); `-n` numbers the diff output, so resolve each hit to its
-         `<file:line>` with the `fs_grep` tool: the hit text after the `+`,
-         regex metacharacters escaped, is its pattern (never paste diff text
-         into a shell string); keep only matches in files the diff touched)
-         plus any env-gated or opt-in test it added. A `cfg_attr(` hit that
-         carries neither `allow` nor `expect` is not debt; drop it. A marker
+      5. Debt sweep. A deterministic scan already ran; its results are in
+         the "## Debt scan" section below - one `<file>:<line> -- <added
+         line text>` per hit, real positions already resolved, bare
+         `cfg_attr(` without allow|expect already dropped, "no hits (clean)"
+         = no debt. If the section starts with DEBT_SCAN_FAILED, run the
+         manual fallback it quotes (resolving each hit to its real `<file:line>`
+         with the `fs_grep` tool, as it describes) and use that result instead. To the
+         scan's list, add any env-gated or opt-in test the coder added
+         (read the changed test files the coder result names). A marker
          with no same-line comment naming its owning task is a finding. This
          node has no edge back to the coder, so record each one in
          `edge_case_report` under a `Debt left behind:` heading
@@ -420,6 +436,9 @@ nodes:
 
       ## Staleness report from orientation
       {{staleness_report}}
+
+      ## Debt scan
+      {{debt_hits}}
     tools:
       - fs_cat
       - fs_grep

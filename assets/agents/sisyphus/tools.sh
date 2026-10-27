@@ -70,6 +70,15 @@ run_build() {
   fi
 }
 
+# @cmd Deterministic debt-marker scan over the working-tree diff - replaces the manual ls-files/add -N/diff/grep pipeline. Prints one `<file>:<line> -- <line text>` per ADDED debt marker with real positions already resolved (bare `cfg_attr(` without allow|expect already dropped; "no hits (clean)" = no debt), or a DEBT_SCAN_FAILED report quoting the manual fallback.
+# @option --base Diff base commit/ref (default HEAD)
+# @option --dir Project directory override (default: the agent's project_dir)
+debt_scan() {
+  local dir
+  dir="${argc_dir:-$(_project_dir)}"
+  python3 "$LLM_ROOT_DIR/agents/.shared/debt_scan.py" --dir "${dir}" --base "${argc_base:-HEAD}" >> "$LLM_OUTPUT"
+}
+
 # @cmd Run tests for the project
 run_tests() {
   local project_dir

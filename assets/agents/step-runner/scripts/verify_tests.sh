@@ -26,7 +26,7 @@ if [[ -z "$cmd" || "$cmd" == "null" ]]; then
   jq -nc '{
     "tests_ok": true,
     "tests_output": "(GATE NOT RUN: no test command configured or detected. This is NOT evidence that tests passed — set TEST_CMD, and never report the suite as green.)",
-    "_next": "edge_case_sweep"
+    "_next": "debt_scan"
   }'
   exit 0
 fi
@@ -44,7 +44,7 @@ if (( exit_code == 0 )); then
     '{
       "tests_ok": true,
       "tests_output": ("Ran: " + $cmd + "\n\n" + .),
-      "_next": "edge_case_sweep"
+      "_next": "debt_scan"
     }'
 else
   trim_output "$output" | jq -Rsc \
