@@ -398,28 +398,37 @@ pub fn build_memory_section(
         return Ok(None);
     }
 
+    let global_len = global_index.as_deref().map_or(0, count_chars);
+    let workspace_len = workspace_index.as_deref().map_or(0, count_chars);
+    let present = global_index.is_some() as usize + workspace_index.is_some() as usize;
+    let share = cap / present;
+
     let mut buf = String::from("<memory>\n");
     let mut consumed = 0usize;
 
     if let Some(s) = &global_index {
-        buf.push_str("<global_index>\n");
-        buf.push_str(s);
-        buf.push_str("\n</global_index>\n");
-        consumed += s.chars().count();
+        // An even share each, except that a workspace index which fits in its
+        // share hands the rest to the global one.
+        let budget = if workspace_len <= share {
+            cap - workspace_len
+        } else {
+            share
+        };
+        consumed += push_index(&mut buf, "global_index", s, budget, with_tools);
     }
 
     if let Some(s) = &workspace_index {
-        buf.push_str("<workspace_index>\n");
-        buf.push_str(s);
-        buf.push_str("\n</workspace_index>\n");
-        consumed += s.chars().count();
+        // Includes the tail the global index lost to its line-boundary cut.
+        let budget = cap.saturating_sub(consumed);
+        consumed += push_index(&mut buf, "workspace_index", s, budget, with_tools);
     }
 
-    if consumed > cap {
+    if consumed < global_len + workspace_len {
         warn!(
-            "memory indexes ({} chars) exceed cap ({} chars); injecting fully - \
-             consider raising memory_cap_* in config or shrinking MEMORY.md",
-            consumed, cap
+            "memory indexes ({} chars) exceed cap ({} chars); truncated to the head of each index - \
+             raise memory_cap_* in config or shrink MEMORY.md",
+            global_len + workspace_len,
+            cap
         );
     }
 
@@ -451,6 +460,51 @@ pub fn build_memory_section(
 
     buf.push_str("</memory>");
     Ok(Some(buf))
+}
+
+fn count_chars(s: &str) -> usize {
+    s.chars().count()
+}
+
+/// Appends `index` wrapped in `<tag>`, cut to the head that fits `budget`,
+/// and returns the number of index chars injected. A truncated index is
+/// followed by a comment telling the model how to reach the rest.
+fn push_index(buf: &mut String, tag: &str, index: &str, budget: usize, with_tools: bool) -> usize {
+    let total = count_chars(index);
+    let shown = if total <= budget {
+        index
+    } else {
+        head_at_line_boundary(index, budget)
+    };
+    buf.push_str(&format!("<{tag}>\n"));
+    buf.push_str(shown);
+    buf.push_str(&format!("\n</{tag}>\n"));
+    let shown_len = count_chars(shown);
+    if shown_len < total {
+        let how = if with_tools {
+            "call memory__list for the full catalogue and memory__read <name> for a file"
+        } else {
+            "enable function calling for full access"
+        };
+        buf.push_str(&format!(
+            "<!-- {tag} truncated: {shown_len} of {total} chars; {how} -->\n"
+        ));
+    }
+    shown_len
+}
+
+/// The first `budget` chars of `s`, pulled back to the last newline so no
+/// line is cut in half. A single line longer than the budget is cut at the
+/// budget rather than dropped.
+fn head_at_line_boundary(s: &str, budget: usize) -> &str {
+    let end = s
+        .char_indices()
+        .nth(budget)
+        .map_or(s.len(), |(byte, _)| byte);
+    match s[..end].rfind('\n') {
+        Some(newline) => &s[..newline],
+        None => &s[..end],
+    }
 }
 
 fn collect_md_files(dir: &Path, out: &mut Vec<MemoryFile>) -> Result<()> {
@@ -649,6 +703,181 @@ mod tests {
             .expect("memory section should exist");
         assert!(!section.contains(&big_body));
         assert!(section.contains("memory file(s) omitted"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A store with both indexes on disk; `workspace_files` are extra
+    /// (name, body) drill files in the workspace memory dir.
+    fn two_index_store(
+        label: &str,
+        global_index: &str,
+        workspace_index: &str,
+        workspace_files: &[(&str, &str)],
+    ) -> (PathBuf, MemoryStore) {
+        let root = temp_root(label);
+        let workspace = root.join("ws");
+        let structured = workspace
+            .join(WORKSPACE_COYOTE_DIR_NAME)
+            .join(MEMORY_DIR_NAME);
+        fs::create_dir_all(&structured).unwrap();
+        fs::write(structured.join(MEMORY_INDEX_FILE_NAME), workspace_index).unwrap();
+        for (name, body) in workspace_files {
+            fs::write(
+                structured.join(format!("{name}.md")),
+                format!("---\nname: {name}\n---\n{body}\n"),
+            )
+            .unwrap();
+        }
+        let global = root.join("global");
+        fs::create_dir_all(&global).unwrap();
+        fs::write(global.join(MEMORY_INDEX_FILE_NAME), global_index).unwrap();
+        let store = MemoryStore {
+            global_dir: global,
+            workspace: discover_workspace_memory(&workspace),
+        };
+        (root, store)
+    }
+
+    /// Forty 11-char lines joined by newlines (479 chars), each starting with `prefix`.
+    fn index_lines(prefix: &str) -> String {
+        (0..40)
+            .map(|_| format!("{prefix}0123456789"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn tag_body<'a>(section: &'a str, tag: &str) -> &'a str {
+        let open = format!("<{tag}>\n");
+        let close = format!("\n</{tag}>\n");
+        let start = section.find(&open).expect("open tag") + open.len();
+        let end = section[start..].find(&close).expect("close tag") + start;
+        &section[start..end]
+    }
+
+    #[test]
+    fn build_memory_section_truncates_both_indexes_to_an_even_share_of_the_cap() {
+        let (root, store) =
+            two_index_store("even_share", &index_lines("g"), &index_lines("w"), &[]);
+
+        let section = build_memory_section(&store, true, 200)
+            .unwrap()
+            .expect("memory section should exist");
+
+        let global = tag_body(&section, "global_index");
+        let workspace = tag_body(&section, "workspace_index");
+        for (body, prefix) in [(global, "g"), (workspace, "w")] {
+            assert!(
+                body.lines().all(|l| l == format!("{prefix}0123456789")),
+                "index must be cut at a line boundary: {body:?}"
+            );
+            assert!(
+                body.chars().count() <= 100,
+                "each index gets cap/2: {body:?}"
+            );
+        }
+        assert!(global.chars().count() + workspace.chars().count() <= 200);
+        assert!(
+            section.find("<global_index>").unwrap() < section.find("<workspace_index>").unwrap()
+        );
+        assert!(section.contains(
+            "</global_index>\n<!-- global_index truncated: 95 of 479 chars; \
+             call memory__list for the full catalogue and memory__read <name> for a file -->\n"
+        ));
+        assert!(section.contains(
+            "</workspace_index>\n<!-- workspace_index truncated: 95 of 479 chars; \
+             call memory__list for the full catalogue and memory__read <name> for a file -->\n"
+        ));
+        assert!(section.ends_with("</memory>"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn build_memory_section_gives_a_short_indexes_leftover_to_the_other() {
+        let (root, store) = two_index_store("leftover", "short", &index_lines("w"), &[]);
+
+        let section = build_memory_section(&store, true, 200)
+            .unwrap()
+            .expect("memory section should exist");
+
+        assert_eq!(tag_body(&section, "global_index"), "short");
+        assert!(!section.contains("global_index truncated"));
+        let workspace = tag_body(&section, "workspace_index");
+        assert_eq!(
+            workspace.chars().count(),
+            191,
+            "cap minus the short index, cut at a line: {workspace:?}"
+        );
+        assert!(section.contains("<!-- workspace_index truncated: 191 of 479 chars;"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn build_memory_section_under_cap_is_untouched() {
+        let (root, store) =
+            two_index_store("under_cap", "global-content", "workspace-content", &[]);
+
+        let section = build_memory_section(&store, true, 6_000)
+            .unwrap()
+            .expect("memory section should exist");
+
+        assert_eq!(
+            section,
+            "<memory>\n<global_index>\nglobal-content\n</global_index>\n\
+             <workspace_index>\nworkspace-content\n</workspace_index>\n</memory>"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn build_memory_section_at_an_odd_cap_keeps_an_index_exactly_its_share_plus_one() {
+        // 109 chars and 110 chars; cap 219 gives each a share of 109, so the
+        // workspace index needs one char more than its share and the total
+        // sits exactly on the cap.
+        let global = (0..10).map(|_| "g012345678").collect::<Vec<_>>().join("\n");
+        let workspace = format!("{}x", global.replace('g', "w"));
+        assert_eq!(global.chars().count(), 109);
+        assert_eq!(workspace.chars().count(), 110);
+        let (root, store) = two_index_store("odd_cap", &global, &workspace, &[]);
+
+        let section = build_memory_section(&store, true, 219)
+            .unwrap()
+            .expect("memory section should exist");
+
+        assert_eq!(tag_body(&section, "global_index"), global);
+        assert_eq!(tag_body(&section, "workspace_index"), workspace);
+        assert!(!section.contains("truncated"), "{section}");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn build_memory_section_without_tools_truncates_indexes_and_omits_drill_bodies() {
+        let big_body = "x".repeat(200);
+        let (root, store) = two_index_store(
+            "no_tools_cap",
+            &index_lines("g"),
+            &index_lines("w"),
+            &[("big", &big_body)],
+        );
+
+        let section = build_memory_section(&store, false, 200)
+            .unwrap()
+            .expect("memory section should exist");
+
+        assert!(section.contains(
+            "<!-- global_index truncated: 95 of 479 chars; enable function calling for full access -->"
+        ));
+        assert!(section.contains(
+            "<!-- workspace_index truncated: 95 of 479 chars; enable function calling for full access -->"
+        ));
+        assert!(!section.contains(&big_body));
+        assert!(
+            section.contains("1 memory file(s) omitted; enable function calling for full access")
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

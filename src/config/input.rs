@@ -19,6 +19,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const IMAGE_EXTS: [&str; 5] = ["png", "jpeg", "jpg", "webp", "gif"];
 const SUMMARY_MAX_WIDTH: usize = 80;
+const EXTENDED_PROMPT_CACHE_TTL: &str = "1h";
 
 pub const TOOL_LOOP_CHECKPOINT_TEXT: &str = "[Context checkpoint: the tool activity above was committed to session history mid-turn so it can be compressed. The task is not finished; it continues in the next turn.]";
 pub const TOOL_LOOP_CONTINUE_TEXT: &str = "Continue exactly where you left off. This is an automatic context checkpoint, not a new instruction: the original request and your progress so far are in the history above. Do not restart or re-summarize; proceed with the next step.";
@@ -44,11 +45,13 @@ pub struct Input {
     rag_name: Option<String>,
     with_session: bool,
     with_agent: bool,
+    long_lived: bool,
 }
 
 impl Input {
     pub fn from_str(ctx: &RequestContext, text: &str, role: Option<Role>) -> Result<Self> {
         let (role, with_session, with_agent) = resolve_role(ctx, role)?;
+        let long_lived = is_long_lived(ctx, with_session);
         let captured = capture_input_config(ctx, &role);
         Ok(Self {
             app_config: Arc::clone(&ctx.app.config),
@@ -70,6 +73,7 @@ impl Input {
             rag_name: None,
             with_session,
             with_agent,
+            long_lived,
         })
     }
 
@@ -83,6 +87,7 @@ impl Input {
         role: Role,
         functions: Option<Vec<FunctionDeclaration>>,
     ) -> Result<Self> {
+        let with_session = ctx.session.is_some();
         Ok(Self {
             app_config: Arc::clone(&ctx.app.config),
             stream_enabled: ctx.app.config.stream,
@@ -101,8 +106,9 @@ impl Input {
             tool_calls: None,
             role,
             rag_name: None,
-            with_session: ctx.session.is_some(),
+            with_session,
             with_agent: ctx.agent.is_some(),
+            long_lived: is_long_lived(ctx, with_session),
         })
     }
 
@@ -140,6 +146,7 @@ impl Input {
             rag_name: None,
             with_session: false,
             with_agent: false,
+            long_lived: false,
         }
     }
 
@@ -192,6 +199,7 @@ impl Input {
             }
         }
         let (role, with_session, with_agent) = resolve_role(ctx, role)?;
+        let long_lived = is_long_lived(ctx, with_session);
         let captured = capture_input_config(ctx, &role);
         Ok(Self {
             app_config: Arc::clone(&ctx.app.config),
@@ -213,6 +221,7 @@ impl Input {
             rag_name: None,
             with_session,
             with_agent,
+            long_lived,
         })
     }
 
@@ -421,6 +430,12 @@ impl Input {
         } else {
             None
         };
+        let extended_ttl = matches!(
+            self.app_config.prompt_cache_ttl.as_deref(),
+            None | Some(EXTENDED_PROMPT_CACHE_TTL)
+        );
+        let prompt_cache_ttl =
+            (self.long_lived && extended_ttl).then(|| EXTENDED_PROMPT_CACHE_TTL.to_string());
         Ok(ChatCompletionsData {
             messages,
             temperature,
@@ -428,6 +443,7 @@ impl Input {
             reasoning_effort,
             functions,
             stream,
+            prompt_cache_ttl,
         })
     }
 
@@ -589,6 +605,13 @@ fn resolve_role(ctx: &RequestContext, role: Option<Role>) -> Result<(Role, bool,
             ctx.agent.is_some(),
         )),
     }
+}
+
+/// A root context seated on a session is paced by a human, so its turns are
+/// often more than five minutes apart. Spawned children and detached
+/// one-shots run back to back and keep the provider's default cache TTL.
+fn is_long_lived(ctx: &RequestContext, with_session: bool) -> bool {
+    ctx.self_agent_id.is_none() && with_session
 }
 
 struct CapturedInputConfig {
@@ -1109,6 +1132,61 @@ mod tests {
         let input = Input::from_str(&ctx, "test", None).unwrap();
         let session = Some(Session::default());
         assert!(input.session(&session).is_some());
+    }
+
+    fn prompt_cache_ttl_of(input: &Input) -> Option<String> {
+        input
+            .prepare_completion_data(input.role().model(), false)
+            .unwrap()
+            .prompt_cache_ttl
+    }
+
+    #[test]
+    fn root_session_turn_requests_the_extended_prompt_cache_ttl() {
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        let input = Input::from_str(&ctx, "test", None).unwrap();
+        assert_eq!(prompt_cache_ttl_of(&input).as_deref(), Some("1h"));
+    }
+
+    #[test]
+    fn sessionless_and_detached_inputs_keep_the_default_prompt_cache_ttl() {
+        let mut ctx = create_test_ctx();
+        let sessionless = Input::from_str(&ctx, "test", None).unwrap();
+        assert_eq!(prompt_cache_ttl_of(&sessionless), None);
+
+        ctx.session = Some(Session::default());
+        let detached = Input::detached_with_role(&ctx, "test", Role::new("r", "p"));
+        assert_eq!(prompt_cache_ttl_of(&detached), None);
+    }
+
+    #[test]
+    fn spawned_child_turn_keeps_the_default_prompt_cache_ttl() {
+        let parent = create_test_ctx();
+        let mut child = RequestContext::new_for_child(
+            Arc::clone(&parent.app),
+            &parent,
+            1,
+            Arc::new(crate::supervisor::mailbox::Inbox::new()),
+            "agent_test_1".to_string(),
+        );
+        child.session = Some(Session::default());
+        let input = Input::from_str(&child, "test", None).unwrap();
+        assert!(input.with_session());
+        assert_eq!(prompt_cache_ttl_of(&input), None);
+    }
+
+    #[test]
+    fn prompt_cache_ttl_knob_set_to_5m_keeps_the_default_ttl() {
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            prompt_cache_ttl: Some("5m".to_string()),
+            ..AppConfig::default()
+        });
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        ctx.session = Some(Session::default());
+        let input = Input::from_str(&ctx, "test", None).unwrap();
+        assert_eq!(prompt_cache_ttl_of(&input), None);
     }
 
     #[test]
