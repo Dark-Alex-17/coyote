@@ -9,8 +9,9 @@ Grep-complete where the ground truth is on disk; verbatim where it is judgment:
                    (`plan:` matches the plan's basename with a trailing `.md` stripped on
                    both sides, so `PLAN-x` and `PLAN-x.md` name the same plan while a
                    dotted slug keeps its dots, when the field exists; `status: complete`
-                   when that field exists), title from frontmatter, commit SHAs from the
-                   log.md `completed` entry
+                   when that field exists; only the ids named by `--tasks` when that is
+                   given - a PR group's members), title from frontmatter, commit SHAs
+                   from the log.md `completed` entry
   Review decisions `rejected-finding:` ledger lines, one entry per tag occurrence
   Hygiene pass     --hygiene-file verbatim, else `HYGIENE:` ledger lines, else "clean"
   Design decisions `design-decision` ledger lines
@@ -76,9 +77,12 @@ def plan_identity(path):
     return os.path.basename(path).removesuffix(".md")
 
 
-def find_tasks(tasks_dir, plan_id):
-    """[(task_id, title, dir)] for the plan's tasks, in TASK number order."""
+def find_tasks(tasks_dir, plan_id, only=None):
+    """[(task_id, title, dir)] for the plan's tasks, in TASK number order. With `only`
+    (a set of task ids) the checklist keeps those ids alone and any listed id that is
+    missing or not complete is a NOTE."""
     found, skipped = [], []
+    seen = set()
     for root, dirs, files in os.walk(tasks_dir):
         dirs.sort()
         base = os.path.basename(root)
@@ -92,6 +96,10 @@ def find_tasks(tasks_dir, plan_id):
         plan = fm.get("plan", "")
         if plan and plan_identity(plan) != plan_id:
             continue
+        task_id = TASK_DIR_RE.match(base).group(1)
+        if only is not None and task_id not in only:
+            continue
+        seen.add(task_id)
         status = fm.get("status", "")
         if status and status != "complete":
             skipped.append(f"{base} (status: {status})")
@@ -101,9 +109,13 @@ def find_tasks(tasks_dir, plan_id):
             m = re.search(r"^#\s+(.+?)\s*$", read(os.path.join(root, "index.md")), re.M)
             title = m.group(1) if m else "(untitled - index.md has no title)"
             note(f"{base}: no `title:` frontmatter; used {'the H1' if m else 'a placeholder'}")
-        found.append((TASK_DIR_RE.match(base).group(1), title, root))
+        found.append((task_id, title, root))
     if skipped:
         note("excluded from the checklist (not `status: complete`): " + ", ".join(skipped))
+    if only is not None:
+        missing = sorted(only - seen, key=task_number)
+        if missing:
+            note("listed in --tasks but not found under the plan: " + ", ".join(missing))
     found.sort(key=lambda t: task_number(t[0]))
     return found
 
@@ -202,6 +214,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--plan", required=True, help="PLAN-<slug>.md (rigor from frontmatter; its name, `.md` stripped, filters tasks)")
     ap.add_argument("--tasks-dir", required=True, help="tree searched recursively for TASK-NNN-*/index.md")
+    ap.add_argument("--tasks", default="", help="comma-separated task ids (TASK-a,TASK-b); keeps only those in the checklist and ledger rollups - a PR group's members")
     ap.add_argument("--summary-file", required=True, help="file holding the Problem/Approach summary, pasted verbatim")
     ap.add_argument("--hygiene-file", help="file holding the kept HYGIENE items, pasted verbatim (else derived from `HYGIENE:` ledger lines)")
     ap.add_argument("--quality-note", default="", help="text appended to the Quality bar line (e.g. deferred-hardening task ids)")
@@ -217,7 +230,8 @@ def main():
 
     plan_base = os.path.basename(args.plan)
     plan_fm = frontmatter(read(args.plan))
-    tasks = find_tasks(args.tasks_dir, plan_identity(args.plan))
+    only = {t.strip() for t in args.tasks.split(",") if t.strip()} or None
+    tasks = find_tasks(args.tasks_dir, plan_identity(args.plan), only)
     if not tasks:
         note(f"no tasks under {args.tasks_dir} belong to {plan_base} - checklist left empty")
 

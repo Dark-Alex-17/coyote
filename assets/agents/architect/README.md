@@ -178,7 +178,7 @@ model (the Problem/Approach summary, acceptance verdicts):
 | Tool | Replaces |
 |---|---|
 | `collect_ledger_lines --tag ... --dir ...` | re-reading every `log.md` for `rejected-finding:` / `design-decision` / `debris-exempt` / `Follow-ups:` / `(deferred by quality bar)` rollups - grep-complete instead of attention-complete |
-| `assemble_pr_body --plan ... --tasks-dir ... --summary-file ... [--followups] [--quality-note ...]` | hand-assembling the draft PR body (Quality bar from plan `rigor:`, task checklist with `completed`-entry SHAs, ledger sections); `assemble_pr_body.py` does the derivation and prints `NOTE` lines for anything it could not derive |
+| `assemble_pr_body --plan ... --tasks-dir ... --summary-file ... [--tasks TASK-a,TASK-b] [--followups] [--quality-note ...]` | hand-assembling the draft PR body (Quality bar from plan `rigor:`, task checklist with `completed`-entry SHAs, ledger sections; `--tasks` scopes the checklist and the ledger rollups to a PR group's members); `assemble_pr_body.py` does the derivation and prints `NOTE` lines for anything it could not derive |
 
 Both fail open to the manual path they replace: a non-zero return or a `NOTE` leaves the
 architect exactly where the prose would have had it, and says what to fix.

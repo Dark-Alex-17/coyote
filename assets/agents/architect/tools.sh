@@ -53,8 +53,9 @@ collect_ledger_lines() {
 }
 
 # @cmd Assemble the single draft PR's body from the plan + tasks tree: your summary file verbatim, the Quality bar line (plan frontmatter rigor, below production only), the task checklist (title + log.md completed-entry SHAs), and the grep-complete ledger sections (Review decisions / Hygiene pass / Design decisions, optional Follow-ups). Prints the body (and NOTE lines for anything it could not derive); review it, then pass it to gh pr create --body-file.
-# @option --plan! Path to PLAN-<slug>.md (rigor read from frontmatter; its basename selects the tasks that carry a matching `plan:` field)
+# @option --plan! Path to PLAN-<slug>.md (rigor read from frontmatter; its name with the `.md` stripped selects the tasks whose `plan:` field names it, with or without `.md`)
 # @option --tasks-dir! Tree searched recursively for TASK-NNN-*/index.md + log.md (the plans tasks dir)
+# @option --tasks Comma-separated task ids (TASK-a,TASK-b): keep only those in the checklist and ledger rollups - a PR group's members under pr_strategy=multi
 # @option --summary-file! File holding the Problem/Approach summary you wrote - pasted verbatim at the top
 # @option --hygiene-file File holding the kept HYGIENE items verbatim (default: derived from `HYGIENE:` ledger lines, else "clean")
 # @option --quality-note Text appended to the Quality bar line (e.g. "deferred hardening tracked in TASK-NNN")
@@ -62,6 +63,7 @@ collect_ledger_lines() {
 # @flag --followups Append a `## Follow-up / manual actions` section from `Follow-ups:` ledger lines
 assemble_pr_body() {
   local -a args=(--plan "${argc_plan}" --tasks-dir "${argc_tasks_dir}" --summary-file "${argc_summary_file}")
+  [[ -n "${argc_tasks:-}" ]] && args+=(--tasks "${argc_tasks}")
   [[ -n "${argc_hygiene_file:-}" ]] && args+=(--hygiene-file "${argc_hygiene_file}")
   [[ -n "${argc_quality_note:-}" ]] && args+=(--quality-note "${argc_quality_note}")
   [[ -n "${argc_out:-}" ]] && args+=(--out "${argc_out}")

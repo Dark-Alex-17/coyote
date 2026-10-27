@@ -1305,19 +1305,30 @@ fn pr_body_fixture(label: &str, log: &str) -> TempDirGuard {
 }
 
 #[cfg(unix)]
-fn assemble_pr_body_with_env(dir: &Path, envs: &[(&str, &str)]) -> (i32, String, String) {
+fn assemble_pr_body_with(
+    dir: &Path,
+    plan: &str,
+    extra_args: &[&str],
+    envs: &[(&str, &str)],
+) -> (i32, String, String) {
     run(Command::new("python3")
         .arg(asset("architect/assemble_pr_body.py"))
         .arg("--plan")
-        .arg(dir.join("PLAN-x.md"))
+        .arg(dir.join(plan))
         .arg("--tasks-dir")
         .arg(dir.join("tasks"))
         .arg("--summary-file")
         .arg(dir.join("summary.md"))
         .arg("--followups")
+        .args(extra_args)
         .envs(envs.iter().copied())
         .output()
         .expect("spawn python3"))
+}
+
+#[cfg(unix)]
+fn assemble_pr_body_with_env(dir: &Path, envs: &[(&str, &str)]) -> (i32, String, String) {
+    assemble_pr_body_with(dir, "PLAN-x.md", &[], envs)
 }
 
 #[cfg(unix)]
@@ -1439,19 +1450,99 @@ fn assemble_pr_body_writes_utf8_whatever_the_locale() {
     assert!(!stderr.contains("Traceback"), "{stderr}");
 }
 
+/// `--tasks` scopes the body to a PR group's members: the checklist and the
+/// ledger rollups hold the listed ids alone, and a listed id that is not
+/// under the plan is a NOTE, never a silent drop.
 #[cfg(unix)]
-fn assemble_pr_body_for_plan(dir: &Path, plan: &str) -> (i32, String, String) {
-    run(Command::new("python3")
-        .arg(asset("architect/assemble_pr_body.py"))
-        .arg("--plan")
-        .arg(dir.join(plan))
-        .arg("--tasks-dir")
-        .arg(dir.join("tasks"))
-        .arg("--summary-file")
-        .arg(dir.join("summary.md"))
-        .arg("--followups")
+#[test]
+fn assemble_pr_body_tasks_filter_scopes_checklist_and_rollups_to_the_group() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = pr_body_fixture(
+        "assemble-pr-body-tasks",
+        "rejected-finding: finding one - evidence src/x.rs:3\n\
+         Follow-ups:\n\
+         - first item\n\n",
+    );
+    let (code, stdout, stderr) =
+        assemble_pr_body_with(&dir.0, "PLAN-x.md", &["--tasks", "TASK-3"], &[]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("\n- [x] TASK-3 - C (`0123abc`)"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("TASK-1") && !stdout.contains("TASK-2"),
+        "only the listed group member may appear: {stdout}"
+    );
+    assert!(
+        !stdout.contains("finding one") && !stdout.contains("first item"),
+        "an unlisted task's ledger lines must stay out of the rollups: {stdout}"
+    );
+    assert!(
+        stdout.contains("## Follow-up / manual actions\nNone.\n"),
+        "{stdout}"
+    );
+    assert!(!stderr.contains("checklist left empty"), "{stderr}");
+
+    let (code, stdout, stderr) = assemble_pr_body_with(
+        &dir.0,
+        "PLAN-x.md",
+        &["--tasks", "TASK-1,TASK-3,TASK-9"],
+        &[],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("\n- [x] TASK-1 - A ("), "{stdout}");
+    assert!(stdout.contains("\n- [x] TASK-3 - C ("), "{stdout}");
+    assert!(!stdout.contains("TASK-2"), "{stdout}");
+    assert!(
+        stdout.contains("- (TASK-1) finding one - evidence src/x.rs:3")
+            && stdout.contains("- [ ] (TASK-1) first item"),
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains("NOTE listed in --tasks but not found under the plan: TASK-9"),
+        "{stderr}"
+    );
+
+    let (code, _, stderr) = assemble_pr_body_with(&dir.0, "PLAN-x.md", &["--tasks", "TASK-2"], &[]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stderr.contains("TASK-2-b (status: pending)") && stderr.contains("checklist left empty"),
+        "a listed but incomplete member is a NOTE: {stderr}"
+    );
+
+    // The tools.sh wrapper is the model's only way in: it must forward the
+    // option, or the directive's `--tasks` never reaches the script.
+    if tools_missing() {
+        return;
+    }
+    let script = format!(
+        "source '{}'; assemble_pr_body",
+        asset("architect/tools.sh").display()
+    );
+    let (code, stdout, stderr) = run(bash()
+        .arg("-c")
+        .arg(&script)
+        .env(
+            "LLM_ROOT_DIR",
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("assets"),
+        )
+        .env("LLM_AGENT_ROOT_DIR", asset("architect"))
+        .env("LLM_OUTPUT", "/dev/stdout")
+        .env("argc_plan", dir.0.join("PLAN-x.md"))
+        .env("argc_tasks_dir", dir.0.join("tasks"))
+        .env("argc_summary_file", dir.0.join("summary.md"))
+        .env("argc_tasks", "TASK-3")
         .output()
-        .expect("spawn python3"))
+        .expect("spawn bash"));
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("\n- [x] TASK-3 - C (") && !stdout.contains("TASK-1"),
+        "the wrapper must forward --tasks: {stdout}"
+    );
 }
 
 /// Plan identity strips only a trailing `.md`: a dotted slug keeps its dots,
@@ -1480,7 +1571,7 @@ fn assemble_pr_body_keeps_the_dots_of_a_dotted_plan_slug() {
         )
         .unwrap();
     }
-    let (code, stdout, stderr) = assemble_pr_body_for_plan(&dir.0, "PLAN-a.b.md");
+    let (code, stdout, stderr) = assemble_pr_body_with(&dir.0, "PLAN-a.b.md", &[], &[]);
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     assert!(
         stdout.contains("\n- [x] TASK-1 - TASK-1-dotted ("),
@@ -1490,6 +1581,42 @@ fn assemble_pr_body_keeps_the_dots_of_a_dotted_plan_slug() {
         !stdout.contains("TASK-2"),
         "a task of the prefix plan must not be mistaken for the dotted plan's: {stdout}"
     );
+}
+
+/// The architect's PR-body directive renders in both strategies; only the
+/// `multi` render adds the `--tasks` group filter, since a single-PR run
+/// wants every complete task of the plan.
+#[test]
+fn architect_pr_body_directive_names_the_tasks_filter_only_under_multi() {
+    if tools_missing() {
+        return;
+    }
+    let script = format!(
+        "source '{}'; render_instructions '{}'",
+        asset(".shared/utils.sh").display(),
+        asset("architect/instructions.md").display()
+    );
+    let directive = "Build the body with `assemble_pr_body --plan";
+    let filter = "Pass `--tasks <this group's member task ids, comma-separated>` as well";
+    for (strategy, filtered) in [("multi", true), ("single", false)] {
+        let (code, stdout, stderr) = run(bash()
+            .arg("-c")
+            .arg(&script)
+            .env("LLM_AGENT_VAR_PR_STRATEGY", strategy)
+            .output()
+            .expect("spawn bash"));
+        assert_eq!(code, 0, "render under {strategy}: {stderr}");
+        assert!(
+            stdout.contains(directive),
+            "{strategy}: missing {directive:?}"
+        );
+        assert_eq!(
+            stdout.contains(filter),
+            filtered,
+            "{strategy}: the `--tasks` sentence must render only under multi"
+        );
+        assert_eq!(stdout.contains("--tasks "), filtered, "{strategy}");
+    }
 }
 
 /// collect_ledger_lines prints the block under each hit indented beneath

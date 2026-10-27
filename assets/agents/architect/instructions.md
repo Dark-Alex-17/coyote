@@ -910,6 +910,13 @@ At the current group's close-out (and, for steps 5-8, after the last group's):
    SHAs in its `completed` entry, a plan without `rigor:`). Read the body, fix what the NOTEs
    name, add any section the tool does not produce (the autonomous-decisions digest when it
    applies), then `gh pr create --draft --body-file <body file>`.
+<!-- when:pr_strategy=multi -->
+   Pass `--tasks <this group's member task ids, comma-separated>` as well (the members are the
+   PLAN's `## PR groups` row for this group): the tool otherwise takes every complete task of
+   the plan, so from group 2 on the earlier groups' tasks and ledger lines would land in this
+   group's body; with `--tasks` the checklist and the rollups hold this group's members alone
+   (a listed id it cannot find or that is not complete is a `NOTE`).
+<!-- end -->
 <!-- when:task_granularity=micro -->
    Micro runs produce 3-5x the tasks: group the checklist BY BATCH, one heading per batch with
    its gauntlet verdict + `batch-closed @ <sha>`, and add a `## Batch gauntlets` section - one
