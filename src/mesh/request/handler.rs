@@ -1,5 +1,5 @@
 use crate::mesh::request::error::RefusalCode;
-use crate::mesh::request::frame::{PathHash, RequestId};
+use crate::mesh::request::frame::{MAX_FETCH_RESPONSE_BYTES, PathHash, RequestId};
 use crate::mesh::request::redact_hashes;
 
 use async_trait::async_trait;
@@ -176,7 +176,10 @@ impl LibraryHandler {
     /// fits the link MDU, a resource otherwise. The settlement is confirmed by the
     /// transfer outcome, which is awaited on a detached task: it is the transfer that is
     /// waited for, not the handler, so neither the handler slot nor `HANDLER_TIMEOUT`
-    /// bounds it.
+    /// bounds it. The encoded frame is held to `MAX_FETCH_RESPONSE_BYTES`, the widest
+    /// bound any requester accepts, so a reply no peer could take is dropped before it
+    /// costs a transfer. A `Reply::Value` is not measured on this side: the library
+    /// encodes and sends it, and the requester's bound for the path drops what is over.
     async fn send_settled(
         &self,
         link_id: LinkId,
@@ -193,6 +196,15 @@ impl LibraryHandler {
             return;
         };
         let bytes = LibraryResponseFrame::new(request_id, value).encode();
+        if bytes.len() > MAX_FETCH_RESPONSE_BYTES {
+            warn!(
+                "Failed to send mesh response {request_id} on link {}: {} bytes over the {MAX_FETCH_RESPONSE_BYTES} byte response cap",
+                link_id.to_hex_string(),
+                bytes.len()
+            );
+            drop_unsent(settlement);
+            return;
+        }
         let Some(link) = transport.find_in_link(&link_id).await else {
             warn!(
                 "Failed to send mesh response {request_id} on link {}: the link is gone",

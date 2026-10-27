@@ -2219,8 +2219,10 @@ pub(crate) mod network {
         )));
     }
 
+    /// Every way a settled reply can fail to go out ends the same: the settlement is
+    /// dropped unsent and the adapter says why, under the request's id.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_settled_reply_is_sent_once_delivered_and_dropped_unsent_when_the_link_is_gone() {
+    async fn a_settled_reply_is_sent_once_delivered_and_dropped_unsent_when_it_cannot_go_out() {
         install_log_collector();
         struct Flags {
             sent: Arc<AtomicBool>,
@@ -2256,6 +2258,47 @@ pub(crate) mod network {
                 self.entered.fetch_add(1, Ordering::SeqCst);
                 self.release.notified().await;
                 self.reply.lock().take().unwrap_or(Reply::Silent)
+            }
+        }
+        impl HoldReply {
+            /// Sends `requester`'s next `/echo` on a short deadline and waits until this
+            /// handler holds its reply, returning the request still in flight with the
+            /// link and request id the handler saw.
+            async fn hold(
+                &self,
+                requester: &Requester,
+                desc: &DestinationDesc,
+            ) -> (
+                JoinHandle<Result<RequestOutcome, RequestError>>,
+                LinkId,
+                RequestId,
+            ) {
+                let entered = self.entered.load(Ordering::SeqCst);
+                let (client, transport, identity, desc) = (
+                    requester.client.clone(),
+                    requester.transport.clone(),
+                    requester.identity.clone(),
+                    *desc,
+                );
+                let envelope = requester.envelope(Value::Nil);
+                let in_flight = tokio::spawn(async move {
+                    client
+                        .request(
+                            &transport,
+                            &identity,
+                            &desc,
+                            "/echo",
+                            envelope,
+                            short_options(),
+                        )
+                        .await
+                });
+                wait_until("the handler to hold the reply", || {
+                    self.entered.load(Ordering::SeqCst) > entered
+                })
+                .await;
+                let (link_id, request_id) = self.last.lock().unwrap();
+                (in_flight, link_id, request_id)
             }
         }
         let handler = Arc::new(HoldReply::default());
@@ -2300,6 +2343,33 @@ pub(crate) mod network {
         })
         .await;
         assert!(dropped.load(Ordering::SeqCst));
+
+        // A frame no requester would accept is dropped before it costs a transfer.
+        let body = Value::Binary(vec![0x5a; MAX_FETCH_RESPONSE_BYTES + 1]);
+        let (reply, sent, dropped) = settled(body.clone());
+        *handler.reply.lock() = Some(reply);
+        let (in_flight, link_id, request_id) = handler.hold(&requester, &desc).await;
+        let encoded = ResponseFrame {
+            request_id,
+            data: body,
+        }
+        .encode()
+        .len();
+        handler.release.notify_one();
+        let warned = format!(
+            "Failed to send mesh response {request_id} on link {}: {encoded} bytes over the {MAX_FETCH_RESPONSE_BYTES} byte response cap",
+            link_id.to_hex_string()
+        );
+        wait_until("the adapter to refuse the oversize reply", || {
+            warn_snapshot().iter().any(|message| message == &warned)
+        })
+        .await;
+        assert!(!sent.load(Ordering::SeqCst));
+        wait_until("the unsent settlement to be dropped", || {
+            dropped.load(Ordering::SeqCst)
+        })
+        .await;
+        in_flight.abort();
 
         // The link is torn down while the handler holds its reply; the send has nowhere to
         // go and the settlement is dropped unsent.
