@@ -74,9 +74,10 @@ const _: () = assert!(
 );
 
 /// Largest fetched body that is looked at. The upstream transport assembles a resource of
-/// up to 64 MiB (`resource.rs:86-90`) and the request client keeps whole responses under
-/// `MAX_REQUEST_PAYLOAD_BYTES` (256 KiB); a single message half that size is already far above
-/// anything LXMF clients send, and the bound keeps one body from being the whole reply.
+/// up to 64 MiB (`resource.rs:86-90`) and the library's per-request response cap, armed by
+/// `request_on_link`, keeps whole responses under `MAX_REQUEST_PAYLOAD_BYTES` (256 KiB); a
+/// single message half that size is already far above anything LXMF clients send, and the
+/// bound keeps one body from being the whole reply.
 /// The reference has no per-body maximum; its per-transfer limit is the only one.
 pub(crate) const MAX_FETCHED_MESSAGE_BYTES: usize = 128 * 1024;
 
@@ -147,7 +148,7 @@ pub(crate) enum FetchError {
         pid: Option<u32>,
     },
     Cancelled,
-    /// Link establishment, a send, a bounded wait or the request client itself failed.
+    /// Link establishment, a send, a bounded wait or the link request failed.
     Link(RequestError),
     /// `ERROR_NO_IDENTITY` (`LXMPeer.py:24`): the node saw no identity on the link.
     NodeSawNoIdentity {
@@ -289,7 +290,7 @@ impl FetchLock {
     }
 }
 
-/// A request client failure as the fetch reports it: the two refusals the reference
+/// A link request failure as the fetch reports it: the two refusals the reference
 /// distinguishes (`LXMRouter.py:1508-1518`) become their own errors with their remedies.
 fn link_error(err: RequestError, node: &str, identity_hash: &str) -> FetchError {
     match err {
@@ -1264,9 +1265,9 @@ impl BodyPipeline<'_> {
 
 /// `wait` on the node, unless `cancel` fires first. Only the waits on the node are
 /// cancellable: the body loop between rounds 2 and 3 runs to its end, so what it records
-/// is persisted however the fetch ends. Stopping the node cancels this token and fails the
-/// request client's pending table in the same instant, so the token is polled first: a
-/// stopped fetch always reads as `Cancelled`, never as the request client's own shutdown.
+/// is persisted however the fetch ends. The token is polled first, so a stopped fetch reads
+/// as `Cancelled` rather than the `LinkClosed` or `Timeout` the library's receipt would
+/// report later.
 async fn unless_cancelled<T>(
     cancel: &CancellationToken,
     wait: impl Future<Output = Result<T, RequestError>>,

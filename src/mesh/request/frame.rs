@@ -22,9 +22,10 @@ pub(crate) const MAX_REQUEST_PAYLOAD_BYTES: usize = 256 * 1024;
 
 /// The bound on a `/fetch` RESPONSE alone: the largest file a node serves plus room for the
 /// frame and the reply's other keys. Every other path, and every request, keeps
-/// `MAX_REQUEST_PAYLOAD_BYTES`. Like that bound it is enforced after assembly: the requester
-/// discards an over-limit response once it has been put together, and the upstream 64 MiB
-/// advertisement cap is the only pre-assembly bound.
+/// `MAX_REQUEST_PAYLOAD_BYTES`. The requester arms the bound on each request through the
+/// library's `max_response_size`, which refuses a response at its advertisement, packet or
+/// Resource, before any of it transfers, or after assembly when the assembled bytes exceed
+/// it.
 pub(crate) const MAX_FETCH_RESPONSE_BYTES: usize =
     (crate::config::mesh_config::MAX_FETCH_FILE_BYTES as usize) + 4096;
 
@@ -44,8 +45,8 @@ pub(crate) const MAX_REQUEST_NESTING_DEPTH: usize = 128;
 pub(crate) const NAME_HASH_LEN: usize = NAME_HASH_LENGTH;
 
 /// The fixed opening of every encoded `ResponseFrame`: a 2-element array header and the
-/// `bin 8` header of its 16-byte request id. The requester reads a response's id straight
-/// off these bytes before it decodes anything.
+/// `bin 8` header of its 16-byte request id. A test-side witness of the library's response
+/// frame wire form; no requester reads it.
 #[cfg(test)]
 pub(crate) const RESPONSE_FRAME_PREFIX: [u8; 3] = [0x92, 0xc4, 0x10];
 

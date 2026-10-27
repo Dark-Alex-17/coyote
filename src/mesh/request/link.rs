@@ -123,7 +123,9 @@ pub(crate) async fn request(
 /// library's, armed per path. Sending counts against `request_timeout` as much as waiting
 /// for the response does. The library runs the same timeout on the receipt, but its clock
 /// pauses while a response Resource is being received, so the deadline here is the ceiling
-/// a peer that trickles its response meets.
+/// a peer that trickles its response meets. Dropping the returned future once the request
+/// is sent cancels nothing: the responder still serves it and the library's own timer
+/// retires the entry.
 pub(crate) async fn request_on_link(
     transport: &Transport,
     link: &Arc<tokio::sync::Mutex<Link>>,

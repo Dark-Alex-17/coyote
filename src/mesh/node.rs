@@ -1161,6 +1161,8 @@ impl MeshRuntime {
             envelope,
             options,
         );
+        // Dropping the request future does not cancel it in the library: the responder
+        // still serves it and the library's own timer retires the entry.
         let outcome = tokio::select! {
             () = self.cancel.cancelled() => Err(RequestError::Shutdown),
             outcome = request => outcome,

@@ -2,8 +2,8 @@
 //! that reuse it, the share set and the grant store, the `/list` and `/fetch` handlers and
 //! requesters, and the on-disk versioning of the stores they read. Every row runs
 //! in-process against this crate's own `WirePath`, `ShareSet`, `GrantStore`, `ListHandler`,
-//! `FetchHandler`, `SharesPage` and record types, on a share root the row
-//! builds in a temporary directory.
+//! `FetchHandler`, `SharesPage` and record types, on a share root the row builds in a
+//! temporary directory.
 //!
 //! Every row carries a descriptive name and the receiver action expected of it. A
 //! row written faithfully from the spec that the code does not honour is kept as written

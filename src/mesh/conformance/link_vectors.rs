@@ -792,6 +792,8 @@ mod loopback {
             MAX_CONCURRENT_INBOUND_REQUESTS,
             "the seventeenth request never reached a handler"
         );
+        // Aborting the tasks drops their receipts, which cancels nothing in the library:
+        // the responder's handlers still run and the library's timer retires the entries.
         for task in in_flight {
             task.abort();
         }
