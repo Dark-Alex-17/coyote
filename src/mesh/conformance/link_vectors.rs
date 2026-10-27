@@ -458,8 +458,8 @@ mod loopback {
     };
     use crate::mesh::request::{
         DEFAULT_REQUEST_TIMEOUT, MAX_CONCURRENT_INBOUND_REQUESTS, MAX_REQUEST_PAYLOAD_BYTES,
-        RefusalCode, Reply, RequestError, RequestFrame, RequestId, RequestOptions, ResponseFrame,
-        STATUS_PATH, SizeBranch, open_link, request, request_on_link, short,
+        RefusalCode, Reply, RequestError, RequestId, RequestOptions, ResponseFrame, STATUS_PATH,
+        SizeBranch, open_link, request, request_frame, request_on_link, short,
     };
     use crate::mesh::session_destination_name;
     use crate::mesh::test_support::{
@@ -743,7 +743,7 @@ mod loopback {
     async fn outbound_cap() {
         let pair = echo_pair().await;
         let body = Value::Binary(vec![0xab; MAX_REQUEST_PAYLOAD_BYTES]);
-        let len = RequestFrame::new(BIG_PATH, pair.requester.envelope(body.clone()).into_value())
+        let len = request_frame(BIG_PATH, pair.requester.envelope(body.clone()).into_value())
             .encode()
             .len();
         assert!(len > MAX_REQUEST_PAYLOAD_BYTES);
@@ -853,11 +853,7 @@ mod loopback {
             .await
             .expect("the responder holds the decoy in-link");
         let mut events = requester.transport.out_link_events();
-        let forged = ResponseFrame {
-            request_id: seen.request_id,
-            data: Value::from("forged"),
-        }
-        .encode();
+        let forged = ResponseFrame::new(seen.request_id, Value::from("forged")).encode();
         let packet = decoy_in_link.lock().await.response_packet(&forged).unwrap();
         let outcome = responder
             .transport
@@ -912,7 +908,7 @@ mod loopback {
             0xab;
             MAX_REQUEST_PAYLOAD_BYTES + 1 - REQUEST_FRAME_OVERHEAD
         ]);
-        let packed = RequestFrame::new(BIG_PATH, body).encode();
+        let packed = request_frame(BIG_PATH, body).encode();
         assert_eq!(packed.len(), MAX_REQUEST_PAYLOAD_BYTES + 1);
 
         transport

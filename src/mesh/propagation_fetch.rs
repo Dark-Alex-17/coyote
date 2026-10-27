@@ -1501,7 +1501,7 @@ mod tests {
     use crate::mesh::peers::PeerSighting;
     use crate::mesh::pending::{InboundKind, InboundStore};
     use crate::mesh::propagation::{OutboundMessage, build_signed_message};
-    use crate::mesh::request::{OriginName, RequestFrame};
+    use crate::mesh::request::{OriginName, request_frame};
     use crate::mesh::session_destination_name;
     use crate::mesh::test_support::{TempDir, TrustList, read_source, rust_sources, siblings_of};
     use crate::supervisor::mailbox::EnvelopePayload;
@@ -1590,7 +1590,7 @@ mod tests {
 
     #[test]
     fn request_frame_around_a_round_is_time_path_hash_and_body() {
-        let frame = RequestFrame::new(GET_PATH, list_request()).encode();
+        let frame = request_frame(GET_PATH, list_request()).encode();
         assert_eq!(frame.len(), 1 + 9 + 18 + 3);
         assert_eq!(frame[0], 0x93);
         assert_eq!(frame[1], 0xcb);

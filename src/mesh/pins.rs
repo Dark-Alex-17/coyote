@@ -1047,9 +1047,9 @@ mod tests {
             MAX_FETCH_RESPONSE_BYTES,
             MAX_FETCH_FILE_BYTES as usize + 4096
         );
-        let largest = ResponseFrame {
-            request_id: RequestId::from([0; 16]),
-            data: Value::Map(vec![
+        let largest = ResponseFrame::new(
+            RequestId::from([0; 16]),
+            Value::Map(vec![
                 (Value::from("v"), Value::from(1)),
                 (Value::from("status"), Value::from("ok")),
                 (Value::from("size"), Value::from(MAX_FETCH_FILE_BYTES)),
@@ -1059,7 +1059,7 @@ mod tests {
                     Value::Binary(vec![0; MAX_FETCH_FILE_BYTES as usize]),
                 ),
             ]),
-        }
+        )
         .encode();
         assert!(
             largest.len() <= MAX_FETCH_RESPONSE_BYTES,

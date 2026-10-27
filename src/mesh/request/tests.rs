@@ -4,7 +4,8 @@ use super::frame::{Envelope, EnvelopeError, NAME_HASH_LEN, OriginName, PathHash}
 use crate::mesh::protocol::MESH_PROTOCOL_VERSION;
 
 use rmpv::Value;
-use std::time::Duration;
+use rns_transport::destination::request::RequestFrame;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn sixteen(byte: u8) -> Value {
     Value::Binary(vec![byte; 16])
@@ -18,6 +19,15 @@ fn packed(value: Value) -> Vec<u8> {
 
 fn nested_arrays(depth: usize, leaf: Value) -> Value {
     (0..depth).fold(leaf, |inner, _| Value::Array(vec![inner]))
+}
+
+/// The frame a requester would send for `path` right now, as a fixture builds it.
+pub(crate) fn request_frame(path: &str, data: Value) -> RequestFrame {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs_f64())
+        .unwrap_or(0.0);
+    RequestFrame::new(now, PathHash::of(path), data)
 }
 
 #[test]
@@ -367,14 +377,11 @@ fn envelope_without_a_supported_version_is_refused_before_its_origin_is_read() {
 pub(crate) mod network {
     use super::super::dispatch::{
         ACCESS_PATH, AdmittedRequest, DispatchError, Dispatcher, FETCH_PATH, Handler, KNOCK_PATH,
-        KNOWN_PATHS, KnockEvent, KnockSink, LIST_PATH, LoggingKnockSink, MESSAGE_PATH,
-        ReservedPath, STATUS_PATH,
+        KNOWN_PATHS, KnockEvent, KnockSink, LIST_PATH, LoggingKnockSink, MAX_FETCH_RESPONSE_BYTES,
+        MAX_REQUEST_PAYLOAD_BYTES, MESSAGE_PATH, ReservedPath, STATUS_PATH,
     };
     use super::super::error::{RefusalCode, RemoteRefusal, RequestError};
-    use super::super::frame::{
-        Envelope, MAX_FETCH_RESPONSE_BYTES, MAX_REQUEST_PAYLOAD_BYTES, NAME_HASH_LEN, OriginName,
-        PathHash, RequestFrame, RequestId, ResponseFrame,
-    };
+    use super::super::frame::{Envelope, NAME_HASH_LEN, OriginName, PathHash, RequestId};
     use super::super::handler::{
         Admission, HANDLER_TIMEOUT, InboundRequest, LibraryHandler,
         MAX_CONCURRENT_INBOUND_REQUESTS, Reply, RequestHandler, Settlement,
@@ -384,6 +391,7 @@ pub(crate) mod network {
         DEFAULT_LINK_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, Deadline, RequestOptions, SizeBranch,
         identify, open_link, request_on_link,
     };
+    use super::request_frame;
     use crate::config::mesh_config::{MAX_FETCH_FILE_BYTES, MeshInterface};
     use crate::config::{ForkRekey, MeshConfig, Session};
     use crate::function::mesh::{inherit_reply_thread, outbound_from_args};
@@ -449,7 +457,9 @@ pub(crate) mod network {
     use rmpv::Value;
     use rns_transport::PacketContext;
     use rns_transport::destination::link::{Link, LinkEvent, LinkEventData, LinkId};
-    use rns_transport::destination::request::RequestOptions as LibraryRequestOptions;
+    use rns_transport::destination::request::{
+        RequestOptions as LibraryRequestOptions, ResponseFrame,
+    };
     use rns_transport::destination::{DestinationDesc, DestinationName, SingleInputDestination};
     use rns_transport::hash::{AddressHash, Hash};
     use rns_transport::identity::Identity;
@@ -1129,7 +1139,7 @@ pub(crate) mod network {
             .map(|n| Value::Binary(vec![0xab; n]))
             .find(|body| {
                 let enveloped = Envelope::new(origin, body.clone()).into_value();
-                RequestFrame::new("/echo", enveloped).encode().len() == target
+                request_frame("/echo", enveloped).encode().len() == target
             })
             .unwrap_or_else(|| panic!("no body encodes a {target}-byte request frame"))
     }
@@ -1138,12 +1148,9 @@ pub(crate) mod network {
         (0..target)
             .map(|n| Value::Binary(vec![0xcd; n]))
             .find(|body| {
-                ResponseFrame {
-                    request_id: RequestId::from([0; 16]),
-                    data: body.clone(),
-                }
-                .encode()
-                .len()
+                ResponseFrame::new(RequestId::from([0; 16]), body.clone())
+                    .encode()
+                    .len()
                     == target
             })
             .unwrap_or_else(|| panic!("no body encodes a {target}-byte response frame"))
@@ -1286,11 +1293,7 @@ pub(crate) mod network {
 
     /// A response frame for `request_id` that encodes to exactly `len` bytes.
     fn response_frame_of(request_id: RequestId, body: Vec<u8>, len: usize) -> Vec<u8> {
-        let bytes = ResponseFrame {
-            request_id,
-            data: Value::Binary(body),
-        }
-        .encode();
+        let bytes = ResponseFrame::new(request_id, Value::Binary(body)).encode();
         assert_eq!(bytes.len(), len);
         bytes
     }
@@ -1317,7 +1320,7 @@ pub(crate) mod network {
     fn oversize_request() -> Vec<u8> {
         let mut random = vec![0u8; MAX_REQUEST_PAYLOAD_BYTES + 1 - REQUEST_FRAME_OVERHEAD];
         RngCore::fill_bytes(&mut OsRng, &mut random);
-        let packed = RequestFrame::new("/big", Value::Binary(random)).encode();
+        let packed = request_frame("/big", Value::Binary(random)).encode();
         assert_eq!(packed.len(), MAX_REQUEST_PAYLOAD_BYTES + 1);
         packed
     }
@@ -1601,7 +1604,7 @@ pub(crate) mod network {
         }
 
         let card = card();
-        let card_len = RequestFrame::new("/card", card.clone()).encode().len();
+        let card_len = request_frame("/card", card.clone()).encode().len();
         assert!(card_len > mdu, "the card frame is {card_len} bytes");
         let mut resources = requester.transport.resource_events();
         let reply = requester
@@ -1775,7 +1778,7 @@ pub(crate) mod network {
             0xab;
             MAX_REQUEST_PAYLOAD_BYTES + 1 - REQUEST_FRAME_OVERHEAD
         ]);
-        let packed = RequestFrame::new("/big", body).encode();
+        let packed = request_frame("/big", body).encode();
         assert_eq!(packed.len(), MAX_REQUEST_PAYLOAD_BYTES + 1);
         transport
             .send_request_resource(
@@ -1976,10 +1979,10 @@ pub(crate) mod network {
             TRANSFER_REQUEST_TIMEOUT,
         )
         .await;
-        let bytes = ResponseFrame {
-            request_id: seen.request_id,
-            data: Value::Binary(compressible_response_body(MAX_FETCH_RESPONSE_BYTES + 1)),
-        }
+        let bytes = ResponseFrame::new(
+            seen.request_id,
+            Value::Binary(compressible_response_body(MAX_FETCH_RESPONSE_BYTES + 1)),
+        )
         .encode();
         assert_eq!(bytes.len(), MAX_FETCH_RESPONSE_BYTES + 2);
         answer_as_resource(&responder, &requester, &seen, bytes).await;
@@ -2046,11 +2049,7 @@ pub(crate) mod network {
 
         // The later request is answered first.
         for (index, answer) in [(second, "second-answer"), (first, "first-answer")] {
-            let bytes = ResponseFrame {
-                request_id: seen[index].request_id,
-                data: Value::from(answer),
-            }
-            .encode();
+            let bytes = ResponseFrame::new(seen[index].request_id, Value::from(answer)).encode();
             answer_as_resource(&responder, &requester, &seen[index], bytes).await;
         }
         let mut replies = Vec::new();
@@ -2128,22 +2127,14 @@ pub(crate) mod network {
 
         // The late answer to the dropped request goes out while another request waits on
         // the same link; only then is the waiting one answered.
-        let late = ResponseFrame {
-            request_id: dropped_seen.request_id,
-            data: Value::from("late"),
-        }
-        .encode();
+        let late = ResponseFrame::new(dropped_seen.request_id, Value::from("late")).encode();
         answer_as_resource(&responder, &requester, &dropped_seen, late).await;
         sleep(Duration::from_millis(500)).await;
         assert!(
             !waiting.is_finished(),
             "the late answer must not resolve the waiting request"
         );
-        let own = ResponseFrame {
-            request_id: waiting_seen.request_id,
-            data: Value::from("own"),
-        }
-        .encode();
+        let own = ResponseFrame::new(waiting_seen.request_id, Value::from("own")).encode();
         answer_as_resource(&responder, &requester, &waiting_seen, own).await;
         let reply = timeout(INTEROP_TIMEOUT, waiting)
             .await
@@ -2259,11 +2250,7 @@ pub(crate) mod network {
         .await;
         let mut random = vec![0u8; MAX_REQUEST_PAYLOAD_BYTES / 2];
         RngCore::fill_bytes(&mut OsRng, &mut random);
-        let bytes = ResponseFrame {
-            request_id: seen.request_id,
-            data: Value::Binary(random),
-        }
-        .encode();
+        let bytes = ResponseFrame::new(seen.request_id, Value::Binary(random)).encode();
         assert!(bytes.len() <= MAX_REQUEST_PAYLOAD_BYTES);
         let mut events = requester.transport.resource_events();
         let hash = answer_as_resource(&responder, &requester, &seen, bytes).await;
@@ -2309,11 +2296,7 @@ pub(crate) mod network {
         .await;
         let mut random = vec![0u8; MAX_REQUEST_PAYLOAD_BYTES / 2];
         RngCore::fill_bytes(&mut OsRng, &mut random);
-        let bytes = ResponseFrame {
-            request_id: seen.request_id,
-            data: Value::Binary(random),
-        }
-        .encode();
+        let bytes = ResponseFrame::new(seen.request_id, Value::Binary(random)).encode();
         let mut events = requester.transport.resource_events();
         let hash = answer_as_resource(&responder, &requester, &seen, bytes).await;
         await_inbound_progress(&mut events, hash).await;
@@ -2535,12 +2518,7 @@ pub(crate) mod network {
         let (reply, sent, dropped) = settled(body.clone());
         *handler.reply.lock() = Some(reply);
         let (in_flight, link_id, request_id) = handler.hold(&requester, &desc).await;
-        let encoded = ResponseFrame {
-            request_id,
-            data: body,
-        }
-        .encode()
-        .len();
+        let encoded = ResponseFrame::new(request_id, body).encode().len();
         handler.release.notify_one();
         let warned = format!(
             "Failed to send mesh response {request_id} on link {}: {encoded} bytes over the {MAX_FETCH_RESPONSE_BYTES} byte response cap",
@@ -2797,7 +2775,7 @@ pub(crate) mod network {
         RngCore::fill_bytes(&mut OsRng, &mut random);
         let body = Value::Binary(random.clone());
         assert_eq!(
-            RequestFrame::new(STATUS_PATH, body.clone()).encode().len(),
+            request_frame(STATUS_PATH, body.clone()).encode().len(),
             MAX_REQUEST_PAYLOAD_BYTES,
             "the fixture must sit exactly on the cap"
         );
@@ -10426,11 +10404,7 @@ pub(crate) mod network {
         let seen = pair.recorder_b.last();
         let mut random = vec![0u8; MAX_REQUEST_PAYLOAD_BYTES / 2];
         RngCore::fill_bytes(&mut OsRng, &mut random);
-        let bytes = ResponseFrame {
-            request_id: seen.request_id,
-            data: Value::Binary(random),
-        }
-        .encode();
+        let bytes = ResponseFrame::new(seen.request_id, Value::Binary(random)).encode();
         assert!(bytes.len() <= MAX_REQUEST_PAYLOAD_BYTES);
         let cancelling = answer_pair_as_resource_then_cancel(&pair, &seen, bytes).await;
         let sent = timeout(INTEROP_TIMEOUT, in_flight)

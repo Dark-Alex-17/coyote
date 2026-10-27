@@ -1937,10 +1937,7 @@ fn custom_vectors() -> Vec<Vector> {
             "no-access-response-frame-pins-its-bytes",
             Kind::Valid,
             || {
-                let frame = ResponseFrame {
-                    request_id: RequestId::from(REQUEST_ID),
-                    data: no_access().to_wire(),
-                };
+                let frame = ResponseFrame::new(RequestId::from(REQUEST_ID), no_access().to_wire());
                 same(
                     "refusal bytes",
                     frame.encode(),

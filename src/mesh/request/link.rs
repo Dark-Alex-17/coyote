@@ -1,7 +1,9 @@
 use crate::mesh::protocol::VersionRefusal;
-use crate::mesh::request::dispatch::FETCH_PATH;
+use crate::mesh::request::dispatch::{
+    FETCH_PATH, MAX_FETCH_RESPONSE_BYTES, MAX_REQUEST_PAYLOAD_BYTES,
+};
 use crate::mesh::request::error::{RefusalCode, RequestError};
-use crate::mesh::request::frame::{Envelope, MAX_FETCH_RESPONSE_BYTES, MAX_REQUEST_PAYLOAD_BYTES};
+use crate::mesh::request::frame::Envelope;
 use crate::mesh::request::short;
 
 use rmpv::Value;

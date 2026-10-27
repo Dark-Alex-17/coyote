@@ -9372,7 +9372,7 @@ fn part_vectors() -> Vec<Vector> {
                 let out = message_at_every_cap()?;
                 let ts = 1_700_000_000.5;
                 let body = to_request_body(&out, ts);
-                let request = crate::mesh::request::RequestFrame::new(
+                let request = crate::mesh::request::request_frame(
                     MESSAGE_PATH,
                     crate::mesh::request::Envelope::new(OriginName(ORIGIN), body.clone())
                         .into_value(),

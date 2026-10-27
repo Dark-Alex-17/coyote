@@ -1,5 +1,6 @@
+use crate::mesh::request::dispatch::MAX_FETCH_RESPONSE_BYTES;
 use crate::mesh::request::error::RefusalCode;
-use crate::mesh::request::frame::{MAX_FETCH_RESPONSE_BYTES, PathHash, RequestId};
+use crate::mesh::request::frame::{PathHash, RequestId};
 use crate::mesh::request::redact_hashes;
 
 use async_trait::async_trait;

@@ -39,6 +39,21 @@ pub(crate) const KNOWN_PATHS: [&str; 6] = [
     ACCESS_PATH,
 ];
 
+/// Frames above this are refused: outbound before anything touches the wire, inbound by the
+/// node's destination, which is armed with it, so the library refuses an oversize request
+/// at advertisement time before any of it transfers and drops an oversize packet-form one
+/// before any handler runs.
+pub(crate) const MAX_REQUEST_PAYLOAD_BYTES: usize = 256 * 1024;
+
+/// The bound on a `/fetch` RESPONSE alone: the largest file a node serves plus room for the
+/// frame and the reply's other keys. Every other path, and every request, keeps
+/// `MAX_REQUEST_PAYLOAD_BYTES`. The requester arms the bound on each request through the
+/// library's `max_response_size`, which refuses a response at its advertisement, packet or
+/// Resource, before any of it transfers, or after assembly when the assembled bytes exceed
+/// it.
+pub(crate) const MAX_FETCH_RESPONSE_BYTES: usize =
+    (crate::config::mesh_config::MAX_FETCH_FILE_BYTES as usize) + 4096;
+
 fn path_name(path_hash: PathHash) -> Option<&'static str> {
     KNOWN_PATHS
         .into_iter()

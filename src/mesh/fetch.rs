@@ -1922,11 +1922,7 @@ mod tests {
     }
 
     fn encoded(reply: Reply) -> Vec<u8> {
-        ResponseFrame {
-            request_id: RequestId::from([1u8; 16]),
-            data: value_of(reply),
-        }
-        .encode()
+        ResponseFrame::new(RequestId::from([1u8; 16]), value_of(reply)).encode()
     }
 
     fn sha256_of(bytes: &[u8]) -> [u8; 32] {
@@ -1962,11 +1958,7 @@ mod tests {
 
         let first = fx.list(None, None).await;
 
-        let frame = ResponseFrame {
-            request_id: RequestId::from([1u8; 16]),
-            data: first.clone(),
-        }
-        .encode();
+        let frame = ResponseFrame::new(RequestId::from([1u8; 16]), first.clone()).encode();
         assert!(
             frame.len() <= MAX_REQUEST_PAYLOAD_BYTES,
             "{} bytes",
@@ -2141,11 +2133,7 @@ mod tests {
         assert_eq!(status_of(&reply), "ok");
         let value = value_of(reply);
         assert_eq!(field_of(&value, "bytes"), Some(&Value::Binary(at_limit)));
-        let frame = ResponseFrame {
-            request_id: RequestId::from([1u8; 16]),
-            data: value,
-        }
-        .encode();
+        let frame = ResponseFrame::new(RequestId::from([1u8; 16]), value).encode();
         assert!(
             frame.len() > MAX_EFFICIENT_SIZE,
             "a {}-byte frame fits one segment of {MAX_EFFICIENT_SIZE}; the limit under test is meant to exceed it",
@@ -2159,9 +2147,9 @@ mod tests {
     fn an_ok_reply_above_one_segment_encodes_and_decodes_byte_exact() {
         let bytes = vec![0xffu8; MAX_EFFICIENT_SIZE + 512 * 1024];
         let digest = sha256_of(&bytes);
-        let frame = ResponseFrame {
-            request_id: RequestId::from([0xeeu8; 16]),
-            data: status_reply(
+        let frame = ResponseFrame::new(
+            RequestId::from([0xeeu8; 16]),
+            status_reply(
                 "ok",
                 vec![
                     ("size", Value::from(bytes.len() as u64)),
@@ -2169,13 +2157,13 @@ mod tests {
                     ("bytes", Value::Binary(bytes.clone())),
                 ],
             ),
-        };
+        );
         let encoded = frame.encode();
         assert!(encoded.len() > MAX_EFFICIENT_SIZE);
         let decoded = ResponseFrame::decode(&encoded).unwrap();
         assert_eq!(decoded, frame);
         assert_eq!(
-            field_of(&decoded.data, "bytes"),
+            field_of(decoded.body(), "bytes"),
             Some(&Value::Binary(bytes))
         );
     }
@@ -3717,11 +3705,7 @@ mod tests {
 
         let first = fx.list(None, None).await;
 
-        let frame = ResponseFrame {
-            request_id: RequestId::from([1u8; 16]),
-            data: first.clone(),
-        }
-        .encode();
+        let frame = ResponseFrame::new(RequestId::from([1u8; 16]), first.clone()).encode();
         assert!(
             frame.len() <= MAX_REQUEST_PAYLOAD_BYTES,
             "{} bytes: the cut must come from the count, not the wire",

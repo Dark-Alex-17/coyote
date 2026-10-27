@@ -13,16 +13,17 @@ mod tests;
 
 #[cfg(all(test, unix))]
 pub(crate) use dispatch::LoggingKnockSink;
+#[cfg(test)]
+pub(crate) use dispatch::MAX_FETCH_RESPONSE_BYTES;
 pub(crate) use dispatch::{
     ACCESS_PATH, AdmittedRequest, DispatchError, Dispatcher, FETCH_PATH, Handler, KNOCK_PATH,
-    KNOWN_PATHS, KnockEvent, KnockSink, LIST_PATH, MESSAGE_PATH, STATUS_PATH, describe_path,
+    KNOWN_PATHS, KnockEvent, KnockSink, LIST_PATH, MAX_REQUEST_PAYLOAD_BYTES, MESSAGE_PATH,
+    STATUS_PATH, describe_path,
 };
 pub(crate) use error::{RefusalCode, RemoteRefusal, RequestError, refusal_remedy, request_remedy};
-pub(crate) use frame::{Envelope, MAX_REQUEST_PAYLOAD_BYTES, NAME_HASH_LEN, OriginName};
+pub(crate) use frame::{Envelope, NAME_HASH_LEN, OriginName};
 #[cfg(test)]
-pub(crate) use frame::{
-    EnvelopeError, MAX_FETCH_RESPONSE_BYTES, PathHash, RequestFrame, RequestId, ResponseFrame,
-};
+pub(crate) use frame::{EnvelopeError, PathHash, RequestId};
 #[cfg(test)]
 pub(crate) use handler::{
     Admission, HANDLER_TIMEOUT, InboundRequest, MAX_CONCURRENT_INBOUND_REQUESTS, RequestHandler,
@@ -34,8 +35,12 @@ pub(crate) use link::{
     DEFAULT_LINK_TIMEOUT, Deadline, RequestOptions, SizeBranch, link_to, open_link, request,
     request_on_link,
 };
+#[cfg(test)]
+pub(crate) use rns_transport::destination::request::ResponseFrame;
 #[cfg(all(test, unix))]
 pub(crate) use tests::network;
+#[cfg(test)]
+pub(crate) use tests::request_frame;
 
 pub(crate) const LOGGED_HASH_CHARS: usize = 8;
 

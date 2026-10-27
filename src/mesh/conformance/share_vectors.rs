@@ -2091,11 +2091,7 @@ fn sha256_of(bytes: &[u8]) -> [u8; 32] {
 
 /// The bytes a reply with this value puts on the wire.
 fn framed(value: Value) -> Vec<u8> {
-    ResponseFrame {
-        request_id: RequestId::from([1u8; 16]),
-        data: value,
-    }
-    .encode()
+    ResponseFrame::new(RequestId::from([1u8; 16]), value).encode()
 }
 
 fn encoded_len(value: &Value) -> usize {
