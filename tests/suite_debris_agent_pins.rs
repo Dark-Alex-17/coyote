@@ -826,7 +826,12 @@ fn git(repo: &Path, args: &[&str]) -> String {
 /// only the scratch repo's own config shapes the diff. Returns (exit code,
 /// stdout, stderr).
 #[cfg(unix)]
-fn debt_scan_full(cwd: &Path, repo: &Path, base: &str) -> (Option<i32>, String, String) {
+fn debt_scan_full(
+    cwd: &Path,
+    repo: &Path,
+    base: &str,
+    envs: &[(&str, &str)],
+) -> (Option<i32>, String, String) {
     let scanner =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared/debt_scan.py");
     let out = Command::new("python3")
@@ -838,6 +843,7 @@ fn debt_scan_full(cwd: &Path, repo: &Path, base: &str) -> (Option<i32>, String, 
         .current_dir(cwd)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .envs(envs.iter().copied())
         .output()
         .unwrap();
     (
@@ -849,8 +855,51 @@ fn debt_scan_full(cwd: &Path, repo: &Path, base: &str) -> (Option<i32>, String, 
 
 #[cfg(unix)]
 fn debt_scan(cwd: &Path, repo: &Path, base: &str) -> (Option<i32>, String) {
-    let (code, out, _) = debt_scan_full(cwd, repo, base);
+    let (code, out, _) = debt_scan_full(cwd, repo, base, &[]);
     (code, out)
+}
+
+/// The scanner's git I/O and its report are bytes-in, UTF-8-out whatever the
+/// host locale: a non-ASCII untracked path under a C locale with a cp1252
+/// console codec (UTF-8 mode switched off) still reaches `git add -N` intact
+/// and is printed literally rather than raising or being escaped.
+#[cfg(unix)]
+#[test]
+fn usage_probe_debt_scan_round_trips_a_non_ascii_untracked_path_under_a_c_locale() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("coyote-debris-debt-scan-locale-{unique}"));
+    let _guard = ScratchDir(root.clone());
+    let repo = root.join("repo");
+    fs::create_dir_all(repo.join("src")).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    fs::write(repo.join("src/lib.rs"), "fn tracked() {}\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "base"]);
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+    let path = "src/caf\u{e9}_\u{3b1}.rs";
+    fs::write(repo.join(path), "#[allow(dead_code)] fn x() {}\n").unwrap();
+
+    let (code, text, err) = debt_scan_full(
+        &root,
+        &repo,
+        &base,
+        &[
+            ("LC_ALL", "C"),
+            ("LANG", "C"),
+            ("PYTHONIOENCODING", "cp1252"),
+            ("PYTHONUTF8", "0"),
+        ],
+    );
+    assert_eq!(code, Some(0), "stdout: {text}\nstderr: {err}");
+    assert!(text.contains("1 hit(s)"), "stdout: {text}\nstderr: {err}");
+    let hit = format!("{path}:1 -- #[allow(dead_code)] fn x() {{}}");
+    assert!(
+        text.contains(&hit),
+        "the hit names the literal path {path:?}\nstdout: {text}\nstderr: {err}"
+    );
 }
 
 /// The architect's Phase F recipes are pinned as text above; this runs them.
@@ -1296,7 +1345,7 @@ fn usage_probe_step_runner_debt_scan_edges_new_dirs_odd_names_no_new_files_and_i
         (repo, base)
     };
     let sweep = |repo: &Path, base: &str| -> (Option<i32>, String, String) {
-        debt_scan_full(&root, repo, base)
+        debt_scan_full(&root, repo, base, &[])
     };
 
     // A new file two directories deep, one with a space in its name and one

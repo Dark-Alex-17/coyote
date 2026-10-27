@@ -56,8 +56,12 @@ HUNK_HEADER_RE = re.compile(r"^@@ -\S+ \+(\d+)(?:,\d+)? @@")
 
 def run_git(args, cwd):
     return subprocess.run(
-        ["git"] + args, cwd=cwd, capture_output=True, text=True, timeout=GIT_TIMEOUT
+        ["git"] + args, cwd=cwd, capture_output=True, timeout=GIT_TIMEOUT
     )
+
+
+def text_of(raw):
+    return raw.decode("utf-8", errors="replace")
 
 
 def scan(project_dir, base):
@@ -65,18 +69,20 @@ def scan(project_dir, base):
     # effect as the sanctioned pipeline; .gitignore keeps artefacts out).
     ls = run_git(["ls-files", "--others", "--exclude-standard", "-z"], project_dir)
     if ls.returncode != 0:
-        raise RuntimeError(f"git ls-files failed: {ls.stderr.strip()}")
-    untracked = [p for p in ls.stdout.split("\0") if p]
+        raise RuntimeError(f"git ls-files failed: {text_of(ls.stderr).strip()}")
+    # fsdecode round-trips undecodable path bytes (surrogateescape), so the
+    # pathspec handed back to git is the one ls-files printed.
+    untracked = [os.fsdecode(p) for p in ls.stdout.split(b"\0") if p]
     if untracked:
         add = run_git(["add", "-N", "--"] + untracked, project_dir)
         if add.returncode != 0:
-            raise RuntimeError(f"git add -N failed: {add.stderr.strip()}")
+            raise RuntimeError(f"git add -N failed: {text_of(add.stderr).strip()}")
 
     # quotePath=false: a path with spaces or non-ASCII bytes comes out literal, not
     # as git's octal-escaped quoted form, so the hit names the real file.
     diff = run_git(["-c", "core.quotePath=false", "diff", "--no-color", "--no-ext-diff", base], project_dir)
     if diff.returncode not in (0, 1):
-        raise RuntimeError(f"git diff {base} failed: {diff.stderr.strip()}")
+        raise RuntimeError(f"git diff {base} failed: {text_of(diff.stderr).strip()}")
 
     # File headers are only recognised outside a hunk, so an added `++x` line
     # (rendered `+++x`) never rewrites the path and a removed `--y` line
@@ -85,7 +91,7 @@ def scan(project_dir, base):
     path = None
     in_hunk = False
     new_line = 0
-    for raw in diff.stdout.split("\n"):
+    for raw in text_of(diff.stdout).split("\n"):
         line = raw[:-1] if raw.endswith("\r") else raw
         if line.startswith("diff --git "):
             path, in_hunk = None, False
@@ -121,6 +127,12 @@ def scan(project_dir, base):
 
 
 def main():
+    # The report is UTF-8 with LF line ends whatever the host locale (the Rust
+    # side decodes it as UTF-8), and an unencodable glyph is escaped rather
+    # than a traceback.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace", newline="\n")
     # Graph mode is decided from the environment alone, so a state file that
     # fails to load still reports through the graph-shaped JSON envelope.
     state_file = os.environ.get("GRAPH_STATE_FILE")
