@@ -387,7 +387,7 @@ pub(crate) mod test_support {
     #[cfg(unix)]
     use super::request::{
         Admission, Dispatcher, HANDLER_TIMEOUT, InboundRequest, KNOWN_PATHS, LibraryHandler,
-        LoggingKnockSink, MAX_REQUEST_PAYLOAD_BYTES, RequestClient, RequestHandler,
+        LoggingKnockSink, MAX_REQUEST_PAYLOAD_BYTES, RequestHandler,
     };
     pub(crate) use super::request::{
         AdmittedRequest, Handler, MESSAGE_PATH, NAME_HASH_LEN, OriginName, PathHash, RefusalCode,
@@ -453,8 +453,6 @@ pub(crate) mod test_support {
     use tokio::task::JoinHandle;
     #[cfg(unix)]
     use tokio::time::{sleep, timeout};
-    #[cfg(unix)]
-    use tokio_util::sync::CancellationToken;
 
     /// How often `wait_until` polls.
     #[cfg(unix)]
@@ -1295,18 +1293,15 @@ pub(crate) mod test_support {
         }
     }
 
-    /// A connecting node: a bare transport with a `TcpClient` and an `RequestClient`, and an
-    /// identity to prove on links.
+    /// A connecting node: a bare transport with a `TcpClient`, and an identity to prove on
+    /// links.
     #[cfg(unix)]
     pub(crate) struct Connector {
         pub(crate) transport: Arc<Transport>,
         pub(crate) identity: TransportIdentity,
-        pub(crate) client: Arc<RequestClient>,
-        pub(crate) client_task: JoinHandle<()>,
         pub(crate) announces: broadcast::Receiver<AnnounceEvent>,
         pub(crate) iface: AddressHash,
         pub(crate) iface_task: JoinHandle<()>,
-        pub(crate) cancel: CancellationToken,
     }
 
     #[cfg(unix)]
@@ -1315,13 +1310,6 @@ pub(crate) mod test_support {
             let identity = TransportIdentity::new_from_rand(OsRng);
             let transport = Arc::new(Transport::new(TransportConfig::new("a", &identity, false)));
             let announces = transport.recv_announces().await;
-            let client = Arc::new(RequestClient::new());
-            let cancel = CancellationToken::new();
-            let client_task = tokio::spawn(client.clone().run(
-                transport.out_link_events(),
-                transport.resource_events(),
-                cancel.clone(),
-            ));
             let tcp = TcpClient::new(format!("127.0.0.1:{port}")).with_mtu(mtu);
             let status = tcp.runtime_status_handle();
             let context = transport.iface_manager().lock().await.new_context(tcp);
@@ -1334,12 +1322,9 @@ pub(crate) mod test_support {
             Self {
                 transport,
                 identity,
-                client,
-                client_task,
                 announces,
                 iface,
                 iface_task,
-                cancel,
             }
         }
 
@@ -1360,7 +1345,6 @@ pub(crate) mod test_support {
         }
 
         pub(crate) async fn stop(self) {
-            self.cancel.cancel();
             // Bounded so a transport that stalls on the stop cannot hang the test.
             let _ = timeout(
                 super::node::SHUTDOWN_GRACE,

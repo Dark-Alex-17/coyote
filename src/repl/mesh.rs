@@ -11643,7 +11643,6 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 discarded: 1,
                 deferred: 1,
                 acknowledged: 5,
-                response_branch: None,
             };
             let line = render_sync(&report);
             assert_eq!(
@@ -34628,7 +34627,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                 .collect()
                         };
                         let listed = pair.b_asks_a(LIST_PATH, list_body(), short_options()).await;
-                        assert_eq!(paths_of(&listed.value), ["docs/a.md"], "{:?}", listed.value);
+                        assert_eq!(paths_of(&listed), ["docs/a.md"], "{:?}", listed);
                         for round in 1..=2 {
                             let served = pair
                                 .b_asks_a(
@@ -34637,14 +34636,9 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                     short_options(),
                                 )
                                 .await;
+                            assert_eq!(wire_status(&served), "ok", "round {round}: {:?}", served);
                             assert_eq!(
-                                wire_status(&served.value),
-                                "ok",
-                                "round {round}: {:?}",
-                                served.value
-                            );
-                            assert_eq!(
-                                wire_field(&served.value, "bytes"),
+                                wire_field(&served, "bytes"),
                                 Some(&Value::Binary(b"# a\n".to_vec())),
                                 "a standing grant is a rule, served every time"
                             );
@@ -34652,7 +34646,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         let other = pair
                             .b_asks_a(FETCH_PATH, fetch_body("docs/b.md", None), short_options())
                             .await;
-                        assert_eq!(wire_status(&other.value), "not_shared");
+                        assert_eq!(wire_status(&other), "not_shared");
 
                         // Another trusted identity: nothing listed, the granted path refused
                         // exactly like one that does not exist.
@@ -34660,10 +34654,10 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             .asks_a_as(&stranger, LIST_PATH, list_body(), short_options())
                             .await;
                         assert_eq!(
-                            paths_of(&strangers_list.value),
+                            paths_of(&strangers_list),
                             Vec::<String>::new(),
                             "{:?}",
-                            strangers_list.value
+                            strangers_list
                         );
                         let strangers_fetch = pair
                             .asks_a_as(
@@ -34681,8 +34675,8 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                 short_options(),
                             )
                             .await;
-                        assert_eq!(wire_status(&strangers_fetch.value), "not_shared");
-                        assert_eq!(strangers_fetch.value, strangers_missing.value);
+                        assert_eq!(wire_status(&strangers_fetch), "not_shared");
+                        assert_eq!(strangers_fetch, strangers_missing);
 
                         assert!(
                             ctx.app
@@ -38405,15 +38399,12 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         let served = pair
                             .b_asks_a(FETCH_PATH, fetch_body("big.bin", None), short_options())
                             .await;
-                        assert_eq!(wire_status(&served.value), "ok");
-                        assert_eq!(
-                            wire_field(&served.value, "bytes"),
-                            Some(&Value::Binary(big))
-                        );
+                        assert_eq!(wire_status(&served), "ok");
+                        assert_eq!(wire_field(&served, "bytes"), Some(&Value::Binary(big)));
                         let spent = pair
                             .b_asks_a(FETCH_PATH, fetch_body("big.bin", None), short_options())
                             .await;
-                        assert_eq!(wire_status(&spent.value), "not_shared");
+                        assert_eq!(wire_status(&spent), "not_shared");
                         pair.stop_node_a().await;
                     });
                 }
@@ -38982,11 +38973,8 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                 short_options(),
                             )
                             .await;
-                        assert_eq!(wire_status(&served.value), "ok", "{:?}", served.value);
-                        assert_eq!(
-                            wire_field(&served.value, "bytes"),
-                            Some(&Value::Binary(big))
-                        );
+                        assert_eq!(wire_status(&served), "ok", "{:?}", served);
+                        assert_eq!(wire_field(&served, "bytes"), Some(&Value::Binary(big)));
                         let spent = pair
                             .b_asks_a(
                                 FETCH_PATH,
@@ -38994,7 +38982,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                 short_options(),
                             )
                             .await;
-                        assert_eq!(wire_status(&spent.value), "not_shared");
+                        assert_eq!(wire_status(&spent), "not_shared");
                         pair.stop_node_a().await;
                     });
                 }
@@ -39277,9 +39265,9 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         let served = pair
                             .b_asks_a(FETCH_PATH, fetch_body("big.bin", None), short_options())
                             .await;
-                        assert_eq!(wire_status(&served.value), "ok", "{:?}", served.value);
+                        assert_eq!(wire_status(&served), "ok", "{:?}", served);
                         assert_eq!(
-                            wire_field(&served.value, "bytes"),
+                            wire_field(&served, "bytes"),
                             Some(&Value::Binary(big.clone()))
                         );
                         let spent = pair
@@ -39288,9 +39276,9 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         let missing = pair
                             .b_asks_a(FETCH_PATH, fetch_body("never.bin", None), short_options())
                             .await;
-                        assert_eq!(wire_status(&spent.value), "not_shared");
+                        assert_eq!(wire_status(&spent), "not_shared");
                         assert_eq!(
-                            spent.value, missing.value,
+                            spent, missing,
                             "a spent lend and a missing path get the same wire answer"
                         );
                         let listed = pair
@@ -39303,9 +39291,9 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                 short_options(),
                             )
                             .await;
-                        let listed_paths: Vec<&str> = wire_field(&listed.value, "entries")
+                        let listed_paths: Vec<&str> = wire_field(&listed, "entries")
                             .and_then(Value::as_array)
-                            .unwrap_or_else(|| panic!("{:?}", listed.value))
+                            .unwrap_or_else(|| panic!("{:?}", listed))
                             .iter()
                             .map(|entry| wire_field(entry, "path").and_then(Value::as_str).unwrap())
                             .collect();

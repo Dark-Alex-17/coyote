@@ -468,7 +468,7 @@ mod loopback {
     };
     use crate::mesh::node::MeshSlot;
     use crate::mesh::request::network::timed_out;
-    use crate::mesh::request::{ACCESS_PATH, FETCH_PATH, LIST_PATH, Reply};
+    use crate::mesh::request::{ACCESS_PATH, FETCH_PATH, LIST_PATH, Reply, request};
     use crate::mesh::shares::{Mutation, PeerRef, Served, ShareLocations, ShareSet, WriteScope};
     use crate::mesh::test_support::{
         NodePair, RecordingEnvoy, ResponderScript, TempDir, access_body, fetch_body, hook_sink_for,
@@ -615,7 +615,7 @@ mod loopback {
         }
 
         async fn b_asks_a(&self, path: &str, body: Value) -> Value {
-            self.pair.b_asks_a(path, body, short_options()).await.value
+            self.pair.b_asks_a(path, body, short_options()).await
         }
     }
 
@@ -835,23 +835,18 @@ mod loopback {
             }
             Case::UnknownRequester => {
                 let stranger = TransportIdentity::new_from_rand(OsRng);
-                let err = live
-                    .pair
-                    .client_b
-                    .request(
-                        &live.pair.responder.transport,
-                        &stranger,
-                        &live.pair.a_desc,
-                        ACCESS_PATH,
-                        live.pair.responder.envelope(access_body(
-                            "acc-stranger",
-                            &["docs/a.md"],
-                            "",
-                        )),
-                        short_options(),
-                    )
-                    .await
-                    .unwrap_err();
+                let err = request(
+                    &live.pair.responder.transport,
+                    &stranger,
+                    &live.pair.a_desc,
+                    ACCESS_PATH,
+                    live.pair
+                        .responder
+                        .envelope(access_body("acc-stranger", &["docs/a.md"], "")),
+                    short_options(),
+                )
+                .await
+                .unwrap_err();
                 assert_eq!(err, timed_out(ACCESS_PATH));
                 assert!(!live.inbound_ids().contains(&"acc-stranger".to_string()));
             }

@@ -2979,7 +2979,7 @@ mod tests {
         use crate::mesh::mesh_cache_dir;
         use crate::mesh::node::{MeshRuntime, MeshSlot, NodeOptions};
         use crate::mesh::request::network::request_sent_as;
-        use crate::mesh::request::{NAME_HASH_LEN, RequestId};
+        use crate::mesh::request::{NAME_HASH_LEN, SizeBranch};
         use crate::mesh::test_support::{
             Connector, FakeNode, INTEROP_TIMEOUT, LEGACY_LINK_MTU, POLL, mesh_paths,
             private_config, started_runtime, wait_until,
@@ -3102,7 +3102,6 @@ mod tests {
                     FETCH_DEADLINE,
                     fetch(
                         &self.connector.transport,
-                        &self.connector.client,
                         &self.connector.identity,
                         &self.node,
                         &self.peers,
@@ -3135,16 +3134,6 @@ mod tests {
             )
         }
 
-        /// The fetcher's own record of which branch `request_id`'s response arrived on.
-        /// The fake node answers through the library, which logs nothing the collector
-        /// reads, so the requester's correlation line is the one witness.
-        fn response_arrived_as(request_id: RequestId, branch: SizeBranch) -> bool {
-            let line = format!("Correlated mesh response {request_id} ({branch:?}, ");
-            debug_snapshot()
-                .iter()
-                .any(|entry| entry.starts_with(&line))
-        }
-
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn three_rounds_identify_first_and_put_the_reference_bytes_on_the_wire() {
             install_log_collector();
@@ -3175,7 +3164,6 @@ mod tests {
                     discarded: 2,
                     deferred: 0,
                     acknowledged: 2,
-                    response_branch: Some(SizeBranch::Resource),
                 }
             );
             let seen = fake.script.seen();
@@ -3195,8 +3183,8 @@ mod tests {
                 expected_ack(&[transient_id_of(&small), transient_id_of(&large)])
             );
             assert_eq!(&round3[..5], &[0x92, 0xc0, 0x92, 0xc4, 0x20]);
-            // Every round's request fits one packet at the legacy MTU; only the second
-            // round's reply, carrying the 600-byte body, comes back as a resource.
+            // Every round's request fits one packet at the legacy MTU, however large the
+            // reply to it is.
             for round in &seen {
                 assert!(request_sent_as(
                     round.request_id,
@@ -3204,12 +3192,6 @@ mod tests {
                     SizeBranch::Packet
                 ));
             }
-            assert!(response_arrived_as(seen[0].request_id, SizeBranch::Packet));
-            assert!(response_arrived_as(
-                seen[1].request_id,
-                SizeBranch::Resource
-            ));
-            assert!(response_arrived_as(seen[2].request_id, SizeBranch::Packet));
 
             // Every round transition is logged with its counts, under the node's short hash.
             let prefix = format!("Propagation fetch from {}: ", short(&fake.hex()));

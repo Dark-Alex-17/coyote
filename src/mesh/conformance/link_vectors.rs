@@ -62,8 +62,6 @@ enum OtherReply {
 enum Case {
     /// The responder answers under the request id the requester computed.
     Correlation { len: Len },
-    /// A response forged onto another link is ignored and the request times out.
-    WrongLink,
     SizeBranch {
         direction: Direction,
         len: Len,
@@ -109,7 +107,6 @@ impl Case {
     fn family(&self) -> &'static str {
         match self {
             Self::Correlation { .. } => "Correlation",
-            Self::WrongLink => "WrongLink",
             Self::SizeBranch { .. } => "SizeBranch",
             Self::OutboundCap => "OutboundCap",
             Self::Identified => "Identified",
@@ -141,12 +138,6 @@ const VECTORS: &[Vector] = &[
         case: Case::Correlation {
             len: Len::MduPlusOne,
         },
-        known_divergence: None,
-    },
-    Vector {
-        name: "response-forged-onto-another-link-is-ignored",
-        kind: Kind::Invalid,
-        case: Case::WrongLink,
         known_divergence: None,
     },
     Vector {
@@ -446,14 +437,13 @@ mod loopback {
     use crate::mesh::request::network::{
         REQUEST_FRAME_OVERHEAD, Recorder, Requester, Responder, SHORT_REQUEST_TIMEOUT, Script,
         Stall, hanging_request, library_refused_oversize_request, link_deadline, pair,
-        request_body_of_encoded_len, request_deadline, request_on, request_sent_as,
-        response_body_of_encoded_len, response_payloads, short_options, timed_out,
-        timed_out_slow_request,
+        request_body_of_encoded_len, request_on, request_sent_as, response_body_of_encoded_len,
+        response_payloads, short_options, timed_out, timed_out_slow_request,
     };
     use crate::mesh::request::{
-        Deadline, MAX_CONCURRENT_INBOUND_REQUESTS, MAX_REQUEST_PAYLOAD_BYTES, RefusalCode, Reply,
-        RequestError, RequestFrame, RequestId, RequestOptions, ResponseFrame, STATUS_PATH,
-        SizeBranch, open_link, short,
+        DEFAULT_REQUEST_TIMEOUT, MAX_CONCURRENT_INBOUND_REQUESTS, MAX_REQUEST_PAYLOAD_BYTES,
+        RefusalCode, Reply, RequestError, RequestFrame, RequestId, RequestOptions, STATUS_PATH,
+        SizeBranch, open_link, request, request_on_link, short,
     };
     use crate::mesh::session_destination_name;
     use crate::mesh::test_support::{
@@ -465,7 +455,6 @@ mod loopback {
     use rmpv::Value;
     use rns_transport::destination::{DestinationDesc, SingleInputDestination};
     use rns_transport::identity::PrivateIdentity as TransportIdentity;
-    use rns_transport::iface::InterfaceSharedConfig;
     use rns_transport::iface::tcp_client::TcpClient;
     use rns_transport::iface::tcp_server::TcpServer;
     use rns_transport::rand_core::OsRng;
@@ -494,9 +483,7 @@ mod loopback {
     fn group(case: &Case) -> Group {
         match case {
             Case::Correlation { .. } | Case::SizeBranch { .. } | Case::Identified => Group::Sizes,
-            Case::WrongLink | Case::UndecodableFrame | Case::InboundCap | Case::HandlerSlots => {
-                Group::Drops
-            }
+            Case::UndecodableFrame | Case::InboundCap | Case::HandlerSlots => Group::Drops,
             Case::OutboundCap
             | Case::HandlerTimeout
             | Case::RequestTimeout
@@ -570,7 +557,6 @@ mod loopback {
     async fn drive(case: Case) {
         match case {
             Case::Correlation { len } => correlation(len).await,
-            Case::WrongLink => wrong_link().await,
             Case::SizeBranch {
                 direction,
                 len,
@@ -638,7 +624,7 @@ mod loopback {
             .await
             .unwrap();
 
-        assert_eq!(outcome.value, body, "{len:?}");
+        assert_eq!(outcome, body, "{len:?}");
         pair.stop().await;
     }
 
@@ -654,7 +640,7 @@ mod loopback {
                     .request(&pair.desc, ECHO_PATH, body.clone())
                     .await
                     .unwrap();
-                assert_eq!(outcome.value, body, "a {target}-byte request frame echoes");
+                assert_eq!(outcome, body, "a {target}-byte request frame echoes");
                 assert!(
                     request_sent_as(pair.recorder.last().request_id, ECHO_PATH, expected),
                     "a {target}-byte request frame goes as a {expected:?}"
@@ -669,11 +655,7 @@ mod loopback {
                     .request(&pair.desc, ECHO_PATH, Value::Nil)
                     .await
                     .unwrap();
-                assert_eq!(
-                    outcome.response_branch, expected,
-                    "a {target}-byte response frame"
-                );
-                assert_eq!(outcome.value, body);
+                assert_eq!(outcome, body, "a {target}-byte response frame");
                 assert!(
                     request_sent_as(
                         pair.recorder.last().request_id,
@@ -696,7 +678,7 @@ mod loopback {
             .await
             .unwrap();
 
-        assert_eq!(outcome.value, Value::from("who"));
+        assert_eq!(outcome, Value::from("who"));
         assert_eq!(
             pair.recorder.last().identity,
             Some(pair.requester.identity.as_identity().address_hash)
@@ -756,11 +738,11 @@ mod loopback {
             &link,
             ECHO_PATH,
             Value::from("after"),
-            request_deadline(),
+            DEFAULT_REQUEST_TIMEOUT,
         )
         .await
         .unwrap();
-        assert_eq!(outcome.value, Value::from("after"));
+        assert_eq!(outcome, Value::from("after"));
         assert_eq!(
             pair.responder.adapter.admitted_count(),
             1,
@@ -773,80 +755,6 @@ mod loopback {
             "only the well-formed request was answered"
         );
         pair.stop().await;
-    }
-
-    async fn wrong_link() {
-        install_log_collector();
-        let recorder = Arc::new(Recorder::default());
-        let (responder, mut requester, desc) = pair(recorder.clone()).await;
-        // The requester's interface is new to its transport, whose announce ingress control
-        // holds a second announce arriving within a second of the first for a minute.
-        requester
-            .transport
-            .iface_manager()
-            .lock()
-            .await
-            .set_shared_config(
-                requester.iface,
-                InterfaceSharedConfig {
-                    ingress_control: Some(false),
-                    ..InterfaceSharedConfig::default()
-                },
-            );
-        let decoy = responder
-            .transport
-            .add_destination(
-                TransportIdentity::new_from_rand(OsRng),
-                session_destination_name("decoy"),
-            )
-            .await;
-        let decoy_hash = decoy.lock().await.desc.address_hash;
-        let packet = decoy.lock().await.announce(OsRng, None).unwrap();
-        responder.transport.send_packet(packet).await;
-        let decoy_desc = requester.learn(&decoy_hash).await;
-        let decoy_link = open_link(
-            &requester.transport,
-            &decoy_desc,
-            SLOW_PATH,
-            link_deadline(),
-        )
-        .await
-        .unwrap();
-        let decoy_link_id = *decoy_link.lock().await.id();
-        let (in_flight, seen) = hanging_request(&requester, &recorder, &desc).await;
-        assert_ne!(seen.link_id, decoy_link_id);
-
-        let decoy_in_link = responder
-            .transport
-            .find_in_link(&decoy_link_id)
-            .await
-            .expect("the responder holds the decoy in-link");
-        let forged = ResponseFrame {
-            request_id: seen.request_id,
-            data: Value::from("forged"),
-        }
-        .encode();
-        let packet = decoy_in_link.lock().await.response_packet(&forged).unwrap();
-        responder
-            .transport
-            .send_link_packet_on_bound_iface(&decoy_in_link, packet)
-            .await;
-
-        let ignored = format!(
-            "Ignored a mesh response for {} that arrived on link {} instead of {}",
-            seen.request_id,
-            decoy_link_id.to_hex_string(),
-            seen.link_id.to_hex_string()
-        );
-        wait_until("the requester to ignore the forged response", || {
-            debug_snapshot().contains(&ignored)
-        })
-        .await;
-        assert_eq!(requester.client.pending_len(), 1);
-        let result = timeout(INTEROP_TIMEOUT, in_flight).await.unwrap().unwrap();
-        assert_eq!(result.unwrap_err(), timed_out_slow_request());
-        requester.stop().await;
-        responder.stop().await;
     }
 
     async fn inbound_cap() {
@@ -889,11 +797,11 @@ mod loopback {
             &link,
             ECHO_PATH,
             Value::from("after"),
-            request_deadline(),
+            DEFAULT_REQUEST_TIMEOUT,
         )
         .await
         .unwrap();
-        assert_eq!(outcome.value, Value::from("after"));
+        assert_eq!(outcome, Value::from("after"));
         assert_eq!(recorder.seen_count(), 1);
         requester.stop().await;
         responder.stop().await;
@@ -907,19 +815,17 @@ mod loopback {
             .unwrap();
         let in_flight: Vec<_> = (0..MAX_CONCURRENT_INBOUND_REQUESTS)
             .map(|_| {
-                let client = requester.client.clone();
                 let transport = requester.transport.clone();
                 let link = link.clone();
                 tokio::spawn(async move {
-                    client
-                        .request_on_link(
-                            &transport,
-                            &link,
-                            SLOW_PATH,
-                            Value::Nil,
-                            request_deadline(),
-                        )
-                        .await
+                    request_on_link(
+                        &transport,
+                        &link,
+                        SLOW_PATH,
+                        Value::Nil,
+                        DEFAULT_REQUEST_TIMEOUT,
+                    )
+                    .await
                 })
             })
             .collect();
@@ -933,7 +839,7 @@ mod loopback {
             &link,
             SLOW_PATH,
             Value::Nil,
-            Deadline::after(SHORT_REQUEST_TIMEOUT),
+            SHORT_REQUEST_TIMEOUT,
         )
         .await
         .unwrap_err();
@@ -965,18 +871,16 @@ mod loopback {
         responder.announce(None).await;
         let desc = requester.learn(&responder.desc.address_hash).await;
 
-        let err = requester
-            .client
-            .request(
-                &requester.transport,
-                &requester.identity,
-                &desc,
-                SLOW_PATH,
-                requester.envelope(Value::Nil),
-                short_options(),
-            )
-            .await
-            .unwrap_err();
+        let err = request(
+            &requester.transport,
+            &requester.identity,
+            &desc,
+            SLOW_PATH,
+            requester.envelope(Value::Nil),
+            short_options(),
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(err, timed_out(SLOW_PATH));
         let seen = recorder.last();
@@ -1008,7 +912,6 @@ mod loopback {
 
         assert_eq!(result.unwrap_err(), timed_out_slow_request());
         assert!(started.elapsed() >= SHORT_REQUEST_TIMEOUT);
-        assert_eq!(requester.client.pending_len(), 0);
         requester.stop().await;
         responder.stop().await;
     }
@@ -1018,21 +921,19 @@ mod loopback {
         let (responder, requester, desc) = pair(recorder.clone()).await;
         responder.stop().await;
 
-        let err = requester
-            .client
-            .request(
-                &requester.transport,
-                &requester.identity,
-                &desc,
-                ECHO_PATH,
-                requester.envelope(Value::Nil),
-                RequestOptions {
-                    link_timeout: SHORT_LINK_TIMEOUT,
-                    request_timeout: SHORT_REQUEST_TIMEOUT,
-                },
-            )
-            .await
-            .unwrap_err();
+        let err = request(
+            &requester.transport,
+            &requester.identity,
+            &desc,
+            ECHO_PATH,
+            requester.envelope(Value::Nil),
+            RequestOptions {
+                link_timeout: SHORT_LINK_TIMEOUT,
+                request_timeout: SHORT_REQUEST_TIMEOUT,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(matches!(err, RequestError::Timeout { .. }), "{err:?}");
         assert_eq!(recorder.seen_count(), 0);
@@ -1051,21 +952,19 @@ mod loopback {
         .desc;
         let ghost_hex = ghost.address_hash.to_hex_string();
 
-        let err = requester
-            .client
-            .request(
-                &requester.transport,
-                &requester.identity,
-                &ghost,
-                ECHO_PATH,
-                requester.envelope(Value::Nil),
-                RequestOptions {
-                    link_timeout: SHORT_LINK_TIMEOUT,
-                    request_timeout: SHORT_REQUEST_TIMEOUT,
-                },
-            )
-            .await
-            .unwrap_err();
+        let err = request(
+            &requester.transport,
+            &requester.identity,
+            &ghost,
+            ECHO_PATH,
+            requester.envelope(Value::Nil),
+            RequestOptions {
+                link_timeout: SHORT_LINK_TIMEOUT,
+                request_timeout: SHORT_REQUEST_TIMEOUT,
+            },
+        )
+        .await
+        .unwrap_err();
 
         let RequestError::LinkFailed(reason) = err else {
             panic!("expected LinkFailed for a destination without a path, got {err:?}");

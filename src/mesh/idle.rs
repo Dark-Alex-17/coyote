@@ -727,7 +727,6 @@ mod tests {
             discarded: 0,
             deferred: 0,
             acknowledged: received,
-            response_branch: None,
         }
     }
 

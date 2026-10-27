@@ -564,7 +564,6 @@ fn envelope_without_a_supported_version_is_refused_before_its_origin_is_read() {
 // under `test_support` are only exercised on unix.
 #[cfg(unix)]
 pub(crate) mod network {
-    use super::super::client::{RequestClient, RequestOutcome};
     use super::super::dispatch::{
         ACCESS_PATH, AdmittedRequest, DispatchError, Dispatcher, FETCH_PATH, Handler, KNOCK_PATH,
         KNOWN_PATHS, KnockEvent, KnockSink, LIST_PATH, LoggingKnockSink, MESSAGE_PATH,
@@ -579,9 +578,10 @@ pub(crate) mod network {
         Admission, HANDLER_TIMEOUT, InboundRequest, LibraryHandler,
         MAX_CONCURRENT_INBOUND_REQUESTS, Reply, RequestHandler, Settlement,
     };
+    use super::super::link;
     use super::super::link::{
         DEFAULT_LINK_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, Deadline, RequestOptions, SizeBranch,
-        identify, open_link,
+        identify, open_link, request_on_link,
     };
     use crate::config::mesh_config::{MAX_FETCH_FILE_BYTES, MeshInterface};
     use crate::config::{ForkRekey, MeshConfig, Session};
@@ -656,7 +656,6 @@ pub(crate) mod network {
     use rns_transport::identity_bridge::{
         to_core_identity, to_core_private_identity, to_transport_private_identity,
     };
-    use rns_transport::iface::InterfaceSharedConfig;
     use rns_transport::iface::tcp_client::TcpClient;
     use rns_transport::iface::tcp_server::TcpServer;
     use rns_transport::rand_core::{OsRng, RngCore};
@@ -695,10 +694,6 @@ pub(crate) mod network {
 
     pub(crate) fn link_deadline() -> Deadline {
         Deadline::after(DEFAULT_LINK_TIMEOUT)
-    }
-
-    pub(crate) fn request_deadline() -> Deadline {
-        Deadline::after(DEFAULT_REQUEST_TIMEOUT)
     }
 
     fn fresh_destination_name() -> DestinationName {
@@ -1055,12 +1050,9 @@ pub(crate) mod network {
         pub(crate) transport: Arc<Transport>,
         pub(crate) identity: TransportIdentity,
         pub(crate) origin: OriginName,
-        pub(crate) client: Arc<RequestClient>,
-        client_task: JoinHandle<()>,
         announces: broadcast::Receiver<AnnounceEvent>,
         pub(crate) iface: AddressHash,
         iface_task: JoinHandle<()>,
-        cancel: CancellationToken,
     }
 
     impl Requester {
@@ -1068,23 +1060,17 @@ pub(crate) mod network {
             let Connector {
                 transport,
                 identity,
-                client,
-                client_task,
                 announces,
                 iface,
                 iface_task,
-                cancel,
             } = Connector::connect(port, mtu).await;
             Self {
                 transport,
                 identity,
                 origin: OriginName::of(&fresh_destination_name()),
-                client,
-                client_task,
                 announces,
                 iface,
                 iface_task,
-                cancel,
             }
         }
 
@@ -1113,21 +1099,19 @@ pub(crate) mod network {
             desc: &DestinationDesc,
             path: &str,
             data: Value,
-        ) -> Result<RequestOutcome, RequestError> {
-            self.client
-                .request(
-                    &self.transport,
-                    &self.identity,
-                    desc,
-                    path,
-                    self.envelope(data),
-                    RequestOptions::default(),
-                )
-                .await
+        ) -> Result<Value, RequestError> {
+            link::request(
+                &self.transport,
+                &self.identity,
+                desc,
+                path,
+                self.envelope(data),
+                RequestOptions::default(),
+            )
+            .await
         }
 
         pub(crate) async fn stop(self) {
-            self.cancel.cancel();
             // Bounded so a transport that stalls on the stop cannot hang the test.
             let _ = timeout(SHUTDOWN_GRACE, self.transport.stop_interface(self.iface)).await;
             self.iface_task.abort();
@@ -1233,18 +1217,16 @@ pub(crate) mod network {
         link: &Arc<tokio::sync::Mutex<Link>>,
         path: &str,
         data: Value,
-        deadline: Deadline,
-    ) -> Result<RequestOutcome, RequestError> {
-        requester
-            .client
-            .request_on_link_with(
-                &requester.transport,
-                link,
-                path,
-                requester.envelope(data),
-                deadline,
-            )
-            .await
+        request_timeout: Duration,
+    ) -> Result<Value, RequestError> {
+        request_on_link(
+            &requester.transport,
+            link,
+            path,
+            requester.envelope(data).into_value(),
+            request_timeout,
+        )
+        .await
     }
 
     /// The response payloads `events` has carried so far, as the requester's transport
@@ -1347,7 +1329,7 @@ pub(crate) mod network {
         requester: &Requester,
         recorder: &Recorder,
         desc: &DestinationDesc,
-    ) -> (JoinHandle<Result<RequestOutcome, RequestError>>, Seen) {
+    ) -> (JoinHandle<Result<Value, RequestError>>, Seen) {
         hanging_request_on(requester, recorder, desc, "/slow", SHORT_REQUEST_TIMEOUT).await
     }
 
@@ -1360,28 +1342,26 @@ pub(crate) mod network {
         desc: &DestinationDesc,
         path: &'static str,
         request_timeout: Duration,
-    ) -> (JoinHandle<Result<RequestOutcome, RequestError>>, Seen) {
+    ) -> (JoinHandle<Result<Value, RequestError>>, Seen) {
         recorder.queue(Script::Hang);
         let before = recorder.seen_count();
-        let client = requester.client.clone();
         let transport = requester.transport.clone();
         let identity = requester.identity.clone();
         let origin = requester.origin;
         let desc = *desc;
         let in_flight = tokio::spawn(async move {
-            client
-                .request(
-                    &transport,
-                    &identity,
-                    &desc,
-                    path,
-                    Envelope::new(origin, Value::Nil),
-                    RequestOptions {
-                        request_timeout,
-                        ..RequestOptions::default()
-                    },
-                )
-                .await
+            link::request(
+                &transport,
+                &identity,
+                &desc,
+                path,
+                Envelope::new(origin, Value::Nil),
+                RequestOptions {
+                    request_timeout,
+                    ..RequestOptions::default()
+                },
+            )
+            .await
         });
         wait_until("the responder to receive the hanging request", || {
             recorder.seen_count() > before
@@ -1443,15 +1423,6 @@ pub(crate) mod network {
         bytes
     }
 
-    /// A response body that encodes one byte over the cap and does not compress: the
-    /// transport's advertisement check compares the bz2-compressed transfer size, so only a
-    /// random body reaches a limit set at that layer.
-    fn incompressible_response_body() -> Vec<u8> {
-        let mut random = vec![0u8; MAX_REQUEST_PAYLOAD_BYTES + 1 - RESPONSE_FRAME_OVERHEAD];
-        RngCore::fill_bytes(&mut OsRng, &mut random);
-        random
-    }
-
     /// A response body that encodes one byte over the cap and compresses to a single
     /// part: a repeating byte sequence rather than a constant, so a body reassembled out
     /// of order would not compare equal. For the per-path bound only the assembled length
@@ -1494,13 +1465,11 @@ pub(crate) mod network {
         }
     }
 
-    /// A started `MeshRuntime` (node A) connected to a bare responder (node B) whose
-    /// transport also runs an `RequestClient`, so either side can request from the other.
+    /// A started `MeshRuntime` (node A) connected to a bare responder (node B), so either
+    /// side can request from the other.
     pub(crate) struct NodePair {
         pub(crate) responder: Responder,
         pub(crate) recorder_b: Arc<Recorder>,
-        pub(crate) client_b: Arc<RequestClient>,
-        cancel_b: CancellationToken,
         pub(crate) node_a: Arc<MeshRuntime>,
         recorder_a: Arc<Recorder>,
         pub(crate) a_desc: DestinationDesc,
@@ -1532,13 +1501,6 @@ pub(crate) mod network {
             let responder =
                 Responder::listen(recorder_b.clone(), TcpServer::DEFAULT_CLIENT_MTU).await;
             let mut b_announces = responder.transport.recv_announces().await;
-            let client_b = Arc::new(RequestClient::new());
-            let cancel_b = CancellationToken::new();
-            tokio::spawn(client_b.clone().run(
-                responder.transport.out_link_events(),
-                responder.transport.resource_events(),
-                cancel_b.clone(),
-            ));
 
             let tmp = TempDir::new(tag);
             let paths = mesh_paths(&tmp);
@@ -1565,8 +1527,6 @@ pub(crate) mod network {
             Self {
                 responder,
                 recorder_b,
-                client_b,
-                cancel_b,
                 node_a,
                 recorder_a,
                 a_desc,
@@ -1596,19 +1556,17 @@ pub(crate) mod network {
 
         /// Node B asks node A for its status card as `identity`, sending `body`.
         async fn status_of_a(&self, identity: &TransportIdentity, body: Value) -> StatusCard {
-            let outcome = self
-                .client_b
-                .request(
-                    &self.responder.transport,
-                    identity,
-                    &self.a_desc,
-                    STATUS_PATH,
-                    self.responder.envelope(body),
-                    RequestOptions::default(),
-                )
-                .await
-                .unwrap();
-            StatusCard::from_value(&outcome.value).unwrap()
+            let reply = link::request(
+                &self.responder.transport,
+                identity,
+                &self.a_desc,
+                STATUS_PATH,
+                self.responder.envelope(body),
+                RequestOptions::default(),
+            )
+            .await
+            .unwrap();
+            StatusCard::from_value(&reply).unwrap()
         }
 
         /// Node B asks node A's `path` as itself.
@@ -1617,7 +1575,7 @@ pub(crate) mod network {
             path: &str,
             body: Value,
             options: RequestOptions,
-        ) -> RequestOutcome {
+        ) -> Value {
             self.b_asks_destination(&self.a_desc, path, body, options)
                 .await
         }
@@ -1630,18 +1588,17 @@ pub(crate) mod network {
             path: &str,
             body: Value,
             options: RequestOptions,
-        ) -> RequestOutcome {
-            self.client_b
-                .request(
-                    &self.responder.transport,
-                    &self.responder.identity,
-                    desc,
-                    path,
-                    self.responder.envelope(body),
-                    options,
-                )
-                .await
-                .unwrap()
+        ) -> Value {
+            link::request(
+                &self.responder.transport,
+                &self.responder.identity,
+                desc,
+                path,
+                self.responder.envelope(body),
+                options,
+            )
+            .await
+            .unwrap()
         }
 
         /// Node B's transport asks node A's `path` proving `identity` instead of B's own,
@@ -1652,18 +1609,17 @@ pub(crate) mod network {
             path: &str,
             body: Value,
             options: RequestOptions,
-        ) -> RequestOutcome {
-            self.client_b
-                .request(
-                    &self.responder.transport,
-                    identity,
-                    &self.a_desc,
-                    path,
-                    self.responder.envelope(body),
-                    options,
-                )
-                .await
-                .unwrap()
+        ) -> Value {
+            link::request(
+                &self.responder.transport,
+                identity,
+                &self.a_desc,
+                path,
+                self.responder.envelope(body),
+                options,
+            )
+            .await
+            .unwrap()
         }
 
         /// Stops node A through a slot, the way the REPL does, and returns how long it took.
@@ -1673,7 +1629,6 @@ pub(crate) mod network {
             let stopping = Instant::now();
             assert!(slot.stop().await.unwrap());
             let stopped_in = stopping.elapsed();
-            self.cancel_b.cancel();
             self.responder.stop().await;
             stopped_in
         }
@@ -1685,7 +1640,7 @@ pub(crate) mod network {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn boundary_sizes_pick_packet_or_resource_on_both_halves() {
+    async fn boundary_sizes_pick_packet_or_resource_for_the_request() {
         install_log_collector();
         let recorder = Arc::new(Recorder::default());
         let (responder, requester, desc) = pair(recorder.clone()).await;
@@ -1708,11 +1663,11 @@ pub(crate) mod network {
         // requester's own log line is the record.
         for (target, expected) in matrix {
             let body = request_body_of_encoded_len(requester.origin, target);
-            let outcome = requester
+            let reply = requester
                 .request(&desc, "/echo", body.clone())
                 .await
                 .unwrap();
-            assert_eq!(outcome.value, body, "a {target}-byte request frame echoes");
+            assert_eq!(reply, body, "a {target}-byte request frame echoes");
             let seen = recorder.last();
             assert_eq!(seen.path_hash, PathHash::of("/echo"));
             assert!(
@@ -1720,15 +1675,11 @@ pub(crate) mod network {
                 "a {target}-byte request frame goes as a {expected:?}"
             );
         }
-        for (target, expected) in matrix {
+        for (target, _) in matrix {
             let body = response_body_of_encoded_len(target);
             recorder.queue(Script::Reply(Reply::Value(body.clone())));
-            let outcome = requester.request(&desc, "/echo", Value::Nil).await.unwrap();
-            assert_eq!(
-                outcome.response_branch, expected,
-                "a {target}-byte response frame"
-            );
-            assert_eq!(outcome.value, body, "a {target}-byte response frame");
+            let reply = requester.request(&desc, "/echo", Value::Nil).await.unwrap();
+            assert_eq!(reply, body, "a {target}-byte response frame");
             assert!(
                 request_sent_as(recorder.last().request_id, "/echo", SizeBranch::Packet),
                 "the Nil-bodied request goes as a packet whatever the response's size"
@@ -1738,27 +1689,17 @@ pub(crate) mod network {
         let card = card();
         let card_len = RequestFrame::new("/card", card.clone()).encode().len();
         assert!(card_len > mdu, "the card frame is {card_len} bytes");
-        let outcome = requester
+        let reply = requester
             .request(&desc, "/card", card.clone())
             .await
             .unwrap();
-        let seen = recorder.last();
-        assert_eq!(outcome.response_branch, SizeBranch::Resource);
-        assert_eq!(outcome.value, card);
-        // The transfer's own completion event can land after the reply, so give it a
-        // moment; the id binds the line to this request and no other.
-        let delivered = format!(
-            "Mesh request {} was delivered as a resource",
-            seen.request_id
-        );
-        wait_until("the requester to log the resource delivery", || {
-            debug_snapshot()
-                .iter()
-                .any(|message| message.contains(&delivered))
-        })
-        .await;
+        assert_eq!(reply, card);
+        assert!(request_sent_as(
+            recorder.last().request_id,
+            "/card",
+            SizeBranch::Resource
+        ));
 
-        assert_eq!(requester.client.pending_len(), 0);
         requester.stop().await;
         responder.stop().await;
     }
@@ -1794,7 +1735,7 @@ pub(crate) mod network {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn unanswered_request_times_out_and_clears_the_pending_table() {
+    async fn unanswered_request_times_out() {
         let recorder = Arc::new(Recorder::default());
         recorder.queue(Script::Hang);
         recorder.queue(Script::Reply(Reply::Silent));
@@ -1806,18 +1747,16 @@ pub(crate) mod network {
 
         for _ in 0..2 {
             let started = Instant::now();
-            let err = requester
-                .client
-                .request(
-                    &requester.transport,
-                    &requester.identity,
-                    &desc,
-                    "/slow",
-                    requester.envelope(Value::Nil),
-                    options,
-                )
-                .await
-                .unwrap_err();
+            let err = link::request(
+                &requester.transport,
+                &requester.identity,
+                &desc,
+                "/slow",
+                requester.envelope(Value::Nil),
+                options,
+            )
+            .await
+            .unwrap_err();
             assert_eq!(
                 err,
                 RequestError::Timeout {
@@ -1830,78 +1769,18 @@ pub(crate) mod network {
                 "{:?}",
                 started.elapsed()
             );
-            assert_eq!(requester.client.pending_len(), 0);
         }
         assert_eq!(recorder.seen_count(), 2);
 
-        let outcome = requester
+        let reply = requester
             .request(&desc, "/echo", Value::from("after"))
             .await
             .unwrap();
         assert_eq!(
-            outcome.value,
+            reply,
             Value::from("after"),
             "a hung handler must not stall the responder's event loop"
         );
-        requester.stop().await;
-        responder.stop().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancelling_the_client_fails_in_flight_requests_with_shutdown() {
-        let recorder = Arc::new(Recorder::default());
-        recorder.queue(Script::Hang);
-        let (responder, requester, desc) = pair(recorder.clone()).await;
-        let client = requester.client.clone();
-        let transport = requester.transport.clone();
-        let identity = requester.identity.clone();
-        let origin = requester.origin;
-        let in_flight = tokio::spawn(async move {
-            client
-                .request(
-                    &transport,
-                    &identity,
-                    &desc,
-                    "/slow",
-                    Envelope::new(origin, Value::Nil),
-                    RequestOptions::default(),
-                )
-                .await
-        });
-        wait_until("the request to be pending", || {
-            requester.client.pending_len() == 1
-        })
-        .await;
-
-        requester.cancel.cancel();
-
-        let result = timeout(INTEROP_TIMEOUT, in_flight).await.unwrap().unwrap();
-        assert_eq!(result.unwrap_err(), RequestError::Shutdown);
-        assert_eq!(requester.client.pending_len(), 0);
-        requester.stop().await;
-        responder.stop().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_request_after_the_client_loop_exits_fails_with_shutdown_at_once() {
-        let recorder = Arc::new(Recorder::default());
-        let (responder, mut requester, desc) = pair(recorder.clone()).await;
-        let link = identified_link(&requester, &responder, &desc).await;
-        requester.cancel.cancel();
-        timeout(INTEROP_TIMEOUT, &mut requester.client_task)
-            .await
-            .unwrap()
-            .unwrap();
-
-        let result = timeout(
-            SHORT_REQUEST_TIMEOUT,
-            request_on(&requester, &link, TEST_PATH, Value::Nil, request_deadline()),
-        )
-        .await
-        .expect("a closed client must fail the request without waiting out the deadline");
-
-        assert_eq!(result.unwrap_err(), RequestError::Shutdown);
-        assert_eq!(requester.client.pending_len(), 0);
         requester.stop().await;
         responder.stop().await;
     }
@@ -1918,11 +1797,15 @@ pub(crate) mod network {
             .unwrap();
         let link_id = *link.lock().await.id();
 
-        requester
-            .client
-            .request_on_link(transport, &link, "/who", Value::Nil, request_deadline())
-            .await
-            .unwrap();
+        request_on_link(
+            transport,
+            &link,
+            "/who",
+            Value::Nil,
+            DEFAULT_REQUEST_TIMEOUT,
+        )
+        .await
+        .unwrap();
         let unproven = recorder.last();
         assert_eq!(unproven.identity, None);
 
@@ -1936,11 +1819,15 @@ pub(crate) mod network {
         .await
         .unwrap();
         wait_for_identity(&responder, link_id).await;
-        requester
-            .client
-            .request_on_link(transport, &link, "/who", Value::Nil, request_deadline())
-            .await
-            .unwrap();
+        request_on_link(
+            transport,
+            &link,
+            "/who",
+            Value::Nil,
+            DEFAULT_REQUEST_TIMEOUT,
+        )
+        .await
+        .unwrap();
         let proven = recorder.last();
         assert_eq!(
             proven.identity,
@@ -1991,18 +1878,16 @@ pub(crate) mod network {
         assert_eq!(recorder.seen_count(), 0);
         assert_eq!(responder.adapter.admitted_count(), 0);
 
-        let outcome = requester
-            .client
-            .request_on_link(
-                transport,
-                &link,
-                "/echo",
-                Value::from("after"),
-                request_deadline(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(outcome.value, Value::from("after"));
+        let reply = request_on_link(
+            transport,
+            &link,
+            "/echo",
+            Value::from("after"),
+            DEFAULT_REQUEST_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply, Value::from("after"));
         assert_eq!(recorder.seen_count(), 1);
         requester.stop().await;
         responder.stop().await;
@@ -2028,118 +1913,41 @@ pub(crate) mod network {
             .is_some_and(|line| line.contains(&sizes) && line.ends_with(&limit))
     }
 
+    /// The response cap is the library's, armed per path when the request is sent: a
+    /// `/status` response one byte over `MAX_REQUEST_PAYLOAD_BYTES` fails the request as
+    /// oversize at its advertisement, and a `/fetch` response of the same size, under that
+    /// path's own bound, is delivered.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn oversized_response_resource_is_dropped_after_assembly() {
-        install_log_collector();
+    async fn the_response_cap_is_armed_per_path_and_held_by_the_library() {
         let recorder = Arc::new(Recorder::default());
         let responder = Responder::listen(recorder.clone(), TcpServer::DEFAULT_CLIENT_MTU).await;
         let mut requester = Requester::connect(responder.port, TcpClient::DEFAULT_MTU).await;
         responder.announce(None).await;
         let desc = requester.learn(&responder.desc.address_hash).await;
+
         let (in_flight, seen) = hanging_request_on(
             &requester,
             &recorder,
             &desc,
-            "/slow",
+            STATUS_PATH,
             TRANSFER_REQUEST_TIMEOUT,
         )
         .await;
-
-        // With no response-size limit registered the advertisement is accepted whatever its
-        // size, and the assembled bytes are dropped by the client instead.
         answer_as_resource(
             &responder,
             &requester,
             &seen,
-            oversize_response(seen.request_id, incompressible_response_body()),
+            oversize_response(seen.request_id, compressible_response_body()),
         )
-        .await;
-
-        let dropped = format!(
-            "Dropped an oversize mesh response on link {} ({} bytes, max {MAX_REQUEST_PAYLOAD_BYTES})",
-            seen.link_id.to_hex_string(),
-            MAX_REQUEST_PAYLOAD_BYTES + 1
-        );
-        wait_until("the requester to drop the oversize response", || {
-            debug_snapshot().contains(&dropped)
-        })
         .await;
         let result = timeout(INTEROP_TIMEOUT, in_flight).await.unwrap().unwrap();
         assert_eq!(
             result.unwrap_err(),
-            timed_out_after("/slow", TRANSFER_REQUEST_TIMEOUT)
+            RequestError::Oversize {
+                len: MAX_REQUEST_PAYLOAD_BYTES + 1,
+                max: MAX_REQUEST_PAYLOAD_BYTES,
+            }
         );
-        assert_eq!(requester.client.pending_len(), 0);
-
-        let outcome = requester
-            .request(&desc, "/echo", Value::from("after"))
-            .await
-            .unwrap();
-        assert_eq!(
-            outcome.value,
-            Value::from("after"),
-            "an oversize response must not wedge the requester's transport"
-        );
-        requester.stop().await;
-        responder.stop().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn oversized_response_is_dropped_before_decode() {
-        install_log_collector();
-        let recorder = Arc::new(Recorder::default());
-        let responder = Responder::listen(recorder.clone(), TcpServer::DEFAULT_CLIENT_MTU).await;
-        let mut requester = Requester::connect(responder.port, TcpClient::DEFAULT_MTU).await;
-        responder.announce(None).await;
-        let desc = requester.learn(&responder.desc.address_hash).await;
-        let (in_flight, seen) = hanging_request_on(
-            &requester,
-            &recorder,
-            &desc,
-            "/slow",
-            TRANSFER_REQUEST_TIMEOUT,
-        )
-        .await;
-
-        // A repeating body compresses far below the cap, so the advertisement passes the
-        // transport's check and the assembled bytes reach the client.
-        let body = vec![0xcd; MAX_REQUEST_PAYLOAD_BYTES + 1 - RESPONSE_FRAME_OVERHEAD];
-        answer_as_resource(
-            &responder,
-            &requester,
-            &seen,
-            oversize_response(seen.request_id, body),
-        )
-        .await;
-
-        let dropped = format!(
-            "Dropped an oversize mesh response on link {} ({} bytes, max {MAX_REQUEST_PAYLOAD_BYTES})",
-            seen.link_id.to_hex_string(),
-            MAX_REQUEST_PAYLOAD_BYTES + 1
-        );
-        wait_until("the requester to drop the oversize response", || {
-            debug_snapshot().contains(&dropped)
-        })
-        .await;
-        assert_eq!(requester.client.pending_len(), 1);
-        let result = timeout(INTEROP_TIMEOUT, in_flight).await.unwrap().unwrap();
-        assert_eq!(
-            result.unwrap_err(),
-            timed_out_after("/slow", TRANSFER_REQUEST_TIMEOUT)
-        );
-        requester.stop().await;
-        responder.stop().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_fetch_response_between_the_two_bounds_is_delivered_and_a_status_response_of_that_size_is_dropped()
-     {
-        install_log_collector();
-        let recorder = Arc::new(Recorder::default());
-        let responder = Responder::listen(recorder.clone(), TcpServer::DEFAULT_CLIENT_MTU).await;
-        let mut requester = Requester::connect(responder.port, TcpClient::DEFAULT_MTU).await;
-        responder.announce(None).await;
-        let desc = requester.learn(&responder.desc.address_hash).await;
 
         let (in_flight, seen) = hanging_request_on(
             &requester,
@@ -2157,171 +1965,14 @@ pub(crate) mod network {
             oversize_response(seen.request_id, body.clone()),
         )
         .await;
-        let outcome = timeout(INTEROP_TIMEOUT, in_flight)
+        let reply = timeout(INTEROP_TIMEOUT, in_flight)
             .await
             .unwrap()
             .unwrap()
             .unwrap();
-        assert_eq!(outcome.value, Value::Binary(body));
-        assert_eq!(outcome.response_branch, SizeBranch::Resource);
-        assert_eq!(requester.client.pending_len(), 0);
-
-        let (in_flight, seen) = hanging_request_on(
-            &requester,
-            &recorder,
-            &desc,
-            STATUS_PATH,
-            TRANSFER_REQUEST_TIMEOUT,
-        )
-        .await;
-        answer_as_resource(
-            &responder,
-            &requester,
-            &seen,
-            oversize_response(seen.request_id, compressible_response_body()),
-        )
-        .await;
-        let dropped = format!(
-            "Dropped an oversize mesh response on link {} ({} bytes, max {MAX_REQUEST_PAYLOAD_BYTES})",
-            seen.link_id.to_hex_string(),
-            MAX_REQUEST_PAYLOAD_BYTES + 1
-        );
-        wait_until("the requester to drop the oversize status response", || {
-            debug_snapshot().contains(&dropped)
-        })
-        .await;
-        assert_eq!(
-            requester.client.pending_len(),
-            1,
-            "a dropped response leaves the request pending"
-        );
-        let result = timeout(INTEROP_TIMEOUT, in_flight).await.unwrap().unwrap();
-        assert_eq!(
-            result.unwrap_err(),
-            timed_out_after(STATUS_PATH, TRANSFER_REQUEST_TIMEOUT)
-        );
+        assert_eq!(reply, Value::Binary(body));
         requester.stop().await;
         responder.stop().await;
-    }
-
-    #[test]
-    fn a_response_whose_prefix_is_not_a_frame_falls_back_to_the_coarse_bound() {
-        install_log_collector();
-        let client = RequestClient::new();
-        let link_id = LinkId::new_from_rand(OsRng);
-        let oversize_line = |len: usize, max: usize| {
-            format!(
-                "Dropped an oversize mesh response on link {} ({len} bytes, max {max})",
-                link_id.to_hex_string()
-            )
-        };
-
-        // msgpack `nil` repeated: no frame prefix, so no path to bound by.
-        client.deliver(
-            link_id,
-            &vec![0xc0; MAX_FETCH_RESPONSE_BYTES + 1],
-            SizeBranch::Resource,
-        );
-        assert!(debug_snapshot().contains(&oversize_line(
-            MAX_FETCH_RESPONSE_BYTES + 1,
-            MAX_FETCH_RESPONSE_BYTES
-        )));
-
-        client.deliver(link_id, &[0xc0; 64], SizeBranch::Resource);
-        assert!(
-            debug_snapshot()
-                .iter()
-                .any(|message| message
-                    .starts_with("Dropped an undecodable mesh response (Resource)"))
-        );
-
-        // A well-formed frame for an id nothing is pending on gets the coarse bound too, so
-        // one byte over the fine bound reaches the decoder and fails to match.
-        let request_id = RequestId::from([7u8; 16]);
-        client.deliver(
-            link_id,
-            &oversize_response(
-                request_id,
-                vec![0xc0; MAX_REQUEST_PAYLOAD_BYTES + 1 - RESPONSE_FRAME_OVERHEAD],
-            ),
-            SizeBranch::Resource,
-        );
-        let snapshot = debug_snapshot();
-        assert!(!snapshot.contains(&oversize_line(
-            MAX_REQUEST_PAYLOAD_BYTES + 1,
-            MAX_REQUEST_PAYLOAD_BYTES
-        )));
-        assert!(snapshot.contains(&format!(
-            "Unmatched mesh response {} (Resource); the request timed out or was never ours",
-            request_id
-        )));
-    }
-
-    /// The `/fetch` bound is held at its own limit, not merely somewhere above the common
-    /// one: a pending `/fetch` takes a frame of exactly `MAX_FETCH_RESPONSE_BYTES` and drops
-    /// one byte more with the expected log line, naming that bound; the request stays pending.
-    #[tokio::test]
-    async fn a_fetch_response_at_its_bound_is_delivered_and_one_byte_over_is_dropped() {
-        install_log_collector();
-        let client = RequestClient::new();
-        let link_id = LinkId::new_from_rand(OsRng);
-        let frame_of = |request_id: RequestId, total: usize| {
-            let bytes = ResponseFrame {
-                request_id,
-                data: Value::Binary(vec![0x5a; total - RESPONSE_FRAME_OVERHEAD]),
-            }
-            .encode();
-            assert_eq!(bytes.len(), total);
-            bytes
-        };
-
-        let over_id = RequestId::from([0xa1u8; 16]);
-        let over = client.insert_pending(over_id, link_id, FETCH_PATH).unwrap();
-        client.deliver(
-            link_id,
-            &frame_of(over_id, MAX_FETCH_RESPONSE_BYTES + 1),
-            SizeBranch::Resource,
-        );
-        assert!(debug_snapshot().contains(&format!(
-            "Dropped an oversize mesh response on link {} ({} bytes, max {MAX_FETCH_RESPONSE_BYTES})",
-            link_id.to_hex_string(),
-            MAX_FETCH_RESPONSE_BYTES + 1
-        )));
-        assert_eq!(
-            client.pending_len(),
-            1,
-            "a dropped response leaves the request pending"
-        );
-        drop(over);
-
-        let at_id = RequestId::from([0xa2u8; 16]);
-        let at = client.insert_pending(at_id, link_id, FETCH_PATH).unwrap();
-        client.deliver(
-            link_id,
-            &frame_of(at_id, MAX_FETCH_RESPONSE_BYTES),
-            SizeBranch::Resource,
-        );
-        let (value, branch) = at.await.unwrap().unwrap();
-        assert_eq!(branch, SizeBranch::Resource);
-        assert_eq!(
-            value.as_slice().map(<[u8]>::len),
-            Some(MAX_FETCH_RESPONSE_BYTES - RESPONSE_FRAME_OVERHEAD)
-        );
-
-        // The same frame answering a pending `/status` is one byte over THAT bound by far.
-        let status_id = RequestId::from([0xa3u8; 16]);
-        let _status = client
-            .insert_pending(status_id, link_id, STATUS_PATH)
-            .unwrap();
-        client.deliver(
-            link_id,
-            &frame_of(status_id, MAX_FETCH_RESPONSE_BYTES),
-            SizeBranch::Resource,
-        );
-        assert!(debug_snapshot().contains(&format!(
-            "Dropped an oversize mesh response on link {} ({MAX_FETCH_RESPONSE_BYTES} bytes, max {MAX_REQUEST_PAYLOAD_BYTES})",
-            link_id.to_hex_string()
-        )));
     }
 
     /// Every way a settled reply can fail to go out ends the same: the settlement is
@@ -2373,30 +2024,24 @@ pub(crate) mod network {
                 &self,
                 requester: &Requester,
                 desc: &DestinationDesc,
-            ) -> (
-                JoinHandle<Result<RequestOutcome, RequestError>>,
-                LinkId,
-                RequestId,
-            ) {
+            ) -> (JoinHandle<Result<Value, RequestError>>, LinkId, RequestId) {
                 let entered = self.entered.load(Ordering::SeqCst);
-                let (client, transport, identity, desc) = (
-                    requester.client.clone(),
+                let (transport, identity, desc) = (
                     requester.transport.clone(),
                     requester.identity.clone(),
                     *desc,
                 );
                 let envelope = requester.envelope(Value::Nil);
                 let in_flight = tokio::spawn(async move {
-                    client
-                        .request(
-                            &transport,
-                            &identity,
-                            &desc,
-                            "/echo",
-                            envelope,
-                            short_options(),
-                        )
-                        .await
+                    link::request(
+                        &transport,
+                        &identity,
+                        &desc,
+                        "/echo",
+                        envelope,
+                        short_options(),
+                    )
+                    .await
                 });
                 wait_until("the handler to hold the reply", || {
                     self.entered.load(Ordering::SeqCst) > entered
@@ -2426,8 +2071,7 @@ pub(crate) mod network {
         *handler.reply.lock() = Some(reply);
         handler.release.notify_one();
         let outcome = requester.request(&desc, "/echo", Value::Nil).await.unwrap();
-        assert_eq!(outcome.value, Value::from("settled"));
-        assert_eq!(outcome.response_branch, SizeBranch::Packet);
+        assert_eq!(outcome, Value::from("settled"));
         assert!(sent.load(Ordering::SeqCst));
         assert!(
             dropped.load(Ordering::SeqCst),
@@ -2441,8 +2085,7 @@ pub(crate) mod network {
         *handler.reply.lock() = Some(reply);
         handler.release.notify_one();
         let outcome = requester.request(&desc, "/echo", Value::Nil).await.unwrap();
-        assert_eq!(outcome.value, card);
-        assert_eq!(outcome.response_branch, SizeBranch::Resource);
+        assert_eq!(outcome, card);
         wait_until("the completed transfer to settle the reply", || {
             sent.load(Ordering::SeqCst)
         })
@@ -2486,22 +2129,17 @@ pub(crate) mod network {
         let link_id = *link.lock().await.id();
         let entered = handler.entered.load(Ordering::SeqCst);
         let in_flight = {
-            let (client, transport, origin, link) = (
-                requester.client.clone(),
-                requester.transport.clone(),
-                requester.origin,
-                link.clone(),
-            );
+            let (transport, origin, link) =
+                (requester.transport.clone(), requester.origin, link.clone());
             tokio::spawn(async move {
-                client
-                    .request_on_link_with(
-                        &transport,
-                        &link,
-                        "/echo",
-                        Envelope::new(origin, Value::Nil),
-                        Deadline::after(SHORT_REQUEST_TIMEOUT),
-                    )
-                    .await
+                request_on_link(
+                    &transport,
+                    &link,
+                    "/echo",
+                    Envelope::new(origin, Value::Nil).into_value(),
+                    SHORT_REQUEST_TIMEOUT,
+                )
+                .await
             })
         };
         wait_until("the handler to hold the reply", || {
@@ -2629,78 +2267,6 @@ pub(crate) mod network {
         responder.stop().await;
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn response_on_the_wrong_link_is_ignored() {
-        install_log_collector();
-        let recorder = Arc::new(Recorder::default());
-        let (responder, mut requester, desc) = pair(recorder.clone()).await;
-        // The requester's interface is new to its transport, whose announce ingress control
-        // holds a second announce arriving within a second of the first for a minute.
-        requester
-            .transport
-            .iface_manager()
-            .lock()
-            .await
-            .set_shared_config(
-                requester.iface,
-                InterfaceSharedConfig {
-                    ingress_control: Some(false),
-                    ..InterfaceSharedConfig::default()
-                },
-            );
-        let decoy = responder
-            .transport
-            .add_destination(
-                TransportIdentity::new_from_rand(OsRng),
-                fresh_destination_name(),
-            )
-            .await;
-        let decoy_hash = decoy.lock().await.desc.address_hash;
-        let packet = decoy.lock().await.announce(OsRng, None).unwrap();
-        responder.transport.send_packet(packet).await;
-        let decoy_desc = requester.learn(&decoy_hash).await;
-        let decoy_link = open_link(&requester.transport, &decoy_desc, "/slow", link_deadline())
-            .await
-            .unwrap();
-        let decoy_link_id = *decoy_link.lock().await.id();
-        let (in_flight, seen) = hanging_request(&requester, &recorder, &desc).await;
-        assert_ne!(seen.link_id, decoy_link_id);
-
-        // Both ends derive the link id from the link request packet, so the responder's
-        // in-link for the decoy carries the id the requester saw.
-        let decoy_in_link = responder
-            .transport
-            .find_in_link(&decoy_link_id)
-            .await
-            .expect("the responder holds the decoy in-link");
-        let forged = ResponseFrame {
-            request_id: seen.request_id,
-            data: Value::from("forged"),
-        }
-        .encode();
-        let packet = decoy_in_link.lock().await.response_packet(&forged).unwrap();
-        responder
-            .transport
-            .send_link_packet_on_bound_iface(&decoy_in_link, packet)
-            .await;
-
-        let ignored = format!(
-            "Ignored a mesh response for {} that arrived on link {} instead of {}",
-            seen.request_id,
-            decoy_link_id.to_hex_string(),
-            seen.link_id.to_hex_string()
-        );
-        wait_until("the requester to ignore the forged response", || {
-            debug_snapshot().contains(&ignored)
-        })
-        .await;
-        assert_eq!(requester.client.pending_len(), 1);
-        let result = timeout(INTEROP_TIMEOUT, in_flight).await.unwrap().unwrap();
-        assert_eq!(result.unwrap_err(), timed_out_slow_request());
-        requester.stop().await;
-        responder.stop().await;
-    }
-
     /// The end-to-end refusal targets the destination registered at start: node B's
     /// transport holds a second announce on an interface this young (the library's announce
     /// ingress control), so it never learns the fork's destination within the test, and the
@@ -2743,20 +2309,18 @@ pub(crate) mod network {
             "the library refused the request at its advertisement"
         );
 
-        let outcome = pair
-            .client_b
-            .request(
-                transport_b,
-                &TransportIdentity::new_from_rand(OsRng),
-                &pair.a_desc,
-                STATUS_PATH,
-                pair.responder.envelope(Value::from("after")),
-                RequestOptions::default(),
-            )
-            .await
-            .unwrap();
+        let outcome = link::request(
+            transport_b,
+            &TransportIdentity::new_from_rand(OsRng),
+            &pair.a_desc,
+            STATUS_PATH,
+            pair.responder.envelope(Value::from("after")),
+            RequestOptions::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
-            outcome.value,
+            outcome,
             Value::from("after"),
             "a refused oversize request must not wedge the node's transport"
         );
@@ -2804,18 +2368,16 @@ pub(crate) mod network {
             .await
             .unwrap();
         let link_id = *link.lock().await.id();
-        let outcome = pair
-            .client_b
-            .request_on_link(
-                transport_b,
-                &link,
-                STATUS_PATH,
-                body,
-                Deadline::after(TRANSFER_REQUEST_TIMEOUT),
-            )
-            .await
-            .expect("a request on the cap must be served, not refused");
-        assert_eq!(outcome.value, Value::from("served"));
+        let outcome = request_on_link(
+            transport_b,
+            &link,
+            STATUS_PATH,
+            body,
+            TRANSFER_REQUEST_TIMEOUT,
+        )
+        .await
+        .expect("a request on the cap must be served, not refused");
+        assert_eq!(outcome, Value::from("served"));
 
         assert_eq!(pair.recorder_a.seen_count(), 1, "the handler ran once");
         let seen = pair.recorder_a.last();
@@ -2833,25 +2395,19 @@ pub(crate) mod network {
         pair.stop_node_a().await;
     }
 
-    /// A node serves through the library and asks through its own client. Its stop
-    /// returns inside the grace window and fails its own in-flight request as a shutdown;
-    /// the request it was still handling goes with the transport, whose dispatch worker
-    /// aborts its handler tasks, and the stop waits for the hung handler to be gone, with
-    /// its slot back, before it releases the node's locks: a handler's drop never runs
-    /// against a lock another process may by then hold.
+    /// A node serves and asks through the library. Its stop returns inside the grace
+    /// window and fails its own in-flight request as a shutdown; the request it was still
+    /// handling goes with the transport, whose dispatch worker aborts its handler tasks,
+    /// and the stop waits for the hung handler to be gone, with its slot back, before it
+    /// releases the node's locks: a handler's drop never runs against a lock another
+    /// process may by then hold. The peer's request to the stopped node fails with the
+    /// link.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mesh_runtime_requests_and_serves_and_stop_aborts_and_drains_in_flight_requests() {
         let recorder_b = Arc::new(Recorder::default());
         // A `MeshRuntime` joins with `TcpClient`'s default MTU, so the responder matches it.
         let responder = Responder::listen(recorder_b.clone(), TcpServer::DEFAULT_CLIENT_MTU).await;
         let mut b_announces = responder.transport.recv_announces().await;
-        let client_b = Arc::new(RequestClient::new());
-        let cancel_b = CancellationToken::new();
-        tokio::spawn(client_b.clone().run(
-            responder.transport.out_link_events(),
-            responder.transport.resource_events(),
-            cancel_b.clone(),
-        ));
 
         let tmp = TempDir::new("request-runtime");
         let mut session = Session::default();
@@ -2903,46 +2459,41 @@ pub(crate) mod network {
             )
             .await
             .unwrap();
-        assert_eq!(outcome.value, Value::from("from a"));
+        assert_eq!(outcome, Value::from("from a"));
         assert!(recorder_b.last().identity.is_some());
 
         // Node A serves `KNOWN_PATHS` and nothing else; its recorder echoes on any of them.
         let b_identity = TransportIdentity::new_from_rand(OsRng);
-        let outcome = client_b
-            .request(
-                &responder.transport,
-                &b_identity,
-                &a_desc,
-                STATUS_PATH,
-                responder.envelope(card()),
-                RequestOptions::default(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(outcome.value, card());
-        // At the 262144-byte TCP MTU a card fits one link packet in each direction.
-        assert_eq!(outcome.response_branch, SizeBranch::Packet);
+        let outcome = link::request(
+            &responder.transport,
+            &b_identity,
+            &a_desc,
+            STATUS_PATH,
+            responder.envelope(card()),
+            RequestOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, card());
         assert_eq!(
             recorder_a.last().identity,
             Some(b_identity.as_identity().address_hash)
         );
 
         recorder_a.queue(Script::Hang);
-        let client = client_b.clone();
         let transport_b = responder.transport.clone();
         let identity_b = b_identity.clone();
         let origin_b = responder.origin();
         let b_in_flight = tokio::spawn(async move {
-            client
-                .request(
-                    &transport_b,
-                    &identity_b,
-                    &a_desc,
-                    MESSAGE_PATH,
-                    Envelope::new(origin_b, Value::Nil),
-                    RequestOptions::default(),
-                )
-                .await
+            link::request(
+                &transport_b,
+                &identity_b,
+                &a_desc,
+                MESSAGE_PATH,
+                Envelope::new(origin_b, Value::Nil),
+                short_options(),
+            )
+            .await
         });
         wait_until("node A to receive the hanging request", || {
             recorder_a.seen_count() == 2
@@ -2980,12 +2531,17 @@ pub(crate) mod network {
         );
         let result = timeout(INTEROP_TIMEOUT, in_flight).await.unwrap().unwrap();
         assert_eq!(result.unwrap_err(), RequestError::Shutdown);
-        cancel_b.cancel();
         let result = timeout(INTEROP_TIMEOUT, b_in_flight)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(result.unwrap_err(), RequestError::Shutdown);
+        assert!(
+            matches!(
+                result,
+                Err(RequestError::LinkClosed | RequestError::Timeout { .. })
+            ),
+            "{result:?}"
+        );
         responder.stop().await;
     }
 
@@ -3008,7 +2564,7 @@ pub(crate) mod network {
             &link,
             STATUS_PATH,
             Value::Nil,
-            Deadline::after(SHORT_REQUEST_TIMEOUT),
+            SHORT_REQUEST_TIMEOUT,
         )
         .await
         .unwrap_err();
@@ -3055,17 +2611,15 @@ pub(crate) mod network {
             Value::Map(vec![(Value::from("v"), Value::from(MESH_PROTOCOL_VERSION))]),
         ];
         for body in bodies {
-            let err = requester
-                .client
-                .request_on_link(
-                    &requester.transport,
-                    &link,
-                    TEST_PATH,
-                    body.clone(),
-                    Deadline::after(SHORT_REQUEST_TIMEOUT),
-                )
-                .await
-                .unwrap_err();
+            let err = request_on_link(
+                &requester.transport,
+                &link,
+                TEST_PATH,
+                body.clone(),
+                SHORT_REQUEST_TIMEOUT,
+            )
+            .await
+            .unwrap_err();
             assert_eq!(err, timed_out(TEST_PATH), "{body:?}");
         }
 
@@ -3135,11 +2689,11 @@ pub(crate) mod network {
             &link,
             TEST_PATH,
             Value::from("after"),
-            request_deadline(),
+            DEFAULT_REQUEST_TIMEOUT,
         )
         .await
         .unwrap();
-        assert_eq!(outcome.value, Value::from("after"));
+        assert_eq!(outcome, Value::from("after"));
         assert_eq!(
             responder.adapter.admitted_count(),
             1,
@@ -3179,7 +2733,7 @@ pub(crate) mod network {
             &link,
             TEST_PATH,
             super::nested_arrays(127, Value::Nil),
-            Deadline::after(SHORT_REQUEST_TIMEOUT),
+            SHORT_REQUEST_TIMEOUT,
         )
         .await
         .unwrap_err();
@@ -3199,11 +2753,11 @@ pub(crate) mod network {
             &link,
             TEST_PATH,
             super::nested_arrays(126, Value::Nil),
-            request_deadline(),
+            DEFAULT_REQUEST_TIMEOUT,
         )
         .await
         .unwrap();
-        assert_eq!(outcome.value, Value::from("served"));
+        assert_eq!(outcome, Value::from("served"));
         assert_eq!(
             responder.adapter.admitted_count(),
             1,
@@ -3260,7 +2814,7 @@ pub(crate) mod network {
             &link,
             TEST_PATH,
             super::nested_arrays(127, leaf.clone()),
-            Deadline::after(SHORT_REQUEST_TIMEOUT),
+            SHORT_REQUEST_TIMEOUT,
         )
         .await
         .unwrap_err();
@@ -3283,11 +2837,11 @@ pub(crate) mod network {
             &link,
             TEST_PATH,
             super::nested_arrays(126, leaf.clone()),
-            request_deadline(),
+            DEFAULT_REQUEST_TIMEOUT,
         )
         .await
         .unwrap();
-        assert_eq!(outcome.value, Value::from("served"));
+        assert_eq!(outcome, Value::from("served"));
         assert_eq!(
             resource_sends(),
             sends_before + 2,
@@ -3338,7 +2892,7 @@ pub(crate) mod network {
             &link,
             "/nope",
             Value::Nil,
-            Deadline::after(SHORT_REQUEST_TIMEOUT),
+            SHORT_REQUEST_TIMEOUT,
         )
         .await
         .unwrap_err();
@@ -3360,7 +2914,7 @@ pub(crate) mod network {
             &link,
             "/nope",
             Value::Nil,
-            Deadline::after(SHORT_REQUEST_TIMEOUT),
+            SHORT_REQUEST_TIMEOUT,
         )
         .await
         .unwrap_err();
@@ -3375,11 +2929,11 @@ pub(crate) mod network {
             &link,
             TEST_PATH,
             Value::from("served"),
-            request_deadline(),
+            DEFAULT_REQUEST_TIMEOUT,
         )
         .await
         .unwrap();
-        assert_eq!(outcome.value, Value::from("served"));
+        assert_eq!(outcome, Value::from("served"));
         assert_eq!(responder.adapter.admitted_count(), 1);
         requester.stop().await;
         responder.stop().await;
@@ -3400,7 +2954,7 @@ pub(crate) mod network {
             &link,
             TEST_PATH,
             Value::Nil,
-            Deadline::after(SHORT_REQUEST_TIMEOUT),
+            SHORT_REQUEST_TIMEOUT,
         )
         .await
         .unwrap_err();
@@ -4018,7 +3572,7 @@ pub(crate) mod network {
             &link,
             TEST_PATH,
             Value::from("intro"),
-            request_deadline(),
+            DEFAULT_REQUEST_TIMEOUT,
         )
         .await
         .unwrap_err();
@@ -4067,9 +3621,15 @@ pub(crate) mod network {
         let link = identified_link(&requester, &responder, &desc).await;
         let link_id = *link.lock().await.id();
 
-        let err = request_on(&requester, &link, TEST_PATH, Value::Nil, request_deadline())
-            .await
-            .unwrap_err();
+        let err = request_on(
+            &requester,
+            &link,
+            TEST_PATH,
+            Value::Nil,
+            DEFAULT_REQUEST_TIMEOUT,
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
         assert_eq!(gate.sink.count(), 0, "a deny is final, not a knock");
@@ -4124,16 +3684,14 @@ pub(crate) mod network {
             let mut events = requester.transport.out_link_events();
             let result = if *raw_body {
                 let link = identified_link(&requester, &responder, &desc).await;
-                requester
-                    .client
-                    .request_on_link(
-                        &requester.transport,
-                        &link,
-                        TEST_PATH,
-                        Value::from(n),
-                        request_deadline(),
-                    )
-                    .await
+                request_on_link(
+                    &requester.transport,
+                    &link,
+                    TEST_PATH,
+                    Value::from(n),
+                    DEFAULT_REQUEST_TIMEOUT,
+                )
+                .await
             } else {
                 requester.request(&desc, TEST_PATH, Value::from(n)).await
             };
@@ -4209,17 +3767,15 @@ pub(crate) mod network {
             ]),
         ];
         for body in bodies {
-            let err = requester
-                .client
-                .request_on_link(
-                    &requester.transport,
-                    &link,
-                    TEST_PATH,
-                    body.clone(),
-                    request_deadline(),
-                )
-                .await
-                .unwrap_err();
+            let err = request_on_link(
+                &requester.transport,
+                &link,
+                TEST_PATH,
+                body.clone(),
+                DEFAULT_REQUEST_TIMEOUT,
+            )
+            .await
+            .unwrap_err();
             assert_eq!(
                 err,
                 RequestError::Refused(RefusalCode::NoAccess),
@@ -4296,17 +3852,15 @@ pub(crate) mod network {
         let newer = MESH_PROTOCOL_VERSION + 1;
 
         for path in KNOWN_PATHS.into_iter().chain(["/echo"]) {
-            let err = requester
-                .client
-                .request_on_link(
-                    &requester.transport,
-                    &link,
-                    path,
-                    envelope_at(requester.origin, Some(newer)),
-                    request_deadline(),
-                )
-                .await
-                .unwrap_err();
+            let err = request_on_link(
+                &requester.transport,
+                &link,
+                path,
+                envelope_at(requester.origin, Some(newer)),
+                DEFAULT_REQUEST_TIMEOUT,
+            )
+            .await
+            .unwrap_err();
             assert_eq!(
                 err,
                 RequestError::UnsupportedVersion {
@@ -4345,17 +3899,15 @@ pub(crate) mod network {
         );
         let link = identified_link(&requester, &responder, &desc).await;
 
-        let err = requester
-            .client
-            .request_on_link(
-                &requester.transport,
-                &link,
-                MESSAGE_PATH,
-                envelope_at(requester.origin, None),
-                request_deadline(),
-            )
-            .await
-            .unwrap_err();
+        let err = request_on_link(
+            &requester.transport,
+            &link,
+            MESSAGE_PATH,
+            envelope_at(requester.origin, None),
+            DEFAULT_REQUEST_TIMEOUT,
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(
             err,
@@ -4387,17 +3939,15 @@ pub(crate) mod network {
         );
         let link = identified_link(&requester, &responder, &desc).await;
 
-        let err = requester
-            .client
-            .request_on_link(
-                &requester.transport,
-                &link,
-                MESSAGE_PATH,
-                envelope_at(requester.origin, Some(MESH_PROTOCOL_VERSION + 1)),
-                Deadline::after(SHORT_REQUEST_TIMEOUT),
-            )
-            .await
-            .unwrap_err();
+        let err = request_on_link(
+            &requester.transport,
+            &link,
+            MESSAGE_PATH,
+            envelope_at(requester.origin, Some(MESH_PROTOCOL_VERSION + 1)),
+            SHORT_REQUEST_TIMEOUT,
+        )
+        .await
+        .unwrap_err();
 
         assert!(matches!(err, RequestError::Timeout { .. }), "{err:?}");
         assert_eq!(recorder.seen_count(), 0, "the handler was never entered");
@@ -4456,7 +4006,7 @@ pub(crate) mod network {
             .request(&desc, TEST_PATH, Value::from("ping"))
             .await
             .unwrap();
-        assert_eq!(outcome.value, Value::from("ping"));
+        assert_eq!(outcome, Value::from("ping"));
         let seen = recorder.last();
         assert_eq!(
             seen.identity,
@@ -4481,7 +4031,7 @@ pub(crate) mod network {
             .await
             .unwrap();
         assert_eq!(
-            DispatchError::from_value(&outcome.value),
+            DispatchError::from_value(&outcome),
             Some(DispatchError::NoProvider {
                 path: STATUS_PATH.to_string(),
             })
@@ -4497,7 +4047,7 @@ pub(crate) mod network {
             .await
             .unwrap();
         assert_eq!(
-            DispatchError::from_value(&outcome.value),
+            DispatchError::from_value(&outcome),
             Some(DispatchError::NoProvider {
                 path: MESSAGE_PATH.to_string(),
             })
@@ -4507,7 +4057,7 @@ pub(crate) mod network {
             .request(&desc, KNOCK_PATH, Value::from("hello"))
             .await
             .unwrap();
-        assert_eq!(outcome.value, Value::Nil);
+        assert_eq!(outcome, Value::Nil);
         assert_eq!(
             gate.sink.count(),
             0,
@@ -4536,13 +4086,17 @@ pub(crate) mod network {
 
         let in_flight: Vec<_> = (0..MAX_CONCURRENT_INBOUND_REQUESTS)
             .map(|_| {
-                let client = requester.client.clone();
                 let transport = requester.transport.clone();
                 let link = link.clone();
                 tokio::spawn(async move {
-                    client
-                        .request_on_link(&transport, &link, "/slow", Value::Nil, request_deadline())
-                        .await
+                    request_on_link(
+                        &transport,
+                        &link,
+                        "/slow",
+                        Value::Nil,
+                        DEFAULT_REQUEST_TIMEOUT,
+                    )
+                    .await
                 })
             })
             .collect();
@@ -4556,7 +4110,7 @@ pub(crate) mod network {
             &link,
             "/slow",
             Value::Nil,
-            Deadline::after(SHORT_REQUEST_TIMEOUT),
+            SHORT_REQUEST_TIMEOUT,
         )
         .await
         .unwrap_err();
@@ -4592,13 +4146,17 @@ pub(crate) mod network {
 
         let in_flight: Vec<_> = (0..MAX_CONCURRENT_INBOUND_REQUESTS)
             .map(|_| {
-                let client = requester.client.clone();
                 let transport = requester.transport.clone();
                 let link = link.clone();
                 tokio::spawn(async move {
-                    client
-                        .request_on_link(&transport, &link, "/slow", Value::Nil, request_deadline())
-                        .await
+                    request_on_link(
+                        &transport,
+                        &link,
+                        "/slow",
+                        Value::Nil,
+                        DEFAULT_REQUEST_TIMEOUT,
+                    )
+                    .await
                 })
             })
             .collect();
@@ -4613,7 +4171,7 @@ pub(crate) mod network {
             &link,
             "/echo",
             Value::from("dropped"),
-            Deadline::after(SHORT_REQUEST_TIMEOUT),
+            SHORT_REQUEST_TIMEOUT,
         )
         .await
         .unwrap_err();
@@ -4630,7 +4188,7 @@ pub(crate) mod network {
         release.send(true).unwrap();
         for task in in_flight {
             let outcome = task.await.unwrap().unwrap();
-            assert_eq!(outcome.value, Value::from("released"));
+            assert_eq!(outcome, Value::from("released"));
         }
         wait_until("every handler slot to be free again", || {
             responder.adapter.available_permits() == MAX_CONCURRENT_INBOUND_REQUESTS
@@ -4647,11 +4205,11 @@ pub(crate) mod network {
             &link,
             "/echo",
             Value::from("after"),
-            request_deadline(),
+            DEFAULT_REQUEST_TIMEOUT,
         )
         .await
         .unwrap();
-        assert_eq!(outcome.value, Value::from("released"));
+        assert_eq!(outcome, Value::from("released"));
         assert_eq!(
             stall.entered.load(Ordering::SeqCst),
             MAX_CONCURRENT_INBOUND_REQUESTS + 1,
@@ -4676,18 +4234,16 @@ pub(crate) mod network {
         responder.announce(None).await;
         let desc = requester.learn(&responder.desc.address_hash).await;
 
-        let err = requester
-            .client
-            .request(
-                &requester.transport,
-                &requester.identity,
-                &desc,
-                "/slow",
-                requester.envelope(Value::Nil),
-                short_options(),
-            )
-            .await
-            .unwrap_err();
+        let err = link::request(
+            &requester.transport,
+            &requester.identity,
+            &desc,
+            "/slow",
+            requester.envelope(Value::Nil),
+            short_options(),
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(err, timed_out("/slow"));
         let seen = recorder.last();
@@ -4712,35 +4268,7 @@ pub(crate) mod network {
             .request(&desc, "/echo", Value::from("after"))
             .await
             .unwrap();
-        assert_eq!(outcome.value, Value::from("after"));
-        requester.stop().await;
-        responder.stop().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn dropping_the_request_future_clears_its_pending_entry() {
-        let recorder = Arc::new(Recorder::default());
-        recorder.queue(Script::Hang);
-        let (responder, requester, desc) = pair(recorder.clone()).await;
-        let link = open_link(&requester.transport, &desc, "/slow", link_deadline())
-            .await
-            .unwrap();
-
-        let abandoned = timeout(
-            Duration::from_secs(1),
-            request_on(&requester, &link, "/slow", Value::Nil, request_deadline()),
-        )
-        .await;
-
-        assert!(
-            abandoned.is_err(),
-            "the request future was dropped mid-wait"
-        );
-        wait_until("the responder to have received the request", || {
-            recorder.seen_count() == 1
-        })
-        .await;
-        assert_eq!(requester.client.pending_len(), 0);
+        assert_eq!(outcome, Value::from("after"));
         requester.stop().await;
         responder.stop().await;
     }
@@ -4773,18 +4301,16 @@ pub(crate) mod network {
         let pair = NodePair::start_as_started("request-runtime-dispatcher").await;
         let stranger = TransportIdentity::new_from_rand(OsRng);
 
-        let err = pair
-            .client_b
-            .request(
-                &pair.responder.transport,
-                &stranger,
-                &pair.a_desc,
-                STATUS_PATH,
-                pair.responder.envelope(Value::Nil),
-                short_options(),
-            )
-            .await
-            .unwrap_err();
+        let err = link::request(
+            &pair.responder.transport,
+            &stranger,
+            &pair.a_desc,
+            STATUS_PATH,
+            pair.responder.envelope(Value::Nil),
+            short_options(),
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(err, timed_out(STATUS_PATH));
         assert_eq!(pair.recorder_a.seen_count(), 0);
@@ -4813,7 +4339,7 @@ pub(crate) mod network {
         )
         .await;
         let ask = |body: Value| {
-            pair.client_b.request(
+            link::request(
                 &pair.responder.transport,
                 &peer,
                 &pair.a_desc,
@@ -4825,7 +4351,7 @@ pub(crate) mod network {
 
         let outcome = ask(Value::from("ping")).await.unwrap();
         assert_eq!(
-            DispatchError::from_value(&outcome.value),
+            DispatchError::from_value(&outcome),
             Some(DispatchError::NoProvider {
                 path: MESSAGE_PATH.to_string(),
             }),
@@ -4852,11 +4378,7 @@ pub(crate) mod network {
         let outcome = ask(to_request_body(&message, 1_700_000_000.0))
             .await
             .unwrap();
-        assert!(
-            is_received_reply(&outcome.value, &message.id),
-            "{:?}",
-            outcome.value
-        );
+        assert!(is_received_reply(&outcome, &message.id), "{:?}", outcome);
         assert_eq!(slot.peer_inbox().len(), 1);
         let punctuated = OutboundPeer {
             id: "Abc-1.2:x".to_string(),
@@ -4866,9 +4388,9 @@ pub(crate) mod network {
             .await
             .unwrap();
         assert!(
-            is_received_reply(&outcome.value, "Abc-1.2:x"),
+            is_received_reply(&outcome, "Abc-1.2:x"),
             "the raw wire id is acknowledged: {:?}",
-            outcome.value
+            outcome
         );
         assert_eq!(slot.peer_inbox().len(), 2);
         assert_eq!(pair.recorder_a.seen_count(), 0);
@@ -4883,7 +4405,7 @@ pub(crate) mod network {
         );
 
         let outcome = ask(Value::from("ping")).await.unwrap();
-        assert_eq!(outcome.value, Value::from("ping"));
+        assert_eq!(outcome, Value::from("ping"));
         assert_eq!(pair.recorder_a.seen_count(), 1);
         let seen = pair.recorder_a.last();
         assert_eq!(seen.path_hash, PathHash::of(MESSAGE_PATH));
@@ -4997,7 +4519,7 @@ pub(crate) mod network {
                 RequestOptions::default(),
             )
             .await;
-        assert_eq!(outcome.value, Value::from("from the fork"));
+        assert_eq!(outcome, Value::from("from the fork"));
         assert_eq!(
             pair.recorder_a.seen_count(),
             seen_before + 1,
@@ -5042,7 +4564,7 @@ pub(crate) mod network {
                 .b_asks_destination(&fork_desc, path, Value::Nil, RequestOptions::default())
                 .await;
             assert_eq!(
-                outcome.value,
+                outcome,
                 Value::from(*path),
                 "the fork's destination must serve {path}"
             );
@@ -5055,21 +4577,19 @@ pub(crate) mod network {
 
         // A path with no handler on the fork is the library's to drop: nothing is heard
         // and the handler count does not move.
-        let err = pair
-            .client_b
-            .request(
-                &pair.responder.transport,
-                &pair.responder.identity,
-                &fork_desc,
-                TEST_PATH,
-                pair.responder.envelope(Value::Nil),
-                RequestOptions {
-                    request_timeout: SHORT_REQUEST_TIMEOUT,
-                    ..RequestOptions::default()
-                },
-            )
-            .await
-            .unwrap_err();
+        let err = link::request(
+            &pair.responder.transport,
+            &pair.responder.identity,
+            &fork_desc,
+            TEST_PATH,
+            pair.responder.envelope(Value::Nil),
+            RequestOptions {
+                request_timeout: SHORT_REQUEST_TIMEOUT,
+                ..RequestOptions::default()
+            },
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err, timed_out(TEST_PATH));
         assert_eq!(
             pair.recorder_a.seen_count(),
@@ -5299,7 +4819,7 @@ pub(crate) mod network {
             &proven,
             KNOCK_PATH,
             Value::from("let me in"),
-            Deadline::after(SHORT_REQUEST_TIMEOUT),
+            SHORT_REQUEST_TIMEOUT,
         )
         .await
         .unwrap_err();
@@ -5323,7 +4843,7 @@ pub(crate) mod network {
             &anonymous,
             TEST_PATH,
             Value::from("hello"),
-            Deadline::after(SHORT_REQUEST_TIMEOUT),
+            SHORT_REQUEST_TIMEOUT,
         )
         .await
         .unwrap_err();
@@ -5382,19 +4902,17 @@ pub(crate) mod network {
             "registering a path again returns the provider it replaces"
         );
 
-        let outcome = pair
-            .client_b
-            .request(
-                &pair.responder.transport,
-                &peer,
-                &pair.a_desc,
-                STATUS_PATH,
-                pair.responder.envelope(Value::from("before")),
-                short_options(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(outcome.value, Value::from("before"));
+        let outcome = link::request(
+            &pair.responder.transport,
+            &peer,
+            &pair.a_desc,
+            STATUS_PATH,
+            pair.responder.envelope(Value::from("before")),
+            short_options(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, Value::from("before"));
         assert_eq!(pair.recorder_a.seen_count(), 1);
         assert_eq!(
             replaced.seen_count(),
@@ -5413,18 +4931,16 @@ pub(crate) mod network {
             "identity trust alone has no destinations to remove"
         );
 
-        let err = pair
-            .client_b
-            .request(
-                &pair.responder.transport,
-                &peer,
-                &pair.a_desc,
-                STATUS_PATH,
-                pair.responder.envelope(Value::from("after")),
-                short_options(),
-            )
-            .await
-            .unwrap_err();
+        let err = link::request(
+            &pair.responder.transport,
+            &peer,
+            &pair.a_desc,
+            STATUS_PATH,
+            pair.responder.envelope(Value::from("after")),
+            short_options(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err, timed_out(STATUS_PATH));
         assert_eq!(
             pair.recorder_a.seen_count(),
@@ -5503,7 +5019,7 @@ pub(crate) mod network {
             "the slot's install registered the status provider this replaces"
         );
         let status = |body: &str| {
-            pair.client_b.request(
+            link::request(
                 &pair.responder.transport,
                 &b_identity,
                 &pair.a_desc,
@@ -5541,7 +5057,7 @@ pub(crate) mod network {
         assert_eq!(granted.identity_hash, b_identity_hex);
 
         let outcome = status("again").await.unwrap();
-        assert_eq!(outcome.value, Value::from("again"));
+        assert_eq!(outcome, Value::from("again"));
         assert_eq!(pair.recorder_a.seen_count(), 1);
         let seen = pair.recorder_a.last();
         assert_eq!(
@@ -5746,19 +5262,17 @@ pub(crate) mod network {
         let b_identity = pair.responder.desc.identity.address_hash.to_hex_string();
         let b_instance = pair.responder.desc.address_hash.to_hex_string();
 
-        let err = pair
-            .client_b
-            .request(
-                &pair.responder.transport,
-                &pair.responder.identity,
-                &pair.a_desc,
-                KNOCK_PATH,
-                pair.responder
-                    .envelope(KnockIntro::new("hello").unwrap().to_request_body()),
-                short_options(),
-            )
-            .await
-            .unwrap_err();
+        let err = link::request(
+            &pair.responder.transport,
+            &pair.responder.identity,
+            &pair.a_desc,
+            KNOCK_PATH,
+            pair.responder
+                .envelope(KnockIntro::new("hello").unwrap().to_request_body()),
+            short_options(),
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
         wait_until("the knock to surface", || !idle.0.lock().is_empty()).await;
@@ -5783,18 +5297,17 @@ pub(crate) mod network {
     }
 
     /// Node B knocks node A as itself, naming its own instance.
-    async fn b_knocks_a(pair: &NodePair) -> Result<RequestOutcome, RequestError> {
-        pair.client_b
-            .request(
-                &pair.responder.transport,
-                &pair.responder.identity,
-                &pair.a_desc,
-                KNOCK_PATH,
-                pair.responder
-                    .envelope(KnockIntro::new("hello").unwrap().to_request_body()),
-                short_options(),
-            )
-            .await
+    async fn b_knocks_a(pair: &NodePair) -> Result<Value, RequestError> {
+        link::request(
+            &pair.responder.transport,
+            &pair.responder.identity,
+            &pair.a_desc,
+            KNOCK_PATH,
+            pair.responder
+                .envelope(KnockIntro::new("hello").unwrap().to_request_body()),
+            short_options(),
+        )
+        .await
     }
 
     /// How many knocks node A's knock file holds right now.
@@ -6085,18 +5598,16 @@ pub(crate) mod network {
             IdentityStanding::Unknown
         );
 
-        let err = pair
-            .client_b
-            .request(
-                &pair.responder.transport,
-                &pair.responder.identity,
-                &pair.a_desc,
-                STATUS_PATH,
-                pair.responder.envelope(Value::Nil),
-                short_options(),
-            )
-            .await
-            .unwrap_err();
+        let err = link::request(
+            &pair.responder.transport,
+            &pair.responder.identity,
+            &pair.a_desc,
+            STATUS_PATH,
+            pair.responder.envelope(Value::Nil),
+            short_options(),
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(err, timed_out(STATUS_PATH));
         assert_debug_logged_from(&b_identity[..8], "dropped: unknown identity");
@@ -6343,7 +5854,7 @@ pub(crate) mod network {
             "unblocking the instance does not touch the identity's block"
         );
         let status = || {
-            pair.client_b.request(
+            link::request(
                 &pair.responder.transport,
                 &pair.responder.identity,
                 &pair.a_desc,
@@ -6495,7 +6006,7 @@ pub(crate) mod network {
         let b_instance = pair.responder.desc.address_hash.to_hex_string();
         let bound = destination_address(&pair.responder.origin().0, &bound_to).to_hex_string();
         let knock = || {
-            pair.client_b.request(
+            link::request(
                 &pair.responder.transport,
                 &pair.responder.identity,
                 &pair.a_desc,
@@ -6682,18 +6193,16 @@ pub(crate) mod network {
             );
         }
 
-        let err = pair
-            .client_b
-            .request(
-                &pair.responder.transport,
-                &pair.responder.identity,
-                &pair.a_desc,
-                STATUS_PATH,
-                pair.responder.envelope(Value::Nil),
-                short_options(),
-            )
-            .await
-            .unwrap_err();
+        let err = link::request(
+            &pair.responder.transport,
+            &pair.responder.identity,
+            &pair.a_desc,
+            STATUS_PATH,
+            pair.responder.envelope(Value::Nil),
+            short_options(),
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
         assert_eq!(fs::read(&trust_path).unwrap(), before);
@@ -6716,18 +6225,16 @@ pub(crate) mod network {
             swept.contains(&earlier_destination.to_hex_string()) && swept.contains(&b_instance),
             "both rows are gone: {swept:?}"
         );
-        let err = pair
-            .client_b
-            .request(
-                &pair.responder.transport,
-                &pair.responder.identity,
-                &pair.a_desc,
-                STATUS_PATH,
-                pair.responder.envelope(Value::Nil),
-                short_options(),
-            )
-            .await
-            .unwrap_err();
+        let err = link::request(
+            &pair.responder.transport,
+            &pair.responder.identity,
+            &pair.a_desc,
+            STATUS_PATH,
+            pair.responder.envelope(Value::Nil),
+            short_options(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(
             err,
             RequestError::Refused(RefusalCode::NoAccess),
@@ -6781,18 +6288,16 @@ pub(crate) mod network {
 
         pair.introduce_b_to_a().await;
         wait_until("the error to surface", || !idle.0.lock().is_empty()).await;
-        let err = pair
-            .client_b
-            .request(
-                &pair.responder.transport,
-                &pair.responder.identity,
-                &pair.a_desc,
-                STATUS_PATH,
-                pair.responder.envelope(Value::Nil),
-                short_options(),
-            )
-            .await
-            .unwrap_err();
+        let err = link::request(
+            &pair.responder.transport,
+            &pair.responder.identity,
+            &pair.a_desc,
+            STATUS_PATH,
+            pair.responder.envelope(Value::Nil),
+            short_options(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
         assert_eq!(fs::read(&trust_path).unwrap(), before);
         let line = idle.0.lock()[0].text.clone();
@@ -7130,18 +6635,16 @@ pub(crate) mod network {
         let b_instance = pair.responder.desc.address_hash.to_hex_string();
         let bound = destination_address(&pair.responder.origin().0, &bound_to).to_hex_string();
 
-        let err = pair
-            .client_b
-            .request(
-                &pair.responder.transport,
-                &pair.responder.identity,
-                &pair.a_desc,
-                STATUS_PATH,
-                pair.responder.envelope(Value::Nil),
-                short_options(),
-            )
-            .await
-            .unwrap_err();
+        let err = link::request(
+            &pair.responder.transport,
+            &pair.responder.identity,
+            &pair.a_desc,
+            STATUS_PATH,
+            pair.responder.envelope(Value::Nil),
+            short_options(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
         assert_debug_logged(": refused: IdentityChanged");
         assert!(
@@ -7237,18 +6740,16 @@ pub(crate) mod network {
         let b_identity = pair.responder.desc.identity.address_hash.to_hex_string();
         let bound = destination_address(&pair.responder.origin().0, &bound_to).to_hex_string();
 
-        let err = pair
-            .client_b
-            .request(
-                &pair.responder.transport,
-                &pair.responder.identity,
-                &pair.a_desc,
-                STATUS_PATH,
-                pair.responder.envelope(Value::Nil),
-                short_options(),
-            )
-            .await
-            .unwrap_err();
+        let err = link::request(
+            &pair.responder.transport,
+            &pair.responder.identity,
+            &pair.a_desc,
+            STATUS_PATH,
+            pair.responder.envelope(Value::Nil),
+            short_options(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
         assert_debug_logged(": refused: DestinationDenied");
         let marked = pair
@@ -7339,18 +6840,16 @@ pub(crate) mod network {
         );
 
         // The stranger asks: silence, no knock, and the mark stands.
-        let err = pair
-            .client_b
-            .request(
-                &pair.responder.transport,
-                &pair.responder.identity,
-                &pair.a_desc,
-                STATUS_PATH,
-                pair.responder.envelope(Value::Nil),
-                short_options(),
-            )
-            .await
-            .unwrap_err();
+        let err = link::request(
+            &pair.responder.transport,
+            &pair.responder.identity,
+            &pair.a_desc,
+            STATUS_PATH,
+            pair.responder.envelope(Value::Nil),
+            short_options(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err, timed_out(STATUS_PATH), "a stranger hears nothing");
         assert!(
             pair.node_a
@@ -7458,18 +6957,16 @@ pub(crate) mod network {
             "nothing to mark, nothing marked"
         );
 
-        let err = pair
-            .client_b
-            .request(
-                &pair.responder.transport,
-                &pair.responder.identity,
-                &pair.a_desc,
-                STATUS_PATH,
-                pair.responder.envelope(Value::Nil),
-                short_options(),
-            )
-            .await
-            .unwrap_err();
+        let err = link::request(
+            &pair.responder.transport,
+            &pair.responder.identity,
+            &pair.a_desc,
+            STATUS_PATH,
+            pair.responder.envelope(Value::Nil),
+            short_options(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err, timed_out(STATUS_PATH), "the line said refused; it is");
         assert_eq!(idle.0.lock().len(), 1, "{:#?}", idle.0.lock());
         assert_eq!(fs::read(&trust_path).unwrap(), before);
@@ -7505,18 +7002,16 @@ pub(crate) mod network {
         let before = fs::read(&trust_path).unwrap();
 
         pair.introduce_b_to_a().await;
-        let err = pair
-            .client_b
-            .request(
-                &pair.responder.transport,
-                &pair.responder.identity,
-                &pair.a_desc,
-                STATUS_PATH,
-                pair.responder.envelope(Value::Nil),
-                short_options(),
-            )
-            .await
-            .unwrap_err();
+        let err = link::request(
+            &pair.responder.transport,
+            &pair.responder.identity,
+            &pair.a_desc,
+            STATUS_PATH,
+            pair.responder.envelope(Value::Nil),
+            short_options(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(
             err,
             timed_out(STATUS_PATH),
@@ -8173,7 +7668,7 @@ pub(crate) mod network {
             &link,
             KNOCK_PATH,
             KnockIntro::new("knock knock").unwrap().to_request_body(),
-            Deadline::after(SHORT_REQUEST_TIMEOUT),
+            SHORT_REQUEST_TIMEOUT,
         )
         .await
         .unwrap_err();
@@ -8184,18 +7679,16 @@ pub(crate) mod network {
         .await;
 
         let started = Instant::now();
-        let err = requester_y
-            .client
-            .request(
-                &requester_y.transport,
-                &requester_y.identity,
-                &desc,
-                KNOCK_PATH,
-                requester_y.envelope(KnockIntro::new("anyone home").unwrap().to_request_body()),
-                short_options(),
-            )
-            .await
-            .unwrap_err();
+        let err = link::request(
+            &requester_y.transport,
+            &requester_y.identity,
+            &desc,
+            KNOCK_PATH,
+            requester_y.envelope(KnockIntro::new("anyone home").unwrap().to_request_body()),
+            short_options(),
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
         assert!(started.elapsed() < SHORT_REQUEST_TIMEOUT);
@@ -8273,29 +7766,27 @@ pub(crate) mod network {
             "request-log-hashes-served",
         );
         let link = identified_link(&requester, &responder, &desc).await;
-        let err = requester
-            .client
-            .request_on_link(
-                &requester.transport,
-                &link,
-                TEST_PATH,
-                Value::Nil,
-                request_deadline(),
-            )
-            .await
-            .unwrap_err();
+        let err = request_on_link(
+            &requester.transport,
+            &link,
+            TEST_PATH,
+            Value::Nil,
+            DEFAULT_REQUEST_TIMEOUT,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
         let outcome = request_on(
             &requester,
             &link,
             STATUS_PATH,
             Value::Nil,
-            request_deadline(),
+            DEFAULT_REQUEST_TIMEOUT,
         )
         .await
         .unwrap();
         assert_eq!(
-            DispatchError::from_value(&outcome.value),
+            DispatchError::from_value(&outcome),
             Some(DispatchError::NoProvider {
                 path: STATUS_PATH.to_string()
             })
@@ -8305,11 +7796,11 @@ pub(crate) mod network {
             &link,
             TEST_PATH,
             Value::from("served"),
-            request_deadline(),
+            DEFAULT_REQUEST_TIMEOUT,
         )
         .await
         .unwrap();
-        assert_eq!(outcome.value, Value::from("served"));
+        assert_eq!(outcome, Value::from("served"));
         assert_eq!(recorder.seen_count(), 1);
 
         let logs: Vec<String> = debug_snapshot()
@@ -8350,25 +7841,23 @@ pub(crate) mod network {
 
         let in_flight: Vec<_> = (0..MAX_CONCURRENT_INBOUND_REQUESTS)
             .map(|n| {
-                let client = requester.client.clone();
                 let transport = requester.transport.clone();
                 let link = link.clone();
                 tokio::spawn(async move {
-                    client
-                        .request_on_link(
-                            &transport,
-                            &link,
-                            "/echo",
-                            Value::from(format!("req-{n}")),
-                            request_deadline(),
-                        )
-                        .await
+                    request_on_link(
+                        &transport,
+                        &link,
+                        "/echo",
+                        Value::from(format!("req-{n}")),
+                        DEFAULT_REQUEST_TIMEOUT,
+                    )
+                    .await
                 })
             })
             .collect();
         for (n, task) in in_flight.into_iter().enumerate() {
             let outcome = task.await.unwrap().unwrap();
-            assert_eq!(outcome.value, Value::from(format!("req-{n}")));
+            assert_eq!(outcome, Value::from(format!("req-{n}")));
         }
         assert_eq!(recorder.seen_count(), MAX_CONCURRENT_INBOUND_REQUESTS);
         wait_until("every handler slot to return", || {
@@ -8381,11 +7870,11 @@ pub(crate) mod network {
             &link,
             "/echo",
             Value::from("one more"),
-            request_deadline(),
+            DEFAULT_REQUEST_TIMEOUT,
         )
         .await
         .unwrap();
-        assert_eq!(outcome.value, Value::from("one more"));
+        assert_eq!(outcome, Value::from("one more"));
         assert_eq!(recorder.seen_count(), MAX_CONCURRENT_INBOUND_REQUESTS + 1);
         requester.stop().await;
         responder.stop().await;
@@ -8419,8 +7908,7 @@ pub(crate) mod network {
 
         let outcome = requester.request(&desc, "/echo", Value::Nil).await.unwrap();
 
-        assert_eq!(outcome.value, card());
-        assert_eq!(outcome.response_branch, SizeBranch::Resource);
+        assert_eq!(outcome, card());
         wait_until("the completed transfer to confirm the settlement", || {
             free.lock().is_some()
         })
@@ -8596,7 +8084,7 @@ pub(crate) mod network {
             &anonymous,
             STATUS_PATH,
             Value::Nil,
-            Deadline::after(SHORT_REQUEST_TIMEOUT),
+            SHORT_REQUEST_TIMEOUT,
         )
         .await
         .unwrap_err();
@@ -8624,7 +8112,7 @@ pub(crate) mod network {
             &link,
             STATUS_PATH,
             Value::Nil,
-            Deadline::after(SHORT_REQUEST_TIMEOUT),
+            SHORT_REQUEST_TIMEOUT,
         )
         .await
         .unwrap_err();
@@ -8651,7 +8139,7 @@ pub(crate) mod network {
             &link,
             STATUS_PATH,
             Value::Nil,
-            Deadline::after(SHORT_REQUEST_TIMEOUT),
+            SHORT_REQUEST_TIMEOUT,
         )
         .await
         .unwrap_err();
@@ -8704,7 +8192,7 @@ pub(crate) mod network {
             .await
             .unwrap();
         assert_eq!(handler.calls(), 1);
-        let card = StatusCard::from_value(&outcome.value).unwrap();
+        let card = StatusCard::from_value(&outcome).unwrap();
         assert_eq!(timeless(card.clone()), timeless(source.card(now)));
         assert_eq!(card.display_name.as_deref(), Some("Zed Quill"));
         assert_eq!(
@@ -8740,12 +8228,7 @@ pub(crate) mod network {
             .await
             .unwrap();
         assert_eq!(handler.calls(), 1);
-        assert_eq!(
-            outcome.response_branch,
-            SizeBranch::Resource,
-            "a card at every cap is over the link MDU"
-        );
-        let card = StatusCard::from_value(&outcome.value).unwrap();
+        let card = StatusCard::from_value(&outcome).unwrap();
         assert_eq!(timeless(card.clone()), timeless(source.card(now)));
         assert_eq!(
             card.objective.as_ref().map(|text| text.chars().count()),
@@ -8759,8 +8242,7 @@ pub(crate) mod network {
             .await
             .unwrap();
         assert_eq!(handler.calls(), 1);
-        assert_eq!(outcome.response_branch, SizeBranch::Packet);
-        let card = StatusCard::from_value(&outcome.value).unwrap();
+        let card = StatusCard::from_value(&outcome).unwrap();
         assert_eq!(
             timeless(card),
             timeless(build_card(None, None, None, None, None, &[], now))
@@ -8842,7 +8324,6 @@ pub(crate) mod network {
             .await
             .unwrap_err();
         assert_eq!(err, StatusError::Transport(RequestError::NotRunning));
-        pair.cancel_b.cancel();
         pair.responder.stop().await;
     }
 
@@ -8911,7 +8392,6 @@ pub(crate) mod network {
         );
         assert!(!text.contains("0xf1"), "{text}");
         assert_eq!(pair.node_a.last_card(&b_instance), None);
-        pair.cancel_b.cancel();
         pair.responder.stop().await;
     }
 
@@ -8969,7 +8449,6 @@ pub(crate) mod network {
             assert!(!text.contains("no access"), "{text}");
         }
         assert!(pair.node_a.last_listing(&b_instance).is_none());
-        pair.cancel_b.cancel();
         pair.responder.stop().await;
     }
 
@@ -9041,7 +8520,6 @@ pub(crate) mod network {
         );
 
         assert!(slot.stop().await.unwrap());
-        pair.cancel_b.cancel();
         pair.responder.stop().await;
     }
 
@@ -9088,7 +8566,6 @@ pub(crate) mod network {
         );
 
         assert!(slot.stop().await.unwrap());
-        pair.cancel_b.cancel();
         pair.responder.stop().await;
     }
 
@@ -9136,21 +8613,17 @@ pub(crate) mod network {
     }
 
     /// Node B sends `message` to node A's `/message` as itself, naming its own instance.
-    async fn b_sends_to_a(
-        pair: &NodePair,
-        message: &OutboundPeer,
-    ) -> Result<RequestOutcome, RequestError> {
-        pair.client_b
-            .request(
-                &pair.responder.transport,
-                &pair.responder.identity,
-                &pair.a_desc,
-                MESSAGE_PATH,
-                pair.responder
-                    .envelope(to_request_body(message, 1_700_000_000.5)),
-                short_options(),
-            )
-            .await
+    async fn b_sends_to_a(pair: &NodePair, message: &OutboundPeer) -> Result<Value, RequestError> {
+        link::request(
+            &pair.responder.transport,
+            &pair.responder.identity,
+            &pair.a_desc,
+            MESSAGE_PATH,
+            pair.responder
+                .envelope(to_request_body(message, 1_700_000_000.5)),
+            short_options(),
+        )
+        .await
     }
 
     fn only_peer(
@@ -9219,11 +8692,7 @@ pub(crate) mod network {
 
         let outcome = b_sends_to_a(&pair, &message).await.unwrap();
 
-        assert!(
-            is_received_reply(&outcome.value, &message.id),
-            "{:?}",
-            outcome.value
-        );
+        assert!(is_received_reply(&outcome, &message.id), "{:?}", outcome);
         let (envelopes, dropped) = slot.peer_inbox().drain();
         assert_eq!(dropped, 0);
         let received = only_peer(&envelopes);
@@ -9309,7 +8778,7 @@ pub(crate) mod network {
         .unwrap();
         assert_eq!(reply.kind, PeerKind::Reply);
         let outcome = b_sends_to_a(&pair, &reply).await.unwrap();
-        assert!(is_received_reply(&outcome.value, &reply.id));
+        assert!(is_received_reply(&outcome, &reply.id));
 
         let waited = slot
             .correlations()
@@ -9385,7 +8854,7 @@ pub(crate) mod network {
         .unwrap();
         assert_eq!(reply.thread, None, "B knows no thread to put on the wire");
         let outcome = b_sends_to_a(&pair, &reply).await.unwrap();
-        assert!(is_received_reply(&outcome.value, &reply.id));
+        assert!(is_received_reply(&outcome, &reply.id));
 
         let waited = slot
             .correlations()
@@ -9435,7 +8904,7 @@ pub(crate) mod network {
 
         let outcome = b_sends_to_a(&pair, &message).await.unwrap();
 
-        assert!(is_received_reply(&outcome.value, &message.id));
+        assert!(is_received_reply(&outcome, &message.id));
         let (envelopes, dropped) = slot.peer_inbox().drain();
         assert_eq!(dropped, 0);
         let received = only_peer(&envelopes);
@@ -9517,7 +8986,7 @@ pub(crate) mod network {
 
         let outcome = b_sends_to_a(&pair, &message).await.unwrap();
 
-        assert!(is_received_reply(&outcome.value, &message.id));
+        assert!(is_received_reply(&outcome, &message.id));
         wait_until("node A to send node B the refusal", || {
             pair.recorder_b.seen_count() == 1
         })
@@ -9594,7 +9063,7 @@ pub(crate) mod network {
 
         drop(held);
         let outcome = b_sends_to_a(&pair, &message).await.unwrap();
-        assert!(is_received_reply(&outcome.value, &message.id));
+        assert!(is_received_reply(&outcome, &message.id));
         wait_until("the envoy to take the message", || {
             envoy.job_ids() == [message.id.clone()]
         })
@@ -9701,10 +9170,10 @@ pub(crate) mod network {
         for message in [&bulletin, &notice, &reply] {
             let outcome = b_sends_to_a(&pair, message).await.unwrap();
             assert!(
-                is_received_reply(&outcome.value, &message.id),
+                is_received_reply(&outcome, &message.id),
                 "{:?}: {:?}",
                 message.kind,
-                outcome.value
+                outcome
             );
         }
         let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.clone()).collect();
@@ -9779,7 +9248,7 @@ pub(crate) mod network {
 
         let bulletin = OutboundPeer::new(PeerKind::Bulletin, "fyi", None, None, None).unwrap();
         let outcome = b_sends_to_a(&pair, &bulletin).await.unwrap();
-        assert!(is_received_reply(&outcome.value, &bulletin.id));
+        assert!(is_received_reply(&outcome, &bulletin.id));
         let (envelopes, _) = slot.peer_inbox().drain();
         assert_eq!(only_peer(&envelopes).message_id, bulletin.id);
         assert_eq!(
@@ -9818,11 +9287,7 @@ pub(crate) mod network {
 
         let outcome = b_sends_to_a(&pair, &ask).await.unwrap();
 
-        assert!(
-            is_received_reply(&outcome.value, &ask.id),
-            "{:?}",
-            outcome.value
-        );
+        assert!(is_received_reply(&outcome, &ask.id), "{:?}", outcome);
         let (envelopes, dropped) = slot.peer_inbox().drain();
         assert_eq!(dropped, 0);
         assert_eq!(only_peer(&envelopes).message_id, ask.id);
@@ -9878,10 +9343,10 @@ pub(crate) mod network {
         for message in [&bulletin, &notice, &reply] {
             let outcome = b_sends_to_a(&pair, message).await.unwrap();
             assert!(
-                is_received_reply(&outcome.value, &message.id),
+                is_received_reply(&outcome, &message.id),
                 "{:?}: {:?}",
                 message.kind,
-                outcome.value
+                outcome
             );
         }
         let question = OutboundPeer::new(PeerKind::Message, "and this?", None, None, None).unwrap();
@@ -9943,9 +9408,9 @@ pub(crate) mod network {
         let ask = OutboundPeer::new(PeerKind::Ask, "room for one more?", None, None, None).unwrap();
         let outcome = b_sends_to_a(&pair, &ask).await.unwrap();
         assert!(
-            is_received_reply(&outcome.value, &ask.id),
+            is_received_reply(&outcome, &ask.id),
             "one run in flight under a cap of two is acknowledged: {:?}",
-            outcome.value
+            outcome
         );
         wait_until("the envoy to take the question", || {
             envoy.job_ids() == [ask.id.clone()]
@@ -9985,7 +9450,7 @@ pub(crate) mod network {
 
         drop(second);
         let outcome = b_sends_to_a(&pair, &again).await.unwrap();
-        assert!(is_received_reply(&outcome.value, &again.id));
+        assert!(is_received_reply(&outcome, &again.id));
         assert_eq!(messages(), 2);
         drop(first);
         pair.stop_node_a().await;
@@ -10026,9 +9491,9 @@ pub(crate) mod network {
         let ask = OutboundPeer::new(PeerKind::Ask, "room for a fourth?", None, None, None).unwrap();
         let outcome = b_sends_to_a(&pair, &ask).await.unwrap();
         assert!(
-            is_received_reply(&outcome.value, &ask.id),
+            is_received_reply(&outcome, &ask.id),
             "three in flight under no cap is acknowledged: {:?}",
-            outcome.value
+            outcome
         );
         wait_until("the envoy to take the question", || {
             envoy.job_ids() == [ask.id.clone()]
@@ -10073,11 +9538,7 @@ pub(crate) mod network {
 
         let outcome = b_sends_to_a(&pair, &message).await.unwrap();
 
-        assert!(
-            is_received_reply(&outcome.value, &message.id),
-            "{:?}",
-            outcome.value
-        );
+        assert!(is_received_reply(&outcome, &message.id), "{:?}", outcome);
         wait_until("the envoy to take the message", || {
             envoy.job_ids() == [message.id.clone()]
         })
@@ -10516,12 +9977,7 @@ pub(crate) mod network {
     }
 
     /// Node B asks node A's `path` as itself.
-    async fn b_asks_a(
-        pair: &NodePair,
-        path: &str,
-        body: Value,
-        options: RequestOptions,
-    ) -> RequestOutcome {
+    async fn b_asks_a(pair: &NodePair, path: &str, body: Value, options: RequestOptions) -> Value {
         pair.b_asks_a(path, body, options).await
     }
 
@@ -10544,7 +10000,7 @@ pub(crate) mod network {
             short_options(),
         )
         .await;
-        let paths: Vec<&str> = wire_field(&listed.value, "entries")
+        let paths: Vec<&str> = wire_field(&listed, "entries")
             .and_then(Value::as_array)
             .unwrap()
             .iter()
@@ -10559,16 +10015,12 @@ pub(crate) mod network {
             short_options(),
         )
         .await;
-        assert_eq!(wire_status(&served.value), "ok");
+        assert_eq!(wire_status(&served), "ok");
         assert_eq!(
-            wire_field(&served.value, "sha256"),
+            wire_field(&served, "sha256"),
             Some(&Value::Binary(digest.to_vec()))
         );
-        assert_eq!(
-            wire_field(&served.value, "bytes"),
-            Some(&Value::Binary(bytes))
-        );
-        assert_eq!(served.response_branch, SizeBranch::Packet);
+        assert_eq!(wire_field(&served, "bytes"), Some(&Value::Binary(bytes)));
 
         let unchanged = b_asks_a(
             &pair,
@@ -10577,7 +10029,7 @@ pub(crate) mod network {
             short_options(),
         )
         .await;
-        assert_eq!(wire_status(&unchanged.value), "not_modified");
+        assert_eq!(wire_status(&unchanged), "not_modified");
 
         let missing = b_asks_a(
             &pair,
@@ -10593,12 +10045,12 @@ pub(crate) mod network {
             short_options(),
         )
         .await;
-        assert_eq!(wire_status(&missing.value), "not_shared");
-        assert_eq!(missing.value, unshared.value);
+        assert_eq!(wire_status(&missing), "not_shared");
+        assert_eq!(missing, unshared);
 
         let traversal =
             b_asks_a(&pair, FETCH_PATH, fetch_body("../x", None), short_options()).await;
-        assert_eq!(wire_status(&traversal.value), "invalid_path");
+        assert_eq!(wire_status(&traversal), "invalid_path");
 
         assert_eq!(envoy.0.load(Ordering::SeqCst), 0);
         let fetch_fires = sink
@@ -10666,9 +10118,9 @@ pub(crate) mod network {
             short_options(),
         )
         .await;
-        assert_eq!(wire_status(&asked.value), "pending");
+        assert_eq!(wire_status(&asked), "pending");
         assert_eq!(
-            wire_field(&asked.value, "id").and_then(Value::as_str),
+            wire_field(&asked, "id").and_then(Value::as_str),
             Some("acc-1")
         );
         {
@@ -10724,11 +10176,8 @@ pub(crate) mod network {
             short_options(),
         )
         .await;
-        assert_eq!(wire_status(&served.value), "ok");
-        assert_eq!(
-            wire_field(&served.value, "bytes"),
-            Some(&Value::Binary(secret))
-        );
+        assert_eq!(wire_status(&served), "ok");
+        assert_eq!(wire_field(&served, "bytes"), Some(&Value::Binary(secret)));
         let spent = b_asks_a(
             &pair,
             FETCH_PATH,
@@ -10736,7 +10185,7 @@ pub(crate) mod network {
             short_options(),
         )
         .await;
-        assert_eq!(wire_status(&spent.value), "not_shared");
+        assert_eq!(wire_status(&spent), "not_shared");
 
         wait_until("the served fetch to fire mesh.fetch.served", || {
             sink.snapshot()
@@ -10781,8 +10230,8 @@ pub(crate) mod network {
         )
         .await;
 
-        assert_eq!(wire_status(&asked.value), "granted");
-        let expires = wire_field(&asked.value, "expires")
+        assert_eq!(wire_status(&asked), "granted");
+        let expires = wire_field(&asked, "expires")
             .and_then(Value::as_f64)
             .unwrap();
         assert!(
@@ -10808,19 +10257,17 @@ pub(crate) mod network {
         let (slot, idle) = installed_slot(&pair);
         let _workspace = share_docs_from_a(&pair, &slot, "request-access-bad-path-root");
 
-        let err = pair
-            .client_b
-            .request(
-                &pair.responder.transport,
-                &pair.responder.identity,
-                &pair.a_desc,
-                ACCESS_PATH,
-                pair.responder
-                    .envelope(access_body("acc-1", &["../secret.rs"], "")),
-                short_options(),
-            )
-            .await
-            .unwrap_err();
+        let err = link::request(
+            &pair.responder.transport,
+            &pair.responder.identity,
+            &pair.a_desc,
+            ACCESS_PATH,
+            pair.responder
+                .envelope(access_body("acc-1", &["../secret.rs"], "")),
+            short_options(),
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(err, RequestError::Refused(RefusalCode::InvalidData));
         assert!(
@@ -10854,32 +10301,28 @@ pub(crate) mod network {
             share_docs_from_a(&pair, &slot, "usage-probe-request-access-untrusted-root");
         fs::write(workspace.path.join("docs").join("a.md"), b"# a\n").unwrap();
 
-        let shared = pair
-            .client_b
-            .request(
-                &pair.responder.transport,
-                &pair.responder.identity,
-                &pair.a_desc,
-                ACCESS_PATH,
-                pair.responder
-                    .envelope(access_body("acc-1", &["docs/a.md"], "already shared")),
-                short_options(),
-            )
-            .await
-            .unwrap_err();
-        let unshared = pair
-            .client_b
-            .request(
-                &pair.responder.transport,
-                &pair.responder.identity,
-                &pair.a_desc,
-                ACCESS_PATH,
-                pair.responder
-                    .envelope(access_body("acc-2", &["src/x.rs"], "not shared")),
-                short_options(),
-            )
-            .await
-            .unwrap_err();
+        let shared = link::request(
+            &pair.responder.transport,
+            &pair.responder.identity,
+            &pair.a_desc,
+            ACCESS_PATH,
+            pair.responder
+                .envelope(access_body("acc-1", &["docs/a.md"], "already shared")),
+            short_options(),
+        )
+        .await
+        .unwrap_err();
+        let unshared = link::request(
+            &pair.responder.transport,
+            &pair.responder.identity,
+            &pair.a_desc,
+            ACCESS_PATH,
+            pair.responder
+                .envelope(access_body("acc-2", &["src/x.rs"], "not shared")),
+            short_options(),
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(shared, timed_out(ACCESS_PATH));
         assert_eq!(unshared, timed_out(ACCESS_PATH));
@@ -10933,19 +10376,17 @@ pub(crate) mod network {
         );
         fs::write(workspace.path.join("docs").join("a.md"), b"# a\n").unwrap();
 
-        let err = pair
-            .client_b
-            .request(
-                &pair.responder.transport,
-                &pair.responder.identity,
-                &pair.a_desc,
-                ACCESS_PATH,
-                pair.responder
-                    .envelope(access_body("acc-1", &["docs/a.md"], "let me in")),
-                short_options(),
-            )
-            .await
-            .unwrap_err();
+        let err = link::request(
+            &pair.responder.transport,
+            &pair.responder.identity,
+            &pair.a_desc,
+            ACCESS_PATH,
+            pair.responder
+                .envelope(access_body("acc-1", &["docs/a.md"], "let me in")),
+            short_options(),
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
         assert!(
@@ -10994,7 +10435,7 @@ pub(crate) mod network {
             short_options(),
         )
         .await;
-        assert_eq!(wire_status(&asked.value), "pending");
+        assert_eq!(wire_status(&asked), "pending");
         assert_eq!(idle.0.lock().len(), 1);
 
         pair.recorder_b.queue(Script::Acknowledge);
@@ -11013,8 +10454,8 @@ pub(crate) mod network {
         )
         .await;
 
-        assert_eq!(wire_status(&fetched.value), "not_shared");
-        assert_eq!(fetched.value, missing.value);
+        assert_eq!(wire_status(&fetched), "not_shared");
+        assert_eq!(fetched, missing);
         assert_eq!(envoy.0.load(Ordering::SeqCst), 0);
         pair.stop_node_a().await;
     }
@@ -11054,7 +10495,7 @@ pub(crate) mod network {
             short_options(),
         )
         .await;
-        assert_eq!(wire_status(&asked.value), "pending");
+        assert_eq!(wire_status(&asked), "pending");
         assert_eq!(idle.0.lock().len(), 1);
         let before = SystemTime::now();
 
@@ -11182,28 +10623,22 @@ pub(crate) mod network {
         RngCore::fill_bytes(&mut OsRng, &mut bytes);
         fs::write(workspace.path.join("docs").join("big.bin"), &bytes).unwrap();
 
-        let outcome = pair
-            .client_b
-            .request(
-                &pair.responder.transport,
-                &pair.responder.identity,
-                &pair.a_desc,
-                FETCH_PATH,
-                pair.responder.envelope(fetch_body("docs/big.bin", None)),
-                RequestOptions {
-                    request_timeout: FILE_FETCH_REQUEST_TIMEOUT,
-                    link_timeout: PEER_LINK_TIMEOUT,
-                },
-            )
-            .await
-            .unwrap();
+        let outcome = link::request(
+            &pair.responder.transport,
+            &pair.responder.identity,
+            &pair.a_desc,
+            FETCH_PATH,
+            pair.responder.envelope(fetch_body("docs/big.bin", None)),
+            RequestOptions {
+                request_timeout: FILE_FETCH_REQUEST_TIMEOUT,
+                link_timeout: PEER_LINK_TIMEOUT,
+            },
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(wire_status(&outcome.value), "ok");
-        assert_eq!(
-            wire_field(&outcome.value, "bytes"),
-            Some(&Value::Binary(bytes))
-        );
-        assert_eq!(outcome.response_branch, SizeBranch::Resource);
+        assert_eq!(wire_status(&outcome), "ok");
+        assert_eq!(wire_field(&outcome, "bytes"), Some(&Value::Binary(bytes)));
         pair.stop_node_a().await;
     }
 
@@ -11234,7 +10669,7 @@ pub(crate) mod network {
         )
         .unwrap();
         let fetch = |path: &'static str| {
-            pair.client_b.request(
+            link::request(
                 &pair.responder.transport,
                 &pair.responder.identity,
                 &pair.a_desc,
@@ -11248,30 +10683,29 @@ pub(crate) mod network {
         };
 
         let outcome = fetch("docs/at.bin").await.unwrap();
-        assert_eq!(wire_status(&outcome.value), "ok");
+        assert_eq!(wire_status(&outcome), "ok");
         assert_eq!(
-            wire_field(&outcome.value, "size").and_then(Value::as_u64),
+            wire_field(&outcome, "size").and_then(Value::as_u64),
             Some(MAX_FETCH_FILE_BYTES)
         );
         assert_eq!(
-            wire_field(&outcome.value, "sha256"),
+            wire_field(&outcome, "sha256"),
             Some(&Value::Binary(Sha256::digest(&at_limit).to_vec()))
         );
         assert_eq!(
-            wire_field(&outcome.value, "bytes"),
+            wire_field(&outcome, "bytes"),
             Some(&Value::Binary(at_limit))
         );
-        assert_eq!(outcome.response_branch, SizeBranch::Resource);
 
         let outcome = fetch("docs/over.bin").await.unwrap();
-        assert_eq!(wire_status(&outcome.value), "too_large");
+        assert_eq!(wire_status(&outcome), "too_large");
         assert_eq!(
-            wire_field(&outcome.value, "limit").and_then(Value::as_u64),
+            wire_field(&outcome, "limit").and_then(Value::as_u64),
             Some(MAX_FETCH_FILE_BYTES),
             "the refusal reports the setting, not a lower limit"
         );
         assert!(
-            wire_field(&outcome.value, "bytes").is_none(),
+            wire_field(&outcome, "bytes").is_none(),
             "a refusal carries no file bytes"
         );
         pair.stop_node_a().await;
@@ -11519,18 +10953,16 @@ pub(crate) mod network {
             (FETCH_PATH, fetch_body("docs/missing.md", None)),
         ];
         for (path, body) in asks {
-            let err = pair
-                .client_b
-                .request(
-                    &pair.responder.transport,
-                    &pair.responder.identity,
-                    &pair.a_desc,
-                    path,
-                    pair.responder.envelope(body.clone()),
-                    short_options(),
-                )
-                .await
-                .unwrap_err();
+            let err = link::request(
+                &pair.responder.transport,
+                &pair.responder.identity,
+                &pair.a_desc,
+                path,
+                pair.responder.envelope(body.clone()),
+                short_options(),
+            )
+            .await
+            .unwrap_err();
             assert_eq!(err, timed_out(path), "{path} {body:?}");
         }
 
@@ -11565,14 +10997,14 @@ pub(crate) mod network {
         )
         .await;
         assert_eq!(
-            wire_field(&listed.value, "v").and_then(Value::as_u64),
+            wire_field(&listed, "v").and_then(Value::as_u64),
             Some(PEER_WIRE_VERSION)
         );
         assert_eq!(
-            wire_field(&listed.value, "entries"),
+            wire_field(&listed, "entries"),
             Some(&Value::Array(Vec::new()))
         );
-        assert_eq!(wire_field(&listed.value, "next"), Some(&Value::Nil));
+        assert_eq!(wire_field(&listed, "next"), Some(&Value::Nil));
 
         let fetched = b_asks_a(
             &pair,
@@ -11581,8 +11013,8 @@ pub(crate) mod network {
             short_options(),
         )
         .await;
-        assert_eq!(wire_status(&fetched.value), "not_shared");
-        assert_eq!(wire_field(&fetched.value, "bytes"), None);
+        assert_eq!(wire_status(&fetched), "not_shared");
+        assert_eq!(wire_field(&fetched, "bytes"), None);
         pair.stop_node_a().await;
     }
 
@@ -11823,7 +11255,7 @@ pub(crate) mod network {
             short_options(),
         )
         .await;
-        let paths: Vec<&str> = wire_field(&listed.value, "entries")
+        let paths: Vec<&str> = wire_field(&listed, "entries")
             .and_then(Value::as_array)
             .unwrap()
             .iter()
@@ -11845,9 +11277,9 @@ pub(crate) mod network {
             short_options(),
         )
         .await;
-        assert_eq!(wire_status(&inbox_fetch.value), "not_shared");
+        assert_eq!(wire_status(&inbox_fetch), "not_shared");
         assert_eq!(
-            inbox_fetch.value, missing.value,
+            inbox_fetch, missing,
             "a staged file and a missing one are refused with the same bytes"
         );
 
@@ -11858,9 +11290,9 @@ pub(crate) mod network {
             short_options(),
         )
         .await;
-        assert_eq!(wire_status(&served.value), "ok");
+        assert_eq!(wire_status(&served), "ok");
         assert_eq!(
-            wire_field(&served.value, "bytes"),
+            wire_field(&served, "bytes"),
             Some(&Value::Binary(b"ours\n".to_vec()))
         );
         assert!(
@@ -11895,7 +11327,7 @@ pub(crate) mod network {
 
         for path in ["docs/one.md", "docs/two.md"] {
             let served = b_asks_a(&pair, FETCH_PATH, fetch_body(path, None), short_options()).await;
-            assert_eq!(wire_status(&served.value), "ok", "{path}");
+            assert_eq!(wire_status(&served), "ok", "{path}");
         }
         let unchanged = b_asks_a(
             &pair,
@@ -11904,7 +11336,7 @@ pub(crate) mod network {
             short_options(),
         )
         .await;
-        assert_eq!(wire_status(&unchanged.value), "not_modified");
+        assert_eq!(wire_status(&unchanged), "not_modified");
         let unshared = b_asks_a(
             &pair,
             FETCH_PATH,
@@ -11912,7 +11344,7 @@ pub(crate) mod network {
             short_options(),
         )
         .await;
-        assert_eq!(wire_status(&unshared.value), "not_shared");
+        assert_eq!(wire_status(&unshared), "not_shared");
 
         // The hook is dispatched after the reply is on the wire; give it a moment to land.
         wait_until("both served fetches to fire mesh.fetch.served", || {
@@ -12029,7 +11461,7 @@ pub(crate) mod network {
             short_options(),
         )
         .await;
-        let paths: Vec<&str> = wire_field(&listed.value, "entries")
+        let paths: Vec<&str> = wire_field(&listed, "entries")
             .and_then(Value::as_array)
             .unwrap()
             .iter()
@@ -12048,7 +11480,7 @@ pub(crate) mod network {
             short_options(),
         )
         .await;
-        assert_eq!(wire_status(&missing.value), "not_shared");
+        assert_eq!(wire_status(&missing), "not_shared");
         let denied_but_granted = b_asks_a(
             &pair,
             FETCH_PATH,
@@ -12057,8 +11489,8 @@ pub(crate) mod network {
         )
         .await;
         assert_eq!(
-            wire_bytes(&denied_but_granted.value),
-            wire_bytes(&missing.value),
+            wire_bytes(&denied_but_granted),
+            wire_bytes(&missing),
             "a denied-but-granted path is refused byte for byte like a missing one"
         );
 
@@ -12069,9 +11501,9 @@ pub(crate) mod network {
             short_options(),
         )
         .await;
-        assert_eq!(wire_status(&granted.value), "ok");
+        assert_eq!(wire_status(&granted), "ok");
         assert_eq!(
-            wire_field(&granted.value, "bytes"),
+            wire_field(&granted, "bytes"),
             Some(&Value::Binary(b"fn main() {}\n".to_vec()))
         );
         let spent = b_asks_a(
@@ -12082,8 +11514,8 @@ pub(crate) mod network {
         )
         .await;
         assert_eq!(
-            wire_bytes(&spent.value),
-            wire_bytes(&missing.value),
+            wire_bytes(&spent),
+            wire_bytes(&missing),
             "the second fetch of a one-off grant is not_shared byte for byte"
         );
         // The denied path is still refused after the grant's other use was spent.
@@ -12094,7 +11526,7 @@ pub(crate) mod network {
             short_options(),
         )
         .await;
-        assert_eq!(wire_status(&still_denied.value), "not_shared");
+        assert_eq!(wire_status(&still_denied), "not_shared");
 
         wait_until("the one served fetch to fire mesh.fetch.served", || {
             sink.snapshot()
@@ -12144,7 +11576,7 @@ pub(crate) mod network {
             short_options(),
         )
         .await;
-        assert_eq!(wire_status(&first.value), "pending");
+        assert_eq!(wire_status(&first), "pending");
 
         let again = b_asks_a(
             &pair,
@@ -12154,16 +11586,16 @@ pub(crate) mod network {
         )
         .await;
 
-        assert_eq!(wire_status(&again.value), "refused");
+        assert_eq!(wire_status(&again), "refused");
         assert_eq!(
-            wire_field(&again.value, "reason").and_then(Value::as_str),
+            wire_field(&again, "reason").and_then(Value::as_str),
             Some("duplicate")
         );
         assert_eq!(
-            wire_field(&again.value, "id").and_then(Value::as_str),
+            wire_field(&again, "id").and_then(Value::as_str),
             Some("acc-1")
         );
-        assert_eq!(wire_field(&again.value, "expires"), None);
+        assert_eq!(wire_field(&again, "expires"), None);
         {
             let notes = idle.0.lock();
             assert_eq!(notes.len(), 1, "{notes:?}");
@@ -12213,9 +11645,9 @@ pub(crate) mod network {
             short_options(),
         )
         .await;
-        assert_eq!(wire_status(&served.value), "ok");
-        assert_eq!(wire_status(&smuggled.value), "not_shared");
-        assert_eq!(wire_bytes(&smuggled.value), wire_bytes(&missing.value));
+        assert_eq!(wire_status(&served), "ok");
+        assert_eq!(wire_status(&smuggled), "not_shared");
+        assert_eq!(wire_bytes(&smuggled), wire_bytes(&missing));
 
         let fired = sink.drain();
         let requested = fires_of(&fired, HookEvent::MeshAccessRequested);
@@ -12251,7 +11683,7 @@ pub(crate) mod network {
             short_options(),
         )
         .await;
-        assert_eq!(wire_status(&asked.value), "pending");
+        assert_eq!(wire_status(&asked), "pending");
         pair.recorder_b.queue(Script::Acknowledge);
         slot.access()
             .grant("acc-2", GrantKind::OneOff { ttl: None })
@@ -12266,18 +11698,18 @@ pub(crate) mod network {
         let b_first = fetch("src/b.rs").await;
         let b_second = fetch("src/b.rs").await;
 
-        assert_eq!(wire_status(&a_first.value), "ok");
-        assert_eq!(wire_status(&a_second.value), "not_shared");
+        assert_eq!(wire_status(&a_first), "ok");
+        assert_eq!(wire_status(&a_second), "not_shared");
         assert_eq!(
-            wire_status(&b_first.value),
+            wire_status(&b_first),
             "ok",
             "a.rs's spend did not touch b.rs"
         );
         assert_eq!(
-            wire_field(&b_first.value, "bytes"),
+            wire_field(&b_first, "bytes"),
             Some(&Value::Binary(b"struct B;\n".to_vec()))
         );
-        assert_eq!(wire_status(&b_second.value), "not_shared");
+        assert_eq!(wire_status(&b_second), "not_shared");
         pair.stop_node_a().await;
     }
 
@@ -12307,7 +11739,7 @@ pub(crate) mod network {
             short_options(),
         )
         .await;
-        assert_eq!(wire_status(&asked.value), "pending");
+        assert_eq!(wire_status(&asked), "pending");
         pair.recorder_b.queue(Script::Acknowledge);
         let report = slot
             .access()
@@ -12362,7 +11794,7 @@ pub(crate) mod network {
                 short_options(),
             )
             .await;
-            assert_eq!(wire_status(&served.value), "ok", "fetch {round}");
+            assert_eq!(wire_status(&served), "ok", "fetch {round}");
         }
 
         let again = b_asks_a(
@@ -12372,9 +11804,9 @@ pub(crate) mod network {
             short_options(),
         )
         .await;
-        assert_eq!(wire_status(&again.value), "granted");
+        assert_eq!(wire_status(&again), "granted");
         assert!(
-            wire_field(&again.value, "expires")
+            wire_field(&again, "expires")
                 .and_then(Value::as_f64)
                 .is_some()
         );
@@ -12400,7 +11832,7 @@ pub(crate) mod network {
                 short_options(),
             )
             .await;
-            assert_eq!(wire_status(&asked.value), "pending", "ask {n}");
+            assert_eq!(wire_status(&asked), "pending", "ask {n}");
         }
         let sixth = b_asks_a(
             &pair,
@@ -12410,9 +11842,9 @@ pub(crate) mod network {
         )
         .await;
 
-        assert_eq!(wire_status(&sixth.value), "refused");
+        assert_eq!(wire_status(&sixth), "refused");
         assert_eq!(
-            wire_field(&sixth.value, "reason").and_then(Value::as_str),
+            wire_field(&sixth, "reason").and_then(Value::as_str),
             Some("too_many_pending")
         );
         assert_eq!(idle.0.lock().len(), 5);
@@ -12462,7 +11894,7 @@ pub(crate) mod network {
             short_options(),
         )
         .await;
-        assert_eq!(wire_status(&asked.value), "pending");
+        assert_eq!(wire_status(&asked), "pending");
         {
             let notes = idle.0.lock();
             assert_eq!(notes.len(), 1, "{notes:?}");
@@ -12544,7 +11976,7 @@ pub(crate) mod network {
             short_options(),
         )
         .await;
-        assert_eq!(wire_status(&fetched.value), "not_shared");
+        assert_eq!(wire_status(&fetched), "not_shared");
 
         wait_until("the refusal to fire mesh.access.decided", || {
             sink.snapshot()
@@ -12608,7 +12040,7 @@ pub(crate) mod network {
             short_options(),
         )
         .await;
-        assert_eq!(wire_status(&again.value), "pending");
+        assert_eq!(wire_status(&again), "pending");
         assert_eq!(idle.0.lock().len(), 2);
         pair.stop_node_a().await;
     }
@@ -12631,7 +12063,7 @@ pub(crate) mod network {
             short_options(),
         )
         .await;
-        assert_eq!(wire_status(&asked.value), "pending");
+        assert_eq!(wire_status(&asked), "pending");
         let before = SystemTime::now();
         pair.recorder_b.queue(Script::Acknowledge);
         let report = slot
@@ -12674,7 +12106,7 @@ pub(crate) mod network {
             short_options(),
         )
         .await;
-        assert_eq!(wire_status(&served.value), "ok");
+        assert_eq!(wire_status(&served), "ok");
         let spent = b_asks_a(
             &pair,
             FETCH_PATH,
@@ -12682,7 +12114,7 @@ pub(crate) mod network {
             short_options(),
         )
         .await;
-        assert_eq!(wire_status(&spent.value), "not_shared");
+        assert_eq!(wire_status(&spent), "not_shared");
         pair.stop_node_a().await;
     }
 
@@ -12802,17 +12234,17 @@ pub(crate) mod network {
                 short_options(),
             )
             .await;
-            assert_eq!(wire_status(&reply.value), "refused", "{colliding}");
+            assert_eq!(wire_status(&reply), "refused", "{colliding}");
             assert_eq!(
-                wire_field(&reply.value, "reason").and_then(Value::as_str),
+                wire_field(&reply, "reason").and_then(Value::as_str),
                 Some("duplicate"),
                 "{colliding}: a re-used id is a duplicate, whatever it collides with"
             );
             assert_eq!(
-                wire_field(&reply.value, "id").and_then(Value::as_str),
+                wire_field(&reply, "id").and_then(Value::as_str),
                 Some(colliding)
             );
-            assert_eq!(wire_field(&reply.value, "expires"), None);
+            assert_eq!(wire_field(&reply, "expires"), None);
         }
 
         // The colliding records stand exactly as filed.
@@ -12855,7 +12287,7 @@ pub(crate) mod network {
             short_options(),
         )
         .await;
-        assert_eq!(wire_status(&fresh.value), "pending");
+        assert_eq!(wire_status(&fresh), "pending");
         assert_eq!(store.list(SystemTime::now()).unwrap().len(), 3);
         assert_eq!(idle.0.lock().len(), 1);
         pair.stop_node_a().await;

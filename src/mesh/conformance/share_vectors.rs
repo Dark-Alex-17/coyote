@@ -2,7 +2,7 @@
 //! that reuse it, the share set and the grant store, the `/list` and `/fetch` handlers and
 //! requesters, and the on-disk versioning of the stores they read. Every row runs
 //! in-process against this crate's own `WirePath`, `ShareSet`, `GrantStore`, `ListHandler`,
-//! `FetchHandler`, `SharesPage`, `RequestClient` and record types, on a share root the row
+//! `FetchHandler`, `SharesPage` and record types, on a share root the row
 //! builds in a temporary directory.
 //!
 //! Every row carries a descriptive name and the receiver action expected of it. A
@@ -32,9 +32,8 @@ use crate::mesh::message::{
 use crate::mesh::pending::{INBOUND_RECORD_VERSION, InboundKind, InboundRecord};
 use crate::mesh::request::{
     AdmittedRequest, DispatchError, Dispatcher, Envelope, FETCH_PATH, Handler, InboundRequest,
-    KnockEvent, KnockSink, LIST_PATH, MAX_FETCH_RESPONSE_BYTES, MAX_REQUEST_PAYLOAD_BYTES,
-    NAME_HASH_LEN, OriginName, PathHash, RESPONSE_FRAME_PREFIX, RefusalCode, Reply, RequestClient,
-    RequestError, RequestHandler, RequestId, ResponseFrame, STATUS_PATH, SizeBranch,
+    KnockEvent, KnockSink, LIST_PATH, MAX_REQUEST_PAYLOAD_BYTES, NAME_HASH_LEN, OriginName,
+    PathHash, RefusalCode, Reply, RequestHandler, RequestId, ResponseFrame,
 };
 use crate::mesh::schema::{Remedy, version_refusal};
 use crate::mesh::shares::{
@@ -62,7 +61,6 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime};
-use tokio::sync::oneshot::error::TryRecvError;
 
 /// One named input and the receiver action expected of it.
 struct Vector {
@@ -95,8 +93,8 @@ enum Case {
     ListServe(ListProbe),
     /// `FetchHandler` over a share root built for the row.
     FetchServe(FetchProbe),
-    /// The requester's side of both paths: `SharesPage`, the inbox staging, the response
-    /// bound of `RequestClient` and the card keys that announce the paths.
+    /// The requester's side of both paths: `SharesPage`, the inbox staging and the card
+    /// keys that announce the paths.
     FetchClient(ClientProbe),
 }
 
@@ -1764,9 +1762,6 @@ fn the_version_pin_names_the_share_and_grant_constants() -> Result<(), String> {
 
 const GRANT_ID: &str = "0123456789abcdef";
 const ORIGIN: [u8; NAME_HASH_LEN] = [7; NAME_HASH_LEN];
-/// A response frame around a `bin32` body: the array and request-id headers plus the
-/// body's own header.
-const RESPONSE_FRAME_OVERHEAD: usize = 24;
 
 struct TestSource {
     root: Option<PathBuf>,
@@ -2107,30 +2102,6 @@ fn encoded_len(value: &Value) -> usize {
     let mut bytes = Vec::new();
     rmpv::encode::write_value(&mut bytes, value).unwrap();
     bytes.len()
-}
-
-fn frame_of(request_id: RequestId, total: usize) -> Result<Vec<u8>, String> {
-    let bytes = ResponseFrame {
-        request_id,
-        data: Value::Binary(vec![0x5a; total - RESPONSE_FRAME_OVERHEAD]),
-    }
-    .encode();
-    same("frame length", bytes.len(), total)?;
-    Ok(bytes)
-}
-
-/// The requester's end of one pending request, as `RequestClient::request` holds it.
-type Pending = tokio::sync::oneshot::Receiver<Result<(Value, SizeBranch), RequestError>>;
-
-fn pending_on(
-    client: &RequestClient,
-    request_id: RequestId,
-    link_id: LinkId,
-    path: &str,
-) -> Result<Pending, String> {
-    client
-        .insert_pending(request_id, link_id, path)
-        .map_err(|err| format!("insert_pending: {err:?}"))
 }
 
 fn list_check(name: &'static str, kind: Kind, check: Check) -> Vector {
@@ -2881,130 +2852,6 @@ fn a_rule_is_kept_when_known_read_as_unknown_otherwise_and_malformed_when_not_te
     )?;
     same("not text", rule_of(&Value::from(7)), None)?;
     same("nil", rule_of(&Value::Nil), None)
-}
-
-fn a_fetch_response_at_its_bound_is_delivered_and_one_byte_over_is_dropped() -> Result<(), String> {
-    block_on(async {
-        let client = RequestClient::new();
-        let link_id = LinkId::new_from_rand(OsRng);
-
-        let over_id = RequestId::from([0xa1u8; 16]);
-        let mut over = pending_on(&client, over_id, link_id, FETCH_PATH)?;
-        client.deliver(
-            link_id,
-            &frame_of(over_id, MAX_FETCH_RESPONSE_BYTES + 1)?,
-            SizeBranch::Resource,
-        );
-        ensure(
-            matches!(over.try_recv(), Err(TryRecvError::Empty)),
-            "one byte over the fetch bound was delivered or failed the request",
-        )?;
-
-        let at_id = RequestId::from([0xa2u8; 16]);
-        let at = pending_on(&client, at_id, link_id, FETCH_PATH)?;
-        client.deliver(
-            link_id,
-            &frame_of(at_id, MAX_FETCH_RESPONSE_BYTES)?,
-            SizeBranch::Resource,
-        );
-        let (value, branch) = at
-            .await
-            .map_err(|err| format!("the pending request was dropped: {err}"))?
-            .map_err(|err| format!("the response failed: {err:?}"))?;
-        same("branch", branch, SizeBranch::Resource)?;
-        same(
-            "payload",
-            value.as_slice().map(<[u8]>::len),
-            Some(MAX_FETCH_RESPONSE_BYTES - RESPONSE_FRAME_OVERHEAD),
-        )?;
-        same(
-            "bound",
-            MAX_FETCH_RESPONSE_BYTES,
-            MAX_FETCH_FILE_BYTES as usize + 4096,
-        )
-    })
-}
-
-fn the_bound_is_found_from_the_frame_prefix_before_the_frame_is_decoded() -> Result<(), String> {
-    install_log_collector();
-    block_on(async {
-        let client = RequestClient::new();
-        let link_id = LinkId::new_from_rand(OsRng);
-        let oversize_line = |len: usize, max: usize| {
-            format!(
-                "Dropped an oversize mesh response on link {} ({len} bytes, max {max})",
-                link_id.to_hex_string()
-            )
-        };
-
-        // One frame, one byte over the common bound: dropped for a pending `/status`,
-        // delivered for a pending `/fetch`.
-        let status_id = RequestId::from([0xb1u8; 16]);
-        let mut status = pending_on(&client, status_id, link_id, STATUS_PATH)?;
-        client.deliver(
-            link_id,
-            &frame_of(status_id, MAX_REQUEST_PAYLOAD_BYTES + 1)?,
-            SizeBranch::Resource,
-        );
-        ensure(
-            matches!(status.try_recv(), Err(TryRecvError::Empty)),
-            "a status response over the common bound was delivered or failed the request",
-        )?;
-        ensure(
-            debug_snapshot().contains(&oversize_line(
-                MAX_REQUEST_PAYLOAD_BYTES + 1,
-                MAX_REQUEST_PAYLOAD_BYTES,
-            )),
-            "the status drop was not logged against the common bound",
-        )?;
-        let fetch_id = RequestId::from([0xb2u8; 16]);
-        let fetch = pending_on(&client, fetch_id, link_id, FETCH_PATH)?;
-        client.deliver(
-            link_id,
-            &frame_of(fetch_id, MAX_REQUEST_PAYLOAD_BYTES + 1)?,
-            SizeBranch::Resource,
-        );
-        let (value, _) = fetch
-            .await
-            .map_err(|err| format!("the pending request was dropped: {err}"))?
-            .map_err(|err| format!("the response failed: {err:?}"))?;
-        same(
-            "fetch payload",
-            value.as_slice().map(<[u8]>::len),
-            Some(MAX_REQUEST_PAYLOAD_BYTES + 1 - RESPONSE_FRAME_OVERHEAD),
-        )?;
-
-        // No frame prefix: the coarse bound.
-        client.deliver(
-            link_id,
-            &vec![0xc0; MAX_FETCH_RESPONSE_BYTES + 1],
-            SizeBranch::Resource,
-        );
-        ensure(
-            debug_snapshot().contains(&oversize_line(
-                MAX_FETCH_RESPONSE_BYTES + 1,
-                MAX_FETCH_RESPONSE_BYTES,
-            )),
-            "bytes without a frame prefix were not judged under the coarse bound",
-        )?;
-
-        // A frame for an id nothing is pending on: the coarse bound, so one byte over the
-        // common bound reaches the decoder and fails to match.
-        let stray_id = RequestId::from([0xb3u8; 16]);
-        client.deliver(
-            link_id,
-            &frame_of(stray_id, MAX_REQUEST_PAYLOAD_BYTES + 1)?,
-            SizeBranch::Resource,
-        );
-        let unmatched = format!("Unmatched mesh response {stray_id}");
-        ensure(
-            debug_snapshot()
-                .iter()
-                .any(|line| line.contains(&unmatched)),
-            "a frame for no pending request was not judged under the coarse bound",
-        )?;
-        same("prefix", RESPONSE_FRAME_PREFIX, [0x92, 0xc4, 0x10])
-    })
 }
 
 fn the_inbox_stages_under_the_instance_and_peer_and_refuses_a_collision() -> Result<(), String> {
@@ -5499,16 +5346,6 @@ fn fetch_client_rows() -> Vec<Vector> {
                 bin(&hash),
             ),
             Ok(FetchReply::TooLarge { limit: 4096 }),
-        ),
-        client_check(
-            "fetch-response-at-its-bound-is-delivered-and-one-byte-over-is-dropped",
-            Boundary,
-            a_fetch_response_at_its_bound_is_delivered_and_one_byte_over_is_dropped,
-        ),
-        client_check(
-            "bound-is-found-from-the-frame-prefix-before-the-frame-is-decoded",
-            Valid,
-            the_bound_is_found_from_the_frame_prefix_before_the_frame_is_decoded,
         ),
         client_check(
             "inbox-stages-under-the-instance-and-peer-and-refuses-a-collision",
