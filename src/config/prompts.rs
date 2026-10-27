@@ -92,6 +92,7 @@ pub(in crate::config) const DEFAULT_SPAWN_INSTRUCTIONS: &str = indoc! {"
     | `agent__collect` | Blocking wait: wait for an agent to finish, return its output. |
     | `agent__list_available` | List all agent types you can spawn (name + description + declared variables). Use this to discover specialists and the `variables` they accept before calling `agent__spawn`. |
     | `agent__list_running` | List all subagents YOU have spawned, with their status. |
+    | `agent__list_sessions` | List this context's child sessions (resumable `session_id`s, effective status, run count), newest first, paginated with `page_size`/`cursor`. |
     | `agent__cancel` | Cancel a running agent by ID. |
     | `agent__task_create` | Create a task in the dependency-aware task queue. Optional `variables` (string map) is passed to the auto-dispatched agent. |
     | `agent__task_list` | List all tasks and their status/dependencies. |

@@ -25,6 +25,10 @@ use uuid::Uuid;
 /// listing can show what each child was asked without loading its session.
 pub(crate) const PROMPT_HEAD_CHARS: usize = 200;
 
+/// How many runs a child's sidecar remembers; the first spawn is run 0
+/// and every resume adds one, dropping the oldest past this many.
+const CHILD_RUN_HISTORY: usize = 50;
+
 const META_SUFFIX: &str = ".meta.yaml";
 
 /// Sibling of `root.yaml` whose kernel lock serialises every
@@ -934,7 +938,25 @@ pub(crate) enum EffectiveStatus {
     Crashed,
 }
 
-/// Sidecar describing one child session.
+/// One run of a child session: its first spawn or a later resume, each
+/// under its own agent id and process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ChildRun {
+    pub agent_id: String,
+    pub pid: u32,
+    pub pid_start: u64,
+    pub started_at: DateTime<Utc>,
+    #[serde(default)]
+    pub finished_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub status: Option<ChildStatus>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Sidecar describing one child session. The top-level status, agent id
+/// and process stamp mirror the last entry of `runs`; sidecars written
+/// before runs were recorded load with an empty ring.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ChildMeta {
     #[serde(default = "default_version")]
@@ -957,6 +979,8 @@ pub(crate) struct ChildMeta {
     pub task_id: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
+    #[serde(default)]
+    pub runs: Vec<ChildRun>,
 }
 
 impl ChildMeta {
@@ -1019,6 +1043,38 @@ impl ChildMeta {
             prompt_head: prompt_head(prompt),
             task_id,
             error: None,
+            runs: vec![ChildRun {
+                agent_id: agent_id.into(),
+                pid: stamp.pid,
+                pid_start: stamp.start,
+                started_at: now,
+                finished_at: None,
+                status: None,
+                error: None,
+            }],
+        }
+    }
+
+    /// Marks the child running again under `agent_id` and `stamp` for a
+    /// resume, opening a new run.
+    pub(crate) fn restamp(&mut self, stamp: ProcessStamp, agent_id: &str, now: DateTime<Utc>) {
+        self.status = ChildStatus::Running;
+        self.agent_id = agent_id.to_string();
+        self.pid = stamp.pid;
+        self.pid_start = stamp.start;
+        self.updated_at = now;
+        self.error = None;
+        self.runs.push(ChildRun {
+            agent_id: agent_id.to_string(),
+            pid: stamp.pid,
+            pid_start: stamp.start,
+            started_at: now,
+            finished_at: None,
+            status: None,
+            error: None,
+        });
+        if self.runs.len() > CHILD_RUN_HISTORY {
+            self.runs.drain(..self.runs.len() - CHILD_RUN_HISTORY);
         }
     }
 
@@ -1033,6 +1089,11 @@ impl ChildMeta {
         error: Option<String>,
     ) {
         self.status = status;
+        if let Some(run) = self.runs.last_mut() {
+            run.finished_at = Some(now);
+            run.status = Some(status);
+            run.error = error.clone();
+        }
         self.error = error;
         self.updated_at = now;
     }

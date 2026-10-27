@@ -45,6 +45,12 @@ pub const PENDING_TASKS_GUARDRAIL_MAX: u32 = 3;
 
 pub const PARENT_ALIAS: &str = "parent";
 
+/// Rows per page of `agent__list_sessions` when the caller names none.
+const LIST_SESSIONS_PAGE_SIZE: usize = 20;
+
+/// Most rows one page of `agent__list_sessions` returns; larger requests clamp.
+const LIST_SESSIONS_PAGE_CAP: usize = 100;
+
 /// Heading of the roster section a teammate's instructions end with; the
 /// strip in `Agent::interpolated_instructions` anchors on it.
 pub(crate) const TEAMMATE_ROSTER_HEADING: &str = "## Teammate roster";
@@ -439,6 +445,38 @@ pub fn agent_function_declarations() -> Vec<FunctionDeclaration> {
             agent: false,
         },
         FunctionDeclaration {
+            name: format!("{AGENT_FUNCTION_PREFIX}list_sessions"),
+            description: "List the child sessions recorded under this context, newest first, whether or not the \
+                          child is still running. Each row carries the resumable `session_id` (pass it to \
+                          `agent__spawn`), the agent, its effective status (`running`, `completed`, `failed`, \
+                          `cancelled` or `crashed`), timestamps, the head of its prompt and how many runs it has \
+                          had. Page with `page_size` and `cursor`; `next_cursor` is null on the last page. For the \
+                          agents the supervisor is tracking right now, use `agent__list_running`.".to_string(),
+            parameters: JsonSchema {
+                type_value: Some("object".to_string()),
+                properties: Some(IndexMap::from([
+                    (
+                        "page_size".to_string(),
+                        JsonSchema {
+                            type_value: Some("integer".to_string()),
+                            description: Some(format!("Rows per page (default {LIST_SESSIONS_PAGE_SIZE}, at most {LIST_SESSIONS_PAGE_CAP})")),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "cursor".to_string(),
+                        JsonSchema {
+                            type_value: Some("string".to_string()),
+                            description: Some("The `next_cursor` of the previous page: the `session_id` to continue after".into()),
+                            ..Default::default()
+                        },
+                    ),
+                ])),
+                ..Default::default()
+            },
+            agent: false,
+        },
+        FunctionDeclaration {
             name: format!("{AGENT_FUNCTION_PREFIX}list_available"),
             description: "List all agent types installed and available to spawn (name + description + declared \
                           variables). Use this to discover what specialists exist before calling `agent__spawn` — \
@@ -644,6 +682,7 @@ pub async fn handle_agent_tool(
         "check" => handle_check(ctx, args).await,
         "collect" => handle_collect(ctx, args).await,
         "list_running" => handle_list_running(ctx),
+        "list_sessions" => handle_list_sessions(ctx, args),
         "list_available" => handle_list_available(ctx),
         "cancel" => handle_cancel(ctx, args).await,
         "send_message" => handle_send_message(ctx, args),
@@ -1678,13 +1717,7 @@ async fn resume_child_session(
         }
         let saved_bytes = std::fs::read_to_string(&sidecar)
             .with_context(|| format!("Failed to read {}", sidecar.display()))?;
-        let stamp = ProcessStamp::current();
-        meta.status = ChildStatus::Running;
-        meta.agent_id = agent_id.to_string();
-        meta.pid = stamp.pid;
-        meta.pid_start = stamp.start;
-        meta.updated_at = Utc::now();
-        meta.error = None;
+        meta.restamp(ProcessStamp::current(), agent_id, Utc::now());
         root.save_child_meta(&meta)?;
         saved_bytes
     };
@@ -2516,6 +2549,105 @@ fn handle_list_running(ctx: &mut RequestContext) -> Result<Value> {
     }
 
     Ok(result)
+}
+
+fn effective_status_word(status: EffectiveStatus) -> &'static str {
+    match status {
+        EffectiveStatus::Running => "running",
+        EffectiveStatus::Completed => "completed",
+        EffectiveStatus::Failed => "failed",
+        EffectiveStatus::Cancelled => "cancelled",
+        EffectiveStatus::Crashed => "crashed",
+    }
+}
+
+fn empty_sessions_page(note: &str) -> Value {
+    json!({
+        "sessions": [],
+        "total": 0,
+        "next_cursor": Value::Null,
+        "note": note,
+    })
+}
+
+/// Lists the sidecars under this context's child session root without
+/// creating the root: a context that has not spawned yet and has no saved
+/// session has nothing to list, and listing must not give it a uid.
+fn handle_list_sessions(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
+    let page_size = match args.get("page_size") {
+        None | Some(Value::Null) => LIST_SESSIONS_PAGE_SIZE,
+        Some(value) => {
+            let requested = value
+                .as_u64()
+                .filter(|n| *n >= 1)
+                .ok_or_else(|| anyhow!("'page_size' must be a whole number of at least 1"))?;
+            usize::try_from(requested)
+                .unwrap_or(LIST_SESSIONS_PAGE_CAP)
+                .min(LIST_SESSIONS_PAGE_CAP)
+        }
+    };
+    let cursor = match args.get("cursor") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(cursor)) => Some(cursor.as_str()),
+        Some(_) => bail!("'cursor' must be a session id string"),
+    };
+
+    if !child_sessions_enabled(None, ctx.app.config.as_ref()) {
+        return Ok(empty_sessions_page(
+            "Child sessions are off (`child_sessions: false`), so nothing is recorded.",
+        ));
+    }
+    let root = match ctx.child_session_root.clone() {
+        Some(root) => root,
+        None => match ctx.session.as_ref().and_then(|session| session.uid()) {
+            Some(uid) => Arc::new(ChildSessionRoot::Uid(uid)),
+            None => {
+                return Ok(empty_sessions_page(
+                    "No child sessions yet: this context has no saved session and has not spawned a child.",
+                ));
+            }
+        },
+    };
+
+    let mut children = root.list_children()?;
+    children.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
+    let total = children.len();
+    let start = match cursor {
+        None => 0,
+        Some(cursor) => children
+            .iter()
+            .position(|meta| meta.session_id == cursor)
+            .map(|at| at + 1)
+            .ok_or_else(|| anyhow!("no child session '{cursor}' to continue after"))?,
+    };
+    let page = &children[start..(start + page_size).min(total)];
+    let sessions: Vec<Value> = page
+        .iter()
+        .map(|meta| {
+            json!({
+                "session_id": meta.session_id,
+                "agent": meta.agent,
+                "status": effective_status_word(meta.effective_status()),
+                "created_at": meta.created_at.to_rfc3339(),
+                "updated_at": meta.updated_at.to_rfc3339(),
+                "prompt_head": meta.prompt_head,
+                "runs": meta.runs.len(),
+            })
+        })
+        .collect();
+    let next_cursor = match page.last() {
+        Some(last) if start + page.len() < total => json!(last.session_id),
+        _ => Value::Null,
+    };
+    Ok(json!({
+        "sessions": sessions,
+        "total": total,
+        "next_cursor": next_cursor,
+    }))
 }
 
 fn variables_json(vars: &[AgentVariable]) -> Option<Value> {
