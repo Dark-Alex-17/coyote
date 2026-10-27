@@ -100,6 +100,8 @@ pub(crate) struct LibraryHandler {
     handler_timeout: Duration,
     #[cfg(test)]
     admitted: AtomicUsize,
+    #[cfg(all(test, unix))]
+    drained: AtomicUsize,
 }
 
 impl LibraryHandler {
@@ -111,6 +113,8 @@ impl LibraryHandler {
             handler_timeout: HANDLER_TIMEOUT,
             #[cfg(test)]
             admitted: AtomicUsize::new(0),
+            #[cfg(all(test, unix))]
+            drained: AtomicUsize::new(0),
         }
     }
 
@@ -133,6 +137,12 @@ impl LibraryHandler {
         self.admitted.load(Ordering::SeqCst)
     }
 
+    /// How many times `drained` resolved: how often every slot was seen free.
+    #[cfg(all(test, unix))]
+    pub(crate) fn drained_count(&self) -> usize {
+        self.drained.load(Ordering::SeqCst)
+    }
+
     #[cfg(all(test, unix))]
     pub(crate) fn available_permits(&self) -> usize {
         self.permits.available_permits()
@@ -149,6 +159,8 @@ impl LibraryHandler {
                 .await
                 .expect("the handler semaphore is never closed"),
         );
+        #[cfg(all(test, unix))]
+        self.drained.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Runs Coyote's handler under one permit and maps its reply onto the library's.

@@ -597,6 +597,7 @@ pub(crate) mod network {
     use crate::mesh::envoy_sessions::{EnvoyRole, EnvoyTurn, RememberedOf};
     use crate::mesh::events::{MeshHookSink, MeshHooks, RecordingHookSink};
     use crate::mesh::fetch::{FILE_FETCH_REQUEST_TIMEOUT, FetchError, Fetched, ListedFile};
+    use crate::mesh::identity::load_or_mint_identity;
     use crate::mesh::idle::{IdleNotify, IdleSink, Origin};
     use crate::mesh::knock::{
         ChannelKnockSink, KNOCK_QUEUE_CAPACITY, KnockError, KnockFallback, KnockGate, KnockIntro,
@@ -611,7 +612,8 @@ pub(crate) mod network {
         received_reply, to_request_body,
     };
     use crate::mesh::node::{
-        FullEnvoy, KnockOptions, MeshRuntime, MeshSlot, NodeOptions, RecordingEnvoy, SHUTDOWN_GRACE,
+        DRAINED_ON_ABANDON, FullEnvoy, KnockOptions, MeshRuntime, MeshSlot, NodeOptions,
+        RecordingEnvoy, SHUTDOWN_GRACE, fail_first_announce_of,
     };
     use crate::mesh::notify::Source;
     use crate::mesh::peers::{PEER_TTL, PeerSighting, PeerTable};
@@ -646,7 +648,9 @@ pub(crate) mod network {
     use rns_transport::hash::{AddressHash, Hash};
     use rns_transport::identity::Identity;
     use rns_transport::identity::PrivateIdentity as TransportIdentity;
-    use rns_transport::identity_bridge::{to_core_identity, to_core_private_identity};
+    use rns_transport::identity_bridge::{
+        to_core_identity, to_core_private_identity, to_transport_private_identity,
+    };
     use rns_transport::iface::InterfaceSharedConfig;
     use rns_transport::iface::tcp_client::TcpClient;
     use rns_transport::iface::tcp_server::TcpServer;
@@ -4814,6 +4818,67 @@ pub(crate) mod network {
             !identity_path.exists(),
             "a refused start must not mint an identity"
         );
+        relay.abort();
+    }
+
+    /// A start whose first announce fails has already put its handlers on a registered
+    /// destination, so unwinding it waits for them the way a stop does before the instance
+    /// and identity locks go, and leaves nothing behind that a second start trips over.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_start_whose_first_announce_fails_drains_its_handlers_and_releases_its_locks() {
+        let (addr, relay, _) = loopback_relay().await;
+        let tmp = TempDir::new("request-runtime-announce-failed");
+        let paths = mesh_paths(&tmp);
+        let mut session = Session::default();
+        let instance_id = session.ensure_mesh_instance_id().to_string();
+        // The identity is minted ahead of the start so the destination it will register
+        // is known, which is what the announce fault is keyed by.
+        let identity =
+            to_transport_private_identity(&load_or_mint_identity(&paths.identity_path).unwrap());
+        let hash = SingleInputDestination::new(identity, session_destination_name(&instance_id))
+            .desc
+            .address_hash;
+        fail_first_announce_of(hash);
+        let drained_before = DRAINED_ON_ABANDON.load(Ordering::SeqCst);
+
+        let Err(err) = MeshRuntime::start(
+            &private_config(addr.port()),
+            true,
+            &mut session,
+            paths,
+            NodeOptions::default(),
+        )
+        .await
+        else {
+            panic!("a failed first announce must refuse the start");
+        };
+
+        let text = format!("{err:#}");
+        assert!(
+            text.contains(&format!(
+                "The mesh announce for destination {} failed for the test",
+                hash.to_hex_string()
+            )),
+            "the refusal must be the announce's: {text}"
+        );
+        assert_eq!(
+            DRAINED_ON_ABANDON.load(Ordering::SeqCst),
+            drained_before + 1,
+            "the abandoned start must wait for its request handlers"
+        );
+
+        let node = MeshRuntime::start(
+            &private_config(addr.port()),
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            NodeOptions::default(),
+        )
+        .await
+        .expect("the abandoned start must release the instance and identity locks");
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(node).unwrap();
+        assert!(slot.stop().await.unwrap());
         relay.abort();
     }
 

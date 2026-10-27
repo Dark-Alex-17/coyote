@@ -601,7 +601,7 @@ impl MeshRuntime {
             .iter()
             .any(|status| status.state == InterfaceState::Connected)
         {
-            abandon_start(transport, joined).await;
+            abandon_start(transport, joined, None).await;
             // `validate` refused an empty list above, so every plan failed and the first
             // failure is the first plan.
             let mut text = failures[0].clone();
@@ -628,7 +628,7 @@ impl MeshRuntime {
         {
             Ok(registered) => registered,
             Err(err) => {
-                abandon_start(transport, joined).await;
+                abandon_start(transport, joined, None).await;
                 return Err(err.context(format!(
                     "The mesh node's destination could not be registered within {}s",
                     SHUTDOWN_GRACE.as_secs()
@@ -646,11 +646,11 @@ impl MeshRuntime {
             {
                 Ok(Ok(sent_at)) => last_announce = Some(sent_at),
                 Ok(Err(err)) => {
-                    abandon_start(transport, joined).await;
+                    abandon_start(transport, joined, Some(&request_handler)).await;
                     return Err(err);
                 }
                 Err(_) => {
-                    abandon_start(transport, joined).await;
+                    abandon_start(transport, joined, Some(&request_handler)).await;
                     bail!(
                         "The mesh node's first announce for destination {} was not sent within {}s",
                         hash.to_hex_string(),
@@ -1586,15 +1586,7 @@ impl MeshRuntime {
             );
         }
         drop(transport);
-        if timeout_at(deadline, self.request_handler.drained())
-            .await
-            .is_err()
-        {
-            warn!(
-                "Mesh request handlers did not stop within {}s; the node releases its locks with them still running",
-                SHUTDOWN_GRACE.as_secs()
-            );
-        }
+        drain_request_handlers(&self.request_handler, deadline).await;
         state.lock = None;
         *self.identity_lock.lock() = None;
         if let Err(err) = self.peers.persist_if_dirty() {
@@ -1709,6 +1701,17 @@ async fn announce_destination(
     app_data: &[u8],
     last_announce_at: &ArcSwapOption<SystemTime>,
 ) -> Result<Instant> {
+    #[cfg(all(test, unix))]
+    if FAIL_FIRST_ANNOUNCE_OF
+        .lock()
+        .take_if(|failing| failing == hash)
+        .is_some()
+    {
+        bail!(
+            "The mesh announce for destination {} failed for the test",
+            hash.to_hex_string()
+        );
+    }
     transport
         .try_send_announce(dest, Some(app_data))
         .await
@@ -1726,12 +1729,57 @@ async fn announce_destination(
     Ok(Instant::now())
 }
 
-/// Unwinds a start that failed once the transport existed: the joined interfaces are stopped
-/// and the transport goes with them, which cancels its own tasks.
-async fn abandon_start(transport: Arc<Transport>, joined: Vec<JoinedInterface>) {
+/// The destination whose next announce fails instead of being built, consumed by that
+/// announce. Keyed by destination so a start under test cannot fail another test's
+/// announce in the same process.
+#[cfg(all(test, unix))]
+static FAIL_FIRST_ANNOUNCE_OF: parking_lot::Mutex<Option<AddressHash>> =
+    parking_lot::Mutex::new(None);
+
+/// Makes the first announce of destination `hash` fail; the next one is sent as usual.
+#[cfg(all(test, unix))]
+pub(crate) fn fail_first_announce_of(hash: AddressHash) {
+    *FAIL_FIRST_ANNOUNCE_OF.lock() = Some(hash);
+}
+
+/// How many abandoned starts saw their request handlers drained before the grace window
+/// ran out, summed over the process. A start's handler is fresh, so its own drain count
+/// is 0 or 1 when the start is abandoned.
+#[cfg(all(test, unix))]
+pub(crate) static DRAINED_ON_ABANDON: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Unwinds a start that failed once the transport existed: the joined interfaces are
+/// stopped, the transport goes with them, which cancels its own tasks and aborts the
+/// request handlers of a destination it already held, and those handlers are waited for
+/// under the same deadline before the caller releases the locks they may still touch.
+/// `request_handler` is `None` while no destination has been registered.
+async fn abandon_start(
+    transport: Arc<Transport>,
+    joined: Vec<JoinedInterface>,
+    request_handler: Option<&Arc<LibraryHandler>>,
+) {
     let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
     for iface in joined {
         stop_interface(&transport, iface, deadline).await;
+    }
+    drop(transport);
+    if let Some(handler) = request_handler {
+        drain_request_handlers(handler, deadline).await;
+        #[cfg(all(test, unix))]
+        DRAINED_ON_ABANDON.fetch_add(handler.drained_count(), Ordering::SeqCst);
+    }
+}
+
+/// Waits until no request handler the transport aborted is still running, giving up at
+/// `deadline` with a warning: past it the caller releases what a handler's drop may still
+/// touch.
+async fn drain_request_handlers(handler: &LibraryHandler, deadline: tokio::time::Instant) {
+    if timeout_at(deadline, handler.drained()).await.is_err() {
+        warn!(
+            "Mesh request handlers did not stop within {}s; the node releases its locks with them still running",
+            SHUTDOWN_GRACE.as_secs()
+        );
     }
 }
 
