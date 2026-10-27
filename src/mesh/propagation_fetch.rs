@@ -2979,7 +2979,7 @@ mod tests {
         use crate::config::Session;
         use crate::mesh::mesh_cache_dir;
         use crate::mesh::node::{MeshRuntime, MeshSlot, NodeOptions};
-        use crate::mesh::request::network::request_sent_as;
+        use crate::mesh::request::network::{request_sent_as, request_went_as};
         use crate::mesh::request::{NAME_HASH_LEN, SizeBranch};
         use crate::mesh::test_support::{
             Connector, FakeNode, INTEROP_TIMEOUT, LEGACY_LINK_MTU, POLL, mesh_paths,
@@ -3151,6 +3151,7 @@ mod tests {
                 Value::Array(vec![]),
             ]);
 
+            let mut resources = fetcher.connector.transport.resource_events();
             let report = fetcher.fetch().await.unwrap();
 
             assert_eq!(
@@ -3185,7 +3186,13 @@ mod tests {
             );
             assert_eq!(&round3[..5], &[0x92, 0xc0, 0x92, 0xc4, 0x20]);
             // Every round's request fits one packet at the legacy MTU, however large the
-            // reply to it is.
+            // reply to it is: the library raised no sender-side resource event across the
+            // three rounds, and every round's log line says so too.
+            assert_eq!(
+                request_went_as(&mut resources),
+                SizeBranch::Packet,
+                "no round of the fetch went out as a resource"
+            );
             for round in &seen {
                 assert!(request_sent_as(
                     round.request_id,

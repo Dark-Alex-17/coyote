@@ -406,8 +406,8 @@ mod loopback {
     use crate::mesh::request::network::{
         REQUEST_FRAME_OVERHEAD, Recorder, Requester, Responder, SHORT_REQUEST_TIMEOUT, Script,
         Stall, hanging_request, library_refused_oversize_request, link_deadline, pair,
-        request_body_of_encoded_len, request_on, request_sent_as, response_payloads, short_options,
-        timed_out, timed_out_slow_request,
+        request_body_of_encoded_len, request_on, request_sent_as, request_went_as,
+        response_payloads, short_options, timed_out, timed_out_slow_request,
     };
     use crate::mesh::request::{
         DEFAULT_REQUEST_TIMEOUT, MAX_CONCURRENT_INBOUND_REQUESTS, MAX_REQUEST_PAYLOAD_BYTES,
@@ -598,12 +598,18 @@ mod loopback {
         let pair = echo_pair().await;
         let target = len.target(pair.mdu);
         let body = request_body_of_encoded_len(pair.requester.origin, target);
+        let mut resources = pair.requester.transport.resource_events();
         let outcome = pair
             .requester
             .request(&pair.desc, ECHO_PATH, body.clone())
             .await
             .unwrap();
         assert_eq!(outcome, body, "a {target}-byte request frame echoes");
+        assert_eq!(
+            request_went_as(&mut resources),
+            expected,
+            "the library sends a {target}-byte request frame as a {expected:?}"
+        );
         assert!(
             request_sent_as(pair.recorder.last().request_id, ECHO_PATH, expected),
             "a {target}-byte request frame goes as a {expected:?}"

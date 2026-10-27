@@ -1248,6 +1248,33 @@ pub(crate) mod network {
         payloads
     }
 
+    /// Which way the library sent the one request made since `events` was subscribed, as
+    /// the library itself reports it: a request that travels as a Resource ends in one
+    /// of the sender-side resource events on the requester's transport, a request that
+    /// fits a packet raises none. Inbound resource events (a response arriving as a
+    /// Resource) are not sender-side and do not count.
+    pub(crate) fn request_went_as(events: &mut broadcast::Receiver<ResourceEvent>) -> SizeBranch {
+        let mut outbound = false;
+        loop {
+            match events.try_recv() {
+                Ok(event) => match event.kind {
+                    ResourceEventKind::OutboundComplete
+                    | ResourceEventKind::OutboundFailed
+                    | ResourceEventKind::OutboundRejected { .. }
+                    | ResourceEventKind::OutboundCancelled => outbound = true,
+                    _ => {}
+                },
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+        if outbound {
+            SizeBranch::Resource
+        } else {
+            SizeBranch::Packet
+        }
+    }
+
     pub(crate) fn assert_debug_logged(needle: &str) {
         let debugs = debug_snapshot();
         assert!(
@@ -1672,10 +1699,12 @@ pub(crate) mod network {
             (mdu, SizeBranch::Packet),
             (mdu + 1, SizeBranch::Resource),
         ];
-        // The responder's handler sees no trace of which way a request travelled; the
-        // requester's own log line is the record.
+        // The responder's handler sees no trace of which way a request travelled. The
+        // library's sender-side resource events are the record of what it did, and the
+        // requester's log line has to agree with them.
         for (target, expected) in matrix {
             let body = request_body_of_encoded_len(requester.origin, target);
+            let mut resources = requester.transport.resource_events();
             let reply = requester
                 .request(&desc, "/echo", body.clone())
                 .await
@@ -1683,6 +1712,11 @@ pub(crate) mod network {
             assert_eq!(reply, body, "a {target}-byte request frame echoes");
             let seen = recorder.last();
             assert_eq!(seen.path_hash, PathHash::of("/echo"));
+            assert_eq!(
+                request_went_as(&mut resources),
+                expected,
+                "the library sends a {target}-byte request frame as a {expected:?}"
+            );
             assert!(
                 request_sent_as(seen.request_id, "/echo", expected),
                 "a {target}-byte request frame goes as a {expected:?}"
@@ -1691,8 +1725,14 @@ pub(crate) mod network {
         for (target, _) in matrix {
             let body = response_body_of_encoded_len(target);
             recorder.queue(Script::Reply(Reply::Value(body.clone())));
+            let mut resources = requester.transport.resource_events();
             let reply = requester.request(&desc, "/echo", Value::Nil).await.unwrap();
             assert_eq!(reply, body, "a {target}-byte response frame");
+            assert_eq!(
+                request_went_as(&mut resources),
+                SizeBranch::Packet,
+                "the library sends the Nil-bodied request as a packet whatever the response's size"
+            );
             assert!(
                 request_sent_as(recorder.last().request_id, "/echo", SizeBranch::Packet),
                 "the Nil-bodied request goes as a packet whatever the response's size"
@@ -1702,11 +1742,13 @@ pub(crate) mod network {
         let card = card();
         let card_len = RequestFrame::new("/card", card.clone()).encode().len();
         assert!(card_len > mdu, "the card frame is {card_len} bytes");
+        let mut resources = requester.transport.resource_events();
         let reply = requester
             .request(&desc, "/card", card.clone())
             .await
             .unwrap();
         assert_eq!(reply, card);
+        assert_eq!(request_went_as(&mut resources), SizeBranch::Resource);
         assert!(request_sent_as(
             recorder.last().request_id,
             "/card",
