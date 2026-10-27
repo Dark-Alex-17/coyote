@@ -97,6 +97,7 @@ initial_state:
   final_report: ''
   gate_feedback: ''
   gate_attempts: 0
+  gate_prior_report: ''
   parse_failure: ''
   refine_failure: ''
   aux_failure: ''
@@ -296,6 +297,8 @@ nodes:
       Linter output (extract the lines for your files):
       {{linter_notes}}
       {{extra_context}}
+
+      {{gate_prior_report}}
     max_attempts: 2
     state_updates:
       domain_report: '{{output}}'
@@ -348,6 +351,16 @@ nodes:
       A lane whose trigger does not match, whose agent name is empty, or whose agent
       fails: skip it and say why in `aux_note` (one line each). Never invent lane
       content; empty results are valid results.
+
+      **Reuse before re-spawn**: when the change facts' extra context carries a
+      `Prior aux context` block (a previous round's org-context / operational-history
+      notes for this same PR - history does not change between pushes), and a lane's
+      trigger fires on the SAME areas that block already covers, REUSE it: copy the
+      relevant content into that lane's notes, prefixed `(reused from prior round)`,
+      instead of spawning the agent. Spawn fresh when the block is absent, covers
+      different areas than the current triggers, or looks incomplete - when in doubt,
+      spawn. Never reuse to AVOID a lane the triggers demand; reuse only replaces the
+      fetch, not the lane.
     prompt: |
       Change facts:
       - files: {{changed_files}}

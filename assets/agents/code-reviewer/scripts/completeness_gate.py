@@ -48,6 +48,18 @@ def main():
                 {
                     "_next": "review_domain",
                     "gate_attempts": attempts + 1,
+                    # The rejection is a FORMAT violation; the rejected report is
+                    # the leader's own same-tree analysis. Hand it back so the
+                    # retry reuses it instead of re-reviewing the slice from
+                    # scratch (a full opus lane re-run to recover a header).
+                    "gate_prior_report": (
+                        "## YOUR PREVIOUS REPORT (rejected by the completeness gate "
+                        "for the missing sections named in MUST DO - it is your own "
+                        "analysis of this same diff. REUSE it: re-emit the full, "
+                        "corrected report; re-run ONLY checks that are genuinely "
+                        "absent below, and never invent content for a check you did "
+                        "not run.)\n\n" + report
+                    ),
                     "gate_feedback": (
                         "- COMPLETENESS GATE REJECTED your previous report — missing: "
                         + "; ".join(missing)
