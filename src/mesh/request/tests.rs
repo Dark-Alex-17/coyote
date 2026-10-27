@@ -369,7 +369,7 @@ fn no_access_is_named_at_exactly_one_site_outside_the_error_module() {
             .min()
             .unwrap_or(source.len());
         let production = &source[..end];
-        if name == "server.rs" {
+        if name == "handler.rs" {
             assert!(production.contains("code.to_wire()"));
         }
         if name == "node.rs" {
