@@ -103,12 +103,16 @@ Windows CI leg does.
   428-byte frame. Under `rmpv`'s default depth limit of 1024 that is deep enough to
   overflow a 2 MiB thread stack in a debug build and abort the process before the limit is
   reached, while a release build returns `depth limit exceeded` cleanly. `decode_whole` in
-  `src/mesh/request/frame.rs` reads with `MAX_REQUEST_NESTING_DEPTH` = 128. The deepest
+  `src/mesh/request/frame.rs` reads with `MAX_REQUEST_NESTING_DEPTH` = 128: that is the
+  budget a requester spends on the responses it reads and the one Coyote's test-side
+  decoder spends on the round trip of the request frames the requester builds. The deepest
   frame the spec delivers intact (envelope, body and `fields` nested to the sanitiser's
   `PEER_FIELDS_MAX_DEPTH` limit) spends about 25 of the 128; 62 nested one-element arrays
-  under `data` fit and a 63rd overruns it, so both request and response frames past it
-  fail to decode and a request earns silence. The `unpack_whole` helper in `oracles.rs`
-  reads with the same budget so the predicate agrees.
+  under `data` fit and a 63rd overruns it, so response frames past it fail to decode and
+  request frames past it fail that round trip. A responder's inbound request frames are
+  read by the library, whose own bound is 128 nested containers; the live tests in
+  `src/mesh/request/tests.rs` pin it. The `unpack_whole` helper in `oracles.rs` reads with
+  the same budget so the predicate agrees.
 
 The protocol defines no reserved or must-be-zero field in any structure
 (envelope, card, body, knock, announce, LXMF custom data), so the "nonzero reserved

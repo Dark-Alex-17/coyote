@@ -628,7 +628,7 @@ impl MeshRuntime {
         {
             Ok(registered) => registered,
             Err(err) => {
-                abandon_start(transport, joined, None).await;
+                abandon_start(transport, joined, Some(&request_handler)).await;
                 return Err(err.context(format!(
                     "The mesh node's destination could not be registered within {}s",
                     SHUTDOWN_GRACE.as_secs()
@@ -1551,8 +1551,9 @@ impl MeshRuntime {
     /// still winding down may settle a reply against files the locks guard. A settled
     /// resource reply's transfer confirmation runs on a detached task outside the handler
     /// slot, so the drain does not cover it; it only touches the settlement, whose store
-    /// has its own lock. The task joins share one grace window and the transport teardown
-    /// another.
+    /// has its own lock, and the same holds for the blocking drop of an unsent settlement,
+    /// which the slot leaves behind the same way. The task joins share one grace window
+    /// and the transport teardown another.
     async fn shutdown(&self) -> Result<()> {
         self.cancel.cancel();
         let tasks = std::mem::take(&mut *self.tasks.lock());
@@ -1726,7 +1727,7 @@ async fn announce_destination(
     last_announce_at: &ArcSwapOption<SystemTime>,
 ) -> Result<Instant> {
     #[cfg(all(test, unix))]
-    if FAIL_FIRST_ANNOUNCE_OF
+    if FAIL_NEXT_ANNOUNCE_OF
         .lock()
         .take_if(|failing| failing == hash)
         .is_some()
@@ -1753,17 +1754,18 @@ async fn announce_destination(
     Ok(Instant::now())
 }
 
-/// The destination whose next announce fails instead of being built, consumed by that
-/// announce. Keyed by destination so a start under test cannot fail another test's
-/// announce in the same process.
+/// The destination whose next announce, whichever path sends it, fails instead of being
+/// built; that announce consumes the entry. Keyed by destination so a start under test
+/// cannot fail another test's announce in the same process.
 #[cfg(all(test, unix))]
-static FAIL_FIRST_ANNOUNCE_OF: parking_lot::Mutex<Option<AddressHash>> =
+static FAIL_NEXT_ANNOUNCE_OF: parking_lot::Mutex<Option<AddressHash>> =
     parking_lot::Mutex::new(None);
 
-/// Makes the first announce of destination `hash` fail; the next one is sent as usual.
+/// Makes the next announce of destination `hash` fail; the one after it is sent as usual.
+/// Armed before a start, that is the start's first announce.
 #[cfg(all(test, unix))]
-pub(crate) fn fail_first_announce_of(hash: AddressHash) {
-    *FAIL_FIRST_ANNOUNCE_OF.lock() = Some(hash);
+pub(crate) fn fail_next_announce_of(hash: AddressHash) {
+    *FAIL_NEXT_ANNOUNCE_OF.lock() = Some(hash);
 }
 
 /// How many abandoned starts saw their request handlers drained before the grace window
@@ -1775,9 +1777,10 @@ pub(crate) static DRAINED_ON_ABANDON: std::sync::atomic::AtomicUsize =
 
 /// Unwinds a start that failed once the transport existed: the joined interfaces are
 /// stopped, the transport goes with them, which cancels its own tasks and aborts the
-/// request handlers of a destination it already held, and those handlers are waited for
-/// under the same deadline before the caller releases the locks they may still touch.
-/// `request_handler` is `None` while no destination has been registered.
+/// request handlers of any destination it came to hold, and those handlers are waited for
+/// under the same deadline before the caller releases the locks they may still touch. A
+/// handler nothing ran on drains at once, so every arm with a handler in hand passes it;
+/// `request_handler` is `None` only before one exists.
 async fn abandon_start(
     transport: Arc<Transport>,
     joined: Vec<JoinedInterface>,

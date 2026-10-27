@@ -617,7 +617,7 @@ pub(crate) mod network {
     };
     use crate::mesh::node::{
         DRAINED_ON_ABANDON, FullEnvoy, KnockOptions, MeshRuntime, MeshSlot, NodeOptions,
-        RecordingEnvoy, SHUTDOWN_GRACE, fail_first_announce_of,
+        RecordingEnvoy, SHUTDOWN_GRACE, fail_next_announce_of,
     };
     use crate::mesh::notify::Source;
     use crate::mesh::peers::{PEER_TTL, PeerSighting, PeerTable};
@@ -1617,17 +1617,8 @@ pub(crate) mod network {
             body: Value,
             options: RequestOptions,
         ) -> RequestOutcome {
-            self.client_b
-                .request(
-                    &self.responder.transport,
-                    &self.responder.identity,
-                    &self.a_desc,
-                    path,
-                    self.responder.envelope(body),
-                    options,
-                )
+            self.b_asks_destination(&self.a_desc, path, body, options)
                 .await
-                .unwrap()
         }
 
         /// Node B asks `path` of `desc`, a destination of node A's other than the one it
@@ -1737,6 +1728,10 @@ pub(crate) mod network {
                 "a {target}-byte response frame"
             );
             assert_eq!(outcome.value, body, "a {target}-byte response frame");
+            assert!(
+                request_sent_as(recorder.last().request_id, "/echo", SizeBranch::Packet),
+                "the Nil-bodied request goes as a packet whatever the response's size"
+            );
         }
 
         let card = card();
@@ -5144,7 +5139,7 @@ pub(crate) mod network {
         let hash = SingleInputDestination::new(identity, session_destination_name(&instance_id))
             .desc
             .address_hash;
-        fail_first_announce_of(hash);
+        fail_next_announce_of(hash);
         let drained_before = DRAINED_ON_ABANDON.load(Ordering::SeqCst);
 
         let Err(err) = MeshRuntime::start(
