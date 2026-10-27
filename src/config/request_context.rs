@@ -29406,6 +29406,72 @@ mod tests {
         );
     }
 
+    /// A report rejected for a missing section is handed back to the leader
+    /// once so the retry re-emits its own analysis instead of re-reviewing;
+    /// the second failure keeps the report under a banner.
+    #[test]
+    fn code_reviewer_completeness_gate_hands_the_rejected_report_back_once() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let report = "## Domain: x\n\n### Findings\nnone\n\nDOMAIN_REVIEW_COMPLETE\n";
+
+        let out = run_code_reviewer_script(
+            "completeness_gate.py",
+            &json!({"domain_report": report, "gate_attempts": 0}),
+        );
+        assert_eq!(out["_next"], "review_domain", "{out}");
+        assert_eq!(out["gate_attempts"], 1, "{out}");
+        assert!(
+            out["gate_prior_report"]
+                .as_str()
+                .is_some_and(|prior| !prior.is_empty() && prior.contains(report)),
+            "the rejected report must be handed back verbatim: {out}"
+        );
+        assert!(
+            out["gate_feedback"]
+                .as_str()
+                .is_some_and(|feedback| feedback.contains("Mandatory checks")),
+            "the feedback must name the missing section: {out}"
+        );
+
+        let out = run_code_reviewer_script(
+            "completeness_gate.py",
+            &json!({
+                "domain_report": report,
+                "gate_attempts": 1,
+                "domain_group": {"domain": "x"},
+            }),
+        );
+        let flagged = out["domain_report"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{out}"));
+        assert!(
+            flagged.starts_with("> ")
+                && flagged.contains("COMPLETENESS GATE")
+                && flagged.ends_with(report),
+            "the second failure keeps the report under a banner: {out}"
+        );
+        assert!(out.get("gate_prior_report").is_none(), "{out}");
+        assert!(out.get("_next").is_none(), "{out}");
+
+        let graph = read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/code-reviewer/graph.yaml"),
+        )
+        .unwrap();
+        for needle in [
+            "{{gate_prior_report}}",
+            "gate_prior_report: ''",
+            "gate_attempts: 0",
+        ] {
+            assert!(
+                graph.contains(needle),
+                "code-reviewer graph.yaml must carry {needle:?}"
+            );
+        }
+    }
+
     #[test]
     fn finding_verifier_verify_fault_normalizes_failure_text() {
         if !cmd_available("python3") {
