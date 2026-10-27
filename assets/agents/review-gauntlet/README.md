@@ -46,7 +46,9 @@ those rules are *structure*:
 
 - **Lane selection floor is deterministic** (`build_items.py`): code-review
   always runs; adversary runs when a spec/plan is present; security runs on
-  attack-surface signals (auth/deps/exec paths or diff content) or hardened
+  attack-surface signals (auth/deps/exec paths or diff content - the surface
+  patterns live once in `agents/.shared/diff_signals.py`, shared with any
+  downstream watch-round classifier; `signals.py` keeps an inline fallback) or hardened
   posture; probe runs when consumer-facing surface changed *and* a local-run
   recipe exists. The `select_lanes` LLM can only **widen** the set — a false
   flag never removes a rule-selected lane. `forced_lanes` from the caller

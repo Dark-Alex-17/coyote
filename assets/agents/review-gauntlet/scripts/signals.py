@@ -22,7 +22,9 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
+
 
 def load_state():
     if path := os.environ.get("GRAPH_STATE_FILE"):
@@ -85,42 +87,66 @@ def normalize_base(spec):
         return spec
 
 
-# Shared surface patterns: the primary diff and the re-review delta are
-# classified with the SAME rules, so "would the delta alone have selected
-# this lane" (build_items' narrowing test) is answered on the same evidence
-# basis the original selection used.
-DOCS_RE = r"\.(md|rst|txt|adoc)$"
-TESTS_RE = (
-    r"(^|/)tests?/|(^|/)testdata/|(^|/)__tests__/|(^|/)spec/"
-    r"|_test\.|\.test\.|(^|/)test_|_spec\.|\.spec\."
+# Shared surface patterns: the primary diff, the re-review delta, AND any
+# downstream watch-round delta are classified with the SAME rules, so
+# "would the delta alone have selected this lane" (build_items' narrowing
+# test) is answered on the same evidence basis the original selection used.
+# The one copy of the rules is agents/.shared/diff_signals.py; the inline
+# block below is the fallback for an install without the shared module and
+# must stay byte-identical to it.
+sys.path.insert(
+    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".shared")
 )
-# auth(?!or(?!i[sz])) admits auth/authn/authz/oauth/authoriz(e|ation) but not
-# "author". Deliberately wider than code-reviewer's touches_auth (token,
-# session, secret; tests and docs included).
-# Over-firing here is the safe direction: it only ADDS a lane.
-AUTH_PATH_RE = (
-    r"auth(?!or(?!i[sz]))|login|logout|token|session|permission|rbac|\bacl\b|credential|secret"
-)
-# Superset of code-reviewer facts.py's content vocabulary plus token/session.
-AUTH_ADDED_RE = (
-    r"auth(?!or(?!i[sz]))|password|token|secret|credential|jwt|session|bearer"
-    r"|permission|rbac|\bacl\b|csrf|saml|oidc|\bsso\b|\bmfa\b|\botp\b"
-)
-DEPS_RE = (
-    r"go\.(mod|sum)$|package(-lock)?\.json$|yarn\.lock$|pnpm-lock\.yaml$"
-    r"|Cargo\.(toml|lock)$|requirements[^/]*\.txt$|pyproject\.toml$"
-    r"|Gemfile(\.lock)?$|pom\.xml$|build\.gradle|composer\.(json|lock)$"
-)
-EXEC_RE = (
-    r"exec\.Command|subprocess|os/exec|Runtime\.getRuntime"
-    r"|shell_exec|\beval\(|\bsystem\(|child_process"
-)
-CONSUMER_RE = (
-    r"routes?|handlers?|\bapi\b|endpoints?|\bcmd/|\bcli\b|\.proto$"
-    r"|openapi|swagger|controllers?|graphql"
-)
-PROTO_RE = r"\.proto$|buf\.(yaml|gen\.yaml)$"
-MIGRATIONS_RE = r"migrations?/|\.sql$"
+try:
+    from diff_signals import classify as _classify  # noqa: E402
+except Exception:  # noqa: BLE001 - fall back to the inline copy
+    DOCS_RE = r"\.(md|rst|txt|adoc)$"
+    TESTS_RE = (
+        r"(^|/)tests?/|(^|/)testdata/|(^|/)__tests__/|(^|/)spec/"
+        r"|_test\.|\.test\.|(^|/)test_|_spec\.|\.spec\."
+    )
+    # auth(?!or) admits auth/authn/authz/oauth but not "author".
+    # Over-firing here is the safe direction: it only ADDS a lane.
+    AUTH_PATH_RE = (
+        r"auth(?!or)|login|logout|token|session|permission|rbac|\bacl\b|credential|secret"
+    )
+    AUTH_ADDED_RE = r"auth(?!or)|password|token|secret|credential|jwt|session"
+    DEPS_RE = (
+        r"go\.(mod|sum)$|package(-lock)?\.json$|yarn\.lock$|pnpm-lock\.yaml$"
+        r"|Cargo\.(toml|lock)$|requirements[^/]*\.txt$|pyproject\.toml$"
+        r"|Gemfile(\.lock)?$|pom\.xml$|build\.gradle|composer\.(json|lock)$"
+    )
+    EXEC_RE = (
+        r"exec\.Command|subprocess|os/exec|Runtime\.getRuntime"
+        r"|shell_exec|\beval\(|\bsystem\(|child_process"
+    )
+    CONSUMER_RE = (
+        r"routes?|handlers?|\bapi\b|endpoints?|\bcmd/|\bcli\b|\.proto$"
+        r"|openapi|swagger|controllers?|graphql"
+    )
+    PROTO_RE = r"\.proto$|buf\.(yaml|gen\.yaml)$"
+    MIGRATIONS_RE = r"migrations?/|\.sql$"
+
+    def _classify(files, added):
+        def any_path(pattern):
+            return any(re.search(pattern, f, re.I) for f in files)
+
+        return {
+            "files": list(files),
+            "touches_proto": any_path(PROTO_RE),
+            "touches_migrations": any_path(MIGRATIONS_RE),
+            "touches_auth": any_path(AUTH_PATH_RE)
+            or bool(re.search(AUTH_ADDED_RE, added, re.I)),
+            "touches_deps": any_path(DEPS_RE),
+            "touches_exec": bool(re.search(EXEC_RE, added)),
+            "consumer_surface": any_path(CONSUMER_RE),
+            "docs_only": bool(files)
+            and all(re.search(DOCS_RE, f, re.I) for f in files),
+            "tests_docs_only": bool(files)
+            and all(
+                re.search(DOCS_RE, f, re.I) or re.search(TESTS_RE, f, re.I) for f in files
+            ),
+        }
 
 
 def diff_signals(spec_):
@@ -140,26 +166,7 @@ def diff_signals(spec_):
     added = "\n".join(
         l for l in difftext.splitlines() if l.startswith("+") and not l.startswith("+++")
     )
-
-    def any_path(pattern):
-        return any(re.search(pattern, f, re.I) for f in files)
-
-    return {
-        "files": files,
-        "touches_proto": any_path(PROTO_RE),
-        "touches_migrations": any_path(MIGRATIONS_RE),
-        "touches_auth": any_path(AUTH_PATH_RE)
-        or bool(re.search(AUTH_ADDED_RE, added, re.I)),
-        "touches_deps": any_path(DEPS_RE),
-        "touches_exec": bool(re.search(EXEC_RE, added)),
-        "consumer_surface": any_path(CONSUMER_RE),
-        "docs_only": bool(files)
-        and all(re.search(DOCS_RE, f, re.I) for f in files),
-        "tests_docs_only": bool(files)
-        and all(
-            re.search(DOCS_RE, f, re.I) or re.search(TESTS_RE, f, re.I) for f in files
-        ),
-    }
+    return _classify(files, added)
 
 
 out = {"project_dir": proj, "diff_spec_resolved": spec}
