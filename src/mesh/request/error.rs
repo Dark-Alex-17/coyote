@@ -18,7 +18,9 @@ pub(crate) enum RequestError {
     LinkFailed(String),
     /// The link closed while the request was pending, or was gone by the time we replied.
     LinkClosed,
-    /// The encoded frame exceeds `MAX_REQUEST_PAYLOAD_BYTES` and was not sent at all.
+    /// The encoded request frame exceeds `MAX_REQUEST_PAYLOAD_BYTES` and was not sent at
+    /// all, or the peer's response exceeds the path's response cap and the transport
+    /// refused it before assembly.
     Oversize { len: usize, max: usize },
     /// Bytes that are not a well-formed request or response frame.
     Decode(String),

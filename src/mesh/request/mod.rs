@@ -1,7 +1,7 @@
-//! Request/response over Reticulum links: the framing RNS `Link.request` and
-//! `Link.handle_request` speak, the packet-or-resource size branches, request-id
-//! correlation, a handler seam for whatever answers requests, and the dispatcher that
-//! decides, from the trust list alone, who gets an answer at all.
+//! Request/response over Reticulum links: the envelope framing RNS `Link.request` and
+//! `Link.handle_request` speak, the link helpers over the library's request layer, a
+//! handler seam for whatever answers requests, and the dispatcher that decides, from the
+//! trust list alone, who gets an answer at all.
 
 mod dispatch;
 mod error;

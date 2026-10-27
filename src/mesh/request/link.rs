@@ -1,9 +1,7 @@
 use crate::mesh::protocol::VersionRefusal;
 use crate::mesh::request::dispatch::FETCH_PATH;
 use crate::mesh::request::error::{RefusalCode, RequestError};
-use crate::mesh::request::frame::{
-    Envelope, MAX_FETCH_RESPONSE_BYTES, MAX_REQUEST_PAYLOAD_BYTES, now_secs,
-};
+use crate::mesh::request::frame::{Envelope, MAX_FETCH_RESPONSE_BYTES, MAX_REQUEST_PAYLOAD_BYTES};
 use crate::mesh::request::short;
 
 use rmpv::Value;
@@ -11,8 +9,7 @@ use rns_transport::delivery::await_link_activation;
 use rns_transport::destination::DestinationDesc;
 use rns_transport::destination::link::Link;
 use rns_transport::destination::request::{
-    PathHash, RequestError as LibraryRequestError, RequestFrame as LibraryRequestFrame,
-    RequestOptions as LibraryRequestOptions,
+    RequestError as LibraryRequestError, RequestOptions as LibraryRequestOptions,
 };
 use rns_transport::error::RnsError;
 use rns_transport::identity::PrivateIdentity as TransportIdentity;
@@ -124,7 +121,9 @@ pub(crate) async fn request(
 ///
 /// The request is capped before anything touches the wire; the response cap is the
 /// library's, armed per path. Sending counts against `request_timeout` as much as waiting
-/// for the response does.
+/// for the response does. The library runs the same timeout on the receipt, but its clock
+/// pauses while a response Resource is being received, so the deadline here is the ceiling
+/// a peer that trickles its response meets.
 pub(crate) async fn request_on_link(
     transport: &Transport,
     link: &Arc<tokio::sync::Mutex<Link>>,
@@ -132,7 +131,9 @@ pub(crate) async fn request_on_link(
     data: Value,
     request_timeout: Duration,
 ) -> Result<Value, RequestError> {
-    let packed = LibraryRequestFrame::new(now_secs(), PathHash::of(path), data.clone()).encode();
+    let packed = Link::request_payload(path, data.clone())
+        .map_err(|err| RequestError::Send(format!("request frame: {err}")))?
+        .packed;
     if packed.len() > MAX_REQUEST_PAYLOAD_BYTES {
         return Err(RequestError::Oversize {
             len: packed.len(),
@@ -168,7 +169,7 @@ pub(crate) async fn request_on_link(
         },
         packed.len()
     );
-    let response = match receipt.response().await {
+    let response = match deadline.bound(path, receipt.response()).await? {
         Ok(response) => response,
         Err(LibraryRequestError::Timeout) => {
             return Err(RequestError::Timeout {
@@ -181,6 +182,8 @@ pub(crate) async fn request_on_link(
             return Err(RequestError::Send(err.to_string()));
         }
         Err(LibraryRequestError::Oversize) => {
+            // The library records the advertised size before it concludes `Oversize`; the
+            // fallback only ever names a count above the cap.
             return Err(RequestError::Oversize {
                 len: receipt.response_size().unwrap_or(max + 1),
                 max,

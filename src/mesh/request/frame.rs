@@ -11,6 +11,7 @@ use rns_transport::destination::{DestinationName, NAME_HASH_LENGTH};
 use rns_transport::hash::ADDRESS_HASH_SIZE;
 #[cfg(test)]
 use std::io::Cursor;
+#[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Frames above this are refused: outbound before anything touches the wire, inbound by the
@@ -245,7 +246,8 @@ impl Envelope {
     }
 }
 
-pub(super) fn now_secs() -> f64 {
+#[cfg(test)]
+fn now_secs() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs_f64())
