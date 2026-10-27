@@ -7,8 +7,11 @@
 //! scrubbed sandbox/provider env so host state cannot leak in.
 
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, process};
 
@@ -2622,4 +2625,321 @@ fn usage_probe_uncommenting_the_example_carry_block_loads_from_a_cold_start() {
             );
         }
     }
+}
+
+/// A loopback chat-completions server that answers every request with one
+/// fixed assistant message and keeps every request body it saw. It stands
+/// in for the model so a plain prompt can cross the route classifier in the
+/// real binary without a live provider; the end-only graph never asks for a
+/// second completion. One connection per request (`Connection: close`); a
+/// request asking for `stream: true` is answered as an event stream.
+struct StubModel {
+    port: u16,
+    requests: Arc<Mutex<Vec<String>>>,
+}
+
+impl StubModel {
+    fn answering(content: &str) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let requests: Arc<Mutex<Vec<String>>> = Arc::default();
+        let seen = Arc::clone(&requests);
+        let whole = serde_json::json!({
+            "id": "stub",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "stub-model",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": content },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+        })
+        .to_string();
+        let delta = serde_json::json!({
+            "id": "stub",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "stub-model",
+            "choices": [{
+                "index": 0,
+                "delta": { "role": "assistant", "content": content },
+                "finish_reason": "stop"
+            }]
+        })
+        .to_string();
+        let streamed = format!("data: {delta}\n\ndata: [DONE]\n\n");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut raw = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let (header_end, content_length) = loop {
+                    let Ok(n) = stream.read(&mut chunk) else {
+                        break (None, 0);
+                    };
+                    if n == 0 {
+                        break (None, 0);
+                    }
+                    raw.extend_from_slice(&chunk[..n]);
+                    if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&raw[..pos]).to_ascii_lowercase();
+                        let length = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        break (Some(pos + 4), length);
+                    }
+                };
+                let Some(header_end) = header_end else {
+                    continue;
+                };
+                while raw.len() < header_end + content_length {
+                    let Ok(n) = stream.read(&mut chunk) else {
+                        break;
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&chunk[..n]);
+                }
+                let body = String::from_utf8_lossy(&raw[header_end..]).into_owned();
+                seen.lock().unwrap().push(body);
+                let compact: String = raw[header_end..]
+                    .iter()
+                    .filter(|b| !b.is_ascii_whitespace())
+                    .map(|&b| b as char)
+                    .collect();
+                let (content_type, reply) = if compact.contains("\"stream\":true") {
+                    ("text/event-stream", &streamed)
+                } else {
+                    ("application/json", &whole)
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        Self { port, requests }
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+/// A live (non-dry-run) fixture whose only model is the stub: a graph agent
+/// with a session block whose end node prints `ran=<prompt>`, `save_session`
+/// on so the exit saves `s` without a prompt, and a `helper` role for the
+/// `.role <name> <text>` form.
+fn write_stub_model_fixture(dir: &Path, stub: &StubModel) {
+    write_fixture(dir, "session:\n  chat:\n    instructions: Answer.\n");
+    let vault_pass = dir.join("vault-pass");
+    fs::write(
+        dir.join("config.yaml"),
+        format!(
+            "model: stub:stub-model\n\
+             dry_run: false\n\
+             save_session: true\n\
+             vault_password_file: '{vault_pass}'\n\
+             clients:\n\
+             \x20 - type: openai\n\
+             \x20   name: stub\n\
+             \x20   auth: none\n\
+             \x20   api_key: 'unused'\n\
+             \x20   api_base: http://127.0.0.1:{port}/v1\n\
+             \x20   models:\n\
+             \x20     - name: stub-model\n\
+             \x20       max_input_tokens: 100000\n\
+             \x20       supports_function_calling: true\n\
+             save: false\n\
+             memory: false\n\
+             skills_enabled: true\n\
+             stream: false\n",
+            vault_pass = vault_pass.display(),
+            port = stub.port,
+        ),
+    )
+    .unwrap();
+    let agent_dir = dir.join("agents").join(AGENT);
+    fs::write(
+        agent_dir.join("graph.yaml"),
+        "name: echo-graph\n\
+         version: \"1.0\"\n\
+         initial_state: { said: \"\" }\n\
+         start: done\n\
+         nodes:\n\
+         \x20 done: { type: end, output: \"ran={{initial_prompt}}\" }\n\
+         session:\n\
+         \x20 chat:\n\
+         \x20   instructions: Answer.\n",
+    )
+    .unwrap();
+    fs::create_dir_all(dir.join("roles")).unwrap();
+    fs::write(dir.join("roles").join("helper.md"), "You are terse.\n").unwrap();
+}
+
+/// One REPL turn as a macro, then `.save session` so the headless macro
+/// arm (which saves nothing on its own) leaves `s.yaml` on disk for the
+/// test to read; a turn that recorded nothing still writes the file.
+fn run_macro_against_stub(dir: &Path, step: &str) -> Output {
+    fs::create_dir_all(dir.join("macros")).unwrap();
+    fs::write(
+        dir.join("macros/turn.yaml"),
+        format!("isolated: false\nsteps:\n  - {step}\n  - \".save session\"\n"),
+    )
+    .unwrap();
+    // Loopback must not be sent through a host proxy.
+    run_with_env(
+        dir,
+        &["-a", AGENT, "--session", "s", "--macro", "turn"],
+        &[
+            ("NO_PROXY", "127.0.0.1,localhost"),
+            ("no_proxy", "127.0.0.1,localhost"),
+        ],
+    )
+}
+
+/// A plain prompt on a graph agent with a session block crosses the route
+/// classifier (one model call, answered here by the stub with `run`), the
+/// graph runs, and the turn is recorded: `last_run` names the prompt and
+/// the output, and the exchange sits in `messages`. The `.role <name>
+/// <text>` form of the same prompt is detached from the session: it crosses
+/// the same classifier and runs the same graph, but records NOTHING - no
+/// `last_run`, no exchange - so the next turn on `s` has no earlier turn to
+/// read. Both halves run the real binary from a cold config dir.
+#[test]
+fn usage_probe_a_role_prefixed_prompt_runs_the_graph_unrecorded_while_a_plain_one_is_recorded() {
+    let stub = StubModel::answering("{\"decision\":\"run\"}");
+
+    // Plain prompt: attached, classified, run, recorded.
+    let dir = fresh_config_dir("routed-plain");
+    let _guard = TempDirGuard(dir.clone());
+    write_stub_model_fixture(&dir, &stub);
+    let plain = run_macro_against_stub(&dir, "\"hi there\"");
+    let plain_text = format!("{}\n{}", stderr_of(&plain), stdout_of(&plain));
+    assert!(
+        plain.status.success() && !plain_text.contains("panicked"),
+        "plain prompt: exit {:?}\n{plain_text}",
+        plain.status
+    );
+    assert!(
+        stdout_of(&plain).lines().any(|l| l == "ran=hi there"),
+        "the classifier routed the plain prompt to a run:\n{plain_text}"
+    );
+    let classifier_calls = stub.requests();
+    assert_eq!(
+        classifier_calls.len(),
+        1,
+        "one plain prompt costs exactly one model call (the classifier):\n{classifier_calls:#?}"
+    );
+    assert!(
+        classifier_calls[0].contains("New message: hi there")
+            && classifier_calls[0].contains("has_last_run: false"),
+        "the classifier saw the typed text and an empty session:\n{}",
+        classifier_calls[0]
+    );
+    let saved = dir
+        .join("agents")
+        .join(AGENT)
+        .join("sessions")
+        .join("s.yaml");
+    let yaml = fs::read_to_string(&saved)
+        .unwrap_or_else(|e| panic!("the session file was not written ({e}):\n{plain_text}"));
+    let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+    assert_eq!(
+        doc["last_run"]["prompt"].as_str(),
+        Some("hi there"),
+        "last_run.prompt is the bare typed prompt:\n{yaml}"
+    );
+    assert_eq!(
+        doc["last_run"]["output"].as_str(),
+        Some("ran=hi there"),
+        "last_run.output is the graph output:\n{yaml}"
+    );
+    let roles: Vec<&str> = doc["messages"]
+        .as_sequence()
+        .map(|m| m.iter().filter_map(|m| m["role"].as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        roles,
+        vec!["system", "user", "assistant"],
+        "the routed run stores the block's prompt row and one exchange:\n{yaml}"
+    );
+
+    // `.role helper <text>`: detached, classified, run, NOT recorded.
+    let dir = fresh_config_dir("routed-role");
+    let _guard = TempDirGuard(dir.clone());
+    write_stub_model_fixture(&dir, &stub);
+    let detached = run_macro_against_stub(&dir, "\".role helper hi there\"");
+    let detached_text = format!("{}\n{}", stderr_of(&detached), stdout_of(&detached));
+    assert!(
+        detached.status.success() && !detached_text.contains("panicked"),
+        "role-prefixed prompt: exit {:?}\n{detached_text}",
+        detached.status
+    );
+    assert!(
+        stdout_of(&detached).lines().any(|l| l == "ran=hi there"),
+        "the role-prefixed prompt still runs the graph:\n{detached_text}"
+    );
+    let calls = stub.requests();
+    assert_eq!(
+        calls.len(),
+        2,
+        "the detached prompt crossed the classifier too (one more model call):\n{calls:#?}"
+    );
+    assert!(
+        calls[1].contains("New message: hi there"),
+        "the classifier saw the role-prefixed text:\n{}",
+        calls[1]
+    );
+    let saved = dir
+        .join("agents")
+        .join(AGENT)
+        .join("sessions")
+        .join("s.yaml");
+    let yaml = fs::read_to_string(&saved)
+        .unwrap_or_else(|e| panic!("`.save session` wrote no file ({e}):\n{detached_text}"));
+    let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+    assert!(
+        doc.get("last_run").is_none_or(|run| run.is_null()),
+        "a detached run records no last_run:\n{yaml}"
+    );
+    assert!(
+        !yaml.contains("hi there"),
+        "a detached run stores no exchange:\n{yaml}"
+    );
+
+    // The next turn on `s` has nothing to read back.
+    let graph = dir.join("agents").join(AGENT).join("graph.yaml");
+    let text = fs::read_to_string(&graph).unwrap();
+    fs::write(
+        &graph,
+        text.replace(
+            "output: \"ran={{initial_prompt}}\"",
+            "output: \"prev=[{{previous_turns}}] now={{initial_prompt}}\"",
+        ),
+    )
+    .unwrap();
+    let next = run_macro_against_stub(&dir, "\".run later\"");
+    let next_text = format!("{}\n{}", stderr_of(&next), stdout_of(&next));
+    assert!(
+        next.status.success() && !next_text.contains("panicked"),
+        "next turn: exit {:?}\n{next_text}",
+        next.status
+    );
+    assert!(
+        stdout_of(&next).lines().any(|l| l == "prev=[] now=later"),
+        "nothing from the detached turn reaches previous_turns:\n{next_text}"
+    );
+    assert_eq!(
+        stub.requests().len(),
+        2,
+        "`.run` is forced and never asks the classifier"
+    );
 }
