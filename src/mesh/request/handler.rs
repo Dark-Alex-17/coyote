@@ -87,7 +87,8 @@ pub(crate) trait RequestHandler: Send + Sync {
 /// Coyote's `RequestHandler`. It bounds the handler (the slots and `HANDLER_TIMEOUT`),
 /// asks it whether to admit the request, and maps its reply onto the library's: a
 /// `Reply::Value` or `Reply::Code` is handed back for the library to send, while a
-/// `Reply::Settled` is sent here, since its producer must hear whether it went out.
+/// `Reply::Settled` is sent here, under the same slot, since its producer must hear
+/// whether it went out.
 ///
 /// The transport is held weakly: the destination owns this handler and the transport owns
 /// the destination, so a strong reference would keep the transport alive past its last
@@ -137,13 +138,28 @@ impl LibraryHandler {
         self.permits.available_permits()
     }
 
-    /// Runs Coyote's handler under one permit. `None` is a request the handler was never
-    /// entered for or answers nothing to.
+    /// Resolves once no request handler is running: every slot is free. The handlers
+    /// are aborted by the library when the transport goes, and their slots come back as
+    /// their futures are dropped, so a node waits on this before it releases what a
+    /// handler's drop may still touch. The semaphore is never closed.
+    pub(crate) async fn drained(&self) {
+        drop(
+            self.permits
+                .acquire_many(MAX_CONCURRENT_INBOUND_REQUESTS as u32)
+                .await
+                .expect("the handler semaphore is never closed"),
+        );
+    }
+
+    /// Runs Coyote's handler under one permit and maps its reply onto the library's.
+    /// `None` is a request the handler was never entered for, answers nothing to, or
+    /// whose settled reply was sent from here: that send is dispatched under the permit
+    /// too, so a slot is only free once nothing of the request is left to do.
     async fn reply(
         &self,
         permit: OwnedSemaphorePermit,
         request: LibraryInboundRequest,
-    ) -> Option<Reply> {
+    ) -> Option<RequestResponse> {
         let _permit = permit;
         let handler = self.handler.read().clone();
         let (link_id, request_id) = (request.link_id(), request.request_id());
@@ -159,14 +175,24 @@ impl LibraryHandler {
             path_hash: request.path_hash(),
             data: request.into_data(),
         };
-        match timeout(self.handler_timeout, handler.handle(inbound)).await {
-            Ok(reply) => Some(reply),
+        let reply = match timeout(self.handler_timeout, handler.handle(inbound)).await {
+            Ok(reply) => reply,
             Err(_) => {
                 warn!(
                     "Mesh request {request_id} on link {} was not handled within {:?}; sent nothing",
                     link_id.to_hex_string(),
                     self.handler_timeout
                 );
+                return None;
+            }
+        };
+        match reply {
+            Reply::Value(value) => Some(RequestResponse::Value(value)),
+            Reply::Code(code) => Some(RequestResponse::Value(code.to_wire())),
+            Reply::Silent => None,
+            Reply::Settled { value, settlement } => {
+                self.send_settled(link_id, request_id, value, settlement)
+                    .await;
                 None
             }
         }
@@ -175,14 +201,15 @@ impl LibraryHandler {
     /// Sends a settled reply the way the library sends its own: a packet when the frame
     /// fits the link MDU, a resource otherwise. The settlement is confirmed by the
     /// transfer outcome, which is awaited on a detached task: it is the transfer that is
-    /// waited for, not the handler, so neither the handler slot nor `HANDLER_TIMEOUT`
-    /// bounds it. The encoded frame is held to `MAX_FETCH_RESPONSE_BYTES`, the widest
-    /// bound any requester accepts, so a reply no peer could take is dropped before it
-    /// costs a transfer. A `Reply::Value` is not measured on this side: the library
-    /// encodes and sends it, and the requester's bound for the path drops what is over.
-    /// A link the peer has already closed is still found until the library sweeps it, so
-    /// the status is checked under the same lock the packet is built under; a settlement
-    /// is never confirmed for a packet the peer cannot read.
+    /// waited for, not the handler, so the handler slot covers dispatching the send and
+    /// neither it nor `HANDLER_TIMEOUT` bounds the transfer. The encoded frame is held to
+    /// `MAX_FETCH_RESPONSE_BYTES`, the widest bound any requester accepts, so a reply no
+    /// peer could take is dropped before it costs a transfer. A `Reply::Value` is not
+    /// measured on this side: the library encodes and sends it, and the requester's bound
+    /// for the path drops what is over. A link the peer has already closed is still found
+    /// until the library sweeps it, so the status is checked under the same lock the
+    /// packet is built under; a settlement is never confirmed for a packet the peer
+    /// cannot read.
     async fn send_settled(
         &self,
         link_id: LinkId,
@@ -310,7 +337,8 @@ fn drop_unsent(settlement: Box<dyn Settlement>) {
 
 impl LibraryRequestHandler for LibraryHandler {
     /// A request is dropped, never queued, when every slot is busy. The permit covers
-    /// admission and the handler; a settled reply's send runs after it is released.
+    /// admission, the handler and the dispatch of a settled reply's send; the transfer
+    /// that send may start runs after it is released.
     fn handle(
         &self,
         request: LibraryInboundRequest,
@@ -324,16 +352,7 @@ impl LibraryRequestHandler for LibraryHandler {
                 );
                 return None;
             };
-            match self.reply(permit, request).await? {
-                Reply::Value(value) => Some(RequestResponse::Value(value)),
-                Reply::Code(code) => Some(RequestResponse::Value(code.to_wire())),
-                Reply::Silent => None,
-                Reply::Settled { value, settlement } => {
-                    self.send_settled(link_id, request_id, value, settlement)
-                        .await;
-                    None
-                }
-            }
+            self.reply(permit, request).await
         })
     }
 }

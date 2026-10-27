@@ -2678,10 +2678,11 @@ pub(crate) mod network {
     /// A node serves through the library and asks through its own client. Its stop
     /// returns inside the grace window and fails its own in-flight request as a shutdown;
     /// the request it was still handling goes with the transport, whose dispatch worker
-    /// aborts its handler tasks, so the hung handler is dropped soon after rather than
-    /// left to its `HANDLER_TIMEOUT`.
+    /// aborts its handler tasks, and the stop waits for the hung handler to be gone, with
+    /// its slot back, before it releases the node's locks: a handler's drop never runs
+    /// against a lock another process may by then hold.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn mesh_runtime_requests_and_serves_and_stop_aborts_in_flight_requests() {
+    async fn mesh_runtime_requests_and_serves_and_stop_aborts_and_drains_in_flight_requests() {
         let recorder_b = Arc::new(Recorder::default());
         // A `MeshRuntime` joins with `TcpClient`'s default MTU, so the responder matches it.
         let responder = Responder::listen(recorder_b.clone(), TcpServer::DEFAULT_CLIENT_MTU).await;
@@ -2802,17 +2803,23 @@ pub(crate) mod network {
         })
         .await;
         let slot = Arc::new(MeshSlot::default());
-        slot.install(node_a).unwrap();
+        slot.install(node_a.clone()).unwrap();
 
         let stopping = Instant::now();
         assert!(slot.stop().await.unwrap());
         let stopped_in = stopping.elapsed();
 
         assert!(stopped_in < SHUTDOWN_GRACE, "stop took {stopped_in:?}");
-        wait_until("the stop to drop the hung handler", || {
-            recorder_a.abandoned_count() == 1
-        })
-        .await;
+        assert_eq!(
+            recorder_a.abandoned_count(),
+            1,
+            "the hung handler was dropped before stop returned"
+        );
+        assert_eq!(
+            node_a.free_request_handler_slots(),
+            MAX_CONCURRENT_INBOUND_REQUESTS,
+            "every handler slot is back once stop returns"
+        );
         let result = timeout(INTEROP_TIMEOUT, in_flight).await.unwrap().unwrap();
         assert_eq!(result.unwrap_err(), RequestError::Shutdown);
         cancel_b.cancel();

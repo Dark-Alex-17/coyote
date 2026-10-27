@@ -1355,6 +1355,12 @@ impl MeshRuntime {
         self.request_handler.set_handler(handler);
     }
 
+    /// Handler slots not in use; every one of them once `shutdown` has returned.
+    #[cfg(all(test, unix))]
+    pub(crate) fn free_request_handler_slots(&self) -> usize {
+        self.request_handler.available_permits()
+    }
+
     /// Announces the current destination unless it was announced within
     /// `REANNOUNCE_FLOOR_SECS`, in which case nothing is sent and `Ok(false)` is returned.
     pub(crate) async fn announce_now(&self) -> Result<bool> {
@@ -1539,9 +1545,11 @@ impl MeshRuntime {
         Ok(())
     }
 
-    /// Cancels and joins the node's tasks, stops the interfaces, drops the transport and
-    /// releases the instance and identity locks, in that order so nothing outlives what it
-    /// depends on. The task joins share one grace window and the transport teardown another.
+    /// Cancels and joins the node's tasks, stops the interfaces, drops the transport,
+    /// waits for the request handlers it aborted to be gone and releases the instance and
+    /// identity locks, in that order so nothing outlives what it depends on: a handler
+    /// still winding down may settle a reply against files the locks guard. The task
+    /// joins share one grace window and the transport teardown another.
     async fn shutdown(&self) -> Result<()> {
         self.cancel.cancel();
         let tasks = std::mem::take(&mut *self.tasks.lock());
@@ -1578,6 +1586,15 @@ impl MeshRuntime {
             );
         }
         drop(transport);
+        if timeout_at(deadline, self.request_handler.drained())
+            .await
+            .is_err()
+        {
+            warn!(
+                "Mesh request handlers did not stop within {}s; the node releases its locks with them still running",
+                SHUTDOWN_GRACE.as_secs()
+            );
+        }
         state.lock = None;
         *self.identity_lock.lock() = None;
         if let Err(err) = self.peers.persist_if_dirty() {
