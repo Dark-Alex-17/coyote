@@ -90,3 +90,30 @@ Every missing question must be phrased as the QUESTION the implementer would act
 - Recommending a pointer you did not verify exists and covers the topic.
 - Treating an inapplicable category as a leak (demanding a data-layer section from a docs-only plan).
 - Re-reviewing executability/approach — that is `plan-review`'s lane.
+
+## Micro-grain addendum (applies ONLY when the spawner names it)
+
+Inert unless the spawn prompt says "Audit to the Micro-grain addendum". A micro-grain plan
+(the architect's `task_granularity: micro`) tightens the container test: the implementer may be
+a small model that follows pointers poorly and judges nothing. Three extra LEAK classes, each a
+BLOCKING question in the verdict:
+
+1. **Size.** A task that touches more than one seam, or more than 3 files including tests,
+   WITHOUT a stated compile-atomicity reason ("the signature change travels with its N callers")
+   is a leak. The floor beats the cap: a task split below compile-atomicity (tree would not build
+   after it) is the worse leak.
+2. **Executable criteria.** Every acceptance criterion must be a COMMAND with its expected
+   output - a test invocation, a hurl file run, a grep that must match/not match, a build
+   command. Audit each one mechanically: does the referenced test/hurl/file path exist in the
+   plan's file list or the tree (`fs_glob`)? Is the expected output stated? A prose criterion
+   ("works correctly", "handles errors") is a leak, as is a command whose target the plan never
+   creates.
+3. **Nothing left to judgment.** Every new or changed function/type/route is given its exact
+   signature, types and target path in the plan. "Add a helper that..." with no signature is a
+   leak. Every task has a **Context pack** (the snippets it needs, inline - a pointer is
+   acceptable only for a target longer than a screen, and only if verified) and a `Batch`
+   value; a missing pack or batch is a leak.
+
+Everything else in this skill applies unchanged. Do not demand smaller tasks than
+compile-atomicity allows, and do not re-review batch grouping or dependency order - that is
+`plan-review`'s lane in micro mode too.

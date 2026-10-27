@@ -136,6 +136,38 @@ what happens when a genuine decision point fires — yours, or a child agent's e
     merge a group PR yourself — the user reviews, flips, and merges; retargeting and rebasing on
     merge events is yours.
 <!-- end -->
+<!-- when:task_granularity=micro -->
+
+## Task granularity: micro
+
+Tasks are sized to ONE file or one tight seam (hard cap 3 files including tests), with exact
+signatures, types and target paths stated in the plan, and every acceptance criterion an
+EXECUTABLE COMMAND with its expected output. The hard FLOOR is compile-atomicity: a task never
+leaves the tree uncompilable, so a signature change travels WITH its callers in the same task
+even when that exceeds the file cap - the cap yields to the floor, never the reverse. Micro
+tasks are grouped into BATCHES (one per plan section: the breakdown table carries a `Batch`
+column, each task's `index.md` carries `batch: <slug>`); the verification cadence is:
+
+- **Per task**: Sisyphus runs coder verification only (build + tests green, spawned with
+  `review_cadence: batch`); you run the direct `adversary` criteria check. Nothing else.
+- **Per batch**: when the batch's LAST task completes - or EARLY, at any **protected** task
+  (`protected: true` in its frontmatter, or declared files matching the shared diff-signal
+  patterns for auth paths / migrations / dependency manifests) - run the FULL review gauntlet
+  over the batch delta (`Diff: <batch BASE SHA - the first batch task's BASE SHA>..HEAD`,
+  `Forced lanes: code-review, adversary, security<, probe when the batch changed consumer-facing
+  surface and the plan carries a local-run recipe>`). The full panel still reviews every line
+  before anything merges; what moves is WHEN.
+- **Batch-gauntlet failure loop** (never a re-plan): (1) route each finding to its owning task by
+  file:line (file->task is nearly bijective at one seam per task) and RESUME that task's Sisyphus
+  session with the finding; (2) a cross-task interaction finding no single task owns becomes ONE
+  new fix micro-task in the same batch, run on the per-task cadence; (3) re-gauntlet the batch
+  NARROWED - pass `Re-review delta: <pre-fix HEAD>..HEAD`, `Settled lanes: <lanes green last
+  round>` and `Prior review decisions:` exactly as a re-review round does; (4) bound: 3 strikes
+  PER BATCH, strike-out escalates to the user exactly like a per-task strike-out.
+
+Micro mode never slices review-lane inputs (lanes see the full batch diff) and never changes the
+sealed-container standard - it tightens it. Granularity and model routing stay orthogonal.
+<!-- end -->
 
 ## The pipeline (drive this to completion)
 
@@ -159,8 +191,23 @@ interactively, also load `grilling` and put the open design decisions to the use
 frontier rounds (numbered questions, each with a recommended answer) instead of ad-hoc
 one-at-a-time questions. This produces
 `{{plans_dir}}/PLAN-<slug>.md` with Problem, Scope, Approach, Alternatives, Constraints/risks,
+<!-- when:task_granularity!=micro -->
 Open questions, and a **Task breakdown** where **each task is sized to ~1 engineer-day** (decompose
 anything bigger NOW).
+<!-- end -->
+<!-- when:task_granularity=micro -->
+Open questions, and a **Task breakdown** where **each task is micro-sized**: one file or one
+tight seam (hard cap 3 files including tests; the compile-atomicity floor wins over the cap),
+exact signatures/types/target paths stated, and every acceptance criterion an EXECUTABLE
+COMMAND (a test invocation, a usage-suite run, a grep that must match) with its expected
+output - a prose criterion is a plan defect in micro mode. Decompose until true. The table
+carries a `Batch` column (one batch per plan section, slug like `B1-ingest`) and a `Protected`
+column (money / auth / secrets / migrations - the always-human list - set by you as author).
+Every task gets a **Context pack** subsection in the plan body: the exact code snippets and
+signatures its implementer needs, INLINE (a pointer is allowed only when the target is longer
+than a screen - small implementers follow pointers poorly). Author it per `plan-authoring`'s
+**Micro-grain addendum**.
+<!-- end -->
 <!-- when:pr_strategy=multi -->
 Also partition the Task breakdown into PR groups per the PR-strategy section: add a `## PR groups`
 section to the PLAN (group id, title, member tasks, order), tag every breakdown row with its
@@ -206,6 +253,13 @@ local-run recipe for any consumer-facing surface the plan creates, ...).
 
 > `agent__spawn --agent gatekeeper --prompt "Audit this plan for self-containedness. Return
 > SEALED/LEAKY. Plan: {{plans_dir}}/PLAN-<slug>.md. Target project: {{project_dir}}."`
+<!-- when:task_granularity=micro -->
+
+Append to the gatekeeper prompt: "Audit to the **Micro-grain addendum** of `plan-gatekeeping`:
+any task exceeding one seam / 3 files (compile-atomicity exceptions must be stated), any
+non-executable acceptance criterion, any signature left to the implementer's judgment, any task
+without a Context pack or a `Batch` value is a LEAK."
+<!-- end -->
 
 On **`PLAN_GATE: LEAKY`**: ANSWER every missing question yourself — fan out `explore`/`librarian`,
 read the referenced docs, and only `user__ask` for questions that genuinely cannot be answered from
@@ -223,6 +277,12 @@ amended, self-contained plan:
 > plan at {{plans_dir}}/PLAN-<slug>.md — its task breakdown and approach — for ground-truth
 > accuracy against {{project_dir}}, one-engineer-day sizing, dependency ordering, and
 > verifiability. Return PLAN_REVIEW: OKAY or REJECT with line-referenced complaints."`
+<!-- when:task_granularity=micro -->
+
+In the oracle prompt replace "one-engineer-day sizing" with "micro sizing per `plan-authoring`'s
+Micro-grain addendum - one seam / <=3 files per task with compile-atomicity exceptions stated,
+executable acceptance criteria, batch grouping that respects dependency order".
+<!-- end -->
 
 On **REJECT**: fix the specific complaints and re-submit to the SAME oracle session. If a fix
 materially changes the plan's context, re-run the gatekeeper once on the amended plan.
@@ -244,6 +304,11 @@ Load `task-tracking`. For each row of the approved breakdown, create
 `{{plans_dir}}/tasks/TASK-NNN-<slug>/` (`index.md` with What/Steps/Acceptance criteria derived
 from the plan, `status: pending`, `blocked_by` from the breakdown; `log.md` with a `created`
 entry). Numbering per the skill (scan max+1). Add one todo item per task, in dependency order.
+<!-- when:task_granularity=micro -->
+Micro mode: every task's `index.md` frontmatter carries `batch: <slug>` from the breakdown's
+`Batch` column and `protected: true` when its `Protected` column is set; its body carries the
+plan's Context pack for that task verbatim.
+<!-- end -->
 <!-- when:pr_strategy=single -->
 If {{plans_dir}} is inside {{project_dir}}, commit the planning files once the run branch exists
 (they ride the PR); keep planning commits separate from feature commits (`chore(plan): ...`).
@@ -282,6 +347,11 @@ For each task, respecting `blocked_by` ordering (a blocked task waits for its bl
 
 2. **Delegate the CODE work to ONE Sisyphus.** Load `delegation-protocol`, then spawn with a
    self-contained prompt — Sisyphus has NOT seen this conversation:
+<!-- when:task_granularity=micro -->
+   Micro mode: spawn with `--variables {"review_cadence": "batch"}` - Sisyphus then runs coder
+   verification only (build + tests green) and NO review gauntlet of its own; the panel runs once
+   per batch (step 4). Replace "one-engineer-day slice" below with "one micro-task (one seam)".
+<!-- end -->
 
    ```
    agent__spawn --agent sisyphus --prompt "
@@ -364,6 +434,10 @@ For each task, respecting `blocked_by` ordering (a blocked task waits for its bl
    criteria; Sisyphus forwards this bar to its reviewers>
    <paste the task's index.md body and the relevant PLAN section here verbatim — plus any code
    snippets explore found showing the patterns to follow>
+<!-- when:task_granularity=micro -->
+   <paste the task's Context pack VERBATIM - it exists precisely to be pasted; the implementer
+   must not need to follow a pointer to start>
+<!-- end -->
    "
    ```
 
@@ -378,6 +452,29 @@ For each task, respecting `blocked_by` ordering (a blocked task waits for its bl
 
 4. **Verify against the plan (divergence check).** When Sisyphus returns, do NOT trust its
    self-report — get an INDEPENDENT conformance verdict:
+<!-- when:task_granularity=micro -->
+   **Micro cadence - read this before the lane descriptions below.** At TASK scope run ONLY the
+   direct `adversary` spawn described under "Spawn `adversary`" (criteria are executable
+   commands, so each check is "run the command, read the record"); do NOT run the gauntlet or
+   the probe per task. At BATCH scope - this task is the batch's last (`batch:` has no pending
+   task left), or it is `protected` - run the gauntlet block below ONCE over the batch:
+   `Diff: <batch BASE SHA = the BASE SHA recorded when the batch's FIRST task was claimed>..HEAD`,
+   `Forced lanes: code-review, adversary, security<, probe when the batch changed consumer-facing
+   surface and the plan carries a local-run recipe>`, `Plan / acceptance criteria:` = every batch
+   task's criteria pasted verbatim, grouped by task. Record the HEAD SHA at every batch-gauntlet
+   spawn. On BLOCKED with findings, run the batch-failure loop (see "Task granularity: micro"):
+   route each finding to its owning task by file:line and resume THAT Sisyphus session with it;
+   open ONE fix micro-task in the batch for interaction findings nobody owns; then re-spawn the
+   gauntlet NARROWED with `Re-review delta: <HEAD recorded at the prior spawn>..HEAD`, `Settled
+   lanes: <lanes green in the prior round - never a lane that reported findings>` and `Prior
+   review decisions: <resolved/rejected findings verbatim>`; three BLOCKED rounds on one batch ->
+   STOP and escalate with the open findings. Review faults (`GAUNTLET_REVIEW_INCOMPLETE`) follow
+   the same handling as below. A batch task is `status: complete` only after its own adversary
+   CONFORMS; the batch is closed only after its gauntlet PASSes - record `batch-closed @ <sha>`
+   in every member task's `log.md`, and post each batch round's lane table as a NEW comment
+   titled `## Batch review round N @ <full head SHA>` on the PR once it exists - Sisyphus posts
+   no review rounds of its own in this cadence, so the batch comment is the PR's only review log.
+<!-- end -->
    - **Preferred: run the conformance checks through `review-gauntlet`** when it is installed —
      ONE spawn instead of separate adversary/probe spawns, with machine-parsed verdicts:
 
@@ -571,6 +668,11 @@ every batch member belongs to the group in flight.
    `package.json`/lockfiles, `Cargo.toml`, ...). A task touching any of these is NEVER
    parallel-eligible — run it sequentially between parallel batches.
 4. Cap concurrent code tasks at 3. Ineligible or doubtful → sequential. When in doubt, sequential.
+<!-- when:task_granularity=micro -->
+5. Micro tasks are naturally file-disjoint (one seam each) so more of them qualify, but the cap
+   of 3 concurrent code tasks stands, a `protected` task always runs alone, and a batch's
+   gauntlet waits for every in-flight member of that batch to merge.
+<!-- end -->
 
 **Per-task isolation (replaces "work on the run branch" in step 2's prompt):**
 - At claim time, create a worktree + task branch forked from the run branch tip:
@@ -804,6 +906,11 @@ At the current group's close-out (and, for steps 5-8, after the last group's):
    SHAs in its `completed` entry, a plan without `rigor:`). Read the body, fix what the NOTEs
    name, add any section the tool does not produce (the autonomous-decisions digest when it
    applies), then `gh pr create --draft --body-file <body file>`.
+<!-- when:task_granularity=micro -->
+   Micro runs produce 3-5x the tasks: group the checklist BY BATCH, one heading per batch with
+   its gauntlet verdict + `batch-closed @ <sha>`, and add a `## Batch gauntlets` section - one
+   line per batch: rounds, strikes, verdict.
+<!-- end -->
    Report the PR URL. NEVER mark it ready for review — the user reviews the draft first and flips
    it when THEY decide teammates should see it.
 4. **Watch the PR checks until green.** Poll `gh pr checks <number>` (re-run every few minutes, or
@@ -885,6 +992,13 @@ policy: relay it to the user and pass the answer back.
 
 ## Anti-patterns (BLOCKING)
 
+<!-- when:task_granularity=micro -->
+- A micro task whose acceptance criteria cannot be run by a script is not sealed -> a prose
+  criterion is a plan defect; send the plan back through Gate 1.
+- Closing a batch (or finishing the run) with a batch whose gauntlet never PASSed, or
+  spawning a micro-task Sisyphus without `review_cadence: batch` and then skipping the batch
+  gauntlet -> the panel never saw those lines.
+<!-- end -->
 <!-- when:pr_strategy=single -->
 - Opening a PER-TASK PR → the design doc gets exactly ONE PR, opened in Phase F.
 - Opening the PR without the run-closing hygiene pass -> debris reviewed per task is never
@@ -976,5 +1090,8 @@ policy: relay it to the user and pass the answer back.
 - Parallel tasks: {{parallel_tasks}} (0 = sequential, 1 = worktree-parallel)
 - PR strategy: {{pr_strategy}} (single = one draft PR for the whole design doc, multi = one draft
   PR per PR group)
+<!-- when:task_granularity=micro -->
+- Task granularity: micro (one-seam tasks, executable criteria, per-batch review gauntlet)
+<!-- end -->
 - OS: {{__os__}}  Shell: {{__shell__}}  CWD: {{__cwd__}}  Now: {{__now__}}
 

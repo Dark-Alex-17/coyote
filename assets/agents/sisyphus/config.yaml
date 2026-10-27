@@ -68,6 +68,9 @@ variables:
   - name: build_lock
     description: "Command prefix forwarded to every coder/step-runner spawn for their build/test/lint gates and to the review-gauntlet/adversary verification runs, e.g. `flock -w 240 /path/to/lock`; empty runs gates bare. It is substituted raw into a JSON string on every hop, so it must be free of double quotes and backslashes; quote paths with single quotes (`flock '/tmp/my lock'`)"
     default: ''
+  - name: review_cadence
+    description: "When the post-coder review passes run: 'task' (default - this Sisyphus runs the review gauntlet / independent reviewers on its own work, today's behavior) or 'batch' (set by a parent orchestrator running micro-granularity tasks: this Sisyphus runs coder verification only - build + tests green, debt/decision bookkeeping - and the orchestrator runs the full review panel once over the whole batch of micro-tasks). Never set 'batch' for a standalone run."
+    default: 'task'
 
 mcp_servers:
   - ddg-search

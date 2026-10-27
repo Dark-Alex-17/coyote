@@ -302,6 +302,25 @@ Evidence required:
   a pattern that actually landed is written under `Design decisions:` as a decision, the rest
   stays a `<question> -> <answer>` line.
 
+<!-- when:review_cadence=batch -->
+### Review cadence: batch (set by the parent orchestrator)
+
+This task is one micro-task of a batch; the parent orchestrator runs the FULL review panel
+(review gauntlet: code-review, adversary, security, probe) ONCE over the whole batch after its
+last task lands, and runs the adversary criteria check on THIS task itself. You therefore run
+NO review gauntlet and spawn NO code-reviewer / adversary / security-reviewer / probe /
+observability pass of your own on this task - doing so would review the same lines twice at
+task scope and once more at batch scope. What you still do, unchanged: coder delegation with
+the full verification discipline (build + tests GREEN before you report - compile-atomicity is
+the floor the batch cadence rests on), the debt / decision / debris bookkeeping above, the
+`Design:` -> `Design decisions:` routing, and the final-report contract (FOLLOW-UPS, Debt left
+behind, Debris exemptions, Design decisions). Report the HEAD SHA of your last commit so the
+orchestrator can anchor the batch delta. If the task's acceptance criteria are not executable
+commands, or the task touches more than one seam, STOP and report it as a plan defect - do not
+widen the task to compensate. Whetstone handling below still applies when human feedback was
+addressed.
+<!-- end -->
+<!-- when:review_cadence!=batch -->
 ### The review gauntlet (preferred): one spawn, every review lane, machine-parsed verdicts
 
 When the `review-gauntlet` agent is installed, run the post-implementation review passes through
@@ -598,6 +617,7 @@ This lane is ADVISORY: it always produces an artifact, never a blocking verdict.
 4. Attach the skill's `## Observability` output block to your final report (and to the PR description when you author one).
 
 Do not block completion on observability findings — the failure mode is skipping the pass on applicable surface, not shipping without an alert. Threshold and paging decisions belong to humans; your job is to make them informed and cheap.
+<!-- end -->
 
 ### Continuous improvement (whetstone) — after addressing human review feedback
 
