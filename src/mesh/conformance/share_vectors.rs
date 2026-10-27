@@ -19,8 +19,8 @@ use crate::mesh::card::{STATE_IDLE, STATUS_CARD_VERSION, StatusCard};
 use crate::mesh::events::{MeshHooks, RecordingHookSink, env_value};
 use crate::mesh::fetch::{
     CURSOR_MAX_BYTES, FILE_FETCH_REQUEST_TIMEOUT, FetchError, FetchHandler, FetchReply,
-    FetchServing, Fetched, FileReader, LIST_PAGE_HEADROOM, ListHandler,
-    SINGLE_SEGMENT_FETCH_CEILING, ShareSource, SharesPage, field, read_fetch_reply, rule_of,
+    FetchServing, Fetched, FileReader, LIST_PAGE_HEADROOM, ListHandler, ShareSource, SharesPage,
+    field, read_fetch_reply, rule_of,
 };
 use crate::mesh::grants::{
     DEFAULT_GRANT_TTL, DEFAULT_GRANT_USES, GRANT_MAX_PATHS, GRANT_RECORD_VERSION, GrantStore,
@@ -54,6 +54,7 @@ use rns_transport::destination::link::LinkId;
 use rns_transport::hash::AddressHash;
 use rns_transport::identity::PrivateIdentity;
 use rns_transport::rand_core::OsRng;
+use rns_transport::resource::MAX_EFFICIENT_SIZE;
 use sha2::{Digest, Sha256};
 use std::fmt::Debug;
 use std::fs;
@@ -2709,14 +2710,14 @@ fn not_shared_is_byte_identical_for_a_missing_an_unshared_and_a_denied_file() ->
     same("builtin-denied", denied, missing)
 }
 
-fn the_serving_limit_is_the_configured_bytes_under_the_ceiling() -> Result<(), String> {
+fn the_serving_limit_is_the_configured_bytes() -> Result<(), String> {
     let small = Serve::new("fetch-limit-small", 8, &["**"]);
     same("small limit", small.serving.serving_limit(), 8)?;
     let full = Serve::new("fetch-limit-full", MAX_FETCH_FILE_BYTES, &["**"]);
     same(
-        "capped limit",
+        "full limit",
         full.serving.serving_limit(),
-        MAX_FETCH_FILE_BYTES.min(SINGLE_SEGMENT_FETCH_CEILING),
+        MAX_FETCH_FILE_BYTES,
     )?;
     same("file ceiling", MAX_FETCH_FILE_BYTES, 4_194_304)?;
     small.file("big.bin", &[b'x'; 9]);
@@ -2729,25 +2730,25 @@ fn the_serving_limit_is_the_configured_bytes_under_the_ceiling() -> Result<(), S
     )
 }
 
-fn a_file_one_past_the_ceiling_is_too_large_and_one_at_it_is_ok() -> Result<(), String> {
-    let serve = Serve::new("fetch-ceiling", MAX_FETCH_FILE_BYTES, &["**"]);
-    let ceiling = SINGLE_SEGMENT_FETCH_CEILING as usize;
-    serve.file("over.bin", &vec![b'x'; ceiling + 1]);
-    serve.file("at.bin", &vec![b'x'; ceiling]);
+fn a_file_one_past_max_bytes_is_too_large_and_one_at_it_is_ok() -> Result<(), String> {
+    let limit = MAX_EFFICIENT_SIZE + 512 * 1024;
+    let serve = Serve::new("fetch-max-bytes", limit as u64, &["**"]);
+    serve.file("over.bin", &vec![b'x'; limit + 1]);
+    serve.file("at.bin", &vec![b'x'; limit]);
 
     let over = answered(serve.fetch(fetch_body("over.bin", None)))?;
     same("over status", status_of(&over), Some("too_large"))?;
     same(
         "over limit",
         key_of(&over, "limit").and_then(Value::as_u64),
-        Some(1_048_447),
+        Some(limit as u64),
     )?;
     let at = answered(serve.fetch(fetch_body("at.bin", None)))?;
     same("at status", status_of(&at), Some("ok"))?;
     same(
         "at size",
         key_of(&at, "size").and_then(Value::as_u64),
-        Some(SINGLE_SEGMENT_FETCH_CEILING),
+        Some(limit as u64),
     )
 }
 
@@ -4930,14 +4931,14 @@ fn fetch_serve_rows() -> Vec<Vector> {
             not_shared_is_byte_identical_for_a_missing_an_unshared_and_a_denied_file,
         ),
         fetch_check(
-            "serving-limit-is-the-configured-bytes-under-the-ceiling",
+            "serving-limit-is-the-configured-bytes",
             Valid,
-            the_serving_limit_is_the_configured_bytes_under_the_ceiling,
+            the_serving_limit_is_the_configured_bytes,
         ),
         fetch_check(
-            "file-one-past-the-ceiling-is-too-large-and-one-at-it-is-ok",
+            "file-one-past-max-bytes-is-too-large-and-one-at-it-is-ok",
             Boundary,
-            a_file_one_past_the_ceiling_is_too_large_and_one_at_it_is_ok,
+            a_file_one_past_max_bytes_is_too_large_and_one_at_it_is_ok,
         ),
         fetch_check(
             "served-fetch-fires-once-sent-with-peer-size-and-hash-prefix-and-no-path",

@@ -571,9 +571,7 @@ pub(crate) mod network {
     use crate::mesh::envoy::{EnvoyJob, EnvoySink};
     use crate::mesh::envoy_sessions::{EnvoyRole, EnvoyTurn, RememberedOf};
     use crate::mesh::events::{MeshHookSink, MeshHooks, RecordingHookSink};
-    use crate::mesh::fetch::{
-        FILE_FETCH_REQUEST_TIMEOUT, FetchError, Fetched, ListedFile, SINGLE_SEGMENT_FETCH_CEILING,
-    };
+    use crate::mesh::fetch::{FILE_FETCH_REQUEST_TIMEOUT, FetchError, Fetched, ListedFile};
     use crate::mesh::idle::{IdleNotify, IdleSink, Origin};
     use crate::mesh::knock::{
         ChannelKnockSink, KNOCK_QUEUE_CAPACITY, KnockError, KnockFallback, KnockGate, KnockIntro,
@@ -626,7 +624,9 @@ pub(crate) mod network {
     use rns_transport::iface::tcp_client::TcpClient;
     use rns_transport::iface::tcp_server::TcpServer;
     use rns_transport::rand_core::{OsRng, RngCore};
-    use rns_transport::resource::{LINK_PACKET_MDU, ResourceEvent, ResourceEventKind};
+    use rns_transport::resource::{
+        LINK_PACKET_MDU, MAX_EFFICIENT_SIZE, ResourceEvent, ResourceEventKind,
+    };
     use rns_transport::transport::{AnnounceEvent, Transport};
     use sha2::{Digest as _, Sha256};
     use std::collections::VecDeque;
@@ -10236,17 +10236,16 @@ pub(crate) mod network {
         node.stop().await;
     }
 
-    /// The largest file the responder serves rides one Resource segment; the split
-    /// (multi-segment) case waits on the upstream fix `SINGLE_SEGMENT_FETCH_CEILING`
-    /// documents. The ceiling is one byte away from the next segment, so a response here
-    /// also proves the ceiling's framing allowance against a real link.
+    /// A file of `MAX_EFFICIENT_SIZE` plus 512 KiB spans two Resource segments, and
+    /// coyote-rns-transport 0.16.0 carries every segment on the link's interface, so the
+    /// requester gets the whole file back over a live link in one `ok` reply.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_fetch_response_at_the_single_segment_ceiling_arrives_as_one_resource() {
+    async fn a_fetch_response_above_one_segment_arrives_whole_over_a_live_link() {
         install_log_collector();
         let pair = NodePair::start_with("request-fetch-big", |_| {}, trusting_b).await;
         let (slot, _idle) = installed_slot(&pair);
         let workspace = share_docs_from_a(&pair, &slot, "request-fetch-big-root");
-        let mut bytes = vec![0u8; usize::try_from(SINGLE_SEGMENT_FETCH_CEILING).unwrap()];
+        let mut bytes = vec![0u8; MAX_EFFICIENT_SIZE + 512 * 1024];
         RngCore::fill_bytes(&mut OsRng, &mut bytes);
         fs::write(workspace.path.join("docs").join("big.bin"), &bytes).unwrap();
 
