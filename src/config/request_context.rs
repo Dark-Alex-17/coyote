@@ -27211,6 +27211,116 @@ mod tests {
             .collect()
     }
 
+    /// `python_regex_literal` for an assignment that may sit inside an
+    /// indented block: the `NAME = ` must be the first token on its line and
+    /// a multi-line form closes at the first line holding only `)`.
+    fn python_regex_literal_at_any_indent(source: &str, name: &str) -> String {
+        let head = format!("{name} = ");
+        let start = source
+            .match_indices(&head)
+            .map(|(at, _)| at)
+            .find(|&at| source[..at].rsplit('\n').next().unwrap().trim().is_empty())
+            .unwrap_or_else(|| panic!("{name} is not assigned"))
+            + head.len();
+        let rest = &source[start..];
+        let statement = if rest.starts_with('(') {
+            let close = rest
+                .match_indices('\n')
+                .map(|(at, _)| at)
+                .find(|&at| rest[at + 1..].trim_start().starts_with(')'))
+                .unwrap_or_else(|| panic!("{name} is never closed"));
+            &rest[..close]
+        } else {
+            &rest[..rest.find('\n').unwrap()]
+        };
+        statement
+            .split("r\"")
+            .skip(1)
+            .map(|piece| piece.split('"').next().unwrap())
+            .collect()
+    }
+
+    /// signals.py imports `classify` from the shared module and carries an
+    /// inline copy for installs without it; the copy must not drift.
+    #[test]
+    fn gauntlet_signals_inline_fallback_matches_the_shared_module() {
+        let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents");
+        let signals = read_to_string(assets.join("review-gauntlet/scripts/signals.py")).unwrap();
+        let shared = read_to_string(assets.join(".shared/diff_signals.py")).unwrap();
+
+        let import_at = signals
+            .find("from diff_signals import classify")
+            .expect("signals.py imports classify from the shared module");
+        let fallback_at = import_at
+            + signals[import_at..]
+                .find("\nexcept Exception:")
+                .expect("the import is guarded by an except block");
+        let fallback_end = signals
+            .find("\ndef diff_signals(")
+            .expect("diff_signals follows the fallback block");
+        let fallback = &signals[fallback_at..fallback_end];
+
+        for name in [
+            "DOCS_RE",
+            "TESTS_RE",
+            "AUTH_PATH_RE",
+            "AUTH_ADDED_RE",
+            "DEPS_RE",
+            "EXEC_RE",
+            "CONSUMER_RE",
+            "PROTO_RE",
+            "MIGRATIONS_RE",
+        ] {
+            assert_eq!(
+                python_regex_literal_at_any_indent(fallback, name),
+                python_regex_literal_at_any_indent(&shared, name),
+                "{name}: the inline fallback in signals.py must stay byte-identical to the shared module"
+            );
+        }
+
+        let inline_body = &fallback[fallback
+            .find("def _classify(files, added):")
+            .expect("the fallback defines _classify")..];
+        let shared_def = shared
+            .find("def classify(files, added):")
+            .expect("the shared module defines classify");
+        let shared_body = &shared[shared_def..];
+        let shared_body = shared_body
+            .match_indices('\n')
+            .map(|(at, _)| at)
+            .find(|&at| {
+                let line = &shared_body[at + 1..];
+                !line.is_empty() && !line.starts_with(['\n', ' '])
+            })
+            .map_or(shared_body, |at| &shared_body[..at]);
+        let docstring_start = shared_body
+            .find("\"\"\"")
+            .expect("the shared classify has a docstring");
+        let docstring_end = docstring_start
+            + 3
+            + shared_body[docstring_start + 3..]
+                .find("\"\"\"")
+                .expect("the docstring closes")
+            + 3;
+        let shared_body = format!(
+            "{}{}",
+            &shared_body[..docstring_start],
+            &shared_body[docstring_end..]
+        );
+
+        let squash = |body: &str| -> String {
+            body.replace("_classify", "classify")
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect()
+        };
+        assert_eq!(
+            squash(inline_body),
+            squash(&shared_body),
+            "the inline classify in signals.py must stay identical to the shared module modulo line wrapping"
+        );
+    }
+
     /// The sentinel contract is stated the same way everywhere it is read:
     /// the lane selector's settled-lanes line names its source, the README
     /// states the whole-line and last-wins rules and where the line is split,
