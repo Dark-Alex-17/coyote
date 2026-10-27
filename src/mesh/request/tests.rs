@@ -564,10 +564,7 @@ fn envelope_without_a_supported_version_is_refused_before_its_origin_is_read() {
 // under `test_support` are only exercised on unix.
 #[cfg(unix)]
 pub(crate) mod network {
-    use super::super::client::{
-        DEFAULT_LINK_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, Deadline, RequestClient, RequestOptions,
-        RequestOutcome, SizeBranch, identify, open_link,
-    };
+    use super::super::client::{RequestClient, RequestOutcome};
     use super::super::dispatch::{
         ACCESS_PATH, AdmittedRequest, DispatchError, Dispatcher, FETCH_PATH, Handler, KNOCK_PATH,
         KNOWN_PATHS, KnockEvent, KnockSink, LIST_PATH, LoggingKnockSink, MESSAGE_PATH,
@@ -581,6 +578,10 @@ pub(crate) mod network {
     use super::super::handler::{
         Admission, HANDLER_TIMEOUT, InboundRequest, LibraryHandler,
         MAX_CONCURRENT_INBOUND_REQUESTS, Reply, RequestHandler, Settlement,
+    };
+    use super::super::link::{
+        DEFAULT_LINK_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, Deadline, RequestOptions, SizeBranch,
+        identify, open_link,
     };
     use crate::config::mesh_config::{MAX_FETCH_FILE_BYTES, MeshInterface};
     use crate::config::{ForkRekey, MeshConfig, Session};

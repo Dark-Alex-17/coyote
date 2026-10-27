@@ -8,15 +8,11 @@ mod dispatch;
 mod error;
 mod frame;
 mod handler;
+mod link;
 #[cfg(test)]
 mod tests;
 
-#[cfg(test)]
-pub(crate) use client::DEFAULT_REQUEST_TIMEOUT;
-pub(crate) use client::{
-    DEFAULT_LINK_TIMEOUT, Deadline, RequestClient, RequestOptions, RequestOutcome, SizeBranch,
-    link_to, open_link,
-};
+pub(crate) use client::{RequestClient, RequestOutcome};
 #[cfg(all(test, unix))]
 pub(crate) use dispatch::LoggingKnockSink;
 pub(crate) use dispatch::{
@@ -35,6 +31,11 @@ pub(crate) use handler::{
     Admission, HANDLER_TIMEOUT, InboundRequest, MAX_CONCURRENT_INBOUND_REQUESTS, RequestHandler,
 };
 pub(crate) use handler::{LibraryHandler, Reply, Settlement};
+#[cfg(test)]
+pub(crate) use link::DEFAULT_REQUEST_TIMEOUT;
+pub(crate) use link::{
+    DEFAULT_LINK_TIMEOUT, Deadline, RequestOptions, SizeBranch, link_to, open_link,
+};
 #[cfg(all(test, unix))]
 pub(crate) use tests::network;
 
