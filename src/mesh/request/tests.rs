@@ -1014,6 +1014,18 @@ pub(crate) mod network {
             self.transport.send_packet(packet).await;
         }
 
+        /// Turns announce ingress control off on every interface of this transport, which
+        /// on an interface this young would otherwise hold a second announce for minutes.
+        pub(crate) async fn hear_every_announce(&self) {
+            let manager = self.transport.iface_manager();
+            let mut manager = manager.lock().await;
+            for iface in manager.interface_hashes() {
+                let mut config = manager.shared_config(&iface).cloned().unwrap_or_default();
+                config.ingress_control = Some(false);
+                manager.set_shared_config(iface, config);
+            }
+        }
+
         fn origin(&self) -> OriginName {
             OriginName::of(&self.desc.name)
         }
@@ -1606,6 +1618,28 @@ pub(crate) mod network {
                     &self.responder.transport,
                     &self.responder.identity,
                     &self.a_desc,
+                    path,
+                    self.responder.envelope(body),
+                    options,
+                )
+                .await
+                .unwrap()
+        }
+
+        /// Node B asks `path` of `desc`, a destination of node A's other than the one it
+        /// started as, the way `b_asks_a` asks the original.
+        pub(crate) async fn b_asks_destination(
+            &self,
+            desc: &DestinationDesc,
+            path: &str,
+            body: Value,
+            options: RequestOptions,
+        ) -> RequestOutcome {
+            self.client_b
+                .request(
+                    &self.responder.transport,
+                    &self.responder.identity,
+                    desc,
                     path,
                     self.responder.envelope(body),
                     options,
@@ -4754,13 +4788,19 @@ pub(crate) mod network {
 
     /// The destination registered at start serves every known path, and so does the one
     /// a rekey registers in its place: each is put behind the handler before it reaches
-    /// the transport, so no request can find a destination without its handlers.
+    /// the transport, so no request can find a destination without its handlers. The
+    /// fork's destination is then asked for real, from a peer that learned it off the
+    /// rekey's announce, and the request reaches node A's handler.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn every_known_path_is_registered_on_the_destination_at_start_and_after_a_rekey() {
         let pair = NodePair::start("request-runtime-registered-paths").await;
         assert_eq!(pair.node_a.registered_request_paths().await, KNOWN_PATHS);
 
         let original_hash = pair.node_a.destination_hash().await;
+        // Node B would otherwise hold the fork's announce as a second one on a young
+        // interface; subscribing before the rekey means it cannot be missed either.
+        pair.responder.hear_every_announce().await;
+        let mut b_announces = pair.responder.transport.recv_announces().await;
         pair.node_a
             .rekey(ForkRekey {
                 original_instance_id: Some(pair.node_a.instance_id().await),
@@ -4768,11 +4808,42 @@ pub(crate) mod network {
             })
             .await
             .unwrap();
-        assert_ne!(pair.node_a.destination_hash().await, original_hash);
+        let fork_hash = pair.node_a.destination_hash().await;
+        assert_ne!(fork_hash, original_hash);
         assert_eq!(
             pair.node_a.registered_request_paths().await,
             KNOWN_PATHS,
             "the fork's destination must serve every known path too"
+        );
+
+        // The library drops a request whose link names a destination the transport has
+        // not learned, so node B needs the fork's announce before it can ask.
+        let fork_desc = loop {
+            let event = timeout(INTEROP_TIMEOUT, b_announces.recv())
+                .await
+                .expect("node B must hear the fork's announce")
+                .unwrap();
+            let desc = event.destination.lock().await.desc;
+            if desc.address_hash.to_hex_string() == fork_hash {
+                break desc;
+            }
+        };
+        let seen_before = pair.recorder_a.seen_count();
+        pair.recorder_a
+            .queue(Script::Reply(Reply::Value(Value::from("from the fork"))));
+        let outcome = pair
+            .b_asks_destination(
+                &fork_desc,
+                STATUS_PATH,
+                Value::Nil,
+                RequestOptions::default(),
+            )
+            .await;
+        assert_eq!(outcome.value, Value::from("from the fork"));
+        assert_eq!(
+            pair.recorder_a.seen_count(),
+            seen_before + 1,
+            "the fork's destination must hand the request to node A's handler"
         );
         pair.stop_node_a().await;
     }

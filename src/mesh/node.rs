@@ -1635,7 +1635,7 @@ async fn register_destination(
     destination
         .set_max_request_size(MAX_REQUEST_PAYLOAD_BYTES)
         .expect("the cap setter is infallible");
-    register_request_paths(&mut destination, request_handler)?;
+    let registered = register_request_paths(&mut destination, request_handler)?;
     let hash = destination.desc.address_hash;
     let origin = OriginName::of(&destination.desc.name);
     let dest = timeout_at(deadline, transport.register_destination(destination))
@@ -1646,10 +1646,7 @@ async fn register_destination(
                 hash.to_hex_string()
             )
         })?;
-    #[cfg(all(test, unix))]
-    REGISTERED_REQUEST_PATHS
-        .lock()
-        .extend(KNOWN_PATHS.iter().map(|path| (hash, *path)));
+    registered.record();
     let app_data = transport.set_destination_announce_app_data(&dest, Some(app_data.to_vec()));
     if timeout_at(deadline, app_data).await.is_err() {
         let released = timeout_at(deadline, transport.deregister_destination(&hash))
@@ -1672,22 +1669,46 @@ async fn register_destination(
 /// registered, so no request can arrive at a destination without its handlers. Every path
 /// is open to any peer at this layer (`RequestAllow::All`); who is served is the
 /// dispatcher's verdict, taken on the proven identity. The handlers live on the destination
-/// and go with it when it is deregistered, so nothing deregisters them separately.
+/// and go with it when it is deregistered, so nothing deregisters them separately. The
+/// paths it registered come back for the caller to record once the transport holds the
+/// destination.
 fn register_request_paths(
     destination: &mut SingleInputDestination,
     request_handler: &Arc<LibraryHandler>,
-) -> Result<()> {
+) -> Result<RegisteredRequestPaths> {
+    #[cfg(all(test, unix))]
+    let mut paths = Vec::new();
     for path in KNOWN_PATHS {
         destination
             .register_request_handler(path, request_handler.clone(), RequestAllow::All, true)
             .map_err(|err| anyhow!("Failed to register the mesh request path {path}: {err}"))?;
+        #[cfg(all(test, unix))]
+        paths.push((destination.desc.address_hash, path));
     }
-    Ok(())
+    Ok(RegisteredRequestPaths {
+        #[cfg(all(test, unix))]
+        paths,
+    })
 }
 
-/// Every path given a request handler, with the destination it was registered on, recorded
-/// once the transport holds that destination. The library keeps its handler table
-/// private, so this is what a test reads to pin them.
+/// The paths `register_request_paths` put a handler behind, with the destination that
+/// carries them, held until that destination is the transport's.
+struct RegisteredRequestPaths {
+    #[cfg(all(test, unix))]
+    paths: Vec<(AddressHash, &'static str)>,
+}
+
+impl RegisteredRequestPaths {
+    /// Files the paths where a test reads them; nothing is kept outside tests.
+    fn record(self) {
+        #[cfg(all(test, unix))]
+        REGISTERED_REQUEST_PATHS.lock().extend(self.paths);
+    }
+}
+
+/// Every path a request handler was registered behind, with the destination it was
+/// registered on, filed once the transport holds that destination. The library keeps its
+/// handler table private, so this is what a test reads to pin them.
 #[cfg(all(test, unix))]
 static REGISTERED_REQUEST_PATHS: parking_lot::Mutex<Vec<(AddressHash, &'static str)>> =
     parking_lot::Mutex::new(Vec::new());
