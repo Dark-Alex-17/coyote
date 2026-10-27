@@ -448,9 +448,10 @@ pub(crate) struct MeshRuntime {
     /// Every TCP client joined at start, connected or not, in config order.
     watched_interfaces: Vec<WatchedInterface>,
     hooks: MeshHooks,
-    /// `None` once `shutdown` has released this owner. Requests and the server loop hold
-    /// clones, so the upstream `Drop` that cancels the transport's tasks runs when the last
-    /// of those finishes, not when this lock is emptied.
+    /// `None` once `shutdown` has released this owner. Requests hold clones, so the
+    /// upstream `Drop` that cancels the transport's tasks runs when the last of those
+    /// finishes, not when this lock is emptied. The request handler holds only a `Weak`
+    /// reference: an inbound request still being handled ends with the transport.
     transport: Mutex<Option<Arc<Transport>>>,
     interfaces: Mutex<Vec<JoinedInterface>>,
     destination: Mutex<DestinationState>,

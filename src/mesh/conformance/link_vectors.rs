@@ -75,7 +75,8 @@ enum Case {
     Identified,
     /// Bytes that are not a request frame are dropped in silence.
     UndecodableFrame,
-    /// A request resource over `MAX_REQUEST_PAYLOAD_BYTES` is dropped after assembly.
+    /// A request resource over `MAX_REQUEST_PAYLOAD_BYTES` is refused at its advertisement,
+    /// before any part is transferred.
     InboundCap,
     /// The request past the last handler slot is dropped in silence.
     HandlerSlots,
@@ -217,7 +218,7 @@ const VECTORS: &[Vector] = &[
         known_divergence: None,
     },
     Vector {
-        name: "assembled-resource-over-the-payload-cap-is-dropped",
+        name: "request-resource-over-the-payload-cap-is-refused-at-the-advertisement",
         kind: Kind::Invalid,
         case: Case::InboundCap,
         known_divergence: None,

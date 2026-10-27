@@ -502,6 +502,7 @@ mod tests {
     use crate::mesh::destination_address;
     use crate::mesh::request::frame::{NAME_HASH_LEN, OriginName};
     use crate::mesh::test_support::TrustList;
+    use crate::testing::{debug_snapshot, install_log_collector};
     use rns_transport::identity::PrivateIdentity;
     use rns_transport::rand_core::OsRng;
     use std::sync::Mutex;
@@ -633,5 +634,46 @@ mod tests {
         assert_eq!(admitted.link_id, link_id);
         assert_eq!(admitted.identity.address_hash, identity.address_hash);
         assert_eq!(admitted.destination_hash, destination);
+    }
+
+    /// Every path the destination registers is seeded as a route, so a request for a path
+    /// with no route can only come from a registration the dispatcher never heard of. It
+    /// is served nothing and logged by hash, with the rule that admitted the peer.
+    #[tokio::test]
+    async fn a_trusted_request_for_a_path_without_a_route_is_dropped_silently() {
+        install_log_collector();
+        const ORIGIN: [u8; NAME_HASH_LEN] = [9; NAME_HASH_LEN];
+        let identity = *PrivateIdentity::new_from_rand(OsRng).as_identity();
+        let identity_hex = identity.address_hash.to_hex_string();
+        let (store, _tmp) = TrustList::default()
+            .identity(&identity_hex, true)
+            .open("dispatch-no-route");
+        let dispatcher = Dispatcher::new(store, Arc::new(NoKnocks));
+
+        let link_id = LinkId::new_from_rand(OsRng);
+        let request_id = RequestId::from([9u8; 16]);
+        let path_hash = PathHash::of("/shares");
+        let reply = RequestHandler::handle(
+            &dispatcher,
+            InboundRequest {
+                link_id,
+                identity: Some(identity),
+                request_id,
+                path_hash,
+                data: Envelope::new(OriginName(ORIGIN), Value::Nil).into_value(),
+            },
+        )
+        .await;
+
+        assert!(matches!(reply, Reply::Silent));
+        let line = format!(
+            "Mesh request {request_id} for hash {path_hash} from {} on link {}: dropped: no route for a registered path (IdentityTrusted)",
+            short(&identity_hex),
+            link_id.to_hex_string()
+        );
+        assert!(
+            debug_snapshot().contains(&line),
+            "the no-route drop must be logged: {line:?}"
+        );
     }
 }
