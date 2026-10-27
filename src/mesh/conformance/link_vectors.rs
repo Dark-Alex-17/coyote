@@ -446,8 +446,9 @@ mod loopback {
     use crate::mesh::request::network::{
         REQUEST_FRAME_OVERHEAD, Recorder, Requester, Responder, SHORT_REQUEST_TIMEOUT, Script,
         Stall, hanging_request, library_refused_oversize_request, link_deadline, pair,
-        request_body_of_encoded_len, request_deadline, request_on, response_body_of_encoded_len,
-        response_payloads, short_options, timed_out, timed_out_slow_request,
+        request_body_of_encoded_len, request_deadline, request_on, request_sent_as,
+        response_body_of_encoded_len, response_payloads, short_options, timed_out,
+        timed_out_slow_request,
     };
     use crate::mesh::request::{
         Deadline, MAX_CONCURRENT_INBOUND_REQUESTS, MAX_REQUEST_PAYLOAD_BYTES, RefusalCode, Reply,
@@ -642,6 +643,7 @@ mod loopback {
     }
 
     async fn size_branch(direction: Direction, len: Len, expected: SizeBranch) {
+        install_log_collector();
         let pair = echo_pair().await;
         let target = len.target(pair.mdu);
         match direction {
@@ -652,9 +654,11 @@ mod loopback {
                     .request(&pair.desc, ECHO_PATH, body.clone())
                     .await
                     .unwrap();
-                // Which way the request travelled is the requester's choice, and the
-                // responder's handler sees no trace of it: the round trip is the check.
                 assert_eq!(outcome.value, body, "a {target}-byte request frame echoes");
+                assert!(
+                    request_sent_as(pair.recorder.last().request_id, ECHO_PATH, expected),
+                    "a {target}-byte request frame goes as a {expected:?}"
+                );
             }
             Direction::Response => {
                 let body = response_body_of_encoded_len(target);

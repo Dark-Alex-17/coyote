@@ -1191,6 +1191,19 @@ pub(crate) mod network {
         );
     }
 
+    /// Whether the requester logged sending `request_id` for `path` on `branch`: its own
+    /// record of the packet-or-resource choice, which the responder's handler never sees.
+    pub(crate) fn request_sent_as(request_id: RequestId, path: &str, branch: SizeBranch) -> bool {
+        let branch = match branch {
+            SizeBranch::Packet => "packet",
+            SizeBranch::Resource => "resource",
+        };
+        let line = format!("Sending mesh request {request_id} for {path} as a {branch} (");
+        debug_snapshot()
+            .iter()
+            .any(|message| message.starts_with(&line))
+    }
+
     /// A body whose request frame, envelope included, encodes to exactly `target` bytes;
     /// the bin header grows at 256 bytes so the search is over lengths rather than
     /// arithmetic.
@@ -1590,9 +1603,9 @@ pub(crate) mod network {
             (mdu, SizeBranch::Packet),
             (mdu + 1, SizeBranch::Resource),
         ];
-        // The request half runs each size; which way the request travelled is the
-        // requester's choice, and the responder's handler sees no trace of it.
-        for (target, _) in matrix {
+        // The responder's handler sees no trace of which way a request travelled; the
+        // requester's own log line is the record.
+        for (target, expected) in matrix {
             let body = request_body_of_encoded_len(requester.origin, target);
             let outcome = requester
                 .request(&desc, "/echo", body.clone())
@@ -1601,6 +1614,10 @@ pub(crate) mod network {
             assert_eq!(outcome.value, body, "a {target}-byte request frame echoes");
             let seen = recorder.last();
             assert_eq!(seen.path_hash, PathHash::of("/echo"));
+            assert!(
+                request_sent_as(seen.request_id, "/echo", expected),
+                "a {target}-byte request frame goes as a {expected:?}"
+            );
         }
         for (target, expected) in matrix {
             let body = response_body_of_encoded_len(target);
