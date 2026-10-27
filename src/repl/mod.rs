@@ -1068,6 +1068,14 @@ pub async fn run_repl_command_with_prefix(
                     bail!("{}", graph::no_session_block_text(&name));
                 }
                 let app = Arc::clone(&ctx.app.config);
+                // A root resolved while sessionless is settled when the
+                // session attaches; children still running under it
+                // would be writing into the directory that removes. With
+                // a session attached the attach is refused, so a cached
+                // uid root is left alone.
+                if ctx.session.is_none() && ctx.child_session_root.is_some() {
+                    ctx.cancel_background_tasks_and_wait(EXIT_CANCEL_WAIT).await;
+                }
                 ctx.use_session(app.as_ref(), args, abort_signal.clone())
                     .await?;
                 if ctx.maybe_autoname_session() {
@@ -1310,6 +1318,11 @@ pub async fn run_repl_command_with_prefix(
             }
             ".empty" => match args {
                 Some("session") => {
+                    // The empty removes the session's uid directory;
+                    // children still running would be writing under it.
+                    if ctx.session.is_some() {
+                        ctx.cancel_background_tasks_and_wait(EXIT_CANCEL_WAIT).await;
+                    }
                     ctx.empty_session()?;
                 }
                 _ => {
@@ -1638,6 +1651,11 @@ pub async fn run_repl_command_with_prefix(
                     ctx.exit_rag()?;
                 }
                 Some("agent") => {
+                    // `exit_agent` settles the session's child directory
+                    // before it tears the agent's children down.
+                    if ctx.session.is_some() || ctx.child_session_root.is_some() {
+                        ctx.cancel_background_tasks_and_wait(EXIT_CANCEL_WAIT).await;
+                    }
                     let app = Arc::clone(&ctx.app.config);
                     ctx.exit_agent(app.as_ref())?;
                     ctx.bootstrap_tools(app.as_ref(), true, abort_signal.clone())
@@ -9858,9 +9876,264 @@ local_hello() {\n\
         });
     }
 
-    /// Both session exits run behind a live editor loop, so the ordering is
-    /// pinned by source scrape: the cancel-and-wait must precede the exit
-    /// that settles the session's child directory.
+    #[test]
+    #[serial]
+    fn exit_agent_with_a_session_attached_cancels_background_work() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        run_async(async {
+            let mut ctx = repl_ctx();
+            let mut session = Session::default();
+            session.set_save_session(Some(false));
+            ctx.session = Some(session);
+            let (supervisor, child_signal) = supervisor_with_cancellable_agent();
+            ctx.supervisor = Some(Arc::clone(&supervisor));
+
+            repl_command(&mut ctx, ".exit agent").await.unwrap();
+
+            assert!(ctx.session.is_none());
+            assert!(
+                child_signal.aborted_ctrlc(),
+                "leaving the agent settles the session, so it cancels first"
+            );
+            assert_eq!(supervisor.read().is_finished("a1"), Some(true));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn exit_agent_with_nothing_attached_leaves_background_work_alone() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        run_async(async {
+            let mut ctx = repl_ctx();
+            assert!(ctx.session.is_none());
+            assert!(ctx.child_session_root.is_none());
+            let (supervisor, child_signal) = supervisor_with_cancellable_agent();
+            ctx.supervisor = Some(Arc::clone(&supervisor));
+
+            repl_command(&mut ctx, ".exit agent").await.unwrap();
+
+            assert!(!child_signal.aborted_ctrlc());
+            assert_eq!(supervisor.read().is_finished("a1"), Some(false));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn empty_session_with_a_session_attached_cancels_background_work() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        run_async(async {
+            let mut ctx = repl_ctx();
+            let mut session = Session::default();
+            session.set_save_session(Some(false));
+            ctx.session = Some(session);
+            let (supervisor, child_signal) = supervisor_with_cancellable_agent();
+            ctx.supervisor = Some(Arc::clone(&supervisor));
+
+            repl_command(&mut ctx, ".empty session").await.unwrap();
+
+            assert!(
+                ctx.session
+                    .as_ref()
+                    .is_some_and(|session| session.messages().is_empty()),
+                "the session stays attached, emptied"
+            );
+            assert!(
+                child_signal.aborted_ctrlc(),
+                "children would write under the directory the empty removes"
+            );
+            assert_eq!(supervisor.read().is_finished("a1"), Some(true));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn empty_session_with_nothing_attached_leaves_background_work_alone() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        run_async(async {
+            let mut ctx = repl_ctx();
+            assert!(ctx.session.is_none());
+            assert!(ctx.child_session_root.is_none());
+            let (supervisor, child_signal) = supervisor_with_cancellable_agent();
+            ctx.supervisor = Some(Arc::clone(&supervisor));
+
+            let err = repl_command(&mut ctx, ".empty session").await.unwrap_err();
+
+            assert_eq!(err.to_string(), "No session");
+            assert!(!child_signal.aborted_ctrlc());
+            assert_eq!(supervisor.read().is_finished("a1"), Some(false));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn empty_session_with_only_a_process_root_leaves_background_work_alone() {
+        use crate::config::child_sessions::{ChildSessionRoot, RootFile};
+        use crate::utils::process::ProcessStamp;
+
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        run_async(async {
+            let mut ctx = repl_ctx();
+            assert!(ctx.session.is_none());
+            let root = ChildSessionRoot::from_stamp(ProcessStamp::current());
+            root.ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
+                .unwrap();
+            ctx.child_session_root = Some(Arc::new(root.clone()));
+            let (supervisor, child_signal) = supervisor_with_cancellable_agent();
+            ctx.supervisor = Some(Arc::clone(&supervisor));
+
+            let err = repl_command(&mut ctx, ".empty session").await.unwrap_err();
+
+            assert_eq!(err.to_string(), "No session");
+            assert!(
+                !child_signal.aborted_ctrlc(),
+                "an empty that bails removes nothing, so it cancels nothing"
+            );
+            assert_eq!(supervisor.read().is_finished("a1"), Some(false));
+            assert!(root.dir().exists());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn session_attach_with_a_process_root_cancels_background_work_and_settles_the_root() {
+        use crate::config::child_sessions::{ChildSessionRoot, RootFile};
+        use crate::utils::process::ProcessStamp;
+
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        run_async(async {
+            let mut ctx = repl_ctx();
+            assert!(ctx.session.is_none());
+            let root = ChildSessionRoot::from_stamp(ProcessStamp::current());
+            root.ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
+                .unwrap();
+            ctx.child_session_root = Some(Arc::new(root.clone()));
+            let (supervisor, child_signal) = supervisor_with_cancellable_agent();
+            ctx.supervisor = Some(Arc::clone(&supervisor));
+
+            repl_command(&mut ctx, ".session attach-test")
+                .await
+                .unwrap();
+
+            assert!(
+                child_signal.aborted_ctrlc(),
+                "the attach settles the process root the children run under"
+            );
+            assert_eq!(supervisor.read().is_finished("a1"), Some(true));
+            assert!(!root.dir().exists());
+            assert!(ctx.child_session_root.is_none());
+            assert!(ctx.session.is_some());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn session_attach_with_no_root_leaves_background_work_alone() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        run_async(async {
+            let mut ctx = repl_ctx();
+            assert!(ctx.session.is_none());
+            assert!(ctx.child_session_root.is_none());
+            let (supervisor, child_signal) = supervisor_with_cancellable_agent();
+            ctx.supervisor = Some(Arc::clone(&supervisor));
+
+            repl_command(&mut ctx, ".session attach-test-2")
+                .await
+                .unwrap();
+
+            assert!(
+                !child_signal.aborted_ctrlc(),
+                "with no root to settle the attach cancels nothing"
+            );
+            assert_eq!(supervisor.read().is_finished("a1"), Some(false));
+            assert!(ctx.session.is_some());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn session_attach_while_attached_with_a_uid_root_leaves_background_work_alone() {
+        use crate::config::child_sessions::ChildSessionRoot;
+
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        run_async(async {
+            let mut ctx = repl_ctx();
+            let mut session = Session::default();
+            session.set_save_session(Some(false));
+            ctx.session = Some(session);
+            let root = ChildSessionRoot::Uid(uuid::Uuid::new_v4());
+            ctx.child_session_root = Some(Arc::new(root));
+            let (supervisor, child_signal) = supervisor_with_cancellable_agent();
+            ctx.supervisor = Some(Arc::clone(&supervisor));
+
+            let err = repl_command(&mut ctx, ".session attach-test-3")
+                .await
+                .unwrap_err();
+
+            assert!(err.to_string().starts_with("Already in a session"), "{err}");
+            assert!(
+                !child_signal.aborted_ctrlc(),
+                "a refused attach settles nothing, so it cancels nothing"
+            );
+            assert_eq!(supervisor.read().is_finished("a1"), Some(false));
+            assert!(ctx.session.is_some());
+            assert!(ctx.child_session_root.is_some());
+        });
+    }
+
+    /// `.fork` is not an exit: the session stays attached and its children
+    /// keep running, so nothing is cancelled and nothing waits on them. The
+    /// cached process root an attached session never has is still settled
+    /// as a defensive mirror of the attach, without a drain.
+    #[test]
+    #[serial]
+    fn usage_probe_fork_leaves_background_work_alone_while_settling_a_process_root() {
+        use crate::config::child_sessions::{ChildSessionRoot, RootFile};
+        use crate::utils::process::ProcessStamp;
+
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        run_async(async {
+            let mut ctx = repl_ctx();
+            let app = ctx.app.config.clone();
+            let mut session = Session::new_from_ctx(&ctx, &app, "fork-src").unwrap();
+            session.set_save_session(Some(true));
+            ctx.session = Some(session);
+            let path = ctx.session_file_for("fork-src", SessionScope::Global);
+            let root = ChildSessionRoot::from_stamp(ProcessStamp::current());
+            root.ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
+                .unwrap();
+            ctx.child_session_root = Some(Arc::new(root.clone()));
+            let (supervisor, child_signal) = supervisor_with_cancellable_agent();
+            ctx.supervisor = Some(Arc::clone(&supervisor));
+
+            repl_command(&mut ctx, ".fork fork-dst").await.unwrap();
+
+            assert!(
+                !child_signal.aborted_ctrlc(),
+                "a fork keeps the session and its children; nothing is cancelled"
+            );
+            assert_eq!(supervisor.read().is_finished("a1"), Some(false));
+            assert_eq!(ctx.session.as_ref().map(Session::name), Some("fork-dst"));
+            assert!(
+                ctx.session_file_for("fork-dst", SessionScope::Global)
+                    .is_file()
+            );
+            assert!(
+                path.is_file(),
+                "the source session's file is saved and stays"
+            );
+            assert!(
+                !root.dir().exists(),
+                "the inherited process root is settled"
+            );
+            assert!(ctx.child_session_root.is_none());
+
+            child_signal.set_ctrlc();
+        });
+    }
+
+    /// Every session exit runs behind a live editor loop, so the ordering
+    /// is pinned by source scrape: the cancel-and-wait must precede the
+    /// exit, or the empty, that settles the session's child directory.
     #[test]
     fn session_exits_cancel_and_wait_before_settling_the_session() {
         let source = include_str!("mod.rs").replace("\r\n", "\n");
@@ -9868,6 +10141,7 @@ local_hello() {\n\
         let call = "cancel_background_tasks_and_wait(EXIT_CANCEL_WAIT).await";
         assert_eq!(EXIT_CANCEL_WAIT, Duration::from_secs(5));
         assert!(production.contains("const EXIT_CANCEL_WAIT: Duration = Duration::from_secs(5);"));
+        assert_eq!(production.matches(&format!("{call};")).count(), 5);
 
         let finished = production.find("top_level_agent_finished(").unwrap();
         let before_finished = &production[..finished];
@@ -9884,6 +10158,19 @@ local_hello() {\n\
             "the signal-only cancel has no place at an exit seam"
         );
 
+        let either_guard = "if ctx.session.is_some() || ctx.child_session_root.is_some() {";
+        let session_guard = "if ctx.session.is_some() {";
+        let guarded_wait_before = |arm: &str, guard: &str, settles: &str| {
+            let arm_guard = arm.find(guard).unwrap();
+            let arm_wait = arm_guard + arm[arm_guard..].find(&format!("{call};")).unwrap();
+            assert_eq!(
+                arm[arm_guard + guard.len()..arm_wait].trim(),
+                "ctx.",
+                "the guard wraps the wait"
+            );
+            assert!(arm_wait < arm.find(settles).unwrap(), "{arm}");
+        };
+
         let exit_match = production.find("\".exit\" => match args {").unwrap();
         let arm_start = exit_match
             + production[exit_match..]
@@ -9891,18 +10178,36 @@ local_hello() {\n\
                 .unwrap();
         let arm_len = production[arm_start..].find("Some(\"rag\") =>").unwrap();
         let arm = &production[arm_start..arm_start + arm_len];
-        let guard = "if ctx.session.is_some() || ctx.child_session_root.is_some() {";
-        let arm_guard = arm.find(guard).unwrap();
-        let arm_wait = arm_guard + arm[arm_guard..].find(&format!("{call};")).unwrap();
-        assert_eq!(
-            arm[arm_guard + guard.len()..arm_wait].trim(),
-            "ctx.",
-            "the guard wraps the wait"
+        guarded_wait_before(arm, either_guard, "exit_agent_session()");
+        guarded_wait_before(arm, either_guard, "exit_session()");
+
+        let agent_start = exit_match
+            + production[exit_match..]
+                .find("Some(\"agent\") => {")
+                .unwrap();
+        let agent_len = production[agent_start..]
+            .find("Some(_) => unknown_command")
+            .unwrap();
+        guarded_wait_before(
+            &production[agent_start..agent_start + agent_len],
+            either_guard,
+            "exit_agent(",
         );
-        assert!(
-            arm_wait < arm.find("exit_agent_session()").unwrap(),
-            "{arm}"
+
+        let empty_start = production.find("\".empty\" => match args {").unwrap();
+        let empty_len = production[empty_start..].find("_ =>").unwrap();
+        guarded_wait_before(
+            &production[empty_start..empty_start + empty_len],
+            session_guard,
+            "empty_session()",
         );
-        assert!(arm_wait < arm.find("exit_session()").unwrap(), "{arm}");
+
+        let session_start = production.find("\".session\" => {").unwrap();
+        let session_len = production[session_start..].find("\".install\" =>").unwrap();
+        guarded_wait_before(
+            &production[session_start..session_start + session_len],
+            "if ctx.session.is_none() && ctx.child_session_root.is_some() {",
+            "use_session(",
+        );
     }
 }
