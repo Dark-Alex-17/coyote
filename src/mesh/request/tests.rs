@@ -553,7 +553,7 @@ pub(crate) mod network {
         Admission, InboundRequest, MAX_CONCURRENT_INBOUND_REQUESTS, Reply, RequestHandler,
         RequestServer, Settlement,
     };
-    use crate::config::mesh_config::MeshInterface;
+    use crate::config::mesh_config::{MAX_FETCH_FILE_BYTES, MeshInterface};
     use crate::config::{ForkRekey, MeshConfig, Session};
     use crate::function::mesh::{inherit_reply_thread, outbound_from_args};
     use crate::hooks::HookEvent;
@@ -10271,6 +10271,76 @@ pub(crate) mod network {
             Some(&Value::Binary(bytes))
         );
         assert_eq!(outcome.response_branch, SizeBranch::Resource);
+        pair.stop_node_a().await;
+    }
+
+    /// Under the default configuration `mesh.fetch.max_bytes` is the 4 MiB cap itself, and
+    /// that number is now the one a requester can rely on: a file of exactly `max_bytes`
+    /// comes back whole over a live link (four Resource segments, a frame the requester's
+    /// `/fetch` response bound still admits), and one byte more is refused `too_large` with
+    /// `limit` equal to the setting, not to any lower number.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_fetch_at_the_default_max_bytes_arrives_whole_and_one_past_it_is_too_large()
+     {
+        install_log_collector();
+        let pair = NodePair::start_with("request-fetch-default-max", |_| {}, trusting_b).await;
+        assert_eq!(
+            pair.node_a.serving().serving_limit(),
+            MAX_FETCH_FILE_BYTES,
+            "the default serving limit is the setting's own cap"
+        );
+        let (slot, _idle) = installed_slot(&pair);
+        let workspace = share_docs_from_a(&pair, &slot, "request-fetch-default-max-root");
+        let limit = usize::try_from(MAX_FETCH_FILE_BYTES).unwrap();
+        let mut at_limit = vec![0u8; limit];
+        RngCore::fill_bytes(&mut OsRng, &mut at_limit);
+        fs::write(workspace.path.join("docs").join("at.bin"), &at_limit).unwrap();
+        fs::write(
+            workspace.path.join("docs").join("over.bin"),
+            vec![0x5au8; limit + 1],
+        )
+        .unwrap();
+        let fetch = |path: &'static str| {
+            pair.client_b.request(
+                &pair.responder.transport,
+                &pair.responder.identity,
+                &pair.a_desc,
+                FETCH_PATH,
+                pair.responder.envelope(fetch_body(path, None)),
+                RequestOptions {
+                    request_timeout: FILE_FETCH_REQUEST_TIMEOUT,
+                    link_timeout: PEER_LINK_TIMEOUT,
+                },
+            )
+        };
+
+        let outcome = fetch("docs/at.bin").await.unwrap();
+        assert_eq!(wire_status(&outcome.value), "ok");
+        assert_eq!(
+            wire_field(&outcome.value, "size").and_then(Value::as_u64),
+            Some(MAX_FETCH_FILE_BYTES)
+        );
+        assert_eq!(
+            wire_field(&outcome.value, "sha256"),
+            Some(&Value::Binary(Sha256::digest(&at_limit).to_vec()))
+        );
+        assert_eq!(
+            wire_field(&outcome.value, "bytes"),
+            Some(&Value::Binary(at_limit))
+        );
+        assert_eq!(outcome.response_branch, SizeBranch::Resource);
+
+        let outcome = fetch("docs/over.bin").await.unwrap();
+        assert_eq!(wire_status(&outcome.value), "too_large");
+        assert_eq!(
+            wire_field(&outcome.value, "limit").and_then(Value::as_u64),
+            Some(MAX_FETCH_FILE_BYTES),
+            "the refusal reports the setting, not a lower limit"
+        );
+        assert!(
+            wire_field(&outcome.value, "bytes").is_none(),
+            "a refusal carries no file bytes"
+        );
         pair.stop_node_a().await;
     }
 

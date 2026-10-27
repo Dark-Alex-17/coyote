@@ -2782,6 +2782,100 @@ fn the_interfaces_block_is_byte_identical_across_the_template_the_example_and_th
     );
 }
 
+/// `mesh.fetch.max_bytes` is the one bound on a served file, on every surface that
+/// documents it: the template, the example and the Configuration page's yaml carry the same
+/// `max_bytes:` comment, that comment and the README and Keys-table rows state the setting's
+/// range and nothing under it, and no Mesh page keeps a clause about a lower served limit,
+/// a one-segment cap, a transport workaround or the number such a cap used to be. The
+/// template/example/README half runs on every run; the pages only with `COYOTE_WIKI_DIR`.
+#[test]
+fn usage_probe_the_max_bytes_twins_name_the_setting_as_the_only_bound_on_a_served_file() {
+    const RETIRED: [&str; 8] = [
+        "1048447",
+        "min(max_bytes",
+        "per-file ceiling",
+        "segment ceiling",
+        "transport workaround",
+        "capped near",
+        "This build carries",
+        "max_bytes` applies alone",
+    ];
+    let fetch_max_line = |label: &str, text: &str| -> String {
+        commented_entry(
+            label,
+            text,
+            "commented `max_bytes:` line under `fetch:`",
+            |line| line.trim_start().starts_with("max_bytes: 4194304") && line.contains('#'),
+        )
+    };
+    let clean = |label: &str, text: &str| {
+        let flat = flat(text);
+        for stale in RETIRED {
+            assert!(
+                !flat.contains(stale),
+                "{label} still carries the retired clause {stale:?}:\n{text}"
+            );
+        }
+    };
+
+    let template = read(repo_root().join("assets/config-template.yaml"));
+    let example = read(repo_root().join("config.example.yaml"));
+    let template_entry = fetch_max_line("assets/config-template.yaml", &template);
+    let example_entry = fetch_max_line("config.example.yaml", &example);
+    assert_eq!(
+        example_entry, template_entry,
+        "config.example.yaml's `fetch.max_bytes` entry differs from the template"
+    );
+    let comment = comment_text(&template_entry);
+    assert!(
+        comment.ends_with("(default: 4194304; must be 1 to 4194304, 4 MiB)"),
+        "the template's `max_bytes` comment does not end on the setting's own range: {comment:?}"
+    );
+    clean(
+        "assets/config-template.yaml `max_bytes` entry",
+        &template_entry,
+    );
+
+    let readme_row = read(repo_root().join("README.md"))
+        .lines()
+        .find(|line| line.starts_with("| `mesh.fetch.max_bytes`"))
+        .expect("README.md has a `mesh.fetch.max_bytes` row")
+        .to_string();
+    assert!(
+        readme_row.contains("`1` to `4194304` (4 MiB)")
+            && readme_row.contains("refused with `too_large` and the limit applied"),
+        "the README row does not state the range and the refusal shape: {readme_row}"
+    );
+    clean("README.md `mesh.fetch.max_bytes` row", &readme_row);
+
+    let Some(wiki) = wiki_dir() else { return };
+    let configuration = read(wiki.join("Mesh-Configuration.md"));
+    assert_eq!(
+        fetch_max_line("Mesh-Configuration.md", &configuration),
+        template_entry,
+        "Mesh-Configuration.md's `fetch.max_bytes` yaml entry differs from the template"
+    );
+    let row = configuration
+        .lines()
+        .find(|line| line.starts_with("| `fetch.max_bytes`"))
+        .expect("Mesh-Configuration.md's Keys table has a `fetch.max_bytes` row");
+    let cells = table_cells(row);
+    assert_eq!(cells[2], "`4194304`", "{row}");
+    assert_eq!(cells[4], "1 to 4194304 when enabled", "{row}");
+    assert!(
+        !cells[3].contains("See [fetch]"),
+        "the Keys row still points at a section for a limit under the setting: {row}"
+    );
+    for page in [
+        "Mesh-Configuration.md",
+        "Mesh-File-Sharing.md",
+        "Mesh.md",
+        "Mesh-Commands.md",
+    ] {
+        clean(page, &read(wiki.join(page)));
+    }
+}
+
 /// `label: spells <needle>` for every needle `text` spells, whitespace runs collapsed to
 /// one space and case ignored, so a phrase wrapped across lines is caught.
 fn local_routing_hits(label: &str, text: &str, needles: &[&str]) -> Vec<String> {

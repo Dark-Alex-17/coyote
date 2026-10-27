@@ -39558,6 +39558,44 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     });
                 }
 
+                /// A peer's `too_large` limit is quoted as the peer's number, whatever it is:
+                /// one byte under a Resource segment (the figure a build before this one capped
+                /// every served file at) gets the same one sentence and the same next step as
+                /// any other, with no clause about this build, a segment or a ceiling, and the
+                /// grant pre-flight on this node's own setting says nothing about one either.
+                #[test]
+                #[serial]
+                fn usage_probe_a_too_large_limit_under_one_segment_gets_the_plain_sentence() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-fetch-old-ceiling");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = FetchFixture::new("repl-mesh-fetch-old-ceiling", true).await;
+                        let dest = fx.stub.destination_hex();
+                        let line = format!(".mesh fetch {dest} docs/a.md");
+                        let under_one_segment =
+                            rns_transport::resource::MAX_EFFICIENT_SIZE as u64 - 128;
+                        assert_eq!(under_one_segment, 1_048_447);
+
+                        fx.queue("too_large", vec![("limit", Value::from(under_one_segment))]);
+                        let refused = refusal(&mut fx.ctx, &line).await;
+                        assert_eq!(
+                            refused,
+                            format!(
+                                "{0} serves files of at most 1048447 bytes and `docs/a.md` is larger. Ask {0}'s human for a smaller copy, or for the file another way.",
+                                fx.dest()
+                            )
+                        );
+                        for stale in ["This build", "segment", "ceiling", "MiB", "another way."] {
+                            let count = refused.matches(stale).count();
+                            let expected = usize::from(stale == "another way.");
+                            assert_eq!(count, expected, "{stale:?} in {refused:?}");
+                        }
+                        assert_eq!(fx.heard().len(), 1);
+                        fx.stop().await;
+                    });
+                }
+
                 #[test]
                 #[serial]
                 fn fetch_reports_not_shared_from_what_this_node_remembers_before_the_generic_sentence()
