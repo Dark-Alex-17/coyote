@@ -48,10 +48,23 @@ Verification commands run with GRAPH_STATE* (GRAPH_STATE, GRAPH_STATE_FILE)
 scrubbed from their environment: the reviewed repo's own tests may exec these very
 scripts with their own GRAPH_STATE, and load_state() prefers
 GRAPH_STATE_FILE, so an inherited live state file would silently win.
+
+Lock prefix: the `build_lock` graph variable (read from state only, never
+from the environment: a harness that itself runs under the lock would
+otherwise nest a second one) is a command prefix such as `flock -w 240 /path/to/lock`.
+When non-empty each declared command runs as
+`<prefix> bash -o pipefail -c '<cmd>'`, the whole command as one unit under
+the prefix, and its record gains an `under` field naming the prefix. The
+record's `cmd` stays the declared command. pipefail applies only under a
+prefix (the bare arm is plain shell, Windows-compatible); the prefixed form
+is POSIX-only. A present, non-string value is a
+declaration error and fails closed the same way as a malformed
+`verification_commands`: PIPELINE-FAULT, nothing executed.
 """
 
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -141,6 +154,21 @@ def declared_commands(declared):
     return [c.strip() for c in declared if c.strip()]
 
 
+def lock_prefix(declared):
+    """Normalize the build_lock declaration to a stripped prefix string.
+
+    Missing/None means no prefix. Anything other than a string raises
+    InvalidDeclaration.
+    """
+    if declared is None:
+        return ""
+    if not isinstance(declared, str):
+        raise InvalidDeclaration(
+            f"expected a string, got {type(declared).__name__}"
+        )
+    return declared.strip()
+
+
 def tail_of(text):
     tail = "\n".join(text.splitlines()[-TAIL_LINES:])
     if len(tail) > MAX_TAIL_CHARS:
@@ -148,13 +176,16 @@ def tail_of(text):
     return tail
 
 
-def run_one(cmd, proj, budget):
-    """Run one command, hard-bounded by `budget` seconds; return its record."""
+def run_one(cmd, proj, budget, prefix=""):
+    """Run one command, hard-bounded by `budget` seconds; return its record.
+    A non-empty `prefix` wraps the command, which keeps its own quoting."""
     start = time.monotonic()
     popen_kwargs = {"start_new_session": True} if os.name == "posix" else {}
     env = {k: v for k, v in os.environ.items() if not k.startswith("GRAPH_STATE")}
+    shell_cmd = f"{prefix} bash -o pipefail -c {shlex.quote(cmd)}" if prefix else cmd
+    under = {"under": prefix} if prefix else {}
     p = subprocess.Popen(
-        cmd,
+        shell_cmd,
         shell=True,
         cwd=proj,
         stdout=subprocess.PIPE,
@@ -184,6 +215,7 @@ def run_one(cmd, proj, budget):
             "exit": -1,
             "duration_s": round(time.monotonic() - start, 1),
             "tail": f"TIMEOUT: no exit within {budget:.0f}s — recorded as a failing run",
+            **under,
         }
     combined = (out_s or "") + (("\n" + err_s) if err_s else "")
     return {
@@ -191,7 +223,16 @@ def run_one(cmd, proj, budget):
         "exit": p.returncode,
         "duration_s": round(time.monotonic() - start, 1),
         "tail": tail_of(combined),
+        **under,
     }
+
+
+def emit_pipeline_fault(state, msg):
+    """Print the fail-closed record for a malformed declaration: nothing runs."""
+    prior = state.get("pipeline_faults")
+    faults = [f for f in prior if isinstance(f, str)] if isinstance(prior, list) else []
+    faults.append(msg)
+    print(json.dumps({"exec_results": msg, "pipeline_faults": faults}))
 
 
 def main():
@@ -200,10 +241,12 @@ def main():
         cmds = declared_commands(state.get("verification_commands"))
     except InvalidDeclaration as e:
         msg = f"PIPELINE-FAULT: verification_commands declaration invalid — {e}"
-        prior = state.get("pipeline_faults")
-        faults = [f for f in prior if isinstance(f, str)] if isinstance(prior, list) else []
-        faults.append(msg)
-        print(json.dumps({"exec_results": msg, "pipeline_faults": faults}))
+        emit_pipeline_fault(state, msg)
+        return
+    try:
+        prefix = lock_prefix(state.get("build_lock"))
+    except InvalidDeclaration as e:
+        emit_pipeline_fault(state, f"PIPELINE-FAULT: build_lock declaration invalid: {e}")
         return
     if not cmds:
         print(
@@ -231,7 +274,7 @@ def main():
         if remaining <= 0:
             results.append({"cmd": cmd, "skipped": "deadline"})
             continue
-        results.append(run_one(cmd, proj, min(PER_COMMAND_TIMEOUT_SECS, remaining)))
+        results.append(run_one(cmd, proj, min(PER_COMMAND_TIMEOUT_SECS, remaining), prefix))
     print(json.dumps({"exec_results": results}))
 
 

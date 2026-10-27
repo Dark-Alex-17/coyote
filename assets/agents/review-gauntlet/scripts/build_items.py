@@ -188,11 +188,19 @@ def main():
     # Re-review narrowing: deterministic, caller-authorized, fail-open.
     # Runs AFTER the LLM additions (an explicitly re-added lane is never
     # narrowed) and BEFORE forced lanes (forcing resurrects anything).
-    settled_raw = state.get("settled_lanes") or []
-    settled, unknown_settled = set(), []
-    for lane in settled_raw:
+    # The settled list is bare lane names only: one token that is not a lane
+    # name refuses the whole line, because a half-parsed line (names plus a
+    # prose remark) would narrow on the names while the remark goes unread.
+    settled = set()
+    for lane in state.get("settled_lanes") or []:
         canon = ALIASES.get(str(lane).strip().lower())
-        (settled.add(canon) if canon else unknown_settled.append(str(lane)))
+        if canon is None:
+            reasons.append(
+                f"settled lanes ignored: unrecognised token '{lane}' (bare lane names only)"
+            )
+            settled = set()
+            break
+        settled.add(canon)
     delta_summary = text("delta_summary")
     delta_ok = bool(delta_summary) and not delta_summary.startswith(
         "delta signals unavailable"
@@ -247,8 +255,6 @@ def main():
             "narrowing requested (settled lanes) but primary diff signals are "
             "unavailable — fail-open, selection stays widened"
         )
-    if unknown_settled:
-        reasons.append(f"ignored unknown settled lane name(s): {unknown_settled}")
 
     # Caller-forced lanes are ADDITIVE: they widen the computed selection,
     # never replace it. (Honoring them as the exact set dropped code-review —

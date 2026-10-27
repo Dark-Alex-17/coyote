@@ -70,6 +70,9 @@ variables:
   - name: pr_strategy
     description: "PR packaging: 'single' = the whole design doc lands as ONE draft PR opened in Phase F (default); 'multi' = the plan partitions tasks into PR groups, each landing as its own stacked draft PR opened at group close-out — for larger plans where one PR would be unreviewable"
     default: 'single'
+  - name: build_lock
+    description: "Command prefix forwarded to every Sisyphus spawn and on to its coder/step-runner build/test/lint gates and to the review-gauntlet/adversary verification runs, e.g. `flock -w 240 /path/to/lock`; empty runs gates bare. It is substituted raw into a JSON string on every hop, so it must be free of double quotes and backslashes; quote paths with single quotes (`flock '/tmp/my lock'`)"
+    default: ''
 
 global_tools:
   - ast_grep.sh

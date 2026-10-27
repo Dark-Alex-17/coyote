@@ -65,6 +65,9 @@ variables:
   - name: escalation_policy
     description: "How escalation-worthy decisions are handled mid-run: 'interactive' pauses and asks the user; 'autonomous' self-resolves decisions covered by a standing ruling or a clearly recommended option, reports them in a final-report digest, and only pings on hard triggers or novel conflicts"
     default: 'interactive'
+  - name: build_lock
+    description: "Command prefix forwarded to every coder/step-runner spawn for their build/test/lint gates and to the review-gauntlet/adversary verification runs, e.g. `flock -w 240 /path/to/lock`; empty runs gates bare. It is substituted raw into a JSON string on every hop, so it must be free of double quotes and backslashes; quote paths with single quotes (`flock '/tmp/my lock'`)"
+    default: ''
 
 mcp_servers:
   - ddg-search

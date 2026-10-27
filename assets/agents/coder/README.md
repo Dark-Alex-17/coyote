@@ -88,9 +88,31 @@ coyote -a coder --agent-variable project_dir /path/to/your/project "Add..."
 
 - `max_fix_attempts` (default `5`) — fix-loop budget before `end_failure`.
 
+`graph.yaml` `variables` also exposes:
+
+- `build_lock` (default empty): command prefix applied to every gate (build
+  and tests), e.g. `flock /tmp/coyote-cargo.lock` so parallel agents sharing
+  one target directory serialise their gate runs (the coder's own ad-hoc
+  cargo calls are not covered). The whole gate command runs under the prefix
+  as one unit. Waiting on the lock counts toward the gate node's timeout
+  (300 s build, 600 s tests), so prefer `flock -w <secs>` or raise those
+  timeouts when runs are long. A gate killed by its timeout while still
+  waiting leaves the lock request queued; `-w` below the node timeout makes
+  it give up instead of running later unobserved. The prefix is a shell
+  fragment and is re-parsed: quote paths containing spaces
+  (`flock '/tmp/my lock'`); `$VAR` inside it expands when the gate runs.
+  `flock` is util-linux (not shipped on macOS);
+  any wrapper that serialises its argument command works.
+
+  ```bash
+  coyote -a coder --agent-variable build_lock 'flock -w 240 /tmp/coyote-cargo.lock' "Add..."
+  ```
+
 Environment overrides honored by the script nodes:
 
 - `BUILD_CMD` — skip project-type detection for the build/check command.
+  Under a `build_lock` prefix the inner shell sees only exported variables;
+  a gate command must not depend on the gate script's own locals.
 - `TEST_CMD` — skip detection for tests.
 - `COYOTE_GATE_OUTPUT_MAX_BYTES` — cap on each gate transcript kept in state
   (default 64 KiB; keeps the head ¼ and tail ¾, trimming the middle).

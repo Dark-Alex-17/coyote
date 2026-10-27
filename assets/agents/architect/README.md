@@ -154,6 +154,7 @@ coyote -a architect \
 | `parallel_tasks` | `0` | `0` = sequential (default) · `1` = opt-in worktree-parallel execution for eligible tasks. |
 | `pr_strategy` | `single` | `single` = one draft PR for the whole design doc (default) · `multi` = the plan partitions tasks into PR groups, each landing as its own stacked draft PR at group close-out. |
 | `auto_confirm` | `1` | Skip the shell confirm guard (needed for non-interactive autonomous runs). |
+| `build_lock` | *(empty)* | Command prefix (e.g. `flock -w 240 /tmp/coyote-cargo.lock`) forwarded to every Sisyphus spawn and from there to the coder/step-runner gates and the review-gauntlet/adversary verification runs, so parallel worktrees sharing one target directory serialise their builds. Empty runs them bare. The value is substituted raw into a JSON string on every hop, so it must be free of double quotes and backslashes; quote paths with single quotes (`flock '/tmp/my lock'`). |
 
 ### Dynamic instructions
 

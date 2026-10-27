@@ -172,9 +172,11 @@ def render_exec_results(exec_results):
                 )
                 continue
             status = "PASS" if r.get("exit") == 0 else "FAIL"
+            under = f" (under: {r['under']})" if r.get("under") else ""
             out.append(
                 f"- [{status}] `{r.get('cmd', '?')}` — exit {r.get('exit', '?')}, "
                 f"{r.get('duration_s', '?')}s"
+                + under
             )
             if status == "FAIL":
                 tail = (r.get("tail") or "").strip()

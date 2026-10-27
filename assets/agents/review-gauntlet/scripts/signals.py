@@ -94,12 +94,18 @@ TESTS_RE = (
     r"(^|/)tests?/|(^|/)testdata/|(^|/)__tests__/|(^|/)spec/"
     r"|_test\.|\.test\.|(^|/)test_|_spec\.|\.spec\."
 )
-# auth(?!or) admits auth/authn/authz/oauth but not "author".
+# auth(?!or(?!i[sz])) admits auth/authn/authz/oauth/authoriz(e|ation) but not
+# "author". Deliberately wider than code-reviewer's touches_auth (token,
+# session, secret; tests and docs included).
 # Over-firing here is the safe direction: it only ADDS a lane.
 AUTH_PATH_RE = (
-    r"auth(?!or)|login|logout|token|session|permission|rbac|\bacl\b|credential|secret"
+    r"auth(?!or(?!i[sz]))|login|logout|token|session|permission|rbac|\bacl\b|credential|secret"
 )
-AUTH_ADDED_RE = r"auth(?!or)|password|token|secret|credential|jwt|session"
+# Superset of code-reviewer facts.py's content vocabulary plus token/session.
+AUTH_ADDED_RE = (
+    r"auth(?!or(?!i[sz]))|password|token|secret|credential|jwt|session|bearer"
+    r"|permission|rbac|\bacl\b|csrf|saml|oidc|\bsso\b|\bmfa\b|\botp\b"
+)
 DEPS_RE = (
     r"go\.(mod|sum)$|package(-lock)?\.json$|yarn\.lock$|pnpm-lock\.yaml$"
     r"|Cargo\.(toml|lock)$|requirements[^/]*\.txt$|pyproject\.toml$"
@@ -183,6 +189,7 @@ if isinstance(_prompt, str) and _prompt:
 # a usable revision spec is dropped rather than guessed.
 _rr_spec = ""
 _settled = []
+_EMPTY_MARKERS = ("none", "-", "(none)")
 if isinstance(_prompt, str) and _prompt:
     if m := re.search(
         r"^[ \t]*Re-review delta:[ \t]*(\S+)([^\n]*)$", _prompt, re.M | re.I
@@ -190,7 +197,7 @@ if isinstance(_prompt, str) and _prompt:
         tok = m.group(1).strip().rstrip(".,;:")
         rest = m.group(2).strip()
         if (
-            tok.lower() not in ("none", "-", "(none)", "worktree")
+            tok.lower() not in (*_EMPTY_MARKERS, "worktree")
             and re.fullmatch(rf"{_TOKEN}(\.\.\.?{_TOKEN})?", tok)
             # The line must be the bare token, optionally followed by a
             # parenthetical/em-dash remark — a prose sentence whose first
@@ -200,11 +207,14 @@ if isinstance(_prompt, str) and _prompt:
         ):
             _rr_spec = tok
     if m := re.search(r"^[ \t]*Settled lanes:[ \t]*(.+)$", _prompt, re.M | re.I):
-        _settled = [
-            t
-            for t in re.split(r"[,\s]+", m.group(1).strip())
-            if t and t.lower() not in ("none", "-", "(none)")
-        ]
+        toks = [t for t in re.split(r"[,\s]+", m.group(1).strip()) if t]
+        # A leading empty marker makes the rest of the line a comment
+        # ("none (nothing was green)"), so no remark token can reach the
+        # lane-name check in build_items.py.
+        if toks and toks[0].lower() in _EMPTY_MARKERS:
+            _settled = []
+        else:
+            _settled = [t for t in toks if t.lower() not in _EMPTY_MARKERS]
 out["rereview_spec"] = _rr_spec
 out["settled_lanes"] = _settled
 

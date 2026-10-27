@@ -3250,6 +3250,78 @@ mod tests {
         );
     }
 
+    /// A graph child whose script node reports the `LLM_AGENT_VAR_BUILD_LOCK`
+    /// it was handed (or `unset` when the variable never reached its
+    /// environment), so the run's output is the child's view of the variable.
+    #[cfg(unix)]
+    fn write_graph_agent_that_reports_build_lock(agent_name: &str) {
+        let agent_dir = paths::agent_data_dir(agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("probe.sh"),
+            "#!/bin/bash\nprintf '{\"seen\": \"%s\"}' \"${LLM_AGENT_VAR_BUILD_LOCK-unset}\"\n",
+        )
+        .unwrap();
+        write(
+            agent_dir.join("graph.yaml"),
+            format!(
+                "name: {agent_name}\n\
+                 variables:\n\
+                 \x20 - name: build_lock\n\
+                 \x20   description: gate\n\
+                 \x20   default: \"\"\n\
+                 start: probe\n\
+                 nodes:\n\
+                 \x20 probe:\n\
+                 \x20   type: script\n\
+                 \x20   script: probe.sh\n\
+                 \x20   state_updates: {{}}\n\
+                 \x20   next: done\n\
+                 \x20 done:\n\
+                 \x20   type: end\n\
+                 \x20   output: \"{{{{seen}}}}\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// The child of an agent node is built with `new_for_child`, which
+    /// carries the parent's `agent_variables`, and seats them over its own
+    /// declared defaults, so a `build_lock` handed to the enclosing graph
+    /// reaches the child's scripts as `LLM_AGENT_VAR_BUILD_LOCK`.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn run_agent_for_graph_child_seats_the_parents_build_lock_over_its_default() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_graph_child_build_lock");
+        write_graph_agent_that_reports_build_lock(&agent_name);
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        ctx.agent_variables = Some(AgentVariables::from([(
+            "build_lock".to_string(),
+            "env GATE_SEEN=1".to_string(),
+        )]));
+
+        let output = run_async(run_agent_for_graph(&mut ctx, &agent_name, "hi", None)).unwrap();
+
+        assert_eq!(output, "env GATE_SEEN=1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn run_agent_for_graph_child_without_a_parent_value_seats_its_declared_default() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_graph_child_build_lock_default");
+        write_graph_agent_that_reports_build_lock(&agent_name);
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        assert!(ctx.agent_variables.is_none());
+
+        let output = run_async(run_agent_for_graph(&mut ctx, &agent_name, "hi", None)).unwrap();
+
+        assert_eq!(output, "");
+    }
+
     /// The other half of the inheritance rule: `handle_spawn` builds its
     /// child with `new_for_child` and never copies the session signal, so a
     /// latched root interrupt is invisible to the background child.

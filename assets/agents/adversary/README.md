@@ -144,6 +144,7 @@ Direct invocation for ad-hoc use:
 ```sh
 coyote -a adversary --agent-variable project_dir /path/to/repo \
   --agent-variable verification_commands '["cargo test --all"]' \
+  --agent-variable build_lock 'flock -w 240 /tmp/coyote-cargo.lock' \
   "Review staged changes against these criteria: <paste criteria>"
 ```
 
@@ -157,6 +158,15 @@ wrong side of it: it also carries plan and diff text pasted from the repo under 
 the reviewer's shell. Hence the commands are never in the prompt and never in `parse`'s output
 schema; `review-gauntlet` forwards its own `verification_commands` variable to the adversary lane
 as a structured `inputs:` passthrough, not as prompt text.
+
+`build_lock` (default `''`) is a command prefix such as `flock -w 240 /path/to/lock`. When
+non-empty, `run_checks` runs each declared command as `<prefix> bash -o pipefail -c '<cmd>'`, the
+whole command as one unit under the prefix, and the record gains an `under` field naming the
+prefix; `cmd` stays the declared command. `review-gauntlet` forwards its own `build_lock` the same
+way as `verification_commands`. Empty runs the commands bare; pipefail applies only under a prefix
+(the bare arm is plain shell, Windows-compatible); the prefixed form is POSIX-only. A value that is
+not a string is an
+invalid declaration and fails closed like a malformed `verification_commands`.
 
 - `'[]'` (or omitted) ⇒ the "none declared" marker; execution criteria are at best PARTIAL.
 - Anything that is not a JSON array of strings (unparsable JSON, an object, non-string items) is

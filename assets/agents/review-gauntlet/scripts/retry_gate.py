@@ -49,12 +49,13 @@ LANES = {
 # Must stay identical to verdict_gate.py's sentinel regexes: a lane this
 # gate calls completed must be one the verdict gate can parse, or a drift
 # would re-run lanes the verdict gate accepts (or accept lanes it cannot
-# read). A cross-pin test compares the literals in both files.
+# read). A cross-pin test compares the literals in both files. The security
+# and probe sentinels are line-anchored, so is_faulted matches with re.M.
 SENTINELS = {
     "code-review": r"Verdict:\**\s*\**\s*(MERGE-READY|NEEDS-HUMAN)",
     "adversary": r"ADVERSARIAL_REVIEW:\s*(CONFORMS|DIVERGES)",
-    "security": r"SECURITY_REVIEW:\s*(PASS|FAIL)",
-    "probe": r"USAGE_PROBE:\s*(PASS|FAIL|INCONCLUSIVE)",
+    "security": r"^SECURITY_REVIEW:\s*(PASS|FAIL)\s*$",
+    "probe": r"^USAGE_PROBE:\s*(PASS|FAIL|INCONCLUSIVE)\s*$",
 }
 
 # Filled by main() so the crash guard can append to an upstream fault
@@ -114,7 +115,7 @@ def is_faulted(lane, report):
         return True
     if report.strip().startswith("PIPELINE-FAULT:"):
         return True
-    if not re.search(SENTINELS[lane], report):
+    if not re.search(SENTINELS[lane], report, re.M):
         return True
     return nested_degraded(lane, report)
 

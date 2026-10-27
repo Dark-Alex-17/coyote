@@ -139,6 +139,8 @@ Skill nudge: load `frontend-ui-ux` before touching components.
 
 **Paste actual code snippets, not just file paths.** "Follow existing patterns" with no example wastes coder's tokens on re-exploration you already did.
 
+Every coder spawn also passes `--variables {"build_lock": "{{build_lock}}"}` so the coder's build/test gates run under that prefix (`""` is an accepted value and runs them bare).
+
 ### Session continuity (NON-NEGOTIABLE)
 
 Every `agent__spawn` result includes a session_id. Store it. A fix or follow-up to a child's work resumes that child's `session_id`; a fresh spawn is for new work.
@@ -322,12 +324,12 @@ decisions the reviewers must not re-litigate; omit on the first round>
 Re-review delta: <on re-review rounds ONLY, when the fixes landed as commits: the HEAD SHA
 recorded when you spawned the PRIOR round (`git rev-parse HEAD` — record it at EVERY gauntlet
 spawn), or an explicit <sha>..HEAD range; omit on the first round or while fixes are uncommitted>
-Settled lanes: <on re-review rounds ONLY: the lanes whose verdict in the immediately-prior
-round was green (code-review PASS with 0 criticals, adversary CONFORMS, security PASS, probe
-PASS) — NEVER a lane that reported findings: it must re-run to verify your fix; omit on the
-first round>
+Settled lanes: <on re-review rounds ONLY: bare lane names, comma-separated, e.g. 'security, probe'
+-- no verdict words, round numbers or parentheticals; list only lanes whose verdict in the
+immediately-prior round was green (code-review PASS with 0 criticals, adversary CONFORMS, security
+PASS, probe PASS), NEVER a lane that reported findings; omit on the first round (ignored unless `Re-review delta:` is also given)>
 Local-run recipe / usage suites: <from the plan — enables the probe lane; omit when none>"
---variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]"}
+--variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]", "build_lock": "{{build_lock}}"}
 <— the cargo commands above are only an EXAMPLE: replace them with THIS project's exact build/test/lint commands; never guess, and pass "[]" when none apply>
 ```
 
@@ -460,7 +462,7 @@ DIFF: run get_diff (or --base <ref>), or: <paste diff>
 
 PLAN — acceptance criteria to check against:
 <paste the task/step spec + acceptance criteria VERBATIM — not a summary>"
---variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]"}
+--variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]", "build_lock": "{{build_lock}}"}
 <— the cargo commands above are only an EXAMPLE: replace them with THIS project's exact build/test/lint commands; never guess, and pass "[]" when none apply>
 ```
 
@@ -671,6 +673,8 @@ Detect this mode when the user references step plans, handoffs, or a plan repo �
 ### Execution lifecycle (one step at a time)
 
 **Default: delegate the whole step to `step-runner`** — a graph agent that enforces the step protocol as graph edges (orient → staleness check → coder → verify → edge-case sweep → optional independent review → validated handoff → user approval gate): `agent__spawn --agent step-runner --prompt "Execute step <N> of the plan at <plans_dir>"`. It returns `STEP_COMPLETE` / `STEP_BLOCKED` / `STEP_REJECTED` / `STEP_FAILED`. Relay its escalations (deviation gate, approval gate) promptly. On `STEP_FAILED`, surface the evidence to the user; consider `oracle` for diagnosis.
+
+The step-runner spawn also passes `--variables {"build_lock": "{{build_lock}}"}` so its format/lint/build/test gates run under that prefix (`""` is an accepted value and runs them bare).
 
 Carry a STEP_COMPLETE `Design decisions:` block into the final report under the same heading, and treat a `Design: ASK -- <question>` line in its `step_summary` the same way as a coder `Design: ASK` line: put it to the user as a `Design question:`, record `<question> -> <answer>`, and treat an adopting answer as work for the next step. An empty block is dropped.
 

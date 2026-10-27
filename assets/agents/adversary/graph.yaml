@@ -42,6 +42,9 @@ variables:
       services (compose projects, fixed ports) — those collide with the probe
       lane running in parallel.
     default: '[]'
+  - name: build_lock
+    description: Command prefix for every declared verification command, e.g. `flock -w 240 /path/to/lock`; empty runs them bare.
+    default: ''
   - name: debris_exclude
     description: Repo-relative directories the debris lint leaves out of its diff, as a JSON array string (e.g. '["plans"]') or one directory name; empty = none.
     default: ''

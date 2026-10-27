@@ -145,9 +145,6 @@ def diff_text():
 
 
 dtext = diff_text()
-added_lines = "\n".join(
-    l for l in dtext.splitlines() if l.startswith("+") and not l.startswith("+++")
-)
 
 # --- quality bar resolution --------------------------------------------------
 rigor_in = (state.get("rigor_in") or state.get("rigor") or "").strip()
@@ -310,6 +307,33 @@ def any_path(pattern):
     return any(re.search(pattern, f, re.I) for f in files)
 
 
+def added_code_lines():
+    """(path, added line) pairs from the diff body, comment-shaped lines dropped."""
+    pairs, path = [], ""
+    for l in dtext.splitlines():
+        if l.startswith("+++ "):
+            path = l[4:]
+            path = path[2:] if path.startswith("b/") else path
+        elif l.startswith("+") and path:
+            body = l[1:].lstrip()
+            if not body.startswith(("//", "#", "/*", "*")):
+                pairs.append((path, body))
+    return pairs
+
+
+# Same path shapes as review-gauntlet/scripts/signals.py TESTS_RE and DOCS_RE.
+TEST_PATH_RE = (
+    r"(^|/)tests?/|(^|/)testdata/|(^|/)__tests__/|(^|/)spec/"
+    r"|_test\.|\.test\.|(^|/)test_|_spec\.|\.spec\."
+)
+DOCS_PATH_RE = r"\.(md|rst|txt|adoc)$"
+
+
+def auth_bearing_path(f):
+    # Tests and docs mention auth vocabulary without changing an auth surface.
+    return not re.search(TEST_PATH_RE, f, re.I) and not re.search(DOCS_PATH_RE, f, re.I)
+
+
 migration_files = [f for f in files if re.search(r"migrations?/|\.sql$", f, re.I)]
 mig_added = "\n".join(
     l for l in dtext.splitlines()
@@ -319,9 +343,26 @@ out["destructive_migration"] = bool(
     migration_files
     and re.search(r"(?i)drop\s+(table|column)|rename\s+(table|column|to)|alter\s+\S+\s+drop", mig_added)
 )
+# review-gauntlet/scripts/signals.py keeps a wider definition on purpose: over-firing
+# there only adds a lane, while a hit here forces a human signature. Cookie,
+# session and token stay out of the content regex: they name plumbing far more
+# often than an auth decision.
 out["touches_auth"] = bool(
-    any_path(r"auth(?!or)|login|logout|token|session|permission|rbac|\bacl\b|credential")
-    or re.search(r"auth(?!or)|password|jwt|session|credential", added_lines, re.I)
+    any(
+        auth_bearing_path(f)
+        and re.search(r"auth(?!or(?!i[sz]))|login|logout|permission|rbac|\bacl\b|credential", f, re.I)
+        for f in files
+    )
+    or any(
+        auth_bearing_path(f)
+        and re.search(
+            r"authenticat|authori[sz]|oauth|password|jwt|credential|secret|permission"
+            r"|rbac|\bacl\b|csrf|saml|oidc|\bsso\b|\bmfa\b|\botp\b|bearer",
+            l,
+            re.I,
+        )
+        for f, l in added_code_lines()
+    )
 )
 out["consumer_surface"] = any_path(
     r"routes?|handlers?|\bapi\b|endpoints?|\bcmd/|\bcli\b|\.proto$|openapi|swagger|controllers?|graphql"

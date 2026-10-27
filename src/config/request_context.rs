@@ -24719,7 +24719,7 @@ mod tests {
             "code_review_results": ["**Verdict: MERGE-READY**"],
             "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
             "security_results": [],
-            "probe_results": ["USAGE_PROBE: INCONCLUSIVE — could not boot the stack"]
+            "probe_results": ["could not boot the stack\n\nUSAGE_PROBE: INCONCLUSIVE\n"]
         });
         let out = run_gauntlet_script("verdict_gate.py", &state);
         assert_eq!(out["gauntlet_verdict"], "BLOCKED");
@@ -26896,8 +26896,8 @@ mod tests {
         for sentinel in [
             r"Verdict:\**\s*\**\s*(MERGE-READY|NEEDS-HUMAN)",
             r"ADVERSARIAL_REVIEW:\s*(CONFORMS|DIVERGES)",
-            r"SECURITY_REVIEW:\s*(PASS|FAIL)",
-            r"USAGE_PROBE:\s*(PASS|FAIL|INCONCLUSIVE)",
+            r"^SECURITY_REVIEW:\s*(PASS|FAIL)\s*$",
+            r"^USAGE_PROBE:\s*(PASS|FAIL|INCONCLUSIVE)\s*$",
         ] {
             assert!(
                 retry.contains(sentinel),
@@ -26980,6 +26980,306 @@ mod tests {
                 "the adversary degraded predicate must stay byte-identical in both gate scripts"
             );
         }
+    }
+
+    /// The security reviewer closes its report with the sentinel on its own
+    /// line; a body that quotes `SECURITY_REVIEW: FAIL` while explaining the
+    /// rule must not outrank that closing line in either gate script.
+    #[test]
+    fn gauntlet_security_sentinel_last_whole_line_wins() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let report = "# Security review\n\nRule: a `SECURITY_REVIEW: FAIL` blocks completion.\n\
+                      No exploitable finding.\n\nSECURITY_REVIEW: PASS\n";
+        let out = run_gauntlet_script(
+            "verdict_gate.py",
+            &json!({
+                "code_review_results": ["**Verdict: MERGE-READY**"],
+                "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+                "security_results": [report],
+                "probe_results": []
+            }),
+        );
+        assert_eq!(
+            out["gauntlet_verdict"], "PASS",
+            "a quoted FAIL mid-body must not outrank the closing PASS line: {out}"
+        );
+        assert!(
+            out["gauntlet_report"]
+                .as_str()
+                .unwrap()
+                .contains("| security | GREEN | PASS |"),
+            "{out}"
+        );
+
+        let retry = run_gauntlet_script("retry_gate.py", &gauntlet_lane_ran("security", report));
+        assert_eq!(
+            retry["retry_lanes"],
+            json!([]),
+            "the closing sentinel line completes the lane: {retry}"
+        );
+
+        // Only an inline quote, no whole-line sentinel: sentinel-less to both.
+        let quoted_only = "Rule: a `SECURITY_REVIEW: FAIL` blocks completion.\n";
+        let retry =
+            run_gauntlet_script("retry_gate.py", &gauntlet_lane_ran("security", quoted_only));
+        assert_eq!(retry["retry_lanes"], json!(["security"]), "{retry}");
+    }
+
+    /// The probe closes its report with the sentinel on its own line; a body
+    /// that quotes `USAGE_PROBE: PASS` while describing the suite must not
+    /// outrank the closing FAIL line in either gate script.
+    #[test]
+    fn gauntlet_probe_sentinel_last_whole_line_wins() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let report = "# Usage probe\n\nThe suite prints USAGE_PROBE: PASS when green.\n\
+                      Observed: POST /items returned 500 where the spec says 201.\n\n\
+                      USAGE_PROBE: FAIL\n";
+        let out = run_gauntlet_script(
+            "verdict_gate.py",
+            &json!({
+                "code_review_results": ["**Verdict: MERGE-READY**"],
+                "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+                "security_results": [],
+                "probe_results": [report]
+            }),
+        );
+        assert_eq!(
+            out["gauntlet_verdict"], "BLOCKED",
+            "a quoted PASS mid-body must not outrank the closing FAIL line: {out}"
+        );
+        assert!(
+            out["gauntlet_report"]
+                .as_str()
+                .unwrap()
+                .contains("| probe | BLOCKED | FAIL |"),
+            "{out}"
+        );
+
+        let retry = run_gauntlet_script("retry_gate.py", &gauntlet_lane_ran("probe", report));
+        assert_eq!(
+            retry["retry_lanes"],
+            json!([]),
+            "the closing sentinel line completes the lane: {retry}"
+        );
+
+        // Only an inline quote, no whole-line sentinel: sentinel-less to both.
+        let quoted_only = "The suite prints USAGE_PROBE: PASS when green.\n";
+        let retry = run_gauntlet_script("retry_gate.py", &gauntlet_lane_ran("probe", quoted_only));
+        assert_eq!(retry["retry_lanes"], json!(["probe"]), "{retry}");
+    }
+
+    /// A sentinel followed by text on its own line is not a whole-line
+    /// sentinel: the retry gate re-runs the lane and the verdict gate blocks
+    /// the row as missing, in agreement.
+    #[test]
+    fn gauntlet_sentinel_with_trailing_text_is_missing_to_both_gates() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let security = "# Security review\n\nNo exploitable finding.\n\n\
+                        SECURITY_REVIEW: PASS -- see above\n";
+        let retry = run_gauntlet_script("retry_gate.py", &gauntlet_lane_ran("security", security));
+        assert_eq!(
+            retry["retry_lanes"],
+            json!(["security"]),
+            "same-line trailing text must leave the lane sentinel-less: {retry}"
+        );
+        let out = run_gauntlet_script(
+            "verdict_gate.py",
+            &json!({
+                "code_review_results": ["**Verdict: MERGE-READY**"],
+                "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+                "security_results": [security],
+                "probe_results": []
+            }),
+        );
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("| security | BLOCKED | missing verdict sentinel |"),
+            "{out}"
+        );
+
+        let probe = "# Usage probe\n\nSuites green.\n\nUSAGE_PROBE: FAIL (see notes)\n";
+        let retry = run_gauntlet_script("retry_gate.py", &gauntlet_lane_ran("probe", probe));
+        assert_eq!(
+            retry["retry_lanes"],
+            json!(["probe"]),
+            "same-line trailing text must leave the lane sentinel-less: {retry}"
+        );
+        let out = run_gauntlet_script(
+            "verdict_gate.py",
+            &json!({
+                "code_review_results": ["**Verdict: MERGE-READY**"],
+                "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+                "security_results": [],
+                "probe_results": [probe]
+            }),
+        );
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("| probe | BLOCKED | missing verdict sentinel |"),
+            "{out}"
+        );
+    }
+
+    /// Two whole-line sentinels in one report: the last one is the verdict.
+    /// Both orders are pinned so reading the first match cannot pass.
+    #[test]
+    fn gauntlet_verdict_gate_last_whole_line_sentinel_wins_in_both_directions() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let security = "# Security review\n\nSECURITY_REVIEW: FAIL\n\n\
+                        Retested after the fix landed; the finding no longer reproduces.\n\n\
+                        SECURITY_REVIEW: PASS\n";
+        let out = run_gauntlet_script(
+            "verdict_gate.py",
+            &json!({
+                "code_review_results": ["**Verdict: MERGE-READY**"],
+                "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+                "security_results": [security],
+                "probe_results": []
+            }),
+        );
+        assert_eq!(
+            out["gauntlet_verdict"], "PASS",
+            "an earlier whole-line FAIL must not outrank the closing PASS: {out}"
+        );
+        assert!(
+            out["gauntlet_report"]
+                .as_str()
+                .unwrap()
+                .contains("| security | GREEN | PASS |"),
+            "{out}"
+        );
+
+        let probe = "# Usage probe\n\nUSAGE_PROBE: PASS\n\n\
+                     Second pass against a cold instance: POST /items returned 500.\n\n\
+                     USAGE_PROBE: FAIL\n";
+        let out = run_gauntlet_script(
+            "verdict_gate.py",
+            &json!({
+                "code_review_results": ["**Verdict: MERGE-READY**"],
+                "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+                "security_results": [],
+                "probe_results": [probe]
+            }),
+        );
+        assert_eq!(
+            out["gauntlet_verdict"], "BLOCKED",
+            "an earlier whole-line PASS must not outrank the closing FAIL: {out}"
+        );
+        assert!(
+            out["gauntlet_report"]
+                .as_str()
+                .unwrap()
+                .contains("| probe | BLOCKED | FAIL |"),
+            "{out}"
+        );
+    }
+
+    /// The regex a Python script assigns to `name`: the raw-string pieces of
+    /// its `NAME = r"..."` line or parenthesised multi-line form, joined the
+    /// way Python's adjacent-literal concatenation joins them.
+    fn python_regex_literal(source: &str, name: &str) -> String {
+        let head = format!("\n{name} = ");
+        let start = source
+            .find(&head)
+            .unwrap_or_else(|| panic!("{name} is not assigned"))
+            + head.len();
+        let rest = &source[start..];
+        let statement = if rest.starts_with('(') {
+            &rest[..rest.find("\n)").unwrap()]
+        } else {
+            &rest[..rest.find('\n').unwrap()]
+        };
+        statement
+            .split("r\"")
+            .skip(1)
+            .map(|piece| piece.split('"').next().unwrap())
+            .collect()
+    }
+
+    /// The sentinel contract is stated the same way everywhere it is read:
+    /// the lane selector's settled-lanes line names its source, the README
+    /// states the whole-line and last-wins rules and where the line is split,
+    /// the auth-path regex the README quotes is the one signals.py runs, and
+    /// the probe's own instructions show each sentinel as a bare fenced line.
+    #[test]
+    fn gauntlet_sentinel_prose_matches_the_gate_scripts() {
+        use crate::graph::NodeType;
+        let graph = load_bundled_graph("review-gauntlet");
+        let NodeType::Llm(select) = &graph.get_node("select_lanes").unwrap().node_type else {
+            panic!("select_lanes must be an llm node");
+        };
+        assert!(
+            select
+                .prompt
+                .contains("caller-supplied `Settled lanes:` tokens"),
+            "select_lanes must label settled lanes as caller-supplied: {}",
+            select.prompt
+        );
+        assert!(
+            !select.prompt.contains("green last round"),
+            "select_lanes must not restate settled lanes as a judgement: {}",
+            select.prompt
+        );
+
+        let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents");
+        let readme = read_to_string(assets.join("review-gauntlet/README.md"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        for claim in [
+            "split in `signals.py`",
+            "`build_items.ALIASES`",
+            "A leading `none` makes the rest of the line\n  a comment",
+            "a sentinel followed by text on the same line is treated as missing and re-runs the lane",
+            "the last such line wins",
+        ] {
+            assert!(
+                readme.contains(claim),
+                "review-gauntlet README must state the sentinel contract: {claim:?}"
+            );
+        }
+        let signals = read_to_string(assets.join("review-gauntlet/scripts/signals.py")).unwrap();
+        let auth_path_re = python_regex_literal(&signals, "AUTH_PATH_RE");
+        let auth_word = auth_path_re
+            .split('|')
+            .next()
+            .expect("AUTH_PATH_RE starts with its auth alternative");
+        assert_eq!(auth_word, "auth(?!or(?!i[sz]))");
+        assert!(
+            readme.contains(&format!("over-fires (`{auth_word}` matches")),
+            "review-gauntlet README must quote signals.py's auth-path regex {auth_word}"
+        );
+
+        let probe = read_to_string(assets.join("probe/config.yaml"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        for sentinel in [
+            "USAGE_PROBE: PASS",
+            "USAGE_PROBE: FAIL",
+            "USAGE_PROBE: INCONCLUSIVE",
+        ] {
+            assert!(
+                probe.contains(&format!("  ```\n  {sentinel}\n  ```\n")),
+                "probe/config.yaml must show {sentinel} as a bare fenced whole line"
+            );
+        }
+        assert!(
+            probe.contains("nothing before or after it on that line"),
+            "probe/config.yaml must state the whole-line rule"
+        );
     }
 
     /// build_items.py's LANE_KEYS and retry_gate.py's LANES name the same
@@ -27129,6 +27429,74 @@ mod tests {
         );
     }
 
+    /// A re-review state whose primary signals select security and probe
+    /// and whose delta carries no attack-surface or consumer signals, so
+    /// settling both lanes is the only thing standing between them and a
+    /// narrowed SKIP.
+    fn gauntlet_narrowable_state(settled_lanes: &[&str]) -> serde_json::Value {
+        json!({
+            "settled_lanes": settled_lanes,
+            "delta_summary": "2 file(s) in delta (abc1234..HEAD)",
+            "signals_summary": "6 file(s) changed (diff: worktree)",
+            "touches_auth": true,
+            "consumer_surface": true,
+            "probe_context": "make run && hurl tests/"
+        })
+    }
+
+    #[test]
+    fn gauntlet_build_items_bare_settled_lane_names_narrow() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out = run_gauntlet_script(
+            "build_items.py",
+            &gauntlet_narrowable_state(&["security", "probe"]),
+        );
+        assert_eq!(out["security_items"], json!([]), "{out}");
+        assert_eq!(out["probe_items"], json!([]), "{out}");
+        let summary = out["lanes_summary"].as_str().unwrap();
+        assert!(
+            summary.contains("security: SKIPPED (narrowed)")
+                && summary.contains("probe: SKIPPED (narrowed)"),
+            "both settled lanes must narrow on a quiet delta: {summary}"
+        );
+    }
+
+    /// signals.py splits the `Settled lanes:` line on commas and whitespace,
+    /// so a trailing remark arrives as extra tokens. One token that is not a
+    /// lane name refuses the whole line: a half-parsed line would narrow on
+    /// the names while the remark goes unread.
+    #[test]
+    fn gauntlet_build_items_unrecognised_settled_token_refuses_the_line() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out = run_gauntlet_script(
+            "build_items.py",
+            &gauntlet_narrowable_state(&["security", "probe", "(both", "PASS", "r1)"]),
+        );
+        assert_eq!(
+            out["security_items"],
+            json!([{"lane": "security"}]),
+            "{out}"
+        );
+        assert_eq!(out["probe_items"], json!([{"lane": "probe"}]), "{out}");
+        let summary = out["lanes_summary"].as_str().unwrap();
+        assert!(
+            summary.contains(
+                "settled lanes ignored: unrecognised token '(both' (bare lane names only)"
+            ),
+            "the first offending token must be named: {summary}"
+        );
+        assert!(
+            !summary.contains("SKIPPED (narrowed)"),
+            "nothing may narrow on a refused line: {summary}"
+        );
+    }
+
     #[test]
     fn gauntlet_signals_stamps_start_time_before_git_runs() {
         if !cmd_available("python3") {
@@ -27161,6 +27529,72 @@ mod tests {
             stamped.get("gauntlet_started_at").is_none(),
             "an existing start stamp must be left alone: {stamped}"
         );
+    }
+
+    /// Runs signals.py with the given `Settled lanes:` line in the initial
+    /// prompt and returns the extracted `settled_lanes` list. The prompt
+    /// fields are read before any git work, so a non-repo directory is enough.
+    fn gauntlet_settled_lanes_from_prompt(settled_line: &str) -> serde_json::Value {
+        let dir = temp_file("-gauntlet-settled-", "");
+        create_dir_all(&dir).unwrap();
+        let prompt = format!(
+            "Post-implementation review gate.\n\nDiff: worktree\nRe-review delta: abc1234\n{settled_line}\n"
+        );
+        let out = run_gauntlet_script(
+            "signals.py",
+            &json!({
+                "project_dir": dir.to_string_lossy(),
+                "diff_spec": "worktree",
+                "initial_prompt": prompt,
+            }),
+        );
+        let _ = remove_dir_all(&dir);
+        out["settled_lanes"].clone()
+    }
+
+    /// The split is deliberately dumb: a remark after the lane names arrives
+    /// as extra tokens so build_items.py can refuse the whole line instead
+    /// of narrowing on a half-read one.
+    #[test]
+    fn gauntlet_signals_settled_lanes_trailing_remark_is_tokenised() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let settled =
+            gauntlet_settled_lanes_from_prompt("Settled lanes: security, probe (both PASS r1)");
+        assert_eq!(
+            settled,
+            json!(["security", "probe", "(both", "PASS", "r1)"]),
+            "every token after the label must reach build_items.py unfiltered"
+        );
+    }
+
+    /// `none` at the head of the line means nothing settled; the remark that
+    /// follows is a comment, not a list of tokens for build_items.py to
+    /// reject.
+    #[test]
+    fn gauntlet_signals_settled_lanes_leading_none_discards_the_remark() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let settled = gauntlet_settled_lanes_from_prompt("Settled lanes: none (nothing was green)");
+        assert_eq!(
+            settled,
+            json!([]),
+            "a leading `none` must not leak its remark as settled-lane tokens"
+        );
+    }
+
+    #[test]
+    fn gauntlet_signals_settled_lanes_bare_list_passes_through() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let settled = gauntlet_settled_lanes_from_prompt("Settled lanes: security, probe");
+        assert_eq!(settled, json!(["security", "probe"]));
     }
 
     #[test]
@@ -27388,6 +27822,63 @@ mod tests {
         }
     }
 
+    // build_lock is prepended to every declared command the same shell runs,
+    // so it is held to the same rule as verification_commands.
+    #[test]
+    fn build_lock_is_a_declared_variable_never_parsed_from_the_prompt() {
+        use crate::graph::NodeType;
+        for name in ["adversary", "review-gauntlet"] {
+            let graph = load_bundled_graph(name);
+            let var = graph
+                .variables
+                .iter()
+                .find(|v| v.name == "build_lock")
+                .unwrap_or_else(|| panic!("{name} must declare the build_lock variable"));
+            assert_eq!(
+                var.default.as_deref(),
+                Some(""),
+                "{name}: an empty build_lock runs the declared commands bare"
+            );
+            assert!(
+                !graph.initial_state.contains_key("build_lock"),
+                "{name}: an initial_state key would shadow the declared variable"
+            );
+            let node = graph
+                .nodes
+                .get("parse")
+                .unwrap_or_else(|| panic!("{name} graph must have a parse node"));
+            let NodeType::Llm(parse) = &node.node_type else {
+                panic!("{name}: parse must be an llm node");
+            };
+            let schema = parse
+                .output_schema
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name}: parse must have an output_schema"));
+            assert!(
+                !schema["properties"]
+                    .as_object()
+                    .unwrap()
+                    .contains_key("build_lock"),
+                "{name}: parse must not extract build_lock: {schema}"
+            );
+            assert!(
+                !schema["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("build_lock")),
+                "{name}: parse must not require build_lock: {schema}"
+            );
+            assert!(
+                !parse
+                    .instructions
+                    .as_deref()
+                    .is_some_and(|s| s.contains("build_lock")),
+                "{name}: parse instructions must not mention build_lock: {:?}",
+                parse.instructions
+            );
+        }
+    }
+
     // ---- code-reviewer suite-script regression tests ----
     //
     // Fail-closed fault paths of the code-reviewer's verdict/fault/render
@@ -27469,6 +27960,171 @@ mod tests {
                 .is_some_and(|n| n.contains("normalized to merge-base")),
             "normalization must be surfaced in facts_note: {out}"
         );
+    }
+
+    /// A repo with one empty base commit and the given files staged, so
+    /// `diff_spec: staged` shows exactly those files as fully added.
+    fn staged_files_repo(files: &[(&str, &str)]) -> PathBuf {
+        let dir = utils::temp_file("-staged-files-", "");
+        create_dir_all(&dir).unwrap();
+        debris_git(&dir, &["init", "-q", "-b", "main"]);
+        debris_git(&dir, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        for (path, body) in files {
+            let target = dir.join(path);
+            create_dir_all(target.parent().unwrap()).unwrap();
+            write(target, body).unwrap();
+        }
+        debris_git(&dir, &["add", "."]);
+        dir
+    }
+
+    fn code_reviewer_touches_auth(files: &[(&str, &str)]) -> bool {
+        let repo = staged_files_repo(files);
+        let out = run_code_reviewer_script(
+            "facts.py",
+            &json!({"project_dir_in": repo.to_string_lossy(), "diff_spec": "staged"}),
+        );
+        let _ = remove_dir_all(&repo);
+        out["touches_auth"]
+            .as_bool()
+            .unwrap_or_else(|| panic!("touches_auth missing for {files:?}: {out}"))
+    }
+
+    /// `touches_auth` selects the security lane, so it reads only code that
+    /// can change an auth surface: tests and docs are excluded on both the
+    /// path and the content side, comment lines are skipped, and the bare
+    /// `session`/`token` vocabulary (ubiquitous in HTTP and parser code) is
+    /// not a trigger.
+    #[test]
+    fn code_reviewer_facts_touches_auth_reads_code_not_tests_docs_or_comments() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        assert!(
+            code_reviewer_touches_auth(&[("src/auth.rs", "pub fn check() {}\n")]),
+            "an auth path in src must trigger"
+        );
+        assert!(
+            code_reviewer_touches_auth(&[("src/authorization.rs", "pub fn check() {}\n")]),
+            "an authorization path in src must trigger"
+        );
+        assert!(
+            !code_reviewer_touches_auth(&[("src/author_index.rs", "pub fn by_author() {}\n")]),
+            "author is not auth vocabulary"
+        );
+        assert!(
+            !code_reviewer_touches_auth(&[("tests/auth_helpers.rs", "pub fn mk() {}\n")]),
+            "an auth path under tests must not trigger"
+        );
+        assert!(
+            !code_reviewer_touches_auth(&[("src/__tests__/auth.js", "test('x', () => {});\n")]),
+            "an auth path under __tests__ must not trigger"
+        );
+        assert!(
+            !code_reviewer_touches_auth(&[(
+                "src/auth_test.go",
+                "func TestAuth(t *testing.T) {}\n"
+            )]),
+            "an _test. suffix must not trigger"
+        );
+        assert!(
+            !code_reviewer_touches_auth(&[("spec/auth_spec.rb", "describe Auth do; end\n")]),
+            "a spec/ path must not trigger"
+        );
+        assert!(
+            code_reviewer_touches_auth(&[("src/lib.rs", "let claims = decode_jwt(raw);\n")]),
+            "an added code line with auth vocabulary must trigger"
+        );
+        assert!(
+            !code_reviewer_touches_auth(&[(
+                "tests/session_test.rs",
+                "fn t() { let session = open(); let password = \"x\"; }\n"
+            )]),
+            "a tests-only diff must not trigger, whatever it mentions"
+        );
+        assert!(
+            !code_reviewer_touches_auth(&[("docs/auth.md", "rotate the secret monthly\n")]),
+            "a docs-only diff must not trigger"
+        );
+        assert!(
+            !code_reviewer_touches_auth(&[("docs/auth.rst", "rotate the secret monthly\n")]),
+            "every docs extension signals.py knows is a docs path here too"
+        );
+        assert!(
+            !code_reviewer_touches_auth(&[("src/lib.rs", "// password handling lives upstream\n")]),
+            "a comment line must not trigger"
+        );
+        assert!(
+            !code_reviewer_touches_auth(&[(
+                "src/lib.rs",
+                "/// password rules are documented here\n"
+            )]),
+            "a doc-comment line must not trigger"
+        );
+        assert!(
+            !code_reviewer_touches_auth(&[("scripts/x.py", "# password = read()\n")]),
+            "a hash comment line must not trigger"
+        );
+        assert!(
+            !code_reviewer_touches_auth(&[("src/lib.rs", " * jwt rules live here\n")]),
+            "a block-comment continuation line must not trigger"
+        );
+        assert!(
+            !code_reviewer_touches_auth(&[("src/lib.rs", "/* credential cache */\n")]),
+            "a block-comment line must not trigger"
+        );
+        assert!(
+            !code_reviewer_touches_auth(&[("src/lib.rs", "let token = lexer.next();\n")]),
+            "bare `token` is not auth vocabulary"
+        );
+        assert!(
+            !code_reviewer_touches_auth(&[("Tests/Auth.cs", "class A {}\n")]),
+            "the tests/ exclusion must be case-insensitive like the .md one"
+        );
+        assert!(
+            code_reviewer_touches_auth(&[("src/lib.rs", "fn authorise(u: &U) {}\n")]),
+            "British spelling of authorise must trigger"
+        );
+        assert!(
+            code_reviewer_touches_auth(&[(
+                "src/http.rs",
+                "let t = oauth_client.exchange(code);\n"
+            )]),
+            "oauth is auth vocabulary"
+        );
+        assert!(
+            code_reviewer_touches_auth(&[("src/http.rs", "verify_csrf(&req)?;\n")]),
+            "csrf is auth vocabulary"
+        );
+        assert!(
+            !code_reviewer_touches_auth(&[("src/http.rs", "let cookie = jar.get(\"theme\");\n")]),
+            "bare `cookie` is not auth vocabulary"
+        );
+        assert!(
+            code_reviewer_touches_auth(&[("src/lib.rs", "let s = read_secret();\n")]),
+            "secret is auth vocabulary on a code line"
+        );
+    }
+
+    /// facts.py spells its test and docs path shapes by hand rather than
+    /// importing signals.py, so the copies are held equal here.
+    #[test]
+    fn code_reviewer_facts_path_regexes_match_gauntlet_signals() {
+        let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents");
+        let facts = read_to_string(assets.join("code-reviewer/scripts/facts.py")).unwrap();
+        let signals = read_to_string(assets.join("review-gauntlet/scripts/signals.py")).unwrap();
+        for (facts_name, signals_name) in
+            [("TEST_PATH_RE", "TESTS_RE"), ("DOCS_PATH_RE", "DOCS_RE")]
+        {
+            let twin = python_regex_literal(&signals, signals_name);
+            assert!(!twin.is_empty(), "signals.py {signals_name} is empty");
+            assert_eq!(
+                python_regex_literal(&facts, facts_name),
+                twin,
+                "facts.py {facts_name} must spell signals.py {signals_name}"
+            );
+        }
     }
 
     const REVIEW_DIFF_FLAGS: &str =
@@ -31957,6 +32613,41 @@ mod tests {
             );
         }
         let _ = remove_dir_all(&repo);
+    }
+
+    fn gauntlet_touches_auth(files: &[(&str, &str)]) -> bool {
+        let repo = staged_files_repo(files);
+        let out = run_gauntlet_script(
+            "signals.py",
+            &json!({"project_dir": repo.to_string_lossy(), "diff_spec": "worktree"}),
+        );
+        let _ = remove_dir_all(&repo);
+        out["touches_auth"]
+            .as_bool()
+            .unwrap_or_else(|| panic!("touches_auth missing for {files:?}: {out}"))
+    }
+
+    /// The hostile-config test above shows the auth trigger cannot be
+    /// forged; this shows it fires on both kinds of evidence signals.py
+    /// reads, a changed path and an added line.
+    #[test]
+    fn gauntlet_signals_touches_auth_fires_on_an_auth_path_and_on_an_added_auth_line() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        assert!(
+            gauntlet_touches_auth(&[("src/authorize.rs", "pub fn check() {}\n")]),
+            "an authorize path must trigger"
+        );
+        assert!(
+            gauntlet_touches_auth(&[("src/http.rs", "verify_csrf(&req)?;\n")]),
+            "an added csrf call must trigger"
+        );
+        assert!(
+            !gauntlet_touches_auth(&[("src/author_index.rs", "pub fn by_author() {}\n")]),
+            "author is not auth vocabulary"
+        );
     }
 
     /// `debris_exclude` is optional and "empty means none" for every shape

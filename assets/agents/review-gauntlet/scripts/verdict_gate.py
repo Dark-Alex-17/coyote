@@ -268,10 +268,14 @@ def main():
         reports.append(("security", sec))
     else:
         reports.append(("security", sec))
-        m = re.search(r"SECURITY_REVIEW:\s*(PASS|FAIL)", sec)
-        if m and m.group(1) == "PASS":
+        # The security reviewer closes its report with the sentinel on its
+        # own line; a body that quotes "SECURITY_REVIEW: FAIL" while explaining
+        # the rule must not outrank that closing line, so the LAST whole-line
+        # match wins. Same literal as retry_gate.SENTINELS (cross-pinned).
+        verdicts = re.findall(r"^SECURITY_REVIEW:\s*(PASS|FAIL)\s*$", sec, re.M)
+        if verdicts and verdicts[-1] == "PASS":
             record("security", "GREEN", "PASS")
-        elif m:
+        elif verdicts:
             blockers.append("security: SECURITY_REVIEW: FAIL — exploitable finding(s)")
             record("security", "BLOCKED", "FAIL")
         else:
@@ -291,13 +295,13 @@ def main():
         reports.append(("probe", pb))
     else:
         reports.append(("probe", pb))
-        m = re.search(r"USAGE_PROBE:\s*(PASS|FAIL|INCONCLUSIVE)", pb)
-        if m and m.group(1) == "PASS":
+        verdicts = re.findall(r"^USAGE_PROBE:\s*(PASS|FAIL|INCONCLUSIVE)\s*$", pb, re.M)
+        if verdicts and verdicts[-1] == "PASS":
             record("probe", "GREEN", "PASS")
-        elif m and m.group(1) == "FAIL":
+        elif verdicts and verdicts[-1] == "FAIL":
             blockers.append("probe: USAGE_PROBE: FAIL — observed behavior contradicts the contract")
             record("probe", "BLOCKED", "FAIL")
-        elif m:
+        elif verdicts:
             blockers.append(
                 "probe: INCONCLUSIVE — the ENVIRONMENT could not be established; this is "
                 "not a code verdict. Follow the plan's local-run recipe to fix the "
