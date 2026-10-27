@@ -20,7 +20,8 @@ pub(crate) enum RequestError {
     LinkClosed,
     /// The encoded request frame exceeds `MAX_REQUEST_PAYLOAD_BYTES` and was not sent at
     /// all, or the peer's response exceeds the path's response cap and the transport
-    /// refused it before assembly.
+    /// refused it, at its advertisement or after assembly. The transport never reports
+    /// the refused size, so `len` for a response is one over `max`.
     Oversize { len: usize, max: usize },
     /// Bytes that are not a well-formed request or response frame.
     Decode(String),
