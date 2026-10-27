@@ -1422,8 +1422,9 @@ fn knob_source(spawned: Option<&Agent>, app: &AppConfig) -> String {
 /// marked `(crashed)` when its sidecar still says running but the
 /// recording process is gone. A stamp recorded with `start` 0 (sysinfo
 /// could not list the own process at spawn) reads as dead, so such a
-/// child is listed as crashed; a resume still refuses it until it is
-/// collected or cancelled, since it may in fact be running.
+/// child is listed as crashed; a resume refuses it only while that pid
+/// still exists, since it may in fact be running. Once the pid is gone
+/// the child resumes like any crashed one.
 fn recent_child_ids_hint(root: &ChildSessionRoot) -> String {
     let (children, more) = root.recent_children(10);
     if children.is_empty() {
@@ -1529,11 +1530,13 @@ fn resume_child_session(
                 meta.agent
             );
         }
-        // A stamp with no start time cannot be told apart from a live
-        // process, so it is refused like one rather than resumed over a
-        // child that may still be writing the session.
+        // A stamp with no start time under a pid that still exists cannot
+        // be told apart from the live child, so it is refused like one
+        // rather than resumed over a child that may still be writing the
+        // session. A pid sysinfo no longer lists is dead like any other
+        // dead stamp and the child resumes.
         if meta.status == ChildStatus::Running {
-            if meta.pid_start == 0 {
+            if meta.pid_start == 0 && ProcessStamp::pid_exists(meta.pid) {
                 bail!(
                     "'{id}' may still be running (its process start time is unknown); collect or cancel it first"
                 );

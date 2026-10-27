@@ -26,11 +26,20 @@ impl ProcessStamp {
     /// the pid was reused by an unrelated process. A stamp recorded with
     /// `start` 0 (sysinfo could not list the own process at spawn) reads as
     /// dead unless sysinfo later lists that pid with a start time of 0 as
-    /// well, so such a child is listed as crashed. Resuming a child treats
-    /// a `start` of 0 as unknown and refuses; the orphan sweep still reads
-    /// it as dead.
+    /// well, so such a child is listed as crashed. When that pid is also
+    /// absent the child is dead everywhere. When the pid still exists it
+    /// reads dead here as well (and is listed crashed), but a resume refuses
+    /// it, since the process under that pid may be the live child.
     pub(crate) fn is_alive(&self) -> bool {
         lookup_start_time(self.pid) == Some(self.start)
+    }
+
+    /// True when sysinfo lists a process under this pid, whatever its start
+    /// time. Unlike [`Self::is_alive`] this cannot tell the original process
+    /// from one that inherited the pid; it answers only whether the pid is
+    /// in use.
+    pub(crate) fn pid_exists(pid: u32) -> bool {
+        lookup_start_time(pid).is_some()
     }
 }
 
@@ -71,6 +80,12 @@ mod tests {
             start: current.start + 1,
         };
         assert!(!stale.is_alive());
+    }
+
+    #[test]
+    fn pid_exists_tracks_the_process_table() {
+        assert!(ProcessStamp::pid_exists(std::process::id()));
+        assert!(!ProcessStamp::pid_exists(u32::MAX - 1));
     }
 
     #[test]
