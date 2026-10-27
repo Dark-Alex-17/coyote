@@ -4366,6 +4366,31 @@ pub(crate) mod network {
         pair.stop_node_a().await;
     }
 
+    /// The destination registered at start serves every known path, and so does the one
+    /// a rekey registers in its place: each is put behind the handler before it reaches
+    /// the transport, so no request can find a destination without its handlers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_known_path_is_registered_on_the_destination_at_start_and_after_a_rekey() {
+        let pair = NodePair::start("request-runtime-registered-paths").await;
+        assert_eq!(pair.node_a.registered_request_paths().await, KNOWN_PATHS);
+
+        let original_hash = pair.node_a.destination_hash().await;
+        pair.node_a
+            .rekey(ForkRekey {
+                original_instance_id: Some(pair.node_a.instance_id().await),
+                fork_instance_id: Session::default().ensure_mesh_instance_id().to_string(),
+            })
+            .await
+            .unwrap();
+        assert_ne!(pair.node_a.destination_hash().await, original_hash);
+        assert_eq!(
+            pair.node_a.registered_request_paths().await,
+            KNOWN_PATHS,
+            "the fork's destination must serve every known path too"
+        );
+        pair.stop_node_a().await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mesh_runtime_refuses_to_start_on_a_corrupt_trust_list() {
         let (addr, relay, _) = loopback_relay().await;

@@ -1061,6 +1061,19 @@ impl MeshRuntime {
         state.dest.lock().await.max_request_size()
     }
 
+    /// The paths the node's current destination was given a request handler for, in
+    /// registration order.
+    #[cfg(all(test, unix))]
+    pub(crate) async fn registered_request_paths(&self) -> Vec<&'static str> {
+        let hash = self.destination.lock().await.hash;
+        REGISTERED_REQUEST_PATHS
+            .lock()
+            .iter()
+            .filter(|(destination, _)| *destination == hash)
+            .map(|(_, path)| *path)
+            .collect()
+    }
+
     /// The node's private key as hex, for tests that prove no hook env carries it.
     #[cfg(all(test, unix))]
     pub(crate) fn private_key_hex(&self) -> String {
@@ -1655,9 +1668,19 @@ fn register_request_paths(
         destination
             .register_request_handler(path, request_handler.clone(), RequestAllow::All, true)
             .map_err(|err| anyhow!("Failed to register the mesh request path {path}: {err}"))?;
+        #[cfg(all(test, unix))]
+        REGISTERED_REQUEST_PATHS
+            .lock()
+            .push((destination.desc.address_hash, path));
     }
     Ok(())
 }
+
+/// Every path given a request handler, with the destination it was registered on. The
+/// library keeps its handler table private, so this is what a test reads to pin them.
+#[cfg(all(test, unix))]
+static REGISTERED_REQUEST_PATHS: parking_lot::Mutex<Vec<(AddressHash, &'static str)>> =
+    parking_lot::Mutex::new(Vec::new());
 
 /// Sends one announce and records the moment in `last_announce_at`, so every path that
 /// announces (start, connect, reconnect, heartbeat, re-key) is counted there.
