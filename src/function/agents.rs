@@ -7746,6 +7746,310 @@ mod tests {
         );
     }
 
+    /// The tool's own description promises `runs` tops out at a number and
+    /// that older runs are dropped; a child resumed past that many lists
+    /// exactly the promised number, read from the description itself, and
+    /// the description stays ASCII for the model that reads it.
+    #[test]
+    #[serial]
+    fn usage_probe_list_sessions_runs_saturates_at_the_number_the_description_promises() {
+        let _guard = TestConfigDirGuard::new();
+        let decl = agent_function_declarations()
+            .into_iter()
+            .find(|d| d.name == "agent__list_sessions")
+            .unwrap();
+        assert!(decl.description.is_ascii(), "{}", decl.description);
+        let marker = "`runs`: at most ";
+        let after = &decl.description[decl.description.find(marker).unwrap() + marker.len()..];
+        let promised: usize = after
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse()
+            .unwrap();
+        assert!(promised >= 2, "the promise must be a real cap: {promised}");
+        assert!(
+            after[promised.to_string().len()..].starts_with(", older runs are dropped"),
+            "{after}"
+        );
+
+        let (mut ctx, ids) = ctx_with_completed_children(1);
+        let sid = ids[0].clone();
+        let root = Arc::clone(ctx.child_session_root.as_ref().unwrap());
+        let dead = ProcessStamp {
+            pid: u32::MAX - 1,
+            start: 0,
+        };
+        let mut meta = child_meta_of(&ctx, &sid);
+        assert_eq!(meta.runs.len(), 1);
+        // One resume short of the cap keeps every run, so the saturation
+        // below is the cap and not an off-by-one on the first spawn's run 0.
+        for n in 1..promised as u32 {
+            meta.restamp(dead, &format!("resume_{n}"), fixture_time(n));
+        }
+        assert_eq!(meta.runs.len(), promised);
+        assert_eq!(
+            meta.runs[0].agent_id, "agent_x",
+            "run 0 survives at the cap"
+        );
+        root.save_child_meta(&meta).unwrap();
+        let page = list_sessions(&mut ctx, json!({})).unwrap();
+        assert_eq!(page["sessions"][0]["runs"], json!(promised));
+
+        // Two more resumes: the count stays at the promise and the oldest
+        // runs are the ones that went.
+        for n in promised as u32..promised as u32 + 2 {
+            meta.restamp(dead, &format!("resume_{n}"), fixture_time(n));
+        }
+        root.save_child_meta(&meta).unwrap();
+        let page = list_sessions(&mut ctx, json!({})).unwrap();
+        assert_eq!(page["total"], json!(1));
+        assert_eq!(page["sessions"][0]["session_id"], json!(sid));
+        assert_eq!(page["sessions"][0]["runs"], json!(promised));
+        assert_eq!(page["sessions"][0]["status"], json!("crashed"));
+        let kept = child_meta_of(&ctx, &sid);
+        assert_eq!(kept.runs.len(), promised);
+        assert_eq!(kept.runs[0].agent_id, "resume_2");
+        assert_eq!(
+            kept.runs.last().unwrap().agent_id,
+            format!("resume_{}", promised + 1)
+        );
+    }
+
+    /// The listing is ordered by `created_at` alone: a resume re-stamps a
+    /// child's `updated_at` and run ring but never moves it up the page,
+    /// so a consumer paging newest-first sees the oldest child last even
+    /// when it is the one most recently worked on.
+    #[test]
+    #[serial]
+    fn usage_probe_list_sessions_orders_by_created_at_not_by_the_latest_resume() {
+        let _guard = TestConfigDirGuard::new();
+        let (mut ctx, seeded) = ctx_with_completed_children(5);
+        let root = Arc::clone(ctx.child_session_root.as_ref().unwrap());
+        let dead = ProcessStamp {
+            pid: u32::MAX - 1,
+            start: 0,
+        };
+        // seeded[0] was created at minute 0, the oldest; resume it well
+        // after every sibling and let that resume finish.
+        let oldest = seeded[0].clone();
+        let mut meta = child_meta_of(&ctx, &oldest);
+        assert_eq!(meta.created_at, fixture_time(0));
+        meta.restamp(dead, "resume_1", fixture_time(40));
+        meta.finish_at(fixture_time(41), ChildStatus::Completed, None);
+        root.save_child_meta(&meta).unwrap();
+
+        let mut visited = Vec::new();
+        let mut cursor = Value::Null;
+        let last_row = loop {
+            let page = list_sessions(&mut ctx, json!({"page_size": 2, "cursor": cursor})).unwrap();
+            assert_eq!(page["total"], json!(5));
+            visited.extend(session_ids_of(&page));
+            if page["next_cursor"].is_null() {
+                break page["sessions"]
+                    .as_array()
+                    .unwrap()
+                    .last()
+                    .cloned()
+                    .unwrap();
+            }
+            cursor = page["next_cursor"].clone();
+        };
+
+        let mut expected: Vec<String> = seeded.clone();
+        expected.reverse();
+        assert_eq!(visited, expected, "newest created first, every child once");
+        assert_eq!(last_row["session_id"], json!(oldest));
+        assert_eq!(last_row["created_at"], json!(fixture_time(0).to_rfc3339()));
+        assert_eq!(last_row["updated_at"], json!(fixture_time(41).to_rfc3339()));
+        assert_eq!(last_row["runs"], json!(2));
+        assert_eq!(last_row["status"], json!("completed"));
+    }
+
+    /// Listing reads the root and never writes to it: the lock file the
+    /// seat left behind is not reopened, no sidecar is rewritten, no entry
+    /// appears or changes under the uid directory across two pages (every
+    /// entry's size, mtime and inode are compared), so a listing can run
+    /// beside a child that is saving its own sidecar without contending
+    /// for the root lock.
+    #[test]
+    #[serial]
+    fn usage_probe_list_sessions_reads_the_root_without_touching_a_file() {
+        let _guard = TestConfigDirGuard::new();
+        let (mut ctx, _) = ctx_with_completed_children(3);
+        let root = Arc::clone(ctx.child_session_root.as_ref().unwrap());
+        assert!(root.root_file().is_file());
+        assert!(
+            root.lock_file().is_file(),
+            "the seat leaves the lock file in place"
+        );
+
+        fn snapshot(
+            dir: &Path,
+        ) -> std::collections::BTreeMap<PathBuf, (u64, std::time::SystemTime, u64)> {
+            paths_under(dir)
+                .into_iter()
+                .map(|path| {
+                    let meta = std::fs::symlink_metadata(&path).unwrap();
+                    #[cfg(unix)]
+                    let ino = {
+                        use std::os::unix::fs::MetadataExt;
+                        meta.ino()
+                    };
+                    #[cfg(not(unix))]
+                    let ino = 0;
+                    (path, (meta.len(), meta.modified().unwrap(), ino))
+                })
+                .collect()
+        }
+        let before = snapshot(&root.dir());
+        assert!(
+            before.len() >= 5,
+            "root.yaml, children/, three sidecars: {before:?}"
+        );
+
+        let first = list_sessions(&mut ctx, json!({"page_size": 2})).unwrap();
+        let cursor = first["next_cursor"].clone();
+        assert!(cursor.is_string());
+        let second = list_sessions(&mut ctx, json!({"page_size": 2, "cursor": cursor})).unwrap();
+        assert_eq!(second["sessions"].as_array().unwrap().len(), 1);
+
+        assert_eq!(
+            snapshot(&root.dir()),
+            before,
+            "listing changed something on disk"
+        );
+    }
+
+    /// A `running` sidecar whose process start time was unknown at spawn
+    /// (`pid_start` 0) and whose pid is still in use reads as dead by the
+    /// documented rule, so the listing says `crashed`; the same consumer
+    /// asking to resume it is refused with the fuller story, so a listing
+    /// that says `crashed` never leaves a `session_id` that silently fails
+    /// to resume without saying why.
+    #[test]
+    #[serial]
+    fn usage_probe_list_sessions_crashed_row_with_an_unknown_start_is_refused_on_resume_with_why() {
+        let _guard = TestConfigDirGuard::new();
+        let current = ProcessStamp::current();
+        if current.start == 0 {
+            eprintln!(
+                "sysinfo cannot read this process's start time; the start-0 rule is not probeable here"
+            );
+            return;
+        }
+        let agent_name = unique_agent_name("test_list_unknown_start");
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let root = ctx.ensure_child_session_root().unwrap();
+        root.ensure_dir(&RootFile::seed(current, None)).unwrap();
+        let unknown_start_live_pid = ProcessStamp {
+            pid: current.pid,
+            start: 0,
+        };
+        let sid = seed_sidecar(
+            &root,
+            &agent_name,
+            1,
+            ChildStatus::Running,
+            unknown_start_live_pid,
+        );
+        let truly_live = seed_sidecar(&root, &agent_name, 2, ChildStatus::Running, current);
+
+        let page = list_sessions(&mut ctx, json!({})).unwrap();
+        let rows = page["sessions"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["session_id"], json!(truly_live));
+        assert_eq!(rows[0]["status"], json!("running"));
+        assert_eq!(rows[1]["session_id"], json!(sid));
+        assert_eq!(rows[1]["status"], json!("crashed"));
+
+        let error = resume_error(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+        assert!(
+            error.contains(&format!(
+                "'{sid}' may still be running (its process start time is unknown); collect or cancel it first"
+            )),
+            "{error}"
+        );
+        assert!(error.is_ascii(), "{error}");
+        let still = child_meta_of(&ctx, &sid);
+        assert_eq!(
+            still.status,
+            ChildStatus::Running,
+            "a refused resume re-stamps nothing"
+        );
+        assert_eq!(still.runs.len(), 1);
+    }
+
+    /// A sidecar whose run ring is malformed (a run missing its required
+    /// fields, a ring that is not a list, a run with an unknown status
+    /// word) is one corrupt sidecar: it is skipped with a warning and
+    /// cannot hide its siblings or fail the page, while a run that merely
+    /// omits the optional closing fields still loads.
+    #[test]
+    #[serial]
+    fn usage_probe_list_sessions_skips_a_sidecar_whose_run_ring_is_malformed_and_keeps_the_rest() {
+        let _guard = TestConfigDirGuard::new();
+        crate::testing::install_log_collector();
+        let (mut ctx, ids) = ctx_with_completed_children(5);
+        let root = Arc::clone(ctx.child_session_root.as_ref().unwrap());
+        let text_of = |sid: &str| std::fs::read_to_string(root.child_meta_file(sid)).unwrap();
+        let runs_at = |text: &str| text.find("\nruns:").expect("the seed writes a runs ring");
+
+        // ids[0..3] get a damaged ring each; ids[3] keeps a run that omits
+        // every optional field; ids[4] is untouched.
+        let head = |sid: &str| text_of(sid)[..runs_at(&text_of(sid))].to_string();
+        write(
+            root.child_meta_file(&ids[0]),
+            format!("{}\nruns: 7\n", head(&ids[0])),
+        )
+        .unwrap();
+        write(
+            root.child_meta_file(&ids[1]),
+            format!("{}\nruns:\n- agent_id: only_a_name\n", head(&ids[1])),
+        )
+        .unwrap();
+        write(
+            root.child_meta_file(&ids[2]),
+            format!(
+                "{}\nruns:\n- agent_id: a\n  pid: 1\n  pid_start: 1\n  started_at: 2023-11-14T22:13:20Z\n  status: bogus\n",
+                head(&ids[2])
+            ),
+        )
+        .unwrap();
+        write(
+            root.child_meta_file(&ids[3]),
+            format!(
+                "{}\nruns:\n- agent_id: bare\n  pid: 1\n  pid_start: 1\n  started_at: 2023-11-14T22:13:20Z\n",
+                head(&ids[3])
+            ),
+        )
+        .unwrap();
+
+        let page = list_sessions(&mut ctx, json!({})).unwrap();
+
+        assert_eq!(page["total"], json!(2));
+        assert_eq!(session_ids_of(&page), vec![ids[4].clone(), ids[3].clone()]);
+        assert_eq!(page["sessions"][1]["runs"], json!(1));
+        assert_eq!(page["sessions"][1]["status"], json!("completed"));
+        let bare = child_meta_of(&ctx, &ids[3]);
+        assert_eq!(bare.runs[0].finished_at, None);
+        assert_eq!(bare.runs[0].status, None);
+        assert_eq!(bare.runs[0].error, None);
+        let warned = crate::testing::warn_snapshot();
+        for sid in &ids[..3] {
+            assert!(
+                warned.iter().any(|line| line
+                    .contains("Skipping unreadable child session sidecar")
+                    && line.contains(sid.as_str())),
+                "{sid}: {warned:?}"
+            );
+        }
+    }
+
     #[test]
     #[serial]
     fn resume_refuses_malformed_ids_before_building_any_path() {
