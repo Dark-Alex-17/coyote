@@ -6854,6 +6854,320 @@ mod tests {
         );
     }
 
+    /// Writes a sidecar for a child spawned at `fixture_time(minute)` under
+    /// `stamp`; any status but running closes it at the same minute.
+    /// Returns its session id.
+    fn seed_sidecar(
+        root: &ChildSessionRoot,
+        agent_name: &str,
+        minute: u32,
+        status: ChildStatus,
+        stamp: ProcessStamp,
+    ) -> String {
+        let sid = child_sessions::new_session_id(agent_name);
+        let mut meta = ChildMeta::new_running_at(
+            fixture_time(minute),
+            &sid,
+            agent_name,
+            "agent_x",
+            stamp,
+            None,
+            None,
+            "hi",
+            None,
+        );
+        if status != ChildStatus::Running {
+            meta.finish_at(fixture_time(minute), status, None);
+        }
+        root.save_child_meta(&meta).unwrap();
+        sid
+    }
+
+    /// A root under a fresh supervisor context seeded with `count`
+    /// completed children, one per minute.
+    fn ctx_with_completed_children(count: u32) -> (RequestContext, Vec<String>) {
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let root = ctx.ensure_child_session_root().unwrap();
+        root.ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
+            .unwrap();
+        let dead = ProcessStamp {
+            pid: u32::MAX - 1,
+            start: 0,
+        };
+        let ids = (0..count)
+            .map(|minute| seed_sidecar(&root, "lister", minute, ChildStatus::Completed, dead))
+            .collect();
+        (ctx, ids)
+    }
+
+    fn list_sessions(ctx: &mut RequestContext, args: Value) -> Result<Value> {
+        run_async(handle_agent_tool(ctx, "agent__list_sessions", &args))
+    }
+
+    fn keys_of(value: &Value) -> std::collections::BTreeSet<&str> {
+        value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect()
+    }
+
+    fn session_ids_of(page: &Value) -> Vec<String> {
+        page["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["session_id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    #[serial]
+    fn list_sessions_pages_newest_first_and_the_cursor_visits_every_child_once() {
+        let _guard = TestConfigDirGuard::new();
+        let (mut ctx, seeded) = ctx_with_completed_children(45);
+
+        let first = list_sessions(&mut ctx, json!({})).unwrap();
+
+        assert_eq!(
+            keys_of(&first),
+            ["sessions", "total", "next_cursor"].into_iter().collect()
+        );
+        let rows = first["sessions"].as_array().unwrap();
+        assert_eq!(rows.len(), LIST_SESSIONS_PAGE_SIZE);
+        assert_eq!(first["total"], json!(45));
+        assert_eq!(first["next_cursor"], rows.last().unwrap()["session_id"]);
+        assert_eq!(
+            keys_of(&rows[0]),
+            [
+                "session_id",
+                "agent",
+                "status",
+                "created_at",
+                "updated_at",
+                "prompt_head",
+                "runs"
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(rows[0]["agent"], json!("lister"));
+        assert_eq!(rows[0]["status"], json!("completed"));
+        assert_eq!(rows[0]["prompt_head"], json!("hi"));
+        assert_eq!(rows[0]["runs"], json!(1));
+        assert_eq!(rows[0]["created_at"], json!(fixture_time(44).to_rfc3339()));
+
+        let mut visited = session_ids_of(&first);
+        let mut created: Vec<String> = rows
+            .iter()
+            .map(|row| row["created_at"].as_str().unwrap().to_string())
+            .collect();
+        let mut page = first;
+        let mut pages = 1;
+        while !page["next_cursor"].is_null() {
+            assert_eq!(page["total"], json!(45));
+            let cursor = page["next_cursor"].clone();
+            page = list_sessions(&mut ctx, json!({"cursor": cursor})).unwrap();
+            visited.extend(session_ids_of(&page));
+            created.extend(
+                page["sessions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| row["created_at"].as_str().unwrap().to_string()),
+            );
+            pages += 1;
+        }
+
+        assert_eq!(pages, 3);
+        assert_eq!(page["sessions"].as_array().unwrap().len(), 5);
+        assert_eq!(visited.len(), 45);
+        let distinct: std::collections::BTreeSet<&String> = visited.iter().collect();
+        assert_eq!(distinct.len(), 45);
+        assert_eq!(distinct, seeded.iter().collect());
+        assert!(
+            created.windows(2).all(|pair| pair[0] > pair[1]),
+            "created_at must strictly descend across pages: {created:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn list_sessions_breaks_created_at_ties_by_session_id() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let root = ctx.ensure_child_session_root().unwrap();
+        root.ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
+            .unwrap();
+        let dead = ProcessStamp {
+            pid: u32::MAX - 1,
+            start: 0,
+        };
+        let mut seeded: Vec<String> = (0..3)
+            .map(|_| seed_sidecar(&root, "tied", 7, ChildStatus::Completed, dead))
+            .collect();
+        seeded.sort();
+
+        let page = list_sessions(&mut ctx, json!({})).unwrap();
+
+        assert_eq!(session_ids_of(&page), seeded);
+        assert_eq!(page["total"], json!(3));
+        assert!(page["next_cursor"].is_null());
+    }
+
+    #[test]
+    #[serial]
+    fn list_sessions_caps_page_size_and_refuses_zero_or_an_unknown_cursor() {
+        let _guard = TestConfigDirGuard::new();
+        let (mut ctx, _) = ctx_with_completed_children(120);
+
+        let capped = list_sessions(&mut ctx, json!({"page_size": 1000})).unwrap();
+        assert_eq!(
+            capped["sessions"].as_array().unwrap().len(),
+            LIST_SESSIONS_PAGE_CAP
+        );
+        assert_eq!(capped["total"], json!(120));
+        assert!(capped["next_cursor"].is_string());
+
+        let just_over =
+            list_sessions(&mut ctx, json!({"page_size": LIST_SESSIONS_PAGE_CAP + 1})).unwrap();
+        assert_eq!(
+            just_over["sessions"].as_array().unwrap().len(),
+            LIST_SESSIONS_PAGE_CAP
+        );
+
+        let zero = list_sessions(&mut ctx, json!({"page_size": 0})).unwrap_err();
+        assert!(zero.to_string().contains("page_size"), "{zero:#}");
+
+        let unknown =
+            list_sessions(&mut ctx, json!({"cursor": "sess_nobody_000000000000"})).unwrap_err();
+        assert!(
+            unknown.to_string().contains("sess_nobody_000000000000"),
+            "{unknown:#}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn list_sessions_after_a_restart_derives_the_root_from_the_session_uid_without_minting() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = spawner_with_session("root");
+        let root = ctx.ensure_child_session_root().unwrap();
+        let ChildSessionRoot::Uid(uid) = *root else {
+            panic!("a spawner with a session roots its children under a uid: {root:?}");
+        };
+        root.ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
+            .unwrap();
+        let dead = ProcessStamp {
+            pid: u32::MAX - 1,
+            start: 0,
+        };
+        let mut seeded: Vec<String> = (0..2)
+            .map(|minute| seed_sidecar(&root, "restarted", minute, ChildStatus::Completed, dead))
+            .collect();
+        seeded.reverse();
+
+        let mut ctx2 = spawner_with_session("root");
+        ctx2.session.as_mut().unwrap().set_uid(Some(uid));
+        assert!(ctx2.child_session_root.is_none());
+        let sessions_dir = child_sessions::sessions_root();
+        let before = paths_under(&sessions_dir);
+
+        let page = list_sessions(&mut ctx2, json!({})).unwrap();
+
+        assert_eq!(session_ids_of(&page), seeded);
+        assert_eq!(page["total"], json!(2));
+        assert!(ctx2.child_session_root.is_none());
+        assert_eq!(ctx2.session.as_ref().unwrap().uid(), Some(uid));
+        assert_eq!(paths_under(&sessions_dir), before);
+    }
+
+    #[test]
+    #[serial]
+    fn list_sessions_reports_a_dead_running_sidecar_as_crashed() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let root = ctx.ensure_child_session_root().unwrap();
+        root.ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
+            .unwrap();
+        let dead = ProcessStamp {
+            pid: u32::MAX - 1,
+            start: 1,
+        };
+        let crashed = seed_sidecar(&root, "dead", 1, ChildStatus::Running, dead);
+        let completed = seed_sidecar(&root, "done", 0, ChildStatus::Completed, dead);
+
+        let page = list_sessions(&mut ctx, json!({})).unwrap();
+
+        let rows = page["sessions"].as_array().unwrap();
+        assert_eq!(rows[0]["session_id"], json!(crashed));
+        assert_eq!(rows[0]["status"], json!("crashed"));
+        assert_eq!(rows[1]["session_id"], json!(completed));
+        assert_eq!(rows[1]["status"], json!("completed"));
+    }
+
+    #[test]
+    #[serial]
+    fn list_sessions_returns_the_empty_shape_with_a_note_when_child_sessions_are_off() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = ctx_with_child_sessions_off();
+
+        let page = list_sessions(&mut ctx, json!({})).unwrap();
+
+        assert_eq!(
+            keys_of(&page),
+            ["sessions", "total", "next_cursor", "note"]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(page["sessions"], json!([]));
+        assert_eq!(page["total"], json!(0));
+        assert!(page["next_cursor"].is_null());
+        assert!(page["note"].as_str().unwrap().contains("off"), "{page}");
+    }
+
+    #[test]
+    #[serial]
+    fn list_sessions_returns_the_empty_shape_with_a_note_without_a_root() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let sessions_dir = child_sessions::sessions_root();
+        let before = paths_under(&sessions_dir);
+        let off_note =
+            list_sessions(&mut ctx_with_child_sessions_off(), json!({})).unwrap()["note"].clone();
+
+        let page = list_sessions(&mut ctx, json!({})).unwrap();
+
+        assert_eq!(
+            keys_of(&page),
+            ["sessions", "total", "next_cursor", "note"]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(page["sessions"], json!([]));
+        assert_eq!(page["total"], json!(0));
+        assert!(page["next_cursor"].is_null());
+        assert!(page["note"].is_string());
+        assert_ne!(page["note"], off_note);
+        assert!(ctx.child_session_root.is_none());
+        assert_eq!(paths_under(&sessions_dir), before);
+    }
+
+    /// The resume marks the sidecar running again through the one method
+    /// that also records the run, so the two cannot drift apart.
+    #[test]
+    fn resume_child_session_restamps_through_restamp_exactly_once() {
+        let source = include_str!("agents.rs").replace("\r\n", "\n");
+        let start = source.find("\nfn resume_child_session(").unwrap();
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert_eq!(body.matches("meta.restamp(").count(), 1);
+        assert!(!body.contains("meta.pid_start = "));
+        assert!(!body.contains("meta.pid = "));
+        assert!(!body.contains("meta.agent_id = "));
+    }
+
     fn paths_under(dir: &Path) -> std::collections::BTreeSet<PathBuf> {
         let mut found = std::collections::BTreeSet::new();
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -10060,7 +10374,7 @@ mod tests {
             .find("is still running; collect or cancel it first")
             .unwrap();
         let bytes_at = resume.find("read_to_string(&sidecar)").unwrap();
-        let restamp_at = resume.find("meta.status = ChildStatus::Running;").unwrap();
+        let restamp_at = resume.find("meta.restamp(").unwrap();
         let save_at = resume.find("root.save_child_meta(&meta)?;").unwrap();
         let seam_at = resume.find("between_resume_phases();").unwrap();
         let session_load_at = resume.find("load_and_gate(").unwrap();
@@ -12599,6 +12913,19 @@ mod tests {
         ))
         .unwrap();
         assert!(result["active_count"].is_number());
+    }
+
+    #[test]
+    fn dispatch_routes_list_sessions() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let result = run_async(handle_agent_tool(
+            &mut ctx,
+            "agent__list_sessions",
+            &json!({}),
+        ))
+        .unwrap();
+        assert!(result["sessions"].is_array());
+        assert!(result["total"].is_number());
     }
 
     #[test]
