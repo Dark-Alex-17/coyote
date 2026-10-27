@@ -2990,6 +2990,7 @@ mod tests {
         use rns_transport::identity::PrivateIdentity as TransportIdentity;
         use rns_transport::iface::InterfaceSharedConfig;
         use rns_transport::iface::tcp_server::TcpServer;
+        use rns_transport::resource::ResourceEventKind;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::time::{Instant, sleep, timeout};
 
@@ -3142,7 +3143,8 @@ mod tests {
             let fetcher = Fetcher::join(&fake, "fetch-net-rounds", TrustList::default()).await;
             let ids = [id(1), id(2)];
             // Garbage past the size floor: discarded once received, which is all this test
-            // needs of them. The second alone is over the 431-byte link MDU.
+            // needs of them. The second alone is over the 431-byte link MDU, so the reply
+            // carrying it is the one that crosses the link as a resource.
             let small = vec![0x5a; 200];
             let large = vec![0xa5; 600];
             fake.script.reply_with([
@@ -3151,7 +3153,10 @@ mod tests {
                 Value::Array(vec![]),
             ]);
 
+            // `request_went_as` drains its receiver, so the inbound count reads a second
+            // subscription to the same channel.
             let mut resources = fetcher.connector.transport.resource_events();
+            let mut inbound = fetcher.connector.transport.resource_events();
             let report = fetcher.fetch().await.unwrap();
 
             assert_eq!(
@@ -3200,6 +3205,18 @@ mod tests {
                     SizeBranch::Packet
                 ));
             }
+            let mut replies_as_resource = 0;
+            while let Ok(event) = inbound.try_recv() {
+                if let ResourceEventKind::Complete(complete) = event.kind
+                    && complete.is_response
+                {
+                    replies_as_resource += 1;
+                }
+            }
+            assert_eq!(
+                replies_as_resource, 1,
+                "exactly one reply crossed the link as a resource"
+            );
 
             // Every round transition is logged with its counts, under the node's short hash.
             let prefix = format!("Propagation fetch from {}: ", short(&fake.hex()));
