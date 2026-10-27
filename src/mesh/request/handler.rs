@@ -211,8 +211,9 @@ impl LibraryHandler {
                 Ok(packet) => packet,
                 Err(err) => {
                     warn!(
-                        "Failed to send mesh response {request_id} on link {}: response packet: {err}",
-                        link_id.to_hex_string()
+                        "Failed to send mesh response {request_id} on link {}: response packet: {}",
+                        link_id.to_hex_string(),
+                        redact_hashes(&err.to_string())
                     );
                     drop_unsent(settlement);
                     return;
@@ -287,15 +288,14 @@ impl LibraryRequestHandler for LibraryHandler {
         request: LibraryInboundRequest,
     ) -> Pin<Box<dyn Future<Output = Option<RequestResponse>> + Send + '_>> {
         Box::pin(async move {
+            let (link_id, request_id) = (request.link_id(), request.request_id());
             let Ok(permit) = self.permits.clone().try_acquire_owned() else {
                 debug!(
-                    "Dropped mesh request {} on link {}: all {MAX_CONCURRENT_INBOUND_REQUESTS} handler slots are busy",
-                    request.request_id(),
-                    request.link_id().to_hex_string()
+                    "Dropped mesh request {request_id} on link {}: all {MAX_CONCURRENT_INBOUND_REQUESTS} handler slots are busy",
+                    link_id.to_hex_string()
                 );
                 return None;
             };
-            let (link_id, request_id) = (request.link_id(), request.request_id());
             match self.reply(permit, request).await? {
                 Reply::Value(value) => Some(RequestResponse::Value(value)),
                 Reply::Code(code) => Some(RequestResponse::Value(code.to_wire())),
