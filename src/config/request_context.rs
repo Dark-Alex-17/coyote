@@ -29851,6 +29851,12 @@ mod tests {
             ),
             (
                 "step-runner",
+                "debt_scan",
+                "edge_case_sweep",
+                "fail-open scan: the sweep still runs on the DEBT_SCAN_FAILED default",
+            ),
+            (
+                "step-runner",
                 "revise_from_choice",
                 "get_revision",
                 "re-asks the human for the revision",
