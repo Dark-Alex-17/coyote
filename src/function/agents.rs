@@ -1170,7 +1170,10 @@ fn finish_child_meta(
 /// The one wording for a child whose task never returned a result, shared
 /// by the sidecar record and the error handed to the caller. A join error
 /// is either a panic or an abort of the task itself; the two are told apart
-/// so a sidecar does not report a panic that never happened.
+/// so a sidecar does not report a panic that never happened. Nothing in
+/// production aborts an agent task whose handle is later awaited (the
+/// refused-registration path aborts an unregistered one), so the abort arm
+/// only guards a future caller.
 fn task_join_error(error: &tokio::task::JoinError) -> String {
     if error.is_panic() {
         format!("agent task panicked: {error}")
@@ -1334,9 +1337,27 @@ fn seat_child_session(
 #[cfg(not(test))]
 fn before_seat_flush() {}
 
+/// The point in the spawn task after the child's run has returned and
+/// before its verdict is read off the abort signal. A no-op outside tests.
+#[cfg(not(test))]
+fn after_child_run() {}
+
 #[cfg(test)]
 fn before_seat_flush() {
-    if let Some(hook) = BEFORE_SEAT_FLUSH.with(|slot| slot.take()) {
+    run_test_hook(&BEFORE_SEAT_FLUSH);
+}
+
+#[cfg(test)]
+fn after_child_run() {
+    run_test_hook(&AFTER_CHILD_RUN);
+}
+
+#[cfg(test)]
+type TestHookSlot = std::thread::LocalKey<std::cell::RefCell<Option<Box<dyn FnOnce()>>>>;
+
+#[cfg(test)]
+fn run_test_hook(slot: &'static TestHookSlot) {
+    if let Some(hook) = slot.with(|slot| slot.take()) {
         hook();
     }
 }
@@ -1345,16 +1366,36 @@ fn before_seat_flush() {
 thread_local! {
     static BEFORE_SEAT_FLUSH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    static AFTER_CHILD_RUN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
-/// Runs `f` with `hook` armed to run once on this thread at
-/// `before_seat_flush`, so a test can make the session write fail.
+/// Runs `f` with `hook` armed to run once on this thread at the seam
+/// `slot` belongs to, and disarms it afterwards whether or not it fired.
+#[cfg(test)]
+fn with_test_hook<T>(
+    slot: &'static TestHookSlot,
+    hook: impl FnOnce() + 'static,
+    f: impl FnOnce() -> T,
+) -> T {
+    slot.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    let result = f();
+    slot.with(|slot| slot.borrow_mut().take());
+    result
+}
+
+/// `with_test_hook` at `before_seat_flush`, so a test can make the
+/// session write fail.
 #[cfg(test)]
 fn with_hook_before_seat_flush<T>(hook: impl FnOnce() + 'static, f: impl FnOnce() -> T) -> T {
-    BEFORE_SEAT_FLUSH.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
-    let result = f();
-    BEFORE_SEAT_FLUSH.with(|slot| slot.borrow_mut().take());
-    result
+    with_test_hook(&BEFORE_SEAT_FLUSH, hook, f)
+}
+
+/// `with_test_hook` at `after_child_run`, so a test can land a ctrl-c
+/// between the run's return and the verdict.
+#[cfg(test)]
+fn with_hook_after_child_run<T>(hook: impl FnOnce() + 'static, f: impl FnOnce() -> T) -> T {
+    with_test_hook(&AFTER_CHILD_RUN, hook, f)
 }
 
 /// Names the setting that turned child sessions off for a spawn, so the
@@ -1934,6 +1975,7 @@ fn launch_child_spawn(ctx: &mut RequestContext, spawn: Box<ChildSpawn>) -> Resul
 
     let join_handle = tokio::spawn(async move {
         let result = run_child_agent(child_ctx, input, spawn_abort).await;
+        after_child_run();
 
         // A ctrl-c'd child reports cancelled whatever its run returned, so
         // the sidecar agrees with the cancel path that signalled it; the
@@ -2000,9 +2042,13 @@ fn launch_child_spawn(ctx: &mut RequestContext, spawn: Box<ChildSpawn>) -> Resul
     let registered = match ctx.supervisor.as_ref() {
         Some(supervisor) => supervisor.write().register(handle),
         None => Err(anyhow!("No supervisor active")),
-    }
-    .context("spawn refused");
+    };
     if let Err(error) = registered {
+        // One line, not a context layer: the tool result renders `Display`,
+        // which shows only the outermost layer of a chain, so the refusal
+        // and its cause (the capacity or depth numbers) read the same on
+        // the tool result, the hook and the sidecar.
+        let error = anyhow!("spawn refused: {error:#}");
         // Aborted before the failed write so the orphan's own exit can
         // never overwrite it with completed/failed, fire result hooks, or
         // notify about a child no supervisor tracks. `agent.started` already
@@ -2013,9 +2059,9 @@ fn launch_child_spawn(ctx: &mut RequestContext, spawn: Box<ChildSpawn>) -> Resul
             root.as_deref(),
             session_id.as_deref(),
             ChildStatus::Failed,
-            Some(format!("{error:#}")),
+            Some(error.to_string()),
         );
-        refused_hooks.fire(Some(&format!("{error:#}")), false);
+        refused_hooks.fire(Some(&error.to_string()), false);
         return Err(error);
     }
 
@@ -6802,17 +6848,16 @@ mod tests {
             (sid, error)
         });
 
-        assert_eq!(error.to_string(), "spawn refused");
+        // `Display` is what every tool-error consumer renders, so the cause
+        // and its numbers must sit on the one line, not in a `{:#}` chain.
+        assert_eq!(
+            error.to_string(),
+            "spawn refused: Cannot spawn agent: at capacity (0/0)"
+        );
+        assert_eq!(format!("{error:#}"), error.to_string());
         let meta = child_meta_of(&ctx, &sid);
         assert_eq!(meta.status, ChildStatus::Failed);
-        assert_eq!(meta.error.as_deref(), Some(format!("{error:#}").as_str()));
-        assert!(
-            meta.error
-                .as_deref()
-                .unwrap()
-                .contains("spawn refused: Cannot spawn agent: at capacity"),
-            "{meta:?}"
-        );
+        assert_eq!(meta.error.as_deref(), Some(error.to_string().as_str()));
         assert_eq!(
             hook_captures_named("sidecar_register_fails_started").len(),
             1
