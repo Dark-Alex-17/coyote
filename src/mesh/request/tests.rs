@@ -1265,7 +1265,10 @@ pub(crate) mod network {
     /// the library itself reports it: a request that travels as a Resource ends in one
     /// of the sender-side resource events on the requester's transport, a request that
     /// fits a packet raises none. Inbound resource events (a response arriving as a
-    /// Resource) are not sender-side and do not count.
+    /// Resource) are not sender-side and do not count. No wait is needed before reading:
+    /// the library publishes the sender-side event while it processes the proof, which
+    /// the single inbound worker dequeues before the response packet, so by the time the
+    /// request has returned the event is already in the channel.
     pub(crate) fn request_went_as(events: &mut broadcast::Receiver<ResourceEvent>) -> SizeBranch {
         let mut outbound = false;
         loop {
@@ -2515,7 +2518,7 @@ pub(crate) mod network {
             response_frame_of(seen.request_id, body.clone(), MAX_FETCH_RESPONSE_BYTES),
         )
         .await;
-        let reply = timeout(FETCH_TRANSFER_REQUEST_TIMEOUT, in_flight)
+        let reply = timeout(INTEROP_TIMEOUT, in_flight)
             .await
             .unwrap()
             .unwrap()

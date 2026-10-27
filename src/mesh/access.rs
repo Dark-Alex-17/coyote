@@ -561,8 +561,8 @@ impl MeshSlot {
 impl MeshRuntime {
     /// Puts `request` to `destination` over a link and reads the answer. Only the
     /// peer-unreachable errors fall back to store-and-forward: a refusal of any code
-    /// means the peer heard and said no, and an oversize or undecodable frame is this
-    /// node's fault.
+    /// means the peer heard and said no, and an oversize or undecodable frame means the
+    /// exchange reached the peer, so nothing is held for later.
     pub(crate) async fn request_access_wire(
         &self,
         destination: &DestinationDesc,

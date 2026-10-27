@@ -7487,6 +7487,10 @@ mod tests {
         );
         let gone = peer.collect(&id, 1).await;
         assert_eq!(gone["status"], "error", "{gone}");
+        wait_until("the notice to reach A's inbox", || {
+            peer.ctx.app.mesh.peer_inbox().len() == 2
+        })
+        .await;
         let inbox = peer.tool("check_inbox", json!({})).await;
         assert_eq!(inbox["escalated"], json!([]), "{inbox}");
         // Both replies also took the inbox path, each in its own thread, with its
@@ -8021,6 +8025,10 @@ mod tests {
         assert_collected(&replied, &id, &peer.to_b, "answered", "yes, merge it");
         runner.stop().await;
         assert!(store_b.get(&id).unwrap().is_none());
+        wait_until("the notice to reach A's inbox", || {
+            peer.ctx.app.mesh.peer_inbox().len() == 1
+        })
+        .await;
         inbox = peer.tool("check_inbox", json!({})).await;
         assert_eq!(inbox["escalated"], json!([]), "{inbox}");
         assert_eq!(inbox["count"], 1, "{inbox}");
