@@ -1022,6 +1022,83 @@ fn build_lock_prose_twins_carry_the_same_warnings() {
     );
 }
 
+/// The engineer's three surfaces agree: the README usage block spawns it
+/// with `--agent-variable` (never the orchestrators' `--variables` hop), the
+/// config grants `fs_cat.sh`, and every fs tool the instructions call "your
+/// own" is a granted global tool.
+#[test]
+fn engineer_agent_surface_is_consistent() {
+    let readme = fs::read_to_string(asset("engineer/README.md")).unwrap();
+    let usage = readme
+        .split("## Usage")
+        .nth(1)
+        .and_then(|rest| rest.split("```").nth(1))
+        .expect("engineer/README.md: fenced block under ## Usage");
+    for needle in [
+        "--agent-variable project_dir",
+        "--agent-variable reference_root",
+    ] {
+        assert!(
+            usage.contains(needle),
+            "engineer/README.md usage: missing {needle:?}"
+        );
+    }
+    for stale in ["--variable ", "--variables"] {
+        assert!(
+            !readme.contains(stale),
+            "engineer/README.md: {stale:?} is the orchestrators' flag, not a config agent's"
+        );
+    }
+
+    let doc: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(asset("engineer/config.yaml")).unwrap()).unwrap();
+    let global_tools: Vec<String> = doc["global_tools"]
+        .as_sequence()
+        .expect("engineer/config.yaml: global_tools")
+        .iter()
+        .map(|t| {
+            t.as_str()
+                .expect("global_tools entry is a string")
+                .to_string()
+        })
+        .collect();
+    assert!(
+        global_tools.iter().any(|t| t == "fs_cat.sh"),
+        "engineer/config.yaml: global_tools must grant fs_cat.sh: {global_tools:?}"
+    );
+
+    let instructions = fs::read_to_string(asset("engineer/instructions.md")).unwrap();
+    // Indented lines continue the list item above them, so the tool list
+    // reads the same whichever name the line wrap lands on.
+    let mut unwrapped = String::with_capacity(instructions.len());
+    for line in instructions.lines() {
+        if line.starts_with(' ') {
+            unwrapped.push_str(line.trim_start());
+        } else {
+            unwrapped.push('\n');
+            unwrapped.push_str(line);
+        }
+    }
+    let lead = "own fs tools (";
+    let listed = unwrapped
+        .split_once(lead)
+        .and_then(|(_, rest)| rest.split_once(" - "))
+        .map(|(names, _)| names)
+        .unwrap_or_else(|| panic!("engineer/instructions.md: no `{lead}<a/b/c> - ...` sentence"));
+    let names: Vec<&str> = listed.split('/').collect();
+    assert!(
+        names.len() >= 2,
+        "engineer/instructions.md: own fs tools list {listed:?}"
+    );
+    for name in names {
+        let tool = format!("{name}.sh");
+        assert!(
+            global_tools.contains(&tool),
+            "engineer/instructions.md names {name} as an own fs tool but config.yaml does not grant {tool}: {global_tools:?}"
+        );
+    }
+}
+
 /// run_checks.py wraps each declared command in the `build_lock` prefix and
 /// records the prefix as `under`; without one (absent or empty) the record is
 /// unchanged. A failing command's exit status survives the wrapper. The
