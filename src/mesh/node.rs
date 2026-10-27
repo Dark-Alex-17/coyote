@@ -1654,6 +1654,10 @@ async fn register_destination(
                 hash.to_hex_string()
             )
         })?;
+    #[cfg(all(test, unix))]
+    REGISTERED_REQUEST_PATHS
+        .lock()
+        .extend(KNOWN_PATHS.iter().map(|path| (hash, *path)));
     let app_data = transport.set_destination_announce_app_data(&dest, Some(app_data.to_vec()));
     if timeout_at(deadline, app_data).await.is_err() {
         let released = timeout_at(deadline, transport.deregister_destination(&hash))
@@ -1685,16 +1689,13 @@ fn register_request_paths(
         destination
             .register_request_handler(path, request_handler.clone(), RequestAllow::All, true)
             .map_err(|err| anyhow!("Failed to register the mesh request path {path}: {err}"))?;
-        #[cfg(all(test, unix))]
-        REGISTERED_REQUEST_PATHS
-            .lock()
-            .push((destination.desc.address_hash, path));
     }
     Ok(())
 }
 
-/// Every path given a request handler, with the destination it was registered on. The
-/// library keeps its handler table private, so this is what a test reads to pin them.
+/// Every path given a request handler, with the destination it was registered on, recorded
+/// once the transport holds that destination. The library keeps its handler table
+/// private, so this is what a test reads to pin them.
 #[cfg(all(test, unix))]
 static REGISTERED_REQUEST_PATHS: parking_lot::Mutex<Vec<(AddressHash, &'static str)>> =
     parking_lot::Mutex::new(Vec::new());
