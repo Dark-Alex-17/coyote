@@ -4204,13 +4204,52 @@ mod tests {
             .expect("spawn task must return an AgentResult")
     }
 
+    /// A ctrl-c that lands after the child's run has returned `Ok` and
+    /// before the spawn task reads its verdict is an interruption: the
+    /// sidecar says cancelled, exactly one `agent.interrupted` fires, and
+    /// the result the collector gets is still the run's own `Completed`.
+    /// Driven through `launch_child_spawn` with the ctrl-c set at the seam
+    /// between the run and the verdict.
+    #[test]
+    #[serial]
+    fn a_ctrlc_after_an_ok_run_lands_the_sidecar_cancelled_and_fires_interrupted() {
+        let _guard = TestConfigDirGuard::new();
+        let _sink = hooks::test_sink::install();
+        let agent_name = unique_agent_name("test_ctrlc_after_ok_run");
+        write_graph_agent_with_hooks(&agent_name, "ctrlc_after_ok", false);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let spawn = build_ready_spawn(&mut ctx, json!({"agent": agent_name, "prompt": "hi"}));
+        let sid = spawn
+            .session_id
+            .clone()
+            .expect("a seated child has a session id");
+        let child_abort = spawn.child_abort.clone();
+
+        let result = with_hook_after_child_run(
+            move || child_abort.set_ctrlc(),
+            || run_async(launch_and_reclaim(&mut ctx, spawn)),
+        );
+
+        assert_eq!(result.exit_status, AgentExitStatus::Completed);
+        assert_eq!(result.output, "done");
+        let meta = child_meta_of(&ctx, &sid);
+        assert_eq!(meta.status, ChildStatus::Cancelled);
+        assert!(meta.error.is_none(), "{meta:?}");
+        let interrupted = hook_captures_named("ctrlc_after_ok_interrupted");
+        assert_eq!(interrupted.len(), 1, "{interrupted:?}");
+        assert_eq!(interrupted[0].envs["COYOTE_AGENT_ID"], result.id);
+        assert_session_envs(&interrupted[0], &sid);
+        assert!(hook_captures_named("ctrlc_after_ok_completed").is_empty());
+        assert!(hook_captures_named("ctrlc_after_ok_failed").is_empty());
+    }
+
     /// A ctrl-c that lands after the model answered but before the task
     /// records its verdict is an interruption even though the run came
     /// back `Ok`: the hooks fire `agent.interrupted`, not
-    /// `agent.completed`. Nothing in a run ignores its abort signal, so
-    /// the verdict is driven directly, with hooks resolved from a seated
-    /// child, and the spawn task is held to passing that one verdict to
-    /// both the sidecar and the hooks.
+    /// `agent.completed`. The test above drives that through the spawn
+    /// task; this one drives the verdict directly, with hooks resolved
+    /// from a seated child, and holds the spawn task's source to passing
+    /// that one verdict to both the sidecar and the hooks.
     #[test]
     #[serial]
     fn a_ctrlc_verdict_fires_interrupted_even_when_the_run_returned_ok() {
@@ -4343,6 +4382,46 @@ mod tests {
             .filter(|m| m.contains(&marker))
             .collect();
         assert_eq!(warns.len(), 1, "{warns:?}");
+    }
+
+    /// The graph twin: a seated graph child records its run through
+    /// `record_graph_run`, whose flush is the one write on that path that
+    /// can fail, so the run ends failed with the flush error on the
+    /// result, the sidecar and the hook alike.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn a_graph_child_whose_final_session_flush_fails_ends_failed_with_that_error() {
+        let _guard = TestConfigDirGuard::new();
+        let _sink = hooks::test_sink::install();
+        let agent_name = unique_agent_name("test_graph_child_flush_failed");
+        write_graph_agent_with_hooks(&agent_name, "graph_flush_failed", false);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let spawn = build_ready_spawn(&mut ctx, json!({"agent": agent_name, "prompt": "hi"}));
+        let sid = spawn
+            .session_id
+            .clone()
+            .expect("a seated child has a session id");
+        let session_file = spawner_root(&ctx).child_session_file(&sid);
+        std::fs::remove_file(&session_file).unwrap();
+        create_dir_all(&session_file).unwrap();
+
+        let result = run_async(launch_and_reclaim(&mut ctx, spawn));
+
+        let AgentExitStatus::Failed(error) = &result.exit_status else {
+            panic!("the run must fail on the flush: {:?}", result.exit_status);
+        };
+        let flush_failed = format!("final session flush failed: Failed to write session '{sid}'");
+        assert!(error.contains(&flush_failed), "{error}");
+        let meta = child_meta_of(&ctx, &sid);
+        assert_eq!(meta.status, ChildStatus::Failed);
+        let recorded = meta.error.as_deref().unwrap_or_default();
+        assert!(recorded.contains(&flush_failed), "{meta:?}");
+        let failed = hook_captures_named("graph_flush_failed_failed");
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert_eq!(failed[0].envs["COYOTE_AGENT_ERROR"], recorded, "{failed:?}");
+        assert!(hook_captures_named("graph_flush_failed_completed").is_empty());
+        assert!(hook_captures_named("graph_flush_failed_interrupted").is_empty());
     }
 
     fn spawn_declaration() -> FunctionDeclaration {
@@ -6686,17 +6765,22 @@ mod tests {
         write_graph_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
 
-        let (spawned, collected) = run_async(async {
+        let Some((spawned, collected)) = run_async(async {
             let spawned = handle_spawn(&mut ctx, &json!({"agent": agent_name, "prompt": "hi"}))
                 .await
                 .unwrap();
             assert_eq!(spawned["status"], "ok", "{spawned}");
             let children = ctx.child_session_root.as_ref().unwrap().children_dir();
             std::fs::set_permissions(&children, std::fs::Permissions::from_mode(0o500)).unwrap();
-            let _restore = crate::testing::RestoreMode(children, 0o700);
+            let _restore = crate::testing::RestoreMode(children.clone(), 0o700);
+            if crate::testing::mode_bits_are_ignored_in(&children) {
+                return None;
+            }
             let collected = handle_collect(&mut ctx, &json!({"id": spawned["id"]})).await;
-            (spawned, collected.unwrap())
-        });
+            Some((spawned, collected.unwrap()))
+        }) else {
+            return;
+        };
 
         assert_eq!(collected["status"], "completed", "{collected}");
         let exit_status = collected["exit_status"].as_str().unwrap();
@@ -6869,11 +6953,42 @@ mod tests {
             .envs
             .get("COYOTE_AGENT_ERROR")
             .expect("a failed registration reports its error");
-        assert!(
-            hook_error.contains("spawn refused: Cannot spawn agent: at capacity"),
-            "{hook_error}"
-        );
+        assert_eq!(hook_error, &error.to_string());
         assert_session_envs(&failed[0], &sid);
+    }
+
+    /// The error `handle_spawn` hands back is what the tool loop renders
+    /// into `tool_call_error` with `Display`, so a spawn error reaches the
+    /// model as its whole message. The registration refusal above cannot be
+    /// driven through `handle_spawn` (the capacity pre-check answers first),
+    /// so this pins the route with the one `handle_spawn` error that can:
+    /// together with the `Display` pin above, the cause the model reads is
+    /// the cause the spawn task recorded.
+    #[test]
+    #[serial]
+    fn a_spawn_error_reaches_the_tool_result_as_its_whole_message() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_spawn_error_tool_result");
+        write_graph_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        ctx.tool_scope.functions.append_supervisor_functions();
+        ctx.supervisor = None;
+
+        let results = run_async(crate::function::eval_tool_calls(
+            &mut ctx,
+            vec![ToolCall::new(
+                format!("{AGENT_FUNCTION_PREFIX}spawn"),
+                json!({"agent": agent_name, "prompt": "hi"}),
+                Some("call-1".into()),
+            )],
+        ))
+        .unwrap();
+
+        let error = results[0].output["tool_call_error"].as_str().unwrap();
+        assert!(
+            error.contains("No supervisor active; Agent spawning not enabled"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -7690,9 +7805,17 @@ mod tests {
         let root = ctx.ensure_child_session_root().unwrap();
         let children = root.children_dir();
         let _restore = crate::testing::RestoreMode(children.clone(), 0o700);
-        let make_read_only = move || {
-            std::fs::set_permissions(&children, std::fs::Permissions::from_mode(0o500)).unwrap();
-        };
+        let read_only = std::fs::Permissions::from_mode(0o500);
+        // The seat creates `children/` itself; it is made early here so the
+        // mode probe has the directory the seat will write into, then
+        // opened again so the hook is what closes it mid-seat.
+        create_dir_all(&children).unwrap();
+        std::fs::set_permissions(&children, read_only.clone()).unwrap();
+        if crate::testing::mode_bits_are_ignored_in(&children) {
+            return;
+        }
+        std::fs::set_permissions(&children, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let make_read_only = move || std::fs::set_permissions(&children, read_only).unwrap();
 
         let error = with_hook_before_seat_flush(make_read_only, || {
             resume_error(&mut ctx, json!({"agent": agent_name, "prompt": "hi"}))
