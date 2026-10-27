@@ -6,10 +6,11 @@ Grep-complete where the ground truth is on disk; verbatim where it is judgment:
   summary          --summary-file, pasted verbatim (the Problem/Approach prose)
   Quality bar      plan frontmatter `rigor:`; the line is emitted only below `production`
   task checklist   every task dir under --tasks-dir whose index.md belongs to the plan
-                   (`plan:` matches the plan's basename with any `.md` stripped on both
-                   sides, so `PLAN-x` and `PLAN-x.md` name the same plan, when the field
-                   exists; `status: complete` when that field exists), title from
-                   frontmatter, commit SHAs from the log.md `completed` entry
+                   (`plan:` matches the plan's basename with a trailing `.md` stripped on
+                   both sides, so `PLAN-x` and `PLAN-x.md` name the same plan while a
+                   dotted slug keeps its dots, when the field exists; `status: complete`
+                   when that field exists), title from frontmatter, commit SHAs from the
+                   log.md `completed` entry
   Review decisions `rejected-finding:` ledger lines, one entry per tag occurrence
   Hygiene pass     --hygiene-file verbatim, else `HYGIENE:` ledger lines, else "clean"
   Design decisions `design-decision` ledger lines
@@ -70,8 +71,9 @@ def task_number(name):
 
 
 def plan_identity(path):
-    """The plan a path or `plan:` value names: its basename without the extension."""
-    return os.path.splitext(os.path.basename(path))[0]
+    """The plan a path or `plan:` value names: its basename, a trailing `.md` dropped.
+    Only that suffix goes, so `PLAN-a.b.md` and `PLAN-a.b` agree and `PLAN-a` does not."""
+    return os.path.basename(path).removesuffix(".md")
 
 
 def find_tasks(tasks_dir, plan_id):
@@ -264,7 +266,7 @@ def main():
 
     body = "\n".join(out).rstrip() + "\n"
     if args.out:
-        with open(args.out, "w", encoding="utf-8") as fh:
+        with open(args.out, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(body)
     sys.stdout.write(body)
 

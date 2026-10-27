@@ -1439,6 +1439,59 @@ fn assemble_pr_body_writes_utf8_whatever_the_locale() {
     assert!(!stderr.contains("Traceback"), "{stderr}");
 }
 
+#[cfg(unix)]
+fn assemble_pr_body_for_plan(dir: &Path, plan: &str) -> (i32, String, String) {
+    run(Command::new("python3")
+        .arg(asset("architect/assemble_pr_body.py"))
+        .arg("--plan")
+        .arg(dir.join(plan))
+        .arg("--tasks-dir")
+        .arg(dir.join("tasks"))
+        .arg("--summary-file")
+        .arg(dir.join("summary.md"))
+        .arg("--followups")
+        .output()
+        .expect("spawn python3"))
+}
+
+/// Plan identity strips only a trailing `.md`: a dotted slug keeps its dots,
+/// so `PLAN-a.b.md` owns a task saying `plan: PLAN-a.b` and not one saying
+/// `plan: PLAN-a`.
+#[cfg(unix)]
+#[test]
+fn assemble_pr_body_keeps_the_dots_of_a_dotted_plan_slug() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = fixture_dir("assemble-pr-body-dotted");
+    fs::write(
+        dir.0.join("PLAN-a.b.md"),
+        "---\nrigor: production\n---\n# Plan\n",
+    )
+    .unwrap();
+    fs::write(dir.0.join("summary.md"), "Summary prose.\n").unwrap();
+    for (name, plan) in [("TASK-1-dotted", "PLAN-a.b"), ("TASK-2-prefix", "PLAN-a")] {
+        let task = dir.0.join("tasks").join(name);
+        fs::create_dir_all(&task).unwrap();
+        fs::write(
+            task.join("index.md"),
+            format!("---\nplan: {plan}\nstatus: complete\ntitle: \"{name}\"\n---\n"),
+        )
+        .unwrap();
+    }
+    let (code, stdout, stderr) = assemble_pr_body_for_plan(&dir.0, "PLAN-a.b.md");
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("\n- [x] TASK-1 - TASK-1-dotted ("),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("TASK-2"),
+        "a task of the prefix plan must not be mistaken for the dotted plan's: {stdout}"
+    );
+}
+
 /// collect_ledger_lines prints the block under each hit indented beneath
 /// the `<task> (log.md:NN): <line>` line, stopping at the next entry tag, so
 /// a bare `Follow-ups:` line arrives with its bullets and a wrapped bullet
