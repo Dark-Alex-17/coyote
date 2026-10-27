@@ -4926,6 +4926,99 @@ mod tests {
         assert!(!stored_before.contains("seam-summary-r3o"));
     }
 
+    /// Through the real child loop: the once-per-run limit on the
+    /// error-retry compression holds even when the second rejection finds a
+    /// transcript that could be folded again. A resumed child compresses on
+    /// the first rejection and retries; the retry's tool round is large
+    /// enough that the checkpoint commits it (so the session has user
+    /// messages and foldable rounds again) and the checkpoint carries the
+    /// retry's compressed copy to disk; the next request is rejected the
+    /// same way and the child surfaces it instead of folding a second time,
+    /// so exactly three requests reach the model, the summarizer runs once,
+    /// and the script's fourth reply is never asked for.
+    #[test]
+    #[serial]
+    fn usage_probe_a_second_overflow_with_a_foldable_transcript_is_surfaced_not_compressed() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_child_overflow_once_foldable");
+        write_config_only_agent(&agent_name);
+        // A 6_000-char argument blob rides both the call and the refusal
+        // text, so the round weighs ~3_000 tokens: over a quarter of the
+        // 10_000-token window and over the absolute checkpoint floor.
+        let blob = "y".repeat(6_000);
+        let server = ScriptedModelServer::serving(vec![
+            ScriptedModelServer::overflow_reply(),
+            ScriptedModelServer::tool_call_reply("call-1", &json!({"blob": blob})),
+            ScriptedModelServer::overflow_reply(),
+            ScriptedModelServer::text_reply("a fourth request must never be sent"),
+        ]);
+        let mut ctx = ctx_with_stub_model(&server, 10_000);
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&fetches);
+        ctx.test_summary_fetch = Some(Arc::new(move |_: &str| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            "seam-summary-r4o".to_string()
+        }));
+        let (sid, _) = seed_completed_config_child_with_replies(
+            &mut ctx,
+            &agent_name,
+            &[LONG_REPLY, LONG_REPLY, LONG_REPLY],
+        );
+        let path = spawner_root(&ctx).child_session_file(&sid);
+
+        let spawn = build_ready_spawn(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+        let ChildSpawn {
+            mut child_ctx,
+            input,
+            child_abort,
+            ..
+        } = *spawn;
+        // Keep the turn-boundary and checkpoint folds quiet so the only
+        // compression this run can perform is the error-retry one.
+        child_ctx
+            .session
+            .as_mut()
+            .unwrap()
+            .set_compression_threshold(Some(1_000_000));
+        let error = run_async(run_child_agent(child_ctx, input, child_abort))
+            .expect_err("the second rejection must surface");
+
+        assert!(
+            graph::is_context_overflow_error(&error),
+            "the surfaced error is the model's rejection: {error:#}"
+        );
+        let requests = server.requests();
+        assert_eq!(requests.len(), 3, "{}", requests.len());
+        assert!(!requests[0].contains("seam-summary-r4o"));
+        assert!(
+            requests[1].contains("seam-summary-r4o"),
+            "the retry carries the compressed transcript"
+        );
+        assert!(
+            requests[2].contains(&blob),
+            "the committed tool round rides the request that is then rejected"
+        );
+        assert_eq!(fetches.load(Ordering::SeqCst), 1, "compressed once per run");
+        // The checkpoint committed the tool round on top of the compressed
+        // transcript, so the retry's fold reached disk with it.
+        let on_disk: Session = read_yaml(&path);
+        assert!(
+            on_disk.messages().iter().any(|message| {
+                message.role.is_system() && message.content.to_text().contains("seam-summary-r4o")
+            }),
+            "{:?}",
+            on_disk.messages()
+        );
+        assert!(
+            on_disk.has_user_messages(),
+            "the checkpoint committed the retry's turn"
+        );
+        assert!(!on_disk.compressing());
+    }
+
     /// A child's turn-boundary compression runs the same predicates as the
     /// REPL's, so the safety valve compresses a transcript that is still
     /// under its `compression_threshold` once the last prompt's reported
