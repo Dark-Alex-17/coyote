@@ -845,6 +845,39 @@ pub(crate) mod network {
         }
     }
 
+    /// A `Stall` whose parked handlers can all be let go at once: each answers
+    /// `released` as soon as `release` is flipped, so a test can prove what a request
+    /// dropped while the slots were full does once they are free again.
+    pub(crate) struct ReleasableStall {
+        pub(crate) entered: AtomicUsize,
+        release: tokio::sync::watch::Receiver<bool>,
+    }
+
+    impl ReleasableStall {
+        pub(crate) fn new() -> (Arc<Self>, tokio::sync::watch::Sender<bool>) {
+            let (tx, release) = tokio::sync::watch::channel(false);
+            let stall = Arc::new(Self {
+                entered: AtomicUsize::new(0),
+                release,
+            });
+            (stall, tx)
+        }
+    }
+
+    #[async_trait]
+    impl RequestHandler for ReleasableStall {
+        fn admit(&self, _link_id: LinkId, _identity: Option<&Identity>) -> Admission {
+            Admission::Admit
+        }
+
+        async fn handle(&self, _request: InboundRequest) -> Reply {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            let mut release = self.release.clone();
+            release.wait_for(|released| *released).await.unwrap();
+            Reply::Value(Value::from("released"))
+        }
+    }
+
     #[derive(Default)]
     pub(crate) struct SpySink {
         knocks: Mutex<Vec<KnockEvent>>,
@@ -2959,6 +2992,77 @@ pub(crate) mod network {
         responder.stop().await;
     }
 
+    /// Admission is judged before the envelope is read: a blocked identity sending a
+    /// body that is not an envelope hears the same silence as one sending a good one,
+    /// where a trusted identity sending that body is refused `no_access` for its
+    /// unverifiable origin. A blocked peer must not learn whether its bytes parsed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_blocked_identitys_malformed_body_is_dropped_before_it_is_read() {
+        install_log_collector();
+        let recorder = Arc::new(Recorder::default());
+        let (responder, requester, desc) = pair(recorder.clone()).await;
+        let list = TrustList::default().block(&identity_hex(&requester));
+        let gate = gate(
+            &responder,
+            recorder.clone(),
+            &list,
+            "request-gate-blocked-raw",
+        );
+        let link = identified_link(&requester, &responder, &desc).await;
+        let link_id = *link.lock().await.id();
+
+        let bodies = [
+            Value::Nil,
+            Value::from("not an envelope"),
+            Value::Map(vec![(Value::from("v"), Value::from(MESH_PROTOCOL_VERSION))]),
+        ];
+        for body in bodies {
+            let err = requester
+                .client
+                .request_on_link(
+                    &requester.transport,
+                    &link,
+                    TEST_PATH,
+                    body.clone(),
+                    Deadline::after(SHORT_REQUEST_TIMEOUT),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(err, timed_out(TEST_PATH), "{body:?}");
+        }
+
+        assert_eq!(responder.adapter.admitted_count(), 0);
+        assert_eq!(recorder.seen_count(), 0);
+        assert_eq!(gate.sink.count(), 0, "a blocked identity never knocks");
+        let admit_line = format!(
+            "Mesh request (envelope not yet read) from {} on link {}: dropped: blocked identity",
+            short(&identity_hex(&requester)),
+            link_id.to_hex_string()
+        );
+        // The admit line is the responder's and may land after the requester gave up.
+        wait_until("every request to be dropped at admission", || {
+            debug_snapshot()
+                .iter()
+                .filter(|line| **line == admit_line)
+                .count()
+                == 3
+        })
+        .await;
+        // The log buffer is shared by every test in the process, so judge only this
+        // test's link.
+        let link_hex = link_id.to_hex_string();
+        let mine: Vec<_> = debug_snapshot()
+            .into_iter()
+            .filter(|line| line.contains(&link_hex))
+            .collect();
+        assert!(
+            !mine.iter().any(|line| line.contains("unverifiable origin")),
+            "the body was never read, so no origin was ever judged: {mine:?}"
+        );
+        requester.stop().await;
+        responder.stop().await;
+    }
+
     /// A trusted peer's request that is not a request frame is dropped by the library
     /// before Coyote's handler is asked anything, and the link goes on serving.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4273,6 +4377,90 @@ pub(crate) mod network {
         for task in in_flight {
             task.abort();
         }
+        requester.stop().await;
+        responder.stop().await;
+    }
+
+    /// The slot bound is one count for every path the adapter serves, and a request it
+    /// drops is dropped for good: once the busy handlers let go, the dropped request is
+    /// never run late, while a fresh one is served at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_dropped_for_busy_slots_is_never_served_once_they_free() {
+        install_log_collector();
+        let (stall, release) = ReleasableStall::new();
+        let (responder, requester, desc) = pair(stall.clone()).await;
+        let link = open_link(&requester.transport, &desc, "/slow", link_deadline())
+            .await
+            .unwrap();
+        let link_id = *link.lock().await.id();
+
+        let in_flight: Vec<_> = (0..MAX_CONCURRENT_INBOUND_REQUESTS)
+            .map(|_| {
+                let client = requester.client.clone();
+                let transport = requester.transport.clone();
+                let link = link.clone();
+                tokio::spawn(async move {
+                    client
+                        .request_on_link(&transport, &link, "/slow", Value::Nil, request_deadline())
+                        .await
+                })
+            })
+            .collect();
+        wait_until("every handler slot to be taken", || {
+            stall.entered.load(Ordering::SeqCst) == MAX_CONCURRENT_INBOUND_REQUESTS
+        })
+        .await;
+
+        // A different registered path on the same link shares the one bound.
+        let err = request_on(
+            &requester,
+            &link,
+            "/echo",
+            Value::from("dropped"),
+            Deadline::after(SHORT_REQUEST_TIMEOUT),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, timed_out("/echo"));
+        assert_debug_logged(&format!(
+            "on link {}: all {MAX_CONCURRENT_INBOUND_REQUESTS} handler slots are busy",
+            link_id.to_hex_string()
+        ));
+        assert_eq!(
+            stall.entered.load(Ordering::SeqCst),
+            MAX_CONCURRENT_INBOUND_REQUESTS
+        );
+
+        release.send(true).unwrap();
+        for task in in_flight {
+            let outcome = task.await.unwrap().unwrap();
+            assert_eq!(outcome.value, Value::from("released"));
+        }
+        wait_until("every handler slot to be free again", || {
+            responder.adapter.available_permits() == MAX_CONCURRENT_INBOUND_REQUESTS
+        })
+        .await;
+        assert_eq!(
+            stall.entered.load(Ordering::SeqCst),
+            MAX_CONCURRENT_INBOUND_REQUESTS,
+            "the request dropped while the slots were busy must not run once they are free"
+        );
+
+        let outcome = request_on(
+            &requester,
+            &link,
+            "/echo",
+            Value::from("after"),
+            request_deadline(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.value, Value::from("released"));
+        assert_eq!(
+            stall.entered.load(Ordering::SeqCst),
+            MAX_CONCURRENT_INBOUND_REQUESTS + 1,
+            "only the fresh request reaches the handler"
+        );
         requester.stop().await;
         responder.stop().await;
     }
