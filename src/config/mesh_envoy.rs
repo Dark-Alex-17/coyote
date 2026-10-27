@@ -1435,7 +1435,7 @@ mod tests {
     use crate::mesh::pending::InboundStore;
     use crate::mesh::test_support::{
         AdmittedRequest, Handler, InboundMessage, InboundSink, MESSAGE_PATH, NAME_HASH_LEN,
-        OriginName, PathHash, RefusalCode, Reply, RequestId, SizeBranch, TempDir, TrustList,
+        OriginName, PathHash, RefusalCode, Reply, RequestId, TempDir, TrustList,
     };
     #[cfg(unix)]
     use crate::mesh::test_support::{
@@ -4076,7 +4076,6 @@ mod tests {
             request_id: RequestId::from([1u8; 16]),
             path_hash: PathHash::of(MESSAGE_PATH),
             body: to_request_body(message, 1_700_000_000.0),
-            branch: SizeBranch::Packet,
         }
     }
 

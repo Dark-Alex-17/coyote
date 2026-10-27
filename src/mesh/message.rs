@@ -2405,7 +2405,7 @@ mod tests {
         KNOCK_TYPE, KnockIntro, KnockSurface, RecordingSurface as KeyChangeSurface, knock_message,
     };
     use crate::mesh::limits::RefusalReason;
-    use crate::mesh::request::{PathHash, RequestId, SizeBranch};
+    use crate::mesh::request::{PathHash, RequestId};
     use crate::mesh::test_support::{TempDir, TrustList};
     use crate::supervisor::notification::MESH_EVENTS_DROPPED_EVENT;
 
@@ -4839,7 +4839,6 @@ mod tests {
                     request_id: RequestId::from([1u8; 16]),
                     path_hash: PathHash::of(MESSAGE_PATH),
                     body: to_request_body(&out, 1_700_000_000.0),
-                    branch: SizeBranch::Packet,
                 },
             )
         };
@@ -4958,7 +4957,6 @@ mod tests {
             request_id: RequestId::from([1u8; 16]),
             path_hash: PathHash::of(MESSAGE_PATH),
             body: Value::Map(entries),
-            branch: SizeBranch::Packet,
         };
 
         match handler.handle(request).await {
@@ -4996,7 +4994,6 @@ mod tests {
             request_id: RequestId::from([1u8; 16]),
             path_hash: PathHash::of(MESSAGE_PATH),
             body: Value::Map(entries),
-            branch: SizeBranch::Packet,
         };
 
         assert!(matches!(
@@ -5128,7 +5125,6 @@ mod tests {
                 request_id: RequestId::from([1u8; 16]),
                 path_hash: PathHash::of(MESSAGE_PATH),
                 body: Value::Map(entries),
-                branch: SizeBranch::Packet,
             };
             match handler.handle(request).await {
                 Reply::Value(value) | Reply::Settled { value, .. } => {

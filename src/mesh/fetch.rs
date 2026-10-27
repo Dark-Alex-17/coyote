@@ -1659,9 +1659,7 @@ mod tests {
     use crate::mesh::card::build_card;
     use crate::mesh::events::{RecordingHookSink, env_value, one_fire};
     use crate::mesh::mesh_config_dir;
-    use crate::mesh::request::{
-        FETCH_PATH, LIST_PATH, PathHash, RequestId, ResponseFrame, SizeBranch,
-    };
+    use crate::mesh::request::{FETCH_PATH, LIST_PATH, PathHash, RequestId, ResponseFrame};
     use crate::mesh::test_support::TempDir;
     use crate::mesh::wire_path::WIRE_PATH_MAX_BYTES;
     #[cfg(unix)]
@@ -1844,7 +1842,6 @@ mod tests {
             request_id: RequestId::from([1u8; 16]),
             path_hash: PathHash::of(path),
             body,
-            branch: SizeBranch::Packet,
         }
     }
 

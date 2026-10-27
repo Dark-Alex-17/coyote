@@ -38,7 +38,7 @@ use crate::mesh::request::{ACCESS_PATH, DispatchError};
 use crate::mesh::snapshot::MeshSnapshot;
 use crate::mesh::test_support::{
     AdmittedRequest, Handler, InboundMessage, InboundSink, NAME_HASH_LEN, OriginName, PathHash,
-    RefusalCode, Reply, RequestId, SizeBranch, TempDir, TrustList, snapshot_fixture,
+    RefusalCode, Reply, RequestId, TempDir, TrustList, snapshot_fixture,
 };
 use crate::mesh::{destination_address, hex_lower, rfc3339_utc};
 
@@ -349,7 +349,6 @@ impl BareSlot {
             request_id: RequestId::from([1u8; 16]),
             path_hash: PathHash::of(ACCESS_PATH),
             body,
-            branch: SizeBranch::Packet,
         }
     }
 

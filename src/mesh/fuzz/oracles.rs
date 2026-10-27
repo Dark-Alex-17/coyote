@@ -38,7 +38,7 @@ use crate::mesh::request::{
     ACCESS_PATH, AdmittedRequest, DispatchError, Dispatcher, Envelope, EnvelopeError, FETCH_PATH,
     Handler, InboundRequest, KNOCK_PATH, KNOWN_PATHS, KnockEvent, KnockSink, LIST_PATH,
     MAX_REQUEST_NESTING_DEPTH, MESSAGE_PATH, NAME_HASH_LEN, OriginName, PathHash, RefusalCode,
-    Reply, RequestError, RequestFrame, RequestHandler, RequestId, STATUS_PATH, SizeBranch,
+    Reply, RequestError, RequestFrame, RequestHandler, RequestId, STATUS_PATH,
 };
 use crate::mesh::shares::LIST_PAGE_SIZE;
 use crate::mesh::test_support::{TempDir, TrustList};
@@ -972,7 +972,6 @@ fn check_tier(
         request_id: RequestId::from([1u8; ADDRESS_HASH_SIZE]),
         path_hash: frame.path_hash,
         data: frame.data.clone(),
-        branch: SizeBranch::Packet,
     };
     let reply = fx
         .rt
@@ -1100,14 +1099,29 @@ fn check_tier(
                     ensure(knocks.is_empty(), || {
                         "an allowed request files no knock".to_string()
                     })?;
+                    let path_hash = frame.path_hash;
+                    let Some(path) = KNOWN_PATHS
+                        .into_iter()
+                        .find(|path| PathHash::of(path) == path_hash)
+                    else {
+                        ensure(handled == 0, || {
+                            "(c) only /status has a provider here; no other path may run it"
+                                .to_string()
+                        })?;
+                        return ensure(matches!(reply, Reply::Silent), || {
+                            format!(
+                                "a path the dispatcher has no route for is dropped in silence, got {}",
+                                describe_reply(&reply)
+                            )
+                        });
+                    };
                     let Reply::Value(value) = &reply else {
                         return Err(format!(
                             "an allowed request is answered with a value, got {}",
                             describe_reply(&reply)
                         ));
                     };
-                    let path_hash = frame.path_hash;
-                    if path_hash == PathHash::of(STATUS_PATH) {
+                    if path == STATUS_PATH {
                         ensure(handled == 1, || {
                             format!(
                                 "the provided path runs its handler exactly once, ran {handled}"
@@ -1120,37 +1134,21 @@ fn check_tier(
                     ensure(handled == 0, || {
                         "(c) only /status has a provider here; no other path may run it".to_string()
                     })?;
-                    if path_hash == PathHash::of(KNOCK_PATH) {
+                    if path == KNOCK_PATH {
                         ensure(value.is_nil(), || {
                             format!(
                                 "the dispatcher's own /knock handler answers nil to a trusted instance, got {value}"
                             )
                         })
-                    } else if let Some(unprovided) = KNOWN_PATHS
-                        .into_iter()
-                        .filter(|path| *path != KNOCK_PATH && *path != STATUS_PATH)
-                        .find(|path| PathHash::of(path) == path_hash)
-                    {
+                    } else {
                         ensure(
                             DispatchError::from_value(value)
                                 == Some(DispatchError::NoProvider {
-                                    path: unprovided.to_string(),
+                                    path: path.to_string(),
                                 }),
                             || {
                                 format!(
                                     "a known path without a provider earns the no_provider map, got {value}"
-                                )
-                            },
-                        )
-                    } else {
-                        ensure(
-                            DispatchError::from_value(value)
-                                == Some(DispatchError::UnknownPath {
-                                    path_hash: path_hash.to_string(),
-                                }),
-                            || {
-                                format!(
-                                    "an unknown path earns the unknown_path map naming its hash, got {value}"
                                 )
                             },
                         )

@@ -374,7 +374,7 @@ pub(crate) mod test_support {
     #[cfg(unix)]
     use super::propagation::pn_announce_app_data;
     #[cfg(unix)]
-    use super::propagation_fetch::FETCH_TRANSFER_LIMIT_KB;
+    use super::propagation_fetch::{FETCH_TRANSFER_LIMIT_KB, GET_PATH};
     pub(crate) use super::propagation_fetch::{InboundMessage, InboundSink};
     pub(crate) use super::protocol::Compatibility;
     #[cfg(all(test, unix))]
@@ -386,12 +386,12 @@ pub(crate) mod test_support {
     pub(crate) use super::request::{ACCESS_PATH, FETCH_PATH, LIST_PATH};
     #[cfg(unix)]
     use super::request::{
-        Admission, Dispatcher, InboundRequest, LoggingKnockSink, RequestClient, RequestHandler,
-        RequestServer,
+        Admission, Dispatcher, HANDLER_TIMEOUT, InboundRequest, KNOWN_PATHS, LibraryHandler,
+        LoggingKnockSink, MAX_REQUEST_PAYLOAD_BYTES, RequestClient, RequestHandler,
     };
     pub(crate) use super::request::{
         AdmittedRequest, Handler, MESSAGE_PATH, NAME_HASH_LEN, OriginName, PathHash, RefusalCode,
-        Reply, RequestId, SizeBranch,
+        Reply, RequestId,
     };
     #[cfg(unix)]
     use super::session_destination_name;
@@ -414,6 +414,8 @@ pub(crate) mod test_support {
     use rmpv::Value;
     #[cfg(unix)]
     use rns_transport::destination::link::LinkId;
+    #[cfg(unix)]
+    use rns_transport::destination::request::RequestAllow;
     #[cfg(unix)]
     use rns_transport::destination::{DestinationDesc, DestinationName, SingleInputDestination};
     #[cfg(unix)]
@@ -885,28 +887,43 @@ pub(crate) mod test_support {
         }
     }
 
-    /// A listening node: a bare transport with a `TcpServer`, one destination and an
-    /// `RequestServer` answering on it, the shape `MeshConfig` cannot express since it only
-    /// connects outward.
+    /// A listening node: a bare transport with a `TcpServer` and one destination whose
+    /// request paths a `LibraryHandler` answers on, the shape `MeshConfig` cannot express
+    /// since it only connects outward.
     #[cfg(unix)]
     pub(crate) struct Listener {
         pub(crate) transport: Arc<Transport>,
-        pub(crate) server: Arc<RequestServer>,
+        pub(crate) adapter: Arc<LibraryHandler>,
         pub(crate) dest: Arc<tokio::sync::Mutex<SingleInputDestination>>,
         pub(crate) desc: DestinationDesc,
         pub(crate) iface: AddressHash,
-        pub(crate) cancel: CancellationToken,
         pub(crate) port: u16,
     }
 
     #[cfg(unix)]
     impl Listener {
+        /// Listens with `handler` behind every path in `paths`, bounded by `HANDLER_TIMEOUT`.
         pub(crate) async fn listen(
-            server: Arc<RequestServer>,
             handler: Arc<dyn RequestHandler>,
             client_mtu: usize,
             identity: TransportIdentity,
             name: DestinationName,
+            paths: &[&str],
+        ) -> Self {
+            Self::listen_with_timeout(handler, client_mtu, identity, name, paths, HANDLER_TIMEOUT)
+                .await
+        }
+
+        /// `listen` with the handler bound by `handler_timeout` instead. The destination is
+        /// armed with `MAX_REQUEST_PAYLOAD_BYTES` the way the node's is, so the library
+        /// refuses an oversize request before the handler sees it.
+        pub(crate) async fn listen_with_timeout(
+            handler: Arc<dyn RequestHandler>,
+            client_mtu: usize,
+            identity: TransportIdentity,
+            name: DestinationName,
+            paths: &[&str],
+            handler_timeout: Duration,
         ) -> Self {
             let port = closed_port().await;
             let transport = Arc::new(Transport::new(TransportConfig::new(
@@ -914,14 +931,10 @@ pub(crate) mod test_support {
                 &TransportIdentity::new_from_rand(OsRng),
                 false,
             )));
-            server.set_handler(handler);
-            let cancel = CancellationToken::new();
-            tokio::spawn(server.clone().run(
-                transport.clone(),
-                transport.in_link_events(),
-                transport.resource_events(),
-                cancel.clone(),
-            ));
+            let adapter = Arc::new(
+                LibraryHandler::new(handler, &transport)
+                    .with_handler_timeout_for_test(handler_timeout),
+            );
             let tcp = TcpServer::new(format!("127.0.0.1:{port}"), transport.iface_manager())
                 .with_client_mtu(client_mtu);
             let status = tcp.runtime_status_handle();
@@ -934,15 +947,23 @@ pub(crate) mod test_support {
                 status.to_json()["listener_state"].as_str() == Some("listening")
             })
             .await;
-            let dest = transport.add_destination(identity, name).await;
+            let mut destination = SingleInputDestination::new(identity, name);
+            destination
+                .set_max_request_size(MAX_REQUEST_PAYLOAD_BYTES)
+                .unwrap();
+            for path in paths {
+                destination
+                    .register_request_handler(path, adapter.clone(), RequestAllow::All, true)
+                    .unwrap();
+            }
+            let dest = transport.register_destination(destination).await;
             let desc = dest.lock().await.desc;
             Self {
                 transport,
-                server,
+                adapter,
                 dest,
                 desc,
                 iface,
-                cancel,
                 port,
             }
         }
@@ -953,7 +974,6 @@ pub(crate) mod test_support {
         }
 
         pub(crate) async fn stop(self) {
-            self.cancel.cancel();
             self.transport
                 .iface_manager()
                 .lock()
@@ -966,9 +986,7 @@ pub(crate) mod test_support {
     #[cfg(unix)]
     #[derive(Clone)]
     pub(crate) struct Seen {
-        pub(crate) request_id: String,
         pub(crate) identity: Option<AddressHash>,
-        pub(crate) branch: SizeBranch,
         pub(crate) data: Value,
     }
 
@@ -1001,9 +1019,7 @@ pub(crate) mod test_support {
 
         async fn handle(&self, request: InboundRequest) -> Reply {
             self.seen.lock().push(Seen {
-                request_id: request.request_id.to_string(),
                 identity: request.identity.map(|identity| identity.address_hash),
-                branch: request.branch,
                 data: request.data,
             });
             let next = self.replies.lock().pop_front();
@@ -1030,11 +1046,11 @@ pub(crate) mod test_support {
         pub(crate) async fn listen_with_mtu(client_mtu: usize) -> Self {
             let script = Arc::new(Script::default());
             let listener = Listener::listen(
-                Arc::new(RequestServer::new()),
                 script.clone(),
                 client_mtu,
                 TransportIdentity::new_from_rand(OsRng),
                 DestinationName::new("lxmf", "propagation"),
+                &[GET_PATH],
             )
             .await;
             Self { listener, script }
@@ -1127,11 +1143,11 @@ pub(crate) mod test_support {
             let trust_dir = TempDir::new(tag);
             let handler = Self::gate(&TrustList::default(), &trust_dir, recorder.clone(), &[]);
             let listener = Listener::listen(
-                Arc::new(RequestServer::new()),
                 handler,
                 client_mtu,
                 identity.clone(),
                 session_destination_name(tag),
+                &KNOWN_PATHS,
             )
             .await;
             Self {
@@ -1162,7 +1178,7 @@ pub(crate) mod test_support {
         }
 
         fn regate(&self) {
-            self.listener.server.set_handler(Self::gate(
+            self.listener.adapter.set_handler(Self::gate(
                 &self.list.lock(),
                 &self.trust_dir,
                 self.recorder.clone(),

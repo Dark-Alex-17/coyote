@@ -4569,7 +4569,7 @@ mod tests {
     use crate::mesh::propagation_fetch::InboundMessage;
     use crate::mesh::request::{
         AdmittedRequest, DEFAULT_LINK_TIMEOUT, Deadline, Handler, NAME_HASH_LEN, PathHash, Reply,
-        RequestId, SizeBranch,
+        RequestId,
     };
     use crate::mesh::rfc3339_utc;
     #[cfg(unix)]
@@ -6043,7 +6043,6 @@ mod tests {
                 request_id: RequestId::from([1u8; 16]),
                 path_hash: PathHash::of(MESSAGE_PATH),
                 body: to_request_body(&direct, 1_700_000_000.0),
-                branch: SizeBranch::Packet,
             })
             .await;
         match reply {
@@ -6112,7 +6111,6 @@ mod tests {
             request_id: RequestId::from([1u8; 16]),
             path_hash: PathHash::of(MESSAGE_PATH),
             body: to_request_body(message, 1_700_000_000.0),
-            branch: SizeBranch::Packet,
         }
     }
 

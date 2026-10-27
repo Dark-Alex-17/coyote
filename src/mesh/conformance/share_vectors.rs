@@ -1888,7 +1888,6 @@ impl Serve {
             request_id: RequestId::from([1u8; 16]),
             path_hash: PathHash::of(path),
             body,
-            branch: SizeBranch::Packet,
         }
     }
 
@@ -1951,7 +1950,6 @@ impl Serve {
             request_id: RequestId::from([1u8; 16]),
             path_hash: PathHash::of(path),
             data: Envelope::new(OriginName(ORIGIN), body).into_value(),
-            branch: SizeBranch::Packet,
         };
         block_on(RequestHandler::handle(&dispatcher, request))
     }

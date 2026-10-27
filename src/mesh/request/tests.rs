@@ -549,9 +549,9 @@ pub(crate) mod network {
         Envelope, MAX_FETCH_RESPONSE_BYTES, MAX_REQUEST_PAYLOAD_BYTES, NAME_HASH_LEN, OriginName,
         PathHash, RequestFrame, RequestId, ResponseFrame,
     };
-    use super::super::server::{
-        Admission, InboundRequest, MAX_CONCURRENT_INBOUND_REQUESTS, Reply, RequestHandler,
-        RequestServer, Settlement,
+    use super::super::handler::{
+        Admission, HANDLER_TIMEOUT, InboundRequest, LibraryHandler,
+        MAX_CONCURRENT_INBOUND_REQUESTS, Reply, RequestHandler, Settlement,
     };
     use crate::config::mesh_config::{MAX_FETCH_FILE_BYTES, MeshInterface};
     use crate::config::{ForkRekey, MeshConfig, Session};
@@ -599,8 +599,9 @@ pub(crate) mod network {
     use crate::mesh::shares::WriteScope;
     use crate::mesh::snapshot::{MeshSnapshot, RepoInfo, TurnState};
     use crate::mesh::test_support::{
-        Connector, INTEROP_TIMEOUT, LEGACY_LINK_MTU, Listener, TempDir, TrustList, contains_bytes,
-        loopback_relay, mesh_paths, private_config, snapshot_fixture, started_runtime, wait_until,
+        Connector, INTEROP_TIMEOUT, LEGACY_LINK_MTU, Listener, POLL, TempDir, TrustList,
+        contains_bytes, loopback_relay, mesh_paths, private_config, snapshot_fixture,
+        started_runtime, wait_until,
     };
     use crate::mesh::trust::{
         IdentityStanding, InstancePresence, Rule, ServedBy, TRUST_FILE_VERSION, TrustChange,
@@ -680,7 +681,6 @@ pub(crate) mod network {
         /// stands in for the dispatcher and nothing derived one.
         pub(crate) destination: Option<AddressHash>,
         pub(crate) path_hash: PathHash,
-        pub(crate) branch: SizeBranch,
     }
 
     pub(crate) enum Script {
@@ -776,7 +776,6 @@ pub(crate) mod network {
                 identity: request.identity.map(|identity| identity.address_hash),
                 destination: None,
                 path_hash: request.path_hash,
-                branch: request.branch,
             };
             let body = match Envelope::from_value(request.data.clone()) {
                 Ok(envelope) => envelope.body,
@@ -796,7 +795,6 @@ pub(crate) mod network {
                 identity: Some(request.identity.address_hash),
                 destination: Some(request.destination_hash),
                 path_hash: request.path_hash,
-                branch: request.branch,
             };
             self.record(seen, request.body).await
         }
@@ -858,6 +856,25 @@ pub(crate) mod network {
 
     pub(crate) const TEST_PATH: &str = "/test";
 
+    /// Every path a `Responder` answers on: the node's own and the ones these tests ask
+    /// for by name. A path outside this list is never delivered to the handler, which is
+    /// what the unregistered-path tests rely on.
+    pub(crate) const TEST_PATHS: [&str; 13] = [
+        KNOCK_PATH,
+        STATUS_PATH,
+        MESSAGE_PATH,
+        LIST_PATH,
+        FETCH_PATH,
+        ACCESS_PATH,
+        TEST_PATH,
+        "/echo",
+        "/big",
+        "/slow",
+        "/sync",
+        "/who",
+        "/card",
+    ];
+
     /// Puts the real dispatcher over `list` in front of `responder`, serving `TEST_PATH`
     /// with `recorder` and knocking into the returned spy.
     pub(crate) fn gate(
@@ -870,7 +887,7 @@ pub(crate) mod network {
         let sink = Arc::new(SpySink::default());
         let dispatcher = Dispatcher::new(trust, sink.clone());
         assert!(dispatcher.register(TEST_PATH, recorder).unwrap().is_none());
-        responder.server.set_handler(Arc::new(dispatcher));
+        responder.adapter.set_handler(Arc::new(dispatcher));
         Gate { sink, _tmp: tmp }
     }
 
@@ -882,50 +899,49 @@ pub(crate) mod network {
     /// A `Listener` serving a fresh Coyote destination.
     pub(crate) struct Responder {
         pub(crate) transport: Arc<Transport>,
-        pub(crate) server: Arc<RequestServer>,
+        pub(crate) adapter: Arc<LibraryHandler>,
         dest: Arc<tokio::sync::Mutex<SingleInputDestination>>,
         pub(crate) desc: DestinationDesc,
         identity: TransportIdentity,
         iface: AddressHash,
-        cancel: CancellationToken,
         pub(crate) port: u16,
     }
 
     impl Responder {
         pub(crate) async fn listen(handler: Arc<dyn RequestHandler>, client_mtu: usize) -> Self {
-            Self::listen_on(Arc::new(RequestServer::new()), handler, client_mtu).await
+            Self::listen_with_timeout(handler, client_mtu, HANDLER_TIMEOUT).await
         }
 
-        pub(crate) async fn listen_on(
-            server: Arc<RequestServer>,
+        /// `listen` with the handler bound by `handler_timeout` instead of `HANDLER_TIMEOUT`.
+        pub(crate) async fn listen_with_timeout(
             handler: Arc<dyn RequestHandler>,
             client_mtu: usize,
+            handler_timeout: Duration,
         ) -> Self {
             let identity = TransportIdentity::new_from_rand(OsRng);
             let Listener {
                 transport,
-                server,
+                adapter,
                 dest,
                 desc,
                 iface,
-                cancel,
                 port,
-            } = Listener::listen(
-                server,
+            } = Listener::listen_with_timeout(
                 handler,
                 client_mtu,
                 identity.clone(),
                 fresh_destination_name(),
+                &TEST_PATHS,
+                handler_timeout,
             )
             .await;
             Self {
                 transport,
-                server,
+                adapter,
                 dest,
                 desc,
                 identity,
                 iface,
-                cancel,
                 port,
             }
         }
@@ -945,7 +961,6 @@ pub(crate) mod network {
         }
 
         pub(crate) async fn stop(self) {
-            self.cancel.cancel();
             self.transport
                 .iface_manager()
                 .lock()
@@ -1108,11 +1123,27 @@ pub(crate) mod network {
         )
         .await
         .unwrap();
-        wait_until("the responder to record the identity", || {
-            responder.server.identified_peer_count() == 1
-        })
-        .await;
+        let link_id = *link.lock().await.id();
+        wait_for_identity(responder, link_id).await;
         link
+    }
+
+    /// Waits until the responder's transport has recorded the peer's identity on
+    /// `link_id`, which is where the library reads it from for every request.
+    pub(crate) async fn wait_for_identity(responder: &Responder, link_id: LinkId) {
+        let deadline = tokio::time::Instant::now() + INTEROP_TIMEOUT;
+        loop {
+            if let Some(link) = responder.transport.find_in_link(&link_id).await
+                && link.lock().await.identified_peer_identity().is_some()
+            {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for the responder to record the identity"
+            );
+            sleep(POLL).await;
+        }
     }
 
     /// One request over `link` from the requester's own instance, as `Requester::request`
@@ -1559,7 +1590,9 @@ pub(crate) mod network {
             (mdu, SizeBranch::Packet),
             (mdu + 1, SizeBranch::Resource),
         ];
-        for (target, expected) in matrix {
+        // The request half runs each size; which way the request travelled is the
+        // requester's choice, and the responder's handler sees no trace of it.
+        for (target, _) in matrix {
             let body = request_body_of_encoded_len(requester.origin, target);
             let outcome = requester
                 .request(&desc, "/echo", body.clone())
@@ -1567,14 +1600,12 @@ pub(crate) mod network {
                 .unwrap();
             assert_eq!(outcome.value, body, "a {target}-byte request frame echoes");
             let seen = recorder.last();
-            assert_eq!(seen.branch, expected, "a {target}-byte request frame");
             assert_eq!(seen.path_hash, PathHash::of("/echo"));
         }
         for (target, expected) in matrix {
             let body = response_body_of_encoded_len(target);
             recorder.queue(Script::Reply(Reply::Value(body.clone())));
             let outcome = requester.request(&desc, "/echo", Value::Nil).await.unwrap();
-            assert_eq!(recorder.last().branch, SizeBranch::Packet);
             assert_eq!(
                 outcome.response_branch, expected,
                 "a {target}-byte response frame"
@@ -1590,7 +1621,6 @@ pub(crate) mod network {
             .await
             .unwrap();
         let seen = recorder.last();
-        assert_eq!(seen.branch, SizeBranch::Resource);
         assert_eq!(outcome.response_branch, SizeBranch::Resource);
         assert_eq!(outcome.value, card);
         // The transfer's own completion event can land after the reply, so give it a
@@ -1754,14 +1784,17 @@ pub(crate) mod network {
         responder.stop().await;
     }
 
+    /// The handler sees the peer's identity only once the peer has proven it on the link;
+    /// before that the request reaches it anonymous.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn identity_is_tracked_only_after_proof_and_forgotten_on_close() {
+    async fn identity_reaches_the_handler_only_after_proof() {
         let recorder = Arc::new(Recorder::default());
         let (responder, requester, desc) = pair(recorder.clone()).await;
         let transport = &requester.transport;
         let link = open_link(transport, &desc, "/who", link_deadline())
             .await
             .unwrap();
+        let link_id = *link.lock().await.id();
 
         requester
             .client
@@ -1770,7 +1803,6 @@ pub(crate) mod network {
             .unwrap();
         let unproven = recorder.last();
         assert_eq!(unproven.identity, None);
-        assert_eq!(responder.server.identified_peer_count(), 0);
 
         identify(
             transport,
@@ -1781,10 +1813,7 @@ pub(crate) mod network {
         )
         .await
         .unwrap();
-        wait_until("the responder to record the identity", || {
-            responder.server.identified_peer_count() == 1
-        })
-        .await;
+        wait_for_identity(&responder, link_id).await;
         requester
             .client
             .request_on_link(transport, &link, "/who", Value::Nil, request_deadline())
@@ -1795,26 +1824,15 @@ pub(crate) mod network {
             proven.identity,
             Some(requester.identity.as_identity().address_hash)
         );
-        assert_eq!(responder.server.identified_peer_count(), 1);
-
-        let teardown = link
-            .lock()
-            .await
-            .teardown()
-            .expect("an active link builds a teardown");
-        transport
-            .send_link_packet_on_bound_iface(&link, teardown)
-            .await;
-        wait_until("the responder to forget the closed link", || {
-            responder.server.identified_peer_count() == 0
-        })
-        .await;
         requester.stop().await;
         responder.stop().await;
     }
 
+    /// The responder's destination is armed with the request cap, so the library refuses
+    /// an oversize request at its advertisement: nothing of it transfers, the handler is
+    /// never entered, and the link goes on serving.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn oversized_request_resource_is_dropped_before_the_handler_runs() {
+    async fn oversized_request_resource_is_refused_at_its_advertisement() {
         install_log_collector();
         let recorder = Arc::new(Recorder::default());
         // The default TCP MTU so the transfer is a couple of segments rather than thousands.
@@ -1844,16 +1862,12 @@ pub(crate) mod network {
             .await
             .unwrap();
 
-        let dropped = format!(
-            "Dropped an oversize mesh request on link {} ({} bytes, max {MAX_REQUEST_PAYLOAD_BYTES})",
-            link_id.to_hex_string(),
-            MAX_REQUEST_PAYLOAD_BYTES + 1
-        );
-        wait_until("the responder to drop the oversize request", || {
-            debug_snapshot().contains(&dropped)
+        wait_until("the library to refuse the oversize advertisement", || {
+            library_refused_oversize_request(link_id)
         })
         .await;
         assert_eq!(recorder.seen_count(), 0);
+        assert_eq!(responder.adapter.admitted_count(), 0);
 
         let outcome = requester
             .client
@@ -1870,6 +1884,26 @@ pub(crate) mod network {
         assert_eq!(recorder.seen_count(), 1);
         requester.stop().await;
         responder.stop().await;
+    }
+
+    /// The library's warning that it refused a request advertisement on `link_id`, if it
+    /// has. The link id renders the way `AddressHash`'s `Display` does, between slashes.
+    pub(crate) fn library_request_refusal_on(link_id: LinkId) -> Option<String> {
+        let opening = format!("reject_request_advertisement link={link_id} hash=");
+        warn_snapshot()
+            .into_iter()
+            .find(|line| line.contains(&opening))
+    }
+
+    /// Whether the library has refused a request advertisement on `link_id` one byte over
+    /// the destination's cap. The advertisement's hash sits between the link and the
+    /// sizes, and the transfer size depends on compression, so only the data size and the
+    /// limit are matched.
+    pub(crate) fn library_refused_oversize_request(link_id: LinkId) -> bool {
+        let sizes = format!("data_size={} transfer_size=", MAX_REQUEST_PAYLOAD_BYTES + 1);
+        let limit = format!(" limit={MAX_REQUEST_PAYLOAD_BYTES}");
+        library_request_refusal_on(link_id)
+            .is_some_and(|line| line.contains(&sizes) && line.ends_with(&limit))
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2169,10 +2203,8 @@ pub(crate) mod network {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_settled_reply_is_sent_on_success_and_dropped_unsent_when_the_send_fails() {
+    async fn a_settled_reply_is_sent_once_delivered_and_dropped_unsent_when_the_link_is_gone() {
         install_log_collector();
-        let recorder = Arc::new(Recorder::default());
-        let (responder, requester, desc) = pair(recorder.clone()).await;
         struct Flags {
             sent: Arc<AtomicBool>,
             dropped: Arc<AtomicBool>,
@@ -2187,6 +2219,30 @@ pub(crate) mod network {
                 self.dropped.store(true, Ordering::SeqCst);
             }
         }
+        /// Answers with the armed reply once released, so the test can act on the link
+        /// while the handler holds the reply.
+        #[derive(Default)]
+        struct HoldReply {
+            reply: Mutex<Option<Reply>>,
+            release: tokio::sync::Notify,
+            entered: AtomicUsize,
+            last: Mutex<Option<(LinkId, RequestId)>>,
+        }
+        #[async_trait]
+        impl RequestHandler for HoldReply {
+            fn admit(&self, _link_id: LinkId, _identity: Option<&Identity>) -> Admission {
+                Admission::Admit
+            }
+
+            async fn handle(&self, request: InboundRequest) -> Reply {
+                *self.last.lock() = Some((request.link_id, request.request_id));
+                self.entered.fetch_add(1, Ordering::SeqCst);
+                self.release.notified().await;
+                self.reply.lock().take().unwrap_or(Reply::Silent)
+            }
+        }
+        let handler = Arc::new(HoldReply::default());
+        let (responder, requester, desc) = pair(handler.clone()).await;
         let settled = |value: Value| {
             let sent = Arc::new(AtomicBool::new(false));
             let dropped = Arc::new(AtomicBool::new(false));
@@ -2200,49 +2256,95 @@ pub(crate) mod network {
             (reply, sent, dropped)
         };
 
+        // A reply that fits a packet is settled once the packet is on the interface.
         let (reply, sent, dropped) = settled(Value::from("settled"));
-        recorder.queue(Script::Reply(reply));
+        *handler.reply.lock() = Some(reply);
+        handler.release.notify_one();
         let outcome = requester.request(&desc, "/echo", Value::Nil).await.unwrap();
         assert_eq!(outcome.value, Value::from("settled"));
+        assert_eq!(outcome.response_branch, SizeBranch::Packet);
         assert!(sent.load(Ordering::SeqCst));
         assert!(
             dropped.load(Ordering::SeqCst),
             "`sent` consumes the settlement"
         );
 
-        let body = Value::Binary(vec![
-            0xcd;
-            MAX_REQUEST_PAYLOAD_BYTES + 1 - RESPONSE_FRAME_OVERHEAD
-        ]);
-        let (reply, sent, dropped) = settled(body);
-        recorder.queue(Script::Reply(reply));
-        let err = requester
-            .client
-            .request(
-                &requester.transport,
-                &requester.identity,
-                &desc,
-                "/echo",
-                requester.envelope(Value::Nil),
-                short_options(),
-            )
+        // A reply over the link MDU travels as a resource and is settled by the transfer's
+        // outcome, which can land after the requester has read the reply.
+        let card = card();
+        let (reply, sent, dropped) = settled(card.clone());
+        *handler.reply.lock() = Some(reply);
+        handler.release.notify_one();
+        let outcome = requester.request(&desc, "/echo", Value::Nil).await.unwrap();
+        assert_eq!(outcome.value, card);
+        assert_eq!(outcome.response_branch, SizeBranch::Resource);
+        wait_until("the completed transfer to settle the reply", || {
+            sent.load(Ordering::SeqCst)
+        })
+        .await;
+        assert!(dropped.load(Ordering::SeqCst));
+
+        // The link is torn down while the handler holds its reply; the send has nowhere to
+        // go and the settlement is dropped unsent.
+        let (reply, sent, dropped) = settled(Value::from("too late"));
+        *handler.reply.lock() = Some(reply);
+        let link = open_link(&requester.transport, &desc, "/echo", link_deadline())
             .await
-            .unwrap_err();
-        assert_eq!(err, timed_out("/echo"));
-        let seen = recorder.last();
+            .unwrap();
+        let link_id = *link.lock().await.id();
+        let entered = handler.entered.load(Ordering::SeqCst);
+        let in_flight = {
+            let (client, transport, origin, link) = (
+                requester.client.clone(),
+                requester.transport.clone(),
+                requester.origin,
+                link.clone(),
+            );
+            tokio::spawn(async move {
+                client
+                    .request_on_link_with(
+                        &transport,
+                        &link,
+                        "/echo",
+                        Envelope::new(origin, Value::Nil),
+                        Deadline::after(SHORT_REQUEST_TIMEOUT),
+                    )
+                    .await
+            })
+        };
+        wait_until("the handler to hold the reply", || {
+            handler.entered.load(Ordering::SeqCst) > entered
+        })
+        .await;
+        let (seen_link, seen_request) = handler.last.lock().unwrap();
+        assert_eq!(seen_link, link_id);
+        let teardown = link
+            .lock()
+            .await
+            .teardown()
+            .expect("an active link builds a teardown");
+        requester
+            .transport
+            .send_link_packet_on_bound_iface(&link, teardown)
+            .await;
+        let forgotten = tokio::time::Instant::now() + INTEROP_TIMEOUT;
+        while responder.transport.find_in_link(&link_id).await.is_some() {
+            assert!(
+                tokio::time::Instant::now() < forgotten,
+                "timed out waiting for the responder to drop the torn-down link"
+            );
+            sleep(POLL).await;
+        }
+        handler.release.notify_one();
+        assert!(in_flight.await.unwrap().is_err());
         let warned = format!(
-            "Failed to send mesh response {} on link {}: {}",
-            seen.request_id,
-            seen.link_id.to_hex_string(),
-            RequestError::Oversize {
-                len: MAX_REQUEST_PAYLOAD_BYTES + 1,
-                max: MAX_REQUEST_PAYLOAD_BYTES,
-            }
+            "Failed to send mesh response {seen_request} on link {}: the link is gone",
+            link_id.to_hex_string()
         );
-        assert!(
-            warn_snapshot().iter().any(|message| message == &warned),
-            "expected {warned:?}"
-        );
+        wait_until("the adapter to give up on the reply", || {
+            warn_snapshot().iter().any(|message| message == &warned)
+        })
+        .await;
         assert!(!sent.load(Ordering::SeqCst));
         // The unsent settlement is dropped on a blocking thread, a moment after the warning.
         wait_until("the unsent settlement to be dropped", || {
@@ -2362,14 +2464,9 @@ pub(crate) mod network {
             0,
             "nothing reached the handler"
         );
-        let dropped_by_server_cap = format!(
-            "Dropped an oversize mesh request on link {} ({} bytes, max {MAX_REQUEST_PAYLOAD_BYTES})",
-            link_id.to_hex_string(),
-            MAX_REQUEST_PAYLOAD_BYTES + 1
-        );
         assert!(
-            !debug_snapshot().contains(&dropped_by_server_cap),
-            "the library refused the request at its advertisement; the server's own cap never saw it"
+            library_refused_oversize_request(link_id),
+            "the library refused the request at its advertisement"
         );
 
         let outcome = pair
@@ -2378,7 +2475,7 @@ pub(crate) mod network {
                 transport_b,
                 &TransportIdentity::new_from_rand(OsRng),
                 &pair.a_desc,
-                "/echo",
+                STATUS_PATH,
                 pair.responder.envelope(Value::from("after")),
                 RequestOptions::default(),
             )
@@ -2408,10 +2505,10 @@ pub(crate) mod network {
 
     /// The armed cap is inclusive, and it is judged on the same bytes Coyote's own
     /// gates judge: a request whose frame encodes to exactly `MAX_REQUEST_PAYLOAD_BYTES`
-    /// travels as a resource, passes the requester's send gate, the library's
-    /// advertisement check and the server's post-assembly bound, and the handler serves
-    /// it. A cap armed one byte short, or a library comparator that counts something other
-    /// than the packed frame, turns this into a refusal.
+    /// travels as a resource, passes the requester's send gate and the library's
+    /// advertisement check, and the handler serves it. A cap armed one byte short, or a
+    /// library comparator that counts something other than the packed frame, turns this
+    /// into a refusal.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_request_exactly_at_the_armed_cap_is_served_end_to_end() {
         install_log_collector();
@@ -2423,13 +2520,13 @@ pub(crate) mod network {
         RngCore::fill_bytes(&mut OsRng, &mut random);
         let body = Value::Binary(random.clone());
         assert_eq!(
-            RequestFrame::new("/big", body.clone()).encode().len(),
+            RequestFrame::new(STATUS_PATH, body.clone()).encode().len(),
             MAX_REQUEST_PAYLOAD_BYTES,
             "the fixture must sit exactly on the cap"
         );
 
         let transport_b = &pair.responder.transport;
-        let link = open_link(transport_b, &pair.a_desc, "/big", link_deadline())
+        let link = open_link(transport_b, &pair.a_desc, STATUS_PATH, link_deadline())
             .await
             .unwrap();
         let link_id = *link.lock().await.id();
@@ -2438,7 +2535,7 @@ pub(crate) mod network {
             .request_on_link(
                 transport_b,
                 &link,
-                "/big",
+                STATUS_PATH,
                 body,
                 Deadline::after(TRANSFER_REQUEST_TIMEOUT),
             )
@@ -2450,28 +2547,25 @@ pub(crate) mod network {
         let seen = pair.recorder_a.last();
         assert_eq!(seen.link_id, link_id);
         assert_eq!(
-            seen.branch,
-            SizeBranch::Resource,
-            "a frame this size travels as a resource, so the library's advertisement check judged it"
-        );
-        assert_eq!(
             pair.recorder_a.last_body(),
             Value::Binary(random),
             "the body arrives byte for byte"
         );
-        let dropped_by_server_cap = format!(
-            "Dropped an oversize mesh request on link {} ({MAX_REQUEST_PAYLOAD_BYTES} bytes, max {MAX_REQUEST_PAYLOAD_BYTES})",
-            link_id.to_hex_string()
-        );
-        assert!(
-            !debug_snapshot().contains(&dropped_by_server_cap),
-            "the server's own bound is inclusive too"
+        assert_eq!(
+            library_request_refusal_on(link_id),
+            None,
+            "a frame on the cap is not over it"
         );
         pair.stop_node_a().await;
     }
 
+    /// A node serves through the library and asks through its own client. Its stop
+    /// returns inside the grace window and fails its own in-flight request as a shutdown;
+    /// the request it was still handling goes with the transport, whose dispatch worker
+    /// aborts its handler tasks, so the hung handler is dropped soon after rather than
+    /// left to its `HANDLER_TIMEOUT`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn mesh_runtime_requests_and_serves_and_stop_drains_in_flight_requests() {
+    async fn mesh_runtime_requests_and_serves_and_stop_aborts_in_flight_requests() {
         let recorder_b = Arc::new(Recorder::default());
         // A `MeshRuntime` joins with `TcpClient`'s default MTU, so the responder matches it.
         let responder = Responder::listen(recorder_b.clone(), TcpServer::DEFAULT_CLIENT_MTU).await;
@@ -2537,13 +2631,14 @@ pub(crate) mod network {
         assert_eq!(outcome.value, Value::from("from a"));
         assert!(recorder_b.last().identity.is_some());
 
+        // Node A serves `KNOWN_PATHS` and nothing else; its recorder echoes on any of them.
         let b_identity = TransportIdentity::new_from_rand(OsRng);
         let outcome = client_b
             .request(
                 &responder.transport,
                 &b_identity,
                 &a_desc,
-                "/echo",
+                STATUS_PATH,
                 responder.envelope(card()),
                 RequestOptions::default(),
             )
@@ -2551,7 +2646,6 @@ pub(crate) mod network {
             .unwrap();
         assert_eq!(outcome.value, card());
         // At the 262144-byte TCP MTU a card fits one link packet in each direction.
-        assert_eq!(recorder_a.last().branch, SizeBranch::Packet);
         assert_eq!(outcome.response_branch, SizeBranch::Packet);
         assert_eq!(
             recorder_a.last().identity,
@@ -2569,7 +2663,7 @@ pub(crate) mod network {
                     &transport_b,
                     &identity_b,
                     &a_desc,
-                    "/slow",
+                    MESSAGE_PATH,
                     Envelope::new(origin_b, Value::Nil),
                     RequestOptions::default(),
                 )
@@ -2599,11 +2693,10 @@ pub(crate) mod network {
         let stopped_in = stopping.elapsed();
 
         assert!(stopped_in < SHUTDOWN_GRACE, "stop took {stopped_in:?}");
-        assert_eq!(
-            recorder_a.abandoned_count(),
-            1,
-            "stop must wait for the hung handler to be dropped, not only cancel it"
-        );
+        wait_until("the stop to drop the hung handler", || {
+            recorder_a.abandoned_count() == 1
+        })
+        .await;
         let result = timeout(INTEROP_TIMEOUT, in_flight).await.unwrap().unwrap();
         assert_eq!(result.unwrap_err(), RequestError::Shutdown);
         cancel_b.cancel();
@@ -2616,7 +2709,7 @@ pub(crate) mod network {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn empty_trust_list_admits_nobody_and_never_decodes() {
+    async fn empty_trust_list_admits_nobody_and_never_handles() {
         install_log_collector();
         let recorder = Arc::new(Recorder::default());
         let (responder, requester, desc) = pair(recorder.clone()).await;
@@ -2642,9 +2735,9 @@ pub(crate) mod network {
         assert_eq!(err, timed_out(STATUS_PATH));
         assert_eq!(recorder.seen_count(), 0, "the handler was never entered");
         assert_eq!(
-            responder.server.decoded_count(),
+            responder.adapter.admitted_count(),
             0,
-            "the payload was never decoded"
+            "the request was never admitted"
         );
         assert_eq!(gate.sink.count(), 0);
         assert_debug_logged(&format!(
@@ -2656,11 +2749,10 @@ pub(crate) mod network {
         responder.stop().await;
     }
 
-    /// A trusted peer's request that is not a request frame is dropped after admission,
-    /// and the drop names who sent it by the truncated identity, like the dispatcher's
-    /// per-request lines.
+    /// A trusted peer's request that is not a request frame is dropped by the library
+    /// before Coyote's handler is asked anything, and the link goes on serving.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_undecodable_request_from_a_trusted_peer_is_dropped_naming_its_truncated_identity() {
+    async fn an_undecodable_request_from_a_trusted_peer_is_dropped_before_admission() {
         install_log_collector();
         let recorder = Arc::new(Recorder::default());
         let (responder, requester, desc) = pair(recorder.clone()).await;
@@ -2671,7 +2763,6 @@ pub(crate) mod network {
             "request-gate-undecodable",
         );
         let link = identified_link(&requester, &responder, &desc).await;
-        let link_id = *link.lock().await.id();
 
         let two_element_request =
             super::packed(Value::Array(vec![Value::F64(1.0), super::sixteen(1)]));
@@ -2680,36 +2771,42 @@ pub(crate) mod network {
             .await
             .request_packet(&two_element_request)
             .unwrap();
-        let request_id = RequestId::from_packet_hash(&packet.hash());
         requester
             .transport
             .send_link_packet_on_bound_iface(&link, packet)
             .await;
 
-        let dropped = format!(
-            "Dropped an undecodable mesh request {} from {} on link {}: ",
-            request_id,
-            &identity_hex(&requester)[..8],
-            link_id.to_hex_string()
-        );
-        wait_until("the responder to drop the undecodable request", || {
-            debug_snapshot()
-                .iter()
-                .any(|message| message.contains(&dropped))
-        })
-        .await;
+        // The library logs the malformed frame under its own target, which the collector
+        // does not keep; a request served behind it shows the drop left nothing waiting.
+        let outcome = request_on(
+            &requester,
+            &link,
+            TEST_PATH,
+            Value::from("after"),
+            request_deadline(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.value, Value::from("after"));
         assert_eq!(
-            responder.server.decoded_count(),
+            responder.adapter.admitted_count(),
             1,
-            "the drop came after admission"
+            "only the well-formed request was admitted"
         );
-        assert_eq!(recorder.seen_count(), 0, "the handler was never entered");
+        assert_eq!(
+            recorder.seen_count(),
+            1,
+            "only the well-formed request was handled"
+        );
         requester.stop().await;
         responder.stop().await;
     }
 
+    /// A path no handler is registered for is dropped by the library before Coyote's
+    /// handler is asked anything, for a stranger and a trusted peer alike: neither hears
+    /// back, and the trusted peer's request files no knock.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn unknown_path_is_silent_to_strangers_and_a_typed_error_to_peers() {
+    async fn an_unregistered_path_is_silent_to_strangers_and_peers_alike() {
         install_log_collector();
         let recorder = Arc::new(Recorder::default());
         let (responder, requester, desc) = pair(recorder.clone()).await;
@@ -2736,11 +2833,7 @@ pub(crate) mod network {
         .await
         .unwrap_err();
         assert_eq!(err, timed_out("/nope"));
-        assert_eq!(responder.server.decoded_count(), 0);
-        assert_debug_logged(&format!(
-            "from anonymous on link {}: dropped: unauthenticated",
-            link_id.to_hex_string()
-        ));
+        assert_eq!(responder.adapter.admitted_count(), 0);
 
         identify(
             transport,
@@ -2751,35 +2844,39 @@ pub(crate) mod network {
         )
         .await
         .unwrap();
-        wait_until("the responder to record the identity", || {
-            responder.server.identified_peer_count() == 1
-        })
-        .await;
-        let outcome = request_on(&requester, &link, "/nope", Value::Nil, request_deadline())
-            .await
-            .unwrap();
+        wait_for_identity(&responder, link_id).await;
+        let err = request_on(
+            &requester,
+            &link,
+            "/nope",
+            Value::Nil,
+            Deadline::after(SHORT_REQUEST_TIMEOUT),
+        )
+        .await
+        .unwrap_err();
 
-        assert_eq!(
-            DispatchError::from_value(&outcome.value),
-            Some(DispatchError::UnknownPath {
-                path_hash: PathHash::of("/nope").to_string(),
-            })
-        );
-        assert_eq!(responder.server.decoded_count(), 1);
+        assert_eq!(err, timed_out("/nope"));
+        assert_eq!(responder.adapter.admitted_count(), 0);
         assert_eq!(recorder.seen_count(), 0);
         assert_eq!(gate.sink.count(), 0);
-        assert_debug_logged(&format!(
-            " for hash {} from {} on link {}: unknown path: IdentityTrusted",
-            PathHash::of("/nope"),
-            &identity_hex(&requester)[..8],
-            link_id.to_hex_string()
-        ));
+        // The same peer on a registered path is served, so the silence was the path's.
+        let outcome = request_on(
+            &requester,
+            &link,
+            TEST_PATH,
+            Value::from("served"),
+            request_deadline(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.value, Value::from("served"));
+        assert_eq!(responder.adapter.admitted_count(), 1);
         requester.stop().await;
         responder.stop().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn blocked_identity_is_dropped_before_decode_without_a_knock() {
+    async fn blocked_identity_is_dropped_at_admission_without_a_knock() {
         install_log_collector();
         let recorder = Arc::new(Recorder::default());
         let (responder, requester, desc) = pair(recorder.clone()).await;
@@ -2799,7 +2896,7 @@ pub(crate) mod network {
         .unwrap_err();
 
         assert_eq!(err, timed_out(TEST_PATH));
-        assert_eq!(responder.server.decoded_count(), 0);
+        assert_eq!(responder.adapter.admitted_count(), 0);
         assert_eq!(recorder.seen_count(), 0);
         assert_eq!(gate.sink.count(), 0, "a blocked identity never knocks");
         assert_debug_logged(&format!(
@@ -2819,7 +2916,6 @@ pub(crate) mod network {
             request_id: RequestId::from([1u8; 16]),
             path_hash: PathHash::of(KNOCK_PATH),
             data: Envelope::new(origin, Value::Nil).into_value(),
-            branch: SizeBranch::Packet,
         }
     }
 
@@ -3658,7 +3754,7 @@ pub(crate) mod network {
             dispatcher.register(KNOCK_PATH, recorder),
             Err(ReservedPath(path)) if path == KNOCK_PATH
         ));
-        responder.server.set_handler(Arc::new(dispatcher));
+        responder.adapter.set_handler(Arc::new(dispatcher));
         Gate { sink, _tmp: tmp }
     }
 
@@ -3675,8 +3771,8 @@ pub(crate) mod network {
     }
 
     /// A fully trusted identity on another protocol version is refused with the version
-    /// refusal on every path, the unknown one included, before any handler or the knock
-    /// sink sees it: the check sits in the one place all paths pass.
+    /// refusal on every path, one the dispatcher has no route for included, before any
+    /// handler or the knock sink sees it: the check sits in the one place all paths pass.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wrong_version_requests_are_refused_on_every_path_without_reaching_a_handler() {
         install_log_collector();
@@ -3688,7 +3784,7 @@ pub(crate) mod network {
         let link_id = *link.lock().await.id();
         let newer = MESH_PROTOCOL_VERSION + 1;
 
-        for path in KNOWN_PATHS.into_iter().chain(["/nope"]) {
+        for path in KNOWN_PATHS.into_iter().chain(["/echo"]) {
             let err = requester
                 .client
                 .request_on_link(
@@ -3918,28 +4014,6 @@ pub(crate) mod network {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn identity_is_read_from_the_link_when_the_table_has_lost_it() {
-        let recorder = Arc::new(Recorder::default());
-        let (responder, requester, desc) = pair(recorder.clone()).await;
-        let link = identified_link(&requester, &responder, &desc).await;
-
-        responder.server.forget_identities_for_test();
-        assert_eq!(responder.server.identified_peer_count(), 0);
-        request_on(&requester, &link, "/who", Value::Nil, request_deadline())
-            .await
-            .unwrap();
-
-        let seen = recorder.last();
-        assert_eq!(
-            seen.identity,
-            Some(requester.identity.as_identity().address_hash),
-            "the link itself knows who proved themselves on it"
-        );
-        requester.stop().await;
-        responder.stop().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn requests_beyond_the_handler_slots_are_dropped_silently() {
         install_log_collector();
         let stall = Arc::new(Stall::default());
@@ -3997,10 +4071,12 @@ pub(crate) mod network {
         install_log_collector();
         let recorder = Arc::new(Recorder::default());
         recorder.queue(Script::Hang);
-        let server = Arc::new(RequestServer::with_handler_timeout_for_test(
+        let responder = Responder::listen_with_timeout(
+            recorder.clone(),
+            LEGACY_LINK_MTU,
             Duration::from_millis(300),
-        ));
-        let responder = Responder::listen_on(server, recorder.clone(), LEGACY_LINK_MTU).await;
+        )
+        .await;
         let mut requester = Requester::connect(responder.port, LEGACY_LINK_MTU).await;
         responder.announce(None).await;
         let desc = requester.learn(&responder.desc.address_hash).await;
@@ -4034,7 +4110,7 @@ pub(crate) mod network {
         })
         .await;
         wait_until("the handler slot to be freed", || {
-            responder.server.available_permits() == MAX_CONCURRENT_INBOUND_REQUESTS
+            responder.adapter.available_permits() == MAX_CONCURRENT_INBOUND_REQUESTS
         })
         .await;
         let outcome = requester
@@ -4074,6 +4150,8 @@ pub(crate) mod network {
         responder.stop().await;
     }
 
+    /// Two requests to the same destination share one link, which the responder sees as
+    /// one identified peer: the second request arrives on the first's link already proven.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sequential_requests_reuse_the_link_and_stay_one_identified_peer() {
         let recorder = Arc::new(Recorder::default());
@@ -4085,7 +4163,9 @@ pub(crate) mod network {
         let second = recorder.last();
 
         assert_eq!(first.link_id, second.link_id);
-        assert_eq!(responder.server.identified_peer_count(), 1);
+        let identity = Some(requester.identity.as_identity().address_hash);
+        assert_eq!(first.identity, identity);
+        assert_eq!(second.identity, identity);
         assert_eq!(recorder.seen_count(), 2);
         requester.stop().await;
         responder.stop().await;
@@ -4312,12 +4392,12 @@ pub(crate) mod network {
         relay.abort();
     }
 
-    /// A peer the list knows but does not admit must learn nothing about which paths exist:
-    /// the refusal for a served path and for a path nobody registered is the same bytes,
-    /// under the default-closed rule (which knocks for each) and under a deny (which
-    /// does not), and neither ever decodes the payload.
+    /// A peer the list knows but does not admit must learn nothing about which paths are
+    /// served: the refusal for a served path and for a known path nobody provides is the
+    /// same bytes, under the default-closed rule (which knocks for each) and under a deny
+    /// (which does not), and neither ever reaches a handler.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_unadmitted_peer_cannot_tell_a_served_path_from_an_unknown_one() {
+    async fn an_unadmitted_peer_cannot_tell_a_served_path_from_an_unprovided_one() {
         install_log_collector();
         let recorder = Arc::new(Recorder::default());
         let (responder, requester, desc) = pair(recorder.clone()).await;
@@ -4330,7 +4410,7 @@ pub(crate) mod network {
                 .deny(&destination),
         ];
         let knocks_expected = [2, 0];
-        let paths = [TEST_PATH, "/nope"];
+        let paths = [TEST_PATH, STATUS_PATH];
 
         let mut tails = Vec::new();
         for (n, list) in lists.iter().enumerate() {
@@ -4382,15 +4462,15 @@ pub(crate) mod network {
             "every refusal must be the same bytes: {tails:?}"
         );
         assert_eq!(recorder.seen_count(), 0, "no handler was entered");
-        // The identity tier runs before any decoding (see the stranger tests). The
-        // destination tier cannot: a knock has to name the path that was asked for and the
-        // refusal log line names it too, and the path hash is inside the frame. So each of
-        // these four refusals decodes exactly one frame from an identity the user listed,
-        // and never more than that.
+        // The identity tier runs at admission (see the stranger tests). The destination
+        // tier cannot: a knock has to name the path that was asked for and the refusal log
+        // line names it too, and that needs the request body. So each of these four
+        // refusals admits exactly one request from an identity the user listed, and never
+        // more than that.
         assert_eq!(
-            responder.server.decoded_count(),
+            responder.adapter.admitted_count(),
             4,
-            "one decode per known-identity refusal, none beyond"
+            "one admission per known-identity refusal, none beyond"
         );
         assert!(
             debug_snapshot()
@@ -4407,7 +4487,7 @@ pub(crate) mod network {
 
     /// The knock path is not a way in for identities the list has never seen, and a link
     /// that never proved an identity is not served even on a registered path: both get no
-    /// bytes back, no knock, no decode, and never reach a handler.
+    /// bytes back, no knock, no admission, and never reach a handler.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_stranger_cannot_knock_and_an_anonymous_link_is_not_served() {
         install_log_collector();
@@ -4462,7 +4542,11 @@ pub(crate) mod network {
         );
 
         assert_eq!(recorder.seen_count(), 0, "no handler was entered");
-        assert_eq!(responder.server.decoded_count(), 0, "nothing was decoded");
+        assert_eq!(
+            responder.adapter.admitted_count(),
+            0,
+            "nothing was admitted"
+        );
         assert_eq!(gate.sink.count(), 0);
         requester.stop().await;
         responder.stop().await;
@@ -4747,7 +4831,7 @@ pub(crate) mod network {
         let (trust, tmp) = list.open(tag);
         let (sink, rx) = ChannelKnockSink::new(KNOCK_QUEUE_CAPACITY);
         responder
-            .server
+            .adapter
             .set_handler(Arc::new(Dispatcher::new(trust.clone(), sink)));
         let peers =
             Arc::new(PeerTable::load(tmp.path.join("peers.json"), SystemTime::now()).unwrap());
@@ -6678,7 +6762,7 @@ pub(crate) mod network {
             .open("request-knock-trusted-gate");
         let sink = Arc::new(SpySink::default());
         pair.responder
-            .server
+            .adapter
             .set_handler(Arc::new(Dispatcher::new(trust.clone(), sink.clone())));
         let peers =
             Arc::new(PeerTable::load(tmp.path.join("peers.json"), SystemTime::now()).unwrap());
@@ -6749,7 +6833,7 @@ pub(crate) mod network {
         let dest8 = pair.responder.desc.address_hash.to_hex_string()[..8].to_string();
         assert_eq!(err, KnockError::Unanswered { dest8 });
         assert!(!err.to_string().contains("unreachable"), "{err}");
-        assert_eq!(pair.responder.server.decoded_count(), 0);
+        assert_eq!(pair.responder.adapter.admitted_count(), 0);
         assert_eq!(surface.count(), 0);
         assert!(!rig.gate.cache().path().exists());
         assert!(rig.gate.tracked_identities().is_empty());
@@ -6798,7 +6882,7 @@ pub(crate) mod network {
                 "Knocked on {dest8}; no answer. A knock is heard only by a peer that already trusts this identity (a new instance of a known identity). For first contact, exchange destination hashes and run `.mesh trust <destination>` on both sides. No propagation node is known yet to hold the knock for it."
             )
         );
-        assert_eq!(pair.responder.server.decoded_count(), 0);
+        assert_eq!(pair.responder.adapter.admitted_count(), 0);
         assert_eq!(surface.count(), 0);
         assert!(!rig.gate.cache().path().exists());
         assert!(rig.gate.tracked_identities().is_empty());
@@ -7355,8 +7439,8 @@ pub(crate) mod network {
 
     /// Every line the serving path logs names a peer by a truncated hash only. After one
     /// peer has been knocked for through the sink the runtime installs, refused as
-    /// unverifiable, told a path is unknown and served, neither its full identity hash nor
-    /// its full instance hash appears anywhere in the debug or warn log.
+    /// unverifiable, told a path has no provider and served, neither its full identity
+    /// hash nor its full instance hash appears anywhere in the debug or warn log.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn serving_path_logs_never_carry_a_full_identity_or_instance_hash() {
         install_log_collector();
@@ -7373,7 +7457,7 @@ pub(crate) mod network {
                     .unwrap()
                     .is_none()
             );
-            responder.server.set_handler(Arc::new(dispatcher));
+            responder.adapter.set_handler(Arc::new(dispatcher));
             tmp
         };
 
@@ -7412,13 +7496,18 @@ pub(crate) mod network {
         let outcome = request_on(
             &requester,
             &link,
-            "/nowhere",
+            STATUS_PATH,
             Value::Nil,
             request_deadline(),
         )
         .await
         .unwrap();
-        assert!(DispatchError::from_value(&outcome.value).is_some());
+        assert_eq!(
+            DispatchError::from_value(&outcome.value),
+            Some(DispatchError::NoProvider {
+                path: STATUS_PATH.to_string()
+            })
+        );
         let outcome = request_on(
             &requester,
             &link,
@@ -7491,7 +7580,7 @@ pub(crate) mod network {
         }
         assert_eq!(recorder.seen_count(), MAX_CONCURRENT_INBOUND_REQUESTS);
         wait_until("every handler slot to return", || {
-            responder.server.available_permits() == MAX_CONCURRENT_INBOUND_REQUESTS
+            responder.adapter.available_permits() == MAX_CONCURRENT_INBOUND_REQUESTS
         })
         .await;
 
@@ -7633,7 +7722,7 @@ pub(crate) mod network {
                 .unwrap()
                 .is_none()
         );
-        responder.server.set_handler(Arc::new(dispatcher));
+        responder.adapter.set_handler(Arc::new(dispatcher));
         (handler, tmp)
     }
 
@@ -7891,7 +7980,7 @@ pub(crate) mod network {
 
         let (trust, _tmp) = trusts_a.open("request-status-client-placeholder");
         pair.responder
-            .server
+            .adapter
             .set_handler(Arc::new(Dispatcher::new(trust, Arc::new(LoggingKnockSink))));
         let err = pair
             .node_a
@@ -8005,7 +8094,7 @@ pub(crate) mod network {
             .identity(&a_identity, false)
             .open("request-files-not-trusted-by-peer-gate");
         pair.responder
-            .server
+            .adapter
             .set_handler(Arc::new(Dispatcher::new(trust, Arc::new(LoggingKnockSink))));
         let expected = RemoteRefusal::new(&b_instance, Some("Bea"), a_instance.clone());
 

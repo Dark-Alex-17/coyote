@@ -1603,7 +1603,7 @@ mod tests {
         Part, PeerMessage, RawPeerMessage, from_request_body, peer_lxmf_message, to_request_body,
     };
     use crate::mesh::notify::{NOTIFICATION_LINE_MAX_CHARS, Notification};
-    use crate::mesh::request::{PathHash, RequestId, SizeBranch};
+    use crate::mesh::request::{PathHash, RequestId};
     use crate::mesh::test_support::{TempDir, TrustList, snapshot_fixture};
     use crate::mesh::wire_path::WIRE_PATH_MAX_BYTES;
     use rns_transport::destination::link::LinkId;
@@ -1689,7 +1689,6 @@ mod tests {
             request_id: RequestId::from([1u8; 16]),
             path_hash: PathHash::of(ACCESS_PATH),
             body,
-            branch: SizeBranch::Packet,
         }
     }
 

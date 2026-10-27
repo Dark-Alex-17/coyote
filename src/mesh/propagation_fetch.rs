@@ -40,7 +40,7 @@ use std::time::{Duration, SystemTime};
 use tokio_util::sync::CancellationToken;
 
 /// The request path every round of the conversation goes to (`LXMPeer.py:15`).
-const GET_PATH: &str = "/get";
+pub(crate) const GET_PATH: &str = "/get";
 
 /// Ceiling on waiting for one round's response. Round 2 may carry up to
 /// `FETCH_TRANSFER_LIMIT_KB` of bodies as a resource, which a slow link needs longer for
@@ -3139,14 +3139,6 @@ mod tests {
             )
         }
 
-        /// The server's own record of which branch it sent `request_id`'s response on.
-        fn response_sent_as(request_id: &str, branch: &str) -> bool {
-            let line = format!("Sending mesh response {request_id} as a {branch} (");
-            debug_snapshot()
-                .iter()
-                .any(|entry| entry.starts_with(&line))
-        }
-
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn three_rounds_identify_first_and_put_the_reference_bytes_on_the_wire() {
             install_log_collector();
@@ -3185,11 +3177,6 @@ mod tests {
             let ours = fetcher.identity().address_hash;
             for round in &seen {
                 assert_eq!(round.identity, Some(ours), "identified before every round");
-                assert_eq!(
-                    round.branch,
-                    SizeBranch::Packet,
-                    "every request fits a packet"
-                );
             }
             assert_eq!(packed(&seen[0].data), vec![0x92, 0xc0, 0xc0]);
             let round2 = packed(&seen[1].data);
@@ -3202,9 +3189,6 @@ mod tests {
                 expected_ack(&[transient_id_of(&small), transient_id_of(&large)])
             );
             assert_eq!(&round3[..5], &[0x92, 0xc0, 0x92, 0xc4, 0x20]);
-            assert!(response_sent_as(&seen[0].request_id, "packet"));
-            assert!(response_sent_as(&seen[1].request_id, "resource"));
-            assert!(response_sent_as(&seen[2].request_id, "packet"));
 
             // Every round transition is logged with its counts, under the node's short hash.
             let prefix = format!("Propagation fetch from {}: ", short(&fake.hex()));

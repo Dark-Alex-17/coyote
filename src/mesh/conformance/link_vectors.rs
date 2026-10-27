@@ -444,14 +444,14 @@ mod loopback {
     };
     use crate::mesh::request::network::{
         REQUEST_FRAME_OVERHEAD, Recorder, Requester, Responder, SHORT_REQUEST_TIMEOUT, Script,
-        Stall, hanging_request, link_deadline, pair, request_body_of_encoded_len, request_deadline,
-        request_on, response_body_of_encoded_len, response_payloads, short_options, timed_out,
-        timed_out_slow_request,
+        Stall, hanging_request, library_refused_oversize_request, link_deadline, pair,
+        request_body_of_encoded_len, request_deadline, request_on, response_body_of_encoded_len,
+        response_payloads, short_options, timed_out, timed_out_slow_request,
     };
     use crate::mesh::request::{
         Deadline, MAX_CONCURRENT_INBOUND_REQUESTS, MAX_REQUEST_PAYLOAD_BYTES, RefusalCode, Reply,
-        RequestError, RequestFrame, RequestId, RequestOptions, RequestServer, ResponseFrame,
-        STATUS_PATH, SizeBranch, open_link, short,
+        RequestError, RequestFrame, RequestId, RequestOptions, ResponseFrame, STATUS_PATH,
+        SizeBranch, open_link, short,
     };
     use crate::mesh::session_destination_name;
     use crate::mesh::test_support::{
@@ -651,12 +651,9 @@ mod loopback {
                     .request(&pair.desc, ECHO_PATH, body.clone())
                     .await
                     .unwrap();
-                assert_eq!(outcome.value, body);
-                assert_eq!(
-                    pair.recorder.last().branch,
-                    expected,
-                    "a {target}-byte request frame"
-                );
+                // Which way the request travelled is the requester's choice, and the
+                // responder's handler sees no trace of it: the round trip is the check.
+                assert_eq!(outcome.value, body, "a {target}-byte request frame echoes");
             }
             Direction::Response => {
                 let body = response_body_of_encoded_len(target);
@@ -667,7 +664,6 @@ mod loopback {
                     .request(&pair.desc, ECHO_PATH, Value::Nil)
                     .await
                     .unwrap();
-                assert_eq!(pair.recorder.last().branch, SizeBranch::Packet);
                 assert_eq!(
                     outcome.response_branch, expected,
                     "a {target}-byte response frame"
@@ -692,7 +688,6 @@ mod loopback {
             pair.recorder.last().identity,
             Some(pair.requester.identity.as_identity().address_hash)
         );
-        assert_eq!(pair.responder.server.identified_peer_count(), 1);
         pair.stop().await;
     }
 
@@ -718,7 +713,7 @@ mod loopback {
             }
         );
         assert_eq!(pair.recorder.seen_count(), 0);
-        assert_eq!(pair.responder.server.decoded_count(), 0);
+        assert_eq!(pair.responder.adapter.admitted_count(), 0);
         pair.stop().await;
     }
 
@@ -740,12 +735,9 @@ mod loopback {
         transport
             .send_link_packet_on_bound_iface(&link, packet)
             .await;
-        wait_until("the responder to reach the frame decoder", || {
-            pair.responder.server.decoded_count() == 1
-        })
-        .await;
 
-        assert_eq!(pair.recorder.seen_count(), 0);
+        // The library logs the malformed frame under its own target, which the collector
+        // does not keep; a request served behind it shows the drop left nothing waiting.
         let outcome = request_on(
             &pair.requester,
             &link,
@@ -756,7 +748,11 @@ mod loopback {
         .await
         .unwrap();
         assert_eq!(outcome.value, Value::from("after"));
-        assert_eq!(pair.responder.server.decoded_count(), 2);
+        assert_eq!(
+            pair.responder.adapter.admitted_count(),
+            1,
+            "only the well-formed request was admitted"
+        );
         assert_eq!(pair.recorder.seen_count(), 1);
         assert_eq!(
             response_payloads(&mut events).len(),
@@ -869,17 +865,12 @@ mod loopback {
             .await
             .unwrap();
 
-        let dropped = format!(
-            "Dropped an oversize mesh request on link {} ({} bytes, max {MAX_REQUEST_PAYLOAD_BYTES})",
-            link_id.to_hex_string(),
-            MAX_REQUEST_PAYLOAD_BYTES + 1
-        );
-        wait_until("the responder to drop the oversize request", || {
-            debug_snapshot().contains(&dropped)
+        wait_until("the library to refuse the oversize advertisement", || {
+            library_refused_oversize_request(link_id)
         })
         .await;
         assert_eq!(recorder.seen_count(), 0);
-        assert_eq!(responder.server.decoded_count(), 0);
+        assert_eq!(responder.adapter.admitted_count(), 0);
         let outcome = request_on(
             &requester,
             &link,
@@ -951,10 +942,12 @@ mod loopback {
         install_log_collector();
         let recorder = Arc::new(Recorder::default());
         recorder.queue(Script::Hang);
-        let server = Arc::new(RequestServer::with_handler_timeout_for_test(
+        let responder = Responder::listen_with_timeout(
+            recorder.clone(),
+            LEGACY_LINK_MTU,
             SHORT_HANDLER_TIMEOUT,
-        ));
-        let responder = Responder::listen_on(server, recorder.clone(), LEGACY_LINK_MTU).await;
+        )
+        .await;
         let mut requester = Requester::connect(responder.port, LEGACY_LINK_MTU).await;
         responder.announce(None).await;
         let desc = requester.learn(&responder.desc.address_hash).await;

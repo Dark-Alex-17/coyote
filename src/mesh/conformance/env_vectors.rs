@@ -18,7 +18,7 @@ use crate::mesh::request::{
     HANDLER_TIMEOUT, Handler, InboundRequest, KNOCK_PATH, KnockEvent, KnockSink, LIST_PATH,
     MAX_CONCURRENT_INBOUND_REQUESTS, MAX_REQUEST_PAYLOAD_BYTES, MESSAGE_PATH, NAME_HASH_LEN,
     OriginName, PathHash, RefusalCode, Reply, RequestError, RequestFrame, RequestHandler,
-    RequestId, ResponseFrame, STATUS_PATH, SizeBranch,
+    RequestId, ResponseFrame, STATUS_PATH,
 };
 use crate::mesh::test_support::{TempDir, TrustList};
 use crate::mesh::trust::{Decision, InstancePresence, KeyChangeOutcome, Rule, TrustStore, Verdict};
@@ -337,7 +337,6 @@ async fn run_dispatch(
         request_id: RequestId::from([1u8; 16]),
         path_hash: PathHash::of(path),
         data,
-        branch: SizeBranch::Packet,
     };
     let observed = match RequestHandler::handle(&dispatcher, request).await {
         Reply::Value(value) | Reply::Settled { value, .. } => Answer::Value(value),
@@ -1448,15 +1447,6 @@ fn version_refused(found: Option<u16>) -> Answer {
     Answer::Value(VersionRefusal::current(found).to_value())
 }
 
-fn unknown_path_answer(path: &str) -> Answer {
-    Answer::Value(
-        DispatchError::UnknownPath {
-            path_hash: PathHash::of(path).to_string(),
-        }
-        .to_value(),
-    )
-}
-
 fn no_provider_answer(path: &str) -> Answer {
     Answer::Value(
         DispatchError::NoProvider {
@@ -1833,12 +1823,12 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "unknown-path-trusted-for-the-destination-reports-unknown-path",
-            Kind::Valid,
+            "unknown-path-trusted-for-the-destination-is-silent",
+            Kind::Invalid,
             UNKNOWN_PATH,
             trusted_for_destination,
             envelope_value(),
-            unknown_path_answer(UNKNOWN_PATH),
+            Answer::Silent,
             Knock::None,
         ),
         dispatch(
@@ -2008,21 +1998,21 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
-            "unknown-path-from-a-trusted-identity-reports-unknown-path",
-            Kind::Valid,
+            "unknown-path-from-a-trusted-identity-is-silent",
+            Kind::Invalid,
             UNKNOWN_PATH,
             trusted,
             envelope_value(),
-            unknown_path_answer(UNKNOWN_PATH),
+            Answer::Silent,
             Knock::None,
         ),
         dispatch(
-            "status-path-with-a-trailing-slash-reports-unknown-path",
-            Kind::Valid,
+            "status-path-with-a-trailing-slash-is-silent",
+            Kind::Invalid,
             "/status/",
             trusted,
             envelope_value(),
-            unknown_path_answer("/status/"),
+            Answer::Silent,
             Knock::None,
         ),
         dispatch(
