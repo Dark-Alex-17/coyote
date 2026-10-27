@@ -48,11 +48,15 @@ MANUAL_PIPELINE = (
     "&& git diff --no-color --no-ext-diff <base> | grep -nE "
     "'^\\+.*(#!?\\[(allow|expect)\\(|cfg_attr\\(|todo!|unimplemented!|#\\[ignore)'"
 )
+# Per git call; three calls run back to back, so the sum stays inside the
+# graph node's own budget instead of equalling it.
+GIT_TIMEOUT = 30
+HUNK_HEADER_RE = re.compile(r"^@@ -\S+ \+(\d+)(?:,\d+)? @@")
 
 
 def run_git(args, cwd):
     return subprocess.run(
-        ["git"] + args, cwd=cwd, capture_output=True, text=True, timeout=120
+        ["git"] + args, cwd=cwd, capture_output=True, text=True, timeout=GIT_TIMEOUT
     )
 
 
@@ -74,26 +78,32 @@ def scan(project_dir, base):
     if diff.returncode not in (0, 1):
         raise RuntimeError(f"git diff {base} failed: {diff.stderr.strip()}")
 
+    # File headers are only recognised outside a hunk, so an added `++x` line
+    # (rendered `+++x`) never rewrites the path and a removed `--y` line
+    # (rendered `---y`) never shifts the numbering of the lines after it.
     hits = []
     path = None
+    in_hunk = False
     new_line = 0
-    for raw in diff.stdout.splitlines():
-        if raw.startswith("+++ "):
-            target = raw[4:].strip()
-            if target.startswith('"') and target.endswith('"'):
-                target = target[1:-1]
-            path = None if target == "/dev/null" else re.sub(r"^b/", "", target)
+    for raw in diff.stdout.split("\n"):
+        line = raw[:-1] if raw.endswith("\r") else raw
+        if line.startswith("diff --git "):
+            path, in_hunk = None, False
             continue
-        if raw.startswith("@@"):
-            m = re.match(r"^@@ -\S+ \+(\d+)(?:,\d+)? @@", raw)
-            if m:
-                new_line = int(m.group(1))
+        if m := HUNK_HEADER_RE.match(line):
+            new_line = int(m.group(1))
+            in_hunk = True
             continue
-        if path is None:
+        if not in_hunk:
+            if line.startswith("+++ "):
+                target = line[4:].strip()
+                if target.startswith('"') and target.endswith('"'):
+                    target = target[1:-1]
+                path = None if target == "/dev/null" else re.sub(r"^b/", "", target)
             continue
-        if raw.startswith("+") and not raw.startswith("+++"):
-            text = raw[1:]
-            m = MARKER_RE.search(text)
+        if line.startswith("+"):
+            text = line[1:]
+            m = MARKER_RE.search(text) if path is not None else None
             if m:
                 # Bare cfg_attr( carrying neither allow nor expect is not debt.
                 if m.group(1) == "cfg_attr(" and not re.search(r"(allow|expect)\(", text):
@@ -101,11 +111,7 @@ def scan(project_dir, base):
                 else:
                     hits.append(f"{path}:{new_line} -- {text.strip()}")
             new_line += 1
-        elif raw.startswith("-") and not raw.startswith("---"):
-            continue
-        elif raw.startswith("\\"):  # "\ No newline at end of file"
-            continue
-        else:
+        elif line.startswith(" ") or line == "":
             new_line += 1
 
     header = f"Debt scan (diff base: {base}): "
@@ -115,32 +121,29 @@ def scan(project_dir, base):
 
 
 def main():
-    state = {}
-    graph_mode = False
+    # Graph mode is decided from the environment alone, so a state file that
+    # fails to load still reports through the graph-shaped JSON envelope.
     state_file = os.environ.get("GRAPH_STATE_FILE")
     state_raw = os.environ.get("GRAPH_STATE")
-    if state_file and os.path.exists(state_file):
-        graph_mode = True
-        with open(state_file, encoding="utf-8") as fh:
-            state = json.load(fh)
-    elif state_raw:
-        graph_mode = True
-        state = json.loads(state_raw)
-
-    if graph_mode:
-        project_dir = state.get("project_dir") or "."
-        base = state.get("debt_base") or "HEAD"
-    else:
-        project_dir, base = ".", "HEAD"
-        args = sys.argv[1:]
-        while args:
-            flag = args.pop(0)
-            if flag in ("--dir", "--project-dir") and args:
-                project_dir = args.pop(0)
-            elif flag == "--base" and args:
-                base = args.pop(0)
-
+    graph_mode = bool(state_file and os.path.exists(state_file)) or bool(state_raw)
+    project_dir, base = ".", "HEAD"
     try:
+        if graph_mode:
+            if state_file and os.path.exists(state_file):
+                with open(state_file, encoding="utf-8") as fh:
+                    state = json.load(fh)
+            else:
+                state = json.loads(state_raw)
+            project_dir = state.get("project_dir") or "."
+            base = state.get("debt_base") or "HEAD"
+        else:
+            args = sys.argv[1:]
+            while args:
+                flag = args.pop(0)
+                if flag in ("--dir", "--project-dir") and args:
+                    project_dir = args.pop(0)
+                elif flag == "--base" and args:
+                    base = args.pop(0)
         report = scan(project_dir, base)
     except Exception as exc:  # fail-open by contract
         report = (

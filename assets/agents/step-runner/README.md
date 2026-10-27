@@ -50,9 +50,12 @@ flowchart TD
     verify_build -->|"fail"| fix_loop_gate
     verify_build -. "script crashed" .-> fix_loop_gate
     verify_tests{"verify_tests<br/>script"}
-    verify_tests -->|"pass"| edge_case_sweep
+    verify_tests -->|"pass"| debt_scan
     verify_tests -->|"fail"| fix_loop_gate
     verify_tests -. "script crashed" .-> fix_loop_gate
+    debt_scan{"debt_scan<br/>script"}
+    debt_scan --> edge_case_sweep
+    debt_scan -. "script crashed" .-> edge_case_sweep
     fix_loop_gate{"fix_loop_gate<br/>script"}
     fix_loop_gate -->|"budget left"| implement
     fix_loop_gate -->|"budget spent"| end_failure
@@ -116,7 +119,10 @@ and reports one `<file>:<line> -- <added line>` per `#[allow(`, `#![allow(`,
 `#[ignore` on an ADDED line, with real positions already resolved (a
 `cfg_attr(` hit carrying neither `allow` nor `expect` is dropped). The scan
 fails open: on any error the sweep sees a `DEBT_SCAN_FAILED` report quoting
-the manual pipeline to run by hand. The edge-case sweep adds any env-gated or
+the manual pipeline to run by hand, and a crash of the shim itself falls
+forward on the node's `fallback:` edge to that same sweep with the
+initial-state `DEBT_SCAN_FAILED` default still in `debt_hits`, so the step
+never fails after build and tests went green. The edge-case sweep adds any env-gated or
 opt-in test the coder introduced. A marker
 with no same-line comment naming its owning task is a finding; since the
 sweep has no edge back to the coder, it lists each one under

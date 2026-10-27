@@ -375,11 +375,13 @@ nodes:
       with real file:line positions parsed from the diff hunk headers. Fail-
       open: scan failures emit a DEBT_SCAN_FAILED report quoting the manual
       pipeline (exit 0), and a shim crash falls forward on this node's
-      declared next edge with the initial_state DEBT_SCAN_FAILED default
-      still in debt_hits. Runs once, forward edge only: no loops.
+      fallback edge to the same sweep, with the initial_state
+      DEBT_SCAN_FAILED default still in debt_hits. Runs once, forward edges
+      only: no loops.
     script: scripts/debt_scan.py
     timeout: 120
     next: edge_case_sweep
+    fallback: edge_case_sweep
 
   edge_case_sweep:
     id: edge_case_sweep

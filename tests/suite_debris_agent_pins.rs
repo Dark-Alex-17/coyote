@@ -482,14 +482,12 @@ fn every_banned_glyph_sentence_names_every_glyph_family_the_debris_lint_reports(
     }
 }
 
-/// The debt grep Sisyphus hands back on and the step-runner closes a step
-/// with is one regex, byte for byte, and the shared lint's `DEBT_MARKERS`
-/// spares task ids on the same markers it names.
 #[test]
 /// The debt-marker regex has ONE home: `MARKER_RE` in the shared `debt_scan.py`.
 /// Its two fallback copies - the manual pipeline the scanner quotes on
 /// `DEBT_SCAN_FAILED` and the step-runner graph's initial-state default (what
-/// the sweep node sees if the scan node crash-forwards) - must carry the same
+/// the sweep node sees when the scan node crashes and the engine takes its
+/// `fallback:` edge to the sweep) - must carry the same
 /// alternation after their own escaping is undone, no prompt may keep a third
 /// copy, and every `DEBT_MARKERS` entry of the debris lint must be matched.
 fn debt_grep_regex_has_one_home_in_debt_scan_and_its_fallbacks_match_the_debris_markers() {
@@ -1415,6 +1413,28 @@ fn usage_probe_step_runner_debt_scan_edges_new_dirs_odd_names_no_new_files_and_i
         "a bare cfg_attr is not debt: {text}"
     );
     assert!(text.contains("// predicate allow"), "{text}");
+
+    // Added lines that start with `++` or removed lines that start with `--`
+    // render as `+++x` / `---y` inside a hunk; neither is a file header. The
+    // path must survive the first and the numbering the second: the marker
+    // on line 6 is reported at src/lib.rs:6, not under a phantom path or at
+    // a shifted line.
+    let (repo, _) = make_repo("hunk-headers");
+    fs::write(repo.join("src/lib.rs"), "fn tracked() {}\n--y\n++x\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "seed the --y line"]);
+    fs::write(
+        repo.join("src/lib.rs"),
+        "fn tracked() {}\n++x\n++ x\n/* a */\n/* b */\n#[allow(dead_code)] // after headers\n",
+    )
+    .unwrap();
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+    let (code, text, _) = sweep(&repo, &base);
+    assert_eq!(code, Some(0), "{text}");
+    assert!(
+        text.contains("src/lib.rs:6 -- #[allow(dead_code)] // after headers"),
+        "a `++`/`--` line inside a hunk is content, not a header: {text}"
+    );
 
     // A repo that is not a git checkout fails OPEN: the report starts with the
     // sentinel and quotes the manual pipeline for the model to run itself.

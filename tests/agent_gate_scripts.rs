@@ -4190,10 +4190,13 @@ fn readme_diagrams_draw_the_fail_closed_gate_edges_and_keep_the_open_ones() {
                 ("route_staleness", "end_failure"),
                 ("route_sweep", "end_failure"),
                 ("route_review", "end_failure"),
+                ("debt_scan", "edge_case_sweep"),
             ][..],
             &[
                 "independent_review -. \"2 attempts failed\" .-> write_handoff",
                 "edge_case_sweep -. \"LLM fault\" .-> write_handoff",
+                "verify_tests -->|\"pass\"| debt_scan",
+                "debt_scan --> edge_case_sweep",
             ][..],
         ),
         (

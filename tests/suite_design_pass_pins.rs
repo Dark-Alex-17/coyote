@@ -478,7 +478,7 @@ fn step_runner_pins_mechanical_debt_sweep() {
             "with the `fs_grep` tool, as it describes) and use that result instead. To the",
             "scan's list, add any env-gated or opt-in test the coder added",
             "  debt_scan:\n    id: debt_scan\n    type: script",
-            "script: scripts/debt_scan.py",
+            "script: scripts/debt_scan.py\n    timeout: 120\n    next: edge_case_sweep\n    fallback: edge_case_sweep",
             "debt_hits: 'DEBT_SCAN_FAILED: the debt_scan node did not run. Manual fallback (<base> normally HEAD):",
             "under a `Debt left behind:` heading",
             "A `Debt left behind:` list in \"Edge cases discovered\" below is copied",
@@ -494,6 +494,8 @@ fn step_runner_pins_mechanical_debt_sweep() {
             "`#[expect(`, `#![expect(`, `cfg_attr(`, `todo!`, `unimplemented!` or",
             "`cfg_attr(` hit carrying neither `allow` nor `expect` is dropped). The scan",
             "fails open: on any error the sweep sees a `DEBT_SCAN_FAILED` report quoting",
+            "the manual pipeline to run by hand, and a crash of the shim itself falls",
+            "forward on the node's `fallback:` edge to that same sweep with the",
             "`Debt left behind:` in the handoff's Notes for next step",
         ],
     );
