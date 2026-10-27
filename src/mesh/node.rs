@@ -1047,6 +1047,11 @@ impl MeshRuntime {
     }
 
     #[cfg(all(test, unix))]
+    pub(crate) async fn transport(&self) -> Option<Arc<Transport>> {
+        self.transport.lock().await.clone()
+    }
+
+    #[cfg(all(test, unix))]
     pub(crate) async fn max_request_size(&self) -> Option<usize> {
         let state = self.destination.lock().await;
         state.dest.lock().await.max_request_size()

@@ -1455,6 +1455,26 @@ pub(crate) mod network {
         hash
     }
 
+    /// `answer_as_resource` for a `NodePair`: node B answers the request it `seen` from
+    /// node A, holding node A's interface manager across the send for the reason given
+    /// there.
+    async fn answer_pair_as_resource(pair: &NodePair, seen: &Seen, bytes: Vec<u8>) {
+        let transport = pair.node_a.transport().await.unwrap();
+        let manager = transport.iface_manager();
+        let held = manager.lock().await;
+        pair.responder
+            .transport
+            .send_response_resource(
+                &seen.link_id,
+                seen.request_id.to_bytes().to_vec(),
+                bytes,
+                None,
+            )
+            .await
+            .unwrap();
+        drop(held);
+    }
+
     /// A response frame for `request_id` that encodes to one byte over `max`.
     fn oversize_response(request_id: RequestId, body: Vec<u8>, max: usize) -> Vec<u8> {
         response_frame_of(request_id, body, max + 1)
@@ -8173,6 +8193,72 @@ pub(crate) mod network {
         node.stop().await;
     }
 
+    /// Node B answers the access request with a response frame one byte over the path
+    /// cap, sent as a Resource. The library refuses the advertisement, so the request
+    /// fails as `Oversize` naming the cap and one over it; the exchange reached the peer,
+    /// so it is a direct failure with nothing stored, and the propagation node known to A
+    /// is never posted to.
+    ///
+    /// The over-cap reply is the only way to reach a direct failure from this surface. A
+    /// request from a live node never travels as a Resource: nodes join at the TCP client
+    /// default MTU, so the link MDU is far above every per-field cap on an access
+    /// request. And a packet-form request over the responder's cap is dropped by the
+    /// library without an answer, which times out and does fall back. So a rejected
+    /// request advertisement cannot be pinned here; the over-cap reply pins the same
+    /// class.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_oversize_access_reply_is_a_direct_failure_and_never_stored() {
+        let (pair, mut node) =
+            pair_with_propagation_node("request-access-oversize-no-fallback").await;
+        pair.introduce_b_to_a().await;
+        pair.recorder_b.queue(Script::Hang);
+        let request = access_request("acc-1", &["src/x.rs"], "");
+        let before = pair.recorder_b.seen_count();
+
+        let node_a = pair.node_a.clone();
+        let desc = pair.responder.desc;
+        let in_flight = tokio::spawn(async move {
+            node_a
+                .request_access_wire(&desc, &request, fallback_access_options())
+                .await
+        });
+        wait_until("node B to hold the request", || {
+            pair.recorder_b.seen_count() > before
+        })
+        .await;
+        let seen = pair.recorder_b.last();
+        assert_eq!(seen.path_hash, PathHash::of(ACCESS_PATH));
+        let body = compressible_response_body(MAX_REQUEST_PAYLOAD_BYTES);
+        answer_pair_as_resource(
+            &pair,
+            &seen,
+            oversize_response(seen.request_id, body, MAX_REQUEST_PAYLOAD_BYTES),
+        )
+        .await;
+        let answered = Instant::now();
+        let err = timeout(INTEROP_TIMEOUT, in_flight)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+
+        assert!(
+            answered.elapsed() < SHORT_REQUEST_TIMEOUT,
+            "the refusal is immediate, not a timeout"
+        );
+        assert_eq!(
+            err,
+            AccessError::Direct(RequestError::Oversize {
+                len: MAX_REQUEST_PAYLOAD_BYTES + 1,
+                max: MAX_REQUEST_PAYLOAD_BYTES,
+            })
+        );
+        sleep(Duration::from_millis(500)).await;
+        node.nothing_else_received();
+        pair.stop_node_a().await;
+        node.stop().await;
+    }
+
     /// With no path to the peer and no propagation node heard, the request fails by name
     /// and points at the command that lists the nodes heard.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10272,6 +10358,78 @@ pub(crate) mod network {
                 dropped_parts: 0,
             }))
         );
+        node.nothing_else_received();
+        pair.stop_node_a().await;
+        node.stop().await;
+    }
+
+    /// Node B answers the message with a response frame one byte over the path cap, sent
+    /// as a Resource. The library refuses the advertisement, so the send fails as
+    /// `Oversize` naming the cap and one over it; the exchange reached the peer, so it is
+    /// a direct failure with nothing stored, and the propagation node known to A is never
+    /// posted to.
+    ///
+    /// The over-cap reply is the only way to reach a direct failure from this surface. A
+    /// request from a live node never travels as a Resource: nodes join at the TCP client
+    /// default MTU, so the link MDU is far above every per-field cap on a message. And a
+    /// packet-form request over the responder's cap is dropped by the library without an
+    /// answer, which times out and does fall back. So a rejected request advertisement
+    /// cannot be pinned here; the over-cap reply pins the same class.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_oversize_peer_message_reply_is_a_direct_failure_and_never_stored() {
+        let (pair, mut node) =
+            pair_with_propagation_node_trusting("request-peer-oversize-no-fallback", trusting_b)
+                .await;
+        pair.introduce_b_to_a().await;
+        let b_instance = pair.responder.desc.address_hash.to_hex_string();
+        pair.recorder_b.queue(Script::Hang);
+        let message = OutboundPeer::new(
+            PeerKind::Message,
+            "are you there",
+            Some("ping"),
+            None,
+            Some(serde_json::json!({ "n": 1 })),
+        )
+        .unwrap();
+        let before = pair.recorder_b.seen_count();
+
+        let node_a = pair.node_a.clone();
+        let in_flight = tokio::spawn(async move {
+            node_a
+                .send_peer_with(&b_instance, &message, peer_send_options())
+                .await
+        });
+        wait_until("node B to hold the request", || {
+            pair.recorder_b.seen_count() > before
+        })
+        .await;
+        let seen = pair.recorder_b.last();
+        let body = compressible_response_body(MAX_REQUEST_PAYLOAD_BYTES);
+        answer_pair_as_resource(
+            &pair,
+            &seen,
+            oversize_response(seen.request_id, body, MAX_REQUEST_PAYLOAD_BYTES),
+        )
+        .await;
+        let answered = Instant::now();
+        let err = timeout(INTEROP_TIMEOUT, in_flight)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+
+        assert!(
+            answered.elapsed() < SHORT_REQUEST_TIMEOUT,
+            "the refusal is immediate, not a timeout"
+        );
+        assert_eq!(
+            err,
+            SendError::Direct(RequestError::Oversize {
+                len: MAX_REQUEST_PAYLOAD_BYTES + 1,
+                max: MAX_REQUEST_PAYLOAD_BYTES,
+            })
+        );
+        sleep(Duration::from_millis(500)).await;
         node.nothing_else_received();
         pair.stop_node_a().await;
         node.stop().await;
