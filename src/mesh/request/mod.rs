@@ -7,7 +7,7 @@ mod client;
 mod dispatch;
 mod error;
 mod frame;
-mod server;
+mod handler;
 #[cfg(test)]
 mod tests;
 
@@ -17,13 +17,11 @@ pub(crate) use client::{
     DEFAULT_LINK_TIMEOUT, Deadline, RequestClient, RequestOptions, RequestOutcome, SizeBranch,
     link_to, open_link,
 };
-#[cfg(test)]
-pub(crate) use dispatch::KNOWN_PATHS;
 #[cfg(all(test, unix))]
 pub(crate) use dispatch::LoggingKnockSink;
 pub(crate) use dispatch::{
     ACCESS_PATH, AdmittedRequest, DispatchError, Dispatcher, FETCH_PATH, Handler, KNOCK_PATH,
-    KnockEvent, KnockSink, LIST_PATH, MESSAGE_PATH, STATUS_PATH, describe_path,
+    KNOWN_PATHS, KnockEvent, KnockSink, LIST_PATH, MESSAGE_PATH, STATUS_PATH, describe_path,
 };
 pub(crate) use error::{RefusalCode, RemoteRefusal, RequestError, refusal_remedy, request_remedy};
 pub(crate) use frame::{Envelope, MAX_REQUEST_PAYLOAD_BYTES, NAME_HASH_LEN, OriginName};
@@ -33,11 +31,10 @@ pub(crate) use frame::{
     RESPONSE_FRAME_PREFIX, RequestFrame, RequestId, ResponseFrame,
 };
 #[cfg(test)]
-pub(crate) use server::{
-    Admission, DEFAULT_RESPONSE_SEND_TIMEOUT, HANDLER_TIMEOUT, InboundRequest,
-    MAX_CONCURRENT_INBOUND_REQUESTS, PEER_RESOLVE_TIMEOUT, RequestHandler,
+pub(crate) use handler::{
+    Admission, HANDLER_TIMEOUT, InboundRequest, MAX_CONCURRENT_INBOUND_REQUESTS, RequestHandler,
 };
-pub(crate) use server::{Reply, RequestServer, Settlement};
+pub(crate) use handler::{LibraryHandler, Reply, Settlement};
 #[cfg(all(test, unix))]
 pub(crate) use tests::network;
 

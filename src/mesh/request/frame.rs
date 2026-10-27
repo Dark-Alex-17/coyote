@@ -9,9 +9,10 @@ use rns_transport::hash::ADDRESS_HASH_SIZE;
 use std::io::Cursor;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Frames above this are refused: outbound before anything touches the wire, inbound after
-/// assembly and before decoding. The node's destination is armed with it too, so the
-/// library refuses an oversize request at advertisement time before any of it transfers.
+/// Frames above this are refused: outbound before anything touches the wire, inbound by the
+/// node's destination, which is armed with it, so the library refuses an oversize request
+/// at advertisement time before any of it transfers and drops an oversize packet-form one
+/// before any handler runs.
 pub(crate) const MAX_REQUEST_PAYLOAD_BYTES: usize = 256 * 1024;
 
 /// The bound on a `/fetch` RESPONSE alone: the largest file a node serves plus room for the
@@ -75,6 +76,7 @@ impl RequestFrame {
         ]))
     }
 
+    #[cfg(test)]
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, RequestError> {
         let Value::Array(elements) = decode_whole(bytes)? else {
             return Err(RequestError::Decode("request frame is not an array".into()));
@@ -110,6 +112,7 @@ pub(crate) struct ResponseFrame {
 }
 
 impl ResponseFrame {
+    #[cfg(test)]
     pub(crate) fn encode(&self) -> Vec<u8> {
         encode_value(Value::Array(vec![
             Value::Binary(self.request_id.to_bytes().to_vec()),

@@ -1,12 +1,10 @@
 use crate::mesh::hex_lower;
 use crate::mesh::protocol::{VersionRefusal, describe_version};
-#[cfg(test)]
-use crate::mesh::request::client::SizeBranch;
 use crate::mesh::request::error::RefusalCode;
 #[cfg(test)]
 use crate::mesh::request::frame::RequestId;
 use crate::mesh::request::frame::{Envelope, EnvelopeError, PathHash};
-use crate::mesh::request::server::{Admission, InboundRequest, Reply, RequestHandler};
+use crate::mesh::request::handler::{Admission, InboundRequest, Reply, RequestHandler};
 use crate::mesh::request::short;
 use crate::mesh::trust::{
     BindingConflict, Decision, IdentityStanding, KeyChangeOutcome, OriginVerdict, Rule, TrustStore,
@@ -49,8 +47,8 @@ fn path_name(path_hash: PathHash) -> Option<&'static str> {
 
 /// One request the dispatcher has let through. `identity` is proven on the link and
 /// `destination_hash` is the requester's own instance, derived from the origin it named and
-/// that identity. The test recorders also see the request id, the path and the size
-/// branch, so a test can tell how a request arrived.
+/// that identity. The test recorders also see the request id and the path, so a test can
+/// tell which request arrived.
 pub(crate) struct AdmittedRequest {
     pub link_id: LinkId,
     pub identity: Identity,
@@ -60,8 +58,6 @@ pub(crate) struct AdmittedRequest {
     #[cfg(test)]
     pub path_hash: PathHash,
     pub body: Value,
-    #[cfg(test)]
-    pub branch: SizeBranch,
 }
 
 /// Everything about who may ask has been settled before a handler runs.
@@ -402,13 +398,14 @@ impl Dispatcher {
                     });
                 match route {
                     None => {
-                        log(short(&identity_hex), &format!("unknown path: {rule:?}"));
-                        Reply::Value(
-                            DispatchError::UnknownPath {
-                                path_hash: request.path_hash.to_string(),
-                            }
-                            .to_value(),
-                        )
+                        // The transport only delivers paths registered on the destination,
+                        // and those are the routes seeded here, so this is a path registered
+                        // there without a route; nothing is owed to the requester for it.
+                        log(
+                            short(&identity_hex),
+                            &format!("dropped: no route for a registered path ({rule:?})"),
+                        );
+                        Reply::Silent
                     }
                     Some(Route::NoProvider(path)) => {
                         log(short(&identity_hex), &format!("no provider: {rule:?}"));
@@ -436,8 +433,6 @@ impl Dispatcher {
                                 #[cfg(test)]
                                 path_hash: request.path_hash,
                                 body: envelope.body,
-                                #[cfg(test)]
-                                branch: request.branch,
                             })
                             .await
                     }
@@ -599,9 +594,9 @@ mod tests {
         }
     }
 
-    /// A served request reaches its handler as it arrived: the request id, the path hash
-    /// and the size branch are the inbound request's own, the body is the envelope's and
-    /// the identity is the one proven on the link.
+    /// A served request reaches its handler as it arrived: the request id and the path
+    /// hash are the inbound request's own, the body is the envelope's and the identity is
+    /// the one proven on the link.
     #[tokio::test]
     async fn a_served_request_reaches_its_handler_as_it_arrived() {
         const ORIGIN: [u8; NAME_HASH_LEN] = [7; NAME_HASH_LEN];
@@ -626,7 +621,6 @@ mod tests {
                 request_id,
                 path_hash: PathHash::of(STATUS_PATH),
                 data: Envelope::new(OriginName(ORIGIN), body.clone()).into_value(),
-                branch: SizeBranch::Resource,
             },
         )
         .await;
@@ -635,7 +629,6 @@ mod tests {
         let admitted = recorder.0.lock().unwrap().take().unwrap();
         assert_eq!(admitted.request_id, request_id);
         assert_eq!(admitted.path_hash, PathHash::of(STATUS_PATH));
-        assert_eq!(admitted.branch, SizeBranch::Resource);
         assert_eq!(admitted.body, body);
         assert_eq!(admitted.link_id, link_id);
         assert_eq!(admitted.identity.address_hash, identity.address_hash);

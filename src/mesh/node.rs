@@ -50,9 +50,10 @@ use crate::mesh::protocol::{Compatibility, MESH_PROTOCOL_MIN_SUPPORTED, MESH_PRO
 #[cfg(all(test, unix))]
 use crate::mesh::request::RequestHandler;
 use crate::mesh::request::{
-    ACCESS_PATH, Dispatcher, Envelope, FETCH_PATH, KNOCK_PATH, LIST_PATH,
-    MAX_REQUEST_PAYLOAD_BYTES, MESSAGE_PATH, OriginName, RefusalCode, RemoteRefusal, RequestClient,
-    RequestError, RequestOptions, RequestOutcome, RequestServer, STATUS_PATH, redact_hashes, short,
+    ACCESS_PATH, Dispatcher, Envelope, FETCH_PATH, KNOCK_PATH, KNOWN_PATHS, LIST_PATH,
+    LibraryHandler, MAX_REQUEST_PAYLOAD_BYTES, MESSAGE_PATH, OriginName, RefusalCode,
+    RemoteRefusal, RequestClient, RequestError, RequestOptions, RequestOutcome, STATUS_PATH,
+    redact_hashes, short,
 };
 use crate::mesh::shares::ShareLocations;
 use crate::mesh::snapshot::MeshSnapshot;
@@ -68,6 +69,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use arc_swap::ArcSwapOption;
 use parking_lot::RwLock;
 use rns_transport::destination::DestinationDesc;
+use rns_transport::destination::request::RequestAllow;
 use rns_transport::destination::{DestinationName, SingleInputDestination};
 use rns_transport::hash::AddressHash;
 use rns_transport::identity::Identity;
@@ -461,7 +463,7 @@ pub(crate) struct MeshRuntime {
     propagation_nodes: Arc<PropagationNodeTable>,
     trust: Arc<TrustStore>,
     request_client: Arc<RequestClient>,
-    request_server: Arc<RequestServer>,
+    request_handler: Arc<LibraryHandler>,
     dispatcher: Arc<Dispatcher>,
     knock_gate: Arc<KnockGate>,
     /// Where fetched peer messages go; attached by the slot the node is installed into.
@@ -559,9 +561,7 @@ impl MeshRuntime {
         // Every stream is subscribed before an interface is joined so nothing is missed.
         let announces = transport.recv_announces().await;
         let out_link_events = transport.out_link_events();
-        let in_link_events = transport.in_link_events();
         let client_resource_events = transport.resource_events();
-        let server_resource_events = transport.resource_events();
         let mut joined = Vec::with_capacity(plans.len());
         let mut states = Vec::with_capacity(plans.len());
         let mut watched = Vec::new();
@@ -595,6 +595,7 @@ impl MeshRuntime {
                 }
             }
         }
+        let transport = Arc::new(transport);
         if !states
             .iter()
             .any(|status| status.state == InterfaceState::Connected)
@@ -610,12 +611,16 @@ impl MeshRuntime {
             }
             bail!(text);
         }
+        let (knock_sink, knock_rx) = ChannelKnockSink::new(KNOCK_QUEUE_CAPACITY);
+        let dispatcher = Arc::new(Dispatcher::new(trust.clone(), knock_sink));
+        let request_handler = Arc::new(LibraryHandler::new(dispatcher.clone(), &transport));
         let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
         let (dest, hash, origin) = match register_destination(
             &transport,
             &transport_identity,
             &instance_id,
             &app_data,
+            &request_handler,
             deadline,
         )
         .await
@@ -660,11 +665,6 @@ impl MeshRuntime {
         );
 
         // Nothing fallible may follow: a failure once the tasks exist would leak them.
-        let transport = Arc::new(transport);
-        let request_server = Arc::new(RequestServer::new());
-        let (knock_sink, knock_rx) = ChannelKnockSink::new(KNOCK_QUEUE_CAPACITY);
-        let dispatcher = Arc::new(Dispatcher::new(trust.clone(), knock_sink));
-        request_server.set_handler(dispatcher.clone());
         let knock_gate = Arc::new(KnockGate::new(
             trust.clone(),
             peers.clone(),
@@ -709,7 +709,7 @@ impl MeshRuntime {
             propagation_nodes: Arc::new(PropagationNodeTable::new()),
             trust,
             request_client: Arc::new(RequestClient::new()),
-            request_server,
+            request_handler,
             dispatcher,
             knock_gate,
             peer_surface: parking_lot::Mutex::new(None),
@@ -726,12 +726,6 @@ impl MeshRuntime {
         runtime.register_task(tokio::spawn(runtime.request_client.clone().run(
             out_link_events,
             client_resource_events,
-            runtime.cancellation_token(),
-        )));
-        runtime.register_task(tokio::spawn(runtime.request_server.clone().run(
-            transport,
-            in_link_events,
-            server_resource_events,
             runtime.cancellation_token(),
         )));
         runtime.register_task(tokio::spawn(receive_announces(
@@ -1344,7 +1338,7 @@ impl MeshRuntime {
     /// Replaces the dispatcher `start` installed, so a test can watch requests directly.
     #[cfg(all(test, unix))]
     pub(crate) fn set_request_handler(&self, handler: Arc<dyn RequestHandler>) {
-        self.request_server.set_handler(handler);
+        self.request_handler.set_handler(handler);
     }
 
     /// Announces the current destination unless it was announced within
@@ -1470,6 +1464,7 @@ impl MeshRuntime {
             &self.transport_identity,
             &rekey.fork_instance_id,
             &self.app_data,
+            &self.request_handler,
             deadline,
         )
         .await
@@ -1596,10 +1591,11 @@ pub(crate) fn session_destination_name(instance_id: &str) -> DestinationName {
     DestinationName::new(SCOPE_APP_NAME, &format!("session.{instance_id}"))
 }
 
-/// Registers the destination for `instance_id` and attaches `app_data` to its announces;
-/// each transport wait gives up at `deadline`. A destination registered but left without
-/// its announce data is deregistered again, best effort, and the error says whether that
-/// worked. The destination is armed with `MAX_REQUEST_PAYLOAD_BYTES`:
+/// Registers the destination for `instance_id`, with `request_handler` serving every known
+/// path on it, and attaches `app_data` to its announces; each transport wait gives up at
+/// `deadline`. A destination registered but left without its announce data is
+/// deregistered again, best effort, and the error says whether that worked. The
+/// destination is armed with `MAX_REQUEST_PAYLOAD_BYTES`:
 /// coyote-rns-transport 0.16.0 refuses an oversize request at the advertisement, before it
 /// reaches a handler (a request that travels as a resource; a packet-form one over the cap
 /// is dropped).
@@ -1608,6 +1604,7 @@ async fn register_destination(
     identity: &TransportIdentity,
     instance_id: &str,
     app_data: &[u8],
+    request_handler: &Arc<LibraryHandler>,
     deadline: tokio::time::Instant,
 ) -> Result<(Arc<Mutex<SingleInputDestination>>, AddressHash, OriginName)> {
     let name = session_destination_name(instance_id);
@@ -1615,6 +1612,7 @@ async fn register_destination(
     destination
         .set_max_request_size(MAX_REQUEST_PAYLOAD_BYTES)
         .expect("the cap setter is infallible");
+    register_request_paths(&mut destination, request_handler)?;
     let hash = destination.desc.address_hash;
     let origin = OriginName::of(&destination.desc.name);
     let dest = timeout_at(deadline, transport.register_destination(destination))
@@ -1641,6 +1639,23 @@ async fn register_destination(
         );
     }
     Ok((dest, hash, origin))
+}
+
+/// Puts `request_handler` behind every path in `KNOWN_PATHS` before the destination is
+/// registered, so no request can arrive at a destination without its handlers. Every path
+/// is open to any peer at this layer (`RequestAllow::All`); who is served is the
+/// dispatcher's verdict, taken on the proven identity. The handlers live on the destination
+/// and go with it when it is deregistered, so nothing deregisters them separately.
+fn register_request_paths(
+    destination: &mut SingleInputDestination,
+    request_handler: &Arc<LibraryHandler>,
+) -> Result<()> {
+    for path in KNOWN_PATHS {
+        destination
+            .register_request_handler(path, request_handler.clone(), RequestAllow::All, true)
+            .map_err(|err| anyhow!("Failed to register the mesh request path {path}: {err}"))?;
+    }
+    Ok(())
 }
 
 /// Sends one announce and records the moment in `last_announce_at`, so every path that
@@ -1671,7 +1686,7 @@ async fn announce_destination(
 
 /// Unwinds a start that failed once the transport existed: the joined interfaces are stopped
 /// and the transport goes with them, which cancels its own tasks.
-async fn abandon_start(transport: Transport, joined: Vec<JoinedInterface>) {
+async fn abandon_start(transport: Arc<Transport>, joined: Vec<JoinedInterface>) {
     let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
     for iface in joined {
         stop_interface(&transport, iface, deadline).await;

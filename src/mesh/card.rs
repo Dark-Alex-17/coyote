@@ -552,7 +552,7 @@ impl fmt::Display for StatusError {
             ),
             Self::NotServed(DispatchError::UnknownPath { path_hash }) => write!(
                 f,
-                "The mesh peer accepted the request but does not know the path (hash {path_hash}); it may be running a different Coyote; ask the person at that node which Coyote it runs, and upgrade the older side"
+                "An older mesh node answered unknown_path for hash {path_hash}; this Coyote no longer sends that answer, so the peer is running a different Coyote; ask the person at that node which Coyote it runs, and upgrade the older side"
             ),
             Self::Malformed(reason) => write!(
                 f,
@@ -1836,7 +1836,7 @@ mod tests {
         .to_string();
         assert_eq!(
             unknown_path,
-            "The mesh peer accepted the request but does not know the path (hash 0a0b); it may be running a different Coyote; ask the person at that node which Coyote it runs, and upgrade the older side"
+            "An older mesh node answered unknown_path for hash 0a0b; this Coyote no longer sends that answer, so the peer is running a different Coyote; ask the person at that node which Coyote it runs, and upgrade the older side"
         );
         let transport = StatusError::Transport(RequestError::NotRunning).to_string();
         assert!(
