@@ -1081,4 +1081,44 @@ mod tests {
             largest.len()
         );
     }
+
+    /// A response that leaves as a resource is compressed at both places it is sent from:
+    /// the paths the node registers carry `auto_compress` for the replies the library
+    /// sends, and the adapter's own send of a settled reply asks for the same. The
+    /// library's `send_response_resource` compresses by default, so this keeps a reply the
+    /// node sends itself the same bytes on the wire as one the library sends for it.
+    #[test]
+    fn every_response_resource_is_sent_with_compression_on() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let files = rust_source_files(root).unwrap();
+        let without_whitespace = |name: &str| -> String {
+            let (_, source) = files
+                .iter()
+                .find(|(path, _)| path == name)
+                .unwrap_or_else(|| panic!("{name} is not under src"));
+            source.split_whitespace().collect()
+        };
+        let node = without_whitespace("src/mesh/node.rs");
+        let registration =
+            ".register_request_handler(path,request_handler.clone(),RequestAllow::All,true)";
+        assert_eq!(
+            node.matches(".register_request_handler(").count(),
+            1,
+            "node.rs registers request paths at one site"
+        );
+        assert!(
+            node.contains(registration),
+            "{registration} is not in node.rs"
+        );
+        let handler = without_whitespace("src/mesh/request/handler.rs");
+        let send = ".send_response_resource_with_outcome(&link_id,request_id.to_bytes().to_vec(),bytes,None,true,)";
+        assert_eq!(
+            handler
+                .matches(".send_response_resource_with_outcome(")
+                .count(),
+            1,
+            "handler.rs sends a response resource at one site"
+        );
+        assert!(handler.contains(send), "{send} is not in handler.rs");
+    }
 }
