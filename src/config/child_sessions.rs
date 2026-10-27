@@ -939,7 +939,9 @@ pub(crate) enum EffectiveStatus {
 }
 
 /// One run of a child session: its first spawn or a later resume, each
-/// under its own agent id and process.
+/// under its own agent id and process. Only the last run is ever closed
+/// by `finish_at`, so an earlier run with no `status` ended without
+/// recording a verdict: its process went away before it could.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ChildRun {
     pub agent_id: String,

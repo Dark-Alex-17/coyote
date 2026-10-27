@@ -450,7 +450,8 @@ pub fn agent_function_declarations() -> Vec<FunctionDeclaration> {
                           child is still running. Each row carries the resumable `session_id` (pass it to \
                           `agent__spawn`), the agent, its effective status (`running`, `completed`, `failed`, \
                           `cancelled` or `crashed`), timestamps, the head of its prompt and how many runs it has \
-                          had. Page with `page_size` and `cursor`; `next_cursor` is null on the last page. For the \
+                          had (`runs`; 0 for a child recorded before run history was kept). Page with `page_size` \
+                          and `cursor`; `next_cursor` is null on the last page. For the \
                           agents the supervisor is tracking right now, use `agent__list_running`.".to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
@@ -467,7 +468,7 @@ pub fn agent_function_declarations() -> Vec<FunctionDeclaration> {
                         "cursor".to_string(),
                         JsonSchema {
                             type_value: Some("string".to_string()),
-                            description: Some("The `next_cursor` of the previous page: the `session_id` to continue after".into()),
+                            description: Some("The `next_cursor` of the previous page: the `session_id` to continue after. If that child is gone, start again without a cursor".into()),
                             ..Default::default()
                         },
                     ),
@@ -2625,13 +2626,21 @@ fn handle_list_sessions(ctx: &mut RequestContext, args: &Value) -> Result<Value>
             .ok_or_else(|| anyhow!("no child session '{cursor}' to continue after"))?,
     };
     let page = &children[start..(start + page_size).min(total)];
+    let running: Vec<ProcessStamp> = page
+        .iter()
+        .filter(|meta| meta.status == ChildStatus::Running)
+        .map(ChildMeta::stamp)
+        .collect();
+    let alive = ProcessStamp::alive_set(&running);
     let sessions: Vec<Value> = page
         .iter()
         .map(|meta| {
             json!({
                 "session_id": meta.session_id,
                 "agent": meta.agent,
-                "status": effective_status_word(meta.effective_status()),
+                "status": effective_status_word(
+                    meta.effective_status_with(|stamp| alive.contains(stamp))
+                ),
                 "created_at": meta.created_at.to_rfc3339(),
                 "updated_at": meta.updated_at.to_rfc3339(),
                 "prompt_head": meta.prompt_head,
