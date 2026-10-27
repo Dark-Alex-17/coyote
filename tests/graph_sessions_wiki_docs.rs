@@ -1948,7 +1948,8 @@ fn sessions_section_names_the_real_workspace_session_directory() {
 /// the tree: when the child file is flushed, what a headless parent leaves
 /// behind, what `.fork` copies, what the session commands do to children
 /// (with the exit wait read from `EXIT_CANCEL_WAIT`), how a graph child
-/// runs, and the sidecar's prompt head length from `PROMPT_HEAD_CHARS`.
+/// runs, when a child's transcript is compressed, and the sidecar's prompt
+/// head length from `PROMPT_HEAD_CHARS`.
 #[test]
 fn sessions_child_section_names_the_layout_and_the_lifecycle_rules() {
     let child_sessions = src(&["config", "child_sessions.rs"]);
@@ -1976,11 +1977,8 @@ fn sessions_child_section_names_the_layout_and_the_lifecycle_rules() {
     );
 
     let Some(wiki) = wiki_dir() else { return };
-    let text = flat(&section(
-        "Sessions.md",
-        &read(wiki.join("Sessions.md")),
-        CHILD_SESSIONS_HEADING,
-    ));
+    let page = read(wiki.join("Sessions.md"));
+    let text = flat(&section("Sessions.md", &page, CHILD_SESSIONS_HEADING));
     for needle in [
         "`root.yaml`",
         "`children/<sid>.yaml`",
@@ -2003,6 +2001,26 @@ fn sessions_child_section_names_the_layout_and_the_lifecycle_rules() {
             "the Child Sessions section does not say {needle:?}"
         );
     }
+    let written = flat(&section(
+        "Sessions.md",
+        &page,
+        "## When the file is written",
+    ));
+    for needle in [
+        "`compression_threshold`",
+        "turn boundary",
+        "`session.compressed`",
+    ] {
+        assert!(
+            written.contains(needle),
+            "the When the file is written section does not say {needle:?}"
+        );
+    }
+    let resuming = flat(&section("Sessions.md", &page, "## Resuming"));
+    assert!(
+        resuming.contains("compressed once"),
+        "the Resuming section does not say a child is compressed once at resume"
+    );
 }
 
 /// The knob's name is read from the config template so the row, the
@@ -2214,14 +2232,19 @@ fn agents_page_quotes_the_spawn_session_id_contract() {
         sentence,
         "`null` on a spawn result means that child cannot be resumed (child sessions are off)."
     );
-    let refusals: Vec<String> = string_literals(&fn_body(&agents, "fn resume_child_session("))
-        .into_iter()
-        .filter(|literal| literal.starts_with('\''))
-        .collect();
+    let refusals: Vec<String> = [
+        fn_body(&agents, "fn resume_child_session("),
+        fn_body(&agents, "fn load_and_gate("),
+    ]
+    .iter()
+    .flat_map(|body| string_literals(body))
+    .filter(|literal| literal.starts_with('\''))
+    .collect();
     let fragments = [
         "expected sess_<agent>_<12 hex>",
         "collect or cancel it first",
-        "child compression is not available yet - spawn fresh",
+        "even after compression - spawn fresh",
+        "could not be compressed",
     ];
     for fragment in fragments {
         assert!(
