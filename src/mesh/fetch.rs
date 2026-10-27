@@ -32,7 +32,6 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use rmpv::Value;
 use rns_transport::destination::DestinationDesc;
-use rns_transport::resource::MAX_EFFICIENT_SIZE;
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::fmt;
@@ -59,27 +58,6 @@ pub(crate) const LIST_PAGE_HEADROOM: usize = 2048;
 /// The longest cursor a peer may send or return; `shares::list_cursor` makes 32 bytes.
 pub(crate) const CURSOR_MAX_BYTES: usize = 64;
 const UNKNOWN_RULE: &str = "unknown";
-/// Largest file an `ok` reply may carry while its response frame still fits one Resource
-/// segment: `MAX_EFFICIENT_SIZE` less the frame and the reply's other keys. A workaround,
-/// not a protocol limit. It predates coyote-rns-transport 0.16.0, which sends every later
-/// segment's advertisement on the link's attached interface the way it sends the first
-/// (`transport/resource_wire_parts/proof.rs` and the resource retry worker in
-/// `transport/jobs.rs`); the upstream code it replaced dispatched them through the path
-/// table, where a link id has no entry, so a node that does not broadcast unroutable
-/// packets never got segment two onto the wire. The ceiling stays
-/// until a fetch above one segment is exercised end to end against that release; then
-/// this constant, `OK_REPLY_FRAMING_BYTES`, their `expected_constants` pins and the
-/// ceiling clauses in README.md and the config template and example go, and
-/// `mesh.fetch.max_bytes` applies alone.
-pub(crate) const SINGLE_SEGMENT_FETCH_CEILING: u64 =
-    (MAX_EFFICIENT_SIZE - OK_REPLY_FRAMING_BYTES) as u64;
-/// Room for the response frame (19 bytes), the map header and the `v`, `status`, `size`,
-/// `sha256` and `bytes` keys with their headers around the file bytes: 99 bytes today,
-/// rounded up.
-pub(crate) const OK_REPLY_FRAMING_BYTES: usize = 128;
-// The ceiling only ever lowers the configured limit; the day it does not, it is dead.
-const _: () =
-    assert!(SINGLE_SEGMENT_FETCH_CEILING < crate::config::mesh_config::MAX_FETCH_FILE_BYTES);
 
 /// `max_bytes` is `mesh.fetch.max_bytes` and never a peer's number; `serving_limit` is
 /// what a request is actually held to. `inbox_dir` is protected from serving along with
@@ -143,10 +121,9 @@ impl FetchServing {
         self.grants.load_full()
     }
 
-    /// The size a served file is held to: the configured limit, capped at what one
-    /// Resource segment carries while `SINGLE_SEGMENT_FETCH_CEILING` stands.
+    /// The size a served file is held to: `mesh.fetch.max_bytes`.
     pub(crate) fn serving_limit(&self) -> u64 {
-        self.max_bytes.min(SINGLE_SEGMENT_FETCH_CEILING)
+        self.max_bytes
     }
 
     /// Whether `root` folds case, learned once per root. The probe writes a file under
@@ -1693,6 +1670,7 @@ mod tests {
     use rns_transport::hash::AddressHash;
     use rns_transport::identity::PrivateIdentity as TransportIdentity;
     use rns_transport::rand_core::OsRng;
+    use rns_transport::resource::MAX_EFFICIENT_SIZE;
     use std::fs;
 
     const GRANT_ID: &str = "0123456789abcdef";
@@ -2144,43 +2122,45 @@ mod tests {
         );
     }
 
-    /// With the configured limit above the single-segment ceiling, the ceiling is what a
-    /// request is held to and what `too_large` reports; a file exactly at it is served and
-    /// its whole response frame fits one Resource segment.
+    /// `max_bytes` alone is what a request is held to and what `too_large` reports, with
+    /// no cap at one Resource segment: a file exactly at a limit above one segment is served
+    /// whole, in a response frame the transport splits.
     #[tokio::test]
-    async fn a_file_above_the_single_segment_ceiling_is_too_large_with_that_limit() {
-        let ceiling = usize::try_from(SINGLE_SEGMENT_FETCH_CEILING).unwrap();
-        let fx = Fixture::new("fetch-segment-ceiling", MAX_FETCH_FILE_BYTES, &["docs/**"]);
-        fx.file("docs/over.bin", &vec![0x5a; ceiling + 1]);
-        let at_ceiling = vec![0xa5; ceiling];
-        fx.file("docs/at.bin", &at_ceiling);
+    async fn a_file_above_max_bytes_is_too_large_with_that_limit() {
+        let limit = MAX_EFFICIENT_SIZE + 512 * 1024;
+        let fx = Fixture::new("fetch-max-bytes", limit as u64, &["docs/**"]);
+        fx.file("docs/over.bin", &vec![0x5a; limit + 1]);
+        let at_limit = vec![0xa5; limit];
+        fx.file("docs/at.bin", &at_limit);
 
         let reply = fx.fetch("docs/over.bin", None).await;
         assert_eq!(status_of(&reply), "too_large");
         assert_eq!(
             field_of(&value_of(reply), "limit").and_then(Value::as_u64),
-            Some(SINGLE_SEGMENT_FETCH_CEILING)
+            Some(limit as u64)
         );
 
         let reply = fx.fetch("docs/at.bin", None).await;
         assert_eq!(status_of(&reply), "ok");
+        let value = value_of(reply);
+        assert_eq!(field_of(&value, "bytes"), Some(&Value::Binary(at_limit)));
         let frame = ResponseFrame {
             request_id: RequestId::from([1u8; 16]),
-            data: value_of(reply),
+            data: value,
         }
         .encode();
         assert!(
-            frame.len() <= MAX_EFFICIENT_SIZE,
-            "a {}-byte frame does not fit one segment of {MAX_EFFICIENT_SIZE}",
+            frame.len() > MAX_EFFICIENT_SIZE,
+            "a {}-byte frame fits one segment of {MAX_EFFICIENT_SIZE}; the limit under test is meant to exceed it",
             frame.len()
         );
     }
 
-    /// The framing allowance behind the ceiling is not optimistic: the largest `ok` reply
-    /// the ceiling admits encodes within one segment with the allowance to spare.
+    /// An `ok` reply above one Resource segment is still one response frame; splitting it
+    /// is the transport's job, and the frame decodes back byte-exact.
     #[test]
-    fn an_ok_reply_at_the_ceiling_fits_one_resource_segment() {
-        let bytes = vec![0xffu8; usize::try_from(SINGLE_SEGMENT_FETCH_CEILING).unwrap()];
+    fn an_ok_reply_above_one_segment_is_one_frame_the_transport_splits() {
+        let bytes = vec![0xffu8; MAX_EFFICIENT_SIZE + 512 * 1024];
         let digest = sha256_of(&bytes);
         let frame = ResponseFrame {
             request_id: RequestId::from([0xeeu8; 16]),
@@ -2189,13 +2169,18 @@ mod tests {
                 vec![
                     ("size", Value::from(bytes.len() as u64)),
                     ("sha256", Value::Binary(digest.to_vec())),
-                    ("bytes", Value::Binary(bytes)),
+                    ("bytes", Value::Binary(bytes.clone())),
                 ],
             ),
-        }
-        .encode();
-        assert!(frame.len() <= MAX_EFFICIENT_SIZE);
-        assert!(MAX_EFFICIENT_SIZE - frame.len() < OK_REPLY_FRAMING_BYTES);
+        };
+        let encoded = frame.encode();
+        assert!(encoded.len() > MAX_EFFICIENT_SIZE);
+        let decoded = ResponseFrame::decode(&encoded).unwrap();
+        assert_eq!(decoded, frame);
+        assert_eq!(
+            field_of(&decoded.data, "bytes"),
+            Some(&Value::Binary(bytes))
+        );
     }
 
     /// `fetch_file` waits `FILE_FETCH_REQUEST_TIMEOUT` for its reply where `list_shares`
