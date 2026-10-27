@@ -2904,6 +2904,57 @@ updated_at: 2026-01-02T03:04:05Z
         );
     }
 
+    /// A `root.yaml` holding bytes that are not UTF-8 is no identity anyone
+    /// wrote, same as a directory in its place: the uid dir gets the hour
+    /// of grace and then goes under arm 0, without a warning naming it,
+    /// and a fresh one is kept. The sweep never panics on the bytes.
+    #[test]
+    #[serial]
+    fn usage_probe_sweep_removes_a_uid_root_whose_identity_is_not_utf8_after_an_hour() {
+        install_log_collector();
+        let _guard = TestConfigDirGuard::new("child-sessions-sweep-not-utf8-identity");
+        let garbage: &[u8] = b"version: 1\n\xff\xfe\x00parent_paths: [\x80]\n";
+        let (fresh, fresh_uid) = bare_uid_dir();
+        fs::write(fresh.join("root.yaml"), garbage).unwrap();
+        let (old, old_uid) = bare_uid_dir();
+        fs::write(old.join("root.yaml"), garbage).unwrap();
+        age_past_grace(&old);
+
+        sweep_orphans();
+
+        assert!(fresh.is_dir());
+        assert!(fresh.join("root.yaml").is_file());
+        assert!(!old.exists());
+        assert!(
+            removal_logged(&old_uid, "orphan sweep arm 0"),
+            "{:?}",
+            info_snapshot()
+        );
+        assert!(
+            !info_snapshot()
+                .iter()
+                .any(|message| message.contains(&fresh_uid)),
+            "{:?}",
+            info_snapshot()
+        );
+        assert!(
+            !warn_snapshot()
+                .iter()
+                .any(|message| message.contains(&old_uid) || message.contains(&fresh_uid)),
+            "an unreadable identity is not a permission problem: {:?}",
+            warn_snapshot()
+        );
+
+        age_past_grace(&fresh);
+        sweep_orphans();
+        assert!(!fresh.exists());
+        assert!(
+            removal_logged(&fresh_uid, "orphan sweep arm 0"),
+            "{:?}",
+            info_snapshot()
+        );
+    }
+
     /// The classifying pass never asks after a single process; only the
     /// re-read guarding the delete still does, since it checks one record
     /// under one lock.

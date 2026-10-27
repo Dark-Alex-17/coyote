@@ -10080,6 +10080,57 @@ local_hello() {\n\
         });
     }
 
+    /// `.fork` is not an exit: the session stays attached and its children
+    /// keep running, so nothing is cancelled and nothing waits on them. The
+    /// cached process root an attached session never has is still settled
+    /// as a defensive mirror of the attach, without a drain.
+    #[test]
+    #[serial]
+    fn usage_probe_fork_leaves_background_work_alone_while_settling_a_process_root() {
+        use crate::config::child_sessions::{ChildSessionRoot, RootFile};
+        use crate::utils::process::ProcessStamp;
+
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        run_async(async {
+            let mut ctx = repl_ctx();
+            let app = ctx.app.config.clone();
+            let mut session = Session::new_from_ctx(&ctx, &app, "fork-src").unwrap();
+            session.set_save_session(Some(true));
+            ctx.session = Some(session);
+            let path = ctx.session_file_for("fork-src", SessionScope::Global);
+            let root = ChildSessionRoot::from_stamp(ProcessStamp::current());
+            root.ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
+                .unwrap();
+            ctx.child_session_root = Some(Arc::new(root.clone()));
+            let (supervisor, child_signal) = supervisor_with_cancellable_agent();
+            ctx.supervisor = Some(Arc::clone(&supervisor));
+
+            repl_command(&mut ctx, ".fork fork-dst").await.unwrap();
+
+            assert!(
+                !child_signal.aborted_ctrlc(),
+                "a fork keeps the session and its children; nothing is cancelled"
+            );
+            assert_eq!(supervisor.read().is_finished("a1"), Some(false));
+            assert_eq!(ctx.session.as_ref().map(Session::name), Some("fork-dst"));
+            assert!(
+                ctx.session_file_for("fork-dst", SessionScope::Global)
+                    .is_file()
+            );
+            assert!(
+                path.is_file(),
+                "the source session's file is saved and stays"
+            );
+            assert!(
+                !root.dir().exists(),
+                "the inherited process root is settled"
+            );
+            assert!(ctx.child_session_root.is_none());
+
+            child_signal.set_ctrlc();
+        });
+    }
+
     /// Every session exit runs behind a live editor loop, so the ordering
     /// is pinned by source scrape: the cancel-and-wait must precede the
     /// exit, or the empty, that settles the session's child directory.

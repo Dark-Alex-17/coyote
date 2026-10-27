@@ -14246,6 +14246,52 @@ mod tests {
         assert!(matches!(*next, ChildSessionRoot::Uid(_)), "{next:?}");
     }
 
+    /// Saving an attached session under a new name is not a rename: the
+    /// old file stays, the root's identity now lists both saved copies, and
+    /// the children survive the exit even once the new file is gone, since
+    /// the old entry is still a parent that exists.
+    #[test]
+    #[serial]
+    fn usage_probe_save_session_under_a_new_name_keeps_the_old_file_and_both_parents_live() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, old_path) = loaded_session_ctx("renamed-from");
+        let root = attach_uid_root(&mut ctx, &old_path, Some(retention_time()));
+        write_child(&root, "sess_coder_0123456789ab", retention_time());
+        ctx.session.as_mut().unwrap().set_save_session(Some(true));
+
+        ctx.save_session(Some("renamed-to"), None).unwrap();
+
+        let new_path = ctx.session_file_for("renamed-to", SessionScope::Workspace);
+        assert!(new_path.is_file());
+        assert!(
+            old_path.is_file(),
+            "the old copy is not removed by a save under a new name"
+        );
+        assert_eq!(ctx.session.as_ref().unwrap().name(), "renamed-to");
+        assert_eq!(session_uid(&ctx), Some(root_uid(&root)));
+        let record = child_sessions::RootFile::load(&root.root_file()).unwrap();
+        let canonical = |path: &Path| std::fs::canonicalize(path).unwrap();
+        assert!(record.parent_paths.contains(&canonical(&old_path)));
+        assert!(record.parent_paths.contains(&canonical(&new_path)));
+        assert_eq!(record.parent_paths.len(), 2);
+        assert!(child_present(&root, "sess_coder_0123456789ab"));
+
+        remove_file(&new_path).unwrap();
+        ctx.exit_session().unwrap();
+
+        assert!(root.dir().is_dir(), "the old copy keeps the root alive");
+        assert!(child_present(&root, "sess_coder_0123456789ab"));
+        assert!(ctx.session.is_none());
+        assert!(ctx.child_session_root.is_none());
+
+        remove_file(&old_path).unwrap();
+        child_sessions::settle_parent_exit(&root, None);
+        assert!(
+            !root.dir().exists(),
+            "with both copies gone the root has no parent left"
+        );
+    }
+
     /// Only a process root is settled at the attach; a uid root already
     /// cached stays as it is.
     #[test]
