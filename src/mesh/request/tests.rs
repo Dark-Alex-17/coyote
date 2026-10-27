@@ -1505,6 +1505,30 @@ pub(crate) mod network {
         }
     }
 
+    /// Waits for the receiver to take the first part of `resource_hash`, after which the
+    /// transfer is one the sender's cancel reaches: a cancel ahead of the receiver's
+    /// acceptance is dropped and the transfer completes anyway.
+    async fn await_inbound_progress(
+        events: &mut broadcast::Receiver<ResourceEvent>,
+        resource_hash: Hash,
+    ) {
+        let deadline = tokio::time::Instant::now() + INTEROP_TIMEOUT;
+        loop {
+            let event = tokio::time::timeout_at(deadline, events.recv())
+                .await
+                .expect("the receiver must start on the response resource")
+                .unwrap();
+            if event.hash == resource_hash
+                && matches!(
+                    event.kind,
+                    ResourceEventKind::Progress(_) | ResourceEventKind::SegmentComplete(_)
+                )
+            {
+                return;
+            }
+        }
+    }
+
     /// A started `MeshRuntime` (node A) connected to a bare responder (node B), so either
     /// side can request from the other.
     pub(crate) struct NodePair {
@@ -2373,6 +2397,59 @@ pub(crate) mod network {
         assert!(
             failed_in < SHORT_REQUEST_TIMEOUT,
             "the request outlived its link by {failed_in:?}"
+        );
+        requester.stop().await;
+        responder.stop().await;
+    }
+
+    /// A response resource that fails under a request in flight fails it as `LinkFailed`
+    /// naming the failed transfer, and does so when the transfer fails rather than when
+    /// the request's budget runs out: the budget is long enough that a timeout cannot
+    /// stand in for it. The responder cancels its own outbound once the requester has
+    /// taken a first part of it, which is how a peer that gives up mid-transfer looks from
+    /// here. The body is random so it compresses to nothing and crosses as many parts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_response_resource_that_fails_mid_transfer_fails_the_request_as_link_failed() {
+        let recorder = Arc::new(Recorder::default());
+        let (responder, requester, desc) = pair(recorder.clone()).await;
+        let (in_flight, seen) = hanging_request_on(
+            &requester,
+            &recorder,
+            &desc,
+            "/slow",
+            TRANSFER_REQUEST_TIMEOUT,
+        )
+        .await;
+        let mut random = vec![0u8; MAX_REQUEST_PAYLOAD_BYTES / 2];
+        RngCore::fill_bytes(&mut OsRng, &mut random);
+        let bytes = ResponseFrame {
+            request_id: seen.request_id,
+            data: Value::Binary(random),
+        }
+        .encode();
+        assert!(bytes.len() <= MAX_REQUEST_PAYLOAD_BYTES);
+        let mut events = requester.transport.resource_events();
+        let hash = answer_as_resource(&responder, &requester, &seen, bytes).await;
+        await_inbound_progress(&mut events, hash).await;
+
+        let cancelling = Instant::now();
+        let cancelled = responder
+            .transport
+            .cancel_resource(&seen.link_id, hash)
+            .await
+            .unwrap();
+        assert!(cancelled, "the response was still being sent");
+        let result = timeout(INTEROP_TIMEOUT, in_flight).await.unwrap().unwrap();
+        let failed_in = cancelling.elapsed();
+        assert_eq!(
+            result.unwrap_err(),
+            RequestError::LinkFailed(
+                "the response resource failed before it completed".to_string()
+            )
+        );
+        assert!(
+            failed_in < TRANSFER_REQUEST_TIMEOUT / 2,
+            "the request outlived its response resource by {failed_in:?}"
         );
         requester.stop().await;
         responder.stop().await;

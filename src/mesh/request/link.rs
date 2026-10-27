@@ -193,6 +193,11 @@ pub(crate) async fn request_on_link(
             return Err(RequestError::Decode("response frame".to_string()));
         }
         Err(err @ LibraryRequestError::Send) => return Err(RequestError::Send(err.to_string())),
+        Err(LibraryRequestError::Receive) => {
+            return Err(RequestError::LinkFailed(
+                "the response resource failed before it completed".to_string(),
+            ));
+        }
         Err(err) => return Err(RequestError::LinkFailed(err.to_string())),
     };
     let value = response.into_value().ok_or_else(|| {
