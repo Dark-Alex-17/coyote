@@ -7058,6 +7058,12 @@ mod tests {
             idle_b.has(&format!("`.mesh answer {id} \"<text>\"`"))
         })
         .await;
+        // The collect wakes on the correlation before the notice is filed in the
+        // inbox.
+        wait_until("the notice to reach A's inbox", || {
+            peer.ctx.app.mesh.peer_inbox().len() == 1
+        })
+        .await;
         let inbox = peer.tool("check_inbox", json!({})).await;
         assert_eq!(inbox["escalated"], json!([id]), "{inbox}");
         assert_eq!(inbox["count"], 1, "{inbox}");
@@ -7221,6 +7227,10 @@ mod tests {
         assert!(store_b.get(&id).unwrap().is_some());
         wait_until("the human on B to be told", || {
             idle_b.has(&format!("`.mesh answer {id} \"<text>\"`"))
+        })
+        .await;
+        wait_until("the notice to reach A's inbox", || {
+            peer.ctx.app.mesh.peer_inbox().len() == 1
         })
         .await;
         let inbox = peer.tool("check_inbox", json!({})).await;
