@@ -625,6 +625,318 @@ fn usage_probe_a_dynamic_instructions_teammate_carries_the_roster_after_the_rend
     );
 }
 
+/// A single PLAIN agent node (no `teammates: true`) on config agent `alpha`,
+/// followed by the same state dump the roster fan-out uses: `worker` is the
+/// start node, `join` dumps the raw state to `dump`.
+fn write_plain_resume_graph(dir: &Path, dump: &Path) {
+    write_roster_fan_out(dir, dump);
+    fs::write(
+        dir.join("agents").join(AGENT).join("graph.yaml"),
+        "name: echo-graph\n\
+         version: \"1.0\"\n\
+         initial_state: { a: \"\" }\n\
+         start: worker\n\
+         nodes:\n\
+         \x20 worker: { type: agent, agent: alpha, prompt: \"hi from a\", state_updates: { a: \"{{output}}\" }, next: join }\n\
+         \x20 join: { type: script, script: scripts/dump.sh, next: done }\n\
+         \x20 done: { type: end, output: \"done\" }\n",
+    )
+    .unwrap();
+}
+
+/// Writes alpha's stored `agent_session: t` from an earlier run: `system`
+/// is both the System row and `agent_instructions`, followed by one
+/// exchange; `extra` is spliced in as further top-level session fields.
+fn write_alpha_session(dir: &Path, system: &str, extra: &str) {
+    let sessions = dir.join("agents").join("alpha").join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(
+        sessions.join("t.yaml"),
+        format!(
+            "model: dryrun:dry-model\n\
+             agent_instructions: {system:?}\n\
+             {extra}\
+             messages:\n\
+             \x20 - role: system\n\
+             \x20   content: {system:?}\n\
+             \x20 - role: user\n\
+             \x20   content: earlier\n\
+             \x20 - role: assistant\n\
+             \x20   content: noted\n",
+        ),
+    )
+    .unwrap();
+}
+
+/// Resuming a stored `agent_session` from a PLAIN agent node (no
+/// `teammates: true`) is the unseated shape: this run has no roster to
+/// append, yet the stored System row may carry the previous run's roster
+/// for seats that no longer exist. That row is re-adopted from the agent's
+/// own instructions, so the model sees exactly `Be brief.` with no roster
+/// text anywhere, the earlier exchange in order and the bare node prompt.
+/// A stored session that never carried a roster is the ordinary resume: it
+/// keeps speaking with the System row it was saved under, even though the
+/// configured instructions differ, so nothing re-adopts it.
+#[test]
+fn usage_probe_an_unseated_resume_drops_a_stored_roster_and_leaves_a_plain_row_alone() {
+    if cfg!(windows) {
+        eprintln!("skipping: the state dump goes through a bash script");
+        return;
+    }
+    const STALE_SEAT: &str = "graph_agent_alpha_deadbeef";
+    for (label, stored_system, expected_system) in [
+        (
+            "stale roster",
+            format!(
+                "Be brief.\n\n## Teammate roster\nYou are `{STALE_SEAT}` (worker_a). Peers: `graph_agent_beta_cafef00d` (worker_b)."
+            ),
+            "Be brief.".to_string(),
+        ),
+        (
+            "no roster",
+            "Old prompt from the stored run.".to_string(),
+            "Old prompt from the stored run.".to_string(),
+        ),
+    ] {
+        let dir = fresh_config_dir("unseated-resume");
+        let _guard = TempDirGuard(dir.clone());
+        write_fixture(&dir, "");
+        write_sessioned_config_agent(&dir, "alpha");
+        let dump = dir.join("state.json");
+        write_plain_resume_graph(&dir, &dump);
+        write_alpha_session(&dir, &stored_system, "");
+
+        let state = run_roster_fan_out(label, &dir, &dump);
+        let echo = state["a"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{label}: state.a is not the echo:\n{state}"));
+        let messages = echoed_messages(echo);
+        let (first_role, system) = &messages[0];
+        assert_eq!(first_role, "system", "{label}:\n{echo}");
+        // A re-adopted row is the agent's prompt, which the built-in tool
+        // guidance follows; a row left alone is sent exactly as stored.
+        assert!(
+            system.starts_with(&expected_system),
+            "{label}: the System row the resumed agent speaks with:\n{echo}"
+        );
+        if label == "no roster" {
+            assert_eq!(
+                system, &expected_system,
+                "{label}: nothing re-adopts a roster-less row:\n{echo}"
+            );
+        }
+        assert!(
+            !echo.contains("Teammate roster") && !echo.contains(STALE_SEAT),
+            "{label}: no roster text anywhere in the request:\n{echo}"
+        );
+        let roles: Vec<&str> = messages.iter().map(|(role, _)| role.as_str()).collect();
+        assert_eq!(
+            roles,
+            ["system", "user", "assistant", "user"],
+            "{label}:\n{echo}"
+        );
+        let users: Vec<&String> = messages
+            .iter()
+            .filter(|(role, _)| role == "user")
+            .map(|(_, content)| content)
+            .collect();
+        assert_eq!(users, vec!["earlier", "hi from a"], "{label}:\n{echo}");
+    }
+}
+
+/// The same unseated resume for a `dynamic_instructions` agent: the stored
+/// session re-enters as the session's dynamic text, so the model sees the
+/// text the earlier run stored (not what the hook says today) with its
+/// trailing roster cut, and nothing else.
+#[test]
+fn usage_probe_an_unseated_dynamic_instructions_resume_keeps_the_stored_text_minus_its_roster() {
+    if cfg!(windows) {
+        eprintln!("skipping: the state dump goes through a bash script");
+        return;
+    }
+    let dir = fresh_config_dir("unseated-dynamic-resume");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, "");
+    let alpha_dir = dir.join("agents").join("alpha");
+    fs::create_dir_all(&alpha_dir).unwrap();
+    fs::write(
+        alpha_dir.join("config.yaml"),
+        "name: alpha\n\
+         description: A helper.\n\
+         instructions: Be brief.\n\
+         dynamic_instructions: true\n\
+         agent_session: t\n",
+    )
+    .unwrap();
+    fs::write(
+        alpha_dir.join("tools.sh"),
+        "#!/usr/bin/env bash\n\
+         set -eo pipefail\n\
+         # @env LLM_OUTPUT=/dev/stdout\n\
+         # @describe alpha tools\n\
+         \n\
+         # @cmd Dynamic instructions hook.\n\
+         _instructions() { printf 'Be brief about dogs.' >> \"$LLM_OUTPUT\"; }\n",
+    )
+    .unwrap();
+    let dump = dir.join("state.json");
+    write_plain_resume_graph(&dir, &dump);
+    write_alpha_session(
+        &dir,
+        "Be brief about cats.\n\n## Teammate roster\nYou are `graph_agent_alpha_deadbeef` (worker_a).",
+        "",
+    );
+
+    let state = run_roster_fan_out("dynamic unseated", &dir, &dump);
+    let echo = state["a"]
+        .as_str()
+        .unwrap_or_else(|| panic!("state.a is not the echo:\n{state}"));
+    let messages = echoed_messages(echo);
+    let (first_role, system) = &messages[0];
+    assert_eq!(first_role, "system", "{echo}");
+    assert!(
+        system.starts_with("Be brief about cats."),
+        "the stored dynamic text, roster cut, hook text not re-run:\n{echo}"
+    );
+    assert!(
+        !echo.contains("Teammate roster") && !echo.contains("deadbeef"),
+        "{echo}"
+    );
+    assert!(
+        !echo.contains("dogs"),
+        "the stored session is not re-rendered by the hook:\n{echo}"
+    );
+    let users: Vec<&String> = messages
+        .iter()
+        .filter(|(role, _)| role == "user")
+        .map(|(_, content)| content)
+        .collect();
+    assert_eq!(users, vec!["earlier", "hi from a"], "{echo}");
+}
+
+/// A teammate resumed on a COMPRESSED `agent_session`: the stored System row
+/// is the prompt of the run that compressed it followed by the summary, and
+/// `compressed_system_prompt` holds that prompt. Re-adoption replaces only
+/// the prompt at the head of the row, so the summary survives behind this
+/// run's prompt and roster. When the row no longer starts with the stored
+/// prompt, nothing is rewritten: the row is sent as stored and the run log
+/// says why.
+#[test]
+fn usage_probe_a_compressed_resume_keeps_its_summary_and_a_drifted_row_is_left_alone() {
+    if cfg!(windows) {
+        eprintln!("skipping: the fan-out joins through a bash script");
+        return;
+    }
+    const STALE_SEAT: &str = "graph_agent_alpha_deadbeef";
+    const SUMMARY: &str = "Summary: earlier we settled on cats.";
+    let stale_system = format!(
+        "Be brief.\n\n## Teammate roster\nYou are `{STALE_SEAT}` (worker_a). Peers: `graph_agent_beta_cafef00d` (worker_b)."
+    );
+    for (label, stored_prompt, row) in [
+        (
+            "prefix hit",
+            stale_system.clone(),
+            format!("{stale_system}\n\n{SUMMARY}"),
+        ),
+        (
+            "prefix miss",
+            "Be brief.".to_string(),
+            format!("Something else entirely.\n\n{stale_system}\n\n{SUMMARY}"),
+        ),
+    ] {
+        let dir = fresh_config_dir("compressed-resume");
+        let _guard = TempDirGuard(dir.clone());
+        write_fixture(&dir, "");
+        write_sessioned_config_agent(&dir, "alpha");
+        write_sessioned_config_agent(&dir, "beta");
+        let dump = dir.join("state.json");
+        write_roster_fan_out(&dir, &dump);
+        let sessions = dir.join("agents").join("alpha").join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            sessions.join("t.yaml"),
+            format!(
+                "model: dryrun:dry-model\n\
+                 agent_instructions: {stale_system:?}\n\
+                 compressed_system_prompt: {stored_prompt:?}\n\
+                 messages:\n\
+                 \x20 - role: system\n\
+                 \x20   content: {row:?}\n\
+                 \x20 - role: user\n\
+                 \x20   content: earlier\n\
+                 \x20 - role: assistant\n\
+                 \x20   content: noted\n",
+            ),
+        )
+        .unwrap();
+
+        let output = run_with_env(&dir, &["-a", AGENT, "go"], &[("COYOTE_LOG_LEVEL", "warn")]);
+        let text = format!("{}\n{}", stderr_of(&output), stdout_of(&output));
+        assert!(
+            output.status.success()
+                && !text.contains("panicked")
+                && stdout_of(&output).lines().any(|l| l == "done"),
+            "{label}: the fan-out completes: exit {:?}\n{text}",
+            output.status
+        );
+        let state: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&dump).unwrap()).unwrap();
+        let echo = state["a"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{label}: state.a is not the echo:\n{state}"));
+        let messages = echoed_messages(echo);
+        let (first_role, system) = &messages[0];
+        assert_eq!(first_role, "system", "{label}:\n{echo}");
+        let log = fs::read_to_string(dir.join("cache").join("coyote.log")).unwrap_or_default();
+        let kept_line = "keeps its summary row: it does not start with the stored prompt";
+        if label == "prefix hit" {
+            assert!(
+                system.starts_with("Be brief.\n\n## Teammate roster\n"),
+                "{label}: this run's prompt and roster lead the row:\n{system}"
+            );
+            assert!(
+                system.ends_with(&format!("\n\n{SUMMARY}")),
+                "{label}: the summary survives behind the fresh prompt:\n{system}"
+            );
+            assert!(
+                system.contains("(worker_a)") && system.contains("worker_b"),
+                "{label}: the roster names this run's seats:\n{system}"
+            );
+            assert!(
+                !echo.contains(STALE_SEAT) && !echo.contains("cafef00d"),
+                "{label}: the stale seats are gone:\n{echo}"
+            );
+            assert_eq!(
+                echo.matches("## Teammate roster").count(),
+                1,
+                "{label}:\n{echo}"
+            );
+            assert!(
+                !log.contains(kept_line),
+                "{label}: nothing to warn about:\n{log}"
+            );
+        } else {
+            assert_eq!(
+                system, &row,
+                "{label}: a row that drifted from the stored prompt is sent as stored:\n{echo}"
+            );
+            assert_eq!(
+                log.lines()
+                    .filter(|l| l.contains("[WARN]") && l.contains(kept_line))
+                    .count(),
+                1,
+                "{label}: the run log says once why the row was left alone:\n{log}"
+            );
+        }
+        let users: Vec<&String> = messages
+            .iter()
+            .filter(|(role, _)| role == "user")
+            .map(|(_, content)| content)
+            .collect();
+        assert_eq!(users, vec!["earlier", "hi from a"], "{label}:\n{echo}");
+    }
+}
+
 /// Declaring `carry:` lifts the engage-time validator pass onto a block-less
 /// graph, but not the session rule: a graph agent without a `session:` block
 /// is still refused a `--session`, with the teaching sentence, and no session

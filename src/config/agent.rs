@@ -2306,6 +2306,89 @@ nodes: {}
         );
     }
 
+    /// The roster heading is a whole line or nothing. The operator's own
+    /// text may mention it mid-sentence (`Keep the ## Teammate roster
+    /// short.`) or open a line with it and keep writing (`## Teammate roster
+    /// is a myth.`); neither is a roster section, so neither is cut when
+    /// this run's roster is appended: the request carries both the sentence
+    /// and exactly one real section, in that order.
+    #[test]
+    fn usage_probe_a_roster_heading_inside_a_line_is_not_a_roster_section() {
+        let fresh = format!("{TEAMMATE_ROSTER_HEADING}\nYou are `p1` (shards[0]).");
+        for base in [
+            format!("Keep the {TEAMMATE_ROSTER_HEADING} short."),
+            format!("Be brief.\n\n{TEAMMATE_ROSTER_HEADING} is a myth."),
+            format!("Be brief.\n\n{TEAMMATE_ROSTER_HEADING}:\nnot a section either"),
+        ] {
+            let mut agent = Agent::test_new(AgentConfig {
+                instructions: base.clone(),
+                ..AgentConfig::default()
+            });
+            agent.set_instructions_appendix(fresh.clone());
+            let output = agent.interpolated_instructions();
+            assert!(
+                output.starts_with(&format!("{base}\n\n{fresh}")),
+                "the operator's sentence survives ahead of the appended roster:\n{output}"
+            );
+            assert_eq!(
+                output.matches(TEAMMATE_ROSTER_HEADING).count(),
+                2,
+                "one mention in the sentence, one real section:\n{output}"
+            );
+        }
+    }
+
+    /// A resumed `agent_session` re-enters a `dynamic_instructions` agent as
+    /// the session's dynamic text, roster and all. That trailing section is
+    /// cut whether or not this run appends a fresh one: an unseated resume
+    /// is left with the stored text alone, a seated one with the stored text
+    /// plus this run's section. The configured text is the operator's own and
+    /// keeps a trailing section until an appendix replaces it.
+    #[test]
+    fn usage_probe_the_session_dynamic_text_drops_its_trailing_roster_without_an_appendix() {
+        let stale = format!("{TEAMMATE_ROSTER_HEADING}\nYou are `graph_agent_x_deadbeef`.");
+        let stored = format!("Be brief about cats.\n\n{stale}\n");
+        let mut dynamic = Agent::test_new(AgentConfig {
+            instructions: "Be brief.".to_string(),
+            dynamic_instructions: true,
+            ..AgentConfig::default()
+        });
+        dynamic
+            .update_session_dynamic_instructions(Some(stored.clone()), None)
+            .unwrap();
+
+        // Built-in tool guidance follows the instructions, so the prompt is
+        // judged by its head and by what it no longer carries.
+        let output = dynamic.interpolated_instructions();
+        assert!(
+            output.starts_with("Be brief about cats."),
+            "the stored dynamic text wins over the configured line and loses its roster:\n{output}"
+        );
+        assert!(!output.contains(TEAMMATE_ROSTER_HEADING), "{output}");
+        assert!(!output.contains("deadbeef"), "{output}");
+
+        let fresh = format!("{TEAMMATE_ROSTER_HEADING}\nYou are `p1` (shards[0]).");
+        dynamic.set_instructions_appendix(fresh.clone());
+        let output = dynamic.interpolated_instructions();
+        assert!(
+            output.starts_with(&format!("Be brief about cats.\n\n{fresh}")),
+            "{output}"
+        );
+        assert_eq!(
+            output.matches(TEAMMATE_ROSTER_HEADING).count(),
+            1,
+            "{output}"
+        );
+
+        // The configured text is only cut when an appendix replaces it.
+        let configured = Agent::test_new(AgentConfig {
+            instructions: stored.clone(),
+            ..AgentConfig::default()
+        });
+        let output = configured.interpolated_instructions();
+        assert!(output.starts_with(&stored), "{output}");
+    }
+
     use crate::testing::TestConfigDirGuard;
 
     const PROBE_GLOBAL_TOOL: &str = "#!/usr/bin/env bash\n# @describe Read a file.\n# @option --path! The file\nmain() { cat \"$argc_path\"; }\n";
