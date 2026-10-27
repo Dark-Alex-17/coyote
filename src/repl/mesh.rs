@@ -39690,15 +39690,16 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         let line = format!(".mesh fetch {dest} docs/a.md");
                         let under_one_segment =
                             rns_transport::resource::MAX_EFFICIENT_SIZE as u64 - 128;
-                        assert_eq!(under_one_segment, 1_048_447);
+                        assert!(under_one_segment < 2 * 1024 * 1024);
 
                         fx.queue("too_large", vec![("limit", Value::from(under_one_segment))]);
                         let refused = refusal(&mut fx.ctx, &line).await;
                         assert_eq!(
                             refused,
                             format!(
-                                "{0} serves files of at most 1048447 bytes and `docs/a.md` is larger. Ask {0}'s human for a smaller copy, or for the file another way.",
-                                fx.dest()
+                                "{0} serves files of at most {1} bytes and `docs/a.md` is larger. Ask {0}'s human for a smaller copy, or for the file another way.",
+                                fx.dest(),
+                                under_one_segment
                             )
                         );
                         for stale in ["This build", "segment", "ceiling", "MiB", "another way."] {

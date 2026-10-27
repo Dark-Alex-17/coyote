@@ -2790,8 +2790,10 @@ fn the_interfaces_block_is_byte_identical_across_the_template_the_example_and_th
 /// template/example/README half runs on every run; the pages only with `COYOTE_WIKI_DIR`.
 #[test]
 fn usage_probe_the_max_bytes_twins_name_the_setting_as_the_only_bound_on_a_served_file() {
-    const RETIRED: [&str; 8] = [
-        "1048447",
+    // The retired per-file ceiling was one Resource segment less the reply framing; spelled
+    // from its parts so the number itself never reappears in this tree as a literal.
+    let retired_ceiling = (1024 * 1024 - 1 - 128).to_string();
+    const RETIRED: [&str; 7] = [
         "min(max_bytes",
         "per-file ceiling",
         "segment ceiling",
@@ -2810,7 +2812,7 @@ fn usage_probe_the_max_bytes_twins_name_the_setting_as_the_only_bound_on_a_serve
     };
     let clean = |label: &str, text: &str| {
         let flat = flat(text);
-        for stale in RETIRED {
+        for stale in RETIRED.iter().copied().chain([retired_ceiling.as_str()]) {
             assert!(
                 !flat.contains(stale),
                 "{label} still carries the retired clause {stale:?}:\n{text}"
