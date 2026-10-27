@@ -57,13 +57,14 @@ mcp_servers:
   - ddg-search
 
 # fs_write/fs_patch/execute_command are granted, but the instructions bind
-# writes to plans//design-doc paths ONLY - this agent never modifies source
+# writes to plans/ design-doc paths ONLY - this agent never modifies source
 # code and never commits or pushes. When the engine grows a
 # `conversational: true` certification, that flag takes over enforcement;
 # until then the discipline is prose + the owner's review.
 global_tools:
   - ast_grep.sh
   - fs_read.sh
+  - fs_cat.sh
   - fs_grep.sh
   - fs_glob.sh
   - fs_ls.sh

@@ -29,15 +29,15 @@ Built as a plain config agent, so it is useful standalone today and becomes the
 |---|---|
 | Spawnables: consult set only (explore, librarian, deep-research, oracle) | read-only doctrine + no recursion |
 | No `agent_session: temp` | The accumulated conversation IS the value; resume, never respawn |
-| `summarization_threshold: 200000` | Long design sessions compress late, like the architect |
+| `summarization_threshold: 200000` | Long design sessions compress later than the architect (100k) and sisyphus (80k) |
 | Write discipline in instructions, not tool grants | A future `conversational: true` certification flag takes over enforcement when it exists; until then the discipline is prose + owner review |
 
 ## Usage
 
 ```
-coyote --agent engineer                                  # standalone, cwd repo
-coyote --agent engineer --variable project_dir=~/code/myrepo \
-                        --variable reference_root=~/code  # enable cross-repo reads
+coyote -a engineer                                                # standalone, cwd repo
+coyote -a engineer --agent-variable project_dir ~/code/myrepo \
+                   --agent-variable reference_root ~/code         # enable cross-repo reads
 ```
 
 Later (graph sessions): `session.chat.agent: engineer` in orchestrator graphs.
