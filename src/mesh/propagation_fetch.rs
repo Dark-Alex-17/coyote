@@ -3202,7 +3202,7 @@ mod tests {
                 ),
                 "listed 2, wanting 2, have 0".to_string(),
                 format!("round 2 requested 2 bodies within {FETCH_TRANSFER_LIMIT_KB} kB"),
-                "received 2 bodies (800 bytes, Resource)".to_string(),
+                "received 2 bodies (800 bytes)".to_string(),
                 "round 3 acknowledging 2 bodies, leaving 0 deferred on the node".to_string(),
                 "round 3 acknowledged 2; delivered 0, duplicates 0, discarded 2, deferred 0"
                     .to_string(),
