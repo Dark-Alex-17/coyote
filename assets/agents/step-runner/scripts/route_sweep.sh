@@ -12,12 +12,12 @@ fi
 needs_review=$(echo "$state" | jq -r '.needs_independent_review // false')
 
 if [[ "${STEP_SKIP_REVIEW:-0}" == "1" ]]; then
-  jq -nc '{"_next": "write_handoff"}'
+  jq -nc '{"_next": "write_handoff", "last_script_error": ""}'
   exit 0
 fi
 
 if [[ "$needs_review" == "true" ]]; then
-  jq -nc '{"_next": "independent_review"}'
+  jq -nc '{"_next": "independent_review", "last_script_error": ""}'
 else
-  jq -nc '{"_next": "write_handoff"}'
+  jq -nc '{"_next": "write_handoff", "last_script_error": ""}'
 fi

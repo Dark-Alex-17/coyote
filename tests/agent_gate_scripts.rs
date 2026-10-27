@@ -1876,6 +1876,38 @@ fn step_runner_route_coder_result_failed_clears_gate_error() {
     assert_eq!(str_field(&out, "last_script_error"), "", "{out}");
 }
 
+/// route_sweep follows the edge-case sweep, whose tolerated script crash is
+/// recorded in `last_script_error`; every arm clears it so a later unrelated
+/// failure does not render the stale message.
+#[test]
+fn route_sweep_clears_the_last_script_error_on_every_arm() {
+    if tools_missing() {
+        return;
+    }
+    for (needs_review, skip_review, next) in [
+        (true, None, "independent_review"),
+        (false, None, "write_handoff"),
+        (true, Some("1"), "write_handoff"),
+    ] {
+        let mut cmd = bash();
+        cmd.arg(asset("step-runner/scripts/route_sweep.sh"))
+            .env(
+                "GRAPH_STATE",
+                serde_json::json!({ "needs_independent_review": needs_review }).to_string(),
+            )
+            .env_remove("GRAPH_STATE_FILE")
+            .env_remove("STEP_SKIP_REVIEW");
+        if let Some(skip) = skip_review {
+            cmd.env("STEP_SKIP_REVIEW", skip);
+        }
+        let (code, stdout, stderr) = run(cmd.output().expect("spawn bash"));
+        assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+        let out: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+        assert_eq!(str_field(&out, "_next"), next, "{out}");
+        assert_eq!(str_field(&out, "last_script_error"), "", "{out}");
+    }
+}
+
 #[test]
 fn graphs_seed_and_render_the_gate_crash_keys() {
     for agent in ["coder", "step-runner"] {
