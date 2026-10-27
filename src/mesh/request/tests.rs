@@ -7748,6 +7748,53 @@ pub(crate) mod network {
         responder.stop().await;
     }
 
+    /// A settled reply too big for a packet is sent as a resource under the handler's
+    /// slot, and the slot is back once the send is dispatched: the transfer's outcome,
+    /// which confirms the settlement, is awaited off it. The settlement counts the free
+    /// slots the moment it is confirmed, so the order of the two is what is asserted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_settled_resource_reply_frees_its_slot_before_the_transfer_confirms_it() {
+        struct SlotsWhenSent {
+            adapter: Arc<LibraryHandler>,
+            free: Arc<Mutex<Option<usize>>>,
+        }
+        impl Settlement for SlotsWhenSent {
+            fn sent(self: Box<Self>) {
+                *self.free.lock() = Some(self.adapter.available_permits());
+            }
+        }
+        let recorder = Arc::new(Recorder::default());
+        let (responder, requester, desc) = pair(recorder.clone()).await;
+        let free = Arc::new(Mutex::new(None));
+        recorder.queue(Script::Reply(Reply::Settled {
+            value: card(),
+            settlement: Box::new(SlotsWhenSent {
+                adapter: responder.adapter.clone(),
+                free: free.clone(),
+            }),
+        }));
+
+        let outcome = requester.request(&desc, "/echo", Value::Nil).await.unwrap();
+
+        assert_eq!(outcome.value, card());
+        assert_eq!(outcome.response_branch, SizeBranch::Resource);
+        wait_until("the completed transfer to confirm the settlement", || {
+            free.lock().is_some()
+        })
+        .await;
+        assert_eq!(
+            *free.lock(),
+            Some(MAX_CONCURRENT_INBOUND_REQUESTS),
+            "the slot was free before the transfer confirmed the settlement"
+        );
+        assert_eq!(
+            responder.adapter.available_permits(),
+            MAX_CONCURRENT_INBOUND_REQUESTS
+        );
+        requester.stop().await;
+        responder.stop().await;
+    }
+
     /// A `CardSource` of plain data, standing in for the slot behind a status provider.
     #[derive(Default)]
     struct FixtureSource {
