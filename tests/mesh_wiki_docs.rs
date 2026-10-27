@@ -7364,14 +7364,14 @@ fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
     }
 }
 
-/// Both pages quote the next step the REPL's `fetch` appends to a too-large refusal
-/// when the limit is below the per-file ceiling, the peer standing as `<dest8>`.
+/// Both pages quote the next step the REPL's `fetch` appends to a too-large refusal, the
+/// peer standing as `<dest8>`.
 #[test]
 fn the_too_large_refusal_is_quoted_with_its_next_step_on_both_pages() {
     let next_step = string_literals(&fn_body("src/repl/mesh.rs", "fetch"))
         .into_iter()
-        .find(|literal| literal.starts_with(" Ask "))
-        .expect("fetch formats the too-large next step as a literal opening with ` Ask `");
+        .find_map(|literal| literal.find(" Ask ").map(|at| literal[at..].to_string()))
+        .expect("fetch formats the too-large refusal with a next step opening ` Ask `");
     assert!(
         next_step.contains("{peer}") && next_step.ends_with('.'),
         "the too-large next step names the peer and is a full sentence: {next_step:?}"
@@ -7808,55 +7808,42 @@ fn the_pages_quote_a_peers_refusal_as_the_code_prints_it_with_the_side_that_has_
     }
 }
 
-/// `ceiling_note` words the one-segment ceiling for two sides: `.mesh fetch` is the client,
-/// so the setting it overrides is the peer's `max_bytes`; `.mesh grant` judges a file
-/// against this node's own `mesh.fetch.max_bytes`, so the note names that instead. The
-/// File-Sharing page's ceiling note quotes both, with the number the page says the build
-/// serves today.
+/// A size refusal blames the limit of the node that holds it: `.mesh fetch` is the client,
+/// so its sentence names the peer's limit; `.mesh grant` judges a file against this node's
+/// own `mesh.fetch.max_bytes`, so its pre-flight names this node's. The File-Sharing page
+/// quotes both sentences in one blockquote, with `<dest8>`, `<limit>`, `<size>` and `<id>`
+/// standing for the values.
 #[test]
-fn the_file_sharing_page_quotes_the_ceiling_note_for_the_side_that_prints_it() {
-    let literals = string_literals(&fn_body("src/repl/mesh.rs", "ceiling_note"));
-    let template = literals
-        .iter()
-        .find(|literal| literal.starts_with(" This build carries at most "))
-        .expect("ceiling_note formats one sentence with the side's setting in it");
-    assert!(
-        template.contains("{SINGLE_SEGMENT_FETCH_CEILING}")
-            && template.contains("whatever {setting} allows"),
-        "{template:?}"
-    );
-    let fetch_side = "the peer's max_bytes";
-    let grant_side = "this node's mesh.fetch.max_bytes";
-    for setting in [fetch_side, grant_side] {
+fn the_file_sharing_page_quotes_the_size_refusal_for_the_side_that_prints_it() {
+    let fetch_side = string_literals(&fn_body("src/repl/mesh.rs", "fetch"))
+        .into_iter()
+        .find(|literal| literal.contains("serves files of at most {limit} bytes"))
+        .expect("fetch formats the too-large refusal naming the peer's limit")
+        .replace("{peer}", "<dest8>")
+        .replace("{shown}", "docs/guide.md")
+        .replace("{limit}", "<limit>");
+    let grant_side = string_literals(&fn_body("src/repl/mesh.rs", "refuse_unservable"))
+        .into_iter()
+        .find(|literal| literal.contains("this node serves at most {limit} bytes"))
+        .expect("refuse_unservable formats the size pre-flight naming this node's limit")
+        .replace("{shown}", "`docs/big.bin`")
+        .replace("{}", "<size>")
+        .replace("{limit}", "<limit>")
+        .replace("{id}", "<id>");
+    for sentence in [&fetch_side, &grant_side] {
         assert!(
-            literals.iter().any(|literal| literal == setting),
-            "ceiling_note no longer names {setting:?}: {literals:?}"
+            !sentence.contains('{') && sentence.ends_with('.'),
+            "a placeholder of the size refusal has no wiki stand-in, or the sentence is cut: {sentence:?}"
         );
     }
-    let sentence = |setting: &str, ceiling: &str| {
-        template
-            .trim_start()
-            .replace("{SINGLE_SEGMENT_FETCH_CEILING}", ceiling)
-            .replace("{setting}", setting)
-    };
 
     let Some(wiki) = wiki_dir() else { return };
-    let page = read(wiki.join("Mesh-File-Sharing.md"));
-    let today = page
-        .lines()
-        .find_map(|line| {
-            line.split_once("Coyote serves at most ")
-                .map(|(_, rest)| rest)
-        })
-        .and_then(|rest| rest.split_once(" bytes today"))
-        .map(|(number, _)| number.to_string())
-        .expect("the File-Sharing page says how many bytes Coyote serves per file today");
-    let note = flat(&blockquote_prose(&page));
-    for (side, setting) in [(".mesh fetch", fetch_side), (".mesh grant", grant_side)] {
-        let quoted = format!("`{}`", sentence(setting, &today));
+    let note = flat(&blockquote_prose(&read(wiki.join("Mesh-File-Sharing.md"))));
+    for (side, sentence) in [(".mesh fetch", fetch_side), (".mesh grant", grant_side)] {
+        let quoted = format!("`` {sentence} ``");
         assert!(
             note.contains(&quoted),
-            "the File-Sharing page does not quote the `{side}` ceiling note {quoted}:\n{note}"
+            "the File-Sharing page does not quote the `{side}` size refusal {quoted}:\n{note}"
         );
     }
 }

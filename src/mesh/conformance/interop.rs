@@ -12,16 +12,20 @@ use crate::mesh::node::{
     FullEnvoy, MeshRuntime, MeshSlot, NodeOptions, RecordingEnvoy, session_destination_name,
 };
 use crate::mesh::notify::{NotificationSink, RenderedNotification};
+use crate::mesh::request::FETCH_PATH;
 use crate::mesh::test_support::{
     Compatibility, OriginName, TempDir, TrustList, disable_ingress_control, mesh_paths,
-    private_config, wait_until,
+    private_config, snapshot_fixture, wait_until,
 };
 use crate::mesh::trust::TrustOptions;
-use crate::mesh::{hex_lower, short};
+use crate::mesh::{decode_hex, hex_lower, mesh_config_dir, short};
 use crate::repl::idle::testing::driver_on_a_fresh_state;
 use crate::supervisor::mailbox::EnvelopePayload;
 
+use rns_transport::rand_core::{OsRng, RngCore};
+use rns_transport::resource::MAX_EFFICIENT_SIZE;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Write};
@@ -341,6 +345,20 @@ impl Reference {
     /// Asks `node` for `path` over a fresh identified link and returns the reply as the
     /// reference unpacked it: an integer for a refusal code, a map otherwise.
     async fn request(&mut self, node: &Node, path: &str, envelope: Value) -> Value {
+        self.request_within(node, path, envelope, REQUEST_TIMEOUT)
+            .await
+    }
+
+    /// `request` with the reference's own wait for the reply set to `timeout`: a reply
+    /// that travels as a multi-segment Resource through Python RNS over loopback takes
+    /// longer than a status round trip.
+    async fn request_within(
+        &mut self,
+        node: &Node,
+        path: &str,
+        envelope: Value,
+        timeout: Duration,
+    ) -> Value {
         let reply = self
             .send(
                 "request",
@@ -349,9 +367,9 @@ impl Reference {
                     "instance_id": node.instance_id,
                     "path": path,
                     "envelope": envelope,
-                    "timeout_secs": REQUEST_TIMEOUT.as_secs(),
+                    "timeout_secs": timeout.as_secs(),
                 }),
-                REQUEST_TIMEOUT + LINK_TIMEOUT,
+                timeout + LINK_TIMEOUT,
             )
             .await;
         assert_eq!(reply["status"], json!("ready"), "{path}: {reply}");
@@ -1386,6 +1404,84 @@ async fn our_requests_are_decoded_by_the_reference() {
 
     node.stop().await;
     drop(reference);
+}
+
+/// A file of `MAX_EFFICIENT_SIZE` plus 512 KiB spans two Resource segments. The reference
+/// fetches it from this node over `/fetch` and hands back what Python RNS reassembled, so
+/// the bytes are compared across implementations and not between two copies of this crate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs COYOTE_MESH_INTEROP=1 and scripts/mesh-interop/setup.sh"]
+async fn a_reference_fetch_of_a_file_above_one_segment_arrives_whole() {
+    const MULTI_SEGMENT_FETCH_TIMEOUT: Duration = Duration::from_secs(90);
+    let Some(mut reference) = Reference::spawn().await else {
+        return;
+    };
+    let (session, _) = session_with_instance_id();
+    let node = Node::start(
+        "interop-fetch-big",
+        reference.ready.relay_port,
+        session,
+        &TrustList::default(),
+    )
+    .await;
+    reference.announce(Some("Reference")).await;
+    node.trust_reference(&reference).await;
+    reference
+        .send(
+            "wait_path",
+            json!({
+                "destination_hash": node.runtime.current_destination_hash(),
+                "timeout_secs": LINK_TIMEOUT.as_secs(),
+            }),
+            LINK_TIMEOUT + POLL,
+        )
+        .await;
+
+    let shares = mesh_config_dir(&mesh_paths(&node.tmp).config_dir).join("shares.yaml");
+    std::fs::create_dir_all(shares.parent().unwrap()).unwrap();
+    std::fs::write(shares, "version: 1\nallow:\n- pattern: 'docs/**'\n").unwrap();
+    let workspace = TempDir::new("interop-fetch-big-root");
+    std::fs::create_dir_all(workspace.path.join("docs")).unwrap();
+    let mut bytes = vec![0u8; MAX_EFFICIENT_SIZE + 512 * 1024];
+    RngCore::fill_bytes(&mut OsRng, &mut bytes);
+    std::fs::write(workspace.path.join("docs").join("big.bin"), &bytes).unwrap();
+    let mut snapshot = snapshot_fixture();
+    snapshot.cwd = workspace.path.clone();
+    node.slot.publish(snapshot);
+
+    let reply = reference
+        .request_within(
+            &node,
+            FETCH_PATH,
+            reference.envelope(json!({ "v": 1, "path": "docs/big.bin", "if_sha256": null })),
+            MULTI_SEGMENT_FETCH_TIMEOUT,
+        )
+        .await;
+    assert_eq!(reply["status"], json!("ok"), "{}", short_reply(&reply));
+    assert_eq!(reply["size"], json!(bytes.len()), "{}", short_reply(&reply));
+    let received = decode_hex(reply["bytes"].as_str().expect("bytes travel as hex"))
+        .expect("the reference renders bytes as hex");
+    assert_eq!(received.len(), bytes.len());
+    assert!(received == bytes, "the fetched bytes differ from the file");
+    assert_eq!(
+        reply["sha256"],
+        json!(hex_lower(&Sha256::digest(&bytes))),
+        "{}",
+        short_reply(&reply)
+    );
+
+    node.stop().await;
+    drop(reference);
+}
+
+/// `reply` with its `bytes` field cut to its length, so an assertion message does not
+/// print megabytes of hex.
+fn short_reply(reply: &Value) -> String {
+    let mut shown = reply.clone();
+    if let Some(hex) = shown["bytes"].as_str() {
+        shown["bytes"] = json!(format!("<{} hex chars>", hex.len()));
+    }
+    shown.to_string()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

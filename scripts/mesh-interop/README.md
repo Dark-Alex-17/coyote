@@ -25,7 +25,7 @@ Linux run of row 1 are covered by the `Mesh Interop` CI job), with the Rust side
 
 | Invocation | Result |
 |---|---|
-| `COYOTE_MESH_INTEROP=1 cargo test --all mesh::conformance -- --include-ignored` (vectors + interop) | 76 passed, 0 ignored |
+| `COYOTE_MESH_INTEROP=1 cargo test --all mesh::conformance -- --include-ignored` (vectors + interop) | 77 passed, 0 ignored |
 | `cargo test --all mesh::fuzz` | 21 passed |
 | `cargo test --all --no-fail-fast` | 7115 passed, 0 failed, 14 ignored in the unit binary; 530 passed, 1 ignored across the integration binaries |
 
@@ -81,7 +81,9 @@ creates a Coyote-shaped destination `scope.session.<instance_id>` serving `/stat
 in-process conformance vectors in `src/mesh/conformance/share_vectors.rs`,
 `access_vectors.rs` and `live_vectors.rs` (the last runs its node-pair rows over the
 loopback pair of `src/mesh/request/tests.rs` and its symlink rows on unix only), so the
-interop matrix exercises only `/status` and `/message`.
+interop matrix exercises `/status` and `/message` against the reference's handlers, and
+fetches one file above one Resource segment from the Coyote node over `/fetch` with the
+reference as the requester.
 
 | Command | Arguments | Reply / effect |
 |---|---|---|
