@@ -1085,8 +1085,8 @@ fn spawned_agent_hook_extras(
 /// cannot be read or written is logged and the caller carries on with the
 /// result it already has. The read-modify-write runs under the root lock,
 /// so two writers of one sidecar leave a whole record, not a torn one. A
-/// root whose directory is already gone, or replaced by a symlink, is not
-/// recreated or followed for the lock.
+/// root whose directory is already gone has no sidecar left to record on,
+/// and one replaced by a symlink is not followed for the lock.
 fn finish_child_meta(
     root: Option<&ChildSessionRoot>,
     session_id: Option<&str>,
@@ -1338,6 +1338,16 @@ fn differing_variables(provided: &AgentVariables, stored: &AgentVariables) -> Ve
     keys
 }
 
+/// How a refused resume's attempt to put the sidecar back ended.
+enum SidecarRestore {
+    Done,
+    /// The root directory was removed between the two locked steps, so
+    /// there is no sidecar left to restore.
+    RootGone,
+    /// The sidecar still carries the provisional running stamp.
+    Failed(anyhow::Error),
+}
+
 /// Seats the child on an existing child session under `root` and re-stamps
 /// its sidecar as running under the fresh agent id. Every refusal happens
 /// before the session file is touched, and the id is validated before any
@@ -1354,11 +1364,11 @@ fn differing_variables(provided: &AgentVariables, stored: &AgentVariables) -> Ve
 /// is then loaded and gated with the lock released; should that refuse,
 /// the lock is taken again and the bytes read in the first step are written
 /// back, so a refused resume leaves the sidecar exactly as it was. A root
-/// that has no directory yet has no children either, and is refused before
-/// the lock would create one; a root replaced by a symlink is refused
-/// without listing ids through the link. The same two checks guard the
-/// second lock, so a root that vanished or became a symlink between the
-/// two steps is neither recreated nor followed for the restore.
+/// that has no directory has no children either and is refused without
+/// taking the lock; a root replaced by a symlink is refused without listing
+/// ids through the link. The same two checks guard the second lock: a root
+/// that vanished between the two steps has nothing left to restore, and one
+/// that became a symlink is not followed for the restore.
 fn resume_child_session(
     child_ctx: &mut RequestContext,
     root: &ChildSessionRoot,
@@ -1448,24 +1458,29 @@ fn resume_child_session(
         Ok(session) => session,
         Err(error) => {
             let restored = if refuse_symlinked_dir(&dir, "child session restored") {
-                Err(anyhow!(
+                SidecarRestore::Failed(anyhow!(
                     "the child session root {} is a symlink or could not be inspected, so the sidecar was not restored",
                     dir.display()
                 ))
             } else if !dir.is_dir() {
-                Err(anyhow!(
-                    "the child session root {} is gone, so the sidecar was not restored",
-                    dir.display()
-                ))
+                SidecarRestore::RootGone
             } else {
-                root.lock().and_then(|_lock| {
+                let written = root.lock().and_then(|_lock| {
                     write_private_atomic(&sidecar, &saved_bytes)
                         .with_context(|| format!("Failed to write {}", sidecar.display()))
-                })
+                });
+                match written {
+                    Ok(()) => SidecarRestore::Done,
+                    Err(restore_error) => SidecarRestore::Failed(restore_error),
+                }
             };
             return Err(match restored {
-                Ok(()) => error,
-                Err(restore_error) => error.context(format!(
+                SidecarRestore::Done => error,
+                SidecarRestore::RootGone => error.context(format!(
+                    "the child session root {} was removed meanwhile; nothing of child '{id}' remains",
+                    dir.display()
+                )),
+                SidecarRestore::Failed(restore_error) => error.context(format!(
                     "'{id}' keeps the running stamp of this refused resume ({restore_error:#}); it becomes resumable once this process exits"
                 )),
             });
@@ -6507,6 +6522,100 @@ mod tests {
             )),
             "{retry}"
         );
+    }
+
+    /// A root removed while the session load ran outside the lock has no
+    /// sidecar left to restore, so the error says nothing remains rather
+    /// than promising a stamp that is gone; and the restore attempt must
+    /// not bring the directory back.
+    #[test]
+    #[serial]
+    fn a_refused_resume_whose_root_vanished_meanwhile_says_nothing_remains() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_rootgone");
+        write_config_agent_with_variables(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let (sid, _) = seed_completed_config_child(&mut ctx, &agent_name, json!({"tone": "loud"}));
+        let root = spawner_root(&ctx);
+        let dir = root.dir();
+        let args = json!({
+            "agent": agent_name,
+            "prompt": "again",
+            "session_id": sid,
+            "variables": {"tone": "loud"},
+        });
+        let remove_root = {
+            let dir = dir.clone();
+            move || remove_dir_all(&dir).unwrap()
+        };
+
+        let error = with_hook_between_resume_phases(remove_root, || resume_error(&mut ctx, args));
+
+        assert!(error.contains(&dir.display().to_string()), "{error}");
+        assert!(error.contains("was removed meanwhile"), "{error}");
+        assert!(
+            error.contains(&format!("nothing of child '{sid}' remains")),
+            "{error}"
+        );
+        assert!(!error.contains("keeps the running stamp"), "{error}");
+        assert!(!error.contains("becomes resumable"), "{error}");
+        assert!(!dir.exists(), "the restore must not recreate the root");
+    }
+
+    /// A root swapped for a symlink while the session load ran outside the
+    /// lock is refused without following the link: the sidecar behind it
+    /// keeps the provisional running stamp, and the error says so.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn a_refused_resume_whose_root_became_a_symlink_meanwhile_does_not_follow_it() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_rootlink");
+        write_config_agent_with_variables(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let (sid, _) = seed_completed_config_child(&mut ctx, &agent_name, json!({"tone": "loud"}));
+        let root = spawner_root(&ctx);
+        let dir = root.dir();
+        let parked = dir.parent().unwrap().join("parked-root");
+        // Different variables make the gate after the session load refuse,
+        // so the restore runs against the link.
+        let args = json!({
+            "agent": agent_name,
+            "prompt": "again",
+            "session_id": sid,
+            "variables": {"tone": "quiet"},
+        });
+        let link_root = {
+            let (dir, parked) = (dir.clone(), parked.clone());
+            move || {
+                std::fs::rename(&dir, &parked).unwrap();
+                std::os::unix::fs::symlink(&parked, &dir).unwrap();
+            }
+        };
+
+        let error = with_hook_between_resume_phases(link_root, || resume_error(&mut ctx, args));
+
+        assert!(
+            error.contains(
+                "is a symlink or could not be inspected, so the sidecar was not restored"
+            ),
+            "{error}"
+        );
+        assert!(error.contains("keeps the running stamp"), "{error}");
+        assert!(
+            std::fs::symlink_metadata(&dir)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the restore must not replace the link"
+        );
+        let sidecar_name = root.child_meta_file(&sid).file_name().unwrap().to_owned();
+        let behind_link: ChildMeta = read_yaml(&parked.join("children").join(sidecar_name));
+        assert_eq!(behind_link.status, ChildStatus::Running);
+        assert_eq!(behind_link.pid, std::process::id());
+
+        std::fs::remove_file(&dir).unwrap();
+        std::fs::rename(&parked, &dir).unwrap();
     }
 
     #[test]

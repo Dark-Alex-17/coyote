@@ -82,23 +82,21 @@ impl ChildSessionRoot {
     }
 
     /// Takes the root directory's lock for one read-modify-write of
-    /// `root.yaml` or a sidecar, or for one delete decision. Opening the
-    /// lock creates the directory, so a caller that must leave an absent
-    /// directory absent checks for it first. A crash between that check
-    /// and the lock can leave a directory holding only `.lock`, which the
-    /// orphan sweep's arm 0 reclaims once its grace has passed.
+    /// `root.yaml` or a sidecar, or for one delete decision. The lock never
+    /// creates the directory, so a caller that must leave an absent
+    /// directory absent only has to check for it; a directory removed
+    /// between that check and the lock is reported, not resurrected.
     pub(crate) fn lock(&self) -> Result<ExclusiveLock> {
         acquire_root_lock(&self.lock_file())
     }
 
     /// Creates the root directory, writes `root.yaml` when it is missing or
     /// does not parse, then creates `children/`, in that order: a crash between
-    /// the steps never leaves children without an identity, at worst a
-    /// directory holding only `.lock`, which the orphan sweep's arm 0
-    /// reclaims after its grace. A `root.yaml` that parses is left untouched
-    /// so a second spawn under the same root cannot erase the parent paths and
-    /// save time recorded by the first; one that does not parse is replaced
-    /// from `root` with a warning, since nothing in it could be kept.
+    /// the steps never leaves children without an identity. A `root.yaml`
+    /// that parses is left untouched so a second spawn under the same root
+    /// cannot erase the parent paths and save time recorded by the first;
+    /// one that does not parse is replaced from `root` with a warning,
+    /// since nothing in it could be kept.
     /// Anything other than a regular file in its place is an error that
     /// leaves it as found. The check and the write happen under the root
     /// lock, so a second spawner, or a parent save, cannot slip a record
@@ -190,7 +188,7 @@ fn default_version() -> u32 {
 }
 
 /// The lock every writer and every deleter of the root directory at `dir`
-/// takes, waiting the standard bound. `dir` is created when absent.
+/// takes, waiting the standard bound. `dir` must already exist.
 fn root_lock(dir: &Path) -> Result<ExclusiveLock> {
     acquire_root_lock(&dir.join(LOCK_FILE_NAME))
 }
@@ -2641,7 +2639,8 @@ updated_at: 2026-01-02T03:04:05Z
     }
 
     /// The locked bookkeeping sites all check for the directory before
-    /// taking the lock, since opening the lock file would create it.
+    /// taking the lock: the lock does not create it, and an absent root
+    /// means no children.
     #[test]
     #[serial]
     fn retention_on_an_absent_uid_root_creates_nothing() {
@@ -2762,6 +2761,29 @@ updated_at: 2026-01-02T03:04:05Z
         held.borrow_mut().take();
         sweep_orphans();
         assert!(!dir.exists());
+    }
+
+    #[test]
+    #[serial]
+    fn sweep_leaves_nothing_behind_when_the_root_vanishes_before_its_lock() {
+        install_log_collector();
+        let _guard = TestConfigDirGuard::new("child-sessions-vanished-sweep");
+        let (dir, _) = uid_dir_with(&sweep_record(Vec::new(), dead_stamp()));
+        let vanish = |about_to_go: &Path| fs::remove_dir_all(about_to_go).unwrap();
+
+        sweep_orphans_with_before_remove(&vanish);
+
+        assert!(!dir.exists(), "the lock must not recreate a removed root");
+        let dir_text = dir.display().to_string();
+        assert!(
+            warn_snapshot()
+                .iter()
+                .any(|message| message.starts_with("Keeping ")
+                    && message.contains(&dir_text)
+                    && message.contains("Failed to open lock file")),
+            "{:?}",
+            warn_snapshot()
+        );
     }
 
     /// Every read-modify-write of `root.yaml` and every delete decision

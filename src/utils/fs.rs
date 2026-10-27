@@ -196,16 +196,12 @@ fn holder_suffix(pid: Option<u32>) -> String {
     pid.map(|pid| format!(" (pid {pid})")).unwrap_or_default()
 }
 
-/// Opens `lock_path` without taking the lock. The parent is created first
-/// (owner-only on unix) because the lock may be taken before the first
-/// write creates the file it guards. The file holds a pid and nothing
-/// secret, so on Windows it keeps the permissions it inherits from the
-/// directory.
+/// Opens `lock_path` without taking the lock. The caller owns the
+/// directory: a missing parent is an error, so a caller that checked for
+/// the directory never recreates it by locking. The file holds a pid and
+/// nothing secret, so on Windows it keeps the permissions it inherits
+/// from the directory.
 fn open_lock_file(lock_path: &Path) -> Result<File> {
-    if let Some(parent) = lock_path.parent() {
-        create_private_dir_all(parent)
-            .with_context(|| format!("Failed to create {}", parent.display()))?;
-    }
     refuse_symlinked_file(lock_path)?;
     open_lock_file_unchecked(lock_path)
 }
@@ -392,9 +388,13 @@ mod tests {
     }
 
     #[test]
-    fn exclusive_lock_creates_its_parent_and_records_the_holder_pid() {
+    fn exclusive_lock_records_the_holder_pid_in_a_pre_created_parent() {
         let dir = TempDir::new("lock-parent");
-        let path = dir.0.join("deeper").join("record.lock");
+        let parent = dir.0.join("deeper");
+        fs::create_dir(&parent).unwrap();
+        let path = parent.join("record.lock");
+        #[cfg(unix)]
+        let parent_mode = mode_of(&parent);
 
         let mut held = ExclusiveLock::acquire(&path, LOCK_WHAT, Duration::ZERO).unwrap();
 
@@ -402,8 +402,28 @@ mod tests {
         #[cfg(unix)]
         {
             assert_eq!(mode_of(&path), 0o600);
-            assert_eq!(mode_of(&dir.0.join("deeper")), 0o700);
+            assert_eq!(mode_of(&parent), parent_mode);
         }
+    }
+
+    #[test]
+    fn exclusive_lock_never_creates_a_missing_parent() {
+        let dir = TempDir::new("lock-no-parent");
+        let path = dir.0.join("deeper").join("record.lock");
+
+        let error = ExclusiveLock::acquire(&path, LOCK_WHAT, Duration::ZERO).unwrap_err();
+
+        let cause = error.root_cause().downcast_ref::<io::Error>();
+        assert_eq!(
+            cause.map(io::Error::kind),
+            Some(io::ErrorKind::NotFound),
+            "{error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("Failed to open lock file"),
+            "{error:#}"
+        );
+        assert!(!dir.0.join("deeper").exists());
     }
 
     #[test]
