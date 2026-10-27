@@ -301,6 +301,12 @@ Evidence required:
   (or materialize a follow-up task when the coder budget is spent) before the final report; only
   a pattern that actually landed is written under `Design decisions:` as a decision, the rest
   stays a `<question> -> <answer>` line.
+- A line the debris lint flags (non-ASCII punctuation, planning-artefact vocabulary) is fixed,
+  not exempted, except for a glyph that is the point (an arrow a renderer draws, a pinned spec
+  title, a fixture) or a line that must name the needles themselves (a rule's own wording, a
+  test): the coder marks that line with the lint's `debris-exempt` token, which exempts it from
+  BOTH lint rules, and you list each new use in your final report under
+  a `Debris exemptions:` heading (`<file:line> -- <reason>`), one line each.
 
 <!-- when:review_cadence=batch -->
 ### Review cadence: batch (set by the parent orchestrator)
@@ -383,11 +389,8 @@ with a lane table, blockers, attention items, and every lane's full report.
   <path>:<line> -- ...` is a real finding: the coder fixes it in the SAME session. (A `debris:`
   blocker of any other shape, such as `malformed debris_findings`, is a pipeline fault and
   arrives with `GAUNTLET_REVIEW_INCOMPLETE: debris`; the next rule owns it.)
-  It is not rejectable, except for a glyph that is the point (an arrow a renderer
-  draws, a pinned spec title, a fixture) or a line that must name the needles themselves (a
-  rule's own wording, a test): the coder marks that line with the lint's `debris-exempt` token,
-  which exempts it from BOTH lint rules, and you list each new use in your final report under
-  a `Debris exemptions:` heading (`<file:line> -- <reason>`), one line each.
+  It is not rejectable except by the `debris-exempt` carve-out above; a fixed or exempted line
+  goes back through a FRESH gauntlet run.
 - `GAUNTLET_REVIEW_INCOMPLETE: <lane>[, <lane>]` (the line directly under `GAUNTLET: BLOCKED`)
   means the review could NOT be completed: the named lanes still faulted after 3 attempts, or the
   gauntlet pipeline itself faulted (`pipeline`). The `debris` row is a single deterministic pass

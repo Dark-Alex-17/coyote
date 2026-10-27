@@ -625,6 +625,97 @@ fn build_lock_is_declared_with_empty_default_and_settled_lanes_are_bare() {
     );
 }
 
+fn declared_variables(rel: &str) -> Vec<serde_yaml::Value> {
+    let doc: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(asset(rel)).unwrap()).unwrap();
+    doc["variables"]
+        .as_sequence()
+        .unwrap_or_else(|| panic!("{rel}: variables"))
+        .clone()
+}
+
+fn declared<'a>(
+    variables: &'a [serde_yaml::Value],
+    rel: &str,
+    name: &str,
+) -> &'a serde_yaml::Value {
+    variables
+        .iter()
+        .find(|v| v["name"].as_str() == Some(name))
+        .unwrap_or_else(|| panic!("{rel}: no {name} variable"))
+}
+
+/// The architect's `task_granularity` and the Sisyphus `review_cadence` are a
+/// pair: micro granularity spawns Sisyphus with `review_cadence: batch`
+/// beside `build_lock`, so both configs declare both halves with their
+/// standalone defaults, and the architect's forward literal names a variable
+/// Sisyphus actually declares.
+#[test]
+fn micro_granularity_and_batch_cadence_are_declared_as_a_pair() {
+    let architect = declared_variables("architect/config.yaml");
+    assert_eq!(
+        declared(&architect, "architect/config.yaml", "task_granularity")["default"],
+        serde_yaml::Value::from("standard")
+    );
+    declared(&architect, "architect/config.yaml", "build_lock");
+
+    let sisyphus = declared_variables("sisyphus/config.yaml");
+    assert_eq!(
+        declared(&sisyphus, "sisyphus/config.yaml", "review_cadence")["default"],
+        serde_yaml::Value::from("task")
+    );
+    declared(&sisyphus, "sisyphus/config.yaml", "build_lock");
+
+    let forwarded = r#""review_cadence": "batch""#;
+    let instructions = fs::read_to_string(asset("architect/instructions.md")).unwrap();
+    assert!(
+        instructions.contains(forwarded),
+        "architect/instructions.md must forward {forwarded}"
+    );
+    let forwarded_name = forwarded.split('"').nth(1).unwrap();
+    declared(&sisyphus, "sisyphus/config.yaml", forwarded_name);
+}
+
+/// Rendering the Sisyphus instructions under `review_cadence=batch` drops the
+/// gauntlet section and keeps the batch section; the `debris-exempt` rule the
+/// batch section leans on lives outside both blocks, so either cadence
+/// renders it.
+#[test]
+fn sisyphus_cadence_blocks_render_exclusively_and_share_the_debris_rule() {
+    if tools_missing() {
+        return;
+    }
+    let hoisted = "a `Debris exemptions:` heading (`<file:line> -- <reason>`)";
+    let script = format!(
+        "source '{}'; render_instructions '{}'",
+        asset(".shared/utils.sh").display(),
+        asset("sisyphus/instructions.md").display()
+    );
+    for (cadence, present, absent) in [
+        (
+            "batch",
+            "### Review cadence: batch",
+            "### The review gauntlet",
+        ),
+        (
+            "task",
+            "### The review gauntlet",
+            "### Review cadence: batch",
+        ),
+    ] {
+        let (code, stdout, stderr) = run(bash()
+            .arg("-c")
+            .arg(&script)
+            .env("LLM_AGENT_VAR_REVIEW_CADENCE", cadence)
+            .output()
+            .expect("spawn bash"));
+        assert_eq!(code, 0, "render under {cadence}: {stderr}");
+        assert!(stdout.contains(present), "{cadence}: missing {present:?}");
+        assert!(!stdout.contains(absent), "{cadence}: leaked {absent:?}");
+        assert!(stdout.contains(hoisted), "{cadence}: missing {hoisted:?}");
+    }
+}
+
 /// The gauntlet hands `build_lock` to the adversary lane through `inputs:`
 /// (the same structured channel as `verification_commands`), and every
 /// spawn template that forwards the variable spells it the same way, so an
