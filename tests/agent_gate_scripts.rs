@@ -1257,8 +1257,10 @@ fn adversary_verdict_names_the_prefix_a_verification_run_was_under() {
     );
 }
 
-/// A plan with one complete and one pending task; the complete task's log
-/// holds `completed` SHAs and the ledger block `log` under its entry.
+/// A plan with two complete tasks and one pending task; the first complete
+/// task's log holds `completed` SHAs and the ledger block `log` under its
+/// entry, the second names the plan without its `.md` (the spelling most task
+/// files in this repo use) and has no ledger lines.
 #[cfg(unix)]
 fn pr_body_fixture(label: &str, log: &str) -> TempDirGuard {
     let dir = fixture_dir(label);
@@ -1287,11 +1289,23 @@ fn pr_body_fixture(label: &str, log: &str) -> TempDirGuard {
         "---\nplan: PLAN-x.md\nstatus: pending\ntitle: \"B\"\n---\n",
     )
     .unwrap();
+    let bare = dir.0.join("tasks/TASK-3-c");
+    fs::create_dir_all(&bare).unwrap();
+    fs::write(
+        bare.join("index.md"),
+        "---\nplan: PLAN-x\nstatus: complete\ntitle: \"C\"\n---\n",
+    )
+    .unwrap();
+    fs::write(
+        bare.join("log.md"),
+        "## 2026-10-27 - completed\nCommit 0123abc on feat/x.\n",
+    )
+    .unwrap();
     dir
 }
 
 #[cfg(unix)]
-fn assemble_pr_body(dir: &Path) -> (i32, String, String) {
+fn assemble_pr_body_with_env(dir: &Path, envs: &[(&str, &str)]) -> (i32, String, String) {
     run(Command::new("python3")
         .arg(asset("architect/assemble_pr_body.py"))
         .arg("--plan")
@@ -1301,8 +1315,14 @@ fn assemble_pr_body(dir: &Path) -> (i32, String, String) {
         .arg("--summary-file")
         .arg(dir.join("summary.md"))
         .arg("--followups")
+        .envs(envs.iter().copied())
         .output()
         .expect("spawn python3"))
+}
+
+#[cfg(unix)]
+fn assemble_pr_body(dir: &Path) -> (i32, String, String) {
+    assemble_pr_body_with_env(dir, &[])
 }
 
 /// assemble_pr_body.py reads a tag line together with the block under it
@@ -1310,7 +1330,8 @@ fn assemble_pr_body(dir: &Path) -> (i32, String, String) {
 /// one entry per bullet with an indented wrap joined onto its bullet, and a
 /// `(deferred by quality bar)` qualifier never cuts an entry short; a wrapped
 /// prose paragraph after a mid-line tag is not a run of entries; a tag line
-/// with nothing on it or under it is a NOTE, not a silent `None.`.
+/// with nothing on it or under it is a NOTE, not a silent `None.`. A task
+/// whose `plan:` omits the `.md` belongs to the plan all the same.
 #[cfg(unix)]
 #[test]
 fn assemble_pr_body_reads_ledger_blocks_whole() {
@@ -1337,6 +1358,11 @@ fn assemble_pr_body_reads_ledger_blocks_whole() {
         "{stdout}"
     );
     assert!(!stdout.contains("TASK-2"), "{stdout}");
+    assert!(
+        stdout.contains("\n- [x] TASK-3 - C (`0123abc`)"),
+        "a task whose `plan:` has no `.md` must still be listed: {stdout}"
+    );
+    assert!(!stderr.contains("checklist left empty"), "{stderr}");
     let decisions: Vec<&str> = stdout
         .lines()
         .skip_while(|l| *l != "## Review decisions")
@@ -1380,6 +1406,37 @@ fn assemble_pr_body_reads_ledger_blocks_whole() {
         stderr.contains("NOTE TASK-1: Follow-ups: tag with nothing under it"),
         "{stderr}"
     );
+}
+
+/// The body is UTF-8 whatever the host locale: a ledger line carrying a
+/// severity glyph reaches stdout intact under a C locale with a cp1252
+/// console codec (UTF-8 mode off) instead of raising on the write.
+#[cfg(unix)]
+#[test]
+fn assemble_pr_body_writes_utf8_whatever_the_locale() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = pr_body_fixture(
+        "assemble-pr-body-locale",
+        "rejected-finding: \u{1f7e1} finding one - evidence src/x.rs:3\n",
+    );
+    let (code, stdout, stderr) = assemble_pr_body_with_env(
+        &dir.0,
+        &[
+            ("LC_ALL", "C"),
+            ("LANG", "C"),
+            ("PYTHONIOENCODING", "cp1252"),
+            ("PYTHONUTF8", "0"),
+        ],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("- (TASK-1) \u{1f7e1} finding one - evidence src/x.rs:3"),
+        "the glyph must reach the body verbatim: {stdout}\nstderr: {stderr}"
+    );
+    assert!(!stderr.contains("Traceback"), "{stderr}");
 }
 
 /// collect_ledger_lines prints the block under each hit indented beneath

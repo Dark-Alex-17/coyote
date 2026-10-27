@@ -6,9 +6,10 @@ Grep-complete where the ground truth is on disk; verbatim where it is judgment:
   summary          --summary-file, pasted verbatim (the Problem/Approach prose)
   Quality bar      plan frontmatter `rigor:`; the line is emitted only below `production`
   task checklist   every task dir under --tasks-dir whose index.md belongs to the plan
-                   (`plan:` basename match when the field exists; `status: complete` when
-                   that field exists), title from frontmatter, commit SHAs from the
-                   log.md `completed` entry
+                   (`plan:` matches the plan's basename with any `.md` stripped on both
+                   sides, so `PLAN-x` and `PLAN-x.md` name the same plan, when the field
+                   exists; `status: complete` when that field exists), title from
+                   frontmatter, commit SHAs from the log.md `completed` entry
   Review decisions `rejected-finding:` ledger lines, one entry per tag occurrence
   Hygiene pass     --hygiene-file verbatim, else `HYGIENE:` ledger lines, else "clean"
   Design decisions `design-decision` ledger lines
@@ -68,7 +69,12 @@ def task_number(name):
     return int(m.group(1)) if m else 10**9
 
 
-def find_tasks(tasks_dir, plan_base):
+def plan_identity(path):
+    """The plan a path or `plan:` value names: its basename without the extension."""
+    return os.path.splitext(os.path.basename(path))[0]
+
+
+def find_tasks(tasks_dir, plan_id):
     """[(task_id, title, dir)] for the plan's tasks, in TASK number order."""
     found, skipped = [], []
     for root, dirs, files in os.walk(tasks_dir):
@@ -82,7 +88,7 @@ def find_tasks(tasks_dir, plan_base):
             note(f"{base}: index.md unreadable ({exc}); skipped")
             continue
         plan = fm.get("plan", "")
-        if plan and os.path.basename(plan) != plan_base:
+        if plan and plan_identity(plan) != plan_id:
             continue
         status = fm.get("status", "")
         if status and status != "complete":
@@ -185,8 +191,14 @@ def bullets(entries, box=""):
 
 
 def main():
+    # The body is UTF-8 with LF line ends whatever the host locale (ledger lines
+    # carry the severity glyphs verbatim and tools.sh hands the text on as-is),
+    # and an unencodable glyph is escaped rather than a traceback.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace", newline="\n")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--plan", required=True, help="PLAN-<slug>.md (rigor from frontmatter; basename filters tasks)")
+    ap.add_argument("--plan", required=True, help="PLAN-<slug>.md (rigor from frontmatter; its name, `.md` stripped, filters tasks)")
     ap.add_argument("--tasks-dir", required=True, help="tree searched recursively for TASK-NNN-*/index.md")
     ap.add_argument("--summary-file", required=True, help="file holding the Problem/Approach summary, pasted verbatim")
     ap.add_argument("--hygiene-file", help="file holding the kept HYGIENE items, pasted verbatim (else derived from `HYGIENE:` ledger lines)")
@@ -203,7 +215,7 @@ def main():
 
     plan_base = os.path.basename(args.plan)
     plan_fm = frontmatter(read(args.plan))
-    tasks = find_tasks(args.tasks_dir, plan_base)
+    tasks = find_tasks(args.tasks_dir, plan_identity(args.plan))
     if not tasks:
         note(f"no tasks under {args.tasks_dir} belong to {plan_base} - checklist left empty")
 
