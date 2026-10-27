@@ -8,6 +8,7 @@ use crate::mesh::protocol::MESH_PROTOCOL_VERSION;
 
 use rmpv::Value;
 use rns_transport::destination::link::{Link, unpack_response_envelope};
+use rns_transport::destination::request::ResponseFrame as LibraryResponseFrame;
 use std::time::Duration;
 
 fn sixteen(byte: u8) -> Value {
@@ -54,6 +55,30 @@ fn response_frame_is_accepted_by_upstream_envelope_unpacker() {
     assert_eq!(RequestId::from(upstream_id), request_id);
     assert_eq!(upstream_value, frame.data);
     assert_eq!(ResponseFrame::decode(&bytes).unwrap(), frame);
+}
+
+/// A settled reply is encoded with the library's frame, so the bytes it puts on the wire
+/// are the bytes a requester decodes with Coyote's.
+#[test]
+fn the_library_response_frame_and_coyotes_encode_to_the_same_bytes() {
+    let request_id = RequestId::from([0x3cu8; 16]);
+    let data = Value::Map(vec![
+        (Value::from("name"), Value::from("Alex")),
+        (
+            Value::from("files"),
+            Value::Array(vec![Value::Binary(vec![0x5a; 300])]),
+        ),
+        (Value::from("n"), Value::from(3)),
+    ]);
+
+    assert_eq!(
+        ResponseFrame {
+            request_id,
+            data: data.clone()
+        }
+        .encode(),
+        LibraryResponseFrame::new(request_id, data).encode()
+    );
 }
 
 #[test]
