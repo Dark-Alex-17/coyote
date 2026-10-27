@@ -113,7 +113,7 @@ mod tests {
     use std::collections::HashSet;
     use std::time::Duration;
 
-    const EXPECTED_LITERALS: &str = r#"1,1,10,16,262144,128,"/knock","/status","/message",30,10,10,2,20,16,0xf0,0xf1,0xf3,0xf4,0xf5,0xf6,0xfd,0xfe,"SCOPE",64,300,3600,60,3660,3,5,6,10980,7320,1024,"scope.knock/1",200,15,10,256,3,600,16,256,16,1,0,1,2,64,280,64,64,280,"scope.peer/1",1,120,4000,64,4096,8,15,10,604800,256,3600,120,256,1,60,100000,120,26,60,2,60,1024,64,240,131072,112,4096,15552000,4096,86400,3,3660,256,0,32,0xfb,0xfc,8,64,256,64,8,2,2,2,2,1,2,1,8,106496,98304,65536,"/list","/fetch",1024,64,1000,100000,64,2048,120,128,1048447,4194304,4194304,4198400,92 c4 10,200,16,32,"/access","scope.access/1",16,500,5,900,1,1,1,16,32768,1048575,4096,1,1,256,16,40,65536,168"#;
+    const EXPECTED_LITERALS: &str = r#"1,1,10,16,262144,128,"/knock","/status","/message",30,10,10,2,20,16,0xf0,0xf1,0xf3,0xf4,0xf5,0xf6,0xfd,0xfe,"SCOPE",64,300,3600,60,3660,3,5,6,10980,7320,1024,"scope.knock/1",200,15,10,256,3,600,16,256,16,1,0,1,2,64,280,64,64,280,"scope.peer/1",1,120,4000,64,4096,8,15,10,604800,256,3600,120,256,1,60,100000,120,26,60,2,60,1024,64,240,131072,112,4096,15552000,4096,86400,3,3660,256,0,32,0xfb,0xfc,8,64,256,64,8,2,2,2,2,1,2,1,8,106496,98304,65536,"/list","/fetch",1024,64,1000,100000,64,2048,120,4194304,4194304,4198400,92 c4 10,200,16,32,"/access","scope.access/1",16,500,5,900,1,1,1,16,32768,1048575,4096,1,1,256,16,40,65536,168"#;
 
     fn expected_constants() -> Vec<(&'static str, String)> {
         let secs = |d: Duration| d.as_secs().to_string();
@@ -426,14 +426,6 @@ mod tests {
                 secs(fetch::FILE_FETCH_REQUEST_TIMEOUT),
             ),
             (
-                "OK_REPLY_FRAMING_BYTES",
-                fetch::OK_REPLY_FRAMING_BYTES.to_string(),
-            ),
-            (
-                "SINGLE_SEGMENT_FETCH_CEILING",
-                fetch::SINGLE_SEGMENT_FETCH_CEILING.to_string(),
-            ),
-            (
                 "DEFAULT_FETCH_MAX_BYTES",
                 DEFAULT_FETCH_MAX_BYTES.to_string(),
             ),
@@ -620,27 +612,26 @@ mod tests {
         assert!(hits.is_empty(), "{}", hits.join("\n"));
     }
 
-    /// The `mesh.fetch.max_bytes` row states the single-segment ceiling as the number a
-    /// user can compare against their setting; a Rust constant name does not belong in a
-    /// user-facing config table. The number is the code's, so the row cannot drift.
+    /// The `mesh.fetch.max_bytes` row states the setting's range as numbers a user can
+    /// compare against their own, and names no second limit under it: the setting alone
+    /// bounds a served file.
     #[test]
-    fn readme_fetch_row_spells_the_single_segment_ceiling_as_a_number() {
+    fn readme_fetch_row_names_max_bytes_alone() {
         let row = README
             .lines()
             .find(|line| line.starts_with("| `mesh.fetch.max_bytes`"))
             .expect("the README has a mesh.fetch.max_bytes row");
-        let clause = format!(
-            "`min(max_bytes, {})` (about 1 MiB)",
-            fetch::SINGLE_SEGMENT_FETCH_CEILING
-        );
+        let clause = format!("`1` to `{MAX_FETCH_FILE_BYTES}` (4 MiB)");
         assert!(
             row.contains(&clause),
             "the fetch row lacks {clause:?}: {row:?}"
         );
-        assert!(
-            !row.contains("SINGLE_SEGMENT_FETCH_CEILING"),
-            "the fetch row names the constant instead of its value: {row:?}"
-        );
+        for stale in ["min(max_bytes", "1 MiB", "ceiling", "SINGLE_SEGMENT"] {
+            assert!(
+                !row.contains(stale),
+                "the fetch row still names a limit under the setting ({stale:?}): {row:?}"
+            );
+        }
     }
 
     /// The envoy memory file name for one (identity, thread) is fixed by this vector: a
