@@ -241,6 +241,10 @@ compression_keep_last: 0         # Upper bound on the most-recent messages kept 
 max_tool_result_chars: null      # Cap on tool result characters forwarded to the model per call (null = no cap)
 max_concurrent_jobs: 5           # Max background jobs (`job__*` tools) running at once per context (default: 5; 0 disables background jobs entirely)
 tool_timeout: 1800               # Max seconds a single tool call may run before being killed (default: 1800; 0 = unlimited). COYOTE_TOOL_TIMEOUT env var overrides
+prompt_cache_ttl: null           # Cache TTL for the system prompt + tool declarations on long-lived root session turns (Anthropic models on any client:
+                                 # Claude, Bedrock, Vertex):
+                                 # "1h" (null = 1h, roughly 3x cheaper than 5m when turns are more than 5 min apart) or "5m" (any other value counts as 5m).
+                                 # Spawned children and graph nodes always use 5m.
 
 # ---- Memory ----
 # See the [Memory documentation](https://github.com/Dark-Alex-17/coyote/wiki/Memory) for more information.
@@ -250,10 +254,10 @@ tool_timeout: 1800               # Max seconds a single tool call may run before
 # Bootstrap with `coyote --init-memory [global|workspace]` to create the marker file
 # the LLM needs before it will write any memory.
 memory: null                     # null = enabled when memory exists on disk; true = force on; false = force off
-memory_cap_with_tools: null      # Char cap for injected memory when function calling is available (default: 6000).
-                                 # Only MEMORY.md indexes are injected; the LLM uses memory__read to fetch drill files.
-memory_cap_without_tools: null   # Char cap when function calling is unavailable (default: 12000).
-                                 # Indexes plus drill file bodies are injected up to this cap.
+memory_cap_with_tools: null      # Char cap for injected memory when function calling is available (null = 6000). Only MEMORY.md indexes are injected,
+                                 # and they are truncated to this cap (the head of each, split evenly); the LLM uses memory__list and memory__read for the rest.
+memory_cap_without_tools: null   # Char cap when function calling is unavailable (null = 12000). Indexes are truncated to this cap the same way,
+                                 # then drill file bodies fill whatever budget is left.
 
 # ---- Child Sessions ----
 # Every agent spawned with `agent__spawn` or `agent__task_create` gets a persisted session of its

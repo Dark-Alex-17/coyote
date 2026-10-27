@@ -79,6 +79,7 @@ pub struct AppConfig {
     pub max_concurrent_jobs: Option<usize>,
     pub tool_timeout: Option<u64>,
     pub child_sessions: Option<bool>,
+    pub prompt_cache_ttl: Option<String>,
 
     pub memory: Option<bool>,
     pub memory_cap_with_tools: Option<usize>,
@@ -175,6 +176,7 @@ impl Default for AppConfig {
             max_concurrent_jobs: None,
             tool_timeout: None,
             child_sessions: None,
+            prompt_cache_ttl: None,
 
             memory: None,
             memory_cap_with_tools: None,
@@ -284,6 +286,7 @@ impl AppConfig {
             max_concurrent_jobs: config.max_concurrent_jobs,
             tool_timeout: config.tool_timeout,
             child_sessions: config.child_sessions,
+            prompt_cache_ttl: config.prompt_cache_ttl,
 
             memory: config.memory,
             memory_cap_with_tools: config.memory_cap_with_tools,

@@ -301,6 +301,7 @@ pub struct Config {
     pub max_concurrent_jobs: Option<usize>,
     pub tool_timeout: Option<u64>,
     pub child_sessions: Option<bool>,
+    pub prompt_cache_ttl: Option<String>,
 
     pub memory: Option<bool>,
     pub memory_cap_with_tools: Option<usize>,
@@ -394,6 +395,7 @@ impl Default for Config {
             max_concurrent_jobs: None,
             tool_timeout: None,
             child_sessions: None,
+            prompt_cache_ttl: None,
 
             memory: None,
             memory_cap_with_tools: None,
@@ -1496,6 +1498,27 @@ clients:
     }
 
     #[test]
+    fn config_template_documents_prompt_cache_ttl() {
+        assert!(CONFIG_TEMPLATE.contains("\nprompt_cache_ttl: null"));
+        assert!(CONFIG_TEMPLATE.contains("long-lived root session turns"));
+        assert!(CONFIG_TEMPLATE.contains("Spawned children and graph nodes always use 5m"));
+        let example = include_str!("../../config.example.yaml");
+        assert!(example.contains("\nprompt_cache_ttl: null"));
+        assert!(example.contains("Spawned children and graph nodes always use 5m"));
+        let cfg = Config::load_from_str(example).unwrap();
+        assert_eq!(cfg.prompt_cache_ttl, None);
+    }
+
+    #[test]
+    fn config_template_documents_memory_cap_as_enforced() {
+        assert!(CONFIG_TEMPLATE.contains("they are truncated to this cap"));
+        assert!(CONFIG_TEMPLATE.contains("Indexes are truncated to this cap the same way"));
+        let example = include_str!("../../config.example.yaml");
+        assert!(example.contains("they are truncated to this cap"));
+        assert!(example.contains("Indexes are truncated to this cap the same way"));
+    }
+
+    #[test]
     fn config_template_documents_command_prefix() {
         assert!(CONFIG_TEMPLATE.contains("command_prefix: dot"));
         assert!(CONFIG_TEMPLATE.contains("Set at runtime with .set command_prefix"));
@@ -1539,6 +1562,13 @@ clients:
         assert!(!example.contains("THIS agent spawns"));
         let cfg: AgentConfig = serde_yaml::from_str(example).unwrap();
         assert_eq!(cfg.child_sessions, None);
+    }
+
+    #[test]
+    fn bundled_explore_agent_runs_without_memory() {
+        let config = include_str!("../../assets/agents/explore/config.yaml");
+        let cfg: AgentConfig = serde_yaml::from_str(config).unwrap();
+        assert_eq!(cfg.memory, Some(false));
     }
 
     #[test]
