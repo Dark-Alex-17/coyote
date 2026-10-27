@@ -88,26 +88,6 @@ impl RequestFrame {
             self.data.clone(),
         ]))
     }
-
-    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, RequestError> {
-        let Value::Array(elements) = decode_whole(bytes)? else {
-            return Err(RequestError::Decode("request frame is not an array".into()));
-        };
-        let [time, path_hash, data] = <[Value; 3]>::try_from(elements).map_err(|elements| {
-            RequestError::Decode(format!(
-                "request frame has {} elements, expected 3",
-                elements.len()
-            ))
-        })?;
-        let Value::F64(time) = time else {
-            return Err(RequestError::Decode("request time is not a float64".into()));
-        };
-        Ok(Self {
-            time,
-            path_hash: PathHash::from(hash_bytes(&path_hash, "request path hash")?),
-            data,
-        })
-    }
 }
 
 /// One response as it travels over a link, in either direction.

@@ -37,8 +37,8 @@ use crate::mesh::protocol::{MESH_PROTOCOL_MIN_SUPPORTED, MESH_PROTOCOL_VERSION, 
 use crate::mesh::request::{
     ACCESS_PATH, AdmittedRequest, DispatchError, Dispatcher, Envelope, EnvelopeError, FETCH_PATH,
     Handler, InboundRequest, KNOCK_PATH, KNOWN_PATHS, KnockEvent, KnockSink, LIST_PATH,
-    MAX_REQUEST_NESTING_DEPTH, MESSAGE_PATH, NAME_HASH_LEN, OriginName, PathHash, RefusalCode,
-    Reply, RequestError, RequestFrame, RequestHandler, RequestId, STATUS_PATH,
+    MESSAGE_PATH, NAME_HASH_LEN, OriginName, PathHash, RefusalCode, Reply, RequestError,
+    RequestHandler, RequestId, STATUS_PATH,
 };
 use crate::mesh::shares::LIST_PAGE_SIZE;
 use crate::mesh::test_support::{TempDir, TrustList};
@@ -53,6 +53,7 @@ use lxmf_core::identity::PrivateIdentity as CorePrivateIdentity;
 use lxmf_core::message::{Payload, WireMessage};
 use rmpv::Value;
 use rns_transport::destination::link::LinkId;
+use rns_transport::destination::request::MAX_DEPTH as FRAME_MAX_DEPTH;
 use rns_transport::hash::{ADDRESS_HASH_SIZE, AddressHash};
 use rns_transport::identity::{Identity, PrivateIdentity};
 use rns_transport::identity_bridge::{to_core_identity, to_transport_identity};
@@ -79,12 +80,12 @@ pub(super) fn packed(value: &Value) -> Vec<u8> {
     bytes
 }
 
-/// The one msgpack value `bytes` hold within the frame decoder's nesting budget; `None`
-/// when they do not decode or leave bytes over.
+/// The one msgpack value `bytes` hold within the library's frame depth bound, spent here
+/// as an `rmpv` depth limit (two units per container, so a little stricter than the
+/// library's container count); `None` when they do not decode or leave bytes over.
 pub(super) fn unpack_whole(bytes: &[u8]) -> Option<Value> {
     let mut cursor = Cursor::new(bytes);
-    let value =
-        rmpv::decode::read_value_with_max_depth(&mut cursor, MAX_REQUEST_NESTING_DEPTH).ok()?;
+    let value = rmpv::decode::read_value_with_max_depth(&mut cursor, FRAME_MAX_DEPTH).ok()?;
     (usize::try_from(cursor.position()).ok() == Some(bytes.len())).then_some(value)
 }
 
@@ -631,26 +632,13 @@ fn check_envelope_value(value: &Value) -> Result<Expect, String> {
     Ok(expected)
 }
 
-/// A request frame around `data` as it would sit on the wire, time 0 and a zero path hash.
-fn frame_around(data: &[u8]) -> Vec<u8> {
-    let mut out = vec![0x93, 0xcb];
-    out.extend_from_slice(&0f64.to_be_bytes());
-    out.extend_from_slice(&[0xc4, 0x10]);
-    out.extend_from_slice(&[0u8; ADDRESS_HASH_SIZE]);
-    out.extend_from_slice(data);
-    out
-}
-
 /// One corpus file or one encoded generator output: an envelope value on the wire. Bytes
-/// that are not one whole value go through Coyote's test-side frame decoder, which pins the
-/// requester-side round trip; a responder's inbound frame rule, depth included, is the
-/// library's.
+/// that are not one whole value within the depth bound never reach the Envelope reader;
+/// refusing them is the library's frame rule, not Coyote's.
 pub(super) fn check_envelope_bytes(bytes: &[u8]) -> Result<(), String> {
     match unpack_whole(bytes) {
         Some(value) => check_envelope_value(&value).map(drop),
-        None => ensure(RequestFrame::decode(&frame_around(bytes)).is_err(), || {
-            "a frame whose data is not one whole msgpack value must not decode".to_string()
-        }),
+        None => Ok(()),
     }
 }
 
@@ -701,66 +689,18 @@ impl PathGen {
     }
 }
 
-/// Wire-level damage to an otherwise well-formed frame.
+/// What the library hands the dispatcher once it has decoded a request frame: the path
+/// hash and the frame's data, here a biased Envelope.
 #[derive(Debug, Arbitrary)]
-enum Tamper {
-    ArbitraryArray(Vec<ArbValue>),
-    Raw(Vec<u8>),
-    Truncate(u16),
-    Trailing(Vec<u8>),
-}
-
-/// A request frame, well-formed seven times in eight, around a biased Envelope.
-#[derive(Debug, Arbitrary)]
-pub(super) struct FrameGen {
-    time: f64,
+pub(super) struct DispatchGen {
     path: PathGen,
     data: EnvelopeGen,
-    tamper: Unlikely<Tamper>,
 }
 
-impl FrameGen {
-    pub(super) fn into_bytes(self) -> Vec<u8> {
-        let frame = RequestFrame {
-            time: self.time,
-            path_hash: self.path.into_hash(),
-            data: self.data.into_value(),
-        };
-        let bytes = frame.encode();
-        match self.tamper.0 {
-            None => bytes,
-            Some(Tamper::ArbitraryArray(items)) => packed(&Value::Array(
-                items
-                    .into_iter()
-                    .take(MAX_CHILDREN)
-                    .map(ArbValue::into_value)
-                    .collect(),
-            )),
-            Some(Tamper::Raw(raw)) => raw,
-            Some(Tamper::Truncate(at)) => {
-                let keep = usize::from(at) % bytes.len();
-                bytes[..keep].to_vec()
-            }
-            Some(Tamper::Trailing(extra)) => [bytes, extra].concat(),
-        }
+impl DispatchGen {
+    pub(super) fn into_input(self) -> (PathHash, Value) {
+        (self.path.into_hash(), self.data.into_value())
     }
-}
-
-/// The request-frame rule as a predicate: one whole msgpack value that is an array of
-/// exactly three elements, an `f64`, a `bin` of 16 and anything.
-fn expect_frame(bytes: &[u8]) -> Option<(f64, [u8; ADDRESS_HASH_SIZE], Value)> {
-    let Value::Array(elements) = unpack_whole(bytes)? else {
-        return None;
-    };
-    let [time, hash, data] = <[Value; 3]>::try_from(elements).ok()?;
-    let Value::F64(time) = time else {
-        return None;
-    };
-    let Value::Binary(hash) = hash else {
-        return None;
-    };
-    let hash = <[u8; ADDRESS_HASH_SIZE]>::try_from(hash.as_slice()).ok()?;
-    Some((time, hash, data))
 }
 
 /// How the trust list stands toward a tier's identity, from which the reference model
@@ -855,7 +795,7 @@ impl KnockSink for SpySink {
 }
 
 /// One dispatcher over one trust list, built once per target run from the seed, and the
-/// seven tiers every frame is run against.
+/// seven tiers every request is run against.
 pub(super) struct DispatchFixture {
     rt: Runtime,
     dispatcher: Dispatcher,
@@ -928,36 +868,29 @@ fn is_no_access(reply: &Reply) -> bool {
     matches!(reply, Reply::Code(code) if code.to_wire() == Value::from(0xf1u8))
 }
 
-/// The same frame bytes against every tier: decoded by Coyote's test-side request-frame
-/// rule, which pins the requester-side round trip (a responder's inbound decode, depth
-/// bound included, is the library's), then the reply, the knock and the handler count each
-/// tier's stage mandates.
+/// One envelope corpus file as a request's data on every known path. Bytes the library's
+/// frame decoder would refuse never reach a dispatcher, so they are not checked here.
 pub(super) fn check_dispatch_bytes(fx: &DispatchFixture, bytes: &[u8]) -> Result<(), String> {
-    let frame = match (RequestFrame::decode(bytes), expect_frame(bytes)) {
-        (Err(_), None) => return Ok(()),
-        (Ok(frame), Some((time, hash, data))) => {
-            ensure(
-                frame.time.to_bits() == time.to_bits()
-                    && frame.path_hash == PathHash::from(hash)
-                    && same_value(&frame.data, &data),
-                || "the decoded frame must carry the three elements on the wire".to_string(),
-            )?;
-            frame
-        }
-        (Ok(frame), None) => {
-            return Err(format!(
-                "the frame decoder accepted bytes the request-frame rule rejects: {frame:?}"
-            ));
-        }
-        (Err(err), Some(_)) => {
-            return Err(format!(
-                "the frame decoder refused a well-formed frame: {err}"
-            ));
-        }
+    let Some(data) = unpack_whole(bytes) else {
+        return Ok(());
     };
-    let expected = expect_envelope(&frame.data);
+    for path in KNOWN_PATHS {
+        check_dispatch_value(fx, PathHash::of(path), &data)
+            .map_err(|what| format!("on {path}: {what}"))?;
+    }
+    Ok(())
+}
+
+/// The same request data against every tier: the reply, the knock and the handler count
+/// each tier's stage mandates.
+pub(super) fn check_dispatch_value(
+    fx: &DispatchFixture,
+    path_hash: PathHash,
+    data: &Value,
+) -> Result<(), String> {
+    let expected = expect_envelope(data);
     for tier in &fx.tiers {
-        check_tier(fx, tier, &frame, &expected)
+        check_tier(fx, tier, path_hash, data, &expected)
             .map_err(|what| format!("{} tier: {what}", tier.label))?;
     }
     Ok(())
@@ -966,7 +899,8 @@ pub(super) fn check_dispatch_bytes(fx: &DispatchFixture, bytes: &[u8]) -> Result
 fn check_tier(
     fx: &DispatchFixture,
     tier: &Tier,
-    frame: &RequestFrame,
+    path_hash: PathHash,
+    data: &Value,
     expected: &Expect,
 ) -> Result<(), String> {
     let handled_before = fx.handler.0.load(Ordering::SeqCst);
@@ -975,8 +909,8 @@ fn check_tier(
         link_id: fx.link_id,
         identity: tier.identity,
         request_id: RequestId::from([1u8; ADDRESS_HASH_SIZE]),
-        path_hash: frame.path_hash,
-        data: frame.data.clone(),
+        path_hash,
+        data: data.clone(),
     };
     let reply = fx
         .rt
@@ -1084,12 +1018,12 @@ fn check_tier(
                         knock.identity_hash == identity.address_hash.to_hex_string()
                             && knock.destination_hash == destination.to_hex_string()
                             && knock.name_hash == hex_lower(origin)
-                            && knock.path_hash == frame.path_hash,
+                            && knock.path_hash == path_hash,
                         || {
                             "the knock names the proven identity, the derived destination, the origin and the path".to_string()
                         },
                     )?;
-                    let is_knock_path = frame.path_hash == PathHash::of(KNOCK_PATH);
+                    let is_knock_path = path_hash == PathHash::of(KNOCK_PATH);
                     ensure(knock.data.is_some() == is_knock_path, || {
                         "the knock retains the body only when the path is /knock".to_string()
                     })?;
@@ -1104,7 +1038,6 @@ fn check_tier(
                     ensure(knocks.is_empty(), || {
                         "an allowed request files no knock".to_string()
                     })?;
-                    let path_hash = frame.path_hash;
                     let Some(path) = KNOWN_PATHS
                         .into_iter()
                         .find(|path| PathHash::of(path) == path_hash)

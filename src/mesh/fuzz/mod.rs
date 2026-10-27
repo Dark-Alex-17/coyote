@@ -6,7 +6,8 @@
 //! reference model, or a round-trip law, never merely "did not panic".
 //!
 //! Budget. Each target replays its committed corpus first (`corpus/<target>/*.bin`, sorted
-//! by file name), then runs its random budget and prints one
+//! by file name; the dispatch target, which has no wire bytes of its own, replays
+//! `corpus/envelope/`), then runs its random budget and prints one
 //! `mesh-fuzz target=... seed=... corpus=... iterations=... elapsed_ms=...` line. By
 //! default the budget is `DEFAULT_ITERS` iterations or `TARGET_WALL_CAP`, whichever comes
 //! first, and a cap that stops the loop early prints a `WALL CAP HIT` line as well. The
@@ -29,11 +30,13 @@
 //!
 //! Promoting a failure. Copy the written `.bin` into `corpus/<target>/` under a name of the
 //! form `<area>-<short-description>.bin` (see `corpus/README.md`); every later run
-//! replays it before any random iteration. Three targets write the wire bytes the oracle
-//! judged. The receipt target judges a whole event sequence whose sealed bodies depend on
-//! the bench they were built against, so it writes `0x01` and the raw `Unstructured` buffer
-//! the sequence was shaped from; replay shapes the same sequence again. A `receipt/` file
-//! starting `0x00` is instead one body, replayed as a single `Garbage` event.
+//! replays it before any random iteration. The envelope and codec targets write the wire
+//! bytes the oracle judged. The dispatch target writes the raw `Unstructured` buffer its
+//! path and envelope were shaped from. The receipt target judges a whole event sequence
+//! whose sealed bodies depend on the bench they were built against, so it writes `0x01`
+//! and the raw `Unstructured` buffer the sequence was shaped from; replay shapes the same
+//! sequence again. A `receipt/` file starting `0x00` is instead one body, replayed as a
+//! single `Garbage` event.
 
 mod oracles;
 
@@ -224,7 +227,7 @@ fn fail(target: &str, seed: u64, case: &str, violation: &str, input: &[u8]) -> !
 }
 
 /// An oracle violation on a random iteration, with the bytes that reproduce it: wire bytes,
-/// or for the receipt target the tagged `Unstructured` buffer.
+/// or for the dispatch and receipt targets the `Unstructured` buffer the input was shaped from.
 struct Violation {
     what: String,
     input: Vec<u8>,
@@ -236,11 +239,22 @@ impl Violation {
     }
 }
 
-/// Replays the corpus, then runs the random budget. `replay` checks one corpus file;
-/// `random` checks one generated value, given also the buffer it was shaped from, and on a
-/// violation hands back the bytes that reproduce it.
+/// Replays the target's own corpus, then runs the random budget. `replay` checks one
+/// corpus file; `random` checks one generated value, given also the buffer it was shaped
+/// from, and on a violation hands back the bytes that reproduce it.
 fn run_target<T: for<'a> Arbitrary<'a>>(
     target: &str,
+    seed: u64,
+    replay: impl Fn(&[u8]) -> Result<(), String>,
+    random: impl Fn(&[u8], T) -> Result<(), Violation>,
+) {
+    run_target_seeded_from(target, target, seed, replay, random);
+}
+
+/// `run_target` with the replay files taken from another target's corpus.
+fn run_target_seeded_from<T: for<'a> Arbitrary<'a>>(
+    target: &str,
+    corpus: &str,
     seed: u64,
     replay: impl Fn(&[u8]) -> Result<(), String>,
     random: impl Fn(&[u8], T) -> Result<(), Violation>,
@@ -249,7 +263,7 @@ fn run_target<T: for<'a> Arbitrary<'a>>(
         requested,
         wall_cap,
     } = budget(parse_iters(std::env::var_os(ITERS_ENV).as_deref()));
-    let files = corpus_files(target);
+    let files = corpus_files(corpus);
     for path in &files {
         let bytes = fs::read(path).unwrap();
         let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
@@ -324,18 +338,21 @@ fn seed() -> u64 {
     )
 }
 
+/// The dispatch tier has no frame bytes of its own to replay: the library decodes the
+/// frame, so the envelope corpus stands in as the request data on every known path.
 #[test]
-fn fuzz_dispatch_authorizes_every_frame_exactly_as_the_trust_model_predicts() {
+fn fuzz_dispatch_authorizes_every_request_exactly_as_the_trust_model_predicts() {
     let seed = seed();
     let fixture = oracles::DispatchFixture::new(&mut SplitMix::new(seed));
-    run_target(
+    run_target_seeded_from(
         "dispatch",
+        "envelope",
         seed,
         |bytes| oracles::check_dispatch_bytes(&fixture, bytes),
-        |_, frame: oracles::FrameGen| {
-            let bytes = frame.into_bytes();
-            oracles::check_dispatch_bytes(&fixture, &bytes)
-                .map_err(|what| Violation::new(what, bytes))
+        |buf, request: oracles::DispatchGen| {
+            let (path_hash, data) = request.into_input();
+            oracles::check_dispatch_value(&fixture, path_hash, &data)
+                .map_err(|what| Violation::new(what, buf.to_vec()))
         },
     );
 }
@@ -1182,10 +1199,9 @@ fn card_decoder_and_oracle_agree_on_every_numeric_edge() {
 #[test]
 fn fuzz_corpus_files_belong_to_the_classes_their_names_claim() {
     use super::card::StatusCard;
-    use super::message::PEER_FIELDS_MAX_DEPTH;
     use super::pending::{PENDING_RECORD_VERSION, PendingRecord};
     use super::propagation_fetch::MAX_FETCHED_MESSAGE_BYTES;
-    use super::request::{MAX_REQUEST_PAYLOAD_BYTES, RefusalCode, RequestError, RequestFrame};
+    use super::request::RefusalCode;
     use oracles::{
         Expect, TAG_BODY, TAG_CARD, TAG_PENDING, TAG_REFUSAL_CODE, expect_envelope, unpack_whole,
     };
@@ -1197,36 +1213,11 @@ fn fuzz_corpus_files_belong_to_the_classes_their_names_claim() {
         })
     }
 
-    /// Containers along the deepest path; a scalar is 0.
-    fn nesting(value: &Value) -> usize {
-        match value {
-            Value::Array(items) => 1 + items.iter().map(nesting).max().unwrap_or(0),
-            Value::Map(entries) => {
-                1 + entries
-                    .iter()
-                    .map(|(key, value)| nesting(key).max(nesting(value)))
-                    .max()
-                    .unwrap_or(0)
-            }
-            _ => 0,
-        }
-    }
-
     let read = |target: &str, name: &str| fs::read(corpus_dir(target).join(name)).unwrap();
     let envelope = |name: &str| {
         unpack_whole(&read("envelope", name)).unwrap_or_else(|| {
             panic!("envelope/{name} must be one msgpack value within the nesting budget")
         })
-    };
-    let frame = |name: &str| RequestFrame::decode(&read("dispatch", name));
-    let frame_data = |name: &str| {
-        frame(name)
-            .unwrap_or_else(|err| panic!("dispatch/{name} must decode as a frame: {err:?}"))
-            .data
-    };
-    let frame_refusal = |name: &str| match frame(name) {
-        Err(RequestError::Decode(reason)) => reason,
-        other => panic!("dispatch/{name} must fail to decode as a frame, got {other:?}"),
     };
     let codec = |name: &str| {
         let bytes = read("codecs", name);
@@ -1253,22 +1244,8 @@ fn fuzz_corpus_files_belong_to_the_classes_their_names_claim() {
             "envelope/{name}: a version refusal with no representable `v`"
         );
     }
-    assert!(
-        matches!(
-            expect_envelope(&frame_data("env-v-two.bin")),
-            Expect::Version(Some(2))
-        ),
-        "dispatch/env-v-two.bin: a version refusal finding v=2"
-    );
-    assert!(
-        matches!(
-            expect_envelope(&frame_data("env-v-u64-max.bin")),
-            Expect::Version(None)
-        ),
-        "dispatch/env-v-u64-max.bin: a version refusal with no representable `v`"
-    );
 
-    // Bytes the frame decoder refuses outright.
+    // Bytes `unpack_whole` refuses outright.
     for name in ["env-truncated-msgpack.bin", "env-nested-past-depth.bin"] {
         assert!(
             unpack_whole(&read("envelope", name)).is_none(),
@@ -1312,55 +1289,6 @@ fn fuzz_corpus_files_belong_to_the_classes_their_names_claim() {
     assert!(
         matches!(expect_envelope(&non_str), Expect::Ok { .. }),
         "envelope/env-non-str-keys-ignored.bin: still a valid envelope"
-    );
-
-    // Frame-level bounds and refusals.
-    assert_eq!(
-        read("dispatch", "env-max-size-frame.bin").len(),
-        MAX_REQUEST_PAYLOAD_BYTES,
-        "dispatch/env-max-size-frame.bin: exactly the payload limit"
-    );
-    assert!(
-        frame("env-max-size-frame.bin").is_ok(),
-        "dispatch/env-max-size-frame.bin: a frame that decodes"
-    );
-    let Expect::Ok { body, .. } = expect_envelope(&frame_data("msg-deeply-nested-body-fields.bin"))
-    else {
-        panic!("dispatch/msg-deeply-nested-body-fields.bin: a valid envelope")
-    };
-    let fields = body
-        .as_map()
-        .and_then(|entries| {
-            entries
-                .iter()
-                .find(|(key, _)| key.as_str() == Some("fields"))
-                .map(|(_, fields)| fields)
-        })
-        .expect("dispatch/msg-deeply-nested-body-fields.bin: a body with `fields`");
-    assert!(
-        nesting(fields) > PEER_FIELDS_MAX_DEPTH,
-        "dispatch/msg-deeply-nested-body-fields.bin: `fields` nested past {PEER_FIELDS_MAX_DEPTH}, got {}",
-        nesting(fields)
-    );
-    for name in [
-        "env-nested-400-arrays.bin",
-        "env-nested-past-rmpv-depth.bin",
-    ] {
-        let reason = frame_refusal(name);
-        assert!(
-            reason.contains("depth limit exceeded"),
-            "dispatch/{name}: refused by the depth budget, got {reason:?}"
-        );
-    }
-    let reason = frame_refusal("env-trailing-bytes.bin");
-    assert!(
-        reason.contains("trailing"),
-        "dispatch/env-trailing-bytes.bin: refused for trailing bytes, got {reason:?}"
-    );
-    let reason = frame_refusal("env-two-element-frame.bin");
-    assert!(
-        reason.contains("elements"),
-        "dispatch/env-two-element-frame.bin: refused for its arity, got {reason:?}"
     );
 
     // Codec sub-targets.

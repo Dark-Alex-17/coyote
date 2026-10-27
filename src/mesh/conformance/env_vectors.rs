@@ -1,6 +1,5 @@
-//! Vectors for the request layer: request and response frames, the Envelope, the
-//! dispatcher's stages, refusal codes and the version refusal, run in-process against this
-//! crate's decoders and `Dispatcher`.
+//! Vectors for the request layer: the Envelope, the dispatcher's stages, refusal codes and
+//! the version refusal, run in-process against this crate's decoders and `Dispatcher`.
 //!
 //! Every row carries a descriptive name and the receiver action expected of it. A row
 //! written faithfully from the spec that the code does not honour is kept as written and
@@ -17,8 +16,8 @@ use crate::mesh::request::{
     ACCESS_PATH, Admission, DispatchError, Dispatcher, Envelope, EnvelopeError, FETCH_PATH,
     HANDLER_TIMEOUT, Handler, InboundRequest, KNOCK_PATH, KnockEvent, KnockSink, LIST_PATH,
     MAX_CONCURRENT_INBOUND_REQUESTS, MAX_REQUEST_PAYLOAD_BYTES, MESSAGE_PATH, NAME_HASH_LEN,
-    OriginName, PathHash, RefusalCode, Reply, RequestError, RequestFrame, RequestHandler,
-    RequestId, ResponseFrame, STATUS_PATH,
+    OriginName, PathHash, RefusalCode, Reply, RequestHandler, RequestId, ResponseFrame,
+    STATUS_PATH,
 };
 use crate::mesh::test_support::{TempDir, TrustList};
 use crate::mesh::trust::{Decision, InstancePresence, KeyChangeOutcome, Rule, TrustStore, Verdict};
@@ -50,16 +49,6 @@ struct Vector {
 /// The input and expectation of a row, one variant per decoder under test. The variant
 /// name is the family label `all_listed` carries for the row.
 enum Case {
-    /// `RequestFrame::decode`.
-    RequestFrameDecode {
-        bytes: Vec<u8>,
-        expect: FrameAction<RequestFrame>,
-    },
-    /// `ResponseFrame::decode`.
-    ResponseFrameDecode {
-        bytes: Vec<u8>,
-        expect: FrameAction<ResponseFrame>,
-    },
     /// `Envelope::from_value`.
     EnvelopeDecode {
         value: Value,
@@ -106,8 +95,6 @@ enum Case {
 impl Case {
     fn family(&self) -> &'static str {
         match self {
-            Case::RequestFrameDecode { .. } => "RequestFrameDecode",
-            Case::ResponseFrameDecode { .. } => "ResponseFrameDecode",
             Case::EnvelopeDecode { .. } => "EnvelopeDecode",
             Case::EnvelopeEncode { .. } => "EnvelopeEncode",
             Case::Dispatch { .. } => "Dispatch",
@@ -118,11 +105,6 @@ impl Case {
             Case::Custom(_) => "Custom",
         }
     }
-}
-
-enum FrameAction<T> {
-    Accepted(T),
-    Rejected(&'static str),
 }
 
 enum EnvelopeAction {
@@ -194,12 +176,6 @@ fn ensure(condition: bool, what: impl Into<String>) -> Result<(), String> {
 
 fn run(case: &Case) -> Result<(), String> {
     match case {
-        Case::RequestFrameDecode { bytes, expect } => {
-            run_frame("request frame", RequestFrame::decode(bytes), expect)
-        }
-        Case::ResponseFrameDecode { bytes, expect } => {
-            run_frame("response frame", ResponseFrame::decode(bytes), expect)
-        }
         Case::EnvelopeDecode { value, expect } => {
             match (Envelope::from_value(value.clone()), expect) {
                 (
@@ -273,29 +249,6 @@ fn run(case: &Case) -> Result<(), String> {
             expect.clone(),
         ),
         Case::Custom(check) => check(),
-    }
-}
-
-fn run_frame<T: Debug + PartialEq>(
-    what: &str,
-    observed: Result<T, RequestError>,
-    expect: &FrameAction<T>,
-) -> Result<(), String> {
-    match (observed, expect) {
-        (Ok(frame), FrameAction::Accepted(expected)) => same(what, &frame, expected),
-        (Ok(frame), FrameAction::Rejected(text)) => {
-            Err(format!("expected rejection {text:?}, observed {frame:?}"))
-        }
-        (Err(RequestError::Decode(detail)), FrameAction::Rejected(text)) => ensure(
-            detail.contains(text),
-            format!("expected a decode error mentioning {text:?}, observed {detail:?}"),
-        ),
-        (Err(error), FrameAction::Rejected(text)) => Err(format!(
-            "expected a decode error mentioning {text:?}, observed {error:?}"
-        )),
-        (Err(error), FrameAction::Accepted(expected)) => {
-            Err(format!("expected {expected:?}, observed {error:?}"))
-        }
     }
 }
 
@@ -395,10 +348,6 @@ fn unpacked(bytes: &[u8]) -> Value {
     rmpv::decode::read_value(&mut Cursor::new(bytes)).unwrap()
 }
 
-fn nested_arrays(depth: usize, leaf: Value) -> Value {
-    (0..depth).fold(leaf, |inner, _| Value::Array(vec![inner]))
-}
-
 fn map(entries: Vec<(&str, Value)>) -> Value {
     Value::Map(
         entries
@@ -494,8 +443,6 @@ impl Handler for Scripted {
 
 fn vectors() -> Vec<Vector> {
     let mut all = Vec::new();
-    all.extend(request_frame_vectors());
-    all.extend(response_frame_vectors());
     all.extend(envelope_vectors());
     all.extend(dispatch_vectors());
     all.extend(custom_vectors());
@@ -503,461 +450,6 @@ fn vectors() -> Vec<Vector> {
     all.extend(dispatch_error_vectors());
     all.extend(refusal_code_vectors());
     all
-}
-
-// ---------------------------------------------------------------------------------------
-// Request and response frames
-// ---------------------------------------------------------------------------------------
-
-const REQUEST_ID: [u8; 16] = [1; 16];
-const NOT_ARRAY: &str = "is not an array";
-const NOT_F64: &str = "time is not a float64";
-const PATH_NOT_BIN: &str = "path hash is not a bin";
-const ID_NOT_BIN: &str = "request id is not a bin";
-const TRAILING: &str = "trailing bytes after the frame";
-const TOO_DEEP: &str = "depth limit exceeded";
-/// Nested one-element arrays under `data` that fit Coyote's own decode budget once the
-/// frame's own array has spent two units of `MAX_REQUEST_NESTING_DEPTH`. The rows built on
-/// it pin the requester-side round trip; a responder's inbound depth bound is the
-/// library's 128 nested containers.
-const DEEPEST_DATA_ARRAYS: usize = 62;
-
-fn request_frame() -> RequestFrame {
-    RequestFrame {
-        time: 1.5,
-        path_hash: PathHash::of(STATUS_PATH),
-        data: Value::from("data"),
-    }
-}
-
-fn request_value(time: Value, path_hash: Value, data: Value) -> Value {
-    Value::Array(vec![time, path_hash, data])
-}
-
-fn path_bin(len: usize) -> Value {
-    Value::Binary(vec![0x5a; len])
-}
-
-fn request(
-    name: &'static str,
-    kind: Kind,
-    bytes: Vec<u8>,
-    expect: FrameAction<RequestFrame>,
-) -> Vector {
-    row(name, kind, Case::RequestFrameDecode { bytes, expect })
-}
-
-/// Request frames through Coyote's test-side decoder, the one that round-trips what the
-/// requester's builder emits. A responder reads no request frame with it: inbound
-/// rejection, depth included, is the library's rule.
-fn request_frame_vectors() -> Vec<Vector> {
-    let encoded = request_frame().encode();
-    let Value::Array(parts) = unpacked(&encoded) else {
-        unreachable!("a request frame encodes as an array")
-    };
-    let path = parts[1].clone();
-    let mut trailing = encoded.clone();
-    trailing.push(0xc0);
-    let mut truncated = encoded.clone();
-    truncated.pop();
-    vec![
-        request(
-            "request-frame-round-trips",
-            Kind::Valid,
-            encoded.clone(),
-            FrameAction::Accepted(request_frame()),
-        ),
-        request(
-            "request-frame-time-as-integer-is-rejected",
-            Kind::Invalid,
-            packed(&request_value(Value::from(1u64), path.clone(), Value::Nil)),
-            FrameAction::Rejected(NOT_F64),
-        ),
-        request(
-            "request-frame-time-as-f32-is-rejected",
-            Kind::Invalid,
-            packed(&request_value(Value::F32(1.5), path.clone(), Value::Nil)),
-            FrameAction::Rejected(NOT_F64),
-        ),
-        request(
-            "request-frame-time-as-string-is-rejected",
-            Kind::Invalid,
-            packed(&request_value(Value::from("1.5"), path.clone(), Value::Nil)),
-            FrameAction::Rejected(NOT_F64),
-        ),
-        request(
-            "request-frame-time-as-nil-is-rejected",
-            Kind::Invalid,
-            packed(&request_value(Value::Nil, path.clone(), Value::Nil)),
-            FrameAction::Rejected(NOT_F64),
-        ),
-        request(
-            "request-frame-path-hash-of-16-bytes-is-accepted",
-            Kind::Boundary,
-            packed(&request_value(Value::F64(0.0), path_bin(16), Value::Nil)),
-            FrameAction::Accepted(RequestFrame {
-                time: 0.0,
-                path_hash: PathHash::from([0x5a; 16]),
-                data: Value::Nil,
-            }),
-        ),
-        request(
-            "request-frame-path-hash-of-15-bytes-is-rejected",
-            Kind::Invalid,
-            packed(&request_value(Value::F64(0.0), path_bin(15), Value::Nil)),
-            FrameAction::Rejected("path hash is 15 bytes, expected 16"),
-        ),
-        request(
-            "request-frame-path-hash-of-17-bytes-is-rejected",
-            Kind::Invalid,
-            packed(&request_value(Value::F64(0.0), path_bin(17), Value::Nil)),
-            FrameAction::Rejected("path hash is 17 bytes, expected 16"),
-        ),
-        request(
-            "request-frame-empty-path-hash-is-rejected",
-            Kind::Invalid,
-            packed(&request_value(Value::F64(0.0), path_bin(0), Value::Nil)),
-            FrameAction::Rejected("path hash is 0 bytes, expected 16"),
-        ),
-        request(
-            "request-frame-path-hash-as-hex-string-is-rejected",
-            Kind::Invalid,
-            packed(&request_value(
-                Value::F64(0.0),
-                Value::from(PathHash::of(STATUS_PATH).to_string()),
-                Value::Nil,
-            )),
-            FrameAction::Rejected(PATH_NOT_BIN),
-        ),
-        request(
-            "request-frame-path-hash-as-array-is-rejected",
-            Kind::Invalid,
-            packed(&request_value(
-                Value::F64(0.0),
-                Value::Array(vec![Value::from(0u8); 16]),
-                Value::Nil,
-            )),
-            FrameAction::Rejected(PATH_NOT_BIN),
-        ),
-        request(
-            "request-frame-path-hash-as-nil-is-rejected",
-            Kind::Invalid,
-            packed(&request_value(Value::F64(0.0), Value::Nil, Value::Nil)),
-            FrameAction::Rejected(PATH_NOT_BIN),
-        ),
-        request(
-            "request-frame-with-2-elements-is-rejected",
-            Kind::Invalid,
-            packed(&Value::Array(vec![Value::F64(0.0), path.clone()])),
-            FrameAction::Rejected("has 2 elements, expected 3"),
-        ),
-        request(
-            "request-frame-with-4-elements-is-rejected",
-            Kind::Invalid,
-            packed(&Value::Array(vec![
-                Value::F64(0.0),
-                path.clone(),
-                Value::Nil,
-                Value::Nil,
-            ])),
-            FrameAction::Rejected("has 4 elements, expected 3"),
-        ),
-        request(
-            "request-frame-as-empty-array-is-rejected",
-            Kind::Invalid,
-            packed(&Value::Array(vec![])),
-            FrameAction::Rejected("has 0 elements, expected 3"),
-        ),
-        request(
-            "request-frame-as-map-is-rejected",
-            Kind::Invalid,
-            packed(&map(vec![
-                ("time", Value::F64(0.0)),
-                ("path_hash", path.clone()),
-                ("data", Value::Nil),
-            ])),
-            FrameAction::Rejected(NOT_ARRAY),
-        ),
-        request(
-            "request-frame-as-nil-is-rejected",
-            Kind::Invalid,
-            packed(&Value::Nil),
-            FrameAction::Rejected(NOT_ARRAY),
-        ),
-        request(
-            "request-frame-wrapped-in-a-bin-is-rejected",
-            Kind::Invalid,
-            packed(&Value::Binary(encoded.clone())),
-            FrameAction::Rejected(NOT_ARRAY),
-        ),
-        request(
-            "request-frame-with-a-trailing-nil-is-rejected",
-            Kind::Invalid,
-            trailing,
-            FrameAction::Rejected(TRAILING),
-        ),
-        request(
-            "request-frame-followed-by-a-second-frame-is-rejected",
-            Kind::Invalid,
-            [encoded.clone(), encoded.clone()].concat(),
-            FrameAction::Rejected(TRAILING),
-        ),
-        request(
-            "request-frame-with-one-trailing-byte-is-rejected",
-            Kind::Invalid,
-            [encoded.clone(), vec![0x00]].concat(),
-            FrameAction::Rejected("1 trailing bytes"),
-        ),
-        request(
-            "request-frame-data-nested-to-the-depth-budget-is-accepted",
-            Kind::Boundary,
-            packed(&request_value(
-                Value::F64(0.0),
-                path_bin(16),
-                nested_arrays(DEEPEST_DATA_ARRAYS, Value::Nil),
-            )),
-            FrameAction::Accepted(RequestFrame {
-                time: 0.0,
-                path_hash: PathHash::from([0x5a; 16]),
-                data: nested_arrays(DEEPEST_DATA_ARRAYS, Value::Nil),
-            }),
-        ),
-        request(
-            "request-frame-nested-past-the-depth-budget-is-rejected",
-            Kind::Invalid,
-            packed(&request_value(
-                Value::F64(0.0),
-                path_bin(16),
-                nested_arrays(DEEPEST_DATA_ARRAYS + 1, Value::Nil),
-            )),
-            FrameAction::Rejected(TOO_DEEP),
-        ),
-        request(
-            "request-frame-truncated-by-one-byte-is-rejected",
-            Kind::Invalid,
-            truncated,
-            FrameAction::Rejected(""),
-        ),
-        request(
-            "request-frame-of-zero-bytes-is-rejected",
-            Kind::Invalid,
-            Vec::new(),
-            FrameAction::Rejected(""),
-        ),
-        request(
-            "request-frame-of-the-reserved-byte-0xc1-is-rejected",
-            Kind::Invalid,
-            vec![0xc1],
-            FrameAction::Rejected(""),
-        ),
-        request(
-            "request-frame-as-string-is-rejected",
-            Kind::Invalid,
-            packed(&Value::from("not a frame")),
-            FrameAction::Rejected(NOT_ARRAY),
-        ),
-    ]
-}
-
-fn response_frame(data: Value) -> ResponseFrame {
-    ResponseFrame {
-        request_id: RequestId::from(REQUEST_ID),
-        data,
-    }
-}
-
-fn response_value(request_id: Value, data: Value) -> Value {
-    Value::Array(vec![request_id, data])
-}
-
-fn response(
-    name: &'static str,
-    kind: Kind,
-    bytes: Vec<u8>,
-    expect: FrameAction<ResponseFrame>,
-) -> Vector {
-    row(name, kind, Case::ResponseFrameDecode { bytes, expect })
-}
-
-fn response_frame_vectors() -> Vec<Vector> {
-    let id = Value::Binary(REQUEST_ID.to_vec());
-    let encoded = response_frame(Value::from("reply")).encode();
-    let refusal = [
-        vec![0x92, 0xc4, 0x10],
-        REQUEST_ID.to_vec(),
-        vec![0xcc, 0xf1],
-    ]
-    .concat();
-    vec![
-        response(
-            "response-frame-round-trips",
-            Kind::Valid,
-            encoded.clone(),
-            FrameAction::Accepted(response_frame(Value::from("reply"))),
-        ),
-        response(
-            "response-frame-with-nil-data-is-accepted",
-            Kind::Boundary,
-            packed(&response_value(id.clone(), Value::Nil)),
-            FrameAction::Accepted(response_frame(Value::Nil)),
-        ),
-        response(
-            "response-frame-with-1-element-is-rejected",
-            Kind::Invalid,
-            packed(&Value::Array(vec![id.clone()])),
-            FrameAction::Rejected("has 1 elements, expected 2"),
-        ),
-        response(
-            "response-frame-with-3-elements-is-rejected",
-            Kind::Invalid,
-            packed(&Value::Array(vec![id.clone(), Value::Nil, Value::Nil])),
-            FrameAction::Rejected("has 3 elements, expected 2"),
-        ),
-        response(
-            "response-frame-as-empty-array-is-rejected",
-            Kind::Invalid,
-            packed(&Value::Array(vec![])),
-            FrameAction::Rejected("has 0 elements, expected 2"),
-        ),
-        response(
-            "response-frame-as-map-is-rejected",
-            Kind::Invalid,
-            packed(&map(vec![("request_id", id.clone()), ("data", Value::Nil)])),
-            FrameAction::Rejected(NOT_ARRAY),
-        ),
-        response(
-            "response-frame-as-nil-is-rejected",
-            Kind::Invalid,
-            packed(&Value::Nil),
-            FrameAction::Rejected(NOT_ARRAY),
-        ),
-        response(
-            "response-frame-id-as-hex-string-is-rejected",
-            Kind::Invalid,
-            packed(&response_value(
-                Value::from(RequestId::from(REQUEST_ID).to_string()),
-                Value::Nil,
-            )),
-            FrameAction::Rejected(ID_NOT_BIN),
-        ),
-        response(
-            "response-frame-id-as-nil-is-rejected",
-            Kind::Invalid,
-            packed(&response_value(Value::Nil, Value::Nil)),
-            FrameAction::Rejected(ID_NOT_BIN),
-        ),
-        response(
-            "response-frame-id-of-15-bytes-is-rejected",
-            Kind::Invalid,
-            packed(&response_value(Value::Binary(vec![1; 15]), Value::Nil)),
-            FrameAction::Rejected("request id is 15 bytes, expected 16"),
-        ),
-        response(
-            "response-frame-id-of-17-bytes-is-rejected",
-            Kind::Invalid,
-            packed(&response_value(Value::Binary(vec![1; 17]), Value::Nil)),
-            FrameAction::Rejected("request id is 17 bytes, expected 16"),
-        ),
-        response(
-            "response-frame-with-a-trailing-nil-is-rejected",
-            Kind::Invalid,
-            [encoded.clone(), vec![0xc0]].concat(),
-            FrameAction::Rejected(TRAILING),
-        ),
-        response(
-            "response-frame-truncated-by-one-byte-is-rejected",
-            Kind::Invalid,
-            encoded[..encoded.len() - 1].to_vec(),
-            FrameAction::Rejected(""),
-        ),
-        response(
-            "response-frame-of-zero-bytes-is-rejected",
-            Kind::Invalid,
-            Vec::new(),
-            FrameAction::Rejected(""),
-        ),
-        response(
-            "response-frame-data-nested-to-the-depth-budget-is-accepted",
-            Kind::Boundary,
-            packed(&response_value(
-                id.clone(),
-                nested_arrays(DEEPEST_DATA_ARRAYS, Value::Nil),
-            )),
-            FrameAction::Accepted(response_frame(nested_arrays(
-                DEEPEST_DATA_ARRAYS,
-                Value::Nil,
-            ))),
-        ),
-        response(
-            "response-frame-nested-past-the-depth-budget-is-rejected",
-            Kind::Invalid,
-            packed(&response_value(
-                id.clone(),
-                nested_arrays(DEEPEST_DATA_ARRAYS + 1, Value::Nil),
-            )),
-            FrameAction::Rejected(TOO_DEEP),
-        ),
-        response(
-            "response-frame-carrying-the-no-access-byte-is-read",
-            Kind::Valid,
-            refusal.clone(),
-            FrameAction::Accepted(response_frame(no_access().to_wire())),
-        ),
-        response(
-            "response-frame-with-a-refusal-code-encodes-as-0xf1",
-            Kind::Valid,
-            response_frame(no_access().to_wire()).encode(),
-            FrameAction::Accepted(response_frame(Value::from(0xf1u8))),
-        ),
-        response(
-            "response-frame-carrying-the-unknown-byte-0xf4-is-passed-through",
-            Kind::Valid,
-            [
-                vec![0x92, 0xc4, 0x10],
-                REQUEST_ID.to_vec(),
-                vec![0xcc, 0xf4],
-            ]
-            .concat(),
-            FrameAction::Accepted(response_frame(Value::from(0xf4u8))),
-        ),
-        response(
-            "response-frame-carrying-the-unknown-byte-0xfe-is-passed-through",
-            Kind::Valid,
-            [
-                vec![0x92, 0xc4, 0x10],
-                REQUEST_ID.to_vec(),
-                vec![0xcc, 0xfe],
-            ]
-            .concat(),
-            FrameAction::Accepted(response_frame(Value::from(0xfeu8))),
-        ),
-        response(
-            "response-frame-carrying-a-version-refusal-is-read",
-            Kind::Valid,
-            packed(&response_value(
-                id.clone(),
-                VersionRefusal::current(None).to_value(),
-            )),
-            FrameAction::Accepted(response_frame(VersionRefusal::current(None).to_value())),
-        ),
-        response(
-            "response-frame-carrying-a-dispatch-error-is-read",
-            Kind::Valid,
-            packed(&response_value(
-                id,
-                DispatchError::NoProvider {
-                    path: STATUS_PATH.to_string(),
-                }
-                .to_value(),
-            )),
-            FrameAction::Accepted(response_frame(
-                DispatchError::NoProvider {
-                    path: STATUS_PATH.to_string(),
-                }
-                .to_value(),
-            )),
-        ),
-    ]
 }
 
 // ---------------------------------------------------------------------------------------
@@ -2369,6 +1861,7 @@ fn surface_presence_line(store: &TrustStore, identity: &AddressHash, heard: Syst
     );
 }
 
+const REQUEST_ID: [u8; 16] = [1; 16];
 const IDENTITY: &str = "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a";
 const DESTINATION: &str = "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1";
 
@@ -3823,9 +3316,7 @@ mod tests {
         );
     }
 
-    const TESTED: [&str; 10] = [
-        "RequestFrameDecode",
-        "ResponseFrameDecode",
+    const TESTED: [&str; 8] = [
         "EnvelopeDecode",
         "EnvelopeEncode",
         "Dispatch",
@@ -3835,16 +3326,6 @@ mod tests {
         "RefusalCodeDecode",
         "Custom",
     ];
-
-    #[test]
-    fn request_frame_vectors_decode_as_the_frame_rules_mandate() {
-        run_family("RequestFrameDecode");
-    }
-
-    #[test]
-    fn response_frame_vectors_decode_as_the_frame_rules_mandate() {
-        run_family("ResponseFrameDecode");
-    }
 
     #[test]
     fn envelope_vectors_decode_as_the_envelope_table_mandates() {

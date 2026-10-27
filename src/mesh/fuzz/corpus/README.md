@@ -1,7 +1,9 @@
 # Mesh fuzz corpus
 
 Wire-byte inputs the fuzz targets in `src/mesh/fuzz/mod.rs` replay before their random
-iterations. One directory per target: `dispatch/`, `envelope/`, `receipt/`, `codecs/`.
+iterations. One directory per target with wire bytes of its own: `envelope/`, `receipt/`,
+`codecs/`. The dispatch target has none: the library decodes the request frame, so it
+replays `envelope/` as the request data on every known path.
 Every file is fed to the same oracle as a random iteration, so a file that no longer
 matches the spec predicate fails the test exactly as a random input would.
 
@@ -17,7 +19,6 @@ promoted from a failure is named after the bug.
 
 | Directory | Bytes | Oracle |
 |---|---|---|
-| `dispatch/` | one request frame: msgpack `[f64 time, bin(16) path_hash, data]` | the frame predicate, then the dispatch pipeline against every trust tier |
 | `envelope/` | one Envelope map: `v`, `name_hash`, `body` | the Envelope predicate and the canonical re-encoding |
 | `receipt/` | a kind byte, then a body or a sequence buffer (below) | the receipt stage order and the dedup model on a fresh store |
 | `codecs/` | a tag byte, then that decoder's wire bytes | per-decoder predicate and round trip |
@@ -36,7 +37,7 @@ length, one less than the file's.
 
 The first byte of a `codecs/` file selects the decoder. The table is `check_codec_bytes`
 in `oracles.rs`; keep the two in step. A msgpack payload that is not exactly one value
-within the frame decoder's nesting budget is a violation, not a skip.
+within the library's frame nesting budget is a violation, not a skip.
 
 | Tag | Decoder | Payload |
 |---|---|---|
@@ -78,7 +79,8 @@ A violation writes its input to `target/mesh-fuzz-failures/<target>-<seed>-<iter
 with its tag byte. For `receipt/` it already starts with kind `0x01` and holds the whole
 `Unstructured` buffer, because the sealed bodies of a sequence depend on the bench they
 were built against and only the buffer reproduces them; a hand-made single body goes in
-under kind `0x00`.
+under kind `0x00`. A dispatch violation also writes the `Unstructured` buffer; to promote
+it, re-encode the envelope it shaped and seed `envelope/` with that.
 
 The four `codecs/` files that spell the announce magic or an LXMF type tag are checked
 against the live constants by `fuzz_codec_corpus_files_carrying_wire_identifiers_are_built_from_the_live_constants`;
@@ -97,22 +99,16 @@ heuristic can take a small msgpack file for text and rewrite a `0x0a` byte (`c4 
 bin-8 header of a ten-byte `name_hash`) as CRLF on a checkout with `autocrlf`, as the
 Windows CI leg does.
 
-## Inputs promoted from failures
+## Nesting depth
 
-- `env-nested-400-arrays.bin` (`dispatch/`): about 400 nested one-element arrays in a
-  428-byte frame. Under `rmpv`'s default depth limit of 1024 that is deep enough to
-  overflow a 2 MiB thread stack in a debug build and abort the process before the limit is
-  reached, while a release build returns `depth limit exceeded` cleanly. `decode_whole` in
-  `src/mesh/request/frame.rs` reads with `MAX_REQUEST_NESTING_DEPTH` = 128: that is the
-  budget a requester spends on the responses it reads and the one Coyote's test-side
-  decoder spends on the round trip of the request frames the requester builds. The deepest
-  frame the spec delivers intact (envelope, body and `fields` nested to the sanitiser's
-  `PEER_FIELDS_MAX_DEPTH` limit) spends about 25 of the 128; 62 nested one-element arrays
-  under `data` fit and a 63rd overruns it, so response frames past it fail to decode and
-  request frames past it fail that round trip. A responder's inbound request frames are
-  read by the library, whose own bound is 128 nested containers; the live tests in
-  `src/mesh/request/tests.rs` pin it. The `unpack_whole` helper in `oracles.rs` reads with
-  the same budget so the predicate agrees.
+`unpack_whole` in `oracles.rs` reads with the library's frame bound, `MAX_DEPTH` = 128, as
+an `rmpv` depth limit; `rmpv` spends two units per container, so the oracle stops a little
+shallower than the library, which counts containers. For the envelope and dispatch targets
+bytes the oracle cannot read are the library's to refuse and are skipped; for `codecs/`
+they are a violation. The cap exists because under `rmpv`'s default limit of 1024 a few
+hundred nested one-element arrays overflow a 2 MiB thread stack in a debug build and abort
+the process before the limit is reached, while a release build returns `depth limit
+exceeded` cleanly. The live tests in `src/mesh/request/tests.rs` pin the library's bound.
 
 The protocol defines no reserved or must-be-zero field in any structure
 (envelope, card, body, knock, announce, LXMF custom data), so the "nonzero reserved
