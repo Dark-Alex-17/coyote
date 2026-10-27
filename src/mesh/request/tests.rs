@@ -2491,6 +2491,59 @@ pub(crate) mod network {
         responder.stop().await;
     }
 
+    /// A reply resource that fails mid-transfer takes down the one request it answered
+    /// and nothing else: the requester's next request to the same peer reuses the same
+    /// link and is answered, and the responder saw both requests over that link.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_failed_reply_resource_leaves_its_link_serving_the_next_request() {
+        let recorder = Arc::new(Recorder::default());
+        let (responder, requester, desc) = pair(recorder.clone()).await;
+        let (in_flight, seen) = hanging_request_on(
+            &requester,
+            &recorder,
+            &desc,
+            "/slow",
+            TRANSFER_REQUEST_TIMEOUT,
+        )
+        .await;
+        let mut random = vec![0u8; MAX_REQUEST_PAYLOAD_BYTES / 2];
+        RngCore::fill_bytes(&mut OsRng, &mut random);
+        let bytes = ResponseFrame {
+            request_id: seen.request_id,
+            data: Value::Binary(random),
+        }
+        .encode();
+        let mut events = requester.transport.resource_events();
+        let hash = answer_as_resource(&responder, &requester, &seen, bytes).await;
+        await_inbound_progress(&mut events, hash).await;
+        assert!(
+            responder
+                .transport
+                .cancel_resource(&seen.link_id, hash)
+                .await
+                .unwrap()
+        );
+        let result = timeout(INTEROP_TIMEOUT, in_flight).await.unwrap().unwrap();
+        assert!(
+            matches!(result, Err(RequestError::LinkFailed(_))),
+            "{result:?}"
+        );
+
+        let echoed = requester
+            .request(&desc, "/echo", Value::from("after"))
+            .await
+            .unwrap();
+        assert_eq!(echoed, Value::from("after"));
+        let next = recorder.last();
+        assert_eq!(
+            next.link_id, seen.link_id,
+            "the next request reused the link"
+        );
+        assert_eq!(recorder.seen_count(), 2, "the failed reply and the echo");
+        requester.stop().await;
+        responder.stop().await;
+    }
+
     /// The `/fetch` bound is inclusive on the requester's side: a response frame of
     /// exactly `MAX_FETCH_RESPONSE_BYTES` is delivered byte for byte, and one of a byte
     /// more fails as `Oversize` naming that cap and one over it.
@@ -8262,6 +8315,55 @@ pub(crate) mod network {
         node.stop().await;
     }
 
+    /// Node B answers the access request with a resource whose bytes are no response
+    /// frame at all. The reply reached node A, so this is not one of the peer-unreachable
+    /// classes: the request fails directly as `Decode` naming the response frame, and the
+    /// propagation node known to A is never posted to.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_an_undecodable_access_reply_is_a_direct_failure_and_never_stored() {
+        let (pair, mut node) =
+            pair_with_propagation_node("request-access-undecodable-no-fallback").await;
+        pair.introduce_b_to_a().await;
+        pair.recorder_b.queue(Script::Hang);
+        let request = access_request("acc-1", &["src/x.rs"], "");
+        let before = pair.recorder_b.seen_count();
+
+        let node_a = pair.node_a.clone();
+        let desc = pair.responder.desc;
+        let in_flight = tokio::spawn(async move {
+            node_a
+                .request_access_wire(&desc, &request, fallback_access_options())
+                .await
+        });
+        wait_until("node B to hold the request", || {
+            pair.recorder_b.seen_count() > before
+        })
+        .await;
+        let seen = pair.recorder_b.last();
+        assert_eq!(seen.path_hash, PathHash::of(ACCESS_PATH));
+        // 0xc1 is the one byte msgpack never assigns, so no decoder reads a frame here.
+        answer_pair_as_resource(&pair, &seen, vec![0xc1; 64]).await;
+        let answered = Instant::now();
+        let err = timeout(INTEROP_TIMEOUT, in_flight)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+
+        assert!(
+            answered.elapsed() < SHORT_REQUEST_TIMEOUT,
+            "the failure is immediate, not a timeout"
+        );
+        assert_eq!(
+            err,
+            AccessError::Direct(RequestError::Decode("response frame".to_string()))
+        );
+        sleep(Duration::from_millis(500)).await;
+        node.nothing_else_received();
+        pair.stop_node_a().await;
+        node.stop().await;
+    }
+
     /// With no path to the peer and no propagation node heard, the request fails by name
     /// and points at the command that lists the nodes heard.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10431,6 +10533,184 @@ pub(crate) mod network {
                 len: MAX_REQUEST_PAYLOAD_BYTES + 1,
                 max: MAX_REQUEST_PAYLOAD_BYTES,
             })
+        );
+        sleep(Duration::from_millis(500)).await;
+        node.nothing_else_received();
+        pair.stop_node_a().await;
+        node.stop().await;
+    }
+
+    /// Node B offers the reply as a resource and cancels it straight after, both while
+    /// node A's interface manager is held, so A reads the advertisement and the cancel
+    /// back to back once the hold lifts: it takes the reply on, then sees it fail. A live
+    /// node's link MDU is wide enough that a reply under the cap crosses in one part, so
+    /// there is no mid-transfer moment to cancel in; this ordering is the one way a reply
+    /// resource fails on a node after it was accepted. Returns the instant the hold lifted.
+    async fn answer_pair_as_resource_then_cancel(
+        pair: &NodePair,
+        seen: &Seen,
+        bytes: Vec<u8>,
+    ) -> Instant {
+        let transport = pair.node_a.transport().await.unwrap();
+        let manager = transport.iface_manager();
+        let held = manager.lock().await;
+        let hash = pair
+            .responder
+            .transport
+            .send_response_resource(
+                &seen.link_id,
+                seen.request_id.to_bytes().to_vec(),
+                bytes,
+                None,
+            )
+            .await
+            .unwrap();
+        let cancelled = pair
+            .responder
+            .transport
+            .cancel_resource(&seen.link_id, hash)
+            .await
+            .unwrap();
+        assert!(cancelled, "the reply was still being sent");
+        let lifted = Instant::now();
+        drop(held);
+        lifted
+    }
+
+    /// Node B offers the message's reply as a resource and gives it up before node A has
+    /// it, which is how a peer that goes away mid-answer looks from A. The failed transfer
+    /// is a link failure, one of the three classes that mean the peer may not have heard,
+    /// so the send falls back: the message is stored with the propagation node, the
+    /// sender hears `StoreAndForward`, and it hears it when the transfer fails rather
+    /// than when the direct budget runs out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_reply_resource_that_fails_mid_transfer_stores_the_message_with_the_propagation_node()
+     {
+        let (pair, mut node) =
+            pair_with_propagation_node_trusting("request-peer-reply-failed-fallback", trusting_b)
+                .await;
+        pair.introduce_b_to_a().await;
+        let b_instance = pair.responder.desc.address_hash.to_hex_string();
+        pair.recorder_b.queue(Script::Hang);
+        let message = OutboundPeer::new(
+            PeerKind::Message,
+            "are you there",
+            Some("ping"),
+            None,
+            Some(serde_json::json!({ "n": 1 })),
+        )
+        .unwrap();
+        let expected_id = message.id.clone();
+        let options = PeerSendOptions {
+            request: RequestOptions {
+                request_timeout: TRANSFER_REQUEST_TIMEOUT,
+                ..RequestOptions::default()
+            },
+            propagation: PropagationOptions {
+                reject_window: Duration::from_millis(300),
+                ..Default::default()
+            },
+        };
+        let before = pair.recorder_b.seen_count();
+
+        let node_a = pair.node_a.clone();
+        let in_flight =
+            tokio::spawn(
+                async move { node_a.send_peer_with(&b_instance, &message, options).await },
+            );
+        wait_until("node B to hold the request", || {
+            pair.recorder_b.seen_count() > before
+        })
+        .await;
+        let seen = pair.recorder_b.last();
+        let mut random = vec![0u8; MAX_REQUEST_PAYLOAD_BYTES / 2];
+        RngCore::fill_bytes(&mut OsRng, &mut random);
+        let bytes = ResponseFrame {
+            request_id: seen.request_id,
+            data: Value::Binary(random),
+        }
+        .encode();
+        assert!(bytes.len() <= MAX_REQUEST_PAYLOAD_BYTES);
+        let cancelling = answer_pair_as_resource_then_cancel(&pair, &seen, bytes).await;
+        let sent = timeout(INTEROP_TIMEOUT, in_flight)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let settled_in = cancelling.elapsed();
+        assert_eq!(
+            sent,
+            SendOutcome {
+                id: expected_id.clone(),
+                via: PeerVia::StoreAndForward,
+            }
+        );
+        assert!(
+            settled_in < TRANSFER_REQUEST_TIMEOUT / 2,
+            "the send waited out its direct budget instead of the failed transfer: {settled_in:?}"
+        );
+        let received = node.next_received().await;
+        let stored = stored_peer(
+            received.bytes(),
+            &pair.responder.identity,
+            &pair.a_desc.identity,
+        );
+        match stored {
+            PeerLxmf::Peer(peer) => {
+                assert_eq!(peer.kind, PeerKind::Message);
+                assert_eq!(peer.id, expected_id);
+                assert_eq!(peer.content, "are you there");
+            }
+            other => panic!("the node stored something other than the message: {other:?}"),
+        }
+        node.nothing_else_received();
+        pair.stop_node_a().await;
+        node.stop().await;
+    }
+
+    /// Node B answers the message with a resource whose bytes are no response frame at
+    /// all. The reply reached node A, so this is not one of the peer-unreachable classes:
+    /// the send fails directly as `Decode` naming the response frame, and the
+    /// propagation node known to A is never posted to.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_an_undecodable_peer_message_reply_is_a_direct_failure_and_never_stored() {
+        let (pair, mut node) =
+            pair_with_propagation_node_trusting("request-peer-undecodable-no-fallback", trusting_b)
+                .await;
+        pair.introduce_b_to_a().await;
+        let b_instance = pair.responder.desc.address_hash.to_hex_string();
+        pair.recorder_b.queue(Script::Hang);
+        let message =
+            OutboundPeer::new(PeerKind::Message, "are you there", None, None, None).unwrap();
+        let before = pair.recorder_b.seen_count();
+
+        let node_a = pair.node_a.clone();
+        let in_flight = tokio::spawn(async move {
+            node_a
+                .send_peer_with(&b_instance, &message, peer_send_options())
+                .await
+        });
+        wait_until("node B to hold the request", || {
+            pair.recorder_b.seen_count() > before
+        })
+        .await;
+        let seen = pair.recorder_b.last();
+        // 0xc1 is the one byte msgpack never assigns, so no decoder reads a frame here.
+        answer_pair_as_resource(&pair, &seen, vec![0xc1; 64]).await;
+        let answered = Instant::now();
+        let err = timeout(INTEROP_TIMEOUT, in_flight)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+
+        assert!(
+            answered.elapsed() < SHORT_REQUEST_TIMEOUT,
+            "the failure is immediate, not a timeout"
+        );
+        assert_eq!(
+            err,
+            SendError::Direct(RequestError::Decode("response frame".to_string()))
         );
         sleep(Duration::from_millis(500)).await;
         node.nothing_else_received();
