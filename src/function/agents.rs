@@ -6293,6 +6293,74 @@ mod tests {
         assert!(recorded.contains("boom"), "{meta:?}");
     }
 
+    /// A task still running at cancel time that panics while tearing down
+    /// never writes its own exit either; the cancel's failed write wins
+    /// over the cancelled one it recorded first, and the cancel itself
+    /// still succeeds.
+    #[test]
+    #[serial]
+    fn handle_cancel_of_a_running_task_that_then_panics_marks_the_sidecar_failed() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_sidecar_cancel_then_panic");
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let (agent_id, sid, root) = seat_for_a_hand_built_handle(&mut ctx, &agent_name);
+
+        let cancelled = run_async(async {
+            let abort = create_abort_signal();
+            let task_abort = abort.clone();
+            let join_handle = tokio::spawn(async move {
+                while !task_abort.aborted_ctrlc() {
+                    tokio::task::yield_now().await;
+                }
+                panic!("boom after cancel")
+            });
+            assert!(!join_handle.is_finished());
+            register_hand_built_handle(
+                &mut ctx,
+                &agent_id,
+                &agent_name,
+                &sid,
+                root,
+                abort,
+                join_handle,
+            );
+            handle_cancel(&mut ctx, &json!({"id": agent_id}))
+                .await
+                .unwrap()
+        });
+
+        assert_eq!(cancelled["status"], "ok", "{cancelled}");
+        let meta = child_meta_of(&ctx, &sid);
+        assert_eq!(meta.status, ChildStatus::Failed);
+        let recorded = meta.error.as_deref().unwrap_or_default();
+        assert!(recorded.contains("panicked"), "{meta:?}");
+        assert!(recorded.contains("boom after cancel"), "{meta:?}");
+    }
+
+    #[test]
+    fn task_join_error_tells_a_panic_from_an_abort() {
+        let (panicked, aborted) = run_async(async {
+            let panicked = tokio::spawn(async { panic!("boom") }).await.unwrap_err();
+            let pending = tokio::spawn(std::future::pending::<()>());
+            pending.abort();
+            let aborted = pending.await.unwrap_err();
+            (panicked, aborted)
+        });
+
+        let panic_text = task_join_error(&panicked);
+        assert!(
+            panic_text.starts_with("agent task panicked: "),
+            "{panic_text}"
+        );
+        assert!(panic_text.contains("boom"), "{panic_text}");
+        let abort_text = task_join_error(&aborted);
+        assert!(
+            abort_text.starts_with("agent task was aborted before it finished: "),
+            "{abort_text}"
+        );
+    }
+
     /// Seats a child of `agent_name` and drops its context, leaving a
     /// `Running` sidecar for a test to put its own task behind.
     fn seat_for_a_hand_built_handle(
@@ -6579,7 +6647,7 @@ mod tests {
             assert_eq!(spawned["status"], "ok", "{spawned}");
             let children = ctx.child_session_root.as_ref().unwrap().children_dir();
             std::fs::set_permissions(&children, std::fs::Permissions::from_mode(0o500)).unwrap();
-            let _restore = RestoreMode(children, 0o700);
+            let _restore = crate::testing::RestoreMode(children, 0o700);
             let collected = handle_collect(&mut ctx, &json!({"id": spawned["id"]})).await;
             (spawned, collected.unwrap())
         });
@@ -6734,10 +6802,17 @@ mod tests {
             (sid, error)
         });
 
-        assert!(error.to_string().contains("at capacity"), "{error}");
+        assert_eq!(error.to_string(), "spawn refused");
         let meta = child_meta_of(&ctx, &sid);
         assert_eq!(meta.status, ChildStatus::Failed);
         assert_eq!(meta.error.as_deref(), Some(format!("{error:#}").as_str()));
+        assert!(
+            meta.error
+                .as_deref()
+                .unwrap()
+                .contains("spawn refused: Cannot spawn agent: at capacity"),
+            "{meta:?}"
+        );
         assert_eq!(
             hook_captures_named("sidecar_register_fails_started").len(),
             1
@@ -6749,7 +6824,10 @@ mod tests {
             .envs
             .get("COYOTE_AGENT_ERROR")
             .expect("a failed registration reports its error");
-        assert!(hook_error.contains("at capacity"), "{hook_error}");
+        assert!(
+            hook_error.contains("spawn refused: Cannot spawn agent: at capacity"),
+            "{hook_error}"
+        );
         assert_session_envs(&failed[0], &sid);
     }
 
@@ -7566,7 +7644,7 @@ mod tests {
         let mut ctx = ctx_with_supervisor(4, 3);
         let root = ctx.ensure_child_session_root().unwrap();
         let children = root.children_dir();
-        let _restore = RestoreMode(children.clone(), 0o700);
+        let _restore = crate::testing::RestoreMode(children.clone(), 0o700);
         let make_read_only = move || {
             std::fs::set_permissions(&children, std::fs::Permissions::from_mode(0o500)).unwrap();
         };
@@ -7605,19 +7683,6 @@ mod tests {
     fn mode_of(path: &Path) -> u32 {
         use std::os::unix::fs::PermissionsExt;
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
-    }
-
-    /// Puts the mode back on a path when dropped, so a failing assertion
-    /// cannot leave a directory the next run cannot clean up.
-    #[cfg(unix)]
-    struct RestoreMode(PathBuf, u32);
-
-    #[cfg(unix)]
-    impl Drop for RestoreMode {
-        fn drop(&mut self) {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
-        }
     }
 
     /// The spawn payload names the session slot on every spawn: a caller
@@ -8263,14 +8328,8 @@ mod tests {
         let children = root.children_dir();
         create_dir_all(&children).unwrap();
         std::fs::set_permissions(&children, std::fs::Permissions::from_mode(0o500)).unwrap();
-        let restore = || {
-            let _ = std::fs::set_permissions(&children, std::fs::Permissions::from_mode(0o700));
-        };
-        if write(children.join("probe"), "").is_ok() {
-            // Running with privileges that ignore the mode bits; the
-            // scenario cannot be staged here.
-            let _ = std::fs::remove_file(children.join("probe"));
-            restore();
+        let _restore = crate::testing::RestoreMode(children.clone(), 0o700);
+        if crate::testing::mode_bits_are_ignored_in(&children) {
             return;
         }
 
@@ -8284,7 +8343,6 @@ mod tests {
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect();
         let mode = mode_of(&children);
-        restore();
 
         let error = outcome.expect_err("an unwritable children dir refuses the spawn");
         let chain = format!("{error:#}");

@@ -13510,10 +13510,13 @@ mod tests {
         let before = read_to_string(&path).unwrap();
         let warns_before = warn_snapshot().len();
         std::fs::set_permissions(&sessions_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let _restore = crate::testing::RestoreMode(sessions_dir.clone(), 0o700);
+        if crate::testing::mode_bits_are_ignored_in(&sessions_dir) {
+            return;
+        }
 
         let result = ctx.checkpoint_session_to_disk(false);
 
-        std::fs::set_permissions(&sessions_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         result.unwrap();
         assert_eq!(read_to_string(&path).unwrap(), before);
         assert!(ctx.session.as_ref().unwrap().dirty());
