@@ -2719,7 +2719,7 @@ fn the_serving_limit_is_the_configured_bytes() -> Result<(), String> {
         full.serving.serving_limit(),
         MAX_FETCH_FILE_BYTES,
     )?;
-    same("file ceiling", MAX_FETCH_FILE_BYTES, 4_194_304)?;
+    same("file bound", MAX_FETCH_FILE_BYTES, 4_194_304)?;
     small.file("big.bin", &[b'x'; 9]);
     let value = answered(small.fetch(fetch_body("big.bin", None)))?;
     same("status", status_of(&value), Some("too_large"))?;

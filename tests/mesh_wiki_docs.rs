@@ -7909,10 +7909,15 @@ fn the_pages_quote_a_peers_refusal_as_the_code_prints_it_with_the_side_that_has_
 /// standing for the values.
 #[test]
 fn the_file_sharing_page_quotes_the_size_refusal_for_the_side_that_prints_it() {
-    let fetch_side = string_literals(&fn_body("src/repl/mesh.rs", "fetch"))
+    let fetch_literal = string_literals(&fn_body("src/repl/mesh.rs", "fetch"))
         .into_iter()
         .find(|literal| literal.contains("serves files of at most {limit} bytes"))
-        .expect("fetch formats the too-large refusal naming the peer's limit")
+        .expect("fetch formats the too-large refusal naming the peer's limit");
+    assert!(
+        fetch_literal.starts_with("{peer} "),
+        "the `.mesh fetch` size refusal names the peer first: {fetch_literal:?}"
+    );
+    let fetch_side = fetch_literal
         .replace("{peer}", "<dest8>")
         .replace("{shown}", "docs/guide.md")
         .replace("{limit}", "<limit>");

@@ -59,11 +59,11 @@ pub(crate) const LIST_PAGE_HEADROOM: usize = 2048;
 pub(crate) const CURSOR_MAX_BYTES: usize = 64;
 const UNKNOWN_RULE: &str = "unknown";
 
-/// `max_bytes` is `mesh.fetch.max_bytes` and never a peer's number; `serving_limit` is
-/// what a request is actually held to. `inbox_dir` is protected from serving along with
-/// the cache dir so a peer cannot fetch what another peer sent. The grant store is swapped
-/// by `rebind_grants` when the node re-keys, so a fork honours its own grants and not the
-/// original's.
+/// `max_bytes` is `mesh.fetch.max_bytes`, never a peer's number, and is the size every
+/// served file is held to (`serving_limit`). `inbox_dir` is protected from serving along
+/// with the cache dir so a peer cannot fetch what another peer sent. The grant store is
+/// swapped by `rebind_grants` when the node re-keys, so a fork honours its own grants and
+/// not the original's.
 pub(crate) struct FetchServing {
     config_dir: PathBuf,
     cache_dir: PathBuf,
@@ -2156,10 +2156,10 @@ mod tests {
         );
     }
 
-    /// An `ok` reply above one Resource segment is still one response frame; splitting it
-    /// is the transport's job, and the frame decodes back byte-exact.
+    /// The response frame codec is size-agnostic: an `ok` reply above one Resource segment
+    /// encodes and decodes back byte-exact.
     #[test]
-    fn an_ok_reply_above_one_segment_is_one_frame_the_transport_splits() {
+    fn an_ok_reply_above_one_segment_encodes_and_decodes_byte_exact() {
         let bytes = vec![0xffu8; MAX_EFFICIENT_SIZE + 512 * 1024];
         let digest = sha256_of(&bytes);
         let frame = ResponseFrame {
