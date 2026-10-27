@@ -36,6 +36,12 @@ pub const INTERRUPTED_RESPONSE_TEXT: &str = "[Response interrupted due to error]
 /// an error checkpoint.
 pub const TURN_INTERRUPTED_TEXT: &str = "[Turn interrupted by the user before the tool loop finished. Background tasks started above were left uncollected; reclaim each with agent__collect / job__collect, or cancel it, before relying on its result.]";
 
+/// Subdirectory of a sessions dir under which auto-named sessions are filed
+/// when a temp session is saved without a name.
+pub(crate) const AUTONAME_PLACEHOLDER: &str = "_";
+/// The label form of [`AUTONAME_PLACEHOLDER`]: what precedes an auto-named session's name.
+pub(crate) const AUTONAME_LABEL_PREFIX: &str = "_/";
+
 /// Auto-compression only fires when at least `threshold / 5` (20%) of the
 /// threshold is reclaimable, so each compression folds a meaningful batch
 /// instead of thrashing every turn.
@@ -406,7 +412,7 @@ impl Session {
         session.model = Model::retrieve_model(app, &session.model_id, ModelType::Chat)?;
         session.scope = scope;
 
-        if let Some(autoname) = name.strip_prefix("_/") {
+        if let Some(autoname) = name.strip_prefix(AUTONAME_LABEL_PREFIX) {
             session.name = TEMP_SESSION_NAME.to_string();
             session.path = None;
             if let Ok(true) = RE_AUTONAME_PREFIX.is_match(autoname) {
@@ -1326,7 +1332,7 @@ impl Session {
                         .prompt()?;
                 }
             } else if save_session == Some(true) && session_name == TEMP_SESSION_NAME {
-                session_dir = session_dir.join("_");
+                session_dir = session_dir.join(AUTONAME_PLACEHOLDER);
                 ensure_parent_exists(&session_dir).with_context(|| {
                     format!("Failed to create directory '{}'", session_dir.display())
                 })?;

@@ -4,9 +4,9 @@ use super::input::TOOL_LOOP_CHECKPOINT_TEXT;
 use super::mcp_tool_policy::{McpToolPolicy, SkillMcpLayer, ToolFilter, expand_mcp_server_alias};
 use super::rag_cache::{RagCache, RagKey};
 use super::session::{
-    CompressionInfo, INTERRUPTED_RESPONSE_TEXT, KeepPolicy, Session, SessionScope,
-    keep_token_budget, labeled_session_names, merged_session_names, min_reclaim_tokens,
-    session_scope_dirs, valve_limit,
+    AUTONAME_LABEL_PREFIX, AUTONAME_PLACEHOLDER, CompressionInfo, INTERRUPTED_RESPONSE_TEXT,
+    KeepPolicy, Session, SessionScope, keep_token_budget, labeled_session_names,
+    merged_session_names, min_reclaim_tokens, session_scope_dirs, valve_limit,
 };
 use super::skill::{SKILL_SCAFFOLD, Skill};
 use super::skill_policy::SkillPolicy;
@@ -48,6 +48,7 @@ use crate::supervisor::Supervisor;
 use crate::supervisor::escalation::EscalationQueue;
 use crate::supervisor::mailbox::{Inbox, PeerRegistry};
 use crate::supervisor::notification::NotificationQueue;
+use crate::utils::fs::refuse_symlinked_dir;
 use crate::utils::process::ProcessStamp;
 use crate::utils::{
     AbortSignal, UserInterrupt, abortable_run_with_spinner, create_abort_signal, edit_file,
@@ -1389,15 +1390,19 @@ impl RequestContext {
 
     fn labeled_autoname_sessions(&self) -> Vec<(String, Option<String>)> {
         let mut values = labeled_session_names(
-            &self.sessions_dir_for(SessionScope::Workspace).join("_"),
-            &self.sessions_dir_for(SessionScope::Global).join("_"),
+            &self
+                .sessions_dir_for(SessionScope::Workspace)
+                .join(AUTONAME_PLACEHOLDER),
+            &self
+                .sessions_dir_for(SessionScope::Global)
+                .join(AUTONAME_PLACEHOLDER),
         );
         values.sort_unstable_by(|a, b| b.0.cmp(&a.0));
         values
             .into_iter()
             .map(|(name, scope)| {
                 (
-                    format!("_/{}", sanitize_display_text(&name)),
+                    format!("{AUTONAME_LABEL_PREFIX}{}", sanitize_display_text(&name)),
                     Some(scope.to_string()),
                 )
             })
@@ -1616,6 +1621,9 @@ impl RequestContext {
         let mut fork = session.clone();
         fork.set_name(fork_name.clone());
         fork.clear_autoname();
+        // The fresh root below is removed without the root lock on failure:
+        // its uid was minted a few lines above, no parent file names it,
+        // and nothing else can learn of it before the fork is attached.
         let inherited = match session.uid() {
             Some(uid) => {
                 let old_root = ChildSessionRoot::Uid(uid);
@@ -1653,14 +1661,28 @@ impl RequestContext {
         }
 
         self.session = Some(fork);
-        // The fork owns its own child directory: its next spawn derives the
-        // root from the fork's uid, never from the original's.
+        // The fork owns its own child directory: its next spawn derives
+        // the root from the fork's uid, never from the original's. A
+        // process root inherited from before the session was attached
+        // would otherwise keep filing children under `_proc/` until exit.
+        // That state is unreachable once `use_session` settles the process
+        // root at attach; this mirror keeps the fork from ever filing
+        // children under `_proc/` should a session be attached another way.
+        if let Some(root) = self
+            .child_session_root
+            .take_if(|root| matches!(**root, ChildSessionRoot::Proc { .. }))
+        {
+            child_sessions::settle_parent_exit(&root, None);
+        }
         self.child_session_root = None;
         println!("Forked '{current_name}' → '{fork_name}'");
 
         Ok(())
     }
 
+    /// The uid directory goes under its root lock, like every other
+    /// deleter, so nothing else is mid-write when it does; the lock never
+    /// creates the directory, hence the existence check first.
     pub fn empty_session(&mut self) -> Result<()> {
         // Between turns the graph agent owns the slot; the leave makes sure.
         self.leave_delegate_turn();
@@ -1675,7 +1697,17 @@ impl RequestContext {
             }
             session.clear_messages();
             if let Some(uid) = session.uid() {
-                child_sessions::remove_dir(&ChildSessionRoot::Uid(uid).dir(), "session emptied");
+                let root = ChildSessionRoot::Uid(uid);
+                let dir = root.dir();
+                if !refuse_symlinked_dir(&dir, "session emptied") && dir.is_dir() {
+                    match root.lock() {
+                        Ok(lock) => {
+                            drop(lock);
+                            child_sessions::remove_dir(&dir, "session emptied");
+                        }
+                        Err(error) => warn!("Keeping {}: {error:#}", dir.display()),
+                    }
+                }
             }
         } else {
             bail!("No session")
@@ -4483,6 +4515,15 @@ impl RequestContext {
     /// goes when that was its last parent). A bare `remove_dir_all` would
     /// leave those roots pointing at files that no longer exist.
     fn delete_agent_data_dir(path: &Path) -> Result<()> {
+        let dir_is_symlink = std::fs::symlink_metadata(path)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false);
+        if dir_is_symlink {
+            bail!(
+                "Refusing to delete agent-data at '{}': it is a symlink",
+                path.display()
+            );
+        }
         let sessions = path.join(SESSIONS_DIR_NAME);
         // `read_dir` would follow a symlinked `sessions/`; `remove_dir_all`
         // below takes the link itself without following it.
@@ -4548,6 +4589,16 @@ impl RequestContext {
     fn delete_sessions(&self) -> Result<()> {
         let entries = self.session_delete_candidates();
         if entries.is_empty() {
+            // Every session on disk being the attached one is a refusal
+            // the user can act on, not an empty list.
+            if let Some(session) = self.session.as_ref()
+                && !self.session_delete_entries().is_empty()
+            {
+                bail!(
+                    "{}",
+                    self.session_in_use_message(session.name(), session.scope())
+                );
+            }
             bail!("No session to delete")
         }
         let labels: Vec<String> = entries
@@ -4619,23 +4670,40 @@ impl RequestContext {
     }
 
     /// Whether `name` in `scope` is the session this context has attached.
+    /// Decided on canonical paths when both files resolve, so a candidate
+    /// reaching the attached file through a symlinked sessions directory
+    /// is recognised; an unsaved session has no file yet and falls back to
+    /// the name and scope.
     fn is_attached_session(&self, name: &str, scope: SessionScope) -> bool {
-        self.session
-            .as_ref()
-            .is_some_and(|session| session.name() == name && session.scope() == scope)
+        let Some(session) = self.session.as_ref() else {
+            return false;
+        };
+        let candidate = std::fs::canonicalize(self.session_file_for(name, scope));
+        let attached = self
+            .attached_session_file()
+            .and_then(|path| std::fs::canonicalize(path).ok());
+        match (candidate, attached) {
+            (Ok(candidate), Some(attached)) => candidate == attached,
+            _ => session.name() == name && session.scope() == scope,
+        }
+    }
+
+    /// Deleting the attached session's own file would also settle the
+    /// child session root this process still writes under; the next flush
+    /// would re-create the file anyway, so the delete is refused instead.
+    fn session_in_use_message(&self, name: &str, scope: SessionScope) -> String {
+        format!(
+            "Cannot delete the {scope} session '{}' while it is in use; run '{}' first",
+            sanitize_display_text(name),
+            self.render_hints(".exit session")
+        )
     }
 
     fn delete_session_at(&self, name: &str, scope: SessionScope) -> Result<()> {
         let path = self.session_file_for(name, scope);
         let shown = sanitize_display_text(name);
-        // Deleting the attached session's own file would also settle the
-        // child session root this process still writes under; the next
-        // flush would re-create the file anyway, so refuse instead.
         if self.is_attached_session(name, scope) {
-            bail!(
-                "Cannot delete the {scope} session '{shown}' while it is in use; run '{}' first",
-                self.render_hints(".exit session")
-            );
+            bail!("{}", self.session_in_use_message(name, scope));
         }
         child_sessions::unlink_parent_yaml(&path).with_context(|| {
             format!(
@@ -5139,7 +5207,7 @@ impl RequestContext {
                         .is_some_and(|name| !graph::graph_supports_sessions(&name))
                     {
                         vec![]
-                    } else if args[0].starts_with("_/") {
+                    } else if args[0].starts_with(AUTONAME_LABEL_PREFIX) {
                         self.labeled_autoname_sessions()
                     } else {
                         self.labeled_sessions()
@@ -6049,6 +6117,15 @@ impl RequestContext {
             }
         }
         self.session = session;
+        // A process root resolved while sessionless would keep filing this
+        // session's children under `_proc/`; the session resolves its own
+        // uid root on the next spawn.
+        if let Some(root) = self
+            .child_session_root
+            .take_if(|root| matches!(**root, ChildSessionRoot::Proc { .. }))
+        {
+            child_sessions::settle_parent_exit(&root, None);
+        }
         self.graph_chat_fc_warned = false;
         // Adopt the session's todo state wholesale: a session without any todo
         // state resets ctx to defaults, so nothing leaks across a session switch.
@@ -14062,6 +14139,254 @@ mod tests {
             .unwrap();
         assert!(root.children_dir().is_dir());
         assert!(!child_present(&root, "sess_coder_0123456789ab"));
+    }
+
+    /// The empty decides under the uid root's lock like every other
+    /// deleter: a holder elsewhere keeps the directory, and the lock is
+    /// let go before the delete since its file lives inside.
+    #[test]
+    #[serial]
+    fn empty_session_keeps_a_uid_dir_whose_lock_another_holder_keeps() {
+        install_log_collector();
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("empty-locked");
+        let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
+        write_child(&root, "sess_coder_0123456789ab", retention_time());
+        let held =
+            crate::utils::fs::ExclusiveLock::acquire(&root.lock_file(), "test", Duration::ZERO)
+                .unwrap();
+
+        child_sessions::with_short_root_lock_wait(|| ctx.empty_session()).unwrap();
+
+        assert!(root.dir().is_dir());
+        assert!(child_present(&root, "sess_coder_0123456789ab"));
+        assert!(ctx.session.as_ref().unwrap().messages().is_empty());
+        let dir_text = root.dir().display().to_string();
+        assert!(
+            warn_snapshot()
+                .iter()
+                .any(|message| message.starts_with("Keeping ")
+                    && message.contains(&dir_text)
+                    && message.contains("is held")),
+            "{:?}",
+            warn_snapshot()
+        );
+
+        drop(held);
+        ctx.empty_session().unwrap();
+        assert!(!root.dir().exists());
+    }
+
+    #[test]
+    fn empty_session_locks_the_uid_dir_and_drops_the_lock_before_removing_it() {
+        let source = include_str!("request_context.rs").replace("\r\n", "\n");
+        let production = &source[..source.find("\n#[cfg(test)]\nmod tests {").unwrap()];
+        let start = production.find("\n    pub fn empty_session(").unwrap();
+        let body = &production[start..];
+        let body = &body[..body.find("\n    }\n").unwrap()];
+        assert_eq!(body.matches(".lock()").count(), 1, "{body}");
+        let lock_at = body.find(".lock()").unwrap();
+        let locked = &body[lock_at..];
+        assert_eq!(locked.matches("remove_dir(").count(), 1, "{body}");
+        assert_eq!(locked.matches("drop(lock);").count(), 1, "{body}");
+        assert!(
+            locked.find("drop(lock);").unwrap() < locked.find("remove_dir(").unwrap(),
+            "{body}"
+        );
+        assert!(body.find("dir.is_dir()").unwrap() < lock_at, "{body}");
+    }
+
+    fn proc_root_with_dir() -> ChildSessionRoot {
+        let root = ChildSessionRoot::from_stamp(ProcessStamp::current());
+        root.ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
+            .unwrap();
+        root
+    }
+
+    /// A process root resolved before the session was attached goes with
+    /// the attach: the session's children belong under its own uid.
+    #[test]
+    #[serial]
+    fn use_session_settles_a_process_root_resolved_while_sessionless() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let resolved = ctx.ensure_child_session_root().unwrap();
+        assert!(matches!(*resolved, ChildSessionRoot::Proc { .. }));
+        let proc_root = proc_root_with_dir();
+        assert_eq!(*resolved, proc_root);
+        write_session_file(
+            &ctx,
+            "after-proc",
+            SessionScope::Workspace,
+            "messages: []\n",
+        );
+        let app = ctx.app.config.clone();
+
+        run_async(ctx.use_session(&app, Some("after-proc"), utils::create_abort_signal())).unwrap();
+
+        assert!(!proc_root.dir().exists());
+        assert!(ctx.child_session_root.is_none());
+        let next = ctx.ensure_child_session_root().unwrap();
+        assert!(matches!(*next, ChildSessionRoot::Uid(_)), "{next:?}");
+    }
+
+    #[test]
+    #[serial]
+    fn fork_session_settles_an_inherited_process_root() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, _path) = loaded_session_ctx("fork-from-proc");
+        let proc_root = proc_root_with_dir();
+        ctx.child_session_root = Some(Arc::new(proc_root.clone()));
+
+        ctx.fork_session(Some("fork-from-proc-fork")).unwrap();
+
+        assert!(!proc_root.dir().exists());
+        assert!(ctx.child_session_root.is_none());
+        let next = ctx.ensure_child_session_root().unwrap();
+        assert!(matches!(*next, ChildSessionRoot::Uid(_)), "{next:?}");
+    }
+
+    /// Only a process root is settled at the attach; a uid root already
+    /// cached stays as it is.
+    #[test]
+    #[serial]
+    fn use_session_leaves_a_cached_uid_root_alone() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let uid_root = ChildSessionRoot::Uid(Uuid::new_v4());
+        uid_root
+            .ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
+            .unwrap();
+        ctx.child_session_root = Some(Arc::new(uid_root.clone()));
+        write_session_file(&ctx, "keep-uid", SessionScope::Workspace, "messages: []\n");
+        let app = ctx.app.config.clone();
+
+        run_async(ctx.use_session(&app, Some("keep-uid"), utils::create_abort_signal())).unwrap();
+
+        assert!(uid_root.dir().is_dir());
+        assert_eq!(
+            ctx.child_session_root.as_deref(),
+            Some(&uid_root),
+            "a cached uid root is not the attach's to settle"
+        );
+    }
+
+    /// A candidate that reaches the attached file through a symlinked
+    /// directory is the attached session, whatever it is called.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn is_attached_session_recognises_the_attached_file_through_a_symlink() {
+        let _config = TestConfigDirGuard::new();
+        let (ctx, path) = loaded_session_ctx("linked");
+        let sessions_dir = path.parent().unwrap();
+        std::os::unix::fs::symlink(sessions_dir, sessions_dir.join("alias")).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(ctx.session_file_for("alias/linked", SessionScope::Workspace))
+                .unwrap(),
+            std::fs::canonicalize(&path).unwrap()
+        );
+
+        assert!(ctx.is_attached_session("linked", SessionScope::Workspace));
+        assert!(ctx.is_attached_session("alias/linked", SessionScope::Workspace));
+        assert!(!ctx.is_attached_session("linked", SessionScope::Global));
+        assert!(!ctx.is_attached_session("other", SessionScope::Workspace));
+    }
+
+    /// An unsaved session has no file to resolve, so the name and scope
+    /// decide.
+    #[test]
+    #[serial]
+    fn is_attached_session_falls_back_to_name_and_scope_for_an_unsaved_session() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let mut session = Session::default();
+        session.set_name("unsaved".to_string());
+        ctx.session = Some(session);
+        let scope = ctx.session.as_ref().unwrap().scope();
+        assert!(!ctx.session_file_for("unsaved", scope).exists());
+
+        assert!(ctx.is_attached_session("unsaved", scope));
+        assert!(!ctx.is_attached_session("other", scope));
+    }
+
+    /// When the attached session is the only one on disk the delete says
+    /// why it is refused instead of reporting nothing to delete.
+    #[test]
+    #[serial]
+    fn delete_sessions_refuses_with_the_in_use_message_when_only_the_attached_session_exists() {
+        let _config = TestConfigDirGuard::new();
+        let (ctx, path) = loaded_session_ctx("only-one");
+        assert_eq!(ctx.session_delete_entries().len(), 1);
+        assert!(ctx.session_delete_candidates().is_empty());
+
+        let err = ctx.delete_sessions().unwrap_err();
+
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("while it is in use") && text.contains("only-one"),
+            "{text}"
+        );
+        assert!(path.is_file());
+    }
+
+    #[test]
+    #[serial]
+    fn delete_sessions_reports_nothing_to_delete_without_any_session_on_disk() {
+        let _config = TestConfigDirGuard::new();
+        let ctx = create_test_ctx();
+        assert!(ctx.session_delete_entries().is_empty());
+
+        let err = ctx.delete_sessions().unwrap_err();
+
+        assert_eq!(format!("{err:#}"), "No session to delete");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn delete_agent_data_dir_refuses_a_symlinked_agent_dir() {
+        let _config = TestConfigDirGuard::new();
+        let (agent_dir, root) = agent_data_with_session("coder", "main.yaml", None);
+        let alias = paths::agents_data_dir().join("alias");
+        std::os::unix::fs::symlink(&agent_dir, &alias).unwrap();
+
+        let err = RequestContext::delete_agent_data_dir(&alias).unwrap_err();
+
+        assert!(format!("{err:#}").contains("it is a symlink"), "{err:#}");
+        assert!(
+            std::fs::symlink_metadata(&alias)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            agent_dir
+                .join(SESSIONS_DIR_NAME)
+                .join("main.yaml")
+                .is_file()
+        );
+        assert!(root.dir().is_dir());
+        assert!(child_present(&root, "sess_coder_0123456789ab"));
+    }
+
+    #[test]
+    fn autoname_sessions_file_under_the_placeholder_constant() {
+        assert_eq!(AUTONAME_PLACEHOLDER, "_");
+        assert_eq!(AUTONAME_LABEL_PREFIX, concat!("_", "/"));
+        for source in [
+            include_str!("request_context.rs"),
+            include_str!("session.rs"),
+        ] {
+            let source = source.replace("\r\n", "\n");
+            let production = &source[..source.find("\n#[cfg(test)]\nmod tests").unwrap()];
+            assert!(!production.contains("join(\"_\")"));
+            let hand_spelled = production
+                .lines()
+                .filter(|line| !line.contains("const AUTONAME_LABEL_PREFIX"))
+                .any(|line| line.contains(concat!("\"_", "/\"")));
+            assert!(!hand_spelled, "the label prefix is spelled once");
+        }
     }
 
     #[test]

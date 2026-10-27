@@ -1,11 +1,12 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 /// A (pid, start time) pair identifying one incarnation of an OS process.
 /// A bare pid is recycled by the kernel; pairing it with the process start
 /// time lets a stamp recorded on disk be checked later without mistaking a
 /// newer process that inherited the pid for the original.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct ProcessStamp {
     pub pid: u32,
     /// Process start time in seconds since the Unix epoch, as reported by
@@ -41,7 +42,44 @@ impl ProcessStamp {
     pub(crate) fn pid_exists(pid: u32) -> bool {
         lookup_start_time(pid).is_some()
     }
+
+    /// The subset of `stamps` whose process is alive by the `is_alive`
+    /// rule, decided with one process-table refresh instead of one per
+    /// stamp. An empty slice asks sysinfo nothing.
+    pub(crate) fn alive_set(stamps: &[ProcessStamp]) -> HashSet<ProcessStamp> {
+        if stamps.is_empty() {
+            return HashSet::new();
+        }
+        #[cfg(test)]
+        ALIVE_SET_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let pids: HashSet<Pid> = stamps
+            .iter()
+            .map(|stamp| Pid::from_u32(stamp.pid))
+            .collect();
+        let pids: Vec<Pid> = pids.into_iter().collect();
+        let mut sys = System::new();
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&pids),
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        stamps
+            .iter()
+            .copied()
+            .filter(|stamp| {
+                sys.process(Pid::from_u32(stamp.pid))
+                    .map(|p| p.start_time())
+                    == Some(stamp.start)
+            })
+            .collect()
+    }
 }
+
+/// How many process-table refreshes `alive_set` has spent in this process,
+/// so a test can pin how many one caller costs.
+#[cfg(test)]
+pub(crate) static ALIVE_SET_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 fn lookup_start_time(pid: u32) -> Option<u64> {
     let pid = Pid::from_u32(pid);
@@ -57,6 +95,7 @@ fn lookup_start_time(pid: u32) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn current_process_is_alive() {
@@ -80,6 +119,43 @@ mod tests {
             start: current.start + 1,
         };
         assert!(!stale.is_alive());
+    }
+
+    /// Serial with the sweep tests that count `alive_set` calls.
+    #[test]
+    #[serial]
+    fn alive_set_keeps_only_the_live_self() {
+        let current = ProcessStamp::current();
+        let dead = ProcessStamp {
+            pid: u32::MAX - 1,
+            start: 0,
+        };
+        if current.start == 0 {
+            eprintln!(
+                "sysinfo cannot report this process's start time; the start discriminator goes untested"
+            );
+            let alive = ProcessStamp::alive_set(&[current, dead]);
+            assert_eq!(alive, HashSet::from([current]));
+            return;
+        }
+        let recycled = ProcessStamp {
+            pid: current.pid,
+            start: current.start + 1,
+        };
+        let unreported = ProcessStamp {
+            pid: current.pid,
+            start: 0,
+        };
+
+        let alive = ProcessStamp::alive_set(&[current, dead, recycled, unreported]);
+
+        assert_eq!(alive, HashSet::from([current]));
+    }
+
+    #[test]
+    #[serial]
+    fn alive_set_of_nothing_is_empty() {
+        assert!(ProcessStamp::alive_set(&[]).is_empty());
     }
 
     #[test]

@@ -14,8 +14,10 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::SystemTime;
 use uuid::Uuid;
 
@@ -90,26 +92,38 @@ impl ChildSessionRoot {
         acquire_root_lock(&self.lock_file())
     }
 
-    /// Creates the root directory, writes `root.yaml` when it is missing or
-    /// does not parse, then creates `children/`, in that order: a crash between
-    /// the steps never leaves children without an identity. A `root.yaml`
-    /// that parses is left untouched so a second spawn under the same root
-    /// cannot erase the parent paths and save time recorded by the first;
-    /// one that does not parse is replaced from `root` with a warning,
-    /// since nothing in it could be kept.
-    /// Anything other than a regular file in its place is an error that
-    /// leaves it as found. The check and the write happen under the root
-    /// lock, so a second spawner, or a parent save, cannot slip a record
-    /// in between them.
+    /// Creates the root directory, writes `root.yaml` when it is missing
+    /// or does not parse, then creates `children/`, in that order: a crash
+    /// between the steps never leaves children without an identity. A
+    /// `root.yaml` that parses keeps its parent paths and save time, so a
+    /// second spawn under the same root cannot erase what the first
+    /// recorded; only its process stamp is refreshed to `root`'s, and only
+    /// when the process it names is gone, so a REPL adopting a uid left by
+    /// a dead one is visible to the orphan sweep before its first save.
+    /// One that does not parse is replaced from `root` with a warning,
+    /// since nothing in it could be kept. Anything other than a regular
+    /// file in its place is an error that leaves it as found, and a
+    /// symlink at the directory's path is refused outright: children are
+    /// about to be written under it. The check and the write happen under
+    /// the root lock, so a second spawner, or a parent save, cannot slip a
+    /// record in between them.
     pub(crate) fn ensure_dir(&self, root: &RootFile) -> Result<()> {
         let dir = self.dir();
+        if refuse_symlinked_dir(&dir, "child session root") {
+            bail!(
+                "Refusing to use {} as a child session root: it is a symlink or cannot be inspected",
+                dir.display()
+            );
+        }
         create_private_dir_all(&dir)
             .with_context(|| format!("Failed to create {}", dir.display()))?;
         let root_file = self.root_file();
         {
             let _lock = self.lock()?;
-            if root_file_needs_writing(&root_file)? {
-                root.save(&root_file)?;
+            match root_file_disposition(&root_file, last_process(root))? {
+                RootDisposition::Seed => root.save(&root_file)?,
+                RootDisposition::Keep => {}
+                RootDisposition::Restamp(record) => record.save(&root_file)?,
             }
         }
         let children = self.children_dir();
@@ -223,14 +237,28 @@ pub(crate) fn with_short_root_lock_wait<T>(f: impl FnOnce() -> T) -> T {
     result
 }
 
-/// Whether `ensure_dir` has to write `path`: it is absent, or a regular
-/// file that does not hold a `RootFile`. A readable record is kept. A
-/// symlink is never followed and, like a directory, is refused rather than
-/// written over.
-fn root_file_needs_writing(path: &Path) -> Result<bool> {
+/// What `ensure_dir` does with the `root.yaml` it finds, decided under the
+/// root lock.
+enum RootDisposition {
+    /// Absent, or a regular file that does not hold a `RootFile`: the
+    /// caller's seed is written.
+    Seed,
+    /// A readable record whose last writer is the caller or still alive.
+    Keep,
+    /// A readable record whose last writer is gone, carried over whole
+    /// with the caller's stamp in its place.
+    Restamp(RootFile),
+}
+
+/// A symlink at `path` is never followed and, like a directory, is refused
+/// rather than written over. The liveness check runs under the lock the
+/// caller holds, so the stamp it reads cannot be mid-rewrite.
+fn root_file_disposition(path: &Path, caller: ProcessStamp) -> Result<RootDisposition> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(RootDisposition::Seed);
+        }
         Err(error) => {
             return Err(error).with_context(|| format!("Failed to inspect {}", path.display()));
         }
@@ -240,16 +268,23 @@ fn root_file_needs_writing(path: &Path) -> Result<bool> {
     }
     let bytes =
         std::fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
-    match serde_yaml::from_slice::<RootFile>(&bytes) {
-        Ok(_) => Ok(false),
+    let mut record = match serde_yaml::from_slice::<RootFile>(&bytes) {
+        Ok(record) => record,
         Err(error) => {
             warn!(
                 "Replacing child session root file {}: it does not parse ({error})",
                 path.display()
             );
-            Ok(true)
+            return Ok(RootDisposition::Seed);
         }
+    };
+    let recorded = last_process(&record);
+    if recorded == caller || recorded.is_alive() {
+        return Ok(RootDisposition::Keep);
     }
+    record.last_pid = caller.pid;
+    record.last_pid_start = caller.start;
+    Ok(RootDisposition::Restamp(record))
 }
 
 /// Identity record at the top of a spawner's directory: which parent
@@ -380,7 +415,7 @@ pub(crate) fn settle_parent_exit(root: &ChildSessionRoot, session: Option<&Sessi
     let dir = root.dir();
     let uid = match root {
         ChildSessionRoot::Proc { .. } => {
-            remove_dir(&dir, "process root exited");
+            remove_dir(&dir, "process root settled");
             return;
         }
         ChildSessionRoot::Uid(uid) => *uid,
@@ -393,7 +428,7 @@ pub(crate) fn settle_parent_exit(root: &ChildSessionRoot, session: Option<&Sessi
         remove_dir(&dir, "session is not saved");
         return;
     }
-    if !dir.exists() {
+    if !dir.is_dir() {
         return;
     }
     let lock = match root.lock() {
@@ -459,6 +494,7 @@ fn remove_child(root: &ChildSessionRoot, session_id: &str, reason: &str) {
         return;
     }
     let mut removed = false;
+    let mut failed = false;
     for path in [
         root.child_session_file(session_id),
         root.child_meta_file(session_id),
@@ -466,10 +502,18 @@ fn remove_child(root: &ChildSessionRoot, session_id: &str, reason: &str) {
         match std::fs::remove_file(&path) {
             Ok(()) => removed = true,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => warn!("Failed to remove {} ({reason}): {error}", path.display()),
+            Err(error) => {
+                failed = true;
+                warn!("Failed to remove {} ({reason}): {error}", path.display());
+            }
         }
     }
-    if removed {
+    if removed && failed {
+        warn!(
+            "Partially removed child session {session_id} under {} ({reason}): one of its files could not be removed",
+            root.dir().display()
+        );
+    } else if removed {
         info!(
             "Removed child session {session_id} under {} ({reason})",
             root.dir().display()
@@ -595,6 +639,25 @@ pub(crate) fn sweep_orphans_with_before_remove(hook: &dyn Fn(&Path)) {
     sweep_orphans_with(hook)
 }
 
+/// What one pass of the orphan sweep decided for a directory before any
+/// process was looked up. Liveness is settled for every candidate at once
+/// so a pass costs one process-table refresh, not one per directory.
+enum SweepAction {
+    Keep,
+    Remove(&'static str),
+    RemoveIfDead(ProcessStamp, &'static str),
+}
+
+impl SweepAction {
+    fn reason(self, alive: &HashSet<ProcessStamp>) -> Option<&'static str> {
+        match self {
+            Self::Keep => None,
+            Self::Remove(reason) => Some(reason),
+            Self::RemoveIfDead(stamp, reason) => (!alive.contains(&stamp)).then_some(reason),
+        }
+    }
+}
+
 fn sweep_orphans_with(before_remove: &dyn Fn(&Path)) {
     let root = sessions_root();
     let entries = match std::fs::read_dir(&root) {
@@ -608,6 +671,7 @@ fn sweep_orphans_with(before_remove: &dyn Fn(&Path)) {
         }
     };
     let now = SystemTime::now();
+    let mut candidates: Vec<(PathBuf, SweepAction)> = Vec::new();
     for entry in entries.flatten() {
         // DirEntry::metadata does not traverse symlinks, so a planted link
         // is skipped rather than followed.
@@ -619,36 +683,53 @@ fn sweep_orphans_with(before_remove: &dyn Fn(&Path)) {
         }
         let dir = entry.path();
         if entry.file_name() == "_proc" {
-            sweep_dead_process_roots(&dir, before_remove);
+            candidates.extend(sweep_dead_process_roots(&dir));
             continue;
         }
-        if let Some(reason) = orphan_reason(&dir, &metadata, now) {
+        // Roots are named by `Uuid::simple`, 32 hex digits; the hyphenated
+        // and braced forms also parse but were never ours.
+        let is_uid_name = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.len() == 32 && Uuid::parse_str(name).is_ok());
+        if !is_uid_name {
+            debug!("Skipping {}: not a session root", dir.display());
+            continue;
+        }
+        let action = orphan_reason(&dir, &metadata, now);
+        candidates.push((dir, action));
+    }
+    let stamps: Vec<ProcessStamp> = candidates
+        .iter()
+        .filter_map(|(_, action)| match action {
+            SweepAction::RemoveIfDead(stamp, _) => Some(*stamp),
+            _ => None,
+        })
+        .collect();
+    let alive = ProcessStamp::alive_set(&stamps);
+    for (dir, action) in candidates {
+        if let Some(reason) = action.reason(&alive) {
             remove_unless_adopted(&dir, reason, before_remove);
         }
     }
 }
 
-/// Why a uid directory is orphaned, or `None` to keep it. Without a usable
-/// identity file it gets an hour from its last change for its spawner to
-/// write one. With parent session files recorded it goes once every one of
-/// them is gone from a directory that still exists; a parent directory
-/// that is itself missing may be an unmounted volume, so nothing is
-/// concluded from it. With no parents recorded it belongs to the process
-/// that last wrote it and goes with that process, unless a recovery file
-/// claims it.
-fn orphan_reason(
-    dir: &Path,
-    metadata: &std::fs::Metadata,
-    now: SystemTime,
-) -> Option<&'static str> {
+/// Why a uid directory is orphaned, or `Keep`. Without a usable identity
+/// file it gets an hour from its last change for its spawner to write
+/// one. With parent session files recorded it goes once every one of them
+/// is gone from a directory that still exists; a parent directory that is
+/// itself missing may be an unmounted volume, so nothing is concluded from
+/// it. With no parents recorded it belongs to the process that last wrote
+/// it and goes with that process, unless a recovery file claims it. An
+/// identity file that exists but cannot be read is kept and reported
+/// once per process, so a second sweep in the same process stays quiet
+/// about a file that is not going to change by itself.
+fn orphan_reason(dir: &Path, metadata: &std::fs::Metadata, now: SystemTime) -> SweepAction {
     let root = match read_root_identity(dir) {
         Ok(root) => root,
         Err(error) => {
-            warn!(
-                "Keeping {}: cannot read its root.yaml: {error}",
-                dir.display()
-            );
-            return None;
+            warn_unreadable_root_once(dir, &error);
+            return SweepAction::Keep;
         }
     };
     let Some(root) = root else {
@@ -656,15 +737,18 @@ fn orphan_reason(
             .modified()
             .ok()
             .and_then(|mtime| now.duration_since(mtime).ok());
-        return age
-            .is_some_and(|age| age >= ORPHAN_IDENTITY_GRACE)
-            .then_some("orphan sweep arm 0: no usable root.yaml after an hour");
+        return if age.is_some_and(|age| age >= ORPHAN_IDENTITY_GRACE) {
+            SweepAction::Remove("orphan sweep arm 0: no usable root.yaml after an hour")
+        } else {
+            SweepAction::Keep
+        };
     };
     if root.parent_paths.is_empty() {
         if recovery_present(dir) {
-            return None;
+            return SweepAction::Keep;
         }
-        return (!last_process(&root).is_alive()).then_some(
+        return SweepAction::RemoveIfDead(
+            last_process(&root),
             "orphan sweep arm 2: its process is gone and no parent session file was recorded",
         );
     }
@@ -678,18 +762,42 @@ fn orphan_reason(
             dir.display(),
             path.display()
         );
-        return None;
+        return SweepAction::Keep;
     }
     let every_parent_gone = root.parent_paths.iter().all(|path| {
         matches!(std::fs::metadata(path), Err(error) if error.kind() == io::ErrorKind::NotFound)
     });
-    every_parent_gone.then_some("orphan sweep arm 1: every parent session file is gone")
+    if every_parent_gone {
+        SweepAction::Remove("orphan sweep arm 1: every parent session file is gone")
+    } else {
+        SweepAction::Keep
+    }
+}
+
+fn warn_unreadable_root_once(dir: &Path, error: &io::Error) {
+    static WARNED: OnceLock<parking_lot::Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    let first_time = WARNED
+        .get_or_init(Default::default)
+        .lock()
+        .insert(dir.to_path_buf());
+    if first_time {
+        warn!(
+            "Keeping {}: cannot read its root.yaml: {error}",
+            dir.display()
+        );
+    } else {
+        debug!(
+            "Keeping {}: cannot read its root.yaml: {error}",
+            dir.display()
+        );
+    }
 }
 
 /// The identity a uid directory carries: `Ok(None)` when `root.yaml` is
-/// missing or unparseable, which says the directory was never finished or
-/// is not ours. A read failure of any other kind says nothing about the
-/// directory, so it is reported as `Err` for the caller to keep it.
+/// missing, unparseable, not text, or a directory, all of which say the
+/// directory was never finished or is not ours. A read failure of any
+/// other kind, permissions above all, says nothing about the directory,
+/// so it is reported as `Err` for the caller to keep it.
 fn read_root_identity(dir: &Path) -> io::Result<Option<RootFile>> {
     let path = dir.join("root.yaml");
     match std::fs::read_to_string(&path) {
@@ -701,7 +809,21 @@ fn read_root_identity(dir: &Path) -> io::Result<Option<RootFile>> {
             }
         },
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
+        Err(error) => {
+            // Windows opens a directory with PermissionDenied rather than
+            // IsADirectory, so the shape is checked outright.
+            let is_dir_entry = std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir());
+            if is_dir_entry
+                || matches!(
+                    error.kind(),
+                    io::ErrorKind::IsADirectory | io::ErrorKind::InvalidData
+                )
+            {
+                debug!("{} has no usable identity: {error}", dir.display());
+                return Ok(None);
+            }
+            Err(error)
+        }
     }
 }
 
@@ -719,35 +841,31 @@ fn last_process(root: &RootFile) -> ProcessStamp {
 }
 
 /// `_proc/` holds one directory per spawner without a saved session, named
-/// `<pid>-<start>`; each dies with its process. A name in any other shape
-/// is not one of ours and is left alone.
-fn sweep_dead_process_roots(proc_dir: &Path, before_remove: &dyn Fn(&Path)) {
+/// `<pid>-<start>`; each goes with its process, decided by the caller's
+/// batched liveness lookup. A name in any other shape is not one of ours
+/// and is left alone.
+fn sweep_dead_process_roots(proc_dir: &Path) -> Vec<(PathBuf, SweepAction)> {
     let entries = match std::fs::read_dir(proc_dir) {
         Ok(entries) => entries,
         Err(error) => {
             debug!("Skipping process roots in {}: {error}", proc_dir.display());
-            return;
+            return Vec::new();
         }
     };
-    for entry in entries.flatten() {
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        if !metadata.is_dir() {
-            continue;
-        }
-        let name = entry.file_name();
-        let Some(stamp) = name.to_str().and_then(parse_process_root_name) else {
-            continue;
-        };
-        if !stamp.is_alive() {
-            remove_unless_adopted(
-                &entry.path(),
-                "orphan sweep arm 3: its process is gone",
-                before_remove,
-            );
-        }
-    }
+    entries
+        .flatten()
+        .filter(|entry| entry.metadata().is_ok_and(|metadata| metadata.is_dir()))
+        .filter_map(|entry| {
+            let stamp = entry
+                .file_name()
+                .to_str()
+                .and_then(parse_process_root_name)?;
+            Some((
+                entry.path(),
+                SweepAction::RemoveIfDead(stamp, "orphan sweep arm 3: its process is gone"),
+            ))
+        })
+        .collect()
 }
 
 fn parse_process_root_name(name: &str) -> Option<ProcessStamp> {
@@ -1341,12 +1459,17 @@ updated_at: 2026-01-02T03:04:05Z
         assert_eq!(RootFile::load(&root.root_file()).unwrap(), file);
     }
 
+    /// The first spawner is this process, so the record names a live
+    /// writer and a second spawn with another seed changes nothing.
     #[test]
     #[serial]
     fn ensure_dir_keeps_an_existing_root_file_byte_for_byte() {
         let _cache = CacheDirGuard::new("child-sessions-ensure-twice");
         let root = ChildSessionRoot::Uid(Uuid::new_v4());
-        root.ensure_dir(&fixture_root()).unwrap();
+        let mut first = fixture_root();
+        first.last_pid = ProcessStamp::current().pid;
+        first.last_pid_start = ProcessStamp::current().start;
+        root.ensure_dir(&first).unwrap();
         let before = fs::read(root.root_file()).unwrap();
 
         let mut other = fixture_root();
@@ -1367,7 +1490,9 @@ updated_at: 2026-01-02T03:04:05Z
         let root = ChildSessionRoot::Uid(Uuid::new_v4());
         let root_file = root.root_file();
         let path_text = root_file.display().to_string();
-        let seed = fixture_root();
+        let mut seed = fixture_root();
+        seed.last_pid = ProcessStamp::current().pid;
+        seed.last_pid_start = ProcessStamp::current().start;
         let replaced = |needle: &str| {
             warn_snapshot().iter().any(|message| {
                 message.contains("Replacing child session root file")
@@ -1389,7 +1514,8 @@ updated_at: 2026-01-02T03:04:05Z
         #[cfg(unix)]
         assert_eq!(mode_of(&root_file), 0o600);
 
-        // Parseable: kept byte for byte even against a different seed.
+        // Parseable and naming a live writer: kept byte for byte even
+        // against a different seed.
         let before = fs::read(&root_file).unwrap();
         let mut other = seed.clone();
         other.last_pid = 999;
@@ -1436,6 +1562,117 @@ updated_at: 2026-01-02T03:04:05Z
                 .unwrap()
                 .file_type()
                 .is_symlink()
+        );
+    }
+
+    /// A record whose stamp is dead and differs from the caller's, so the
+    /// caller is adopting a directory its writer left behind.
+    fn abandoned_record() -> RootFile {
+        let mut record = fixture_root();
+        record.parent_paths = vec![PathBuf::from("/tmp/left-behind.yaml")];
+        record.last_pid = dead_stamp().pid;
+        record.last_pid_start = dead_stamp().start;
+        record
+    }
+
+    fn replacement_warned(root: &ChildSessionRoot) -> bool {
+        let path_text = root.root_file().display().to_string();
+        warn_snapshot().iter().any(|message| {
+            message.contains("Replacing child session root file") && message.contains(&path_text)
+        })
+    }
+
+    #[test]
+    #[serial]
+    fn ensure_dir_restamps_a_record_whose_writer_is_dead_and_keeps_the_rest() {
+        install_log_collector();
+        let _cache = CacheDirGuard::new("child-sessions-ensure-restamp");
+        let root = ChildSessionRoot::Uid(Uuid::new_v4());
+        fs::create_dir_all(root.dir()).unwrap();
+        let abandoned = abandoned_record();
+        write_root(&root.dir(), &abandoned);
+        let current = ProcessStamp::current();
+
+        root.ensure_dir(&RootFile::seed_at(Utc::now(), current, None))
+            .unwrap();
+
+        let mut expected = abandoned;
+        expected.last_pid = current.pid;
+        expected.last_pid_start = current.start;
+        assert_eq!(RootFile::load(&root.root_file()).unwrap(), expected);
+        assert!(!replacement_warned(&root), "{:?}", warn_snapshot());
+    }
+
+    #[test]
+    #[serial]
+    fn ensure_dir_leaves_a_record_whose_writer_is_alive_byte_for_byte() {
+        install_log_collector();
+        let _cache = CacheDirGuard::new("child-sessions-ensure-live-writer");
+        let root = ChildSessionRoot::Uid(Uuid::new_v4());
+        fs::create_dir_all(root.dir()).unwrap();
+        let mut live = abandoned_record();
+        live.last_pid = ProcessStamp::current().pid;
+        live.last_pid_start = ProcessStamp::current().start;
+        write_root(&root.dir(), &live);
+        let before = fs::read(root.root_file()).unwrap();
+        let foreign = ProcessStamp {
+            pid: 4242,
+            start: 1,
+        };
+
+        root.ensure_dir(&RootFile::seed_at(Utc::now(), foreign, None))
+            .unwrap();
+
+        assert_eq!(fs::read(root.root_file()).unwrap(), before);
+        assert!(!replacement_warned(&root), "{:?}", warn_snapshot());
+    }
+
+    #[test]
+    #[serial]
+    fn ensure_dir_leaves_a_record_already_carrying_the_callers_stamp_byte_for_byte() {
+        install_log_collector();
+        let _cache = CacheDirGuard::new("child-sessions-ensure-same-stamp");
+        let root = ChildSessionRoot::Uid(Uuid::new_v4());
+        fs::create_dir_all(root.dir()).unwrap();
+        write_root(&root.dir(), &abandoned_record());
+        let before = fs::read(root.root_file()).unwrap();
+
+        root.ensure_dir(&RootFile::seed_at(Utc::now(), dead_stamp(), None))
+            .unwrap();
+
+        assert_eq!(fs::read(root.root_file()).unwrap(), before);
+        assert!(!replacement_warned(&root), "{:?}", warn_snapshot());
+    }
+
+    /// A symlink where the root directory goes is refused before anything
+    /// is created, so nothing lands in the link's target.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn ensure_dir_refuses_a_symlinked_root_dir_and_writes_nothing_through_it() {
+        let cache = CacheDirGuard::new("child-sessions-ensure-link-dir");
+        let root = ChildSessionRoot::Uid(Uuid::new_v4());
+        let target = cache.root.join("elsewhere");
+        fs::create_dir_all(&target).unwrap();
+        fs::create_dir_all(sessions_root()).unwrap();
+        std::os::unix::fs::symlink(&target, root.dir()).unwrap();
+
+        let error = root.ensure_dir(&fixture_root()).unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("Refusing to use"),
+            "{error:#}"
+        );
+        assert!(
+            fs::symlink_metadata(root.dir())
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_dir(&target).unwrap().count(),
+            0,
+            "nothing may be written through the link"
         );
     }
 
@@ -1870,15 +2107,31 @@ updated_at: 2026-01-02T03:04:05Z
     #[test]
     #[serial]
     fn settle_parent_exit_removes_a_process_root() {
+        install_log_collector();
         let _cache = CacheDirGuard::new("child-sessions-settle-proc");
         let root = ChildSessionRoot::from_stamp(fixture_stamp());
         root.ensure_dir(&RootFile::seed_at(fixture_time(), fixture_stamp(), None))
             .unwrap();
         write_child(&root, "sess_a_0123456789ab", 0);
+        // The cache root is read from the environment on every `dir()`
+        // call, so the pin keys on the process-root leaf the stamp fixes,
+        // not on the full path a concurrent test could re-point.
+        let leaf = format!(
+            "{}-{} (process root settled)",
+            fixture_stamp().pid,
+            fixture_stamp().start
+        );
 
         settle_parent_exit(&root, None);
 
         assert!(!root.dir().exists());
+        assert!(
+            info_snapshot().iter().any(|message| {
+                message.starts_with("Removed child session directory") && message.ends_with(&leaf)
+            }),
+            "{:?}",
+            info_snapshot()
+        );
     }
 
     #[cfg(unix)]
@@ -2488,41 +2741,257 @@ updated_at: 2026-01-02T03:04:05Z
         assert!(!dir.exists());
     }
 
-    /// A `root.yaml` that exists but cannot be read is neither missing nor
-    /// unparseable: the sweep learns nothing from it and keeps the
+    /// Root bypasses file modes, so a test that needs a read to be refused
+    /// has nothing to assert there.
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    #[cfg(unix)]
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// A `root.yaml` that exists but may not be read is neither missing
+    /// nor unparseable: the sweep learns nothing from it and keeps the
     /// directory, both when deciding and when re-reading before a delete.
-    /// A directory planted at the file's path fails the read with an error
-    /// other than NotFound whoever runs the test.
+    /// The decision is reported once per process, not at every start.
+    #[cfg(unix)]
     #[test]
     #[serial]
     fn sweep_keeps_a_uid_root_whose_identity_cannot_be_read() {
+        if running_as_root() {
+            eprintln!("skipping: file modes do not bind root");
+            return;
+        }
         install_log_collector();
         let _guard = TestConfigDirGuard::new("child-sessions-sweep-unreadable-identity");
-        let (undecidable, undecidable_uid) = bare_uid_dir();
-        fs::create_dir(undecidable.join("root.yaml")).unwrap();
+        let (undecidable, undecidable_uid) = uid_dir_with(&sweep_record(Vec::new(), dead_stamp()));
+        set_mode(&undecidable.join("root.yaml"), 0o000);
         age_past_grace(&undecidable);
         let (unreadable_on_reread, _) = uid_dir_with(&sweep_record(Vec::new(), dead_stamp()));
-        let swap_in_directory = |about_to_go: &Path| {
-            let identity = about_to_go.join("root.yaml");
-            fs::remove_file(&identity).unwrap();
-            fs::create_dir(&identity).unwrap();
+        let revoke_read = |about_to_go: &Path| set_mode(&about_to_go.join("root.yaml"), 0o000);
+        let unreadable_warns = || {
+            warn_snapshot()
+                .iter()
+                .filter(|message| {
+                    message.contains(&undecidable_uid)
+                        && message.contains("cannot read its root.yaml")
+                })
+                .count()
         };
 
-        sweep_orphans_with_before_remove(&swap_in_directory);
+        sweep_orphans_with_before_remove(&revoke_read);
+        sweep_orphans();
 
         assert!(undecidable.is_dir());
         assert!(unreadable_on_reread.is_dir());
-        assert!(
-            warn_snapshot().iter().any(|message| {
-                message.contains(&undecidable_uid) && message.contains("cannot read its root.yaml")
-            }),
-            "{:?}",
-            warn_snapshot()
-        );
+        assert_eq!(unreadable_warns(), 1, "{:?}", warn_snapshot());
         assert!(
             !info_snapshot()
                 .iter()
                 .any(|message| message.contains(&undecidable_uid)),
+            "{:?}",
+            info_snapshot()
+        );
+        set_mode(&undecidable.join("root.yaml"), 0o600);
+        set_mode(&unreadable_on_reread.join("root.yaml"), 0o600);
+    }
+
+    /// A directory where `root.yaml` goes is not an identity anyone wrote:
+    /// it gets the same hour as a missing file and then goes.
+    #[test]
+    #[serial]
+    fn sweep_removes_a_uid_root_whose_identity_is_a_directory_after_an_hour() {
+        install_log_collector();
+        let _guard = TestConfigDirGuard::new("child-sessions-sweep-dir-identity");
+        let (fresh, _) = bare_uid_dir();
+        fs::create_dir(fresh.join("root.yaml")).unwrap();
+        let (old, old_uid) = bare_uid_dir();
+        fs::create_dir(old.join("root.yaml")).unwrap();
+        age_past_grace(&old);
+
+        sweep_orphans();
+
+        assert!(fresh.is_dir());
+        assert!(!old.exists());
+        assert!(
+            removal_logged(&old_uid, "orphan sweep arm 0"),
+            "{:?}",
+            info_snapshot()
+        );
+        assert!(
+            !warn_snapshot()
+                .iter()
+                .any(|message| message.contains(&old_uid)),
+            "{:?}",
+            warn_snapshot()
+        );
+    }
+
+    /// Only directories named by a 32-hex uuid are session roots; anything
+    /// else under `sessions/`, a hyphenated uuid included, is not the
+    /// sweep's to age out.
+    #[test]
+    #[serial]
+    fn sweep_leaves_a_directory_that_is_not_uuid_named_alone() {
+        install_log_collector();
+        let _guard = TestConfigDirGuard::new("child-sessions-sweep-stranger");
+        let stranger = sessions_root().join("stranger");
+        fs::create_dir_all(&stranger).unwrap();
+        age_past_grace(&stranger);
+        let hyphenated = sessions_root().join(Uuid::new_v4().hyphenated().to_string());
+        fs::create_dir_all(&hyphenated).unwrap();
+        age_past_grace(&hyphenated);
+        let (old_missing, old_missing_uid) = bare_uid_dir();
+        age_past_grace(&old_missing);
+
+        sweep_orphans();
+
+        assert!(stranger.is_dir());
+        assert!(hyphenated.is_dir());
+        assert!(!old_missing.exists());
+        assert!(
+            removal_logged(&old_missing_uid, "orphan sweep arm 0"),
+            "{:?}",
+            info_snapshot()
+        );
+        let stranger_text = stranger.display().to_string();
+        assert!(
+            !info_snapshot()
+                .iter()
+                .chain(warn_snapshot().iter())
+                .any(|message| message.contains(&stranger_text)),
+            "{:?} {:?}",
+            info_snapshot(),
+            warn_snapshot()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn sweep_looks_the_process_table_up_once_for_every_candidate() {
+        use crate::utils::process::ALIVE_SET_CALLS;
+        use std::sync::atomic::Ordering;
+
+        let _guard = TestConfigDirGuard::new("child-sessions-sweep-one-lookup");
+        let current = ProcessStamp::current();
+        let (first, _) = uid_dir_with(&sweep_record(Vec::new(), current));
+        let (second, _) = uid_dir_with(&sweep_record(Vec::new(), current));
+        let proc_dir = ChildSessionRoot::from_stamp(current).dir();
+        fs::create_dir_all(&proc_dir).unwrap();
+
+        let before = ALIVE_SET_CALLS.load(Ordering::SeqCst);
+        sweep_orphans();
+        let during = ALIVE_SET_CALLS.load(Ordering::SeqCst) - before;
+
+        assert_eq!(during, 1);
+        assert!(first.is_dir());
+        assert!(second.is_dir());
+        assert!(proc_dir.is_dir());
+
+        fs::remove_dir_all(&first).unwrap();
+        fs::remove_dir_all(&second).unwrap();
+        fs::remove_dir_all(&proc_dir).unwrap();
+        let before = ALIVE_SET_CALLS.load(Ordering::SeqCst);
+        sweep_orphans();
+        assert_eq!(
+            ALIVE_SET_CALLS.load(Ordering::SeqCst) - before,
+            0,
+            "no candidate, no lookup"
+        );
+    }
+
+    /// The classifying pass never asks after a single process; only the
+    /// re-read guarding the delete still does, since it checks one record
+    /// under one lock.
+    #[test]
+    fn only_the_adoption_recheck_asks_after_a_single_process() {
+        let source = include_str!("child_sessions.rs").replace("\r\n", "\n");
+        let production = &source[..source.find("\n#[cfg(test)]\nmod tests").unwrap()];
+        let fn_body = |head: &str| {
+            let start = production.find(head).unwrap();
+            let body = &production[start..];
+            &body[..body.find("\n}\n").unwrap()]
+        };
+        for head in [
+            "\nfn sweep_orphans_with(",
+            "\nfn orphan_reason(",
+            "\nfn sweep_dead_process_roots(",
+        ] {
+            assert!(!fn_body(head).contains(".is_alive("), "{head}");
+        }
+        assert!(fn_body("\nfn remove_unless_adopted(").contains(".is_alive("));
+        assert_eq!(
+            fn_body("\nfn sweep_orphans_with(")
+                .matches("alive_set(")
+                .count(),
+            1
+        );
+        assert_eq!(production.matches("alive_set(").count(), 1);
+    }
+
+    /// A regular file at a root's path is not a root: settling it neither
+    /// opens a lock inside it nor reports it.
+    #[test]
+    #[serial]
+    fn settle_parent_exit_on_a_file_at_the_root_path_touches_nothing() {
+        install_log_collector();
+        let _guard = TestConfigDirGuard::new("child-sessions-settle-file");
+        let root = ChildSessionRoot::Uid(Uuid::new_v4());
+        fs::create_dir_all(sessions_root()).unwrap();
+        fs::write(root.dir(), "in the way\n").unwrap();
+
+        settle_parent_exit(&root, None);
+
+        assert_eq!(fs::read_to_string(root.dir()).unwrap(), "in the way\n");
+        let dir_text = root.dir().display().to_string();
+        assert!(
+            !warn_snapshot()
+                .iter()
+                .any(|message| message.contains(&dir_text)),
+            "{:?}",
+            warn_snapshot()
+        );
+        let source = include_str!("child_sessions.rs").replace("\r\n", "\n");
+        let start = source.find("\npub(crate) fn settle_parent_exit(").unwrap();
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(body.find("!dir.is_dir()").unwrap() < body.find("root.lock()").unwrap());
+        assert!(!body.contains("!dir.exists()"));
+    }
+
+    /// A child whose sidecar cannot be unlinked is reported as partially
+    /// removed, never as removed.
+    #[test]
+    #[serial]
+    fn remove_child_reports_a_partial_removal_when_one_file_stays() {
+        install_log_collector();
+        let _guard = TestConfigDirGuard::new("child-sessions-remove-child-partial");
+        let root = ChildSessionRoot::Uid(Uuid::new_v4());
+        root.ensure_dir(&fixture_root()).unwrap();
+        let session_id = "sess_coder_0123456789ab";
+        fs::write(root.child_session_file(session_id), "messages: []\n").unwrap();
+        let meta = root.child_meta_file(session_id);
+        fs::create_dir(&meta).unwrap();
+        fs::write(meta.join("pin"), "x").unwrap();
+
+        remove_child(&root, session_id, "test");
+
+        assert!(!root.child_session_file(session_id).exists());
+        assert!(meta.is_dir());
+        let partial = |message: &String| {
+            message.contains("Partially removed child session")
+                && message.contains(session_id)
+                && message.contains("(test)")
+        };
+        assert!(warn_snapshot().iter().any(partial), "{:?}", warn_snapshot());
+        assert!(
+            !info_snapshot().iter().any(|message| {
+                message.contains("Removed child session") && message.contains(session_id)
+            }),
             "{:?}",
             info_snapshot()
         );
