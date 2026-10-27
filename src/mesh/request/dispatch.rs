@@ -458,7 +458,7 @@ impl RequestHandler for Dispatcher {
             }
         };
         debug!(
-            "Mesh request (not yet decoded) from {id8} on link {}: {outcome}",
+            "Mesh request (envelope not yet read) from {id8} on link {}: {outcome}",
             link_id.to_hex_string()
         );
         Admission::Drop
