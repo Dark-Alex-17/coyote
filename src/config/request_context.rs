@@ -3046,6 +3046,10 @@ impl RequestContext {
                 super::format_option_value(&app.memory_cap_without_tools),
             ),
             (
+                "memory_run_state_ttl_days",
+                super::format_option_value(&app.memory_run_state_ttl_days),
+            ),
+            (
                 "workspace_instructions",
                 super::format_option_value(&app.workspace_instructions),
             ),

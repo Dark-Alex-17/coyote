@@ -209,6 +209,8 @@ memory_cap_with_tools: null      # Char cap for injected memory when function ca
                                  # Only MEMORY.md indexes are injected; the LLM uses memory__read to fetch drill files.
 memory_cap_without_tools: null   # Char cap when function calling is unavailable (null = 12000).
                                  # Indexes plus drill file bodies are injected up to this cap.
+memory_run_state_ttl_days: null  # Days a `run-state` memory written without `expires` stays live (null = 14).
+                                 # Expired and superseded files drop out of injection and memory__list.
 
 # ---- Child Sessions ----
 # Every agent spawned with `agent__spawn` or `agent__task_create` gets a persisted session of its

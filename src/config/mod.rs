@@ -305,6 +305,7 @@ pub struct Config {
     pub memory: Option<bool>,
     pub memory_cap_with_tools: Option<usize>,
     pub memory_cap_without_tools: Option<usize>,
+    pub memory_run_state_ttl_days: Option<u32>,
 
     pub workspace_instructions: Option<bool>,
     pub workspace_instructions_files: Option<Vec<String>>,
@@ -398,6 +399,7 @@ impl Default for Config {
             memory: None,
             memory_cap_with_tools: None,
             memory_cap_without_tools: None,
+            memory_run_state_ttl_days: None,
 
             workspace_instructions: None,
             workspace_instructions_files: None,
@@ -1511,6 +1513,12 @@ clients:
         assert!(!CONFIG_TEMPLATE.contains("own children out"));
         assert!(CONFIG_TEMPLATE.contains("not settable with .set"));
         assert!(!CONFIG_TEMPLATE.contains(".set child_sessions"));
+    }
+
+    #[test]
+    fn config_template_documents_memory_run_state_ttl() {
+        assert!(CONFIG_TEMPLATE.contains("\nmemory_run_state_ttl_days: null"));
+        assert!(CONFIG_TEMPLATE.contains("null = 14"));
     }
 
     #[test]
