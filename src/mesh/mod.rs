@@ -451,7 +451,7 @@ pub(crate) mod test_support {
     #[cfg(unix)]
     use tokio::sync::broadcast;
     #[cfg(unix)]
-    use tokio::task::JoinHandle;
+    use tokio::task::{JoinHandle, JoinSet};
     #[cfg(unix)]
     use tokio::time::{sleep, timeout};
 
@@ -544,6 +544,26 @@ pub(crate) mod test_support {
             }
         });
         (handle, closed)
+    }
+
+    /// Serves `listener` like `serve_as_sink`, except that aborting the handle closes
+    /// every accepted stream along with the listener, the way a daemon that exits takes
+    /// its sockets with it: the stand-in for an rnsd whose going away the attached
+    /// shared-instance client has to notice.
+    #[cfg(unix)]
+    pub(crate) async fn serve_as_daemon(listener: TcpListener) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut streams = JoinSet::new();
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                streams.spawn(async move {
+                    let mut sink = [0u8; 1024];
+                    while matches!(stream.read(&mut sink).await, Ok(n) if n > 0) {}
+                });
+            }
+        })
     }
 
     /// A loopback port that refuses connections until the test calls `.listen(backlog)`

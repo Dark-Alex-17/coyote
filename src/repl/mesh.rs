@@ -8275,6 +8275,9 @@ mod tests {
         );
     }
 
+    /// The `local` rows cover both producers of `Connecting`: the probe's reason while
+    /// nothing listens and the bare `not connected yet` once the transport is attached
+    /// and dialing; `Disconnected` carries the fixed reason the client's drop sets.
     #[test]
     fn interface_warnings_name_the_tail_for_lan_a_remote_relay_and_a_loopback_relay() {
         let states = [
@@ -8330,7 +8333,7 @@ mod tests {
                 kind: "local",
                 endpoint: Some("@rns/default".into()),
                 state: InterfaceState::Disconnected {
-                    reason: "local unix preflight connect failed endpoint=@rns/default err=Connection refused (os error 111)".into(),
+                    reason: "rnsd closed the socket".into(),
                 },
             },
         ];
@@ -8343,7 +8346,7 @@ mod tests {
                 "WARNING: private 127.0.0.1:4242 is unreachable (tcp connect failed endpoint=127.0.0.1:4242); sessions on this machine cannot reach each other until a local Reticulum daemon (rnsd) is listening there.".to_string(),
                 "WARNING: local rnsd at 127.0.0.1:37428 is not reachable yet: tcp connect failed endpoint=127.0.0.1:37428; start the local rnsd".to_string(),
                 "WARNING: local rnsd at @rns/default is not reachable yet: not connected yet; start the local rnsd".to_string(),
-                "WARNING: local rnsd at @rns/default dropped the connection: local unix preflight connect failed endpoint=@rns/default err=Connection refused (os error 111); it is being redialed".to_string(),
+                "WARNING: local rnsd at @rns/default dropped the connection: rnsd closed the socket; it is being redialed".to_string(),
             ]
         );
     }
@@ -13405,9 +13408,9 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             use crate::mesh::test_support::{
                 FakeNode, PEER_TTL, PeerSighting, PeerStub, StartedRuntime, TempDir,
                 TransportRelay, closed_port, held_port, loopback_relay, mesh_paths, private_config,
-                serve_as_sink, snapshot_fixture, started_runtime, started_runtime_on,
-                started_runtime_on_with, started_runtime_with, started_runtime_with_options,
-                status_round_trip, wait_until,
+                serve_as_daemon, serve_as_sink, snapshot_fixture, started_runtime,
+                started_runtime_on, started_runtime_on_with, started_runtime_with,
+                started_runtime_with_options, status_round_trip, wait_until,
             };
             use crate::mesh::trust::{KeyChangeOutcome, LiveMesh, TrustOptions};
             use crate::testing::EnvVarGuard;
@@ -17062,7 +17065,8 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             /// task is aborted: every connection is accepted and drained, which satisfies the
             /// node's probe and the shared-instance client it attaches alike. Binding the TCP
             /// shape fresh (reuse-address on) is what lets the stub come back on the same port
-            /// after it was dropped, the way a restarted rnsd does.
+            /// after it was dropped, the way a restarted rnsd does; the abort closes the
+            /// accepted streams with the listener, the way a stopped one does.
             #[cfg(unix)]
             async fn serve_local_rnsd(endpoint: &LocalEndpoint) -> tokio::task::JoinHandle<()> {
                 match endpoint {
@@ -17070,7 +17074,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         let socket = tokio::net::TcpSocket::new_v4().unwrap();
                         socket.set_reuseaddr(true).unwrap();
                         socket.bind(*addr).unwrap();
-                        serve_as_sink(socket.listen(16).unwrap()).await.0
+                        serve_as_daemon(socket.listen(16).unwrap()).await
                     }
                     #[cfg(any(target_os = "linux", target_os = "android"))]
                     LocalEndpoint::Abstract(value) => {
@@ -17084,11 +17088,12 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         listener.set_nonblocking(true).unwrap();
                         let listener = tokio::net::UnixListener::from_std(listener).unwrap();
                         tokio::spawn(async move {
+                            let mut streams = tokio::task::JoinSet::new();
                             loop {
                                 let Ok((mut stream, _)) = listener.accept().await else {
                                     break;
                                 };
-                                tokio::spawn(async move {
+                                streams.spawn(async move {
                                     let mut sink = [0u8; 1024];
                                     while matches!(stream.read(&mut sink).await, Ok(n) if n > 0) {}
                                 });
@@ -17130,10 +17135,11 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             /// The operator sees a `local` rnsd's whole story through the REPL. `.mesh on`
             /// beside a working relay warns that the local rnsd is not reachable yet (with
             /// the probe's reason and the start-the-daemon tail) and `.mesh info` lists it as
-            /// `connecting, retrying`; when something answers at the endpoint the row reads
-            /// `connected` and the kind joins the node's interfaces with no idle line (the
-            /// local rnsd prints none, only the TCP kinds do); when it goes away again the row
-            /// reads `lost, retrying` with the probe's reason and the kind leaves; and when it
+            /// `connecting, retrying`; when something answers at the endpoint the transport is
+            /// attached and its client's `Connected` makes the row `connected` and the kind
+            /// join the node's interfaces with no idle line (the local rnsd prints none, only
+            /// the TCP kinds do); when it goes away again the client's `Disconnected` makes
+            /// the row `lost, retrying` with the fixed reason and the kind leaves; and when it
             /// is back the row is `connected` again, still with no idle line and no second
             /// WARNING. `.mesh off` then detaches cleanly.
             #[cfg(unix)]
@@ -17222,14 +17228,14 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     let info = wait_for_info_row(
                         &mut ctx,
                         1,
-                        |row| row.starts_with(&format!("{label}  lost, retrying: ")),
+                        |row| row == format!("{label}  lost, retrying: rnsd closed the socket"),
                         "the local row to report the drop",
                     )
                     .await;
-                    let row = info_row(&info, "interfaces[1]");
-                    assert!(
-                        row.len() > format!("{label}  lost, retrying: ").len(),
-                        "the drop names the probe's reason: {row:?}"
+                    assert_eq!(
+                        info_row(&info, "interfaces[0]"),
+                        format!("{relay_label}  connected"),
+                        "{info}"
                     );
                     assert_eq!(runtime.interface_kinds(), vec!["private"]);
 
@@ -17335,7 +17341,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             ) -> tokio::task::JoinHandle<()> {
                 match (endpoint, held) {
                     (LocalEndpoint::Tcp(_), Some(socket)) => {
-                        serve_as_sink(socket.listen(16).unwrap()).await.0
+                        serve_as_daemon(socket.listen(16).unwrap()).await
                     }
                     (endpoint, _) => serve_local_rnsd(endpoint).await,
                 }

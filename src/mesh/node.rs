@@ -70,6 +70,7 @@ use crate::supervisor::notification::{SystemNotification, mesh_notification};
 
 use anyhow::{Context, Result, anyhow, bail};
 use arc_swap::ArcSwapOption;
+use futures_util::future::select_all;
 use parking_lot::RwLock;
 use rns_transport::destination::DestinationDesc;
 use rns_transport::destination::request::RequestAllow;
@@ -87,7 +88,8 @@ use rns_transport::iface::local::{LocalUnixEndpoint, preflight_unix_connect};
 use rns_transport::iface::tcp_client::{TcpClient, TcpRuntimeStatusHandle};
 use rns_transport::iface::{IfaceRole, InterfaceMode};
 use rns_transport::transport::{
-    AnnounceEvent, SharedInstanceEndpoint, SharedInstanceOptions, Transport, TransportConfig,
+    AnnounceEvent, SharedInstanceEndpoint, SharedInstanceEvent, SharedInstanceOptions, Transport,
+    TransportConfig,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -114,16 +116,18 @@ pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 pub(crate) const REKEY_GRACE: Duration = Duration::from_secs(5);
 /// Poll interval while waiting for a TCP relay to report itself connected.
 const CONNECT_POLL: Duration = Duration::from_millis(50);
-/// How often the interface watcher probes every `local` rnsd and polls a TCP client that
-/// has not connected yet, for the node's lifetime.
+/// How often the interface watcher probes a `local` rnsd it has not attached yet and polls
+/// a TCP client that has not connected yet, for the node's lifetime.
 const CONNECT_WATCH_TICK: Duration = Duration::from_secs(1);
 /// Depth of each channel the TCP clients report their reconnects and disconnects on. The
 /// client drops an event when the channel is full, which is as far as the watcher's
 /// best-effort lines go.
 const TCP_EVENT_CAPACITY: usize = 16;
-/// How long the shared-instance client waits before redialing rnsd after a drop. The
-/// probe can read the listener back up to one wait before the client has redialed, so
-/// it is kept close to `CONNECT_WATCH_TICK`.
+/// Depth of the channel a `local` rnsd's shared-instance client reports its connection
+/// state on; the client drops an event when it is full, the same as the TCP clients.
+const LOCAL_EVENT_CAPACITY: usize = 16;
+/// How long the shared-instance client waits before redialing rnsd after a drop; the row
+/// reads `lost, retrying` until a redial lands.
 const LOCAL_RECONNECT_WAIT: Duration = Duration::from_secs(2);
 /// Depth of the host channel a LAN interface feeds the transport through.
 const LAN_CHANNEL_CAPACITY: usize = 128;
@@ -335,11 +339,14 @@ impl fmt::Display for LocalEndpoint {
 }
 
 /// What one configured interface is doing. `retrying` means it is tried again without
-/// the user: a TCP client the transport keeps reconnecting, or a `local` rnsd endpoint the
-/// node keeps probing. `Unreachable` without it is a `lan` bind that failed and will not
-/// be tried again. `Connecting` is a `local` rnsd not reached yet, its reason the last
-/// probe's; `Disconnected` one that dropped the socket after the node attached, which the
-/// transport is redialing.
+/// the user: a TCP client the transport keeps reconnecting, or a `local` rnsd endpoint
+/// the node keeps probing until it attaches and the transport then keeps redialing.
+/// `Unreachable` without it is a `lan` bind that failed and will not be tried again.
+/// `Connecting` is a `local` rnsd not connected yet: with the last probe's reason while
+/// nothing listens, without one once the transport is attached and dialing;
+/// `Disconnected` one that dropped the socket after the node attached, which the
+/// transport is redialing. An attached rnsd's row follows the shared-instance client's
+/// state events.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum InterfaceState {
     Connected,
@@ -433,7 +440,6 @@ enum JoinedInterface {
     /// The shared-instance client; the transport holds it and stops it with the rest.
     Local {
         label: String,
-        endpoint: LocalEndpoint,
     },
     Tcp {
         hash: AddressHash,
@@ -445,6 +451,13 @@ enum JoinedInterface {
 
 enum Joined {
     Connected(JoinedInterface),
+    /// A `local` rnsd the probe reached and the transport attached to; `events` is where
+    /// its shared-instance client reports its connection state from here on.
+    Attached {
+        label: String,
+        endpoint: LocalEndpoint,
+        events: mpsc::Receiver<SharedInstanceEvent>,
+    },
     /// A TCP client whose first connect failed; it stays attached and keeps reconnecting.
     Pending {
         iface: JoinedInterface,
@@ -466,7 +479,8 @@ enum Joined {
 }
 
 /// An interface the watcher follows for the node's lifetime: a TCP client whose stream
-/// events it listens for, or the local rnsd it probes.
+/// events it listens for, or the local rnsd whose shared-instance client reports its
+/// connection state once attached.
 pub(crate) enum WatchedInterface {
     Tcp {
         /// Position in `interface_states`.
@@ -484,23 +498,19 @@ pub(crate) enum WatchedInterface {
         index: usize,
         label: String,
         endpoint: LocalEndpoint,
-        /// Whether the shared-instance client was attached when `start` returned; one
-        /// that was not is attached on the first probe that answers.
-        attached: bool,
+        /// The state events of a shared-instance client attached when `start` returned;
+        /// `None` once the watcher has taken them, and for an rnsd that was not reached
+        /// at start, which the watcher attaches on the first probe that answers.
+        events: parking_lot::Mutex<Option<mpsc::Receiver<SharedInstanceEvent>>>,
     },
 }
 
 impl WatchedInterface {
-    /// `None` for a LAN interface, which has no client to follow.
+    /// `None` for a LAN interface, which has no client to follow; a `local` rnsd is
+    /// watched from `Joined::Attached` or `Joined::NotReached`, never from here.
     fn of(index: usize, iface: &JoinedInterface, connected_at_start: bool) -> Option<Self> {
         match iface {
-            JoinedInterface::Lan { .. } => None,
-            JoinedInterface::Local { label, endpoint } => Some(Self::Local {
-                index,
-                label: label.clone(),
-                endpoint: endpoint.clone(),
-                attached: true,
-            }),
+            JoinedInterface::Lan { .. } | JoinedInterface::Local { .. } => None,
             JoinedInterface::Tcp {
                 hash,
                 label,
@@ -722,6 +732,20 @@ impl MeshRuntime {
                     joined.push(iface);
                     states.push(plan.status(InterfaceState::Connected));
                 }
+                Joined::Attached {
+                    label,
+                    endpoint,
+                    events,
+                } => {
+                    watched.push(WatchedInterface::Local {
+                        index,
+                        label: label.clone(),
+                        endpoint,
+                        events: parking_lot::Mutex::new(Some(events)),
+                    });
+                    joined.push(JoinedInterface::Local { label });
+                    states.push(plan.status(InterfaceState::Connected));
+                }
                 Joined::Pending {
                     iface,
                     reason,
@@ -744,7 +768,7 @@ impl MeshRuntime {
                         index,
                         label: plan.label(),
                         endpoint,
-                        attached: false,
+                        events: parking_lot::Mutex::new(None),
                     });
                     states.push(plan.status(InterfaceState::Connecting {
                         reason: Some(reason),
@@ -2002,7 +2026,9 @@ async fn join_interface(
         }
     };
     match &joined {
-        Joined::Connected(_) => debug!("Joined mesh interface {}", plan.label()),
+        Joined::Connected(_) | Joined::Attached { .. } => {
+            debug!("Joined mesh interface {}", plan.label());
+        }
         Joined::Pending { reason, .. } => warn!(
             "Mesh interface {} is unreachable and keeps reconnecting: {reason}",
             plan.label()
@@ -2077,8 +2103,9 @@ fn lan_bind_failure_message(err: &dyn fmt::Display) -> String {
 
 /// Probes rnsd's shared-instance listener at `endpoint`, then attaches the transport to
 /// it as a shared-instance client. The attach returns once the client task is spawned,
-/// not once it is connected, so the probe is what decides `Connected`; after it the
-/// transport owns reconnecting and re-announcing.
+/// not once it is connected, so the probe is what decides `Connected` at start; from
+/// there the client's state events drive the row, and the transport owns reconnecting
+/// and re-announcing.
 async fn join_local(
     transport: &Transport,
     endpoint: &LocalEndpoint,
@@ -2089,10 +2116,11 @@ async fn join_local(
         Err(reason) => Err(reason),
     };
     match outcome {
-        Ok(()) => Joined::Connected(JoinedInterface::Local {
+        Ok(events) => Joined::Attached {
             label: local_label(endpoint),
             endpoint: endpoint.clone(),
-        }),
+            events,
+        },
         Err(reason) => Joined::NotReached {
             endpoint: endpoint.clone(),
             message: format!(
@@ -2104,8 +2132,10 @@ async fn join_local(
 }
 
 /// Whether rnsd's shared-instance listener answers at `endpoint`: one connect, dropped as
-/// soon as it is accepted, bounded by `connect_timeout`. The transport exposes no readable
-/// connection state for its attached client, so this probe is what the row follows.
+/// soon as it is accepted, bounded by `connect_timeout`. It gates the attach: a client
+/// attached while nothing listens would dial forever with nothing to report, so the
+/// transport is attached only once something answers, and the row follows the client's
+/// events after that.
 async fn probe_local(endpoint: &LocalEndpoint, connect_timeout: Duration) -> Result<(), String> {
     let connect = async {
         match endpoint {
@@ -2128,7 +2158,12 @@ async fn probe_local(endpoint: &LocalEndpoint, connect_timeout: Duration) -> Res
         .unwrap_or_else(|_| Err(format!("connect to {endpoint} timed out")))
 }
 
-async fn attach_local(transport: &Transport, endpoint: &LocalEndpoint) -> Result<(), String> {
+/// Attaches the transport to rnsd's shared instance at `endpoint` and returns the stream
+/// its client reports `SharedInstanceEvent`s on, the first `Connecting` already queued.
+async fn attach_local(
+    transport: &Transport,
+    endpoint: &LocalEndpoint,
+) -> Result<mpsc::Receiver<SharedInstanceEvent>, String> {
     let shared = match endpoint {
         LocalEndpoint::Tcp(addr) => SharedInstanceEndpoint::Tcp(*addr),
         #[cfg(unix)]
@@ -2142,11 +2177,14 @@ async fn attach_local(transport: &Transport, endpoint: &LocalEndpoint) -> Result
             ));
         }
     };
-    let options = SharedInstanceOptions::default().with_reconnect_wait(LOCAL_RECONNECT_WAIT);
+    let (events, receiver) = mpsc::channel(LOCAL_EVENT_CAPACITY);
+    let options = SharedInstanceOptions::default()
+        .with_reconnect_wait(LOCAL_RECONNECT_WAIT)
+        .with_state_events(events);
     transport
         .attach_shared_instance(shared, options)
         .await
-        .map(drop)
+        .map(|_| receiver)
         .map_err(|err| redact_hashes(&format!("attach to the shared instance failed: {err}")))
 }
 
@@ -2663,10 +2701,12 @@ enum Transition {
     Reconnect,
 }
 
-/// What a TCP client sent on its event channels.
-enum TcpEvent {
+/// What a TCP client sent on its event channels, or what an attached `local` rnsd's
+/// client reported on its; `None` there is the end of that client's stream.
+enum WatchEvent {
     Reconnect(AddressHash),
     Disconnect(AddressHash),
+    Local(usize, Option<SharedInstanceEvent>),
 }
 
 /// The next event on `events`, or never once every client holding a sender is gone, so
@@ -2676,6 +2716,30 @@ async fn next_tcp_event(events: &mut mpsc::Receiver<AddressHash>) -> AddressHash
         Some(hash) => hash,
         None => std::future::pending().await,
     }
+}
+
+/// The next state event from any attached `local` rnsd's client, with its row, or `None`
+/// for the row whose stream has ended. Never resolves while no stream is open, so the
+/// watcher's `select!` keeps ticking.
+async fn next_local_event(watches: &mut [Watch]) -> (usize, Option<SharedInstanceEvent>) {
+    let streams: Vec<_> = watches
+        .iter_mut()
+        .filter_map(|watch| match watch {
+            Watch::Local {
+                index,
+                events: Some(events),
+                ..
+            } => {
+                let index = *index;
+                Some(Box::pin(async move { (index, events.recv().await) }))
+            }
+            _ => None,
+        })
+        .collect();
+    if streams.is_empty() {
+        return std::future::pending().await;
+    }
+    select_all(streams).await.0
 }
 
 /// The watcher's own copy of one watched interface, with what it keeps between ticks.
@@ -2698,7 +2762,13 @@ enum Watch {
         index: usize,
         label: String,
         endpoint: LocalEndpoint,
+        /// Whether the transport holds a shared-instance client for this rnsd. Until it
+        /// does, the tick probes the endpoint and attaches on the first answer; after
+        /// that its events are what count.
         attached: bool,
+        /// The client's state events; `None` before the attach and once the stream has
+        /// ended.
+        events: Option<mpsc::Receiver<SharedInstanceEvent>>,
     },
 }
 
@@ -2723,13 +2793,17 @@ impl Watch {
                 index,
                 label,
                 endpoint,
-                attached,
-            } => Self::Local {
-                index: *index,
-                label: label.clone(),
-                endpoint: endpoint.clone(),
-                attached: *attached,
-            },
+                events,
+            } => {
+                let events = events.lock().take();
+                Self::Local {
+                    index: *index,
+                    label: label.clone(),
+                    endpoint: endpoint.clone(),
+                    attached: events.is_some(),
+                    events,
+                }
+            }
         }
     }
 
@@ -2777,26 +2851,27 @@ impl Watch {
     }
 }
 
-/// Follows every TCP client and `local` rnsd for the node's lifetime: the TCP clients
-/// through the events they send, the rnsd through a probe once a tick. A client that was
-/// unreachable at start sends no event for its first connect, so the tick polls its
-/// status until it reads `connected`; then it is recorded on the node, told to the user
-/// and announced over, so the line never waits on the announce. That announce skips the
-/// floor, as the peers behind that relay have never heard this destination. From then
-/// on, and from the start for a client that connected at start, each reconnect event
-/// gets an announce through `announce_now`: the relay forgot every path it held through
-/// the closed socket, and the heartbeat is up to an hour away. That announce honours and
-/// resets the floor, so a relay that flaps cannot make this node announce more often than
-/// once per `REANNOUNCE_FLOOR_SECS`; the first connect of a relay that was down at start
-/// is the one announce without it. A reconnect event queued before the poll read the
-/// first `connected` is dropped at the switch, once per tick for every client switching
-/// on it, so a connect, drop and return inside one tick does not announce twice. A
-/// disconnect event is only logged: the client redials
-/// on its own. A `local` rnsd only has its row kept: the transport's shared-instance
-/// client re-announces and redials by itself, so no line is printed and no announce sent
-/// for it; see `observe_local`. The watcher holds no peer-controlled state: a fixed list
-/// from the node's own config, one flag per client and one per rnsd. Ends when the node
-/// or its slot is gone.
+/// Follows every TCP client and `local` rnsd for the node's lifetime through the events
+/// their clients send. A TCP client that was unreachable at start sends no event for its
+/// first connect, so the tick polls its status until it reads `connected`; then it is
+/// recorded on the node, told to the user and announced over, so the line never waits on
+/// the announce. That announce skips the floor, as the peers behind that relay have
+/// never heard this destination. From then on, and from the start for a client that
+/// connected at start, each reconnect event gets an announce through `announce_now`: the
+/// relay forgot every path it held through the closed socket, and the heartbeat is up to
+/// an hour away. That announce honours and resets the floor, so a relay that flaps cannot
+/// make this node announce more often than once per `REANNOUNCE_FLOOR_SECS`; the first
+/// connect of a relay that was down at start is the one announce without it. A reconnect
+/// event queued before the poll read the first `connected` is dropped at the switch, once
+/// per tick for every client switching on it, so a connect, drop and return inside one
+/// tick does not announce twice. A disconnect event is only logged: the client redials
+/// on its own. A `local` rnsd that was not reached at start is probed once a tick until
+/// something answers and the transport is attached to it; from there, as from the start
+/// for one attached at start, its shared-instance client's state events drive the row,
+/// see `follow_local_event`. That client re-announces and redials by itself, so no line
+/// is printed and no announce sent for an rnsd. The watcher holds no peer-controlled
+/// state: a fixed list from the node's own config, one flag per client and one per rnsd.
+/// Ends when the node or its slot is gone.
 async fn watch_interfaces(
     slot: Weak<MeshSlot>,
     runtime: Weak<MeshRuntime>,
@@ -2820,8 +2895,9 @@ async fn watch_interfaces(
         let event = tokio::select! {
             () = cancel.cancelled() => return,
             _ = ticks.tick() => None,
-            hash = next_tcp_event(&mut events.reconnect) => Some(TcpEvent::Reconnect(hash)),
-            hash = next_tcp_event(&mut events.disconnect) => Some(TcpEvent::Disconnect(hash)),
+            hash = next_tcp_event(&mut events.reconnect) => Some(WatchEvent::Reconnect(hash)),
+            hash = next_tcp_event(&mut events.disconnect) => Some(WatchEvent::Disconnect(hash)),
+            (index, event) = next_local_event(&mut watches) => Some(WatchEvent::Local(index, event)),
         };
         let (Some(slot), Some(runtime)) = (slot.upgrade(), runtime.upgrade()) else {
             return;
@@ -2839,12 +2915,19 @@ async fn watch_interfaces(
                             label,
                             endpoint,
                             attached,
+                            events,
                         } => {
+                            if *attached {
+                                continue;
+                            }
                             let probe = tokio::select! {
                                 () = cancel.cancelled() => return,
                                 outcome = probe_local(endpoint, runtime.connect_timeout) => outcome,
                             };
-                            observe_local(&runtime, *index, label, endpoint, attached, probe).await;
+                            attach_probed_local(
+                                &runtime, *index, label, endpoint, attached, events, probe,
+                            )
+                            .await;
                         }
                         Watch::Tcp {
                             hash,
@@ -2868,7 +2951,7 @@ async fn watch_interfaces(
                     drain_switching_reconnects(&switching, &mut events.reconnect, &mut transitions);
                 }
             }
-            Some(TcpEvent::Reconnect(hash)) => {
+            Some(WatchEvent::Reconnect(hash)) => {
                 if Watch::switched_within(&watches, hash, CONNECT_WATCH_TICK, Instant::now()) {
                     debug!(
                         "Mesh interface {} reported the connect its switch already announced",
@@ -2878,12 +2961,15 @@ async fn watch_interfaces(
                     transitions.push((hash, Transition::Reconnect));
                 }
             }
-            Some(TcpEvent::Disconnect(hash)) => {
+            Some(WatchEvent::Disconnect(hash)) => {
                 if let Some(label) = Watch::tcp_label(&watches, hash) {
                     debug!(
                         "Mesh interface {label} dropped its connection; the client is redialing it"
                     );
                 }
+            }
+            Some(WatchEvent::Local(index, event)) => {
+                follow_local_event(&runtime, &mut watches, index, event);
             }
         }
         for (hash, transition) in transitions {
@@ -2980,42 +3066,38 @@ fn drain_switching_reconnects(
     }
 }
 
-/// Folds one probe of a `local` rnsd into its row. Before the first attach a probe that
-/// answers is followed by the attach itself, and a probe that does not keeps the row
-/// `Connecting`; after it the transport redials on its own, so the probe only says whether
-/// rnsd is back. No idle line and no announce: the shared-instance client re-announces
-/// over a restored socket itself.
-async fn observe_local(
+/// Folds one probe of a `local` rnsd the transport is not attached to into its row: a
+/// probe that answers is followed by the attach, after which the row reads `connecting`
+/// until the client's first `Connected` and its events are what the watcher follows; a
+/// probe that does not keeps the row `Connecting` with its reason.
+async fn attach_probed_local(
     runtime: &MeshRuntime,
     index: usize,
     label: &str,
     endpoint: &LocalEndpoint,
     attached: &mut bool,
+    events: &mut Option<mpsc::Receiver<SharedInstanceEvent>>,
     probe: Result<(), String>,
 ) {
     match probe {
-        Ok(()) if *attached => {
-            if runtime.mark_interface_connected(index).is_some() {
-                info!("Mesh interface {label} connected");
-            }
-        }
         Ok(()) => {
             let Some(transport) = runtime.transport_handle().await else {
                 return;
             };
             match attach_local(&transport, endpoint).await {
-                Ok(()) => {
+                Ok(receiver) => {
                     *attached = true;
+                    *events = Some(receiver);
                     runtime
                         .interfaces
                         .lock()
                         .await
                         .push(JoinedInterface::Local {
                             label: label.to_string(),
-                            endpoint: endpoint.clone(),
                         });
-                    if runtime.mark_interface_connected(index).is_some() {
-                        info!("Mesh interface {label} connected");
+                    let state = InterfaceState::Connecting { reason: None };
+                    if runtime.mark_interface_state(index, state).is_some() {
+                        debug!("Mesh interface {label} is attached and dialing rnsd");
                     }
                 }
                 Err(reason) => {
@@ -3030,14 +3112,6 @@ async fn observe_local(
                 }
             }
         }
-        Err(reason) if *attached => {
-            let state = InterfaceState::Disconnected {
-                reason: reason.clone(),
-            };
-            if runtime.mark_interface_state(index, state).is_some() {
-                warn!("Mesh interface {label} lost rnsd; the transport is redialing it: {reason}");
-            }
-        }
         Err(reason) => {
             let state = InterfaceState::Connecting {
                 reason: Some(reason.clone()),
@@ -3046,6 +3120,54 @@ async fn observe_local(
                 debug!("Mesh interface {label} is not reachable yet: {reason}");
             }
         }
+    }
+}
+
+/// Folds one state event of an attached `local` rnsd's client into its row. `Connected`
+/// is the row's `connected`, logged at info when it moved the row (an rnsd reached at
+/// start was already there). `Disconnected` is `lost, retrying` with a fixed reason, the
+/// client being the one that saw the socket close. `Connecting` leaves the row alone:
+/// the client sends it right after every `Disconnected`, before a redial has landed, and
+/// the drop stays the row's until a stream is back; the attach itself already put the
+/// row at `connecting`. No idle line and no announce for any of it: the client
+/// re-announces over a restored socket itself. `None` is the end of the stream, which the
+/// detach at stop brings, and the receiver is let go.
+fn follow_local_event(
+    runtime: &MeshRuntime,
+    watches: &mut [Watch],
+    index: usize,
+    event: Option<SharedInstanceEvent>,
+) {
+    let Some(Watch::Local { label, events, .. }) = watches
+        .iter_mut()
+        .find(|watch| matches!(watch, Watch::Local { index: at, .. } if *at == index))
+    else {
+        return;
+    };
+    match event {
+        None => {
+            *events = None;
+            debug!("Mesh interface {label} stopped reporting; its client is detached");
+        }
+        Some(SharedInstanceEvent::Connected) => {
+            if runtime.mark_interface_connected(index).is_some() {
+                info!("Mesh interface {label} connected");
+            } else {
+                debug!("Mesh interface {label} reported its connection to rnsd");
+            }
+        }
+        Some(SharedInstanceEvent::Disconnected) => {
+            let state = InterfaceState::Disconnected {
+                reason: "rnsd closed the socket".to_string(),
+            };
+            if runtime.mark_interface_state(index, state).is_some() {
+                warn!("Mesh interface {label} lost rnsd; the transport is redialing it");
+            }
+        }
+        Some(SharedInstanceEvent::Connecting) => {
+            debug!("Mesh interface {label} is dialing rnsd");
+        }
+        Some(other) => debug!("Mesh interface {label} reported {other:?}"),
     }
 }
 
@@ -5167,9 +5289,9 @@ mod tests {
     use crate::mesh::rfc3339_utc;
     #[cfg(unix)]
     use crate::mesh::test_support::{
-        PeerStub, StartedRuntime, TransportRelay, held_port, loopback_relay, serve_as_sink,
-        started_runtime, started_runtime_on, started_runtime_on_with, started_runtime_with,
-        started_runtime_with_options, status_round_trip,
+        PeerStub, StartedRuntime, TransportRelay, held_port, loopback_relay, serve_as_daemon,
+        serve_as_sink, started_runtime, started_runtime_on, started_runtime_on_with,
+        started_runtime_with, started_runtime_with_options, status_round_trip,
     };
     use crate::mesh::test_support::{
         TempDir, TrustList, mesh_paths, private_config, snapshot_fixture,
@@ -11839,15 +11961,15 @@ mod tests {
 
     /// Stands in for rnsd's shared-instance listener at `endpoint`: every connection is
     /// accepted and drained, which satisfies the probe and the attached client alike.
-    /// `socket` is the held port the TCP shape listens on. The listener closes with the
-    /// returned task.
+    /// `socket` is the held port the TCP shape listens on. The listener and every stream
+    /// it accepted close with the returned task, so the attached client sees the drop.
     #[cfg(unix)]
     async fn serve_local_stub(
         endpoint: &LocalEndpoint,
         socket: tokio::net::TcpSocket,
     ) -> JoinHandle<()> {
         match endpoint {
-            LocalEndpoint::Tcp(_) => serve_as_sink(socket.listen(16).unwrap()).await.0,
+            LocalEndpoint::Tcp(_) => serve_as_daemon(socket.listen(16).unwrap()).await,
             #[cfg(target_os = "linux")]
             LocalEndpoint::Abstract(value) => {
                 use std::os::linux::net::SocketAddrExt;
@@ -11859,11 +11981,12 @@ mod tests {
                 listener.set_nonblocking(true).unwrap();
                 let listener = tokio::net::UnixListener::from_std(listener).unwrap();
                 tokio::spawn(async move {
+                    let mut streams = tokio::task::JoinSet::new();
                     loop {
                         let Ok((mut stream, _)) = listener.accept().await else {
                             break;
                         };
-                        tokio::spawn(async move {
+                        streams.spawn(async move {
                             let mut sink = [0u8; 1024];
                             while matches!(stream.read(&mut sink).await, Ok(n) if n > 0) {}
                         });
@@ -11939,13 +12062,15 @@ mod tests {
         .await;
     }
 
-    /// The `local` row follows the probe: `connecting` with the probe's reason until a
-    /// listener answers, `connected` once the transport is attached to it (and the kind
-    /// joins `interface_kinds`), `lost, retrying` when the listener goes away again, with
-    /// no idle line for any of it; `stop` detaches the shared-instance client.
+    /// The `local` row follows the shared-instance client's events once it is attached:
+    /// `connecting` with the probe's reason until a listener answers, `connected` on the
+    /// client's `Connected` (and the kind joins `interface_kinds`), `lost, retrying` with
+    /// the fixed reason on its `Disconnected` when the listener goes away again, and it
+    /// stays there while the client's redials are refused, with no idle line for any of
+    /// it; `stop` detaches the shared-instance client.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_local_row_follows_the_probe_from_connecting_to_connected_to_lost() {
+    async fn a_local_row_follows_the_events_from_connecting_to_connected_to_lost() {
         let (port, socket) = held_port().await;
         let endpoint = local_endpoint(port);
         let label = format!("local rnsd at {endpoint}");
@@ -11994,14 +12119,23 @@ mod tests {
         );
 
         stub.abort();
-        wait_for_state(
-            &runtime,
-            1,
-            "the local row to report the drop",
-            |state| matches!(state, InterfaceState::Disconnected { reason } if !reason.is_empty()),
-        )
+        wait_for_state(&runtime, 1, "the local row to report the drop", |state| {
+            *state
+                == InterfaceState::Disconnected {
+                    reason: "rnsd closed the socket".to_string(),
+                }
+        })
         .await;
         assert_eq!(runtime.interface_kinds(), vec!["private"]);
+        // The client's `Connecting` follows its `Disconnected` at once; the row keeps the
+        // drop through it and through the redials the held port refuses.
+        sleep(LOCAL_RECONNECT_WAIT + CONNECT_WATCH_TICK).await;
+        assert_eq!(
+            states_of(&runtime)[1].1,
+            InterfaceState::Disconnected {
+                reason: "rnsd closed the socket".to_string(),
+            }
+        );
         assert!(
             notifier.0.lock().is_empty(),
             "a local row prints no idle line: {:?}",
@@ -12062,7 +12196,8 @@ mod tests {
         let envs = one_fire(&hooks, HookEvent::MeshStarted);
         assert_eq!(env_value(&envs, "COYOTE_MESH_INTERFACES"), Some("local"));
 
-        // A few probe ticks later the row is still `connected` and nothing was said.
+        // A few ticks later, the client's first `Connected` read, the row is still
+        // `connected` and nothing was said.
         sleep(CONNECT_WATCH_TICK * 2).await;
         assert_eq!(states_of(&runtime)[0].1, InterfaceState::Connected);
         assert!(
