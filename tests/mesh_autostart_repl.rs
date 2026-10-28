@@ -4543,3 +4543,90 @@ fn usage_probe_a_local_only_node_is_refused_until_rnsd_listens_then_joins_throug
     );
     assert_eq!(probe.marker_count("MESH_STOPPED"), 1, "one stop at exit");
 }
+
+/// Puts one hand-spelled `local` entry at the head of the fixture's `interfaces:` list.
+/// `entry` is the flow-mapping body an operator would type after `type: local`.
+fn probe_with_local_entry(label: &str, entry: &str) -> Probe {
+    let probe = Probe::new(label, false, &[]);
+    let path = probe.config_dir.join("config.yaml");
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("  interfaces:\n"), "{text}");
+    let line = format!("  interfaces:\n    - {{type: local, {entry}}}\n");
+    fs::write(&path, text.replacen("  interfaces:\n", &line, 1)).unwrap();
+    probe
+}
+
+/// The three `local` entries the loader refuses are refused by the real binary at config
+/// load, before any prompt: `--info` exits non-zero and stderr carries the exact sentence,
+/// so an operator sees the rule and never a probe or a node. A padded `instance` is not a
+/// refusal: it loads, and the `.info` row shows the endpoint built from the TRIMMED name
+/// (the abstract socket on Linux and Android; the TCP endpoint everywhere else, where the
+/// instance does not reach the label).
+#[test]
+fn a_cold_start_refuses_host_blank_instance_and_port_zero_on_a_local_entry_and_trims_the_instance()
+{
+    let refused = [
+        (
+            "local-entry-host-refused",
+            "host: 127.0.0.1",
+            "type 'local' takes no host; use port and instance to pick the local rnsd",
+        ),
+        (
+            "local-entry-blank-instance-refused",
+            "instance: '   '",
+            "type 'local' requires a non-empty instance when one is given",
+        ),
+        (
+            "local-entry-port-zero-refused",
+            "port: 0",
+            "port 0 is out of range; use 1-65535",
+        ),
+    ];
+    for (label, entry, sentence) in refused {
+        let probe = probe_with_local_entry(label, entry);
+        let output = probe.command().arg("--info").output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !output.status.success(),
+            "{entry}: the config must be refused at load\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("mesh.interfaces: {sentence}")),
+            "{entry}: the refusal names the rule\n{stderr}"
+        );
+        assert!(
+            !stdout.contains("interfaces[0]"),
+            "{entry}: nothing is rendered from a refused config\n{stdout}"
+        );
+        assert_eq!(
+            probe.marker_count("MESH_STARTED"),
+            0,
+            "{entry}: no node starts from a refused config"
+        );
+    }
+
+    let probe = probe_with_local_entry("local-entry-padded-instance", "instance: '  lab  '");
+    let output = probe.command().arg("--info").output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    let endpoint = if cfg!(any(target_os = "linux", target_os = "android")) {
+        "@rns/lab"
+    } else {
+        "127.0.0.1:37428"
+    };
+    let row = stdout
+        .lines()
+        .find(|line| line.trim_start().starts_with("interfaces[0]"))
+        .unwrap_or_else(|| panic!("no interfaces[0] row\n{stdout}"));
+    assert_eq!(
+        row.split_whitespace().skip(1).collect::<Vec<_>>().join(" "),
+        format!("local rnsd at {endpoint}"),
+        "{row}"
+    );
+    assert!(
+        !stdout.contains("@rns/  lab") && !stdout.contains("lab  "),
+        "the padding never reaches a row\n{stdout}"
+    );
+}

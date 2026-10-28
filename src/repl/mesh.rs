@@ -17266,6 +17266,66 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 });
             }
 
+            /// Two `local` entries are refused by `.mesh on` itself, before the preview and
+            /// before anything is probed or attached: a relay that WOULD have carried the
+            /// node sits beside them, so a start that merely ignored the rule would come up
+            /// degraded with two `connecting, retrying` rows; instead the command bails with
+            /// the one-client-per-process sentence, the node stays off, no WARNING and no
+            /// confirm prompt is consumed. The same two endpoints alone (no relay) are still
+            /// refused on the rule, never on their closed ports.
+            #[cfg(unix)]
+            #[test]
+            #[serial]
+            fn a_second_local_entry_is_refused_before_the_preview_even_beside_a_live_relay() {
+                let guard = TestConfigDirGuard::new("repl-mesh-on-two-locals");
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                let _script = prompt_script::install(&[]);
+                let _capture = capture::install();
+                run_async(async {
+                    let (port_a, _held_a) = held_port().await;
+                    let (port_b, _held_b) = held_port().await;
+                    let (first, _) = absent_local_entry(port_a);
+                    let (second, _) = absent_local_entry(port_b);
+                    let (addr, relay_handle, _) = loopback_relay().await;
+                    let relay = MeshInterface::Private {
+                        host: "127.0.0.1".to_string(),
+                        port: addr.port(),
+                    };
+                    let rule = "mesh.interfaces lists local more than once; only one shared-instance client can be attached per process";
+
+                    for interfaces in [
+                        vec![relay.clone(), first.clone(), second.clone()],
+                        vec![first.clone(), second.clone()],
+                    ] {
+                        let mut ctx = ctx_with(
+                            MeshConfig {
+                                interfaces,
+                                ..MeshConfig::default()
+                            },
+                            true,
+                        );
+                        ctx.session = Some(Session::default());
+                        let before = stdout_lines().len();
+
+                        let err = run(&mut ctx, ".mesh on").await.unwrap_err().to_string();
+                        assert_eq!(err, rule);
+                        assert!(ctx.app.mesh.get().is_none(), "the node must stay off");
+                        assert!(
+                            !err.contains("not reachable"),
+                            "refused on the rule, not on the closed ports: {err}"
+                        );
+                        let out = &stdout_lines()[before..];
+                        assert!(
+                            out.iter()
+                                .all(|line| !line.contains("the nodes joined to that relay")),
+                            "no preview is printed before the refusal: {out:?}"
+                        );
+                        assert!(warnings().is_empty(), "{:?}", stderr_lines());
+                    }
+                    relay_handle.abort();
+                });
+            }
+
             /// `serve_local_rnsd`, but the first TCP open listens on the socket the test has
             /// been holding (so nothing else took the port meanwhile); later opens bind fresh.
             #[cfg(unix)]
