@@ -337,8 +337,8 @@ mesh:
                                  # types (default: a single local entry, the shared instance of the local rnsd)
     - type: local                # local = shared-instance client of the host rnsd (Linux/Android: abstract socket @rns/<instance>, default instance `default`;
                                  # elsewhere TCP 127.0.0.1:<port>, default 37428). Run scripts/mesh-relay.sh once per host to install and start rnsd
-    #   port: 37428              # The shared-instance TCP port, where the abstract socket is not used
-    #   instance: default        # The rnsd instance name, where the abstract socket is used
+    #   port: 37428              # The shared-instance TCP port where rnsd has no abstract socket (macOS, BSD, Windows); ignored on Linux and Android
+    #   instance: default        # The rnsd instance whose abstract socket @rns/<instance> is dialed on Linux and Android; ignored elsewhere
     # - type: lan                # lan = link-local only (Reticulum AutoInterface), the no-daemon fallback. Does not cross sbx, WireGuard, Tailscale or
                                  # OpenVPN; only one process per host can bind it
     # - type: private            # private = TCP client to a relay your team runs; requires host + port
@@ -347,7 +347,7 @@ mesh:
     # - type: public             # public = same wire shape as private, but the relay is a community node so your presence is world-visible; requires host + port
     #   host: node.example.com
     #   port: 4242
-    # Other transports (LoRa/RNode, I2P, UDP, serial) are configured in rnsd and reached through the loopback hop above.
+    # Other transports (LoRa/RNode, I2P, UDP, serial) are configured in rnsd and reached through the local rnsd above.
   brief: auto                    # What the envoy serves to trusted peers (default: auto): auto = status card + session digest + user brief;
                                  # manual = card + user brief only, no model spend; off = card only
   digest_prompt: null            # Prompt used to build the shareable session digest. If null or blank, uses built-in default

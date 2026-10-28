@@ -3129,15 +3129,18 @@ fn the_commands_and_deployment_pages_quote_the_interface_warnings_and_states_as_
     }
 }
 
-/// The Commands and Deployment pages no longer name `127.0.0.1:4242` as the default: the
+/// No `Mesh*.md` page and not the Sandboxes page names `127.0.0.1:4242` as the default: the
 /// shipped `interfaces` entry is `{type: local}`, the local rnsd at `127.0.0.1:37428` (the
 /// abstract socket `@rns/default` on Linux and Android). A relay at 4242 may still appear
 /// as an example, so only a line that also says `default` fails.
 #[test]
-fn the_commands_and_deployment_pages_do_not_call_the_4242_relay_the_default() {
+fn no_mesh_page_or_the_sandboxes_page_calls_the_4242_relay_the_default() {
     let Some(wiki) = wiki_dir() else { return };
-    for page_name in ["Mesh-Commands.md", "Mesh-Deployment.md"] {
-        let page = read(wiki.join(page_name));
+    let mut pages = mesh_pages(&wiki);
+    pages.push(wiki.join("Sandboxes.md"));
+    for path in pages {
+        let page_name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let page = read(&path);
         for (index, line) in page.lines().enumerate() {
             assert!(
                 !(line.contains("default") && line.contains("127.0.0.1:4242")),
@@ -3145,6 +3148,41 @@ fn the_commands_and_deployment_pages_do_not_call_the_4242_relay_the_default() {
                 index + 1
             );
         }
+    }
+}
+
+/// The Configuration page's validation table quotes the three `local` refusals as the code
+/// bails: a `host` on a `local` entry, a blank `instance`, and a second `local` entry. The
+/// bails' shape is checked on every run.
+#[test]
+fn the_configuration_page_quotes_the_local_refusals_as_the_code_bails() {
+    let source = read(repo_root().join("src/config/mesh_config.rs"));
+    let refusals = [
+        "type 'local' takes no host; use port and instance to pick the local rnsd",
+        "type 'local' requires a non-empty instance when one is given",
+        "mesh.interfaces lists local more than once; only one shared-instance client can be attached per process",
+    ];
+    for literal in refusals {
+        let start = source
+            .find(&format!("\"{literal}\""))
+            .unwrap_or_else(|| panic!("src/config/mesh_config.rs has no literal {literal:?}"));
+        let bail = source[..start]
+            .rfind("bail!(")
+            .unwrap_or_else(|| panic!("{literal:?} is not raised with bail!"));
+        assert!(
+            source[bail + "bail!(".len()..start].trim().is_empty(),
+            "{literal:?} is not the bail!'s first argument"
+        );
+    }
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Mesh-Configuration.md"));
+    let validation = section("Mesh-Configuration.md", &page, "## Validation");
+    for literal in refusals {
+        assert!(
+            validation.contains(literal),
+            "Mesh-Configuration.md's Validation section does not quote the local refusal as the code bails:\n{literal}"
+        );
     }
 }
 
@@ -3338,9 +3376,9 @@ fn decision_tree(label: &str, page: &str) -> String {
 
 /// The Mesh page's lead carries the three setups of the decision tree, the trust sentence
 /// and the one-command daemon setup; its Pages row for Mesh Deployment names the daemon;
-/// the interfaces list spells `private` as the loopback default ahead of `lan`; the Quick
-/// start points at the daemon setup; and the inbox section quotes the idle line a late
-/// relay prints.
+/// the interfaces list spells `local` as the default ahead of `private` and `lan`; the
+/// Quick start points at the daemon setup; and the inbox section quotes the idle line a
+/// late relay prints.
 #[test]
 fn the_mesh_page_lead_carries_the_three_setups_and_the_pages_row_names_the_daemon() {
     let Some(wiki) = wiki_dir() else { return };
@@ -3379,11 +3417,17 @@ fn the_mesh_page_lead_carries_the_three_setups_and_the_pages_row_names_the_daemo
             .position(|line| line.starts_with(&format!("- `{kind}`")))
             .unwrap_or_else(|| panic!("Mesh.md's interfaces list has no `{kind}` bullet:\n{how}"))
     };
+    let local_at = bullet("local");
     let private_at = bullet("private");
     let lan_at = bullet("lan");
     assert_eq!(
+        bullets[local_at],
+        "- `local`: shared-instance client of the host's rnsd; the default, `local rnsd at 127.0.0.1:37428` (the abstract socket `@rns/default` on Linux and Android).",
+        "Mesh.md's `local` bullet changed"
+    );
+    assert_eq!(
         bullets[private_at],
-        "- `private`: TCP client to a relay; the default dials the local rnsd on `127.0.0.1:4242`.",
+        "- `private`: TCP client to a relay your team runs; requires `host` and `port`.",
         "Mesh.md's `private` bullet changed"
     );
     assert_eq!(
@@ -3392,8 +3436,8 @@ fn the_mesh_page_lead_carries_the_three_setups_and_the_pages_row_names_the_daemo
         "Mesh.md's `lan` bullet changed"
     );
     assert!(
-        private_at < lan_at,
-        "Mesh.md lists `lan` before the `private` default:\n{how}"
+        local_at < private_at && private_at < lan_at,
+        "Mesh.md's interfaces list is not ordered `local`, `private`, `lan`:\n{how}"
     );
     let quick_start = flat(&section("Mesh.md", &page, "## Quick start"));
     assert!(
@@ -3424,7 +3468,7 @@ fn the_relay_restart_idle_lines_are_quoted_on_the_wiki() {
     for needle in [
         announced,
         deferred,
-        "[mesh] private 127.0.0.1:4242 reconnected; announced",
+        "[mesh] private relay.example.com:4242 reconnected; announced",
         "forgets every path it held through the closed sockets",
         "no `.mesh off`/`.mesh on` is needed",
         "announced less than five minutes earlier",
@@ -3622,8 +3666,8 @@ fn the_decision_tree_is_byte_identical_on_the_mesh_and_deployment_pages() {
     );
 }
 
-/// The Deployment page keeps its section order, leads with the one-liner and the loopback
-/// default, climbs the ladder loopback, then team relay, then `type: public`, and quotes
+/// The Deployment page keeps its section order, leads with the one-liner and the local
+/// rnsd default, climbs the ladder local rnsd, then team relay, then `type: public`, and quotes
 /// the relay script: every line of the rnsd config it writes, its firewall sentence (on
 /// the Platform page too), its usage lines, its exit codes, both root refusals and the
 /// enable command it prints when no user session bus answers. The script-side shape
@@ -3764,7 +3808,7 @@ fn the_deployment_page_keeps_its_section_order_and_quotes_the_relay_script() {
     for (rung, needle) in rungs.iter().zip(["rnsd", "relay", "type: public"]) {
         assert!(
             rung.contains(needle),
-            "ladder rung {rung:?} does not name {needle:?}; the order is loopback, team relay, public"
+            "ladder rung {rung:?} does not name {needle:?}; the order is local rnsd, team relay, public"
         );
     }
     assert!(
@@ -4165,7 +4209,7 @@ fn the_commands_page_info_sample_is_the_key_value_table_the_code_draws() {
             flat(&section(
                 "Mesh-Deployment.md",
                 &read(wiki.join("Mesh-Deployment.md")),
-                "### 1. The host: `rnsd` on loopback",
+                "### 1. The host: Coyote is a client of your `rnsd`",
             )),
         ),
     ] {
@@ -4462,7 +4506,7 @@ fn the_commands_page_states_the_blank_line_convention_and_its_progress_samples_f
 /// `local` shares with `private`), the summary's `interfaces:` row names the local rnsd,
 /// and the idle line a late relay prints is quoted.
 #[test]
-fn the_commands_page_on_samples_name_the_private_default_and_the_connect_idle_line() {
+fn the_commands_page_on_samples_name_the_local_default_and_the_connect_idle_line() {
     let audiences = string_literals(&fn_body("src/repl/mesh.rs", "audience"));
     let private = audiences
         .iter()
@@ -4574,15 +4618,11 @@ fn the_containers_page_names_the_entrypoint_variables() {
 
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join("Mesh-Containers.md"));
-    let private = section(
-        "Mesh-Containers.md",
-        &page,
-        "## Running with `type: private`",
-    );
+    let local = section("Mesh-Containers.md", &page, "## Running with `type: local`");
     for variable in &variables {
         assert!(
-            private.contains(&format!("`{variable}")),
-            "Mesh-Containers.md's `type: private` section does not name `{variable}`"
+            local.contains(&format!("`{variable}")),
+            "Mesh-Containers.md's `type: local` section does not name `{variable}`"
         );
     }
     let rns_spec = format!("rns=={rns_version}");
@@ -4749,10 +4789,10 @@ fn the_hooks_page_scopes_mesh_interfaces_to_the_start_event_and_the_log_path_var
 /// The README names the daemon prerequisite with both one-liners and the installer flags,
 /// shows the shipped `mesh.interfaces` default, and says what the propagation node is and
 /// is not for; the node's own README points hosts at `--relay` with all four recipes, keeps
-/// the loopback default and describes the existing-config path as `write_config` in
+/// the local default and describes the existing-config path as `write_config` in
 /// `scripts/mesh-relay.sh` takes it. Reads only the repo, so it runs without the wiki.
 #[test]
-fn the_readme_names_the_daemon_prerequisite_and_the_private_default() {
+fn the_readme_names_the_daemon_prerequisite_and_the_local_default() {
     let readme = read(repo_root().join("README.md"));
     let prose = flat(&readme);
     for needle in [
@@ -4773,6 +4813,13 @@ fn the_readme_names_the_daemon_prerequisite_and_the_private_default() {
         INTERFACES_DEFAULT,
         "README.md's `mesh.interfaces` default is not the shipped local rnsd entry: {row}"
     );
+    let (local_clause, _) = row
+        .split_once("`private`")
+        .expect("README.md's `mesh.interfaces` row describes `private` after `local`");
+    assert!(
+        local_clause.contains("at most once"),
+        "README.md's `mesh.interfaces` row does not say the `local` entry is allowed at most once: {row}"
+    );
     let mesh = section("README.md", &readme, "### Mesh");
     for needle in [
         "store-and-forward across devices for a team",
@@ -4784,7 +4831,7 @@ fn the_readme_names_the_daemon_prerequisite_and_the_private_default() {
         );
     }
     let node_readme = read(repo_root().join("deployment/propagation-node/README.md"));
-    for needle in ["scripts/mesh-relay.sh --relay", "host: 127.0.0.1"] {
+    for needle in ["scripts/mesh-relay.sh --relay", "- type: local"] {
         assert!(
             node_readme.contains(needle),
             "deployment/propagation-node/README.md does not say {needle:?}"
@@ -4821,6 +4868,10 @@ fn the_readme_names_the_daemon_prerequisite_and_the_private_default() {
             "deployment/propagation-node/README.md's `## Coyote side` does not say {needle:?}:\n{coyote_side}"
         );
     }
+    assert!(
+        !coyote_side.contains("host: 127.0.0.1"),
+        "deployment/propagation-node/README.md's `## Coyote side` still points the default at the daemon's 4242 listener:\n{coyote_side}"
+    );
     assert!(
         !coyote_side.contains("`launchctl bootout`/`bootstrap` pair"),
         "deployment/propagation-node/README.md's `## Coyote side` describes the macOS reload as manual advice again:\n{coyote_side}"

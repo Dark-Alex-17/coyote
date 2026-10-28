@@ -160,19 +160,18 @@ ran the setup keeps its config: the script prints the stanza to add by hand, and
 changed service definition it restarts the service for you (on macOS it runs `launchctl bootout`, waits for launchd to
 unload the agent, then `launchctl bootstrap`); on Windows the task is re-registered in place and
 `Stop-ScheduledTask`/`Start-ScheduledTask 'Coyote rnsd'` is printed for you to run. Coyote keeps the shipped default
-`mesh.interfaces`, which dials that daemon; there is nothing to change:
+`mesh.interfaces`, which attaches to that daemon's shared instance; there is nothing to change:
 
 ```yaml
 mesh:
   enabled: true
   interfaces:
-    - type: private
-      host: 127.0.0.1
-      port: 4242
+    - type: local
 ```
 
-Only a session running without `rnsd` dials the node directly, with `host: <node host>` in place of `127.0.0.1`; the
-Docker image (from v0.10.4) has its own `rnsd` and reaches the node through `COYOTE_MESH_RELAY=<node host>:4242` instead.
+Only a session running without `rnsd` dials the node directly, with `{type: private, host: <node host>, port: 4242}` in
+place of the `local` entry; the Docker image (from v0.10.4) has its own `rnsd` and reaches the node through
+`COYOTE_MESH_RELAY=<node host>:4242` instead.
 
 Once the node's announce is heard, `.mesh info` shows it under `propagation_nodes`. Selection is nearest by hops;
 pinning a specific node is not supported yet, and `.mesh info` prints that line itself.
