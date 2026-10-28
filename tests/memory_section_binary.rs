@@ -15,10 +15,10 @@ const WORKSPACE_INDEX: &str = "# Workspace Memory Index\n\n## Always-on facts\n-
                                - **Fact B.** bravo\n- **Fact C.** charlie\n- **Fact D.** delta\n\n\
                                ## Drill files\n- [[w-one]]: workspace drill one\n- [[w-two]]: workspace drill two\n";
 
-/// Every non-catalogue line of both indexes, workspace first; 160 chars.
-const FACTS: &str = "# Workspace Memory Index\n\n## Always-on facts\n- **Fact A.** alpha\n\
-                     - **Fact B.** bravo\n- **Fact C.** charlie\n- **Fact D.** delta\n\n\
-                     ## Drill files\nPLACEHOLDER_CHECK";
+/// Every non-catalogue line of both indexes, global first; 160 chars.
+const FACTS: &str = "PLACEHOLDER_CHECK\n# Workspace Memory Index\n\n## Always-on facts\n\
+                     - **Fact A.** alpha\n- **Fact B.** bravo\n- **Fact C.** charlie\n\
+                     - **Fact D.** delta\n\n## Drill files";
 
 /// Every catalogue line of both indexes, workspace first; 125 chars.
 const CATALOGUE: &str = "- [[w-one]]: workspace drill one\n- [[w-two]]: workspace drill two\n\
@@ -186,8 +186,8 @@ fn old_cap_keys_load_into_the_renamed_info_rows_without_a_warning() {
     assert_eq!(
         lines,
         vec![
-            "memory: 160 fact chars + 125 catalogue chars; 8 lines / 180 chars truncated at \
-             memory_facts_cap=123; run memory__lint"
+            "memory: 160 fact chars + 125 catalogue chars; 8 lines / 184 chars truncated at \
+             memory_facts_cap=123 (global 2, workspace 6); run memory__lint"
         ],
         "{stderr}"
     );
@@ -243,7 +243,8 @@ fn a_catalogue_only_index_whose_first_line_exceeds_the_new_facts_cap_keeps_its_f
     let stdout = stdout_of(&output);
     let expected = format!(
         "<memory>\n<facts>\n</facts>\n<catalogue>\n{}\n</catalogue>\n\
-         <!-- memory facts truncated: 1 lines / {} chars omitted; run memory__lint -->\n</memory>",
+         <!-- memory facts truncated: 1 lines / {} chars omitted (global 0, workspace 1); \
+         run memory__lint -->\n</memory>",
         &row[..20],
         row.len() - 20,
     );
@@ -256,7 +257,7 @@ fn a_catalogue_only_index_whose_first_line_exceeds_the_new_facts_cap_keeps_its_f
         notice_lines(&stderr_of(&output)),
         vec![format!(
             "memory: 0 fact chars + {} catalogue chars; 1 lines / {} chars truncated at \
-             memory_facts_cap=20; run memory__lint",
+             memory_facts_cap=20 (global 0, workspace 1); run memory__lint",
             row.len(),
             row.len() - 20,
         )],
@@ -284,7 +285,8 @@ fn a_facts_heading_longer_than_the_new_facts_cap_is_cut_at_the_cap_and_counts_as
         memory_sections(&stdout),
         vec![
             "<memory>\n<facts>\n# Workspac\n</facts>\n<catalogue>\n</catalogue>\n\
-             <!-- memory facts truncated: 2 lines / 47 chars omitted; run memory__lint -->\n</memory>"
+             <!-- memory facts truncated: 2 lines / 47 chars omitted (global 0, workspace 2); \
+             run memory__lint -->\n</memory>"
         ],
         "{stdout}"
     );
@@ -292,7 +294,7 @@ fn a_facts_heading_longer_than_the_new_facts_cap_is_cut_at_the_cap_and_counts_as
         notice_lines(&stderr_of(&output)),
         vec![
             "memory: 24 fact chars + 32 catalogue chars; 2 lines / 47 chars truncated at \
-             memory_facts_cap=10; run memory__lint"
+             memory_facts_cap=10 (global 0, workspace 2); run memory__lint"
         ],
         "{}",
         stderr_of(&output)
@@ -318,19 +320,22 @@ fn the_configured_facts_cap_governs_the_cut_and_the_notice_fires_once_per_proces
     let stdout = stdout_of(&output);
     let sections = memory_sections(&stdout);
     // 286 chars of facts+catalogue cut at the last line boundary under 123:
-    // six facts lines (106 chars) survive, the cut lands inside the facts, so
-    // the catalogue block is empty and one notice follows it.
-    let expected = "<memory>\n<facts>\n# Workspace Memory Index\n\n## Always-on facts\n\
-                    - **Fact A.** alpha\n- **Fact B.** bravo\n- **Fact C.** charlie\n</facts>\n\
+    // the global line and five workspace facts lines (102 chars) survive, the
+    // cut lands inside the facts, so the catalogue block is empty and one
+    // notice follows it. The omitted lines are four workspace facts and the
+    // four catalogue lines, two per scope.
+    let expected = "<memory>\n<facts>\nPLACEHOLDER_CHECK\n# Workspace Memory Index\n\n\
+                    ## Always-on facts\n- **Fact A.** alpha\n- **Fact B.** bravo\n</facts>\n\
                     <catalogue>\n</catalogue>\n\
-                    <!-- memory facts truncated: 8 lines / 180 chars omitted; run memory__lint -->\n\
+                    <!-- memory facts truncated: 8 lines / 184 chars omitted \
+                    (global 2, workspace 6); run memory__lint -->\n\
                     </memory>";
     assert_eq!(sections, vec![expected, expected], "{stdout}");
     assert_eq!(
         notice_lines(&stderr_of(&output)),
         vec![
-            "memory: 160 fact chars + 125 catalogue chars; 8 lines / 180 chars truncated at \
-             memory_facts_cap=123; run memory__lint"
+            "memory: 160 fact chars + 125 catalogue chars; 8 lines / 184 chars truncated at \
+             memory_facts_cap=123 (global 2, workspace 6); run memory__lint"
         ],
         "two injections, one notice:\n{}",
         stderr_of(&output)

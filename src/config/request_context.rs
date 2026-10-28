@@ -248,8 +248,8 @@ fn memory_section_notice(section: &MemorySection, cap: usize) -> String {
     } = section;
     match truncated {
         Some(cut) => format!(
-            "memory: {facts_chars} fact chars + {catalogue_chars} catalogue chars; {} lines / {} chars truncated at memory_facts_cap={cap}; run memory__lint",
-            cut.lines, cut.chars
+            "memory: {facts_chars} fact chars + {catalogue_chars} catalogue chars; {} lines / {} chars truncated at memory_facts_cap={cap} (global {}, workspace {}); run memory__lint",
+            cut.lines, cut.chars, cut.global_lines, cut.workspace_lines
         ),
         None => format!(
             "memory: {facts_chars} fact chars + {catalogue_chars} catalogue chars injected under memory_facts_cap={cap}"
@@ -18741,12 +18741,14 @@ mod tests {
             truncated: Some(memory::Truncated {
                 lines: 338,
                 chars: 20_618,
+                global_lines: 338,
+                workspace_lines: 0,
             }),
         };
         assert_eq!(
             memory_section_notice(&section, 4_000),
             "memory: 154 fact chars + 24435 catalogue chars; 338 lines / 20618 chars \
-             truncated at memory_facts_cap=4000; run memory__lint"
+             truncated at memory_facts_cap=4000 (global 338, workspace 0); run memory__lint"
         );
     }
 
