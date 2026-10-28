@@ -101,15 +101,14 @@ use tokio::task::JoinHandle;
 use tokio::time::{interval, sleep, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 
-/// One grace window on the transport. `stop` spends at most one on registered tasks and one
-/// on transport teardown, plus any `REKEY_GRACE` a concurrent rekey is spending; `start`
-/// spends one on registering and first announcing the destination, and `abandon_start` and
-/// the `join_lan` failure cleanup spend one unwinding. The request-layer tests bound their
-/// own teardown with it too.
+/// Budget for each join and lock wait around the node's lifecycle: `stop` gives the node's
+/// tasks one window and, once the transport has stopped, the TCP client tasks and the
+/// request handlers another; `start` gives registering and first announcing the
+/// destination one, and `abandon_start` and the `join_lan` failure cleanup bound their
+/// unwinding with it. The request-layer tests bound their own teardown with it too.
 pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
-/// How long `rekey` and `announce_now` wait on the transport for each of their steps
-/// (registering and releasing a destination, attaching announce data, announcing), so a
-/// slow transport cannot hold the `destination` lock indefinitely.
+/// Budget for each step `rekey` and `announce_now` take under the `destination` lock:
+/// registering and releasing a destination, attaching announce data, announcing.
 pub(crate) const REKEY_GRACE: Duration = Duration::from_secs(5);
 /// Poll interval while waiting for a TCP relay to report itself connected.
 const CONNECT_POLL: Duration = Duration::from_millis(50);
