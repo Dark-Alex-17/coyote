@@ -4528,6 +4528,149 @@ mod tests {
         assert_eq!(on_disk.messages().len(), session.messages().len());
     }
 
+    /// The other checkpoint trigger: rounds too small for the in-flight
+    /// share still commit once the last prompt the API reported sits at
+    /// the safety valve, and the child folds them right away, which also
+    /// releases the valve latch the checkpoint set.
+    #[test]
+    #[serial]
+    fn a_child_folds_after_a_safety_valve_checkpoint() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_child_valve_checkpoint_compress");
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        // Wide enough that the transcript (which carries this host's
+        // memory and workspace sections) plus three rounds of ten 400-char
+        // results sits well under the valve, and the rounds alone under
+        // the in-flight share, so only a reported prompt size can
+        // checkpoint them.
+        let window = 100_000_000;
+        ctx.model = windowed_test_model("valve-checkpointing", window);
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&fetches);
+        ctx.test_summary_fetch = Some(Arc::new(move |_: &str| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            "seam-summary-v8c".to_string()
+        }));
+        let spawn = build_ready_spawn(&mut ctx, json!({"agent": agent_name, "prompt": "hi"}));
+        let ChildSpawn {
+            mut child_ctx,
+            input,
+            session_id,
+            ..
+        } = *spawn;
+        let path = child_ctx
+            .child_session_root
+            .as_ref()
+            .unwrap()
+            .child_session_file(&session_id.unwrap());
+        let app = Arc::clone(&child_ctx.app.config);
+        assert_eq!(app.compression_safety_valve, 0.8);
+        let has_summary = |session: &Session| {
+            session.messages().iter().any(|message| {
+                message.role.is_system() && message.content.to_text().contains("seam-summary-v8c")
+            })
+        };
+        let in_flight = |input: &Input, rounds: usize, output_chars: usize| {
+            let mut input = input.clone();
+            for round in 0..rounds {
+                let results = (round * 10..(round + 1) * 10)
+                    .map(|i| {
+                        ToolResult::new(
+                            ToolCall::new("t".into(), json!({}), Some(format!("id-{i}"))),
+                            json!("x".repeat(output_chars)),
+                        )
+                    })
+                    .collect();
+                input = input.merge_tool_results(String::new(), results);
+            }
+            input
+        };
+
+        child_ctx
+            .after_chat_completion(app.as_ref(), &input, LONG_REPLY, &[])
+            .unwrap();
+        // A threshold the transcript cannot reach keeps the threshold
+        // predicate quiet, so only the valve can fold.
+        child_ctx
+            .session
+            .as_mut()
+            .unwrap()
+            .set_compression_threshold(Some(window / 10));
+        let keep = child_ctx.compression_keep_policy(None);
+        let session = child_ctx.session.as_ref().unwrap();
+        assert!(!session.needs_compression(app.compression_threshold, keep));
+        let committed_count = session.messages().len();
+        let rounds = in_flight(&input, 3, 400);
+        let in_flight_tokens = session
+            .model()
+            .tool_calls_tokens(rounds.tool_calls().as_ref().unwrap());
+        assert!(
+            (2_000..window / 4).contains(&in_flight_tokens),
+            "{in_flight_tokens}"
+        );
+        // The valve's share of the window, as `tool_loop_checkpoint_due`
+        // and `Session::safety_valve_triggered` size it.
+        let limit = (app.compression_safety_valve * window as f32) as usize;
+        assert!(
+            session.tokens() + in_flight_tokens < limit,
+            "{} + {in_flight_tokens} >= {limit}",
+            session.tokens()
+        );
+
+        assert!(child_ctx.last_prompt_token_usage.is_none());
+        let (_, checkpoint) = child_ctx
+            .maybe_checkpoint_tool_loop(rounds.clone())
+            .unwrap();
+        assert!(checkpoint.is_none());
+        assert!(child_ctx.valve_checkpoint_floor.is_none());
+        assert_eq!(
+            child_ctx.session.as_ref().unwrap().messages().len(),
+            committed_count
+        );
+
+        // The API reported a prompt exactly at the valve's limit.
+        child_ctx.last_prompt_token_usage = Some(limit);
+        let (next, checkpoint) = child_ctx.maybe_checkpoint_tool_loop(rounds).unwrap();
+        assert!(checkpoint.is_some());
+        assert!(next.tool_calls().is_none());
+        let committed = child_ctx.session.as_ref().unwrap();
+        assert_eq!(committed.messages().len(), committed_count + 3);
+        assert!(
+            committed.messages()[committed_count + 2]
+                .content
+                .to_text()
+                .contains("Context checkpoint"),
+            "{:?}",
+            committed.messages()[committed_count + 2]
+        );
+        let committed_tokens = committed.tokens();
+        let committed_count = committed.messages().len();
+        assert_eq!(child_ctx.valve_checkpoint_floor, Some(committed_tokens));
+        assert!(!has_summary(&read_yaml::<Session>(&path)));
+
+        let folded = checkpoint.is_some()
+            && run_async(maybe_compress_child_turn(&mut child_ctx, app.as_ref()));
+        assert!(folded);
+
+        let session = child_ctx.session.as_ref().unwrap();
+        assert!(has_summary(session));
+        assert!(session.messages()[0].role.is_system());
+        assert!(session.messages().len() < committed_count);
+        assert!(
+            session.tokens() < committed_tokens,
+            "{} >= {committed_tokens}",
+            session.tokens()
+        );
+        assert!(!session.compressing());
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        assert!(child_ctx.valve_checkpoint_floor.is_none());
+        assert!(child_ctx.last_prompt_token_usage.is_none());
+        let on_disk: Session = read_yaml(&path);
+        assert!(has_summary(&on_disk));
+        assert_eq!(on_disk.messages().len(), session.messages().len());
+    }
+
     /// A request the model rejected as too long compresses the committed
     /// transcript once and asks for a retry, like the REPL; a retry already
     /// spent, an aborted child, an error that is not an overflow while the
@@ -4880,7 +5023,8 @@ mod tests {
             "{:?}",
             on_disk.messages()
         );
-        assert!(!on_disk.compressing());
+        let raw = read_to_string(&path).unwrap();
+        assert!(!raw.contains("compressing"));
     }
 
     /// Through the real child loop: a resumed child whose first request the
@@ -5036,7 +5180,8 @@ mod tests {
             on_disk.has_user_messages(),
             "the checkpoint committed the retry's turn"
         );
-        assert!(!on_disk.compressing());
+        let raw = read_to_string(&path).unwrap();
+        assert!(!raw.contains("compressing"));
     }
 
     /// A child's turn-boundary compression runs the same predicates as the
@@ -7008,6 +7153,94 @@ mod tests {
             "{written:?}"
         );
         assert_eq!(on_disk.messages().len(), session.messages().len());
+    }
+
+    /// A resume whose compressed transcript cannot be written back still
+    /// admits the child on the compressed transcript in memory; the stored
+    /// copy is left exactly as it was and the failure is logged.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn a_resume_whose_write_back_fails_still_admits_and_keeps_the_stored_copy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        crate::testing::install_log_collector();
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_write_back_fails");
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&fetches);
+        ctx.test_summary_fetch = Some(Arc::new(move |_: &str| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            "seam-summary-r9w".to_string()
+        }));
+        let (sid, stored_count) = seed_completed_config_child_with_replies(
+            &mut ctx,
+            &agent_name,
+            &[LONG_REPLY, LONG_REPLY, LONG_REPLY],
+        );
+        let root = spawner_root(&ctx);
+        let path = root.child_session_file(&sid);
+        let (before, after) = fixed_point_window(&ctx, &path);
+        assert!(before > after, "{before} -> {after}");
+        fetches.store(0, Ordering::SeqCst);
+        let window = after;
+        ctx.model = windowed_test_model("fits", window);
+        // The sidecar re-stamp is on disk by the time the summarizer runs,
+        // so a directory made read-only from inside the fetch fails only
+        // the write-back of the compressed copy.
+        let children = root.children_dir();
+        let _restore = crate::testing::RestoreMode(children.clone(), 0o700);
+        let counted = Arc::clone(&fetches);
+        let locked = children.clone();
+        ctx.test_summary_fetch = Some(Arc::new(move |_: &str| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+            "seam-summary-r9w".to_string()
+        }));
+        let stored_before = read_to_string(&path).unwrap();
+        let warned_before = crate::testing::warn_snapshot().len();
+
+        let spawn = build_ready_spawn(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+
+        if crate::testing::mode_bits_are_ignored_in(&children) {
+            return;
+        }
+        assert_eq!(spawn.session_id.as_deref(), Some(sid.as_str()));
+        assert_eq!(
+            read_to_string(&path).unwrap(),
+            stored_before,
+            "the stored copy is the resume record"
+        );
+        let session = spawn.child_ctx.session.as_ref().unwrap();
+        let first = &session.messages()[0];
+        assert!(first.role.is_system(), "{first:?}");
+        assert!(
+            first.content.to_text().contains("seam-summary-r9w"),
+            "{first:?}"
+        );
+        assert!(session.messages().len() < stored_count);
+        assert!(
+            session.tokens() <= window,
+            "{} > {window}",
+            session.tokens()
+        );
+        assert!(!session.compressing());
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        let warns: Vec<String> = crate::testing::warn_snapshot()
+            .into_iter()
+            .skip(warned_before)
+            .filter(|m| m.contains("Resumed child session was not written back"))
+            .collect();
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(
+            warns[0].contains("the stored copy stays as it was"),
+            "{warns:?}"
+        );
     }
 
     /// A resume that compresses holds no root lock while the summarizer
