@@ -689,17 +689,31 @@ fn write_memory_index(target_dir: &Path, content: &str) -> Result<PathBuf> {
 
 fn ensure_index_entry(index_path: &Path, name: &str, description: &str) -> Result<bool> {
     let existing = fs::read_to_string(index_path).unwrap_or_default();
-    if existing.lines().any(|l| catalogue_slug(l) == Some(name)) {
-        return Ok(false);
+    let entry = format!("- [[{name}]]: {description}");
+    let mut offset = 0;
+    for raw in existing.split_inclusive('\n') {
+        let line = raw.trim_end_matches(['\r', '\n']);
+        if catalogue_slug(line) == Some(name) {
+            if catalogue_entry(line).is_some_and(|(_, desc)| desc == description) {
+                return Ok(false);
+            }
+            let rewritten = format!(
+                "{}{entry}{}",
+                &existing[..offset],
+                &existing[offset + line.len()..]
+            );
+            fs::write(index_path, rewritten)?;
+            return Ok(true);
+        }
+        offset += raw.len();
     }
 
-    let entry = format!("- [[{name}]]: {description}\n");
     let new_content = if existing.is_empty() {
-        format!("# Memory Index\n\n{entry}")
+        format!("# Memory Index\n\n{entry}\n")
     } else if existing.ends_with('\n') {
-        format!("{existing}{entry}")
+        format!("{existing}{entry}\n")
     } else {
-        format!("{existing}\n{entry}")
+        format!("{existing}\n{entry}\n")
     };
 
     if let Some(parent) = index_path.parent() {
@@ -1012,15 +1026,21 @@ mod tests {
     }
 
     #[test]
-    fn ensure_index_entry_skips_when_referenced() {
-        let root = temp_root("index_skip");
+    fn ensure_index_entry_rewrites_the_line_in_place_when_the_description_differs() {
+        let root = temp_root("index_rewrite");
         let index = root.join("MEMORY.md");
-        let original = "# Memory Index\n\n- [[existing]]: already here\n";
+        let original =
+            "# Memory Index\n\n- [[existing]]: already here\n- [[other]]: untouched\n\nfooter\n";
         fs::write(&index, original).unwrap();
 
         let updated = ensure_index_entry(&index, "existing", "different description").unwrap();
-        assert!(!updated);
-        assert_eq!(fs::read_to_string(&index).unwrap(), original);
+        assert!(updated);
+        let rewritten = "# Memory Index\n\n- [[existing]]: different description\n- [[other]]: untouched\n\nfooter\n";
+        assert_eq!(fs::read_to_string(&index).unwrap(), rewritten);
+
+        let updated = ensure_index_entry(&index, "existing", "different description").unwrap();
+        assert!(!updated, "an identical description is not a rewrite");
+        assert_eq!(fs::read_to_string(&index).unwrap(), rewritten);
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -2112,6 +2132,30 @@ mod tests {
         assert!(refuse(bad_body_and_expires).starts_with("content is 4001 chars"));
 
         assert!(md_files(&structured).is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_memory_overwrite_refreshes_the_index_line_in_place() {
+        let root = temp_root("write_refresh_index");
+        let (store, workspace, structured) = workspace_store(
+            &root,
+            "# Memory Index\n\n- [[before]]: b\n- [[fact]]: first take\n- [[after]]: a\n",
+        );
+
+        let result = write_memory(
+            &store,
+            &workspace,
+            &write_args("fact", "second take", "x"),
+            3,
+        )
+        .unwrap();
+        assert_eq!(result["index_updated"], true, "{result}");
+        assert_eq!(
+            fs::read_to_string(structured.join("MEMORY.md")).unwrap(),
+            "# Memory Index\n\n- [[before]]: b\n- [[fact]]: second take\n- [[after]]: a\n"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
