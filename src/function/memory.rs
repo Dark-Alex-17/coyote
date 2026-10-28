@@ -67,10 +67,9 @@ pub fn memory_function_declarations() -> Vec<FunctionDeclaration> {
                         JsonSchema {
                             type_value: Some("string".to_string()),
                             description: Some(format!(
-                                "REQUIRED. Short kebab-case slug for the file (no extension): \
-                                 lowercase letters, digits, hyphens and underscores, starting with a \
-                                 letter or digit, at most {MEMORY_SLUG_MAX_LEN} chars. A function \
-                                 argument, not a front-matter line."
+                                "REQUIRED. Short kebab-case slug for the file (no extension): {}. \
+                                 A function argument, not a front-matter line.",
+                                slug_grammar()
                             )),
                             ..Default::default()
                         },
@@ -255,9 +254,10 @@ pub fn memory_function_declarations() -> Vec<FunctionDeclaration> {
                         "new_name".to_string(),
                         JsonSchema {
                             type_value: Some("string".to_string()),
-                            description: Some(
-                                "New kebab-case slug for the file (no extension)".into(),
-                            ),
+                            description: Some(format!(
+                                "New kebab-case slug for the file (no extension): {}.",
+                                slug_grammar()
+                            )),
                             ..Default::default()
                         },
                     ),
@@ -550,6 +550,14 @@ fn validate_slug(what: &str, name: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The slug rule as the tool schema states it, shared by every slug argument.
+fn slug_grammar() -> String {
+    format!(
+        "lowercase letters, digits, hyphens and underscores, starting with a letter or digit, \
+         at most {MEMORY_SLUG_MAX_LEN} chars"
+    )
 }
 
 /// Splits `<base>-r<N>` into `(base, N)`; any other shape is not a round name.
@@ -2276,6 +2284,20 @@ mod tests {
             "Either way, a round written below an existing one keeps superseded_by pointing at \
              the round above."
         ));
+    }
+
+    #[test]
+    fn rename_declaration_states_the_same_slug_grammar_as_write() {
+        let declarations = memory_function_declarations();
+        let rename = declarations
+            .iter()
+            .find(|d| d.name == "memory__rename")
+            .unwrap();
+        let new_name = rename.parameters.properties.as_ref().unwrap()["new_name"]
+            .description
+            .as_deref()
+            .unwrap();
+        assert!(new_name.contains(&slug_grammar()), "{new_name}");
     }
 
     fn write_args(name: &str, description: &str, content: &str) -> Value {
