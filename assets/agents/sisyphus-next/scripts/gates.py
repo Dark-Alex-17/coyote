@@ -1189,7 +1189,7 @@ def triage_route(state):
     fixes, escalations = [], []
     rejected = list(as_list(state.get("rejected_findings")))
     deferred = list(as_list(state.get("deferred_findings")))
-    exemptions = list(as_list(state.get("debris_exemptions")))
+    exemptions = list(as_list(state.get("debris_exemptions"))) + [e for e in as_list(state.get("debris_exemptions_new", [])) if e]
     for t in triage:
         finding = str(t.get("finding", ""))
         action = t.get("action") or "fix"
@@ -1216,7 +1216,7 @@ def triage_route(state):
     for e in as_list(state.get("debris_exemptions")):
         if e not in exemptions:
             exemptions.append(e)
-    u.update({"rejected_findings": rejected, "deferred_findings": deferred, "debris_exemptions": exemptions})
+    u.update({"rejected_findings": rejected, "deferred_findings": deferred, "debris_exemptions": exemptions, "debris_exemptions_new": []})
 
     streak = dict(as_dict(state.get("lane_block_streak")))
     lanes_now = {lane for lane, _ in fixes}

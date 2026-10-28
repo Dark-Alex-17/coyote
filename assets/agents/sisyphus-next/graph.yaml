@@ -236,6 +236,7 @@ initial_state:
   deferred_findings: []
   skipped_reviews: []
   debris_exemptions: []
+  debris_exemptions_new: []
   prior_review_decisions: ''
   debris_exclude: ''
   # --- observability / whetstone ---
@@ -1440,7 +1441,7 @@ nodes:
               citation: { type: string }
               reason: { type: string }
             required: [finding, action]
-        debris_exemptions:
+        debris_exemptions_new:
           type: array
           items: { type: string }
         anomalies:

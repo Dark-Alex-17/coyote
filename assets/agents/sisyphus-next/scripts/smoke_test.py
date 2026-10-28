@@ -401,6 +401,14 @@ u = gates.triage_route(base_state(triage=[{"finding": "🟡 maybe", "action": "e
 check("triage_route: unsure yellow -> fix-or-accept escalation", u["escalation"]["kind"] == "yellow_findings")
 u = gates.triage_route(base_state(triage=[], gauntlet_blockers=["b1", "b2"], last_script_error="llm died"))
 check("triage_route: fail-open when triage died -> every blocker is a fix", u["_next"] == "compose_fix" and u["fix_items"] == ["b1", "b2"])
+_fix = [{"finding": "x", "action": "fix", "lane": "code-review"}]
+u = gates.triage_route(base_state(debris_exemptions=["a:1 -- x"], debris_exemptions_new=["b:2 -- y"], triage=_fix, review_rounds=0))
+check("triage_route: per-round debris_exemptions_new merges into the ledger and is reset",
+      u["debris_exemptions"] == ["a:1 -- x", "b:2 -- y"] and u["debris_exemptions_new"] == [])
+u = gates.triage_route(base_state(debris_exemptions=u["debris_exemptions"], debris_exemptions_new=["c:3 -- z"], triage=_fix, review_rounds=0))
+check("triage_route: a second round appends to the ledger in order", u["debris_exemptions"] == ["a:1 -- x", "b:2 -- y", "c:3 -- z"])
+u = gates.triage_route(base_state(debris_exemptions=u["debris_exemptions"], debris_exemptions_new=[], triage=_fix, review_rounds=0))
+check("triage_route: a round that omits the property re-merges nothing", u["debris_exemptions"] == ["a:1 -- x", "b:2 -- y", "c:3 -- z"])
 
 # ---------------------------------------------------------------- observability / whetstone / publish
 open(os.path.join(REPO, "handler.go"), "w").write("func Handler() { http.HandleFunc(\"/x\", f) }\n")

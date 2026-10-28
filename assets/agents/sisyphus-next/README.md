@@ -33,23 +33,23 @@ below. Later landings add their own rows (grammar reconciliation, fast-path re-e
 | em dashes | `graph.yaml` (2 lines in the `git_ops` instructions) | replaced with ASCII ` - ` so the repo's punctuation lint stays clean |
 | `build_lock` variable | `graph.yaml` `variables:` | declared after `escalation_policy` with default `''`, mirroring the prose `sisyphus/config.yaml`; `scripts/check_session_block.sh` asserts the two variable lists match name-for-name, default-for-default (threading it to child spawns is a separate adjustment) |
 | run dir | `scripts/_lib.py` `cache_dir()` / `runs_root()`, this README | moved from `$XDG_STATE_HOME/coyote/sisyphus/runs` to `<cache dir>/sisyphus-next/runs` (precedence above); `scripts/smoke_test.py` pins each resolution tier |
-| dead state read | `scripts/gates.py` `triage_route` | dropped the read of `debris_exemptions_new`, a key no node writes (the `triage_findings` schema emits `debris_exemptions`); the repo's bundled-graph walker requires a declared writer for every consumed key |
+| debris exemptions ledger merge | `graph.yaml` `triage_findings` output_schema + initial_state, `scripts/gates.py` `triage_route` | the schema emitted `debris_exemptions`, and the engine merges every schema property into state, so each triage round overwrote the run-wide ledger; the property is now `debris_exemptions_new` (seeded `[]` in initial_state), `triage_route` merges it into the ledger (staging's own merge line) and resets it to `[]` so a round that omits the property cannot re-merge a stale list; the smoke battery pins three rounds |
 | smoke summary | `scripts/smoke_test.py` | the failure tally is taken after the last check so the summary line and exit code cover every check (the three `ci_gate` checks were recorded after it) |
 | `debt_scan` fallback | `graph.yaml` `debt_scan` node, `scripts/debt_scan.py` | `fallback: bookkeeping_scan` added next to `next:` - the engine forwards a script crash only along `fallback:`, so the shim's crash-forward sentence now names that edge; the validator baseline is unchanged because `debt_scan` itself is entered only through a script `_next` edge, so nothing downstream becomes declared-edge reachable |
 
 Recorded `diff -r` census against the staging tree (files that differ, hunks per file):
 
 ```
-graph.yaml              4 hunks  (variables: build_lock; debt_scan fallback; git_ops instructions em dashes, 2 lines)
+graph.yaml              6 hunks  (variables: build_lock; initial_state debris_exemptions_new; debt_scan fallback; triage_findings schema property rename; git_ops instructions em dashes, 2 lines)
 scripts/_lib.py         3 hunks  (new cache_dir; runs_root docstring; runs_root base path)
-scripts/smoke_test.py   4 hunks  (import _lib; run dir resolution checks; the failure tally moved below the last check, 2 hunks)
-scripts/gates.py        1 hunk   (triage_route: dead debris_exemptions_new read)
+scripts/smoke_test.py   5 hunks  (import _lib; run dir resolution checks; three-round exemptions ledger pin; the failure tally moved below the last check, 2 hunks)
+scripts/gates.py        1 hunk   (triage_route: the debris_exemptions_new reset in the update dict; the merge line itself is byte-equal to staging again)
 scripts/debt_scan.py    1 hunk   (docstring: the crash-forward sentence names the fallback edge)
 README.md               this section, the run-state bullet above, the Verify section
 ```
 
-Every other file is byte-identical to staging; the graph's node set, prompts, schemas,
-loop bounds and node timeouts are unchanged.
+Every other file is byte-identical to staging; the graph's node set, prompts, loop bounds
+and node timeouts are unchanged, and the one schema change is the property rename above.
 
 Toolchain census (the gates must stay project-agnostic; verification commands come
 from the brief, never from a hard-coded toolchain):
@@ -57,8 +57,8 @@ from the brief, never from a hard-coded toolchain):
 ```
 $ grep -nE '\b(cargo|npm|pnpm|yarn|go (test|build)|pytest|mvn|gradle|make)\b' scripts/*.py
 scripts/gates.py:902:        lines += ["Observability pass: make these alert-as-code / instrumentation changes following the repo's existing "
-scripts/smoke_test.py:506:u = gates.ci_gate({"git_report": "ok\nANOMALY: commits I did not make\n", ...})
-scripts/smoke_test.py:507:check("ci_gate: ANOMALY: lines harvested from git_report", any("commits I did not make" in e for e in ...))
+scripts/smoke_test.py:513:u = gates.ci_gate({"git_report": "ok\nANOMALY: commits I did not make\n", ...})
+scripts/smoke_test.py:514:check("ci_gate: ANOMALY: lines harvested from git_report", any("commits I did not make" in e for e in ...))
 ```
 
 All three hits are the English verb `make` (one prompt sentence, two battery fixtures);
