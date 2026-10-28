@@ -520,6 +520,19 @@ fn probe_readme_pins_docs_spawn_arm() {
     );
 }
 
+/// True when `sess_` occurs in `text` at an identifier boundary: the character
+/// before it is not `[A-Za-z0-9_]`, or the match opens the text. A child
+/// session id (`sess_<agent>_<hex>`) trips it; an identifier that merely ends
+/// in those letters, such as a node named `assess_fault`, does not.
+fn names_a_child_session_id(text: &str) -> bool {
+    text.match_indices("sess_").any(|(idx, _)| {
+        text[..idx]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'))
+    })
+}
+
 /// The `session_id` parameter's description on `agent__spawn` is the one
 /// place the resume mechanics live. The bundled prose that tells an
 /// orchestrator when to resume states the policy sentence exactly once,
@@ -560,11 +573,46 @@ fn bundled_prose_leaves_resume_mechanics_to_the_tool_description() {
             let bytes = fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
             let text = String::from_utf8_lossy(&bytes);
             for needle in needles {
-                if text.contains(needle) {
+                let tripped = match *needle {
+                    "sess_" => names_a_child_session_id(&text),
+                    _ => text.contains(needle),
+                };
+                if tripped {
                     hits.push(format!("{}: {needle}", path.display()));
                 }
             }
         }
     }
     assert!(hits.is_empty(), "{}", hits.join("\n"));
+}
+
+/// Positive control for the `sess_` needle above, on strings rather than on
+/// the asset tree: a session id trips it at the start of the text and after a
+/// non-identifier character, while identifiers whose tail happens to spell
+/// `sess_` stay clean.
+#[test]
+fn child_session_id_needle_is_identifier_bounded() {
+    for text in [
+        "sess_coder_0f3a9c2b7d14",
+        "x sess_y",
+        "resume (sess_abc) later",
+        "`sess_",
+    ] {
+        assert!(
+            names_a_child_session_id(text),
+            "{text:?} names a child session id"
+        );
+    }
+    for text in [
+        "assess_fault",
+        "assess_fault_sess_x",
+        "scripts/assess_fault.py",
+        "sess",
+        "",
+    ] {
+        assert!(
+            !names_a_child_session_id(text),
+            "{text:?} does not name a child session id"
+        );
+    }
 }
