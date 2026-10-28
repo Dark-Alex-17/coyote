@@ -288,6 +288,14 @@ mod tests {
     }
 
     #[test]
+    fn description_cap_rule_tracks_the_const() {
+        assert!(DEFAULT_MEMORY_INSTRUCTIONS.contains(&format!(
+            "at most {} chars",
+            crate::config::memory::MEMORY_DESCRIPTION_CAP
+        )));
+    }
+
+    #[test]
     fn memory_prompt_consts_are_ascii() {
         assert!(DEFAULT_MEMORY_INSTRUCTIONS.is_ascii());
         assert!(DEFAULT_MEMORY_INSTRUCTIONS_READONLY.is_ascii());
