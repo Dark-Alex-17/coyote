@@ -7400,6 +7400,184 @@ mod tests {
         );
     }
 
+    /// The stored copy a failed resume write-back left behind is the
+    /// previous record only until the child commits its next turn: that
+    /// checkpoint writes the compressed transcript (the summary System
+    /// message, the kept tail and the new exchange) to the session file
+    /// without folding again.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn usage_probe_a_resume_whose_write_back_failed_lands_the_compressed_copy_with_the_next_turn() {
+        use std::os::unix::fs::PermissionsExt;
+
+        crate::testing::install_log_collector();
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_write_back_next_turn");
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&fetches);
+        ctx.test_summary_fetch = Some(Arc::new(move |_: &str| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            "seam-summary-q2v".to_string()
+        }));
+        let (sid, stored_count) = seed_completed_config_child_with_replies(
+            &mut ctx,
+            &agent_name,
+            &[LONG_REPLY, LONG_REPLY, LONG_REPLY],
+        );
+        let root = spawner_root(&ctx);
+        let path = root.child_session_file(&sid);
+        let (before, after) = fixed_point_window(&ctx, &path);
+        assert!(before > after, "{before} -> {after}");
+        fetches.store(0, Ordering::SeqCst);
+        ctx.model = windowed_test_model("fits", after);
+        let children = root.children_dir();
+        let _restore = crate::testing::RestoreMode(children.clone(), 0o700);
+        let counted = Arc::clone(&fetches);
+        let locked = children.clone();
+        ctx.test_summary_fetch = Some(Arc::new(move |_: &str| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+            "seam-summary-q2v".to_string()
+        }));
+        let stored_before = read_to_string(&path).unwrap();
+
+        let spawn = build_ready_spawn(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+        if crate::testing::mode_bits_are_ignored_in(&children) {
+            return;
+        }
+        std::fs::set_permissions(&children, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let ChildSpawn {
+            mut child_ctx,
+            input,
+            ..
+        } = *spawn;
+        assert_eq!(read_to_string(&path).unwrap(), stored_before);
+        assert!(
+            !read_yaml::<Session>(&path)
+                .messages()
+                .iter()
+                .any(|m| m.content.to_text().contains("seam-summary-q2v"))
+        );
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        let compressed_count = child_ctx.session.as_ref().unwrap().messages().len();
+        assert!(compressed_count < stored_count);
+
+        // The next committed turn is what carries the compressed copy to
+        // disk: no second fold, the summary leads, the new exchange ends it.
+        let app = Arc::clone(&child_ctx.app.config);
+        child_ctx
+            .after_chat_completion(app.as_ref(), &input, "a fresh reply after the resume", &[])
+            .unwrap();
+
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            1,
+            "the next turn must not fold again"
+        );
+        let in_memory = child_ctx.session.as_ref().unwrap();
+        assert_eq!(in_memory.messages().len(), compressed_count + 2);
+        let on_disk = read_yaml::<Session>(&path);
+        assert_eq!(
+            on_disk.messages().len(),
+            in_memory.messages().len(),
+            "the committed turn writes the compressed transcript, not the stored record"
+        );
+        assert!(on_disk.messages().len() < stored_count + 2);
+        let first = &on_disk.messages()[0];
+        assert!(first.role.is_system(), "{first:?}");
+        assert!(
+            first.content.to_text().contains("seam-summary-q2v"),
+            "{first:?}"
+        );
+        let last = on_disk.messages().last().unwrap();
+        assert!(
+            last.content
+                .to_text()
+                .contains("a fresh reply after the resume"),
+            "{last:?}"
+        );
+        assert!(!on_disk.compressing());
+        assert_eq!(child_meta_of(&ctx, &sid).status, ChildStatus::Running);
+    }
+
+    /// A resume future dropped after the re-stamp (the parent aborted while
+    /// the summarizer was running) restores nothing: the sidecar keeps this
+    /// process's running stamp, so a second resume in this process is
+    /// refused as still running, and the child resumes again once that pid
+    /// is dead, exactly like a child whose process exited mid-run.
+    #[test]
+    #[serial]
+    fn usage_probe_a_resume_dropped_after_the_re_stamp_is_refused_until_this_process_exits() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_dropped");
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let (sid, _) = seed_completed_config_child(&mut ctx, &agent_name, json!({}));
+        let root = spawner_root(&ctx);
+        let stored_before = read_to_string(root.child_session_file(&sid)).unwrap();
+        let live = ProcessStamp::current();
+        assert_ne!(
+            live.start, 0,
+            "this host reports no start time for its own process"
+        );
+        let args = json!({"agent": agent_name, "prompt": "again", "session_id": sid});
+
+        // The resume future is torn down right after the re-stamp landed,
+        // with no lock held, the way an aborted parent drops it.
+        let outcome = with_hook_between_resume_phases(
+            || panic!("the resume future is dropped here"),
+            || {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_async(build_child_spawn(&mut ctx, &args)).map(|_| ())
+                }))
+            },
+        );
+        assert!(outcome.is_err(), "the hook must have torn the resume down");
+
+        let left = child_meta_of(&ctx, &sid);
+        assert_eq!(left.status, ChildStatus::Running);
+        assert_eq!(left.pid, live.pid);
+        assert_eq!(left.pid_start, live.start);
+        assert_eq!(
+            read_to_string(root.child_session_file(&sid)).unwrap(),
+            stored_before,
+            "a dropped resume never touched the session file"
+        );
+
+        let retry = resume_error(&mut ctx, args.clone());
+        assert!(
+            retry.contains(&format!(
+                "'{sid}' is still running; collect or cancel it first"
+            )),
+            "{retry}"
+        );
+        assert_eq!(
+            child_meta_of(&ctx, &sid).pid,
+            live.pid,
+            "the refused retry leaves the dropped resume's stamp alone"
+        );
+
+        // Once the stamping process is gone the stamp reads dead and the
+        // child resumes; the sidecar then carries the new resume's stamp.
+        let mut meta = root.load_child_meta(&sid).unwrap().unwrap();
+        meta.pid = u32::MAX - 1;
+        root.save_child_meta(&meta).unwrap();
+        assert_eq!(meta.effective_status(), EffectiveStatus::Crashed);
+        let spawn = build_ready_spawn(&mut ctx, args);
+        assert_eq!(spawn.session_id.as_deref(), Some(sid.as_str()));
+        let meta = child_meta_of(&ctx, &sid);
+        assert_eq!(meta.status, ChildStatus::Running);
+        assert_eq!(meta.agent_id, spawn.agent_id);
+        assert_eq!(meta.pid, live.pid);
+        assert_eq!(meta.pid_start, live.start);
+    }
+
     /// A resume that compresses holds no root lock while the summarizer
     /// runs, so a sibling child finishing meanwhile records its sidecar
     /// straight away instead of waiting out the lock bound. The fetch
