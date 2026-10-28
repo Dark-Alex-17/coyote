@@ -240,18 +240,6 @@ pub fn memory_function_declarations() -> Vec<FunctionDeclaration> {
                         },
                     ),
                     type_filter_schema(),
-                    (
-                        "agent".to_string(),
-                        JsonSchema {
-                            type_value: Some("string".to_string()),
-                            description: Some(
-                                "Only files written by this agent; honoured once entries carry \
-                                 `agent:`"
-                                    .into(),
-                            ),
-                            ..Default::default()
-                        },
-                    ),
                     scope_filter_schema(),
                     (
                         "include_stale".to_string(),
@@ -3487,13 +3475,19 @@ mod tests {
         assert_eq!(first["offset"], 0);
         assert_eq!(first["returned"], 2);
 
-        let middle = list(&mut ctx, json!({"scope": "global", "offset": 2, "limit": 2}));
+        let middle = list(
+            &mut ctx,
+            json!({"scope": "global", "offset": 2, "limit": 2}),
+        );
         assert_eq!(list_names(&middle), ["note-3", "note-5"], "{middle}");
         assert_eq!(middle["total"], 5);
         assert_eq!(middle["offset"], 2);
         assert_eq!(middle["returned"], 2);
 
-        let past_end = list(&mut ctx, json!({"scope": "global", "offset": 9, "limit": 2}));
+        let past_end = list(
+            &mut ctx,
+            json!({"scope": "global", "offset": 9, "limit": 2}),
+        );
         assert!(list_names(&past_end).is_empty(), "{past_end}");
         assert_eq!(past_end["total"], 5);
         assert_eq!(past_end["offset"], 9);
@@ -3543,10 +3537,7 @@ mod tests {
         assert!(!search.agent);
         let properties = search.parameters.properties.unwrap();
         let keys: Vec<&str> = properties.keys().map(String::as_str).collect();
-        assert_eq!(
-            keys,
-            vec!["query", "k", "type", "agent", "scope", "include_stale"]
-        );
+        assert_eq!(keys, vec!["query", "k", "type", "scope", "include_stale"]);
         assert_eq!(search.parameters.required, Some(vec!["query".to_string()]));
     }
 }
