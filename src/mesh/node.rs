@@ -778,7 +778,7 @@ impl MeshRuntime {
         }
         let (knock_sink, knock_rx) = ChannelKnockSink::new(KNOCK_QUEUE_CAPACITY);
         let dispatcher = Arc::new(Dispatcher::new(trust.clone(), knock_sink));
-        let request_handler = Arc::new(LibraryHandler::new(dispatcher.clone(), &transport));
+        let request_handler = Arc::new(LibraryHandler::new(dispatcher.clone()));
         let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
         let (dest, hash, origin) = match register_destination(
             &transport,

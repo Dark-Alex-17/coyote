@@ -1070,10 +1070,10 @@ mod tests {
 
     /// A response that leaves as a resource is compressed at every place it is sent from:
     /// the paths the node registers carry `auto_compress` for the replies the library
-    /// sends, the test listener that stands in for the node registers its paths the same
-    /// way, and the adapter's own send of a settled reply asks for the same. The
-    /// library's `send_response_resource` compresses by default, so this keeps a reply the
-    /// node sends itself the same bytes on the wire as one the library sends for it.
+    /// sends, and the test listener that stands in for the node registers its paths the
+    /// same way. The adapter sends nothing itself: a settled reply is handed back for the
+    /// library to send under that same flag, so there is no second send site to keep in
+    /// step.
     #[test]
     fn every_response_resource_is_sent_with_compression_on() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -1108,14 +1108,10 @@ mod tests {
             );
         }
         let handler = flattened("src/mesh/request/handler.rs");
-        let send = ".send_response_resource_with_outcome(&link_id,request_id.to_bytes().to_vec(),bytes,None,true)";
-        assert_eq!(
-            handler
-                .matches(".send_response_resource_with_outcome(")
-                .count(),
-            1,
-            "handler.rs sends a response resource at one site"
+        assert!(
+            !handler.contains(".send_response_resource")
+                && !handler.contains(".send_link_packet_on_bound_iface("),
+            "handler.rs sends a response itself; the library sends every reply"
         );
-        assert!(handler.contains(send), "{send} is not in handler.rs");
     }
 }

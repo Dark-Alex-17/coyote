@@ -971,8 +971,7 @@ pub(crate) mod test_support {
                 false,
             )));
             let adapter = Arc::new(
-                LibraryHandler::new(handler, &transport)
-                    .with_handler_timeout_for_test(handler_timeout),
+                LibraryHandler::new(handler).with_handler_timeout_for_test(handler_timeout),
             );
             let tcp = TcpServer::new(format!("127.0.0.1:{port}"), transport.iface_manager())
                 .with_client_mtu(client_mtu);

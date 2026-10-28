@@ -2414,7 +2414,9 @@ pub(crate) mod network {
     }
 
     /// Every way a settled reply can fail to go out ends the same: the settlement is
-    /// dropped unsent and the adapter says why, under the request's id.
+    /// dropped unsent and the adapter says why, under the request's id. The reply over
+    /// the cap is refused before the library sees it; every other failure reaches the
+    /// adapter as the response outcome the library resolved.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_settled_reply_is_sent_once_delivered_and_dropped_unsent_when_it_cannot_go_out() {
         install_log_collector();
@@ -2552,8 +2554,8 @@ pub(crate) mod network {
         .await;
         in_flight.abort();
 
-        // The link is torn down while the handler holds its reply; the send has nowhere to
-        // go and the settlement is dropped unsent.
+        // The link is torn down while the handler holds its reply; the library finds no
+        // link to send on, the outcome is `NotSent` and the settlement is dropped unsent.
         let (reply, sent, dropped) = settled(Value::from("too late"));
         *handler.reply.lock() = Some(reply);
         let link = open_link(&requester.transport, &desc, "/echo", link_deadline())
@@ -2601,7 +2603,7 @@ pub(crate) mod network {
         handler.release.notify_one();
         assert!(in_flight.await.unwrap().is_err());
         let warned = format!(
-            "Failed to send mesh response {seen_request} on link {}: the link is gone",
+            "Mesh response {seen_request} on link {} did not complete: NotSent",
             link_id.to_hex_string()
         );
         wait_until("the adapter to give up on the reply", || {
@@ -2616,7 +2618,7 @@ pub(crate) mod network {
         .await;
 
         // The peer's side of the link is closed but not yet swept from the transport's
-        // table: the link is still found, and the reply is still not sent on it. The
+        // table: the link is still found, and the library still sends nothing on it. The
         // requester's own link is closed by the teardown above, so this opens a fresh one.
         let (reply, sent, dropped) = settled(Value::from("closed"));
         *handler.reply.lock() = Some(reply);
@@ -2629,7 +2631,7 @@ pub(crate) mod network {
         );
         handler.release.notify_one();
         let warned = format!(
-            "Failed to send mesh response {request_id} on link {}: the link has closed",
+            "Mesh response {request_id} on link {} did not complete: NotSent",
             link_id.to_hex_string()
         );
         wait_until("the adapter to give up on the closed link", || {
@@ -2684,7 +2686,7 @@ pub(crate) mod network {
         let (_, request_id) = handler.last.lock().unwrap();
         handler.release.notify_one();
         let warned = format!(
-            "Mesh response {request_id} on link {} did not complete: Rejected(PeerCancelled)",
+            "Mesh response {request_id} on link {} did not complete: Resource(Rejected(PeerCancelled))",
             link_id.to_hex_string()
         );
         wait_until("the rejected transfer to give up on the reply", || {
@@ -8425,8 +8427,8 @@ pub(crate) mod network {
         responder.stop().await;
     }
 
-    /// A settled reply too big for a packet is sent as a resource under the handler's
-    /// slot, and the slot is back once the send is dispatched: the transfer's outcome,
+    /// A settled reply too big for a packet is handed back under the handler's slot and
+    /// sent by the library as a resource once the slot is free: the response outcome,
     /// which confirms the settlement, is awaited off it. The settlement counts the free
     /// slots the moment it is confirmed, so the order of the two is what is asserted.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

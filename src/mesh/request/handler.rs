@@ -1,24 +1,22 @@
 use crate::mesh::request::dispatch::MAX_FETCH_RESPONSE_BYTES;
 use crate::mesh::request::error::RefusalCode;
 use crate::mesh::request::frame::{PathHash, RequestId};
-use crate::mesh::request::redact_hashes;
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use rmpv::Value;
-use rns_transport::destination::link::{LinkId, LinkStatus};
+use rns_transport::destination::link::LinkId;
 use rns_transport::destination::request::{
     InboundRequest as LibraryInboundRequest, RequestHandler as LibraryRequestHandler,
-    RequestResponse, ResponseFrame as LibraryResponseFrame,
+    RequestResponse, ResponseFrame as LibraryResponseFrame, ResponseOutcome,
 };
 use rns_transport::identity::Identity;
 use rns_transport::resource::OutboundResult;
-use rns_transport::transport::{SendPacketOutcome, Transport};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
@@ -87,16 +85,11 @@ pub(crate) trait RequestHandler: Send + Sync {
 /// The handler the library's request layer calls for every registered path, in front of
 /// Coyote's `RequestHandler`. It bounds the handler (the slots and `HANDLER_TIMEOUT`),
 /// asks it whether to admit the request, and maps its reply onto the library's: a
-/// `Reply::Value` or `Reply::Code` is handed back for the library to send, while a
-/// `Reply::Settled` is sent here, under the same slot, since its producer must hear
-/// whether it went out.
-///
-/// The transport is held weakly: the destination owns this handler and the transport owns
-/// the destination, so a strong reference would keep the transport alive past its last
-/// owner. The weak reference is upgraded only for a settled reply's own send.
+/// `Reply::Value` or `Reply::Code` is handed back for the library to send, and so is a
+/// `Reply::Settled`'s value, whose producer then hears what became of it through the
+/// request's response outcome.
 pub(crate) struct LibraryHandler {
     handler: RwLock<Arc<dyn RequestHandler>>,
-    transport: Weak<Transport>,
     permits: Arc<Semaphore>,
     handler_timeout: Duration,
     #[cfg(test)]
@@ -106,10 +99,9 @@ pub(crate) struct LibraryHandler {
 }
 
 impl LibraryHandler {
-    pub(crate) fn new(handler: Arc<dyn RequestHandler>, transport: &Arc<Transport>) -> Self {
+    pub(crate) fn new(handler: Arc<dyn RequestHandler>) -> Self {
         Self {
             handler: RwLock::new(handler),
-            transport: Arc::downgrade(transport),
             permits: Arc::new(Semaphore::new(MAX_CONCURRENT_INBOUND_REQUESTS)),
             handler_timeout: HANDLER_TIMEOUT,
             #[cfg(test)]
@@ -166,12 +158,14 @@ impl LibraryHandler {
 
     /// Runs Coyote's handler under one permit and maps its reply onto the library's.
     /// `None` is a request the handler was never entered for, answers nothing to, or
-    /// whose settled reply was sent from here: that send is dispatched under the permit
-    /// too, so a slot is only free once nothing of the request is left to do.
+    /// whose settled reply no peer could take. A settled reply that is handed back is
+    /// confirmed by the response outcome the library resolves once it has sent it,
+    /// awaited on a detached task: the permit covers the handler, not the transfer, and
+    /// neither it nor `HANDLER_TIMEOUT` bounds that transfer.
     async fn reply(
         &self,
         permit: OwnedSemaphorePermit,
-        request: LibraryInboundRequest,
+        mut request: LibraryInboundRequest,
     ) -> Option<RequestResponse> {
         // Bound first so it drops last, after everything the request does.
         let _permit = permit;
@@ -182,6 +176,7 @@ impl LibraryHandler {
         }
         #[cfg(test)]
         self.admitted.fetch_add(1, Ordering::SeqCst);
+        let outcome = request.track_outcome();
         let inbound = InboundRequest {
             link_id,
             identity: request.remote_identity().copied(),
@@ -205,122 +200,25 @@ impl LibraryHandler {
             Reply::Code(code) => Some(RequestResponse::Value(code.to_wire())),
             Reply::Silent => None,
             Reply::Settled { value, settlement } => {
-                self.send_settled(link_id, request_id, value, settlement)
-                    .await;
-                None
-            }
-        }
-    }
-
-    /// Sends a settled reply the way the library sends its own: a packet when the frame
-    /// fits the link MDU, a resource otherwise. The settlement is confirmed by the
-    /// transfer outcome, which is awaited on a detached task: it is the transfer that is
-    /// waited for, not the handler, so the handler slot covers dispatching the send and
-    /// neither it nor `HANDLER_TIMEOUT` bounds the transfer. The encoded frame is held to
-    /// `MAX_FETCH_RESPONSE_BYTES`, the widest bound any requester accepts, so a reply no
-    /// peer could take is dropped before it costs a transfer. A `Reply::Value` is not
-    /// measured on this side: the library encodes and sends it, and the requester's bound
-    /// for the path drops what is over. A link the peer has already closed is still found
-    /// until the library sweeps it, so the status is checked under the same lock the
-    /// packet is built under; a settlement is never confirmed for a packet the peer
-    /// cannot read.
-    async fn send_settled(
-        &self,
-        link_id: LinkId,
-        request_id: RequestId,
-        value: Value,
-        settlement: Box<dyn Settlement>,
-    ) {
-        let Some(transport) = self.transport.upgrade() else {
-            warn!(
-                "Failed to send mesh response {request_id} on link {}: the transport is gone",
-                link_id.to_hex_string()
-            );
-            drop_unsent(settlement);
-            return;
-        };
-        let bytes = LibraryResponseFrame::new(request_id, value).encode();
-        if bytes.len() > MAX_FETCH_RESPONSE_BYTES {
-            warn!(
-                "Failed to send mesh response {request_id} on link {}: {} bytes over the {MAX_FETCH_RESPONSE_BYTES} byte response cap",
-                link_id.to_hex_string(),
-                bytes.len()
-            );
-            drop_unsent(settlement);
-            return;
-        }
-        let Some(link) = transport.find_in_link(&link_id).await else {
-            warn!(
-                "Failed to send mesh response {request_id} on link {}: the link is gone",
-                link_id.to_hex_string()
-            );
-            drop_unsent(settlement);
-            return;
-        };
-        let (mdu, packet) = {
-            let link = link.lock().await;
-            if link.status() != LinkStatus::Active {
-                warn!(
-                    "Failed to send mesh response {request_id} on link {}: the link has closed",
-                    link_id.to_hex_string()
-                );
-                drop_unsent(settlement);
-                return;
-            }
-            let mdu = link.link_mdu();
-            let packet = (bytes.len() <= mdu).then(|| link.response_packet(&bytes));
-            (mdu, packet)
-        };
-        if let Some(packet) = packet {
-            debug!(
-                "Sending mesh response {request_id} as a packet ({} bytes, link MDU {mdu})",
-                bytes.len()
-            );
-            let packet = match packet {
-                Ok(packet) => packet,
-                Err(err) => {
+                // The library's frame for this value, measured against
+                // `MAX_FETCH_RESPONSE_BYTES`, the widest bound any requester accepts: a
+                // reply no peer could take is dropped before it costs a transfer. A
+                // `Reply::Value` is not measured here; the requester's bound for the path
+                // drops what is over.
+                let frame = LibraryResponseFrame::new(request_id, value);
+                let encoded = frame.encode().len();
+                if encoded > MAX_FETCH_RESPONSE_BYTES {
                     warn!(
-                        "Failed to send mesh response {request_id} on link {}: response packet: {}",
-                        link_id.to_hex_string(),
-                        redact_hashes(&err.to_string())
-                    );
-                    drop_unsent(settlement);
-                    return;
-                }
-            };
-            match transport
-                .send_link_packet_on_bound_iface(&link, packet)
-                .await
-            {
-                SendPacketOutcome::SentDirect => settlement.sent(),
-                outcome => {
-                    warn!(
-                        "Failed to send mesh response {request_id} on link {}: response packet not sent: {outcome:?}",
+                        "Failed to send mesh response {request_id} on link {}: {encoded} bytes over the {MAX_FETCH_RESPONSE_BYTES} byte response cap",
                         link_id.to_hex_string()
                     );
                     drop_unsent(settlement);
+                    return None;
                 }
-            }
-            return;
-        }
-        debug!(
-            "Sending mesh response {request_id} as a resource ({} bytes, link MDU {mdu})",
-            bytes.len()
-        );
-        let sent = transport
-            .send_response_resource_with_outcome(
-                &link_id,
-                request_id.to_bytes().to_vec(),
-                bytes,
-                None,
-                true,
-            )
-            .await;
-        match sent {
-            Ok((_, outcome)) => {
                 tokio::spawn(async move {
                     match outcome.await {
-                        OutboundResult::Complete => settlement.sent(),
+                        ResponseOutcome::Packet
+                        | ResponseOutcome::Resource(OutboundResult::Complete) => settlement.sent(),
                         verdict => {
                             warn!(
                                 "Mesh response {request_id} on link {} did not complete: {verdict:?}",
@@ -330,14 +228,7 @@ impl LibraryHandler {
                         }
                     }
                 });
-            }
-            Err(err) => {
-                warn!(
-                    "Failed to send mesh response {request_id} on link {}: response resource: {}",
-                    link_id.to_hex_string(),
-                    redact_hashes(&err.to_string())
-                );
-                drop_unsent(settlement);
+                Some(RequestResponse::Value(frame.into_body()))
             }
         }
     }
@@ -351,8 +242,7 @@ fn drop_unsent(settlement: Box<dyn Settlement>) {
 
 impl LibraryRequestHandler for LibraryHandler {
     /// A request is dropped, never queued, when every slot is busy. The permit covers
-    /// admission, the handler and the dispatch of a settled reply's send; the transfer
-    /// that send may start runs after it is released.
+    /// admission and the handler; the library sends the reply after it is released.
     fn handle(
         &self,
         request: LibraryInboundRequest,
