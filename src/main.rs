@@ -178,6 +178,11 @@ async fn async_main() -> Result<()> {
         return config::list_installed_bundles();
     }
 
+    if let Some(scope) = cli.memory_migrate {
+        print!("{}", memory_migrate::run(scope, cli.apply)?);
+        return Ok(());
+    }
+
     let mcp_inspect =
         cli.mcp_list && cli.mcp_get.is_none() && cli.mcp_remove.is_none() && cli.mcp_add.is_none();
     let vault_inspect = cli.list_secrets
@@ -563,10 +568,6 @@ async fn run(
             memory::append_gitignore_entry(&git_root)?;
         }
         println!("✓ Created memory marker at '{}'.", path.display());
-        return Ok(());
-    }
-    if let Some(scope) = cli.memory_migrate {
-        print!("{}", memory_migrate::run(scope, cli.apply)?);
         return Ok(());
     }
     if cli.init_instructions {

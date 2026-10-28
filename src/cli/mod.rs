@@ -137,11 +137,20 @@ pub struct Cli {
         long,
         value_name = "SCOPE",
         value_enum,
-        help_heading = "Session & Memory"
+        help_heading = "Session & Memory",
+        conflicts_with_all = [
+            "agent", "session", "role", "temp_role", "model", "empty_session", "save_session",
+            "init_memory", "text", "file", "execute", "code", "dry_run",
+        ]
     )]
     pub memory_migrate: Option<MigrateScope>,
     /// With --memory-migrate, back up each memory dir and write the changes
-    #[arg(long, requires = "memory_migrate", help_heading = "Session & Memory")]
+    #[arg(
+        long,
+        requires = "memory_migrate",
+        conflicts_with = "dry_run",
+        help_heading = "Session & Memory"
+    )]
     pub apply: bool,
     /// Scaffold a COYOTE.md workspace instructions file in the current directory
     #[arg(long, help_heading = "Session & Memory")]
@@ -670,6 +679,34 @@ mod tests {
         assert!(Cli::try_parse_from(["coyote", "--memory-migrate", "both"]).is_err());
         assert!(Cli::try_parse_from(["coyote", "--init-memory", "all"]).is_err());
         assert!(Cli::try_parse_from(["coyote", "--sandbox", "--memory-migrate", "all"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "coyote",
+                "--init-memory",
+                "global",
+                "--memory-migrate",
+                "all"
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["coyote", "--apply", "--dry-run"]).is_err());
+        assert!(
+            Cli::try_parse_from(["coyote", "--memory-migrate", "all", "--apply", "--dry-run"])
+                .is_err()
+        );
+        for extra in [
+            &["--agent", "a"][..],
+            &["--session", "s"],
+            &["--role", "r"],
+            &["--model", "m"],
+            &["--empty-session"],
+            &["--save-session"],
+            &["some", "prompt"],
+        ] {
+            let mut args = vec!["coyote", "--memory-migrate", "all"];
+            args.extend_from_slice(extra);
+            assert!(Cli::try_parse_from(&args).is_err(), "{extra:?}");
+        }
     }
 
     #[test]
