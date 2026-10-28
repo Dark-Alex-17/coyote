@@ -216,6 +216,89 @@ fn a_dry_run_prompt_carries_facts_first_then_the_catalogue_under_the_default_cap
     );
 }
 
+/// Replaces both indexes with a single workspace index; the global one is
+/// removed so the section holds exactly `index`.
+fn only_workspace_index(fx: &Fixture, index: &str) {
+    fs::write(
+        fx.workspace
+            .join(".coyote")
+            .join("memory")
+            .join("MEMORY.md"),
+        index,
+    )
+    .unwrap();
+    fs::remove_file(fx.dir.join("memory").join("MEMORY.md")).unwrap();
+}
+
+#[test]
+fn a_catalogue_only_index_whose_first_line_exceeds_the_new_facts_cap_keeps_its_first_cap_chars() {
+    // The facts cap arrives under its NEW name. With no facts at all the
+    // first catalogue line is the first line of the joined text; it does not
+    // fit, so it is cut at the cap and counted as one omitted line.
+    let row = format!("- [[w]]: {}", "d".repeat(60));
+    let fx = fixture("catalogue-first-cut", "memory_facts_cap: 20\n");
+    only_workspace_index(&fx, &format!("{row}\n"));
+    let output = run(&fx, &["-e", "hello"]);
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let stdout = stdout_of(&output);
+    let expected = format!(
+        "<memory>\n<facts>\n</facts>\n<catalogue>\n{}\n</catalogue>\n\
+         <!-- memory facts truncated: 1 lines / {} chars omitted; run memory__lint -->\n</memory>",
+        &row[..20],
+        row.len() - 20,
+    );
+    assert_eq!(
+        memory_sections(&stdout),
+        vec![expected.as_str()],
+        "{stdout}"
+    );
+    assert_eq!(
+        notice_lines(&stderr_of(&output)),
+        vec![format!(
+            "memory: 0 fact chars + {} catalogue chars; 1 lines / {} chars truncated at \
+             memory_facts_cap=20; run memory__lint",
+            row.len(),
+            row.len() - 20,
+        )],
+        "{}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn a_facts_heading_longer_than_the_new_facts_cap_is_cut_at_the_cap_and_counts_as_one_omitted_line()
+{
+    // Facts-first twin of the catalogue-first cut: the 24-char heading is the
+    // first line and the cap is 10, so the facts block is its first ten chars
+    // and the omitted count is the heading (as one line) plus the whole
+    // catalogue line, over the joined text (24 + newline + 32 = 57 chars).
+    let fx = fixture("facts-first-cut", "memory_facts_cap: 10\n");
+    only_workspace_index(
+        &fx,
+        "# Workspace Memory Index\n- [[w-one]]: workspace drill one\n",
+    );
+    let output = run(&fx, &["-e", "hello"]);
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let stdout = stdout_of(&output);
+    assert_eq!(
+        memory_sections(&stdout),
+        vec![
+            "<memory>\n<facts>\n# Workspac\n</facts>\n<catalogue>\n</catalogue>\n\
+             <!-- memory facts truncated: 2 lines / 47 chars omitted; run memory__lint -->\n</memory>"
+        ],
+        "{stdout}"
+    );
+    assert_eq!(
+        notice_lines(&stderr_of(&output)),
+        vec![
+            "memory: 24 fact chars + 32 catalogue chars; 2 lines / 47 chars truncated at \
+             memory_facts_cap=10; run memory__lint"
+        ],
+        "{}",
+        stderr_of(&output)
+    );
+}
+
 #[test]
 fn the_configured_facts_cap_governs_the_cut_and_the_notice_fires_once_per_process() {
     // The caps arrive under their OLD names and differ, so a caller that
