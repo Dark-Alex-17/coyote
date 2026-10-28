@@ -12,15 +12,16 @@ use serde_json::{Value, json};
 use super::{FunctionDeclaration, JsonSchema};
 use crate::config::RequestContext;
 use crate::config::memory::{
-    DEFAULT_MEMORY_RUN_STATE_TTL_DAYS, KindField, MemoryFile, MemoryFrontmatter, MemoryKind,
-    MemoryStore, Retention, WorkspaceMemory, bootstrap_workspace_memory, catalogue_entry,
-    catalogue_slug, find_git_root, today_string,
+    DEFAULT_MEMORY_RUN_STATE_TTL_DAYS, KindField, MEMORY_DESCRIPTION_CAP, MEMORY_FILE_HARD_CAP,
+    MemoryFile, MemoryFrontmatter, MemoryKind, MemoryStore, Retention, WorkspaceMemory,
+    bootstrap_workspace_memory, catalogue_entry, catalogue_slug, find_git_root, today_string,
 };
 use crate::config::paths;
 
 pub const MEMORY_FUNCTION_PREFIX: &str = "memory__";
 
 const PER_FILE_SOFT_CAP: usize = 2_000;
+const MEMORY_SLUG_MAX_LEN: usize = 64;
 
 pub fn memory_function_declarations() -> Vec<FunctionDeclaration> {
     vec![
@@ -428,10 +429,25 @@ fn write_memory(
              Remove the block from `content` and pass those values as arguments instead."
         );
     }
+    validate_slug("name", &name)?;
     let kind = match args.get("type").and_then(Value::as_str) {
         Some(value) => MemoryKind::from_str(value)?.into(),
         None => KindField::default(),
     };
+    if description.contains('\n') {
+        bail!("description must be one line (no newline)");
+    }
+    let description_chars = description.chars().count();
+    if description_chars > MEMORY_DESCRIPTION_CAP {
+        bail!("description is {description_chars} chars, the cap is {MEMORY_DESCRIPTION_CAP}");
+    }
+    let content_chars = content.chars().count();
+    if content_chars > MEMORY_FILE_HARD_CAP {
+        bail!(
+            "content is {content_chars} chars, the cap is {MEMORY_FILE_HARD_CAP} \
+             (split the topic across linked files)"
+        );
+    }
     let superseded_by = args
         .get("superseded_by")
         .and_then(Value::as_str)
@@ -491,20 +507,27 @@ fn write_memory(
     }))
 }
 
+fn validate_slug(what: &str, name: &str) -> Result<()> {
+    let mut chars = name.chars();
+    let well_formed = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+        && name.len() <= MEMORY_SLUG_MAX_LEN;
+    if !well_formed {
+        bail!(
+            "invalid {what} '{name}': use a kebab-case slug of lowercase letters, digits, \
+             hyphens and underscores (max {MEMORY_SLUG_MAX_LEN} chars)"
+        );
+    }
+    Ok(())
+}
+
 fn rename_memory(store: &MemoryStore, cwd: &Path, args: &Value) -> Result<Value> {
     let name = arg_str(args, "name")?;
     let new_name = arg_str(args, "new_name")?;
     let scope = arg_str(args, "scope")?;
-    if new_name.is_empty()
-        || !new_name
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-    {
-        bail!(
-            "invalid new_name '{}': use a kebab-case slug (alphanumeric, hyphens, underscores)",
-            new_name
-        );
-    }
+    validate_slug("new_name", &new_name)?;
 
     if name == new_name {
         bail!("new_name matches the current name");
@@ -1955,6 +1978,142 @@ mod tests {
             description.contains("user | feedback | project | reference | run-state"),
             "{description}"
         );
+    }
+
+    fn write_args(name: &str, description: &str, content: &str) -> Value {
+        json!({
+            "name": name,
+            "description": description,
+            "content": content,
+            "scope": "workspace",
+        })
+    }
+
+    fn md_files(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".md") && n != "MEMORY.md")
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn write_memory_rejects_bad_slugs_and_writes_nothing() {
+        let root = temp_root("write_bad_slug");
+        let (store, workspace, structured) = workspace_store(&root, "# Memory Index\n");
+        let long = "a".repeat(65);
+
+        for bad in [
+            "Upper",
+            "has space",
+            long.as_str(),
+            "-leading",
+            "",
+            "dots.too",
+        ] {
+            let args = write_args(bad, "d", "x");
+            let text = write_memory(&store, &workspace, &args, 3)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                text.starts_with(&format!("invalid name '{bad}'")) && text.contains("max 64 chars"),
+                "{bad}: {text}"
+            );
+            assert!(md_files(&structured).is_empty(), "{bad} wrote a file");
+        }
+        assert_eq!(
+            fs::read_to_string(structured.join("MEMORY.md")).unwrap(),
+            "# Memory Index\n"
+        );
+
+        let longest = "b".repeat(64);
+        write_memory(&store, &workspace, &write_args(&longest, "d", "x"), 3).unwrap();
+        write_memory(&store, &workspace, &write_args("7_ok-slug", "d", "x"), 3).unwrap();
+        assert_eq!(
+            md_files(&structured),
+            vec!["7_ok-slug.md".to_string(), format!("{longest}.md")]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_memory_caps_the_description_and_the_body() {
+        let root = temp_root("write_caps");
+        let (store, workspace, structured) = workspace_store(&root, "# Memory Index\n");
+        let refuse = |args: Value| {
+            let text = write_memory(&store, &workspace, &args, 3)
+                .unwrap_err()
+                .to_string();
+            assert!(md_files(&structured).is_empty(), "{text} wrote a file");
+            text
+        };
+
+        let text = refuse(write_args("fact", &"d".repeat(161), "x"));
+        assert_eq!(text, "description is 161 chars, the cap is 160");
+
+        let text = refuse(write_args("fact", "two\nlines", "x"));
+        assert_eq!(text, "description must be one line (no newline)");
+
+        let text = refuse(write_args("fact", "d", &"x".repeat(4001)));
+        assert_eq!(
+            text,
+            "content is 4001 chars, the cap is 4000 (split the topic across linked files)"
+        );
+
+        let at_cap = write_args("fact", &"d".repeat(160), &"x".repeat(4000));
+        write_memory(&store, &workspace, &at_cap, 3).unwrap();
+        let saved = MemoryFile::load(&structured.join("fact.md")).unwrap();
+        assert_eq!(saved.char_len(), 4000);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_memory_guards_run_in_a_fixed_order() {
+        let root = temp_root("write_guard_order");
+        let (store, workspace, structured) = workspace_store(&root, "# Memory Index\n");
+        let refuse = |args: Value| {
+            write_memory(&store, &workspace, &args, 3)
+                .unwrap_err()
+                .to_string()
+        };
+
+        let missing_and_bad_slug = json!({
+            "name": "Bad Name",
+            "content": "x",
+            "scope": "workspace",
+        });
+        assert!(
+            refuse(missing_and_bad_slug).starts_with("missing required argument(s): description.")
+        );
+
+        let front_matter_and_bad_slug = write_args("Bad Name", "d", "---\nname: x\n---\nbody");
+        assert!(
+            refuse(front_matter_and_bad_slug)
+                .starts_with("`content` starts with a YAML front-matter block.")
+        );
+
+        let mut bad_slug_and_type = write_args("Bad Name", "two\nlines", "x");
+        bad_slug_and_type["type"] = json!("bogus");
+        assert!(refuse(bad_slug_and_type).starts_with("invalid name 'Bad Name'"));
+
+        let mut bad_type_and_description = write_args("fact", "two\nlines", "x");
+        bad_type_and_description["type"] = json!("bogus");
+        assert!(refuse(bad_type_and_description).starts_with("Invalid value 'bogus'"));
+
+        let bad_description_and_body = write_args("fact", "two\nlines", &"x".repeat(4001));
+        assert!(refuse(bad_description_and_body).starts_with("description must be one line"));
+
+        let mut bad_body_and_expires = write_args("fact", "d", &"x".repeat(4001));
+        bad_body_and_expires["expires"] = json!("tomorrow");
+        assert!(refuse(bad_body_and_expires).starts_with("content is 4001 chars"));
+
+        assert!(md_files(&structured).is_empty());
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
