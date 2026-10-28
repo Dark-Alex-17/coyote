@@ -10,7 +10,7 @@ use crate::config::memory::{
     MEMORY_DESCRIPTION_CAP, MEMORY_FILE_HARD_CAP, MemoryFile, MemoryKind, catalogue_entry,
     discover_workspace_memory,
 };
-use crate::config::{MEMORY_INDEX_FILE_NAME, MigrateScope, paths};
+use crate::config::{MEMORY_INDEX_FILE_NAME, MigrateScope, paths, sanitize_display_text};
 use crate::function::memory::round_chain_name;
 use crate::utils::fs::{copy_dir_all, write_private_atomic};
 
@@ -385,7 +385,7 @@ impl fmt::Display for Report {
                 ScopeOutcome::Skipped {
                     label,
                     dir: Some(dir),
-                } => writeln!(f, "{label}: skipped, no memory dir at {}", dir.display())?,
+                } => writeln!(f, "{label}: skipped, no memory dir at {}", shown(dir))?,
                 ScopeOutcome::Skipped { label, dir: None } => writeln!(
                     f,
                     "{label}: skipped, no workspace memory found from the current directory"
@@ -408,7 +408,7 @@ impl fmt::Display for Report {
 }
 
 fn write_scope(f: &mut fmt::Formatter<'_>, report: &ScopeReport, apply: bool) -> fmt::Result {
-    writeln!(f, "{}: {}", report.label, report.dir.display())?;
+    writeln!(f, "{}: {}", report.label, shown(&report.dir))?;
     writeln!(f, "  changes: {}", report.change_count())?;
     write_section(
         f,
@@ -519,7 +519,7 @@ fn write_scope(f: &mut fmt::Formatter<'_>, report: &ScopeReport, apply: bool) ->
             SECTION_LIST_CAP,
         )?;
         match &report.backup {
-            Some(backup) => writeln!(f, "  backup: {}", backup.display()),
+            Some(backup) => writeln!(f, "  backup: {}", shown(backup)),
             None => writeln!(f, "  backup: none, nothing to write"),
         }
     } else {
@@ -545,6 +545,12 @@ fn pairs<A: fmt::Display, B: fmt::Display>(items: &[(A, B)], sep: &str) -> Vec<S
     items.iter().map(|(a, b)| format!("{a}{sep}{b}")).collect()
 }
 
+fn shown(path: &Path) -> String {
+    sanitize_display_text(&path.display().to_string())
+}
+
+/// Every item comes from the memory dir, which a cloned repo controls, so
+/// terminal escapes in it are stripped before printing.
 fn write_section(
     f: &mut fmt::Formatter<'_>,
     title: &str,
@@ -553,7 +559,7 @@ fn write_section(
 ) -> fmt::Result {
     writeln!(f, "  {title}: {}", items.len())?;
     for item in items.iter().take(cap) {
-        writeln!(f, "    {item}")?;
+        writeln!(f, "    {}", sanitize_display_text(item))?;
     }
     if items.len() > cap {
         writeln!(f, "    +{} more", items.len() - cap)?;
@@ -973,6 +979,22 @@ mod tests {
             "{err:#}"
         );
         assert_eq!(fs::read_to_string(&index_path).unwrap(), edited);
+    }
+
+    #[test]
+    fn repo_text_is_printed_without_terminal_escapes() {
+        let fx = Fixture::new("escapes");
+        fs::write(
+            fx.global.join(MEMORY_INDEX_FILE_NAME),
+            "- [[ghost]]: \u{1b}[31mred\u{1b}]0;title\u{7}\n",
+        )
+        .unwrap();
+
+        let text = fx.migrate(false).to_string();
+
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        assert!(!text.contains('\u{7}'), "{text:?}");
+        assert!(text.contains("    ghost: red\n"), "{text}");
     }
 
     #[test]
