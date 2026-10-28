@@ -102,10 +102,12 @@ use tokio::time::{interval, sleep, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 
 /// Budget for each join and lock wait around the node's lifecycle: `stop` gives the node's
-/// tasks one window and, once the transport has stopped, the TCP client tasks and the
-/// request handlers another; `start` gives registering and first announcing the
-/// destination one, and `abandon_start` and the `join_lan` failure cleanup bound their
-/// unwinding with it. The request-layer tests bound their own teardown with it too.
+/// tasks one window, and a second window, opened before the transport stops, is shared by
+/// the transport's own stop, the TCP client joins and the request handler drain, so a
+/// transport that uses up its own budget leaves the joins and the drain nothing but their
+/// warnings; `start` gives registering and first announcing the destination one, and
+/// `abandon_start` and the `join_lan` failure cleanup bound their unwinding with it. The
+/// request-layer tests bound their own teardown with it too.
 pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// Budget for each step `rekey` and `announce_now` take under the `destination` lock:
 /// registering and releasing a destination, attaching announce data, announcing.
@@ -450,7 +452,7 @@ enum Joined {
         message: String,
     },
     /// A `local` rnsd the probe or the attach did not reach; nothing is attached and the
-    /// connect-poller probes it again every tick.
+    /// interface watcher probes it again every tick.
     NotReached {
         endpoint: LocalEndpoint,
         reason: String,
@@ -489,7 +491,7 @@ pub(crate) enum WatchedInterface {
 }
 
 impl WatchedInterface {
-    /// `None` for a LAN interface, which has no client to sample.
+    /// `None` for a LAN interface, which has no client to follow.
     fn of(index: usize, iface: &JoinedInterface, connected_at_start: bool) -> Option<Self> {
         match iface {
             JoinedInterface::Lan { .. } => None,
@@ -596,9 +598,9 @@ pub(crate) struct MeshRuntime {
     /// interface watcher has taken them.
     tcp_events: parking_lot::Mutex<Option<TcpEventReceivers>>,
     hooks: MeshHooks,
-    /// `None` once `shutdown` has released this owner. Requests hold clones, so the
-    /// upstream `Drop` that cancels the transport's tasks runs when the last of those
-    /// finishes, not when this lock is emptied. The request handler holds only a `Weak`
+    /// `None` once `shutdown` has released this owner. `shutdown` stops the transport
+    /// explicitly, which cancels its tasks; the clones requests hold only keep the memory
+    /// alive until the last of them finishes. The request handler holds only a `Weak`
     /// reference: an inbound request still being handled ends with the transport.
     transport: Mutex<Option<Arc<Transport>>>,
     interfaces: Mutex<Vec<JoinedInterface>>,
@@ -1100,7 +1102,7 @@ impl MeshRuntime {
     }
 
     /// Human labels of the connected interfaces, in config order. A pending interface
-    /// joins the list when the connect-poller sees it come up; `mesh.started` fired once
+    /// joins the list when the interface watcher sees it come up; `mesh.started` fired once
     /// at install with the kinds connected then and nothing refires on a later connect,
     /// so a hook consumer learns of it only through `.mesh info`.
     pub(crate) fn interfaces(&self) -> Vec<String> {
@@ -1128,8 +1130,8 @@ impl MeshRuntime {
         self.interface_states.read().clone()
     }
 
-    /// Every interface the connect-poller follows: each TCP client with its status handle,
-    /// each `local` rnsd with its endpoint.
+    /// Every interface the interface watcher follows: each TCP client with its status
+    /// handle, each `local` rnsd with its endpoint.
     pub(crate) fn watched_interfaces(&self) -> &[WatchedInterface] {
         &self.watched_interfaces
     }
@@ -1733,9 +1735,10 @@ impl MeshRuntime {
     /// resource reply's transfer confirmation runs on a detached task outside the handler
     /// slot, so the drain does not cover it; it only touches the settlement, whose store
     /// has its own lock, and the same holds for the blocking drop of an unsent settlement,
-    /// which the slot leaves behind the same way. The task joins share one grace window
-    /// and, after the transport's own stop budget, the client joins and the handler drain
-    /// another.
+    /// which the slot leaves behind the same way. The task joins share one grace window;
+    /// a second one, opened before the transport stops, is shared by the transport's own
+    /// stop, the client joins and the handler drain, so when the transport's stop uses it
+    /// up the clients are aborted and the drain gives up at once, each with its warning.
     async fn shutdown(&self) -> Result<()> {
         self.cancel.cancel();
         let tasks = std::mem::take(&mut *self.tasks.lock());
@@ -1944,8 +1947,10 @@ pub(crate) static DRAINED_ON_ABANDON: std::sync::atomic::AtomicUsize =
 
 /// Unwinds a start that failed once the transport existed: the transport is stopped with
 /// the joined interfaces, which cancels its own tasks and aborts the request handlers of
-/// any destination it came to hold, and those handlers are waited for under the same
-/// deadline before the caller releases the locks they may still touch. A handler nothing
+/// any destination it came to hold, and those handlers are waited for before the caller
+/// releases the locks they may still touch. The transport's own stop, the client joins
+/// and the handler drain share one window opened before the transport stops, so a stop
+/// that uses it up leaves the joins and the drain only their warnings. A handler nothing
 /// ran on drains at once, so every arm with a handler in hand passes it;
 /// `request_handler` is `None` only before one exists.
 async fn abandon_start(
@@ -2228,7 +2233,10 @@ async fn detach_interface(
 /// Stops `transport` with every interface joined to it. The LAN discovery runtime is
 /// Coyote's own and goes first; `Transport::stop` then detaches every interface, which
 /// also cancels the TCP client tasks Coyote spawned, and those are joined under
-/// `deadline` since the transport's own wait does not cover them.
+/// `deadline` since the transport's own wait does not cover them. `deadline` is taken by
+/// the caller before the transport stops and bounds the transport's stop and the client
+/// joins together: a stop that runs past it leaves the joins nothing, and each client is
+/// then aborted with a warning.
 async fn stop_transport(
     transport: Arc<Transport>,
     interfaces: Vec<JoinedInterface>,
@@ -3339,9 +3347,9 @@ impl MeshSlot {
     /// cached but not surfaced, and not marked as surfaced either, so a repeat from that
     /// identity still earns its one line. The caller refreshes the session's tool catalog
     /// once this returns, since the `mesh__*` tools are declared only while a node is on.
-    /// The connect-poller for interfaces still reconnecting is spawned here, so this must
-    /// run inside a tokio runtime; a connect that landed between `MeshRuntime::start` and
-    /// this call is seen on the poller's first tick.
+    /// The interface watcher is spawned here, so this must run inside a tokio runtime; a
+    /// connect that landed between `MeshRuntime::start` and this call is seen on the
+    /// watcher's first tick, and a reconnect event sent in that gap waits in its channel.
     pub(crate) fn install(self: &Arc<Self>, runtime: Arc<MeshRuntime>) -> Result<()> {
         if self.get().is_some() {
             bail!(MESH_ALREADY_ON);
@@ -5138,7 +5146,7 @@ mod tests {
     const POLL: Duration = Duration::from_millis(100);
     #[cfg(unix)]
     const INTEROP_TIMEOUT: Duration = Duration::from_secs(15);
-    /// Covers the transport's fixed 5 s reconnect sleep plus one connect and one poller tick.
+    /// Covers the transport's fixed 5 s reconnect sleep plus one connect and one watcher tick.
     #[cfg(unix)]
     const CONNECT_LATER_TIMEOUT: Duration = Duration::from_secs(12);
 
@@ -12044,7 +12052,7 @@ mod tests {
         assert!(slot.stop().await.unwrap());
 
         wait_until(
-            "the node's tasks, the connect-poller among them, to exit",
+            "the node's tasks, the interface watcher among them, to exit",
             || metrics.num_alive_tasks() == baseline,
         )
         .await;
@@ -12634,9 +12642,9 @@ mod tests {
         silent.relay_handle.abort();
     }
 
-    /// One connect announce per pending interface: the tracker reports the first
-    /// `connected` once, so the ticks that keep sampling the client find a steady
-    /// `connected` and announce nothing.
+    /// One connect announce per pending interface: the first `connected` the poll reads
+    /// takes the client off the poll, and a connection that holds sends no event, so the
+    /// later ticks announce nothing.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_second_connected_poll_never_reannounces() {
@@ -12900,7 +12908,7 @@ mod tests {
     /// seconds later, sends nothing and says the heartbeat will carry it, naming how long
     /// ago the first one went out. Two returns, one announce: a relay that flaps cannot
     /// make the node announce faster than the floor. Between a drop and the return nothing
-    /// is said and the interface still reads connected: the poller reports returns, not
+    /// is said and the interface still reads connected: the watcher reports returns, not
     /// outages.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -13028,8 +13036,8 @@ mod tests {
         slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
         slot.install(runtime.clone()).unwrap();
         let before = debug_snapshot().len();
-        // Let the client fail a few attempts first: counters that grow before the first
-        // connect are not reconnects.
+        // Let the client fail a few attempts first: attempts that fail before the first
+        // connect send no event.
         sleep(CONNECT_WATCH_TICK * 2).await;
         assert_eq!(announces_since(before, &hash8), 0);
 
@@ -13110,7 +13118,7 @@ mod tests {
         relay.stop().await;
         let relay = TransportRelay::start_on(port).await;
         // Wait for the client itself to report the drop and the return, then give the
-        // poller a few ticks on the restored connection.
+        // watcher a few ticks on the restored connection.
         let WatchedInterface::Tcp { status, .. } = &runtime.watched_interfaces()[0] else {
             panic!("the relay is a TCP client");
         };
@@ -13357,11 +13365,11 @@ mod tests {
         .await;
     }
 
-    /// `.mesh off` while the connect announce is still in flight: the poller yields to the
+    /// `.mesh off` while the connect announce is still in flight: the watcher yields to the
     /// stop at once rather than being aborted after the grace window, so the stop reports
     /// no task it had to kill. The announce is stalled the same way, the destination lock
     /// held by the test, and released only once the stop has waited longer than the grace
-    /// window, which is when a poller that did not yield would have been aborted.
+    /// window, which is when a watcher that did not yield would have been aborted.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stop_during_the_connect_announce_aborts_no_task() {
@@ -13396,7 +13404,7 @@ mod tests {
             async move { slot.stop().await }
         });
         // The stop cannot finish while the destination is busy; hold it past the grace
-        // window so a poller still inside its announce would have been aborted by now.
+        // window so a watcher still inside its announce would have been aborted by now.
         sleep(SHUTDOWN_GRACE + Duration::from_secs(1)).await;
         assert!(!stopping.is_finished(), "stop needs the destination");
         drop(busy_destination);
