@@ -35,16 +35,18 @@ below. Later landings add their own rows (grammar reconciliation, fast-path re-e
 | run dir | `scripts/_lib.py` `cache_dir()` / `runs_root()`, this README | moved from `$XDG_STATE_HOME/coyote/sisyphus/runs` to `<cache dir>/sisyphus-next/runs` (precedence above); `scripts/smoke_test.py` pins each resolution tier |
 | debris exemptions ledger merge | `graph.yaml` `triage_findings` output_schema + initial_state, `scripts/gates.py` `triage_route` | the schema emitted `debris_exemptions`, and the engine merges every schema property into state, so each triage round overwrote the run-wide ledger; the property is now `debris_exemptions_new` (seeded `[]` in initial_state), `triage_route` merges it into the ledger (staging's own merge line) and resets it to `[]` so a round that omits the property cannot re-merge a stale list; the smoke battery pins three rounds |
 | smoke summary | `scripts/smoke_test.py` | the failure tally is taken after the last check so the summary line and exit code cover every check (the three `ci_gate` checks were recorded after it) |
-| `debt_scan` fallback | `graph.yaml` `debt_scan` node, `scripts/debt_scan.py` | `fallback: bookkeeping_scan` added next to `next:` - the engine forwards a script crash only along `fallback:`, so the shim's crash-forward sentence now names that edge; the validator baseline is unchanged because `debt_scan` itself is entered only through a script `_next` edge, so nothing downstream becomes declared-edge reachable |
+| `debt_scan` fallback | `graph.yaml` `debt_scan` node, `scripts/debt_scan.py`, `scripts/gates.py` `bookkeeping_scan` | `fallback: bookkeeping_scan` added next to `next:` - the engine forwards a script crash only along `fallback:`, so the shim's crash-forward sentence now names that edge; the validator baseline is unchanged because `debt_scan` itself is entered only through a script `_next` edge, so nothing downstream becomes declared-edge reachable; `bookkeeping_scan` treats `debt_hits` as untrusted after a crash (the engine leaves the key as it was and `route_coder_result` re-enters `debt_scan` every coder round, so a later round's crash discards the previous report and substitutes a short DEBT_SCAN_FAILED note that the judge sees; the first pass keeps the initial_state default) |
+| `triage` reset | `scripts/gates.py` `triage_route` | the update dict resets `triage` to `[]` beside `debris_exemptions_new` (both are schema properties of `triage_findings`; the engine merges nothing when an llm node fails, so without the reset a crashed round 2+ replayed round 1's verdicts); the fail-safe stays keyed on an empty list because an llm failure never sets `last_script_error` - it lands in `last_node_output`, which `note_script_error` already ledgers |
 
-Recorded `diff -r` census against the staging tree (files that differ, hunks per file):
+Recorded census against the staging tree (files that differ; hunks per file as counted by
+`diff -u <staging file> <file> | grep -c '^@@'`):
 
 ```
-graph.yaml              6 hunks  (variables: build_lock; initial_state debris_exemptions_new; debt_scan fallback; triage_findings schema property rename; git_ops instructions em dashes, 2 lines)
-scripts/_lib.py         3 hunks  (new cache_dir; runs_root docstring; runs_root base path)
-scripts/smoke_test.py   5 hunks  (import _lib; run dir resolution checks; three-round exemptions ledger pin; the failure tally moved below the last check, 2 hunks)
-scripts/gates.py        1 hunk   (triage_route: the debris_exemptions_new reset in the update dict; the merge line itself is byte-equal to staging again)
-scripts/debt_scan.py    1 hunk   (docstring: the crash-forward sentence names the fallback edge)
+graph.yaml              6 hunks  (variables: build_lock; initial_state debt_hits comment; initial_state debris_exemptions_new; debt_scan fallback; triage_findings schema property rename; git_ops instructions em dashes, 2 lines)
+scripts/_lib.py         1 hunk   (new cache_dir; runs_root docstring; runs_root base path - three edits close enough to share one hunk)
+scripts/smoke_test.py   6 hunks  (import _lib; run dir resolution checks; bookkeeping_scan crash rows; triage reset rows + three-round exemptions ledger pin; the failure tally moved below the last check, 2 hunks)
+scripts/gates.py        3 hunks  (the DEBT_HITS_STALE constant; bookkeeping_scan: debt_hits untrusted after a crash; triage_route: the debris_exemptions_new + triage resets in the update dict, the merge line itself byte-equal to staging)
+scripts/debt_scan.py    1 hunk   (docstring: the crash-forward sentence names the fallback edge and what bookkeeping_scan does with debt_hits)
 README.md               this section, the run-state bullet above, the Verify section
 ```
 
@@ -62,7 +64,10 @@ scripts/smoke_test.py:514:check("ci_gate: ANOMALY: lines harvested from git_repo
 ```
 
 All three hits are the English verb `make` (one prompt sentence, two battery fixtures);
-no gate names a toolchain command.
+no gate names a toolchain command. The wrapper test `no_gate_names_a_toolchain_command`
+keeps it that way with a `make`-less variant of the pattern: it matches
+`\b(cargo|rustc|npm|pnpm|yarn|pytest|mvn|gradle|just)\b|\bgo (test|build|run)\b` against every
+line of `graph.yaml` and of each `scripts/*.py` except `smoke_test.py`, and fails on any hit.
 
 ## Verify
 
@@ -78,10 +83,11 @@ The Rust wrapper runs the batteries with `HOME`, `LLM_ROOT_DIR`, `COYOTE_CACHE_D
 `PYTHONDONTWRITEBYTECODE=1`, so nothing under this directory or `~/.config/coyote` is
 touched. `audit_graph.py` and `check_session_block.sh` need the Go `yq` by mikefarah
 (`yq --version` names it); the wrapper skips both of those tests when a different `yq`
-(or none) is on `PATH`. The wrapper
-also sweeps every bundled agent for a `spawnable_agents` entry, a `session.chat.agent`
-value or an `agent:` node naming `sisyphus-next`, pinning the candidate status above.
+(or none) is on `PATH`. The wrapper also sweeps every bundled agent's `graph.yaml` and
+`config.yaml` for a `spawnable_agents` entry, a `session.chat.agent` value or an `agent:`
+key naming `sisyphus-next` or `architect-next`, and every `instructions.md` and
+`config.yaml` for prose containing either name, pinning the candidate status above.
 
 Measured 2026-10-28 after the adjustments above, from a fresh scratch dir: audit
-`PROBLEMS: none`; smoke `201/201 checks passed`; session check ok (mikefarah yq
+`PROBLEMS: none`; smoke `205/205 checks passed`; session check ok (mikefarah yq
 v4.53.3).
