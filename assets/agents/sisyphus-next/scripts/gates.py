@@ -35,6 +35,8 @@ OPERATIONAL_RE = re.compile(
     r"endpoint|handler|route|webhook|retry|timeout|error",
     re.I,
 )
+DEBT_HITS_STALE = ("DEBT_SCAN_FAILED: the debt_scan node did not run this round and the previous round's report "
+                   "was discarded; run the manual fallback named in the graph's initial_state default for debt_hits.")
 
 
 # ====================================================================== 2.1
@@ -959,16 +961,25 @@ def strikeout_route(state):
 # ====================================================================== 2.5
 def bookkeeping_scan(state):
     u = {}
+    crashed = bool(state.get("last_script_error"))
     note_script_error(state, u, "debt_scan")
     root = state.get("git_root") or state.get("project_dir") or "."
     base = state.get("base_sha") or ""
+    hits = state.get("debt_hits") or ""
     items = []
-    for line in (state.get("debt_hits") or "").splitlines():
-        m = re.match(r"^(\S+?:\d+)\s+--\s+(.*)$", line.strip())
-        if not m:
-            continue
-        owner = re.search(r"\b[A-Z][A-Z0-9]+-\d{2,}\b", m.group(2))
-        items.append({"where": m.group(1), "text": m.group(2).strip(), "owner": owner.group(0) if owner else ""})
+    if crashed:
+        # The engine leaves debt_hits untouched on a crash, so it holds the initial_state
+        # default (first pass) or a previous round's report; neither describes this worktree.
+        if not hits.startswith("DEBT_SCAN_FAILED"):
+            u["debt_hits"] = DEBT_HITS_STALE
+            ledger(state, u, "debt_scan: the node did not run this round; the previous round's report was discarded")
+    else:
+        for line in hits.splitlines():
+            m = re.match(r"^(\S+?:\d+)\s+--\s+(.*)$", line.strip())
+            if not m:
+                continue
+            owner = re.search(r"\b[A-Z][A-Z0-9]+-\d{2,}\b", m.group(2))
+            items.append({"where": m.group(1), "text": m.group(2).strip(), "owner": owner.group(0) if owner else ""})
     u["debt_items"] = items
     u["changed_files"] = changed_files_since(root, base)
     u["diff_stat"] = tail(git_out(root, "diff", "--stat", base) if base else git_out(root, "diff", "--stat", "HEAD"), 3000)

@@ -205,8 +205,8 @@ initial_state:
   inbox_instructions: ''
   # --- bookkeeping ---
   debt_base: ''
-  # Overwritten by the debt_scan node; this default is what bookkeeping sees if
-  # the shim crash-forwards, so it carries the manual fallback (step-runner precedent).
+  # Overwritten by the debt_scan node; this default is what bookkeeping sees when the shim
+  # crashes on the first pass (a later-round crash discards the previous report instead).
   debt_hits: 'DEBT_SCAN_FAILED: the debt_scan node did not run. Manual fallback (<base> normally HEAD):
     git ls-files --others --exclude-standard -z | xargs -0 -r git add -N -- && git diff --no-color --no-ext-diff <base> | grep -nE ''^\+.*(#!?\[(allow|expect)\(|cfg_attr\(|todo!|unimplemented!|#\[ignore)'' ;
     grep exit 1 with no lines = no debt; -n numbers the DIFF, so resolve each hit to its real <file:line> with the fs_grep tool: the hit text after the + is its pattern (regex metacharacters escaped) -- never paste diff text into a shell string -- and keep only matches in files the diff touched; bare cfg_attr( without allow|expect is not debt.'

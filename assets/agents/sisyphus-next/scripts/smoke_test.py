@@ -336,6 +336,12 @@ check("strikeout_route: resolved -> one-round option recommended", "ONE more" in
 # ---------------------------------------------------------------- bookkeeping (B8/B9)
 u = gates.bookkeeping_scan(base_state(debt_hits="src/a.rs:10 -- #[allow(dead_code)] // TASK-009\nsrc/b.rs:3 -- todo!()\n"))
 check("bookkeeping_scan: hits parsed with owners", [i["owner"] for i in u["debt_items"]] == ["TASK-009", ""])
+u = gates.bookkeeping_scan(base_state(debt_hits="src/b.rs:3 -- todo!()\n", last_script_error="script 'debt_scan' failed: boom"))
+check("bookkeeping_scan: a crash after a prior round discards the stale report -> no items, DEBT_SCAN_FAILED note, ledgered",
+      u["debt_items"] == [] and u["debt_hits"].startswith("DEBT_SCAN_FAILED") and any(d.startswith("fallback: debt_scan:") for d in u["decisions"]) and any("discarded" in d for d in u["decisions"]))
+u = gates.bookkeeping_scan(base_state(debt_hits="DEBT_SCAN_FAILED: the debt_scan node did not run. Manual fallback", last_script_error="script 'debt_scan' failed: boom"))
+check("bookkeeping_scan: a first-pass crash keeps the initial_state default untouched",
+      u["debt_items"] == [] and "debt_hits" not in u and any(d.startswith("fallback: debt_scan:") for d in u["decisions"]))
 u = gates.bookkeeping_route(base_state(debt_items=[{"where": "b:3", "text": "todo!()", "owner": ""}], debt_rounds=0))
 check("bookkeeping_route: unowned marker -> one coder round (B8)", u["_next"] == "compose_fix" and u["debt_rounds"] == 1 and u["fix_source"] == "debt")
 u = gates.bookkeeping_route(base_state(debt_items=[{"where": "b:3", "text": "todo!()", "owner": ""}], debt_rounds=RERUN_ONCE))

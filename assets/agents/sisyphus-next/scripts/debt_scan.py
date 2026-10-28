@@ -6,8 +6,9 @@ and `debt_base` from state); output is {"debt_hits": "<report>"} and the node's
 static `next:` routes onward. Fail-open: the shared script never exits non-zero
 for scan failures (it reports DEBT_SCAN_FAILED + the manual pipeline), and a
 hard crash of this shim falls forward on the node's declared `fallback:` edge
-(the same node its `next:` names) with the initial_state DEBT_SCAN_FAILED
-default still in `debt_hits`."""
+(the same node its `next:` names) with `debt_hits` left as it was - the
+initial_state DEBT_SCAN_FAILED default on the first pass; bookkeeping_scan
+treats it as untrusted after a crash."""
 
 import os
 import runpy
