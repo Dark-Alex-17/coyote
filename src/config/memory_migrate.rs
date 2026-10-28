@@ -321,7 +321,7 @@ fn stamp_round_chains(
 
 fn apply_scope(report: &mut ScopeReport, backup_root: &Path, stamp: &str) -> Result<()> {
     let backup = unused_backup_dir(backup_root, report.label, stamp);
-    copy_dir_all(&report.dir, &backup, &is_catalogue_cache)
+    copy_dir_all(&report.dir, &backup)
         .with_context(|| format!("back up {} to {}", report.dir.display(), backup.display()))?;
     report.backup = Some(backup);
     for file in &report.rewrites {
@@ -345,12 +345,6 @@ fn unused_backup_dir(backup_root: &Path, label: &str, stamp: &str) -> PathBuf {
         candidate = backup_root.join(format!("{label}-{stamp}-{n}"));
     }
     candidate
-}
-
-fn is_catalogue_cache(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.starts_with(".catalogue."))
 }
 
 impl fmt::Display for Report {
@@ -742,7 +736,7 @@ mod tests {
     fn apply_backs_up_the_untouched_dir_before_rewriting() {
         let fx = Fixture::new("apply_backup");
         let global_before = snapshot(&fx.global);
-        let mut workspace_before = snapshot(&fx.workspace);
+        let workspace_before = snapshot(&fx.workspace);
 
         let report = fx.migrate(true);
 
@@ -753,7 +747,6 @@ mod tests {
             Some(fx.backups.join("global-20260301T123045").as_path())
         );
         assert_eq!(snapshot(global.backup.as_ref().unwrap()), global_before);
-        workspace_before.remove(Path::new(".catalogue.yaml"));
         assert_eq!(
             snapshot(workspace.backup.as_ref().unwrap()),
             workspace_before
