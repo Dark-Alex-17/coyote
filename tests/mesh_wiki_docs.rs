@@ -37,7 +37,7 @@ const SPEC_REPO: &str = "https://github.com/Dark-Alex-17/scope-protocol";
 const SCOPE_LEAD: &str = "SCOPE: Session Coordination & Presence Exchange";
 /// The shipped `mesh.interfaces` default as the README's and the Configuration page's
 /// Default cells spell it.
-const INTERFACES_DEFAULT: &str = "`[{type: private, host: 127.0.0.1, port: 4242}]`";
+const INTERFACES_DEFAULT: &str = "`[{type: local}]`";
 /// The live-sharing sentence the two-sessions prose carries on the Deployment and
 /// Configuration pages alike, whitespace flattened: the trust list is reloaded before
 /// every decision and written under its lock, so nothing needs splitting for a change
@@ -2740,7 +2740,7 @@ fn the_enabled_line_names_the_session_entered_later_on_every_surface() {
 
 /// The `interfaces:` block is one text on every surface: the example and the
 /// Configuration page's yaml carry the template's lines byte for byte, and the template's
-/// default is the private loopback entry, which the page's Keys table spells as the README does.
+/// default is the local rnsd entry, which the page's Keys table spells as the README does.
 /// The template/example comparison runs on every run.
 #[test]
 fn the_interfaces_block_is_byte_identical_across_the_template_the_example_and_the_configuration_page()
@@ -2757,7 +2757,7 @@ fn the_interfaces_block_is_byte_identical_across_the_template_the_example_and_th
         example, template,
         "config.example.yaml's `interfaces:` block differs from the template"
     );
-    for needle in ["type: private", "127.0.0.1"] {
+    for needle in ["type: local", "#   port: 37428", "#   instance: default"] {
         assert!(
             template.contains(needle),
             "the template's `interfaces:` block does not say {needle}:\n{template}"
@@ -2778,7 +2778,7 @@ fn the_interfaces_block_is_byte_identical_across_the_template_the_example_and_th
     assert_eq!(
         table_cells(row)[2],
         INTERFACES_DEFAULT,
-        "Mesh-Configuration.md's `interfaces` Default cell is not the shipped loopback entry: {row}"
+        "Mesh-Configuration.md's `interfaces` Default cell is not the shipped local rnsd entry: {row}"
     );
 }
 
@@ -3022,9 +3022,9 @@ fn impl_body(path: &str, header: &str) -> String {
 }
 
 /// The Commands and Deployment pages quote what `.mesh on` prints for an interface that
-/// did not come up as the code formats it: the three `WARNING:` lines, the `Mesh relay`
+/// did not come up as the code formats it: the five `WARNING:` lines, the `Mesh relay`
 /// failure text, the hint appended when every configured interface is a loopback relay,
-/// the `lan` bind failure and the three `InterfaceState` rows of `.mesh info`. Every piece
+/// the `lan` bind failure and the six `InterfaceState` rows of `.mesh info`. Every piece
 /// of text around a placeholder is on both pages byte for byte. The code side is checked
 /// on every run.
 #[test]
@@ -3042,8 +3042,8 @@ fn the_commands_and_deployment_pages_quote_the_interface_warnings_and_states_as_
         .collect();
     assert_eq!(
         warnings.len(),
-        3,
-        "interface_warnings in src/repl/mesh.rs does not format exactly three WARNING lines: {warnings:?}"
+        5,
+        "interface_warnings in src/repl/mesh.rs does not format exactly five WARNING lines: {warnings:?}"
     );
     let failures: Vec<String> = string_literals(&fn_body("src/mesh/node.rs", "join_tcp"))
         .into_iter()
@@ -3080,7 +3080,10 @@ fn the_commands_and_deployment_pages_quote_the_interface_warnings_and_states_as_
         [
             "connected",
             "unreachable, retrying: {reason}",
-            "unreachable: {reason}"
+            "unreachable: {reason}",
+            "connecting",
+            "connecting, retrying: {reason}",
+            "lost, retrying: {reason}"
         ],
         "InterfaceState's Display pieces moved; update the wiki and this test"
     );
@@ -3102,7 +3105,12 @@ fn the_commands_and_deployment_pages_quote_the_interface_warnings_and_states_as_
                 );
             }
         }
-        for needle in ["unreachable, retrying: <reason>", "connected"] {
+        for needle in [
+            "unreachable, retrying: <reason>",
+            "connected",
+            "connecting, retrying: <reason>",
+            "lost, retrying: <reason>",
+        ] {
             assert!(
                 page.contains(needle),
                 "{page_name} does not show the `.mesh info` interface state {needle:?}"
@@ -3708,7 +3716,7 @@ fn the_deployment_page_keeps_its_section_order_and_quotes_the_relay_script() {
 
     let intro = flat(&lead(&page));
     for needle in [
-        "private 127.0.0.1:4242",
+        "local rnsd at 127.0.0.1:37428",
         "rnsd",
         "scripts/mesh-relay.sh | bash",
     ] {
@@ -4098,7 +4106,7 @@ fn the_commands_page_info_sample_is_the_key_value_table_the_code_draws() {
         "the `.mesh info` sample shows one interfaces[0] row:\n{sample}"
     );
     assert_eq!(
-        interface_rows[0][1], "private 127.0.0.1:4242  connected",
+        interface_rows[0][1], "local rnsd at 127.0.0.1:37428  connected",
         "the interfaces[0] row is not what interface_row formats for the default"
     );
     let keys: Vec<&str> = rows[1..].iter().map(|row| row[0].as_str()).collect();
@@ -4120,7 +4128,7 @@ fn the_commands_page_info_sample_is_the_key_value_table_the_code_draws() {
         info.contains(&format!("`{node_off}`")),
         "the `.mesh info` section does not quote the node-off line {node_off:?}"
     );
-    let loopback_example = format!("`via rnsd at 127.0.0.1:4242{reach_tail}`");
+    let loopback_example = format!("`via rnsd at 127.0.0.1:37428{reach_tail}`");
     for (label, text) in [
         ("Mesh-Commands.md's `.mesh info` section", flat(&info)),
         (
@@ -4421,8 +4429,9 @@ fn the_commands_page_states_the_blank_line_convention_and_its_progress_samples_f
 }
 
 /// The `.mesh on` section's samples follow the shipped default: the preview's `To whom:`
-/// line names the private audience as `audience` words it, the summary's `interfaces:`
-/// row names the loopback relay, and the idle line a late relay prints is quoted.
+/// line names the local rnsd's audience as `audience` words it (the relay text, which
+/// `local` shares with `private`), the summary's `interfaces:` row names the local rnsd,
+/// and the idle line a late relay prints is quoted.
 #[test]
 fn the_commands_page_on_samples_name_the_private_default_and_the_connect_idle_line() {
     let audiences = string_literals(&fn_body("src/repl/mesh.rs", "audience"));
@@ -4437,8 +4446,8 @@ fn the_commands_page_on_samples_name_the_private_default_and_the_connect_idle_li
     let page = read(wiki.join("Mesh-Commands.md"));
     let on = section("Mesh-Commands.md", &page, "### `.mesh on`");
     for needle in [
-        format!("  private 127.0.0.1:4242: {private}"),
-        "  interfaces: private 127.0.0.1:4242".to_string(),
+        format!("  local rnsd at 127.0.0.1:37428: {private}"),
+        "  interfaces: local rnsd at 127.0.0.1:37428".to_string(),
         "`[mesh] <label> connected`".to_string(),
     ] {
         assert!(
@@ -4733,7 +4742,7 @@ fn the_readme_names_the_daemon_prerequisite_and_the_private_default() {
     assert_eq!(
         table_cells(row)[1],
         INTERFACES_DEFAULT,
-        "README.md's `mesh.interfaces` default is not the shipped loopback entry: {row}"
+        "README.md's `mesh.interfaces` default is not the shipped local rnsd entry: {row}"
     );
     let mesh = section("README.md", &readme, "### Mesh");
     for needle in [
