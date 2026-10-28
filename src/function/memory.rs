@@ -527,7 +527,7 @@ fn write_memory(
     });
     if let Some((base, round)) = chain {
         result["siblings"] =
-            Value::Array(settle_round_siblings(older, &name, &today, round_chains)?);
+            Value::Array(settle_round_siblings(older, &name, &today, round_chains));
         let newer_rounds: Vec<&str> = newer.iter().map(|s| s.name.as_str()).collect();
         result["round_chain"] = json!({"base": base, "round": round, "newer_rounds": newer_rounds});
     }
@@ -598,41 +598,53 @@ fn scan_round_siblings(dir: &Path, base: &str) -> Result<Vec<RoundSibling>> {
     Ok(found)
 }
 
-/// The older rounds, each after any supersede update.
+/// One row per older round, after any supersede update. A sibling that cannot
+/// be read or saved is reported with its on-disk mark and an `error` instead
+/// of failing the write that already landed.
 fn settle_round_siblings(
     older: Vec<RoundSibling>,
     successor: &str,
     today: &str,
     round_chains: RoundChains,
-) -> Result<Vec<Value>> {
-    let mut siblings = Vec::new();
-    for sibling in older {
-        let mut file = match MemoryFile::load(&sibling.path) {
-            Ok(file) => file,
-            Err(e) => {
-                warn!(
-                    "skip malformed memory file {}: {}",
-                    sibling.path.display(),
-                    e
-                );
-                continue;
+) -> Vec<Value> {
+    older
+        .into_iter()
+        .map(|sibling| {
+            let mut mark = None;
+            let outcome = settle_round_sibling(&sibling, successor, today, round_chains, &mut mark);
+            let mut row = json!({"name": sibling.name, "superseded_by": mark});
+            if let Err(e) = outcome {
+                warn!("skip memory round {}: {e:#}", sibling.path.display());
+                row["error"] = json!(format!("{e:#}"));
             }
-        };
-        if round_chains == RoundChains::Supersede && file.frontmatter.superseded_by.is_none() {
-            file.frontmatter.superseded_by = Some(successor.to_string());
-            file.frontmatter.updated = Some(today.to_string());
-            if !file.frontmatter.kind.is_known() {
-                file.frontmatter.kind = MemoryKind::RunState.into();
-            }
-            file.save()?;
-        }
-        siblings.push(json!({
-            "name": sibling.name,
-            "superseded_by": file.frontmatter.superseded_by,
-        }));
-    }
+            row
+        })
+        .collect()
+}
 
-    Ok(siblings)
+/// `mark` ends as the sibling's `superseded_by` on disk, whether or not this
+/// write changed it.
+fn settle_round_sibling(
+    sibling: &RoundSibling,
+    successor: &str,
+    today: &str,
+    round_chains: RoundChains,
+    mark: &mut Option<String>,
+) -> Result<()> {
+    let mut file = MemoryFile::load(&sibling.path)?;
+    *mark = file.frontmatter.superseded_by.clone();
+    if round_chains == RoundChains::Keep || mark.is_some() {
+        return Ok(());
+    }
+    file.frontmatter.superseded_by = Some(successor.to_string());
+    file.frontmatter.updated = Some(today.to_string());
+    if !file.frontmatter.kind.is_known() {
+        file.frontmatter.kind = MemoryKind::RunState.into();
+    }
+    file.save()
+        .with_context(|| format!("save memory file {}", sibling.path.display()))?;
+    *mark = file.frontmatter.superseded_by;
+    Ok(())
 }
 
 fn rename_memory(store: &MemoryStore, cwd: &Path, args: &Value) -> Result<Value> {
@@ -2504,6 +2516,84 @@ mod tests {
         let r1 = MemoryFile::load(&structured.join("foo-r1.md")).unwrap();
         assert_eq!(r1.frontmatter.superseded_by.as_deref(), Some("elsewhere"));
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_memory_reports_a_malformed_older_round_and_settles_the_rest() {
+        let root = temp_root("write_round_malformed");
+        let (store, workspace, structured) = workspace_store(&root, "# Memory Index\n");
+        write_round(&structured, "foo-r1", "");
+        fs::write(structured.join("foo-r2.md"), "---\nname: [\n---\nbroken\n").unwrap();
+        let broken = fs::read_to_string(structured.join("foo-r2.md")).unwrap();
+
+        let result = write_memory(
+            &store,
+            &workspace,
+            &write_args("foo-r3", "round three", "x"),
+            3,
+            RoundChains::Supersede,
+        )
+        .unwrap();
+
+        assert_eq!(result["status"], "ok", "{result}");
+        let siblings = result["siblings"].as_array().unwrap();
+        assert_eq!(
+            siblings[0],
+            json!({"name": "foo-r1", "superseded_by": "foo-r3"}),
+            "{result}"
+        );
+        assert_eq!(siblings[1]["name"], "foo-r2", "{result}");
+        assert_eq!(siblings[1]["superseded_by"], Value::Null, "{result}");
+        let error = siblings[1]["error"].as_str().unwrap();
+        assert!(error.contains("parse frontmatter"), "{error}");
+        assert_eq!(
+            fs::read_to_string(structured.join("foo-r2.md")).unwrap(),
+            broken
+        );
+        assert!(structured.join("foo-r3.md").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_memory_reports_an_older_round_it_cannot_save() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root("write_round_readonly");
+        let (store, workspace, structured) = workspace_store(&root, "# Memory Index\n");
+        write_round(&structured, "foo-r1", "");
+        let locked = structured.join("foo-r1.md");
+        let before = fs::read_to_string(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o444)).unwrap();
+        if fs::write(&locked, &before).is_ok() {
+            eprintln!("skipping: mode bits are ignored here (running as root)");
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+
+        let result = write_memory(
+            &store,
+            &workspace,
+            &write_args("foo-r2", "round two", "x"),
+            3,
+            RoundChains::Supersede,
+        )
+        .unwrap();
+
+        assert_eq!(result["status"], "ok", "{result}");
+        let row = &result["siblings"][0];
+        assert_eq!(row["name"], "foo-r1", "{result}");
+        assert_eq!(row["superseded_by"], Value::Null, "{result}");
+        assert!(
+            row["error"].as_str().unwrap().contains("save memory file"),
+            "{result}"
+        );
+        assert_eq!(fs::read_to_string(&locked).unwrap(), before);
+        assert!(structured.join("foo-r2.md").exists());
+
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).unwrap();
         let _ = fs::remove_dir_all(&root);
     }
 
