@@ -13,12 +13,18 @@ TESTS_RE = (
     r"(^|/)tests?/|(^|/)testdata/|(^|/)__tests__/|(^|/)spec/"
     r"|_test\.|\.test\.|(^|/)test_|_spec\.|\.spec\."
 )
-# auth(?!or) admits auth/authn/authz/oauth but not "author".
+# auth(?!or(?!i[sz])) admits auth/authn/authz/oauth/authoriz(e|ation) but not
+# "author". Deliberately wider than code-reviewer's touches_auth (token,
+# session, secret; tests and docs included).
 # Over-firing here is the safe direction: it only ADDS a lane.
 AUTH_PATH_RE = (
-    r"auth(?!or)|login|logout|token|session|permission|rbac|\bacl\b|credential|secret"
+    r"auth(?!or(?!i[sz]))|login|logout|token|session|permission|rbac|\bacl\b|credential|secret"
 )
-AUTH_ADDED_RE = r"auth(?!or)|password|token|secret|credential|jwt|session"
+# Superset of code-reviewer facts.py's content vocabulary plus token/session.
+AUTH_ADDED_RE = (
+    r"auth(?!or(?!i[sz]))|password|token|secret|credential|jwt|session|bearer"
+    r"|permission|rbac|\bacl\b|csrf|saml|oidc|\bsso\b|\bmfa\b|\botp\b"
+)
 DEPS_RE = (
     r"go\.(mod|sum)$|package(-lock)?\.json$|yarn\.lock$|pnpm-lock\.yaml$"
     r"|Cargo\.(toml|lock)$|requirements[^/]*\.txt$|pyproject\.toml$"
