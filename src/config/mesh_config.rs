@@ -292,6 +292,16 @@ impl MeshConfig {
                 "mesh.interfaces lists lan more than once; only one lan interface can be bound per process"
             );
         }
+        let local_count = self
+            .interfaces
+            .iter()
+            .filter(|interface| matches!(interface, MeshInterface::Local { .. }))
+            .count();
+        if local_count > 1 {
+            bail!(
+                "mesh.interfaces lists local more than once; only one shared-instance client can be attached per process"
+            );
+        }
         if let Some(about) = &self.about {
             let n = about.chars().count();
             if n > ABOUT_MAX_CHARS {
@@ -474,10 +484,8 @@ impl TryFrom<RawMeshInterface> for MeshInterface {
                 if port == Some(0) {
                     bail!("port 0 is out of range; use 1-65535");
                 }
-                if instance
-                    .as_deref()
-                    .is_some_and(|name| name.trim().is_empty())
-                {
+                let instance = instance.map(|name| name.trim().to_owned());
+                if instance.as_deref().is_some_and(str::is_empty) {
                     bail!("type 'local' requires a non-empty instance when one is given");
                 }
                 Ok(Self::Local { port, instance })
@@ -825,6 +833,18 @@ mod tests {
                 instance: Some("lab".into())
             }]
         );
+        let cfg: Config = serde_yaml::from_str(
+            "mesh:\n  interfaces:\n    - type: local\n      instance: '  lab '\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.mesh.interfaces(),
+            &[MeshInterface::Local {
+                port: None,
+                instance: Some("lab".into())
+            }],
+            "the instance is stored trimmed"
+        );
     }
 
     #[test]
@@ -1135,6 +1155,33 @@ mod tests {
         );
         assert!(
             err.contains("only one lan interface can be bound per process"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_local_interfaces() {
+        let mesh = MeshConfig {
+            enabled: true,
+            interfaces: vec![
+                MeshInterface::Local {
+                    port: None,
+                    instance: None,
+                },
+                MeshInterface::Local {
+                    port: Some(37429),
+                    instance: Some("lab".into()),
+                },
+            ],
+            ..Default::default()
+        };
+        let err = mesh.validate(true).unwrap_err().to_string();
+        assert!(
+            err.contains("mesh.interfaces lists local more than once"),
+            "{err}"
+        );
+        assert!(
+            err.contains("only one shared-instance client can be attached per process"),
             "{err}"
         );
     }
