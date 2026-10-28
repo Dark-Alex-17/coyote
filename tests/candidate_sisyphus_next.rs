@@ -410,6 +410,13 @@ fn batteries_never_consult_the_user_config_dir() {
     let home = scratch.0.join("home");
 
     let yq = mikefarah_yq();
+    if yq.is_none() {
+        eprintln!("skipping: the audit and session legs need the mikefarah yq");
+    }
+    let bash = which::which("bash").ok();
+    if bash.is_none() {
+        eprintln!("skipping: bash not available");
+    }
     if let Some(yq) = &yq {
         let audit = battery(&python, &scratch)
             .env("PATH", path_with(yq.parent().unwrap()))
@@ -438,9 +445,8 @@ fn batteries_never_consult_the_user_config_dir() {
         transcript(&smoke)
     );
 
-    if let Some(yq) = &yq {
-        let bash = which::which("bash").expect("bash");
-        let session = battery(&bash, &scratch)
+    if let (Some(yq), Some(bash)) = (&yq, &bash) {
+        let session = battery(bash, &scratch)
             .env("PATH", path_with(yq.parent().unwrap()))
             .arg("scripts/check_session_block.sh")
             .output()
@@ -603,7 +609,7 @@ fn build_lock_is_declared_at_the_prose_twins_position() {
             .position(|n| *n == "build_lock")
             .unwrap_or_else(|| panic!("{label} declares no build_lock: {names:?}"));
         assert_eq!(
-            names.get(at - 1),
+            at.checked_sub(1).and_then(|i| names.get(i)),
             Some(&"escalation_policy"),
             "{label}: {names:?}"
         );
