@@ -2616,6 +2616,39 @@ mod tests {
     }
 
     #[test]
+    fn write_memory_prefers_the_previous_mark_over_the_next_round_up() {
+        let root = temp_root("write_round_previous_mark");
+        let (store, workspace, structured) = workspace_store(&root, "# Memory Index\n");
+        write_round(&structured, "foo-r1", "superseded_by: foo-r3\n");
+        write_round(&structured, "foo-r2", "");
+        write_round(&structured, "foo-r3", "");
+
+        let result = write_memory(
+            &store,
+            &workspace,
+            &write_args("foo-r1", "round one again", "x"),
+            3,
+            RoundChains::Supersede,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result["round_chain"]["newer_rounds"],
+            json!(["foo-r2", "foo-r3"]),
+            "{result}"
+        );
+        assert_eq!(result["siblings"], json!([]), "{result}");
+        let r1 = MemoryFile::load(&structured.join("foo-r1.md")).unwrap();
+        assert_eq!(
+            r1.frontmatter.superseded_by.as_deref(),
+            Some("foo-r3"),
+            "the mark the file already carried wins over the lowest higher round"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn write_memory_marks_an_unmarked_older_round_with_the_next_round_up() {
         let root = temp_root("write_round_next_up");
         let (store, workspace, structured) = workspace_store(&root, "# Memory Index\n");
