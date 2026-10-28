@@ -54,7 +54,9 @@ pub fn memory_function_declarations() -> Vec<FunctionDeclaration> {
                  scope (all four must be passed as function arguments; the call fails without them). \
                  Coyote writes the YAML front matter and the MEMORY.md index entry itself from these \
                  arguments, so never put `name:` / `description:` / `scope:` / `type:` lines inside \
-                 `content`."
+                 `content`. Writing `<base>-r<N>` applies the `memory_round_chains` config key to the \
+                 older `<base>-r<M>` files in the same scope (supersede marks them superseded_by, keep \
+                 leaves them alone)."
                     .to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
@@ -63,11 +65,12 @@ pub fn memory_function_declarations() -> Vec<FunctionDeclaration> {
                         "name".to_string(),
                         JsonSchema {
                             type_value: Some("string".to_string()),
-                            description: Some(
-                                "REQUIRED. Short kebab-case slug for the file (no extension). \
-                                 A function argument, not a front-matter line."
-                                    .into(),
-                            ),
+                            description: Some(format!(
+                                "REQUIRED. Short kebab-case slug for the file (no extension): \
+                                 lowercase letters, digits, hyphens and underscores, starting with a \
+                                 letter or digit, at most {MEMORY_SLUG_MAX_LEN} chars. A function \
+                                 argument, not a front-matter line."
+                            )),
                             ..Default::default()
                         },
                     ),
@@ -75,11 +78,11 @@ pub fn memory_function_declarations() -> Vec<FunctionDeclaration> {
                         "description".to_string(),
                         JsonSchema {
                             type_value: Some("string".to_string()),
-                            description: Some(
-                                "REQUIRED. One plain-text line for the MEMORY.md index entry. \
+                            description: Some(format!(
+                                "REQUIRED. One plain-text line (no newline, at most \
+                                 {MEMORY_DESCRIPTION_CAP} chars) for the MEMORY.md index entry. \
                                  A function argument, not a front-matter line inside `content`."
-                                    .into(),
-                            ),
+                            )),
                             ..Default::default()
                         },
                     ),
@@ -2089,6 +2092,28 @@ mod tests {
             description.contains("user | feedback | project | reference | run-state"),
             "{description}"
         );
+    }
+
+    #[test]
+    fn write_declaration_states_the_slug_and_description_limits() {
+        let declarations = memory_function_declarations();
+        let write = declarations
+            .iter()
+            .find(|d| d.name == "memory__write")
+            .unwrap();
+        let properties = write.parameters.properties.as_ref().unwrap();
+        let name = properties["name"].description.as_deref().unwrap();
+        assert!(
+            name.contains("lowercase letters, digits, hyphens and underscores")
+                && name.contains("at most 64 chars"),
+            "{name}"
+        );
+        let description = properties["description"].description.as_deref().unwrap();
+        assert!(
+            description.contains("no newline") && description.contains("at most 160 chars"),
+            "{description}"
+        );
+        assert!(write.description.contains("`memory_round_chains`"));
     }
 
     fn write_args(name: &str, description: &str, content: &str) -> Value {
