@@ -12030,33 +12030,68 @@ mod tests {
         match endpoint {
             LocalEndpoint::Tcp(_) => serve_as_daemon(socket.listen(16).unwrap()).await,
             #[cfg(target_os = "linux")]
-            LocalEndpoint::Abstract(value) => {
-                use std::os::linux::net::SocketAddrExt;
-                use tokio::io::AsyncReadExt;
-                let name = value.strip_prefix('@').unwrap();
-                let addr =
-                    std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
-                let listener = std::os::unix::net::UnixListener::bind_addr(&addr).unwrap();
-                listener.set_nonblocking(true).unwrap();
-                let listener = tokio::net::UnixListener::from_std(listener).unwrap();
-                tokio::spawn(async move {
-                    let mut streams = tokio::task::JoinSet::new();
-                    loop {
-                        let Ok((mut stream, _)) = listener.accept().await else {
-                            break;
-                        };
-                        streams.spawn(async move {
-                            let mut sink = [0u8; 1024];
-                            while matches!(stream.read(&mut sink).await, Ok(n) if n > 0) {}
-                        });
-                    }
-                })
-            }
+            LocalEndpoint::Abstract(value) => serve_abstract_stub(value),
             #[cfg(not(target_os = "linux"))]
             LocalEndpoint::Abstract(value) => {
                 panic!("{value}: abstract sockets exist on Linux only")
             }
         }
+    }
+
+    /// Serves the stub at `endpoint` again after the task `serve_local_stub` returned was
+    /// aborted, the way a restarted rnsd listens where the old one did. The TCP shape
+    /// binds the same port afresh, retrying while the aborted task is still letting it
+    /// go.
+    #[cfg(unix)]
+    async fn restart_local_stub(endpoint: &LocalEndpoint) -> JoinHandle<()> {
+        match endpoint {
+            LocalEndpoint::Tcp(addr) => {
+                let deadline = tokio::time::Instant::now() + CONNECT_LATER_TIMEOUT;
+                let listener = loop {
+                    match tokio::net::TcpListener::bind(addr).await {
+                        Ok(listener) => break listener,
+                        Err(err) => {
+                            assert!(
+                                tokio::time::Instant::now() < deadline,
+                                "the stub's port {addr} was not released: {err}"
+                            );
+                            sleep(POLL).await;
+                        }
+                    }
+                };
+                serve_as_daemon(listener).await
+            }
+            #[cfg(target_os = "linux")]
+            LocalEndpoint::Abstract(value) => serve_abstract_stub(value),
+            #[cfg(not(target_os = "linux"))]
+            LocalEndpoint::Abstract(value) => {
+                panic!("{value}: abstract sockets exist on Linux only")
+            }
+        }
+    }
+
+    /// `serve_as_daemon` for the abstract socket `value` names.
+    #[cfg(target_os = "linux")]
+    fn serve_abstract_stub(value: &str) -> JoinHandle<()> {
+        use std::os::linux::net::SocketAddrExt;
+        use tokio::io::AsyncReadExt;
+        let name = value.strip_prefix('@').unwrap();
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind_addr(&addr).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+        tokio::spawn(async move {
+            let mut streams = tokio::task::JoinSet::new();
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                streams.spawn(async move {
+                    let mut sink = [0u8; 1024];
+                    while matches!(stream.read(&mut sink).await, Ok(n) if n > 0) {}
+                });
+            }
+        })
     }
 
     /// Waits up to `CONNECT_LATER_TIMEOUT` for the interface at `index` to read `state`.
@@ -12126,13 +12161,25 @@ mod tests {
     /// client's `Connected` (and the kind joins `interface_kinds`), `lost, retrying` with
     /// the fixed reason on its `Disconnected` when the listener goes away again, and it
     /// stays there while the client's redials are refused, with no idle line for any of
-    /// it; `stop` detaches the shared-instance client.
+    /// it. When the listener is back on the same port the client's redial lands and the
+    /// row is `connected` again, each connect told at info exactly once; `stop` detaches
+    /// the shared-instance client.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_local_row_follows_the_events_from_connecting_to_connected_to_lost() {
+        use crate::testing::info_snapshot;
+
+        install_log_collector();
         let (port, socket) = held_port().await;
         let endpoint = local_endpoint(port);
         let label = format!("local rnsd at {endpoint}");
+        let connected_line = format!("Mesh interface {label} connected");
+        let connects_told = || {
+            info_snapshot()
+                .iter()
+                .filter(|line| *line == &connected_line)
+                .count()
+        };
         let (relay, relay_handle, _) = loopback_relay().await;
         let tmp = TempDir::new("node-local-later");
         let mut session = Session::default();
@@ -12176,6 +12223,8 @@ mod tests {
             runtime.interfaces(),
             vec![private_label(relay.port()), label.clone()]
         );
+        sleep(CONNECT_WATCH_TICK * 2).await;
+        assert_eq!(connects_told(), 1, "{:?}", info_snapshot());
 
         stub.abort();
         wait_for_state(&runtime, 1, "the local row to report the drop", |state| {
@@ -12195,6 +12244,17 @@ mod tests {
                 reason: "rnsd closed the socket".to_string(),
             }
         );
+
+        // rnsd is back where it was: the client's next redial lands, the row moves from
+        // the drop to `connected` and that move is the second connect told.
+        let restarted = restart_local_stub(&endpoint).await;
+        wait_for_state(&runtime, 1, "the local row to reconnect", |state| {
+            *state == InterfaceState::Connected
+        })
+        .await;
+        assert_eq!(runtime.interface_kinds(), vec!["private", "local"]);
+        sleep(CONNECT_WATCH_TICK * 2).await;
+        assert_eq!(connects_told(), 2, "{:?}", info_snapshot());
         assert!(
             notifier.0.lock().is_empty(),
             "a local row prints no idle line: {:?}",
@@ -12205,6 +12265,7 @@ mod tests {
         assert!(transport.shared_instance().is_some());
         assert!(slot.stop().await.unwrap());
         assert!(transport.shared_instance().is_none());
+        restarted.abort();
         relay_handle.abort();
     }
 
