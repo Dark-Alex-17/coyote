@@ -1284,6 +1284,7 @@ nodes:
     script: scripts/debt_scan.py
     timeout: 120
     next: bookkeeping_scan
+    fallback: bookkeeping_scan
 
   bookkeeping_scan:
     id: bookkeeping_scan
