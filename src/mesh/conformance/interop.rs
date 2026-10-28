@@ -5,11 +5,14 @@
 //! `TcpClient`, the production relay topology.
 
 use crate::config::Session;
+use crate::config::mesh_config::{MeshConfig, MeshInterface};
 use crate::mesh::announce::ANNOUNCE_MAGIC;
 use crate::mesh::envoy::EnvoySink;
+use crate::mesh::knock::{KnockIntro, KnockOutcome, KnockVia};
 use crate::mesh::message::{OutboundPeer, PEER_MESSAGE_TYPE, PeerKind, PeerVia};
 use crate::mesh::node::{
-    FullEnvoy, MeshRuntime, MeshSlot, NodeOptions, RecordingEnvoy, session_destination_name,
+    FullEnvoy, InterfaceState, MeshRuntime, MeshSlot, NodeOptions, RecordingEnvoy,
+    session_destination_name,
 };
 use crate::mesh::notify::{NotificationSink, RenderedNotification};
 use crate::mesh::request::FETCH_PATH;
@@ -28,9 +31,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::ffi::OsStr;
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
@@ -407,23 +411,241 @@ impl Reference {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
-
-    fn print_debug_log(&self) {
-        let Some(mark) = self.debug_mark else { return };
-        for line in crate::testing::debug_snapshot().iter().skip(mark) {
-            eprintln!("[coyote] DEBUG {line}");
-        }
-        for line in crate::testing::warn_snapshot() {
-            eprintln!("[coyote] WARN {line}");
-        }
-    }
 }
 
 impl Drop for Reference {
     fn drop(&mut self) {
         self.shut_down();
-        self.print_debug_log();
+        print_debug_log(self.debug_mark);
     }
+}
+
+/// This crate's captured debug log from `mark` on, and every warning, to stderr; nothing
+/// without a mark.
+fn print_debug_log(mark: Option<usize>) {
+    let Some(mark) = mark else { return };
+    for line in crate::testing::debug_snapshot().iter().skip(mark) {
+        eprintln!("[coyote] DEBUG {line}");
+    }
+    for line in crate::testing::warn_snapshot() {
+        eprintln!("[coyote] WARN {line}");
+    }
+}
+
+/// The pinned Python `rnsd`, sharing its instance where no other daemon listens: this
+/// crate's nodes attach to it as `local` clients, the way they attach to a host's rnsd.
+/// The config dir outlives a `respawn`, so the second rnsd is the first one restarted:
+/// same endpoint, same `storage/`.
+struct Rnsd {
+    child: Child,
+    config_dir: TempDir,
+    python: PathBuf,
+    pythonpath: String,
+    entry: MeshInterface,
+    /// As `Reference::debug_mark`: this crate's debug log from the spawn on is printed
+    /// at teardown when `COYOTE_MESH_INTEROP_DEBUG` is set.
+    debug_mark: Option<usize>,
+}
+
+impl Rnsd {
+    /// `None` when the suite is not switched on; see `require_reference` for what happens
+    /// once it is.
+    async fn spawn(tag: &str) -> Option<Self> {
+        if !interop_enabled() {
+            eprintln!("{}", off_switch_skip_line("scripts/mesh-interop/setup.sh"));
+            return None;
+        }
+        crate::testing::install_log_collector();
+        let debug_mark = env::var_os("COYOTE_MESH_INTEROP_DEBUG")
+            .map(|_| crate::testing::debug_snapshot().len());
+        let (dir, python) = require_reference();
+        let pythonpath = format!(
+            "{}:{}",
+            dir.join("reticulum").display(),
+            dir.join("lxmf").display()
+        );
+        let config_dir = TempDir::new(tag);
+        let (instance, entry) = Self::instance();
+        fs::write(
+            config_dir.path.join("config"),
+            format!(
+                "[reticulum]\nenable_transport = No\nshare_instance = Yes\n{instance}[logging]\nloglevel = 6\n[interfaces]\n"
+            ),
+        )
+        .unwrap();
+        let child = Self::launch(&python, &pythonpath, &config_dir);
+        let mut rnsd = Self {
+            child,
+            config_dir,
+            python,
+            pythonpath,
+            entry,
+            debug_mark,
+        };
+        rnsd.wait_ready().await;
+        Some(rnsd)
+    }
+
+    /// The `[reticulum]` lines that put the shared instance on an endpoint of this run's
+    /// own, and the `local` entry a node attaches with. rnsd shares on an abstract socket
+    /// named by `instance_name` on Linux and Android and on loopback TCP everywhere else.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn instance() -> (String, MeshInterface) {
+        let name = format!("coyote-interop-{}-{}", std::process::id(), unix_nanos());
+        (
+            format!("instance_name = {name}\n"),
+            MeshInterface::Local {
+                port: None,
+                instance: Some(name),
+            },
+        )
+    }
+
+    /// The TCP arm: rnsd also binds its RPC listener on `instance_control_port`, and the
+    /// default is the host rnsd's, so both ports are this run's own. A shared port in
+    /// use would turn this rnsd into a client of whoever holds it rather than fail.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn instance() -> (String, MeshInterface) {
+        let (shared, control) = two_free_ports();
+        (
+            format!("shared_instance_port = {shared}\ninstance_control_port = {control}\n"),
+            MeshInterface::Local {
+                port: Some(shared),
+                instance: None,
+            },
+        )
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    async fn answers(&self) -> bool {
+        use rns_transport::iface::local::{LocalUnixEndpoint, preflight_unix_connect};
+        let MeshInterface::Local {
+            instance: Some(name),
+            ..
+        } = &self.entry
+        else {
+            unreachable!("the Linux arm names its instance")
+        };
+        preflight_unix_connect(&LocalUnixEndpoint::from_config_value(&format!(
+            "@rns/{name}"
+        )))
+        .await
+        .is_ok()
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    async fn answers(&self) -> bool {
+        let MeshInterface::Local {
+            port: Some(port), ..
+        } = &self.entry
+        else {
+            unreachable!("the TCP arm holds its port")
+        };
+        tokio::net::TcpStream::connect(("127.0.0.1", *port))
+            .await
+            .is_ok()
+    }
+
+    /// rnsd prints through a bare `print()`: a piped stdout nobody reads would block it,
+    /// so it is dropped unless `COYOTE_MESH_INTEROP_DEBUG` asks for it.
+    fn launch(python: &Path, pythonpath: &str, config_dir: &TempDir) -> Child {
+        let stdout = if env::var_os("COYOTE_MESH_INTEROP_DEBUG").is_some() {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        };
+        Command::new(python)
+            .args(["-m", "RNS.Utilities.rnsd", "--config"])
+            .arg(&config_dir.path)
+            .arg("-vv")
+            .env("PYTHONPATH", pythonpath)
+            .env("PYTHONUNBUFFERED", "1")
+            .stdin(Stdio::null())
+            .stdout(stdout)
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap_or_else(|err| {
+                panic!(
+                    "failed to spawn {} -m RNS.Utilities.rnsd: {err}; run scripts/mesh-interop/setup.sh",
+                    python.display()
+                )
+            })
+    }
+
+    async fn wait_ready(&mut self) {
+        let deadline = Instant::now() + LINK_TIMEOUT;
+        while !self.answers().await {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                panic!(
+                    "rnsd exited {status} before it listened; run scripts/mesh-interop/setup.sh"
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "rnsd did not listen at {} within {LINK_TIMEOUT:?}; run scripts/mesh-interop/setup.sh",
+                self.entry
+            );
+            sleep(POLL).await;
+        }
+    }
+
+    /// The `local` entry a node attaches to this rnsd with.
+    fn entry(&self) -> MeshInterface {
+        self.entry.clone()
+    }
+
+    /// SIGTERM, then the exit status; a child still running five seconds later is killed.
+    fn terminate(&mut self) -> ExitStatus {
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg(self.child.id().to_string())
+            .status();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                return status;
+            }
+            thread::sleep(POLL);
+        }
+        let _ = self.child.kill();
+        self.child.wait().unwrap()
+    }
+
+    /// rnsd again on the same config dir: the restarted daemon the attached clients redial.
+    async fn respawn(&mut self) {
+        self.child = Self::launch(&self.python, &self.pythonpath, &self.config_dir);
+        self.wait_ready().await;
+    }
+}
+
+impl Drop for Rnsd {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        print_debug_log(self.debug_mark);
+    }
+}
+
+/// Two distinct loopback ports nothing holds, both bound before either is released so
+/// the second bind cannot be handed the first port back.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn two_free_ports() -> (u16, u16) {
+    let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let second = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    (
+        first.local_addr().unwrap().port(),
+        second.local_addr().unwrap().port(),
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn unix_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
 }
 
 /// This crate's node joined to the reference's relay port, with a slot installed so
@@ -457,9 +679,36 @@ impl Node {
         Self::join(slot, port, session, tmp).await
     }
 
-    async fn join(slot: Arc<MeshSlot>, port: u16, mut session: Session, tmp: TempDir) -> Self {
+    /// A node whose only interface is `entry`, a `local` client of an `Rnsd`. `port` has
+    /// no meaning for it and reads 0.
+    async fn start_local(
+        tag: &str,
+        entry: MeshInterface,
+        session: Session,
+        trust: &TrustList,
+    ) -> Self {
+        let tmp = TempDir::new(tag);
+        trust.write(&mesh_paths(&tmp).config_dir);
+        let config = MeshConfig {
+            interfaces: vec![entry],
+            ..MeshConfig::default()
+        };
+        Self::join_with(Arc::new(MeshSlot::default()), &config, 0, session, tmp).await
+    }
+
+    async fn join(slot: Arc<MeshSlot>, port: u16, session: Session, tmp: TempDir) -> Self {
+        Self::join_with(slot, &private_config(port), port, session, tmp).await
+    }
+
+    async fn join_with(
+        slot: Arc<MeshSlot>,
+        config: &MeshConfig,
+        port: u16,
+        mut session: Session,
+        tmp: TempDir,
+    ) -> Self {
         let runtime = MeshRuntime::start(
-            &private_config(port),
+            config,
             true,
             &mut session,
             mesh_paths(&tmp),
@@ -1610,4 +1859,177 @@ async fn a_propagation_node_demanding_a_raised_stamp_cost_still_takes_our_messag
 
     node.stop().await;
     drop(reference);
+}
+
+/// What a `local` row's `Disconnected` carries once rnsd drops the socket. `node.rs` owns
+/// the literal; a drift there fails this suite rather than passing it quietly.
+const RNSD_DROP_REASON: &str = "rnsd closed the socket";
+/// How long after SIGTERM both `local` rows must read lost: the client sees the socket
+/// close as soon as rnsd detaches its interfaces.
+const RNSD_LOST_DEADLINE: Duration = Duration::from_secs(3);
+/// How long after the respawn both `local` rows must read connected: two reconnect waits
+/// of the client's two-second cadence, with slack for rnsd to listen again.
+const RNSD_RECONNECTED_DEADLINE: Duration = Duration::from_secs(7);
+
+/// Waits until the interface at `index` reads `state` or `deadline` passes.
+async fn wait_for_state(
+    runtime: &MeshRuntime,
+    index: usize,
+    what: &str,
+    deadline: Instant,
+    state: impl Fn(&InterfaceState) -> bool,
+) {
+    while !state(&runtime.interface_states()[index].state) {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {what}; states {:?}",
+            runtime
+                .interface_states()
+                .into_iter()
+                .map(|status| (status.label, status.state))
+                .collect::<Vec<_>>()
+        );
+        sleep(POLL).await;
+    }
+}
+
+/// Two nodes attached to one rnsd as `local` clients reach each other through it, both
+/// rows follow it down when it is killed and back when it is restarted on the same
+/// endpoint, and a knock lands again after the restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs COYOTE_MESH_INTEROP=1 and scripts/mesh-interop/setup.sh"]
+async fn two_local_clients_of_one_rnsd_knock_through_it_and_follow_it_down_and_back() {
+    let Some(mut rnsd) = Rnsd::spawn("interop-rnsd").await else {
+        return;
+    };
+    let a = Node::start_local(
+        "interop-rnsd-a",
+        rnsd.entry(),
+        Session::default(),
+        &TrustList::default(),
+    )
+    .await;
+    // B knows A's identity without trusting its instance, so A's knock is answered
+    // `NoAccess` (landed) rather than met with the silence a stranger hears.
+    let b = Node::start_local(
+        "interop-rnsd-b",
+        rnsd.entry(),
+        Session::default(),
+        &TrustList::default().identity(a.runtime.fingerprint(), false),
+    )
+    .await;
+    for node in [&a, &b] {
+        assert_eq!(node.runtime.interface_kinds(), ["local"]);
+        assert_eq!(
+            node.runtime.interface_states()[0].state,
+            InterfaceState::Connected
+        );
+    }
+
+    let b_hash = b.runtime.current_destination_hash();
+    let peers = a.runtime.peers();
+    wait_until("A to file B's announce relayed by rnsd", || {
+        peers.get(&b_hash).is_some()
+    })
+    .await;
+    let b_desc = a.runtime.resolve_destination(&b_hash).await.unwrap();
+    let outcome = a
+        .runtime
+        .knock(&b_desc, &KnockIntro::new("hi from A").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        KnockOutcome {
+            via: KnockVia::Direct,
+            fallback: None,
+        }
+    );
+    let gate = b.runtime.knock_gate();
+    wait_until("B to file A's knock", || {
+        gate.cache().list(SystemTime::now()).unwrap().len() == 1
+    })
+    .await;
+    let filed = gate.cache().list(SystemTime::now()).unwrap();
+    assert_eq!(filed[0].identity_hash, a.runtime.fingerprint());
+    assert_eq!(
+        filed[0].destination_hash,
+        a.runtime.current_destination_hash()
+    );
+    assert_eq!(filed[0].intro.as_deref(), Some("hi from A"));
+
+    let killed = Instant::now();
+    let status = rnsd.terminate();
+    assert!(status.success(), "rnsd exited {status} on SIGTERM");
+    let lost = InterfaceState::Disconnected {
+        reason: RNSD_DROP_REASON.to_string(),
+    };
+    for (node, what) in [
+        (&a, "A's local row to read lost"),
+        (&b, "B's local row to read lost"),
+    ] {
+        wait_for_state(
+            &node.runtime,
+            0,
+            what,
+            killed + RNSD_LOST_DEADLINE,
+            |state| *state == lost,
+        )
+        .await;
+        let state = node.runtime.interface_states()[0].state.to_string();
+        assert!(state.starts_with("lost, retrying:"), "{state}");
+        assert_eq!(state, "lost, retrying: rnsd closed the socket");
+    }
+    eprintln!(
+        "both local rows read lost {:?} after SIGTERM",
+        killed.elapsed()
+    );
+
+    // Sampled only now: rnsd goes on accepting while its exit handler runs, so a client's
+    // first redial can land on the dying daemon and its re-announce reach A through it.
+    // With the old rnsd reaped and both rows lost, anything A hears next came through
+    // the new one.
+    let b_heard_before = peers.get(&b_hash).unwrap().last_seen;
+    let respawned = Instant::now();
+    rnsd.respawn().await;
+    for (node, what) in [
+        (&a, "A's local row to read connected again"),
+        (&b, "B's local row to read connected again"),
+    ] {
+        wait_for_state(
+            &node.runtime,
+            0,
+            what,
+            respawned + RNSD_RECONNECTED_DEADLINE,
+            |state| *state == InterfaceState::Connected,
+        )
+        .await;
+    }
+    eprintln!(
+        "both local rows read connected {:?} after the respawn",
+        respawned.elapsed()
+    );
+
+    // Each client re-announces over its restored socket; A's path to B is good again
+    // once B's re-announce has come through the new rnsd.
+    wait_until(
+        "A to hear B's re-announce through the restarted rnsd",
+        || {
+            peers
+                .get(&b_hash)
+                .is_some_and(|peer| peer.last_seen > b_heard_before)
+        },
+    )
+    .await;
+    let again = a
+        .runtime
+        .knock(&b_desc, &KnockIntro::new("hi again from A").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(again.via, KnockVia::Direct);
+
+    a.stop().await;
+    b.stop().await;
+    let status = rnsd.terminate();
+    assert!(status.success(), "rnsd exited {status} on SIGTERM");
 }
