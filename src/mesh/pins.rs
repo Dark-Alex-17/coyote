@@ -1109,9 +1109,8 @@ mod tests {
         }
         let handler = flattened("src/mesh/request/handler.rs");
         assert!(
-            !handler.contains(".send_response_resource")
-                && !handler.contains(".send_link_packet_on_bound_iface("),
-            "handler.rs sends a response itself; the library sends every reply"
+            !handler.contains("Transport") && !handler.contains(".send_"),
+            "handler.rs reaches the transport or sends something itself; the adapter can only hand a value back for the library to send"
         );
     }
 }
