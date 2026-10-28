@@ -81,3 +81,7 @@ touched. `audit_graph.py` and `check_session_block.sh` need the Go `yq` by mikef
 (or none) is on `PATH`. The wrapper
 also sweeps every bundled agent for a `spawnable_agents` entry, a `session.chat.agent`
 value or an `agent:` node naming `sisyphus-next`, pinning the candidate status above.
+
+Measured 2026-10-28 after the adjustments above, from a fresh scratch dir: audit
+`PROBLEMS: none`; smoke `201/201 checks passed`; session check ok (mikefarah yq
+v4.53.3).
