@@ -61,7 +61,7 @@ use super::install_remote::DEFAULT_GIT_HOST;
 use super::instructions;
 use super::macros::Macro;
 use super::memory::{
-    DEFAULT_MEMORY_CAP_WITH_TOOLS, DEFAULT_MEMORY_CAP_WITHOUT_TOOLS, MemoryStore, WorkspaceMemory,
+    DEFAULT_MEMORY_DRILL_CAP, DEFAULT_MEMORY_FACTS_CAP, MemoryStore, WorkspaceMemory,
 };
 use crate::graph;
 use crate::hooks::{self, HookEvent};
@@ -2167,11 +2167,9 @@ impl RequestContext {
                 let with_tools =
                     app.function_calling_support && self.graph_chat_model_supports_fc(app, &role);
                 let cap = if with_tools {
-                    app.memory_cap_with_tools
-                        .unwrap_or(DEFAULT_MEMORY_CAP_WITH_TOOLS)
+                    app.memory_facts_cap.unwrap_or(DEFAULT_MEMORY_FACTS_CAP)
                 } else {
-                    app.memory_cap_without_tools
-                        .unwrap_or(DEFAULT_MEMORY_CAP_WITHOUT_TOOLS)
+                    app.memory_drill_cap.unwrap_or(DEFAULT_MEMORY_DRILL_CAP)
                 };
                 match memory::build_memory_section(&store, with_tools, cap) {
                     Ok(Some(section)) => {
@@ -3038,12 +3036,12 @@ impl RequestContext {
         items.extend([
             ("memory", super::format_option_value(&app.memory)),
             (
-                "memory_cap_with_tools",
-                super::format_option_value(&app.memory_cap_with_tools),
+                "memory_facts_cap",
+                super::format_option_value(&app.memory_facts_cap),
             ),
             (
-                "memory_cap_without_tools",
-                super::format_option_value(&app.memory_cap_without_tools),
+                "memory_drill_cap",
+                super::format_option_value(&app.memory_drill_cap),
             ),
             (
                 "memory_run_state_ttl_days",
@@ -18062,10 +18060,9 @@ mod tests {
             app.memory = None;
         };
         let store = MemoryStore::new(&env::current_dir().unwrap());
-        let memory_section =
-            memory::build_memory_section(&store, true, DEFAULT_MEMORY_CAP_WITH_TOOLS)
-                .unwrap()
-                .unwrap();
+        let memory_section = memory::build_memory_section(&store, true, DEFAULT_MEMORY_FACTS_CAP)
+            .unwrap()
+            .unwrap();
         let memory_tail = format!(
             "{memory_section}\n\n{}",
             prompts::DEFAULT_MEMORY_INSTRUCTIONS

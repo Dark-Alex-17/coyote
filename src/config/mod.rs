@@ -306,8 +306,10 @@ pub struct Config {
     pub prompt_cache_ttl: Option<String>,
 
     pub memory: Option<bool>,
-    pub memory_cap_with_tools: Option<usize>,
-    pub memory_cap_without_tools: Option<usize>,
+    #[serde(alias = "memory_cap_with_tools")]
+    pub memory_facts_cap: Option<usize>,
+    #[serde(alias = "memory_cap_without_tools")]
+    pub memory_drill_cap: Option<usize>,
     pub memory_run_state_ttl_days: Option<u32>,
     pub memory_round_chains: RoundChains,
 
@@ -402,8 +404,8 @@ impl Default for Config {
             prompt_cache_ttl: None,
 
             memory: None,
-            memory_cap_with_tools: None,
-            memory_cap_without_tools: None,
+            memory_facts_cap: None,
+            memory_drill_cap: None,
             memory_run_state_ttl_days: None,
             memory_round_chains: RoundChains::default(),
 
@@ -1517,11 +1519,35 @@ clients:
 
     #[test]
     fn config_template_documents_memory_cap_as_enforced() {
-        assert!(CONFIG_TEMPLATE.contains("they are truncated to this cap"));
-        assert!(CONFIG_TEMPLATE.contains("Indexes are truncated to this cap the same way"));
+        assert!(CONFIG_TEMPLATE.contains("\nmemory_facts_cap: null"));
+        assert!(CONFIG_TEMPLATE.contains("\nmemory_drill_cap: null"));
+        assert!(CONFIG_TEMPLATE.contains("facts first, then the drill-file catalogue"));
+        assert!(CONFIG_TEMPLATE.contains("Old key memory_cap_with_tools still loads"));
+        assert!(CONFIG_TEMPLATE.contains("the facts section counts against it"));
+        assert!(CONFIG_TEMPLATE.contains("Old key memory_cap_without_tools still loads"));
+        assert!(!CONFIG_TEMPLATE.contains("\nmemory_cap_with_tools:"));
+        assert!(!CONFIG_TEMPLATE.contains("\nmemory_cap_without_tools:"));
         let example = include_str!("../../config.example.yaml");
-        assert!(example.contains("they are truncated to this cap"));
-        assert!(example.contains("Indexes are truncated to this cap the same way"));
+        assert!(example.contains("\nmemory_facts_cap: null"));
+        assert!(example.contains("\nmemory_drill_cap: null"));
+        assert!(example.contains("facts first, then the drill-file catalogue"));
+        assert!(example.contains("Old key memory_cap_with_tools still loads"));
+        assert!(example.contains("the facts section counts against it"));
+        assert!(example.contains("Old key memory_cap_without_tools still loads"));
+        assert!(!example.contains("\nmemory_cap_with_tools:"));
+        assert!(!example.contains("\nmemory_cap_without_tools:"));
+    }
+
+    #[test]
+    fn memory_cap_keys_load_under_their_old_and_new_names() {
+        let old = "memory_cap_with_tools: 123\nmemory_cap_without_tools: 456\n";
+        let cfg = Config::load_from_str(old).unwrap();
+        assert_eq!(cfg.memory_facts_cap, Some(123));
+        assert_eq!(cfg.memory_drill_cap, Some(456));
+        let new = "memory_facts_cap: 123\nmemory_drill_cap: 456\n";
+        let cfg = Config::load_from_str(new).unwrap();
+        assert_eq!(cfg.memory_facts_cap, Some(123));
+        assert_eq!(cfg.memory_drill_cap, Some(456));
     }
 
     #[test]

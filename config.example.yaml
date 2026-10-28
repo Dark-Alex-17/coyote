@@ -254,10 +254,10 @@ prompt_cache_ttl: null           # Cache TTL for the system prompt + tool declar
 # Bootstrap with `coyote --init-memory [global|workspace]` to create the marker file
 # the LLM needs before it will write any memory.
 memory: null                     # null = enabled when memory exists on disk; true = force on; false = force off
-memory_cap_with_tools: null      # Char cap for injected memory when function calling is available (null = 6000). Only MEMORY.md indexes are injected,
-                                 # and they are truncated to this cap (the head of each, split evenly); the LLM uses memory__list and memory__read for the rest.
-memory_cap_without_tools: null   # Char cap when function calling is unavailable (null = 12000). Indexes are truncated to this cap the same way,
-                                 # then drill file bodies fill whatever budget is left.
+memory_facts_cap: null           # Char cap for the injected MEMORY.md section (null = 4000): facts first, then the drill-file catalogue,
+                                 # cut at a line boundary with a notice. Old key memory_cap_with_tools still loads.
+memory_drill_cap: null           # Char cap for drill file bodies injected when function calling is unavailable (null = 12000);
+                                 # the facts section counts against it. Old key memory_cap_without_tools still loads.
 memory_run_state_ttl_days: null  # Days a `run-state` memory written without `expires` stays live (default: 14).
                                  # Expired and superseded files drop out of injection and memory__list.
 memory_round_chains: supersede   # What a write of <base>-r<N> does to older <base>-r<M> files in the same scope:
