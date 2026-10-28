@@ -4630,3 +4630,259 @@ fn a_cold_start_refuses_host_blank_instance_and_port_zero_on_a_local_entry_and_t
         "the padding never reaches a row\n{stdout}"
     );
 }
+
+/// Stands in for an rnsd the operator stops and starts: every connection is accepted and
+/// held, and `stop` closes the listener together with every stream it accepted, the way
+/// a daemon that exits takes its sockets with it, so an attached shared-instance client
+/// sees the drop; `start` brings the same endpoint back, the way a restarted rnsd does.
+/// The TCP shape is the `local` endpoint where rnsd has no abstract socket; the abstract
+/// socket `@rns/<instance>` under a name no rnsd uses where it has.
+struct LocalDaemon {
+    port: u16,
+    instance: String,
+    held: std::sync::Arc<std::sync::Mutex<Vec<DaemonStream>>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    accepting: Option<thread::JoinHandle<()>>,
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+type DaemonStream = std::net::TcpStream;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+type DaemonStream = std::os::unix::net::UnixStream;
+
+impl LocalDaemon {
+    fn new() -> Self {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        Self {
+            instance: format!("coyote-probe-daemon-{port}"),
+            port,
+            held: Default::default(),
+            stop: Default::default(),
+            accepting: None,
+        }
+    }
+
+    fn endpoint(&self) -> String {
+        if cfg!(any(target_os = "linux", target_os = "android")) {
+            format!("@rns/{}", self.instance)
+        } else {
+            format!("127.0.0.1:{}", self.port)
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn start(&mut self) {
+        assert!(self.accepting.is_none(), "the daemon is already up");
+        let socket = TcpSocket::new_v4().unwrap();
+        socket.set_reuseaddr(true).unwrap();
+        socket
+            .bind(format!("127.0.0.1:{}", self.port).parse().unwrap())
+            .unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let listener = runtime
+            .block_on(async { socket.listen(16).unwrap().into_std() })
+            .unwrap();
+        listener.set_nonblocking(false).unwrap();
+        let held = self.held.clone();
+        let stop = self.stop.clone();
+        stop.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.accepting = Some(thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                held.lock().unwrap().push(stream.try_clone().unwrap());
+                thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut sink = [0u8; 1024];
+                    while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
+                });
+            }
+        }));
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn stop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Wake the accept so the thread reads the flag and drops the listener.
+        let _ = std::net::TcpStream::connect(format!("127.0.0.1:{}", self.port));
+        self.accepting
+            .take()
+            .expect("the daemon is up")
+            .join()
+            .unwrap();
+        for stream in self.held.lock().unwrap().drain(..) {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn start(&mut self) {
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::{SocketAddr, UnixListener};
+        assert!(self.accepting.is_none(), "the daemon is already up");
+        let addr = SocketAddr::from_abstract_name(format!("rns/{}", self.instance)).unwrap();
+        let listener = UnixListener::bind_addr(&addr).unwrap();
+        let held = self.held.clone();
+        let stop = self.stop.clone();
+        stop.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.accepting = Some(thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                held.lock().unwrap().push(stream.try_clone().unwrap());
+                thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut sink = [0u8; 1024];
+                    while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
+                });
+            }
+        }));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn stop(&mut self) {
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::{SocketAddr, UnixStream};
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let addr = SocketAddr::from_abstract_name(format!("rns/{}", self.instance)).unwrap();
+        let _ = UnixStream::connect_addr(&addr);
+        self.accepting
+            .take()
+            .expect("the daemon is up")
+            .join()
+            .unwrap();
+        for stream in self.held.lock().unwrap().drain(..) {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
+/// Asks `.mesh info` once a second until `interfaces[0]` reads `want`, or fails after
+/// `budget` with the last table seen.
+fn wait_for_local_row(session: &mut Target, want: &str, budget: Duration, what: &str) -> String {
+    let deadline = Instant::now() + budget;
+    loop {
+        let info = command_text(session, ".mesh info", "└", SESSION_PROMPT);
+        let table = boxed_table(".mesh info", &info);
+        let row = table.value("interfaces[0]");
+        if row == want {
+            return info;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {what}: interfaces[0] reads {row:?}, wanted {want:?}\n{info}"
+        );
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// The `local` row's whole lifecycle through the real binary, as an operator who stops
+/// and restarts rnsd sees it: with rnsd (stood in for) listening, `.mesh on` joins with
+/// no WARNING and `.mesh info` reads `connected`; when rnsd goes away the row reads
+/// `lost, retrying: rnsd closed the socket` (the fixed reason the client's drop sets,
+/// nothing from a probe) and the kind leaves the join; when rnsd is back the row is
+/// `connected` again. Through all of it nothing is printed between prompts: no WARNING,
+/// no `not reachable`, no `reconnected` idle line (those are the TCP kinds'); `.exit`
+/// stops the node once.
+#[test]
+fn the_local_row_reports_rnsd_going_away_and_coming_back_through_the_real_binary() {
+    let mut rnsd = LocalDaemon::new();
+    rnsd.start();
+    let endpoint = rnsd.endpoint();
+    let label = format!("local rnsd at {endpoint}");
+    let reach = format!("via rnsd at {endpoint} - rnstatus shows what it reaches");
+    const NOTHING_REACHABLE: &str = "nothing reachable yet (every interface is unreachable or still retrying; the interface rows below say which)";
+    let probe =
+        Probe::new("local-lifecycle", false, &[]).with_local_interface(rnsd.port, &rnsd.instance);
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    let mut transcript = strip_escapes(&wait_for(&mut session, SESSION_PROMPT));
+
+    let joined = command_prints(
+        &mut session,
+        ".mesh on --yes",
+        MESH_ON_SUMMARY,
+        SESSION_PROMPT,
+    );
+    assert!(
+        joined.contains(&format!("  interfaces: {label}")),
+        "the summary names the connected local entry: {joined:?}"
+    );
+    transcript.push_str(&joined);
+    probe.wait_for_marker("MESH_STARTED");
+    let info = wait_for_local_row(
+        &mut session,
+        &format!("{label}  connected"),
+        Duration::from_secs(10),
+        "the local row to read connected after the join",
+    );
+    assert_eq!(
+        boxed_table(".mesh info (up)", &info).value("reach"),
+        reach,
+        "{info}"
+    );
+    transcript.push_str(&info);
+
+    // rnsd exits, taking its sockets with it: the attached client reports the drop with
+    // the one reason a drop has, and the row holds it while the redials are refused.
+    rnsd.stop();
+    let lost = format!("{label}  lost, retrying: rnsd closed the socket");
+    let info = wait_for_local_row(
+        &mut session,
+        &lost,
+        Duration::from_secs(15),
+        "the local row to report the drop",
+    );
+    transcript.push_str(&info);
+    thread::sleep(Duration::from_secs(3));
+    let info = command_text(&mut session, ".mesh info", "└", SESSION_PROMPT);
+    let table = boxed_table(".mesh info (rnsd down)", &info);
+    assert_eq!(
+        table.value("interfaces[0]"),
+        lost,
+        "the drop holds through the refused redials: {info}"
+    );
+    // `reach` is keyed on what is connected, so the lost rnsd takes it with it.
+    assert_eq!(table.value("reach"), NOTHING_REACHABLE, "{info}");
+    transcript.push_str(&info);
+
+    // rnsd is back on the same endpoint: the client's next redial lands and the row is
+    // `connected` again without a new join.
+    rnsd.start();
+    let info = wait_for_local_row(
+        &mut session,
+        &format!("{label}  connected"),
+        Duration::from_secs(15),
+        "the local row to read connected again",
+    );
+    assert_eq!(
+        boxed_table(".mesh info (back)", &info).value("reach"),
+        reach,
+        "{info}"
+    );
+    transcript.push_str(&info);
+
+    for forbidden in ["WARNING", "not reachable", "reconnected"] {
+        assert!(
+            !transcript.contains(forbidden),
+            "a local row says nothing between prompts, found {forbidden:?}:\n{transcript}"
+        );
+    }
+
+    let status = exit_clean(&mut session);
+    probe.wait_for_marker("MESH_STOPPED");
+    assert!(
+        matches!(status, WaitStatus::Exited(_, 0)),
+        ".exit: expected a clean exit, got {status:?}"
+    );
+    assert_eq!(probe.marker_count("MESH_STARTED"), 1, "one join");
+    assert_eq!(probe.marker_count("MESH_STOPPED"), 1, "one stop at exit");
+    rnsd.stop();
+}

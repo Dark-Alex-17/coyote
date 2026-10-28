@@ -12211,6 +12211,188 @@ mod tests {
         stub.abort();
     }
 
+    /// The first real producer of a bare `connecting`: an rnsd that was not reached at
+    /// start answers the probe, the transport is attached, and while its client's dials
+    /// are still refused the row reads `Connecting` WITHOUT a reason (the probe's reason
+    /// left with the probe; the client has established nothing to report), the kind has
+    /// not joined, nothing is told at info and no idle line is printed. Once rnsd takes
+    /// the client's redial the row is `connected`, told at info exactly once. The lever
+    /// is a listener whose backlog of one the probe fills and nobody drains: macOS resets
+    /// every connect past the backlog, which is the attached client dialing into a
+    /// refusal, so the arm is not reachable through the abstract-socket shape and the
+    /// test runs where the TCP shape is the `local` endpoint.
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_local_row_reads_connecting_without_a_reason_while_the_attached_client_dials() {
+        use crate::testing::info_snapshot;
+
+        install_log_collector();
+        let (port, socket) = held_port().await;
+        let endpoint = local_endpoint(port);
+        let label = format!("local rnsd at {endpoint}");
+        let (relay, relay_handle, _) = loopback_relay().await;
+        let tmp = TempDir::new("node-local-connecting-bare");
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &MeshConfig {
+                interfaces: vec![
+                    MeshInterface::Private {
+                        host: "127.0.0.1".to_string(),
+                        port: relay.port(),
+                    },
+                    local_entry(port),
+                ],
+                ..MeshConfig::default()
+            },
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                states_of(&runtime)[1].1,
+                InterfaceState::Connecting { reason: Some(_) }
+            ),
+            "{:?}",
+            states_of(&runtime)
+        );
+        let slot = Arc::new(MeshSlot::default());
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        slot.install(runtime.clone()).unwrap();
+
+        // rnsd comes up but takes only the probe: a backlog of one that nobody drains.
+        let listener = socket.listen(1).unwrap();
+        wait_for_state(
+            &runtime,
+            1,
+            "the local row to read connecting without a reason",
+            |state| *state == InterfaceState::Connecting { reason: None },
+        )
+        .await;
+        assert_eq!(
+            InterfaceState::Connecting { reason: None }.to_string(),
+            "connecting"
+        );
+        let transport = runtime.transport_handle().await.unwrap();
+        assert!(
+            transport.shared_instance().is_some(),
+            "the transport is attached while its client dials"
+        );
+        // The client redials into a reset for a redial wait and more; the row holds the
+        // bare `connecting`, the kind stays out and nothing is told.
+        sleep(LOCAL_RECONNECT_WAIT * 2).await;
+        assert_eq!(
+            states_of(&runtime)[1].1,
+            InterfaceState::Connecting { reason: None },
+            "{:?}",
+            states_of(&runtime)
+        );
+        assert_eq!(runtime.interface_kinds(), vec!["private"]);
+        let connected_line = format!("Mesh interface {label} connected");
+        assert!(
+            !info_snapshot().iter().any(|line| line == &connected_line),
+            "nothing is connected while the client dials: {:?}",
+            info_snapshot()
+        );
+
+        // rnsd starts taking connections: the client's next redial lands and the row
+        // moves once.
+        let daemon = serve_as_daemon(listener).await;
+        wait_for_state(&runtime, 1, "the local row to connect", |state| {
+            *state == InterfaceState::Connected
+        })
+        .await;
+        assert_eq!(runtime.interface_kinds(), vec!["private", "local"]);
+        sleep(CONNECT_WATCH_TICK * 2).await;
+        assert_eq!(
+            info_snapshot()
+                .iter()
+                .filter(|line| *line == &connected_line)
+                .count(),
+            1,
+            "the connect is told once: {:?}",
+            info_snapshot()
+        );
+        assert!(
+            notifier.0.lock().is_empty(),
+            "a local row prints no idle line: {:?}",
+            notifier.0.lock()
+        );
+
+        assert!(slot.stop().await.unwrap());
+        assert!(transport.shared_instance().is_none());
+        daemon.abort();
+        relay_handle.abort();
+    }
+
+    /// The peer table is not a routing input: a row whose stored name hash is not the
+    /// announce's (a hand-edited or corrupted `peers.json`) still resolves at once, because
+    /// the description is the transport's, and the operator's upper-case spelling of the
+    /// hash resolves the same destination, lower-cased first. No path request is paid for
+    /// either.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_foreign_name_hash_in_the_row_and_an_upper_case_hash_still_resolve() {
+        let stub = PeerStub::listen(
+            "node-resolve-foreign-name-stub",
+            TcpServer::DEFAULT_CLIENT_MTU,
+        )
+        .await;
+        let started = started_runtime_on("node-resolve-foreign-name", stub.port()).await;
+        let runtime = started.runtime.clone();
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        stub.wait_to_be_filed(&peers, &to).await;
+        let desc = runtime.resolve_destination(&to).await.unwrap();
+
+        let row = peers.get(&to).unwrap();
+        let foreign = "00".repeat(NAME_HASH_LEN);
+        assert_ne!(row.name_hash, foreign);
+        peers.observe(
+            PeerSighting {
+                destination_hash: row.destination_hash.clone(),
+                identity_hash: row.identity_hash.clone(),
+                name_hash: foreign.clone(),
+                display_name: row.display_name.clone(),
+                protocol_version: row.protocol_version,
+                hops: row.hops,
+            },
+            SystemTime::now(),
+        );
+        assert_eq!(peers.get(&to).unwrap().name_hash, foreign);
+
+        let asked = Instant::now();
+        let again = runtime
+            .resolve_destination(&to)
+            .await
+            .expect("a row with a foreign name hash does not gate the transport's description");
+        let upper = runtime
+            .resolve_destination_cached(&to.to_uppercase())
+            .await
+            .expect("an upper-case hash is lower-cased before the lookup");
+        assert!(
+            asked.elapsed() < Duration::from_secs(1),
+            "a held description is not asked for: {:?}",
+            asked.elapsed()
+        );
+        assert_eq!(again.address_hash, desc.address_hash);
+        assert_eq!(
+            again.name.as_name_hash_slice(),
+            desc.name.as_name_hash_slice()
+        );
+        assert_eq!(upper.address_hash, desc.address_hash);
+        assert!(!peers.take_path_request(&to, SystemTime::now()));
+
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        slot.stop().await.unwrap();
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn traffic_flows_over_an_interface_that_connected_after_start() {
