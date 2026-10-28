@@ -1913,6 +1913,93 @@ fn collect_ledger_lines_refuses_a_call_without_a_plan() {
     );
 }
 
+/// A `--plan` that names no file is an error, not an empty read: the tool
+/// returns non-zero, prints no `(none)`, and the output names the path.
+#[cfg(unix)]
+#[test]
+fn collect_ledger_lines_refuses_a_missing_plan_file() {
+    if tools_missing() {
+        return;
+    }
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = shared_tasks_fixture("collect-ledger-no-plan-file");
+    let missing = dir.0.join("PLAN-missing.md");
+    let (code, stdout, stderr) = collect_ledger_lines_with(
+        &dir.0,
+        "debris-exempt",
+        &[("argc_plan", missing.to_str().unwrap())],
+    );
+    assert_ne!(code, 0, "a missing plan file must fail: {stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "plan_tasks: plan not found: {}",
+            missing.display()
+        )) && stdout.contains("could not list the plan's tasks"),
+        "the output must name the plan path: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("(none)") && !stdout.contains("debris-exempt:"),
+        "a false clean is the failure this guards: {stdout}"
+    );
+}
+
+/// A task whose index.md has no `plan:` or no `status:` field is still read
+/// (the field cannot exclude it), and the tool says so with a NOTE naming the
+/// dir and the missing field, so the leniency is never silent.
+#[cfg(unix)]
+#[test]
+fn collect_ledger_lines_names_a_task_without_plan_or_status_fields() {
+    if tools_missing() {
+        return;
+    }
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = shared_tasks_fixture("collect-ledger-fieldless");
+    for (name, front) in [
+        ("TASK-6-f", "---\ntitle: \"F\"\n---\n"),
+        ("TASK-7-g", "---\nplan: PLAN-x.md\ntitle: \"G\"\n---\n"),
+        ("TASK-8-h", "---\nstatus: complete\ntitle: \"H\"\n---\n"),
+    ] {
+        let task = dir.0.join("tasks").join(name);
+        fs::create_dir_all(&task).unwrap();
+        fs::write(task.join("index.md"), front).unwrap();
+        fs::write(
+            task.join("log.md"),
+            format!("debris-exempt: src/z.rs:1 -- {name}\n"),
+        )
+        .unwrap();
+    }
+    let (code, stdout, stderr) = collect_ledger_lines_with(&dir.0, "debris-exempt", &[]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    for (name, fields) in [
+        ("TASK-6-f", "plan:/status:"),
+        ("TASK-7-g", "status:"),
+        ("TASK-8-h", "plan:"),
+    ] {
+        assert!(
+            stdout.contains(&format!(
+                "plan_tasks: NOTE {name}: index.md has no {fields}; kept"
+            )),
+            "{name}: the missing field must be named: {stdout}"
+        );
+        assert!(
+            stdout.contains(&format!(
+                "{name} (log.md:1): debris-exempt: src/z.rs:1 -- {name}"
+            )),
+            "{name}: a field-less task is kept and read: {stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("NOTE TASK-1-a") && !stdout.contains("NOTE TASK-3-c"),
+        "a task with both fields earns no NOTE: {stdout}"
+    );
+}
+
 /// Every rendered `collect_ledger_lines --tag ...` call carries `--plan`,
 /// under both PR strategies, so no instruction sends the tool at the shared
 /// tasks dir without the plan that scopes it.

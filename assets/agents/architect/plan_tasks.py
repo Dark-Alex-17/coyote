@@ -6,13 +6,15 @@ A task dir under --tasks-dir qualifies when its name opens with a task id
 (`TASK-<n>` with an optional one-letter suffix, `TASK-265a`), its index.md
 frontmatter `plan:` names the plan (basename compare with a trailing `.md`
 stripped on both sides, so `PLAN-x` and `PLAN-x.md` agree while a dotted slug
-keeps its dots; a task without the field is kept), its `status:` is `complete`
-when the field exists, and - when `--tasks TASK-a,TASK-b` is given - its id is
-one of those (a PR group's members). Order: task number, then suffix.
+keeps its dots), its `status:` is `complete`, and - when `--tasks TASK-a,TASK-b`
+is given - its id is one of those (a PR group's members). A task whose index.md
+has no `plan:` or no `status:` field is kept and named in a stderr NOTE, so the
+leniency is visible. Order: task number, then suffix.
 
 CLI: `plan_tasks.py --plan PLAN-<slug>.md --tasks-dir DIR [--tasks IDS]` prints
 one qualifying dir per line, as `<tasks-dir>/<rel>` with the dir spelled as
-given, and a `NOTE` on stderr for a listed id it could not find.
+given, and NOTE lines on stderr. A missing plan file or tasks dir is an error,
+never an empty listing.
 """
 import argparse
 import os
@@ -103,9 +105,17 @@ def main(argv):
     args = ap.parse_args(argv)
     if not os.path.isdir(args.tasks_dir):
         sys.exit(f"plan_tasks: tasks dir not found: {args.tasks_dir}")
+    if not os.path.isfile(args.plan):
+        sys.exit(f"plan_tasks: plan not found: {args.plan}")
     rows, missing = walk_tasks(args.tasks_dir, plan_identity(args.plan), parse_task_ids(args.tasks))
     for _, fm, root in rows:
-        if fm is not None and is_complete(fm):
+        if fm is None:
+            continue
+        absent = [f"{key}:" for key in ("plan", "status") if not fm.get(key)]
+        if absent:
+            base = os.path.basename(root).replace("\n", "\\n")
+            print(f"plan_tasks: NOTE {base}: index.md has no {'/'.join(absent)}; kept", file=sys.stderr)
+        if is_complete(fm):
             print(root)
     if missing:
         print("plan_tasks: NOTE listed in --tasks but not found under the plan: " + ", ".join(missing), file=sys.stderr)

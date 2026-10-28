@@ -177,7 +177,7 @@ model (the Problem/Approach summary, acceptance verdicts):
 
 | Tool | Replaces |
 |---|---|
-| `collect_ledger_lines --tag ... --plan ... --dir ... [--tasks TASK-a,TASK-b]` | re-reading every `log.md` for `rejected-finding:` / `design-decision` / `debris-exempt` / `Follow-ups:` / `(deferred by quality bar)` rollups - grep-complete instead of attention-complete; `--plan` (required) keeps the read to the named plan's `status: complete` tasks, since the tasks dir is shared across plans, and `--tasks` narrows it to a PR group's members; `plan_tasks.py` holds that one selection rule for both tools |
+| `collect_ledger_lines --tag ... --plan ... --dir ... [--tasks TASK-a,TASK-b]` | re-reading every `log.md` for `rejected-finding:` / `design-decision` / `debris-exempt` / `Follow-ups:` / `(deferred by quality bar)` rollups - grep-complete instead of attention-complete; `--plan` (required) keeps the read to the named plan's `status: complete` tasks, since the tasks dir is shared across plans (a task whose `index.md` has no `plan:` or no `status:` field is kept and named in a `NOTE`), and `--tasks` narrows it to a PR group's members; `plan_tasks.py` holds that one selection rule for both tools |
 | `assemble_pr_body --plan ... --tasks-dir ... --summary-file ... [--tasks TASK-a,TASK-b] [--followups] [--quality-note ...]` | hand-assembling the draft PR body (Quality bar from plan `rigor:`, task checklist with `completed`-entry SHAs, ledger sections; `--tasks` scopes the checklist and the ledger rollups to a PR group's members); `assemble_pr_body.py` does the derivation and prints `NOTE` lines for anything it could not derive |
 
 Both fail open to the manual path they replace: a non-zero return or a `NOTE` leaves the
