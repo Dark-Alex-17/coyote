@@ -233,7 +233,8 @@ fn chat_agent_mismatch_warning(session_name: &str, previous: Option<&str>) -> St
 }
 
 /// Set by the first memory injection of the process; the notice about what
-/// the section holds is printed once, not on every turn.
+/// the section holds is logged once, not on every turn. It goes to the log
+/// only, never to the terminal.
 /// The once-only property has no in-process unit pin: the gate is process
 /// wide, so whichever test injects first consumes it. The cold-start binary
 /// suite in tests/memory_section_binary.rs pins it across two injections.
@@ -2196,9 +2197,7 @@ impl RequestContext {
                 match memory::build_memory_section(&store, with_tools, facts_cap, drill_cap) {
                     Ok(Some(section)) => {
                         if MEMORY_SECTION_NOTICE.set(()).is_ok() {
-                            let notice = memory_section_notice(&section, facts_cap);
-                            eprintln!("{notice}");
-                            warn!("{notice}");
+                            warn!("{}", memory_section_notice(&section, facts_cap));
                         }
                         let separator = if role.is_empty_prompt() { "" } else { "\n\n" };
                         role.append_to_prompt(separator);

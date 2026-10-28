@@ -1,7 +1,7 @@
 //! Cold-start probes of the injected MEMORY.md section through the real
 //! binary. The dry-run model echoes the whole system prompt, so the rendered
 //! `<memory>` block is observable on stdout and the once-per-process notice
-//! on stderr. Each test boots a fresh temp config dir holding a config.yaml,
+//! in the log file (never on the terminal). Each test boots a fresh temp config dir holding a config.yaml,
 //! a global `memory/MEMORY.md` and a workspace `.coyote/memory/MEMORY.md`.
 
 use std::fs;
@@ -107,7 +107,9 @@ fn run(fx: &Fixture, args: &[&str]) -> Output {
         .env("HOME", &home)
         .env("USERPROFILE", &home)
         .env("NO_COLOR", "1")
-        .env_remove("COYOTE_LOG_PATH")
+        .env("COYOTE_LOG_PATH", log_path(fx))
+        .env("COYOTE_LOG_LEVEL", "info")
+        .env_remove("COYOTE_LOG_FILTER")
         .env_remove("COYOTE_WORKSPACE_CONFIG_DIR")
         .env_remove("IS_SANDBOX")
         .env_remove("COYOTE_PROVIDER")
@@ -138,10 +140,28 @@ fn memory_sections(stdout: &str) -> Vec<&str> {
     out
 }
 
-fn notice_lines(stderr: &str) -> Vec<&str> {
-    stderr
-        .lines()
-        .filter(|l| l.starts_with("memory: "))
+fn log_path(fx: &Fixture) -> PathBuf {
+    fx.dir.join("coyote.log")
+}
+
+/// The memory notices the runs so far wrote to the fixture''s log file, with
+/// the log line prefix (timestamp, level, source location) stripped. Also
+/// asserts the notice never reached the terminal.
+fn notice_lines(fx: &Fixture, output: &Output) -> Vec<String> {
+    let stderr = stderr_of(output);
+    assert!(
+        !stderr.lines().any(|l| l.starts_with("memory: ")),
+        "the memory notice is log-only, but stderr carried it:\n{stderr}"
+    );
+    let stdout = stdout_of(output);
+    assert!(
+        !stdout.lines().any(|l| l.starts_with("memory: ")),
+        "the memory notice is log-only, but stdout carried it:\n{stdout}"
+    );
+    let log = fs::read_to_string(log_path(fx)).unwrap_or_default();
+    log.lines()
+        .filter_map(|l| l.split_once(" - memory: "))
+        .map(|(_, rest)| format!("memory: {rest}"))
         .collect()
 }
 
@@ -179,17 +199,17 @@ fn old_cap_keys_load_into_the_renamed_info_rows_without_a_warning() {
         info_row(&stdout, "memory_cap_without_tools").is_none(),
         "{stdout}"
     );
-    // The old names are silent aliases: the only stderr line is the memory
-    // notice, which already carries the renamed cap and the alias's value.
+    // The old names are silent aliases: nothing reaches stderr, and the
+    // logged memory notice already carries the renamed cap and the alias's
+    // value.
     let stderr = stderr_of(&output);
-    let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert!(stderr.trim().is_empty(), "{stderr}");
     assert_eq!(
-        lines,
+        notice_lines(&fx, &output),
         vec![
             "memory: 160 fact chars + 125 catalogue chars; 8 lines / 184 chars truncated at \
              memory_facts_cap=123 (global 2, workspace 6); run memory__lint"
         ],
-        "{stderr}"
     );
 }
 
@@ -211,7 +231,7 @@ fn a_dry_run_prompt_carries_facts_first_then_the_catalogue_under_the_default_cap
     assert!(stdout.contains("\n## Memory\n"), "{stdout}");
     assert!(!stdout.contains("## Memory (read-only)"), "{stdout}");
     assert_eq!(
-        notice_lines(&stderr_of(&output)),
+        notice_lines(&fx, &output),
         vec!["memory: 160 fact chars + 125 catalogue chars injected under memory_facts_cap=4000"]
     );
 }
@@ -278,7 +298,7 @@ fn under_the_default_cap_a_workspace_index_too_big_for_it_loses_only_its_own_fac
         "{stdout}"
     );
     assert_eq!(
-        notice_lines(&stderr_of(&output)),
+        notice_lines(&fx, &output),
         vec![format!(
             "memory: {fact_chars} fact chars + {} catalogue chars; {} lines / {omitted_chars} \
              chars truncated at memory_facts_cap=4000 (global 1, workspace {workspace_lost}); \
@@ -322,7 +342,7 @@ fn a_global_fact_longer_than_the_cap_is_cut_at_the_head_and_counted_as_global() 
         "{stdout}"
     );
     assert_eq!(
-        notice_lines(&stderr_of(&output)),
+        notice_lines(&fx, &output),
         vec![format!(
             "memory: {fact_chars} fact chars + {} catalogue chars; 3 lines / {omitted_chars} \
              chars truncated at memory_facts_cap=15 (global 1, workspace 2); run memory__lint",
@@ -371,7 +391,7 @@ fn a_catalogue_only_index_whose_first_line_exceeds_the_new_facts_cap_keeps_its_f
         "{stdout}"
     );
     assert_eq!(
-        notice_lines(&stderr_of(&output)),
+        notice_lines(&fx, &output),
         vec![format!(
             "memory: 0 fact chars + {} catalogue chars; 1 lines / {} chars truncated at \
              memory_facts_cap=20 (global 0, workspace 1); run memory__lint",
@@ -408,7 +428,7 @@ fn a_facts_heading_longer_than_the_new_facts_cap_is_cut_at_the_cap_and_counts_as
         "{stdout}"
     );
     assert_eq!(
-        notice_lines(&stderr_of(&output)),
+        notice_lines(&fx, &output),
         vec![
             "memory: 24 fact chars + 32 catalogue chars; 2 lines / 47 chars truncated at \
              memory_facts_cap=10 (global 0, workspace 2); run memory__lint"
@@ -449,7 +469,7 @@ fn the_configured_facts_cap_governs_the_cut_and_the_notice_fires_once_per_proces
                     </memory>";
     assert_eq!(sections, vec![expected, expected], "{stdout}");
     assert_eq!(
-        notice_lines(&stderr_of(&output)),
+        notice_lines(&fx, &output),
         vec![
             "memory: 160 fact chars + 125 catalogue chars; 8 lines / 184 chars truncated at \
              memory_facts_cap=123 (global 2, workspace 6); run memory__lint"
@@ -482,7 +502,7 @@ fn a_facts_only_index_renders_an_empty_catalogue_block_and_zero_catalogue_chars(
         "{stdout}"
     );
     assert_eq!(
-        notice_lines(&stderr_of(&output)),
+        notice_lines(&fx, &output),
         vec!["memory: 29 fact chars + 0 catalogue chars injected under memory_facts_cap=4000"]
     );
 }
@@ -546,7 +566,7 @@ fn without_function_calling_the_drill_cap_minus_the_section_bounds_the_bodies() 
     // The facts cap is untouched on this arm; the notice reports the section
     // the way the with-tools arm would.
     assert_eq!(
-        notice_lines(&stderr_of(&output)),
+        notice_lines(&fx, &output),
         vec!["memory: 160 fact chars + 125 catalogue chars injected under memory_facts_cap=4000"]
     );
 }
