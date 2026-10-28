@@ -67,7 +67,7 @@ no gate names a toolchain command.
 ## Verify
 
 ```
-python3 scripts/audit_graph.py .        # static edges + script _next edges, cycles vs bounds
+python3 scripts/audit_graph.py .        # static edges + script _next edges, cycles vs bounds (needs mikefarah yq)
 python3 scripts/smoke_test.py           # every gate, both sides of every bound, fail-open paths
 bash scripts/check_session_block.sh     # session block + variable mirror vs sisyphus/config.yaml (needs mikefarah yq)
 cargo test --test candidate_sisyphus_next   # the Rust wrapper: runs all three from the asset path
@@ -76,7 +76,8 @@ cargo test --test candidate_sisyphus_next   # the Rust wrapper: runs all three f
 The Rust wrapper runs the batteries with `HOME`, `LLM_ROOT_DIR`, `COYOTE_CACHE_DIR`,
 `TMPDIR` and `SISYPHUS_RUNS_ROOT` pointed at a scratch directory and
 `PYTHONDONTWRITEBYTECODE=1`, so nothing under this directory or `~/.config/coyote` is
-touched. `check_session_block.sh` needs the Go `yq` by mikefarah (`yq --version` names it);
-the wrapper skips that one test when a different `yq` (or none) is on `PATH`. The wrapper
+touched. `audit_graph.py` and `check_session_block.sh` need the Go `yq` by mikefarah
+(`yq --version` names it); the wrapper skips both of those tests when a different `yq`
+(or none) is on `PATH`. The wrapper
 also sweeps every bundled agent for a `spawnable_agents` entry, a `session.chat.agent`
 value or an `agent:` node naming `sisyphus-next`, pinning the candidate status above.
