@@ -258,6 +258,20 @@ impl Probe {
         self
     }
 
+    /// Puts one `local` entry at the head of the fixture's `interfaces:` list, spelled
+    /// with both overrides the way an operator who wrote the whole entry would: `port`
+    /// is the loopback TCP endpoint where rnsd has no abstract socket, `instance` the
+    /// socket's name where it has one.
+    fn with_local_interface(self, port: u16, instance: &str) -> Self {
+        let path = self.config_dir.join("config.yaml");
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("  interfaces:\n"), "{text}");
+        let entry =
+            format!("  interfaces:\n    - {{type: local, port: {port}, instance: {instance}}}\n");
+        fs::write(&path, text.replacen("  interfaces:\n", &entry, 1)).unwrap();
+        self
+    }
+
     fn command(&self) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_coyote"));
         cmd.env("COYOTE_CONFIG_DIR", &self.config_dir)
@@ -4348,4 +4362,184 @@ fn usage_probe_brief_confirmations_under_slash_name_their_next_command_with_the_
     let status = session.get_process().wait().unwrap();
     assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
     assert_eq!(probe.marker_count("MESH_STARTED"), 0, "no node was started");
+}
+
+/// The `local` interface kind at a real cold start, with a `local` entry nothing answers
+/// at first. One entry carries both overrides, so on every platform it points at an
+/// endpoint only this test can open: the held loopback `port` where rnsd has no abstract
+/// socket, the abstract socket `@rns/<instance>` under a name no rnsd uses where it has.
+struct LocalRnsd {
+    held: HeldPort,
+    instance: String,
+}
+
+impl LocalRnsd {
+    fn absent() -> Self {
+        let held = HeldPort::hold();
+        let instance = format!("coyote-probe-{}", held.port);
+        Self { held, instance }
+    }
+
+    fn port(&self) -> u16 {
+        self.held.port
+    }
+
+    fn instance(&self) -> &str {
+        &self.instance
+    }
+
+    /// The endpoint text the `local` row and the config row carry for this entry.
+    fn endpoint(&self) -> String {
+        if cfg!(any(target_os = "linux", target_os = "android")) {
+            format!("@rns/{}", self.instance)
+        } else {
+            format!("127.0.0.1:{}", self.held.port)
+        }
+    }
+
+    /// Stands in for rnsd's shared-instance listener at the endpoint from now on: every
+    /// connection is accepted and held silent, which satisfies the node's probe and the
+    /// shared-instance client it attaches alike.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn listen(&mut self) {
+        self.held.open();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn listen(&mut self) {
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::{SocketAddr, UnixListener};
+        let addr = SocketAddr::from_abstract_name(format!("rns/{}", self.instance)).unwrap();
+        let listener = UnixListener::bind_addr(&addr).unwrap();
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut sink = [0u8; 1024];
+                    while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
+                });
+            }
+        });
+    }
+}
+
+/// A `local`-only config through the real binary, as the shipped default is used: with
+/// nothing listening at the endpoint the bare `.mesh info` already shows the entry as
+/// `local rnsd at <endpoint>` and keys `reach` on it, `.mesh on` is refused with the
+/// endpoint, the kind, the probe's reason and the loopback hint, and nothing is started
+/// (no `mesh.started`, `.mesh peers` still says the mesh is off). Once a listener answers
+/// there the same `.mesh on` joins: the summary names the entry, the node's row reads
+/// `local rnsd at <endpoint>  connected`, `reach` keeps the endpoint, no WARNING is
+/// printed, and `.exit` stops the node once.
+#[test]
+fn usage_probe_a_local_only_node_is_refused_until_rnsd_listens_then_joins_through_it() {
+    let mut rnsd = LocalRnsd::absent();
+    let endpoint = rnsd.endpoint();
+    let label = format!("local rnsd at {endpoint}");
+    let reach = format!("via rnsd at {endpoint} - rnstatus shows what it reaches");
+    let probe =
+        Probe::new("local-only", false, &[]).with_local_interface(rnsd.port(), rnsd.instance());
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+
+    let startup = strip_escapes(&wait_for(&mut session, SESSION_PROMPT));
+    assert!(
+        !startup.contains(MESH_ON_SUMMARY) && !startup.contains("joining the mesh"),
+        "mesh.enabled is false: {startup:?}"
+    );
+
+    // Node off: the config row names the entry by its endpoint and `reach` is keyed on it.
+    let info = command_text(&mut session, ".mesh info", "└", SESSION_PROMPT);
+    assert!(
+        info.contains("node: off - .mesh on joins"),
+        "the node-off line precedes the settings table: {info}"
+    );
+    let table = boxed_table(".mesh info (node off)", &info);
+    assert_eq!(table.value("interfaces[0]"), label, "{info}");
+    assert_eq!(table.value("reach"), reach, "{info}");
+    assert!(!info.contains("private "), "{info}");
+
+    // Nothing answers at the endpoint: `.mesh on` is refused with the reason and the hint.
+    let refused = command_text(
+        &mut session,
+        ".mesh on --yes",
+        "is not reachable",
+        SESSION_PROMPT,
+    );
+    assert!(
+        refused.contains(&format!(
+            "Error: Local rnsd at {endpoint} (type: local) is not reachable: "
+        )),
+        "{refused:?}"
+    );
+    assert!(
+        refused.contains(&format!(" Nothing is listening on {endpoint}.")),
+        "{refused:?}"
+    );
+    assert!(
+        refused
+            .contains("The default configuration expects a local Reticulum daemon (rnsd) there."),
+        "{refused:?}"
+    );
+    assert!(
+        !refused.contains(MESH_ON_SUMMARY) && !refused.contains("WARNING"),
+        "a local-only node that cannot reach rnsd is refused, not started with a warning: {refused:?}"
+    );
+    let peers = command_text(
+        &mut session,
+        ".mesh peers",
+        MESH_OFF_PATTERN,
+        SESSION_PROMPT,
+    );
+    assert!(peers.contains(MESH_OFF), "{peers:?}");
+    assert_eq!(
+        probe.marker_count("MESH_STARTED"),
+        0,
+        "a refused `.mesh on` fires no mesh.started"
+    );
+
+    // rnsd (stood in for) comes up: the same command joins through it.
+    rnsd.listen();
+    let joined = command_prints(
+        &mut session,
+        ".mesh on --yes",
+        MESH_ON_SUMMARY,
+        SESSION_PROMPT,
+    );
+    assert!(
+        joined.contains(&format!("  interfaces: {label}")),
+        "the summary names the connected local entry: {joined:?}"
+    );
+    assert!(
+        !joined.contains("WARNING") && !joined.contains("not reachable"),
+        "{joined:?}"
+    );
+    probe.wait_for_marker("MESH_STARTED");
+
+    let info = command_text(&mut session, ".mesh info", "└", SESSION_PROMPT);
+    let table = boxed_table(".mesh info (node on)", &info);
+    assert_eq!(
+        table.value("interfaces[0]"),
+        format!("{label}  connected"),
+        "the running node's row replaces the settings row: {info}"
+    );
+    assert_eq!(table.value("reach"), reach, "{info}");
+    assert!(
+        !info.contains("node: off"),
+        "no node-off line while the node is on: {info}"
+    );
+
+    let status = exit_clean(&mut session);
+    probe.wait_for_marker("MESH_STOPPED");
+    assert!(
+        matches!(status, WaitStatus::Exited(_, 0)),
+        ".exit: expected a clean exit, got {status:?}"
+    );
+    assert_eq!(
+        probe.marker_count("MESH_STARTED"),
+        1,
+        "one join once rnsd answered"
+    );
+    assert_eq!(probe.marker_count("MESH_STOPPED"), 1, "one stop at exit");
 }

@@ -11853,6 +11853,67 @@ mod tests {
         relay_handle.abort();
     }
 
+    /// The shipped default as it is used: a `local`-only config with rnsd already
+    /// listening comes up at once with the row `connected`, the kind is the one the node
+    /// serves on (`interface_kinds`, the `mesh.started` hook's `COYOTE_MESH_INTERFACES`),
+    /// no idle line is printed for it, and `stop` detaches the shared-instance client.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_local_only_node_with_rnsd_listening_is_connected_at_start() {
+        let (port, socket) = held_port().await;
+        let endpoint = local_endpoint(port);
+        let label = format!("local rnsd at {endpoint}");
+        let stub = serve_local_stub(&endpoint, socket).await;
+        let tmp = TempDir::new("node-local-present");
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &MeshConfig {
+                interfaces: vec![local_entry(port)],
+                ..MeshConfig::default()
+            },
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            states_of(&runtime),
+            vec![(label.clone(), InterfaceState::Connected)],
+            "a probe that answers before the first attach is Connected at start"
+        );
+        assert_eq!(runtime.interface_kinds(), vec!["local"]);
+        assert_eq!(runtime.interfaces(), vec![label.clone()]);
+        let transport = runtime.transport_handle().await.unwrap();
+        assert!(
+            transport.shared_instance().is_some(),
+            "the transport is attached to the shared instance once the probe answered"
+        );
+
+        let slot = Arc::new(MeshSlot::default());
+        let hooks = RecordingHookSink::attach(&slot.hooks());
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        slot.install(runtime.clone()).unwrap();
+        let envs = one_fire(&hooks, HookEvent::MeshStarted);
+        assert_eq!(env_value(&envs, "COYOTE_MESH_INTERFACES"), Some("local"));
+
+        // A few probe ticks later the row is still `connected` and nothing was said.
+        sleep(CONNECT_WATCH_TICK * 2).await;
+        assert_eq!(states_of(&runtime)[0].1, InterfaceState::Connected);
+        assert!(
+            notifier.0.lock().is_empty(),
+            "a local row prints no idle line: {:?}",
+            notifier.0.lock()
+        );
+
+        assert!(slot.stop().await.unwrap());
+        assert!(transport.shared_instance().is_none());
+        stub.abort();
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn traffic_flows_over_an_interface_that_connected_after_start() {

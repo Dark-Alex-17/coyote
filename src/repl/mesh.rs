@@ -17038,6 +17038,245 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 });
             }
 
+            /// A `local` entry nothing answers at first, as the REPL spells it for one
+            /// platform: the held loopback port where rnsd has no abstract socket, an
+            /// abstract socket under a name no rnsd uses where it has.
+            #[cfg(unix)]
+            fn absent_local_entry(port: u16) -> (MeshInterface, LocalEndpoint) {
+                let entry = MeshInterface::Local {
+                    port: Some(port),
+                    instance: Some(format!("coyote-repl-probe-{port}")),
+                };
+                let MeshInterface::Local { port, instance } = &entry else {
+                    unreachable!()
+                };
+                let endpoint = LocalEndpoint::of(*port, instance.as_deref());
+                (entry, endpoint)
+            }
+
+            /// Stands in for rnsd's shared-instance listener at `endpoint` until the returned
+            /// task is aborted: every connection is accepted and drained, which satisfies the
+            /// node's probe and the shared-instance client it attaches alike. Binding the TCP
+            /// shape fresh (reuse-address on) is what lets the stub come back on the same port
+            /// after it was dropped, the way a restarted rnsd does.
+            #[cfg(unix)]
+            async fn serve_local_rnsd(endpoint: &LocalEndpoint) -> tokio::task::JoinHandle<()> {
+                match endpoint {
+                    LocalEndpoint::Tcp(addr) => {
+                        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+                        socket.set_reuseaddr(true).unwrap();
+                        socket.bind(*addr).unwrap();
+                        serve_as_sink(socket.listen(16).unwrap()).await.0
+                    }
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    LocalEndpoint::Abstract(value) => {
+                        use std::os::linux::net::SocketAddrExt;
+                        use tokio::io::AsyncReadExt;
+                        let name = value.strip_prefix('@').unwrap();
+                        let addr =
+                            std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())
+                                .unwrap();
+                        let listener = std::os::unix::net::UnixListener::bind_addr(&addr).unwrap();
+                        listener.set_nonblocking(true).unwrap();
+                        let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+                        tokio::spawn(async move {
+                            loop {
+                                let Ok((mut stream, _)) = listener.accept().await else {
+                                    break;
+                                };
+                                tokio::spawn(async move {
+                                    let mut sink = [0u8; 1024];
+                                    while matches!(stream.read(&mut sink).await, Ok(n) if n > 0) {}
+                                });
+                            }
+                        })
+                    }
+                    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                    LocalEndpoint::Abstract(value) => {
+                        panic!("{value}: abstract sockets exist on Linux and Android only")
+                    }
+                }
+            }
+
+            /// Polls `.mesh info` until the `interfaces[index]` row reads `want`, within the
+            /// connect-later budget; the probe behind a `local` row ticks once a second.
+            #[cfg(unix)]
+            async fn wait_for_info_row(
+                ctx: &mut RequestContext,
+                index: usize,
+                want: impl Fn(&str) -> bool,
+                what: &str,
+            ) -> String {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+                let name = format!("interfaces[{index}]");
+                loop {
+                    let info = out_of(ctx, ".mesh info").await.unwrap();
+                    let row = info_row(&info, &name);
+                    if want(&row) {
+                        return info;
+                    }
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "timed out waiting for {what}; last row {row:?}\n{info}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+
+            /// The operator sees a `local` rnsd's whole story through the REPL. `.mesh on`
+            /// beside a working relay warns that the local rnsd is not reachable yet (with
+            /// the probe's reason and the start-the-daemon tail) and `.mesh info` lists it as
+            /// `connecting, retrying`; when something answers at the endpoint the row reads
+            /// `connected` and the kind joins the node's interfaces with no idle line (the
+            /// local rnsd prints none, only the TCP kinds do); when it goes away again the row
+            /// reads `lost, retrying` with the probe's reason and the kind leaves; and when it
+            /// is back the row is `connected` again, still with no idle line and no second
+            /// WARNING. `.mesh off` then detaches cleanly.
+            #[cfg(unix)]
+            #[test]
+            #[serial]
+            fn usage_probe_info_follows_a_local_rnsd_through_connecting_connected_lost_and_back() {
+                let guard = TestConfigDirGuard::new("repl-mesh-info-local-round-trip");
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                let _script = prompt_script::install(&[true]);
+                let _capture = capture::install();
+                run_async(async {
+                    let (port, socket) = held_port().await;
+                    let (entry, endpoint) = absent_local_entry(port);
+                    let (addr, relay_handle, _) = loopback_relay().await;
+                    let mut ctx = ctx_with(
+                        MeshConfig {
+                            interfaces: vec![
+                                MeshInterface::Private {
+                                    host: "127.0.0.1".to_string(),
+                                    port: addr.port(),
+                                },
+                                entry,
+                            ],
+                            ..MeshConfig::default()
+                        },
+                        true,
+                    );
+                    ctx.session = Some(Session::default());
+                    let idle = Arc::new(Recording::default());
+                    ctx.app.mesh.set_idle(idle.clone());
+                    let label = format!("local rnsd at {endpoint}");
+                    let relay_label = format!("private 127.0.0.1:{}", addr.port());
+
+                    run(&mut ctx, ".mesh on").await.unwrap();
+
+                    let runtime = ctx.app.mesh.get().unwrap();
+                    let states = runtime.interface_states();
+                    let InterfaceState::Connecting {
+                        reason: Some(reason),
+                    } = &states[1].state
+                    else {
+                        panic!("{states:?}");
+                    };
+                    assert!(!reason.is_empty(), "{states:?}");
+                    assert_eq!(
+                        warnings(),
+                        vec![format!(
+                            "WARNING: {label} is not reachable yet: {reason}; start the local rnsd"
+                        )],
+                        "{:?}",
+                        stderr_lines()
+                    );
+                    let out = stdout_lines();
+                    let summary = &out[index_of(&out, "Mesh is on for this session")];
+                    assert!(
+                        summary.contains(&format!("  interfaces: {relay_label}")),
+                        "{summary}"
+                    );
+                    assert!(!summary.contains("local rnsd"), "{summary}");
+                    let info = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    assert_eq!(
+                        info_row(&info, "interfaces[1]"),
+                        format!("{label}  connecting, retrying: {reason}"),
+                        "{info}"
+                    );
+                    assert_eq!(runtime.interface_kinds(), vec!["private"]);
+
+                    // rnsd (stood in for) starts answering at the endpoint.
+                    let stub = serve_as_sink_at(&endpoint, Some(socket)).await;
+                    let info = wait_for_info_row(
+                        &mut ctx,
+                        1,
+                        |row| row == format!("{label}  connected"),
+                        "the local row to connect",
+                    )
+                    .await;
+                    assert_eq!(
+                        info_row(&info, "interfaces[0]"),
+                        format!("{relay_label}  connected"),
+                        "{info}"
+                    );
+                    assert_eq!(runtime.interface_kinds(), vec!["private", "local"]);
+
+                    // ... goes away again ...
+                    stub.abort();
+                    let info = wait_for_info_row(
+                        &mut ctx,
+                        1,
+                        |row| row.starts_with(&format!("{label}  lost, retrying: ")),
+                        "the local row to report the drop",
+                    )
+                    .await;
+                    let row = info_row(&info, "interfaces[1]");
+                    assert!(
+                        row.len() > format!("{label}  lost, retrying: ").len(),
+                        "the drop names the probe's reason: {row:?}"
+                    );
+                    assert_eq!(runtime.interface_kinds(), vec!["private"]);
+
+                    // ... and comes back on the same endpoint.
+                    let stub = serve_as_sink_at(&endpoint, None).await;
+                    wait_for_info_row(
+                        &mut ctx,
+                        1,
+                        |row| row == format!("{label}  connected"),
+                        "the local row to connect again",
+                    )
+                    .await;
+                    assert_eq!(runtime.interface_kinds(), vec!["private", "local"]);
+
+                    assert!(
+                        idle.0
+                            .lock()
+                            .iter()
+                            .all(|text| !text.contains("local rnsd")),
+                        "a local rnsd prints no idle line for any of it: {:?}",
+                        idle.0.lock()
+                    );
+                    assert_eq!(
+                        warnings().len(),
+                        1,
+                        "no second WARNING: {:?}",
+                        stderr_lines()
+                    );
+
+                    run(&mut ctx, ".mesh off --yes").await.unwrap();
+                    assert!(ctx.app.mesh.get().is_none());
+                    stub.abort();
+                    relay_handle.abort();
+                });
+            }
+
+            /// `serve_local_rnsd`, but the first TCP open listens on the socket the test has
+            /// been holding (so nothing else took the port meanwhile); later opens bind fresh.
+            #[cfg(unix)]
+            async fn serve_as_sink_at(
+                endpoint: &LocalEndpoint,
+                held: Option<tokio::net::TcpSocket>,
+            ) -> tokio::task::JoinHandle<()> {
+                match (endpoint, held) {
+                    (LocalEndpoint::Tcp(_), Some(socket)) => {
+                        serve_as_sink(socket.listen(16).unwrap()).await.0
+                    }
+                    (endpoint, _) => serve_local_rnsd(endpoint).await,
+                }
+            }
+
             /// While a node is on, the node's rows are the only `interfaces[i]` rows. While
             /// off, bare `.mesh info` lists the configured interfaces as settings (`public
             /// ... (world-visible)`, `private ...`); while on (degraded), every
