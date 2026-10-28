@@ -1,4 +1,5 @@
 use super::paths;
+use crate::mesh::LocalEndpoint;
 use crate::mesh::card::ABOUT_MAX_CHARS;
 use crate::mesh::message::PEER_REQUEST_TIMEOUT;
 use crate::mesh::request::DEFAULT_LINK_TIMEOUT;
@@ -29,6 +30,10 @@ pub const DEFAULT_ENVOY_MEMORY_MAX_PER_IDENTITY: u64 = 16;
 pub const DEFAULT_ENVOY_MEMORY_MAX_TURNS: u64 = 40;
 pub const DEFAULT_ENVOY_MEMORY_MAX_BYTES: u64 = 65536;
 pub const DEFAULT_ENVOY_MEMORY_TTL_HOURS: u64 = 168;
+/// The loopback TCP port rnsd's shared instance listens on when a `local` entry names none.
+pub const DEFAULT_LOCAL_RNSD_PORT: u16 = 37428;
+/// The rnsd instance whose abstract socket a `local` entry dials when it names none.
+pub const DEFAULT_LOCAL_RNSD_INSTANCE: &str = "default";
 /// Width of the label column in the `mesh:` section of `.info`.
 const MESH_INFO_LABEL_WIDTH: usize = 32;
 
@@ -225,9 +230,9 @@ impl Default for MeshConfig {
             display_name: None,
             display_name_on_public: false,
             about: None,
-            interfaces: vec![MeshInterface::Private {
-                host: "127.0.0.1".into(),
-                port: 4242,
+            interfaces: vec![MeshInterface::Local {
+                port: None,
+                instance: None,
             }],
             brief: MeshBrief::default(),
             digest_prompt: None,
@@ -274,7 +279,7 @@ impl MeshConfig {
         }
         if self.interfaces.is_empty() {
             bail!(
-                "mesh.interfaces is empty; list at least one interface (the default is a single {{type: private, host: 127.0.0.1, port: 4242}} entry, the local rnsd)"
+                "mesh.interfaces is empty; list at least one interface (the default is a single {{type: local}} entry, the local rnsd)"
             );
         }
         let lan_count = self
@@ -392,14 +397,30 @@ impl fmt::Display for MeshBrief {
 #[serde(try_from = "RawMeshInterface", into = "RawMeshInterface")]
 pub enum MeshInterface {
     Lan,
-    Private { host: String, port: u16 },
-    Public { host: String, port: u16 },
+    /// A shared-instance client of the host's rnsd; `LocalEndpoint` says where it dials.
+    Local {
+        port: Option<u16>,
+        instance: Option<String>,
+    },
+    Private {
+        host: String,
+        port: u16,
+    },
+    Public {
+        host: String,
+        port: u16,
+    },
 }
 
 impl fmt::Display for MeshInterface {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Lan => f.write_str("lan"),
+            Self::Local { port, instance } => write!(
+                f,
+                "local rnsd at {}",
+                LocalEndpoint::of(*port, instance.as_deref())
+            ),
             Self::Private { host, port } => write!(f, "private {host}:{port}"),
             Self::Public { host, port } => write!(f, "public {host}:{port} (world-visible)"),
         }
@@ -409,7 +430,7 @@ impl fmt::Display for MeshInterface {
 #[derive(Serialize, Deserialize)]
 #[serde(
     deny_unknown_fields,
-    expecting = "a mapping like {type: lan} or {type: private, host: relay.example.com, port: 4242}"
+    expecting = "a mapping like {type: local}, {type: lan} or {type: private, host: relay.example.com, port: 4242}"
 )]
 struct RawMeshInterface {
     #[serde(rename = "type")]
@@ -418,13 +439,23 @@ struct RawMeshInterface {
     host: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    instance: Option<String>,
 }
 
 impl TryFrom<RawMeshInterface> for MeshInterface {
     type Error = anyhow::Error;
 
     fn try_from(raw: RawMeshInterface) -> Result<Self> {
-        let RawMeshInterface { kind, host, port } = raw;
+        let RawMeshInterface {
+            kind,
+            host,
+            port,
+            instance,
+        } = raw;
+        if instance.is_some() && kind != "local" {
+            bail!("type '{kind}' takes no instance; only type 'local' names an rnsd instance");
+        }
         match kind.as_str() {
             "lan" => {
                 if host.is_some() || port.is_some() {
@@ -433,6 +464,23 @@ impl TryFrom<RawMeshInterface> for MeshInterface {
                     );
                 }
                 Ok(Self::Lan)
+            }
+            "local" => {
+                if host.is_some() {
+                    bail!(
+                        "type 'local' takes no host; use port and instance to pick the local rnsd"
+                    );
+                }
+                if port == Some(0) {
+                    bail!("port 0 is out of range; use 1-65535");
+                }
+                if instance
+                    .as_deref()
+                    .is_some_and(|name| name.trim().is_empty())
+                {
+                    bail!("type 'local' requires a non-empty instance when one is given");
+                }
+                Ok(Self::Local { port, instance })
             }
             "private" | "public" => {
                 let (Some(host), Some(port)) = (host, port) else {
@@ -453,7 +501,7 @@ impl TryFrom<RawMeshInterface> for MeshInterface {
             "auto" => bail!(
                 "type 'auto' was removed and is no longer valid; use 'lan' for link-local discovery (the likely intent), or 'private'/'public' with host and port for a relay"
             ),
-            other => bail!("unknown type '{other}'; valid values are lan, private, public"),
+            other => bail!("unknown type '{other}'; valid values are lan, local, private, public"),
         }
     }
 }
@@ -465,16 +513,25 @@ impl From<MeshInterface> for RawMeshInterface {
                 kind: "lan".into(),
                 host: None,
                 port: None,
+                instance: None,
+            },
+            MeshInterface::Local { port, instance } => Self {
+                kind: "local".into(),
+                host: None,
+                port,
+                instance,
             },
             MeshInterface::Private { host, port } => Self {
                 kind: "private".into(),
                 host: Some(host),
                 port: Some(port),
+                instance: None,
             },
             MeshInterface::Public { host, port } => Self {
                 kind: "public".into(),
                 host: Some(host),
                 port: Some(port),
+                instance: None,
             },
         }
     }
@@ -626,9 +683,9 @@ mod tests {
         assert_eq!(mesh.about, None);
         assert_eq!(
             mesh.interfaces,
-            vec![MeshInterface::Private {
-                host: "127.0.0.1".into(),
-                port: 4242
+            vec![MeshInterface::Local {
+                port: None,
+                instance: None
             }]
         );
         assert_eq!(mesh.brief, MeshBrief::Auto);
@@ -747,6 +804,104 @@ mod tests {
     }
 
     #[test]
+    fn mesh_interface_local_parses_with_or_without_port_and_instance() {
+        let cfg: Config =
+            serde_yaml::from_str("mesh:\n  interfaces:\n    - type: local\n").unwrap();
+        assert_eq!(
+            cfg.mesh.interfaces(),
+            &[MeshInterface::Local {
+                port: None,
+                instance: None
+            }]
+        );
+        let cfg: Config = serde_yaml::from_str(
+            "mesh:\n  interfaces:\n    - type: local\n      port: 37429\n      instance: lab\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.mesh.interfaces(),
+            &[MeshInterface::Local {
+                port: Some(37429),
+                instance: Some("lab".into())
+            }]
+        );
+    }
+
+    #[test]
+    fn mesh_interface_local_refuses_a_host_port_zero_and_a_blank_instance() {
+        let err =
+            interface_error("mesh:\n  interfaces:\n    - type: local\n      host: 127.0.0.1\n");
+        assert!(
+            err.contains(
+                "type 'local' takes no host; use port and instance to pick the local rnsd"
+            ),
+            "{err}"
+        );
+        let err = interface_error("mesh:\n  interfaces:\n    - type: local\n      port: 0\n");
+        assert!(err.contains("port 0 is out of range"), "{err}");
+        let err = interface_error("mesh:\n  interfaces:\n    - type: local\n      instance: ' '\n");
+        assert!(
+            err.contains("type 'local' requires a non-empty instance"),
+            "{err}"
+        );
+        let err = interface_error(
+            "mesh:\n  interfaces:\n    - type: private\n      host: h\n      port: 1\n      instance: lab\n",
+        );
+        assert!(err.contains("type 'private' takes no instance"), "{err}");
+    }
+
+    #[test]
+    fn mesh_interface_local_round_trips_through_serde_with_and_without_overrides() {
+        let mesh = MeshConfig {
+            interfaces: vec![
+                MeshInterface::Local {
+                    port: None,
+                    instance: None,
+                },
+                MeshInterface::Local {
+                    port: Some(37429),
+                    instance: Some("lab".into()),
+                },
+            ],
+            ..Default::default()
+        };
+        let yaml = serde_yaml::to_string(&mesh).unwrap();
+        assert!(yaml.contains("type: local\n"), "{yaml}");
+        assert!(!yaml.contains("host"), "{yaml}");
+        let parsed: MeshConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed, mesh);
+    }
+
+    /// The config row carries the same endpoint text as the node label.
+    #[test]
+    fn mesh_interface_local_displays_the_rnsd_endpoint() {
+        let shown = MeshInterface::Local {
+            port: None,
+            instance: None,
+        }
+        .to_string();
+        assert_eq!(
+            shown,
+            format!("local rnsd at {}", LocalEndpoint::of(None, None))
+        );
+        assert!(
+            shown == "local rnsd at @rns/default" || shown == "local rnsd at 127.0.0.1:37428",
+            "{shown}"
+        );
+        assert_eq!(
+            MeshInterface::Local {
+                port: Some(37429),
+                instance: Some("lab".into()),
+            }
+            .to_string(),
+            format!(
+                "local rnsd at {}",
+                LocalEndpoint::of(Some(37429), Some("lab"))
+            )
+        );
+    }
+
+    #[test]
     fn mesh_interface_public_parses_with_host_and_port() {
         let cfg: Config = serde_yaml::from_str(
             "mesh:\n  interfaces:\n    - type: public\n      host: node.example.com\n      port: 4242\n",
@@ -811,7 +966,7 @@ mod tests {
     fn mesh_interface_rejects_unknown_type() {
         let err = interface_error("mesh:\n  interfaces:\n    - type: bluetooth\n");
         assert!(
-            err.contains("unknown type 'bluetooth'; valid values are lan, private, public"),
+            err.contains("unknown type 'bluetooth'; valid values are lan, local, private, public"),
             "{err}"
         );
     }
@@ -963,10 +1118,7 @@ mod tests {
         };
         let err = mesh.validate(true).unwrap_err().to_string();
         assert!(err.contains("mesh.interfaces is empty"), "{err}");
-        assert!(
-            err.contains("{type: private, host: 127.0.0.1, port: 4242}"),
-            "{err}"
-        );
+        assert!(err.contains("{type: local}"), "{err}");
     }
 
     #[test]

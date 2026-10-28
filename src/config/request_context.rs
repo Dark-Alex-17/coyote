@@ -9070,8 +9070,11 @@ mod tests {
             mesh.starts_with("  enabled                         false\n"),
             "{mesh}"
         );
+        let default_interface = &MeshConfig::default().interfaces[0];
         assert!(
-            mesh.contains("  interfaces[0]                   private 127.0.0.1:4242\n"),
+            mesh.contains(&format!(
+                "  interfaces[0]                   {default_interface}\n"
+            )),
             "{mesh}"
         );
     }
