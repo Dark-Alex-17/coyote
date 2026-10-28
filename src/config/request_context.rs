@@ -9070,7 +9070,11 @@ mod tests {
             mesh.starts_with("  enabled                         false\n"),
             "{mesh}"
         );
-        let default_interface = &MeshConfig::default().interfaces[0];
+        let default_interface = if cfg!(any(target_os = "linux", target_os = "android")) {
+            "local rnsd at @rns/default"
+        } else {
+            "local rnsd at 127.0.0.1:37428"
+        };
         assert!(
             mesh.contains(&format!(
                 "  interfaces[0]                   {default_interface}\n"

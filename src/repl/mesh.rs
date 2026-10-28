@@ -8739,16 +8739,16 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
 │ src/vault/keys.yaml ┆ denied        │
 └─────────────────────┴───────────────┘"#;
 
-    /// The node facts of a bare `.mesh info` with the node on, the default interface
-    /// connected, nothing retired or heard yet: the rows the Commands page carries, the
-    /// ages the page cannot know as placeholders.
+    /// The node facts of a bare `.mesh info` with the node on, the shipped default (the
+    /// local rnsd, as a non-Linux host labels it) connected, nothing retired or heard yet:
+    /// the rows the Commands page carries, the ages the page cannot know as placeholders.
     #[test]
     fn info_table_snapshot() {
         let rows = [
             ("identity", "<identity hash>"),
             ("destination", "<destination hash>"),
             ("instance", "<instance id>"),
-            ("interfaces[0]", "private 127.0.0.1:4242  connected"),
+            ("interfaces[0]", "local rnsd at 127.0.0.1:37428  connected"),
             ("joined", "<age>"),
             ("last announce", "<age> (next in <span>)"),
             ("envoy memory", "off"),
@@ -8798,25 +8798,25 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         );
     }
 
-    const INFO_SNAPSHOT: &str = r#"┌───────────────────┬───────────────────────────────────┐
-│ key               ┆ value                             │
-╞═══════════════════╪═══════════════════════════════════╡
-│ identity          ┆ <identity hash>                   │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ destination       ┆ <destination hash>                │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ instance          ┆ <instance id>                     │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ interfaces[0]     ┆ private 127.0.0.1:4242  connected │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ joined            ┆ <age>                             │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ last announce     ┆ <age> (next in <span>)            │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ envoy memory      ┆ off                               │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ propagation_nodes ┆ none heard yet                    │
-└───────────────────┴───────────────────────────────────┘"#;
+    const INFO_SNAPSHOT: &str = r#"┌───────────────────┬──────────────────────────────────────────┐
+│ key               ┆ value                                    │
+╞═══════════════════╪══════════════════════════════════════════╡
+│ identity          ┆ <identity hash>                          │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ destination       ┆ <destination hash>                       │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ instance          ┆ <instance id>                            │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ interfaces[0]     ┆ local rnsd at 127.0.0.1:37428  connected │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ joined            ┆ <age>                                    │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ last announce     ┆ <age> (next in <span>)                   │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ envoy memory      ┆ off                                      │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ propagation_nodes ┆ none heard yet                           │
+└───────────────────┴──────────────────────────────────────────┘"#;
 
     /// `mesh_table` is `asset_table` with the terminal lookup turned off: the same preset
     /// (its top-left corner is the UTF8_FULL one) and, without a terminal, the same bytes.
@@ -14756,7 +14756,9 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     assert!(!has_info_row(&out, "selection"), "{out}");
 
                     // The node's rows, with the values only this run knows replaced by
-                    // the placeholders the snapshot carries, are the snapshot's rows.
+                    // the placeholders the snapshot carries, are the snapshot's rows. The
+                    // live node sits on a private loopback relay; the snapshot shows the
+                    // shipped default's label in the same `<label>  <state>` shape.
                     let snapshot: Vec<(String, String)> = table_rows(INFO_SNAPSHOT)
                         .into_iter()
                         .map(|row| (row[0].clone(), row[1].clone()))
@@ -14766,7 +14768,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         .iter()
                         .rposition(|(key, _)| key.starts_with("propagation_nodes"))
                         .unwrap();
-                    let port = format!(":{port}");
+                    let live_label = format!("private 127.0.0.1:{port}");
                     let facts: Vec<(String, String)> = rows[first..=last]
                         .iter()
                         .map(|(key, value)| {
@@ -14774,7 +14776,9 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                 "identity" => "<identity hash>".to_string(),
                                 "destination" => "<destination hash>".to_string(),
                                 "instance" => "<instance id>".to_string(),
-                                "interfaces[0]" => value.replacen(&port, ":4242", 1),
+                                "interfaces[0]" => {
+                                    value.replacen(&live_label, "local rnsd at 127.0.0.1:37428", 1)
+                                }
                                 "joined" => "<age>".to_string(),
                                 "last announce" => "<age> (next in <span>)".to_string(),
                                 _ => value.clone(),
