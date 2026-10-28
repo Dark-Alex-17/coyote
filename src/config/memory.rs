@@ -282,12 +282,15 @@ impl MemoryFile {
             fs::create_dir_all(parent)?;
         }
 
-        let frontmatter_yaml = serde_yaml::to_string(&self.frontmatter)?;
-        let content = format!("---\n{}---\n\n{}", frontmatter_yaml, self.body);
-
-        fs::write(&self.path, content)?;
+        fs::write(&self.path, self.render()?)?;
 
         Ok(())
+    }
+
+    /// The file contents `save` writes.
+    pub fn render(&self) -> Result<String> {
+        let frontmatter_yaml = serde_yaml::to_string(&self.frontmatter)?;
+        Ok(format!("---\n{}---\n\n{}", frontmatter_yaml, self.body))
     }
 
     pub fn char_len(&self) -> usize {

@@ -830,7 +830,7 @@ fn other_index_paths(store: &MemoryStore, own_dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-pub(crate) fn write_memory_index(target_dir: &Path, content: &str) -> Result<PathBuf> {
+fn write_memory_index(target_dir: &Path, content: &str) -> Result<PathBuf> {
     fs::create_dir_all(target_dir)?;
     let index_path = target_dir.join("MEMORY.md");
 

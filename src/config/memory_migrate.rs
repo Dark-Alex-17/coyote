@@ -3,7 +3,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::{env, fs, io};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{Local, NaiveDateTime};
 
 use crate::config::memory::{
@@ -11,8 +11,8 @@ use crate::config::memory::{
     discover_workspace_memory,
 };
 use crate::config::{MEMORY_INDEX_FILE_NAME, MigrateScope, paths};
-use crate::function::memory::{round_chain_name, write_memory_index};
-use crate::utils::fs::copy_dir_all;
+use crate::function::memory::round_chain_name;
+use crate::utils::fs::{copy_dir_all, write_private_atomic};
 
 const BACKUP_DIR_NAME: &str = "memory-backups";
 const DRILL_FILES_HEADING: &str = "## Drill files";
@@ -118,6 +118,7 @@ struct ScopeReport {
     missing_targets: Vec<(String, String)>,
     orphans: Vec<String>,
     unreadable: Vec<String>,
+    index: Option<String>,
     new_index: Option<String>,
     rewrites: Vec<MemoryFile>,
     backup: Option<PathBuf>,
@@ -209,6 +210,7 @@ fn plan_scope(label: &'static str, dir: &Path, today: &str) -> Result<ScopeRepor
             report.new_index = Some(rewritten);
         }
     }
+    report.index = index;
 
     stamp_round_chains(&mut files, &mut report, &mut changed);
     for slug in &changed {
@@ -328,14 +330,28 @@ fn apply_scope(report: &mut ScopeReport, backup_root: &Path, stamp: &str) -> Res
     let backup = unused_backup_dir(backup_root, report.label, stamp);
     copy_dir_all(&report.dir, &backup)
         .with_context(|| format!("back up {} to {}", report.dir.display(), backup.display()))?;
-    report.backup = Some(backup);
+    report.backup = Some(backup.clone());
     for file in &report.rewrites {
-        file.save()
-            .with_context(|| format!("save memory file {}", file.path.display()))?;
+        write_private_atomic(&file.path, &file.render()?)
+            .with_context(|| format!("write memory file {}", file.path.display()))?;
         report.written.push(file.path.clone());
     }
     if let Some(index) = &report.new_index {
-        report.written.push(write_memory_index(&report.dir, index)?);
+        let index_path = report.dir.join(MEMORY_INDEX_FILE_NAME);
+        let current = fs::read_to_string(&index_path)
+            .with_context(|| format!("read {}", index_path.display()))?;
+        if report.index.as_ref() != Some(&current) {
+            bail!(
+                "{} changed since the migration was planned, so it was left alone; \
+                 the drill files were already rewritten. Rerun --memory-migrate; \
+                 the pre-run copy is in {}",
+                index_path.display(),
+                backup.display()
+            );
+        }
+        write_private_atomic(&index_path, index)
+            .with_context(|| format!("write {}", index_path.display()))?;
+        report.written.push(index_path);
     }
     Ok(())
 }
@@ -884,6 +900,24 @@ mod tests {
         assert_eq!(blank.updated.as_deref(), Some("2026-03-01"));
         let untouched = load(&fx.workspace, "drifted").frontmatter;
         assert_eq!(untouched.updated, None);
+    }
+
+    #[test]
+    fn an_index_edited_after_planning_is_left_alone() {
+        let fx = Fixture::new("index_race");
+        let mut plan = plan_scope("workspace", &fx.workspace, "2026-03-01").unwrap();
+        let index_path = fx.workspace.join(MEMORY_INDEX_FILE_NAME);
+        let edited = format!("{}- [[late]]: added meanwhile\n", workspace_index());
+        fs::write(&index_path, &edited).unwrap();
+
+        let err = apply_scope(&mut plan, &fx.backups, "20260301T123045").unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("changed since the migration was planned"),
+            "{err:#}"
+        );
+        assert_eq!(fs::read_to_string(&index_path).unwrap(), edited);
     }
 
     #[test]
