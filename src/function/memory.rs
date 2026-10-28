@@ -578,11 +578,18 @@ fn scan_round_siblings(dir: &Path, base: &str) -> Result<Vec<RoundSibling>> {
     };
     let mut found = Vec::new();
     for entry in entries {
-        let path = entry?.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("md")
-            || path.symlink_metadata()?.is_symlink()
-        {
+        let path = entry
+            .with_context(|| format!("read {}", dir.display()))?
+            .path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
             continue;
+        }
+        match path.symlink_metadata() {
+            Ok(meta) if meta.is_symlink() => continue,
+            Ok(_) => {}
+            // The entry vanished between read_dir and stat.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("read {}", dir.display())),
         }
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
@@ -2687,6 +2694,50 @@ mod tests {
             broken
         );
         assert!(structured.join("foo-r3.md").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_memory_refuses_a_round_when_the_scope_dir_cannot_be_listed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root("write_round_unlistable_dir");
+        let (store, workspace, structured) = workspace_store(&root, "# Memory Index\n");
+        write_round(&structured, "foo-r1", "");
+        let index_before = fs::read_to_string(structured.join("MEMORY.md")).unwrap();
+        fs::set_permissions(&structured, fs::Permissions::from_mode(0o300)).unwrap();
+        if fs::read_dir(&structured).is_ok() {
+            eprintln!("skipping: mode bits are ignored here (running as root)");
+            fs::set_permissions(&structured, fs::Permissions::from_mode(0o755)).unwrap();
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+
+        let err = write_memory(
+            &store,
+            &workspace,
+            &write_args("foo-r2", "round two", "x"),
+            3,
+            RoundChains::Supersede,
+        )
+        .unwrap_err();
+
+        fs::set_permissions(&structured, fs::Permissions::from_mode(0o755)).unwrap();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains(&format!("read {}", structured.display())),
+            "{text}"
+        );
+        assert!(
+            !structured.join("foo-r2.md").exists(),
+            "nothing is written when the siblings cannot be listed"
+        );
+        assert_eq!(
+            fs::read_to_string(structured.join("MEMORY.md")).unwrap(),
+            index_before
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
