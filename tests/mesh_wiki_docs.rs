@@ -2554,13 +2554,13 @@ fn every_envoy_memory_key_is_documented_on_every_surface_with_the_default_the_co
 }
 
 /// The Mesh page's lead, the text before its first section, names the local daemon and
-/// the loopback endpoint the shipped default dials.
+/// the loopback endpoint the shipped default attaches to.
 #[test]
 fn the_mesh_page_names_the_local_daemon_and_its_loopback_endpoint_before_the_first_section() {
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join("Mesh.md"));
     let lead = lead(&page);
-    for needle in ["rnsd", "127.0.0.1:4242"] {
+    for needle in ["rnsd", "127.0.0.1:37428"] {
         assert!(
             lead.contains(needle),
             "Mesh.md does not name {needle} before its first `## ` heading:\n{lead}"
@@ -3022,11 +3022,11 @@ fn impl_body(path: &str, header: &str) -> String {
 }
 
 /// The Commands and Deployment pages quote what `.mesh on` prints for an interface that
-/// did not come up as the code formats it: the five `WARNING:` lines, the `Mesh relay`
-/// failure text, the hint appended when every configured interface is a loopback relay,
-/// the `lan` bind failure and the six `InterfaceState` rows of `.mesh info`. Every piece
-/// of text around a placeholder is on both pages byte for byte. The code side is checked
-/// on every run.
+/// did not come up as the code formats it: the five `WARNING:` lines, the `Mesh relay` and
+/// `Local rnsd` failure texts, the hint appended when every configured interface is a
+/// loopback relay, the `lan` bind failure and the six `InterfaceState` rows of `.mesh info`.
+/// Every piece of text around a placeholder is on both pages byte for byte. The code side
+/// is checked on every run.
 #[test]
 fn the_commands_and_deployment_pages_quote_the_interface_warnings_and_states_as_the_code_prints_them()
  {
@@ -3053,6 +3053,15 @@ fn the_commands_and_deployment_pages_quote_the_interface_warnings_and_states_as_
         failures.len(),
         1,
         "join_tcp in src/mesh/node.rs does not format exactly one `Mesh relay` failure: {failures:?}"
+    );
+    let local_failures: Vec<String> = string_literals(&fn_body("src/mesh/node.rs", "join_local"))
+        .into_iter()
+        .filter(|literal| literal.starts_with("Local rnsd at "))
+        .collect();
+    assert_eq!(
+        local_failures.len(),
+        1,
+        "join_local in src/mesh/node.rs does not format exactly one `Local rnsd at` failure: {local_failures:?}"
     );
     let hints = string_literals(&fn_body("src/mesh/node.rs", "loopback_hint"));
     assert_eq!(
@@ -3094,6 +3103,7 @@ fn the_commands_and_deployment_pages_quote_the_interface_warnings_and_states_as_
         for literal in warnings
             .iter()
             .chain(&failures)
+            .chain(&local_failures)
             .chain(&hints)
             .chain(&lan_failures)
             .chain(&states)
@@ -3114,6 +3124,25 @@ fn the_commands_and_deployment_pages_quote_the_interface_warnings_and_states_as_
             assert!(
                 page.contains(needle),
                 "{page_name} does not show the `.mesh info` interface state {needle:?}"
+            );
+        }
+    }
+}
+
+/// The Commands and Deployment pages no longer name `127.0.0.1:4242` as the default: the
+/// shipped `interfaces` entry is `{type: local}`, the local rnsd at `127.0.0.1:37428` (the
+/// abstract socket `@rns/default` on Linux and Android). A relay at 4242 may still appear
+/// as an example, so only a line that also says `default` fails.
+#[test]
+fn the_commands_and_deployment_pages_do_not_call_the_4242_relay_the_default() {
+    let Some(wiki) = wiki_dir() else { return };
+    for page_name in ["Mesh-Commands.md", "Mesh-Deployment.md"] {
+        let page = read(wiki.join(page_name));
+        for (index, line) in page.lines().enumerate() {
+            assert!(
+                !(line.contains("default") && line.contains("127.0.0.1:4242")),
+                "{page_name}:{} names 127.0.0.1:4242 as the default; the shipped default is the local rnsd at 127.0.0.1:37428:\n{line}",
+                index + 1
             );
         }
     }
