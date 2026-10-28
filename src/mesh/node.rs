@@ -12060,29 +12060,13 @@ mod tests {
         }
     }
 
-    /// Serves the stub at `endpoint` again after the task `serve_local_stub` returned was
-    /// aborted, the way a restarted rnsd listens where the old one did. The TCP shape
-    /// binds the same port afresh, retrying while the aborted task is still letting it
-    /// go.
+    /// Serves the stub at `endpoint` again after the listener that was there went away
+    /// (an aborted `serve_local_stub`, or `accept_once_then_close` done with the probe),
+    /// the way a restarted rnsd listens where the old one did.
     #[cfg(unix)]
     async fn restart_local_stub(endpoint: &LocalEndpoint) -> JoinHandle<()> {
         match endpoint {
-            LocalEndpoint::Tcp(addr) => {
-                let deadline = tokio::time::Instant::now() + CONNECT_LATER_TIMEOUT;
-                let listener = loop {
-                    match tokio::net::TcpListener::bind(addr).await {
-                        Ok(listener) => break listener,
-                        Err(err) => {
-                            assert!(
-                                tokio::time::Instant::now() < deadline,
-                                "the stub's port {addr} was not released: {err}"
-                            );
-                            sleep(POLL).await;
-                        }
-                    }
-                };
-                serve_as_daemon(listener).await
-            }
+            LocalEndpoint::Tcp(addr) => serve_as_daemon(rebind_local_port(addr).await).await,
             #[cfg(target_os = "linux")]
             LocalEndpoint::Abstract(value) => serve_abstract_stub(value),
             #[cfg(not(target_os = "linux"))]
@@ -12090,6 +12074,37 @@ mod tests {
                 panic!("{value}: abstract sockets exist on Linux only")
             }
         }
+    }
+
+    /// Binds `addr` afresh, retrying while the listener that held it is still letting
+    /// it go.
+    #[cfg(unix)]
+    async fn rebind_local_port(addr: &SocketAddr) -> tokio::net::TcpListener {
+        let deadline = tokio::time::Instant::now() + CONNECT_LATER_TIMEOUT;
+        loop {
+            match tokio::net::TcpListener::bind(addr).await {
+                Ok(listener) => return listener,
+                Err(err) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "the stub's port {addr} was not released: {err}"
+                    );
+                    sleep(POLL).await;
+                }
+            }
+        }
+    }
+
+    /// Stands in for an rnsd that answers the probe and nothing after it: the task
+    /// accepts one connection and ends, closing the listener and the probe's stream
+    /// together, so every later dial to the port is refused, which is the attached
+    /// client dialing into a refusal. Awaiting the task proves the port is free for
+    /// `restart_local_stub`.
+    #[cfg(unix)]
+    fn accept_once_then_close(listener: tokio::net::TcpListener) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let (_probe, _) = listener.accept().await.unwrap();
+        })
     }
 
     /// `serve_as_daemon` for the abstract socket `value` names.
@@ -12375,10 +12390,10 @@ mod tests {
     /// left with the probe; the client has established nothing to report), the kind has
     /// not joined, nothing is told at info and no idle line is printed. Once rnsd takes
     /// the client's redial the row is `connected`, told at info exactly once. The lever
-    /// is a listener whose backlog of one the probe fills and nobody drains: macOS resets
-    /// every connect past the backlog, which is the attached client dialing into a
-    /// refusal, so the arm is not reachable through the abstract-socket shape and the
-    /// test runs where the TCP shape is the `local` endpoint.
+    /// is a listener that takes the probe's connection and closes, so the attached
+    /// client dials into a refusal; it is written for the TCP shape, so the test runs
+    /// where that shape is the `local` endpoint (Linux and Android dial an abstract
+    /// socket there).
     #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_local_row_reads_connecting_without_a_reason_while_the_attached_client_dials() {
@@ -12422,8 +12437,8 @@ mod tests {
         slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
         slot.install(runtime.clone()).unwrap();
 
-        // rnsd comes up but takes only the probe: a backlog of one that nobody drains.
-        let listener = socket.listen(1).unwrap();
+        // rnsd comes up but takes only the probe.
+        let stub = accept_once_then_close(socket.listen(16).unwrap());
         wait_for_state(
             &runtime,
             1,
@@ -12440,7 +12455,7 @@ mod tests {
             transport.shared_instance().is_some(),
             "the transport is attached while its client dials"
         );
-        // The client redials into a reset for a redial wait and more; the row holds the
+        // The client redials into a refusal for a redial wait and more; the row holds the
         // bare `connecting`, the kind stays out and nothing is told.
         sleep(LOCAL_RECONNECT_WAIT * 2).await;
         assert_eq!(
@@ -12459,7 +12474,8 @@ mod tests {
 
         // rnsd starts taking connections: the client's next redial lands and the row
         // moves once.
-        let daemon = serve_as_daemon(listener).await;
+        stub.await.unwrap();
+        let daemon = restart_local_stub(&endpoint).await;
         wait_for_state(&runtime, 1, "the local row to connect", |state| {
             *state == InterfaceState::Connected
         })
@@ -12487,16 +12503,14 @@ mod tests {
         relay_handle.abort();
     }
 
-    /// The probe is not what decides `connected` at start. A listener whose backlog of
-    /// one the probe fills and nobody drains answers the probe and then resets the
-    /// attached client's dials (the same lever as the bare-`connecting` test, and the
-    /// same gate). A `local`-only config is refused the way no rnsd is, with the probe's
-    /// shape of message and the loopback hint, and nothing stays attached. Next to a
-    /// relay the node starts, the row reads a bare `connecting` with the kind out and no
-    /// connect told, and the watcher moves it to `connected`, told once, when the
-    /// listener starts taking connections and the client's redial lands. Each leg has
-    /// its own port: the probe's closed connection stays queued on a backlog nobody
-    /// drains, so the first leg's listener would reset the second leg's probe.
+    /// The probe is not what decides `connected` at start. A listener that takes the
+    /// probe's connection and closes leaves the attached client dialing into a refusal
+    /// (the same lever as the bare-`connecting` test, and the same gate). A `local`-only
+    /// config is refused the way no rnsd is, with the probe's shape of message and the
+    /// loopback hint, and nothing stays attached. Next to a relay the node starts, the
+    /// row reads a bare `connecting` with the kind out and no connect told, and the
+    /// watcher moves it to `connected`, told once, when a listener is back on the port
+    /// and the client's redial lands.
     #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_local_row_is_not_connected_at_start_on_the_probe_alone() {
@@ -12505,7 +12519,7 @@ mod tests {
         install_log_collector();
         let (port, socket) = held_port().await;
         let endpoint = local_endpoint(port);
-        let _undrained = socket.listen(1).unwrap();
+        let stub = accept_once_then_close(socket.listen(16).unwrap());
         let tmp = TempDir::new("node-local-probe-only");
         let mut session = Session::default();
 
@@ -12533,6 +12547,7 @@ mod tests {
             err.contains(&format!(" Nothing is listening on {endpoint}.")),
             "{err}"
         );
+        stub.await.unwrap();
         let metrics = tokio::runtime::Handle::current().metrics();
         wait_until("the transport's tasks to exit", || {
             metrics.num_alive_tasks() == 0
@@ -12542,7 +12557,7 @@ mod tests {
         let (port, socket) = held_port().await;
         let endpoint = local_endpoint(port);
         let label = format!("local rnsd at {endpoint}");
-        let listener = socket.listen(1).unwrap();
+        let stub = accept_once_then_close(socket.listen(16).unwrap());
         let tmp = TempDir::new("node-local-probe-only-relay");
         let mut session = Session::default();
         let (relay, relay_handle, _) = loopback_relay().await;
@@ -12586,7 +12601,8 @@ mod tests {
         let slot = Arc::new(MeshSlot::default());
         slot.install(runtime.clone()).unwrap();
 
-        let daemon = serve_as_daemon(listener).await;
+        stub.await.unwrap();
+        let daemon = restart_local_stub(&endpoint).await;
         wait_for_state(&runtime, 1, "the local row to connect", |state| {
             *state == InterfaceState::Connected
         })
