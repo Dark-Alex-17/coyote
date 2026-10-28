@@ -1433,6 +1433,56 @@ fn assemble_pr_body_reads_ledger_blocks_whole() {
     );
 }
 
+/// A complete task whose index.md has no `plan:` or no `status:` field is
+/// listed in the body and named in a NOTE with the missing field, the same
+/// sentence the ledger tool prints, so the leniency is visible on both
+/// consumers and neither can drift from the other.
+#[cfg(unix)]
+#[test]
+fn assemble_pr_body_lists_a_field_less_task_and_names_it() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = pr_body_fixture("assemble-pr-body-fieldless", "Follow-ups:\n- first item\n");
+    for (name, front) in [
+        ("TASK-6-f", "---\ntitle: \"F\"\n---\n"),
+        ("TASK-7-g", "---\nplan: PLAN-x.md\ntitle: \"G\"\n---\n"),
+        ("TASK-8-h", "---\nstatus: complete\ntitle: \"H\"\n---\n"),
+    ] {
+        let task = dir.0.join("tasks").join(name);
+        fs::create_dir_all(&task).unwrap();
+        fs::write(task.join("index.md"), front).unwrap();
+        fs::write(
+            task.join("log.md"),
+            "## 2026-10-27 - completed\nCommit 89abcde on feat/x.\n",
+        )
+        .unwrap();
+    }
+    let (code, stdout, stderr) = assemble_pr_body(&dir.0);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    for (name, id, title, fields) in [
+        ("TASK-6-f", "TASK-6", "F", "plan:/status:"),
+        ("TASK-7-g", "TASK-7", "G", "status:"),
+        ("TASK-8-h", "TASK-8", "H", "plan:"),
+    ] {
+        assert!(
+            stdout.contains(&format!("\n- [x] {id} - {title} (`89abcde`)")),
+            "{name}: a field-less complete task is listed: {stdout}"
+        );
+        assert!(
+            stderr.contains(&format!(
+                "assemble_pr_body: NOTE {name}: index.md has no {fields}; kept"
+            )),
+            "{name}: the missing field must be named: {stderr}"
+        );
+    }
+    assert!(
+        !stderr.contains("NOTE TASK-1-a: index.md has no"),
+        "{stderr}"
+    );
+}
+
 /// The body is UTF-8 whatever the host locale: a ledger line carrying a
 /// severity glyph reaches stdout intact under a C locale with a cp1252
 /// console codec (UTF-8 mode off) instead of raising on the write.
@@ -2010,6 +2060,61 @@ fn collect_ledger_lines_names_a_task_without_plan_or_status_fields() {
     assert!(
         !stdout.contains("NOTE TASK-1-a") && !stdout.contains("NOTE TASK-3-c"),
         "a task with both fields earns no NOTE: {stdout}"
+    );
+}
+
+/// A task whose index.md exists but cannot be read is skipped with a NOTE
+/// naming the dir, its log.md stays unread, and the other tasks still list.
+/// Skipped where mode bits do not bind (root, or a filesystem that ignores
+/// them), since the unreadable state cannot be produced there.
+#[cfg(unix)]
+#[test]
+fn collect_ledger_lines_names_an_unreadable_index_and_skips_the_task() {
+    use std::os::unix::fs::PermissionsExt;
+    if tools_missing() {
+        return;
+    }
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = shared_tasks_fixture("collect-ledger-unreadable-index");
+    let task = dir.0.join("tasks/TASK-6-u");
+    fs::create_dir_all(&task).unwrap();
+    let index = task.join("index.md");
+    fs::write(&index, "---\nplan: PLAN-x.md\nstatus: complete\n---\n").unwrap();
+    fs::write(
+        task.join("log.md"),
+        "debris-exempt: src/u.rs:6 -- UNREAD-SENTINEL\n",
+    )
+    .unwrap();
+    fs::set_permissions(&index, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&index).is_ok() {
+        eprintln!("skipping: mode bits do not bind here (root or a permissive filesystem)");
+        fs::set_permissions(&index, fs::Permissions::from_mode(0o644)).unwrap();
+        return;
+    }
+    let (code, stdout, stderr) = collect_ledger_lines_with(&dir.0, "debris-exempt", &[]);
+    fs::set_permissions(&index, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("plan_tasks: NOTE TASK-6-u: index.md unreadable; skipped"),
+        "the unreadable task must be named: {stdout}"
+    );
+    assert!(
+        !stdout.contains("UNREAD-SENTINEL"),
+        "a task whose index.md cannot be read must not be read at all: {stdout}"
+    );
+    assert_eq!(
+        stdout
+            .lines()
+            .filter(|l| l.contains("(log.md:"))
+            .collect::<Vec<_>>(),
+        [
+            "TASK-1-a (log.md:3): debris-exempt: src/a.rs:1 -- TASK-1-a",
+            "TASK-3-c (log.md:3): debris-exempt: src/c.rs:3 -- TASK-3-c",
+        ],
+        "the readable tasks still list: {stdout}"
     );
 }
 

@@ -8,8 +8,9 @@ frontmatter `plan:` names the plan (basename compare with a trailing `.md`
 stripped on both sides, so `PLAN-x` and `PLAN-x.md` agree while a dotted slug
 keeps its dots), its `status:` is `complete`, and - when `--tasks TASK-a,TASK-b`
 is given - its id is one of those (a PR group's members). A task whose index.md
-has no `plan:` or no `status:` field is kept and named in a stderr NOTE, so the
-leniency is visible. Order: task number, then suffix.
+has no `plan:` or no `status:` field is kept and named in a NOTE by both consumers
+(this CLI on stderr, assemble_pr_body in its NOTE lines), so the leniency is
+visible; an unreadable index.md is skipped with a NOTE the same way. Order: task number, then suffix.
 
 CLI: `plan_tasks.py --plan PLAN-<slug>.md --tasks-dir DIR [--tasks IDS]` prints
 one qualifying dir per NUL-terminated record (a dir name may hold a newline),
@@ -94,6 +95,17 @@ def is_complete(fm):
     return not status or status == "complete"
 
 
+def absent_fields(fm):
+    """The selection fields index.md lacks (`plan:`, `status:`), in that order; a task
+    missing one is kept, and both consumers name it with the same NOTE."""
+    return [f"{key}:" for key in ("plan", "status") if not fm.get(key)]
+
+
+def label(root):
+    """A task dir name for a NOTE: one line, a newline in the name escaped."""
+    return os.path.basename(root).replace("\n", "\\n")
+
+
 def main(argv):
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
@@ -110,11 +122,11 @@ def main(argv):
     rows, missing = walk_tasks(args.tasks_dir, plan_identity(args.plan), parse_task_ids(args.tasks))
     for _, fm, root in rows:
         if fm is None:
+            print(f"plan_tasks: NOTE {label(root)}: index.md unreadable; skipped", file=sys.stderr)
             continue
-        absent = [f"{key}:" for key in ("plan", "status") if not fm.get(key)]
+        absent = absent_fields(fm)
         if absent:
-            base = os.path.basename(root).replace("\n", "\\n")
-            print(f"plan_tasks: NOTE {base}: index.md has no {'/'.join(absent)}; kept", file=sys.stderr)
+            print(f"plan_tasks: NOTE {label(root)}: index.md has no {'/'.join(absent)}; kept", file=sys.stderr)
         if is_complete(fm):
             print(root, end="\0")
     if missing:

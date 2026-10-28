@@ -55,10 +55,13 @@ def find_tasks(tasks_dir, plan_id, only=None):
     rows, missing = plan_tasks.walk_tasks(tasks_dir, plan_id, only)
     found, skipped = [], []
     for task_id, fm, root in rows:
-        base = os.path.basename(root)
+        base = plan_tasks.label(root)
         if fm is None:
             note(f"{base}: index.md unreadable; skipped")
             continue
+        absent = plan_tasks.absent_fields(fm)
+        if absent:
+            note(f"{base}: index.md has no {'/'.join(absent)}; kept")
         if not plan_tasks.is_complete(fm):
             skipped.append(f"{base} (status: {fm.get('status', '')})")
             continue
