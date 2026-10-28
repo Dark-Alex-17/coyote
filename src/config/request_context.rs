@@ -61,7 +61,7 @@ use super::install_remote::DEFAULT_GIT_HOST;
 use super::instructions;
 use super::macros::Macro;
 use super::memory::{
-    DEFAULT_MEMORY_DRILL_CAP, DEFAULT_MEMORY_FACTS_CAP, MemoryStore, WorkspaceMemory,
+    DEFAULT_MEMORY_DRILL_CAP, DEFAULT_MEMORY_FACTS_CAP, MemorySection, MemoryStore, WorkspaceMemory,
 };
 use crate::graph;
 use crate::hooks::{self, HookEvent};
@@ -81,7 +81,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions, read_dir, read_to_string, remove_dir_all, remove_file};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use std::{env, fs, slice};
 use uuid::Uuid;
@@ -228,6 +228,28 @@ fn chat_agent_mismatch_warning(session_name: &str, previous: Option<&str>) -> St
         }
         None => format!(
             "Warning: session '{session_name}' was born with inline chat instructions; its recorded system prompt stays as is"
+        ),
+    }
+}
+
+/// Set by the first memory injection of the process; the notice about what
+/// the section holds is printed once, not on every turn.
+static MEMORY_SECTION_NOTICE: OnceLock<()> = OnceLock::new();
+
+fn memory_section_notice(section: &MemorySection, cap: usize) -> String {
+    let MemorySection {
+        facts_chars,
+        catalogue_chars,
+        truncated,
+        ..
+    } = section;
+    match truncated {
+        Some(cut) => format!(
+            "memory: {facts_chars} fact chars + {catalogue_chars} catalogue chars; {} lines / {} chars truncated at memory_facts_cap={cap}; run memory__lint",
+            cut.lines, cut.chars
+        ),
+        None => format!(
+            "memory: {facts_chars} fact chars + {catalogue_chars} catalogue chars injected under memory_facts_cap={cap}"
         ),
     }
 }
@@ -2170,6 +2192,11 @@ impl RequestContext {
                 let drill_cap = app.memory_drill_cap.unwrap_or(DEFAULT_MEMORY_DRILL_CAP);
                 match memory::build_memory_section(&store, with_tools, facts_cap, drill_cap) {
                     Ok(Some(section)) => {
+                        if MEMORY_SECTION_NOTICE.set(()).is_ok() {
+                            let notice = memory_section_notice(&section, facts_cap);
+                            eprintln!("{notice}");
+                            warn!("{notice}");
+                        }
                         let separator = if role.is_empty_prompt() { "" } else { "\n\n" };
                         role.append_to_prompt(separator);
                         role.append_to_prompt(&section.text);
@@ -18686,6 +18713,38 @@ mod tests {
         assert_eq!(delegate.agent.variables()["tone"], "terse");
         assert!(delegate.agent.shared_variables().is_empty());
         assert_eq!(*delegate.agent.variables(), *session.chat_agent_variables());
+    }
+
+    #[test]
+    fn memory_section_notice_counts_an_untruncated_section() {
+        let section = MemorySection {
+            text: String::new(),
+            facts_chars: 154,
+            catalogue_chars: 71,
+            truncated: None,
+        };
+        assert_eq!(
+            memory_section_notice(&section, 4_000),
+            "memory: 154 fact chars + 71 catalogue chars injected under memory_facts_cap=4000"
+        );
+    }
+
+    #[test]
+    fn memory_section_notice_reports_the_cut_and_points_at_lint() {
+        let section = MemorySection {
+            text: String::new(),
+            facts_chars: 154,
+            catalogue_chars: 24_435,
+            truncated: Some(memory::Truncated {
+                lines: 338,
+                chars: 20_618,
+            }),
+        };
+        assert_eq!(
+            memory_section_notice(&section, 4_000),
+            "memory: 154 fact chars + 24435 catalogue chars; 338 lines / 20618 chars \
+             truncated at memory_facts_cap=4000; run memory__lint"
+        );
     }
 
     #[test]
