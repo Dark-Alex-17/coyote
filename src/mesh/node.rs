@@ -1793,7 +1793,7 @@ pub(crate) fn session_destination_name(instance_id: &str) -> DestinationName {
 /// `deadline`. A destination registered but left without its announce data is
 /// deregistered again, best effort, and the error says whether that worked. The
 /// destination is armed with `MAX_REQUEST_PAYLOAD_BYTES`:
-/// coyote-rns-transport 0.16.0 refuses an oversize request at the advertisement, before it
+/// coyote-rns-transport 0.17.0 refuses an oversize request at the advertisement, before it
 /// reaches a handler (a request that travels as a resource; a packet-form one over the cap
 /// is dropped).
 async fn register_destination(

@@ -141,9 +141,17 @@ arc-swap = "1.9.2"
 # `log::warn!` beside it already records the close), and has since moved ahead of
 # upstream on its own semver line: fork patches that keep the public API bump the patch
 # digit, breaking ones bump the minor digit, each listed under `### Breaking` in the
-# fork's CHANGELOG. A new upstream release is handled by rebasing the fork onto it,
-# republishing `coyote-rns-transport` at the first version above both numbers, and
-# bumping the version here, as the crate README spells out.
+# fork's CHANGELOG, and a release that only adds public API may bump the minor digit
+# too so the digit says there is new surface to opt into (its `### Breaking` then reads
+# "None"). A new upstream release is handled by rebasing the fork onto it, republishing
+# `coyote-rns-transport` at the first version above both numbers, and bumping the
+# version here, as the crate README spells out.
+#
+# Of the fork-only surface, Coyote consumes `Transport::destination_desc` (the resolved
+# description of an announced destination), `InboundRequest::track_outcome` with its
+# `ResponseOutcome` (what became of a response the library sent for a handler), and
+# `SharedInstanceOptions::with_state_events` with `SharedInstanceEvent` (the shared
+# instance client's connection state).
 #
 # `lxmf-wire` still comes from upstream LXMF-rs, so its version no longer matches the
 # fork's. What ties the two is `reticulum-rs-core`: the fork depends on
@@ -170,7 +178,7 @@ arc-swap = "1.9.2"
 # re-exports surface this crate does not use, and it covers only the `rns-*` crates and
 # not `lxmf-wire`, so it cannot replace both entries anyway. Depending on the two
 # directly keeps one mechanism instead of two.
-coyote-rns-transport = "0.16.0"
+coyote-rns-transport = "0.17.0"
 lxmf-wire = "0.14.0"
 # Its `Value` appears in `rns_transport`'s `Link::request_payload` and
 # `unpack_response_envelope` signatures, so it must stay semver-unified with the

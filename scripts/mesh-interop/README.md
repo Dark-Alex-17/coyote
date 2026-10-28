@@ -17,9 +17,9 @@ rules, in `src/repl/mesh_share_vectors.rs`).
 
 ### Verification record
 
-Last verified 2026-10-26, on macOS (the netns rows do not exist on this host; they and the
+Last verified 2026-10-28, on macOS (the netns rows do not exist on this host; they and the
 Linux run of row 1 are covered by the `Mesh Interop` CI job), with the Rust side at
-[`coyote-rns-transport`](https://github.com/Dark-Alex-17/coyote-rns-transport) `0.16.0`
+[`coyote-rns-transport`](https://github.com/Dark-Alex-17/coyote-rns-transport) `0.17.0`
 (Coyote's fork of `reticulum-rs-transport`), `lxmf-wire` `0.14.0` and `reticulum-rs-core`
 `0.14.0`, and the Python side at RNS `1.5.2` / LXMF `0.9.6` (the two commits pinned above):
 
