@@ -8132,6 +8132,77 @@ mod tests {
         assert!(!cache_root.exists());
     }
 
+    /// The guard's memory-root pin, felt the way a prompt-building test
+    /// feels it. `memory_config()` starts its workspace walk at the process
+    /// cwd, and under `cargo test` that cwd sits inside a checkout whose
+    /// ancestors may carry a live `.coyote/memory/MEMORY.md`; with the guard
+    /// up the walk starts at the guard's own workspace root instead, so no
+    /// workspace memory is discovered and the rendered prompt carries no
+    /// `<workspace_index>`. An index planted under that root is what the
+    /// walk then finds (the pin steers discovery rather than switching it
+    /// off), and dropping the guard puts the variable back.
+    #[test]
+    #[serial]
+    fn usage_probe_the_guard_pins_the_workspace_memory_root_and_restores_it_on_drop() {
+        let key = memory::WORKSPACE_MEMORY_ROOT_TEST_ENV;
+        let before = env::var_os(key);
+        let workspace_root = {
+            let guard = TestConfigDirGuard::new();
+            write_global_memory_store();
+            let pinned = env::var_os(key).expect("memory root pinned while the guard lives");
+            assert_eq!(PathBuf::from(&pinned), guard.workspace_root);
+            assert_eq!(
+                guard.workspace_root.join(WORKSPACE_COYOTE_DIR_NAME),
+                PathBuf::from(env::var_os(get_env_name("workspace_config_dir")).unwrap()),
+                "the pinned root is the parent of the pinned workspace config dir"
+            );
+
+            let mut ctx = create_test_ctx();
+            ctx.update_app_config(|app| {
+                app.workspace_instructions = Some(false);
+                app.skills_enabled = false;
+                app.memory = None;
+            });
+            let app = ctx.app.config.clone();
+            let config = ctx.memory_config();
+            assert!(config.enabled, "the guarded global store keeps memory on");
+            assert!(
+                config.workspace.is_none(),
+                "the walk never leaves the guard's workspace root: {:?}",
+                config.workspace
+            );
+            let role = ctx.extract_role(&app).unwrap();
+            let prompt = role.prompt();
+            assert!(prompt.contains("<global_index>"), "{prompt}");
+            assert!(!prompt.contains("<workspace_index>"), "{prompt}");
+
+            let index = paths::workspace_memory_dir_for(&guard.workspace_root)
+                .join(crate::config::MEMORY_INDEX_FILE_NAME);
+            create_dir_all(index.parent().unwrap()).unwrap();
+            write(
+                &index,
+                "# Workspace Memory Index\n- planted under the pinned root\n",
+            )
+            .unwrap();
+            let config = ctx.memory_config();
+            assert_eq!(
+                config.workspace.as_ref().map(|w| w.workspace_root.clone()),
+                Some(guard.workspace_root.clone()),
+                "an index under the pinned root is the one the walk finds"
+            );
+            let role = ctx.extract_role(&app).unwrap();
+            let prompt = role.prompt();
+            assert!(
+                prompt.contains("<workspace_index>")
+                    && prompt.contains("planted under the pinned root"),
+                "{prompt}"
+            );
+            guard.workspace_root.clone()
+        };
+        assert_eq!(env::var_os(key), before);
+        assert!(!workspace_root.exists());
+    }
+
     fn default_app_state() -> Arc<AppState> {
         Arc::new(AppState::test_default())
     }
