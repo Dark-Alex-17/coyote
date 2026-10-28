@@ -52,6 +52,8 @@ pub fn memory_function_declarations() -> Vec<FunctionDeclaration> {
             description:
                 "Create or replace a memory file. REQUIRED arguments: name, description, content, \
                  scope (all four must be passed as function arguments; the call fails without them). \
+                 Prefer updating an existing slug over minting a new one; a `-rN` name supersedes the \
+                 previous round under the default policy. \
                  Coyote writes the YAML front matter and the MEMORY.md index entry itself from these \
                  arguments, so never put `name:` / `description:` / `scope:` / `type:` lines inside \
                  `content`. Writing `<base>-r<N>` applies the `memory_round_chains` config key to the \
@@ -2280,6 +2282,11 @@ mod tests {
             "{description}"
         );
         assert!(write.description.contains("`memory_round_chains`"));
+        assert!(
+            write
+                .description
+                .contains("Prefer updating an existing slug")
+        );
         assert!(write.description.contains(
             "Either way, a round written below an existing one keeps superseded_by pointing at \
              the round above."
