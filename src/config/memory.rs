@@ -2091,6 +2091,7 @@ mod tests {
             );
         }
         assert_eq!(store.catalogue().unwrap().entries().len(), 5_000);
+        store.search("topic3", 10, &Filter::default()).unwrap();
 
         let started = time::Instant::now();
         let hits = store
