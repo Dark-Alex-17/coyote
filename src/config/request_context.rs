@@ -2166,16 +2166,13 @@ impl RequestContext {
                 };
                 let with_tools =
                     app.function_calling_support && self.graph_chat_model_supports_fc(app, &role);
-                let cap = if with_tools {
-                    app.memory_facts_cap.unwrap_or(DEFAULT_MEMORY_FACTS_CAP)
-                } else {
-                    app.memory_drill_cap.unwrap_or(DEFAULT_MEMORY_DRILL_CAP)
-                };
-                match memory::build_memory_section(&store, with_tools, cap) {
+                let facts_cap = app.memory_facts_cap.unwrap_or(DEFAULT_MEMORY_FACTS_CAP);
+                let drill_cap = app.memory_drill_cap.unwrap_or(DEFAULT_MEMORY_DRILL_CAP);
+                match memory::build_memory_section(&store, with_tools, facts_cap, drill_cap) {
                     Ok(Some(section)) => {
                         let separator = if role.is_empty_prompt() { "" } else { "\n\n" };
                         role.append_to_prompt(separator);
-                        role.append_to_prompt(&section);
+                        role.append_to_prompt(&section.text);
                         role.append_to_prompt("\n\n");
                         role.append_to_prompt(if with_tools {
                             prompts::DEFAULT_MEMORY_INSTRUCTIONS
@@ -18060,9 +18057,15 @@ mod tests {
             app.memory = None;
         };
         let store = MemoryStore::new(&env::current_dir().unwrap());
-        let memory_section = memory::build_memory_section(&store, true, DEFAULT_MEMORY_FACTS_CAP)
-            .unwrap()
-            .unwrap();
+        let memory_section = memory::build_memory_section(
+            &store,
+            true,
+            DEFAULT_MEMORY_FACTS_CAP,
+            DEFAULT_MEMORY_DRILL_CAP,
+        )
+        .unwrap()
+        .unwrap()
+        .text;
         let memory_tail = format!(
             "{memory_section}\n\n{}",
             prompts::DEFAULT_MEMORY_INSTRUCTIONS

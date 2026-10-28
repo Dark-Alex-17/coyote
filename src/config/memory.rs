@@ -396,11 +396,34 @@ impl MemoryStore {
     }
 }
 
+/// The rendered `<memory>` block plus the figures behind it: how many chars
+/// the facts and catalogue lines held before the cap, and what the cap cut.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemorySection {
+    pub text: String,
+    pub facts_chars: usize,
+    pub catalogue_chars: usize,
+    pub truncated: Option<Truncated>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Truncated {
+    pub lines: usize,
+    pub chars: usize,
+}
+
+/// Renders both MEMORY.md indexes facts first: every non-catalogue line of
+/// the workspace index, then of the global index, under `<facts>`; the
+/// catalogue lines of both under `<catalogue>`. The whole is cut at a line
+/// boundary to `facts_cap` chars, so a catalogue too long for the cap loses
+/// its tail before any fact does. Without tools, drill file bodies follow
+/// inside whatever `drill_cap` leaves after the section so far.
 pub fn build_memory_section(
     store: &MemoryStore,
     with_tools: bool,
-    cap: usize,
-) -> Result<Option<String>> {
+    facts_cap: usize,
+    drill_cap: usize,
+) -> Result<Option<MemorySection>> {
     let global_index = store.load_global_index()?;
     let workspace_index = store.load_workspace_index()?;
 
@@ -408,42 +431,39 @@ pub fn build_memory_section(
         return Ok(None);
     }
 
-    let global_len = global_index.as_deref().map_or(0, count_chars);
-    let workspace_len = workspace_index.as_deref().map_or(0, count_chars);
-    let present = global_index.is_some() as usize + workspace_index.is_some() as usize;
-    let share = cap / present;
+    let mut facts: Vec<&str> = Vec::new();
+    let mut catalogue: Vec<&str> = Vec::new();
+    for index in [&workspace_index, &global_index].into_iter().flatten() {
+        let mut scope_facts = Vec::new();
+        for line in index.lines() {
+            if catalogue_entry(line).is_some() {
+                catalogue.push(line);
+            } else {
+                scope_facts.push(line);
+            }
+        }
+        while scope_facts.last().is_some_and(|l| l.trim().is_empty()) {
+            scope_facts.pop();
+        }
+        facts.extend(scope_facts);
+    }
+    let facts_chars = joined_chars(&facts);
+    let catalogue_chars = joined_chars(&catalogue);
+    let (facts_body, catalogue_body, truncated) =
+        cut_at_line_boundary(&facts, &catalogue, facts_cap);
 
     let mut buf = String::from("<memory>\n");
-    let mut consumed = 0usize;
-
-    if let Some(s) = &global_index {
-        // An even share each, except that a workspace index which fits in its
-        // share hands the rest to the global one.
-        let budget = if workspace_len <= share {
-            cap - workspace_len
-        } else {
-            share
-        };
-        consumed += push_index(&mut buf, "global_index", s, budget, with_tools);
-    }
-
-    if let Some(s) = &workspace_index {
-        // Includes the tail the global index lost to its line-boundary cut.
-        let budget = cap.saturating_sub(consumed);
-        consumed += push_index(&mut buf, "workspace_index", s, budget, with_tools);
-    }
-
-    if consumed < global_len + workspace_len {
-        warn!(
-            "memory indexes ({} chars) exceed cap ({} chars); truncated to the head of each index - \
-             raise memory_cap_* in config or shrink MEMORY.md",
-            global_len + workspace_len,
-            cap
-        );
+    push_block(&mut buf, "facts", &facts_body);
+    push_block(&mut buf, "catalogue", &catalogue_body);
+    if let Some(cut) = &truncated {
+        buf.push_str(&format!(
+            "<!-- memory facts truncated: {} lines / {} chars omitted; run memory__lint -->\n",
+            cut.lines, cut.chars
+        ));
     }
 
     if !with_tools {
-        let mut budget = cap.saturating_sub(consumed);
+        let mut budget = drill_cap.saturating_sub(count_chars(&buf));
         let mut files = store.list_files(Retention::live())?;
         files.retain(|f| f.frontmatter.kind.kind() != MemoryKind::RunState);
         files.sort_by(|a, b| a.frontmatter.name.cmp(&b.frontmatter.name));
@@ -469,52 +489,84 @@ pub fn build_memory_section(
     }
 
     buf.push_str("</memory>");
-    Ok(Some(buf))
+    Ok(Some(MemorySection {
+        text: buf,
+        facts_chars,
+        catalogue_chars,
+        truncated,
+    }))
 }
 
 fn count_chars(s: &str) -> usize {
     s.chars().count()
 }
 
-/// Appends `index` wrapped in `<tag>`, cut to the head that fits `budget`,
-/// and returns the number of index chars injected. A truncated index is
-/// followed by a comment telling the model how to reach the rest.
-fn push_index(buf: &mut String, tag: &str, index: &str, budget: usize, with_tools: bool) -> usize {
-    let total = count_chars(index);
-    let shown = if total <= budget {
-        index
-    } else {
-        head_at_line_boundary(index, budget)
-    };
-    buf.push_str(&format!("<{tag}>\n"));
-    buf.push_str(shown);
-    buf.push_str(&format!("\n</{tag}>\n"));
-    let shown_len = count_chars(shown);
-    if shown_len < total {
-        let how = if with_tools {
-            "call memory__list for the full catalogue and memory__read <name> for a file"
-        } else {
-            "enable function calling for full access"
-        };
-        buf.push_str(&format!(
-            "<!-- {tag} truncated: {shown_len} of {total} chars; {how} -->\n"
-        ));
-    }
-    shown_len
+/// Chars of `lines` once joined by newlines.
+fn joined_chars(lines: &[&str]) -> usize {
+    lines.iter().map(|l| count_chars(l)).sum::<usize>() + lines.len().saturating_sub(1)
 }
 
-/// The first `budget` chars of `s`, pulled back to the last newline so no
-/// line is cut in half. A single line longer than the budget is cut at the
-/// budget rather than dropped.
-fn head_at_line_boundary(s: &str, budget: usize) -> &str {
-    let end = s
-        .char_indices()
-        .nth(budget)
-        .map_or(s.len(), |(byte, _)| byte);
-    match s[..end].rfind('\n') {
-        Some(newline) => &s[..newline],
-        None => &s[..end],
+/// The facts and catalogue bodies once the line sequence `facts ++ catalogue`
+/// is cut at the last line boundary within `cap` chars (counted as joined by
+/// newlines). A first line longer than the cap is cut at the cap rather than
+/// dropped, and counts as one omitted line.
+fn cut_at_line_boundary(
+    facts: &[&str],
+    catalogue: &[&str],
+    cap: usize,
+) -> (String, String, Option<Truncated>) {
+    let total_lines = facts.len() + catalogue.len();
+    let mut kept = 0usize;
+    let mut used = 0usize;
+    for (i, line) in facts.iter().chain(catalogue).enumerate() {
+        let next = used + count_chars(line) + usize::from(i > 0);
+        if next > cap {
+            break;
+        }
+        used = next;
+        kept += 1;
     }
+    if kept == total_lines {
+        return (facts.join("\n"), catalogue.join("\n"), None);
+    }
+    let total_chars = joined_chars(facts)
+        + joined_chars(catalogue)
+        + usize::from(!facts.is_empty() && !catalogue.is_empty());
+    if kept == 0 {
+        let first = facts
+            .first()
+            .or(catalogue.first())
+            .copied()
+            .unwrap_or_default();
+        let head: String = first.chars().take(cap).collect();
+        let cut = Some(Truncated {
+            lines: total_lines,
+            chars: total_chars - cap,
+        });
+        return if facts.is_empty() {
+            (String::new(), head, cut)
+        } else {
+            (head, String::new(), cut)
+        };
+    }
+    let kept_facts = kept.min(facts.len());
+    (
+        facts[..kept_facts].join("\n"),
+        catalogue[..kept - kept_facts].join("\n"),
+        Some(Truncated {
+            lines: total_lines - kept,
+            chars: total_chars - used,
+        }),
+    )
+}
+
+fn push_block(buf: &mut String, tag: &str, body: &str) {
+    buf.push_str(&format!("<{tag}>\n"));
+    if !body.is_empty() {
+        buf.push_str(body);
+        buf.push('\n');
+    }
+    buf.push_str(&format!("</{tag}>\n"));
 }
 
 fn collect_md_files(dir: &Path, out: &mut Vec<MemoryFile>) -> Result<()> {
@@ -612,7 +664,11 @@ mod tests {
             workspace: discover_workspace_memory(&workspace),
         };
 
-        assert!(build_memory_section(&store, true, 6_000).unwrap().is_none());
+        assert!(
+            build_memory_section(&store, true, 4_000, 12_000)
+                .unwrap()
+                .is_none()
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -641,9 +697,10 @@ mod tests {
             workspace: discover_workspace_memory(&workspace),
         };
 
-        let section = build_memory_section(&store, true, 6_000)
+        let section = build_memory_section(&store, true, 4_000, 12_000)
             .unwrap()
-            .expect("memory section should exist");
+            .expect("memory section should exist")
+            .text;
         assert!(section.contains("workspace-index-content"));
         assert!(!section.contains("foo body that should not appear"));
         assert!(section.starts_with("<memory>"));
@@ -677,9 +734,10 @@ mod tests {
             workspace: discover_workspace_memory(&workspace),
         };
 
-        let section = build_memory_section(&store, false, 6_000)
+        let section = build_memory_section(&store, false, 4_000, 12_000)
             .unwrap()
-            .expect("memory section should exist");
+            .expect("memory section should exist")
+            .text;
         let alpha_pos = section.find("alpha body").expect("alpha body missing");
         let zebra_pos = section.find("zebra body").expect("zebra body missing");
         assert!(alpha_pos < zebra_pos, "drill bodies must be alphabetical");
@@ -708,9 +766,10 @@ mod tests {
             workspace: discover_workspace_memory(&workspace),
         };
 
-        let section = build_memory_section(&store, false, 100)
+        let section = build_memory_section(&store, false, 4_000, 100)
             .unwrap()
-            .expect("memory section should exist");
+            .expect("memory section should exist")
+            .text;
         assert!(!section.contains(&big_body));
         assert!(section.contains("memory file(s) omitted"));
 
@@ -749,140 +808,292 @@ mod tests {
         (root, store)
     }
 
-    /// Forty 11-char lines joined by newlines (479 chars), each starting with `prefix`.
-    fn index_lines(prefix: &str) -> String {
-        (0..40)
-            .map(|_| format!("{prefix}0123456789"))
+    /// A global index as `--init-memory` leaves it plus two drill files.
+    const GLOBAL_INDEX: &str = "PLACEHOLDER_CHECK\n- [[g-one]]: desc\n- [[g-two]]: desc";
+    /// A workspace index with headings, four facts and two drill files.
+    const WORKSPACE_INDEX: &str = "# Workspace Memory Index\n\n## Always-on facts\n\
+        - **Fact A.** text\n- **Fact B.** text\n- **Fact C.** text\n- **Fact D.** text\n\n\
+        ## Drill files\n- [[w-one]]: desc\n- [[w-two]]: desc";
+    /// The facts lines of both, workspace first (154 chars).
+    const WORKSPACE_THEN_GLOBAL_FACTS: &str = "# Workspace Memory Index\n\n## Always-on facts\n\
+        - **Fact A.** text\n- **Fact B.** text\n- **Fact C.** text\n- **Fact D.** text\n\n\
+        ## Drill files\nPLACEHOLDER_CHECK";
+
+    /// `count` catalogue lines of 60 chars each, slugs `{prefix}-NNN`, joined by newlines.
+    fn catalogue_lines(prefix: &str, count: usize) -> String {
+        (0..count)
+            .map(|i| format!("- [[{prefix}-{i:03}]]: {}", "d".repeat(48 - prefix.len())))
             .collect::<Vec<_>>()
             .join("\n")
     }
 
     fn tag_body<'a>(section: &'a str, tag: &str) -> &'a str {
         let open = format!("<{tag}>\n");
-        let close = format!("\n</{tag}>\n");
+        let close = format!("</{tag}>\n");
         let start = section.find(&open).expect("open tag") + open.len();
         let end = section[start..].find(&close).expect("close tag") + start;
-        &section[start..end]
+        section[start..end].strip_suffix('\n').unwrap_or("")
     }
 
     #[test]
-    fn build_memory_section_truncates_both_indexes_to_an_even_share_of_the_cap() {
-        let (root, store) =
-            two_index_store("even_share", &index_lines("g"), &index_lines("w"), &[]);
+    fn facts_render_before_the_catalogue_across_both_scopes() {
+        let (root, store) = two_index_store("facts_first", GLOBAL_INDEX, WORKSPACE_INDEX, &[]);
 
-        let section = build_memory_section(&store, true, 200)
+        let section = build_memory_section(&store, true, 4_000, 12_000)
             .unwrap()
             .expect("memory section should exist");
 
-        let global = tag_body(&section, "global_index");
-        let workspace = tag_body(&section, "workspace_index");
-        for (body, prefix) in [(global, "g"), (workspace, "w")] {
-            assert!(
-                body.lines().all(|l| l == format!("{prefix}0123456789")),
-                "index must be cut at a line boundary: {body:?}"
-            );
-            assert!(
-                body.chars().count() <= 100,
-                "each index gets cap/2: {body:?}"
-            );
-        }
-        assert!(global.chars().count() + workspace.chars().count() <= 200);
+        let facts = tag_body(&section.text, "facts");
+        assert_eq!(facts, WORKSPACE_THEN_GLOBAL_FACTS);
         assert!(
-            section.find("<global_index>").unwrap() < section.find("<workspace_index>").unwrap()
+            facts.lines().all(|l| catalogue_entry(l).is_none()),
+            "{facts}"
         );
-        assert!(section.contains(
-            "</global_index>\n<!-- global_index truncated: 95 of 479 chars; \
-             call memory__list for the full catalogue and memory__read <name> for a file -->\n"
-        ));
-        assert!(section.contains(
-            "</workspace_index>\n<!-- workspace_index truncated: 95 of 479 chars; \
-             call memory__list for the full catalogue and memory__read <name> for a file -->\n"
-        ));
-        assert!(section.ends_with("</memory>"));
+        assert_eq!(
+            tag_body(&section.text, "catalogue"),
+            "- [[w-one]]: desc\n- [[w-two]]: desc\n- [[g-one]]: desc\n- [[g-two]]: desc"
+        );
+        assert!(section.text.find("<facts>").unwrap() < section.text.find("<catalogue>").unwrap());
+        assert_eq!(section.facts_chars, 154);
+        assert_eq!(section.catalogue_chars, 4 * 17 + 3);
+        assert_eq!(section.truncated, None);
+        assert!(!section.text.contains("truncated"), "{}", section.text);
 
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn build_memory_section_gives_a_short_indexes_leftover_to_the_other() {
-        let (root, store) = two_index_store("leftover", "short", &index_lines("w"), &[]);
+    fn four_workspace_facts_survive_a_4000_char_cap_with_a_huge_catalogue() {
+        let global = format!("PLACEHOLDER_CHECK\n{}", catalogue_lines("g", 400));
+        let (root, store) = two_index_store("huge_catalogue", &global, WORKSPACE_INDEX, &[]);
 
-        let section = build_memory_section(&store, true, 200)
+        let section = build_memory_section(&store, true, 4_000, 12_000)
             .unwrap()
             .expect("memory section should exist");
 
-        assert_eq!(tag_body(&section, "global_index"), "short");
-        assert!(!section.contains("global_index truncated"));
-        let workspace = tag_body(&section, "workspace_index");
+        let facts = tag_body(&section.text, "facts");
+        assert_eq!(facts, WORKSPACE_THEN_GLOBAL_FACTS);
+        let catalogue = tag_body(&section.text, "catalogue");
+        assert!(catalogue.starts_with("- [[w-one]]: desc\n- [[w-two]]: desc\n- [[g-000]]:"));
+        assert!(facts.chars().count() + 1 + catalogue.chars().count() <= 4_000);
+        // 154 fact chars and the two 17-char workspace lines (36 with their
+        // newlines) leave room for 62 of the 400 global lines at 61 each.
+        assert_eq!(catalogue.lines().count(), 64);
+        let kept_chars = 154 + 36 + 62 * 61;
+        let total_chars = 154 + 1 + 35 + 1 + (400 * 60 + 399);
+        assert_eq!(section.facts_chars, 154);
+        assert_eq!(section.catalogue_chars, 35 + 1 + 400 * 60 + 399);
         assert_eq!(
-            workspace.chars().count(),
-            191,
-            "cap minus the short index, cut at a line: {workspace:?}"
+            section.truncated,
+            Some(Truncated {
+                lines: 338,
+                chars: total_chars - kept_chars,
+            })
         );
-        assert!(section.contains("<!-- workspace_index truncated: 191 of 479 chars;"));
+        assert!(section.text.ends_with(&format!(
+            "</catalogue>\n<!-- memory facts truncated: 338 lines / {} chars omitted; \
+             run memory__lint -->\n</memory>",
+            total_chars - kept_chars
+        )));
 
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn build_memory_section_under_cap_is_untouched() {
-        let (root, store) =
-            two_index_store("under_cap", "global-content", "workspace-content", &[]);
+    fn cut_falls_on_a_line_boundary() {
+        let (root, store) = two_index_store(
+            "line_boundary",
+            &catalogue_lines("g", 40),
+            &catalogue_lines("w", 40),
+            &[],
+        );
 
-        let section = build_memory_section(&store, true, 6_000)
+        let section = build_memory_section(&store, true, 200, 12_000)
+            .unwrap()
+            .expect("memory section should exist");
+
+        assert!(section.text.contains("<facts>\n</facts>\n<catalogue>\n"));
+        let catalogue = tag_body(&section.text, "catalogue");
+        assert!(
+            catalogue
+                .lines()
+                .all(|l| l.chars().count() == 60 && catalogue_entry(l).is_some()),
+            "{catalogue:?}"
+        );
+        // Three 60-char lines and two newlines; a fourth line would need 243.
+        assert_eq!(catalogue.chars().count(), 182);
+        assert!(catalogue.starts_with("- [[w-000]]:"));
+        assert_eq!(section.facts_chars, 0);
+        assert_eq!(section.catalogue_chars, 80 * 60 + 79);
+        assert_eq!(
+            section.truncated,
+            Some(Truncated {
+                lines: 77,
+                chars: 80 * 60 + 79 - 182,
+            })
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn under_cap_is_untouched() {
+        let (root, store) = two_index_store(
+            "under_cap",
+            "global-content\n- [[g]]: desc",
+            "workspace-content\n- [[w]]: desc",
+            &[],
+        );
+
+        let section = build_memory_section(&store, true, 4_000, 12_000)
             .unwrap()
             .expect("memory section should exist");
 
         assert_eq!(
             section,
-            "<memory>\n<global_index>\nglobal-content\n</global_index>\n\
-             <workspace_index>\nworkspace-content\n</workspace_index>\n</memory>"
+            MemorySection {
+                text: "<memory>\n<facts>\nworkspace-content\nglobal-content\n</facts>\n\
+                       <catalogue>\n- [[w]]: desc\n- [[g]]: desc\n</catalogue>\n</memory>"
+                    .into(),
+                facts_chars: 32,
+                catalogue_chars: 27,
+                truncated: None,
+            }
         );
 
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn build_memory_section_at_an_odd_cap_keeps_an_index_exactly_its_share_plus_one() {
-        // 109 chars and 110 chars; cap 219 gives each a share of 109, so the
-        // workspace index needs one char more than its share and the total
-        // sits exactly on the cap.
-        let global = (0..10).map(|_| "g012345678").collect::<Vec<_>>().join("\n");
-        let workspace = format!("{}x", global.replace('g', "w"));
-        assert_eq!(global.chars().count(), 109);
-        assert_eq!(workspace.chars().count(), 110);
-        let (root, store) = two_index_store("odd_cap", &global, &workspace, &[]);
+    fn a_body_exactly_at_the_cap_is_untouched_and_one_under_loses_a_line() {
+        let (root, store) = two_index_store(
+            "exact_cap",
+            "global-content\n- [[g]]: desc",
+            "workspace-content\n- [[w]]: desc",
+            &[],
+        );
 
-        let section = build_memory_section(&store, true, 219)
+        let exact = build_memory_section(&store, true, 60, 12_000)
             .unwrap()
             .expect("memory section should exist");
+        assert_eq!(exact.truncated, None);
+        assert_eq!(
+            tag_body(&exact.text, "catalogue"),
+            "- [[w]]: desc\n- [[g]]: desc"
+        );
 
-        assert_eq!(tag_body(&section, "global_index"), global);
-        assert_eq!(tag_body(&section, "workspace_index"), workspace);
-        assert!(!section.contains("truncated"), "{section}");
+        let short = build_memory_section(&store, true, 59, 12_000)
+            .unwrap()
+            .expect("memory section should exist");
+        assert_eq!(tag_body(&short.text, "catalogue"), "- [[w]]: desc");
+        assert_eq!(
+            short.truncated,
+            Some(Truncated {
+                lines: 1,
+                chars: 14
+            })
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn build_memory_section_without_tools_truncates_indexes_and_omits_drill_bodies() {
+    fn a_first_line_longer_than_the_cap_is_cut_at_the_cap() {
+        let (root, store) = two_index_store("long_line", "- [[g]]: desc", &"x".repeat(50), &[]);
+
+        let section = build_memory_section(&store, true, 20, 12_000)
+            .unwrap()
+            .expect("memory section should exist");
+
+        assert_eq!(tag_body(&section.text, "facts"), "x".repeat(20));
+        assert_eq!(tag_body(&section.text, "catalogue"), "");
+        assert_eq!(
+            section.truncated,
+            Some(Truncated {
+                lines: 2,
+                chars: 50 + 1 + 13 - 20,
+            })
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_one_megabyte_index_renders_within_cap_plus_notice() {
+        let global = catalogue_lines("g", 17_200);
+        assert!(global.len() >= 1 << 20);
+        let (root, store) = two_index_store("one_megabyte", &global, WORKSPACE_INDEX, &[]);
+
+        let section = build_memory_section(&store, true, 4_000, 12_000)
+            .unwrap()
+            .expect("memory section should exist");
+
+        let notice_start = section
+            .text
+            .find("<!-- memory facts truncated:")
+            .expect("notice");
+        let notice_len = section.text[notice_start..].find("-->\n").unwrap() + 4;
+        let tag_overhead =
+            "<memory>\n<facts>\n\n</facts>\n<catalogue>\n\n</catalogue>\n</memory>".len();
+        assert!(
+            section.text.chars().count() <= 4_000 + notice_len + tag_overhead,
+            "{}",
+            section.text.chars().count()
+        );
+        assert!(tag_body(&section.text, "facts").contains("- **Fact D.** text"));
+        assert!(section.truncated.is_some());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn drill_bodies_fill_what_the_drill_cap_leaves_after_the_section() {
+        // "<memory>\n<facts>\nidx\n</facts>\n<catalogue>\n</catalogue>\n" is 55
+        // chars; the body is stored with its trailing newline, 101 chars, and
+        // costs 151 of what is left.
+        let body = "y".repeat(100);
+        let (root, store) = two_index_store("drill_budget", "", "idx", &[("small", &body)]);
+
+        let fits = build_memory_section(&store, false, 4_000, 206)
+            .unwrap()
+            .expect("memory section should exist");
+        assert!(
+            fits.text.contains("<file name=\"small\">\n"),
+            "{}",
+            fits.text
+        );
+        assert!(!fits.text.contains("memory file(s) omitted"));
+
+        let short = build_memory_section(&store, false, 4_000, 205)
+            .unwrap()
+            .expect("memory section should exist");
+        assert!(!short.text.contains(&body));
+        assert!(
+            short.text.contains("1 memory file(s) omitted"),
+            "{}",
+            short.text
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn without_tools_truncates_facts_and_omits_drill_bodies() {
         let big_body = "x".repeat(200);
         let (root, store) = two_index_store(
             "no_tools_cap",
-            &index_lines("g"),
-            &index_lines("w"),
+            &catalogue_lines("g", 40),
+            &catalogue_lines("w", 40),
             &[("big", &big_body)],
         );
 
-        let section = build_memory_section(&store, false, 200)
+        let section = build_memory_section(&store, false, 200, 300)
             .unwrap()
-            .expect("memory section should exist");
+            .expect("memory section should exist")
+            .text;
 
         assert!(section.contains(
-            "<!-- global_index truncated: 95 of 479 chars; enable function calling for full access -->"
-        ));
-        assert!(section.contains(
-            "<!-- workspace_index truncated: 95 of 479 chars; enable function calling for full access -->"
+            "</catalogue>\n<!-- memory facts truncated: 77 lines / 4697 chars omitted; run memory__lint -->\n"
         ));
         assert!(!section.contains(&big_body));
         assert!(
@@ -1096,9 +1307,10 @@ mod tests {
             workspace: discover_workspace_memory(&workspace),
         };
 
-        let section = build_memory_section(&store, false, 6_000)
+        let section = build_memory_section(&store, false, 4_000, 12_000)
             .unwrap()
-            .expect("memory section should exist");
+            .expect("memory section should exist")
+            .text;
         assert!(section.contains("durable body"));
         assert!(!section.contains("scratch body"));
         assert!(!section.contains("bygone body"));
