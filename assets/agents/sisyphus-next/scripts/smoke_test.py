@@ -401,6 +401,12 @@ u = gates.triage_route(base_state(triage=[{"finding": "🟡 maybe", "action": "e
 check("triage_route: unsure yellow -> fix-or-accept escalation", u["escalation"]["kind"] == "yellow_findings")
 u = gates.triage_route(base_state(triage=[], gauntlet_blockers=["b1", "b2"], last_script_error="llm died"))
 check("triage_route: fail-open when triage died -> every blocker is a fix", u["_next"] == "compose_fix" and u["fix_items"] == ["b1", "b2"])
+# round 2: the llm node crashed after round 1 (engine merges nothing, the "failed" string lands in
+# last_node_output), so the stale round-1 verdicts must not be replayed on the new blockers
+u = gates.triage_route(base_state(triage=[{"finding": "old", "action": "reject", "citation": "src/x.go:1", "lane": "code-review"}], gauntlet_blockers=["b3"], review_rounds=1))
+check("triage_route: the previous round's triage list is reset in the update dict", u["triage"] == [])
+u = gates.triage_route(base_state(triage=[], gauntlet_blockers=["b3"], last_node_output="LLM node failed: timeout", review_rounds=1))
+check("triage_route: round 2 crash with a reset list -> every new blocker is a fix", u["_next"] == "compose_fix" and u["fix_items"] == ["b3"] and u["triage"] == [])
 _fix = [{"finding": "x", "action": "fix", "lane": "code-review"}]
 u = gates.triage_route(base_state(debris_exemptions=["a:1 -- x"], debris_exemptions_new=["b:2 -- y"], triage=_fix, review_rounds=0))
 check("triage_route: per-round debris_exemptions_new merges into the ledger and is reset",

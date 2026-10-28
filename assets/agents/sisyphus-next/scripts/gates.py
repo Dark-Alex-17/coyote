@@ -1216,7 +1216,7 @@ def triage_route(state):
     for e in as_list(state.get("debris_exemptions")):
         if e not in exemptions:
             exemptions.append(e)
-    u.update({"rejected_findings": rejected, "deferred_findings": deferred, "debris_exemptions": exemptions, "debris_exemptions_new": []})
+    u.update({"rejected_findings": rejected, "deferred_findings": deferred, "debris_exemptions": exemptions, "debris_exemptions_new": [], "triage": []})
 
     streak = dict(as_dict(state.get("lane_block_streak")))
     lanes_now = {lane for lane, _ in fixes}
