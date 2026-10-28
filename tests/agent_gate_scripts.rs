@@ -1619,6 +1619,36 @@ fn architect_pr_body_directive_names_the_tasks_filter_only_under_multi() {
     }
 }
 
+/// Runs `collect_ledger_lines` from the sourced tools.sh with the argc
+/// variables bound by `envs` (`argc_plan` points at the fixture's plan file
+/// unless an env overrides it).
+#[cfg(unix)]
+fn collect_ledger_lines_with(
+    dir: &Path,
+    tag: &str,
+    envs: &[(&str, &str)],
+) -> (i32, String, String) {
+    let script = format!(
+        "source '{}'; collect_ledger_lines",
+        asset("architect/tools.sh").display()
+    );
+    run(bash()
+        .arg("-c")
+        .arg(&script)
+        .env(
+            "LLM_ROOT_DIR",
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("assets"),
+        )
+        .env("LLM_AGENT_ROOT_DIR", asset("architect"))
+        .env("LLM_OUTPUT", "/dev/stdout")
+        .env("argc_dir", dir.join("tasks"))
+        .env("argc_tag", tag)
+        .env("argc_plan", dir.join("PLAN-x.md"))
+        .envs(envs.iter().copied())
+        .output()
+        .expect("spawn bash"))
+}
+
 /// collect_ledger_lines prints the block under each hit indented beneath
 /// the `<task> (log.md:NN): <line>` line, stopping at the next entry tag, so
 /// a bare `Follow-ups:` line arrives with its bullets and a wrapped bullet
@@ -1629,6 +1659,10 @@ fn collect_ledger_lines_prints_the_block_under_a_hit() {
     if tools_missing() {
         return;
     }
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
     let dir = pr_body_fixture(
         "collect-ledger-lines",
         "Follow-ups:\n\
@@ -1637,22 +1671,7 @@ fn collect_ledger_lines_prints_the_block_under_a_hit() {
            that wraps\n\
          rejected-finding: finding one - evidence src/x.rs:3\n",
     );
-    let script = format!(
-        "source '{}'; collect_ledger_lines",
-        asset("architect/tools.sh").display()
-    );
-    let (code, stdout, stderr) = run(bash()
-        .arg("-c")
-        .arg(&script)
-        .env(
-            "LLM_ROOT_DIR",
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("assets"),
-        )
-        .env("LLM_OUTPUT", "/dev/stdout")
-        .env("argc_dir", dir.0.join("tasks"))
-        .env("argc_tag", "Follow-ups:")
-        .output()
-        .expect("spawn bash"));
+    let (code, stdout, stderr) = collect_ledger_lines_with(&dir.0, "Follow-ups:", &[]);
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     assert_eq!(
         stdout,
@@ -1665,6 +1684,217 @@ fn collect_ledger_lines_prints_the_block_under_a_hit() {
         ]
         .join("\n")
     );
+}
+
+/// A tasks tree shared by two plans: one plan owns a complete task, a
+/// pending task and a complete task whose `plan:` has no `.md`; the other
+/// plan owns a complete task. Every log carries the same tag line.
+#[cfg(unix)]
+fn shared_tasks_fixture(label: &str) -> TempDirGuard {
+    let dir = fixture_dir(label);
+    fs::write(
+        dir.0.join("PLAN-x.md"),
+        "---\nrigor: production\n---\n# Plan\n",
+    )
+    .unwrap();
+    for (name, plan, status, file) in [
+        ("TASK-1-a", "PLAN-x.md", "complete", "src/a.rs:1"),
+        ("TASK-2-b", "PLAN-x.md", "pending", "src/b.rs:2"),
+        ("TASK-3-c", "PLAN-x", "complete", "src/c.rs:3"),
+        ("TASK-5-e", "PLAN-y.md", "complete", "src/e.rs:5"),
+    ] {
+        let task = dir.0.join("tasks").join(name);
+        fs::create_dir_all(&task).unwrap();
+        fs::write(
+            task.join("index.md"),
+            format!("---\nplan: {plan}\nstatus: {status}\ntitle: \"{name}\"\n---\n"),
+        )
+        .unwrap();
+        fs::write(
+            task.join("log.md"),
+            format!("## 2026-10-27 - completed\nCommit 0123abc on feat/x.\ndebris-exempt: {file} -- {name}\n"),
+        )
+        .unwrap();
+    }
+    dir
+}
+
+/// `--plan` keeps the read to the named plan's `status: complete` tasks: the
+/// other plan's task and the pending task stay out, and a `plan:` written
+/// without `.md` still matches. `--tasks` narrows the read to the listed
+/// ids, and a listed id with no task under the plan is a NOTE in the tool
+/// output, never a silent drop.
+#[cfg(unix)]
+#[test]
+fn collect_ledger_lines_reads_only_the_plans_complete_tasks() {
+    if tools_missing() {
+        return;
+    }
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = shared_tasks_fixture("collect-ledger-plan");
+    let (code, stdout, stderr) = collect_ledger_lines_with(&dir.0, "debris-exempt", &[]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        stdout,
+        [
+            "TASK-1-a (log.md:3): debris-exempt: src/a.rs:1 -- TASK-1-a",
+            "TASK-3-c (log.md:3): debris-exempt: src/c.rs:3 -- TASK-3-c",
+            "",
+        ]
+        .join("\n"),
+        "only the named plan's complete tasks may be read"
+    );
+
+    let (code, stdout, stderr) =
+        collect_ledger_lines_with(&dir.0, "debris-exempt", &[("argc_tasks", "TASK-3")]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        stdout, "TASK-3-c (log.md:3): debris-exempt: src/c.rs:3 -- TASK-3-c\n",
+        "`--tasks` must keep the listed member alone"
+    );
+
+    let (code, stdout, stderr) =
+        collect_ledger_lines_with(&dir.0, "debris-exempt", &[("argc_tasks", "TASK-3,TASK-9")]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("plan_tasks: NOTE listed in --tasks but not found under the plan: TASK-9"),
+        "the unknown member must reach the tool output as a NOTE: {stdout}"
+    );
+    assert!(
+        stdout.contains("TASK-3-c (log.md:3): debris-exempt: src/c.rs:3 -- TASK-3-c")
+            && !stdout.contains("TASK-1-a")
+            && !stdout.contains("NOTE listed in --tasks but not found under the plan: TASK-9 ("),
+        "the NOTE is its own line, never read as a task dir: {stdout}"
+    );
+
+    let (code, stdout, stderr) =
+        collect_ledger_lines_with(&dir.0, "debris-exempt", &[("argc_tasks", "TASK-9")]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("NOTE listed in --tasks but not found under the plan: TASK-9")
+            && stdout.ends_with("(none)\n"),
+        "{stdout}"
+    );
+}
+
+/// Through the built argc tool, `--plan` is required: a call without it is
+/// a usage error (non-zero, no `(none)`, the option named), and a call with
+/// it plus `--tasks` reaches the same scoped read the sourced function gave.
+#[cfg(unix)]
+#[test]
+fn collect_ledger_lines_refuses_a_call_without_a_plan() {
+    if tools_missing() {
+        return;
+    }
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = shared_tasks_fixture("collect-ledger-argc");
+    let source = fs::read_to_string(asset("architect/tools.sh")).unwrap();
+    let built = argc::build(&source, "", None).expect("argc build");
+    let tool = dir.0.join("tools.built.sh");
+    fs::write(&tool, built).unwrap();
+    let run_tool = |args: &[&str]| {
+        run(bash()
+            .arg(&tool)
+            .arg("collect_ledger_lines")
+            .args(args)
+            .env(
+                "LLM_ROOT_DIR",
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("assets"),
+            )
+            .env("LLM_AGENT_ROOT_DIR", asset("architect"))
+            .env("LLM_OUTPUT", "/dev/stdout")
+            .output()
+            .expect("spawn bash"))
+    };
+    let tasks = dir.0.join("tasks");
+    let tasks = tasks.to_str().unwrap();
+    let plan = dir.0.join("PLAN-x.md");
+    let plan = plan.to_str().unwrap();
+
+    let (code, stdout, stderr) = run_tool(&["--tag", "debris-exempt", "--dir", tasks]);
+    assert_ne!(code, 0, "a call without --plan must fail: {stdout}");
+    assert!(
+        stderr.contains("--plan"),
+        "the usage error must name the missing option: {stderr}"
+    );
+    assert!(
+        !stdout.contains("(none)") && !stdout.contains("debris-exempt:"),
+        "nothing may be read without a plan: {stdout}"
+    );
+
+    let (code, stdout, stderr) = run_tool(&[
+        "--tag",
+        "debris-exempt",
+        "--plan",
+        plan,
+        "--dir",
+        tasks,
+        "--tasks",
+        "TASK-3",
+    ]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        stdout, "TASK-3-c (log.md:3): debris-exempt: src/c.rs:3 -- TASK-3-c\n",
+        "the argc options must reach the function"
+    );
+}
+
+/// Every rendered `collect_ledger_lines --tag ...` call carries `--plan`,
+/// under both PR strategies, so no instruction sends the tool at the shared
+/// tasks dir without the plan that scopes it.
+#[test]
+fn architect_ledger_calls_always_name_the_plan() {
+    if tools_missing() {
+        return;
+    }
+    let script = format!(
+        "source '{}'; render_instructions '{}'",
+        asset(".shared/utils.sh").display(),
+        asset("architect/instructions.md").display()
+    );
+    let call = "collect_ledger_lines --tag";
+    for strategy in ["multi", "single"] {
+        let (code, stdout, stderr) = run(bash()
+            .arg("-c")
+            .arg(&script)
+            .env("LLM_AGENT_VAR_PR_STRATEGY", strategy)
+            .output()
+            .expect("spawn bash"));
+        assert_eq!(code, 0, "render under {strategy}: {stderr}");
+        let calls: Vec<&str> = stdout
+            .match_indices(call)
+            .map(|(at, _)| {
+                let rest = &stdout[at..];
+                let end = rest.find('`').unwrap_or(rest.len());
+                &rest[..end]
+            })
+            .collect();
+        assert!(
+            !calls.is_empty(),
+            "{strategy}: the hygiene brief must still collect its starting ledger with the tool"
+        );
+        for text in &calls {
+            assert!(
+                text.contains("--plan ") && text.contains("--dir "),
+                "{strategy}: a ledger call without --plan reads every plan's tasks: {text:?}"
+            );
+        }
+        assert!(
+            !stdout.contains("--tag <tag> --dir"),
+            "{strategy}: the body's ledger sections come from assemble_pr_body, not a second collection step"
+        );
+        assert_eq!(
+            stdout.contains("goes on every `collect_ledger_lines` call made for this group"),
+            strategy == "multi",
+            "{strategy}: the group-member rule for ledger calls renders only under multi"
+        );
+    }
 }
 
 #[test]

@@ -11,9 +11,11 @@ _instructions() {
   render_instructions "$LLM_AGENT_ROOT_DIR/instructions.md" >> "$LLM_OUTPUT"
 }
 
-# @cmd Collect tagged ledger lines from task log.md files - the grep-complete rollup for Phase F reports, hygiene briefs, and PR bodies (rejected-finding: / design-decision / Follow-ups: / debris-exempt / "(deferred by quality bar)"). Prints one "<task> (log.md:NN): <line>" per hit grouped by task, with the block under a tag line (its bullets, up to a blank line, the next ## heading, or the next tag line) indented beneath it, or "(none)" - a missed line is a tool bug, not an attention slip.
+# @cmd Collect tagged ledger lines from the plan's completed tasks' log.md files - the grep-complete rollup for Phase F reports, hygiene briefs, and PR bodies (rejected-finding: / design-decision / Follow-ups: / debris-exempt / "(deferred by quality bar)"). Only task dirs whose index.md names the plan (`plan:`, with or without `.md`) and is `status: complete` are read, so a tasks dir shared by several plans never leaks another run's lines. Prints one "<task> (log.md:NN): <line>" per hit grouped by task, with the block under a tag line (its bullets, up to a blank line, the next ## heading, or the next tag line) indented beneath it, or "(none)" - a missed line is a tool bug, not an attention slip.
 # @option --tag! Literal tag text to collect (fixed string, not a regex)
+# @option --plan! Path to PLAN-<slug>.md; its name with the `.md` stripped selects the tasks whose `plan:` field names it
 # @option --dir! Directory searched recursively for log.md files (the plans tasks dir)
+# @option --tasks Comma-separated task ids (TASK-a,TASK-b): read only those tasks - a PR group's members under pr_strategy=multi
 collect_ledger_lines() {
   local dir="${argc_dir}"
   local tag="${argc_tag}"
@@ -21,10 +23,31 @@ collect_ledger_lines() {
     echo "collect_ledger_lines: directory not found: ${dir}" >> "$LLM_OUTPUT"
     return 1
   fi
-  local hits
+  # The plan's completed task dirs (plan_tasks.py: same identity rule as
+  # assemble_pr_body), printed as <dir>/<rel> so the prefix strip below holds.
+  # Its NOTE lines (a listed id it could not find) go to fd 3, opened on
+  # LLM_OUTPUT outside the capture: inside `$(...)` a `2>>/dev/stdout` would
+  # land in the listing instead and be read as a task dir.
+  local -a scope=(--plan "${argc_plan}" --tasks-dir "${dir}")
+  [[ -n "${argc_tasks:-}" ]] && scope+=(--tasks "${argc_tasks}")
+  local listing listed=0
+  { listing=$(python3 "$LLM_AGENT_ROOT_DIR/plan_tasks.py" "${scope[@]}" 2>&3) || listed=$?; } 3>> "$LLM_OUTPUT"
+  if [[ "${listed}" -ne 0 ]]; then
+    echo "collect_ledger_lines: could not list the plan's tasks under ${dir}" >> "$LLM_OUTPUT"
+    return 1
+  fi
+  local -a task_dirs=()
+  local d
+  while IFS= read -r d; do
+    [[ -n "${d}" ]] && task_dirs+=("${d}")
+  done <<< "${listing}"
+  local hits=""
   # -F: the tag is a literal, never a pattern; -I skips binaries; grep exit 1
-  # (no matches) is the clean result, not an error.
-  hits=$(grep -rInF --include=log.md -- "${tag}" "${dir}" 2>/dev/null) || true
+  # (no matches) is the clean result, not an error. -r on each task dir keeps
+  # the <path>:NN:line prefix whatever the count.
+  if [[ ${#task_dirs[@]} -gt 0 ]]; then
+    hits=$(grep -rInF --include=log.md -- "${tag}" "${task_dirs[@]}" 2>/dev/null) || true
+  fi
   if [[ -z "${hits}" ]]; then
     echo "(none)" >> "$LLM_OUTPUT"
     return 0

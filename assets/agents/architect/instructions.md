@@ -814,8 +814,9 @@ At the current group's close-out (and, for steps 5-8, after the last group's):
    invalid and must not be sent. Also
    collect every `debris-exempt` line from the completed tasks' `log.md` files into a
    starting ledger the brief carries verbatim (those are the exemptions earlier tasks already
-   justified) - use `collect_ledger_lines --tag debris-exempt --dir {{plans_dir}}/tasks`; it is
-   grep-complete. The brief:
+   justified) - use `collect_ledger_lines --tag debris-exempt --plan {{plans_dir}}/PLAN-<slug>.md
+   --dir {{plans_dir}}/tasks`; it is grep-complete and reads only THIS plan's completed tasks
+   (the tasks dir is shared across plans). The brief:
    - Sweep the RUN's whole diff -- `git -C {{project_dir}} diff --no-color --no-ext-diff $base..HEAD -- :/ ":(top,literal,exclude)<plans rel>"`
      (the plan files name tasks and premises by design; same `..` rule for the exclude) -- for:
      the debt markers named in the code-review skill (every owning task is complete by the time
@@ -874,11 +875,11 @@ At the current group's close-out (and, for steps 5-8, after the last group's):
    (resume the SAME Sisyphus session, then a FRESH gauntlet run). Copy the `HYGIENE:` items into
    the hygiene task's `log.md` and mark it complete per Phase E step 5.
 3. **Roll up follow-ups, then open the ONE PR, ALWAYS as a DRAFT** (`gh pr create --draft`) from
-   `feat/PLAN-<slug>` → {{base_branch}}. First collect every "Follow-ups:" line from the completed
-   tasks' `log.md` files — findings tagged `(deferred by quality bar)` ride this rollup unchanged
-   -- and every `rejected-finding:` line, with `collect_ledger_lines --tag <tag> --dir
-   {{plans_dir}}/tasks` (one call per tag; the tool is grep-complete, an attention pass is not,
-   and a dropped ledger line is a silent report defect). Title: `PLAN-<slug>: <design doc
+   `feat/PLAN-<slug>` -> {{base_branch}}. Every "Follow-ups:" line from the completed tasks'
+   `log.md` files -- findings tagged `(deferred by quality bar)` ride this rollup unchanged -- and
+   every `rejected-finding:` line reach the body through `assemble_pr_body` below (the tool is
+   grep-complete, an attention pass is not, and a dropped ledger line is a silent report
+   defect; there is no separate collection step). Title: `PLAN-<slug>: <design doc
    title>`. Body MUST contain, in order:
    - the plan's Problem/Approach summary,
    - a `**Quality bar:**` line — MANDATORY whenever the plan's rigor is below `production` (omit
@@ -915,7 +916,9 @@ At the current group's close-out (and, for steps 5-8, after the last group's):
    PLAN's `## PR groups` row for this group): the tool otherwise takes every complete task of
    the plan, so from group 2 on the earlier groups' tasks and ledger lines would land in this
    group's body; with `--tasks` the checklist and the rollups hold this group's members alone
-   (a listed id it cannot find or that is not complete is a `NOTE`).
+   (a listed id it cannot find or that is not complete is a `NOTE`). The same `--tasks <member
+   ids>` goes on every `collect_ledger_lines` call made for this group (the hygiene ledger in
+   step 2 when the hygiene pass runs per group), so a sibling group's lines stay out of it.
 <!-- end -->
 <!-- when:task_granularity=micro -->
    Micro runs produce 3-5x the tasks: group the checklist BY BATCH, one heading per batch with
