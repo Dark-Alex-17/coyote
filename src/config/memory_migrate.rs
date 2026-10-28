@@ -394,7 +394,10 @@ impl fmt::Display for Report {
             }
         }
         if self.apply {
-            writeln!(f, "next: `coyote -r memory-hygiene` for the judgement pass")
+            writeln!(
+                f,
+                "next: review the remaining sections by hand; migrate leaves them as they are"
+            )
         } else {
             writeln!(
                 f,
@@ -460,6 +463,13 @@ fn write_scope(f: &mut fmt::Formatter<'_>, report: &ScopeReport, apply: bool) ->
         report.run_state_stamps.clone(),
         SECTION_LIST_CAP,
     )?;
+    if !report.run_state_stamps.is_empty() {
+        writeln!(
+            f,
+            "    these are now run-state: no longer inlined into the prompt, and \
+             lint flags each until it has an expires date"
+        )?;
+    }
     write_section(
         f,
         &format!("bodies over {MEMORY_FILE_HARD_CAP} chars"),
@@ -806,7 +816,15 @@ mod tests {
         );
         assert!(text.contains("  backup: "), "{text}");
         assert!(
-            text.ends_with("next: `coyote -r memory-hygiene` for the judgement pass\n"),
+            text.ends_with(
+                "next: review the remaining sections by hand; migrate leaves them as they are\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "  type set to run-state: 2\n    plan-r1\n    plan-r3\n    these are now run-state"
+            ),
             "{text}"
         );
     }
@@ -1079,7 +1097,7 @@ mod tests {
             format!(
                 "global: skipped, no memory dir at {}\n\
                  workspace: skipped, no workspace memory found from the current directory\n\
-                 next: `coyote -r memory-hygiene` for the judgement pass\n",
+                 next: review the remaining sections by hand; migrate leaves them as they are\n",
                 nowhere.join("memory").display()
             )
         );
