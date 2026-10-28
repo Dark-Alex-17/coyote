@@ -21645,6 +21645,19 @@ mod tests {
                 .collect()
         }
 
+        fn unbounded(node_id: &str, kind: &str) -> String {
+            format!(
+                "{node_id}: timeout: 0 disables the wall-clock bound for {kind} node \
+                 '{node_id}'; it runs until it returns or an enclosing bound \
+                 (settings.timeout, an outer agent node's timeout, or abort) ends it"
+            )
+        }
+
+        fn sorted(mut lines: Vec<String>) -> Vec<String> {
+            lines.sort();
+            lines
+        }
+
         fn shadowed(names: &[&str]) -> Vec<String> {
             names
                 .iter()
@@ -21731,6 +21744,106 @@ mod tests {
             ("finding-verifier".to_string(), Vec::new()),
             ("librarian".to_string(), Vec::new()),
             ("review-gauntlet".to_string(), Vec::new()),
+            // The candidate graph routes almost everything through script
+            // `_next` edges and runs its long islands (coder, gauntlet,
+            // step-runner) plus the owner poll without a wall-clock bound.
+            (
+                "sisyphus-next".to_string(),
+                sorted(
+                    [
+                        vec![
+                            "-: settings.timeout: 0 disables the graph wall-clock bound; \
+                             the run ends only when the graph completes, is aborted, or \
+                             another limit stops it"
+                                .to_string(),
+                            unbounded("ask_owner_poll", "script"),
+                            unbounded("run_coder", "agent"),
+                            unbounded("run_gauntlet", "agent"),
+                            unbounded("run_step", "agent"),
+                        ],
+                        unreachable(&[
+                            "apply_answer",
+                            "architecture_review",
+                            "ask_dispatch",
+                            "ask_owner_poll",
+                            "ask_owner_route",
+                            "ask_review_incomplete",
+                            "ask_user",
+                            "bookkeeping_judge",
+                            "bookkeeping_route",
+                            "bookkeeping_scan",
+                            "build_gauntlet_prompt",
+                            "check_inbox_final",
+                            "check_inbox_pre",
+                            "ci_apply",
+                            "ci_diagnose",
+                            "ci_gate",
+                            "ci_poll",
+                            "ci_route",
+                            "compose_brief",
+                            "compose_fix",
+                            "consult_navigator",
+                            "consult_oracle",
+                            "consult_route",
+                            "debt_scan",
+                            "design_gate",
+                            "diagnose_failure",
+                            "end_aborted",
+                            "end_answer",
+                            "end_blocked",
+                            "end_complete",
+                            "end_redirect",
+                            "escalate_gate",
+                            "explore_fanout_solo",
+                            "explore_fanout_team",
+                            "explore_fault",
+                            "explore_slice_solo",
+                            "explore_slice_team",
+                            "final_report",
+                            "git_ops",
+                            "inbox_route_pre",
+                            "ladder_judge",
+                            "ladder_route",
+                            "librarian_fanout",
+                            "librarian_fault",
+                            "librarian_question",
+                            "merge_oracle",
+                            "next_subtask",
+                            "observability_gate",
+                            "observability_pass",
+                            "observability_route",
+                            "oracle_gate",
+                            "oracle_strikeout",
+                            "parse_answer",
+                            "plan_research",
+                            "plan_subtasks",
+                            "pr_gate",
+                            "record_subtasks",
+                            "render_coder_prompt",
+                            "research_answer",
+                            "research_dispatch",
+                            "review_gate",
+                            "route_coder_result",
+                            "route_gauntlet",
+                            "run_coder",
+                            "run_gauntlet",
+                            "run_step",
+                            "run_whetstone",
+                            "scope_check",
+                            "send_breach_notice",
+                            "strikeout",
+                            "strikeout_route",
+                            "summarize_run",
+                            "synthesize_context",
+                            "triage_findings",
+                            "triage_route",
+                            "whetstone_gate",
+                            "write_context_pack",
+                        ]),
+                    ]
+                    .concat(),
+                ),
+            ),
             (
                 "step-runner".to_string(),
                 [
