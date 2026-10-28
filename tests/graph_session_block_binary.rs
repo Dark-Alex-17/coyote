@@ -137,7 +137,8 @@ fn run_with(dir: &Path, args: &[&str]) -> Output {
 /// cases that pin a host knob (the log level) rather than inherit it.
 fn run_with_env(dir: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
     let home = dir.join("home");
-    Command::new(env!("CARGO_BIN_EXE_coyote"))
+    let binary = Path::new(env!("CARGO_BIN_EXE_coyote"));
+    Command::new(binary)
         .args(args)
         .current_dir(dir)
         .env("COYOTE_CONFIG_DIR", dir)
@@ -145,6 +146,7 @@ fn run_with_env(dir: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output
         .env("HOME", &home)
         .env("USERPROFILE", &home)
         .env("NO_COLOR", "1")
+        .env("PATH", pinned_path(binary.parent().unwrap()))
         .env_remove("COYOTE_LOG_PATH")
         .env_remove("COYOTE_WORKSPACE_CONFIG_DIR")
         .env_remove("IS_SANDBOX")
@@ -154,6 +156,20 @@ fn run_with_env(dir: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output
         .stdin(Stdio::null())
         .output()
         .unwrap()
+}
+
+/// A PATH holding only `bin_dir` (the built binary's own directory) and the
+/// system shell directories, so the fixture's `sh`/`bash` hooks and tool
+/// scripts resolve the same way on every host and nothing else on the
+/// developer's PATH can leak into a run.
+fn pinned_path(bin_dir: &Path) -> std::ffi::OsString {
+    let system_dirs: Vec<PathBuf> = if cfg!(windows) {
+        let system_root = env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+        vec![Path::new(&system_root).join("System32")]
+    } else {
+        vec![PathBuf::from("/usr/bin"), PathBuf::from("/bin")]
+    };
+    env::join_paths(std::iter::once(bin_dir.to_path_buf()).chain(system_dirs)).unwrap()
 }
 
 fn stdout_of(output: &Output) -> String {
@@ -2545,7 +2561,7 @@ fn usage_probe_example_carry_fixture_is_line_ending_independent() {
     );
     let crlf = lf.replace('\n', "\r\n");
     assert!(
-        crlf.contains("\r\n# carry:\r\n#   - final_report\r\n"),
+        crlf.contains(&COMMENTED_CARRY.replace('\n', "\r\n")),
         "CRLF fixture must present the carry block with CRLF bytes"
     );
     assert!(
@@ -2624,6 +2640,67 @@ fn usage_probe_uncommenting_the_example_carry_block_loads_from_a_cold_start() {
                 &["carry key 'nope' is not declared anywhere"],
             );
         }
+    }
+}
+
+/// Graph-Agents.md says `previous_turns` is reserved like `initial_prompt`:
+/// declaring it in `initial_state` or as a `variables[]` name fails at graph
+/// load with the quoted text, from a cold start, before any model or script
+/// runs. The same graph with the declaration dropped loads and runs.
+#[test]
+fn usage_probe_a_reserved_previous_turns_declaration_fails_at_graph_load() {
+    const GRAPH_TAIL: &str = "start: done\n\
+        nodes:\n\
+        \x20 done: { type: end, output: \"{{initial_prompt}}\" }\n";
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "previous_turns in initial_state",
+            "initial_state: { said: \"\", previous_turns: x }\n",
+            "initial_state key 'previous_turns' is reserved (the dispatcher seeds it)",
+        ),
+        (
+            "previous_turns as a variable name",
+            "initial_state: { said: \"\" }\n\
+             variables:\n\
+             \x20 - name: previous_turns\n\
+             \x20   description: the earlier turns\n\
+             \x20   default: none\n",
+            "variables[] name 'previous_turns' is reserved",
+        ),
+    ];
+    for (label, head, expected) in cases {
+        let dir = fresh_config_dir("reserved-turns");
+        let _guard = TempDirGuard(dir.clone());
+        write_fixture(&dir, "");
+        let graph = dir.join("agents").join(AGENT).join("graph.yaml");
+        fs::write(
+            &graph,
+            format!(
+                "name: echo-graph\nversion: \"1.0\"\ndescription: Echoes the prompt.\n{head}{GRAPH_TAIL}"
+            ),
+        )
+        .unwrap();
+        let output = run_echo(&dir);
+        assert_fails_at_graph_load(label, &output, &[expected]);
+        // The run never reached the graph: the dry-run echo is absent.
+        assert!(
+            !stdout_of(&output).lines().any(|line| line == "hello"),
+            "{label}: the graph ran despite the reserved key:\n{}",
+            stdout_of(&output)
+        );
+
+        // Control: the same graph without the reserved declaration runs.
+        let clean = head
+            .replace(", previous_turns: x", "")
+            .replace("previous_turns", "earlier_turns");
+        fs::write(
+            &graph,
+            format!(
+                "name: echo-graph\nversion: \"1.0\"\ndescription: Echoes the prompt.\n{clean}{GRAPH_TAIL}"
+            ),
+        )
+        .unwrap();
+        assert_echoes_hello(&format!("{label} (control)"), &run_echo(&dir));
     }
 }
 

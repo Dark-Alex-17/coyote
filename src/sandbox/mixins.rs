@@ -477,6 +477,10 @@ capabilities:
             ]
         );
         assert!(
+            paths::sbx_kits_dir().starts_with(config.cache_root()),
+            "the guard pins the sbx kit cache under its cache root, or the next assert is vacuous"
+        );
+        assert!(
             kits.iter()
                 .all(|kit| !kit.dir.starts_with(config.cache_root())),
             "the sbx kit cache is not a discovery root: {kits:?}"

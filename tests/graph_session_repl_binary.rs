@@ -20,9 +20,30 @@ use std::{env, process};
 
 struct TempDirGuard(PathBuf);
 
+/// Teardown budget for the hook race: the binary only waits for a hook's
+/// spawn, so the `turn.completed` capture shell can still be writing its
+/// log while the directory is removed. Bounded waits, never asserted on.
+const TEARDOWN_BUDGET: Duration = Duration::from_secs(2);
+const TEARDOWN_POLL: Duration = Duration::from_millis(50);
+
 impl Drop for TempDirGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        let deadline = Instant::now() + TEARDOWN_BUDGET;
+        if env_log(&self.0, "turn.started").exists() {
+            while !env_log(&self.0, "turn.completed").exists() && Instant::now() < deadline {
+                thread::sleep(TEARDOWN_POLL);
+            }
+        }
+        let mut result = fs::remove_dir_all(&self.0);
+        while result.is_err() && Instant::now() < deadline {
+            thread::sleep(TEARDOWN_POLL);
+            result = fs::remove_dir_all(&self.0);
+        }
+        if let Err(error) = result
+            && self.0.exists()
+        {
+            eprintln!("leaked temp dir {}: {error}", self.0.display());
+        }
     }
 }
 
@@ -2810,5 +2831,83 @@ fn usage_probe_a_live_block_removal_keeps_recording_while_carrying_and_clears_th
         four["messages"].as_sequence().unwrap().len(),
         messages_after_one + 6,
         "{four:?}"
+    );
+}
+
+/// Graph-Agents.md: under a session the dispatcher seeds `previous_turns`
+/// with the session's earlier exchanges as `user: ...` / `assistant: ...`
+/// lines, skipping the System row; without a session the key is `""`. The
+/// recipe's dry run records nothing, so the saved session file is left
+/// byte-for-byte as it was and `<cache>/sessions` never appears.
+#[test]
+fn usage_probe_previous_turns_renders_the_sessions_exchanges_and_nothing_without_one() {
+    const TURNS_GRAPH: &str = "name: echo-graph\n\
+        version: \"1.0\"\n\
+        description: Echoes the earlier turns.\n\
+        initial_state: { said: \"\" }\n\
+        start: done\n\
+        nodes:\n\
+        \x20 done: { type: end, output: \"turns<{{previous_turns}}>\" }\n";
+    const DEMO: &str = "model: dryrun:dry-model\n\
+        messages:\n\
+        \x20 - role: system\n\
+        \x20   content: ROLE PROMPT NEVER RENDERED\n\
+        \x20 - role: user\n\
+        \x20   content: hello\n\
+        \x20 - role: assistant\n\
+        \x20   content: 'before: '\n";
+    let dir = fresh_config_dir("previous-turns");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, RECIPE_BLOCK);
+    let agent_dir = dir.join("agents").join(GRAPH_AGENT);
+    fs::write(
+        agent_dir.join("graph.yaml"),
+        format!("{TURNS_GRAPH}{RECIPE_BLOCK}"),
+    )
+    .unwrap();
+    fs::create_dir_all(agent_dir.join("sessions")).unwrap();
+    let saved = agent_dir.join("sessions").join("demo.yaml");
+    fs::write(&saved, DEMO).unwrap();
+
+    write_macro(&dir, "turns", &[".run again"]);
+    let under = run_coyote(
+        &dir,
+        &["-a", GRAPH_AGENT, "--session", "demo", "--macro", "turns"],
+    );
+    let text = combined(&under);
+    assert!(
+        under.status.success() && !text.contains("panicked"),
+        "under a session: exit {:?}\n{text}",
+        under.status
+    );
+    let stdout = stdout_of(&under);
+    assert!(
+        stdout.contains("turns<user: hello\nassistant: before: >"),
+        "the run renders the earlier exchange as user/assistant lines:\n{text}"
+    );
+    assert!(
+        !stdout.contains("ROLE PROMPT NEVER RENDERED"),
+        "the System row never reaches previous_turns:\n{text}"
+    );
+    assert_eq!(
+        fs::read_to_string(&saved).unwrap(),
+        DEMO,
+        "the dry run leaves the saved session file as it was"
+    );
+    assert!(
+        !dir.join("cache").join("sessions").exists(),
+        "the dry run forces child sessions off: no root under <cache>/sessions"
+    );
+
+    let loose = run_coyote(&dir, &["-a", GRAPH_AGENT, "--macro", "turns"]);
+    let text = combined(&loose);
+    assert!(
+        loose.status.success() && !text.contains("panicked"),
+        "without a session: exit {:?}\n{text}",
+        loose.status
+    );
+    assert!(
+        stdout_of(&loose).contains("turns<>"),
+        "without a session previous_turns is the empty string:\n{text}"
     );
 }

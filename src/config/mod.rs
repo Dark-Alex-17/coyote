@@ -1541,6 +1541,30 @@ clients:
         assert_eq!(cfg.child_sessions, None);
     }
 
+    /// The `# ---- Child Sessions ----` heading through the `child_sessions:`
+    /// line, so the template and the example are pinned to the same words.
+    fn child_sessions_block(text: &str) -> &str {
+        let start = text
+            .find("# ---- Child Sessions ----")
+            .expect("child sessions heading");
+        let block = &text[start..];
+        let key = block
+            .find("\nchild_sessions:")
+            .expect("child_sessions key after the heading");
+        let end = block[key + 1..]
+            .find('\n')
+            .map_or(block.len(), |offset| key + 1 + offset + 1);
+        &block[..end]
+    }
+
+    #[test]
+    fn config_template_and_example_child_sessions_blocks_are_byte_identical() {
+        let example = include_str!("../../config.example.yaml");
+        let block = child_sessions_block(CONFIG_TEMPLATE);
+        assert!(block.ends_with("not settable with .set)\n"), "{block}");
+        assert_eq!(block, child_sessions_block(example));
+    }
+
     #[test]
     fn config_loads_child_sessions_knob() {
         assert_eq!(Config::default().child_sessions, None);

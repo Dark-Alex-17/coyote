@@ -70,16 +70,27 @@ const CARRY_BULLET_LEAD: &str = "- **`carry`:**";
 /// The lead of the script Environment note on what `previous_turns` does
 /// to the state size.
 const SCRIPT_TURNS_LEAD: &str = "Under a session, [`previous_turns`]";
-/// The `agent.*` events a spawned child fires.
-const AGENT_EVENTS: [&str; 4] = [
-    "agent.started",
-    "agent.completed",
-    "agent.failed",
-    "agent.interrupted",
-];
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// The `agent.*` events a spawned child fires, scraped from the
+/// `HookEvent::as_str` arms in `src/hooks.rs` so a renamed or added event
+/// reaches the wiki checks without a hand-kept copy.
+fn agent_events() -> Vec<String> {
+    let body = fn_body(&src(&["hooks.rs"]), "pub fn as_str(");
+    let mut events: Vec<String> = string_literals(&body)
+        .into_iter()
+        .filter(|literal| literal.starts_with("agent."))
+        .collect();
+    events.dedup();
+    assert_eq!(
+        events.len(),
+        4,
+        "HookEvent::as_str names four agent.* events (started, completed, interrupted, failed): {events:?}"
+    );
+    events
 }
 
 /// Every edited section and row together.
@@ -566,14 +577,19 @@ fn workspace_agent_session_dir_literal() -> String {
 }
 
 /// The paragraph of `page` whose first line starts with `lead`: that line
-/// and every following line up to the next blank one.
+/// and every following line up to the next blank one or the next bullet,
+/// so a list item set directly under the paragraph is not read as part of
+/// it.
 fn paragraph(label: &str, page: &str, lead: &str) -> String {
     let mut lines = page.lines().skip_while(|line| !line.starts_with(lead));
     let first = lines
         .next()
         .unwrap_or_else(|| panic!("{label} has no paragraph opening {lead:?}"));
     let mut out = vec![first];
-    out.extend(lines.take_while(|line| !line.trim().is_empty()));
+    out.extend(lines.take_while(|line| {
+        let line = line.trim();
+        !line.is_empty() && !line.starts_with("- ") && !line.starts_with("* ")
+    }));
     out.join("\n")
 }
 
@@ -742,8 +758,10 @@ fn wording_for_graph_agents_without_sessions_is_gone() {
     ];
     let mut hits = Vec::new();
     for entry in fs::read_dir(&wiki).expect("read the wiki checkout") {
-        let path = entry.expect("wiki entry").path();
-        if path.extension().is_some_and(|ext| ext == "md") {
+        let entry = entry.expect("wiki entry");
+        let path = entry.path();
+        let is_file = entry.file_type().expect("wiki entry type").is_file();
+        if is_file && path.extension().is_some_and(|ext| ext == "md") {
             let text = flat(&read(&path));
             for needle in retired {
                 if text.contains(needle) {
@@ -1788,7 +1806,7 @@ fn edited_rows(wiki: &Path) -> Vec<(String, String)> {
             table_row("Environment-Variables.md", &env, &format!("`{var}`")).join(" "),
         )
     }));
-    rows.extend(AGENT_EVENTS.iter().map(|event| {
+    rows.extend(agent_events().into_iter().map(|event| {
         (
             format!("Hooks.md agent row `{event}`"),
             table_row("Hooks.md", &hooks, &format!("`{event}`")).join(" "),
@@ -2121,7 +2139,7 @@ fn hook_pages_carry_the_child_session_variable() {
 
     let Some(wiki) = wiki_dir() else { return };
     let hooks = read(wiki.join("Hooks.md"));
-    for event in AGENT_EVENTS {
+    for event in agent_events() {
         let row = table_row("Hooks.md", &hooks, &format!("`{event}`")).join(" ");
         assert!(
             row.contains(&format!("`{var}`")),
