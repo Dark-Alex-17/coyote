@@ -3111,6 +3111,10 @@ impl RequestContext {
                 super::format_option_value(&app.memory_cap_without_tools),
             ),
             (
+                "child_sessions",
+                super::format_option_value(&app.child_sessions),
+            ),
+            (
                 "workspace_instructions",
                 super::format_option_value(&app.workspace_instructions),
             ),
@@ -8435,6 +8439,56 @@ mod tests {
         let values = ctx.repl_complete(".set", &["command_prefix", ""], "command_prefix ");
         let names: Vec<&str> = values.iter().map(|(v, _)| v.as_str()).collect();
         assert_eq!(names, ["dot", "slash", "both"]);
+    }
+
+    /// `child_sessions` is a config-file-only knob: `.set` refuses it as an
+    /// unknown key and completion never offers it, while `.info` reports the
+    /// effective value after the memory rows, leaving the compression rows
+    /// contiguous between `save_session` and `memory`.
+    #[test]
+    #[serial]
+    fn child_sessions_is_not_settable_but_is_reported_by_info() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+
+        let err = run_async(ctx.update("child_sessions true", utils::create_abort_signal()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Unknown key 'child_sessions'"), "{err}");
+        assert!(!SET_COMPLETION_KEYS.contains(&"child_sessions"));
+
+        let child_sessions_row = |ctx: &RequestContext| {
+            let app = ctx.app.config.clone();
+            let info = ctx.sysinfo(&app).unwrap();
+            let lines: Vec<&str> = info.lines().collect();
+            let save_session = lines
+                .iter()
+                .position(|line| line.starts_with("save_session"))
+                .unwrap();
+            let memory = lines
+                .iter()
+                .position(|line| line.starts_with("memory "))
+                .unwrap();
+            assert!(
+                lines[save_session + 1..memory]
+                    .iter()
+                    .all(|line| line.starts_with("compression_")),
+                "compression rows sit between save_session and memory:\n{info}"
+            );
+            let row = lines
+                .iter()
+                .position(|line| line.trim_start().starts_with("child_sessions"))
+                .unwrap_or_else(|| panic!("child_sessions row missing from:\n{info}"));
+            assert!(
+                row > memory,
+                "child_sessions sits after the memory rows:\n{info}"
+            );
+            lines[row].to_string()
+        };
+
+        assert!(child_sessions_row(&ctx).ends_with("null"));
+        ctx.update_app_config(|app| app.child_sessions = Some(false));
+        assert!(child_sessions_row(&ctx).ends_with("false"));
     }
 
     #[test]
