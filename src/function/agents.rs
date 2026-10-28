@@ -1618,6 +1618,9 @@ enum SidecarRestore {
 /// that became a symlink is not followed for the restore. A transcript over
 /// the model window is compressed once between the two steps, with no lock
 /// held, so a sibling child finishing meanwhile is not kept waiting.
+/// Because that compression sits inside the unlocked step, a spawn future
+/// dropped while the summarizer runs leaves the provisional running stamp
+/// in place, and the child becomes resumable again once this process exits.
 async fn resume_child_session(
     child_ctx: &mut RequestContext,
     root: &ChildSessionRoot,
@@ -1737,7 +1740,7 @@ async fn resume_child_session(
     child_ctx.session = Some(session);
     if let Err(err) = child_ctx.checkpoint_session_to_disk(app_config.dry_run) {
         warn!(
-            "Resumed child session was not written back; the stored copy stays as it was: {err:#}"
+            "Resumed child session was not written back for '{id}'; the stored copy stays as it was: {err:#}"
         );
     }
     Ok(())
