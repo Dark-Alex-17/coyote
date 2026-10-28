@@ -681,3 +681,312 @@ fn no_gate_names_a_toolchain_command() {
         hits.join("\n")
     );
 }
+
+/// Copies `src` into `dst` recursively (regular files and directories only).
+fn copy_tree(src: &Path, dst: &Path) {
+    fs::create_dir_all(dst).unwrap();
+    for entry in fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let target = dst.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+/// A scratch copy of the candidate dir beside the shared scripts it reaches
+/// through `../../.shared`, so a battery can be edited without touching the
+/// asset tree. Returns the copied candidate dir.
+fn scratch_candidate_copy(scratch: &TempDirGuard) -> PathBuf {
+    let agents = scratch.0.join("tree").join("agents");
+    copy_tree(&agents_dir().join(".shared"), &agents.join(".shared"));
+    let copy = agents.join(CANDIDATE);
+    copy_tree(&candidate_dir(), &copy);
+    copy
+}
+
+fn smoke_summary(stdout: &str) -> (usize, usize) {
+    let summary = stdout
+        .lines()
+        .rev()
+        .find(|l| l.ends_with(" checks passed"))
+        .unwrap_or_else(|| panic!("no `N/N checks passed` line in:\n{stdout}"));
+    let (passed, total) = summary
+        .trim_end_matches(" checks passed")
+        .split_once('/')
+        .unwrap();
+    (passed.parse().unwrap(), total.parse().unwrap())
+}
+
+/// The summary line and the exit code are taken after the last check, so a
+/// failure recorded by the final check of the battery is neither hidden from
+/// the `N/N` tally nor from the exit code. Driven on a scratch copy with one
+/// failing check appended after the battery's last `check(` call.
+#[test]
+fn smoke_summary_and_exit_code_cover_a_check_recorded_last() {
+    let Some(python) = python3() else { return };
+    let scratch = scratch_dir("tally");
+    let copy = scratch_candidate_copy(&scratch);
+    let run = |copy: &Path| {
+        let mut cmd = battery(&python, &scratch);
+        cmd.current_dir(copy).arg("scripts/smoke_test.py");
+        cmd.output().unwrap()
+    };
+
+    let pristine = run(&copy);
+    assert!(pristine.status.success(), "{}", transcript(&pristine));
+    let (passed, total) = smoke_summary(&String::from_utf8_lossy(&pristine.stdout));
+    assert_eq!(passed, total, "{}", transcript(&pristine));
+
+    let script = copy.join("scripts").join("smoke_test.py");
+    let text = fs::read_to_string(&script).unwrap();
+    let mut lines: Vec<&str> = text.lines().collect();
+    let last_check = lines
+        .iter()
+        .rposition(|l| l.starts_with("check("))
+        .expect("the battery has a check( call");
+    let forced = "check(\"probe: a failure recorded after the last battery check\", False)";
+    lines.insert(last_check + 1, forced);
+    fs::write(&script, lines.join("\n") + "\n").unwrap();
+
+    let broken = run(&copy);
+    let report = transcript(&broken);
+    let stdout = String::from_utf8_lossy(&broken.stdout);
+    assert!(
+        stdout.lines().any(|l| l.starts_with("FAIL probe:")),
+        "the forced check did not run:\n{report}"
+    );
+    assert_eq!(
+        smoke_summary(&stdout),
+        (total, total + 1),
+        "the summary must count the check recorded last:\n{report}"
+    );
+    assert!(
+        !broken.status.success(),
+        "a failure recorded last must fail the battery:\n{report}"
+    );
+}
+
+/// The shipped `debt_scan` node lifted verbatim into a two-node graph with
+/// the shipped `bookkeeping_scan`, run through the real binary. The binary
+/// installs the bundled `agents/.shared/` into the config dir but leaves a
+/// file that is already there alone, so a planted scanner that exits
+/// non-zero is the hard crash of the shim: it falls forward on the
+/// `fallback:` edge, `bookkeeping_scan` still runs with the initial_state
+/// `DEBT_SCAN_FAILED` default in `debt_hits` and records the hop in the
+/// decisions ledger; with the shipped scanner the same graph takes `next:`
+/// and the default is replaced by the scanner's report.
+#[test]
+fn a_debt_scan_crash_falls_forward_to_bookkeeping_scan_with_the_default_report() {
+    let Some(_python) = python3() else { return };
+    let Ok(git) = which::which("git") else {
+        eprintln!("skipping: git not available");
+        return;
+    };
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let shipped: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let default_report = shipped["initial_state"]["debt_hits"]
+        .as_str()
+        .expect("shipped debt_hits default")
+        .to_string();
+    assert!(default_report.starts_with("DEBT_SCAN_FAILED"));
+
+    let run_leg = |label: &str, scanner_crashes: bool| -> (serde_json::Value, String) {
+        let scratch = scratch_dir(label);
+        let dir = scratch.0.clone();
+        let project = dir.join("project");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("note.txt"), "clean\n").unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec![
+                "-c",
+                "user.name=probe",
+                "-c",
+                "user.email=probe@example.invalid",
+                "add",
+                ".",
+            ],
+            vec![
+                "-c",
+                "user.name=probe",
+                "-c",
+                "user.email=probe@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "base",
+            ],
+        ] {
+            let status = Command::new(&git)
+                .args(&args)
+                .current_dir(&project)
+                .env("HOME", dir.join("home"))
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        }
+
+        let vault_pass = dir.join("vault-pass");
+        fs::write(&vault_pass, "test-password\n").unwrap();
+        fs::write(
+            dir.join("config.yaml"),
+            format!(
+                "model: dryrun:dry-model\ndry_run: true\nvault_password_file: '{}'\nclients:\n  - type: openai\n    name: dryrun\n    auth: none\n    api_key: 'unused'\n    models:\n      - name: dry-model\n        max_input_tokens: 100000\n        supports_function_calling: true\nsave: false\nmemory: false\nstream: false\n",
+                vault_pass.display()
+            ),
+        )
+        .unwrap();
+
+        let agents = dir.join("agents");
+        copy_tree(&agents_dir().join(".shared"), &agents.join(".shared"));
+        if scanner_crashes {
+            fs::write(
+                agents.join(".shared").join("debt_scan.py"),
+                "raise SystemExit('probe: scanner crashed')\n",
+            )
+            .unwrap();
+        }
+        let agent = agents.join("probe-debt");
+        copy_tree(&candidate_dir().join("scripts"), &agent.join("scripts"));
+        let dump = dir.join("dump.json");
+        fs::write(
+            agent.join("scripts").join("probe_dump.py"),
+            format!(
+                "import json, os, sys\n\
+                 sys.dont_write_bytecode = True\n\
+                 path = os.environ.get('GRAPH_STATE_FILE')\n\
+                 state = json.load(open(path)) if path else json.loads(os.environ.get('GRAPH_STATE', '{{}}'))\n\
+                 keys = ('debt_hits', 'decisions', 'last_script_error', 'debt_items')\n\
+                 open({:?}, 'w').write(json.dumps({{k: state.get(k) for k in keys}}))\n\
+                 print('{{}}')\n",
+                dump.display()
+            ),
+        )
+        .unwrap();
+
+        let mut nodes = serde_yaml::Mapping::new();
+        for id in ["debt_scan", "bookkeeping_scan"] {
+            nodes.insert(id.into(), shipped["nodes"][id].clone());
+        }
+        let mut judge = serde_yaml::Mapping::new();
+        judge.insert("id".into(), "bookkeeping_judge".into());
+        judge.insert("type".into(), "script".into());
+        judge.insert("script".into(), "scripts/probe_dump.py".into());
+        judge.insert("next".into(), "done".into());
+        nodes.insert(
+            "bookkeeping_judge".into(),
+            serde_yaml::Value::Mapping(judge),
+        );
+        for end in ["done", "end_failure"] {
+            let mut node = serde_yaml::Mapping::new();
+            node.insert("id".into(), end.into());
+            node.insert("type".into(), "end".into());
+            node.insert("output".into(), format!("PROBE_ROUTE={end}").into());
+            nodes.insert(end.into(), serde_yaml::Value::Mapping(node));
+        }
+        let mut initial = serde_yaml::Mapping::new();
+        initial.insert("debt_hits".into(), default_report.clone().into());
+        initial.insert(
+            "project_dir".into(),
+            project.to_string_lossy().into_owned().into(),
+        );
+        initial.insert("debt_base".into(), "HEAD".into());
+        initial.insert(
+            "run_dir".into(),
+            dir.join("run").to_string_lossy().into_owned().into(),
+        );
+        initial.insert("decisions".into(), serde_yaml::Value::Sequence(vec![]));
+        initial.insert("last_script_error".into(), "".into());
+        let mut graph = serde_yaml::Mapping::new();
+        graph.insert("name".into(), "probe_debt".into());
+        graph.insert("start".into(), "debt_scan".into());
+        graph.insert("initial_state".into(), serde_yaml::Value::Mapping(initial));
+        graph.insert("nodes".into(), serde_yaml::Value::Mapping(nodes));
+        fs::write(
+            agent.join("graph.yaml"),
+            serde_yaml::to_string(&serde_yaml::Value::Mapping(graph)).unwrap(),
+        )
+        .unwrap();
+
+        let output = Command::new(env!("CARGO_BIN_EXE_coyote"))
+            .args(["--agent", "probe-debt", "probe"])
+            .current_dir(&dir)
+            .env("HOME", dir.join("home"))
+            .env("COYOTE_CONFIG_DIR", &dir)
+            .env("COYOTE_CACHE_DIR", dir.join("cache"))
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .env("NO_COLOR", "1")
+            .env_remove("COYOTE_LOG_PATH")
+            .env_remove("IS_SANDBOX")
+            .env_remove("GRAPH_STATE")
+            .env_remove("GRAPH_STATE_FILE")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let report = transcript(&output);
+        assert!(output.status.success(), "{label}: {report}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("PROBE_ROUTE=done"), "{label}: {report}");
+        let dumped: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&dump).unwrap_or_else(|e| {
+                panic!("{label}: bookkeeping_judge never ran ({e}): {report}")
+            }))
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr).replace("\r\n", "\n");
+        let trace = stderr
+            .lines()
+            .find(|l| l.contains("debt_scan (script) done in"))
+            .unwrap_or_else(|| panic!("{label}: no debt_scan trace line in:\n{report}"))
+            .to_string();
+        assert_no_bytecode_under_candidate();
+        (dumped, trace)
+    };
+
+    let (crashed, trace) = run_leg("debtcrash", true);
+    assert!(
+        trace.contains("-> bookkeeping_scan (fallback)"),
+        "a shim crash must take the fallback edge: {trace}"
+    );
+    assert_eq!(
+        crashed["debt_hits"].as_str(),
+        Some(default_report.as_str()),
+        "the initial_state default must survive the crash: {crashed}"
+    );
+    let decisions = crashed["decisions"].as_array().unwrap();
+    assert!(
+        decisions.iter().any(|d| d
+            .as_str()
+            .is_some_and(|s| s.starts_with("fallback: debt_scan:"))),
+        "bookkeeping_scan must record the hop: {decisions:?}"
+    );
+    assert_eq!(
+        crashed["last_script_error"].as_str(),
+        Some(""),
+        "the engine's crash note is consumed by bookkeeping_scan: {crashed}"
+    );
+
+    let (clean, trace) = run_leg("debtclean", false);
+    assert!(
+        !trace.contains("(fallback)"),
+        "with the scanner present debt_scan routes on next: {trace}"
+    );
+    assert!(
+        !clean["debt_hits"]
+            .as_str()
+            .unwrap()
+            .starts_with("DEBT_SCAN_FAILED"),
+        "the scanner's report must replace the default: {clean}"
+    );
+    assert!(
+        !clean["decisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d.as_str().is_some_and(|s| s.starts_with("fallback:"))),
+        "no fallback hop on the clean run: {clean}"
+    );
+}
