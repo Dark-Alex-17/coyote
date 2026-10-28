@@ -4406,6 +4406,158 @@ mod tests {
         );
     }
 
+    /// Every child compression warn names the child session it is about:
+    /// the summarizer failure at a turn boundary, the same failure on the
+    /// overflow-retry arm, and a boundary fold whose write-back fails. The
+    /// name is the child's own session id, the fragment sits between the
+    /// verdict and the cause, and a session without a name gets no
+    /// dangling ` for ''`.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn usage_probe_child_compression_warns_name_the_child_session() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::testing::{install_log_collector, warn_snapshot};
+
+        install_log_collector();
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_child_compress_warn_names");
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        ctx.model = Model::from_config("test-seeded", &[ModelData::new("chat")]).remove(0);
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&fetches);
+        ctx.test_summary_fetch = Some(Arc::new(move |_: &str| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            "seam-summary-n4m".to_string()
+        }));
+        let spawn = build_ready_spawn(&mut ctx, json!({"agent": agent_name, "prompt": "hi"}));
+        let ChildSpawn {
+            mut child_ctx,
+            input,
+            session_id,
+            ..
+        } = *spawn;
+        let sid = session_id.unwrap();
+        let root = Arc::clone(child_ctx.child_session_root.as_ref().unwrap());
+        let path = root.child_session_file(&sid);
+        let app = Arc::clone(&child_ctx.app.config);
+        assert_eq!(child_ctx.session.as_ref().unwrap().name(), sid);
+        for _ in 0..3 {
+            child_ctx
+                .after_chat_completion(app.as_ref(), &input, LONG_REPLY, &[])
+                .unwrap();
+        }
+        child_ctx
+            .session
+            .as_mut()
+            .unwrap()
+            .set_compression_threshold(Some(1));
+        let has_summary = |session: &Session| {
+            session.messages().iter().any(|message| {
+                message.role.is_system() && message.content.to_text().contains("seam-summary-n4m")
+            })
+        };
+        let warns_since = |from: usize| -> Vec<String> {
+            warn_snapshot()
+                .into_iter()
+                .skip(from)
+                .filter(|m| m.contains("hild session"))
+                .collect()
+        };
+        let for_child = format!(" for '{sid}'");
+
+        // (1) The summarizer fails at the turn boundary.
+        let working_fetch = child_ctx.test_summary_fetch.take();
+        let warned_before = warn_snapshot().len();
+        let folded = run_async(maybe_compress_child_turn(&mut child_ctx, app.as_ref()));
+        assert!(!folded);
+        let warns = warns_since(warned_before);
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(
+            warns[0].contains(&format!(
+                "Child session compression failed{for_child}; continuing uncompressed: "
+            )),
+            "{warns:?}"
+        );
+        assert!(!child_ctx.session.as_ref().unwrap().compressing());
+
+        // (2) The summarizer fails on the overflow-retry arm.
+        let warned_before = warn_snapshot().len();
+        let retried = run_async(compress_child_for_error_retry(
+            &mut child_ctx,
+            app.as_ref(),
+            false,
+            &create_abort_signal(),
+            &anyhow!("prompt is too long: 250000 tokens > 200000 maximum"),
+        ));
+        assert!(!retried);
+        let warns = warns_since(warned_before);
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(
+            warns[0].contains(&format!(
+                "Child session compression failed{for_child}; continuing uncompressed: "
+            )),
+            "{warns:?}"
+        );
+        assert_eq!(fetches.load(Ordering::SeqCst), 0);
+
+        // (3) The fold succeeds but the write-back cannot land: the warn
+        // names the child, the in-memory transcript is compressed and the
+        // previous turn's copy is what stays on disk.
+        child_ctx.test_summary_fetch = working_fetch;
+        let children = root.children_dir();
+        let _restore = crate::testing::RestoreMode(children.clone(), 0o700);
+        std::fs::set_permissions(&children, std::fs::Permissions::from_mode(0o500)).unwrap();
+        if crate::testing::mode_bits_are_ignored_in(&children) {
+            return;
+        }
+        let stored_before = read_to_string(&path).unwrap();
+        let warned_before = warn_snapshot().len();
+        let folded = run_async(maybe_compress_child_turn(&mut child_ctx, app.as_ref()));
+        std::fs::set_permissions(&children, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            folded,
+            "a fold whose write-back fails still counts as a fold"
+        );
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        let session = child_ctx.session.as_ref().unwrap();
+        assert!(has_summary(session), "{:?}", session.messages());
+        assert!(!session.compressing());
+        assert_eq!(read_to_string(&path).unwrap(), stored_before);
+        assert!(!has_summary(&read_yaml::<Session>(&path)));
+        let warns = warns_since(warned_before);
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(
+            warns[0].contains(&format!(
+                "Compressed child session was not written back{for_child}; the previous turn's copy stays on disk: "
+            )),
+            "{warns:?}"
+        );
+
+        // (4) A session without a name gets the bare sentence.
+        child_ctx.test_summary_fetch = None;
+        for _ in 0..3 {
+            child_ctx
+                .after_chat_completion(app.as_ref(), &input, LONG_REPLY, &[])
+                .unwrap();
+        }
+        let session = child_ctx.session.as_mut().unwrap();
+        session.set_name(String::new());
+        session.set_compression_threshold(Some(1));
+        let warned_before = warn_snapshot().len();
+        let folded = run_async(maybe_compress_child_turn(&mut child_ctx, app.as_ref()));
+        assert!(!folded);
+        let warns = warns_since(warned_before);
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(
+            warns[0].contains("Child session compression failed; continuing uncompressed: "),
+            "{warns:?}"
+        );
+        assert!(!warns[0].contains(" for '"), "{warns:?}");
+    }
+
     /// A tool-loop checkpoint commits the in-flight rounds as a turn, so
     /// the child folds them right away when the stored threshold fires,
     /// the same as at a turn boundary; a loop whose rounds are too small to
@@ -7241,7 +7393,9 @@ mod tests {
             .collect();
         assert_eq!(warns.len(), 1, "{warns:?}");
         assert!(
-            warns[0].contains("the stored copy stays as it was"),
+            warns[0].contains(&format!(
+                "Resumed child session was not written back for '{sid}'; the stored copy stays as it was: "
+            )),
             "{warns:?}"
         );
     }
