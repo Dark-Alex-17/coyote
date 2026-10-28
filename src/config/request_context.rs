@@ -5,8 +5,8 @@ use super::mcp_tool_policy::{McpToolPolicy, SkillMcpLayer, ToolFilter, expand_mc
 use super::rag_cache::{RagCache, RagKey};
 use super::session::{
     CompressionInfo, INTERRUPTED_RESPONSE_TEXT, KeepPolicy, Session, SessionScope,
-    keep_token_budget, labeled_session_names, merged_session_names, min_reclaim_tokens,
-    session_scope_dirs, valve_limit,
+    SystemPromptSplit, keep_token_budget, labeled_session_names, merged_session_names,
+    min_reclaim_tokens, session_scope_dirs, valve_limit,
 };
 use super::skill::{SKILL_SCAFFOLD, Skill};
 use super::skill_policy::SkillPolicy;
@@ -256,6 +256,23 @@ fn memory_section_notice(section: &MemorySection, cap: usize) -> String {
             "memory: {facts_chars} fact chars + {catalogue_chars} catalogue chars injected under memory_facts_cap={cap}"
         ),
     }
+}
+
+/// Above this share of the model window the system prompt draws a warning.
+const SYSTEM_PROMPT_SHARE_WARN_PERCENT: usize = 25;
+
+/// Set by the first oversized system prompt of the process, so the warning
+/// is printed once rather than on every turn.
+static SYSTEM_PROMPT_SHARE_WARNING: OnceLock<()> = OnceLock::new();
+
+fn system_prompt_share_warning(split: &SystemPromptSplit, window: Option<usize>) -> Option<String> {
+    let pct = split.share_percent(window)?;
+    (pct > SYSTEM_PROMPT_SHARE_WARN_PERCENT).then(|| {
+        format!(
+            "system prompt is at least {pct}% of the model window ({} memory tokens); prune memory or lower memory_facts_cap",
+            split.memory_tokens
+        )
+    })
 }
 
 /// The one sentence every failure to bring up a graph agent's chat agent is
@@ -527,6 +544,10 @@ pub struct RequestContext {
     /// Runtime-only, like `last_prompt_token_usage`.
     pub valve_checkpoint_floor: Option<usize>,
 
+    /// What the last memory-injecting `extract_role` put in the system
+    /// prompt. Runtime-only; `.info` and the compression bail read it.
+    pub system_prompt_split: parking_lot::Mutex<Option<SystemPromptSplit>>,
+
     pub tool_scope: ToolScope,
 
     pub declared_function_names: HashSet<String>,
@@ -625,6 +646,7 @@ impl RequestContext {
             last_cost: None,
             last_prompt_token_usage: None,
             valve_checkpoint_floor: None,
+            system_prompt_split: parking_lot::Mutex::default(),
             tool_scope: ToolScope::default(),
             declared_function_names: Default::default(),
             node_job_scope: None,
@@ -705,6 +727,7 @@ impl RequestContext {
             last_cost: None,
             last_prompt_token_usage: None,
             valve_checkpoint_floor: None,
+            system_prompt_split: parking_lot::Mutex::default(),
             tool_scope: ToolScope {
                 functions,
                 mcp_runtime,
@@ -828,6 +851,7 @@ impl RequestContext {
             last_cost: self.last_cost,
             last_prompt_token_usage: self.last_prompt_token_usage,
             valve_checkpoint_floor: self.valve_checkpoint_floor,
+            system_prompt_split: parking_lot::Mutex::new(*self.system_prompt_split.lock()),
             tool_scope,
             declared_function_names: self.declared_function_names.clone(),
             node_job_scope: None,
@@ -891,6 +915,7 @@ impl RequestContext {
             last_cost: None,
             last_prompt_token_usage: None,
             valve_checkpoint_floor: None,
+            system_prompt_split: parking_lot::Mutex::default(),
             tool_scope: ToolScope {
                 functions: Functions::default(),
                 mcp_runtime: McpRuntime::default(),
@@ -1467,9 +1492,10 @@ impl RequestContext {
             .and_then(Session::compression_threshold)
             .unwrap_or(app.compression_threshold);
         let valve = app.compression_safety_valve;
+        let role = self.extract_role(app)?;
         let window = match session {
             Some(session) => session.model().max_input_tokens(),
-            None => self.extract_role(app)?.model().max_input_tokens(),
+            None => role.model().max_input_tokens(),
         };
         let keep = self.compression_keep_policy(None);
         let tail = session.map(|session| session.kept_tail(keep));
@@ -1489,6 +1515,8 @@ impl RequestContext {
                 .zip(tail)
                 .map(|(session, tail)| session.model().total_tokens(tail)),
             archived_messages: session.map(|session| session.compressed_messages().len()),
+            system_prompt: self.system_prompt_split.lock().unwrap_or_default(),
+            max_input_tokens: window,
         })
     }
 
@@ -2184,6 +2212,10 @@ impl RequestContext {
         }
 
         if inject_memory {
+            let mut split = SystemPromptSplit {
+                role_tokens: estimate_token_length(role.prompt()),
+                ..SystemPromptSplit::default()
+            };
             let memory_config = self.memory_config();
             if memory_config.enabled {
                 let store = MemoryStore {
@@ -2200,18 +2232,30 @@ impl RequestContext {
                             warn!("{}", memory_section_notice(&section, facts_cap));
                         }
                         let separator = if role.is_empty_prompt() { "" } else { "\n\n" };
-                        role.append_to_prompt(separator);
-                        role.append_to_prompt(&section.text);
-                        role.append_to_prompt("\n\n");
-                        role.append_to_prompt(if with_tools {
+                        let instructions = if with_tools {
                             prompts::DEFAULT_MEMORY_INSTRUCTIONS
                         } else {
                             prompts::DEFAULT_MEMORY_INSTRUCTIONS_READONLY
-                        });
+                        };
+                        role.append_to_prompt(separator);
+                        role.append_to_prompt(&section.text);
+                        role.append_to_prompt("\n\n");
+                        role.append_to_prompt(instructions);
+                        split.memory_tokens = estimate_token_length(&section.text);
+                        split.instructions_tokens = estimate_token_length(instructions);
+                        split.truncated = section.truncated;
                     }
                     Ok(None) => {}
                     Err(e) => warn!("memory injection failed: {}", e),
                 }
+            }
+            *self.system_prompt_split.lock() = Some(split);
+            if let Some(warning) =
+                system_prompt_share_warning(&split, role.model().max_input_tokens())
+                && SYSTEM_PROMPT_SHARE_WARNING.set(()).is_ok()
+            {
+                eprintln!("{warning}");
+                warn!("{warning}");
             }
         }
 
@@ -6871,10 +6915,21 @@ impl RequestContext {
             let mut message =
                 String::from("Nothing to compress: the kept tail is the whole session");
             if keep_last_override.is_none() && self.working_mode.is_repl() {
-                message
-                    .push_str(&self.render_hints(
-                        "; lower compression_keep_last or run `.compress session 0`",
-                    ));
+                let memory_tokens = self
+                    .system_prompt_split
+                    .lock()
+                    .map_or(0, |split| split.memory_tokens);
+                let system_tokens = session.messages().first().map_or(0, |first| {
+                    session.model().total_tokens(slice::from_ref(first))
+                });
+                let hint = if memory_tokens > session.tokens().saturating_sub(system_tokens) {
+                    format!(
+                        "; the system prompt holds {memory_tokens} memory tokens, more than the conversation - prune memory or lower memory_facts_cap"
+                    )
+                } else {
+                    String::from("; lower compression_keep_last or run `.compress session 0`")
+                };
+                message.push_str(&self.render_hints(&hint));
             }
             bail!(message);
         }
@@ -9811,6 +9866,121 @@ mod tests {
         let session = ctx.session.as_ref().unwrap();
         assert_eq!(session.messages().len(), 1, "keep_last 0 folds everything");
         assert!(session.messages()[0].content.to_text().contains("summary"));
+    }
+
+    #[test]
+    #[serial]
+    fn compress_session_impl_bail_points_at_memory_larger_than_the_conversation() {
+        let _guard = TestConfigDirGuard::new();
+        let index = paths::global_memory_index_file();
+        create_dir_all(index.parent().unwrap()).unwrap();
+        let fact = format!("- {}\n", "x".repeat(158));
+        write(&index, fact.repeat(10_000)).unwrap();
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            compression_threshold: 0,
+            compression_keep_last: 10,
+            memory: Some(true),
+            memory_facts_cap: Some(2_000_000),
+            memory_drill_cap: Some(2_000_000),
+            ..AppConfig::default()
+        });
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Repl);
+        ctx.session = Some(Session::default());
+        let input = Input::from_str(&ctx, &"y".repeat(150_000), Some(Role::new("", ""))).unwrap();
+        ctx.session
+            .as_mut()
+            .unwrap()
+            .add_message(&input, "hi")
+            .unwrap();
+        let app = ctx.app.config.clone();
+        ctx.extract_role(&app).unwrap();
+        let memory_tokens = ctx.system_prompt_split.lock().unwrap().memory_tokens;
+        assert!(memory_tokens > 300_000, "{memory_tokens}");
+
+        let fetch = |_: Input| async { Ok("summary".to_string()) };
+        let err = run_async(ctx.compress_session_impl(None, fetch)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Nothing to compress: the kept tail is the whole session; the system prompt holds {memory_tokens} memory tokens, more than the conversation - prune memory or lower memory_facts_cap"
+            )
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn extract_role_records_the_system_prompt_split_only_when_injecting_memory() {
+        let _guard = TestConfigDirGuard::new();
+        write_global_memory_store();
+        let ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+
+        let prompt = ctx.extract_role(&app).unwrap().prompt().to_string();
+        let split = ctx.system_prompt_split.lock().unwrap();
+        assert!(split.memory_tokens > 0, "{split:?}");
+        assert!(
+            [
+                estimate_token_length(prompts::DEFAULT_MEMORY_INSTRUCTIONS),
+                estimate_token_length(prompts::DEFAULT_MEMORY_INSTRUCTIONS_READONLY),
+            ]
+            .contains(&split.instructions_tokens),
+            "{split:?}"
+        );
+        assert!(
+            split.role_tokens + split.memory_tokens + split.instructions_tokens
+                <= estimate_token_length(&prompt) + 3,
+            "{split:?} for:\n{prompt}"
+        );
+        let sentinel = SystemPromptSplit {
+            role_tokens: 1,
+            memory_tokens: 2,
+            instructions_tokens: 3,
+            truncated: None,
+        };
+        *ctx.system_prompt_split.lock() = Some(sentinel);
+        ctx.generate_prompt_context(&app);
+        assert_eq!(*ctx.system_prompt_split.lock(), Some(sentinel));
+    }
+
+    #[test]
+    #[serial]
+    fn extract_role_records_a_memoryless_split_when_memory_is_off() {
+        let _guard = TestConfigDirGuard::new();
+        write_global_memory_store();
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            memory: Some(false),
+            ..AppConfig::default()
+        });
+        let ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        let app = ctx.app.config.clone();
+
+        ctx.extract_role(&app).unwrap();
+        let split = ctx.system_prompt_split.lock().unwrap();
+        assert_eq!((split.memory_tokens, split.instructions_tokens), (0, 0));
+    }
+
+    #[test]
+    fn system_prompt_share_warning_fires_only_above_a_quarter_of_the_window() {
+        let split = |memory_tokens| SystemPromptSplit {
+            role_tokens: 100,
+            memory_tokens,
+            instructions_tokens: 0,
+            truncated: None,
+        };
+        assert_eq!(
+            system_prompt_share_warning(&split(160), Some(1_000)).as_deref(),
+            Some(
+                "system prompt is at least 26% of the model window (160 memory tokens); prune memory or lower memory_facts_cap"
+            )
+        );
+        assert_eq!(system_prompt_share_warning(&split(150), Some(1_000)), None);
+        assert_eq!(system_prompt_share_warning(&split(159), Some(1_000)), None);
+        assert_eq!(system_prompt_share_warning(&split(0), Some(1_000)), None);
+        assert_eq!(system_prompt_share_warning(&split(10_000), None), None);
+        assert_eq!(system_prompt_share_warning(&split(10_000), Some(0)), None);
+        assert!(system_prompt_share_warning(&split(0), Some(300)).is_some());
     }
 
     #[test]
@@ -16196,6 +16366,11 @@ mod tests {
         assert!(row("compression_keep_tokens").ends_with("40000"));
         assert!(row("compression_checkpoint_tokens").ends_with("50000"));
         assert!(row("compression_min_reclaim").ends_with("24691"));
+        assert!(row("system_prompt_role_tokens").ends_with(char::is_numeric));
+        assert!(row("system_prompt_memory_tokens").ends_with(char::is_numeric));
+        assert!(row("system_prompt_share").ends_with("% of 200000"));
+        let truncated = row("memory_facts_truncated");
+        assert!(truncated.ends_with("none") || truncated.ends_with(" chars"));
         let lines: Vec<&str> = info.lines().collect();
         let save_session = lines
             .iter()
@@ -16206,10 +16381,14 @@ mod tests {
             .position(|line| line.starts_with("memory "))
             .unwrap();
         assert!(
-            lines[save_session + 1..memory]
-                .iter()
-                .all(|line| line.starts_with("compression_")),
-            "compression rows sit between save_session and memory:\n{info}"
+            lines[save_session + 1..memory].iter().all(|line| [
+                "compression_",
+                "system_prompt_",
+                "memory_facts_truncated"
+            ]
+            .iter()
+            .any(|prefix| line.starts_with(prefix))),
+            "compression and system prompt rows sit between save_session and memory:\n{info}"
         );
     }
 
@@ -16243,7 +16422,7 @@ mod tests {
         assert_eq!(info.kept_tail_messages, None);
         assert_eq!(info.kept_tail_tokens, None);
         assert_eq!(info.archived_messages, None);
-        assert_eq!(info.rows().len(), 9);
+        assert_eq!(info.rows().len(), 13);
     }
 
     // --- usage-probe (spec-first) coverage for the workspace-sessions surface ---
