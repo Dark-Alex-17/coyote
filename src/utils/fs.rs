@@ -1,7 +1,9 @@
-use std::fs::{DirBuilder, OpenOptions, remove_file, rename};
+use std::fs::{DirBuilder, OpenOptions, copy, read_dir, remove_file, rename};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use log::warn;
 
 /// Distinguishes the temp files of concurrent `write_private_atomic` calls
 /// in one process, so one writer's stale-temp retry cannot unlink another
@@ -75,6 +77,34 @@ pub(crate) fn create_private_dir_all(path: &Path) -> io::Result<()> {
         builder.mode(0o700);
     }
     builder.create(path)
+}
+
+/// Copies the regular files under `src` into `dst`, recreating directories
+/// owner-only. A symlink is skipped with a warning rather than followed, and
+/// an entry `skip` accepts is left out together with everything beneath it.
+pub(crate) fn copy_dir_all(src: &Path, dst: &Path, skip: &dyn Fn(&Path) -> bool) -> io::Result<()> {
+    create_private_dir_all(dst)?;
+    for entry in read_dir(src)? {
+        let entry = entry?;
+        let path = entry.path();
+        if skip(&path) {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        let target = dst.join(entry.file_name());
+        if file_type.is_symlink() {
+            warn!(
+                "skip symlink {} while copying {}",
+                path.display(),
+                src.display()
+            );
+        } else if file_type.is_dir() {
+            copy_dir_all(&path, &target, skip)?;
+        } else if file_type.is_file() {
+            copy(&path, &target)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -166,5 +196,35 @@ mod tests {
             assert_eq!(mode_of(&dir.0.join("a").join("b")), 0o700);
             assert_eq!(mode_of(&dir.0.join("a")), 0o700);
         }
+    }
+
+    #[test]
+    fn copy_dir_all_copies_regular_files_and_leaves_out_skipped_entries() {
+        let dir = TempDir::new("copy");
+        let src = dir.0.join("src");
+        fs::create_dir_all(src.join("nested")).unwrap();
+        fs::write(src.join("a.md"), "a").unwrap();
+        fs::write(src.join("nested").join("b.md"), "b").unwrap();
+        fs::write(src.join(".catalogue.yaml"), "cache").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(src.join("a.md"), src.join("link.md")).unwrap();
+
+        let dst = dir.0.join("backup").join("dst");
+        let skip = |path: &Path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(".catalogue."))
+        };
+        copy_dir_all(&src, &dst, &skip).unwrap();
+
+        assert_eq!(fs::read_to_string(dst.join("a.md")).unwrap(), "a");
+        assert_eq!(
+            fs::read_to_string(dst.join("nested").join("b.md")).unwrap(),
+            "b"
+        );
+        assert!(!dst.join(".catalogue.yaml").exists());
+        assert!(fs::symlink_metadata(dst.join("link.md")).is_err());
+        #[cfg(unix)]
+        assert_eq!(mode_of(&dst), 0o700);
     }
 }
