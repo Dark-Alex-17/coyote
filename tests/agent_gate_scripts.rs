@@ -1301,6 +1301,20 @@ fn pr_body_fixture(label: &str, log: &str) -> TempDirGuard {
         "## 2026-10-27 - completed\nCommit 0123abc on feat/x.\n",
     )
     .unwrap();
+    // A suffixed id (the split-task convention): keeps its letter in the
+    // checklist and as a `--tasks` key.
+    let suffixed = dir.0.join("tasks/TASK-4a-d");
+    fs::create_dir_all(&suffixed).unwrap();
+    fs::write(
+        suffixed.join("index.md"),
+        "---\nplan: PLAN-x.md\nstatus: complete\ntitle: \"D\"\n---\n",
+    )
+    .unwrap();
+    fs::write(
+        suffixed.join("log.md"),
+        "## 2026-10-27 - completed\nCommit 4567abc on feat/x.\n",
+    )
+    .unwrap();
     dir
 }
 
@@ -1580,6 +1594,60 @@ fn assemble_pr_body_keeps_the_dots_of_a_dotted_plan_slug() {
     assert!(
         !stdout.contains("TASK-2"),
         "a task of the prefix plan must not be mistaken for the dotted plan's: {stdout}"
+    );
+}
+
+/// A task id keeps its one-letter split suffix: it lists under that id in
+/// the checklist, sorts by number then suffix (after the bare id before it),
+/// and selects by that id through `--tasks`.
+#[cfg(unix)]
+#[test]
+fn assemble_pr_body_keeps_a_split_task_suffix() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = pr_body_fixture("assemble-pr-body-suffix", "Follow-ups:\n- first item\n");
+    let (code, stdout, stderr) = assemble_pr_body(&dir.0);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let suffixed = "\n- [x] TASK-4a - D (`4567abc`)";
+    assert!(
+        stdout.contains(suffixed),
+        "the suffixed id must list whole, with its SHA: {stdout}"
+    );
+    assert!(!stdout.contains("TASK-4 -"), "{stdout}");
+    let before = stdout.find("\n- [x] TASK-3 - C (").expect("bare id listed");
+    let after = stdout.find(suffixed).unwrap();
+    assert!(
+        before < after,
+        "the suffixed id sorts after the bare id before it: {stdout}"
+    );
+    assert!(
+        !stderr.contains("TASK-4a") && !stderr.contains("TASK-4-"),
+        "the suffixed task is complete and must not be a NOTE: {stderr}"
+    );
+
+    let (code, stdout, stderr) =
+        assemble_pr_body_with(&dir.0, "PLAN-x.md", &["--tasks", "TASK-4a"], &[]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains(suffixed), "{stdout}");
+    assert!(
+        !stdout.contains("TASK-1") && !stdout.contains("TASK-3"),
+        "`--tasks` must select by the whole suffixed id: {stdout}"
+    );
+    assert!(
+        !stdout.contains("first item"),
+        "an unlisted task's ledger lines must stay out: {stdout}"
+    );
+    assert!(
+        !stderr.contains("NOTE listed in --tasks but not found"),
+        "{stderr}"
+    );
+    let (code, _, stderr) = assemble_pr_body_with(&dir.0, "PLAN-x.md", &["--tasks", "TASK-4"], &[]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stderr.contains("NOTE listed in --tasks but not found under the plan: TASK-4"),
+        "the bare number is not the suffixed task: {stderr}"
     );
 }
 

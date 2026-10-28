@@ -34,7 +34,9 @@ import os
 import re
 import sys
 
-TASK_DIR_RE = re.compile(r"^(TASK-\d+)")
+import plan_tasks
+from plan_tasks import frontmatter, plan_identity, read
+
 SHA_RE = re.compile(r"\b(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b")
 HEX_WORDS = {"deadbeef", "cafebabe"}
 # Tags that open an entry; an entry stops at the next of these on its line or below it.
@@ -46,63 +48,19 @@ def note(msg):
     print(f"assemble_pr_body: NOTE {msg}", file=sys.stderr)
 
 
-def read(path):
-    with open(path, encoding="utf-8", errors="replace") as fh:
-        return fh.read()
-
-
-def frontmatter(text):
-    """Flat `key: value` pairs from a leading --- block; values unquoted."""
-    fm = {}
-    if not text.startswith("---"):
-        return fm
-    end = text.find("\n---", 3)
-    if end < 0:
-        return fm
-    for line in text[3:end].splitlines():
-        m = re.match(r"^([A-Za-z_][\w-]*):\s*(.*?)\s*$", line)
-        if m:
-            fm[m.group(1)] = m.group(2).strip().strip('"').strip("'")
-    return fm
-
-
-def task_number(name):
-    m = re.match(r"^TASK-(\d+)", name)
-    return int(m.group(1)) if m else 10**9
-
-
-def plan_identity(path):
-    """The plan a path or `plan:` value names: its basename, a trailing `.md` dropped.
-    Only that suffix goes, so `PLAN-a.b.md` and `PLAN-a.b` agree and `PLAN-a` does not."""
-    return os.path.basename(path).removesuffix(".md")
-
-
 def find_tasks(tasks_dir, plan_id, only=None):
-    """[(task_id, title, dir)] for the plan's tasks, in TASK number order. With `only`
-    (a set of task ids) the checklist keeps those ids alone and any listed id that is
-    missing or not complete is a NOTE."""
+    """[(task_id, title, dir)] for the plan's complete tasks, in task order (number, then
+    suffix). With `only` (a set of task ids) the checklist keeps those ids alone and any
+    listed id that is missing or not complete is a NOTE."""
+    rows, missing = plan_tasks.walk_tasks(tasks_dir, plan_id, only)
     found, skipped = [], []
-    seen = set()
-    for root, dirs, files in os.walk(tasks_dir):
-        dirs.sort()
+    for task_id, fm, root in rows:
         base = os.path.basename(root)
-        if "index.md" not in files or not TASK_DIR_RE.match(base):
+        if fm is None:
+            note(f"{base}: index.md unreadable; skipped")
             continue
-        try:
-            fm = frontmatter(read(os.path.join(root, "index.md")))
-        except OSError as exc:
-            note(f"{base}: index.md unreadable ({exc}); skipped")
-            continue
-        plan = fm.get("plan", "")
-        if plan and plan_identity(plan) != plan_id:
-            continue
-        task_id = TASK_DIR_RE.match(base).group(1)
-        if only is not None and task_id not in only:
-            continue
-        seen.add(task_id)
-        status = fm.get("status", "")
-        if status and status != "complete":
-            skipped.append(f"{base} (status: {status})")
+        if not plan_tasks.is_complete(fm):
+            skipped.append(f"{base} (status: {fm.get('status', '')})")
             continue
         title = fm.get("title", "")
         if not title:
@@ -112,11 +70,8 @@ def find_tasks(tasks_dir, plan_id, only=None):
         found.append((task_id, title, root))
     if skipped:
         note("excluded from the checklist (not `status: complete`): " + ", ".join(skipped))
-    if only is not None:
-        missing = sorted(only - seen, key=task_number)
-        if missing:
-            note("listed in --tasks but not found under the plan: " + ", ".join(missing))
-    found.sort(key=lambda t: task_number(t[0]))
+    if missing:
+        note("listed in --tasks but not found under the plan: " + ", ".join(missing))
     return found
 
 
@@ -230,7 +185,7 @@ def main():
 
     plan_base = os.path.basename(args.plan)
     plan_fm = frontmatter(read(args.plan))
-    only = {t.strip() for t in args.tasks.split(",") if t.strip()} or None
+    only = plan_tasks.parse_task_ids(args.tasks)
     tasks = find_tasks(args.tasks_dir, plan_identity(args.plan), only)
     if not tasks:
         note(f"no tasks under {args.tasks_dir} belong to {plan_base} - checklist left empty")
