@@ -453,10 +453,6 @@ fn write_memory(
              (split the topic across linked files)"
         );
     }
-    let superseded_by = args
-        .get("superseded_by")
-        .and_then(Value::as_str)
-        .map(String::from);
     let expires = args
         .get("expires")
         .and_then(Value::as_str)
@@ -473,6 +469,14 @@ fn write_memory(
     };
 
     let target_dir = scope_dir(store, cwd, &scope)?;
+    let chain = round_chain_name(&name);
+    let (older, newer): (Vec<RoundSibling>, Vec<RoundSibling>) = match chain {
+        Some((base, round)) => scan_round_siblings(&target_dir, base)?
+            .into_iter()
+            .filter(|s| s.round != round)
+            .partition(|s| s.round < round),
+        None => (Vec::new(), Vec::new()),
+    };
     let path = target_dir.join(format!("{name}.md"));
     let previous = if path.exists() {
         MemoryFile::load(&path).ok()
@@ -483,6 +487,17 @@ fn write_memory(
         .as_ref()
         .and_then(|p| p.frontmatter.created.clone())
         .unwrap_or_else(|| today.clone());
+    // Rewriting an older round must keep it superseded: without an argument,
+    // reuse the mark it had, else point at the next round up.
+    let superseded_by = match args.get("superseded_by").and_then(Value::as_str) {
+        Some(value) => Some(value.to_string()),
+        None => newer.first().map(|next| {
+            previous
+                .as_ref()
+                .and_then(|p| p.frontmatter.superseded_by.clone())
+                .unwrap_or_else(|| next.name.clone())
+        }),
+    };
 
     let file = MemoryFile {
         path,
@@ -491,7 +506,7 @@ fn write_memory(
             description: Some(description.clone()),
             kind,
             created: Some(created),
-            updated: Some(today),
+            updated: Some(today.clone()),
             superseded_by,
             expires,
         },
@@ -510,15 +525,11 @@ fn write_memory(
         "replaced": previous.is_some(),
         "previous_description": previous.and_then(|p| p.frontmatter.description),
     });
-    if let Some((base, round)) = round_chain_name(&name) {
-        result["siblings"] = Value::Array(settle_round_siblings(
-            &target_dir,
-            base,
-            round,
-            &name,
-            round_chains,
-        )?);
-        result["round_chain"] = json!({"base": base, "round": round});
+    if let Some((base, round)) = chain {
+        result["siblings"] =
+            Value::Array(settle_round_siblings(older, &name, &today, round_chains)?);
+        let newer_rounds: Vec<&str> = newer.iter().map(|s| s.name.as_str()).collect();
+        result["round_chain"] = json!({"base": base, "round": round, "newer_rounds": newer_rounds});
     }
 
     Ok(result)
@@ -549,17 +560,23 @@ fn round_chain_name(name: &str) -> Option<(&str, u32)> {
     Some((base, digits.parse().ok()?))
 }
 
-/// The older rounds of `base` in `dir`, in round order, each after any
-/// supersede update. Only this directory is scanned: a chain never crosses scopes.
-fn settle_round_siblings(
-    dir: &Path,
-    base: &str,
+struct RoundSibling {
     round: u32,
-    successor: &str,
-    round_chains: RoundChains,
-) -> Result<Vec<Value>> {
-    let mut older = Vec::new();
-    for entry in fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
+    name: String,
+    path: PathBuf,
+}
+
+/// Every `<base>-r<M>` file in `dir`, in round order. Only this directory is
+/// scanned: a chain never crosses scopes. A directory that does not exist yet
+/// simply has no rounds.
+fn scan_round_siblings(dir: &Path, base: &str) -> Result<Vec<RoundSibling>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("read {}", dir.display())),
+    };
+    let mut found = Vec::new();
+    for entry in entries {
         let path = entry?.path();
         if path.extension().and_then(|e| e.to_str()) != Some("md") {
             continue;
@@ -567,35 +584,50 @@ fn settle_round_siblings(
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
-        if let Some((sibling_base, m)) = round_chain_name(stem)
+        if let Some((sibling_base, round)) = round_chain_name(stem)
             && sibling_base == base
-            && m < round
         {
-            older.push((m, stem.to_string(), path));
+            found.push(RoundSibling {
+                round,
+                name: stem.to_string(),
+                path,
+            });
         }
     }
-    older.sort_by_key(|(m, _, _)| *m);
+    found.sort_by(|a, b| a.round.cmp(&b.round).then_with(|| a.name.cmp(&b.name)));
+    Ok(found)
+}
 
-    let today = today_string();
+/// The older rounds, each after any supersede update.
+fn settle_round_siblings(
+    older: Vec<RoundSibling>,
+    successor: &str,
+    today: &str,
+    round_chains: RoundChains,
+) -> Result<Vec<Value>> {
     let mut siblings = Vec::new();
-    for (_, stem, path) in older {
-        let mut file = match MemoryFile::load(&path) {
+    for sibling in older {
+        let mut file = match MemoryFile::load(&sibling.path) {
             Ok(file) => file,
             Err(e) => {
-                warn!("skip malformed memory file {}: {}", path.display(), e);
+                warn!(
+                    "skip malformed memory file {}: {}",
+                    sibling.path.display(),
+                    e
+                );
                 continue;
             }
         };
         if round_chains == RoundChains::Supersede && file.frontmatter.superseded_by.is_none() {
             file.frontmatter.superseded_by = Some(successor.to_string());
-            file.frontmatter.updated = Some(today.clone());
+            file.frontmatter.updated = Some(today.to_string());
             if !file.frontmatter.kind.is_known() {
                 file.frontmatter.kind = MemoryKind::RunState.into();
             }
             file.save()?;
         }
         siblings.push(json!({
-            "name": stem,
+            "name": sibling.name,
             "superseded_by": file.frontmatter.superseded_by,
         }));
     }
@@ -2341,7 +2373,7 @@ mod tests {
 
         assert_eq!(
             result["round_chain"],
-            json!({"base": "foo", "round": 3}),
+            json!({"base": "foo", "round": 3, "newer_rounds": ["foo-r4"]}),
             "{result}"
         );
         assert_eq!(
@@ -2388,9 +2420,89 @@ mod tests {
 
         let written = fs::read_to_string(structured.join("foo-r3.md")).unwrap();
         assert!(
-            written.contains("\ntype: null\n") && !written.contains("superseded_by"),
+            written.contains("\ntype: null\n") && written.contains("\nsuperseded_by: foo-r4\n"),
             "the written file keeps its own defaulting: {written}"
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_memory_keeps_a_rewritten_older_round_superseded() {
+        let root = temp_root("write_round_rewrite_older");
+        let (store, workspace, structured) = workspace_store(&root, "# Memory Index\n");
+        write_round(&structured, "foo-r1", "superseded_by: foo-r2\n");
+        write_round(&structured, "foo-r2", "");
+        let untouched_r2 = fs::read_to_string(structured.join("foo-r2.md")).unwrap();
+
+        let result = write_memory(
+            &store,
+            &workspace,
+            &write_args("foo-r1", "round one again", "new body"),
+            3,
+            RoundChains::Supersede,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result["round_chain"],
+            json!({"base": "foo", "round": 1, "newer_rounds": ["foo-r2"]}),
+            "{result}"
+        );
+        assert_eq!(result["siblings"], json!([]), "{result}");
+        let r1 = MemoryFile::load(&structured.join("foo-r1.md")).unwrap();
+        assert_eq!(r1.frontmatter.superseded_by.as_deref(), Some("foo-r2"));
+        assert_eq!(r1.body, "new body");
+        assert_eq!(
+            fs::read_to_string(structured.join("foo-r2.md")).unwrap(),
+            untouched_r2
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_memory_marks_an_unmarked_older_round_with_the_next_round_up() {
+        let root = temp_root("write_round_next_up");
+        let (store, workspace, structured) = workspace_store(&root, "# Memory Index\n");
+        write_round(&structured, "foo-r1", "");
+        write_round(&structured, "foo-r3", "");
+        write_round(&structured, "foo-r2", "");
+
+        let result = write_memory(
+            &store,
+            &workspace,
+            &write_args("foo-r1", "round one again", "x"),
+            3,
+            RoundChains::Supersede,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result["round_chain"]["newer_rounds"],
+            json!(["foo-r2", "foo-r3"]),
+            "{result}"
+        );
+        let r1 = MemoryFile::load(&structured.join("foo-r1.md")).unwrap();
+        assert_eq!(r1.frontmatter.superseded_by.as_deref(), Some("foo-r2"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_memory_lets_an_explicit_superseded_by_win_over_the_round_default() {
+        let root = temp_root("write_round_explicit_mark");
+        let (store, workspace, structured) = workspace_store(&root, "# Memory Index\n");
+        write_round(&structured, "foo-r1", "superseded_by: foo-r2\n");
+        write_round(&structured, "foo-r2", "");
+
+        let mut args = write_args("foo-r1", "round one again", "x");
+        args["superseded_by"] = json!("elsewhere");
+        let result = write_memory(&store, &workspace, &args, 3, RoundChains::Supersede).unwrap();
+
+        assert_eq!(result["round_chain"]["newer_rounds"], json!(["foo-r2"]));
+        let r1 = MemoryFile::load(&structured.join("foo-r1.md")).unwrap();
+        assert_eq!(r1.frontmatter.superseded_by.as_deref(), Some("elsewhere"));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -2416,7 +2528,10 @@ mod tests {
             json!([{"name": "foo-r1", "superseded_by": null}]),
             "{result}"
         );
-        assert_eq!(result["round_chain"], json!({"base": "foo", "round": 2}));
+        assert_eq!(
+            result["round_chain"],
+            json!({"base": "foo", "round": 2, "newer_rounds": []})
+        );
         assert_eq!(
             fs::read_to_string(structured.join("foo-r1.md")).unwrap(),
             before
@@ -2443,7 +2558,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(result["siblings"], json!([]), "{result}");
-        assert_eq!(result["round_chain"], json!({"base": "foo", "round": 2}));
+        assert_eq!(
+            result["round_chain"],
+            json!({"base": "foo", "round": 2, "newer_rounds": []})
+        );
         assert_eq!(
             fs::read_to_string(store.global_dir.join("foo-r1.md")).unwrap(),
             before
@@ -2466,7 +2584,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(first["siblings"], json!([]), "{first}");
-        assert_eq!(first["round_chain"], json!({"base": "foo", "round": 1}));
+        assert_eq!(
+            first["round_chain"],
+            json!({"base": "foo", "round": 1, "newer_rounds": []})
+        );
 
         let plain = write_memory(
             &store,
