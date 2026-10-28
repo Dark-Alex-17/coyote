@@ -567,8 +567,9 @@ struct RoundSibling {
 }
 
 /// Every `<base>-r<M>` file in `dir`, in round order. Only this directory is
-/// scanned: a chain never crosses scopes. A directory that does not exist yet
-/// simply has no rounds.
+/// scanned: a chain never crosses scopes, and a symlink is never followed, so
+/// settling a round cannot rewrite a file outside the scope. A directory that
+/// does not exist yet simply has no rounds.
 fn scan_round_siblings(dir: &Path, base: &str) -> Result<Vec<RoundSibling>> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -578,7 +579,9 @@ fn scan_round_siblings(dir: &Path, base: &str) -> Result<Vec<RoundSibling>> {
     let mut found = Vec::new();
     for entry in entries {
         let path = entry?.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+        if path.extension().and_then(|e| e.to_str()) != Some("md")
+            || path.symlink_metadata()?.is_symlink()
+        {
             continue;
         }
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
@@ -633,6 +636,12 @@ fn settle_round_sibling(
 ) -> Result<()> {
     let mut file = MemoryFile::load(&sibling.path)?;
     *mark = file.frontmatter.superseded_by.clone();
+    if file.frontmatter.name != sibling.name {
+        bail!(
+            "front matter name '{}' does not match the file name",
+            file.frontmatter.name
+        );
+    }
     if round_chains == RoundChains::Keep || mark.is_some() {
         return Ok(());
     }
@@ -2594,6 +2603,67 @@ mod tests {
         assert!(structured.join("foo-r2.md").exists());
 
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_memory_leaves_an_older_round_whose_front_matter_name_differs() {
+        let root = temp_root("write_round_name_mismatch");
+        let (store, workspace, structured) = workspace_store(&root, "# Memory Index\n");
+        write_round(&structured, "other", "superseded_by: elsewhere\n");
+        fs::rename(structured.join("other.md"), structured.join("foo-r1.md")).unwrap();
+        let before = fs::read_to_string(structured.join("foo-r1.md")).unwrap();
+
+        let result = write_memory(
+            &store,
+            &workspace,
+            &write_args("foo-r2", "round two", "x"),
+            3,
+            RoundChains::Supersede,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result["siblings"],
+            json!([{
+                "name": "foo-r1",
+                "superseded_by": "elsewhere",
+                "error": "front matter name 'other' does not match the file name",
+            }]),
+            "{result}"
+        );
+        assert_eq!(
+            fs::read_to_string(structured.join("foo-r1.md")).unwrap(),
+            before
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_memory_skips_a_symlinked_older_round() {
+        let root = temp_root("write_round_symlink");
+        let (store, workspace, structured) = workspace_store(&root, "# Memory Index\n");
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        write_round(&outside, "foo-r1", "");
+        let target = outside.join("foo-r1.md");
+        std::os::unix::fs::symlink(&target, structured.join("foo-r1.md")).unwrap();
+        let before = fs::read_to_string(&target).unwrap();
+
+        let result = write_memory(
+            &store,
+            &workspace,
+            &write_args("foo-r2", "round two", "x"),
+            3,
+            RoundChains::Supersede,
+        )
+        .unwrap();
+
+        assert_eq!(result["siblings"], json!([]), "{result}");
+        assert_eq!(fs::read_to_string(&target).unwrap(), before);
+
         let _ = fs::remove_dir_all(&root);
     }
 
