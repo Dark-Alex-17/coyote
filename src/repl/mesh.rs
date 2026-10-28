@@ -41,11 +41,11 @@ use crate::mesh::trust::{
 use crate::mesh::wire_path::{WIRE_PATH_MAX_BYTES, WirePath};
 use crate::mesh::{
     AlreadyClosed, FetchError, FetchReport, HEARTBEAT_PERIOD_SECS, HEARTBEAT_SECS, HUMAN_DECLINED,
-    InterfaceState, InterfaceStatus, LoggingInboundSink, MAX_WANTS_PER_FETCH, MESH_ALREADY_ON,
-    MeshPaths, MeshRuntime, NodeOptions, PATH_REQUEST_TIMEOUT, PEER_STALE_AFTER, PEER_TTL,
-    PeerRecord, PropagationNodeRecord, age_text, canonical_hash, canonicalize, decode_hex,
-    destination_address, display_text, hex_lower, human_size, loopback_endpoint, parse_rfc3339,
-    redact_hashes, refuse_symlink, rfc3339_utc, short, span_text,
+    InterfaceState, InterfaceStatus, LocalEndpoint, LoggingInboundSink, MAX_WANTS_PER_FETCH,
+    MESH_ALREADY_ON, MeshPaths, MeshRuntime, NodeOptions, PATH_REQUEST_TIMEOUT, PEER_STALE_AFTER,
+    PEER_TTL, PeerRecord, PropagationNodeRecord, age_text, canonical_hash, canonicalize,
+    decode_hex, destination_address, display_text, hex_lower, human_size, loopback_endpoint,
+    parse_rfc3339, redact_hashes, refuse_symlink, rfc3339_utc, short, span_text,
 };
 use crate::repl::printer::terminal_width;
 use crate::supervisor::mailbox::EnvelopePayload;
@@ -5984,6 +5984,10 @@ fn reach_facts_of_config(config: &MeshConfig) -> Vec<ReachFact> {
         .iter()
         .map(|interface| match interface {
             MeshInterface::Lan => ("lan", None),
+            MeshInterface::Local { port, instance } => (
+                "local",
+                Some(LocalEndpoint::of(*port, instance.as_deref()).to_string()),
+            ),
             MeshInterface::Private { host, port } => ("private", Some(format!("{host}:{port}"))),
             MeshInterface::Public { host, port } => ("public", Some(format!("{host}:{port}"))),
         })
@@ -5991,13 +5995,14 @@ fn reach_facts_of_config(config: &MeshConfig) -> Vec<ReachFact> {
 }
 
 /// How far this node is visible. A public interface decides it; else the private relays
-/// do, and relays that are all on this host's loopback are the local rnsd, whose own
-/// `rnstatus` is the only thing that knows what lies beyond it.
+/// and the local rnsd do, and relays that are all on this host (loopback, or rnsd's own
+/// socket) are the local rnsd, whose own `rnstatus` is the only thing that knows what
+/// lies beyond it.
 fn reach_line(interfaces: &[ReachFact]) -> String {
     let public = interfaces.iter().any(|(kind, _)| *kind == "public");
     let relays: Vec<&str> = interfaces
         .iter()
-        .filter(|(kind, _)| *kind == "private")
+        .filter(|(kind, _)| matches!(*kind, "private" | "local"))
         .filter_map(|(_, endpoint)| endpoint.as_deref())
         .collect();
     let all_loopback = relays.iter().all(|endpoint| loopback_endpoint(endpoint));
@@ -6040,7 +6045,9 @@ fn trust_refusal(
 fn audience(interface: &MeshInterface) -> &'static str {
     match interface {
         MeshInterface::Lan => "every node on this LAN",
-        MeshInterface::Private { .. } => "the nodes joined to that relay",
+        MeshInterface::Private { .. } | MeshInterface::Local { .. } => {
+            "the nodes joined to that relay"
+        }
         MeshInterface::Public { .. } => "anyone on the internet who reaches that relay",
     }
 }
@@ -6209,22 +6216,27 @@ fn interface_warnings(states: &[InterfaceStatus]) -> Vec<String> {
     states
         .iter()
         .filter_map(|status| {
-            let InterfaceState::Unreachable { reason, .. } = &status.state else {
-                return None;
-            };
             let label = &status.label;
-            Some(if status.is_loopback() {
-                format!(
+            Some(match &status.state {
+                InterfaceState::Connected => return None,
+                InterfaceState::Unreachable { reason, .. } if status.is_loopback() => format!(
                     "WARNING: {label} is unreachable ({reason}); sessions on this machine cannot reach each other until a local Reticulum daemon (rnsd) is listening there."
-                )
-            } else if status.kind == "lan" {
-                format!(
+                ),
+                InterfaceState::Unreachable { reason, .. } if status.kind == "lan" => format!(
                     "WARNING: lan is unreachable ({reason}); peers on this link-local segment are out of reach."
-                )
-            } else {
-                format!(
+                ),
+                InterfaceState::Unreachable { reason, .. } => format!(
                     "WARNING: {label} is unreachable ({reason}); peers behind that relay are out of reach."
-                )
+                ),
+                InterfaceState::Connecting { reason } => {
+                    let reason = reason.as_deref().unwrap_or("not connected yet");
+                    format!(
+                        "WARNING: {label} is not reachable yet: {reason}; start the local rnsd"
+                    )
+                }
+                InterfaceState::Disconnected { reason } => format!(
+                    "WARNING: {label} dropped the connection: {reason}; it is being redialed"
+                ),
             })
         })
         .collect()
@@ -8154,9 +8166,10 @@ mod tests {
             }],
             ..MeshConfig::default()
         };
+        let default_endpoint = LocalEndpoint::of(None, None);
         assert_eq!(
             reach_line(&reach_facts_of_config(&MeshConfig::default())),
-            "via rnsd at 127.0.0.1:4242 - rnstatus shows what it reaches"
+            format!("via rnsd at {default_endpoint} - rnstatus shows what it reaches")
         );
         for host in ["127.0.0.1", "localhost", "[::1]"] {
             assert_eq!(
@@ -8199,6 +8212,32 @@ mod tests {
             ])),
             "via rnsd at 127.0.0.1:4242, [::1]:4243 - rnstatus shows what it reaches",
             "a lan interface beside the relays changes nothing"
+        );
+        for endpoint in ["@rns/default", "127.0.0.1:37428"] {
+            let local = InterfaceStatus {
+                label: format!("local rnsd at {endpoint}"),
+                kind: "local",
+                endpoint: Some(endpoint.to_string()),
+                state: InterfaceState::Connected,
+            };
+            assert_eq!(
+                reach_line(&reach_facts_of_states(&[local])),
+                format!("via rnsd at {endpoint} - rnstatus shows what it reaches")
+            );
+        }
+        let local_config = |port: Option<u16>, instance: Option<&str>| MeshConfig {
+            interfaces: vec![MeshInterface::Local {
+                port,
+                instance: instance.map(str::to_string),
+            }],
+            ..MeshConfig::default()
+        };
+        assert_eq!(
+            reach_facts_of_config(&local_config(Some(37429), Some("lab"))),
+            vec![(
+                "local",
+                Some(LocalEndpoint::of(Some(37429), Some("lab")).to_string())
+            )]
         );
     }
 
@@ -8272,6 +8311,28 @@ mod tests {
                     retrying: true,
                 },
             },
+            InterfaceStatus {
+                label: "local rnsd at 127.0.0.1:37428".into(),
+                kind: "local",
+                endpoint: Some("127.0.0.1:37428".into()),
+                state: InterfaceState::Connecting {
+                    reason: Some("tcp connect failed endpoint=127.0.0.1:37428".into()),
+                },
+            },
+            InterfaceStatus {
+                label: "local rnsd at @rns/default".into(),
+                kind: "local",
+                endpoint: Some("@rns/default".into()),
+                state: InterfaceState::Connecting { reason: None },
+            },
+            InterfaceStatus {
+                label: "local rnsd at @rns/default".into(),
+                kind: "local",
+                endpoint: Some("@rns/default".into()),
+                state: InterfaceState::Disconnected {
+                    reason: "local unix preflight connect failed endpoint=@rns/default err=Connection refused (os error 111)".into(),
+                },
+            },
         ];
 
         assert_eq!(
@@ -8280,6 +8341,9 @@ mod tests {
                 "WARNING: lan is unreachable (address in use); peers on this link-local segment are out of reach.".to_string(),
                 "WARNING: private relay.example:4965 is unreachable (tcp connect failed endpoint=relay.example:4965); peers behind that relay are out of reach.".to_string(),
                 "WARNING: private 127.0.0.1:4242 is unreachable (tcp connect failed endpoint=127.0.0.1:4242); sessions on this machine cannot reach each other until a local Reticulum daemon (rnsd) is listening there.".to_string(),
+                "WARNING: local rnsd at 127.0.0.1:37428 is not reachable yet: tcp connect failed endpoint=127.0.0.1:37428; start the local rnsd".to_string(),
+                "WARNING: local rnsd at @rns/default is not reachable yet: not connected yet; start the local rnsd".to_string(),
+                "WARNING: local rnsd at @rns/default dropped the connection: local unix preflight connect failed endpoint=@rns/default err=Connection refused (os error 111); it is being redialed".to_string(),
             ]
         );
     }
