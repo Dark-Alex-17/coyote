@@ -2222,6 +2222,55 @@ fn architect_ledger_calls_always_name_the_plan() {
     }
 }
 
+/// Under `task_granularity=micro` the PR-body step keeps the tool's flat
+/// checklist and APPENDS a `## Batch gauntlets` section (with each batch's
+/// `batch-closed @ <sha>`): the micro render never asks the architect to
+/// regroup the checklist the tool prints, and the step-3 "you write ONLY the
+/// summary" contract survives in both granularities.
+#[test]
+fn architect_micro_render_appends_batch_gauntlets_without_regrouping_the_checklist() {
+    if tools_missing() {
+        return;
+    }
+    let script = format!(
+        "source '{}'; render_instructions '{}'",
+        asset(".shared/utils.sh").display(),
+        asset("architect/instructions.md").display()
+    );
+    let contract = "you write ONLY the summary";
+    for (granularity, micro) in [("micro", true), ("standard", false)] {
+        let (code, stdout, stderr) = run(bash()
+            .arg("-c")
+            .arg(&script)
+            .env("LLM_AGENT_VAR_TASK_GRANULARITY", granularity)
+            .output()
+            .expect("spawn bash"));
+        assert_eq!(code, 0, "render under {granularity}: {stderr}");
+        assert!(
+            stdout.contains(contract),
+            "{granularity}: the step-3 contract must survive: missing {contract:?}"
+        );
+        assert_eq!(
+            stdout.contains("APPEND a `## Batch gauntlets` section"),
+            micro,
+            "{granularity}: the appended section renders only under micro"
+        );
+        assert_eq!(
+            stdout.contains("`batch-closed @ <sha>` copied from the batch's `batch-closed` entry"),
+            micro,
+            "{granularity}"
+        );
+        assert!(
+            !stdout.contains("group the checklist") && !stdout.contains("BY BATCH"),
+            "{granularity}: the tool's checklist is never regrouped by hand: {stdout}"
+        );
+        assert!(
+            stdout.contains("`## Tasks` checklist stays as it prints it") == micro,
+            "{granularity}"
+        );
+    }
+}
+
 #[test]
 fn verify_format_lint_bounds_300kb_formatter_transcript() {
     if tools_missing() {

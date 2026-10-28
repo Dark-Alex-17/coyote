@@ -921,9 +921,12 @@ At the current group's close-out (and, for steps 5-8, after the last group's):
    step 2 when the hygiene pass runs per group), so a sibling group's lines stay out of it.
 <!-- end -->
 <!-- when:task_granularity=micro -->
-   Micro runs produce 3-5x the tasks: group the checklist BY BATCH, one heading per batch with
-   its gauntlet verdict + `batch-closed @ <sha>`, and add a `## Batch gauntlets` section - one
-   line per batch: rounds, strikes, verdict.
+   Micro runs produce 3-5x the tasks. The tool's `## Tasks` checklist stays as it prints it (one
+   flat line per task; the tool reads neither `batch:` nor the `batch-closed` entries). Right
+   after that checklist APPEND a `## Batch gauntlets` section - one line per batch: the batch
+   slug, its member task ids, the gauntlet rounds, strikes, the final verdict, and
+   `batch-closed @ <sha>` copied from the batch's `batch-closed` entry in its members' `log.md`.
+   This is one of the sections the tool does not produce, so step 3 already allows adding it.
 <!-- end -->
    Report the PR URL. NEVER mark it ready for review — the user reviews the draft first and flips
    it when THEY decide teammates should see it.
