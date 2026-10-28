@@ -1948,8 +1948,9 @@ fn sessions_section_names_the_real_workspace_session_directory() {
 /// the tree: when the child file is flushed, what a headless parent leaves
 /// behind, what `.fork` copies, what the session commands do to children
 /// (with the exit wait read from `EXIT_CANCEL_WAIT`), how a graph child
-/// runs, when a child's transcript is compressed, and the sidecar's prompt
-/// head length from `PROMPT_HEAD_CHARS`.
+/// runs, when a child's transcript is compressed and written back (with the
+/// Hooks.md `session.compressed` row saying REPL only), and the sidecar's
+/// prompt head length from `PROMPT_HEAD_CHARS`.
 #[test]
 fn sessions_child_section_names_the_layout_and_the_lifecycle_rules() {
     let child_sessions = src(&["config", "child_sessions.rs"]);
@@ -2009,6 +2010,8 @@ fn sessions_child_section_names_the_layout_and_the_lifecycle_rules() {
     for needle in [
         "`compression_threshold`",
         "turn boundary",
+        "writes the compressed copy back at once",
+        "reaches disk with the next committed turn",
         "`session.compressed`",
     ] {
         assert!(
@@ -2020,6 +2023,12 @@ fn sessions_child_section_names_the_layout_and_the_lifecycle_rules() {
     assert!(
         resuming.contains("compressed once"),
         "the Resuming section does not say a child is compressed once at resume"
+    );
+    let hooks = read(wiki.join("Hooks.md"));
+    let compressed = table_row("Hooks.md", &hooks, "`session.compressed`").join(" ");
+    assert!(
+        compressed.contains("REPL only"),
+        "the Hooks.md `session.compressed` row does not say REPL only: {compressed}"
     );
 }
 
