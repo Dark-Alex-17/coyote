@@ -13344,6 +13344,120 @@ mod tests {
         .await;
     }
 
+    /// Two relays that were down at start come up together, so their clients read
+    /// `connected` on the same watcher tick: each is told once, each first connect
+    /// announces once without the floor, and no `reconnected` line is printed for either,
+    /// since a first connect is not a reconnect. Both rows then follow their events: a
+    /// restart of one of them is reported for that relay alone, announced once more past
+    /// the floor, while the other two relays, which never went away, stay silent.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_relays_down_at_start_that_come_up_together_each_connect_once_and_then_follow_their_events()
+     {
+        install_log_collector();
+        let late_a = closed_port().await;
+        let late_b = closed_port().await;
+        let relay = TransportRelay::start().await;
+        let tmp = TempDir::new("node-two-late");
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &private_relays(&[relay.port, late_a, late_b]),
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .unwrap();
+        let states = states_of(&runtime);
+        assert_eq!(states[0].1, InterfaceState::Connected);
+        assert!(is_retrying(&states[1].1), "{states:?}");
+        assert!(is_retrying(&states[2].1), "{states:?}");
+        let hash = runtime.destination_hash().await;
+        let hash8 = short(&hash).to_string();
+        let label_a = private_label(late_a);
+        let label_b = private_label(late_b);
+        let slot = Arc::new(MeshSlot::default());
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        slot.install(runtime.clone()).unwrap();
+        let before = debug_snapshot().len();
+        sleep(CONNECT_WATCH_TICK * 2).await;
+        assert_eq!(announces_since(before, &hash8), 0);
+
+        // Both relays listen long before the clients' next redial, which they took at the
+        // same moment, so both first connects land within one tick.
+        let (relay_a, mut heard_a) = TransportRelay::start_on_subscribed(late_a).await;
+        let (relay_b, mut heard_b) = TransportRelay::start_on_subscribed(late_b).await;
+        wait_for_mesh_line(&notifier, &format!("{label_a} connected")).await;
+        wait_for_mesh_line(&notifier, &format!("{label_b} connected")).await;
+        TransportRelay::heard_from(&mut heard_a, &hash).await;
+        TransportRelay::heard_from(&mut heard_b, &hash).await;
+        sleep(CONNECT_WATCH_TICK * 3).await;
+        let lines = mesh_lines(&notifier);
+        for label in [&label_a, &label_b] {
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|line| line.contains(&format!("{label} connected")))
+                    .count(),
+                1,
+                "one connected line per relay: {lines:?}"
+            );
+        }
+        assert!(
+            !lines.iter().any(|line| line.contains("reconnected")),
+            "a first connect is never reported as a reconnect: {lines:?}"
+        );
+        assert_eq!(
+            announces_since(before, &hash8),
+            2,
+            "each first connect announces once and nothing else does"
+        );
+        assert!(all_connected(&runtime));
+
+        runtime.destination.lock().await.last_announce =
+            Some(Instant::now() - Duration::from_secs(REANNOUNCE_FLOOR_SECS + 1));
+        sleep(Duration::from_millis(2500)).await;
+        relay_b.stop().await;
+        let (relay_b, mut heard_b) = TransportRelay::start_on_subscribed(late_b).await;
+        wait_for_mesh_line(&notifier, &format!("{label_b} reconnected; announced")).await;
+        TransportRelay::heard_from(&mut heard_b, &hash).await;
+        sleep(CONNECT_WATCH_TICK * 3).await;
+        let lines = mesh_lines(&notifier);
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains("reconnected"))
+                .count(),
+            1,
+            "only the relay that went away is reported: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| {
+                line.contains(&format!("{label_a} reconnected"))
+                    || line.contains(&format!("{} reconnected", private_label(relay.port)))
+            }),
+            "{lines:?}"
+        );
+        assert_eq!(
+            announces_since(before, &hash8),
+            3,
+            "the restart announces once more"
+        );
+        assert!(all_connected(&runtime));
+
+        assert!(slot.stop().await.unwrap());
+        relay.stop().await;
+        relay_a.stop().await;
+        relay_b.stop().await;
+        let metrics = tokio::runtime::Handle::current().metrics();
+        wait_until("the node's tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
     /// A node configured not to announce stays silent on a late connect too, and its
     /// floor stays unset.
     #[cfg(unix)]
