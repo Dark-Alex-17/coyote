@@ -680,16 +680,34 @@ pub(crate) mod test_support {
             announces: &mut broadcast::Receiver<AnnounceEvent>,
             destination: &str,
         ) {
-            let hash = AddressHash::new_from_hex_string(destination).unwrap();
+            Self::heard_from_each(announces, &[destination]).await;
+        }
+
+        /// `heard_from` for several destinations in whichever order their announces
+        /// arrive: nodes whose clients redial a restarted relay together announce
+        /// within the same millisecond, and an announce consumed while waiting for
+        /// another node is not heard again.
+        pub(crate) async fn heard_from_each(
+            announces: &mut broadcast::Receiver<AnnounceEvent>,
+            destinations: &[&str],
+        ) {
+            let mut pending = destinations
+                .iter()
+                .map(|destination| {
+                    (
+                        *destination,
+                        AddressHash::new_from_hex_string(destination).unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
             let deadline = tokio::time::Instant::now() + INTEROP_TIMEOUT;
-            loop {
+            while let Some((destination, _)) = pending.first() {
                 let event = tokio::time::timeout_at(deadline, announces.recv())
                     .await
                     .unwrap_or_else(|_| panic!("the relay must hear {destination}'s announce"))
                     .unwrap();
-                if event.destination.lock().await.desc.address_hash == hash {
-                    return;
-                }
+                let heard = event.destination.lock().await.desc.address_hash;
+                pending.retain(|(_, hash)| *hash != heard);
             }
         }
 

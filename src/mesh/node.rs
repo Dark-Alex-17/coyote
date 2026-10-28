@@ -12797,8 +12797,7 @@ mod tests {
 
         relay.stop().await;
         let (relay, mut announces) = TransportRelay::start_on_subscribed(port).await;
-        TransportRelay::heard_from(&mut announces, &a.hash).await;
-        TransportRelay::heard_from(&mut announces, &b.hash).await;
+        TransportRelay::heard_from_each(&mut announces, &[&a.hash, &b.hash]).await;
         let line = format!("{label} reconnected; announced");
         wait_for_mesh_line(&a.notifier, &line).await;
         wait_for_mesh_line(&b.notifier, &line).await;
