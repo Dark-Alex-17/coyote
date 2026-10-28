@@ -77,7 +77,8 @@ fn repo_root() -> PathBuf {
 
 /// The `agent.*` events a spawned child fires, scraped from the
 /// `HookEvent::as_str` arms in `src/hooks.rs` so a renamed or added event
-/// reaches the wiki checks without a hand-kept copy.
+/// reaches the wiki checks without a hand-kept copy. The four lifecycle
+/// events every child fires today must stay among them.
 fn agent_events() -> Vec<String> {
     let body = fn_body(&src(&["hooks.rs"]), "pub fn as_str(");
     let mut events: Vec<String> = string_literals(&body)
@@ -85,11 +86,17 @@ fn agent_events() -> Vec<String> {
         .filter(|literal| literal.starts_with("agent."))
         .collect();
     events.dedup();
-    assert_eq!(
-        events.len(),
-        4,
-        "HookEvent::as_str names four agent.* events (started, completed, interrupted, failed): {events:?}"
-    );
+    for known in [
+        "agent.started",
+        "agent.completed",
+        "agent.interrupted",
+        "agent.failed",
+    ] {
+        assert!(
+            events.iter().any(|event| event == known),
+            "HookEvent::as_str no longer names {known}: {events:?}"
+        );
+    }
     events
 }
 
@@ -2137,9 +2144,10 @@ fn hook_pages_carry_the_child_session_variable() {
         .expect("spawned_agent_hook_extras pushes a session id variable");
     assert_eq!(var, "COYOTE_AGENT_SESSION_ID");
 
+    let events = agent_events();
     let Some(wiki) = wiki_dir() else { return };
     let hooks = read(wiki.join("Hooks.md"));
-    for event in agent_events() {
+    for event in events {
         let row = table_row("Hooks.md", &hooks, &format!("`{event}`")).join(" ");
         assert!(
             row.contains(&format!("`{var}`")),
@@ -2435,4 +2443,35 @@ fn usage_probe_sessions_sweep_bullets_match_the_sweep_arms() {
             "the sweep section does not say {needle:?}"
         );
     }
+}
+
+/// `paragraph` hands back the lead line and its continuation lines only: a
+/// blank line ends it, and so does a list item set directly under it (both
+/// `-` and `*` bullets, at any indent), so a lead that is itself a bullet
+/// never swallows the bullets that follow it in the same list. Runs without
+/// a wiki checkout.
+#[test]
+fn paragraph_stops_at_a_blank_line_or_the_next_bullet() {
+    let page = "intro\n\
+                - **`carry`:** Optional. A list of state keys\n\
+                \x20 remembered into the record.\n\
+                - **`max_concurrency`:** Caps the branches.\n\
+                \x20 Default 8.\n\
+                \n\
+                Under a session, the key is seeded\n\
+                before any node runs.\n\
+                  * nested bullet after the note\n\
+                tail\n";
+    assert_eq!(
+        paragraph("page", page, "- **`carry`:**"),
+        "- **`carry`:** Optional. A list of state keys\n  remembered into the record."
+    );
+    assert_eq!(
+        paragraph("page", page, "- **`max_concurrency`:**"),
+        "- **`max_concurrency`:** Caps the branches.\n  Default 8."
+    );
+    assert_eq!(
+        paragraph("page", page, "Under a session,"),
+        "Under a session, the key is seeded\nbefore any node runs."
+    );
 }

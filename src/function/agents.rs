@@ -6413,7 +6413,7 @@ mod tests {
     /// until `release` exists, so a test can hold the child mid-run for
     /// exactly as long as it needs. Returns `(started, release)`. A test
     /// that never creates `release` leaks nothing: the script node runner
-    /// spawns with `kill_on_drop(true)`, so dropping the run reaps the
+    /// spawns with `kill_on_drop(true)`, so dropping the run kills the
     /// waiting loop.
     #[cfg(unix)]
     fn write_graph_agent_gated_by_markers(agent_name: &str) -> (PathBuf, PathBuf) {

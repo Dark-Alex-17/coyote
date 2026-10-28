@@ -449,6 +449,10 @@ capabilities:
             VALID_MIXIN,
         );
         write_kit(&workspace_kits, "w", VALID_MIXIN);
+        assert!(
+            paths::sbx_kits_dir().starts_with(config.cache_root()),
+            "the guard pins the sbx kit cache under its cache root, or the next write lands in the real cache"
+        );
         write_kit(&paths::sbx_kits_dir(), "cached", VALID_MIXIN);
 
         let kits = ws.discover().unwrap();
@@ -475,10 +479,6 @@ capabilities:
             vec![
                 "c", "f", "a1", "a2", "ah1", "ah2", "r", "ro", "rh", "h", "w"
             ]
-        );
-        assert!(
-            paths::sbx_kits_dir().starts_with(config.cache_root()),
-            "the guard pins the sbx kit cache under its cache root, or the next assert is vacuous"
         );
         assert!(
             kits.iter()

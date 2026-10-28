@@ -21,21 +21,31 @@ use std::{env, process};
 struct TempDirGuard(PathBuf);
 
 /// Teardown budget for the hook race: the binary only waits for a hook's
-/// spawn, so the `turn.completed` capture shell can still be writing its
-/// log while the directory is removed. Bounded waits, never asserted on.
+/// spawn, so the capture shell that closes a turn can still be writing its
+/// log while the directory is removed. Each teardown phase (waiting for
+/// the closing log, retrying the removal) gets its own budget so a slow
+/// hook cannot eat the retries. Bounded waits, never asserted on.
 const TEARDOWN_BUDGET: Duration = Duration::from_secs(2);
 const TEARDOWN_POLL: Duration = Duration::from_millis(50);
+/// The events whose capture closes a turn once `turn.started` has fired.
+const TURN_CLOSING_EVENTS: [&str; 2] = ["turn.completed", "turn.failed"];
 
 impl Drop for TempDirGuard {
     fn drop(&mut self) {
-        let deadline = Instant::now() + TEARDOWN_BUDGET;
-        if env_log(&self.0, "turn.started").exists() {
-            while !env_log(&self.0, "turn.completed").exists() && Instant::now() < deadline {
+        if env_log(&self.0, TURN_EVENTS[0]).exists() {
+            let closed = |dir: &Path| {
+                TURN_CLOSING_EVENTS
+                    .iter()
+                    .any(|event| env_log(dir, event).exists())
+            };
+            let settled = Instant::now() + TEARDOWN_BUDGET;
+            while !closed(&self.0) && Instant::now() < settled {
                 thread::sleep(TEARDOWN_POLL);
             }
         }
+        let retry_until = Instant::now() + TEARDOWN_BUDGET;
         let mut result = fs::remove_dir_all(&self.0);
-        while result.is_err() && Instant::now() < deadline {
+        while result.is_err() && Instant::now() < retry_until {
             thread::sleep(TEARDOWN_POLL);
             result = fs::remove_dir_all(&self.0);
         }
@@ -2909,5 +2919,52 @@ fn usage_probe_previous_turns_renders_the_sessions_exchanges_and_nothing_without
     assert!(
         stdout_of(&loose).contains("turns<>"),
         "without a session previous_turns is the empty string:\n{text}"
+    );
+}
+
+/// `child_sessions` is a config-file knob, not a `.set` one: from a cold
+/// start the value the config file holds shows in the `.info` table, and
+/// `.set child_sessions true` is refused as an unknown key the way the
+/// config comments promise ("not settable with .set"). A refused step ends
+/// the macro like any other failing step, so the refusal is the last line
+/// of the run and the run reports failure without panicking.
+#[test]
+fn usage_probe_child_sessions_shows_in_info_and_is_refused_by_set_from_a_cold_start() {
+    let dir = fresh_config_dir("child-sessions-knob");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, "");
+    let config = dir.join("config.yaml");
+    let mut text = fs::read_to_string(&config).unwrap();
+    text.push_str("child_sessions: false\n");
+    fs::write(&config, text).unwrap();
+    write_macro(
+        &dir,
+        "knob",
+        &[".info", ".set child_sessions true", "hello"],
+    );
+
+    let output = run_coyote(&dir, &["--macro", "knob"]);
+    let text = combined(&output);
+    assert!(
+        !output.status.success() && !text.contains("panicked"),
+        "a refused `.set` fails the macro without a panic: exit {:?}\n{text}",
+        output.status
+    );
+    let row = stdout_of(&output)
+        .lines()
+        .find(|line| line.trim_start().starts_with("child_sessions"))
+        .unwrap_or_else(|| panic!("`.info` lists a child_sessions row:\n{text}"))
+        .to_string();
+    assert!(
+        row.trim_end().ends_with("false"),
+        "the row reports the config file's value:\n{row}\n{text}"
+    );
+    assert!(
+        text.contains("Unknown key 'child_sessions'"),
+        "`.set` refuses the knob as an unknown key:\n{text}"
+    );
+    assert!(
+        !stdout_of(&output).lines().any(|line| line == "hello"),
+        "the macro stops at the refused step:\n{text}"
     );
 }

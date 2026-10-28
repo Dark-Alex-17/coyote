@@ -1541,9 +1541,15 @@ clients:
         assert_eq!(cfg.child_sessions, None);
     }
 
+    /// The spawn-source phrase every `child_sessions` note shares, so the
+    /// three yaml twins cannot drift apart on how a child comes to exist.
+    const CHILD_SESSIONS_SPAWN_PHRASE: &str =
+        "`agent__spawn` (or a task-queue entry that names an `agent:`)";
+
     /// The `# ---- Child Sessions ----` heading through the `child_sessions:`
-    /// line, so the template and the example are pinned to the same words.
-    fn child_sessions_block(text: &str) -> &str {
+    /// line, read as LF text so a CRLF checkout compares the same bytes.
+    fn child_sessions_block(text: &str) -> String {
+        let text = text.replace("\r\n", "\n");
         let start = text
             .find("# ---- Child Sessions ----")
             .expect("child sessions heading");
@@ -1554,7 +1560,7 @@ clients:
         let end = block[key + 1..]
             .find('\n')
             .map_or(block.len(), |offset| key + 1 + offset + 1);
-        &block[..end]
+        block[..end].to_string()
     }
 
     #[test]
@@ -1563,6 +1569,35 @@ clients:
         let block = child_sessions_block(CONFIG_TEMPLATE);
         assert!(block.ends_with("not settable with .set)\n"), "{block}");
         assert_eq!(block, child_sessions_block(example));
+        assert_eq!(
+            block,
+            child_sessions_block(&example.replace('\n', "\r\n")),
+            "a CRLF checkout of the example compares as the same block"
+        );
+        assert!(block.contains(CHILD_SESSIONS_SPAWN_PHRASE), "{block}");
+    }
+
+    #[test]
+    fn every_child_sessions_note_names_the_same_spawn_sources() {
+        let agent_example = include_str!("../../config.agent.example.yaml");
+        let agent_block = agent_example
+            .split("\nchild_sessions:")
+            .nth(1)
+            .expect("agent example declares child_sessions")
+            .split("\n\n")
+            .next()
+            .unwrap()
+            .replace("\r\n", "\n");
+        let one_line = agent_block
+            .lines()
+            .map(|line| line.trim_start_matches([' ', '#']).trim_end())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(one_line.contains(CHILD_SESSIONS_SPAWN_PHRASE), "{one_line}");
+        assert!(
+            !agent_example.contains("agent__task_create"),
+            "the agent example names the task queue by its agent: entry, not the tool"
+        );
     }
 
     #[test]

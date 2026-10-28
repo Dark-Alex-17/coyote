@@ -2810,6 +2810,14 @@ updated_at: 2026-01-02T03:04:05Z
         sweep_orphans_with_before_remove(&adopt);
         assert!(dir.is_dir());
         assert!(!removal_logged(&uid, "orphan sweep arm 1"));
+        assert!(
+            debug_snapshot()
+                .iter()
+                .any(|message| message.contains(&uid)
+                    && message.contains("a live process adopted it")),
+            "{:?}",
+            debug_snapshot()
+        );
 
         write_root(&dir, &sweep_record(missing, dead_stamp()));
         sweep_orphans();
@@ -2822,8 +2830,7 @@ updated_at: 2026-01-02T03:04:05Z
     }
 
     /// A sessions root that cannot be listed skips the whole sweep with one
-    /// debug line naming the root, and the REPL start it runs under is
-    /// unaffected.
+    /// debug line naming the root and leaves the root as it found it.
     #[test]
     #[serial]
     fn sweep_skips_a_sessions_root_it_cannot_read_with_a_debug_line() {

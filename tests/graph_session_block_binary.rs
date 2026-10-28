@@ -25,6 +25,10 @@ impl Drop for TempDirGuard {
 
 const AGENT: &str = "echo-graph";
 
+/// The built binary every run here spawns; the one place the harness
+/// names it, so a test that needs its directory reads it from here.
+const COYOTE_BIN: &str = env!("CARGO_BIN_EXE_coyote");
+
 /// The `name:` the fixture graph declares; the run-time logger keys its
 /// `[graph:<name>]` prefix on `graph.name`, not on the agent directory.
 const GRAPH_NAME: &str = "echo-graph";
@@ -137,7 +141,7 @@ fn run_with(dir: &Path, args: &[&str]) -> Output {
 /// cases that pin a host knob (the log level) rather than inherit it.
 fn run_with_env(dir: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
     let home = dir.join("home");
-    let binary = Path::new(env!("CARGO_BIN_EXE_coyote"));
+    let binary = Path::new(COYOTE_BIN);
     Command::new(binary)
         .args(args)
         .current_dir(dir)
@@ -3018,5 +3022,73 @@ fn usage_probe_a_role_prefixed_prompt_runs_the_graph_unrecorded_while_a_plain_on
         stub.requests().len(),
         2,
         "`.run` is forced and never asks the classifier"
+    );
+}
+
+/// Every run of the real binary here gets a PATH of exactly the built
+/// binary's own directory followed by the system shell directories, so a
+/// script node (which the engine runs through the `bash` on PATH) sees that
+/// value and nothing from the developer's PATH. The only other entries are
+/// the ones the engine itself prepends from inside the fixture's config dir
+/// (its tool shim directories). The script reports the PATH it ran with
+/// through its JSON stdout and the end node echoes it; the expectation is
+/// spelled from the documented shape, not read back from the fixture helper.
+#[cfg(unix)]
+#[test]
+fn usage_probe_a_script_node_runs_with_only_the_binary_dir_and_the_system_shells_on_path() {
+    let dir = fresh_config_dir("pinned-path");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, "");
+    let agent_dir = dir.join("agents").join(AGENT);
+    let scripts = agent_dir.join("scripts");
+    fs::create_dir_all(&scripts).unwrap();
+    fs::write(
+        scripts.join("path.sh"),
+        "#!/usr/bin/env bash\n\
+         printf '{\"seen\":\"%s\"}' \"$PATH\"\n",
+    )
+    .unwrap();
+    fs::write(
+        agent_dir.join("graph.yaml"),
+        "name: echo-graph\n\
+         version: \"1.0\"\n\
+         initial_state: { said: \"\", seen: \"\" }\n\
+         start: probe\n\
+         nodes:\n\
+         \x20 probe: { type: script, script: scripts/path.sh, next: done }\n\
+         \x20 done: { type: end, output: \"path=<{{seen}}>\" }\n",
+    )
+    .unwrap();
+
+    let output = run_with(&dir, &["-a", AGENT, "hello"]);
+    let text = format!("{}\n{}", stderr_of(&output), stdout_of(&output));
+    assert!(
+        output.status.success() && !text.contains("panicked"),
+        "path run: exit {:?}\n{text}",
+        output.status
+    );
+    let bin_dir = Path::new(COYOTE_BIN).parent().unwrap();
+    let line = stdout_of(&output)
+        .lines()
+        .rev()
+        .find(|l| l.starts_with("path=<"))
+        .unwrap_or_else(|| panic!("the end node reports the script's PATH:\n{text}"))
+        .to_string();
+    let seen = line
+        .strip_prefix("path=<")
+        .and_then(|rest| rest.strip_suffix('>'))
+        .unwrap_or_else(|| panic!("unexpected report shape {line:?}"));
+    let from_outside_the_fixture: Vec<&str> = seen
+        .split(':')
+        .filter(|entry| !Path::new(entry).starts_with(&dir))
+        .collect();
+    assert_eq!(
+        from_outside_the_fixture,
+        [bin_dir.to_str().unwrap(), "/usr/bin", "/bin"],
+        "beyond the engine's own shim dirs under the fixture, the child PATH is the binary dir plus /usr/bin:/bin:\n{text}"
+    );
+    assert!(
+        seen.contains("/usr/bin:/bin"),
+        "the system shell directories come last and in order:\n{line}"
     );
 }

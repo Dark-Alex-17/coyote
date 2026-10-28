@@ -627,6 +627,57 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// The shared test guard points the override at its own temp workspace
+    /// root (the parent of the directory it hands out as the workspace
+    /// config dir), which holds no memory index, so a store built from any
+    /// cwd under the guard carries no workspace memory even when that cwd
+    /// sits inside a workspace that has one. Dropping the guard puts the cwd
+    /// walk back.
+    #[test]
+    #[serial]
+    fn usage_probe_the_test_config_dir_guard_pins_the_workspace_memory_root_to_its_own_workspace() {
+        let _unset = EnvVarGuard::unset(WORKSPACE_MEMORY_ROOT_TEST_ENV);
+        let root = temp_root("guard_pins_memory_root");
+        let indexed = workspace_with_index(&root, "indexed");
+        let cwd = indexed.join("src").join("deep");
+        fs::create_dir_all(&cwd).unwrap();
+
+        let guard = crate::testing::TestConfigDirGuard::new("memory-root-pin");
+        let pinned = PathBuf::from(
+            env::var_os(WORKSPACE_MEMORY_ROOT_TEST_ENV).expect("the guard sets the override"),
+        );
+        let workspace_config_dir = PathBuf::from(
+            env::var_os(crate::utils::get_env_name("workspace_config_dir"))
+                .expect("the guard sets the workspace config dir"),
+        );
+        assert_eq!(
+            pinned.join(WORKSPACE_COYOTE_DIR_NAME),
+            workspace_config_dir,
+            "the override is the guard's workspace root"
+        );
+        assert!(
+            !pinned
+                .join(WORKSPACE_COYOTE_DIR_NAME)
+                .join(MEMORY_DIR_NAME)
+                .join(MEMORY_INDEX_FILE_NAME)
+                .exists(),
+            "the guard's workspace carries no memory index"
+        );
+        assert!(
+            MemoryStore::new(&cwd).workspace.is_none(),
+            "under the guard the indexed workspace around the cwd is never discovered"
+        );
+
+        drop(guard);
+        assert!(env::var_os(WORKSPACE_MEMORY_ROOT_TEST_ENV).is_none());
+        let found = MemoryStore::new(&cwd)
+            .workspace
+            .expect("without the guard the cwd walk finds the index again");
+        assert_eq!(found.workspace_root, indexed);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn find_git_root_returns_dir_containing_git_dir() {
         let root = temp_root("git_root");
