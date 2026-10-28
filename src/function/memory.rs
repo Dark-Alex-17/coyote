@@ -171,22 +171,43 @@ pub fn memory_function_declarations() -> Vec<FunctionDeclaration> {
         },
         FunctionDeclaration {
             name: format!("{MEMORY_FUNCTION_PREFIX}list"),
-            description: "List all live drill files with metadata (size, type, scope). Superseded \
-                          and expired files are hidden unless include_stale is true."
+            description: "List live drill files with metadata (size, type, scope), one page at a \
+                          time. Superseded and expired files are hidden unless include_stale is \
+                          true; `total` counts every file that passed the filters."
                 .to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
-                properties: Some(IndexMap::from([(
-                    "include_stale".to_string(),
-                    JsonSchema {
-                        type_value: Some("boolean".to_string()),
-                        description: Some(
-                            "Also list superseded and expired files, marked `stale: true` (default false)"
-                                .into(),
-                        ),
-                        ..Default::default()
-                    },
-                )])),
+                properties: Some(IndexMap::from([
+                    type_filter_schema(),
+                    scope_filter_schema(),
+                    (
+                        "include_stale".to_string(),
+                        JsonSchema {
+                            type_value: Some("boolean".to_string()),
+                            description: Some(
+                                "Also list superseded and expired files, marked `stale: true` (default false)"
+                                    .into(),
+                            ),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "offset".to_string(),
+                        JsonSchema {
+                            type_value: Some("integer".to_string()),
+                            description: Some("Files to skip before the page starts (default 0)".into()),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "limit".to_string(),
+                        JsonSchema {
+                            type_value: Some("integer".to_string()),
+                            description: Some("Most files to return (default all)".into()),
+                            ..Default::default()
+                        },
+                    ),
+                ])),
                 ..Default::default()
             },
             agent: false,
@@ -415,16 +436,10 @@ pub fn handle_memory_tool(ctx: &mut RequestContext, cmd_name: &str, args: &Value
             }))
         }
         "list" => {
-            let include_stale = args
-                .get("include_stale")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-
-            Ok(json!({
-                "files": list_entries(&store, include_stale)?,
-                "global_index_exists": paths::global_memory_index_file().exists(),
-                "workspace": store.workspace.as_ref().map(workspace_label),
-            }))
+            let mut page = list_entries(&store, args)?;
+            page["global_index_exists"] = json!(paths::global_memory_index_file().exists());
+            page["workspace"] = json!(store.workspace.as_ref().map(workspace_label));
+            Ok(page)
         }
         "write" => write_memory(&store, &cwd, args, run_state_ttl_days, round_chains),
         "search" => search_memory(&store, args),
@@ -524,34 +539,47 @@ fn count_arg(args: &Value, key: &str, default: usize) -> Result<usize> {
     }
 }
 
-fn list_entries(store: &MemoryStore, include_stale: bool) -> Result<Vec<Value>> {
-    let retention = if include_stale {
-        Retention::all()
-    } else {
-        Retention::live()
-    };
+fn list_entries(store: &MemoryStore, args: &Value) -> Result<Value> {
+    let filter = filter_arg(args)?;
+    let offset = count_arg(args, "offset", 0)?;
+    let limit = count_arg(args, "limit", usize::MAX)?;
     let today = today_string();
-    store
-        .list_files(retention)?
+    let catalogue = store.catalogue()?;
+    let admitted: Vec<_> = catalogue
+        .entries()
         .iter()
+        .filter(|entry| filter.admits(entry, &today))
+        .collect();
+    let entries = admitted
+        .iter()
+        .skip(offset)
+        .take(limit)
         .map(|f| {
-            let kind = &f.frontmatter.kind;
+            let kind = &f.kind;
             let mut entry = json!({
-                "name": f.frontmatter.name,
-                "description": f.frontmatter.description,
+                "name": f.name,
+                "description": f.description,
                 "type": kind.kind().name(),
-                "char_len": f.char_len(),
+                "scope": f.scope.name(),
+                "char_len": f.char_len,
                 "path": f.path.display().to_string(),
             });
             if !kind.raw_kind().is_null() && !kind.is_known() {
                 entry["raw_type"] = serde_json::to_value(kind.raw_kind())?;
             }
-            if include_stale && f.is_stale(&today) {
+            if filter.include_stale && f.is_stale(&today) {
                 entry["stale"] = Value::Bool(true);
             }
             Ok(entry)
         })
-        .collect()
+        .collect::<Result<Vec<Value>>>()?;
+
+    Ok(json!({
+        "returned": entries.len(),
+        "files": entries,
+        "total": admitted.len(),
+        "offset": offset,
+    }))
 }
 
 fn write_memory(
@@ -3269,14 +3297,17 @@ mod tests {
         )
         .unwrap();
 
-        let by_name = |entries: Vec<Value>| -> IndexMap<String, Value> {
-            entries
-                .into_iter()
+        let by_name = |page: Value| -> IndexMap<String, Value> {
+            page["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .cloned()
                 .map(|e| (e["name"].as_str().unwrap().to_string(), e))
                 .collect()
         };
 
-        let live = by_name(list_entries(&store, false).unwrap());
+        let live = by_name(list_entries(&store, &json!({})).unwrap());
         assert_eq!(live.len(), 3, "{live:?}");
         assert!(!live.contains_key("bygone"));
         assert_eq!(live["known"]["type"], "user");
@@ -3287,7 +3318,7 @@ mod tests {
         assert!(live["untyped"].get("raw_type").is_none());
         assert!(live.values().all(|e| e.get("stale").is_none()));
 
-        let all = by_name(list_entries(&store, true).unwrap());
+        let all = by_name(list_entries(&store, &json!({"include_stale": true})).unwrap());
         assert_eq!(all.len(), 4, "{all:?}");
         assert_eq!(all["bygone"]["stale"], true);
         assert!(all["known"].get("stale").is_none());
@@ -3419,6 +3450,87 @@ mod tests {
         let mut found = names(&projects);
         found.sort();
         assert_eq!(found, ["habitat-notes", "quokka-habitat-r1"], "{projects}");
+    }
+
+    fn list_names(page: &Value) -> Vec<&str> {
+        page["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap())
+            .collect()
+    }
+
+    fn paging_ctx() -> RequestContext {
+        global_memory_ctx(&[
+            ("note-1", "type: user\n"),
+            ("note-2", "type: project\n"),
+            ("note-3", "type: user\n"),
+            ("note-4", "type: user\nexpires: 2000-01-01\n"),
+            ("note-5", "type: project\n"),
+            ("note-6", "type: user\n"),
+        ])
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn memory_list_pages_through_live_files_with_a_stable_total() {
+        let _guard = crate::testing::TestConfigDirGuard::new("memory-list-paging");
+        let mut ctx = paging_ctx();
+        let list = |ctx: &mut RequestContext, args: Value| {
+            handle_memory_tool(ctx, "memory__list", &args).unwrap()
+        };
+
+        let first = list(&mut ctx, json!({"scope": "global", "limit": 2}));
+        assert_eq!(list_names(&first), ["note-1", "note-2"], "{first}");
+        assert_eq!(first["total"], 5);
+        assert_eq!(first["offset"], 0);
+        assert_eq!(first["returned"], 2);
+
+        let middle = list(&mut ctx, json!({"scope": "global", "offset": 2, "limit": 2}));
+        assert_eq!(list_names(&middle), ["note-3", "note-5"], "{middle}");
+        assert_eq!(middle["total"], 5);
+        assert_eq!(middle["offset"], 2);
+        assert_eq!(middle["returned"], 2);
+
+        let past_end = list(&mut ctx, json!({"scope": "global", "offset": 9, "limit": 2}));
+        assert!(list_names(&past_end).is_empty(), "{past_end}");
+        assert_eq!(past_end["total"], 5);
+        assert_eq!(past_end["offset"], 9);
+        assert_eq!(past_end["returned"], 0);
+
+        let err = handle_memory_tool(&mut ctx, "memory__list", &json!({"limit": -1}))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "limit must be a non-negative integer");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn memory_list_filters_by_type_and_scope_before_paging() {
+        let _guard = crate::testing::TestConfigDirGuard::new("memory-list-filters");
+        let mut ctx = paging_ctx();
+
+        let users = handle_memory_tool(
+            &mut ctx,
+            "memory__list",
+            &json!({"scope": "global", "type": "user", "offset": 1, "limit": 5}),
+        )
+        .unwrap();
+        assert_eq!(list_names(&users), ["note-3", "note-6"], "{users}");
+        assert_eq!(users["total"], 3);
+        assert_eq!(users["returned"], 2);
+        assert!(users["files"][0].get("stale").is_none());
+
+        let with_stale = handle_memory_tool(
+            &mut ctx,
+            "memory__list",
+            &json!({"scope": "global", "type": "user", "include_stale": true, "offset": 2, "limit": 1}),
+        )
+        .unwrap();
+        assert_eq!(list_names(&with_stale), ["note-4"], "{with_stale}");
+        assert_eq!(with_stale["files"][0]["stale"], true);
+        assert_eq!(with_stale["total"], 4);
     }
 
     #[test]
