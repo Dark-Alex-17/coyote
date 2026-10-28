@@ -12625,6 +12625,215 @@ mod tests {
         relay_handle.abort();
     }
 
+    /// Starts a node whose `local` entry answers the probe and nothing after it, next to
+    /// a relay, and returns it once its local row reads a bare `connecting`. The lever is
+    /// a listener that takes the probe's connection and closes; the kernel can complete
+    /// the attached client's first dial in the accept queue before that close lands, in
+    /// which case the client saw a stream and its drop and the row reads `lost,
+    /// retrying` instead, so a start that came up any other way is stopped and the lever
+    /// is re-armed on a fresh port, a bounded number of times.
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    async fn start_beside_a_relay_with_a_dialing_local(
+        tmp: &TempDir,
+        relay_port: u16,
+    ) -> (Arc<MeshRuntime>, LocalEndpoint, JoinHandle<()>) {
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let (port, socket) = held_port().await;
+            let endpoint = local_endpoint(port);
+            let stub = accept_once_then_close(socket.listen(16).unwrap());
+            let mut session = Session::default();
+            let runtime = MeshRuntime::start(
+                &MeshConfig {
+                    interfaces: vec![
+                        MeshInterface::Private {
+                            host: "127.0.0.1".to_string(),
+                            port: relay_port,
+                        },
+                        local_entry(port),
+                    ],
+                    ..MeshConfig::default()
+                },
+                true,
+                &mut session,
+                mesh_paths(tmp),
+                short_connect(),
+            )
+            .await
+            .unwrap();
+            if states_of(&runtime)[1].1 == (InterfaceState::Connecting { reason: None }) {
+                return (runtime, endpoint, stub);
+            }
+            seen.push(states_of(&runtime)[1].1.clone());
+            runtime.shutdown().await.unwrap();
+            stub.abort();
+        }
+        panic!(
+            "no start left the local row at a bare connecting (a dial that lands in the accept queue before the close reads lost, retrying): {seen:?}"
+        );
+    }
+
+    /// A `local` row that is still a bare `connecting` when the operator turns the mesh
+    /// off: `stop` detaches the shared-instance client while it is dialing, nothing hangs
+    /// on the start wait's leftover receiver, the client does not keep dialing the
+    /// endpoint after the detach (an rnsd that comes up afterwards hears nothing), no
+    /// connect is ever told, and the same config dir starts again at once against that
+    /// rnsd with the row `connected`.
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dialing_local_row_stops_cleanly_and_its_detached_client_dials_no_more() {
+        use crate::testing::info_snapshot;
+
+        install_log_collector();
+        let (relay, relay_handle, _) = loopback_relay().await;
+        let tmp = TempDir::new("node-local-dialing-stop");
+        let (runtime, endpoint, stub) =
+            start_beside_a_relay_with_a_dialing_local(&tmp, relay.port()).await;
+        let label = format!("local rnsd at {endpoint}");
+        let connected_line = format!("Mesh interface {label} connected");
+        let transport = runtime.transport_handle().await.unwrap();
+        assert!(transport.shared_instance().is_some());
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+
+        let stopped_at = tokio::time::Instant::now();
+        assert!(slot.stop().await.unwrap(), "stop while the client dials");
+        assert!(
+            stopped_at.elapsed() < SHUTDOWN_GRACE,
+            "stop did not wait on the dialing client: {:?}",
+            stopped_at.elapsed()
+        );
+        assert!(
+            transport.shared_instance().is_none(),
+            "the dialing client is detached with the node"
+        );
+        stub.await.unwrap();
+
+        // rnsd comes up after the stop: the detached client is gone and dials nothing.
+        let LocalEndpoint::Tcp(addr) = &endpoint else {
+            unreachable!("the TCP shape is the local endpoint on this platform")
+        };
+        let listener = rebind_local_port(addr).await;
+        let dial = tokio::time::timeout(LOCAL_RECONNECT_WAIT * 2 + Duration::from_secs(1), async {
+            listener.accept().await.map(|_| ())
+        })
+        .await;
+        assert!(
+            dial.is_err(),
+            "a client the stop detached must not dial the endpoint again: {dial:?}"
+        );
+        assert!(
+            !info_snapshot().iter().any(|line| line == &connected_line),
+            "nothing was ever connected: {:?}",
+            info_snapshot()
+        );
+
+        // The same config dir starts again against that rnsd, `local`-only, at once.
+        let daemon = serve_as_daemon(listener).await;
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &MeshConfig {
+                interfaces: vec![local_entry(addr.port())],
+                ..MeshConfig::default()
+            },
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            states_of(&runtime),
+            vec![(label.clone(), InterfaceState::Connected)]
+        );
+        assert_eq!(
+            info_snapshot()
+                .iter()
+                .filter(|line| *line == &connected_line)
+                .count(),
+            1,
+            "the restart tells its connect once: {:?}",
+            info_snapshot()
+        );
+        runtime.shutdown().await.unwrap();
+        daemon.abort();
+        relay_handle.abort();
+    }
+
+    /// The start-abort gate on a `local`-only config waits for the client's first
+    /// `Connected` no longer than `connect_timeout`: a stand-in that takes the probe and
+    /// refuses the dial makes `start` bail within a small multiple of that timeout, not
+    /// hang on the client's redials, and the reason names the configured wait as the
+    /// operator spelled it. The kernel race the probe-alone test describes is handled the
+    /// same way: a start that came up `connected` is stopped and the lever re-armed.
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_local_only_bail_on_a_dialing_client_is_bounded_by_connect_timeout() {
+        use crate::testing::info_snapshot;
+
+        install_log_collector();
+        let connect_timeout = short_connect().connect_timeout;
+        let tmp = TempDir::new("node-local-dialing-bound");
+        let mut outcome = None;
+        for _ in 0..3 {
+            let (port, socket) = held_port().await;
+            let endpoint = local_endpoint(port);
+            let stub = accept_once_then_close(socket.listen(16).unwrap());
+            let mut session = Session::default();
+            let started_at = tokio::time::Instant::now();
+            let result = MeshRuntime::start(
+                &MeshConfig {
+                    interfaces: vec![local_entry(port)],
+                    ..MeshConfig::default()
+                },
+                true,
+                &mut session,
+                mesh_paths(&tmp),
+                short_connect(),
+            )
+            .await;
+            let elapsed = started_at.elapsed();
+            stub.await.unwrap();
+            match result {
+                Err(err) => {
+                    outcome = Some((endpoint, err.to_string(), elapsed));
+                    break;
+                }
+                Ok(runtime) => runtime.shutdown().await.unwrap(),
+            }
+        }
+        let (endpoint, err, elapsed) =
+            outcome.expect("the client's first dial kept landing in the accept queue");
+        assert!(
+            elapsed < connect_timeout * 6,
+            "the start wait is bounded by connect_timeout ({connect_timeout:?}), took {elapsed:?}"
+        );
+        assert!(
+            err.contains(&format!("did not connect within {connect_timeout:?}.")),
+            "the reason names the configured wait: {err}"
+        );
+        assert!(
+            err.starts_with(&format!(
+                "Local rnsd at {endpoint} (type: local) is not reachable: "
+            )),
+            "{err}"
+        );
+        let label = format!("local rnsd at {endpoint}");
+        assert!(
+            !info_snapshot()
+                .iter()
+                .any(|line| line == &format!("Mesh interface {label} connected")),
+            "a bailed start tells no connect: {:?}",
+            info_snapshot()
+        );
+        let metrics = tokio::runtime::Handle::current().metrics();
+        wait_until("the transport's tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
     /// The peer table is not a routing input: a row whose stored name hash is not the
     /// announce's (a hand-edited or corrupted `peers.json`) still resolves at once, because
     /// the description is the transport's, and the operator's upper-case spelling of the

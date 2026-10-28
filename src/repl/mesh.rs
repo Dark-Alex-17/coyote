@@ -17272,6 +17272,168 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 });
             }
 
+            /// Stands in for an rnsd that answers the probe and nothing after it: one
+            /// connection is accepted, then the listener closes with it, so the attached
+            /// client dials into a refusal. Awaiting the task proves the port is free again.
+            #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+            fn accept_once_then_close(
+                listener: tokio::net::TcpListener,
+            ) -> tokio::task::JoinHandle<()> {
+                tokio::spawn(async move {
+                    let (_probe, _) = listener.accept().await.unwrap();
+                })
+            }
+
+            /// The REPL surface of a `local` rnsd that answered the probe but whose client
+            /// had not connected when the start wait ran out, beside a working relay: the
+            /// node comes up, `.mesh on` warns with the bare-connecting tail (`not connected
+            /// yet`, then the start-the-daemon hint), the summary lists only the relay, and
+            /// `.mesh info` carries the row as a bare `connecting` with no reason and no
+            /// `retrying`. When a listener is back on the endpoint the client's redial lands
+            /// and the row is `connected`, told at info once, with no second WARNING and no
+            /// idle line. The kernel can complete the client's first dial before the stub's
+            /// listener closes (the probe-alone test in `mesh::node` describes it), in which
+            /// case the node came up `connected` instead; that start is turned off and the
+            /// lever re-armed on a fresh port, a bounded number of times.
+            #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+            #[test]
+            #[serial]
+            fn mesh_on_beside_a_relay_warns_and_lists_a_dialing_local_rnsd_as_bare_connecting() {
+                use crate::testing::{info_snapshot, install_log_collector};
+
+                let guard = TestConfigDirGuard::new("repl-mesh-local-dialing-bare");
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                let _script = prompt_script::install(&[true, true, true, true, true, true]);
+                let _capture = capture::install();
+                install_log_collector();
+                run_async(async {
+                    let (addr, relay_handle, _) = loopback_relay().await;
+                    let relay_label = format!("private 127.0.0.1:{}", addr.port());
+                    let idle = Arc::new(Recording::default());
+                    let mut armed = None;
+                    for _ in 0..3 {
+                        let (port, socket) = held_port().await;
+                        let (entry, endpoint) = absent_local_entry(port);
+                        let stub = accept_once_then_close(socket.listen(16).unwrap());
+                        let mut ctx = ctx_with(
+                            MeshConfig {
+                                interfaces: vec![
+                                    MeshInterface::Private {
+                                        host: "127.0.0.1".to_string(),
+                                        port: addr.port(),
+                                    },
+                                    entry,
+                                ],
+                                ..MeshConfig::default()
+                            },
+                            true,
+                        );
+                        ctx.session = Some(Session::default());
+                        ctx.app.mesh.set_idle(idle.clone());
+                        let stderr_before = stderr_lines().len();
+                        let stdout_before = stdout_lines().len();
+                        run(&mut ctx, ".mesh on").await.unwrap();
+                        let runtime = ctx.app.mesh.get().unwrap();
+                        if runtime.interface_states()[1].state
+                            == (InterfaceState::Connecting { reason: None })
+                        {
+                            armed = Some((ctx, endpoint, stub, stderr_before, stdout_before));
+                            break;
+                        }
+                        // The dial landed in the accept queue before the close: not the
+                        // shape under test.
+                        run(&mut ctx, ".mesh off --yes").await.unwrap();
+                        stub.await.unwrap();
+                    }
+                    let (mut ctx, endpoint, stub, stderr_before, stdout_before) =
+                        armed.expect("the client's first dial kept landing in the accept queue");
+                    let label = format!("local rnsd at {endpoint}");
+                    let runtime = ctx.app.mesh.get().unwrap();
+
+                    let warnings_now: Vec<String> = stderr_lines()[stderr_before..]
+                        .iter()
+                        .filter(|line| line.starts_with("WARNING:"))
+                        .cloned()
+                        .collect();
+                    assert_eq!(
+                        warnings_now,
+                        vec![format!(
+                            "WARNING: {label} is not reachable yet: not connected yet; start the local rnsd"
+                        )],
+                        "{:?}",
+                        stderr_lines()
+                    );
+                    let out = stdout_lines()[stdout_before..].to_vec();
+                    let summary = &out[index_of(&out, "Mesh is on for this session")];
+                    assert!(
+                        summary.contains(&format!("  interfaces: {relay_label}")),
+                        "{summary}"
+                    );
+                    assert!(!summary.contains("local rnsd"), "{summary}");
+                    let info = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    assert_eq!(
+                        info_row(&info, "interfaces[1]"),
+                        format!("{label}  connecting"),
+                        "a bare connecting carries no reason and no retrying\n{info}"
+                    );
+                    assert_eq!(
+                        info_row(&info, "interfaces[0]"),
+                        format!("{relay_label}  connected"),
+                        "{info}"
+                    );
+                    assert_eq!(runtime.interface_kinds(), vec!["private"]);
+                    let connected_line = format!("Mesh interface {label} connected");
+                    assert!(
+                        !info_snapshot().iter().any(|line| line == &connected_line),
+                        "nothing is told while the client dials: {:?}",
+                        info_snapshot()
+                    );
+
+                    // A listener is back where rnsd listens: the redial lands.
+                    stub.await.unwrap();
+                    let daemon = serve_as_daemon_at(&endpoint, None).await;
+                    wait_for_info_row(
+                        &mut ctx,
+                        1,
+                        |row| row == format!("{label}  connected"),
+                        "the dialing local row to connect",
+                    )
+                    .await;
+                    assert_eq!(runtime.interface_kinds(), vec!["private", "local"]);
+                    assert_eq!(
+                        info_snapshot()
+                            .iter()
+                            .filter(|line| *line == &connected_line)
+                            .count(),
+                        1,
+                        "the connect is told once: {:?}",
+                        info_snapshot()
+                    );
+                    assert_eq!(
+                        stderr_lines()[stderr_before..]
+                            .iter()
+                            .filter(|line| line.starts_with("WARNING:"))
+                            .count(),
+                        1,
+                        "no second WARNING: {:?}",
+                        stderr_lines()
+                    );
+                    assert!(
+                        idle.0
+                            .lock()
+                            .iter()
+                            .all(|text| !text.contains("local rnsd")),
+                        "a local rnsd prints no idle line: {:?}",
+                        idle.0.lock()
+                    );
+
+                    run(&mut ctx, ".mesh off --yes").await.unwrap();
+                    assert!(ctx.app.mesh.get().is_none());
+                    daemon.abort();
+                    relay_handle.abort();
+                });
+            }
+
             /// Two `local` entries are refused by `.mesh on` itself, before the preview and
             /// before anything is probed or attached: a relay that WOULD have carried the
             /// node sits beside them, so a start that merely ignored the rule would come up
