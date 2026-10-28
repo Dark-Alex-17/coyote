@@ -92,6 +92,7 @@ pub(in crate::config) const DEFAULT_SPAWN_INSTRUCTIONS: &str = indoc! {"
     | `agent__collect` | Blocking wait: wait for an agent to finish, return its output. |
     | `agent__list_available` | List all agent types you can spawn (name + description + declared variables). Use this to discover specialists and the `variables` they accept before calling `agent__spawn`. |
     | `agent__list_running` | List all subagents YOU have spawned, with their status. |
+    | `agent__list_sessions` | List this context's child sessions (resumable `session_id`s, effective status, run count), newest first, paginated with `page_size`/`cursor`. |
     | `agent__cancel` | Cancel a running agent by ID. |
     | `agent__task_create` | Create a task in the dependency-aware task queue. Optional `variables` (string map) is passed to the auto-dispatched agent. |
     | `agent__task_list` | List all tasks and their status/dependencies. |
@@ -248,3 +249,47 @@ pub(in crate::config) const DEFAULT_USER_INTERACTION_INSTRUCTIONS: &str = indoc!
     Use these tools when you need user decisions, preferences, or clarification.
     If you are running as a subagent, these questions are automatically escalated to the root agent for resolution."
 };
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_SPAWN_INSTRUCTIONS, DEFAULT_TEAMMATE_INSTRUCTIONS};
+    use crate::function::agents::agent_function_declarations;
+
+    /// Every `agent__*` tool the agent can call is documented where it
+    /// learns about the tool: a `| `name` |` row in the spawn guidance tables
+    /// or a `- `name`` bullet in the teammate guidance.
+    #[test]
+    fn every_agent_tool_declaration_has_a_guidance_row_or_bullet() {
+        let declarations = agent_function_declarations();
+        assert!(!declarations.is_empty());
+        for declaration in declarations {
+            let name = declaration.name;
+            let row = format!("| `{name}` |");
+            let bullet = format!("- `{name}`");
+            assert!(
+                DEFAULT_SPAWN_INSTRUCTIONS.contains(&row)
+                    || DEFAULT_TEAMMATE_INSTRUCTIONS.contains(&bullet),
+                "{name} has no guidance row {row:?} and no teammate bullet {bullet:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn spawn_guidance_table_names_list_sessions_beside_list_running() {
+        let running = DEFAULT_SPAWN_INSTRUCTIONS
+            .find("| `agent__list_running` |")
+            .unwrap();
+        let sessions = DEFAULT_SPAWN_INSTRUCTIONS
+            .find("| `agent__list_sessions` |")
+            .unwrap();
+        let between = &DEFAULT_SPAWN_INSTRUCTIONS[running..sessions];
+        assert_eq!(between.matches('\n').count(), 1, "{between:?}");
+        let row = DEFAULT_SPAWN_INSTRUCTIONS[sessions..]
+            .lines()
+            .next()
+            .unwrap();
+        for needle in ["`session_id`", "`page_size`", "`cursor`", "newest first"] {
+            assert!(row.contains(needle), "{row}");
+        }
+    }
+}

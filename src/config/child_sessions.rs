@@ -25,6 +25,10 @@ use uuid::Uuid;
 /// listing can show what each child was asked without loading its session.
 pub(crate) const PROMPT_HEAD_CHARS: usize = 200;
 
+/// How many runs a child's sidecar remembers; the first spawn is run 0
+/// and every resume adds one, dropping the oldest past this many.
+pub(crate) const CHILD_RUN_HISTORY: usize = 50;
+
 const META_SUFFIX: &str = ".meta.yaml";
 
 /// Sibling of `root.yaml` whose kernel lock serialises every
@@ -934,7 +938,27 @@ pub(crate) enum EffectiveStatus {
     Crashed,
 }
 
-/// Sidecar describing one child session.
+/// One run of a child session: its first spawn or a later resume, each
+/// under its own agent id and process. Only the last run is ever closed
+/// by `finish_at`, so an earlier run with no `status` ended without
+/// recording a verdict: its process went away before it could.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ChildRun {
+    pub agent_id: String,
+    pub pid: u32,
+    pub pid_start: u64,
+    pub started_at: DateTime<Utc>,
+    #[serde(default)]
+    pub finished_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub status: Option<ChildStatus>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Sidecar describing one child session. The top-level status, agent id
+/// and process stamp mirror the last entry of `runs`; sidecars written
+/// before runs were recorded load with an empty ring.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ChildMeta {
     #[serde(default = "default_version")]
@@ -957,6 +981,8 @@ pub(crate) struct ChildMeta {
     pub task_id: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
+    #[serde(default)]
+    pub runs: Vec<ChildRun>,
 }
 
 impl ChildMeta {
@@ -1019,6 +1045,38 @@ impl ChildMeta {
             prompt_head: prompt_head(prompt),
             task_id,
             error: None,
+            runs: vec![ChildRun {
+                agent_id: agent_id.into(),
+                pid: stamp.pid,
+                pid_start: stamp.start,
+                started_at: now,
+                finished_at: None,
+                status: None,
+                error: None,
+            }],
+        }
+    }
+
+    /// Marks the child running again under `agent_id` and `stamp` for a
+    /// resume, opening a new run.
+    pub(crate) fn restamp(&mut self, stamp: ProcessStamp, agent_id: &str, now: DateTime<Utc>) {
+        self.status = ChildStatus::Running;
+        self.agent_id = agent_id.to_string();
+        self.pid = stamp.pid;
+        self.pid_start = stamp.start;
+        self.updated_at = now;
+        self.error = None;
+        self.runs.push(ChildRun {
+            agent_id: agent_id.to_string(),
+            pid: stamp.pid,
+            pid_start: stamp.start,
+            started_at: now,
+            finished_at: None,
+            status: None,
+            error: None,
+        });
+        if self.runs.len() > CHILD_RUN_HISTORY {
+            self.runs.drain(..self.runs.len() - CHILD_RUN_HISTORY);
         }
     }
 
@@ -1033,6 +1091,11 @@ impl ChildMeta {
         error: Option<String>,
     ) {
         self.status = status;
+        if let Some(run) = self.runs.last_mut() {
+            run.finished_at = Some(now);
+            run.status = Some(status);
+            run.error = error.clone();
+        }
         self.error = error;
         self.updated_at = now;
     }
@@ -1172,6 +1235,15 @@ mod tests {
             prompt_head: "do the thing".into(),
             task_id: Some("task-7".into()),
             error: Some("boom".into()),
+            runs: vec![ChildRun {
+                agent_id: "agent-1".into(),
+                pid: 4242,
+                pid_start: 1_700_000_000,
+                started_at: fixture_time(),
+                finished_at: Some(fixture_time()),
+                status: Some(status),
+                error: Some("boom".into()),
+            }],
         }
     }
 
@@ -1365,6 +1437,131 @@ updated_at: 2026-01-02T03:04:05Z
         assert_eq!(meta.prompt_head, "");
         assert_eq!(meta.task_id, None);
         assert_eq!(meta.error, None);
+        assert!(meta.runs.is_empty());
+    }
+
+    #[test]
+    fn old_sidecar_without_runs_loads_with_an_empty_ring_and_finishes_without_panicking() {
+        let yaml = "\
+session_id: sess_coder_0123456789ab
+agent: coder
+status: running
+agent_id: agent-1
+pid: 4242
+pid_start: 1700000000
+created_at: 2026-01-02T03:04:05Z
+updated_at: 2026-01-02T03:04:05Z
+";
+        let mut meta: ChildMeta = serde_yaml::from_str(yaml).unwrap();
+        assert!(meta.runs.is_empty());
+
+        meta.finish_at(fixture_time(), ChildStatus::Completed, None);
+
+        assert_eq!(meta.status, ChildStatus::Completed);
+        assert!(meta.runs.is_empty());
+    }
+
+    #[test]
+    fn new_running_at_seeds_run_zero_and_finish_closes_it() {
+        let now = fixture_time();
+        let mut meta = ChildMeta::new_running_at(
+            now,
+            "sess_coder_0123456789ab",
+            "coder",
+            "agent-1",
+            fixture_stamp(),
+            None,
+            None,
+            "do the thing",
+            None,
+        );
+        assert_eq!(
+            meta.runs,
+            vec![ChildRun {
+                agent_id: "agent-1".into(),
+                pid: fixture_stamp().pid,
+                pid_start: fixture_stamp().start,
+                started_at: now,
+                finished_at: None,
+                status: None,
+                error: None,
+            }]
+        );
+
+        let later = now + Duration::seconds(30);
+        meta.finish_at(later, ChildStatus::Failed, Some("boom".into()));
+
+        assert_eq!(meta.runs.len(), 1);
+        assert_eq!(meta.runs[0].finished_at, Some(later));
+        assert_eq!(meta.runs[0].status, Some(ChildStatus::Failed));
+        assert_eq!(meta.runs[0].error.as_deref(), Some("boom"));
+        assert_eq!(meta.status, ChildStatus::Failed);
+        assert_eq!(meta.error.as_deref(), Some("boom"));
+        assert_eq!(meta.updated_at, later);
+    }
+
+    #[test]
+    fn restamp_pushes_a_run_and_keeps_the_newest_fifty() {
+        let mut meta = ChildMeta::new_running_at(
+            fixture_time(),
+            "sess_coder_0123456789ab",
+            "coder",
+            "agent-0",
+            fixture_stamp(),
+            None,
+            None,
+            "do the thing",
+            None,
+        );
+        meta.finish_at(fixture_time(), ChildStatus::Completed, None);
+        let stamp_at = |n: u32| ProcessStamp {
+            pid: 1000 + n,
+            start: 1_700_000_000 + u64::from(n),
+        };
+        let time_at = |n: u32| fixture_time() + Duration::minutes(i64::from(n));
+
+        meta.restamp(stamp_at(1), "agent-1", time_at(1));
+        meta.finish_at(time_at(1), ChildStatus::Failed, Some("boom".into()));
+        meta.restamp(stamp_at(2), "agent-2", time_at(2));
+
+        assert_eq!(meta.runs.len(), 3);
+        assert_eq!(meta.runs[0].agent_id, "agent-0");
+        assert_eq!(meta.runs[0].status, Some(ChildStatus::Completed));
+        assert_eq!(meta.runs[1].agent_id, "agent-1");
+        assert_eq!(meta.runs[1].status, Some(ChildStatus::Failed));
+        assert_eq!(meta.runs[1].error.as_deref(), Some("boom"));
+        assert_eq!(
+            meta.runs[2],
+            ChildRun {
+                agent_id: "agent-2".into(),
+                pid: stamp_at(2).pid,
+                pid_start: stamp_at(2).start,
+                started_at: time_at(2),
+                finished_at: None,
+                status: None,
+                error: None,
+            }
+        );
+        assert_eq!(meta.status, ChildStatus::Running);
+        assert_eq!(meta.error, None);
+
+        for n in 3..CHILD_RUN_HISTORY as u32 {
+            meta.restamp(stamp_at(n), &format!("agent-{n}"), time_at(n));
+        }
+        assert_eq!(meta.runs.len(), CHILD_RUN_HISTORY);
+        assert_eq!(meta.runs[0].agent_id, "agent-0");
+
+        let last = CHILD_RUN_HISTORY as u32;
+        meta.restamp(stamp_at(last), &format!("agent-{last}"), time_at(last));
+
+        assert_eq!(meta.runs.len(), CHILD_RUN_HISTORY);
+        assert_eq!(meta.runs[0].agent_id, "agent-1");
+        assert_eq!(meta.runs[0].status, Some(ChildStatus::Failed));
+        assert_eq!(meta.runs.last().unwrap().agent_id, format!("agent-{last}"));
+        assert_eq!(meta.agent_id, format!("agent-{last}"));
+        assert_eq!(meta.pid, stamp_at(last).pid);
+        assert_eq!(meta.pid_start, stamp_at(last).start);
+        assert_eq!(meta.updated_at, time_at(last));
     }
 
     #[test]

@@ -2611,11 +2611,12 @@ fn polyfill_cmd_name<T: AsRef<Path>>(cmd_name: &str, bin_dir: &[T]) -> String {
 // Polling tools are expected to repeat with identical arguments (status probes,
 // list views, inbox checks); recording them would also let them break up
 // detection of a real loop in the calls they interleave with.
-const LOOP_TRACKER_EXEMPT_TOOLS: [&str; 6] = [
+const LOOP_TRACKER_EXEMPT_TOOLS: [&str; 7] = [
     "job__check",
     "job__list",
     "agent__check",
     "agent__list_running",
+    "agent__list_sessions",
     "agent__task_list",
     "agent__check_inbox",
 ];
@@ -3442,12 +3443,13 @@ mod tests {
             "job__list",
             "agent__check",
             "agent__list_running",
+            "agent__list_sessions",
             "agent__task_list",
             "agent__check_inbox",
         ]
         .into_iter()
         .collect();
-        assert_eq!(LOOP_TRACKER_EXEMPT_TOOLS.len(), 6);
+        assert_eq!(LOOP_TRACKER_EXEMPT_TOOLS.len(), 7);
         assert_eq!(actual, expected);
     }
 
@@ -3484,13 +3486,18 @@ mod tests {
         assert!(tracker.check_loop(&x).is_some());
     }
 
-    /// Zero-argument polls (`agent__check_inbox`, `agent__task_list`) are
-    /// byte-identical on every call, so the protocol-mandated "check your inbox
-    /// after each round" cadence must never read as a loop — even when the
-    /// polls are back-to-back and well past the repeat threshold.
+    /// Zero-argument polls (`agent__check_inbox`, `agent__task_list`,
+    /// `agent__list_sessions`) are byte-identical on every call, so the
+    /// protocol-mandated "check your inbox after each round" cadence must
+    /// never read as a loop, even when the polls are back-to-back and well
+    /// past the repeat threshold.
     #[test]
     fn tracker_zero_arg_polls_never_trip_even_when_consecutive() {
-        for name in ["agent__check_inbox", "agent__task_list"] {
+        for name in [
+            "agent__check_inbox",
+            "agent__task_list",
+            "agent__list_sessions",
+        ] {
             let mut tracker = ToolCallTracker::default();
             let poll = call_with_args(name, json!({}));
             for _ in 0..10 {
@@ -3585,6 +3592,7 @@ mod tests {
         assert!(f.contains("agent__check"));
         assert!(f.contains("agent__collect"));
         assert!(f.contains("agent__list_running"));
+        assert!(f.contains("agent__list_sessions"));
         assert!(f.contains("agent__list_available"));
         assert!(f.contains("agent__cancel"));
         assert!(f.contains("agent__reply_escalation"));

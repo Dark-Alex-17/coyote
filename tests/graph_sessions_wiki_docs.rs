@@ -2275,6 +2275,14 @@ fn agents_page_quotes_the_spawn_session_id_contract() {
             ')',
         )
     );
+    let page_size = format!(
+        "default {}",
+        number_after(&agents, "const LIST_SESSIONS_PAGE_SIZE: usize =", ';')
+    );
+    let page_cap = format!(
+        "max {}",
+        number_after(&agents, "const LIST_SESSIONS_PAGE_CAP: usize =", ';')
+    );
     let policy = resume_policy_sentence();
     assert_eq!(
         policy,
@@ -2292,6 +2300,20 @@ fn agents_page_quotes_the_spawn_session_id_contract() {
         row.contains(sentence),
         "the `agent__spawn` row does not quote {sentence:?}: {row}"
     );
+    let sessions = table_row("Agents.md", &page, "`agent__list_sessions`").join(" ");
+    for needle in [
+        "`session_id`",
+        "`crashed`",
+        "`page_size`",
+        "`cursor`",
+        page_size.as_str(),
+        page_cap.as_str(),
+    ] {
+        assert!(
+            sessions.contains(needle),
+            "the `agent__list_sessions` row does not say {needle:?}: {sessions}"
+        );
+    }
     let resume = flat(&section("Agents.md", &page, RESUME_HEADING));
     let mut needles = vec![
         "`agent__check`",
