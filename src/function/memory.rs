@@ -774,7 +774,7 @@ fn ensure_index_entry(index_path: &Path, name: &str, description: &str) -> Resul
     for raw in existing.split_inclusive('\n') {
         let line = raw.trim_end_matches(['\r', '\n']);
         if catalogue_slug(line) == Some(name) {
-            if catalogue_entry(line).is_some_and(|(_, desc)| desc == description) {
+            if catalogue_entry(line).is_some_and(|(_, desc)| desc == description.trim()) {
                 return Ok(false);
             }
             let rewritten = format!(
@@ -1120,6 +1120,13 @@ mod tests {
 
         let updated = ensure_index_entry(&index, "existing", "different description").unwrap();
         assert!(!updated, "an identical description is not a rewrite");
+        assert_eq!(fs::read_to_string(&index).unwrap(), rewritten);
+
+        let updated = ensure_index_entry(&index, "existing", "  different description \n").unwrap();
+        assert!(
+            !updated,
+            "surrounding whitespace on the argument does not count as a change"
+        );
         assert_eq!(fs::read_to_string(&index).unwrap(), rewritten);
 
         let _ = fs::remove_dir_all(&root);
