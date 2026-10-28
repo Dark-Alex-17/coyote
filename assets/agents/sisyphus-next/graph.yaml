@@ -1,0 +1,1848 @@
+name: sisyphus-next
+description: |
+  CANDIDATE decomposition of the sisyphus orchestrator into a session graph.
+  The protocol the prose sisyphus enforces becomes edges: script nodes
+  own routing, bounds, ledgers and sentinel parsing; short single-question llm nodes
+  own the judgment; coder / review-gauntlet / explore / librarian / oracle /
+  step-runner / whetstone / engineer run as agent-node islands exactly as they ship.
+  Candidate status: no agent lists this as spawnable, the shipped sisyphus is
+  untouched, and this directory is replaced by the facade at cutover (D1) once the
+  A9 artifact-equivalence replay passes. The run-or-chat session surface is the
+  facade's: work routes to the graph, conversation to the engineer chat lane.
+version: '1.0'
+
+# Dynamic spawning from llm nodes (research_answer, send_breach_notice, the inbox
+# checks, observability_pass) plus the agent-node islands. Limits mirror
+# sisyphus/config.yaml.
+can_spawn_agents: true
+max_concurrent_agents: 40
+max_agent_depth: 5
+
+global_tools:
+  - ast_grep.sh
+  - fs_read.sh
+  - fs_grep.sh
+  - fs_glob.sh
+  - fs_ls.sh
+  - fs_write.sh
+  - fs_patch.sh
+  - execute_command.sh
+  - web_search_coyote.sh
+
+skills_enabled: true
+enabled_skills:
+  - code-review
+  - diagnosing-bugs
+  - observability-review
+  - git-master
+  - delegation-protocol
+  - parallel-research
+  - verification-gates
+  - oracle-protocol
+
+variables:
+  # Mirror of sisyphus's variables: names AND defaults identical, so an
+  # explicit spawn override and an unset variable both behave as they do today.
+  - name: project_dir
+    description: Project directory to work in
+    default: '.'
+  - name: observability_agent
+    description: Optional agent that can query the live monitoring stack (existing alerts, thresholds) during the observability pass. Empty disables the live lookup; repo-derived inventory still runs.
+    default: ''
+  - name: parallel
+    description: "Set to '1' when this Sisyphus is one task agent in a parallel batch (isolated worktree, own task branch, teammate roster from the parent). Gates the parallel-batch teamwork protocol into the graph; leave '0' for a standalone or sequential run."
+    default: '0'
+  - name: auto_confirm
+    description: Auto-confirm command execution
+    default: '1'
+  - name: escalation_policy
+    description: "How escalation-worthy decisions are handled mid-run: 'interactive' pauses and asks the user; 'autonomous' self-resolves decisions covered by a standing ruling or a clearly recommended option, reports them in a final-report digest, and only pings on hard triggers or novel conflicts"
+    default: 'interactive'
+  - name: build_lock
+    description: "Command prefix for every declared verification command, e.g. `flock -w 240 /path/to/lock`; empty runs them bare. It is substituted raw into a JSON string on every hop, so it must be free of double quotes and backslashes; quote paths with single quotes (`flock '/tmp/my lock'`)"
+    default: ''
+  - name: review_cadence
+    description: "When the post-coder review passes run: 'task' (default: this Sisyphus runs the review gauntlet on its own work) or 'batch' (set by a parent orchestrator running micro-granularity tasks: coder verification only; the orchestrator runs the full review panel once over the whole batch). Never set 'batch' for a standalone run."
+    default: 'task'
+
+settings:
+  # Engine backstop only: every cycle carries its own named bound in a script. Worst legitimate visit count of the most-visited node
+  # (run_gauntlet: 1 + 3 fix rounds + 1 debris re-run + 1 observability round = 6
+  # per subtask, x3 subtasks = 18); user-driven review retries ride the headroom.
+  max_loop_iterations: 100
+  log_state_snapshots: true
+  validate_before_run: true
+  # Orchestration runs are long by design (the facade's choice); the islands that
+  # run to completion carry their own graph timeouts (coder 14400, gauntlet 69600).
+  timeout: 0
+
+session:
+  expose:
+    - run_id
+    - run_dir
+    - intent
+    - sizing
+    - base_sha
+    - head_sha
+    - gauntlet_verdict
+    - report
+  route:
+    instructions: |
+      Route RUN when the message asks for WORK to be executed: implement, fix,
+      refactor, or build something; execute a task, plan, or handoff ("execute
+      the handoff at <path>"); resume, continue, or retry a task; run
+      verification, reviews, or the gauntlet. Route CHAT for everything
+      conversational: questions ("how does X work", "where is Y"), status and
+      run-record questions, debugging discussions, design or research requests,
+      brainstorming, and anything about UNDERSTANDING rather than doing - the
+      chat lane is the engineer, a read-only staff-engineer companion with its
+      own explore/librarian/oracle research fan-out that writes handoffs and
+      amendment artifacts instead of code. When uncertain or the message mixes
+      both, route CHAT: the engineer can always end with a handoff the user
+      explicitly runs, but a wrongly-routed RUN performs writes nobody asked for.
+  chat:
+    agent: engineer
+    variables:
+      chat_agent_for: sisyphus
+
+initial_state:
+  # --- run identity / A2 artifacts ---
+  run_id: ''
+  run_dir: ''
+  base_sha: ''
+  head_sha: ''
+  git_root: ''
+  delegated: false
+  top_level: true
+  parallel_mode: false
+  resume_mode: false
+  resume_action: ''
+  resume_note: ''
+  brief: ''
+  quality_rigor: 'production'
+  quality_surfaces: ''
+  plans_detected: false
+  owner_away: false
+  roster_scope: {}
+  own_scope: []
+  # --- assess ---
+  intent: ''
+  sizing: ''
+  intent_statement: ''
+  clarifying_questions: []
+  clarifications: ''
+  clarify_rounds: 0
+  needs_oracle: false
+  oracle_question: ''
+  architecture_scale: false
+  has_spec: false
+  spec_text: ''
+  consumer_surface: false
+  security_posture: 'standard'
+  posture_reason: ''
+  verification_commands: '[]'
+  local_run_recipe: ''
+  git_actions: {}
+  pr_base_branch: ''
+  external_feedback: []
+  batch_plan_defect: ''
+  anomalies: []
+  anomalies_log: []
+  # --- subtasks (A11) ---
+  subtasks: []
+  subtask_index: 0
+  current_task: ''
+  task_number: 0
+  # --- research ---
+  explore_slices: []
+  librarian_questions: []
+  team_mode: false
+  explore_findings: []
+  librarian_findings: []
+  context_pack: ''
+  context_pack_degraded: false
+  codebase_register: ''
+  register_question: ''
+  design_options: []
+  confirm_scope: false
+  oracle_consulted: false
+  oracle_result: ''
+  architecture_proposal: ''
+  # --- escalation ladder ---
+  escalation: {}
+  ask_question: ''
+  last_answer: ''
+  last_answer_text: ''
+  parked: ''
+  standing_rulings: ''
+  ladder_resolution: ''
+  ladder_choice: ''
+  ladder_basis: ''
+  consult_result: ''
+  owner_poll_result: ''
+  owner_polls: 0
+  reask_rounds: 0
+  autonomous_digest: []
+  decisions: []
+  # --- implementation ---
+  coder_brief: {}
+  coder_prompt: ''
+  expected_files: []
+  scope_breach: ''
+  fix_instructions: ''
+  fix_round: 0
+  coder_result: ''
+  coder_sentinel: ''
+  fix_strikes: 0
+  rejected_rounds: 0
+  strikeout_rounds: 0
+  diagnosis: ''
+  last_coder_error: ''
+  design_block: ''
+  design_asks: []
+  design_ask_rounds: 0
+  design_decisions: []
+  inbox_instructions: ''
+  # --- bookkeeping ---
+  debt_base: ''
+  # Overwritten by the debt_scan node; this default is what bookkeeping sees if
+  # the shim crash-forwards, so it carries the manual fallback (step-runner precedent).
+  debt_hits: 'DEBT_SCAN_FAILED: the debt_scan node did not run. Manual fallback (<base> normally HEAD):
+    git ls-files --others --exclude-standard -z | xargs -0 -r git add -N -- && git diff --no-color --no-ext-diff <base> | grep -nE ''^\+.*(#!?\[(allow|expect)\(|cfg_attr\(|todo!|unimplemented!|#\[ignore)'' ;
+    grep exit 1 with no lines = no debt; -n numbers the DIFF, so resolve each hit to its real <file:line> with the fs_grep tool: the hit text after the + is its pattern (regex metacharacters escaped) -- never paste diff text into a shell string -- and keep only matches in files the diff touched; bare cfg_attr( without allow|expect is not debt.'
+  debt_items: []
+  debt_left_behind: []
+  debt_rounds: 0
+  diff_stat: ''
+  changed_files: []
+  decisions_in_docs: []
+  env_gated_tests: []
+  bookkeeping_notes: ''
+  # --- review ---
+  review_skipped_note: ''
+  gauntlet_prompt: ''
+  gauntlet_result: ''
+  gauntlet_verdict: ''
+  gauntlet_incomplete: []
+  gauntlet_blockers: []
+  gauntlet_lanes: {}
+  gauntlet_attention: ''
+  review_rounds: 0
+  round_heads: []
+  lane_block_streak: {}
+  debris_reruns: 0
+  triage: []
+  rejected_findings: []
+  deferred_findings: []
+  skipped_reviews: []
+  debris_exemptions: []
+  prior_review_decisions: ''
+  debris_exclude: ''
+  # --- observability / whetstone ---
+  operational_surface: false
+  obs_inventory_note: ''
+  observability_artifact: ''
+  obs_rounds: 0
+  obs_coder_brief: ''
+  whetstone_result: ''
+  whetstone_note: ''
+  # --- publish / CI ---
+  git_report: ''
+  git_task: ''
+  ci_owner: false
+  ci_polls: 0
+  ci_poll_fails: 0
+  ci_status: ''
+  ci_started_at: 0
+  ci_evidence: ''
+  ci_diagnosis: ''
+  ci_reruns: {}
+  ci_fix_strikes: 0
+  flip_ready: false
+  # --- report ---
+  report: ''
+  summary: ''
+  follow_ups: []
+  human_attention: ''
+  failure_reason: ''
+  redirect_reason: ''
+  last_script_error: ''
+  last_node_output: ''
+
+start: intake
+
+nodes:
+  # =====================================================================
+  # 2.1 Intake and sizing
+  # =====================================================================
+  intake:
+    id: intake
+    type: script
+    description: >-
+      Resolve project_dir, record the git base, create the A2 run directory
+      (outside the project tree), write the brief verbatim, detect re-entry
+      ("Sisyphus run id:"), a delegated brief, the quality bar, a teammate roster,
+      a plan repo, and the owner-away flag.
+    script: scripts/intake.py
+    timeout: 60
+    fallback: end_failure
+    next: assess
+
+  assess:
+    id: assess
+    type: llm
+    description: >-
+      Phase 0 intent gate + section 10.13 sizing, as one structured verdict. Reads
+      the repo's own docs for verification commands (never guesses them).
+    instructions: |
+      You are the intake judgment of an orchestrator that drives coding tasks to
+      completion by delegating. You classify; you never edit files and never run
+      build or test commands here.
+
+      Verbalize the intent in one sentence (intent_statement): map the surface
+      form of the message to what the user actually wants from an orchestrator.
+      Classify from THIS message only (never carry implementation mode from
+      earlier turns):
+        trivial          single file, known location, typo-class fix
+        exploration      "find X", "where is Y", "how does Z work"
+        implementation   add / fix / write / create / change / refactor
+        design_question  "how should I", "what's the best way", "should I use X or Y",
+                         "review this", tradeoffs, 3+ module questions, vague
+                         "improve/clean up" with NO implementation verb
+        ambiguous        unclear scope or multiple interpretations with a 2x+ effort
+                         difference, or missing critical info - these MUST ask
+        plan_execution   "execute step N", a handoff path, a plan repo step
+        plan_authoring   "write the plan", "draft steps" for a plan repo
+
+      Size an implementation (sizing): simple = one coherent change (one PR);
+      compound = a small ordered breakdown of at most 3 subtasks, each sealable
+      with executable acceptance criteria; plan_shaped = more than 3 subtasks,
+      cross-PR sequencing, or batch/protected semantics - that wants an architect
+      run. Unsure defaults UP (compound over simple; plan_shaped over compound),
+      never silently ambitious.
+
+      Oracle triggers (needs_oracle=true, oracle_question set): "how should I",
+      "what's wrong with / why does X keep", technology or pattern choices, how
+      to structure, review requests, tradeoffs, anything spanning 3+ files or
+      modules, vague open-ended improvement asks. An implementation that carries
+      such a question consults the oracle BEFORE any code.
+
+      architecture_scale=true for "improve the architecture of X", "this module is
+      hard to test", "make this easier to navigate" (architecture-reviewer first).
+
+      has_spec=true when the message or its task file carries acceptance criteria
+      or "done when" conditions; put them in spec_text VERBATIM (they drive the
+      adversary lane). consumer_surface=true when endpoints/RPCs/CLI/request
+      shapes/contract semantics are touched or when consumer docs for such a
+      surface change.
+
+      security_posture: prototype when the user said POC/spike/demo/throwaway or
+      the tool is localhost-only; hardened for auth, payments, secrets, public or
+      multi-tenant surface; otherwise standard. A declared rigor maps poc ->
+      prototype, prototype -> standard, production -> standard unless the plan
+      overrides. State posture_reason in one line.
+
+      verification_commands: a JSON array of the project's exact build/test/lint
+      commands taken ONLY from the message, the task file, or the repo's own
+      conventions docs (CLAUDE.md, AGENTS.md, CONTRIBUTING.md, Makefile, package
+      scripts) which you may read with the tools. Never guess; "[]" when none are
+      documented. Targeted build/unit commands only - never commands that boot
+      shared stacks or services.
+
+      git_actions: what the message explicitly asks for among commit, push,
+      open_pr (with base branch and draft); absent keys mean NOT asked - commits
+      and PRs never happen unasked. external_feedback: human / third-party
+      review comments the message asks you to address (verbatim items), else [].
+
+      When review_cadence is batch: if the acceptance criteria are not executable
+      commands, or the task touches more than one seam, set batch_plan_defect to
+      the one-line defect description (the run stops and reports it; never widen
+      the task to compensate).
+
+      When this is a RE-ENTRY (resume context present): resume_action is fix
+      (findings/failures to address with a coder round), git_ops (rebase,
+      restack, conflict resolution, publish), or answer (a question about the
+      run); intent stays implementation.
+
+      clarifying_questions: for ambiguous messages, each question with options
+      (mark exactly one recommended when evidence supports it, and cite the
+      evidence). Keep it to what genuinely blocks execution.
+
+      anomalies: anything you noticed that is NOT this task's job but someone
+      should know (stale downstream plan, smelly branch topology); empty is the
+      normal case. Never let it change your verdict.
+
+      Project directory: {{project_dir}}
+      Review cadence: {{review_cadence}}   Parallel batch member: {{parallel}}
+      Delegated brief (task file / plan / roster present): {{delegated}}
+      Plan repo detected (plans/ with steps/ and handoffs/): {{plans_detected}}
+      Declared quality bar: rigor={{quality_rigor}} surfaces={{quality_surfaces}}
+    prompt: |
+      ## Message
+      {{brief}}
+
+      ## Clarifications already answered (verbatim)
+      {{clarifications}}
+
+      ## Re-entry context (empty for a fresh run)
+      {{resume_note}}
+    tools: [fs_read, fs_grep, fs_glob, fs_ls, ast_grep]
+    max_iterations: 20
+    timeout: 900
+    output_schema:
+      type: object
+      properties:
+        intent_statement: { type: string }
+        intent:
+          type: string
+          enum: [trivial, exploration, implementation, design_question, ambiguous, plan_execution, plan_authoring]
+        sizing:
+          type: string
+          enum: [simple, compound, plan_shaped, n/a]
+        clarifying_questions:
+          type: array
+          items:
+            type: object
+            properties:
+              question: { type: string }
+              options:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    text: { type: string }
+                    recommended: { type: boolean }
+                    evidence: { type: string }
+                  required: [text]
+            required: [question]
+        needs_oracle: { type: boolean }
+        oracle_question: { type: string }
+        architecture_scale: { type: boolean }
+        has_spec: { type: boolean }
+        spec_text: { type: string }
+        consumer_surface: { type: boolean }
+        security_posture:
+          type: string
+          enum: [prototype, standard, hardened]
+        posture_reason: { type: string }
+        verification_commands: { type: string }
+        local_run_recipe: { type: string }
+        git_actions:
+          type: object
+          properties:
+            commit: { type: boolean }
+            push: { type: boolean }
+            open_pr: { type: boolean }
+            base: { type: string }
+            draft: { type: boolean }
+        external_feedback:
+          type: array
+          items: { type: string }
+        batch_plan_defect: { type: string }
+        resume_action:
+          type: string
+          enum: [fix, git_ops, answer, '']
+        anomalies:
+          type: array
+          items: { type: string }
+      required: [intent_statement, intent, sizing]
+    state_updates:
+      last_node_output: '{{output}}'
+    fallback: assess_fault
+    next: route_intent
+
+  assess_fault:
+    id: assess_fault
+    type: script
+    description: Fail-safe default when assess died - the run asks instead of guessing.
+    script: scripts/assess_fault.py
+    next: route_intent
+
+  route_intent:
+    id: route_intent
+    type: script
+    description: The Phase 0 table as edges (design doc 2.1); clarification bound B1.
+    script: scripts/route_intent.py
+    fallback: end_failure
+
+  plan_subtasks:
+    id: plan_subtasks
+    type: llm
+    description: A11 - compound work becomes at most 3 sealed in-run subtasks.
+    instructions: |
+      You break a compound implementation request into an ORDERED list of at
+      most 3 subtasks. Each subtask must be sealed to the delegation standard: a
+      concrete outcome, the constraints it inherits, and EXECUTABLE acceptance
+      criteria (commands or observable checks). If the work genuinely needs more
+      than 3 subtasks, cross-PR sequencing, or batch/protected semantics, return
+      an empty list and say why in plan_shaped_reason - that is plan-shaped work
+      for the architect, by definition. Never invent a shadow plan format.
+    prompt: |
+      ## Request
+      {{brief}}
+
+      ## Clarifications
+      {{clarifications}}
+
+      ## Intent statement
+      {{intent_statement}}
+    tools: []
+    timeout: 600
+    output_schema:
+      type: object
+      properties:
+        subtasks:
+          type: array
+          items:
+            type: object
+            properties:
+              title: { type: string }
+              outcome: { type: string }
+              constraints: { type: string }
+              acceptance_criteria:
+                type: array
+                items: { type: string }
+            required: [title, outcome, acceptance_criteria]
+        plan_shaped_reason: { type: string }
+        anomalies:
+          type: array
+          items: { type: string }
+      required: [subtasks]
+    state_updates:
+      last_node_output: '{{output}}'
+    fallback: end_redirect
+    next: record_subtasks
+
+  record_subtasks:
+    id: record_subtasks
+    type: script
+    description: Validate the A11 bound (B2, at most 3) and write tasklog.md.
+    script: scripts/record_subtasks.py
+    fallback: end_failure
+
+  next_subtask:
+    id: next_subtask
+    type: script
+    description: Pop the next subtask (B3, list-bounded) or finish.
+    script: scripts/next_subtask.py
+    fallback: end_failure
+
+  # =====================================================================
+  # 2.2 Research
+  # =====================================================================
+  plan_research:
+    id: plan_research
+    type: llm
+    description: Plan the explore / librarian fan-out for this task (one slice per distinct angle).
+    instructions: |
+      You plan a parallel research burst for an implementation task. Produce
+      explore_slices: one NARROW slice per distinct search angle, module
+      boundary, or concern in THIS codebase (a slice = what to find and where to
+      look). Scale to the task: 2-3 for a single feature in a known location,
+      4-6 across 2-3 modules, 7-12 for a cross-cutting concern, more for large
+      refactors - never artificially cap. librarian_questions: one per
+      unfamiliar external library/spec question (official docs, OSS examples);
+      empty when everything is internal. team_mode=true when slices are likely
+      to FEED each other (adjacent modules; one lane's discovery redirects
+      another's search), so the explorers run as a messaging team.
+    prompt: |
+      ## Task
+      {{current_task}}
+
+      ## Clarifications
+      {{clarifications}}
+
+      Project directory: {{project_dir}}
+    tools: []
+    timeout: 300
+    output_schema:
+      type: object
+      properties:
+        explore_slices:
+          type: array
+          items: { type: string }
+        librarian_questions:
+          type: array
+          items: { type: string }
+        team_mode: { type: boolean }
+        anomalies:
+          type: array
+          items: { type: string }
+      required: [explore_slices]
+    state_updates:
+      last_node_output: '{{output}}'
+    fallback: research_dispatch
+    next: research_dispatch
+
+  research_dispatch:
+    id: research_dispatch
+    type: script
+    description: Trivial tasks skip research; otherwise pick the team or solo explore map (a dead plan_research degrades to one slice).
+    script: scripts/research_dispatch.py
+    fallback: end_failure
+
+  explore_fanout_team:
+    id: explore_fanout_team
+    type: map
+    description: Phase 4 fan-out in team mode - native roster + peer messaging replaces the orchestrator's roster broadcast.
+    over: '{{explore_slices}}'
+    as: slice
+    branch: explore_slice_team
+    output_key: finding
+    collect_into: explore_findings
+    next: librarian_fanout
+
+  explore_slice_team:
+    id: explore_slice_team
+    type: agent
+    agent: explore
+    teammates: true
+    prompt: |
+      Research slice for an implementation task in {{project_dir}}.
+
+      Slice: {{slice}}
+
+      Task context: {{current_task}}
+
+      Return file paths and 5-20 line code snippets that show the patterns to
+      follow, the conventions in force, and the call sites that matter. You are
+      one of several explorers; message a teammate directly when you find a fact
+      in THEIR slice, and check your inbox after each search round and before
+      finalizing. End with an optional "Anomalies:" line for anything outside
+      this task's scope that someone should know.
+    timeout: 1800
+    max_attempts: 2
+    state_updates:
+      finding: '{{output}}'
+    fallback: explore_fault
+
+  explore_fanout_solo:
+    id: explore_fanout_solo
+    type: map
+    description: Phase 4 fan-out, independent lanes.
+    over: '{{explore_slices}}'
+    as: slice
+    branch: explore_slice_solo
+    output_key: finding
+    collect_into: explore_findings
+    next: librarian_fanout
+
+  explore_slice_solo:
+    id: explore_slice_solo
+    type: agent
+    agent: explore
+    prompt: |
+      Research slice for an implementation task in {{project_dir}}.
+
+      Slice: {{slice}}
+
+      Task context: {{current_task}}
+
+      Return file paths and 5-20 line code snippets that show the patterns to
+      follow, the conventions in force, and the call sites that matter. End with
+      an optional "Anomalies:" line for anything outside this task's scope that
+      someone should know.
+    timeout: 1800
+    max_attempts: 2
+    state_updates:
+      finding: '{{output}}'
+    fallback: explore_fault
+
+  explore_fault:
+    id: explore_fault
+    type: script
+    description: Branch-local fallback - a dead slice yields a visible PIPELINE-FAULT finding (fail-open, declared).
+    script: scripts/explore_fault.py
+    state_updates: {}
+
+  librarian_fanout:
+    id: librarian_fanout
+    type: map
+    description: External docs / OSS examples, one librarian per question.
+    over: '{{librarian_questions}}'
+    as: question
+    branch: librarian_question
+    output_key: finding
+    collect_into: librarian_findings
+    next: synthesize_context
+
+  librarian_question:
+    id: librarian_question
+    type: agent
+    agent: librarian
+    prompt: |
+      {{question}}
+
+      Context: this answers a question raised while implementing the following
+      task in {{project_dir}}; prefer official docs and cite sources.
+      Task: {{current_task}}
+    timeout: 1800
+    max_attempts: 2
+    state_updates:
+      finding: '{{output}}'
+    fallback: librarian_fault
+
+  librarian_fault:
+    id: librarian_fault
+    type: script
+    description: Branch-local fallback for a dead librarian lane.
+    script: scripts/librarian_fault.py
+    state_updates: {}
+
+  synthesize_context:
+    id: synthesize_context
+    type: llm
+    description: >-
+      One mind over every research report: the context pack the coder receives
+      (reference files + real snippets + conventions), the codebase register,
+      design options, and whether an oracle consult is still needed.
+    instructions: |
+      You hold the whole research set for one implementation task and distill
+      it into a CONTEXT PACK for a coder that has NOT seen the codebase. Paste
+      ACTUAL code snippets (5-20 lines each) with their paths - "follow existing
+      patterns" with no example wastes the coder's budget on re-exploration. Use
+      fs_read to pull a snippet at a verified path when a report only named it.
+
+      Also judge:
+      - codebase_register (Phase 2, open-ended tasks only; else n/a):
+        disciplined (consistent patterns, configs, tests - follow strictly),
+        transitional (mixed patterns - set register_question: "I see X and Y
+        patterns. Which to follow?" with the options), legacy (no consistency -
+        register_question proposes a convention), greenfield (modern practices).
+        Patterns may serve different purposes and a migration may be in
+        progress; do not blindly follow.
+      - design_options: when the task involves a genuine design decision,
+        2-3 options from the findings with exactly one marked recommended and
+        the evidence for it; empty when the approach is settled by precedent.
+      - needs_oracle: true only if the findings raise an architecture / approach
+        question the context pack cannot settle.
+      - anomalies: things outside this task's scope that someone should know.
+
+      Never recommend suppressing errors, deleting failing tests, or writing
+      decisions into README/CONTRIBUTING - those go to the task log.
+    prompt: |
+      ## Task
+      {{current_task}}
+
+      ## Explore findings (one per slice)
+      {{explore_findings}}
+
+      ## Librarian findings (one per question)
+      {{librarian_findings}}
+
+      ## Clarifications
+      {{clarifications}}
+
+      Project directory: {{project_dir}}
+    tools: [fs_read]
+    max_iterations: 20
+    timeout: 900
+    output_schema:
+      type: object
+      properties:
+        context_pack: { type: string }
+        codebase_register:
+          type: string
+          enum: [disciplined, transitional, legacy, greenfield, n/a]
+        register_question: { type: string }
+        design_options:
+          type: array
+          items:
+            type: object
+            properties:
+              text: { type: string }
+              recommended: { type: boolean }
+              evidence: { type: string }
+            required: [text]
+        needs_oracle: { type: boolean }
+        oracle_question: { type: string }
+        anomalies:
+          type: array
+          items: { type: string }
+      required: [context_pack]
+    state_updates:
+      last_node_output: '{{output}}'
+    fallback: write_context_pack
+    next: write_context_pack
+
+  write_context_pack:
+    id: write_context_pack
+    type: script
+    description: Persist the pack to the run dir (A2); a dead synthesize degrades to the raw findings, declared.
+    script: scripts/write_context_pack.py
+    fallback: end_failure
+    next: oracle_gate
+
+  oracle_gate:
+    id: oracle_gate
+    type: script
+    description: Consult the oracle once per task (B4) when a trigger fired.
+    script: scripts/oracle_gate.py
+    fallback: end_failure
+
+  consult_oracle:
+    id: consult_oracle
+    type: agent
+    agent: oracle
+    description: Blocking by construction - nothing downstream runs until this edge returns.
+    prompt: |
+      {{oracle_question}}
+
+      Context for the question - the task and the research context pack:
+
+      ## Task
+      {{current_task}}
+
+      ## Context pack
+      {{context_pack}}
+
+      Return your analysis with a concrete recommendation.
+    timeout: 1800
+    max_attempts: 2
+    state_updates:
+      oracle_result: '{{output}}'
+    fallback: merge_oracle
+    next: merge_oracle
+
+  merge_oracle:
+    id: merge_oracle
+    type: script
+    description: Append the answer to the pack; a failed consult is an escalation, never "time out and continue".
+    script: scripts/merge_oracle.py
+    fallback: end_failure
+
+  architecture_review:
+    id: architecture_review
+    type: agent
+    agent: architecture-reviewer
+    description: Architecture-scale improvement asks - proposes only, never a gate.
+    prompt: |
+      {{brief}}
+
+      Scan for deepening opportunities weighted by git hot spots in
+      {{project_dir}}, report the candidates, and refine the strongest one into an
+      implementation-ready interface proposal.
+    timeout: 3600
+    max_attempts: 1
+    state_updates:
+      architecture_proposal: '{{output}}'
+    fallback: next_subtask
+    next: next_subtask
+
+  design_gate:
+    id: design_gate
+    type: script
+    description: Register question / design options / 5+ file confirm on standalone briefs become one structured escalation.
+    script: scripts/design_gate.py
+    fallback: end_failure
+
+  # =====================================================================
+  # 2.3 Escalation ladder (section 10.6 / A5 / A14 / escalation policy)
+  # =====================================================================
+  escalate_gate:
+    id: escalate_gate
+    type: script
+    description: Ledger the escalation; interactive or hard trigger -> tier 4; autonomous -> the ladder.
+    script: scripts/escalate_gate.py
+    fallback: end_failure
+
+  ladder_judge:
+    id: ladder_judge
+    type: llm
+    description: Autonomous ladder steps 2-3 - standing rulings, then a clearly recommended option; else consult or escalate.
+    instructions: |
+      The user pre-delegated decision-making for this run. Work this ladder IN
+      ORDER for the decision below and answer with the first step that applies:
+
+      1. Hard triggers were already excluded by the gate; if the decision
+         nevertheless concerns secrets/credentials, money movement, destructive
+         or irreversible actions, or restructuring code outside the task's scope,
+         answer "escalate".
+      2. Standing rulings (pasted below, possibly empty): if a ruling's trigger
+         GENUINELY matches this decision, apply its resolution - resolution
+         "ruling", basis "ruling: <id/title>". Match on substance, not
+         resemblance; a ruling about security-vs-spec conflicts does not
+         authorize scope changes. Unsure whether it matches? Then it does not.
+      3. Clearly recommended option: if exactly one option is marked recommended
+         AND backed by concrete evidence (a reviewer's proposed fix, a failing
+         test naming the cause, a repo convention), take it - resolution
+         "recommended". A design/scope escalation is excluded.
+      4. Otherwise: "consult" when the decision is preference-laden or novel but
+         low-stakes enough that a staff engineer with the design ledger could
+         settle it; "escalate" for anything high-stakes or with no defensible
+         recommendation. Autonomy never converts "I don't know" into a guess.
+    prompt: |
+      ## Decision
+      {{ask_question}}
+
+      ## Escalation record (kind, options, evidence)
+      {{escalation}}
+
+      ## Standing rulings file
+      {{standing_rulings}}
+    tools: []
+    timeout: 300
+    output_schema:
+      type: object
+      properties:
+        ladder_resolution:
+          type: string
+          enum: [ruling, recommended, consult, escalate]
+        ladder_choice: { type: string }
+        ladder_basis: { type: string }
+        anomalies:
+          type: array
+          items: { type: string }
+      required: [ladder_resolution]
+    state_updates:
+      last_node_output: '{{output}}'
+    fallback: ask_dispatch
+    next: ladder_route
+
+  ladder_route:
+    id: ladder_route
+    type: script
+    description: ruling/recommended -> digest + ledger + continue; consult -> navigator; escalate -> owner.
+    script: scripts/ladder_route.py
+    fallback: end_failure
+
+  consult_navigator:
+    id: consult_navigator
+    type: agent
+    agent: engineer
+    description: >-
+      Tier 3 - one bounded request/response edge to the navigator (A5: retries 0,
+      timeout -> tier 4). Rehydrates from artifacts, never a transcript.
+    prompt: |
+      Consult request from a running sisyphus task (you are the navigator the
+      run defers preference-laden or novel decisions to; answer from the task's
+      artifacts and your judgment, and defer when unconfident).
+
+      ## Decision
+      {{ask_question}}
+
+      ## Escalation record (kind, options with evidence)
+      {{escalation}}
+
+      ## Task
+      {{current_task}}
+
+      ## Artifacts (read them; do not edit code)
+      Run directory: {{run_dir}}
+      Context pack: {{run_dir}}/context-pack.md
+      Decisions ledger: {{run_dir}}/decisions.md
+
+      End your reply with EXACTLY one line:
+      CONSULT: ANSWER <option number or text>   (confident, within the task's scope)
+      CONSULT: DEFER <one-line reason>          (owner's call)
+    timeout: 1800
+    max_attempts: 1
+    state_updates:
+      consult_result: '{{output}}'
+    fallback: ask_dispatch
+    next: consult_route
+
+  consult_route:
+    id: consult_route
+    type: script
+    description: Parse the consult; an answer is ledgered and applied, a defer or a fault goes to the owner.
+    script: scripts/consult_route.py
+    fallback: end_failure
+
+  ask_dispatch:
+    id: ask_dispatch
+    type: script
+    description: >-
+      Tier 4. Parks the run (A14) and picks the terminal prompt; away/unattended
+      top-level runs go through ask_owner first when the fork provides it.
+    script: scripts/ask_dispatch.py
+    fallback: end_failure
+
+  ask_owner_poll:
+    id: ask_owner_poll
+    type: script
+    description: One ask_owner call (question + options verbatim); PENDING re-enters within the tool budget (B13); never re-pings.
+    script: scripts/ask_owner_poll.py
+    timeout: 0
+    fallback: ask_user
+
+  ask_owner_route:
+    id: ask_owner_route
+    type: script
+    description: ANSWERED -> apply (recorded as answered via Slack); TIMEOUT / NOT_DELIVERED -> the terminal prompt.
+    script: scripts/ask_owner_route.py
+    fallback: ask_user
+
+  ask_user:
+    id: ask_user
+    type: input
+    description: The structured escalation at the terminal (or escalated to the parent orchestrator when this run is a child).
+    question: |
+      {{ask_question}}
+    validation: 'len(input) > 0'
+    state_updates:
+      last_answer_text: '{{input}}'
+    next: parse_answer
+
+  ask_review_incomplete:
+    id: ask_review_incomplete
+    type: approval
+    description: The one fixed-option escalation - exactly the protocol's three options.
+    question: |
+      {{ask_question}}
+    options:
+      - 'Retry the review again'
+      - 'Accept NEEDS-HUMAN: proceed without the incomplete review (recorded in the report / PR body)'
+      - 'Abort this task'
+    routes:
+      'Retry the review again': apply_answer
+      'Accept NEEDS-HUMAN: proceed without the incomplete review (recorded in the report / PR body)': apply_answer
+      'Abort this task': apply_answer
+    on_other: parse_answer
+    state_updates:
+      last_answer: '{{choice}}'
+      last_answer_text: '{{choice}}'
+
+  parse_answer:
+    id: parse_answer
+    type: script
+    description: Number or text -> option; unparseable re-asks (B14) then the free text stands; clears the parked marker; ledgers the decision.
+    script: scripts/parse_answer.py
+    fallback: end_failure
+
+  apply_answer:
+    id: apply_answer
+    type: script
+    description: The continuation switch on the escalation kind (design doc 2.3).
+    script: scripts/apply_answer.py
+    fallback: end_failure
+
+  # =====================================================================
+  # 2.4 Implementation
+  # =====================================================================
+  compose_brief:
+    id: compose_brief
+    type: llm
+    description: Fill the judgment slots of the MANDATORY coder delegation template; the boilerplate is rendered by script.
+    instructions: |
+      You write the judgment parts of a coder delegation. The coder has NOT seen
+      the codebase; your prompt IS its entire context. Produce:
+      - task: ONE atomic goal - what to build/modify and where.
+      - expected_outcome: concrete deliverables, "Done when ...".
+      - must_do_extra / must_not_do_extra: task-specific lines beyond the
+        standard ones (which are added for you: follow the reference patterns,
+        match conventions, self-review with code-review, owner comments on debt
+        markers, no new dependencies, no error suppression, no non-ASCII or
+        planning vocabulary in code, no decisions in README/CONTRIBUTING).
+      - context_block: the reference files with their ACTUAL snippets from the
+        context pack (never bare paths), plus the acceptance criteria verbatim
+        when a spec exists, plus the oracle's direction when present.
+      - skill_nudges: e.g. "load frontend-ui-ux before touching components".
+      - expected_files: the files the change will most likely touch (used for
+        the parallel-batch scope check).
+      Design choices the user or the ladder already made (decisions below) are
+      binding; restate them in the task.
+    prompt: |
+      ## Task
+      {{current_task}}
+
+      ## Context pack
+      {{context_pack}}
+
+      ## Decisions made for this task
+      {{decisions}}
+
+      ## Spec / acceptance criteria (verbatim; may be empty)
+      {{spec_text}}
+
+      ## Quality bar
+      rigor={{quality_rigor}} surfaces={{quality_surfaces}}
+
+      Project directory: {{project_dir}}
+    tools: []
+    timeout: 600
+    output_schema:
+      type: object
+      properties:
+        coder_brief:
+          type: object
+          properties:
+            task: { type: string }
+            expected_outcome: { type: string }
+            must_do_extra:
+              type: array
+              items: { type: string }
+            must_not_do_extra:
+              type: array
+              items: { type: string }
+            context_block: { type: string }
+            skill_nudges:
+              type: array
+              items: { type: string }
+          required: [task, expected_outcome, context_block]
+        expected_files:
+          type: array
+          items: { type: string }
+        anomalies:
+          type: array
+          items: { type: string }
+      required: [coder_brief]
+    state_updates:
+      last_node_output: '{{output}}'
+    fallback: scope_check
+    next: scope_check
+
+  scope_check:
+    id: scope_check
+    type: script
+    description: Parallel mode only - expected files vs the roster's declared scopes; a breach STOPS before any edit.
+    script: scripts/scope_check.py
+    fallback: end_failure
+
+  send_breach_notice:
+    id: send_breach_notice
+    type: llm
+    description: Parallel mode - message the parent and the owning teammate before escalating the breach.
+    instructions: |
+      You are one task agent in a parallel batch. Correct implementation needs
+      files outside your declared scope. Do NOT edit them. Send ONE message to
+      your parent (agent__send_message --id parent) and ONE to the teammate that
+      owns the overlapping files (their agent id is in the roster) naming the
+      exact files and why. Then reply with the single word SENT (or NOT SENT and
+      the reason).
+    prompt: |
+      Scope breach: {{scope_breach}}
+      Roster: {{roster_scope}}
+    tools: []
+    timeout: 300
+    fallback: escalate_gate
+    next: escalate_gate
+
+  render_coder_prompt:
+    id: render_coder_prompt
+    type: script
+    description: Deterministic assembly of the delegation template (boilerplate verbatim); fix rounds append the prior result + findings (E1, A2).
+    script: scripts/render_coder_prompt.py
+    fallback: end_failure
+
+  check_inbox_pre:
+    id: check_inbox_pre
+    type: llm
+    description: Parallel mode - drain the inbox once before implementation; act only on explicit instructions.
+    instructions: |
+      Call agent__check_inbox exactly once. Task-landed / merged-task broadcasts
+      from the parent are informational. Report ONLY explicit instructions that
+      require action (a conflict-rebase or restack request, a re-scope) as
+      instructions; otherwise an empty string.
+    prompt: Check the inbox now.
+    tools: []
+    timeout: 300
+    output_schema:
+      type: object
+      properties:
+        inbox_instructions: { type: string }
+        anomalies:
+          type: array
+          items: { type: string }
+          description: "Optional (A10): observations outside this node's scope; empty is the normal case."
+      required: [inbox_instructions]
+    state_updates:
+      last_node_output: '{{output}}'
+    fallback: run_coder
+    next: inbox_route_pre
+
+  inbox_route_pre:
+    id: inbox_route_pre
+    type: script
+    description: An explicit git instruction goes to git_ops first; otherwise straight to the coder.
+    script: scripts/inbox_route.py
+    fallback: run_coder
+
+  run_coder:
+    id: run_coder
+    type: agent
+    agent: coder
+    description: The implement -> verify build+tests -> self_review -> bounded fix-loop island, exactly as shipped.
+    prompt: |
+      {{coder_prompt}}
+    timeout: 0
+    max_attempts: 1
+    state_updates:
+      coder_result: '{{output}}'
+    fallback: route_coder_result
+    next: route_coder_result
+
+  route_coder_result:
+    id: route_coder_result
+    type: script
+    description: Sentinel switch + the 3-strike rule (B5) + CODER_REJECTED rounds (B7); a crashed verification gate is an engine fault to surface.
+    script: scripts/route_coder_result.py
+    fallback: end_failure
+
+  compose_fix:
+    id: compose_fix
+    type: script
+    description: Build fix_instructions from whatever routed here (coder error, review blockers, user answer, re-entry prompt).
+    script: scripts/compose_fix.py
+    fallback: end_failure
+
+  diagnose_failure:
+    id: diagnose_failure
+    type: llm
+    description: Phase 7 - load diagnosing-bugs BEFORE strike 2; a diagnosis brief for the next coder round.
+    instructions: |
+      A fix attempt failed and a blind retry is how all 3 strikes burn on the
+      same wrong theory. Load the diagnosing-bugs skill and follow its
+      discipline: build a tight, red-capable reproduction loop BEFORE forming
+      any hypothesis (you may run build/test commands read-only; never edit
+      source files), minimise, then test 3-5 falsifiable hypotheses with tagged
+      instrumentation where possible. Produce a diagnosis brief the coder can
+      act on: the reproduction command, the confirmed cause (or the top ranked
+      hypotheses with their discriminating experiments), and the fix direction.
+    prompt: |
+      ## Task
+      {{current_task}}
+
+      ## Last coder result
+      {{coder_result}}
+
+      ## Last error
+      {{last_coder_error}}
+
+      Project directory: {{project_dir}}
+    tools: [fs_read, fs_grep, fs_glob, fs_ls, ast_grep, execute_command]
+    skills_enabled: true
+    enabled_skills: [diagnosing-bugs]
+    max_iterations: 20
+    timeout: 1800
+    output_schema:
+      type: object
+      properties:
+        diagnosis: { type: string }
+        anomalies:
+          type: array
+          items: { type: string }
+      required: [diagnosis]
+    state_updates:
+      last_node_output: '{{output}}'
+    fallback: compose_fix
+    next: compose_fix
+
+  strikeout:
+    id: strikeout
+    type: script
+    description: 3-strike rule - STOP, stash the broken state (recoverable), DOCUMENT, then CONSULT Oracle.
+    script: scripts/strikeout.py
+    timeout: 60
+    fallback: end_failure
+    next: oracle_strikeout
+
+  oracle_strikeout:
+    id: oracle_strikeout
+    type: agent
+    agent: oracle
+    description: Consult Oracle with the full failure context (step 4 of the 3-strike rule).
+    prompt: |
+      Three consecutive fix attempts failed on the same problem; the broken
+      state was stashed. Diagnose and propose a resolution the coder can apply
+      in one round, or say plainly that you cannot resolve it.
+
+      ## Task
+      {{current_task}}
+
+      ## What was attempted and what failed
+      {{diagnosis}}
+
+      ## Last coder result
+      {{coder_result}}
+
+      ## Last error
+      {{last_coder_error}}
+
+      Project directory: {{project_dir}}
+    timeout: 1800
+    max_attempts: 2
+    state_updates:
+      oracle_result: '{{output}}'
+    fallback: strikeout_route
+    next: strikeout_route
+
+  strikeout_route:
+    id: strikeout_route
+    type: script
+    description: Oracle direction -> escalation (one oracle-directed round, B6); "cannot resolve" -> ASK USER.
+    script: scripts/strikeout_route.py
+    fallback: end_failure
+
+  # =====================================================================
+  # 2.5 Bookkeeping after the coder
+  # =====================================================================
+  debt_scan:
+    id: debt_scan
+    type: script
+    description: Shared deterministic debt-marker scan (agents/.shared/debt_scan.py) over base..worktree; fail-open DEBT_SCAN_FAILED default.
+    script: scripts/debt_scan.py
+    timeout: 120
+    next: bookkeeping_scan
+
+  bookkeeping_scan:
+    id: bookkeeping_scan
+    type: script
+    description: Deterministic extraction - debt hits with owners, the Design block and ASK lines, diff stat, decisions written into README/CONTRIBUTING.
+    script: scripts/bookkeeping_scan.py
+    timeout: 60
+    fallback: end_failure
+    next: bookkeeping_judge
+
+  bookkeeping_judge:
+    id: bookkeeping_judge
+    type: llm
+    description: The judgment residue of bookkeeping - env-gated or opt-in tests the coder added.
+    instructions: |
+      From the coder's result and the diff stat, list any env-gated or opt-in
+      tests the coder added (tests that run only under an environment variable,
+      a feature flag, #[ignore], or an explicit opt-in). Each is a debt marker
+      that needs an owning task. Also flag, in bookkeeping_notes, anything in
+      the coder's report that reads as a decision or an evidence ledger written
+      into README/CONTRIBUTING/code comments (those belong in the task log).
+    prompt: |
+      ## Coder result
+      {{coder_result}}
+
+      ## Diff stat
+      {{diff_stat}}
+
+      ## Debt scan
+      {{debt_hits}}
+    tools: []
+    timeout: 300
+    output_schema:
+      type: object
+      properties:
+        env_gated_tests:
+          type: array
+          items: { type: string }
+        bookkeeping_notes: { type: string }
+        anomalies:
+          type: array
+          items: { type: string }
+      required: [env_gated_tests]
+    state_updates:
+      last_node_output: '{{output}}'
+    fallback: bookkeeping_route
+    next: bookkeeping_route
+
+  bookkeeping_route:
+    id: bookkeeping_route
+    type: script
+    description: Unowned markers / decisions-in-docs -> ONE coder round (B8); Design ASK -> hard-trigger escalation (B9); survivors -> Debt left behind.
+    script: scripts/bookkeeping_route.py
+    fallback: end_failure
+
+  # =====================================================================
+  # 2.6 Review
+  # =====================================================================
+  review_gate:
+    id: review_gate
+    type: script
+    description: batch cadence skips the panel (the parent owns it); trivial one-file no-spec work skips with a note; else the gauntlet.
+    script: scripts/review_gate.py
+    fallback: end_failure
+
+  build_gauntlet_prompt:
+    id: build_gauntlet_prompt
+    type: script
+    description: The gauntlet spawn template field by field (Diff, Rigor/posture, spec, prior decisions, re-review delta, settled lanes, recipe); records the round's HEAD.
+    script: scripts/build_gauntlet_prompt.py
+    timeout: 60
+    fallback: end_failure
+    next: run_gauntlet
+
+  run_gauntlet:
+    id: run_gauntlet
+    type: agent
+    agent: review-gauntlet
+    description: The whole review panel - lane selection, retry gate, verdict gate - machine-parsed.
+    prompt: |
+      {{gauntlet_prompt}}
+    inputs:
+      verification_commands: '{{verification_commands}}'
+      debris_exclude: '{{debris_exclude}}'
+    timeout: 0
+    max_attempts: 1
+    state_updates:
+      gauntlet_result: '{{output}}'
+    fallback: route_gauntlet
+    next: route_gauntlet
+
+  route_gauntlet:
+    id: route_gauntlet
+    type: script
+    description: Parse GAUNTLET / GAUNTLET_REVIEW_INCOMPLETE / lanes / blockers; PASS on, findings to triage, incomplete to the three-option escalation (debris re-run once, B11).
+    script: scripts/route_gauntlet.py
+    fallback: end_failure
+
+  triage_findings:
+    id: triage_findings
+    type: llm
+    description: Per blocker - fix / reject with cited evidence / defer by quality bar / escalate; the script enforces what may not bend.
+    instructions: |
+      You triage the blockers of a review gauntlet round for an implementation
+      task. For EACH blocker decide:
+      - fix: the coder addresses it (default for everything real).
+      - reject: ONLY a [convention] finding, and ONLY with a citation - (a) a
+        repo convention at file:line showing the codebase deliberately does it
+        another way, or (b) a recorded plan decision in the Quality bar's
+        dropped-practices list. Bare rejections ("not needed") are invalid.
+        Never reject a critical finding or a [correctness] finding.
+      - defer: at poc/prototype rigor, a below-threshold [convention] warning the
+        reviewer already moved under "Deferred by quality bar" - it is reported
+        as a follow-up tagged (deferred by quality bar), never silently dropped.
+      - escalate: a warning at production rigor you are unsure whether to fix or
+        accept; an adversary complaint that the PLAN itself is the root cause
+        (an impossible or contradictory criterion - never "fixed" by changing
+        scope); a finding re-raised despite a cited rejection on record.
+      A debris finding (non-ASCII punctuation / planning vocabulary on added
+      lines) is a fix, except a glyph that is the point or a line that must name
+      the needles - then the coder marks it debris-exempt and you record the
+      exemption (file:line -- reason).
+      Carry each blocker's text VERBATIM in `finding`.
+    prompt: |
+      ## Gauntlet result
+      {{gauntlet_result}}
+
+      ## Blockers (parsed)
+      {{gauntlet_blockers}}
+
+      ## Quality bar
+      rigor={{quality_rigor}} surfaces={{quality_surfaces}}
+
+      ## Prior review decisions (settled; do not re-litigate)
+      {{prior_review_decisions}}
+    tools: [fs_read, fs_grep]
+    max_iterations: 10
+    timeout: 900
+    output_schema:
+      type: object
+      properties:
+        triage:
+          type: array
+          items:
+            type: object
+            properties:
+              finding: { type: string }
+              lane: { type: string }
+              severity: { type: string }
+              action:
+                type: string
+                enum: [fix, reject, defer, escalate]
+              citation: { type: string }
+              reason: { type: string }
+            required: [finding, action]
+        debris_exemptions:
+          type: array
+          items: { type: string }
+        anomalies:
+          type: array
+          items: { type: string }
+      required: [triage]
+    state_updates:
+      last_node_output: '{{output}}'
+    fallback: triage_route
+    next: triage_route
+
+  triage_route:
+    id: triage_route
+    type: script
+    description: Enforce non-rejectable classes and citations; round bounds (B10); lane re-run-once rule; probe INCONCLUSIVE is an environment gap.
+    script: scripts/triage_route.py
+    fallback: end_failure
+
+  observability_gate:
+    id: observability_gate
+    type: script
+    description: Operational surface from the shared diff signals (agents/.shared/diff_signals.py); none -> one-line note.
+    script: scripts/observability_gate.py
+    timeout: 60
+    fallback: whetstone_gate
+
+  observability_pass:
+    id: observability_pass
+    type: llm
+    description: Advisory - always an artifact, never a blocking verdict.
+    instructions: |
+      Load the observability-review skill and run its pass for the change in
+      {{project_dir}}: detect the repo's observability stack, inventory existing
+      coverage for the touched paths, classify gaps. {{obs_inventory_note}}
+      When alert-as-code lives in this repo and gaps warrant coverage, write a
+      coder brief for the rule/monitor changes following existing conventions
+      (obs_coder_brief); when alerting is external or the call is judgment-heavy
+      (paging severity, thresholds without baselines), put the skill's
+      structured recommendations block in the artifact instead. Never touch
+      external alerting systems. Output the skill's "## Observability" block as
+      observability_artifact.
+    prompt: |
+      ## Changed files
+      {{changed_files}}
+
+      ## Diff stat
+      {{diff_stat}}
+
+      ## Task
+      {{current_task}}
+
+      Observability agent for a read-only live inventory (empty = none configured): {{observability_agent}}
+    tools: [fs_read, fs_grep, fs_glob, fs_ls]
+    skills_enabled: true
+    enabled_skills: [observability-review]
+    max_iterations: 20
+    timeout: 1200
+    output_schema:
+      type: object
+      properties:
+        observability_artifact: { type: string }
+        obs_coder_brief: { type: string }
+        anomalies:
+          type: array
+          items: { type: string }
+      required: [observability_artifact]
+    state_updates:
+      last_node_output: '{{output}}'
+    fallback: observability_route
+    next: observability_route
+
+  observability_route:
+    id: observability_route
+    type: script
+    description: Attach the artifact; one coder round (B12) when alert-as-code changes are warranted.
+    script: scripts/observability_route.py
+    fallback: whetstone_gate
+
+  whetstone_gate:
+    id: whetstone_gate
+    type: script
+    description: Whetstone only when this run addressed feedback that did NOT come from its own lanes.
+    script: scripts/whetstone_gate.py
+    fallback: pr_gate
+
+  run_whetstone:
+    id: run_whetstone
+    type: agent
+    agent: whetstone
+    description: Continuous improvement; its proposals go to the user; never blocks completion.
+    prompt: |
+      Classify the human / third-party review feedback this run addressed
+      against what its own review passes flagged for the same change.
+
+      ## Feedback items addressed (verbatim)
+      {{external_feedback}}
+
+      ## What the run's own review lanes flagged
+      {{gauntlet_result}}
+
+      ## Git / PR context
+      {{git_actions}}
+      Project directory: {{project_dir}}
+    timeout: 3600
+    max_attempts: 1
+    state_updates:
+      whetstone_result: '{{output}}'
+    fallback: pr_gate
+    next: pr_gate
+
+  # =====================================================================
+  # 2.7 Publish and finish
+  # =====================================================================
+  pr_gate:
+    id: pr_gate
+    type: script
+    description: Commit/push/PR only when the brief asked for it; parallel mode drains the inbox before the final push.
+    script: scripts/pr_gate.py
+    fallback: end_failure
+
+  check_inbox_final:
+    id: check_inbox_final
+    type: llm
+    description: Parallel mode - last inbox drain before the final verification/push.
+    instructions: |
+      Call agent__check_inbox exactly once. Report ONLY explicit instructions
+      that require action (a conflict-rebase or restack request) as
+      instructions; broadcasts are informational; otherwise an empty string.
+    prompt: Check the inbox now.
+    tools: []
+    timeout: 300
+    output_schema:
+      type: object
+      properties:
+        inbox_instructions: { type: string }
+        anomalies:
+          type: array
+          items: { type: string }
+          description: "Optional (A10): observations outside this node's scope; empty is the normal case."
+      required: [inbox_instructions]
+    state_updates:
+      last_node_output: '{{output}}'
+    fallback: git_ops
+    next: git_ops
+
+  git_ops:
+    id: git_ops
+    type: llm
+    description: Commit / push / draft PR / review-round comments / rebase on instruction - the git-master island.
+    instructions: |
+      You perform git and GitHub operations for an orchestrated coding task in
+      {{project_dir}}. Load the git-master skill. Do EXACTLY what the task block
+      says and nothing more; never push to main, never force-push, never create
+      or switch branches unless the task says so, never merge or rebase onto
+      main unasked.
+
+      Rules that always apply:
+      - Commit messages reference the task id when the brief names one.
+      - Draft-first PRs: open every PR as a DRAFT (gh pr create --draft). Flip it
+        (gh pr ready) ONLY when the task block says flip_ready - that means the
+        verification loop is complete AND CI checks are green. Never flip a
+        ready PR back to draft.
+      - The PR DESCRIPTION is a stable document (what, how to verify, the digest
+        sections given below). Every review round's evidence is a NEW comment
+        titled "## Review round N @ <full head SHA>"; every later push is a NEW
+        top-level comment "## Update @ <full head SHA>" mapping each addressed
+        finding to its commit. NEVER rewrite the description as a changelog.
+      - When an orchestrator owns the PR lifecycle (e.g. the architect's single
+        run PR), the flip is NOT yours - leave draft state alone unless the PR
+        is one you authored.
+      - Parallel batch member: never touch the shared branch; commit and push
+        ONLY your own task branch; no merging, no branch switching - integration
+        belongs to the parent. Leave the worktree removable:
+        everything committed and pushed, no untracked scratch files.
+      Report every command you ran with its exit code, the HEAD SHA, and the PR
+      URL/number when one exists. An honest failure with the verbatim error is
+      the correct deliverable.
+      Anomalies (A10): if you observe something wrong OUTSIDE your task - an
+      unexpected branch state, commits you did not make, a dirty tree you did
+      not dirty, repo damage - add a line starting exactly "ANOMALY: " to your
+      report for each observation. Empty is the normal case; never invent one.
+    prompt: |
+      ## Task block
+      {{git_task}}
+
+      ## Git actions the brief asked for
+      {{git_actions}}
+
+      ## PR body digest sections (include when opening a PR)
+      {{report}}
+
+      ## Review rounds (one "## Review round N @ <sha>" comment each)
+      {{round_heads}}
+
+      ## Instruction from the parent (parallel mode; may be empty)
+      {{inbox_instructions}}
+    tools: [execute_command, fs_read, fs_write]
+    skills_enabled: true
+    enabled_skills: [git-master]
+    max_iterations: 20
+    timeout: 1800
+    state_updates:
+      git_report: '{{output}}'
+    fallback: ci_gate
+    next: ci_gate
+
+  ci_gate:
+    id: ci_gate
+    type: script
+    description: Watch checks only for a PR this run owns the flip of; a parent-owned lifecycle leaves the draft alone.
+    script: scripts/ci_gate.py
+    fallback: final_report
+
+  ci_poll:
+    id: ci_poll
+    type: script
+    description: Bounded self-loop over gh pr checks (pr-watch poll precedent; wall clock B15).
+    script: scripts/ci_poll.py
+    timeout: 120
+    fallback: ci_route
+
+  ci_route:
+    id: ci_route
+    type: script
+    description: green -> flip ready via git_ops; red -> diagnose; exhausted -> escalate with the evidence pack.
+    script: scripts/ci_route.py
+    fallback: final_report
+
+  ci_diagnose:
+    id: ci_diagnose
+    type: llm
+    description: Section 10.12 - flake / real / infra / unsure over a trimmed evidence pack; unsure defaults UP.
+    instructions: |
+      Diagnose a red CI run for a PR this run authored. Verdict enum:
+      - flake: transient (re-run; bounded and ledgered - a third red is real).
+      - real: the change broke it (a coder fix round with the failure verbatim).
+      - infra: runner lost, timeout, 429, concurrency-cancelled (wait or escalate).
+      - unsure: ESCALATE. Unsure defaults up, never to re-run - flakiness is not
+        a laundering channel for real failures.
+      Name the failing check(s) and quote the failure signature.
+    prompt: |
+      ## Evidence pack (trimmed)
+      {{ci_evidence}}
+
+      ## Task
+      {{current_task}}
+
+      ## Diff stat
+      {{diff_stat}}
+    tools: []
+    timeout: 600
+    output_schema:
+      type: object
+      properties:
+        ci_diagnosis: { type: string }
+        ci_verdict:
+          type: string
+          enum: [flake, real, infra, unsure]
+        failing_checks:
+          type: array
+          items: { type: string }
+        anomalies:
+          type: array
+          items: { type: string }
+      required: [ci_verdict]
+    state_updates:
+      last_node_output: '{{output}}'
+    fallback: ci_apply
+    next: ci_apply
+
+  ci_apply:
+    id: ci_apply
+    type: script
+    description: The enum as edges with A6 keying (flake re-runs per check-name per PR, fix strikes B5).
+    script: scripts/ci_apply.py
+    timeout: 120
+    fallback: final_report
+
+  final_report:
+    id: final_report
+    type: script
+    description: Grep-complete report assembly from the ledgers; writes report.md and the re-entry handle.
+    script: scripts/final_report.py
+    timeout: 60
+    fallback: end_failure
+    next: summarize_run
+
+  summarize_run:
+    id: summarize_run
+    type: llm
+    description: The prose summary paragraph only - the structured sections are already final.
+    instructions: |
+      Write the 3-6 sentence summary paragraph of an orchestrated coding run for
+      its final report: what was asked, what landed (files/commits), how it was
+      verified (name the gates that ran and their verdicts - never claim a gate
+      passed unless the report shows it ran), and what the user must still
+      decide or do. Plain prose, no headings, no new facts.
+    prompt: |
+      {{report}}
+    tools: []
+    timeout: 300
+    state_updates:
+      summary: '{{output}}'
+    fallback: end_complete
+    next: end_complete
+
+  research_answer:
+    id: research_answer
+    type: llm
+    description: Island for exploration / design-question intents when the run is headless (the facade router sends these to the chat lane).
+    instructions: |
+      Answer an exploration or design question about the codebase at
+      {{project_dir}} as an orchestrator: fan out explore agents in parallel
+      (one per distinct angle; librarian for external libraries; oracle for
+      architecture/design questions - never answer those yourself), collect
+      every agent you spawned, synthesize, and answer with file:line evidence.
+      Do not create todos or edit files; this is a question.
+    prompt: |
+      {{brief}}
+
+      Clarifications: {{clarifications}}
+    tools: [fs_read, fs_grep, fs_glob, fs_ls, ast_grep]
+    skills_enabled: true
+    enabled_skills: [parallel-research, oracle-protocol]
+    max_iterations: 45
+    timeout: 3600
+    state_updates:
+      report: '{{output}}'
+    fallback: end_failure
+    next: end_answer
+
+  run_step:
+    id: run_step
+    type: agent
+    agent: step-runner
+    description: Phase 8 execution lifecycle - the step protocol enforced as the step-runner's own edges.
+    prompt: |
+      {{brief}}
+    timeout: 0
+    max_attempts: 1
+    state_updates:
+      report: '{{output}}'
+    fallback: final_report
+    next: final_report
+
+  # =====================================================================
+  # Ends
+  # =====================================================================
+  end_complete:
+    id: end_complete
+    type: end
+    output: |
+      {{summary}}
+
+      {{report}}
+
+  end_answer:
+    id: end_answer
+    type: end
+    output: |
+      {{report}}
+
+      Sisyphus run id: {{run_id}}
+
+  end_redirect:
+    id: end_redirect
+    type: end
+    output: |
+      SISYPHUS_REDIRECT
+      {{redirect_reason}}
+
+      Sisyphus run id: {{run_id}}
+
+  end_blocked:
+    id: end_blocked
+    type: end
+    output: |
+      SISYPHUS_BLOCKED
+      {{failure_reason}}
+
+      {{report}}
+
+      Sisyphus run id: {{run_id}}
+
+  end_aborted:
+    id: end_aborted
+    type: end
+    output: |
+      SISYPHUS_ABORTED
+      {{failure_reason}}
+
+      {{report}}
+
+      Sisyphus run id: {{run_id}}
+
+  end_failure:
+    id: end_failure
+    type: end
+    output: |
+      SISYPHUS_FAILED
+      {{failure_reason}}
+
+      Last script error:
+      {{last_script_error}}
+
+      Sisyphus run id: {{run_id}}
