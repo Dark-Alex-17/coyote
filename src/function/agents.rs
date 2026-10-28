@@ -843,12 +843,16 @@ async fn maybe_compress_child_turn(child_ctx: &mut RequestContext, app: &AppConf
         return false;
     }
     if let Err(err) = compress_child_session(child_ctx).await {
-        warn!("Child session compression failed; continuing uncompressed: {err:#}");
+        warn!(
+            "Child session compression failed{}; continuing uncompressed: {err:#}",
+            child_for(child_ctx)
+        );
         return false;
     }
     if let Err(err) = child_ctx.checkpoint_session_to_disk(app.dry_run) {
         warn!(
-            "Compressed child session was not written back; the previous turn's copy stays on disk: {err:#}"
+            "Compressed child session was not written back{}; the previous turn's copy stays on disk: {err:#}",
+            child_for(child_ctx)
         );
     }
     true
@@ -857,7 +861,10 @@ async fn maybe_compress_child_turn(child_ctx: &mut RequestContext, app: &AppConf
 /// A context-overflow rejection is proof the prompt is too big even when
 /// the model declares no window for the valve to measure against, so it
 /// earns the same compress-and-retry as a tripped valve, once per child
-/// run, provided there is a session with something to fold.
+/// run, provided there is a session with something to fold. Unlike the
+/// REPL, which re-arms its overflow retry on every committed turn, a child
+/// retries once per run: the caller's `retried_after_compress` flag is
+/// never re-armed, so a second overflow surfaces as the error it is.
 async fn compress_child_for_error_retry(
     child_ctx: &mut RequestContext,
     app: &AppConfig,
@@ -886,10 +893,23 @@ async fn compress_child_for_error_retry(
     match compress_child_session(child_ctx).await {
         Ok(()) => true,
         Err(compress_err) => {
-            warn!("Child session compression failed; continuing uncompressed: {compress_err:#}");
+            warn!(
+                "Child session compression failed{}; continuing uncompressed: {compress_err:#}",
+                child_for(child_ctx)
+            );
             false
         }
     }
+}
+
+/// The child's session name as a ` for '<name>'` suffix for the
+/// compression warns, empty when no named session is seated.
+fn child_for(ctx: &RequestContext) -> String {
+    ctx.session
+        .as_ref()
+        .map(Session::name)
+        .filter(|name| !name.is_empty())
+        .map_or_else(String::new, |name| format!(" for '{name}'"))
 }
 
 /// Runs the session compression with the session marked compressing for
@@ -1717,7 +1737,7 @@ async fn resume_child_session(
     child_ctx.session = Some(session);
     if let Err(err) = child_ctx.checkpoint_session_to_disk(app_config.dry_run) {
         warn!(
-            "Resumed child session was not written back after compression; the stored copy stays as it was: {err:#}"
+            "Resumed child session was not written back; the stored copy stays as it was: {err:#}"
         );
     }
     Ok(())
