@@ -14,6 +14,7 @@ mod macros;
 mod mcp_factory;
 mod mcp_tool_policy;
 pub(crate) mod memory;
+pub(crate) mod memory_migrate;
 pub(crate) mod paths;
 pub(crate) mod prompts;
 mod rag_cache;
@@ -490,6 +491,13 @@ impl AssetCategory {
 pub enum MemoryScope {
     Global,
     Workspace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum MigrateScope {
+    Global,
+    Workspace,
+    All,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]

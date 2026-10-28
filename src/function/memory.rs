@@ -563,7 +563,7 @@ fn slug_grammar() -> String {
 }
 
 /// Splits `<base>-r<N>` into `(base, N)`; any other shape is not a round name.
-fn round_chain_name(name: &str) -> Option<(&str, u32)> {
+pub(crate) fn round_chain_name(name: &str) -> Option<(&str, u32)> {
     let (base, digits) = name.rsplit_once("-r")?;
     if base.is_empty() || digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -829,7 +829,7 @@ fn other_index_paths(store: &MemoryStore, own_dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-fn write_memory_index(target_dir: &Path, content: &str) -> Result<PathBuf> {
+pub(crate) fn write_memory_index(target_dir: &Path, content: &str) -> Result<PathBuf> {
     fs::create_dir_all(target_dir)?;
     let index_path = target_dir.join("MEMORY.md");
 
