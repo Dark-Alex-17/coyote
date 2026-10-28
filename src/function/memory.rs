@@ -425,7 +425,7 @@ fn write_memory(
         bail!("{report}");
     }
     let name = arg_str(args, "name")?;
-    let description = arg_str(args, "description")?;
+    let description = arg_str(args, "description")?.trim().to_string();
     let content = arg_str(args, "content")?;
     let scope = arg_str(args, "scope")?;
     if content.trim_start().starts_with("---") {
@@ -827,7 +827,7 @@ fn ensure_index_entry(index_path: &Path, name: &str, description: &str) -> Resul
     for raw in existing.split_inclusive('\n') {
         let line = raw.trim_end_matches(['\r', '\n']);
         if catalogue_slug(line) == Some(name) {
-            if catalogue_entry(line).is_some_and(|(_, desc)| desc == description.trim()) {
+            if catalogue_entry(line).is_some_and(|(_, desc)| desc == description) {
                 return Ok(false);
             }
             let rewritten = format!(
@@ -1173,13 +1173,6 @@ mod tests {
 
         let updated = ensure_index_entry(&index, "existing", "different description").unwrap();
         assert!(!updated, "an identical description is not a rewrite");
-        assert_eq!(fs::read_to_string(&index).unwrap(), rewritten);
-
-        let updated = ensure_index_entry(&index, "existing", "  different description \n").unwrap();
-        assert!(
-            !updated,
-            "surrounding whitespace on the argument does not count as a change"
-        );
         assert_eq!(fs::read_to_string(&index).unwrap(), rewritten);
 
         let _ = fs::remove_dir_all(&root);
@@ -2346,6 +2339,28 @@ mod tests {
         assert_eq!(
             fs::read_to_string(structured.join("MEMORY.md")).unwrap(),
             "# Memory Index\n\n- [[before]]: b\n- [[fact]]: second take\n- [[after]]: a\n"
+        );
+
+        let result = write_memory(
+            &store,
+            &workspace,
+            &write_args("fact", "  second take \t", "x"),
+            3,
+            RoundChains::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            result["index_updated"], false,
+            "surrounding whitespace on the argument does not count as a change: {result}"
+        );
+        assert_eq!(
+            fs::read_to_string(structured.join("MEMORY.md")).unwrap(),
+            "# Memory Index\n\n- [[before]]: b\n- [[fact]]: second take\n- [[after]]: a\n"
+        );
+        let saved = MemoryFile::load(&structured.join("fact.md")).unwrap();
+        assert_eq!(
+            saved.frontmatter.description.as_deref(),
+            Some("second take")
         );
 
         let _ = fs::remove_dir_all(&root);
