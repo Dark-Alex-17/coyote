@@ -2020,10 +2020,16 @@ fn sessions_child_section_names_the_layout_and_the_lifecycle_rules() {
         );
     }
     let resuming = flat(&section("Sessions.md", &page, "## Resuming"));
-    assert!(
-        resuming.contains("compressed once"),
-        "the Resuming section does not say a child is compressed once at resume"
-    );
+    for needle in [
+        "compressed once",
+        "written back to the child session file at once",
+        "A write-back that fails after a successful compression does not refuse the resume",
+    ] {
+        assert!(
+            resuming.contains(needle),
+            "the Resuming section does not say {needle:?}"
+        );
+    }
     let hooks = read(wiki.join("Hooks.md"));
     let compressed = table_row("Hooks.md", &hooks, "`session.compressed`").join(" ");
     assert!(
@@ -2258,7 +2264,7 @@ fn agents_page_quotes_the_spawn_session_id_contract() {
     for fragment in fragments {
         assert!(
             refusals.iter().any(|literal| literal.contains(fragment)),
-            "resume_child_session no longer refuses with {fragment:?}: {refusals:?}"
+            "neither resume_child_session nor load_and_gate refuses with {fragment:?}: {refusals:?}"
         );
     }
     let recent = format!(
