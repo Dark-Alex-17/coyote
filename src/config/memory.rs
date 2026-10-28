@@ -19,11 +19,13 @@ pub const DEFAULT_MEMORY_CAP_WITHOUT_TOOLS: usize = 12_000;
 pub const DEFAULT_MEMORY_RUN_STATE_TTL_DAYS: u32 = 14;
 /// Chars a `description` may hold; it is one MEMORY.md index line.
 pub const MEMORY_DESCRIPTION_CAP: usize = 160;
-/// Chars a memory body may hold at write; `memory__lint` flags from 2000 up.
+/// Chars a memory body may hold at write; `memory__lint` flags bodies over 2000 chars.
 pub const MEMORY_FILE_HARD_CAP: usize = 4_000;
 
 /// A MEMORY.md line that catalogues a drill file. Only lines of this exact shape
 /// count as indexing a file; a wikilink cited mid-sentence in a FACTS line does not.
+/// The slug class is deliberately wider than the write-side slug grammar so legacy
+/// index lines with dots or uppercase are still recognised.
 pub static CATALOGUE_LINE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^- \[\[(?P<slug>[A-Za-z0-9_.-]+)\]\]:\s*(?P<desc>.*)$").unwrap());
 

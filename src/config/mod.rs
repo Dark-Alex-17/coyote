@@ -1560,6 +1560,7 @@ clients:
         assert!(example.contains("command_prefix: dot"));
         let cfg = Config::load_from_str(example).unwrap();
         assert_eq!(cfg.command_prefix, CommandPrefix::Dot);
+        assert_eq!(cfg.memory_round_chains, RoundChains::Supersede);
     }
 
     #[test]

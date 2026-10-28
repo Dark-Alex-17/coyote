@@ -439,8 +439,8 @@ fn write_memory(
         Some(value) => MemoryKind::from_str(value)?.into(),
         None => KindField::default(),
     };
-    if description.contains('\n') {
-        bail!("description must be one line (no newline)");
+    if description.contains(['\r', '\n']) {
+        bail!("description must be one line (no newline or carriage return)");
     }
     let description_chars = description.chars().count();
     if description_chars > MEMORY_DESCRIPTION_CAP {
@@ -1174,6 +1174,17 @@ mod tests {
         let updated = ensure_index_entry(&index, "existing", "different description").unwrap();
         assert!(!updated, "an identical description is not a rewrite");
         assert_eq!(fs::read_to_string(&index).unwrap(), rewritten);
+
+        let crlf =
+            "# Memory Index\r\n\r\n- [[existing]]: already here\r\n- [[other]]: untouched\r\n";
+        fs::write(&index, crlf).unwrap();
+        let updated = ensure_index_entry(&index, "existing", "different description").unwrap();
+        assert!(updated);
+        assert_eq!(
+            fs::read_to_string(&index).unwrap(),
+            "# Memory Index\r\n\r\n- [[existing]]: different description\r\n- [[other]]: untouched\r\n",
+            "a CRLF index keeps its line endings"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -2257,8 +2268,13 @@ mod tests {
         let text = refuse(write_args("fact", &"d".repeat(161), "x"));
         assert_eq!(text, "description is 161 chars, the cap is 160");
 
-        let text = refuse(write_args("fact", "two\nlines", "x"));
-        assert_eq!(text, "description must be one line (no newline)");
+        for broken in ["two\nlines", "two\rlines"] {
+            let text = refuse(write_args("fact", broken, "x"));
+            assert_eq!(
+                text,
+                "description must be one line (no newline or carriage return)"
+            );
+        }
 
         let text = refuse(write_args("fact", "d", &"x".repeat(4001)));
         assert_eq!(
@@ -2369,8 +2385,17 @@ mod tests {
     #[test]
     fn round_chain_name_splits_only_a_trailing_round_suffix() {
         assert_eq!(round_chain_name("foo-r2"), Some(("foo", 2)));
+        assert_eq!(round_chain_name("foo-r02"), Some(("foo", 2)));
         assert_eq!(round_chain_name("foo-r1-r12"), Some(("foo-r1", 12)));
-        for plain in ["foo", "foo-r", "-r2", "foo-rx", "foo-r2x", "r2"] {
+        for plain in [
+            "foo",
+            "foo-r",
+            "-r2",
+            "foo-rx",
+            "foo-r2x",
+            "r2",
+            "foo-r4294967296",
+        ] {
             assert_eq!(round_chain_name(plain), None, "{plain}");
         }
     }
