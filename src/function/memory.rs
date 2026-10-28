@@ -56,7 +56,8 @@ pub fn memory_function_declarations() -> Vec<FunctionDeclaration> {
                  arguments, so never put `name:` / `description:` / `scope:` / `type:` lines inside \
                  `content`. Writing `<base>-r<N>` applies the `memory_round_chains` config key to the \
                  older `<base>-r<M>` files in the same scope (supersede marks them superseded_by, keep \
-                 leaves them alone)."
+                 leaves them alone). Either way, a round written below an existing one keeps \
+                 superseded_by pointing at the round above."
                     .to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
@@ -2271,6 +2272,10 @@ mod tests {
             "{description}"
         );
         assert!(write.description.contains("`memory_round_chains`"));
+        assert!(write.description.contains(
+            "Either way, a round written below an existing one keeps superseded_by pointing at \
+             the round above."
+        ));
     }
 
     fn write_args(name: &str, description: &str, content: &str) -> Value {
@@ -2905,6 +2910,41 @@ mod tests {
         assert_eq!(
             fs::read_to_string(structured.join("foo-r1.md")).unwrap(),
             before
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_memory_marks_a_lower_round_even_when_configured_to_keep() {
+        let root = temp_root("write_round_keep_lower");
+        let (store, workspace, structured) = workspace_store(&root, "# Memory Index\n");
+        write_round(&structured, "foo-r2", "");
+        let untouched_r2 = fs::read_to_string(structured.join("foo-r2.md")).unwrap();
+
+        let result = write_memory(
+            &store,
+            &workspace,
+            &write_args("foo-r1", "round one", "x"),
+            3,
+            RoundChains::Keep,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result["round_chain"],
+            json!({"base": "foo", "round": 1, "newer_rounds": ["foo-r2"]}),
+            "{result}"
+        );
+        let r1 = MemoryFile::load(&structured.join("foo-r1.md")).unwrap();
+        assert_eq!(
+            r1.frontmatter.superseded_by.as_deref(),
+            Some("foo-r2"),
+            "the key governs older rounds only; the upward mark always applies"
+        );
+        assert_eq!(
+            fs::read_to_string(structured.join("foo-r2.md")).unwrap(),
+            untouched_r2
         );
 
         let _ = fs::remove_dir_all(&root);

@@ -1552,12 +1552,16 @@ clients:
     fn config_template_documents_memory_round_chains() {
         assert!(CONFIG_TEMPLATE.contains("\nmemory_round_chains: supersede"));
         assert!(CONFIG_TEMPLATE.contains("keep leaves them alone"));
+        assert!(CONFIG_TEMPLATE.contains(
+            "# Either way, a round written below an existing one keeps superseded_by pointing at the round above."
+        ));
     }
 
     #[test]
     fn config_example_parses_with_dot_command_prefix() {
         let example = include_str!("../../config.example.yaml");
         assert!(example.contains("command_prefix: dot"));
+        assert!(example.contains("\nmemory_round_chains: supersede"));
         let cfg = Config::load_from_str(example).unwrap();
         assert_eq!(cfg.command_prefix, CommandPrefix::Dot);
         assert_eq!(cfg.memory_round_chains, RoundChains::Supersede);
