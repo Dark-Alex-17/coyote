@@ -719,7 +719,7 @@ fn rename_memory(store: &MemoryStore, cwd: &Path, args: &Value) -> Result<Value>
 
     remove_index_entry(&index_path, &name)?;
     let description = renamed.frontmatter.description.clone().unwrap_or_default();
-    ensure_index_entry(&index_path, &new_name, &description)?;
+    ensure_index_entry_present(&index_path, &new_name, &description)?;
 
     // Other indexes (other scope's MEMORY.md): rewrite wikilinks only.
     for other_index in other_index_paths(store, &target_dir) {
@@ -823,24 +823,52 @@ fn write_memory_index(target_dir: &Path, content: &str) -> Result<PathBuf> {
 fn ensure_index_entry(index_path: &Path, name: &str, description: &str) -> Result<bool> {
     let existing = fs::read_to_string(index_path).unwrap_or_default();
     let entry = format!("- [[{name}]]: {description}");
+    if let Some((offset, line)) = catalogue_line_of(&existing, name) {
+        if catalogue_entry(line).is_some_and(|(_, desc)| desc == description) {
+            return Ok(false);
+        }
+        let rewritten = format!(
+            "{}{entry}{}",
+            &existing[..offset],
+            &existing[offset + line.len()..]
+        );
+        fs::write(index_path, rewritten)?;
+        return Ok(true);
+    }
+    append_index_entry(index_path, &existing, &entry)?;
+    Ok(true)
+}
+
+/// Guarantees `name` has a catalogue line but never rewrites one that is
+/// already there, whatever description it carries: a rename moves the entry,
+/// only a write refreshes it.
+fn ensure_index_entry_present(index_path: &Path, name: &str, description: &str) -> Result<()> {
+    let existing = fs::read_to_string(index_path).unwrap_or_default();
+    if catalogue_line_of(&existing, name).is_some() {
+        return Ok(());
+    }
+    append_index_entry(
+        index_path,
+        &existing,
+        &format!("- [[{name}]]: {description}"),
+    )
+}
+
+/// Byte offset of the catalogue line for `name` and that line without its
+/// line ending.
+fn catalogue_line_of<'a>(index: &'a str, name: &str) -> Option<(usize, &'a str)> {
     let mut offset = 0;
-    for raw in existing.split_inclusive('\n') {
+    for raw in index.split_inclusive('\n') {
         let line = raw.trim_end_matches(['\r', '\n']);
         if catalogue_slug(line) == Some(name) {
-            if catalogue_entry(line).is_some_and(|(_, desc)| desc == description) {
-                return Ok(false);
-            }
-            let rewritten = format!(
-                "{}{entry}{}",
-                &existing[..offset],
-                &existing[offset + line.len()..]
-            );
-            fs::write(index_path, rewritten)?;
-            return Ok(true);
+            return Some((offset, line));
         }
         offset += raw.len();
     }
+    None
+}
 
+fn append_index_entry(index_path: &Path, existing: &str, entry: &str) -> Result<()> {
     let new_content = if existing.is_empty() {
         format!("# Memory Index\n\n{entry}\n")
     } else if existing.ends_with('\n') {
@@ -854,8 +882,7 @@ fn ensure_index_entry(index_path: &Path, name: &str, description: &str) -> Resul
     }
 
     fs::write(index_path, new_content)?;
-
-    Ok(true)
+    Ok(())
 }
 
 fn remove_index_entry(index_path: &Path, name: &str) -> Result<bool> {
@@ -1630,6 +1657,65 @@ mod tests {
         assert_eq!(
             result["rewritten_references"].as_array().unwrap(),
             &vec![json!("linker")]
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rename_memory_moves_the_catalogue_line_without_rewriting_it() {
+        let root = temp_root("rename_index_text");
+        let workspace = root.join("ws");
+        let structured = workspace.join(".coyote").join("memory");
+        fs::create_dir_all(&structured).unwrap();
+        fs::write(
+            structured.join("MEMORY.md"),
+            "# Memory Index\n\n- [[linker]]: links\n- [[drift]]: hand-curated wording\n",
+        )
+        .unwrap();
+        fs::write(
+            structured.join("linker.md"),
+            "---\nname: linker\n---\nno description here\n",
+        )
+        .unwrap();
+        fs::write(
+            structured.join("drift.md"),
+            "---\nname: drift\ndescription: what the file says\n---\nx\n",
+        )
+        .unwrap();
+        fs::write(
+            structured.join("uncatalogued.md"),
+            "---\nname: uncatalogued\ndescription: never indexed\n---\nx\n",
+        )
+        .unwrap();
+        let store = MemoryStore {
+            global_dir: root.join("g"),
+            workspace: discover_workspace_memory(&workspace),
+        };
+
+        let args = json!({"name": "linker", "new_name": "new-linker", "scope": "workspace"});
+        rename_memory(&store, &workspace, &args).unwrap();
+        let index = fs::read_to_string(structured.join("MEMORY.md")).unwrap();
+        assert!(
+            index.contains("- [[new-linker]]: links\n"),
+            "a file without a description keeps the catalogue text: {index}"
+        );
+
+        let args = json!({"name": "drift", "new_name": "drifted", "scope": "workspace"});
+        rename_memory(&store, &workspace, &args).unwrap();
+        let index = fs::read_to_string(structured.join("MEMORY.md")).unwrap();
+        assert!(
+            index.contains("- [[drifted]]: hand-curated wording\n"),
+            "a rename moves the line, only a write refreshes it: {index}"
+        );
+        assert!(!index.contains("what the file says"), "{index}");
+
+        let args = json!({"name": "uncatalogued", "new_name": "catalogued", "scope": "workspace"});
+        rename_memory(&store, &workspace, &args).unwrap();
+        let index = fs::read_to_string(structured.join("MEMORY.md")).unwrap();
+        assert!(
+            index.ends_with("- [[catalogued]]: never indexed\n"),
+            "a missing line is still appended: {index}"
         );
 
         let _ = fs::remove_dir_all(&root);
