@@ -2688,6 +2688,11 @@ enum Watch {
         /// Whether the client has connected since start. Until it has, the tick polls
         /// `status` for its first `connected`; after that its events are what count.
         connected: bool,
+        /// When the tick read the first `connected`. The client marks its status
+        /// connected before it queues the reconnect event for that same stream, so an
+        /// event that lands within one tick of the switch describes the connect the
+        /// switch already announced and is folded into it.
+        switched_at: Option<Instant>,
     },
     Local {
         index: usize,
@@ -2712,6 +2717,7 @@ impl Watch {
                 hash: *hash,
                 status: status.clone(),
                 connected: *connected_at_start,
+                switched_at: None,
             },
             WatchedInterface::Local {
                 index,
@@ -2725,6 +2731,25 @@ impl Watch {
                 attached: *attached,
             },
         }
+    }
+
+    /// Whether the TCP client at `hash` switched from the poll to its events less than
+    /// `within` before `now`: a reconnect event arriving in that window is the first
+    /// connect the switch already announced, not a second one.
+    fn switched_within(
+        watches: &[Self],
+        hash: AddressHash,
+        within: Duration,
+        now: Instant,
+    ) -> bool {
+        watches.iter().any(|watch| match watch {
+            Self::Tcp {
+                hash: at,
+                switched_at: Some(switched),
+                ..
+            } => *at == hash && now.saturating_duration_since(*switched) < within,
+            _ => false,
+        })
     }
 
     /// The row and label of the TCP client at `hash` once it has connected; `None` for a
@@ -2825,6 +2850,7 @@ async fn watch_interfaces(
                             hash,
                             status,
                             connected,
+                            switched_at,
                             ..
                         } => {
                             if *connected
@@ -2833,6 +2859,7 @@ async fn watch_interfaces(
                                 continue;
                             }
                             *connected = true;
+                            *switched_at = Some(Instant::now());
                             switching.push(*hash);
                         }
                     }
@@ -2841,7 +2868,16 @@ async fn watch_interfaces(
                     drain_switching_reconnects(&switching, &mut events.reconnect, &mut transitions);
                 }
             }
-            Some(TcpEvent::Reconnect(hash)) => transitions.push((hash, Transition::Reconnect)),
+            Some(TcpEvent::Reconnect(hash)) => {
+                if Watch::switched_within(&watches, hash, CONNECT_WATCH_TICK, Instant::now()) {
+                    debug!(
+                        "Mesh interface {} reported the connect its switch already announced",
+                        short(&hash.to_hex_string())
+                    );
+                } else {
+                    transitions.push((hash, Transition::Reconnect));
+                }
+            }
             Some(TcpEvent::Disconnect(hash)) => {
                 if let Some(label) = Watch::tcp_label(&watches, hash) {
                     debug!(
@@ -12755,6 +12791,46 @@ mod tests {
             ]
         );
         assert!(rx.try_recv().is_err(), "the queue is drained at the switch");
+    }
+
+    #[test]
+    fn a_reconnect_within_one_tick_of_the_switch_is_the_connect_the_switch_announced() {
+        let hash = AddressHash::new_from_rand(OsRng);
+        let other = AddressHash::new_from_rand(OsRng);
+        let switched = Instant::now();
+        let watch = |switched_at| Watch::Tcp {
+            index: 0,
+            label: "relay".into(),
+            hash,
+            status: TcpClient::new("127.0.0.1:1").runtime_status_handle(),
+            connected: true,
+            switched_at,
+        };
+        let fresh = [watch(Some(switched))];
+        assert!(Watch::switched_within(
+            &fresh,
+            hash,
+            CONNECT_WATCH_TICK,
+            switched + CONNECT_WATCH_TICK / 2
+        ));
+        assert!(
+            !Watch::switched_within(&fresh, other, CONNECT_WATCH_TICK, switched),
+            "another client's event is its own"
+        );
+        assert!(
+            !Watch::switched_within(
+                &fresh,
+                hash,
+                CONNECT_WATCH_TICK,
+                switched + CONNECT_WATCH_TICK
+            ),
+            "a tick later the event is a real reconnect"
+        );
+        let never = [watch(None)];
+        assert!(
+            !Watch::switched_within(&never, hash, CONNECT_WATCH_TICK, switched),
+            "a client connected at start never switched"
+        );
     }
 
     /// A node on a `TransportRelay`, installed in its own slot with a recording notifier.
