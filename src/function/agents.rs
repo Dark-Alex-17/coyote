@@ -7182,7 +7182,7 @@ mod tests {
     #[test]
     fn resume_child_session_restamps_through_restamp_exactly_once() {
         let source = include_str!("agents.rs").replace("\r\n", "\n");
-        let start = source.find("\nfn resume_child_session(").unwrap();
+        let start = source.find("\nasync fn resume_child_session(").unwrap();
         let body = &source[start..];
         let body = &body[..body.find("\n}\n").unwrap()];
         assert_eq!(body.matches("meta.restamp(").count(), 1);
