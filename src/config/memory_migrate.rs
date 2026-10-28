@@ -211,6 +211,11 @@ fn plan_scope(label: &'static str, dir: &Path, today: &str) -> Result<ScopeRepor
     }
 
     stamp_round_chains(&mut files, &mut report, &mut changed);
+    for slug in &changed {
+        if let Some(file) = files.get_mut(slug) {
+            file.frontmatter.updated = Some(today.to_string());
+        }
+    }
 
     for (slug, file) in &files {
         let frontmatter = &file.frontmatter;
@@ -609,7 +614,7 @@ mod tests {
                 "description: front matter wording\ntype: user\n",
                 "d",
             );
-            write_file(&workspace, "blank", "type: user\n", "b");
+            write_file(&workspace, "blank", "type: user\ntags: [x]\n", "b");
             write_file(
                 &workspace,
                 "gotcha",
@@ -863,6 +868,22 @@ mod tests {
             ("drifted", "index wording", "front matter wording")
         );
         assert!(scope(&report, "global").backfilled.is_empty());
+    }
+
+    #[test]
+    fn a_rewrite_keeps_unknown_keys_and_bumps_updated() {
+        let fx = Fixture::new("extra_keys");
+
+        fx.migrate(true);
+
+        let blank = load(&fx.workspace, "blank").frontmatter;
+        assert_eq!(
+            blank.extra.get("tags"),
+            Some(&serde_yaml::Value::Sequence(vec!["x".into()]))
+        );
+        assert_eq!(blank.updated.as_deref(), Some("2026-03-01"));
+        let untouched = load(&fx.workspace, "drifted").frontmatter;
+        assert_eq!(untouched.updated, None);
     }
 
     #[test]

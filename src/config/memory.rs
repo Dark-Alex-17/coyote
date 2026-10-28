@@ -247,6 +247,13 @@ pub struct MemoryFrontmatter {
     pub superseded_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires: Option<String>,
+    /// Keys this struct does not model, kept so a rewrite does not drop them.
+    #[serde(
+        flatten,
+        default,
+        skip_serializing_if = "serde_yaml::Mapping::is_empty"
+    )]
+    pub extra: serde_yaml::Mapping,
 }
 
 #[derive(Debug, Clone)]

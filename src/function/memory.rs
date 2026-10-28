@@ -512,6 +512,7 @@ fn write_memory(
             updated: Some(today.clone()),
             superseded_by,
             expires,
+            extra: Default::default(),
         },
         body: content,
     };
