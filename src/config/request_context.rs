@@ -9903,17 +9903,15 @@ mod tests {
             ..AppConfig::default()
         });
         let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Repl);
-        ctx.session = Some(Session::default());
-        let input = Input::from_str(&ctx, &"y".repeat(150_000), Some(Role::new("", ""))).unwrap();
-        ctx.session
-            .as_mut()
-            .unwrap()
-            .add_message(&input, "hi")
-            .unwrap();
         let app = ctx.app.config.clone();
-        ctx.extract_role(&app).unwrap();
+        let role = ctx.extract_role(&app).unwrap();
         let memory_tokens = ctx.system_prompt_split.lock().unwrap().memory_tokens;
         assert!(memory_tokens > 300_000, "{memory_tokens}");
+        let input = Input::from_str(&ctx, &"y".repeat(150_000), Some(role)).unwrap();
+        let mut session = Session::default();
+        session.add_message(&input, "hi").unwrap();
+        assert_eq!(session.messages()[0].role, MessageRole::System);
+        ctx.session = Some(session);
 
         let fetch = |_: Input| async { Ok("summary".to_string()) };
         let err = run_async(ctx.compress_session_impl(None, fetch)).unwrap_err();
@@ -9922,6 +9920,38 @@ mod tests {
             format!(
                 "Nothing to compress: the kept tail is the whole session; the system prompt holds {memory_tokens} memory tokens, more than the conversation - prune memory or lower memory_facts_cap"
             )
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn compress_session_impl_bail_keeps_the_keep_last_hint_when_the_conversation_outweighs_memory()
+    {
+        let _guard = TestConfigDirGuard::new();
+        write_global_memory_store();
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            compression_threshold: 0,
+            compression_keep_last: 10,
+            memory: Some(true),
+            ..AppConfig::default()
+        });
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Repl);
+        let app = ctx.app.config.clone();
+        let role = ctx.extract_role(&app).unwrap();
+        assert!(ctx.system_prompt_split.lock().unwrap().memory_tokens > 0);
+        let input = Input::from_str(&ctx, &"y".repeat(150_000), Some(role)).unwrap();
+        let mut session = Session::default();
+        session.add_message(&input, "hi").unwrap();
+        assert_eq!(session.messages()[0].role, MessageRole::System);
+        ctx.session = Some(session);
+
+        let fetch = |_: Input| async { Ok("summary".to_string()) };
+        let err = run_async(ctx.compress_session_impl(None, fetch)).unwrap_err();
+        assert!(
+            err.to_string()
+                .ends_with("; lower compression_keep_last or run `.compress session 0`"),
+            "unexpected error: {err}"
         );
     }
 
@@ -9989,15 +10019,25 @@ mod tests {
         assert_eq!(
             system_prompt_share_warning(&split(160), Some(1_000)).as_deref(),
             Some(
-                "system prompt is at least 26% of the model window (160 memory tokens); prune memory or lower memory_facts_cap"
+                "system prompt is over 25% of the model window (260 of 1000 tokens, 160 from memory); prune memory or lower memory_facts_cap"
             )
         );
         assert_eq!(system_prompt_share_warning(&split(150), Some(1_000)), None);
-        assert_eq!(system_prompt_share_warning(&split(159), Some(1_000)), None);
+        assert_eq!(
+            system_prompt_share_warning(&split(159), Some(1_000)).as_deref(),
+            Some(
+                "system prompt is over 25% of the model window (259 of 1000 tokens, 159 from memory); prune memory or lower memory_facts_cap"
+            )
+        );
         assert_eq!(system_prompt_share_warning(&split(0), Some(1_000)), None);
         assert_eq!(system_prompt_share_warning(&split(10_000), None), None);
         assert_eq!(system_prompt_share_warning(&split(10_000), Some(0)), None);
-        assert!(system_prompt_share_warning(&split(0), Some(300)).is_some());
+        assert_eq!(
+            system_prompt_share_warning(&split(0), Some(300)).as_deref(),
+            Some(
+                "system prompt is over 25% of the model window (100 of 300 tokens, 100 from the role and 0 from instructions); shorten the role prompt or instructions"
+            )
+        );
     }
 
     #[test]
@@ -16406,6 +16446,47 @@ mod tests {
             .iter()
             .any(|prefix| line.starts_with(prefix))),
             "compression and system prompt rows sit between save_session and memory:\n{info}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn session_info_reports_the_stored_system_prompt_split() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let mut session = Session::default();
+        session.set_model(windowed_model(20_000));
+        ctx.session = Some(session);
+        *ctx.system_prompt_split.lock() = Some(SystemPromptSplit {
+            role_tokens: 1234,
+            memory_tokens: 5678,
+            instructions_tokens: 0,
+            truncated: Some(memory::Truncated {
+                lines: 9,
+                chars: 321,
+                global_lines: 4,
+                workspace_lines: 5,
+            }),
+        });
+        let app = ctx.app.config.clone();
+
+        let info = ctx.info(&app).unwrap();
+
+        assert!(
+            info.contains("  system_prompt_role_tokens: 1234\n"),
+            "{info}"
+        );
+        assert!(
+            info.contains("  system_prompt_memory_tokens: 5678\n"),
+            "{info}"
+        );
+        assert!(
+            info.contains("  system_prompt_share: 34% of 20000\n"),
+            "{info}"
+        );
+        assert!(
+            info.contains("  memory_facts_truncated: 9 lines / 321 chars\n"),
+            "{info}"
         );
     }
 
