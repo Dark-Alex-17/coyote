@@ -6,6 +6,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result, anyhow};
+use bm25::{Language, SearchEngine, SearchEngineBuilder};
 use chrono::Local;
 use fancy_regex::Regex;
 use log::warn;
@@ -428,6 +429,56 @@ impl MemoryStore {
             .insert(key, (stamps, Arc::clone(&catalogue)));
         Ok(catalogue)
     }
+
+    /// Up to `limit` entries the filter admits, best bm25 score over name and
+    /// description first, ties broken by the most recent `updated`.
+    pub fn search(&self, query: &str, limit: usize, filter: &Filter) -> Result<Vec<Hit>> {
+        let catalogue = self.catalogue()?;
+        let entries = catalogue.entries();
+        let today = today_string();
+        let mut scored: Vec<(&CatalogueEntry, f32)> = catalogue
+            .engine
+            .search(query, entries.len())
+            .into_iter()
+            .filter(|result| result.score > 0.0)
+            .map(|result| (&entries[result.document.id], result.score))
+            .filter(|(entry, _)| filter.admits(entry, &today))
+            .collect();
+        scored.sort_by(|(a, a_score), (b, b_score)| {
+            b_score
+                .total_cmp(a_score)
+                .then_with(|| b.updated.cmp(&a.updated))
+        });
+        Ok(scored
+            .into_iter()
+            .take(limit)
+            .map(|(entry, score)| Hit {
+                entry: entry.clone(),
+                score,
+            })
+            .collect())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Filter {
+    pub kind: Option<MemoryKind>,
+    pub scope: Option<Scope>,
+    pub include_stale: bool,
+}
+
+impl Filter {
+    pub fn admits(&self, entry: &CatalogueEntry, today: &str) -> bool {
+        self.kind.is_none_or(|kind| entry.kind.kind() == kind)
+            && self.scope.is_none_or(|scope| entry.scope == scope)
+            && (self.include_stale || !entry.is_stale(today))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Hit {
+    pub entry: CatalogueEntry,
+    pub score: f32,
 }
 
 /// A drill file's front matter as the catalogue holds it; the body is not kept.
@@ -473,6 +524,7 @@ impl CatalogueEntry {
 /// The global scope's entries, then the workspace's, each in path order.
 pub struct Catalogue {
     entries: Vec<CatalogueEntry>,
+    engine: SearchEngine<usize>,
 }
 
 impl Catalogue {
@@ -487,7 +539,21 @@ impl Catalogue {
             files.sort_by(|a, b| a.path.cmp(&b.path));
             entries.extend(files.into_iter().map(|f| CatalogueEntry::new(f, *scope)));
         }
-        Ok(Self { entries })
+        let documents = entries.iter().enumerate().map(|(id, entry)| {
+            bm25::Document::new(
+                id,
+                format!(
+                    "{} {}",
+                    entry.name,
+                    entry.description.as_deref().unwrap_or_default()
+                ),
+            )
+        });
+        let engine = SearchEngineBuilder::<usize>::with_documents(Language::English, documents)
+            .k1(1.5)
+            .b(0.75)
+            .build();
+        Ok(Self { entries, engine })
     }
 
     pub fn entries(&self) -> &[CatalogueEntry] {
@@ -1847,6 +1913,167 @@ mod tests {
         let rebuilt = store.catalogue().unwrap();
         assert!(!Arc::ptr_eq(&first, &rebuilt));
         assert_eq!(rebuilt.entries(), first.entries());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn hit_names(hits: &[Hit]) -> Vec<&str> {
+        hits.iter().map(|h| h.entry.name.as_str()).collect()
+    }
+
+    #[test]
+    fn search_ranks_a_description_match_above_a_slug_only_match() {
+        let (root, store) = two_index_store("search_rank", "", "idx", &[]);
+        let dir = store.workspace.as_ref().unwrap().dir.clone();
+        write_store_file(&dir, "deploy", "description: unrelated words\n");
+        write_store_file(
+            &dir,
+            "release-notes",
+            "description: how we deploy the release train\n",
+        );
+        write_store_file(&dir, "cooking", "description: pasta recipes\n");
+
+        let hits = store
+            .search("deploy release", 10, &Filter::default())
+            .unwrap();
+
+        assert_eq!(hit_names(&hits), vec!["release-notes", "deploy"]);
+        assert!(hits[0].score > hits[1].score);
+        let top = store
+            .search("deploy release", 1, &Filter::default())
+            .unwrap();
+        assert_eq!(hit_names(&top), vec!["release-notes"]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn search_breaks_score_ties_by_most_recent_update() {
+        let (root, store) = two_index_store("search_ties", "", "idx", &[]);
+        let dir = store.workspace.as_ref().unwrap().dir.clone();
+        write_store_file(
+            &dir,
+            "alpha",
+            "description: shared topic\nupdated: 2024-01-01\n",
+        );
+        write_store_file(
+            &dir,
+            "bravo",
+            "description: shared topic\nupdated: 2024-06-01\n",
+        );
+
+        let hits = store.search("topic", 10, &Filter::default()).unwrap();
+
+        assert_eq!(hit_names(&hits), vec!["bravo", "alpha"]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn search_excludes_stale_entries_unless_asked() {
+        let (root, store) = two_index_store("search_stale", "", "idx", &[]);
+        let dir = store.workspace.as_ref().unwrap().dir.clone();
+        write_store_file(&dir, "live", "description: widget facts\n");
+        write_store_file(
+            &dir,
+            "bygone",
+            "description: widget facts\nexpires: 2000-01-01\n",
+        );
+        write_store_file(
+            &dir,
+            "replaced",
+            "description: widget facts\nsuperseded_by: live\n",
+        );
+
+        let live = store.search("widget", 10, &Filter::default()).unwrap();
+        assert_eq!(hit_names(&live), vec!["live"]);
+
+        let all = Filter {
+            include_stale: true,
+            ..Filter::default()
+        };
+        let mut names = hit_names(&store.search("widget", 10, &all).unwrap())
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, vec!["bygone", "live", "replaced"]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn search_filters_by_type_and_scope() {
+        let (root, store) = two_index_store("search_filters", "", "idx", &[]);
+        let dir = store.workspace.as_ref().unwrap().dir.clone();
+        write_store_file(
+            &store.global_dir,
+            "g-user",
+            "description: gadget\ntype: user\n",
+        );
+        write_store_file(&dir, "w-user", "description: gadget\ntype: user\n");
+        write_store_file(&dir, "w-project", "description: gadget\ntype: project\n");
+
+        let search = |filter: Filter| {
+            let mut names: Vec<String> = store
+                .search("gadget", 10, &filter)
+                .unwrap()
+                .into_iter()
+                .map(|h| h.entry.name)
+                .collect();
+            names.sort();
+            names
+        };
+
+        assert_eq!(
+            search(Filter {
+                kind: Some(MemoryKind::User),
+                ..Filter::default()
+            }),
+            vec!["g-user", "w-user"]
+        );
+        assert_eq!(
+            search(Filter {
+                scope: Some(Scope::Workspace),
+                ..Filter::default()
+            }),
+            vec!["w-project", "w-user"]
+        );
+        assert_eq!(
+            search(Filter {
+                kind: Some(MemoryKind::User),
+                scope: Some(Scope::Global),
+                include_stale: false,
+            }),
+            vec!["g-user"]
+        );
+        assert_eq!(search(Filter::default()).len(), 3);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn search_over_five_thousand_entries_is_fast_once_warm() {
+        let (root, store) = two_index_store("search_5k", "", "idx", &[]);
+        let dir = store.workspace.as_ref().unwrap().dir.clone();
+        for i in 0..5_000 {
+            write_store_file(
+                &dir,
+                &format!("note-{i:04}"),
+                &format!("description: topic{} detail{i}\n", i % 50),
+            );
+        }
+        assert_eq!(store.catalogue().unwrap().entries().len(), 5_000);
+
+        let started = time::Instant::now();
+        let hits = store
+            .search("topic7 detail4207", 10, &Filter::default())
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(hits[0].entry.name, "note-4207");
+        assert_eq!(hits.len(), 10);
+        assert!(elapsed < time::Duration::from_millis(200), "{elapsed:?}");
 
         let _ = fs::remove_dir_all(&root);
     }
