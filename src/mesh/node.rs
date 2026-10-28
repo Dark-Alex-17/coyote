@@ -454,16 +454,23 @@ enum JoinedInterface {
 
 enum Joined {
     Connected(JoinedInterface),
-    /// A `local` rnsd the probe reached and the transport attached to; `events` is where
-    /// its shared-instance client reports its connection state from here on. `dialing`
-    /// is `Some(reason)` when the client had not connected by the time the start wait
-    /// ran out: the row starts at a bare `connecting` and the watcher moves it on the
-    /// client's first `Connected`.
+    /// A `local` rnsd the probe reached, the transport attached to and whose client
+    /// reported its first `Connected` within the start wait; `events` is where that
+    /// client reports its connection state from here on.
     Attached {
         label: String,
         endpoint: LocalEndpoint,
         events: mpsc::Receiver<SharedInstanceEvent>,
-        dialing: Option<String>,
+    },
+    /// `Attached`, but the client had not connected when the start wait ran out: it
+    /// keeps dialing, the row starts at a bare `connecting` and the watcher moves it on
+    /// the client's first `Connected`.
+    Dialing {
+        label: String,
+        endpoint: LocalEndpoint,
+        events: mpsc::Receiver<SharedInstanceEvent>,
+        reason: String,
+        message: String,
     },
     /// A TCP client whose first connect failed; it stays attached and keeps reconnecting.
     Pending {
@@ -514,7 +521,8 @@ pub(crate) enum WatchedInterface {
 
 impl WatchedInterface {
     /// `None` for a LAN interface, which has no client to follow; a `local` rnsd is
-    /// watched from `Joined::Attached` or `Joined::NotReached`, never from here.
+    /// watched from `Joined::Attached`, `Joined::Dialing` or `Joined::NotReached`, never
+    /// from here.
     fn of(index: usize, iface: &JoinedInterface, connected_at_start: bool) -> Option<Self> {
         match iface {
             JoinedInterface::Lan { .. } | JoinedInterface::Local { .. } => None,
@@ -743,18 +751,8 @@ impl MeshRuntime {
                     label,
                     endpoint,
                     events,
-                    dialing,
                 } => {
-                    let state = match dialing {
-                        None => {
-                            info!("Mesh interface {label} connected");
-                            InterfaceState::Connected
-                        }
-                        Some(reason) => {
-                            failures.push(local_not_reachable_message(&endpoint, &reason));
-                            InterfaceState::Connecting { reason: None }
-                        }
-                    };
+                    info!("Mesh interface {label} connected");
                     watched.push(WatchedInterface::Local {
                         index,
                         label: label.clone(),
@@ -762,7 +760,24 @@ impl MeshRuntime {
                         events: parking_lot::Mutex::new(Some(events)),
                     });
                     joined.push(JoinedInterface::Local { label });
-                    states.push(plan.status(state));
+                    states.push(plan.status(InterfaceState::Connected));
+                }
+                Joined::Dialing {
+                    label,
+                    endpoint,
+                    events,
+                    message,
+                    ..
+                } => {
+                    watched.push(WatchedInterface::Local {
+                        index,
+                        label: label.clone(),
+                        endpoint,
+                        events: parking_lot::Mutex::new(Some(events)),
+                    });
+                    joined.push(JoinedInterface::Local { label });
+                    states.push(plan.status(InterfaceState::Connecting { reason: None }));
+                    failures.push(message);
                 }
                 Joined::Pending {
                     iface,
@@ -2044,13 +2059,10 @@ async fn join_interface(
         }
     };
     match &joined {
-        Joined::Connected(_) | Joined::Attached { dialing: None, .. } => {
+        Joined::Connected(_) | Joined::Attached { .. } => {
             debug!("Joined mesh interface {}", plan.label());
         }
-        Joined::Attached {
-            dialing: Some(reason),
-            ..
-        } => warn!(
+        Joined::Dialing { reason, .. } => warn!(
             "Mesh interface {} is attached but not connected yet; its client keeps dialing: {reason}",
             plan.label()
         ),
@@ -2139,9 +2151,14 @@ async fn join_local(
     endpoint: &LocalEndpoint,
     connect_timeout: Duration,
 ) -> Joined {
+    let not_reachable = |reason: &str| {
+        format!(
+            "Local rnsd at {endpoint} (type: local) is not reachable: {reason}. The node cannot join the mesh until rnsd's shared instance answers there; start rnsd or fix mesh.interfaces."
+        )
+    };
     let not_reached = |reason: String| Joined::NotReached {
         endpoint: endpoint.clone(),
-        message: local_not_reachable_message(endpoint, &reason),
+        message: not_reachable(&reason),
         reason,
     };
     if let Err(reason) = probe_local(endpoint, connect_timeout).await {
@@ -2152,21 +2169,20 @@ async fn join_local(
         Err(reason) => return not_reached(reason),
     };
     match await_local_connected(&mut events, connect_timeout).await {
-        Ok(dialing) => Joined::Attached {
+        Ok(None) => Joined::Attached {
             label: local_label(endpoint),
             endpoint: endpoint.clone(),
             events,
-            dialing,
+        },
+        Ok(Some(reason)) => Joined::Dialing {
+            label: local_label(endpoint),
+            endpoint: endpoint.clone(),
+            events,
+            message: not_reachable(&reason),
+            reason,
         },
         Err(reason) => not_reached(reason),
     }
-}
-
-/// The start refusal for a `local` rnsd whose shared instance the node did not connect to.
-fn local_not_reachable_message(endpoint: &LocalEndpoint, reason: &str) -> String {
-    format!(
-        "Local rnsd at {endpoint} (type: local) is not reachable: {reason}. The node cannot join the mesh until rnsd's shared instance answers there; start rnsd or fix mesh.interfaces."
-    )
 }
 
 /// Reads a freshly attached shared-instance client's events until its first `Connected`
