@@ -106,6 +106,7 @@ struct ScopeReport {
     dir: PathBuf,
     facts_lines: Vec<String>,
     catalogue_lines_dropped: usize,
+    dangling: Vec<(String, String)>,
     drill_heading_dropped: bool,
     backfilled: Vec<String>,
     drift: Vec<Drift>,
@@ -155,11 +156,13 @@ fn plan_scope(label: &'static str, dir: &Path, today: &str) -> Result<ScopeRepor
                 kept.push(raw);
                 continue;
             };
+            report.catalogue_lines_dropped += 1;
             let Some(file) = files.get_mut(slug) else {
-                kept.push(raw);
+                report
+                    .dangling
+                    .push((slug.to_string(), line_desc.to_string()));
                 continue;
             };
-            report.catalogue_lines_dropped += 1;
             catalogued.insert(slug.to_string());
             let file_desc = file
                 .frontmatter
@@ -413,6 +416,12 @@ fn write_scope(f: &mut fmt::Formatter<'_>, report: &ScopeReport, apply: bool) ->
     }
     write_section(
         f,
+        "dangling catalogue lines, no readable drill file",
+        pairs(&report.dangling, ": "),
+        SECTION_LIST_CAP,
+    )?;
+    write_section(
+        f,
         "descriptions backfilled from the index",
         report.backfilled.clone(),
         SECTION_LIST_CAP,
@@ -538,7 +547,6 @@ fn write_section(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::memory::catalogue_slug;
     use crate::config::{MEMORY_DIR_NAME, WORKSPACE_COYOTE_DIR_NAME};
     use chrono::NaiveDate;
 
@@ -578,7 +586,8 @@ mod tests {
              - [[plan-r1]]: first round\n- [[plan-r2]]: second round\n\
              - [[plan-r3]]: third round\n- [[drifted]]: index wording\n\
              - [[blank]]: backfilled from the index\n- [[gotcha]]: odd type\n\
-             - [[huge]]: big body\n"
+             - [[huge]]: big body\n- [[deleted]]: file removed\n\
+             - [[broken]]: unreadable file\n"
         )
     }
 
@@ -662,6 +671,11 @@ mod tests {
                 "w",
             );
             fs::write(workspace.join(".catalogue.yaml"), "cache").unwrap();
+            fs::write(
+                workspace.join("broken.md"),
+                "---\nname: [unclosed\n---\n\nb\n",
+            )
+            .unwrap();
 
             Self {
                 _root: root,
@@ -834,14 +848,30 @@ mod tests {
         );
         for index in [&workspace_index, &global_index] {
             assert!(
-                index.lines().all(|l| catalogue_slug(l).is_none()),
+                index.lines().all(|l| catalogue_entry(l).is_none()),
                 "{index}"
             );
         }
 
         let workspace = scope(&report, "workspace");
         assert!(workspace.drill_heading_dropped);
-        assert_eq!(workspace.catalogue_lines_dropped, 7);
+        assert_eq!(workspace.catalogue_lines_dropped, 9);
+        assert_eq!(
+            workspace.dangling,
+            vec![
+                ("deleted".to_string(), "file removed".to_string()),
+                ("broken".to_string(), "unreadable file".to_string()),
+            ]
+        );
+        assert_eq!(workspace.unreadable.len(), 1, "{:?}", workspace.unreadable);
+        assert!(
+            report.to_string().contains(
+                "  dangling catalogue lines, no readable drill file: 2\n\
+                 \x20   deleted: file removed\n    broken: unreadable file\n"
+            ),
+            "{report_text}",
+            report_text = report
+        );
         assert_eq!(workspace.facts_lines.len(), 6);
         let global = scope(&report, "global");
         assert_eq!(
