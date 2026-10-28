@@ -2764,8 +2764,9 @@ impl Watch {
 /// resets the floor, so a relay that flaps cannot make this node announce more often than
 /// once per `REANNOUNCE_FLOOR_SECS`; the first connect of a relay that was down at start
 /// is the one announce without it. A reconnect event queued before the poll read the
-/// first `connected` is dropped at the switch, so a connect, drop and return inside one
-/// tick does not announce twice. A disconnect event is only logged: the client redials
+/// first `connected` is dropped at the switch, once per tick for every client switching
+/// on it, so a connect, drop and return inside one tick does not announce twice. A
+/// disconnect event is only logged: the client redials
 /// on its own. A `local` rnsd only has its row kept: the transport's shared-instance
 /// client re-announces and redials by itself, so no line is printed and no announce sent
 /// for it; see `observe_local`. The watcher holds no peer-controlled state: a fixed list
@@ -2805,6 +2806,7 @@ async fn watch_interfaces(
         let mut transitions = Vec::new();
         match event {
             None => {
+                let mut switching = Vec::new();
                 for watch in &mut watches {
                     match watch {
                         Watch::Local {
@@ -2831,9 +2833,12 @@ async fn watch_interfaces(
                                 continue;
                             }
                             *connected = true;
-                            switch_to_events(*hash, &mut events.reconnect, &mut transitions);
+                            switching.push(*hash);
                         }
                     }
+                }
+                if !switching.is_empty() {
+                    drain_switching_reconnects(&switching, &mut events.reconnect, &mut transitions);
                 }
             }
             Some(TcpEvent::Reconnect(hash)) => transitions.push((hash, Transition::Reconnect)),
@@ -2915,18 +2920,25 @@ async fn watch_interfaces(
     }
 }
 
-/// Moves the client at `hash`, which just read `connected` for the first time, onto its
-/// events: its first connect is reported and the reconnects already queued are taken,
-/// dropping its own, which a connect, drop and return inside one tick left behind, and
-/// keeping every other client's in order.
-fn switch_to_events(
-    hash: AddressHash,
+/// Moves the clients in `switching`, which read `connected` for the first time on this
+/// tick, onto their events: each first connect is reported, then the reconnects already
+/// queued are taken once for all of them, dropping those of the switching clients, which
+/// a connect, drop and return inside one tick left behind, and keeping every other
+/// client's in order. One drain for the whole tick, because a drain per client would
+/// forward a reconnect of a client that switches later in the same tick, and that
+/// client would announce twice.
+fn drain_switching_reconnects(
+    switching: &[AddressHash],
     reconnects: &mut mpsc::Receiver<AddressHash>,
     transitions: &mut Vec<(AddressHash, Transition)>,
 ) {
-    transitions.push((hash, Transition::FirstConnect));
+    transitions.extend(
+        switching
+            .iter()
+            .map(|hash| (*hash, Transition::FirstConnect)),
+    );
     while let Ok(queued) = reconnects.try_recv() {
-        if queued != hash {
+        if !switching.contains(&queued) {
             transitions.push((queued, Transition::Reconnect));
         }
     }
@@ -12700,9 +12712,10 @@ mod tests {
         .await;
     }
 
-    /// The switch from the connect poll to the events: the client's own queued reconnects
-    /// go, since its first connect is about to be announced, while another client's stay
-    /// in order behind the first connect.
+    /// The switch from the connect poll to the events: the switching clients' own queued
+    /// reconnects go, since their first connects are about to be announced, while another
+    /// client's stay in order behind every first connect; two clients switching on one
+    /// tick are drained together, so neither forwards the other's reconnect.
     #[test]
     fn the_switch_to_events_drops_only_the_switching_clients_queued_reconnects() {
         let switching = AddressHash::new_from_rand(OsRng);
@@ -12713,13 +12726,31 @@ mod tests {
         }
 
         let mut transitions = Vec::new();
-        switch_to_events(switching, &mut rx, &mut transitions);
+        drain_switching_reconnects(&[switching], &mut rx, &mut transitions);
 
         assert_eq!(
             transitions,
             vec![
                 (switching, Transition::FirstConnect),
                 (other, Transition::Reconnect),
+                (other, Transition::Reconnect),
+            ]
+        );
+        assert!(rx.try_recv().is_err(), "the queue is drained at the switch");
+
+        let second = AddressHash::new_from_rand(OsRng);
+        for hash in [switching, second, other, switching, second] {
+            tx.try_send(hash).unwrap();
+        }
+
+        let mut transitions = Vec::new();
+        drain_switching_reconnects(&[switching, second], &mut rx, &mut transitions);
+
+        assert_eq!(
+            transitions,
+            vec![
+                (switching, Transition::FirstConnect),
+                (second, Transition::FirstConnect),
                 (other, Transition::Reconnect),
             ]
         );
