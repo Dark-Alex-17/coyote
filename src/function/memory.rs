@@ -11,9 +11,10 @@ use serde_json::{Value, json};
 
 use super::{FunctionDeclaration, JsonSchema};
 use crate::config::memory::{
-    DEFAULT_MEMORY_RUN_STATE_TTL_DAYS, KindField, MEMORY_DESCRIPTION_CAP, MEMORY_FILE_HARD_CAP,
-    MemoryFile, MemoryFrontmatter, MemoryKind, MemoryStore, Retention, WorkspaceMemory,
-    bootstrap_workspace_memory, catalogue_entry, catalogue_slug, find_git_root, today_string,
+    DEFAULT_MEMORY_RUN_STATE_TTL_DAYS, Filter, KindField, MEMORY_DESCRIPTION_CAP,
+    MEMORY_FILE_HARD_CAP, MemoryFile, MemoryFrontmatter, MemoryKind, MemoryStore, Retention, Scope,
+    WorkspaceMemory, bootstrap_workspace_memory, catalogue_entry, catalogue_slug, find_git_root,
+    today_string,
 };
 use crate::config::paths;
 use crate::config::{RequestContext, RoundChains};
@@ -22,6 +23,7 @@ pub const MEMORY_FUNCTION_PREFIX: &str = "memory__";
 
 const PER_FILE_SOFT_CAP: usize = 2_000;
 const MEMORY_SLUG_MAX_LEN: usize = 64;
+const DEFAULT_SEARCH_K: usize = 10;
 
 pub fn memory_function_declarations() -> Vec<FunctionDeclaration> {
     vec![
@@ -185,6 +187,63 @@ pub fn memory_function_declarations() -> Vec<FunctionDeclaration> {
                         ..Default::default()
                     },
                 )])),
+                ..Default::default()
+            },
+            agent: false,
+        },
+        FunctionDeclaration {
+            name: format!("{MEMORY_FUNCTION_PREFIX}search"),
+            description: "Search drill files by relevance of their name and description to a \
+                          query, including files the MEMORY.md catalogue does not list. Superseded \
+                          and expired files are left out unless include_stale is true."
+                .to_string(),
+            parameters: JsonSchema {
+                type_value: Some("object".to_string()),
+                properties: Some(IndexMap::from([
+                    (
+                        "query".to_string(),
+                        JsonSchema {
+                            type_value: Some("string".to_string()),
+                            description: Some("Words to look for".into()),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "k".to_string(),
+                        JsonSchema {
+                            type_value: Some("integer".to_string()),
+                            description: Some(format!(
+                                "Most hits to return (default {DEFAULT_SEARCH_K})"
+                            )),
+                            ..Default::default()
+                        },
+                    ),
+                    type_filter_schema(),
+                    (
+                        "agent".to_string(),
+                        JsonSchema {
+                            type_value: Some("string".to_string()),
+                            description: Some(
+                                "Only files written by this agent; honoured once entries carry \
+                                 `agent:`"
+                                    .into(),
+                            ),
+                            ..Default::default()
+                        },
+                    ),
+                    scope_filter_schema(),
+                    (
+                        "include_stale".to_string(),
+                        JsonSchema {
+                            type_value: Some("boolean".to_string()),
+                            description: Some(
+                                "Also search superseded and expired files (default false)".into(),
+                            ),
+                            ..Default::default()
+                        },
+                    ),
+                ])),
+                required: Some(vec!["query".to_string()]),
                 ..Default::default()
             },
             agent: false,
@@ -368,6 +427,7 @@ pub fn handle_memory_tool(ctx: &mut RequestContext, cmd_name: &str, args: &Value
             }))
         }
         "write" => write_memory(&store, &cwd, args, run_state_ttl_days, round_chains),
+        "search" => search_memory(&store, args),
         "rename" => rename_memory(&store, &cwd, args),
         "delete" => delete_memory(&store, &cwd, args),
         "edit_index" => {
@@ -383,6 +443,84 @@ pub fn handle_memory_tool(ctx: &mut RequestContext, cmd_name: &str, args: &Value
         }
         "lint" => lint_memory(&store),
         _ => bail!("unknown memory action: {action}"),
+    }
+}
+
+fn type_filter_schema() -> (String, JsonSchema) {
+    (
+        "type".to_string(),
+        JsonSchema {
+            type_value: Some("string".to_string()),
+            description: Some(format!(
+                "Only files of this type: {}",
+                MemoryKind::NAMES.join(" | ")
+            )),
+            ..Default::default()
+        },
+    )
+}
+
+fn scope_filter_schema() -> (String, JsonSchema) {
+    (
+        "scope".to_string(),
+        JsonSchema {
+            type_value: Some("string".to_string()),
+            description: Some(format!(
+                "Only files of this scope: {}",
+                Scope::NAMES.join(" | ")
+            )),
+            ..Default::default()
+        },
+    )
+}
+
+fn search_memory(store: &MemoryStore, args: &Value) -> Result<Value> {
+    let query = arg_str(args, "query")?;
+    let k = count_arg(args, "k", DEFAULT_SEARCH_K)?;
+    let hits: Vec<Value> = store
+        .search(&query, k, &filter_arg(args)?)?
+        .into_iter()
+        .map(|hit| {
+            json!({
+                "name": hit.entry.name,
+                "description": hit.entry.description,
+                "type": hit.entry.kind.kind().name(),
+                "updated": hit.entry.updated,
+                "scope": hit.entry.scope.name(),
+                "score": hit.score,
+            })
+        })
+        .collect();
+
+    Ok(json!({ "count": hits.len(), "hits": hits }))
+}
+
+fn filter_arg(args: &Value) -> Result<Filter> {
+    Ok(Filter {
+        kind: args
+            .get("type")
+            .and_then(Value::as_str)
+            .map(MemoryKind::from_str)
+            .transpose()?,
+        scope: args
+            .get("scope")
+            .and_then(Value::as_str)
+            .map(Scope::from_str)
+            .transpose()?,
+        include_stale: args
+            .get("include_stale")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+fn count_arg(args: &Value, key: &str, default: usize) -> Result<usize> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(value) => value
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| anyhow!("{key} must be a non-negative integer")),
     }
 }
 
@@ -3155,5 +3293,148 @@ mod tests {
         assert!(all["known"].get("stale").is_none());
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    fn global_memory_ctx(files: &[(&str, &str)]) -> RequestContext {
+        let dir = paths::global_memory_dir();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("MEMORY.md"), "# Memory\n").unwrap();
+        for (name, frontmatter) in files {
+            fs::write(
+                dir.join(format!("{name}.md")),
+                format!("---\nname: {name}\n{frontmatter}---\nbody\n"),
+            )
+            .unwrap();
+        }
+        let ctx = RequestContext::new(
+            std::sync::Arc::new(crate::config::AppState::test_default()),
+            crate::config::WorkingMode::Cmd,
+        );
+        assert!(ctx.should_register_memory_tools());
+        ctx
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn memory_search_tool_returns_ranked_hits_without_an_index_line() {
+        let _guard = crate::testing::TestConfigDirGuard::new("memory-search-tool");
+        let mut ctx = global_memory_ctx(&[
+            (
+                "quokka-care",
+                "description: feeding the quokka\ntype: user\nupdated: 2024-03-01\n",
+            ),
+            ("quokka-old", "description: quokka\nexpires: 2000-01-01\n"),
+            ("unrelated", "description: nothing here\n"),
+        ]);
+
+        let found = handle_memory_tool(
+            &mut ctx,
+            "memory__search",
+            &json!({"query": "quokka feeding", "scope": "global"}),
+        )
+        .unwrap();
+
+        assert_eq!(found["count"], 1, "{found}");
+        let hit = &found["hits"][0];
+        assert_eq!(hit["name"], "quokka-care");
+        assert_eq!(hit["description"], "feeding the quokka");
+        assert_eq!(hit["type"], "user");
+        assert_eq!(hit["updated"], "2024-03-01");
+        assert_eq!(hit["scope"], "global");
+        assert!(hit["score"].as_f64().unwrap() > 0.0);
+
+        let with_stale = handle_memory_tool(
+            &mut ctx,
+            "memory__search",
+            &json!({"query": "quokka", "scope": "global", "include_stale": true, "k": 1}),
+        )
+        .unwrap();
+        assert_eq!(with_stale["count"], 1, "{with_stale}");
+
+        let err = handle_memory_tool(
+            &mut ctx,
+            "memory__search",
+            &json!({"query": "quokka", "scope": "galaxy"}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("global, workspace"), "{err}");
+        let err = handle_memory_tool(&mut ctx, "memory__search", &json!({}))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "query is required");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn memory_search_tool_ranks_and_filters_by_type_and_staleness() {
+        let _guard = crate::testing::TestConfigDirGuard::new("memory-search-tool-filters");
+        let mut ctx = global_memory_ctx(&[
+            (
+                "habitat-notes",
+                "description: quokka habitat survey\ntype: project\n",
+            ),
+            ("quokka", "description: something else\ntype: user\n"),
+            (
+                "quokka-habitat-r1",
+                "description: quokka habitat draft\ntype: project\nsuperseded_by: habitat-notes\n",
+            ),
+        ]);
+        let names = |found: &Value| -> Vec<String> {
+            found["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|hit| hit["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let live = handle_memory_tool(
+            &mut ctx,
+            "memory__search",
+            &json!({"query": "quokka habitat", "scope": "global"}),
+        )
+        .unwrap();
+        assert_eq!(names(&live), ["habitat-notes", "quokka"], "{live}");
+
+        let users = handle_memory_tool(
+            &mut ctx,
+            "memory__search",
+            &json!({"query": "quokka habitat", "scope": "global", "type": "user"}),
+        )
+        .unwrap();
+        assert_eq!(names(&users), ["quokka"], "{users}");
+
+        let projects = handle_memory_tool(
+            &mut ctx,
+            "memory__search",
+            &json!({
+                "query": "quokka habitat",
+                "scope": "global",
+                "type": "project",
+                "include_stale": true
+            }),
+        )
+        .unwrap();
+        let mut found = names(&projects);
+        found.sort();
+        assert_eq!(found, ["habitat-notes", "quokka-habitat-r1"], "{projects}");
+    }
+
+    #[test]
+    fn search_is_declared_beside_the_other_memory_tools() {
+        let search = memory_function_declarations()
+            .into_iter()
+            .find(|d| d.name == "memory__search")
+            .expect("memory__search declared");
+
+        assert!(!search.agent);
+        let properties = search.parameters.properties.unwrap();
+        let keys: Vec<&str> = properties.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            vec!["query", "k", "type", "agent", "scope", "include_stale"]
+        );
+        assert_eq!(search.parameters.required, Some(vec!["query".to_string()]));
     }
 }

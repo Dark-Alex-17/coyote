@@ -633,6 +633,33 @@ pub enum Scope {
     Workspace,
 }
 
+impl Scope {
+    pub const NAMES: [&'static str; 2] = ["global", "workspace"];
+
+    const ALL: [Scope; 2] = [Self::Global, Self::Workspace];
+
+    pub fn name(self) -> &'static str {
+        Self::NAMES[self as usize]
+    }
+}
+
+impl FromStr for Scope {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::NAMES
+            .iter()
+            .position(|name| *name == value)
+            .map(|i| Self::ALL[i])
+            .ok_or_else(|| {
+                anyhow!(
+                    "Invalid scope '{value}', expected one of: {}",
+                    Self::NAMES.join(", ")
+                )
+            })
+    }
+}
+
 /// Renders both MEMORY.md indexes facts first: every non-catalogue line of
 /// the global index, then of the workspace index, under `<facts>`; the
 /// catalogue lines of the workspace index, then of the global index, under
