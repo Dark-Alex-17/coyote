@@ -216,6 +216,123 @@ fn a_dry_run_prompt_carries_facts_first_then_the_catalogue_under_the_default_cap
     );
 }
 
+/// Writes `global` as the global index and `workspace` as the workspace
+/// index of `fx`.
+fn both_indexes(fx: &Fixture, global: &str, workspace: &str) {
+    fs::write(fx.dir.join("memory").join("MEMORY.md"), global).unwrap();
+    fs::write(
+        fx.workspace
+            .join(".coyote")
+            .join("memory")
+            .join("MEMORY.md"),
+        workspace,
+    )
+    .unwrap();
+}
+
+#[test]
+fn under_the_default_cap_a_workspace_index_too_big_for_it_loses_only_its_own_facts() {
+    // A repo-local index whose facts alone exceed the 4000-char default cap
+    // must not evict a single global fact: the global facts come first, the
+    // workspace facts fill what is left, and every line the cut drops is
+    // counted against the scope it came from.
+    let global_facts = ["- **G one.** keep me", "- **G two.** keep me"];
+    let global_row = "- [[g-one]]: global drill one";
+    let workspace_facts: Vec<String> = (0..120)
+        .map(|i| format!("- **W {i:03}.** {}", "w".repeat(40)))
+        .collect();
+    let fx = fixture("workspace-overflow", "");
+    both_indexes(
+        &fx,
+        &format!("{}\n{global_row}\n", global_facts.join("\n")),
+        &format!("{}\n", workspace_facts.join("\n")),
+    );
+    let output = run(&fx, &["-e", "hello"]);
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let stdout = stdout_of(&output);
+
+    let cap = 4000;
+    let mut used = global_facts.join("\n").len();
+    let mut kept = Vec::new();
+    for line in &workspace_facts {
+        if used + 1 + line.len() > cap {
+            break;
+        }
+        used += 1 + line.len();
+        kept.push(line.as_str());
+    }
+    assert!(kept.len() < workspace_facts.len(), "fixture must overflow");
+    let workspace_lost = workspace_facts.len() - kept.len();
+    let fact_chars = global_facts.join("\n").len() + 1 + workspace_facts.join("\n").len();
+    let omitted_chars = fact_chars + 1 + global_row.len() - used;
+    let facts_body = format!("{}\n{}", global_facts.join("\n"), kept.join("\n"));
+    let expected = format!(
+        "<memory>\n<facts>\n{facts_body}\n</facts>\n<catalogue>\n</catalogue>\n\
+         <!-- memory facts truncated: {} lines / {omitted_chars} chars omitted \
+         (global 1, workspace {workspace_lost}); run memory__lint -->\n</memory>",
+        workspace_lost + 1,
+    );
+    assert_eq!(
+        memory_sections(&stdout),
+        vec![expected.as_str()],
+        "{stdout}"
+    );
+    assert_eq!(
+        notice_lines(&stderr_of(&output)),
+        vec![format!(
+            "memory: {fact_chars} fact chars + {} catalogue chars; {} lines / {omitted_chars} \
+             chars truncated at memory_facts_cap=4000 (global 1, workspace {workspace_lost}); \
+             run memory__lint",
+            global_row.len(),
+            workspace_lost + 1,
+        )],
+        "{}",
+        stderr_of(&output)
+    );
+}
+
+#[test]
+fn a_global_fact_longer_than_the_cap_is_cut_at_the_head_and_counted_as_global() {
+    // The first line of the joined text is now a GLOBAL fact. It does not
+    // fit the cap, so its first cap chars are kept, it counts as one omitted
+    // global line, and every workspace line counts against the workspace.
+    let global_fact = "- **G one.** keep me";
+    let workspace_fact = "# W";
+    let workspace_row = "- [[w-one]]: d";
+    let fx = fixture("global-head-cut", "memory_facts_cap: 15\n");
+    both_indexes(
+        &fx,
+        &format!("{global_fact}\n"),
+        &format!("{workspace_fact}\n{workspace_row}\n"),
+    );
+    let output = run(&fx, &["-e", "hello"]);
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let stdout = stdout_of(&output);
+    let fact_chars = global_fact.len() + 1 + workspace_fact.len();
+    let omitted_chars = fact_chars + 1 + workspace_row.len() - 15;
+    let expected = format!(
+        "<memory>\n<facts>\n{}\n</facts>\n<catalogue>\n</catalogue>\n\
+         <!-- memory facts truncated: 3 lines / {omitted_chars} chars omitted \
+         (global 1, workspace 2); run memory__lint -->\n</memory>",
+        &global_fact[..15],
+    );
+    assert_eq!(
+        memory_sections(&stdout),
+        vec![expected.as_str()],
+        "{stdout}"
+    );
+    assert_eq!(
+        notice_lines(&stderr_of(&output)),
+        vec![format!(
+            "memory: {fact_chars} fact chars + {} catalogue chars; 3 lines / {omitted_chars} \
+             chars truncated at memory_facts_cap=15 (global 1, workspace 2); run memory__lint",
+            workspace_row.len(),
+        )],
+        "{}",
+        stderr_of(&output)
+    );
+}
+
 /// Replaces both indexes with a single workspace index; the global one is
 /// removed so the section holds exactly `index`.
 fn only_workspace_index(fx: &Fixture, index: &str) {

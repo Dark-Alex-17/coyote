@@ -407,6 +407,8 @@ pub struct MemorySection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Lines and chars a cap omitted, across facts and catalogue together;
+/// `global_lines + workspace_lines == lines` always holds.
 pub struct Truncated {
     pub lines: usize,
     pub chars: usize,
