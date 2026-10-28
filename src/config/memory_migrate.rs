@@ -142,10 +142,17 @@ fn plan_scope(label: &'static str, dir: &Path, today: &str) -> Result<ScopeRepor
     let mut changed: BTreeSet<String> = BTreeSet::new();
 
     let index_path = dir.join(MEMORY_INDEX_FILE_NAME);
-    let index = match fs::read_to_string(&index_path) {
-        Ok(index) => Some(index),
+    let index = match fs::symlink_metadata(&index_path) {
+        Ok(meta) if !meta.is_file() => bail!(
+            "{} is not a regular file; migrate only rewrites a plain index",
+            index_path.display()
+        ),
+        Ok(_) => Some(
+            fs::read_to_string(&index_path)
+                .with_context(|| format!("read {}", index_path.display()))?,
+        ),
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-        Err(e) => return Err(e).with_context(|| format!("read {}", index_path.display())),
+        Err(e) => return Err(e).with_context(|| format!("stat {}", index_path.display())),
     };
     let mut catalogued: HashSet<String> = HashSet::new();
     if let Some(index) = &index {
@@ -948,6 +955,26 @@ mod tests {
             "{err:#}"
         );
         assert_eq!(fs::read_to_string(&index_path).unwrap(), edited);
+    }
+
+    #[test]
+    fn an_index_that_is_not_a_regular_file_is_refused() {
+        let fx = Fixture::new("index_dir");
+        let index_path = fx.global.join(MEMORY_INDEX_FILE_NAME);
+        fs::remove_file(&index_path).unwrap();
+        fs::create_dir(&index_path).unwrap();
+
+        let err = plan_scope("global", &fx.global, "2026-03-01")
+            .err()
+            .expect("a directory index is refused");
+
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "{} is not a regular file; migrate only rewrites a plain index",
+                index_path.display()
+            )
+        );
     }
 
     #[test]
