@@ -465,6 +465,10 @@ pub(crate) struct Parked {
     pub(crate) rag_key: Option<RagKey>,
 }
 
+/// A summarizer stand-in: the rendered summarization request in, the summary out.
+#[cfg(test)]
+type SummaryFetch = Arc<dyn Fn(&str) -> String + Send + Sync>;
+
 pub struct RequestContext {
     pub app: Arc<AppState>,
 
@@ -578,6 +582,12 @@ pub struct RequestContext {
     pub top_level_agent_id: Option<String>,
 
     pub render_mode: RenderMode,
+
+    /// Test-only replacement for the summarizer call: given the rendered
+    /// summarization request text it returns the summary, so compression
+    /// pins run the real `compress_session` without a model.
+    #[cfg(test)]
+    pub(crate) test_summary_fetch: Option<SummaryFetch>,
 }
 
 impl RequestContext {
@@ -631,6 +641,8 @@ impl RequestContext {
             task_abort: None,
             top_level_agent_id: None,
             render_mode: RenderMode::default(),
+            #[cfg(test)]
+            test_summary_fetch: None,
         }
     }
 
@@ -715,6 +727,8 @@ impl RequestContext {
             task_abort: None,
             top_level_agent_id: None,
             render_mode: RenderMode::default(),
+            #[cfg(test)]
+            test_summary_fetch: None,
         };
         ctx.refresh_mcp_tool_filters();
         Ok(ctx)
@@ -836,6 +850,8 @@ impl RequestContext {
             // root flow that opened it may fire its terminal event.
             top_level_agent_id: None,
             render_mode: self.render_mode,
+            #[cfg(test)]
+            test_summary_fetch: self.test_summary_fetch.clone(),
         }
     }
 
@@ -901,6 +917,8 @@ impl RequestContext {
             task_abort: None,
             top_level_agent_id: None,
             render_mode: parent.render_mode,
+            #[cfg(test)]
+            test_summary_fetch: parent.test_summary_fetch.clone(),
         }
     }
 
@@ -6869,6 +6887,14 @@ impl RequestContext {
                 .map_err(|_| anyhow!("Compression LLM call timed out after 120 s"))?
         }
 
+        #[cfg(test)]
+        if let Some(fetch) = self.test_summary_fetch.clone() {
+            let fetch = move |input: Input| {
+                let summary = fetch(&input.text());
+                async move { Ok(summary) }
+            };
+            return self.compress_session_impl(keep_last_override, fetch).await;
+        }
         self.compress_session_impl(keep_last_override, timed_fetch)
             .await
     }
@@ -9906,6 +9932,63 @@ mod tests {
 
         assert_eq!(ctx.last_prompt_token_usage, None);
         assert_eq!(ctx.valve_checkpoint_floor, None);
+    }
+
+    /// `compress_session` answers each summarization request through the
+    /// test seam when one is set and goes to the model otherwise, where a
+    /// client the config does not declare fails before any network round trip.
+    #[test]
+    fn compress_session_uses_the_test_summary_fetch_when_set() {
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            compression_keep_last: 2,
+            ..AppConfig::default()
+        });
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        let mut session = Session::default();
+        session.set_model(Model::from_config("test-seeded", &[ModelData::new("chat")]).remove(0));
+        ctx.session = Some(session);
+        for text in ["first", "second", "third"] {
+            let input = Input::from_str(&ctx, text, Some(Role::new("", ""))).unwrap();
+            ctx.session
+                .as_mut()
+                .unwrap()
+                .add_message(&input, "reply")
+                .unwrap();
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let err = runtime.block_on(ctx.compress_session()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Invalid model 'test-seeded:chat'"),
+            "{err:#}"
+        );
+        assert_eq!(ctx.session.as_ref().unwrap().messages().len(), 6);
+
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&requests);
+        ctx.test_summary_fetch = Some(Arc::new(move |request: &str| {
+            seen.lock().unwrap().push(request.to_string());
+            "seam summary".to_string()
+        }));
+        runtime.block_on(ctx.compress_session()).unwrap();
+
+        let session = ctx.session.as_ref().unwrap();
+        assert_eq!(session.messages().len(), 3, "{:?}", session.messages());
+        assert!(session.messages()[0].role == MessageRole::System);
+        assert!(
+            session.messages()[0]
+                .content
+                .to_text()
+                .contains("seam summary")
+        );
+        assert!(session.messages()[1].content.to_text().contains("third"));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert!(requests[0].contains("USER: first") && requests[0].contains("USER: second"));
     }
 
     #[test]
