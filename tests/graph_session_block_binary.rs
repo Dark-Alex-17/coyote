@@ -140,11 +140,18 @@ fn run_with(dir: &Path, args: &[&str]) -> Output {
 /// `run_with` plus extra environment pairs applied after the scrub, for
 /// cases that pin a host knob (the log level) rather than inherit it.
 fn run_with_env(dir: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
+    run_from(dir, dir, args, extra_env)
+}
+
+/// `run_with_env` with the process started in `cwd` instead of the config
+/// dir, for cases where the directory the binary runs from is the lever
+/// (workspace discovery walks up from it).
+fn run_from(cwd: &Path, dir: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
     let home = dir.join("home");
     let binary = Path::new(COYOTE_BIN);
     Command::new(binary)
         .args(args)
-        .current_dir(dir)
+        .current_dir(cwd)
         .env("COYOTE_CONFIG_DIR", dir)
         .env("COYOTE_CACHE_DIR", dir.join("cache"))
         .env("HOME", &home)
@@ -156,6 +163,9 @@ fn run_with_env(dir: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output
         .env_remove("IS_SANDBOX")
         .env_remove("COYOTE_PROVIDER")
         .env_remove("COYOTE_PLATFORM")
+        // The unit-test guard's workspace-memory pin; a shipped binary
+        // ignores it, and a run here starts without it unless a case sets it.
+        .env_remove("COYOTE_TEST_WORKSPACE_MEMORY_ROOT")
         .envs(extra_env.iter().copied())
         .stdin(Stdio::null())
         .output()
@@ -3091,4 +3101,109 @@ fn usage_probe_a_script_node_runs_with_only_the_binary_dir_and_the_system_shells
         seen.contains("/usr/bin:/bin"),
         "the system shell directories come last and in order:\n{line}"
     );
+}
+
+/// The shipped binary discovers workspace memory by walking up from the
+/// directory it runs in, and the `COYOTE_TEST_WORKSPACE_MEMORY_ROOT` pin
+/// the unit-test guards set is a test-build seam: a real run that carries
+/// it still reads the index above its cwd. The dry-run model echoes the
+/// whole system prompt, so the `<workspace_index>` block is observable on
+/// stdout.
+#[test]
+fn usage_probe_the_shipped_binary_walks_up_from_its_cwd_for_workspace_memory_and_ignores_the_test_root_pin()
+ {
+    const PIN: &str = "COYOTE_TEST_WORKSPACE_MEMORY_ROOT";
+    const GLOBAL_LINE: &str = "- global fact from the fixture";
+    const WORKSPACE_LINE: &str = "- workspace fact planted by the probe";
+    let dir = fresh_config_dir("workspace-memory");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture_on(
+        &dir,
+        "",
+        Host {
+            memory: true,
+            ..RECIPE_HOST
+        },
+    );
+    fs::create_dir_all(dir.join("memory")).unwrap();
+    fs::write(
+        dir.join("memory").join("MEMORY.md"),
+        format!("PLACEHOLDER_CHECK\n{GLOBAL_LINE}\n"),
+    )
+    .unwrap();
+    // The index sits one level above the cwd so the walk has to climb.
+    let workspace = dir.join("ws");
+    let nested = workspace.join("nested");
+    let index_dir = workspace.join(".coyote").join("memory");
+    fs::create_dir_all(&nested).unwrap();
+    fs::create_dir_all(&index_dir).unwrap();
+    fs::write(
+        index_dir.join("MEMORY.md"),
+        format!("# Workspace Memory Index\n{WORKSPACE_LINE}\n"),
+    )
+    .unwrap();
+    // A sibling with no index anywhere above it short of the temp root.
+    let elsewhere = dir.join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+
+    let memory_block = |output: &Output, label: &str| -> String {
+        let text = format!("{}\n{}", stderr_of(&output), stdout_of(&output));
+        assert!(
+            output.status.success() && !text.contains("panicked"),
+            "{label}: exit {:?}\n{text}",
+            output.status
+        );
+        let stdout = stdout_of(&output);
+        let start = stdout.find("<memory>").unwrap_or_else(|| {
+            panic!("{label}: the dry-run echo carries the memory section:\n{text}")
+        });
+        let end = stdout[start..]
+            .find("</memory>")
+            .unwrap_or_else(|| panic!("{label}: the memory section closes:\n{text}"));
+        stdout[start..start + end].to_string()
+    };
+
+    // 1. From under the workspace: both indexes ride the prompt.
+    let from_workspace = memory_block(
+        &run_from(&nested, &dir, &["-e", "hello"], &[]),
+        "walk from the nested cwd",
+    );
+    assert!(
+        from_workspace.contains("<global_index>"),
+        "{from_workspace}"
+    );
+    assert!(from_workspace.contains(GLOBAL_LINE), "{from_workspace}");
+    assert!(
+        from_workspace.contains("<workspace_index>"),
+        "{from_workspace}"
+    );
+    assert!(from_workspace.contains(WORKSPACE_LINE), "{from_workspace}");
+
+    // 2. Same cwd with the test pin aimed at an index-less dir: the shipped
+    //    binary renders the very same block, so the pin changed nothing.
+    let with_pin = memory_block(
+        &run_from(
+            &nested,
+            &dir,
+            &["-e", "hello"],
+            &[(PIN, elsewhere.to_str().unwrap())],
+        ),
+        "the test pin on a real run",
+    );
+    assert_eq!(
+        with_pin, from_workspace,
+        "the pin is inert outside test builds"
+    );
+
+    // 3. From the index-less sibling: the global index alone.
+    let from_elsewhere = memory_block(
+        &run_from(&elsewhere, &dir, &["-e", "hello"], &[]),
+        "walk from a cwd with no index above it",
+    );
+    assert!(from_elsewhere.contains(GLOBAL_LINE), "{from_elsewhere}");
+    assert!(
+        !from_elsewhere.contains("<workspace_index>"),
+        "{from_elsewhere}"
+    );
+    assert!(!from_elsewhere.contains(WORKSPACE_LINE), "{from_elsewhere}");
 }
