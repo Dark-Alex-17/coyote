@@ -13145,6 +13145,166 @@ mod tests {
         .await;
     }
 
+    /// Stopping a node whose relay has just gone away, beside a relay it never reached,
+    /// is as prompt as stopping a connected one: both clients sit in their redial loop,
+    /// which ends on the stop the transport sends them, so neither is aborted, neither is
+    /// reported as slow, and both are logged as left. The node's tasks exit, the instance
+    /// lock comes free, and a node restarted on the same config dir carries the same
+    /// identity under a fresh session's destination, is heard over the returned relay at
+    /// once and still watches the late one, which it announces over once on its first
+    /// connect.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_stop_with_one_relay_down_and_one_never_reached_is_prompt_and_restartable()
+    {
+        install_log_collector();
+        let late_port = closed_port().await;
+        let relay = TransportRelay::start().await;
+        let port = relay.port;
+        let label = private_label(port);
+        let late_label = private_label(late_port);
+        let tmp = TempDir::new("node-stop-while-down");
+        let paths = mesh_paths(&tmp);
+        let cache_dir = paths.cache_dir.clone();
+        let metrics = tokio::runtime::Handle::current().metrics();
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &private_relays(&[port, late_port]),
+            true,
+            &mut session,
+            paths,
+            short_connect(),
+        )
+        .await
+        .unwrap();
+        let instance_id = runtime.instance_id().await;
+        let fingerprint = runtime.fingerprint.clone();
+        let states = states_of(&runtime);
+        assert_eq!(states[0], (label.clone(), InterfaceState::Connected));
+        assert!(is_retrying(&states[1].1), "{states:?}");
+        let slot = Arc::new(MeshSlot::default());
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        slot.install(runtime.clone()).unwrap();
+        let WatchedInterface::Tcp { status, .. } = &runtime.watched_interfaces()[0] else {
+            panic!("the first relay is a TCP client");
+        };
+        let status = status.clone();
+        // Stay connected past the client's stability window, so the relay's stop counts
+        // as a drop of a working connection and not as a failed connect attempt.
+        sleep(Duration::from_millis(2500)).await;
+        let before_drop = debug_snapshot().len();
+
+        relay.stop().await;
+        wait_until("the client to notice the drop", || {
+            let json = status.to_json();
+            json["closed_events"].as_u64().unwrap_or_default()
+                + json["error_events"].as_u64().unwrap_or_default()
+                >= 1
+                && json["stream_state"].as_str() != Some("connected")
+        })
+        .await;
+        sleep(CONNECT_WATCH_TICK * 2).await;
+        assert_eq!(
+            states_of(&runtime)[0].1,
+            InterfaceState::Connected,
+            "a drop alone flips no TCP row"
+        );
+        assert!(
+            !mesh_lines(&notifier)
+                .iter()
+                .any(|line| line.contains("reconnected")),
+            "nothing is said about a drop: {:?}",
+            mesh_lines(&notifier)
+        );
+        let dropped =
+            format!("Mesh interface {label} dropped its connection; the client is redialing it");
+        assert!(
+            debug_snapshot()
+                .into_iter()
+                .skip(before_drop)
+                .any(|line| line == dropped),
+            "the drop is logged once the client reports it: {:?}",
+            debug_snapshot()
+                .into_iter()
+                .skip(before_drop)
+                .collect::<Vec<_>>()
+        );
+
+        let before = debug_snapshot().len();
+        let started = Instant::now();
+        assert!(slot.stop().await.unwrap());
+        let took = started.elapsed();
+        assert!(
+            took < SHUTDOWN_GRACE,
+            "stopping two clients that are redialing took {took:?}"
+        );
+        let slow = |label: &str| format!("Mesh interface {label} did not stop within");
+        let warned = warn_snapshot();
+        for label in [&label, &late_label] {
+            assert!(
+                !warned.iter().any(|line| line.contains(&slow(label))),
+                "a redialing client ends on the stop and is not aborted: {warned:?}"
+            );
+        }
+        let left: Vec<String> = debug_snapshot().into_iter().skip(before).collect();
+        for label in [&label, &late_label] {
+            let line = format!("Left mesh interface {label}");
+            assert!(left.contains(&line), "{line:?} missing from {left:?}");
+        }
+        let reacquired = InstanceLock::acquire(&cache_dir, &instance_id)
+            .expect("stop must release the instance lock");
+        drop(reacquired);
+        // The relay is already stopped, so once the node's own tasks and its clients are
+        // gone nothing is left running.
+        wait_until("the node's tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+
+        let (relay, mut announces) = TransportRelay::start_on_subscribed(port).await;
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &private_relays(&[port, late_port]),
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .expect("the same config dir starts again once the first node has stopped");
+        assert_eq!(
+            runtime.fingerprint, fingerprint,
+            "the restarted node is the same identity"
+        );
+        let hash = runtime.destination_hash().await;
+        assert_ne!(runtime.instance_id().await, instance_id);
+        TransportRelay::heard_from(&mut announces, &hash).await;
+        let states = states_of(&runtime);
+        assert_eq!(states[0], (label.clone(), InterfaceState::Connected));
+        assert!(is_retrying(&states[1].1), "{states:?}");
+        let slot = Arc::new(MeshSlot::default());
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        slot.install(runtime.clone()).unwrap();
+        let before = debug_snapshot().len();
+
+        let (late_relay, mut heard) = TransportRelay::start_on_subscribed(late_port).await;
+        wait_for_mesh_line(&notifier, &format!("{late_label} connected")).await;
+        TransportRelay::heard_from(&mut heard, &hash).await;
+        sleep(CONNECT_WATCH_TICK * 2).await;
+        assert_eq!(announces_since(before, short(&hash)), 1);
+        assert!(all_connected(&runtime));
+
+        assert!(slot.stop().await.unwrap());
+        relay.stop().await;
+        late_relay.stop().await;
+        wait_until("the restarted node's tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
     /// A node configured not to announce stays silent on a late connect too, and its
     /// floor stays unset.
     #[cfg(unix)]
