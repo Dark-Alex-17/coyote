@@ -787,10 +787,10 @@ fn smoke_summary_and_exit_code_cover_a_check_recorded_last() {
 #[test]
 fn a_debt_scan_crash_falls_forward_to_bookkeeping_scan_with_the_default_report() {
     let Some(_python) = python3() else { return };
-    let Ok(git) = which::which("git") else {
+    if which::which("git").is_err() {
         eprintln!("skipping: git not available");
         return;
-    };
+    }
     let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
     let shipped: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
     let default_report = shipped["initial_state"]["debt_hits"]
@@ -799,160 +799,7 @@ fn a_debt_scan_crash_falls_forward_to_bookkeeping_scan_with_the_default_report()
         .to_string();
     assert!(default_report.starts_with("DEBT_SCAN_FAILED"));
 
-    let run_leg = |label: &str, scanner_crashes: bool| -> (serde_json::Value, String) {
-        let scratch = scratch_dir(label);
-        let dir = scratch.0.clone();
-        let project = dir.join("project");
-        fs::create_dir_all(&project).unwrap();
-        fs::write(project.join("note.txt"), "clean\n").unwrap();
-        for args in [
-            vec!["init", "-q"],
-            vec![
-                "-c",
-                "user.name=probe",
-                "-c",
-                "user.email=probe@example.invalid",
-                "add",
-                ".",
-            ],
-            vec![
-                "-c",
-                "user.name=probe",
-                "-c",
-                "user.email=probe@example.invalid",
-                "commit",
-                "-q",
-                "-m",
-                "base",
-            ],
-        ] {
-            let status = Command::new(&git)
-                .args(&args)
-                .current_dir(&project)
-                .env("HOME", dir.join("home"))
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .status()
-                .unwrap();
-            assert!(status.success(), "git {args:?}");
-        }
-
-        let vault_pass = dir.join("vault-pass");
-        fs::write(&vault_pass, "test-password\n").unwrap();
-        fs::write(
-            dir.join("config.yaml"),
-            format!(
-                "model: dryrun:dry-model\ndry_run: true\nvault_password_file: '{}'\nclients:\n  - type: openai\n    name: dryrun\n    auth: none\n    api_key: 'unused'\n    models:\n      - name: dry-model\n        max_input_tokens: 100000\n        supports_function_calling: true\nsave: false\nmemory: false\nstream: false\n",
-                vault_pass.display()
-            ),
-        )
-        .unwrap();
-
-        let agents = dir.join("agents");
-        copy_tree(&agents_dir().join(".shared"), &agents.join(".shared"));
-        if scanner_crashes {
-            fs::write(
-                agents.join(".shared").join("debt_scan.py"),
-                "raise SystemExit('probe: scanner crashed')\n",
-            )
-            .unwrap();
-        }
-        let agent = agents.join("probe-debt");
-        copy_tree(&candidate_dir().join("scripts"), &agent.join("scripts"));
-        let dump = dir.join("dump.json");
-        fs::write(
-            agent.join("scripts").join("probe_dump.py"),
-            format!(
-                "import json, os, sys\n\
-                 sys.dont_write_bytecode = True\n\
-                 path = os.environ.get('GRAPH_STATE_FILE')\n\
-                 state = json.load(open(path)) if path else json.loads(os.environ.get('GRAPH_STATE', '{{}}'))\n\
-                 keys = ('debt_hits', 'decisions', 'last_script_error', 'debt_items')\n\
-                 open({:?}, 'w').write(json.dumps({{k: state.get(k) for k in keys}}))\n\
-                 print('{{}}')\n",
-                dump.display()
-            ),
-        )
-        .unwrap();
-
-        let mut nodes = serde_yaml::Mapping::new();
-        for id in ["debt_scan", "bookkeeping_scan"] {
-            nodes.insert(id.into(), shipped["nodes"][id].clone());
-        }
-        let mut judge = serde_yaml::Mapping::new();
-        judge.insert("id".into(), "bookkeeping_judge".into());
-        judge.insert("type".into(), "script".into());
-        judge.insert("script".into(), "scripts/probe_dump.py".into());
-        judge.insert("next".into(), "done".into());
-        nodes.insert(
-            "bookkeeping_judge".into(),
-            serde_yaml::Value::Mapping(judge),
-        );
-        for end in ["done", "end_failure"] {
-            let mut node = serde_yaml::Mapping::new();
-            node.insert("id".into(), end.into());
-            node.insert("type".into(), "end".into());
-            node.insert("output".into(), format!("PROBE_ROUTE={end}").into());
-            nodes.insert(end.into(), serde_yaml::Value::Mapping(node));
-        }
-        let mut initial = serde_yaml::Mapping::new();
-        initial.insert("debt_hits".into(), default_report.clone().into());
-        initial.insert(
-            "project_dir".into(),
-            project.to_string_lossy().into_owned().into(),
-        );
-        initial.insert("debt_base".into(), "HEAD".into());
-        initial.insert(
-            "run_dir".into(),
-            dir.join("run").to_string_lossy().into_owned().into(),
-        );
-        initial.insert("decisions".into(), serde_yaml::Value::Sequence(vec![]));
-        initial.insert("last_script_error".into(), "".into());
-        let mut graph = serde_yaml::Mapping::new();
-        graph.insert("name".into(), "probe_debt".into());
-        graph.insert("start".into(), "debt_scan".into());
-        graph.insert("initial_state".into(), serde_yaml::Value::Mapping(initial));
-        graph.insert("nodes".into(), serde_yaml::Value::Mapping(nodes));
-        fs::write(
-            agent.join("graph.yaml"),
-            serde_yaml::to_string(&serde_yaml::Value::Mapping(graph)).unwrap(),
-        )
-        .unwrap();
-
-        let output = Command::new(env!("CARGO_BIN_EXE_coyote"))
-            .args(["--agent", "probe-debt", "probe"])
-            .current_dir(&dir)
-            .env("HOME", dir.join("home"))
-            .env("COYOTE_CONFIG_DIR", &dir)
-            .env("COYOTE_CACHE_DIR", dir.join("cache"))
-            .env("PYTHONDONTWRITEBYTECODE", "1")
-            .env("NO_COLOR", "1")
-            .env_remove("COYOTE_LOG_PATH")
-            .env_remove("IS_SANDBOX")
-            .env_remove("GRAPH_STATE")
-            .env_remove("GRAPH_STATE_FILE")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .unwrap();
-        let report = transcript(&output);
-        assert!(output.status.success(), "{label}: {report}");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("PROBE_ROUTE=done"), "{label}: {report}");
-        let dumped: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&dump).unwrap_or_else(|e| {
-                panic!("{label}: bookkeeping_judge never ran ({e}): {report}")
-            }))
-            .unwrap();
-        let stderr = String::from_utf8_lossy(&output.stderr).replace("\r\n", "\n");
-        let trace = stderr
-            .lines()
-            .find(|l| l.contains("debt_scan (script) done in"))
-            .unwrap_or_else(|| panic!("{label}: no debt_scan trace line in:\n{report}"))
-            .to_string();
-        assert_no_bytecode_under_candidate();
-        (dumped, trace)
-    };
-
-    let (crashed, trace) = run_leg("debtcrash", true);
+    let (crashed, trace) = debt_scan_leg("debtcrash", true, &default_report);
     assert!(
         trace.contains("-> bookkeeping_scan (fallback)"),
         "a shim crash must take the fallback edge: {trace}"
@@ -975,7 +822,7 @@ fn a_debt_scan_crash_falls_forward_to_bookkeeping_scan_with_the_default_report()
         "the engine's crash note is consumed by bookkeeping_scan: {crashed}"
     );
 
-    let (clean, trace) = run_leg("debtclean", false);
+    let (clean, trace) = debt_scan_leg("debtclean", false, &default_report);
     assert!(
         !trace.contains("(fallback)"),
         "with the scanner present debt_scan routes on next: {trace}"
@@ -995,4 +842,559 @@ fn a_debt_scan_crash_falls_forward_to_bookkeeping_scan_with_the_default_report()
             .any(|d| d.as_str().is_some_and(|s| s.starts_with("fallback:"))),
         "no fallback hop on the clean run: {clean}"
     );
+}
+
+/// Writes the dry-run `config.yaml` every lifted-graph run below shares.
+fn write_dry_run_config(dir: &Path) {
+    let vault_pass = dir.join("vault-pass");
+    fs::write(&vault_pass, "test-password\n").unwrap();
+    fs::write(
+        dir.join("config.yaml"),
+        format!(
+            "model: dryrun:dry-model\ndry_run: true\nvault_password_file: '{}'\nclients:\n  - type: openai\n    name: dryrun\n    auth: none\n    api_key: 'unused'\n    models:\n      - name: dry-model\n        max_input_tokens: 100000\n        supports_function_calling: true\nsave: false\nmemory: false\nstream: false\n",
+            vault_pass.display()
+        ),
+    )
+    .unwrap();
+}
+
+/// Runs the real binary on a lifted graph under `dir/agents/<agent>/` and
+/// returns the JSON the probe script dumped plus the process output.
+fn run_lifted_graph(
+    dir: &Path,
+    agent: &str,
+    dump: &Path,
+    label: &str,
+) -> (serde_json::Value, Output) {
+    let output = Command::new(env!("CARGO_BIN_EXE_coyote"))
+        .args(["--agent", agent, "probe"])
+        .current_dir(dir)
+        .env("HOME", dir.join("home"))
+        .env("COYOTE_CONFIG_DIR", dir)
+        .env("COYOTE_CACHE_DIR", dir.join("cache"))
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env("NO_COLOR", "1")
+        .env_remove("COYOTE_LOG_PATH")
+        .env_remove("IS_SANDBOX")
+        .env_remove("GRAPH_STATE")
+        .env_remove("GRAPH_STATE_FILE")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let report = transcript(&output);
+    assert!(output.status.success(), "{label}: {report}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("PROBE_ROUTE=done"), "{label}: {report}");
+    let dumped: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(dump)
+            .unwrap_or_else(|e| panic!("{label}: the probe dump never ran ({e}): {report}")),
+    )
+    .unwrap();
+    assert_no_bytecode_under_candidate();
+    (dumped, output)
+}
+
+fn end_nodes(nodes: &mut serde_yaml::Mapping) {
+    for end in ["done", "end_failure"] {
+        let mut node = serde_yaml::Mapping::new();
+        node.insert("id".into(), end.into());
+        node.insert("type".into(), "end".into());
+        node.insert("output".into(), format!("PROBE_ROUTE={end}").into());
+        nodes.insert(end.into(), serde_yaml::Value::Mapping(node));
+    }
+}
+
+/// One run of the lifted `debt_scan -> bookkeeping_scan -> <dump>` graph with
+/// `seeded_report` as the `debt_hits` the run starts from. Returns the dumped
+/// keys and the `debt_scan` trace line.
+fn debt_scan_leg(
+    label: &str,
+    scanner_crashes: bool,
+    seeded_report: &str,
+) -> (serde_json::Value, String) {
+    let git = which::which("git").expect("callers skip without git");
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let shipped: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let scratch = scratch_dir(label);
+    let dir = scratch.0.clone();
+    let project = dir.join("project");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(project.join("note.txt"), "clean\n").unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec![
+            "-c",
+            "user.name=probe",
+            "-c",
+            "user.email=probe@example.invalid",
+            "add",
+            ".",
+        ],
+        vec![
+            "-c",
+            "user.name=probe",
+            "-c",
+            "user.email=probe@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "base",
+        ],
+    ] {
+        let status = Command::new(&git)
+            .args(&args)
+            .current_dir(&project)
+            .env("HOME", dir.join("home"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+    write_dry_run_config(&dir);
+
+    let agents = dir.join("agents");
+    copy_tree(&agents_dir().join(".shared"), &agents.join(".shared"));
+    if scanner_crashes {
+        fs::write(
+            agents.join(".shared").join("debt_scan.py"),
+            "raise SystemExit('probe: scanner crashed')\n",
+        )
+        .unwrap();
+    }
+    let agent = agents.join("probe-debt");
+    copy_tree(&candidate_dir().join("scripts"), &agent.join("scripts"));
+    let dump = dir.join("dump.json");
+    fs::write(
+        agent.join("scripts").join("probe_dump.py"),
+        format!(
+            "import json, os, sys\n\
+             sys.dont_write_bytecode = True\n\
+             path = os.environ.get('GRAPH_STATE_FILE')\n\
+             state = json.load(open(path)) if path else json.loads(os.environ.get('GRAPH_STATE', '{{}}'))\n\
+             keys = ('debt_hits', 'decisions', 'last_script_error', 'debt_items')\n\
+             open({:?}, 'w').write(json.dumps({{k: state.get(k) for k in keys}}))\n\
+             print('{{}}')\n",
+            dump.display()
+        ),
+    )
+    .unwrap();
+
+    let mut nodes = serde_yaml::Mapping::new();
+    for id in ["debt_scan", "bookkeeping_scan"] {
+        nodes.insert(id.into(), shipped["nodes"][id].clone());
+    }
+    let mut judge = serde_yaml::Mapping::new();
+    judge.insert("id".into(), "bookkeeping_judge".into());
+    judge.insert("type".into(), "script".into());
+    judge.insert("script".into(), "scripts/probe_dump.py".into());
+    judge.insert("next".into(), "done".into());
+    nodes.insert(
+        "bookkeeping_judge".into(),
+        serde_yaml::Value::Mapping(judge),
+    );
+    end_nodes(&mut nodes);
+    let mut initial = serde_yaml::Mapping::new();
+    initial.insert("debt_hits".into(), seeded_report.into());
+    initial.insert(
+        "project_dir".into(),
+        project.to_string_lossy().into_owned().into(),
+    );
+    initial.insert("debt_base".into(), "HEAD".into());
+    initial.insert(
+        "run_dir".into(),
+        dir.join("run").to_string_lossy().into_owned().into(),
+    );
+    initial.insert("decisions".into(), serde_yaml::Value::Sequence(vec![]));
+    initial.insert("last_script_error".into(), "".into());
+    let mut graph = serde_yaml::Mapping::new();
+    graph.insert("name".into(), "probe_debt".into());
+    graph.insert("start".into(), "debt_scan".into());
+    graph.insert("initial_state".into(), serde_yaml::Value::Mapping(initial));
+    graph.insert("nodes".into(), serde_yaml::Value::Mapping(nodes));
+    fs::write(
+        agent.join("graph.yaml"),
+        serde_yaml::to_string(&serde_yaml::Value::Mapping(graph)).unwrap(),
+    )
+    .unwrap();
+
+    let (dumped, output) = run_lifted_graph(&dir, "probe-debt", &dump, label);
+    let stderr = String::from_utf8_lossy(&output.stderr).replace("\r\n", "\n");
+    let trace = stderr
+        .lines()
+        .find(|l| l.contains("debt_scan (script) done in"))
+        .unwrap_or_else(|| {
+            panic!(
+                "{label}: no debt_scan trace line in:\n{}",
+                transcript(&output)
+            )
+        })
+        .to_string();
+    (dumped, trace)
+}
+
+/// `route_coder_result` re-enters `debt_scan` every coder round and the engine
+/// leaves `debt_hits` as it was when the shim crashes, so from the second round
+/// on a crash would hand the judge the PREVIOUS round's report as if it
+/// described this worktree. `bookkeeping_scan` must then discard the stale
+/// report for a short `DEBT_SCAN_FAILED` note, parse no items from it and
+/// ledger the discard; a crash that already finds a `DEBT_SCAN_FAILED`-class
+/// value (the initial_state default, or the note itself from an earlier
+/// crash) keeps it byte-for-byte and adds no second discard line; and with the
+/// scanner present a prior report is simply replaced, never flagged stale.
+#[test]
+fn a_later_round_debt_scan_crash_discards_the_previous_report_for_the_judge() {
+    let Some(_python) = python3() else { return };
+    if which::which("git").is_err() {
+        eprintln!("skipping: git not available");
+        return;
+    }
+    let prior_report =
+        "src/b.rs:3 -- todo!()\nsrc/a.rs:10 -- #[allow(dead_code)] // owner TX-0099\n";
+    let discard_lines = |dumped: &serde_json::Value| -> usize {
+        dumped["decisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|d| d.as_str().is_some_and(|s| s.contains("discarded")))
+            .count()
+    };
+    let fallback_lines = |dumped: &serde_json::Value| -> usize {
+        dumped["decisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|d| {
+                d.as_str()
+                    .is_some_and(|s| s.starts_with("fallback: debt_scan:"))
+            })
+            .count()
+    };
+
+    let (stale, trace) = debt_scan_leg("debtstale", true, prior_report);
+    assert!(trace.contains("-> bookkeeping_scan (fallback)"), "{trace}");
+    let note = stale["debt_hits"].as_str().unwrap().to_string();
+    assert!(
+        note.starts_with("DEBT_SCAN_FAILED") && note.contains("discarded") && note != prior_report,
+        "a later-round crash must replace the stale report with a DEBT_SCAN_FAILED note: {stale}"
+    );
+    assert!(
+        !note.contains("todo!()") && note.len() < prior_report.len() + 400,
+        "the note must be short and carry nothing of the stale report: {note}"
+    );
+    assert_eq!(
+        stale["debt_items"].as_array().map(Vec::len),
+        Some(0),
+        "nothing is parsed from a report that does not describe this worktree: {stale}"
+    );
+    assert_eq!(fallback_lines(&stale), 1, "{stale}");
+    assert_eq!(
+        discard_lines(&stale),
+        1,
+        "the discard is ledgered once: {stale}"
+    );
+    assert_eq!(stale["last_script_error"].as_str(), Some(""), "{stale}");
+
+    let (again, trace) = debt_scan_leg("debtstale2", true, &note);
+    assert!(trace.contains("-> bookkeeping_scan (fallback)"), "{trace}");
+    assert_eq!(
+        again["debt_hits"].as_str(),
+        Some(note.as_str()),
+        "a second consecutive crash keeps the note byte-for-byte: {again}"
+    );
+    assert_eq!(fallback_lines(&again), 1, "{again}");
+    assert_eq!(
+        discard_lines(&again),
+        0,
+        "nothing was discarded this time, so no discard line: {again}"
+    );
+    assert_eq!(
+        again["debt_items"].as_array().map(Vec::len),
+        Some(0),
+        "{again}"
+    );
+
+    let (replaced, trace) = debt_scan_leg("debtreplaced", false, prior_report);
+    assert!(!trace.contains("(fallback)"), "{trace}");
+    let fresh = replaced["debt_hits"].as_str().unwrap();
+    assert!(
+        fresh != prior_report && !fresh.starts_with("DEBT_SCAN_FAILED"),
+        "with the scanner present the prior report is replaced by this run's: {replaced}"
+    );
+    assert_eq!(discard_lines(&replaced), 0, "{replaced}");
+    assert_eq!(fallback_lines(&replaced), 0, "{replaced}");
+}
+
+/// The engine merges `triage_findings`' schema properties into state only when
+/// the llm node returns an object; a failed (or, under `dry_run`, echoed)
+/// round merges nothing, so `triage` keeps whatever the previous round wrote.
+/// `triage_route` therefore resets `triage` to `[]` in its update dict: round
+/// two of a failed triage must fall open onto the NEW blockers, never replay
+/// round one's verdicts. Two rounds through the real binary: the seeded
+/// round-one verdict drives round one (so the echo really merged nothing),
+/// and round two, with new blockers and the same echo, fixes exactly those.
+#[test]
+fn a_failed_second_triage_round_fixes_the_new_blockers_not_round_ones_verdicts() {
+    let Some(_python) = python3() else { return };
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let shipped: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let scratch = scratch_dir("triagereset");
+    let dir = scratch.0.clone();
+    write_dry_run_config(&dir);
+
+    let agents = dir.join("agents");
+    let agent = agents.join("probe-triage");
+    copy_tree(&candidate_dir().join("scripts"), &agent.join("scripts"));
+    let dump = dir.join("dump.json");
+    // Stands in for the shipped `compose_fix` target of `triage_route`: the
+    // first visit records the round, swaps the blockers and loops back to the
+    // llm node; the second visit dumps both rounds and ends the run. A plain
+    // literal, not a `\`-continued one: the indented block must survive.
+    let probe_script = r#"import json, os, sys
+sys.dont_write_bytecode = True
+path = os.environ.get('GRAPH_STATE_FILE')
+state = json.load(open(path)) if path else json.loads(os.environ.get('GRAPH_STATE', '{}'))
+n = int(state.get('probe_pass') or 0) + 1
+rounds = dict(state.get('probe_rounds') or {})
+rounds[str(n)] = {k: state.get(k) for k in ('fix_items', 'triage', 'review_rounds', 'gauntlet_blockers', 'last_node_output', 'decisions')}
+u = {'probe_pass': n, 'probe_rounds': rounds}
+if n == 1:
+    u['gauntlet_blockers'] = ['b2 second round']
+    u['_next'] = 'triage_findings'
+else:
+    open(DUMP_PATH, 'w').write(json.dumps(rounds))
+    u['_next'] = 'done'
+print(json.dumps(u))
+"#;
+    fs::write(
+        agent.join("scripts").join("probe_compose_fix.py"),
+        probe_script.replace("DUMP_PATH", &format!("{:?}", dump.display())),
+    )
+    .unwrap();
+
+    let mut nodes = serde_yaml::Mapping::new();
+    let mut findings = shipped["nodes"]["triage_findings"].clone();
+    // The lifted llm node keeps its instructions, prompt, output_schema,
+    // state_updates, fallback and next; the tool list is dropped because the
+    // probe agent declares no global tools and dry-run never calls one.
+    findings.as_mapping_mut().unwrap().remove("tools");
+    nodes.insert("triage_findings".into(), findings);
+    nodes.insert(
+        "triage_route".into(),
+        shipped["nodes"]["triage_route"].clone(),
+    );
+    let mut compose = serde_yaml::Mapping::new();
+    compose.insert("id".into(), "compose_fix".into());
+    compose.insert("type".into(), "script".into());
+    compose.insert("script".into(), "scripts/probe_compose_fix.py".into());
+    compose.insert("fallback".into(), "end_failure".into());
+    nodes.insert("compose_fix".into(), serde_yaml::Value::Mapping(compose));
+    end_nodes(&mut nodes);
+
+    let mut verdict = serde_yaml::Mapping::new();
+    verdict.insert("finding".into(), "b1 first round".into());
+    verdict.insert("action".into(), "fix".into());
+    verdict.insert("lane".into(), "code-review".into());
+    let mut initial = serde_yaml::Mapping::new();
+    for (key, value) in [
+        ("gauntlet_result", "BLOCKED"),
+        ("quality_rigor", "production"),
+        ("quality_surfaces", "none"),
+        ("prior_review_decisions", ""),
+        ("last_script_error", ""),
+        ("last_node_output", ""),
+    ] {
+        initial.insert(key.into(), value.into());
+    }
+    for key in [
+        "decisions",
+        "anomalies",
+        "anomalies_log",
+        "rejected_findings",
+        "deferred_findings",
+        "debris_exemptions",
+        "debris_exemptions_new",
+        "fix_items",
+    ] {
+        initial.insert(key.into(), serde_yaml::Value::Sequence(vec![]));
+    }
+    initial.insert(
+        "gauntlet_blockers".into(),
+        serde_yaml::Value::Sequence(vec!["b1 first round".into()]),
+    );
+    initial.insert(
+        "triage".into(),
+        serde_yaml::Value::Sequence(vec![serde_yaml::Value::Mapping(verdict)]),
+    );
+    initial.insert("review_rounds".into(), serde_yaml::Value::Number(0.into()));
+    initial.insert("probe_pass".into(), serde_yaml::Value::Number(0.into()));
+    initial.insert(
+        "lane_block_streak".into(),
+        serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+    );
+    initial.insert(
+        "probe_rounds".into(),
+        serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+    );
+    initial.insert(
+        "run_dir".into(),
+        dir.join("run").to_string_lossy().into_owned().into(),
+    );
+    let mut graph = serde_yaml::Mapping::new();
+    graph.insert("name".into(), "probe_triage".into());
+    graph.insert("start".into(), "triage_findings".into());
+    graph.insert("initial_state".into(), serde_yaml::Value::Mapping(initial));
+    graph.insert("nodes".into(), serde_yaml::Value::Mapping(nodes));
+    fs::write(
+        agent.join("graph.yaml"),
+        serde_yaml::to_string(&serde_yaml::Value::Mapping(graph)).unwrap(),
+    )
+    .unwrap();
+
+    let (rounds, output) = run_lifted_graph(&dir, "probe-triage", &dump, "triagereset");
+    let report = transcript(&output);
+    let fix_items = |round: &str| -> Vec<String> {
+        rounds[round]["fix_items"]
+            .as_array()
+            .unwrap_or_else(|| panic!("round {round} has no fix_items: {rounds}\n{report}"))
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(
+        fix_items("1"),
+        vec!["b1 first round".to_string()],
+        "round one must be driven by the seeded verdict, proving the echo merged nothing: {rounds}\n{report}"
+    );
+    assert_eq!(
+        fix_items("2"),
+        vec!["b2 second round".to_string()],
+        "round two must fall open onto the new blockers, not replay round one: {rounds}\n{report}"
+    );
+    for round in ["1", "2"] {
+        assert_eq!(
+            rounds[round]["triage"].as_array().map(Vec::len),
+            Some(0),
+            "triage_route leaves an empty verdict list behind after round {round}: {rounds}"
+        );
+    }
+    assert_eq!(rounds["2"]["review_rounds"].as_u64(), Some(2), "{rounds}");
+    let round_two_decisions: Vec<&str> = rounds["2"]["decisions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d.as_str())
+        .collect();
+    assert!(
+        round_two_decisions
+            .iter()
+            .any(|d| d.starts_with("review: round 2 fixes 1 finding(s)")),
+        "round two is ledgered as a one-finding fix round: {round_two_decisions:?}"
+    );
+    assert_eq!(
+        round_two_decisions
+            .iter()
+            .filter(|d| d.starts_with("fallback: triage_findings: LLM node"))
+            .count(),
+        2,
+        "each round's llm failure reached triage_route through last_node_output and was ledgered: \
+         {round_two_decisions:?}"
+    );
+    assert!(
+        !round_two_decisions
+            .iter()
+            .any(|d| d.contains("b1 first round")),
+        "round one's verdict must not resurface in round two's ledger: {round_two_decisions:?}"
+    );
+}
+
+/// The gates module is the one file whose census row names an exact hunk
+/// count against the staging tree; the staging copy is not in this repo, so
+/// this pins the shape the census describes: one module-level
+/// `DEBT_HITS_STALE` constant, a `bookkeeping_scan` that consults
+/// `last_script_error` before it parses `debt_hits`, and a `triage_route`
+/// update dict that resets both per-round schema properties.
+#[test]
+fn gates_carry_exactly_the_recorded_divergences_from_staging() {
+    let gates = fs::read_to_string(candidate_dir().join("scripts").join("gates.py")).unwrap();
+    let const_lines: Vec<&str> = gates
+        .lines()
+        .filter(|l| l.starts_with("DEBT_HITS_STALE = "))
+        .collect();
+    assert_eq!(
+        const_lines.len(),
+        1,
+        "one module-level constant: {const_lines:?}"
+    );
+    let stale_sites: Vec<usize> = gates
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| l.contains("DEBT_HITS_STALE"))
+        .map(|(i, _)| i + 1)
+        .collect();
+    assert_eq!(
+        stale_sites.len(),
+        2,
+        "the constant is read at exactly one site (bookkeeping_scan): {stale_sites:?}"
+    );
+    let body = |name: &str| -> String {
+        let start = gates
+            .find(&format!("\ndef {name}(state):\n"))
+            .unwrap_or_else(|| panic!("no {name} in gates.py"));
+        let rest = &gates[start + 1..];
+        let end = rest[4..]
+            .find("\ndef ")
+            .map(|i| i + 4)
+            .unwrap_or(rest.len());
+        rest[..end].to_string()
+    };
+    let scan = body("bookkeeping_scan");
+    let crashed_at = scan
+        .find("crashed = bool(state.get(\"last_script_error\"))")
+        .expect("crash flag");
+    let parse_at = scan
+        .find("for line in hits.splitlines():")
+        .expect("report parse");
+    let stale_at = scan
+        .find("u[\"debt_hits\"] = DEBT_HITS_STALE")
+        .expect("stale substitution");
+    let gate_at = scan
+        .find("if not hits.startswith(\"DEBT_SCAN_FAILED\"):")
+        .expect("default gate");
+    assert!(
+        crashed_at < gate_at && gate_at < stale_at && stale_at < parse_at,
+        "crash flag, then the DEBT_SCAN_FAILED gate around the substitution, then the parse: {scan}"
+    );
+    assert!(
+        scan.contains("ledger(state, u, \"debt_scan: the node did not run this round; the previous round's report was discarded\")"),
+        "{scan}"
+    );
+    let route = body("triage_route");
+    let update = route
+        .lines()
+        .find(|l| {
+            l.trim_start()
+                .starts_with("u.update({\"rejected_findings\": rejected")
+        })
+        .expect("triage_route update dict");
+    for reset in ["\"debris_exemptions_new\": []", "\"triage\": []"] {
+        assert!(update.contains(reset), "{reset} missing from {update}");
+    }
+    assert!(
+        route.contains("for e in as_list(state.get(\"debris_exemptions\")):\n        if e not in exemptions:\n            exemptions.append(e)\n"),
+        "the merge lines stay byte-equal to staging: {route}"
+    );
+    let graph = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let shipped: serde_yaml::Value = serde_yaml::from_str(&graph).unwrap();
+    let schema = &shipped["nodes"]["triage_findings"]["output_schema"]["properties"];
+    for key in ["triage", "debris_exemptions_new"] {
+        assert!(
+            schema.get(key).is_some(),
+            "every key the update dict resets is a schema property of triage_findings: {key}"
+        );
+        assert_eq!(
+            shipped["initial_state"][key],
+            serde_yaml::Value::Sequence(vec![]),
+            "and is seeded as an empty list: {key}"
+        );
+    }
 }
