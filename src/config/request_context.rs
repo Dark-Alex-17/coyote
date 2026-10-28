@@ -27211,55 +27211,21 @@ mod tests {
             .collect()
     }
 
-    /// `python_regex_literal` for an assignment that may sit inside an
-    /// indented block: the `NAME = ` must be the first token on its line and
-    /// a multi-line form closes at the first line holding only `)`.
-    fn python_regex_literal_at_any_indent(source: &str, name: &str) -> String {
-        let head = format!("{name} = ");
-        let start = source
-            .match_indices(&head)
-            .map(|(at, _)| at)
-            .find(|&at| source[..at].rsplit('\n').next().unwrap().trim().is_empty())
-            .unwrap_or_else(|| panic!("{name} is not assigned"))
-            + head.len();
-        let rest = &source[start..];
-        let statement = if rest.starts_with('(') {
-            let close = rest
-                .match_indices('\n')
-                .map(|(at, _)| at)
-                .find(|&at| rest[at + 1..].trim_start().starts_with(')'))
-                .unwrap_or_else(|| panic!("{name} is never closed"));
-            &rest[..close]
-        } else {
-            &rest[..rest.find('\n').unwrap()]
-        };
-        statement
-            .split("r\"")
-            .skip(1)
-            .map(|piece| piece.split('"').next().unwrap())
-            .collect()
-    }
-
-    /// signals.py imports `classify` from the shared module and carries an
-    /// inline copy for installs without it; the copy must not drift.
+    /// signals.py imports `classify` from the shared module and keeps an inline
+    /// fallback for installs without it; the constants are shared byte for byte
+    /// and the fallback classifies every fixture exactly as the shared module.
+    /// Mutation check: narrowing the fallback's AUTH_PATH_RE to `auth(?!or)`
+    /// fails the AUTH_PATH_RE pin, and the harness on its own then reports the
+    /// `src/authorize.rs` row diverging (shared true, fallback false); adding
+    /// `re.I` to the fallback's exec search fails the matrix on the uppercase
+    /// exec row; pointing the path insert at a missing directory fails the
+    /// import-binds-shared flag.
     #[test]
-    fn gauntlet_signals_inline_fallback_matches_the_shared_module() {
+    fn gauntlet_signals_fallback_classify_matches_the_shared_module() {
         let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents");
-        let signals = read_to_string(assets.join("review-gauntlet/scripts/signals.py")).unwrap();
+        let signals_path = assets.join("review-gauntlet/scripts/signals.py");
+        let signals = read_to_string(&signals_path).unwrap();
         let shared = read_to_string(assets.join(".shared/diff_signals.py")).unwrap();
-
-        let import_at = signals
-            .find("from diff_signals import classify")
-            .expect("signals.py imports classify from the shared module");
-        let fallback_at = import_at
-            + signals[import_at..]
-                .find("\nexcept Exception:")
-                .expect("the import is guarded by an except block");
-        let fallback_end = signals
-            .find("\ndef diff_signals(")
-            .expect("diff_signals follows the fallback block");
-        let fallback = &signals[fallback_at..fallback_end];
-
         for name in [
             "DOCS_RE",
             "TESTS_RE",
@@ -27271,53 +27237,143 @@ mod tests {
             "PROTO_RE",
             "MIGRATIONS_RE",
         ] {
+            let pinned = python_regex_literal(&signals, name);
+            assert!(!pinned.is_empty(), "signals.py {name} is empty");
             assert_eq!(
-                python_regex_literal_at_any_indent(fallback, name),
-                python_regex_literal_at_any_indent(&shared, name),
-                "{name}: the inline fallback in signals.py must stay byte-identical to the shared module"
+                pinned,
+                python_regex_literal(&shared, name),
+                "{name}: signals.py must carry the shared module's regex byte for byte"
             );
         }
 
-        let inline_body = &fallback[fallback
-            .find("def _classify(files, added):")
-            .expect("the fallback defines _classify")..];
-        let shared_def = shared
-            .find("def classify(files, added):")
-            .expect("the shared module defines classify");
-        let shared_body = &shared[shared_def..];
-        let shared_body = shared_body
-            .match_indices('\n')
-            .map(|(at, _)| at)
-            .find(|&at| {
-                let line = &shared_body[at + 1..];
-                !line.is_empty() && !line.starts_with(['\n', ' '])
-            })
-            .map_or(shared_body, |at| &shared_body[..at]);
-        let docstring_start = shared_body
-            .find("\"\"\"")
-            .expect("the shared classify has a docstring");
-        let docstring_end = docstring_start
-            + 3
-            + shared_body[docstring_start + 3..]
-                .find("\"\"\"")
-                .expect("the docstring closes")
-            + 3;
-        let shared_body = format!(
-            "{}{}",
-            &shared_body[..docstring_start],
-            &shared_body[docstring_end..]
-        );
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        // signals.py is loaded twice: once with the shared module reachable,
+        // which must bind `_classify` to the shared `classify` (a broken
+        // path insert would otherwise fall through silently), and once with
+        // `diff_signals` blocked in sys.modules so the except arm defines the
+        // inline fallback. Stdout is captured because the module prints its
+        // JSON at import time. Mixed-case rows separate the `re.I` sites from
+        // the case-sensitive exec search.
+        const HARNESS: &str = r#"
+import contextlib, importlib.util, io, json, os, sys
 
-        let squash = |body: &str| -> String {
-            body.replace("_classify", "classify")
-                .chars()
-                .filter(|c| !c.is_whitespace())
-                .collect()
-        };
+def load_signals(name):
+    spec = importlib.util.spec_from_file_location(name, os.environ["SIGNALS_PATH"])
+    mod = importlib.util.module_from_spec(spec)
+    with contextlib.redirect_stdout(io.StringIO()):
+        spec.loader.exec_module(mod)
+    return mod
+
+live = load_signals("signals_live")._classify
+sys.path.insert(0, os.environ["SHARED_DIR"])
+import diff_signals
+shared = diff_signals.classify
+import_binds_shared = live is shared
+sys.modules["diff_signals"] = None
+fallback = load_signals("signals")._classify
+cases = [
+    (["api/v1/thing.proto"], ""),
+    (["db/migrations/001_init.sql"], ""),
+    (["src/authorize.rs"], ""),
+    (["src/http.rs"], "verify_csrf(&req)?;"),
+    (["src/author_index.rs"], "pub fn by_author() {}"),
+    (["Cargo.toml"], ""),
+    (["tools/run.py"], "subprocess.run([\"ls\"])"),
+    (["src/routes/users.rs"], ""),
+    (["README.md"], ""),
+    (["tests/foo_test.rs", "docs/x.md"], ""),
+    ([], ""),
+    (["src/client.rs"], "bearer token"),
+    (["internal/oauth/flow.go"], ""),
+    (["README.MD"], ""),
+    (["src/Auth/mod.rs"], ""),
+    (["scripts/launch.py"], "SUBPROCESS.run([])"),
+    (
+        ["api/v1/thing.proto", "db/migrations/001_init.sql", "Cargo.toml", "src/routes/users.rs"],
+        "subprocess.run([\"ls\"])\nverify_csrf(&req)?;",
+    ),
+]
+print(json.dumps({
+    "shared": [shared(f, a) for f, a in cases],
+    "fallback": [fallback(f, a) for f, a in cases],
+    "fallback_is_shared": fallback is shared,
+    "import_binds_shared": import_binds_shared,
+}))
+"#;
+        let dir = temp_file("-gauntlet-fallback-", "");
+        create_dir_all(&dir).unwrap();
+        let out = Command::new("python3")
+            .arg("-c")
+            .arg(HARNESS)
+            .env(
+                "GRAPH_STATE",
+                json!({"project_dir": dir.to_string_lossy(), "diff_spec": "worktree"}).to_string(),
+            )
+            .env_remove("GRAPH_STATE_FILE")
+            .env("SHARED_DIR", assets.join(".shared"))
+            .env("SIGNALS_PATH", &signals_path)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to invoke python3: {e}"));
+        let _ = remove_dir_all(&dir);
+        assert!(
+            out.status.success(),
+            "fallback harness exited nonzero: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let out: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "harness stdout is not JSON ({e}): {}",
+                String::from_utf8_lossy(&out.stdout)
+            )
+        });
         assert_eq!(
-            squash(inline_body),
-            squash(&shared_body),
-            "the inline classify in signals.py must stay identical to the shared module modulo line wrapping"
+            out["shared"], out["fallback"],
+            "the fallback classify must agree with the shared module on every fixture"
+        );
+        assert_eq!(
+            out["fallback_is_shared"], false,
+            "the harness must have exercised the inline fallback, not the shared function"
+        );
+        assert_eq!(
+            out["import_binds_shared"], true,
+            "with the shared module reachable signals.py must bind the shared classify"
+        );
+        let row_flag = |files: &[&str], key: &str| {
+            out["fallback"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["files"] == json!(files))
+                .unwrap_or_else(|| panic!("no fixture row for {files:?}"))[key]
+                .as_bool()
+                .unwrap()
+        };
+        assert!(
+            row_flag(&["src/authorize.rs"], "touches_auth"),
+            "authorize must hit the auth path regex"
+        );
+        assert!(
+            row_flag(&["src/http.rs"], "touches_auth"),
+            "verify_csrf must hit the auth added-line regex"
+        );
+        assert!(
+            !row_flag(&["src/author_index.rs"], "touches_auth"),
+            "author must miss the auth regexes"
+        );
+        assert!(
+            row_flag(&["README.MD"], "docs_only"),
+            "docs paths are matched case-insensitively"
+        );
+        assert!(
+            row_flag(&["src/Auth/mod.rs"], "touches_auth"),
+            "auth paths are matched case-insensitively"
+        );
+        assert!(
+            !row_flag(&["scripts/launch.py"], "touches_exec"),
+            "exec vocabulary is matched case-sensitively"
         );
     }
 
