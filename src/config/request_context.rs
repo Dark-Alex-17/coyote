@@ -8039,7 +8039,7 @@ mod tests {
     /// cache dir is pinned to a fresh temp dir as well, so anything a spawn
     /// writes under the cache lands there instead of in the real cache.
     struct TestConfigDirGuard {
-        keys: [(String, Option<std::ffi::OsString>); 5],
+        keys: [(String, Option<std::ffi::OsString>); 6],
         path: PathBuf,
         workspace_root: PathBuf,
         cache_root: PathBuf,
@@ -8071,6 +8071,10 @@ mod tests {
                     None,
                 ),
                 (get_env_name("cache_dir"), Some(cache_root.as_os_str())),
+                (
+                    memory::WORKSPACE_MEMORY_ROOT_TEST_ENV.to_string(),
+                    Some(workspace_root.as_os_str()),
+                ),
             ]
             .map(|(key, value)| {
                 let previous = env::var_os(&key);
