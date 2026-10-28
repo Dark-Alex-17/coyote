@@ -341,24 +341,25 @@ fn apply_scope(report: &mut ScopeReport, backup_root: &Path, stamp: &str) -> Res
     copy_dir_all(&report.dir, &backup)
         .with_context(|| format!("back up {} to {}", report.dir.display(), backup.display()))?;
     report.backup = Some(backup.clone());
+    let index_path = report.dir.join(MEMORY_INDEX_FILE_NAME);
+    if report.new_index.is_some() {
+        let current = fs::read_to_string(&index_path)
+            .with_context(|| format!("read {}", index_path.display()))?;
+        if report.index.as_ref() != Some(&current) {
+            bail!(
+                "{} changed since the migration was planned, so nothing was rewritten. \
+                 Rerun --memory-migrate; the pre-run copy is in {}",
+                index_path.display(),
+                backup.display()
+            );
+        }
+    }
     for file in &report.rewrites {
         write_private_atomic(&file.path, &file.render()?)
             .with_context(|| format!("write memory file {}", file.path.display()))?;
         report.written.push(file.path.clone());
     }
     if let Some(index) = &report.new_index {
-        let index_path = report.dir.join(MEMORY_INDEX_FILE_NAME);
-        let current = fs::read_to_string(&index_path)
-            .with_context(|| format!("read {}", index_path.display()))?;
-        if report.index.as_ref() != Some(&current) {
-            bail!(
-                "{} changed since the migration was planned, so it was left alone; \
-                 the drill files were already rewritten. Rerun --memory-migrate; \
-                 the pre-run copy is in {}",
-                index_path.display(),
-                backup.display()
-            );
-        }
         write_private_atomic(&index_path, index)
             .with_context(|| format!("write {}", index_path.display()))?;
         report.written.push(index_path);
@@ -979,6 +980,7 @@ mod tests {
             "{err:#}"
         );
         assert_eq!(fs::read_to_string(&index_path).unwrap(), edited);
+        assert!(plan.written.is_empty(), "{:?}", plan.written);
     }
 
     #[test]
