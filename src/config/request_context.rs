@@ -234,6 +234,9 @@ fn chat_agent_mismatch_warning(session_name: &str, previous: Option<&str>) -> St
 
 /// Set by the first memory injection of the process; the notice about what
 /// the section holds is printed once, not on every turn.
+/// The once-only property has no in-process unit pin: the gate is process
+/// wide, so whichever test injects first consumes it. The cold-start binary
+/// suite in tests/memory_section_binary.rs pins it across two injections.
 static MEMORY_SECTION_NOTICE: OnceLock<()> = OnceLock::new();
 
 fn memory_section_notice(section: &MemorySection, cap: usize) -> String {
@@ -18069,7 +18072,7 @@ mod tests {
     /// default when there is no agent) and, for a graph agent, its block's
     /// `chat.memory`, with no block meaning off; the prompt is the agent's
     /// interpolated instructions, a blank line, the MEMORY.md section at the
-    /// with-tools cap, a blank line, the memory tool instructions. A drift in
+    /// default facts cap, a blank line, the memory tool instructions. A drift in
     /// `chat_agent`, `memory_config`, `extract_role` or the engage path shows
     /// as a literal mismatch.
     #[test]

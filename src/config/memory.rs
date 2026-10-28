@@ -808,7 +808,7 @@ mod tests {
         (root, store)
     }
 
-    /// A global index as `--init-memory` leaves it plus two drill files.
+    /// A global index with one non-catalogue line plus two drill files.
     const GLOBAL_INDEX: &str = "PLACEHOLDER_CHECK\n- [[g-one]]: desc\n- [[g-two]]: desc";
     /// A workspace index with headings, four facts and two drill files.
     const WORKSPACE_INDEX: &str = "# Workspace Memory Index\n\n## Always-on facts\n\
@@ -1014,6 +1014,51 @@ mod tests {
                 chars: 50 + 1 + 13 - 20,
             })
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_first_catalogue_line_longer_than_the_cap_is_cut_at_the_cap_when_there_are_no_facts() {
+        let row = format!("- [[g]]: {}", "d".repeat(60));
+        let (root, store) = two_index_store("long_catalogue_line", &row, "", &[]);
+
+        let section = build_memory_section(&store, true, 20, 12_000)
+            .unwrap()
+            .expect("memory section should exist");
+
+        assert_eq!(tag_body(&section.text, "facts"), "");
+        assert_eq!(tag_body(&section.text, "catalogue"), &row[..20]);
+        assert_eq!(section.facts_chars, 0);
+        assert_eq!(section.catalogue_chars, row.len());
+        assert_eq!(
+            section.truncated,
+            Some(Truncated {
+                lines: 1,
+                chars: row.len() - 20,
+            })
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_trailing_blank_line_in_an_index_is_not_carried_into_the_facts() {
+        let (root, store) = two_index_store(
+            "trailing_blank",
+            GLOBAL_INDEX,
+            "# Workspace Memory Index\n\n",
+            &[],
+        );
+
+        let section = build_memory_section(&store, true, 4_000, 12_000)
+            .unwrap()
+            .expect("memory section should exist");
+
+        let facts = tag_body(&section.text, "facts");
+        assert_eq!(facts, "# Workspace Memory Index\nPLACEHOLDER_CHECK");
+        assert_eq!(section.facts_chars, count_chars(facts));
+        assert_eq!(section.truncated, None);
 
         let _ = fs::remove_dir_all(&root);
     }

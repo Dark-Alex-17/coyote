@@ -1519,8 +1519,12 @@ clients:
 
     #[test]
     fn config_template_documents_memory_cap_as_enforced() {
+        let facts_default = format!("null = {}", memory::DEFAULT_MEMORY_FACTS_CAP);
+        let drill_default = format!("null = {}", memory::DEFAULT_MEMORY_DRILL_CAP);
         assert!(CONFIG_TEMPLATE.contains("\nmemory_facts_cap: null"));
         assert!(CONFIG_TEMPLATE.contains("\nmemory_drill_cap: null"));
+        assert!(CONFIG_TEMPLATE.contains(&facts_default));
+        assert!(CONFIG_TEMPLATE.contains(&drill_default));
         assert!(CONFIG_TEMPLATE.contains("facts first, then the drill-file catalogue"));
         assert!(CONFIG_TEMPLATE.contains("Old key memory_cap_with_tools still loads"));
         assert!(CONFIG_TEMPLATE.contains("the facts section counts against it"));
@@ -1530,6 +1534,8 @@ clients:
         let example = include_str!("../../config.example.yaml");
         assert!(example.contains("\nmemory_facts_cap: null"));
         assert!(example.contains("\nmemory_drill_cap: null"));
+        assert!(example.contains(&facts_default));
+        assert!(example.contains(&drill_default));
         assert!(example.contains("facts first, then the drill-file catalogue"));
         assert!(example.contains("Old key memory_cap_with_tools still loads"));
         assert!(example.contains("the facts section counts against it"));
