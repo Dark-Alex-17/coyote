@@ -4,9 +4,12 @@ The interop half of the mesh conformance suite (`src/mesh/conformance/interop.rs
 test spawns the pinned Python Reticulum/LXMF reference as a subprocess, joins this crate's
 node to it as a TCP client (the production `rnsd` relay topology) and proves the two agree
 on the wire: announce filing, request replies, message delivery and store-and-forward
-through a real LXMF propagation node. The vectors half, which needs nothing but Rust, lives
-next to it in the `*_vectors.rs` modules of that directory (and, for the REPL's attachment
-rules, in `src/repl/mesh_share_vectors.rs`).
+through a real LXMF propagation node. One case spawns the pinned `rnsd` itself instead and
+attaches two of this crate's nodes to it as `local` shared-instance clients: a knock lands
+through it, both rows follow it down when it is killed and back when it is restarted. The
+vectors half, which needs nothing but Rust, lives next to it in the `*_vectors.rs` modules
+of that directory (and, for the REPL's attachment rules, in
+`src/repl/mesh_share_vectors.rs`).
 
 ## Pins
 
@@ -25,7 +28,7 @@ Linux run of row 1 are covered by the `Mesh Interop` CI job), with the Rust side
 
 | Invocation | Result |
 |---|---|
-| `COYOTE_MESH_INTEROP=1 cargo test --all mesh::conformance -- --include-ignored` (vectors + interop) | 75 passed, 0 ignored |
+| `COYOTE_MESH_INTEROP=1 cargo test --all mesh::conformance -- --include-ignored` (vectors + interop) | 76 passed, 0 ignored |
 | `cargo test --all mesh::fuzz` | 21 passed |
 | `cargo test --all --no-fail-fast` | 7145 passed, 0 failed, 15 ignored in the unit binary; 535 passed, 1 ignored across the integration binaries |
 
