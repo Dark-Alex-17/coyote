@@ -427,11 +427,9 @@ fn plan_interfaces(interfaces: &[MeshInterface]) -> Vec<InterfacePlan> {
 
 enum JoinedInterface {
     Lan {
-        host_iface: AddressHash,
         runtime: AutoDiscoveryRuntime,
     },
-    /// The shared-instance client; the transport holds it and only
-    /// `detach_shared_instance` stops it.
+    /// The shared-instance client; the transport holds it and stops it with the rest.
     Local {
         label: String,
         endpoint: LocalEndpoint,
@@ -1729,15 +1727,16 @@ impl MeshRuntime {
         Ok(())
     }
 
-    /// Cancels and joins the node's tasks, stops the interfaces, drops the transport,
-    /// waits for the request handlers it aborted to be gone and releases the instance and
+    /// Cancels and joins the node's tasks, stops the transport with its interfaces, waits
+    /// for the request handlers it aborted to be gone and releases the instance and
     /// identity locks, in that order so nothing outlives what it depends on: a handler
     /// still winding down may settle a reply against files the locks guard. A settled
     /// resource reply's transfer confirmation runs on a detached task outside the handler
     /// slot, so the drain does not cover it; it only touches the settlement, whose store
     /// has its own lock, and the same holds for the blocking drop of an unsent settlement,
     /// which the slot leaves behind the same way. The task joins share one grace window
-    /// and the transport teardown another.
+    /// and, after the transport's own stop budget, the client joins and the handler drain
+    /// another.
     async fn shutdown(&self) -> Result<()> {
         self.cancel.cancel();
         let tasks = std::mem::take(&mut *self.tasks.lock());
@@ -1757,23 +1756,8 @@ impl MeshRuntime {
         let Some(transport) = self.transport.lock().await.take() else {
             return Ok(());
         };
-        // The deadline is shared so a stalled transport costs one grace window, not one
-        // per step.
         let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
-        for iface in interfaces {
-            stop_interface(&transport, iface, deadline).await;
-        }
-        if timeout_at(deadline, transport.deregister_destination(&state.hash))
-            .await
-            .is_err()
-        {
-            warn!(
-                "Mesh destination {} could not be deregistered within {}s; dropping the transport",
-                short(&state.hash.to_hex_string()),
-                SHUTDOWN_GRACE.as_secs()
-            );
-        }
-        drop(transport);
+        stop_transport(transport, interfaces, deadline).await;
         drain_request_handlers(&self.request_handler, deadline).await;
         state.lock = None;
         *self.identity_lock.lock() = None;
@@ -1959,11 +1943,11 @@ pub(crate) fn fail_next_announce_of(hash: AddressHash) {
 pub(crate) static DRAINED_ON_ABANDON: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// Unwinds a start that failed once the transport existed: the joined interfaces are
-/// stopped, the transport goes with them, which cancels its own tasks and aborts the
-/// request handlers of any destination it came to hold, and those handlers are waited for
-/// under the same deadline before the caller releases the locks they may still touch. A
-/// handler nothing ran on drains at once, so every arm with a handler in hand passes it;
+/// Unwinds a start that failed once the transport existed: the transport is stopped with
+/// the joined interfaces, which cancels its own tasks and aborts the request handlers of
+/// any destination it came to hold, and those handlers are waited for under the same
+/// deadline before the caller releases the locks they may still touch. A handler nothing
+/// ran on drains at once, so every arm with a handler in hand passes it;
 /// `request_handler` is `None` only before one exists.
 async fn abandon_start(
     transport: Arc<Transport>,
@@ -1971,10 +1955,7 @@ async fn abandon_start(
     request_handler: Option<&Arc<LibraryHandler>>,
 ) {
     let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
-    for iface in joined {
-        stop_interface(&transport, iface, deadline).await;
-    }
-    drop(transport);
+    stop_transport(transport, joined, deadline).await;
     if let Some(handler) = request_handler {
         drain_request_handlers(handler, deadline).await;
         #[cfg(all(test, unix))]
@@ -2067,10 +2048,7 @@ async fn join_lan(transport: &Transport) -> Joined {
         .spawn_discovery_runtime_with_native_scope_ids_and_transport(Some(bridge), None)
         .await
     {
-        Ok(runtime) => Joined::Connected(JoinedInterface::Lan {
-            host_iface,
-            runtime,
-        }),
+        Ok(runtime) => Joined::Connected(JoinedInterface::Lan { runtime }),
         Err(err) => {
             detach_interface(
                 transport,
@@ -2248,57 +2226,42 @@ async fn detach_interface(
     true
 }
 
-/// Detaches one interface, giving up at `deadline` on every wait against the transport.
-async fn stop_interface(
-    transport: &Transport,
-    iface: JoinedInterface,
+/// Stops `transport` with every interface joined to it. The LAN discovery runtime is
+/// Coyote's own and goes first; `Transport::stop` then detaches every interface, which
+/// also cancels the TCP client tasks Coyote spawned, and those are joined under
+/// `deadline` since the transport's own wait does not cover them.
+async fn stop_transport(
+    transport: Arc<Transport>,
+    interfaces: Vec<JoinedInterface>,
     deadline: tokio::time::Instant,
 ) {
-    match iface {
-        JoinedInterface::Lan {
-            host_iface,
-            runtime,
-        } => {
-            runtime.stop().await;
-            if detach_interface(transport, host_iface, "lan", deadline).await {
-                debug!("Left mesh interface lan");
+    let mut left = Vec::with_capacity(interfaces.len());
+    let mut clients = Vec::new();
+    for iface in interfaces {
+        match iface {
+            JoinedInterface::Lan { runtime, .. } => {
+                runtime.stop().await;
+                left.push("lan".to_string());
             }
+            JoinedInterface::Local { label, .. } => left.push(label),
+            JoinedInterface::Tcp { handle, label, .. } => clients.push((handle, label)),
         }
-        // Dropping the transport cancels its own tasks but not the shared-instance
-        // client, which runs under its own stop token until detached.
-        JoinedInterface::Local { label, .. } => {
-            if timeout_at(deadline, transport.detach_shared_instance())
-                .await
-                .is_err()
-            {
-                warn!(
-                    "Mesh interface {label} could not be detached from the transport within {}s",
-                    SHUTDOWN_GRACE.as_secs()
-                );
-                return;
-            }
-            debug!("Left mesh interface {label}");
+    }
+    transport.stop().await;
+    drop(transport);
+    for label in left {
+        debug!("Left mesh interface {label}");
+    }
+    for (mut handle, label) in clients {
+        if timeout_at(deadline, &mut handle).await.is_err() {
+            handle.abort();
+            warn!(
+                "Mesh interface {label} did not stop within {}s; aborted it",
+                SHUTDOWN_GRACE.as_secs()
+            );
+            continue;
         }
-        JoinedInterface::Tcp {
-            hash,
-            mut handle,
-            label,
-            ..
-        } => {
-            if !detach_interface(transport, hash, &label, deadline).await {
-                handle.abort();
-                return;
-            }
-            if timeout_at(deadline, &mut handle).await.is_err() {
-                handle.abort();
-                warn!(
-                    "Mesh interface {label} did not stop within {}s; aborted it",
-                    SHUTDOWN_GRACE.as_secs()
-                );
-                return;
-            }
-            debug!("Left mesh interface {label}");
-        }
+        debug!("Left mesh interface {label}");
     }
 }
 
