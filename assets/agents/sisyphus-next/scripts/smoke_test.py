@@ -501,7 +501,6 @@ check("entry: route_coder_result with null result -> strike, no crash", code == 
 code, out = run_entry("explore_fault", {"slice": "s"})
 check("entry: explore_fault branch fallback", code == 0 and out["finding"].startswith("PIPELINE-FAULT"))
 
-failed = [n for n, ok, _ in RESULTS if not ok]
 # --- A10 conformance: ci_gate harvests (added post-review) ---
 u = gates.ci_gate({"git_report": "ok\nANOMALY: commits I did not make\n", "git_task": {"return_to": "final_report"}, "run_dir": TMP, "anomalies_log": []})
 check("ci_gate: ANOMALY: lines harvested from git_report", any("commits I did not make" in e for e in u.get("anomalies_log", [])))
@@ -510,6 +509,7 @@ check("ci_gate: inbox-final schema anomalies harvested through git_ops", any("in
 u = gates.ci_gate({"git_report": "clean exit 0", "git_task": {"kind": "flip_ready"}, "run_dir": TMP, "anomalies_log": []})
 check("ci_gate: clean case adds nothing", u.get("anomalies_log", []) == [] and u["_next"] == "final_report")
 
+failed = [n for n, ok, _ in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")
 shutil.rmtree(TMP, ignore_errors=True)
 sys.exit(1 if failed else 0)

@@ -34,6 +34,7 @@ below. Later landings add their own rows (grammar reconciliation, fast-path re-e
 | `build_lock` variable | `graph.yaml` `variables:` | declared after `escalation_policy` with default `''`, mirroring the prose `sisyphus/config.yaml`; `scripts/check_session_block.sh` asserts the two variable lists match name-for-name, default-for-default (threading it to child spawns is a separate adjustment) |
 | run dir | `scripts/_lib.py` `cache_dir()` / `runs_root()`, this README | moved from `$XDG_STATE_HOME/coyote/sisyphus/runs` to `<cache dir>/sisyphus-next/runs` (precedence above); `scripts/smoke_test.py` pins each resolution tier |
 | dead state read | `scripts/gates.py` `triage_route` | dropped the read of `debris_exemptions_new`, a key no node writes (the `triage_findings` schema emits `debris_exemptions`); the repo's bundled-graph walker requires a declared writer for every consumed key |
+| smoke summary | `scripts/smoke_test.py` | the failure tally is taken after the last check so the summary line and exit code cover every check (the three `ci_gate` checks were recorded after it) |
 
 Recorded `diff -r` census against the staging tree (files that differ, hunks per file):
 
