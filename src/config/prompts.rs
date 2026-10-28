@@ -288,6 +288,27 @@ mod tests {
     }
 
     #[test]
+    fn durable_facts_rules_keep_their_order_ahead_of_the_edit_rules() {
+        let offsets = [
+            "Write only durable, reusable, cross-session facts",
+            "give it `type: run-state` with an `expires` date",
+            "look for an existing slug to update",
+            "one search-index line of at most 160 chars",
+            "All MEMORY.md edits MUST go through",
+        ]
+        .map(|needle| {
+            DEFAULT_MEMORY_INSTRUCTIONS
+                .find(needle)
+                .unwrap_or_else(|| panic!("memory rules must contain {needle:?}"))
+        });
+        assert!(
+            offsets.windows(2).all(|pair| pair[0] < pair[1]),
+            "{offsets:?}"
+        );
+        assert!(!DEFAULT_MEMORY_INSTRUCTIONS_READONLY.contains("memory content shown above"));
+    }
+
+    #[test]
     fn description_cap_rule_tracks_the_const() {
         assert!(DEFAULT_MEMORY_INSTRUCTIONS.contains(&format!(
             "at most {} chars",
