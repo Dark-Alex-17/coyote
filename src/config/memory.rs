@@ -24,12 +24,16 @@ pub static CATALOGUE_LINE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^- \[\[(?P<slug>[A-Za-z0-9_.-]+)\]\]:\s*(?P<desc>.*)$").unwrap());
 
 pub fn catalogue_slug(line: &str) -> Option<&str> {
-    CATALOGUE_LINE_RE
-        .captures(line)
-        .ok()
-        .flatten()
-        .and_then(|caps| caps.name("slug"))
-        .map(|m| m.as_str())
+    catalogue_entry(line).map(|(slug, _)| slug)
+}
+
+/// The `(slug, description)` of a catalogue line; `None` for any other line.
+pub fn catalogue_entry(line: &str) -> Option<(&str, &str)> {
+    let caps = CATALOGUE_LINE_RE.captures(line).ok().flatten()?;
+    Some((
+        caps.name("slug")?.as_str(),
+        caps.name("desc")?.as_str().trim(),
+    ))
 }
 
 #[derive(Debug, Clone)]

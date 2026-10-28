@@ -13,8 +13,8 @@ use super::{FunctionDeclaration, JsonSchema};
 use crate::config::RequestContext;
 use crate::config::memory::{
     DEFAULT_MEMORY_RUN_STATE_TTL_DAYS, KindField, MemoryFile, MemoryFrontmatter, MemoryKind,
-    MemoryStore, Retention, WorkspaceMemory, bootstrap_workspace_memory, catalogue_slug,
-    find_git_root, today_string,
+    MemoryStore, Retention, WorkspaceMemory, bootstrap_workspace_memory, catalogue_entry,
+    catalogue_slug, find_git_root, today_string,
 };
 use crate::config::paths;
 
@@ -671,19 +671,13 @@ fn ensure_index_entry(index_path: &Path, name: &str, description: &str) -> Resul
     Ok(true)
 }
 
-fn line_references(line: &str, name: &str) -> bool {
-    let file_name = format!("{name}.md");
-    line.split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_' || c == '.'))
-        .any(|token| token == file_name || token.trim_matches('.') == name)
-}
-
 fn remove_index_entry(index_path: &Path, name: &str) -> Result<bool> {
     let Ok(existing) = fs::read_to_string(index_path) else {
         return Ok(false);
     };
     let kept: Vec<&str> = existing
         .lines()
-        .filter(|line| !line_references(line, name))
+        .filter(|line| catalogue_slug(line) != Some(name))
         .collect();
     let mut new_content = kept.join("\n");
 
@@ -903,12 +897,9 @@ fn lint_memory(store: &MemoryStore) -> Result<Value> {
 }
 
 fn index_description(index: &str, name: &str) -> Option<String> {
-    let marker = format!("[[{name}]]");
     index.lines().find_map(|line| {
-        let pos = line.find(&marker)?;
-        let rest = line[pos + marker.len()..].trim_start();
-        let desc = rest.strip_prefix(':')?.trim();
-        (!desc.is_empty()).then(|| desc.to_string())
+        let (slug, desc) = catalogue_entry(line)?;
+        (slug == name && !desc.is_empty()).then(|| desc.to_string())
     })
 }
 
@@ -1213,14 +1204,25 @@ mod tests {
     }
 
     #[test]
-    fn line_references_requires_exact_token_match() {
-        assert!(line_references("- [[auth]]: description", "auth"));
-        assert!(line_references("- auth.md is here", "auth"));
-        assert!(line_references("- referenced", "referenced"));
-        assert!(line_references("see auth.", "auth"));
-        assert!(!line_references("- [[auth-flow]]: description", "auth"));
-        assert!(!line_references("- oauth.md legacy", "auth"));
-        assert!(!line_references("- preauth notes", "auth"));
+    fn remove_index_entry_leaves_lines_that_only_cite_the_slug() {
+        let root = temp_root("index_remove_strict");
+        let index = root.join("MEMORY.md");
+        fs::write(
+            &index,
+            "# Memory Index\n\n- Run auth.md checks before [[auth]] lands\n- [[auth-flow]]: sibling\n- [[auth]]: the file\n",
+        )
+        .unwrap();
+
+        assert!(remove_index_entry(&index, "auth").unwrap());
+        let content = fs::read_to_string(&index).unwrap();
+        assert!(
+            content.contains("- Run auth.md checks before [[auth]] lands\n"),
+            "{content}"
+        );
+        assert!(content.contains("- [[auth-flow]]: sibling\n"));
+        assert!(!content.contains("- [[auth]]: the file"));
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1908,6 +1910,41 @@ mod tests {
 
         let report = lint_memory(&store).unwrap();
         assert!(report["orphans"].as_array().unwrap().is_empty(), "{report}");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn delete_memory_keeps_a_facts_line_that_cites_the_deleted_slug() {
+        let root = temp_root("delete_cited_slug");
+        let (store, workspace, structured) = workspace_store(
+            &root,
+            "# Index\n\n## FACTS\n- See [[cited]]: it explains the gate\n\n- [[cited]]: what cited means\n",
+        );
+        fs::write(
+            structured.join("cited.md"),
+            "---\nname: cited\ndescription: the real description\n---\nx\n",
+        )
+        .unwrap();
+
+        let report = lint_memory(&store).unwrap();
+        let drift = report["description_drift"].as_array().unwrap();
+        assert_eq!(drift.len(), 1, "{report}");
+        assert_eq!(drift[0]["index_description"], "what cited means");
+
+        let result = delete_memory(
+            &store,
+            &workspace,
+            &json!({"name": "cited", "scope": "workspace"}),
+        )
+        .unwrap();
+        assert_eq!(result["index_updated"], true, "{result}");
+        let index = fs::read_to_string(structured.join("MEMORY.md")).unwrap();
+        assert!(
+            index.contains("- See [[cited]]: it explains the gate\n"),
+            "{index}"
+        );
+        assert!(!index.contains("- [[cited]]: what cited means"), "{index}");
 
         let _ = fs::remove_dir_all(&root);
     }
