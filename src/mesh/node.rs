@@ -12796,8 +12796,7 @@ mod tests {
         let before = debug_snapshot().len();
 
         relay.stop().await;
-        let relay = TransportRelay::start_on(port).await;
-        let mut announces = relay.announces().await;
+        let (relay, mut announces) = TransportRelay::start_on_subscribed(port).await;
         TransportRelay::heard_from(&mut announces, &a.hash).await;
         TransportRelay::heard_from(&mut announces, &b.hash).await;
         let line = format!("{label} reconnected; announced");
@@ -13035,8 +13034,7 @@ mod tests {
         sleep(CONNECT_WATCH_TICK * 2).await;
         assert_eq!(announces_since(before, &hash8), 0);
 
-        let relay_b = TransportRelay::start_on(late_port).await;
-        let mut heard = relay_b.announces().await;
+        let (relay_b, mut heard) = TransportRelay::start_on_subscribed(late_port).await;
         wait_for_mesh_line(&notifier, &format!("{late_label} connected")).await;
         TransportRelay::heard_from(&mut heard, &hash).await;
         sleep(CONNECT_WATCH_TICK * 3).await;
@@ -13051,8 +13049,7 @@ mod tests {
         sleep(Duration::from_millis(2500)).await;
 
         relay_b.stop().await;
-        let relay_b = TransportRelay::start_on(late_port).await;
-        let mut heard = relay_b.announces().await;
+        let (relay_b, mut heard) = TransportRelay::start_on_subscribed(late_port).await;
         wait_for_mesh_line(&notifier, &format!("{late_label} reconnected; announced")).await;
         TransportRelay::heard_from(&mut heard, &hash).await;
         sleep(CONNECT_WATCH_TICK * 3).await;

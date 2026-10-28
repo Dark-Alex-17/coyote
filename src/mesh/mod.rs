@@ -584,6 +584,15 @@ pub(crate) mod test_support {
             Self::start_on_with_retries(port, 4).await
         }
 
+        /// `start_on` with a subscription to the relay's announces taken before it
+        /// listens: a node whose client is redialing the port announces as soon as the
+        /// bind answers, which can be before `start_on` has returned.
+        pub(crate) async fn start_on_subscribed(
+            port: u16,
+        ) -> (Self, broadcast::Receiver<AnnounceEvent>) {
+            Self::start_on_with_retries_subscribed(port, 4).await
+        }
+
         /// How many times the first bind is retried while the port reads as in use.
         const BIND_RETRIES: usize = 10;
         /// The pause between two of those attempts.
@@ -594,11 +603,21 @@ pub(crate) mod test_support {
         /// learns an earlier announce only from the relay's answer to its own path
         /// request.
         pub(crate) async fn start_on_with_retries(port: u16, retries: u8) -> Self {
+            Self::start_on_with_retries_subscribed(port, retries)
+                .await
+                .0
+        }
+
+        async fn start_on_with_retries_subscribed(
+            port: u16,
+            retries: u8,
+        ) -> (Self, broadcast::Receiver<AnnounceEvent>) {
             let mut config =
                 TransportConfig::new("relay", &TransportIdentity::new_from_rand(OsRng), false);
             config.set_transport_enabled(true);
             config.set_announce_retry_limit(retries);
             let transport = Arc::new(Transport::new(config));
+            let announces = transport.recv_announces().await;
             let mut attempt = 1;
             let (iface, status) = loop {
                 let (tcp, first_bind) =
@@ -637,11 +656,14 @@ pub(crate) mod test_support {
                 status.to_json()["listener_state"].as_str() == Some("listening")
             })
             .await;
-            Self {
-                transport,
-                iface,
-                port,
-            }
+            (
+                Self {
+                    transport,
+                    iface,
+                    port,
+                },
+                announces,
+            )
         }
 
         /// A subscription to the announces the relay hears, taken before the event a
