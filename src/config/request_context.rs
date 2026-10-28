@@ -3049,6 +3049,7 @@ impl RequestContext {
                 "memory_run_state_ttl_days",
                 super::format_option_value(&app.memory_run_state_ttl_days),
             ),
+            ("memory_round_chains", app.memory_round_chains.to_string()),
             (
                 "workspace_instructions",
                 super::format_option_value(&app.workspace_instructions),

@@ -10,13 +10,13 @@ use log::warn;
 use serde_json::{Value, json};
 
 use super::{FunctionDeclaration, JsonSchema};
-use crate::config::RequestContext;
 use crate::config::memory::{
     DEFAULT_MEMORY_RUN_STATE_TTL_DAYS, KindField, MEMORY_DESCRIPTION_CAP, MEMORY_FILE_HARD_CAP,
     MemoryFile, MemoryFrontmatter, MemoryKind, MemoryStore, Retention, WorkspaceMemory,
     bootstrap_workspace_memory, catalogue_entry, catalogue_slug, find_git_root, today_string,
 };
 use crate::config::paths;
+use crate::config::{RequestContext, RoundChains};
 
 pub const MEMORY_FUNCTION_PREFIX: &str = "memory__";
 
@@ -332,6 +332,7 @@ pub fn handle_memory_tool(ctx: &mut RequestContext, cmd_name: &str, args: &Value
         .config
         .memory_run_state_ttl_days
         .unwrap_or(DEFAULT_MEMORY_RUN_STATE_TTL_DAYS);
+    let round_chains = ctx.app.config.memory_round_chains;
 
     match action {
         "read" => {
@@ -360,7 +361,7 @@ pub fn handle_memory_tool(ctx: &mut RequestContext, cmd_name: &str, args: &Value
                 "workspace": store.workspace.as_ref().map(workspace_label),
             }))
         }
-        "write" => write_memory(&store, &cwd, args, run_state_ttl_days),
+        "write" => write_memory(&store, &cwd, args, run_state_ttl_days, round_chains),
         "rename" => rename_memory(&store, &cwd, args),
         "delete" => delete_memory(&store, &cwd, args),
         "edit_index" => {
@@ -414,6 +415,7 @@ fn write_memory(
     cwd: &Path,
     args: &Value,
     run_state_ttl_days: u32,
+    round_chains: RoundChains,
 ) -> Result<Value> {
     if let Some(report) = missing_write_args(args) {
         warn!("memory__write refused: {report}");
@@ -497,14 +499,26 @@ fn write_memory(
     let index_path = target_dir.join("MEMORY.md");
     let index_updated = ensure_index_entry(&index_path, &name, &description)?;
 
-    Ok(json!({
+    let mut result = json!({
         "status": "ok",
         "path": file.path.display().to_string(),
         "index_path": index_path.display().to_string(),
         "index_updated": index_updated,
         "replaced": previous.is_some(),
         "previous_description": previous.and_then(|p| p.frontmatter.description),
-    }))
+    });
+    if let Some((base, round)) = round_chain_name(&name) {
+        result["siblings"] = Value::Array(settle_round_siblings(
+            &target_dir,
+            base,
+            round,
+            &name,
+            round_chains,
+        )?);
+        result["round_chain"] = json!({"base": base, "round": round});
+    }
+
+    Ok(result)
 }
 
 fn validate_slug(what: &str, name: &str) -> Result<()> {
@@ -521,6 +535,69 @@ fn validate_slug(what: &str, name: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Splits `<base>-r<N>` into `(base, N)`; any other shape is not a round name.
+fn round_chain_name(name: &str) -> Option<(&str, u32)> {
+    let (base, digits) = name.rsplit_once("-r")?;
+    if base.is_empty() || digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((base, digits.parse().ok()?))
+}
+
+/// The older rounds of `base` in `dir`, in round order, each after any
+/// supersede update. Only this directory is scanned: a chain never crosses scopes.
+fn settle_round_siblings(
+    dir: &Path,
+    base: &str,
+    round: u32,
+    successor: &str,
+    round_chains: RoundChains,
+) -> Result<Vec<Value>> {
+    let mut older = Vec::new();
+    for entry in fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if let Some((sibling_base, m)) = round_chain_name(stem)
+            && sibling_base == base
+            && m < round
+        {
+            older.push((m, stem.to_string(), path));
+        }
+    }
+    older.sort_by_key(|(m, _, _)| *m);
+
+    let today = today_string();
+    let mut siblings = Vec::new();
+    for (_, stem, path) in older {
+        let mut file = match MemoryFile::load(&path) {
+            Ok(file) => file,
+            Err(e) => {
+                warn!("skip malformed memory file {}: {}", path.display(), e);
+                continue;
+            }
+        };
+        if round_chains == RoundChains::Supersede && file.frontmatter.superseded_by.is_none() {
+            file.frontmatter.superseded_by = Some(successor.to_string());
+            file.frontmatter.updated = Some(today.clone());
+            if !file.frontmatter.kind.is_known() {
+                file.frontmatter.kind = MemoryKind::RunState.into();
+            }
+            file.save()?;
+        }
+        siblings.push(json!({
+            "name": stem,
+            "superseded_by": file.frontmatter.superseded_by,
+        }));
+    }
+
+    Ok(siblings)
 }
 
 fn rename_memory(store: &MemoryStore, cwd: &Path, args: &Value) -> Result<Value> {
@@ -1543,6 +1620,7 @@ mod tests {
             &workspace,
             &first,
             DEFAULT_MEMORY_RUN_STATE_TTL_DAYS,
+            RoundChains::default(),
         )
         .unwrap();
         let after = today_string();
@@ -1570,6 +1648,7 @@ mod tests {
             &workspace,
             &second,
             DEFAULT_MEMORY_RUN_STATE_TTL_DAYS,
+            RoundChains::default(),
         )
         .unwrap();
         assert_eq!(result["replaced"], true);
@@ -1609,6 +1688,7 @@ mod tests {
             &workspace,
             &missing_description,
             DEFAULT_MEMORY_RUN_STATE_TTL_DAYS,
+            RoundChains::default(),
         )
         .unwrap_err();
         let text = err.to_string();
@@ -1638,6 +1718,7 @@ mod tests {
             &workspace,
             &scope_buried_in_content,
             DEFAULT_MEMORY_RUN_STATE_TTL_DAYS,
+            RoundChains::default(),
         )
         .unwrap_err();
         let text = err.to_string();
@@ -1658,6 +1739,7 @@ mod tests {
             &workspace,
             &everything_missing,
             DEFAULT_MEMORY_RUN_STATE_TTL_DAYS,
+            RoundChains::default(),
         )
         .unwrap_err();
         let text = err.to_string();
@@ -1680,6 +1762,7 @@ mod tests {
             &workspace,
             &front_matter_in_content,
             DEFAULT_MEMORY_RUN_STATE_TTL_DAYS,
+            RoundChains::default(),
         )
         .unwrap_err();
         let text = err.to_string();
@@ -1704,6 +1787,7 @@ mod tests {
             &workspace,
             &body_only,
             DEFAULT_MEMORY_RUN_STATE_TTL_DAYS,
+            RoundChains::default(),
         )
         .unwrap();
         let saved = MemoryFile::load(&structured.join("fact.md")).unwrap();
@@ -1847,7 +1931,7 @@ mod tests {
             "scope": "workspace",
             "type": "run-state",
         });
-        write_memory(&store, &workspace, &scratch, 3).unwrap();
+        write_memory(&store, &workspace, &scratch, 3, RoundChains::default()).unwrap();
         let saved = MemoryFile::load(&structured.join("scratch.md")).unwrap();
         assert_eq!(saved.frontmatter.kind.kind(), MemoryKind::RunState);
         assert_eq!(
@@ -1866,7 +1950,7 @@ mod tests {
             "type": "run-state",
             "expires": "2999-01-01",
         });
-        write_memory(&store, &workspace, &pinned, 3).unwrap();
+        write_memory(&store, &workspace, &pinned, 3, RoundChains::default()).unwrap();
         let saved = MemoryFile::load(&structured.join("pinned.md")).unwrap();
         assert_eq!(saved.frontmatter.expires.as_deref(), Some("2999-01-01"));
 
@@ -1876,7 +1960,7 @@ mod tests {
             "content": "x",
             "scope": "workspace",
         });
-        write_memory(&store, &workspace, &durable, 3).unwrap();
+        write_memory(&store, &workspace, &durable, 3, RoundChains::default()).unwrap();
         let saved = MemoryFile::load(&structured.join("durable.md")).unwrap();
         assert_eq!(saved.frontmatter.expires, None);
         assert!(saved.frontmatter.kind.raw_kind().is_null());
@@ -1903,6 +1987,7 @@ mod tests {
             &workspace,
             &bogus,
             DEFAULT_MEMORY_RUN_STATE_TTL_DAYS,
+            RoundChains::default(),
         )
         .unwrap_err();
         let text = err.to_string();
@@ -1939,7 +2024,13 @@ mod tests {
                 "scope": "workspace",
                 "expires": expires,
             });
-            write_memory(&store, &workspace, &args, DEFAULT_MEMORY_RUN_STATE_TTL_DAYS)
+            write_memory(
+                &store,
+                &workspace,
+                &args,
+                DEFAULT_MEMORY_RUN_STATE_TTL_DAYS,
+                RoundChains::default(),
+            )
         };
 
         for bad in ["tomorrow", "03/15/2026", "2026-1-5", "2026-02-30", ""] {
@@ -2034,7 +2125,7 @@ mod tests {
             "dots.too",
         ] {
             let args = write_args(bad, "d", "x");
-            let text = write_memory(&store, &workspace, &args, 3)
+            let text = write_memory(&store, &workspace, &args, 3, RoundChains::default())
                 .unwrap_err()
                 .to_string();
             assert!(
@@ -2049,8 +2140,22 @@ mod tests {
         );
 
         let longest = "b".repeat(64);
-        write_memory(&store, &workspace, &write_args(&longest, "d", "x"), 3).unwrap();
-        write_memory(&store, &workspace, &write_args("7_ok-slug", "d", "x"), 3).unwrap();
+        write_memory(
+            &store,
+            &workspace,
+            &write_args(&longest, "d", "x"),
+            3,
+            RoundChains::default(),
+        )
+        .unwrap();
+        write_memory(
+            &store,
+            &workspace,
+            &write_args("7_ok-slug", "d", "x"),
+            3,
+            RoundChains::default(),
+        )
+        .unwrap();
         assert_eq!(
             md_files(&structured),
             vec!["7_ok-slug.md".to_string(), format!("{longest}.md")]
@@ -2064,7 +2169,7 @@ mod tests {
         let root = temp_root("write_caps");
         let (store, workspace, structured) = workspace_store(&root, "# Memory Index\n");
         let refuse = |args: Value| {
-            let text = write_memory(&store, &workspace, &args, 3)
+            let text = write_memory(&store, &workspace, &args, 3, RoundChains::default())
                 .unwrap_err()
                 .to_string();
             assert!(md_files(&structured).is_empty(), "{text} wrote a file");
@@ -2084,7 +2189,7 @@ mod tests {
         );
 
         let at_cap = write_args("fact", &"d".repeat(160), &"x".repeat(4000));
-        write_memory(&store, &workspace, &at_cap, 3).unwrap();
+        write_memory(&store, &workspace, &at_cap, 3, RoundChains::default()).unwrap();
         let saved = MemoryFile::load(&structured.join("fact.md")).unwrap();
         assert_eq!(saved.char_len(), 4000);
 
@@ -2096,7 +2201,7 @@ mod tests {
         let root = temp_root("write_guard_order");
         let (store, workspace, structured) = workspace_store(&root, "# Memory Index\n");
         let refuse = |args: Value| {
-            write_memory(&store, &workspace, &args, 3)
+            write_memory(&store, &workspace, &args, 3, RoundChains::default())
                 .unwrap_err()
                 .to_string()
         };
@@ -2149,6 +2254,7 @@ mod tests {
             &workspace,
             &write_args("fact", "second take", "x"),
             3,
+            RoundChains::default(),
         )
         .unwrap();
         assert_eq!(result["index_updated"], true, "{result}");
@@ -2156,6 +2262,190 @@ mod tests {
             fs::read_to_string(structured.join("MEMORY.md")).unwrap(),
             "# Memory Index\n\n- [[before]]: b\n- [[fact]]: second take\n- [[after]]: a\n"
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn round_chain_name_splits_only_a_trailing_round_suffix() {
+        assert_eq!(round_chain_name("foo-r2"), Some(("foo", 2)));
+        assert_eq!(round_chain_name("foo-r1-r12"), Some(("foo-r1", 12)));
+        for plain in ["foo", "foo-r", "-r2", "foo-rx", "foo-r2x", "r2"] {
+            assert_eq!(round_chain_name(plain), None, "{plain}");
+        }
+    }
+
+    fn write_round(dir: &Path, name: &str, extra_frontmatter: &str) {
+        fs::write(
+            dir.join(format!("{name}.md")),
+            format!(
+                "---\nname: {name}\ndescription: {name} notes\ncreated: 2020-01-01\n\
+                 updated: 2020-01-01\n{extra_frontmatter}---\nold body\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn write_memory_supersedes_older_rounds_in_the_same_scope() {
+        let root = temp_root("write_round_supersede");
+        let (store, workspace, structured) = workspace_store(&root, "# Memory Index\n");
+        write_round(&structured, "foo-r0", "superseded_by: foo-r1\n");
+        write_round(&structured, "foo-r1", "");
+        write_round(&structured, "foo-r2", "type: user\n");
+        write_round(&structured, "foo-r4", "");
+        write_round(&structured, "foobar-r1", "");
+        let untouched_r4 = fs::read_to_string(structured.join("foo-r4.md")).unwrap();
+        let untouched_other = fs::read_to_string(structured.join("foobar-r1.md")).unwrap();
+
+        let result = write_memory(
+            &store,
+            &workspace,
+            &write_args("foo-r3", "round three", "new body"),
+            3,
+            RoundChains::Supersede,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result["round_chain"],
+            json!({"base": "foo", "round": 3}),
+            "{result}"
+        );
+        assert_eq!(
+            result["siblings"],
+            json!([
+                {"name": "foo-r0", "superseded_by": "foo-r1"},
+                {"name": "foo-r1", "superseded_by": "foo-r3"},
+                {"name": "foo-r2", "superseded_by": "foo-r3"},
+            ]),
+            "{result}"
+        );
+
+        let today = today_string();
+        let r1 = MemoryFile::load(&structured.join("foo-r1.md")).unwrap();
+        assert_eq!(r1.frontmatter.superseded_by.as_deref(), Some("foo-r3"));
+        assert_eq!(r1.frontmatter.created.as_deref(), Some("2020-01-01"));
+        assert_eq!(r1.frontmatter.updated.as_deref(), Some(today.as_str()));
+        assert_eq!(r1.frontmatter.kind.kind(), MemoryKind::RunState);
+        assert_eq!(r1.frontmatter.expires, None);
+        assert_eq!(r1.body, "old body\n");
+        let raw = fs::read_to_string(structured.join("foo-r1.md")).unwrap();
+        assert!(
+            raw.contains("\ntype: run-state\n") && !raw.contains("expires"),
+            "{raw}"
+        );
+
+        let r2 = MemoryFile::load(&structured.join("foo-r2.md")).unwrap();
+        assert_eq!(r2.frontmatter.superseded_by.as_deref(), Some("foo-r3"));
+        assert_eq!(r2.frontmatter.kind.kind(), MemoryKind::User);
+        assert_eq!(r2.frontmatter.updated.as_deref(), Some(today.as_str()));
+
+        let r0 = MemoryFile::load(&structured.join("foo-r0.md")).unwrap();
+        assert_eq!(r0.frontmatter.superseded_by.as_deref(), Some("foo-r1"));
+        assert_eq!(r0.frontmatter.updated.as_deref(), Some("2020-01-01"));
+
+        assert_eq!(
+            fs::read_to_string(structured.join("foo-r4.md")).unwrap(),
+            untouched_r4
+        );
+        assert_eq!(
+            fs::read_to_string(structured.join("foobar-r1.md")).unwrap(),
+            untouched_other
+        );
+
+        let written = fs::read_to_string(structured.join("foo-r3.md")).unwrap();
+        assert!(
+            written.contains("\ntype: null\n") && !written.contains("superseded_by"),
+            "the written file keeps its own defaulting: {written}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_memory_keeps_older_rounds_when_configured_to() {
+        let root = temp_root("write_round_keep");
+        let (store, workspace, structured) = workspace_store(&root, "# Memory Index\n");
+        write_round(&structured, "foo-r1", "");
+        let before = fs::read_to_string(structured.join("foo-r1.md")).unwrap();
+
+        let result = write_memory(
+            &store,
+            &workspace,
+            &write_args("foo-r2", "round two", "x"),
+            3,
+            RoundChains::Keep,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result["siblings"],
+            json!([{"name": "foo-r1", "superseded_by": null}]),
+            "{result}"
+        );
+        assert_eq!(result["round_chain"], json!({"base": "foo", "round": 2}));
+        assert_eq!(
+            fs::read_to_string(structured.join("foo-r1.md")).unwrap(),
+            before
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_memory_round_chains_never_cross_scopes() {
+        let root = temp_root("write_round_scopes");
+        let (store, workspace, _) = workspace_store(&root, "# Memory Index\n");
+        fs::create_dir_all(&store.global_dir).unwrap();
+        write_round(&store.global_dir, "foo-r1", "");
+        let before = fs::read_to_string(store.global_dir.join("foo-r1.md")).unwrap();
+
+        let result = write_memory(
+            &store,
+            &workspace,
+            &write_args("foo-r2", "round two", "x"),
+            3,
+            RoundChains::Supersede,
+        )
+        .unwrap();
+
+        assert_eq!(result["siblings"], json!([]), "{result}");
+        assert_eq!(result["round_chain"], json!({"base": "foo", "round": 2}));
+        assert_eq!(
+            fs::read_to_string(store.global_dir.join("foo-r1.md")).unwrap(),
+            before
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_memory_reports_a_round_chain_only_for_round_names() {
+        let root = temp_root("write_round_report");
+        let (store, workspace, _) = workspace_store(&root, "# Memory Index\n");
+
+        let first = write_memory(
+            &store,
+            &workspace,
+            &write_args("foo-r1", "round one", "x"),
+            3,
+            RoundChains::Supersede,
+        )
+        .unwrap();
+        assert_eq!(first["siblings"], json!([]), "{first}");
+        assert_eq!(first["round_chain"], json!({"base": "foo", "round": 1}));
+
+        let plain = write_memory(
+            &store,
+            &workspace,
+            &write_args("foo", "no round", "x"),
+            3,
+            RoundChains::Supersede,
+        )
+        .unwrap();
+        assert!(plain.get("siblings").is_none(), "{plain}");
+        assert!(plain.get("round_chain").is_none(), "{plain}");
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -2174,7 +2464,7 @@ mod tests {
             "content": "x",
             "scope": "workspace",
         });
-        let result = write_memory(&store, &workspace, &args, 3).unwrap();
+        let result = write_memory(&store, &workspace, &args, 3, RoundChains::default()).unwrap();
         assert_eq!(result["index_updated"], true);
         let index = fs::read_to_string(structured.join("MEMORY.md")).unwrap();
         assert!(index.contains("- Always run tests before [[cited]] lands\n"));

@@ -19,6 +19,7 @@ pub(crate) mod prompts;
 mod rag_cache;
 mod request_context;
 mod role;
+mod round_chains;
 mod session;
 mod skill;
 mod skill_policy;
@@ -64,6 +65,7 @@ pub use self::request_context::{
 pub use self::role::{
     CODE_ROLE, CREATE_TITLE_ROLE, EXPLAIN_SHELL_ROLE, INPUT_PLACEHOLDER, Role, RoleLike, SHELL_ROLE,
 };
+pub use self::round_chains::RoundChains;
 pub use self::session::{
     Session, SessionScope, TURN_INTERRUPTED_TEXT, labeled_session_names, session_scope_dirs,
 };
@@ -307,6 +309,7 @@ pub struct Config {
     pub memory_cap_with_tools: Option<usize>,
     pub memory_cap_without_tools: Option<usize>,
     pub memory_run_state_ttl_days: Option<u32>,
+    pub memory_round_chains: RoundChains,
 
     pub workspace_instructions: Option<bool>,
     pub workspace_instructions_files: Option<Vec<String>>,
@@ -402,6 +405,7 @@ impl Default for Config {
             memory_cap_with_tools: None,
             memory_cap_without_tools: None,
             memory_run_state_ttl_days: None,
+            memory_round_chains: RoundChains::default(),
 
             workspace_instructions: None,
             workspace_instructions_files: None,
@@ -1542,6 +1546,12 @@ clients:
     fn config_template_documents_memory_run_state_ttl() {
         assert!(CONFIG_TEMPLATE.contains("\nmemory_run_state_ttl_days: null"));
         assert!(CONFIG_TEMPLATE.contains("null = 14"));
+    }
+
+    #[test]
+    fn config_template_documents_memory_round_chains() {
+        assert!(CONFIG_TEMPLATE.contains("\nmemory_round_chains: supersede"));
+        assert!(CONFIG_TEMPLATE.contains("keep leaves them alone"));
     }
 
     #[test]

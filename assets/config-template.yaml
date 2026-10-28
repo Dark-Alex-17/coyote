@@ -215,6 +215,8 @@ memory_cap_without_tools: null   # Char cap when function calling is unavailable
                                  # then drill file bodies fill whatever budget is left.
 memory_run_state_ttl_days: null  # Days a `run-state` memory written without `expires` stays live (null = 14).
                                  # Expired and superseded files drop out of injection and memory__list.
+memory_round_chains: supersede   # What a write of <base>-r<N> does to older <base>-r<M> files in the same scope:
+                                 # supersede (default) marks them superseded_by, keep leaves them alone.
 
 # ---- Child Sessions ----
 # Every agent spawned with `agent__spawn` or `agent__task_create` gets a persisted session of its
