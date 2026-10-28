@@ -33,7 +33,7 @@ use crate::config::{
     install_builtins, list_agents, load_env_file, macro_execute, maybe_spawn_models_refresh,
     sync_models,
 };
-use crate::config::{memory, paths};
+use crate::config::{memory, memory_migrate, paths};
 use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail};
 use crate::mcp::McpServersConfig;
 use crate::render::{prompt_theme, render_error};
@@ -563,6 +563,10 @@ async fn run(
             memory::append_gitignore_entry(&git_root)?;
         }
         println!("✓ Created memory marker at '{}'.", path.display());
+        return Ok(());
+    }
+    if let Some(scope) = cli.memory_migrate {
+        print!("{}", memory_migrate::run(scope, cli.apply)?);
         return Ok(());
     }
     if cli.init_instructions {

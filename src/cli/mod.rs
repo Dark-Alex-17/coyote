@@ -4,7 +4,7 @@ use crate::cli::completer::{
     ShellCompletion, agent_completer, bundle_completer, macro_completer, mcp_server_completer,
     model_completer, rag_completer, role_completer, secrets_completer, session_completer,
 };
-use crate::config::{AssetCategory, InstallFilter, MemoryScope};
+use crate::config::{AssetCategory, InstallFilter, MemoryScope, MigrateScope};
 use anyhow::{Context, Result};
 use clap::{ArgGroup, ValueHint};
 use clap::{Parser, crate_authors, crate_description, crate_version};
@@ -50,7 +50,7 @@ pub enum McpScopeArg {
 			.conflicts_with_all([
 				"model", "temp_role", "role", "session", "agent", "rag", "rebuild_rag",
 				"macro_name", "execute", "code", "file", "no_stream", "no_memory",
-				"init_memory", "dry_run", "info", "build_tools", "install",
+				"init_memory", "memory_migrate", "apply", "dry_run", "info", "build_tools", "install",
 				"install_builtins", "sync_models", "list_models", "list_roles",
 				"list_sessions", "list_agents", "list_rags", "list_macros",
 				"list_skills", "list_bundles", "skill", "tail_logs", "completions",
@@ -131,6 +131,18 @@ pub struct Cli {
         help_heading = "Session & Memory"
     )]
     pub init_memory: Option<MemoryScope>,
+    /// Report what migrating the memory store to front-matter descriptions
+    /// would change; add --apply to back it up and rewrite it
+    #[arg(
+        long,
+        value_name = "SCOPE",
+        value_enum,
+        help_heading = "Session & Memory"
+    )]
+    pub memory_migrate: Option<MigrateScope>,
+    /// With --memory-migrate, back up each memory dir and write the changes
+    #[arg(long, requires = "memory_migrate", help_heading = "Session & Memory")]
+    pub apply: bool,
     /// Scaffold a COYOTE.md workspace instructions file in the current directory
     #[arg(long, help_heading = "Session & Memory")]
     pub init_instructions: bool,
@@ -640,6 +652,35 @@ mod tests {
             Cli::try_parse_from(["coyote", "--install-builtins", "agents", "--install", "x"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn parse_memory_migrate_takes_a_scope_and_an_optional_apply() {
+        let cli = parse(&["--memory-migrate", "all"]);
+        assert_eq!(cli.memory_migrate, Some(MigrateScope::All));
+        assert!(!cli.apply);
+        assert_eq!(
+            parse(&["--memory-migrate", "global", "--apply"]).memory_migrate,
+            Some(MigrateScope::Global)
+        );
+        assert!(parse(&["--memory-migrate", "workspace", "--apply"]).apply);
+        assert!(parse(&[]).memory_migrate.is_none());
+        assert!(Cli::try_parse_from(["coyote", "--apply"]).is_err());
+        assert!(Cli::try_parse_from(["coyote", "--memory-migrate"]).is_err());
+        assert!(Cli::try_parse_from(["coyote", "--memory-migrate", "both"]).is_err());
+        assert!(Cli::try_parse_from(["coyote", "--init-memory", "all"]).is_err());
+        assert!(Cli::try_parse_from(["coyote", "--sandbox", "--memory-migrate", "all"]).is_err());
+    }
+
+    #[test]
+    fn migrate_scope_value_names_are_pinned() {
+        use clap::ValueEnum;
+
+        let names: Vec<String> = MigrateScope::value_variants()
+            .iter()
+            .map(|v| v.to_possible_value().unwrap().get_name().to_string())
+            .collect();
+        assert_eq!(names, ["global", "workspace", "all"]);
     }
 
     #[test]
