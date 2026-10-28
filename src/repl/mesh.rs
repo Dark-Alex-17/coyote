@@ -17208,7 +17208,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     assert_eq!(runtime.interface_kinds(), vec!["private"]);
 
                     // rnsd (stood in for) starts answering at the endpoint.
-                    let stub = serve_as_sink_at(&endpoint, Some(socket)).await;
+                    let stub = serve_as_daemon_at(&endpoint, Some(socket)).await;
                     let info = wait_for_info_row(
                         &mut ctx,
                         1,
@@ -17240,7 +17240,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     assert_eq!(runtime.interface_kinds(), vec!["private"]);
 
                     // ... and comes back on the same endpoint.
-                    let stub = serve_as_sink_at(&endpoint, None).await;
+                    let stub = serve_as_daemon_at(&endpoint, None).await;
                     wait_for_info_row(
                         &mut ctx,
                         1,
@@ -17335,7 +17335,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             /// `serve_local_rnsd`, but the first TCP open listens on the socket the test has
             /// been holding (so nothing else took the port meanwhile); later opens bind fresh.
             #[cfg(unix)]
-            async fn serve_as_sink_at(
+            async fn serve_as_daemon_at(
                 endpoint: &LocalEndpoint,
                 held: Option<tokio::net::TcpSocket>,
             ) -> tokio::task::JoinHandle<()> {

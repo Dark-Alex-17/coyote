@@ -39,8 +39,9 @@ pub(crate) struct InboundRequest {
 
 /// What the handler answers with. `Silent` sends nothing, the way a `None` response does
 /// in RNS `Link.handle_request`. `Settled` is a value whose producer must hear whether it
-/// went out: `settlement.sent()` is called once the transport reports the reply
-/// delivered, and the settlement is dropped unsent on every other outcome.
+/// went out: `settlement.sent()` is called once the library reports the reply dispatched
+/// (a packet) or proven (a resource), and the settlement is dropped unsent on every other
+/// outcome.
 pub(crate) enum Reply {
     Value(Value),
     Code(RefusalCode),
@@ -219,6 +220,7 @@ impl LibraryHandler {
                     match outcome.await {
                         ResponseOutcome::Packet
                         | ResponseOutcome::Resource(OutboundResult::Complete) => settlement.sent(),
+                        // The two success variants are the exhaustive success set.
                         verdict => {
                             warn!(
                                 "Mesh response {request_id} on link {} did not complete: {verdict:?}",

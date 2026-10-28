@@ -3608,14 +3608,15 @@ mod tests {
 
     /// Every production compare of a typed address hash, of a destination against the one
     /// an identity derives, or of a presence holder or a `*_identity` hex string against
-    /// another identity, here and in message.rs, goes through `same_hash` or `ct_eq`, never
-    /// through `==` or `!=`. The holder of an instance is an identity hash wherever it is
-    /// compared, on the verdict rung that refuses a presenter and in the sweep a block runs
-    /// over the memos, so `holder` is a subject on its own. Keyed lookups of a hash the peer
-    /// already knows (the knock cache, the peer table) and the membership scans over the
-    /// user's own records bound to an identity (`knows_identity`, the sweeps an untrust or a
-    /// block runs) are not a timing boundary and stay ordinary compares, which is why the
-    /// bare `identity` operand of `entry.identity == identity` is not a subject.
+    /// another identity, here and in message.rs (which today holds none), goes through
+    /// `same_hash` or `ct_eq`, never through `==` or `!=`. The holder of an instance is an
+    /// identity hash wherever it is compared, on the verdict rung that refuses a presenter
+    /// and in the sweep a block runs over the memos, so `holder` is a subject on its own.
+    /// Keyed lookups of a hash the peer already knows (the knock cache, the peer table)
+    /// and the membership scans over the user's own records bound to an identity
+    /// (`knows_identity`, the sweeps an untrust or a block runs) are not a timing boundary
+    /// and stay ordinary compares, which is why the bare `identity` operand of
+    /// `entry.identity == identity` is not a subject.
     #[test]
     fn production_code_never_compares_hashes_with_the_equality_operators() {
         let sources = [

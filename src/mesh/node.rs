@@ -129,6 +129,9 @@ const LOCAL_EVENT_CAPACITY: usize = 16;
 /// How long the shared-instance client waits before redialing rnsd after a drop; the row
 /// reads `lost, retrying` until a redial lands.
 const LOCAL_RECONNECT_WAIT: Duration = Duration::from_secs(2);
+/// The reason a `local` row carries on the client's `Disconnected`: the client is the one
+/// that saw the socket close, and the event says nothing more.
+const LOCAL_DROP_REASON: &str = "rnsd closed the socket";
 /// Depth of the host channel a LAN interface feeds the transport through.
 const LAN_CHANNEL_CAPACITY: usize = 128;
 /// How often the peer table is written back if it changed; `stop` writes it regardless.
@@ -2853,6 +2856,8 @@ impl Watch {
                 endpoint,
                 events,
             } => {
+                // The start receiver is taken one-shot, the way `watch_interfaces` takes
+                // `tcp_events`: the first watcher is its only reader.
                 let events = events.lock().take();
                 Self::Local {
                     index: *index,
@@ -3217,7 +3222,7 @@ fn follow_local_event(
         }
         Some(SharedInstanceEvent::Disconnected) => {
             let state = InterfaceState::Disconnected {
-                reason: "rnsd closed the socket".to_string(),
+                reason: LOCAL_DROP_REASON.to_string(),
             };
             if runtime.mark_interface_state(index, state).is_some() {
                 warn!("Mesh interface {label} lost rnsd; the transport is redialing it");
@@ -3226,6 +3231,7 @@ fn follow_local_event(
         Some(SharedInstanceEvent::Connecting) => {
             debug!("Mesh interface {label} is dialing rnsd");
         }
+        // Guard for future variants.
         Some(other) => debug!("Mesh interface {label} reported {other:?}"),
     }
 }
@@ -12230,7 +12236,7 @@ mod tests {
         wait_for_state(&runtime, 1, "the local row to report the drop", |state| {
             *state
                 == InterfaceState::Disconnected {
-                    reason: "rnsd closed the socket".to_string(),
+                    reason: LOCAL_DROP_REASON.to_string(),
                 }
         })
         .await;
@@ -12241,7 +12247,7 @@ mod tests {
         assert_eq!(
             states_of(&runtime)[1].1,
             InterfaceState::Disconnected {
-                reason: "rnsd closed the socket".to_string(),
+                reason: LOCAL_DROP_REASON.to_string(),
             }
         );
 
