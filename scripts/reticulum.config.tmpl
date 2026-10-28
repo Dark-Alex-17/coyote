@@ -16,8 +16,15 @@ enable_transport = True
 # lower announce_rate_target here, nor default_ar_target in the [reticulum] section: team
 # relays and community nodes keep the default.
 
-# Shared instance left at the default so rnstatus and rnpath inside the container
-# attach to this daemon instead of binding 4242 again.
+# Every Coyote session in this container attaches to this daemon as a shared-instance
+# client (the shipped mesh.interfaces default, type: local), as do rnstatus and rnpath.
+# The three keys below are Reticulum's own defaults, written out so the contract is
+# visible: on Linux the shared instance is the abstract AF_UNIX socket rns/<instance_name>,
+# so instance_name is the key that matters and shared_instance_port is inert unless
+# shared_instance_type = tcp.
+share_instance = Yes
+shared_instance_port = 37428
+instance_name = default
 
 [logging]
 
@@ -34,7 +41,7 @@ loglevel = 4
     enabled = Yes
 
 #@end
-  # The loopback hop every Coyote session in this container dials.
+  # The TCP hop for a session configured with type: private at 127.0.0.1:4242; sessions in this container attach over the shared instance instead.
   [[Coyote Sessions]]
     type = TCPServerInterface
     enabled = Yes

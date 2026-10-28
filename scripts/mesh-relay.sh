@@ -6,7 +6,8 @@ set -euo pipefail
 # Installs rnsd, writes the Reticulum config once, in the directory rnsd reads
 # (/etc/reticulum, ~/.config/reticulum when it holds a config, else ~/.reticulum),
 # and registers a user service that keeps the daemon running; every Coyote
-# session on this host then dials it at 127.0.0.1:4242.
+# session on this host then attaches to its shared instance (the shipped
+# mesh.interfaces default, type: local).
 #
 # Usage examples:
 #   bash scripts/mesh-relay.sh
@@ -482,7 +483,9 @@ interfaces_text() {
     type = AutoInterface
     enabled = Yes
 
-  # The loopback hop every Coyote session on this host dials.
+  # The TCP hop for other hosts that dial this one as their relay (--relay <this host>:4242)
+  # and for a session configured with type: private at 127.0.0.1:4242; sessions on this host
+  # attach over the shared instance instead.
   [[Coyote Sessions]]
     type = TCPServerInterface
     enabled = Yes
@@ -522,10 +525,18 @@ enable_transport = True
 # lower announce_rate_target here, nor default_ar_target in the [reticulum] section: team
 # relays and community nodes keep the default.
 
-# Shared instance left at the default so rnstatus, rnpath, Sideband and NomadNet on
-# this host attach to this daemon instead of binding 4242 / AutoInterface again.
-# Any other local account on this host can attach to this daemon too, over
-# 127.0.0.1:4242 and the shared instance; that is inherent to Reticulum's shared-instance model.
+# Every Coyote session on this host attaches to this daemon as a shared-instance client
+# (the shipped mesh.interfaces default, type: local), as do rnstatus, rnpath, Sideband and
+# NomadNet. The three keys below are Reticulum's own defaults, written out so the contract
+# is visible. On Linux and Android the shared instance is the abstract AF_UNIX socket
+# rns/<instance_name>: instance_name is the key that matters there, and shared_instance_port
+# is inert unless shared_instance_type = tcp. On macOS and Windows the shared instance is
+# TCP 127.0.0.1:<shared_instance_port>. Any other local account on this host can attach to
+# this daemon too, over the shared instance and 127.0.0.1:4242; that is inherent to
+# Reticulum's shared-instance model.
+share_instance = Yes
+shared_instance_port = 37428
+instance_name = default
 
 [logging]
 
@@ -539,8 +550,8 @@ EOF
 config_text() {
   cat <<'EOF'
 # Reticulum configuration written by scripts/mesh-relay.sh for Coyote mesh.
-# This daemon owns the interfaces; every Coyote session on this host dials it
-# with mesh.interfaces: [{type: private, host: 127.0.0.1, port: 4242}].
+# This daemon owns the interfaces; every Coyote session on this host attaches to its
+# shared instance (mesh.interfaces: [{type: local}], the shipped default).
 # Interface options: https://markqvist.github.io/Reticulum/manual/interfaces.html
 
 EOF
@@ -727,6 +738,7 @@ readiness_diagnostics() {
 wait_ready() {
   local waited=0
   log "Waiting for rnsd on 127.0.0.1:$LISTEN_PORT"
+  # Readiness is the relay port this script opens; Coyote itself attaches over the shared instance.
   while [[ "$waited" -lt "$READY_TIMEOUT" ]]; do
     if port_open; then
       log "rnsd is listening on 127.0.0.1:$LISTEN_PORT"
@@ -900,9 +912,7 @@ print_next_steps() {
   cat <<EOF
 mesh:
   interfaces:
-    - type: private
-      host: 127.0.0.1
-      port: $LISTEN_PORT
+    - type: local
 EOF
   echo
   log "Next: start coyote and run \`.mesh on\`"

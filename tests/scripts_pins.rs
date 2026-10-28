@@ -1051,6 +1051,10 @@ fn relay_scripts_are_config_twins_and_copy_the_propagation_node_comment() {
             "forwards traffic for any other Reticulum peer it hears on its interfaces",
             "[logging]",
             "loglevel = 4",
+            "share_instance = Yes",
+            "shared_instance_port = 37428",
+            "instance_name = default",
+            "shared_instance_type = tcp",
             "[[Coyote Local]]",
             "type = AutoInterface",
             "[[Coyote Sessions]]",
@@ -1309,6 +1313,16 @@ fn relay_scripts_write_the_logging_section_and_unbuffered_service_environment() 
             !script.contains("share_instance = No"),
             "{name} must not write `share_instance = No`: rnstatus, rnpath, Sideband and NomadNet on the host attach to the shared instance"
         );
+        for needle in [
+            "share_instance = Yes",
+            "shared_instance_port = 37428",
+            "instance_name = default",
+        ] {
+            assert!(
+                script.contains(needle),
+                "{name} must write `{needle}`: Coyote's shipped `type: local` entry attaches to this shared instance"
+            );
+        }
         assert!(
             script.contains("exit 3"),
             "{name} must exit 3 when the listener does not come up: the README documents that code"
@@ -1542,6 +1556,16 @@ fn the_image_template_and_entrypoint_carry_the_rnsd_logging_contract() {
         !template.contains("share_instance = No"),
         "reticulum.config.tmpl must not write `share_instance = No`: rnstatus and rnpath inside the container attach to the shared instance"
     );
+    for needle in [
+        "share_instance = Yes",
+        "shared_instance_port = 37428",
+        "instance_name = default",
+    ] {
+        assert!(
+            template.contains(needle),
+            "reticulum.config.tmpl must write `{needle}`: Coyote's shipped `type: local` entry attaches to this shared instance"
+        );
+    }
 
     let entrypoint = read(scripts_dir().join("docker-entrypoint.sh"));
     assert_eq!(

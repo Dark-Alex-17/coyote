@@ -300,8 +300,8 @@ fn interface_lines(config: &str) -> Vec<String> {
 
 /// First start renders the template: the `[logging]` section rnsd needs for `-vv`, the
 /// loopback listener with `ingress_control = No`, transport on, no opt-in stanza, no
-/// marker line, no unexpanded placeholder, no `share_instance`; the file is owner-only
-/// and the main command's status is the script's.
+/// marker line, no unexpanded placeholder, the shared-instance keys Coyote attaches
+/// through; the file is owner-only and the main command's status is the script's.
 #[test]
 fn a_first_start_renders_the_default_config_and_passes_the_exit_code_through() {
     let home = Home::new("first-start");
@@ -322,6 +322,9 @@ fn a_first_start_renders_the_default_config_and_passes_the_exit_code_through() {
         "enable_transport = True",
         "[logging]",
         "loglevel = 4",
+        "share_instance = Yes",
+        "shared_instance_port = 37428",
+        "instance_name = default",
         "[[Coyote Sessions]]",
         "type = TCPServerInterface",
         "listen_ip = 127.0.0.1",
@@ -339,7 +342,6 @@ fn a_first_start_renders_the_default_config_and_passes_the_exit_code_through() {
         "@RELAY_PORT@",
         "AutoInterface",
         "Team Relay",
-        "share_instance",
     ] {
         assert!(
             !config.contains(absent),

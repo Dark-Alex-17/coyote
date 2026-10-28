@@ -318,6 +318,9 @@ fn the_dry_run_prints_the_whole_plan_and_creates_nothing() {
         "enable_transport = True",
         "[logging]",
         "loglevel = 4",
+        "share_instance = Yes",
+        "shared_instance_port = 37428",
+        "instance_name = default",
         "[[Coyote Local]]",
         "type = AutoInterface",
         "[[Coyote Sessions]]",
@@ -327,14 +330,14 @@ fn the_dry_run_prints_the_whole_plan_and_creates_nothing() {
         "ingress_control = No",
         "Service: skipped (--no-service)",
         "Firewall:",
-        "mesh:\n  interfaces:\n    - type: private\n      host: 127.0.0.1\n      port: 4242",
+        "mesh:\n  interfaces:\n    - type: local",
         ".mesh on",
     ] {
         assert!(out.contains(needle), "dry run lacks {needle:?}:\n{out}");
     }
     assert!(
-        !out.contains("share_instance"),
-        "the planned config must leave the shared instance at its default:\n{out}"
+        out.contains("share_instance = Yes"),
+        "the planned config pins the shared instance Coyote attaches to:\n{out}"
     );
     assert!(
         !out.contains("[[Team Relay]]"),
@@ -554,6 +557,9 @@ fn a_present_rnsd_is_reused_and_the_config_is_written_once_owner_only() {
         "enable_transport = True",
         "[logging]",
         "loglevel = 4",
+        "share_instance = Yes",
+        "shared_instance_port = 37428",
+        "instance_name = default",
         "[[Coyote Local]]",
         "type = AutoInterface",
         "[[Coyote Sessions]]",
@@ -563,7 +569,10 @@ fn a_present_rnsd_is_reused_and_the_config_is_written_once_owner_only() {
     ] {
         assert!(text.contains(needle), "config lacks {needle:?}:\n{text}");
     }
-    assert!(!text.contains("share_instance"), "{text}");
+    assert!(
+        text.contains("share_instance = Yes"),
+        "the written config pins the shared instance Coyote attaches to:\n{text}"
+    );
     assert!(!text.contains("[[Team Relay]]"), "{text}");
     let siblings: Vec<_> = fs::read_dir(config.parent().unwrap())
         .unwrap()
