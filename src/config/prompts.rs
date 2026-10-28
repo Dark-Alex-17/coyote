@@ -33,10 +33,18 @@ pub(crate) const DEFAULT_MEMORY_INSTRUCTIONS: &str = indoc! {"
           stale (superseded/expired) files, and index descriptions that drifted from the files.
 
     RULES:
-        - Every interaction has two outputs: your answer AND any memory updates the conversation warrants.
-          Don't let learnings evaporate into chat history.
+        - Write only durable, reusable, cross-session facts: who the user is, hard rules, binding
+          feedback, project facts that outlive this run.
+        - Run and round state belongs in the session, the todo list or the plan repo. If it must be
+          a memory, give it `type: run-state` with an `expires` date.
+        - Before writing, look for an existing slug to update: scan the `<catalogue>` block in your
+          prompt (`memory__read` is slug-exact and cannot read the index). Never mint a `-rN` sibling
+          when the base slug can be rewritten. Writing `<base>-r<N>` applies the `memory_round_chains`
+          key to the older rounds (default `supersede` marks them superseded_by; `keep` leaves them
+          alone).
+        - `description` is one search-index line of at most 160 chars, not a ledger.
         - All MEMORY.md edits MUST go through `memory__edit_index`. NEVER use `fs_write`, `fs_patch`,
-          or any other generic file tool on MEMORY.md — Coyote manages its location and a stray
+          or any other generic file tool on MEMORY.md - Coyote manages its location and a stray
           MEMORY.md outside the managed path is invisible to memory.
         - All drill files MUST go through `memory__write`. The index updates itself. Renames and
           deletions MUST go through `memory__rename` / `memory__delete` so links stay intact.
@@ -44,18 +52,18 @@ pub(crate) const DEFAULT_MEMORY_INSTRUCTIONS: &str = indoc! {"
           `superseded_by`/`expires` so `memory__lint` flags it later. Never leave contradictory
           memories side by side.
         - Use [[wikilink]] notation in memory files to reference other memories by their `name:` slug.
-        - NEVER write secrets, credentials, or API keys to memory — memory is plaintext on disk.
+        - NEVER write secrets, credentials, or API keys to memory - memory is plaintext on disk.
           Use coyote's Vault for secrets.
         - Keep individual drill files focused (under ~2K chars). Split large topics across linked files."
 };
 
 pub(crate) const DEFAULT_MEMORY_INSTRUCTIONS_READONLY: &str = indoc! {"
     ## Memory (read-only)
-    The memory content shown above persists across sessions. In this session it is READ-ONLY — the user
+    The MEMORY.md facts shown above persist across sessions. In this session it is READ-ONLY - the user
     maintains memory files manually outside the conversation.
 
     Reference the memory content as authoritative context about the user and their workspace.
-    Do not propose writing to memory or call any `memory__*` tools — they are unavailable."
+    Do not propose writing to memory or call any `memory__*` tools - they are unavailable."
 };
 
 pub(in crate::config) const DEFAULT_TODO_INSTRUCTIONS: &str = indoc! {"
@@ -248,3 +256,40 @@ pub(in crate::config) const DEFAULT_USER_INTERACTION_INSTRUCTIONS: &str = indoc!
     Use these tools when you need user decisions, preferences, or clarification.
     If you are running as a subagent, these questions are automatically escalated to the root agent for resolution."
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_memory_instructions_pin_the_durable_facts_rules() {
+        assert!(
+            DEFAULT_MEMORY_INSTRUCTIONS
+                .contains("Write only durable, reusable, cross-session facts")
+        );
+        assert!(
+            DEFAULT_MEMORY_INSTRUCTIONS
+                .contains("give it `type: run-state` with an `expires` date")
+        );
+        assert!(DEFAULT_MEMORY_INSTRUCTIONS.contains("look for an existing slug to update"));
+        assert!(DEFAULT_MEMORY_INSTRUCTIONS.contains("Never mint a `-rN` sibling"));
+        assert!(
+            DEFAULT_MEMORY_INSTRUCTIONS
+                .contains("Writing `<base>-r<N>` applies the `memory_round_chains`")
+        );
+        assert!(
+            DEFAULT_MEMORY_INSTRUCTIONS
+                .contains("default `supersede` marks them superseded_by; `keep` leaves them")
+        );
+        assert!(DEFAULT_MEMORY_INSTRUCTIONS.contains("one search-index line of at most 160 chars"));
+        assert!(!DEFAULT_MEMORY_INSTRUCTIONS.contains("Every interaction has two outputs"));
+        assert!(!DEFAULT_MEMORY_INSTRUCTIONS.contains("Don't let learnings evaporate"));
+        assert!(DEFAULT_MEMORY_INSTRUCTIONS_READONLY.contains("MEMORY.md facts"));
+    }
+
+    #[test]
+    fn memory_prompt_consts_are_ascii() {
+        assert!(DEFAULT_MEMORY_INSTRUCTIONS.is_ascii());
+        assert!(DEFAULT_MEMORY_INSTRUCTIONS_READONLY.is_ascii());
+    }
+}
