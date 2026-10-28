@@ -26,10 +26,7 @@ use crate::mesh::trust::{
     Decision, IdentityStanding, KeyChangeOutcome, OriginVerdict, Rule, TrustStore,
 };
 use crate::mesh::wire_path::WirePath;
-use crate::mesh::{
-    CappedText, canonical_hash, capped_peer_text, decode_hex, destination_address, display_text,
-    hex_lower,
-};
+use crate::mesh::{CappedText, canonical_hash, capped_peer_text, display_text, hex_lower};
 use crate::supervisor::mailbox::{Envelope, EnvelopePayload, Inbox};
 use crate::supervisor::notification::{
     MESH_NOTIFICATION_QUEUE_CAPACITY, SystemNotification, fold_into, mesh_events_dropped,
@@ -40,9 +37,8 @@ use futures_util::{StreamExt, stream};
 use lxmf_core::constants::{FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE};
 use parking_lot::Mutex;
 use rmpv::Value;
-use rns_transport::destination::{DestinationDesc, DestinationName};
+use rns_transport::destination::DestinationDesc;
 use rns_transport::hash::AddressHash;
-use rns_transport::identity::Identity;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
@@ -50,7 +46,6 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use subtle::ConstantTimeEq;
 
 /// The LXMF custom type a stored peer message carries, so a fetch can tell it from a
 /// knock or a plain LXMF message before reading anything else. Versioned in the name.
@@ -1922,38 +1917,33 @@ impl MeshRuntime {
         }
     }
 
-    /// The description a request to `destination_hex` links to: the identity the transport
-    /// learned from its announce and the name hash the peer table kept. A peer the table
-    /// knows (a row persisted across a restart counts) whose identity the transport lacks
-    /// is asked for once over the network, and the answer is waited for up to
-    /// `PATH_REQUEST_TIMEOUT`; the mark set first lets the announce filer tell that
-    /// answer from the peer announcing on its own. `None` when the identity is still
-    /// missing after that, or when the two do not derive the destination, since a peer
-    /// record that does not is not that instance's.
+    /// The description a request to `destination_hex` links to, as the transport holds it:
+    /// filled from the peer's announce or a restored path table, with `name` the announce's
+    /// truncated name hash. The peer table is not consulted. A destination the transport
+    /// does not hold is asked for once over the network, and the answer is waited for up
+    /// to `PATH_REQUEST_TIMEOUT`; the mark set first lets the announce filer tell that
+    /// answer from the peer announcing on its own. `None` when the transport still holds
+    /// nothing after that.
     pub(crate) async fn resolve_destination(
         &self,
         destination_hex: &str,
     ) -> Option<DestinationDesc> {
         let destination = canonical_hash(destination_hex)?;
         let address_hash = AddressHash::new_from_hex_string(&destination).ok()?;
-        let name_hash = self.known_name_hash(&destination)?;
         let transport = self.transport_handle().await?;
-        let identity = match transport.destination_identity(&address_hash).await {
-            Some(identity) => identity,
-            None => {
-                debug!(
-                    "Mesh has no route to {}; asking the network for one",
-                    short(&destination)
-                );
-                self.peers()
-                    .note_path_request(&destination, SystemTime::now());
-                transport
-                    .await_path(&address_hash, PATH_REQUEST_TIMEOUT, None)
-                    .await;
-                transport.destination_identity(&address_hash).await?
-            }
-        };
-        describe(&name_hash, identity, address_hash)
+        if let Some(desc) = transport.destination_desc(&address_hash).await {
+            return Some(desc);
+        }
+        debug!(
+            "Mesh has no route to {}; asking the network for one",
+            short(&destination)
+        );
+        self.peers()
+            .note_path_request(&destination, SystemTime::now());
+        transport
+            .await_path(&address_hash, PATH_REQUEST_TIMEOUT, None)
+            .await;
+        transport.destination_desc(&address_hash).await
     }
 
     /// `resolve_destination` without the path request: what the transport holds now, for
@@ -1964,19 +1954,10 @@ impl MeshRuntime {
     ) -> Option<DestinationDesc> {
         let destination = canonical_hash(destination_hex)?;
         let address_hash = AddressHash::new_from_hex_string(&destination).ok()?;
-        let name_hash = self.known_name_hash(&destination)?;
-        let identity = self
-            .transport_handle()
+        self.transport_handle()
             .await?
-            .destination_identity(&address_hash)
-            .await?;
-        describe(&name_hash, identity, address_hash)
-    }
-
-    fn known_name_hash(&self, destination: &str) -> Option<[u8; NAME_HASH_LEN]> {
-        decode_hex(&self.peers().get(destination)?.name_hash)?
-            .try_into()
-            .ok()
+            .destination_desc(&address_hash)
+            .await
     }
 
     pub(crate) async fn path_known(&self, destination_hex: &str) -> bool {
@@ -1990,27 +1971,6 @@ impl MeshRuntime {
             None => false,
         }
     }
-}
-
-/// The description for `address_hash`, or `None` when `name_hash` and `identity` do not
-/// derive it.
-fn describe(
-    name_hash: &[u8; NAME_HASH_LEN],
-    identity: Identity,
-    address_hash: AddressHash,
-) -> Option<DestinationDesc> {
-    if !bool::from(
-        destination_address(name_hash, &identity.address_hash)
-            .as_slice()
-            .ct_eq(address_hash.as_slice()),
-    ) {
-        return None;
-    }
-    Some(DestinationDesc {
-        identity,
-        address_hash,
-        name: DestinationName::new_from_hash_slice(name_hash),
-    })
 }
 
 /// The first sentences of every refusal for a destination the table knows but the network
@@ -2400,6 +2360,7 @@ impl ModelNotes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mesh::destination_address;
     use crate::mesh::events::env_value;
     use crate::mesh::knock::{
         KNOCK_TYPE, KnockIntro, KnockSurface, RecordingSurface as KeyChangeSurface, knock_message,

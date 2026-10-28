@@ -11039,13 +11039,14 @@ mod tests {
         relay.stop().await;
     }
 
-    /// Only a destination the table knows is asked for. One the table does not know is
-    /// `None` at once with no mark set, and the cached twin a listing uses returns `None`
-    /// at once for a known row whose identity the transport lacks, also without a mark,
-    /// so a sweep over silent peers never pays the path-request wait.
+    /// The peer table is no gate on resolving: a destination the transport does not hold
+    /// is asked for once, row or no row, and the mark is set before asking. The cached
+    /// twin a listing uses returns `None` at once for either, without a mark, so a sweep
+    /// over silent peers never pays the path-request wait.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn only_a_known_destination_is_asked_for_and_the_cached_resolve_never_asks() {
+    async fn a_destination_the_transport_lacks_is_asked_for_once_and_the_cached_resolve_never_asks()
+    {
         use crate::mesh::test_support::derived_sighting;
 
         let relay = TransportRelay::start().await;
@@ -11055,15 +11056,31 @@ mod tests {
 
         let stranger = derived_sighting("node-resolve-no-ask-stranger", None).destination_hash;
         let asked = Instant::now();
-        assert!(runtime.resolve_destination(&stranger).await.is_none());
+        assert!(
+            runtime
+                .resolve_destination_cached(&stranger)
+                .await
+                .is_none()
+        );
         assert!(
             asked.elapsed() < Duration::from_secs(1),
-            "a destination without a row is refused without a path request: {:?}",
+            "the cached resolve of a destination without a row does not wait: {:?}",
             asked.elapsed()
         );
         assert!(
             !peers.take_path_request(&stranger, SystemTime::now()),
-            "no mark is set for a destination the table does not know"
+            "the cached resolve sets no mark for a destination without a row"
+        );
+        let asked = Instant::now();
+        assert!(runtime.resolve_destination(&stranger).await.is_none());
+        assert!(
+            asked.elapsed() >= PATH_REQUEST_TIMEOUT,
+            "a destination without a row is still asked for: {:?}",
+            asked.elapsed()
+        );
+        assert!(
+            peers.take_path_request(&stranger, SystemTime::now()),
+            "the waiting resolve marked the destination without a row before asking"
         );
 
         let silent = derived_sighting("node-resolve-no-ask-silent", Some("Sol"));
@@ -11105,6 +11122,46 @@ mod tests {
         slot.install(runtime.clone()).unwrap();
         slot.stop().await.unwrap();
         relay.stop().await;
+    }
+
+    /// The description is the transport's, not the peer table's: a peer whose row the
+    /// sweep has aged out still resolves, at once and without a mark, for as long as the
+    /// transport holds what its announce taught.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_peer_whose_row_was_swept_still_resolves_through_the_transport() {
+        let stub = PeerStub::listen("node-resolve-swept-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let started = started_runtime_on("node-resolve-swept", stub.port()).await;
+        let runtime = started.runtime.clone();
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        stub.wait_to_be_filed(&peers, &to).await;
+        let desc = runtime.resolve_destination(&to).await.unwrap();
+        assert_eq!(desc.address_hash.to_hex_string(), to);
+
+        assert_eq!(peers.sweep(SystemTime::now() + PEER_TTL), vec![to.clone()]);
+        assert!(peers.get(&to).is_none());
+
+        let asked = Instant::now();
+        let cached = runtime.resolve_destination_cached(&to).await.unwrap();
+        let again = runtime.resolve_destination(&to).await.unwrap();
+        assert!(
+            asked.elapsed() < Duration::from_secs(1),
+            "a held description is not asked for: {:?}",
+            asked.elapsed()
+        );
+        assert_eq!(cached.address_hash, desc.address_hash);
+        assert_eq!(again.address_hash, desc.address_hash);
+        assert_eq!(
+            again.name.as_name_hash_slice(),
+            desc.name.as_name_hash_slice()
+        );
+        assert!(!peers.take_path_request(&to, SystemTime::now()));
+
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        slot.stop().await.unwrap();
     }
 
     /// A reference the send never carried is not left lent: the one-off grant written
