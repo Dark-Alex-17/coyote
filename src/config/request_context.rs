@@ -266,13 +266,27 @@ const SYSTEM_PROMPT_SHARE_WARN_PERCENT: usize = 25;
 static SYSTEM_PROMPT_SHARE_WARNING: OnceLock<()> = OnceLock::new();
 
 fn system_prompt_share_warning(split: &SystemPromptSplit, window: Option<usize>) -> Option<String> {
-    let pct = split.share_percent(window)?;
-    (pct > SYSTEM_PROMPT_SHARE_WARN_PERCENT).then(|| {
-        format!(
-            "system prompt is at least {pct}% of the model window ({} memory tokens); prune memory or lower memory_facts_cap",
-            split.memory_tokens
-        )
-    })
+    let window = window.filter(|window| *window > 0)?;
+    let total = split.role_tokens + split.memory_tokens + split.instructions_tokens;
+    if total * 100 <= window * SYSTEM_PROMPT_SHARE_WARN_PERCENT {
+        return None;
+    }
+    let head = format!(
+        "system prompt is over {SYSTEM_PROMPT_SHARE_WARN_PERCENT}% of the model window ({total} of {window} tokens"
+    );
+    Some(
+        if split.memory_tokens >= split.role_tokens.max(split.instructions_tokens) {
+            format!(
+                "{head}, {} from memory); prune memory or lower memory_facts_cap",
+                split.memory_tokens
+            )
+        } else {
+            format!(
+                "{head}, {} from the role and {} from instructions); shorten the role prompt or instructions",
+                split.role_tokens, split.instructions_tokens
+            )
+        },
+    )
 }
 
 /// The one sentence every failure to bring up a graph agent's chat agent is
@@ -1492,10 +1506,9 @@ impl RequestContext {
             .and_then(Session::compression_threshold)
             .unwrap_or(app.compression_threshold);
         let valve = app.compression_safety_valve;
-        let role = self.extract_role(app)?;
         let window = match session {
             Some(session) => session.model().max_input_tokens(),
-            None => role.model().max_input_tokens(),
+            None => self.extract_role(app)?.model().max_input_tokens(),
         };
         let keep = self.compression_keep_policy(None);
         let tail = session.map(|session| session.kept_tail(keep));
@@ -6919,9 +6932,13 @@ impl RequestContext {
                     .system_prompt_split
                     .lock()
                     .map_or(0, |split| split.memory_tokens);
-                let system_tokens = session.messages().first().map_or(0, |first| {
-                    session.model().total_tokens(slice::from_ref(first))
-                });
+                let system_tokens = session
+                    .messages()
+                    .first()
+                    .filter(|first| first.role == MessageRole::System)
+                    .map_or(0, |first| {
+                        session.model().total_tokens(slice::from_ref(first))
+                    });
                 let hint = if memory_tokens > session.tokens().saturating_sub(system_tokens) {
                     format!(
                         "; the system prompt holds {memory_tokens} memory tokens, more than the conversation - prune memory or lower memory_facts_cap"
