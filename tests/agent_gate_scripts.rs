@@ -1696,6 +1696,18 @@ fn collect_ledger_lines_with(
     tag: &str,
     envs: &[(&str, &str)],
 ) -> (i32, String, String) {
+    collect_ledger_lines_in(dir, tag, envs, dir)
+}
+
+/// `collect_ledger_lines_with` run from `cwd`, for the cases where a
+/// relative path the tool is handed would resolve against it.
+#[cfg(unix)]
+fn collect_ledger_lines_in(
+    dir: &Path,
+    tag: &str,
+    envs: &[(&str, &str)],
+    cwd: &Path,
+) -> (i32, String, String) {
     let script = format!(
         "source '{}'; collect_ledger_lines",
         asset("architect/tools.sh").display()
@@ -1703,6 +1715,7 @@ fn collect_ledger_lines_with(
     run(bash()
         .arg("-c")
         .arg(&script)
+        .current_dir(cwd)
         .env(
             "LLM_ROOT_DIR",
             Path::new(env!("CARGO_MANIFEST_DIR")).join("assets"),
@@ -1997,6 +2010,58 @@ fn collect_ledger_lines_names_a_task_without_plan_or_status_fields() {
     assert!(
         !stdout.contains("NOTE TASK-1-a") && !stdout.contains("NOTE TASK-3-c"),
         "a task with both fields earns no NOTE: {stdout}"
+    );
+}
+
+/// A task dir whose NAME holds a newline followed by `..` stays one path:
+/// its own log.md hit is listed under that name, and the `..` tail is never
+/// read as a second search root, so a log.md in the caller's parent dir
+/// never reaches the output.
+#[cfg(unix)]
+#[test]
+fn collect_ledger_lines_keeps_a_newline_named_task_dir_as_one_path() {
+    if tools_missing() {
+        return;
+    }
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = shared_tasks_fixture("collect-ledger-newline-dir");
+    let hostile = dir.0.join("tasks").join("TASK-9-z\n..");
+    fs::create_dir_all(&hostile).unwrap();
+    fs::write(
+        hostile.join("index.md"),
+        "---\nplan: PLAN-x.md\nstatus: complete\ntitle: \"Z\"\n---\n",
+    )
+    .unwrap();
+    fs::write(
+        hostile.join("log.md"),
+        "debris-exempt: src/h.rs:9 -- hostile\n",
+    )
+    .unwrap();
+    // The caller's cwd is a child of the fixture, so a stray `..` search root
+    // would be the fixture dir itself, where this sentinel waits.
+    let cwd = dir.0.join("cwd");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::write(
+        dir.0.join("log.md"),
+        "debris-exempt: SENTINEL-OUTSIDE-THE-TASKS-TREE\n",
+    )
+    .unwrap();
+    let (code, stdout, stderr) = collect_ledger_lines_in(&dir.0, "debris-exempt", &[], &cwd);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        !stdout.contains("SENTINEL-OUTSIDE-THE-TASKS-TREE"),
+        "a dir name must never widen the search past the tasks tree: {stdout}"
+    );
+    assert!(
+        stdout.contains("TASK-9-z\n.. (log.md:1): debris-exempt: src/h.rs:9 -- hostile"),
+        "the odd-named task is read under its own name: {stdout}"
+    );
+    assert!(
+        stdout.contains("TASK-1-a (log.md:3): debris-exempt: src/a.rs:1 -- TASK-1-a"),
+        "{stdout}"
     );
 }
 

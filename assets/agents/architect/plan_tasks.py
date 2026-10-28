@@ -12,9 +12,9 @@ has no `plan:` or no `status:` field is kept and named in a stderr NOTE, so the
 leniency is visible. Order: task number, then suffix.
 
 CLI: `plan_tasks.py --plan PLAN-<slug>.md --tasks-dir DIR [--tasks IDS]` prints
-one qualifying dir per line, as `<tasks-dir>/<rel>` with the dir spelled as
-given, and NOTE lines on stderr. A missing plan file or tasks dir is an error,
-never an empty listing.
+one qualifying dir per NUL-terminated record (a dir name may hold a newline),
+as `<tasks-dir>/<rel>` with the dir spelled as given; NOTE lines go to stderr,
+one per line. A missing plan file or tasks dir is an error, never an empty listing.
 """
 import argparse
 import os
@@ -116,7 +116,7 @@ def main(argv):
             base = os.path.basename(root).replace("\n", "\\n")
             print(f"plan_tasks: NOTE {base}: index.md has no {'/'.join(absent)}; kept", file=sys.stderr)
         if is_complete(fm):
-            print(root)
+            print(root, end="\0")
     if missing:
         print("plan_tasks: NOTE listed in --tasks but not found under the plan: " + ", ".join(missing), file=sys.stderr)
     return 0

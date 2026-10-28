@@ -24,42 +24,48 @@ collect_ledger_lines() {
     return 1
   fi
   # The plan's completed task dirs (plan_tasks.py: same identity rule as
-  # assemble_pr_body), printed as <dir>/<rel> so the prefix strip below holds.
-  # Its NOTE lines (a listed id it could not find) go to fd 3, opened on
-  # LLM_OUTPUT outside the capture: inside `$(...)` a `2>>/dev/stdout` would
-  # land in the listing instead and be read as a task dir.
+  # assemble_pr_body), printed as <dir>/<rel> so the prefix strip below holds,
+  # one NUL-terminated record each: a dir name may hold a newline, and a
+  # newline split would hand its tail (`..`, say) to grep as a path of its
+  # own. The listing lands in a file because `$(...)` drops NUL bytes. Its
+  # NOTE lines go to fd 3, opened on LLM_OUTPUT outside the redirection, so
+  # with LLM_OUTPUT=/dev/stdout they reach the output, never the listing.
   local -a scope=(--plan "${argc_plan}" --tasks-dir "${dir}")
   [[ -n "${argc_tasks:-}" ]] && scope+=(--tasks "${argc_tasks}")
   local listing listed=0
-  { listing=$(python3 "$LLM_AGENT_ROOT_DIR/plan_tasks.py" "${scope[@]}" 2>&3) || listed=$?; } 3>> "$LLM_OUTPUT"
+  listing=$(mktemp "${TMPDIR:-/tmp}/collect_ledger_lines.XXXXXX") || return 1
+  { python3 "$LLM_AGENT_ROOT_DIR/plan_tasks.py" "${scope[@]}" > "${listing}" 2>&3 || listed=$?; } 3>> "$LLM_OUTPUT"
   if [[ "${listed}" -ne 0 ]]; then
+    rm -f "${listing}"
     echo "collect_ledger_lines: could not list the plan's tasks under ${dir}" >> "$LLM_OUTPUT"
     return 1
   fi
   local -a task_dirs=()
   local d
-  while IFS= read -r d; do
+  while IFS= read -r -d '' d; do
     [[ -n "${d}" ]] && task_dirs+=("${d}")
-  done <<< "${listing}"
-  local hits=""
-  # -F: the tag is a literal, never a pattern; -I skips binaries; grep exit 1
-  # (no matches) is the clean result, not an error. -r on each task dir keeps
-  # the <path>:NN:line prefix whatever the count.
+  done < "${listing}"
+  rm -f "${listing}"
+  # -F: the tag is a literal, never a pattern; -I skips binaries; --null ends
+  # the file name with a NUL instead of `:` so a path holding a newline or a
+  # colon still parses; grep exit 1 (no matches) is the clean result, not an
+  # error. -r on each task dir keeps the file-name prefix whatever the count.
+  local hits
+  hits=$(mktemp "${TMPDIR:-/tmp}/collect_ledger_lines.XXXXXX") || return 1
   if [[ ${#task_dirs[@]} -gt 0 ]]; then
-    hits=$(grep -rInF --include=log.md -- "${tag}" "${task_dirs[@]}" 2>/dev/null) || true
+    grep -rInF --null --include=log.md -- "${tag}" "${task_dirs[@]}" > "${hits}" 2>/dev/null || true
   fi
-  if [[ -z "${hits}" ]]; then
+  if [[ ! -s "${hits}" ]]; then
+    rm -f "${hits}"
     echo "(none)" >> "$LLM_OUTPUT"
     return 0
   fi
-  # <dir>/<task>/log.md:NN:line  ->  <task> (log.md:NN): line, then the block
-  # under line NN indented (bullets and their indented wraps, verbatim), so a
-  # bare "Follow-ups:" line brings its bullets along. A column-0 line that is
-  # not a bullet is wrapped prose, not part of the block.
-  local line path rest rel task lineno
-  while IFS= read -r line; do
-    path="${line%%:*}"
-    rest="${line#*:}"
+  # <dir>/<task>/log.md NUL NN:line  ->  <task> (log.md:NN): line, then the
+  # block under line NN indented (bullets and their indented wraps, verbatim),
+  # so a bare "Follow-ups:" line brings its bullets along. A column-0 line
+  # that is not a bullet is wrapped prose, not part of the block.
+  local path rest rel task lineno
+  while IFS= read -r -d '' path && IFS= read -r rest; do
     rel="${path#"${dir}"/}"
     task="${rel%/log.md}"
     lineno="${rest%%:*}"
@@ -72,7 +78,8 @@ collect_ledger_lines() {
       head ~ /^(rejected-finding:|design-decision|Follow-ups:|HYGIENE:)/ { exit }
       { print "  " $0 }
     ' "${path}" >> "$LLM_OUTPUT"
-  done <<< "${hits}"
+  done < "${hits}"
+  rm -f "${hits}"
 }
 
 # @cmd Assemble the single draft PR's body from the plan + tasks tree: your summary file verbatim, the Quality bar line (plan frontmatter rigor, below production only), the task checklist (title + log.md completed-entry SHAs), and the grep-complete ledger sections (Review decisions / Hygiene pass / Design decisions, optional Follow-ups). Prints the body (and NOTE lines for anything it could not derive); review it, then pass it to gh pr create --body-file.
