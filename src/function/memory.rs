@@ -4,7 +4,7 @@ use std::str::FromStr;
 use std::{env, fs};
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{Days, Local};
+use chrono::{Days, Local, NaiveDate};
 use indexmap::IndexMap;
 use log::warn;
 use serde_json::{Value, json};
@@ -125,8 +125,10 @@ pub fn memory_function_declarations() -> Vec<FunctionDeclaration> {
                             type_value: Some("string".to_string()),
                             description: Some(
                                 "Optional `name:` slug of the memory that replaces this one. \
-                                 `memory__lint` flags superseded files for cleanup. Omitting this \
-                                 on overwrite clears any previous value."
+                                 A superseded memory drops out of prompt injection and the default \
+                                 `memory__list` (it stays readable, and `memory__list` with \
+                                 `include_stale` still shows it); `memory__lint` flags it for \
+                                 cleanup. Omitting this on overwrite clears any previous value."
                                     .into(),
                             ),
                             ..Default::default()
@@ -138,8 +140,11 @@ pub fn memory_function_declarations() -> Vec<FunctionDeclaration> {
                             type_value: Some("string".to_string()),
                             description: Some(
                                 "Optional ISO date (YYYY-MM-DD) after which this memory is stale. \
-                                 `memory__lint` flags expired files. Omitting this on overwrite \
-                                 clears any previous value."
+                                 An expired memory drops out of prompt injection and the default \
+                                 `memory__list` (it stays readable, and `memory__list` with \
+                                 `include_stale` still shows it); `memory__lint` flags it for \
+                                 cleanup. Omitting this on overwrite clears any previous value \
+                                 (a `run-state` memory then gets today + memory_run_state_ttl_days)."
                                     .into(),
                             ),
                             ..Default::default()
@@ -435,6 +440,11 @@ fn write_memory(
         .get("expires")
         .and_then(Value::as_str)
         .map(String::from);
+    if let Some(value) = expires.as_deref()
+        && !is_iso_date(value)
+    {
+        bail!("Invalid `expires` '{value}', expected an ISO date (YYYY-MM-DD)");
+    }
     let today = today_string();
     let expires = match (kind.kind(), expires) {
         (MemoryKind::RunState, None) => Some(date_after_days(run_state_ttl_days)?),
@@ -619,6 +629,13 @@ fn date_after_days(days: u32) -> Result<String> {
                 "memory_run_state_ttl_days {days} puts the expiry out of the supported date range"
             )
         })
+}
+
+/// `expires` is compared to today as text, so only the zero-padded `YYYY-MM-DD`
+/// spelling sorts correctly; an unpadded or non-ISO value is refused at write.
+fn is_iso_date(value: &str) -> bool {
+    NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .is_ok_and(|date| date.format("%Y-%m-%d").to_string() == value)
 }
 
 fn other_index_paths(store: &MemoryStore, own_dir: &Path) -> Vec<PathBuf> {
@@ -1865,6 +1882,58 @@ mod tests {
                 && err.contains("out of the supported date range"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn write_memory_rejects_an_expires_that_is_not_a_padded_iso_date() {
+        let root = temp_root("write_bad_expires");
+        let (store, workspace, structured) = workspace_store(&root, "# Memory Index\n");
+        let write = |expires: &str| {
+            let args = json!({
+                "name": "dated",
+                "description": "a dated fact",
+                "content": "x",
+                "scope": "workspace",
+                "expires": expires,
+            });
+            write_memory(&store, &workspace, &args, DEFAULT_MEMORY_RUN_STATE_TTL_DAYS)
+        };
+
+        for bad in ["tomorrow", "03/15/2026", "2026-1-5", "2026-02-30", ""] {
+            let text = write(bad).unwrap_err().to_string();
+            assert!(
+                text.contains(&format!("Invalid `expires` '{bad}'")) && text.contains("YYYY-MM-DD"),
+                "{bad}: {text}"
+            );
+            assert!(!structured.join("dated.md").exists(), "{bad} wrote a file");
+        }
+
+        write("2026-01-05").unwrap();
+        let raw = fs::read_to_string(structured.join("dated.md")).unwrap();
+        assert!(raw.contains("\nexpires: 2026-01-05\n"), "{raw}");
+        assert!(is_iso_date("2099-12-31") && !is_iso_date("2099-12-1"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_declaration_tells_the_model_stale_files_leave_its_context() {
+        let declarations = memory_function_declarations();
+        let write = declarations
+            .iter()
+            .find(|d| d.name == "memory__write")
+            .unwrap();
+        let properties = write.parameters.properties.as_ref().unwrap();
+        for field in ["superseded_by", "expires"] {
+            let description = properties[field].description.as_deref().unwrap();
+            assert!(
+                description
+                    .contains("drops out of prompt injection and the default `memory__list`")
+                    && description.contains("`include_stale`")
+                    && description.contains("stays readable"),
+                "{field}: {description}"
+            );
+        }
     }
 
     #[test]
