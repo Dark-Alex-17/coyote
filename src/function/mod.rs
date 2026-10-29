@@ -1601,7 +1601,10 @@ impl ToolCall {
         hooks::fire(
             HookEvent::ToolStarted,
             ctx,
-            &[("COYOTE_TOOL_NAME", self.name.clone())],
+            &[
+                ("COYOTE_TOOL_NAME", self.name.clone()),
+                ("COYOTE_TOOL_CALL_ID", self.id.clone().unwrap_or_default()),
+            ],
             Some(args_json.clone()),
         );
         info!("Tool call '{}' started", self.name);
@@ -1747,6 +1750,7 @@ impl ToolCall {
                     ctx,
                     &[
                         ("COYOTE_TOOL_NAME", self.name.clone()),
+                        ("COYOTE_TOOL_CALL_ID", self.id.clone().unwrap_or_default()),
                         ("COYOTE_TOOL_ERROR", error),
                     ],
                     Some(args_json),
@@ -1763,6 +1767,7 @@ impl ToolCall {
                     ctx,
                     &[
                         ("COYOTE_TOOL_NAME", self.name.clone()),
+                        ("COYOTE_TOOL_CALL_ID", self.id.clone().unwrap_or_default()),
                         (
                             "COYOTE_TOOL_DURATION_MS",
                             tool_started_at.elapsed().as_millis().to_string(),
@@ -5455,6 +5460,13 @@ mod tests {
             captures[0].envs.get("COYOTE_TOOL_NAME").map(String::as_str),
             Some("todo__init")
         );
+        assert_eq!(
+            captures[0]
+                .envs
+                .get("COYOTE_TOOL_CALL_ID")
+                .map(String::as_str),
+            Some("id1")
+        );
         assert_eq!(captures[0].payload.as_deref(), Some(r#"{"goal":"g"}"#));
         assert_eq!(captures[0].cwd, paths::config_dir());
         assert_eq!(captures[1].event, HookEvent::ToolCompleted);
@@ -5495,6 +5507,13 @@ mod tests {
                 captures[0].envs.get("COYOTE_TOOL_NAME").map(String::as_str),
                 Some("mcp_invoke_fixture")
             );
+            assert_eq!(
+                captures[0]
+                    .envs
+                    .get("COYOTE_TOOL_CALL_ID")
+                    .map(String::as_str),
+                Some("id1")
+            );
             assert_eq!(captures[0].payload.as_deref(), Some(r#"{"tool":"dup"}"#));
             assert_eq!(captures[1].event, HookEvent::ToolCompleted);
         });
@@ -5527,6 +5546,13 @@ mod tests {
             captures[0].envs.get("COYOTE_TOOL_NAME").map(String::as_str),
             Some("echo")
         );
+        assert_eq!(
+            captures[0]
+                .envs
+                .get("COYOTE_TOOL_CALL_ID")
+                .map(String::as_str),
+            Some("id1")
+        );
         assert_eq!(captures[1].event, HookEvent::ToolCompleted);
     }
 
@@ -5554,6 +5580,13 @@ mod tests {
         assert_eq!(captures.len(), 2, "{captures:?}");
         assert_eq!(captures[0].event, HookEvent::ToolStarted);
         assert_eq!(captures[1].event, HookEvent::ToolFailed);
+        assert_eq!(
+            captures[1]
+                .envs
+                .get("COYOTE_TOOL_CALL_ID")
+                .map(String::as_str),
+            Some("id1")
+        );
         assert!(
             captures[1]
                 .envs

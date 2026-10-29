@@ -8,6 +8,7 @@ use super::{FunctionDeclaration, JsonSchema, PATH_SEP, mcp_error_display, render
 use crate::config::{
     McpRuntime, RequestContext, effective_max_concurrent_jobs, jobs_enabled, paths,
 };
+use crate::events::Origin;
 use crate::graph;
 use crate::hooks::{self, HookEvent, ResolvedHook};
 use crate::mcp::{
@@ -90,10 +91,6 @@ impl JobHookSnapshot {
             (HookEvent::JobFailed, self.failed)
         };
 
-        if resolved.is_empty() {
-            return;
-        }
-
         let base_envs = hooks::base_envs_parts(
             event,
             self.session_name.as_deref(),
@@ -106,6 +103,11 @@ impl JobHookSnapshot {
 
         if let Some(error) = error {
             extras.push(("COYOTE_JOB_ERROR", error));
+        }
+
+        hooks::publish_hook_event(event, &base_envs, &extras, None, Origin::detached());
+        if resolved.is_empty() {
+            return;
         }
 
         hooks::fire_resolved(event, resolved, base_envs, &extras, None);

@@ -10,6 +10,7 @@ use crate::config::{
     effective_max_concurrent_jobs, jobs_enabled, list_agents_with_descriptions,
     load_agent_variables, paths,
 };
+use crate::events::Origin;
 use crate::hooks::{self, HookEvent, ResolvedHook};
 use crate::mcp::is_auth_required_error;
 use crate::supervisor::mailbox::{Envelope, EnvelopePayload, Inbox, PeerRegistry, graph_agent_id};
@@ -1158,13 +1159,10 @@ impl SpawnResultHooks {
                 (HookEvent::AgentFailed, self.failed)
             }
         };
-        hooks::fire_resolved(
-            event,
-            resolved,
-            hooks::base_envs_parts(event, self.session_name.as_deref(), Some(&self.agent_name)),
-            &extras,
-            None,
-        );
+        let base_envs =
+            hooks::base_envs_parts(event, self.session_name.as_deref(), Some(&self.agent_name));
+        hooks::publish_hook_event(event, &base_envs, &extras, None, Origin::detached());
+        hooks::fire_resolved(event, resolved, base_envs, &extras, None);
     }
 }
 

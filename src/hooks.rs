@@ -2,6 +2,7 @@ use crate::config::conflict::{self, InstallMode, StickyMode};
 use crate::config::{
     RequestContext, builtin_manifest, ensure_parent_exists, paths, set_executable_bit_if_script,
 };
+use crate::events::{Event, Origin};
 use crate::function::write_file_atomic;
 
 use anyhow::{Error, Result, anyhow};
@@ -308,9 +309,6 @@ impl RagSyncHooks {
         rag_path: &str,
         extras: &[(&str, String)],
     ) {
-        if resolved.is_empty() {
-            return;
-        }
         let base_envs = base_envs_parts(
             event,
             self.session_name.as_deref(),
@@ -321,6 +319,10 @@ impl RagSyncHooks {
             ("COYOTE_RAG_PATH", rag_path.to_string()),
         ];
         envs.extend(extras.iter().map(|(key, value)| (*key, value.clone())));
+        publish_hook_event(event, &base_envs, &envs, None, Origin::detached());
+        if resolved.is_empty() {
+            return;
+        }
         fire_resolved(event, resolved.to_vec(), base_envs, &envs, None);
     }
 }
@@ -370,14 +372,15 @@ impl McpServerHooks {
     }
 
     fn fire(&self, event: HookEvent, resolved: &[ResolvedHook], extras: &[(&str, String)]) {
-        if resolved.is_empty() {
-            return;
-        }
         let base_envs = base_envs_parts(
             event,
             self.session_name.as_deref(),
             self.agent_name.as_deref(),
         );
+        publish_hook_event(event, &base_envs, extras, None, Origin::detached());
+        if resolved.is_empty() {
+            return;
+        }
         fire_resolved(event, resolved.to_vec(), base_envs, extras, None);
     }
 }
@@ -525,6 +528,10 @@ fn push_defs(event_name: &str, defs: &[HookDef], cwd: &Path, out: &mut Vec<Resol
     }
 }
 
+/// Fires `event` for every hook resolved from `ctx` and publishes its
+/// in-process twin on the event bus. The bus event goes out even when no
+/// shell hook is configured, so observers see the full hook stream without
+/// user configuration.
 pub fn fire(
     event: HookEvent,
     ctx: &RequestContext,
@@ -532,11 +539,38 @@ pub fn fire(
     payload: Option<String>,
 ) {
     let resolved = ctx.resolved_hooks(event);
+    let base = base_envs(event, ctx);
+    publish_hook_event(event, &base, extras, payload.clone(), Origin::from(ctx));
     if resolved.is_empty() {
         return;
     }
 
-    fire_resolved(event, resolved, base_envs(event, ctx), extras, payload);
+    fire_resolved(event, resolved, base, extras, payload);
+}
+
+/// Publishes the [`Event::Hook`] twin of a dispatch. Call sites that hand
+/// pre-resolved hooks to [`fire_resolved`] must call this themselves, before
+/// any empty-hooks early return, so the bus sees every event. The envs match
+/// what a hook would receive minus the per-hook `COYOTE_HOOK_NAME`.
+pub(crate) fn publish_hook_event(
+    event: HookEvent,
+    base_envs: &[(String, String)],
+    extras: &[(&str, String)],
+    payload: Option<String>,
+    origin: Origin,
+) {
+    let mut envs = base_envs.to_vec();
+    envs.extend(
+        extras
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.clone())),
+    );
+    crate::events::bus().publish(Event::Hook {
+        event,
+        envs: sanitize_envs(envs),
+        payload,
+        origin,
+    });
 }
 
 /// Dispatches already-resolved hooks, for call sites that outlive the context
@@ -566,21 +600,7 @@ pub fn fire_resolved(
                 .iter()
                 .map(|(key, value)| (key.to_string(), value.clone())),
         );
-        let envs: Vec<(String, String)> = envs
-            .into_iter()
-            .map(|(key, mut value)| {
-                // Values like escalation questions carry agent-authored text;
-                // an interior NUL makes `Command::spawn` fail on Unix, which
-                // would let a child suppress its own hooks. Strip them.
-                if value.contains('\0') {
-                    value.retain(|c| c != '\0');
-                }
-                // `end` is a char boundary by construction, so `truncate` cannot panic.
-                let end = truncate_env_value(&value).len();
-                value.truncate(end);
-                (key, value)
-            })
-            .collect();
+        let envs = sanitize_envs(envs);
 
         #[cfg(test)]
         if test_sink::record(event, &hook, &envs, payload.as_deref()) {
@@ -604,6 +624,25 @@ pub fn fire_resolved(
             SpawnAckGuard::register(),
         )));
     }
+}
+
+/// Makes env values safe to hand to `Command::spawn`: strips NUL bytes and
+/// bounds each value to the hook env size limit.
+pub(crate) fn sanitize_envs(envs: Vec<(String, String)>) -> Vec<(String, String)> {
+    envs.into_iter()
+        .map(|(key, mut value)| {
+            // Values like escalation questions carry agent-authored text;
+            // an interior NUL makes `Command::spawn` fail on Unix, which
+            // would let a child suppress its own hooks. Strip them.
+            if value.contains('\0') {
+                value.retain(|c| c != '\0');
+            }
+            // `end` is a char boundary by construction, so `truncate` cannot panic.
+            let end = truncate_env_value(&value).len();
+            value.truncate(end);
+            (key, value)
+        })
+        .collect()
 }
 
 static PENDING_SPAWNS: AtomicUsize = AtomicUsize::new(0);
@@ -2145,6 +2184,99 @@ mod tests {
         assert!(
             !marker.exists(),
             "no process may spawn while the sink is installed"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn fire_publishes_one_bus_twin_per_hook_event() {
+        let _guard = test_sink::install();
+        let sink = crate::events::RecordingSink::install();
+        for event in HookEvent::ALL {
+            let ctx = ctx_with_global_hooks(hooks_map(event.as_str(), &[("parity-probe", "true")]));
+            test_sink::drain();
+            sink.drain();
+
+            fire(
+                event,
+                &ctx,
+                &[("HOOK_EXTRA", "extra-value".to_string())],
+                Some(format!("{{\"event\":\"{}\"}}", event.as_str())),
+            );
+
+            let captures = test_sink::drain();
+            assert_eq!(captures.len(), 1, "{event:?}: {captures:?}");
+            let capture = &captures[0];
+            assert_eq!(capture.hook_name, "parity-probe", "{event:?}");
+            let published = sink.drain();
+            assert_eq!(published.len(), 1, "{event:?}: {published:?}");
+            let Event::Hook {
+                event: got,
+                envs,
+                payload,
+                origin,
+            } = &published[0]
+            else {
+                panic!("{event:?}: expected Event::Hook, got {:?}", published[0]);
+            };
+            assert_eq!(*got, event);
+            assert_eq!(*payload, capture.payload, "{event:?}");
+            assert_eq!(*origin, Origin::detached(), "{event:?}");
+            let bus_keys: BTreeSet<String> = envs.iter().map(|(key, _)| key.clone()).collect();
+            assert_eq!(
+                bus_keys.len(),
+                envs.len(),
+                "{event:?}: duplicate key in {envs:?}"
+            );
+            let hook_keys: BTreeSet<String> = capture
+                .envs
+                .keys()
+                .filter(|key| key.as_str() != "COYOTE_HOOK_NAME")
+                .cloned()
+                .collect();
+            assert_eq!(bus_keys, hook_keys, "{event:?}");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn fire_publishes_bus_twin_when_no_hook_is_configured() {
+        let _guard = test_sink::install();
+        test_sink::drain();
+        let sink = crate::events::RecordingSink::install();
+        let ctx = ctx_with_global_hooks(IndexMap::new());
+
+        fire(HookEvent::TurnStarted, &ctx, &[], None);
+
+        let published = sink.drain();
+        assert_eq!(published.len(), 1, "{published:?}");
+        assert!(matches!(
+            &published[0],
+            Event::Hook {
+                event: HookEvent::TurnStarted,
+                payload: None,
+                ..
+            }
+        ));
+        assert!(test_sink::drain().is_empty());
+    }
+
+    #[test]
+    fn sanitize_envs_strips_nul_and_bounds_length() {
+        let oversized = "x".repeat(3000);
+        let sanitized = sanitize_envs(vec![
+            ("NUL".to_string(), "before\u{0000}after".to_string()),
+            ("BIG".to_string(), oversized),
+            ("SHORT".to_string(), "fine".to_string()),
+        ]);
+
+        assert_eq!(
+            sanitized,
+            vec![
+                ("NUL".to_string(), "beforeafter".to_string()),
+                ("BIG".to_string(), "x".repeat(2048)),
+                ("SHORT".to_string(), "fine".to_string()),
+            ]
         );
     }
 

@@ -16,6 +16,7 @@ use super::{
 use crate::config::{
     AgentVariable, AgentVariables, RenderMode, RequestContext, child_sessions_enabled,
 };
+use crate::events::Origin;
 use crate::hooks::{self, HookEvent, ResolvedHook};
 use crate::supervisor::mailbox::{Inbox, PeerAssignment, PeerRegistry, graph_agent_id};
 use crate::utils::{AbortSignal, TaskCancelGuard, wait_abort_signal, wait_user_interrupt};
@@ -624,17 +625,13 @@ impl NodeHookEmitter {
     }
 
     fn dispatch(&self, event: HookEvent, resolved: &[ResolvedHook], extras: &[(&str, String)]) {
-        hooks::fire_resolved(
+        let base_envs = hooks::base_envs_parts(
             event,
-            resolved.to_vec(),
-            hooks::base_envs_parts(
-                event,
-                self.session_name.as_deref(),
-                self.agent_name.as_deref(),
-            ),
-            extras,
-            None,
+            self.session_name.as_deref(),
+            self.agent_name.as_deref(),
         );
+        hooks::publish_hook_event(event, &base_envs, extras, None, Origin::detached());
+        hooks::fire_resolved(event, resolved.to_vec(), base_envs, extras, None);
     }
 
     fn completed(&self, elapsed: Duration, route: Option<&str>) {

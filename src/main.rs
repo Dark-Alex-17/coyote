@@ -2,6 +2,7 @@ mod acp;
 mod cli;
 mod client;
 mod config;
+mod events;
 mod function;
 mod graph;
 mod hooks;
