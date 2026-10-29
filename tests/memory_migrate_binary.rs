@@ -5,9 +5,10 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 struct Fixture {
     dir: PathBuf,
@@ -148,22 +149,53 @@ fn report_only_leaves_the_stores_and_the_backups_untouched() {
     assert!(!fx.backups().exists());
 }
 
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 #[test]
 fn piped_stdin_is_not_read_as_a_prompt() {
     let fx = fixture("stdin");
-    let mut child = command(&fx, &["--memory-migrate", "all"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut stdin = child.stdin.take().unwrap();
+    let mut child = KillOnDrop(
+        command(&fx, &["--memory-migrate", "all"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    // Held open until the end: a child that reads stdin to EOF never exits.
+    let mut stdin = child.0.stdin.take().unwrap();
     stdin.write_all(b"summarise this\n").unwrap();
-    drop(stdin);
 
-    let stdout = assert_success(&child.wait_with_output().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "still running with stdin open after 10s"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let mut stdout = String::new();
+    child
+        .0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
 
+    assert!(status.success(), "status {status:?}\nstdout:\n{stdout}");
     assert!(stdout.contains("rerun with --apply to migrate"), "{stdout}");
+    drop(stdin);
 }
 
 #[test]
@@ -198,8 +230,11 @@ fn apply_backs_up_both_stores_and_rewrites_them() {
     );
     assert!(stdout.ends_with(&tail), "{tail:?} does not end\n{stdout}");
 
-    for (store, slug, desc, index) in [
+    // The workspace store is found from the cwd, which the OS reports with
+    // symlinks resolved (/var is /private/var on macOS).
+    for (store, printed, slug, desc, index) in [
         (
+            fx.global_store(),
             fx.global_store(),
             "g-note",
             "global note",
@@ -207,12 +242,20 @@ fn apply_backs_up_both_stores_and_rewrites_them() {
         ),
         (
             fx.workspace_store(),
+            fs::canonicalize(fx.workspace_store()).unwrap(),
             "w-note",
             "workspace note",
             format!("## Always-on facts\n- **Fact.** kept\n\n## Drill files\n{GHOST_LINE}"),
         ),
     ] {
         assert_eq!(fs::read_to_string(store.join("MEMORY.md")).unwrap(), index);
+        for written in [
+            printed.join("MEMORY.md"),
+            printed.join(format!("{slug}.md")),
+        ] {
+            let line = format!("    wrote {}\n", written.display());
+            assert!(stdout.contains(&line), "{line:?} missing from\n{stdout}");
+        }
         let drill = fs::read_to_string(store.join(format!("{slug}.md"))).unwrap();
         let expected = |today: &str| {
             format!(
@@ -220,13 +263,76 @@ fn apply_backs_up_both_stores_and_rewrites_them() {
                  updated: {today}\n---\n\nbody\n"
             )
         };
-        assert_eq!(
-            drill,
-            if drill == expected(&date_after) {
-                expected(&date_after)
-            } else {
-                expected(&date_before)
-            }
+        assert!(
+            drill == expected(&date_before) || drill == expected(&date_after),
+            "{drill}"
         );
     }
+}
+
+#[cfg(unix)]
+struct RestoreMode(PathBuf);
+
+#[cfg(unix)]
+impl Drop for RestoreMode {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_workspace_that_cannot_be_written_stops_after_global_and_names_both_backups() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fx = fixture("readonly");
+    let store = fx.workspace_store();
+    fs::set_permissions(&store, fs::Permissions::from_mode(0o500)).unwrap();
+    let _restore = RestoreMode(store.clone());
+    if fs::write(store.join("probe"), "").is_ok() {
+        eprintln!("skipped: this user can write a 0500 dir, so the failure cannot be staged");
+        return;
+    }
+
+    let output = run(&fx, &["--memory-migrate", "all", "--apply"]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let backup = |label: &str| {
+        let name = fs::read_dir(fx.backups())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .find(|name| name.starts_with(&format!("{label}-")))
+            .unwrap_or_else(|| panic!("no {label} backup\n{stdout}"));
+        fx.backups().join(name)
+    };
+    let (global_backup, workspace_backup) = (backup("global"), backup("workspace"));
+    let lines: Vec<&str> = stdout.lines().collect();
+    let [stopped, tail @ ..] = &lines[lines.len().saturating_sub(4)..] else {
+        panic!("short report\n{stdout}");
+    };
+    assert!(stopped.starts_with("stopped: workspace: "), "{stdout}");
+    assert_eq!(
+        tail,
+        [
+            format!("backup: {}", global_backup.display()),
+            format!("backup: {}", workspace_backup.display()),
+            "next: fix the error and rerun --memory-migrate; each backup above holds its \
+             store as it was before this run"
+                .to_string(),
+        ],
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "workspace migration stopped partway; its backup is at {}",
+            workspace_backup.display()
+        )),
+        "{stderr}"
+    );
 }
