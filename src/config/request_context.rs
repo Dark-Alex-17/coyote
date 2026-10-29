@@ -10130,7 +10130,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn memory_info_without_a_session_does_not_store_split_or_warn() {
+    fn memory_info_with_a_role_does_not_store_split_or_warn() {
         let _guard = TestConfigDirGuard::new();
         write_global_memory_store();
         let mut ctx = create_test_ctx();
@@ -10145,6 +10145,34 @@ mod tests {
         ctx.info(&app).unwrap();
 
         assert_eq!(share_warning_state(&ctx), before);
+    }
+
+    #[test]
+    #[serial]
+    fn memory_info_without_session_role_agent_or_rag_does_not_store_split_or_warn() {
+        let _guard = TestConfigDirGuard::new();
+        let index = paths::global_memory_index_file();
+        create_dir_all(index.parent().unwrap()).unwrap();
+        write(index, "# Memory\n- the user prefers terse answers\n").unwrap();
+        let mut ctx = create_test_ctx();
+        ctx.model = windowed_model(100);
+        assert!(ctx.session.is_none());
+        assert!(ctx.role.is_none());
+        assert!(ctx.agent.is_none());
+        assert!(ctx.rag.is_none());
+        let app = ctx.app.config.clone();
+        assert_a_share_warning_is_due(&ctx, &app);
+        let before = share_warning_state(&ctx);
+        assert_eq!(before.2, None);
+
+        let info = ctx.info(&app).unwrap();
+
+        assert_eq!(share_warning_state(&ctx), before);
+        assert!(
+            info.lines()
+                .any(|line| line.starts_with("system_prompt_share ") && line.ends_with("% of 100")),
+            "{info}"
+        );
     }
 
     #[test]
