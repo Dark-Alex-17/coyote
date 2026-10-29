@@ -1589,16 +1589,25 @@ fn knob_source(spawned: Option<&Agent>, app: &AppConfig) -> String {
 /// could not list the own process at spawn) reads as dead, so such a
 /// child is listed as crashed; a resume refuses it only while that pid
 /// still exists, since it may in fact be running. Once the pid is gone
-/// the child resumes like any crashed one.
+/// the child resumes like any crashed one. Liveness for every running
+/// child is decided with one process-table lookup, the same way the
+/// session lister decides it.
 fn recent_child_ids_hint(root: &ChildSessionRoot) -> String {
     let (children, more) = root.recent_children(10);
     if children.is_empty() {
         return "none".to_string();
     }
+    let running: Vec<ProcessStamp> = children
+        .iter()
+        .filter(|meta| meta.status == ChildStatus::Running)
+        .map(ChildMeta::stamp)
+        .collect();
+    let alive = ProcessStamp::alive_set(&running);
     let mut hint = children
         .iter()
         .map(|meta| {
-            if meta.effective_status() == EffectiveStatus::Crashed {
+            if meta.effective_status_with(|stamp| alive.contains(stamp)) == EffectiveStatus::Crashed
+            {
                 format!("{} (crashed)", meta.session_id)
             } else {
                 meta.session_id.clone()
@@ -2570,7 +2579,9 @@ fn empty_sessions_page(note: &str) -> Value {
 
 /// Lists the sidecars under this context's child session root without
 /// creating the root: a context that has not spawned yet and has no saved
-/// session has nothing to list, and listing must not give it a uid.
+/// session has nothing to list, and listing must not give it a uid. A
+/// root that is a symlink is not followed, and a dry run lists nothing
+/// since it records nothing.
 fn handle_list_sessions(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
     let page_size = match args.get("page_size") {
         None | Some(Value::Null) => LIST_SESSIONS_PAGE_SIZE,
@@ -2590,6 +2601,9 @@ fn handle_list_sessions(ctx: &mut RequestContext, args: &Value) -> Result<Value>
         Some(_) => bail!("'cursor' must be a session id string"),
     };
 
+    if ctx.app.config.dry_run {
+        return Ok(empty_sessions_page("dry run records nothing"));
+    }
     if !child_sessions_enabled(None, ctx.app.config.as_ref()) {
         return Ok(empty_sessions_page(
             "Child sessions are off (`child_sessions: false`), so nothing is recorded.",
@@ -2607,6 +2621,11 @@ fn handle_list_sessions(ctx: &mut RequestContext, args: &Value) -> Result<Value>
         },
     };
 
+    if refuse_symlinked_dir(&root.dir(), "child sessions listed") {
+        return Ok(empty_sessions_page(
+            "the child session root is a symlink; nothing is listed",
+        ));
+    }
     let mut children = root.list_children()?;
     children.sort_by(|a, b| {
         b.created_at
@@ -6843,7 +6862,8 @@ mod tests {
     }
 
     /// The hint labels each child from the listing it already holds; it
-    /// does not read every sidecar a second time.
+    /// does not read every sidecar a second time, and it asks about every
+    /// running child in one process-table lookup.
     #[test]
     fn recent_child_ids_hint_labels_children_from_one_listing() {
         let source = include_str!("agents.rs").replace("\r\n", "\n");
@@ -6851,7 +6871,9 @@ mod tests {
         let body = &source[start..];
         let body = &body[..body.find("\n}\n").unwrap()];
         assert_eq!(body.matches("recent_children(").count(), 1);
-        assert!(body.contains("meta.effective_status()"));
+        assert_eq!(body.matches("ProcessStamp::alive_set(").count(), 1);
+        assert!(body.contains("meta.effective_status_with("));
+        assert!(!body.contains("meta.effective_status()"));
         assert!(!body.contains("load_child_meta("));
         assert!(!body.contains("recent_child_ids("));
     }
@@ -7189,6 +7211,241 @@ mod tests {
         assert_ne!(page["note"], off_note);
         assert!(ctx.child_session_root.is_none());
         assert_eq!(paths_under(&sessions_dir), before);
+    }
+
+    /// The unknown-id hint spends one process-table lookup however many
+    /// children are running, and labels each child crashed exactly when
+    /// the lister reports it crashed.
+    #[test]
+    #[serial]
+    fn recent_child_ids_hint_spends_one_lookup_and_agrees_with_the_lister() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let root = ctx.ensure_child_session_root().unwrap();
+        root.ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
+            .unwrap();
+        let dead = ProcessStamp {
+            pid: u32::MAX - 1,
+            start: 1,
+        };
+        let live = ProcessStamp::current();
+        seed_sidecar(&root, "hintdone", 0, ChildStatus::Completed, dead);
+        seed_sidecar(&root, "hintdead", 1, ChildStatus::Running, dead);
+        seed_sidecar(&root, "hintlive", 2, ChildStatus::Running, live);
+        seed_sidecar(&root, "hintgone", 3, ChildStatus::Running, dead);
+        let calls_before =
+            crate::utils::process::ALIVE_SET_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+
+        let hint = recent_child_ids_hint(&root);
+
+        let calls = crate::utils::process::ALIVE_SET_CALLS
+            .load(std::sync::atomic::Ordering::SeqCst)
+            - calls_before;
+        assert_eq!(calls, 1, "one process-table lookup per hint");
+        let page = list_sessions(&mut ctx, json!({})).unwrap();
+        let expected: Vec<String> = page["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                let sid = row["session_id"].as_str().unwrap();
+                if row["status"] == json!("crashed") {
+                    format!("{sid} (crashed)")
+                } else {
+                    sid.to_string()
+                }
+            })
+            .collect();
+        assert_eq!(expected.len(), 4);
+        if ProcessStamp::current().start != 0 {
+            assert_eq!(
+                expected.iter().filter(|e| e.ends_with("(crashed)")).count(),
+                2
+            );
+        }
+        assert_eq!(hint, expected.join(", "));
+    }
+
+    /// A uid root replaced by a symlink is not followed: the lister
+    /// returns the empty shape with a note and leaves the cache as it was.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn list_sessions_does_not_follow_a_symlinked_root() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = spawner_with_session("root");
+        let root = ctx.ensure_child_session_root().unwrap();
+        root.ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
+            .unwrap();
+        seed_sidecar(
+            &root,
+            "behindlink",
+            0,
+            ChildStatus::Running,
+            ProcessStamp::current(),
+        );
+        let real = root.dir().parent().unwrap().join("real-root");
+        std::fs::rename(root.dir(), &real).unwrap();
+        std::os::unix::fs::symlink(&real, root.dir()).unwrap();
+        let sessions_dir = child_sessions::sessions_root();
+        let before = paths_under(&sessions_dir);
+        let calls_before =
+            crate::utils::process::ALIVE_SET_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+
+        let page = list_sessions(&mut ctx, json!({})).unwrap();
+
+        assert_eq!(
+            keys_of(&page),
+            ["sessions", "total", "next_cursor", "note"]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(page["sessions"], json!([]));
+        assert_eq!(page["total"], json!(0));
+        assert!(page["next_cursor"].is_null());
+        assert_eq!(
+            page["note"],
+            json!("the child session root is a symlink; nothing is listed")
+        );
+        assert_eq!(paths_under(&sessions_dir), before);
+        assert!(root.dir().is_symlink());
+        assert_eq!(
+            crate::utils::process::ALIVE_SET_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            calls_before
+        );
+    }
+
+    /// Under a dry run with no root the lister says the run records
+    /// nothing, rather than that no child was spawned yet.
+    #[test]
+    #[serial]
+    fn list_sessions_under_dry_run_says_dry_run_records_nothing() {
+        let _guard = TestConfigDirGuard::new();
+        let app = AppState {
+            config: Arc::new(AppConfig {
+                dry_run: true,
+                ..Default::default()
+            }),
+            ..AppState::test_default()
+        };
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        ctx.supervisor = Some(Arc::new(RwLock::new(Supervisor::new(4, 3))));
+        let sessions_dir = child_sessions::sessions_root();
+        let before = paths_under(&sessions_dir);
+
+        let page = list_sessions(&mut ctx, json!({})).unwrap();
+
+        assert_eq!(page["sessions"], json!([]));
+        assert_eq!(page["total"], json!(0));
+        assert!(page["next_cursor"].is_null());
+        assert_eq!(page["note"], json!("dry run records nothing"));
+        assert!(ctx.child_session_root.is_none());
+        assert_eq!(paths_under(&sessions_dir), before);
+    }
+
+    /// A dry run whose config also turns child sessions off is worded as
+    /// a dry run, not as the knob.
+    #[test]
+    #[serial]
+    fn list_sessions_under_dry_run_with_child_sessions_off_says_dry_run_records_nothing() {
+        let _guard = TestConfigDirGuard::new();
+        let app = AppState {
+            config: Arc::new(AppConfig {
+                dry_run: true,
+                child_sessions: Some(false),
+                ..Default::default()
+            }),
+            ..AppState::test_default()
+        };
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        ctx.supervisor = Some(Arc::new(RwLock::new(Supervisor::new(4, 3))));
+        let sessions_dir = child_sessions::sessions_root();
+        let before = paths_under(&sessions_dir);
+
+        let page = list_sessions(&mut ctx, json!({})).unwrap();
+
+        assert_eq!(page["sessions"], json!([]));
+        assert_eq!(page["total"], json!(0));
+        assert!(page["next_cursor"].is_null());
+        assert_eq!(page["note"], json!("dry run records nothing"));
+        assert!(ctx.child_session_root.is_none());
+        assert_eq!(paths_under(&sessions_dir), before);
+    }
+
+    /// A root that is a symlink to nothing is refused the same way, and
+    /// the missing target is not created.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn usage_probe_list_sessions_refuses_a_dangling_symlinked_root_and_creates_nothing() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = spawner_with_session("dangling");
+        let root = ctx.ensure_child_session_root().unwrap();
+        let gone = root.dir().parent().unwrap().join("nowhere-at-all");
+        if root.dir().exists() {
+            std::fs::remove_dir_all(root.dir()).unwrap();
+        }
+        std::fs::create_dir_all(root.dir().parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&gone, root.dir()).unwrap();
+        let sessions_dir = child_sessions::sessions_root();
+        let before = paths_under(&sessions_dir);
+
+        let page = list_sessions(&mut ctx, json!({})).unwrap();
+
+        assert_eq!(page["sessions"], json!([]));
+        assert_eq!(page["total"], json!(0));
+        assert!(page["next_cursor"].is_null());
+        assert_eq!(
+            page["note"],
+            json!("the child session root is a symlink; nothing is listed")
+        );
+        assert!(!gone.exists(), "the link target must not be created");
+        assert_eq!(paths_under(&sessions_dir), before);
+    }
+
+    /// A dry run that already holds a root (with children in it) still
+    /// lists nothing and words it as a dry run.
+    #[test]
+    #[serial]
+    fn usage_probe_list_sessions_under_dry_run_with_an_existing_root_lists_nothing() {
+        let _guard = TestConfigDirGuard::new();
+        let (mut ctx, _ids) = ctx_with_completed_children(2);
+        assert_eq!(
+            list_sessions(&mut ctx, json!({})).unwrap()["total"],
+            json!(2)
+        );
+        ctx.app = Arc::new(AppState {
+            config: Arc::new(AppConfig {
+                dry_run: true,
+                ..Default::default()
+            }),
+            ..AppState::test_default()
+        });
+        let sessions_dir = child_sessions::sessions_root();
+        let before = paths_under(&sessions_dir);
+
+        let page = list_sessions(&mut ctx, json!({})).unwrap();
+
+        assert_eq!(page["sessions"], json!([]));
+        assert_eq!(page["total"], json!(0));
+        assert_eq!(page["note"], json!("dry run records nothing"));
+        assert_eq!(paths_under(&sessions_dir), before);
+    }
+
+    /// With no running child the hint still renders every id unlabelled
+    /// and agrees with the lister.
+    #[test]
+    #[serial]
+    fn usage_probe_recent_child_ids_hint_with_no_running_child_labels_nothing() {
+        let _guard = TestConfigDirGuard::new();
+        let (mut ctx, _ids) = ctx_with_completed_children(3);
+        let root = ctx.ensure_child_session_root().unwrap();
+
+        let hint = recent_child_ids_hint(&root);
+
+        let page = list_sessions(&mut ctx, json!({})).unwrap();
+        assert!(!hint.contains("(crashed)"), "{hint}");
+        assert_eq!(hint, session_ids_of(&page).join(", "));
     }
 
     /// The resume marks the sidecar running again through the one method
@@ -8178,6 +8435,75 @@ mod tests {
         assert_eq!(meta.status, ChildStatus::Running);
         assert_eq!(meta.agent_id, spawn.agent_id);
         assert_eq!(meta.pid, live.pid);
+    }
+
+    /// Resuming a child whose process died with its run still open closes
+    /// that run as superseded, opens a new one, and the lister then shows
+    /// the child running with both runs counted.
+    #[test]
+    #[serial]
+    fn usage_probe_resume_over_a_crashed_open_run_closes_it_and_lists_two_runs() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_open_run");
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let (sid, _) = seed_completed_config_child(&mut ctx, &agent_name, json!({}));
+        let root = spawner_root(&ctx);
+        let mut meta = root.load_child_meta(&sid).unwrap().unwrap();
+        let dead = ProcessStamp {
+            pid: u32::MAX - 1,
+            start: 1,
+        };
+        meta.status = ChildStatus::Running;
+        meta.pid = dead.pid;
+        meta.pid_start = dead.start;
+        let last = meta.runs.last_mut().unwrap();
+        last.finished_at = None;
+        last.status = None;
+        last.error = None;
+        let runs_before = meta.runs.len();
+        let crashed_agent_id = meta.runs.last().unwrap().agent_id.clone();
+        root.save_child_meta(&meta).unwrap();
+
+        let spawn = build_ready_spawn(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+
+        let after = child_meta_of(&ctx, &sid);
+        assert_eq!(after.runs.len(), runs_before + 1);
+        let closed = &after.runs[after.runs.len() - 2];
+        assert_eq!(closed.agent_id, crashed_agent_id);
+        assert!(closed.finished_at.is_some());
+        assert_eq!(closed.status, Some(ChildStatus::Failed));
+        assert_eq!(
+            closed.error.as_deref(),
+            Some("superseded by a resume while still marked running")
+        );
+        let open = after.runs.last().unwrap();
+        assert_eq!(open.agent_id, spawn.agent_id);
+        assert!(open.finished_at.is_none());
+        assert_eq!(
+            after
+                .runs
+                .iter()
+                .filter(|r| r.finished_at.is_none())
+                .count(),
+            1
+        );
+        assert_eq!(after.status, ChildStatus::Running);
+        assert_eq!(after.agent_id, spawn.agent_id);
+
+        let page = list_sessions(&mut ctx, json!({})).unwrap();
+        let row = page["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["session_id"] == json!(sid))
+            .unwrap()
+            .clone();
+        assert_eq!(row["status"], json!("running"));
+        assert_eq!(row["runs"], json!(runs_before + 1));
     }
 
     #[test]
