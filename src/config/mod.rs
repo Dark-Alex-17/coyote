@@ -1575,19 +1575,22 @@ clients:
             "a CRLF checkout of the example compares as the same block"
         );
         assert!(block.contains(CHILD_SESSIONS_SPAWN_PHRASE), "{block}");
+        assert!(
+            !block.contains("agent__task_create"),
+            "the app-level note names the task queue by its agent: entry, not the tool:\n{block}"
+        );
     }
 
     #[test]
     fn every_child_sessions_note_names_the_same_spawn_sources() {
-        let agent_example = include_str!("../../config.agent.example.yaml");
+        let agent_example = include_str!("../../config.agent.example.yaml").replace("\r\n", "\n");
         let agent_block = agent_example
             .split("\nchild_sessions:")
             .nth(1)
             .expect("agent example declares child_sessions")
             .split("\n\n")
             .next()
-            .unwrap()
-            .replace("\r\n", "\n");
+            .unwrap();
         let one_line = agent_block
             .lines()
             .map(|line| line.trim_start_matches([' ', '#']).trim_end())

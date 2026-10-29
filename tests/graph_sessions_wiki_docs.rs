@@ -79,13 +79,13 @@ fn repo_root() -> PathBuf {
 /// `HookEvent::as_str` arms in `src/hooks.rs` so a renamed or added event
 /// reaches the wiki checks without a hand-kept copy. The four lifecycle
 /// events every child fires today must stay among them.
+///
+/// The arms are read instead of `HookEvent::ALL` because that list is a
+/// private const of the binary crate, which an integration test cannot
+/// import, and it holds the enum variants rather than the dotted event
+/// names the wiki spells; `as_str` is the one place those names live.
 fn agent_events() -> Vec<String> {
-    let body = fn_body(&src(&["hooks.rs"]), "pub fn as_str(");
-    let mut events: Vec<String> = string_literals(&body)
-        .into_iter()
-        .filter(|literal| literal.starts_with("agent."))
-        .collect();
-    events.dedup();
+    let events = agent_events_in(&src(&["hooks.rs"]));
     for known in [
         "agent.started",
         "agent.completed",
@@ -98,6 +98,32 @@ fn agent_events() -> Vec<String> {
         );
     }
     events
+}
+
+/// The `agent.*` string literals of the `as_str` function in `source`, in
+/// arm order with repeats dropped.
+fn agent_events_in(source: &str) -> Vec<String> {
+    let body = fn_body(source, "pub fn as_str(");
+    let mut events: Vec<String> = string_literals(&body)
+        .into_iter()
+        .filter(|literal| literal.starts_with("agent."))
+        .collect();
+    events.dedup();
+    events
+}
+
+/// The regular `*.md` files directly under `dir`, sorted. A directory whose
+/// name ends in `.md` is skipped, so reading the pages never trips on one.
+fn markdown_pages(dir: &Path) -> Vec<PathBuf> {
+    let mut pages: Vec<PathBuf> = fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        .map(|entry| entry.expect("directory entry"))
+        .filter(|entry| entry.file_type().expect("entry type").is_file())
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+        .collect();
+    pages.sort();
+    pages
 }
 
 /// Every edited section and row together.
@@ -737,6 +763,68 @@ fn string_literals_drops_line_continuations_like_rustc() {
     assert_eq!(string_literals(r#"a "x\"y" b "\\n" c"#), ["x\"y", "\\n"]);
 }
 
+/// The scraper behind `agent_events` returns every `agent.*` arm of an
+/// `as_str`, a newly added one included, and nothing from other families.
+/// Runs without a wiki checkout.
+#[test]
+fn agent_events_in_returns_a_newly_added_agent_arm() {
+    let source = "impl HookEvent {\n\
+                  \x20   pub fn as_str(&self) -> &'static str {\n\
+                  \x20       match self {\n\
+                  \x20           Self::AgentStarted => \"agent.started\",\n\
+                  \x20           Self::AgentCompleted => \"agent.completed\",\n\
+                  \x20           Self::AgentInterrupted => \"agent.interrupted\",\n\
+                  \x20           Self::AgentFailed => \"agent.failed\",\n\
+                  \x20           Self::AgentPaused => \"agent.paused\",\n\
+                  \x20           Self::ToolCalled => \"tool.called\",\n\
+                  \x20       }\n\
+                  \x20   }\n\
+                  \n\
+                  \x20   pub fn other(&self) -> &'static str {\n\
+                  \x20       \"agent.not_an_arm\"\n\
+                  \x20   }\n\
+                  }\n";
+    assert_eq!(
+        agent_events_in(source),
+        [
+            "agent.started",
+            "agent.completed",
+            "agent.interrupted",
+            "agent.failed",
+            "agent.paused",
+        ]
+    );
+}
+
+/// The retired-wording walk reads regular `*.md` files only: a directory
+/// named like a page is skipped rather than read. Runs without a wiki
+/// checkout.
+#[test]
+fn markdown_pages_skips_a_directory_named_like_a_page() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir =
+        std::env::temp_dir().join(format!("coyote-wiki-pages-{}-{unique}", std::process::id()));
+    fs::create_dir_all(dir.join("Folder.md")).unwrap();
+    fs::write(dir.join("Page.md"), "page\n").unwrap();
+    fs::write(dir.join("notes.txt"), "notes\n").unwrap();
+
+    let pages = markdown_pages(&dir);
+    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(pages, [dir.join("Page.md")]);
+}
+
+/// The gated graph agent the child-session tests hold mid-run relies on the
+/// script node runner killing its child when the run is dropped; pin that
+/// the runner still asks for it.
+#[test]
+fn script_node_runner_kills_its_child_on_drop() {
+    let body = fn_body(&src(&["graph", "script.rs"]), "pub async fn execute(");
+    assert!(body.contains("kill_on_drop(true)"), "{body}");
+}
+
 #[test]
 fn section_scopes_level_one_and_level_two_headings() {
     let page = "intro\n\n# A\n\na body\n\n## A1\n\na1 body\n\n# B\n\nb body\n";
@@ -764,16 +852,11 @@ fn wording_for_graph_agents_without_sessions_is_gone() {
         "runs the graph fresh",
     ];
     let mut hits = Vec::new();
-    for entry in fs::read_dir(&wiki).expect("read the wiki checkout") {
-        let entry = entry.expect("wiki entry");
-        let path = entry.path();
-        let is_file = entry.file_type().expect("wiki entry type").is_file();
-        if is_file && path.extension().is_some_and(|ext| ext == "md") {
-            let text = flat(&read(&path));
-            for needle in retired {
-                if text.contains(needle) {
-                    hits.push(format!("{}: {needle:?}", path.display()));
-                }
+    for path in markdown_pages(&wiki) {
+        let text = flat(&read(&path));
+        for needle in retired {
+            if text.contains(needle) {
+                hits.push(format!("{}: {needle:?}", path.display()));
             }
         }
     }

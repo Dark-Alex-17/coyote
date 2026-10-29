@@ -29,6 +29,11 @@ const AGENT: &str = "echo-graph";
 /// names it, so a test that needs its directory reads it from here.
 const COYOTE_BIN: &str = env!("CARGO_BIN_EXE_coyote");
 
+/// The workspace-memory root override the unit-test guards set; it mirrors
+/// `WORKSPACE_MEMORY_ROOT_TEST_ENV` in `src/config/memory.rs`, which an
+/// integration test cannot import from the binary crate.
+const TEST_WORKSPACE_MEMORY_ROOT_ENV: &str = "COYOTE_TEST_WORKSPACE_MEMORY_ROOT";
+
 /// The `name:` the fixture graph declares; the run-time logger keys its
 /// `[graph:<name>]` prefix on `graph.name`, not on the agent directory.
 const GRAPH_NAME: &str = "echo-graph";
@@ -165,7 +170,7 @@ fn run_from(cwd: &Path, dir: &Path, args: &[&str], extra_env: &[(&str, &str)]) -
         .env_remove("COYOTE_PLATFORM")
         // The unit-test guard's workspace-memory pin; a shipped binary
         // ignores it, and a run here starts without it unless a case sets it.
-        .env_remove("COYOTE_TEST_WORKSPACE_MEMORY_ROOT")
+        .env_remove(TEST_WORKSPACE_MEMORY_ROOT_ENV)
         .envs(extra_env.iter().copied())
         .stdin(Stdio::null())
         .output()
@@ -3104,7 +3109,7 @@ fn usage_probe_a_script_node_runs_with_only_the_binary_dir_and_the_system_shells
 }
 
 /// The shipped binary discovers workspace memory by walking up from the
-/// directory it runs in, and the `COYOTE_TEST_WORKSPACE_MEMORY_ROOT` pin
+/// directory it runs in, and the `TEST_WORKSPACE_MEMORY_ROOT_ENV` pin
 /// the unit-test guards set is a test-build seam: a real run that carries
 /// it still reads the index above its cwd. The dry-run model echoes the
 /// whole system prompt, so the `<workspace_index>` block is observable on
@@ -3112,7 +3117,6 @@ fn usage_probe_a_script_node_runs_with_only_the_binary_dir_and_the_system_shells
 #[test]
 fn usage_probe_the_shipped_binary_walks_up_from_its_cwd_for_workspace_memory_and_ignores_the_test_root_pin()
  {
-    const PIN: &str = "COYOTE_TEST_WORKSPACE_MEMORY_ROOT";
     const GLOBAL_LINE: &str = "- global fact from the fixture";
     const WORKSPACE_LINE: &str = "- workspace fact planted by the probe";
     let dir = fresh_config_dir("workspace-memory");
@@ -3128,7 +3132,7 @@ fn usage_probe_the_shipped_binary_walks_up_from_its_cwd_for_workspace_memory_and
     fs::create_dir_all(dir.join("memory")).unwrap();
     fs::write(
         dir.join("memory").join("MEMORY.md"),
-        format!("PLACEHOLDER_CHECK\n{GLOBAL_LINE}\n"),
+        format!("{GLOBAL_LINE}\n"),
     )
     .unwrap();
     // The index sits one level above the cwd so the walk has to climb.
@@ -3147,13 +3151,13 @@ fn usage_probe_the_shipped_binary_walks_up_from_its_cwd_for_workspace_memory_and
     fs::create_dir_all(&elsewhere).unwrap();
 
     let memory_block = |output: &Output, label: &str| -> String {
-        let text = format!("{}\n{}", stderr_of(&output), stdout_of(&output));
+        let text = format!("{}\n{}", stderr_of(output), stdout_of(output));
         assert!(
             output.status.success() && !text.contains("panicked"),
             "{label}: exit {:?}\n{text}",
             output.status
         );
-        let stdout = stdout_of(&output);
+        let stdout = stdout_of(output);
         let start = stdout.find("<memory>").unwrap_or_else(|| {
             panic!("{label}: the dry-run echo carries the memory section:\n{text}")
         });
@@ -3186,7 +3190,7 @@ fn usage_probe_the_shipped_binary_walks_up_from_its_cwd_for_workspace_memory_and
             &nested,
             &dir,
             &["-e", "hello"],
-            &[(PIN, elsewhere.to_str().unwrap())],
+            &[(TEST_WORKSPACE_MEMORY_ROOT_ENV, elsewhere.to_str().unwrap())],
         ),
         "the test pin on a real run",
     );
