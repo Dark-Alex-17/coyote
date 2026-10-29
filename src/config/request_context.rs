@@ -271,6 +271,11 @@ static SYSTEM_PROMPT_SHARE_WARNING: OnceLock<()> = OnceLock::new();
 static SYSTEM_PROMPT_SHARE_WARNINGS_PRINTED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+#[cfg(test)]
+fn system_prompt_share_warning_already_fired() -> bool {
+    SYSTEM_PROMPT_SHARE_WARNING.get().is_some()
+}
+
 fn system_prompt_share_warning(split: &SystemPromptSplit, window: Option<usize>) -> Option<String> {
     let pct = split
         .share_percent(window)
@@ -8134,6 +8139,11 @@ mod tests {
         RequestContext::new(default_app_state(), WorkingMode::Cmd)
     }
 
+    /// The split estimates each part on its own while the prompt joins them
+    /// with separators and rounds once, so the two totals drift by a few
+    /// tokens either way.
+    const SPLIT_SEPARATOR_SLACK: usize = 3;
+
     fn priced_model() -> Model {
         let mut data = ModelData::new("test");
         data.input_price = Some(10.0);
@@ -9993,9 +10003,10 @@ mod tests {
             .contains(&split.instructions_tokens),
             "{split:?}"
         );
+        let parts = split.role_tokens + split.memory_tokens + split.instructions_tokens;
+        let whole = estimate_token_length(&prompt);
         assert!(
-            split.role_tokens + split.memory_tokens + split.instructions_tokens
-                <= estimate_token_length(&prompt) + 3,
+            parts <= whole + SPLIT_SEPARATOR_SLACK && whole <= parts + SPLIT_SEPARATOR_SLACK,
             "{split:?} for:\n{prompt}"
         );
         let sentinel = SystemPromptSplit {
@@ -10028,7 +10039,29 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_share_warning_fires_only_above_a_quarter_of_the_window() {
+    #[serial]
+    fn memory_role_tokens_pins_the_role_prompt_estimate() {
+        let _guard = TestConfigDirGuard::new();
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            memory: Some(false),
+            workspace_instructions: Some(false),
+            function_calling_support: false,
+            ..AppConfig::default()
+        });
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        let prompt = "You are a careful reviewer of pull requests.";
+        ctx.role = Some(Role::new("pinned", prompt));
+        let app = ctx.app.config.clone();
+
+        assert_eq!(ctx.extract_role(&app).unwrap().prompt(), prompt);
+        let split = ctx.system_prompt_split.lock().unwrap();
+        assert_eq!(split.role_tokens, estimate_token_length(prompt));
+        assert_eq!((split.memory_tokens, split.instructions_tokens), (0, 0));
+    }
+
+    #[test]
+    fn memory_system_prompt_share_warning_fires_only_above_a_quarter_of_the_window() {
         let split = |memory_tokens| SystemPromptSplit {
             role_tokens: 100,
             memory_tokens,
@@ -10050,7 +10083,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn extract_role_prints_the_share_warning_once_per_process() {
+    fn memory_extract_role_prints_the_share_warning_once_per_process() {
         let _guard = TestConfigDirGuard::new();
         write_global_memory_store();
         let mut ctx = create_test_ctx();
@@ -10060,6 +10093,8 @@ mod tests {
         let app = ctx.app.config.clone();
         let printed =
             || SYSTEM_PROMPT_SHARE_WARNINGS_PRINTED.load(std::sync::atomic::Ordering::Relaxed);
+        let already_fired = system_prompt_share_warning_already_fired();
+        let before = printed();
 
         ctx.extract_role(&app).unwrap();
         let split = ctx.system_prompt_split.lock().unwrap();
@@ -10067,10 +10102,12 @@ mod tests {
             system_prompt_share_warning(&split, Some(100)).is_some(),
             "{split:?}"
         );
-        assert_eq!(printed(), 1);
+        let expected = if already_fired { before } else { before + 1 };
+        assert_eq!(printed(), expected);
+        assert!(system_prompt_share_warning_already_fired());
 
         ctx.extract_role(&app).unwrap();
-        assert_eq!(printed(), 1);
+        assert_eq!(printed(), expected);
     }
 
     #[test]
