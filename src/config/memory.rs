@@ -599,14 +599,6 @@ fn drill_file_stamps(dirs: &[(Scope, &Path)]) -> Result<Vec<FileStamp>> {
     Ok(stamps)
 }
 
-/// Drops every cached catalogue that covers `dir`.
-#[allow(dead_code)] // TASK-294
-pub(crate) fn invalidate_catalogue(dir: &Path) {
-    CATALOGUE_CACHE
-        .lock()
-        .retain(|dirs, _| !dirs.iter().any(|d| d == dir));
-}
-
 /// The rendered `<memory>` block plus the figures behind it: how many chars
 /// the facts and catalogue lines held before the cap, and what the cap cut.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1926,20 +1918,6 @@ mod tests {
 
         fs::remove_file(dir.join("one.md")).unwrap();
         assert_eq!(catalogue_names(&store), vec!["two"]);
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn invalidate_catalogue_forces_a_rebuild_of_stores_covering_the_dir() {
-        let (root, store) = two_index_store("catalogue_invalidate", "", "idx", &[("one", "b")]);
-        let first = store.catalogue().unwrap();
-
-        invalidate_catalogue(&store.global_dir);
-
-        let rebuilt = store.catalogue().unwrap();
-        assert!(!Arc::ptr_eq(&first, &rebuilt));
-        assert_eq!(rebuilt.entries(), first.entries());
 
         let _ = fs::remove_dir_all(&root);
     }
