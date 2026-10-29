@@ -30,7 +30,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "sisyphus-next";
 const CANDIDATE_NAMES: [&str; 2] = ["sisyphus-next", "architect-next"];
-const SMOKE_FLOOR: usize = 222;
+const SMOKE_FLOOR: usize = 228;
 
 fn agents_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents")
@@ -1320,9 +1320,8 @@ print(json.dumps(u))
     );
 }
 
-/// The gates module is the one file whose census row names an exact hunk
-/// count against the staging tree; the staging copy is not in this repo, so
-/// this pins the shape the census describes: one module-level
+/// The staging copy the README census is measured against is not in this
+/// repo, so this pins the shape the gates.py census row describes: one module-level
 /// `DEBT_HITS_STALE` constant, a `bookkeeping_scan` that consults
 /// `last_script_error` before it parses `debt_hits`, and a `triage_route`
 /// update dict that resets both per-round schema properties.
@@ -1525,18 +1524,25 @@ fn re_review_state(
     })
 }
 
-/// A re-review state whose primary signals select security and probe and
-/// whose delta carries no attack-surface or consumer signals, so settling
-/// both lanes is the only thing standing between them and a narrowed SKIP.
-fn gauntlet_narrowable_state(settled_lanes: &serde_json::Value) -> serde_json::Value {
-    json!({
-        "settled_lanes": settled_lanes,
-        "delta_summary": "2 file(s) in delta (abc1234..HEAD)",
-        "signals_summary": "6 file(s) changed (diff: worktree)",
-        "touches_auth": true,
-        "consumer_surface": true,
-        "probe_context": "make run && hurl tests/"
-    })
+/// The state `build_items.py` sees after the real `signals.py` ran on a
+/// re-review prompt: every key that script emitted (`settled_lanes`,
+/// `rereview_spec`, the `delta_*` signals), with only the primary signals
+/// forced so that security and probe are selected in the first place. The
+/// delta over a text file carries no attack-surface or consumer signal, so
+/// settling both lanes is the only thing standing between them and a
+/// narrowed SKIP.
+fn gauntlet_narrowable_state(signals: &serde_json::Value) -> serde_json::Value {
+    for key in ["settled_lanes", "rereview_spec", "delta_summary"] {
+        assert!(
+            signals.get(key).is_some(),
+            "signals.py output must carry {key}: {signals}"
+        );
+    }
+    let mut state = signals.clone();
+    state["touches_auth"] = json!(true);
+    state["consumer_surface"] = json!(true);
+    state["probe_context"] = json!("make run && hurl tests/");
+    state
 }
 
 fn prompt_lines_starting_with<'a>(prompt: &'a str, prefix: &str) -> Vec<&'a str> {
@@ -1593,10 +1599,7 @@ fn composed_re_review_prompt_narrows_through_the_real_gauntlet_scripts() {
         "{signals}"
     );
 
-    let items = gauntlet_script(
-        "build_items.py",
-        &gauntlet_narrowable_state(&signals["settled_lanes"]),
-    );
+    let items = gauntlet_script("build_items.py", &gauntlet_narrowable_state(&signals));
     let summary = items["lanes_summary"].as_str().unwrap();
     for expected in [
         "security: SKIPPED (narrowed)",
@@ -1653,7 +1656,8 @@ fn blocked_after_findings_prior_report_yields_no_settled_lanes_line() {
 }
 
 /// Feeds `report` to `gates._parse_gauntlet` in a fresh interpreter and
-/// returns the verdict, incomplete list, lane statuses and lane details.
+/// returns the verdict, incomplete list, lane statuses, lane details and
+/// blockers.
 fn parse_gauntlet_report(report: &str, scratch: &TempDirGuard) -> serde_json::Value {
     use std::io::Write;
     let python = python3().expect("callers skip without python3");
@@ -1663,8 +1667,8 @@ fn parse_gauntlet_report(report: &str, scratch: &TempDirGuard) -> serde_json::Va
         .arg(
             "import json, sys\n\
              import gates\n\
-             v, inc, lanes, details, _b, _a = gates._parse_gauntlet(sys.stdin.read())\n\
-             print(json.dumps({\"verdict\": v, \"incomplete\": inc, \"lanes\": lanes, \"details\": details}))\n",
+             v, inc, lanes, details, blockers, _a = gates._parse_gauntlet(sys.stdin.read())\n\
+             print(json.dumps({\"verdict\": v, \"incomplete\": inc, \"lanes\": lanes, \"details\": details, \"blockers\": blockers}))\n",
         )
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -1834,17 +1838,38 @@ fn git_commit_all(project: &Path, home: &Path, message: &str) -> String {
     run(&["rev-parse", "HEAD"])
 }
 
-/// The reply the review-gauntlet graph hands back, assembled from the REAL
-/// `verdict_gate.py` output exactly as the gauntlet's `done` node renders
-/// it: `GAUNTLET: <verdict><incomplete line>` then a blank line and the
-/// report (the lane table, the sections, the full lane reports).
+/// The reply the review-gauntlet graph hands back: the REAL `verdict_gate.py`
+/// output substituted into the REAL `done` node's `output:` template from the
+/// gauntlet's `graph.yaml`, so the sentinel line, the optional incomplete
+/// line and the report land exactly where the engine would put them.
 fn real_gauntlet_reply(verdict_state: &serde_json::Value) -> (String, serde_json::Value) {
     let gate = gauntlet_script("verdict_gate.py", verdict_state);
-    let reply = format!(
-        "GAUNTLET: {}{}\n\n{}",
-        gate["gauntlet_verdict"].as_str().unwrap(),
-        gate["gauntlet_incomplete_line"].as_str().unwrap(),
-        gate["gauntlet_report"].as_str().unwrap()
+    let graph: serde_yaml::Value = serde_yaml::from_str(
+        &fs::read_to_string(agents_dir().join("review-gauntlet/graph.yaml")).unwrap(),
+    )
+    .unwrap();
+    let template = graph["nodes"]["done"]["output"]
+        .as_str()
+        .expect("the gauntlet's done node renders a string output");
+    let mut reply = template.to_string();
+    for key in [
+        "gauntlet_verdict",
+        "gauntlet_incomplete_line",
+        "gauntlet_report",
+    ] {
+        let placeholder = format!("{{{{{key}}}}}");
+        assert!(
+            template.contains(&placeholder),
+            "{placeholder} missing from the done node output:\n{template}"
+        );
+        reply = reply.replace(&placeholder, gate[key].as_str().unwrap());
+    }
+    assert!(!reply.contains("{{"), "unrendered placeholder:\n{reply}");
+    let verdict = gate["gauntlet_verdict"].as_str().unwrap();
+    assert_eq!(
+        reply.lines().next(),
+        Some(format!("GAUNTLET: {verdict}").as_str()),
+        "the sentinel is line 1 of the reply:\n{reply}"
     );
     (reply, gate)
 }
@@ -2012,10 +2037,7 @@ fn a_real_gauntlet_reply_round_trips_from_parser_to_narrowed_re_review() {
         "{signals}"
     );
 
-    let items = gauntlet_script(
-        "build_items.py",
-        &gauntlet_narrowable_state(&signals["settled_lanes"]),
-    );
+    let items = gauntlet_script("build_items.py", &gauntlet_narrowable_state(&signals));
     let summary = items["lanes_summary"].as_str().unwrap();
     assert!(
         summary.contains("security: SKIPPED (narrowed)"),
@@ -2061,4 +2083,239 @@ fn indented_gauntlet_sentinels_are_not_verdicts() {
         &scratch,
     );
     assert_eq!(parsed["verdict"], json!("PASS"), "{parsed}");
+}
+
+/// The gap between the sentinel and its value is `[ \t]*`, and the header
+/// ends only at a column-0 `## Full lane reports` line (or the first
+/// `<details>` when that heading is absent): an indented heading or one
+/// quoted inside a sentence does not end it, and a verdict that first
+/// appears after the boundary is no verdict. An empty reply is BLOCKED.
+#[test]
+fn gauntlet_sentinel_gaps_and_the_header_boundary_are_read_literally() {
+    if python3().is_none() {
+        return;
+    }
+    let scratch = scratch_dir("sentinels-gaps");
+    let table = "| lane | status | detail |\n|------|--------|--------|\n| security | BLOCKED | FAIL (High) |\n| code-review | GREEN | MERGE-READY |\n";
+    let rows = [
+        (format!("GAUNTLET:\tPASS\n{table}"), "PASS"),
+        (format!("GAUNTLET:  PASS\n{table}"), "PASS"),
+        (format!("GAUNTLET:PASS\n{table}"), "PASS"),
+        (
+            format!("  ## Full lane reports\nGAUNTLET: PASS\n{table}"),
+            "PASS",
+        ),
+        (
+            format!("see ## Full lane reports below\nGAUNTLET: PASS\n{table}"),
+            "PASS",
+        ),
+        (
+            format!("## Full lane reports\n\nGAUNTLET: PASS\n{table}"),
+            "BLOCKED",
+        ),
+        (
+            format!("<details>\nGAUNTLET: PASS\n</details>\n{table}"),
+            "BLOCKED",
+        ),
+        (String::new(), "BLOCKED"),
+        ("  \n\t\n".to_string(), "BLOCKED"),
+    ];
+    for (report, expected) in &rows {
+        let parsed = parse_gauntlet_report(report, &scratch);
+        assert_eq!(parsed["verdict"], json!(expected), "{report:?} -> {parsed}");
+    }
+    let parsed = parse_gauntlet_report(&format!("GAUNTLET:\tPASS\n{table}"), &scratch);
+    assert_eq!(parsed["lanes"]["security"], json!("BLOCKED"), "{parsed}");
+    let parsed = parse_gauntlet_report(
+        &format!("GAUNTLET: BLOCKED\nGAUNTLET_REVIEW_INCOMPLETE:\tprobe\n{table}"),
+        &scratch,
+    );
+    assert_eq!(parsed["incomplete"], json!(["probe"]), "{parsed}");
+    for report in [
+        format!("## Full lane reports\n\nGAUNTLET: PASS\n{table}"),
+        format!("<details>\nGAUNTLET: PASS\n</details>\n{table}"),
+    ] {
+        let parsed = parse_gauntlet_report(&report, &scratch);
+        assert_eq!(
+            parsed["lanes"],
+            json!({}),
+            "a table after the boundary is not the header's table: {parsed}"
+        );
+    }
+}
+
+/// Everything under the boundary is a lane's raw report: a lane row for a
+/// lane the header never listed, a `## Blockers` section, or a
+/// `GAUNTLET_REVIEW_INCOMPLETE:` line that appears only there adds nothing
+/// to the lanes, blockers or incomplete list read from the header.
+#[test]
+fn lane_reports_add_no_lanes_blockers_or_incomplete_lanes_to_the_header_parse() {
+    if python3().is_none() {
+        return;
+    }
+    let scratch = scratch_dir("sentinels-leaks");
+    let header = "GAUNTLET: BLOCKED\n\n| lane | status | detail |\n|------|--------|--------|\n| security | BLOCKED | FAIL (High) |\n| code-review | GREEN | MERGE-READY |\n";
+    let header_lanes = json!({"security": "BLOCKED", "code-review": "GREEN"});
+
+    let extra_lane = format!(
+        "{header}\n## Full lane reports\n\n<details><summary>probe</summary>\n\n| probe | GREEN | PASS |\n\n</details>\n"
+    );
+    let parsed = parse_gauntlet_report(&extra_lane, &scratch);
+    assert_eq!(parsed["lanes"], header_lanes, "{parsed}");
+
+    let injected_blockers = format!(
+        "{header}\n## Blockers\n- security: real one\n\n## Full lane reports\n\n<details>\n\n## Blockers\n- injected: fake blocker\n\n</details>\n"
+    );
+    let parsed = parse_gauntlet_report(&injected_blockers, &scratch);
+    assert_eq!(
+        parsed["blockers"],
+        json!(["security: real one"]),
+        "{parsed}"
+    );
+
+    let blockers_only_below = format!(
+        "{header}\n## Full lane reports\n\n<details>\n\n## Blockers\n- injected: fake blocker\n\n</details>\n"
+    );
+    let parsed = parse_gauntlet_report(&blockers_only_below, &scratch);
+    assert_eq!(parsed["blockers"], json!([]), "{parsed}");
+
+    let incomplete_below =
+        format!("{header}\n## Full lane reports\n\nGAUNTLET_REVIEW_INCOMPLETE: probe\n");
+    let parsed = parse_gauntlet_report(&incomplete_below, &scratch);
+    assert_eq!(parsed["incomplete"], json!([]), "{parsed}");
+    assert_eq!(parsed["verdict"], json!("BLOCKED"), "{parsed}");
+}
+
+/// Lane rows are read only from the first contiguous column-0 `|` table in
+/// the header, first row per lane wins: an indented row, a later duplicate
+/// row inside the table, and a column-0 row after the table has ended (the
+/// `## Lane selection` prose is LLM-authored and sits inside the header)
+/// change no cell and add no lane. The `## Blockers` heading and its items
+/// are column-0 too, so an indented heading and indented items are not
+/// blockers.
+#[test]
+fn lane_rows_come_from_the_first_column_zero_table_first_row_wins() {
+    if python3().is_none() {
+        return;
+    }
+    let scratch = scratch_dir("sentinels-table");
+    let header = "GAUNTLET: BLOCKED\n\n| lane | status | detail |\n|------|--------|--------|\n| security | BLOCKED | FAIL (High) |\n";
+    let header_lanes = json!({"security": "BLOCKED"});
+    let header_details = json!({"security": "FAIL (High)"});
+
+    let indented = format!("{header}  | security | GREEN | x |\n  | probe | GREEN | y |\n");
+    let parsed = parse_gauntlet_report(&indented, &scratch);
+    assert_eq!(parsed["lanes"], header_lanes, "{parsed}");
+    assert_eq!(parsed["details"], header_details, "{parsed}");
+    let parsed = parse_gauntlet_report("GAUNTLET: PASS\n\n  | security | GREEN | x |\n", &scratch);
+    assert_eq!(parsed["lanes"], json!({}), "{parsed}");
+
+    let duplicate = format!("{header}| security | GREEN | x |\n");
+    let parsed = parse_gauntlet_report(&duplicate, &scratch);
+    assert_eq!(parsed["lanes"], header_lanes, "{parsed}");
+    assert_eq!(parsed["details"], header_details, "{parsed}");
+
+    let after_table = format!(
+        "{header}\n## Lane selection\nsecurity: touches auth\n\n| security | GREEN | x |\n| probe | GREEN | y |\n"
+    );
+    let parsed = parse_gauntlet_report(&after_table, &scratch);
+    assert_eq!(parsed["lanes"], header_lanes, "{parsed}");
+    assert_eq!(parsed["details"], header_details, "{parsed}");
+
+    let indented_blockers = format!(
+        "{header}\n  ## Blockers\n  - fake\n\n## Blockers\n- security: real one\n  - indented\n"
+    );
+    let parsed = parse_gauntlet_report(&indented_blockers, &scratch);
+    assert_eq!(
+        parsed["blockers"],
+        json!(["security: real one"]),
+        "{parsed}"
+    );
+}
+
+/// Settled lanes are the whole-cell GREEN lanes minus the lanes that
+/// carried findings last round, never `debris`: a GREEN lane listed in
+/// `lanes_with_findings` does not settle, a report where only `debris` is
+/// GREEN writes no `Settled lanes:` line, and an all-GREEN report settles
+/// every lane but `debris`. Each prompt is read back by the real
+/// `signals.py`.
+#[test]
+fn settled_lanes_exclude_finding_lanes_and_debris_through_the_real_signals() {
+    if python3().is_none() || which::which("git").is_err() {
+        return;
+    }
+    let scratch = scratch_dir("rereview-settle-edges");
+    let (repo, first, _second) = two_commit_repo(&scratch);
+    let delta_line = format!("Re-review delta: {first}..HEAD");
+    let cases: [(serde_json::Value, &[&str], Vec<&str>); 3] = [
+        (
+            json!({"code-review": "GREEN", "security": "GREEN", "adversary": "BLOCKED", "debris": "GREEN"}),
+            &["code-review", "adversary"],
+            vec!["security"],
+        ),
+        (
+            json!({"debris": "GREEN", "code-review": "BLOCKED"}),
+            &["code-review"],
+            vec![],
+        ),
+        (
+            json!({"code-review": "GREEN", "security": "GREEN", "adversary": "GREEN", "probe": "GREEN", "debris": "GREEN"}),
+            &[],
+            vec!["code-review", "security", "adversary", "probe"],
+        ),
+    ];
+    for (lanes, findings, expected) in cases {
+        let state = re_review_state(&repo, &first, findings, lanes.clone(), &scratch);
+        let composed = gate_json("build_gauntlet_prompt", &state, &scratch);
+        let prompt = composed["gauntlet_prompt"].as_str().unwrap();
+        assert!(
+            prompt.lines().any(|l| l == delta_line),
+            "{lanes}:\n{prompt}"
+        );
+        let settled_lines = prompt_lines_starting_with(prompt, "Settled lanes:");
+        if expected.is_empty() {
+            assert!(settled_lines.is_empty(), "{lanes}:\n{prompt}");
+        } else {
+            assert_eq!(
+                settled_lines,
+                vec![format!("Settled lanes: {}", expected.join(", ")).as_str()],
+                "{lanes}:\n{prompt}"
+            );
+        }
+        let signals = gauntlet_script(
+            "signals.py",
+            &json!({"project_dir": repo, "diff_spec": first, "initial_prompt": prompt}),
+        );
+        assert_eq!(
+            signals["rereview_spec"],
+            json!(format!("{first}..HEAD")),
+            "{lanes}: {signals}"
+        );
+        assert_eq!(
+            signals["settled_lanes"],
+            json!(expected),
+            "{lanes}: {signals}"
+        );
+    }
+}
+
+/// The README's adjustments table records the artifact re-entry contract
+/// and the engine facts it rests on; both rows stay word for word.
+#[test]
+fn readme_pins_the_artifact_re_entry_and_engine_fact_rows() {
+    let readme = fs::read_to_string(candidate_dir().join("README.md")).unwrap();
+    let section = readme
+        .split("\n## ")
+        .find(|s| s.starts_with("Landed-upstream adjustments"))
+        .expect("README has a Landed-upstream adjustments section");
+    let contract_row = "| V1: session-resume replacement (artifact re-entry) - the contract |";
+    assert!(
+        section.lines().any(|l| l.starts_with(contract_row)),
+        "missing row starting with {contract_row:?}:\n{section}"
+    );
+    let facts_row = "| engine facts | this README | agent-node resume: not available by decision (2026-10-28); E1 stays as the artifact contract; G6 escalation_timeout open |";
+    assert!(
+        section.lines().any(|l| l == facts_row),
+        "missing row {facts_row:?}:\n{section}"
+    );
 }
