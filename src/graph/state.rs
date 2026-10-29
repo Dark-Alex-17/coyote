@@ -114,7 +114,9 @@ impl StateManager {
             write_private_atomic(&path, &json).with_context(|| {
                 format!("Failed to write state to temp file at '{}'", path.display())
             })?;
-            self.temp_file = Some(path.clone());
+            if let Some(old) = self.temp_file.replace(path.clone()) {
+                let _ = fs::remove_file(old);
+            }
 
             Ok(StateRepresentation::File(path))
         } else {
@@ -618,6 +620,30 @@ mod tests {
 
         drop(manager);
         assert!(!path.exists(), "temp file should be cleaned up on drop");
+    }
+
+    #[test]
+    fn a_second_spill_removes_the_first_spill_file() {
+        let big = "x".repeat(MAX_STATE_SIZE_BYTES + 1024);
+        let mut manager = manager_with(&[("blob", json!(big))]);
+
+        let first = manager.serialize_state().unwrap();
+        let first = first.as_file_path().unwrap().clone();
+        let second = manager.serialize_state().unwrap();
+        let second = second.as_file_path().unwrap().clone();
+
+        assert_ne!(first, second);
+        assert!(
+            !first.exists(),
+            "the first spill file outlived the second spill"
+        );
+        assert!(second.exists());
+
+        manager.cleanup();
+        assert!(
+            !second.exists(),
+            "cleanup left the latest spill file behind"
+        );
     }
 
     #[cfg(unix)]
