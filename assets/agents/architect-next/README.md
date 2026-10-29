@@ -56,7 +56,7 @@ scripts/smoke_test.py     3 hunks   (import _lib; utils.sh source + the real-cop
 scripts/mode_matrix.py    1 hunk    (utils.sh source; fails loud instead of stubbing; confirmation line)
 scripts/marker_map.json  25 hunks   (62 regions: two new, line numbers shifted, four first-lines reworded upstream)
 scripts/gates.py          1 hunk    (dead hygiene_pending_for_chain guard in stack_gate removed)
-README.md                 the design-record aside in the status paragraph, the run-state bullet above, this section, the Verify section
+README.md                 2 hunks   (design-record aside in the status paragraph; run-state bullet, this section and the Verify section)
 ```
 
 Every other file is byte-identical to staging; the graph's node set, prompts, loop bounds
@@ -104,25 +104,38 @@ cargo test --test candidate_architect_next              # the Rust wrapper (live
 cargo test --test candidate_architect_next -- --ignored # the mode matrix through the wrapper (three to five minutes; opt-in; needs mikefarah yq)
 ```
 
-The wrapper's live test groups: audit, smoke (plus a tally check that a failure recorded by
-the battery's last check still fails the run), session check, poison (the batteries never
-consult the user config dir), run-dir precedence, `build_lock` position, toolchain census,
-ASCII sweep, README ground-truth pins, the shim pin (every `scripts/<name>.py` shim calls
-`run("<name>")`, names `<name>` in its docstring, and the shims map one-to-one onto the
-`type: script` nodes of `graph.yaml`), the mode-matrix fail-loud test (`mode_matrix.py` exits
-before the walk when `.shared/utils.sh` is missing or a stub), three real-binary dry runs (by
-name from a seeded config dir; from an empty config dir that installs the candidate; re-entry
-by run id in the prompt) and the XDG-tier dry run (only `XDG_CACHE_HOME` set, the run lands
-under the engine's cache dir). The mode-matrix run is the one ignored test.
+The wrapper's live test groups:
+
+- batteries: audit, smoke (plus a tally check that a failure recorded by the battery's last
+  check still fails the run), session check, poison (the batteries never consult the user
+  config dir), and the mode-matrix fail-loud test (`mode_matrix.py` exits before the walk
+  when `.shared/utils.sh` is missing or a stub);
+- run dir: run-dir precedence from a fresh process;
+- graph and gates: `build_lock` position, the variable mirror (the candidate's variables
+  match the prose `architect/config.yaml` name for name and default for default, without
+  `yq`), the description pin (`description_names_no_file_outside_the_repo`), toolchain
+  census, ASCII sweep, and the shim pin (every `scripts/<name>.py` shim calls
+  `run("<name>")`, names `<name>` in its docstring, the shims map one-to-one onto the
+  `type: script` nodes of `graph.yaml`, and every `run()` name is a key of `GATES` in
+  `gates.py`);
+- README ground-truth pins: toolchain census, counts against the graph and the prose twin,
+  the `build_lock` row, the `assemble_pr_body` gap, and the dead-guard census row;
+- real-binary dry runs: four by name (from a seeded config dir; from an empty config dir that
+  installs the candidate; re-entry by run id in the prompt; an unknown run id in the prompt
+  starts a fresh run), the XDG-tier dry run (only `XDG_CACHE_HOME` set, the run lands under
+  the engine's cache dir), and the no-design-doc dry run (without a readable design doc the
+  run parks on the `need_design_doc` escalation before orienting).
+
+The mode-matrix run is the one ignored test.
 
 The Rust wrapper runs the batteries with `HOME`, `LLM_ROOT_DIR`, `COYOTE_CACHE_DIR`,
 `TMPDIR` and `ARCHITECT_RUNS_ROOT` pointed at a scratch directory and
 `PYTHONDONTWRITEBYTECODE=1`, so nothing under this directory or `~/.config/coyote` is
 touched. `audit_graph.py`, `check_session_block.sh` and `mode_matrix.py` need the Go `yq`
-by mikefarah (`yq --version` names it); the wrapper skips those three tests (the matrix
-included) when a different `yq` (or none) is on `PATH`. The sweep that keeps every bundled
-agent from naming this candidate lives in `tests/candidate_sisyphus_next.rs` and covers both
-candidate names.
+by mikefarah (`yq --version` names it); the wrapper's audit, session-check and poison tests,
+and the ignored matrix, skip when a different `yq` (or none) is on `PATH`. The sweep that
+keeps every bundled agent from naming this candidate lives in
+`tests/candidate_sisyphus_next.rs` and covers both candidate names.
 
 Measured 2026-10-28 after the adjustments above, from a fresh scratch dir: audit
 `PROBLEMS: none`; smoke `304/304 checks passed`; mode matrix `53/53 checks passed`
