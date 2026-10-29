@@ -727,10 +727,11 @@ mod tests {
             if arg.is_positional() || id == "memory_migrate" || ALLOWED_WITH_MIGRATE.contains(&id) {
                 continue;
             }
-            let Some(long) = arg.get_long() else {
-                continue;
+            let flag = match (arg.get_long(), arg.get_short()) {
+                (Some(long), _) => format!("--{long}"),
+                (None, Some(short)) => format!("-{short}"),
+                (None, None) => panic!("{id} is neither positional nor named"),
             };
-            let flag = format!("--{long}");
             let mut args = vec![
                 "coyote".to_string(),
                 "--memory-migrate".into(),
