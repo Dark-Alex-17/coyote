@@ -4,7 +4,8 @@ The decomposed architect orchestrator as a session graph. Status: candidate - no
 lists it as spawnable; the shipped `architect` keeps running the prose protocol until the
 artifact-equivalence replay passes and this directory replaces it. The delegate is
 `sisyphus` (two `agent:` lines); the swap to the graph sisyphus is one config edit plus
-three `inputs:` lines (see the design record).
+three `inputs:` lines (the design record lives in the operator's local planning store,
+not in this repo).
 
 ## Shape
 
@@ -38,9 +39,10 @@ below. Later landings add their own rows.
 | Adjustment | Where | What changed |
 |---|---|---|
 | em dashes | `graph.yaml` (3 lines: the `project_dir`, `pr_strategy` and `task_granularity` variable descriptions) | replaced with ASCII ` - ` so the repo's punctuation lint stays clean |
-| `build_lock` variable | `graph.yaml` `variables:` | declared after `pr_strategy` with default `''`, mirroring the prose `architect/config.yaml`; `scripts/check_session_block.sh` asserts the two variable lists match name-for-name, default-for-default. No `inputs: build_lock` is needed on any child node: the engine hands a parent's agent variables to every agent-node child, config and graph alike (`src/graph/agent.rs` runs the child through `run_agent_for_graph`, whose `RequestContext::new_for_child` copies the parent's agent variables, and `src/graph/executor.rs` `seed_variables` seats them over the child graph's declared defaults; pinned by `src/function/agents.rs` `run_agent_for_graph_child_seats_the_parents_build_lock_over_its_default`), so `delegate` and `wave_delegate` (`sisyphus`), `run_gauntlet` and `wave_gauntlet` (`review-gauntlet`) and `run_adversary` (`adversary`) all receive the value by inheritance; each of those five agents declares `build_lock` itself |
+| description provenance | `graph.yaml` `description:` | the shipped description drops two references to planning files that live only in the operator's local planning store, outside the repo; every other word is staging's |
+| `build_lock` variable | `graph.yaml` `variables:` | declared after `pr_strategy` with default `''`, mirroring the prose `architect/config.yaml`; `scripts/check_session_block.sh` asserts the two variable lists match name-for-name, default-for-default. No `inputs: build_lock` is needed on any child node: the engine hands a parent's agent variables to every agent-node child, config and graph alike (`src/graph/agent.rs` runs the child through `run_agent_for_graph`, whose `RequestContext::new_for_child` copies the parent's agent variables, and `src/graph/executor.rs` `seed_variables` seats them over the child graph's declared defaults; pinned by `src/function/agents.rs` `run_agent_for_graph_child_seats_the_parents_build_lock_over_its_default`), so `delegate` and `wave_delegate` (`sisyphus`), `run_gauntlet` and `wave_gauntlet` (`review-gauntlet`) and `run_adversary` (`adversary`) all receive the value by inheritance; each of the three agents behind those five nodes declares `build_lock` itself |
 | run dir | `scripts/_lib.py` `cache_dir()` / `runs_root()`, this README | moved from `$XDG_STATE_HOME/coyote/architect/runs` to `<cache dir>/architect-next/runs` (precedence above); `scripts/smoke_test.py` pins each resolution tier |
-| `utils.sh` source | `scripts/smoke_test.py`, `scripts/mode_matrix.py` | both batteries copy the repo asset `.shared/utils.sh` into the scratch `LLM_ROOT_DIR` instead of the user-config copy, which never existed under the re-pointed `HOME`, so the stub branch always ran; the real `set -euo pipefail` is now live inside `architect/tools.sh` under both batteries, with no unset-variable fallout, and a smoke check pins that the copy is the real file |
+| `utils.sh` source | `scripts/smoke_test.py`, `scripts/mode_matrix.py` | both batteries copy the repo asset `.shared/utils.sh` into the scratch `LLM_ROOT_DIR` instead of the user-config copy, which never existed under the re-pointed `HOME`, so the stub branch always ran; the real `set -euo pipefail` is now live inside `architect/tools.sh` under both batteries, with no unset-variable fallout. A smoke check pins that the copy is the real file; the matrix has no stub branch left: it exits before the first combination if the asset is missing or lacks `set -euo pipefail`, and prints `utils.sh: real asset` otherwise, which the ignored wrapper test asserts |
 | marker map | `scripts/marker_map.json` | regenerated against the landed `architect/instructions.md`, which carries 62 marker regions (staging mapped 60): the two regions added since staging are the micro-mode `review_cadence: batch` line on the parallel wave spawn (mapped to the `## MODE` block `_delegation_text` builds for `compose_delegation` and `wave_claim`) and the multi-PR `--tasks <group members>` line for `assemble_pr_body` (mapped to `pr_body` and recorded as a gap: the graph still calls the tool without `--tasks`, so a group body covers every complete task of the plan). The 60 known regions keep their mechanism and home; four recorded first-lines changed because upstream reworded or ASCII-normalised those lines; `first` keeps `\u2014` JSON escapes for 13 lines of the prose file |
 | dead `hygiene_pending_for_chain` guard | `scripts/gates.py` `stack_gate` | two lines deleted: the guard read `state.get("hygiene_pending_for_chain", {})`, a key no script, variable, `state_updates` target or output schema ever writes, so it was always falsy and the `continue` it guarded never ran; the repo's state-key walker (`bundled_graph_output_schemas_declare_every_key_relied_on`) rejects a consumed key with no declared writer, and deleting the read keeps behaviour identical rather than inventing a writer |
 
@@ -48,13 +50,13 @@ Recorded census against the staging tree (files that differ; hunks per file as c
 `diff -u <staging file> <file> | grep -c '^@@'`):
 
 ```
-graph.yaml                2 hunks   (project_dir em dash; pr_strategy em dash + build_lock + task_granularity em dash)
+graph.yaml                3 hunks   (description provenance; project_dir em dash; pr_strategy em dash + build_lock + task_granularity em dash)
 scripts/_lib.py           1 hunk    (new cache_dir; runs_root docstring; runs_root base path)
 scripts/smoke_test.py     3 hunks   (import _lib; utils.sh source + the real-copy pin; run dir resolution checks)
-scripts/mode_matrix.py    1 hunk    (utils.sh source)
+scripts/mode_matrix.py    1 hunk    (utils.sh source; fails loud instead of stubbing; confirmation line)
 scripts/marker_map.json  25 hunks   (62 regions: two new, line numbers shifted, four first-lines reworded upstream)
 scripts/gates.py          1 hunk    (dead hygiene_pending_for_chain guard in stack_gate removed)
-README.md                 this section, the run-state bullet above, the Verify section
+README.md                 the design-record aside in the status paragraph, the run-state bullet above, this section, the Verify section
 ```
 
 Every other file is byte-identical to staging; the graph's node set, prompts, loop bounds
@@ -98,17 +100,24 @@ python3 scripts/audit_graph.py .        # static edges + script _next edges, cyc
 bash scripts/check_session_block.sh     # session/schema rules; variable mirror vs architect/config.yaml (needs mikefarah yq)
 python3 scripts/smoke_test.py           # every gate, both sides of every bound, fail-open paths
 python3 scripts/mode_matrix.py          # marker regions mapped + all 48 mode combinations walk to end_complete
-cargo test --test candidate_architect_next              # the Rust wrapper: audit, smoke, session check, poison and precedence tests
-cargo test --test candidate_architect_next -- --ignored # the mode matrix through the wrapper (three to five minutes; opt-in)
+cargo test --test candidate_architect_next              # the Rust wrapper (live test groups listed below)
+cargo test --test candidate_architect_next -- --ignored # the mode matrix through the wrapper (three to five minutes; opt-in; needs mikefarah yq)
 ```
+
+The wrapper's live test groups: audit, smoke, session check, poison (the batteries never
+consult the user config dir), run-dir precedence, `build_lock` position, toolchain census,
+ASCII sweep, README ground-truth pins, and two real-binary dry runs (by name from a seeded
+config dir, and from an empty one that installs the candidate). The mode-matrix run is the
+one ignored test.
 
 The Rust wrapper runs the batteries with `HOME`, `LLM_ROOT_DIR`, `COYOTE_CACHE_DIR`,
 `TMPDIR` and `ARCHITECT_RUNS_ROOT` pointed at a scratch directory and
 `PYTHONDONTWRITEBYTECODE=1`, so nothing under this directory or `~/.config/coyote` is
-touched. `audit_graph.py` and `check_session_block.sh` need the Go `yq` by mikefarah
-(`yq --version` names it); the wrapper skips both of those tests when a different `yq`
-(or none) is on `PATH`. The sweep that keeps every bundled agent from naming this
-candidate lives in `tests/candidate_sisyphus_next.rs` and covers both candidate names.
+touched. `audit_graph.py`, `check_session_block.sh` and `mode_matrix.py` need the Go `yq`
+by mikefarah (`yq --version` names it); the wrapper skips those three tests (the matrix
+included) when a different `yq` (or none) is on `PATH`. The sweep that keeps every bundled
+agent from naming this candidate lives in `tests/candidate_sisyphus_next.rs` and covers both
+candidate names.
 
 Measured 2026-10-28 after the adjustments above, from a fresh scratch dir: audit
 `PROBLEMS: none`; smoke `304/304 checks passed`; mode matrix `53/53 checks passed`
