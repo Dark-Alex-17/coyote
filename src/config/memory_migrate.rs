@@ -960,6 +960,28 @@ mod tests {
     }
 
     #[test]
+    fn a_drill_section_left_empty_is_dropped_with_its_heading() {
+        let fx = Fixture::new("heading_drop");
+        let facts = "## Always-on facts\n- **Fact.** kept\n";
+        let index_path = fx.global.join(MEMORY_INDEX_FILE_NAME);
+        fs::write(
+            &index_path,
+            format!("{facts}\n## Drill files\n- [[g-note]]: global note\n\n"),
+        )
+        .unwrap();
+
+        let report = fx.migrate(true);
+
+        assert_eq!(fs::read_to_string(&index_path).unwrap(), facts);
+        assert!(scope(&report, "global").drill_heading_dropped);
+        let text = report.to_string();
+        assert!(
+            text.contains("  empty `## Drill files` heading dropped\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn an_empty_description_is_backfilled_and_a_different_one_wins_over_the_index() {
         let fx = Fixture::new("backfill");
 
