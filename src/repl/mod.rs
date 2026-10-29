@@ -5161,8 +5161,18 @@ local_hello() {\n\
             assert_eq!(born_by_run, first_message(&chat_first));
             let prompt = born_by_run["content"].as_str().unwrap();
             assert!(prompt.starts_with("Be brief."), "{prompt}");
-            assert!(prompt.contains("<global_index>"), "{prompt}");
-            assert!(!prompt.contains("<workspace_index>"), "{prompt}");
+            assert!(prompt.contains("<facts>"), "{prompt}");
+            assert!(
+                prompt.contains("The user prefers terse answers."),
+                "{prompt}"
+            );
+            let memory_start = prompt.find("<memory>").expect("a memory section");
+            let memory_end = prompt.find("</memory>").expect("a closed memory section");
+            assert_eq!(
+                &prompt[memory_start..memory_end],
+                "<memory>\n<facts>\n# Memory\n- The user prefers terse answers.\n</facts>\n<catalogue>\n</catalogue>\n",
+                "only the global index rides in, no workspace one"
+            );
             assert!(prompt.contains("## Memory\n"), "{prompt}");
             assert!(!prompt.contains("## Memory (read-only)"), "{prompt}");
             assert_graph_agent_restored(&run_first, &name, &chat_agent);

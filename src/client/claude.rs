@@ -345,6 +345,7 @@ pub fn claude_build_chat_completions_body(
         reasoning_effort,
         functions,
         stream,
+        prompt_cache_ttl,
     } = data;
 
     let system_message = extract_system_message(&mut messages);
@@ -595,7 +596,7 @@ pub fn claude_build_chat_completions_body(
 					.collect();
     }
     if prompt_cache {
-        apply_prompt_cache_breakpoints(&mut body);
+        apply_prompt_cache_breakpoints(&mut body, prompt_cache_ttl.as_deref());
     }
     Ok(body)
 }
@@ -604,12 +605,21 @@ pub fn claude_build_chat_completions_body(
 /// here: the last tool, the system prompt, and the last two user messages.
 /// Two moving breakpoints guarantee a cache read every turn: turn N+1's
 /// second-to-last breakpoint sits exactly where turn N's last one was.
-fn apply_prompt_cache_breakpoints(body: &mut Value) {
+///
+/// `ttl` goes on the tool and system breakpoints only. Anthropic requires
+/// TTLs to be non-increasing from tools through system to messages, so a
+/// longer TTL can never sit on the message breakpoints, and the stable
+/// prefix is the only part worth paying the longer-TTL write premium for.
+fn apply_prompt_cache_breakpoints(body: &mut Value, ttl: Option<&str>) {
+    let prefix_cache_control = match ttl {
+        Some(ttl) => json!({ "type": "ephemeral", "ttl": ttl }),
+        None => json!({ "type": "ephemeral" }),
+    };
     if let Some(text) = body["system"].as_str().map(str::to_string) {
         body["system"] = json!([{
             "type": "text",
             "text": text,
-            "cache_control": { "type": "ephemeral" },
+            "cache_control": prefix_cache_control.clone(),
         }]);
     }
     if let Some(tool) = body
@@ -617,7 +627,7 @@ fn apply_prompt_cache_breakpoints(body: &mut Value) {
         .and_then(|v| v.as_array_mut())
         .and_then(|v| v.last_mut())
     {
-        tool["cache_control"] = json!({ "type": "ephemeral" });
+        tool["cache_control"] = prefix_cache_control;
     }
     let Some(messages) = body.get_mut("messages").and_then(|v| v.as_array_mut()) else {
         return;
@@ -755,6 +765,7 @@ mod tests {
             reasoning_effort: None,
             functions: None,
             stream: false,
+            prompt_cache_ttl: None,
         };
         claude_build_chat_completions_body(data, &Model::new("claude", "claude-test"), prompt_cache)
             .unwrap()
@@ -783,12 +794,16 @@ mod tests {
             reasoning_effort: None,
             functions: None,
             stream: false,
+            prompt_cache_ttl: None,
         };
         claude_build_chat_completions_body(data, &Model::new("claude", "claude-test"), false)
             .unwrap()
     }
 
-    fn multi_turn_data(functions: Option<Vec<FunctionDeclaration>>) -> ChatCompletionsData {
+    fn multi_turn_data(
+        functions: Option<Vec<FunctionDeclaration>>,
+        prompt_cache_ttl: Option<&str>,
+    ) -> ChatCompletionsData {
         ChatCompletionsData {
             messages: vec![
                 Message::new(MessageRole::System, MessageContent::Text("sys".to_string())),
@@ -812,6 +827,7 @@ mod tests {
             reasoning_effort: None,
             functions,
             stream: false,
+            prompt_cache_ttl: prompt_cache_ttl.map(str::to_string),
         }
     }
 
@@ -1031,24 +1047,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn prompt_cache_places_breakpoints() {
-        let functions = vec![function_declaration("a"), function_declaration("b")];
-        let body = claude_build_chat_completions_body(
-            multi_turn_data(Some(functions)),
-            &Model::new("claude", "claude-test"),
-            true,
-        )
-        .unwrap();
-
-        let cache_control = json!({ "type": "ephemeral" });
+    /// The system block and last tool carry `prefix_cache_control`; the two
+    /// message breakpoints are always the bare default.
+    fn assert_breakpoints(body: &Value, prefix_cache_control: &Value) {
         let tools = body["tools"].as_array().unwrap();
         assert!(tools[0].get("cache_control").is_none(), "body: {body}");
-        assert_eq!(tools[1]["cache_control"], cache_control);
+        assert_eq!(&tools[1]["cache_control"], prefix_cache_control, "body: {body}");
 
         let system = body["system"].as_array().unwrap();
         assert_eq!(system.last().unwrap()["text"], "sys");
-        assert_eq!(system.last().unwrap()["cache_control"], cache_control);
+        assert_eq!(&system.last().unwrap()["cache_control"], prefix_cache_control);
 
         let messages = body["messages"].as_array().unwrap();
         assert!(
@@ -1059,8 +1067,84 @@ mod tests {
             let blocks = messages[idx]["content"].as_array().unwrap();
             let last = blocks.last().unwrap();
             assert_eq!(last["type"], "text", "body: {body}");
-            assert_eq!(last["cache_control"], cache_control, "body: {body}");
+            assert_eq!(last["cache_control"], json!({ "type": "ephemeral" }), "body: {body}");
         }
+    }
+
+    #[test]
+    fn prompt_cache_places_breakpoints() {
+        let functions = vec![function_declaration("a"), function_declaration("b")];
+        let body = claude_build_chat_completions_body(
+            multi_turn_data(Some(functions), None),
+            &Model::new("claude", "claude-test"),
+            true,
+        )
+        .unwrap();
+
+        assert_breakpoints(&body, &json!({ "type": "ephemeral" }));
+        assert!(!body.to_string().contains("ttl"), "body: {body}");
+    }
+
+    #[test]
+    fn prompt_cache_ttl_marks_system_and_last_tool_only() {
+        let functions = vec![function_declaration("a"), function_declaration("b")];
+        let body = claude_build_chat_completions_body(
+            multi_turn_data(Some(functions), Some("1h")),
+            &Model::new("claude", "claude-test"),
+            true,
+        )
+        .unwrap();
+
+        assert_breakpoints(&body, &json!({ "type": "ephemeral", "ttl": "1h" }));
+        assert_eq!(body.to_string().matches("\"ttl\"").count(), 2, "body: {body}");
+    }
+
+    fn breakpoint_fixture() -> Value {
+        json!({
+            "system": "sys",
+            "tools": [{ "name": "a" }, { "name": "b" }],
+            "messages": [
+                { "role": "user", "content": "first" },
+                { "role": "assistant", "content": "reply" },
+                { "role": "user", "content": "second" },
+            ],
+        })
+    }
+
+    #[test]
+    fn prompt_cache_breakpoints_exact_shape_without_ttl() {
+        let mut body = breakpoint_fixture();
+        apply_prompt_cache_breakpoints(&mut body, None);
+        assert_eq!(
+            body,
+            json!({
+                "system": [{ "type": "text", "text": "sys", "cache_control": { "type": "ephemeral" } }],
+                "tools": [{ "name": "a" }, { "name": "b", "cache_control": { "type": "ephemeral" } }],
+                "messages": [
+                    { "role": "user", "content": [{ "type": "text", "text": "first", "cache_control": { "type": "ephemeral" } }] },
+                    { "role": "assistant", "content": "reply" },
+                    { "role": "user", "content": [{ "type": "text", "text": "second", "cache_control": { "type": "ephemeral" } }] },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn prompt_cache_breakpoints_exact_shape_with_ttl() {
+        let mut body = breakpoint_fixture();
+        apply_prompt_cache_breakpoints(&mut body, Some("1h"));
+        assert_eq!(
+            body,
+            json!({
+                "system": [{ "type": "text", "text": "sys", "cache_control": { "type": "ephemeral", "ttl": "1h" } }],
+                "tools": [{ "name": "a" }, { "name": "b", "cache_control": { "type": "ephemeral", "ttl": "1h" } }],
+                "messages": [
+                    { "role": "user", "content": [{ "type": "text", "text": "first", "cache_control": { "type": "ephemeral" } }] },
+                    { "role": "assistant", "content": "reply" },
+                    { "role": "user", "content": [{ "type": "text", "text": "second", "cache_control": { "type": "ephemeral" } }] },
+                ],
+            })
+        );
     }
 
     #[test]
@@ -1090,7 +1174,7 @@ mod tests {
     fn prompt_cache_disabled_leaves_body_unchanged() {
         let functions = vec![function_declaration("a")];
         let body = claude_build_chat_completions_body(
-            multi_turn_data(Some(functions)),
+            multi_turn_data(Some(functions), None),
             &Model::new("claude", "claude-test"),
             false,
         )
@@ -1222,6 +1306,7 @@ mod tests {
             reasoning_effort: None,
             functions: None,
             stream: false,
+            prompt_cache_ttl: None,
         };
         tokio::runtime::Builder::new_current_thread()
             .enable_all()

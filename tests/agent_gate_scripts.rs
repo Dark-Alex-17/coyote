@@ -176,7 +176,8 @@ fn run_script(
         .env_remove("BUILD_CMD")
         .env_remove("TEST_CMD")
         .env_remove("FORMAT_CMD")
-        .env_remove("LINT_CMD");
+        .env_remove("LINT_CMD")
+        .env_remove("LLM_AGENT_VAR_BUILD_LOCK");
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -427,6 +428,663 @@ fn verify_scripts_survive_300kb_failing_transcript() {
         assert!(output.contains("bytes trimmed"), "{}: {output}", script.rel);
         assert!(output.ends_with(LAST_LINE), "{}: tail lost", script.rel);
     }
+}
+
+/// The `build_lock` graph variable wraps every gate command as ONE unit. Each
+/// command reads `$GATE_SEEN` in a child shell so only the prefix can set it.
+/// The compound leg proves the second `&&` half is also under the prefix, and
+/// the env-led leg uses a real wrapper prefix so a leading `FOO=bar` assignment
+/// survives (a word-prefix splice would exec `FOO=bar` as the program). The
+/// empty-string leg mirrors the production default of `build_lock: ''`. The
+/// `Ran:` line names the effective command, prefix included.
+#[test]
+fn verify_scripts_run_gate_under_build_lock_prefix() {
+    if tools_missing() {
+        return;
+    }
+    let dir = fixture_dir("verify-build-lock");
+    let state = project_state(&dir.0);
+    let simple = r#"sh -c 'printf "seen=%s\n" "${GATE_SEEN:-unset}"'"#;
+    let compound = r#"sh -c 'printf "a=%s\n" "${GATE_SEEN:-unset}"' && sh -c 'printf "b=%s\n" "${GATE_SEEN:-unset}"'"#;
+    let env_led = r#"FOO=bar sh -c 'printf "seen=%s foo=%s\n" "${GATE_SEEN:-unset}" "$FOO"'"#;
+    let wrapper = r#"sh -c 'GATE_SEEN=1 exec "$0" "$@"'"#;
+    let legs: [(&str, Option<&str>, &[&str]); 5] = [
+        (
+            simple,
+            Some("env GATE_SEEN=1"),
+            &["seen=1", "Ran: env GATE_SEEN=1 sh -c"],
+        ),
+        (compound, Some("env GATE_SEEN=1"), &["a=1", "b=1"]),
+        (env_led, Some(wrapper), &["seen=1 foo=bar"]),
+        (simple, Some(""), &["seen=unset", "Ran: sh -c"]),
+        (simple, None, &["seen=unset", "Ran: sh -c"]),
+    ];
+    for (cmd, lock, expected) in legs {
+        let lock_env: Vec<(&str, &str)> = lock
+            .into_iter()
+            .map(|v| ("LLM_AGENT_VAR_BUILD_LOCK", v))
+            .collect();
+        for script in &VERIFY_SCRIPTS {
+            let mut envs = vec![(script.cmd_env, cmd)];
+            envs.extend_from_slice(&lock_env);
+            let out = run_script_json(script.rel, &dir.0, &state, &envs);
+            assert_eq!(
+                out[script.ok_key],
+                Value::Bool(true),
+                "{} under {lock:?}: {out}",
+                script.rel
+            );
+            let output = str_field(&out, script.output_key);
+            for needle in expected {
+                assert!(
+                    output.contains(needle),
+                    "{} under {lock:?}: expected {needle} in {output}",
+                    script.rel
+                );
+            }
+        }
+        let mut envs = vec![("FORMAT_CMD", cmd), ("LINT_CMD", cmd)];
+        envs.extend_from_slice(&lock_env);
+        let out = run_script_json(
+            "step-runner/scripts/verify_format_lint.sh",
+            &dir.0,
+            &state,
+            &envs,
+        );
+        assert_eq!(out["lint_ok"], Value::Bool(true), "under {lock:?}: {out}");
+        for key in ["format_output", "lint_output"] {
+            let output = str_field(&out, key);
+            for needle in expected {
+                assert!(
+                    output.contains(needle),
+                    "{key} under {lock:?}: expected {needle} in {output}"
+                );
+            }
+        }
+    }
+}
+
+/// A prefixed gate runs in a child shell; it must still fail the way the bare
+/// gate does: the command's exit status reaches the verdict, and a pipeline
+/// whose left side fails is a failure (`pipefail`), not a pass through `cat`.
+/// The bare legs pin the other arm of run_gate to the same verdict. The
+/// unbound-variable legs expand in the gate shell itself (a `sh -c '...'`
+/// wrapper would hide the reference from `set -u`); the exit code differs
+/// between the arms (1 bare, 127 prefixed), so only the verdict is pinned.
+#[test]
+fn verify_scripts_under_build_lock_keep_exit_status_and_pipefail() {
+    if tools_missing() {
+        return;
+    }
+    let dir = fixture_dir("verify-build-lock-fail");
+    let state = project_state(&dir.0);
+    let prefixed = Some("env GATE_SEEN=1");
+    let unbound = r#"echo "$UNSET_GATE_VAR""#;
+    let legs: [(Option<&str>, &str, Option<&str>); 6] = [
+        (prefixed, "sh -c 'exit 7'", Some("Exit code: 7")),
+        (prefixed, "sh -c 'exit 7' | cat", Some("Exit code: 7")),
+        (None, "sh -c 'exit 7'", Some("Exit code: 7")),
+        (None, "sh -c 'exit 7' | cat", Some("Exit code: 7")),
+        (prefixed, unbound, None),
+        (None, unbound, None),
+    ];
+    for (lock, cmd, exit_line) in legs {
+        let lock_env: Vec<(&str, &str)> = lock
+            .into_iter()
+            .map(|v| ("LLM_AGENT_VAR_BUILD_LOCK", v))
+            .collect();
+        for script in &VERIFY_SCRIPTS {
+            let mut envs = vec![(script.cmd_env, cmd)];
+            envs.extend_from_slice(&lock_env);
+            let out = run_script_json(script.rel, &dir.0, &state, &envs);
+            assert_eq!(
+                out[script.ok_key],
+                Value::Bool(false),
+                "{} running {cmd} under {lock:?}: {out}",
+                script.rel
+            );
+            assert_eq!(str_field(&out, "_next"), "fix_loop_gate", "{}", script.rel);
+            let output = str_field(&out, script.output_key);
+            if let Some(needle) = exit_line {
+                assert!(
+                    output.contains(needle),
+                    "{} running {cmd} under {lock:?}: {output}",
+                    script.rel
+                );
+            }
+        }
+        let mut envs = vec![("FORMAT_CMD", cmd), ("LINT_CMD", cmd)];
+        envs.extend_from_slice(&lock_env);
+        let out = run_script_json(
+            "step-runner/scripts/verify_format_lint.sh",
+            &dir.0,
+            &state,
+            &envs,
+        );
+        assert_eq!(
+            out["lint_ok"],
+            Value::Bool(false),
+            "running {cmd} under {lock:?}: {out}"
+        );
+        if let Some(needle) = exit_line {
+            for key in ["format_output", "lint_output"] {
+                let output = str_field(&out, key);
+                assert!(
+                    output.contains(needle),
+                    "{key} running {cmd} under {lock:?}: {output}"
+                );
+            }
+        }
+    }
+}
+
+/// Every graph that forwards or consumes `build_lock` declares it with an
+/// empty default, so an unset variable renders as `''` and the gate runs bare.
+/// The Sisyphus gauntlet template must ask for bare lane names in `Settled
+/// lanes:` because build_items.py refuses verdict words and parentheticals,
+/// and say the tokens are inert without `Re-review delta:`, which is how
+/// build_items.py treats them.
+#[test]
+fn build_lock_is_declared_with_empty_default_and_settled_lanes_are_bare() {
+    for rel in [
+        "coder/graph.yaml",
+        "step-runner/graph.yaml",
+        "sisyphus/config.yaml",
+        "architect/config.yaml",
+        "review-gauntlet/graph.yaml",
+        "adversary/graph.yaml",
+    ] {
+        let doc: serde_yaml::Value =
+            serde_yaml::from_str(&fs::read_to_string(asset(rel)).unwrap()).unwrap();
+        let variables = doc["variables"]
+            .as_sequence()
+            .unwrap_or_else(|| panic!("{rel}: variables"));
+        let build_lock = variables
+            .iter()
+            .find(|v| v["name"].as_str() == Some("build_lock"))
+            .unwrap_or_else(|| panic!("{rel}: no build_lock variable"));
+        assert_eq!(
+            build_lock["default"],
+            serde_yaml::Value::from(""),
+            "{rel}: build_lock default"
+        );
+    }
+
+    let sisyphus = fs::read_to_string(asset("sisyphus/instructions.md")).unwrap();
+    let settled = sisyphus
+        .lines()
+        .find(|l| l.starts_with("Settled lanes:"))
+        .expect("sisyphus gauntlet template has a `Settled lanes:` placeholder");
+    assert!(settled.contains("bare lane names"), "{settled}");
+    assert!(
+        sisyphus
+            .contains("omit on the first round (ignored unless `Re-review delta:` is also given)>"),
+        "the Settled lanes placeholder must say the tokens are inert without a delta"
+    );
+}
+
+/// The gauntlet hands `build_lock` to the adversary lane through `inputs:`
+/// (the same structured channel as `verification_commands`), and every
+/// spawn template that forwards the variable spells it the same way, so an
+/// empty value travels too rather than being dropped by a conditional.
+#[test]
+fn build_lock_forwarding_is_unconditional_in_templates_and_gauntlet_inputs() {
+    let gauntlet: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(asset("review-gauntlet/graph.yaml")).unwrap())
+            .unwrap();
+    let inputs = &gauntlet["nodes"]["run_adversary"]["inputs"];
+    assert_eq!(
+        inputs["verification_commands"],
+        serde_yaml::Value::from("{{verification_commands}}")
+    );
+    assert_eq!(
+        inputs["build_lock"],
+        serde_yaml::Value::from("{{build_lock}}")
+    );
+
+    let forwarded = r#""build_lock": "{{build_lock}}""#;
+    for rel in ["sisyphus/instructions.md", "architect/instructions.md"] {
+        let doc = fs::read_to_string(asset(rel)).unwrap();
+        let count = doc.matches(forwarded).count();
+        assert_eq!(
+            count, 4,
+            "{rel}: {forwarded} appears {count} times, expected exactly 4"
+        );
+        assert!(
+            !doc.contains("When `{{build_lock}}` is non-empty"),
+            "{rel}: build_lock forwarding must not be conditional"
+        );
+    }
+}
+
+/// The tool-shaped build/test runners share the gate helper with the script
+/// nodes, so a `build_lock` prefix covers them as well.
+#[test]
+fn tools_sh_build_and_test_runners_go_through_run_gate() {
+    for rel in ["coder/tools.sh", "sisyphus/tools.sh"] {
+        let script = fs::read_to_string(asset(rel)).unwrap();
+        for var in ["build_cmd", "test_cmd"] {
+            assert!(
+                !script.contains(&format!("eval \"${{{var}}}\"")),
+                "{rel}: {var} must not be eval'd directly"
+            );
+            assert!(
+                script.contains(&format!("run_gate \"${{{var}}}\"")),
+                "{rel}: {var} must run through run_gate"
+            );
+            assert!(
+                script.contains(&format!("Running: $(gate_ran \"${{{var}}}\")")),
+                "{rel}: the Running: line for {var} must name the effective command"
+            );
+        }
+    }
+}
+
+/// The prose that tells a caller how long a lock wait may take quotes the
+/// gate nodes' timeouts; this reads the figures from the graphs so the two
+/// cannot drift apart silently.
+#[test]
+fn build_lock_prose_quotes_the_gate_node_timeouts() {
+    let cases: [(&str, &str, &[&str]); 2] = [
+        (
+            "coder/graph.yaml",
+            "coder/README.md",
+            &["verify_build", "verify_tests"],
+        ),
+        (
+            "step-runner/graph.yaml",
+            "step-runner/README.md",
+            &["verify_format_lint", "verify_build", "verify_tests"],
+        ),
+    ];
+    for (graph_rel, readme_rel, nodes) in cases {
+        let graph: serde_yaml::Value =
+            serde_yaml::from_str(&fs::read_to_string(asset(graph_rel)).unwrap()).unwrap();
+        let description = graph["variables"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"].as_str() == Some("build_lock"))
+            .and_then(|v| v["description"].as_str())
+            .unwrap_or_else(|| panic!("{graph_rel}: build_lock description"));
+        let readme = fs::read_to_string(asset(readme_rel)).unwrap();
+        for node in nodes {
+            let timeout = graph["nodes"][node]["timeout"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("{graph_rel}: nodes.{node}.timeout"));
+            let figure = format!("{timeout} s");
+            assert!(
+                description.contains(&figure),
+                "{graph_rel}: build_lock description must quote {figure} for {node}"
+            );
+            assert!(
+                readme.contains(&figure),
+                "{readme_rel}: must quote {figure} for {node}"
+            );
+        }
+    }
+}
+
+/// Every `flock -w <secs>` figure in the build_lock prose is less than the
+/// shortest coder or step-runner gate timeout, so a caller who copies the
+/// example gets a wait that gives up before the node is killed. The READMEs
+/// that show the invocation form and the gauntlet/adversary prose must each
+/// carry an example; the latter four show the canonical one.
+#[test]
+fn build_lock_prose_flock_waits_fit_under_the_shortest_gate_timeout() {
+    fn flock_wait_seconds(doc: &str) -> Vec<u64> {
+        doc.split("flock -w ")
+            .skip(1)
+            .filter_map(|rest| {
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                digits.parse().ok()
+            })
+            .collect()
+    }
+    let gates: [(&str, &[&str]); 2] = [
+        ("coder/graph.yaml", &["verify_build", "verify_tests"]),
+        (
+            "step-runner/graph.yaml",
+            &["verify_format_lint", "verify_build", "verify_tests"],
+        ),
+    ];
+    let shortest = gates
+        .iter()
+        .flat_map(|(graph_rel, nodes)| {
+            let graph: serde_yaml::Value =
+                serde_yaml::from_str(&fs::read_to_string(asset(graph_rel)).unwrap()).unwrap();
+            nodes
+                .iter()
+                .map(|node| {
+                    graph["nodes"][node]["timeout"]
+                        .as_u64()
+                        .unwrap_or_else(|| panic!("{graph_rel}: nodes.{node}.timeout"))
+                })
+                .collect::<Vec<_>>()
+        })
+        .min()
+        .unwrap();
+    let must_show_one = [
+        "coder/README.md",
+        "step-runner/README.md",
+        "adversary/graph.yaml",
+        "adversary/scripts/run_checks.py",
+        "review-gauntlet/graph.yaml",
+        "review-gauntlet/README.md",
+    ];
+    let canonical_example = "flock -w 240 /path/to/lock";
+    let must_show_canonical = [
+        "adversary/graph.yaml",
+        "adversary/scripts/run_checks.py",
+        "review-gauntlet/graph.yaml",
+        "review-gauntlet/README.md",
+    ];
+    for rel in [
+        "adversary/graph.yaml",
+        "adversary/scripts/run_checks.py",
+        "adversary/README.md",
+        "review-gauntlet/graph.yaml",
+        "review-gauntlet/README.md",
+        "coder/graph.yaml",
+        "coder/README.md",
+        "step-runner/graph.yaml",
+        "step-runner/README.md",
+        "sisyphus/config.yaml",
+        "architect/config.yaml",
+        "architect/README.md",
+    ] {
+        let doc = fs::read_to_string(asset(rel)).unwrap();
+        let waits = flock_wait_seconds(&doc);
+        if must_show_one.contains(&rel) {
+            assert!(
+                !waits.is_empty(),
+                "{rel}: must show a `flock -w <secs>` example"
+            );
+        }
+        if must_show_canonical.contains(&rel) {
+            assert!(
+                doc.contains(canonical_example),
+                "{rel}: must show the canonical example {canonical_example:?}"
+            );
+        }
+        for wait in waits {
+            assert!(
+                wait < shortest,
+                "{rel}: flock -w {wait} is not below the shortest gate timeout {shortest}"
+            );
+        }
+    }
+}
+
+/// Where a caller learns about `build_lock`: the adversary and gauntlet
+/// READMEs introduce it beside `verification_commands` (the variable it
+/// travels with), and the architect README lists it in the variables table.
+#[test]
+fn build_lock_is_documented_beside_verification_commands() {
+    for rel in ["adversary/README.md", "review-gauntlet/README.md"] {
+        let doc = fs::read_to_string(asset(rel)).unwrap();
+        let paragraph = doc
+            .split("\n\n")
+            .find(|p| p.contains("`build_lock`"))
+            .unwrap_or_else(|| panic!("{rel}: no `build_lock` mention"));
+        assert!(
+            paragraph.contains("`verification_commands`"),
+            "{rel}: `build_lock` must be introduced next to `verification_commands`"
+        );
+    }
+    let architect = fs::read_to_string(asset("architect/README.md")).unwrap();
+    assert!(
+        architect.contains("| `build_lock` |"),
+        "architect/README.md: variables table needs a build_lock row"
+    );
+    let row = architect
+        .lines()
+        .find(|l| l.starts_with("| `build_lock` |"))
+        .unwrap();
+    assert!(
+        row.contains("double quotes"),
+        "architect/README.md: build_lock row must state the JSON-quoting constraint"
+    );
+}
+
+/// The graph descriptions and READMEs for the coder and step-runner are
+/// twins: each must warn that the prefix is re-parsed by the shell and that
+/// a timed-out gate can leave an orphan lock wait behind. The step-runner
+/// README shows the invocation form, and the orchestrator configs state the
+/// JSON-quoting constraint their `--variables` hop imposes.
+#[test]
+fn build_lock_prose_twins_carry_the_same_warnings() {
+    for rel in [
+        "coder/graph.yaml",
+        "coder/README.md",
+        "step-runner/graph.yaml",
+        "step-runner/README.md",
+    ] {
+        let doc = fs::read_to_string(asset(rel)).unwrap();
+        for needle in [
+            "re-parsed",
+            "running later unobserved",
+            "flock '/tmp/my lock'",
+        ] {
+            assert!(doc.contains(needle), "{rel}: missing {needle:?}");
+        }
+        assert!(
+            !doc.contains(r#"flock "/tmp/my lock""#),
+            "{rel}: path examples must use single quotes"
+        );
+    }
+    let step_runner = fs::read_to_string(asset("step-runner/README.md")).unwrap();
+    assert!(step_runner.contains("--agent-variable build_lock"));
+    assert!(
+        step_runner.contains("spawned coder's own gates inherit the prefix"),
+        "step-runner/README.md: must say the spawned coder's gates inherit the prefix"
+    );
+
+    // The inner-shell caveat is spelled in the helper and both READMEs.
+    let exported_only = "sees only exported variables";
+    for rel in [
+        ".shared/utils.sh",
+        "coder/README.md",
+        "step-runner/README.md",
+    ] {
+        let doc = fs::read_to_string(asset(rel)).unwrap();
+        assert!(
+            doc.contains(exported_only),
+            "{rel}: missing {exported_only:?}"
+        );
+    }
+
+    // pipefail and the POSIX limit of the prefixed arm, stated at both
+    // places a caller reads about run_checks.
+    for rel in ["adversary/scripts/run_checks.py", "adversary/README.md"] {
+        let doc = fs::read_to_string(asset(rel)).unwrap();
+        for needle in ["pipefail applies only", "POSIX-only"] {
+            assert!(doc.contains(needle), "{rel}: missing {needle:?}");
+        }
+    }
+
+    for rel in ["sisyphus/config.yaml", "architect/config.yaml"] {
+        let doc: serde_yaml::Value =
+            serde_yaml::from_str(&fs::read_to_string(asset(rel)).unwrap()).unwrap();
+        let description = doc["variables"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"].as_str() == Some("build_lock"))
+            .and_then(|v| v["description"].as_str())
+            .unwrap_or_else(|| panic!("{rel}: build_lock description"));
+        assert!(
+            description.contains("double quotes"),
+            "{rel}: build_lock description must state the JSON-quoting constraint"
+        );
+        assert!(
+            description.contains("review-gauntlet/adversary verification runs"),
+            "{rel}: build_lock description must name the review lanes' verification runs"
+        );
+    }
+    let architect = fs::read_to_string(asset("architect/README.md")).unwrap();
+    assert!(
+        architect.contains("review-gauntlet/adversary verification runs"),
+        "architect/README.md: build_lock row must name the same reach as the config twins"
+    );
+}
+
+/// run_checks.py wraps each declared command in the `build_lock` prefix and
+/// records the prefix as `under`; without one (absent or empty) the record is
+/// unchanged. A failing command's exit status survives the wrapper. The
+/// prefix is read from state only, so an inherited LLM_AGENT_VAR_BUILD_LOCK
+/// must not leak into a bare run. A present non-string value is a declaration
+/// error: nothing runs and the record is the PIPELINE-FAULT marker.
+#[cfg(unix)]
+#[test]
+fn adversary_run_checks_runs_declared_commands_under_build_lock() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = fixture_dir("run-checks-build-lock");
+    let script = asset("adversary/scripts/run_checks.py");
+    let declared = r#"["sh -c 'printf seen=%s \"${GATE_SEEN:-unset}\"'", "sh -c 'exit 3'"]"#;
+    let declared_cmds = serde_json::from_str::<Vec<String>>(declared).unwrap();
+    let legs: [(Option<&str>, &str); 3] = [
+        (Some("env GATE_SEEN=1"), "seen=1"),
+        (Some(""), "seen=unset"),
+        (None, "seen=unset"),
+    ];
+    for (lock, expected) in legs {
+        let mut state = serde_json::json!({
+            "project_dir": dir.0.to_string_lossy(),
+            "verification_commands": declared,
+        });
+        if let Some(prefix) = lock {
+            state["build_lock"] = Value::String(prefix.to_string());
+        }
+        let state_file = dir.0.join(format!(
+            "state-{}.json",
+            lock.map_or("absent", |p| if p.is_empty() { "empty" } else { "set" })
+        ));
+        fs::write(&state_file, state.to_string()).unwrap();
+        let out = Command::new("python3")
+            .arg(&script)
+            .env("GRAPH_STATE_FILE", &state_file)
+            .env("ADVERSARY_STACK_LOCK_PATH", dir.0.join("stack.lock"))
+            .env_remove("GRAPH_STATE")
+            .env("LLM_AGENT_VAR_BUILD_LOCK", "env GATE_SEEN=leaked")
+            .output()
+            .expect("spawn python3");
+        let (code, stdout, stderr) = run(out);
+        assert_eq!(
+            code, 0,
+            "run_checks.py under {lock:?}\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        let out: Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("invalid JSON ({e}): {stdout}\nstderr: {stderr}"));
+        let results = out["exec_results"]
+            .as_array()
+            .unwrap_or_else(|| panic!("exec_results must be a record list: {out}"));
+        assert_eq!(results.len(), declared_cmds.len(), "{out}");
+        for (record, declared_cmd) in results.iter().zip(&declared_cmds) {
+            assert_eq!(
+                record["cmd"].as_str(),
+                Some(declared_cmd.as_str()),
+                "{record}"
+            );
+            match lock {
+                Some(prefix) if !prefix.is_empty() => {
+                    assert_eq!(record["under"], Value::String(prefix.to_string()))
+                }
+                _ => assert!(
+                    record.get("under").is_none(),
+                    "a bare run must not carry `under`: {record}"
+                ),
+            }
+        }
+        let (seen, failing) = (&results[0], &results[1]);
+        assert_eq!(seen["exit"], 0, "{seen}");
+        assert_eq!(str_field(seen, "tail"), expected, "{seen}");
+        assert_eq!(failing["exit"], 3, "{failing}");
+    }
+
+    let state = serde_json::json!({
+        "project_dir": dir.0.to_string_lossy(),
+        "verification_commands": declared,
+        "build_lock": 7,
+    });
+    let state_file = dir.0.join("state-non-string.json");
+    fs::write(&state_file, state.to_string()).unwrap();
+    let out = Command::new("python3")
+        .arg(&script)
+        .env("GRAPH_STATE_FILE", &state_file)
+        .env("ADVERSARY_STACK_LOCK_PATH", dir.0.join("stack.lock"))
+        .env_remove("GRAPH_STATE")
+        .output()
+        .expect("spawn python3");
+    let (code, stdout, stderr) = run(out);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let out: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("invalid JSON ({e}): {stdout}\nstderr: {stderr}"));
+    let marker = str_field(&out, "exec_results");
+    assert!(
+        marker.starts_with("PIPELINE-FAULT: build_lock declaration invalid"),
+        "a non-string build_lock must fail closed, not run bare: {out}"
+    );
+    assert!(marker.contains("got int"), "{marker}");
+    assert_eq!(out["pipeline_faults"], serde_json::json!([marker]));
+}
+
+/// verdict.py names the prefix a verification command ran under, so a reader
+/// of the report can tell a locked run from a bare one; a record without
+/// `under` renders as before.
+#[cfg(unix)]
+#[test]
+fn adversary_verdict_names_the_prefix_a_verification_run_was_under() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = fixture_dir("verdict-under");
+    let state = serde_json::json!({
+        "pipeline_faults": [],
+        "crit_verdicts": [
+            {"id": "c1", "text": "tests pass", "status": "MET",
+             "evidence": "src/x.rs:1 + test src/x.rs:99", "complaint": ""}
+        ],
+        "extra_complaints": [],
+        "observations": "",
+        "exec_results": [
+            {"cmd": "cargo test", "exit": 0, "duration_s": 1.5, "tail": "",
+             "under": "flock -w 240 /tmp/lock"},
+            {"cmd": "cargo build", "exit": 0, "duration_s": 0.5, "tail": ""}
+        ]
+    });
+    let state_file = dir.0.join("state.json");
+    fs::write(&state_file, state.to_string()).unwrap();
+    let out = Command::new("python3")
+        .arg(asset("adversary/scripts/verdict.py"))
+        .env("GRAPH_STATE_FILE", &state_file)
+        .env("ADVERSARY_STACK_LOCK_PATH", dir.0.join("stack.lock"))
+        .env_remove("GRAPH_STATE")
+        .output()
+        .expect("spawn python3");
+    let (code, stdout, stderr) = run(out);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let out: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("invalid JSON ({e}): {stdout}\nstderr: {stderr}"));
+    let report = str_field(&out, "adv_report");
+    let run_line = |cmd: &str| {
+        report
+            .lines()
+            .find(|l| l.contains(&format!("`{cmd}`")))
+            .unwrap_or_else(|| panic!("no run line for {cmd}: {report}"))
+    };
+    assert!(
+        run_line("cargo test").ends_with("1.5s (under: flock -w 240 /tmp/lock)"),
+        "{report}"
+    );
+    assert!(
+        run_line("cargo build").ends_with("0.5s"),
+        "a bare record must not gain an `under` suffix: {report}"
+    );
 }
 
 #[test]
@@ -3752,6 +4410,31 @@ fn step_runner_route_coder_result_failed_label_is_cause_neutral_and_sisyphus_nam
     assert!(
         failed.contains("Last script error:") && failed.to_lowercase().contains("crash"),
         "STEP_FAILED bullet must name the routing-gate crash and `Last script error:`: {failed}"
+    );
+}
+
+/// The memory prompt tells agents that run state kept as a memory must carry
+/// `type: run-state` with an `expires` date. The sisyphus run-state drill
+/// file is exactly that, so both places that describe it must say so or the
+/// orchestrator guidance contradicts the prompt it runs under.
+#[test]
+fn sisyphus_run_state_memory_is_typed_and_expiring() {
+    let sisyphus = fs::read_to_string(asset("sisyphus/instructions.md")).unwrap();
+    assert!(
+        sisyphus.contains("written with `type: run-state` and `expires` set to tomorrow"),
+        "sisyphus Memory row must type the run-state drill file and set expires"
+    );
+    assert!(
+        sisyphus.contains("one `type: run-state` drill file with `expires`"),
+        "sisyphus do-not-hoard rule must name the typed, expiring drill file"
+    );
+    let hoard = sisyphus
+        .lines()
+        .find(|l| l.starts_with("4. Do not hoard"))
+        .expect("sisyphus instructions have a `4. Do not hoard` rule");
+    assert!(
+        hoard.is_ascii(),
+        "the do-not-hoard rule must stay ASCII: {hoard}"
     );
 }
 

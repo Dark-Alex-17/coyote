@@ -2,6 +2,8 @@ name: explore
 description: Fast codebase exploration agent - finds patterns, structures, and relevant files. Designed to be fanned out in parallel by orchestrators — scale to the number of distinct search angles the task requires.
 version: 3.2.0
 
+memory: false
+
 skills_enabled: true
 enabled_skills:
   - ai-slop-remover

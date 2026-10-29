@@ -346,6 +346,7 @@ mod tests {
             reasoning_effort: None,
             functions: None,
             stream: false,
+            prompt_cache_ttl: None,
         };
         tokio::runtime::Builder::new_current_thread()
             .enable_all()

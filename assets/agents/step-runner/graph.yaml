@@ -47,6 +47,23 @@ variables:
       Which step to execute: a step number, or "next" to pick the first
       in-progress (resume) or pending step plan.
     default: 'next'
+  - name: build_lock
+    description: |
+      Command prefix for every gate (format, lint, build and tests), e.g.
+      `flock /path/to/lock` so parallel agents sharing one target directory
+      serialise their gate runs (the coder's own ad-hoc cargo calls are not
+      covered). The whole gate command runs under the prefix as one unit.
+      Waiting on the lock counts toward the gate node's timeout (300 s
+      format/lint, 600 s build, 1200 s tests), so prefer `flock -w <secs>` or
+      raise those timeouts when runs are long. A gate killed by its timeout
+      while still waiting leaves the lock request queued; `-w` below the node
+      timeout makes it give up instead of running later unobserved.
+      The prefix is a shell fragment
+      and is re-parsed: quote paths containing spaces (`flock '/tmp/my lock'`);
+      `$VAR` inside it expands when the gate runs. `flock` is util-linux (not
+      shipped on macOS); any wrapper that serialises its argument command
+      works. Empty (the default) runs the gate command bare.
+    default: ''
 
 settings:
   max_loop_iterations: 20

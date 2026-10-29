@@ -163,8 +163,8 @@ still appear under `## Blockers` and must be fixed as usual.
 |------|----------|-----------|
 | code-reviewer | `**Verdict: MERGE-READY \| NEEDS-HUMAN**` | critical count from the report's summary line (raw 🔴 count if absent); missing sentinel; own verdict line records a pipeline fault |
 | adversary | `ADVERSARIAL_REVIEW: CONFORMS \| DIVERGES` | DIVERGES; own degraded-run header (pipeline fault, died criterion checks, or its verdict script's crash stub); missing sentinel |
-| security-reviewer | `SECURITY_REVIEW: PASS \| FAIL` | FAIL; missing sentinel |
-| probe | `USAGE_PROBE: PASS \| FAIL \| INCONCLUSIVE` | FAIL; INCONCLUSIVE (environment note); missing sentinel |
+| security-reviewer | `SECURITY_REVIEW: PASS \| FAIL` (whole line only; the last such line wins -- a sentinel quoted inside the body is not read; a sentinel followed by text on the same line is treated as missing and re-runs the lane) | FAIL; missing sentinel |
+| probe | `USAGE_PROBE: PASS \| FAIL \| INCONCLUSIVE` (whole line only; the last such line wins -- a sentinel quoted inside the body is not read; a sentinel followed by text on the same line is treated as missing and re-runs the lane) | FAIL; INCONCLUSIVE (environment note); missing sentinel |
 | debris | none -- `debris_lint.py` findings read directly from state | any non-ASCII-punctuation or planning-artefact hit on an added line; a crashed lint (PIPELINE-FAULT, `GAUNTLET_REVIEW_INCOMPLETE: debris`) |
 
 ## Spawning it
@@ -194,11 +194,20 @@ instead of re-running everything:
 
 ```
 Re-review delta: <bare SHA of HEAD when the prior round ran, or an explicit range like abc1234..HEAD>
-Settled lanes: <only the lanes whose verdict in the IMMEDIATELY-PRIOR round was green — e.g. 'security, probe'>
+Settled lanes: <bare lane names only, comma-separated, e.g. 'security, probe' (or 'none')>
 ```
 
-The rules (all deterministic, in `build_items.py`):
+The rules (all deterministic; the lines are split in `signals.py`, judged in
+`build_items.py`):
 
+- **Bare lane names only.** The `Settled lanes:` line is a comma/space
+  separated list of `code-review`, `adversary`, `security`, `probe` (the
+  aliases in `build_items.ALIASES` are also accepted) or `none`; no verdicts,
+  round notes or parentheticals. A leading `none` makes the rest of the line
+  a comment (`none (nothing was green)` settles nothing). Otherwise one
+  unrecognised token refuses the whole line: nothing narrows, and the Lane
+  selection section records `settled lanes ignored: unrecognised token '<t>'
+  (bare lane names only)`.
 - A settled lane is skipped **iff the delta alone would not have selected it
   under the same hard rules**: `security` skips when the delta has no
   auth/deps/exec signals (and posture isn't hardened); `probe` skips when the
@@ -273,11 +282,17 @@ verbatim.
   (`'[]'` ⇒ "none declared"); a declaration that is not a JSON array of
   strings executes nothing and records a `PIPELINE-FAULT`, which the
   adversary lane reports as DIVERGES and the gate as BLOCKED.
+- The `build_lock` variable (default empty) rides the same `inputs:`
+  passthrough: when set, `run_checks` runs each declared command as one unit
+  under that prefix (e.g. `flock -w 240 /path/to/lock`), the same way the coder and
+  step-runner gates do, so a parallel batch sharing one target directory
+  serialises its verification runs too.
 - Signals failures degrade WIDER: if git can't compute the diff, the surface
   is unknown — the security lane is added (and probe, when a local-run recipe
-  exists) on top of caller context + forced lanes, and the report notes it. The auth-path regex deliberately over-fires (`auth(?!or)` matches
-  auth/authn/authz/oauth but not "author") — the safe direction, since signals
-  only ever ADD the security lane.
+  exists) on top of caller context + forced lanes, and the report notes it.
+- The auth-path regex deliberately over-fires (`auth(?!or(?!i[sz]))` matches
+  auth/authn/authz/oauth/authorize/authorise but not "author") -- the safe
+  direction, since signals only ever ADD the security lane.
 - The `debris` lint counts a MOVED line as added: touching a line means
   leaving it ASCII (a `--` for an em dash, `...` for an ellipsis, `->` for an
   arrow). A glyph that is the point (box drawing in a renderer, a pinned spec

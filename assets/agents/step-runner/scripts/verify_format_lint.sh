@@ -27,8 +27,9 @@ if [[ -z "$format_cmd" ]]; then
   format_output="(GATE NOT RUN: no format command configured or detected for project type '$project_type'. This is NOT evidence that formatting is clean. Set FORMAT_CMD to enable.)"
 else
   fmt_rc=0
-  fmt_out=$(cd "$project_dir" && eval "$format_cmd" 2>&1) || fmt_rc=$?
+  fmt_out=$(cd "$project_dir" && run_gate "$format_cmd" 2>&1) || fmt_rc=$?
   fmt_out=$(trim_output "$fmt_out")
+  format_cmd=$(gate_ran "$format_cmd")
   format_output="Ran: $format_cmd
 Exit code: $fmt_rc
 
@@ -68,7 +69,8 @@ if [[ -z "$lint_cmd" || "$lint_cmd" == "null" ]]; then
 fi
 
 lint_rc=0
-lint_out=$(cd "$project_dir" && eval "$lint_cmd" 2>&1) || lint_rc=$?
+lint_out=$(cd "$project_dir" && run_gate "$lint_cmd" 2>&1) || lint_rc=$?
+lint_cmd=$(gate_ran "$lint_cmd")
 
 if (( lint_rc == 0 )); then
   trim_output "$lint_out" | jq -Rsc \

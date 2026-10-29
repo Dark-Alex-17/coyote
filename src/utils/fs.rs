@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use log::{debug, warn};
-use std::fs::{DirBuilder, File, OpenOptions, TryLockError, remove_file, rename};
+use std::ffi::OsStr;
+use std::fs::{DirBuilder, File, OpenOptions, TryLockError, copy, read_dir, remove_file, rename};
 use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,14 +19,6 @@ fn write_temp_path(path: &Path, seq: u64) -> PathBuf {
     PathBuf::from(tmp_name)
 }
 
-/// Current value of the temp-file sequence; a test reads it to predict the
-/// temp path the next `write_private_atomic` call will use. Only meaningful
-/// under `#[serial]`.
-#[cfg(test)]
-pub(crate) fn next_temp_seq() -> u64 {
-    WRITE_TEMP_SEQ.load(Ordering::Relaxed)
-}
-
 /// Writes `content` to `path` through an owner-only (0600) sibling temp file
 /// and renames it over the target, so readers see either the old file or the
 /// complete new one, and a symlink planted at either path is replaced rather
@@ -33,7 +26,14 @@ pub(crate) fn next_temp_seq() -> u64 {
 /// the rename is journaled cannot leave the target truncated or empty. A stale
 /// temp entry is removed and the open retried once.
 pub(crate) fn write_private_atomic(path: &Path, content: &str) -> io::Result<()> {
-    let seq = WRITE_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    write_private_atomic_via(
+        path,
+        content,
+        WRITE_TEMP_SEQ.fetch_add(1, Ordering::Relaxed),
+    )
+}
+
+fn write_private_atomic_via(path: &Path, content: &str, seq: u64) -> io::Result<()> {
     let tmp_path = write_temp_path(path, seq);
     let open_tmp = || {
         let mut options = OpenOptions::new();
@@ -251,6 +251,50 @@ fn read_holder_pid(file: &mut File) -> Option<u32> {
     content.trim().parse().ok()
 }
 
+/// Copies everything under `src` into `dst`, recreating directories
+/// owner-only. A symlink is recreated as a link to the same target rather
+/// than followed; where symlinks cannot be created it is skipped with a
+/// warning. An entry whose file name `skip` accepts is left out, at any depth.
+pub(crate) fn copy_dir_all(
+    src: &Path,
+    dst: &Path,
+    skip: &dyn Fn(&OsStr) -> bool,
+) -> io::Result<()> {
+    create_private_dir_all(dst)?;
+    for entry in read_dir(src)? {
+        let entry = entry?;
+        if skip(&entry.file_name()) {
+            continue;
+        }
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        let target = dst.join(entry.file_name());
+        if file_type.is_symlink() {
+            copy_symlink(&path, &target, src)?;
+        } else if file_type.is_dir() {
+            copy_dir_all(&path, &target, skip)?;
+        } else if file_type.is_file() {
+            copy(&path, &target)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn copy_symlink(link: &Path, target: &Path, _src: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(std::fs::read_link(link)?, target)
+}
+
+#[cfg(not(unix))]
+fn copy_symlink(link: &Path, _target: &Path, src: &Path) -> io::Result<()> {
+    log::warn!(
+        "skip symlink {} while copying {}",
+        link.display(),
+        src.display()
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,13 +360,13 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn stale_temp_is_removed_and_retried() {
         let dir = TempDir::new("stale");
         let target = dir.0.join("out.yaml");
-        let stale = write_temp_path(&target, next_temp_seq());
+        let seq = u64::MAX;
+        let stale = write_temp_path(&target, seq);
         fs::write(&stale, "junk").unwrap();
-        write_private_atomic(&target, "fresh").unwrap();
+        write_private_atomic_via(&target, "fresh", seq).unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "fresh");
         assert!(!stale.exists());
         assert!(temp_entries(&dir.0).is_empty());
@@ -553,5 +597,42 @@ mod tests {
         assert!(!refuse_symlinked_dir(&sub, "test"));
         assert!(!refuse_symlinked_dir(&dir.0.join("missing"), "test"));
         assert!(refuse_symlinked_dir(&dir_link, "test"));
+    }
+
+    #[test]
+    fn copy_dir_all_copies_every_unskipped_file_and_keeps_symlinks_as_links() {
+        let dir = TempDir::new("copy");
+        let src = dir.0.join("src");
+        fs::create_dir_all(src.join("nested")).unwrap();
+        fs::write(src.join("a.md"), "a").unwrap();
+        fs::write(src.join("nested").join("b.md"), "b").unwrap();
+        fs::write(src.join(".catalogue.yaml"), "cache").unwrap();
+        fs::write(src.join("nested").join(".catalogue.lock"), "lock").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("a.md", src.join("link.md")).unwrap();
+
+        let dst = dir.0.join("backup").join("dst");
+        copy_dir_all(&src, &dst, &|name| {
+            name.to_string_lossy().starts_with(".catalogue.")
+        })
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(dst.join("a.md")).unwrap(), "a");
+        assert_eq!(
+            fs::read_to_string(dst.join("nested").join("b.md")).unwrap(),
+            "b"
+        );
+        assert!(!dst.join(".catalogue.yaml").exists());
+        assert!(!dst.join("nested").join(".catalogue.lock").exists());
+        assert!(src.join(".catalogue.yaml").exists());
+        assert!(src.join("nested").join(".catalogue.lock").exists());
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                fs::read_link(dst.join("link.md")).unwrap(),
+                Path::new("a.md")
+            );
+            assert_eq!(mode_of(&dst), 0o700);
+        }
     }
 }

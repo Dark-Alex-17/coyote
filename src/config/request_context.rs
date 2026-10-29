@@ -5,8 +5,9 @@ use super::mcp_tool_policy::{McpToolPolicy, SkillMcpLayer, ToolFilter, expand_mc
 use super::rag_cache::{RagCache, RagKey};
 use super::session::{
     AUTONAME_LABEL_PREFIX, AUTONAME_PLACEHOLDER, CompressionInfo, INTERRUPTED_RESPONSE_TEXT,
-    KeepPolicy, Session, SessionScope, keep_token_budget, labeled_session_names,
-    merged_session_names, min_reclaim_tokens, session_scope_dirs, valve_limit,
+    KeepPolicy, Session, SessionScope, SystemPromptSplit, keep_token_budget,
+    labeled_session_names, merged_session_names, min_reclaim_tokens, session_scope_dirs,
+    valve_limit,
 };
 use super::skill::{SKILL_SCAFFOLD, Skill};
 use super::skill_policy::SkillPolicy;
@@ -62,7 +63,7 @@ use super::install_remote::DEFAULT_GIT_HOST;
 use super::instructions;
 use super::macros::Macro;
 use super::memory::{
-    DEFAULT_MEMORY_CAP_WITH_TOOLS, DEFAULT_MEMORY_CAP_WITHOUT_TOOLS, MemoryStore, WorkspaceMemory,
+    DEFAULT_MEMORY_DRILL_CAP, DEFAULT_MEMORY_FACTS_CAP, MemorySection, MemoryStore, WorkspaceMemory,
 };
 use crate::graph;
 use crate::hooks::{self, HookEvent};
@@ -82,7 +83,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions, read_dir, read_to_string, remove_dir_all, remove_file};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use std::{env, fs, slice};
 use uuid::Uuid;
@@ -231,6 +232,60 @@ fn chat_agent_mismatch_warning(session_name: &str, previous: Option<&str>) -> St
             "Warning: session '{session_name}' was born with inline chat instructions; its recorded system prompt stays as is"
         ),
     }
+}
+
+/// Set by the first memory injection of the process; the notice about what
+/// the section holds is logged once, not on every turn. It goes to the log
+/// only, never to the terminal.
+/// The once-only property has no in-process unit pin: the gate is process
+/// wide, so whichever test injects first consumes it. The cold-start binary
+/// suite in tests/memory_section_binary.rs pins it across two injections.
+static MEMORY_SECTION_NOTICE: OnceLock<()> = OnceLock::new();
+
+fn memory_section_notice(section: &MemorySection, cap: usize) -> String {
+    let MemorySection {
+        facts_chars,
+        catalogue_chars,
+        truncated,
+        ..
+    } = section;
+    match truncated {
+        Some(cut) => format!(
+            "memory: {facts_chars} fact chars + {catalogue_chars} catalogue chars; {} lines / {} chars truncated at memory_facts_cap={cap} (global {}, workspace {}); run memory__lint",
+            cut.lines, cut.chars, cut.global_lines, cut.workspace_lines
+        ),
+        None => format!(
+            "memory: {facts_chars} fact chars + {catalogue_chars} catalogue chars injected under memory_facts_cap={cap}"
+        ),
+    }
+}
+
+/// Above this share of the model window the system prompt draws a warning.
+const SYSTEM_PROMPT_SHARE_WARN_PERCENT: usize = 25;
+
+/// Set by the first oversized system prompt of the process, so the warning
+/// is printed once rather than on every turn.
+static SYSTEM_PROMPT_SHARE_WARNING: OnceLock<()> = OnceLock::new();
+
+/// Counts the share warnings actually printed, so a test can observe the
+/// once-per-process gate without being able to reset it.
+#[cfg(test)]
+static SYSTEM_PROMPT_SHARE_WARNINGS_PRINTED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn system_prompt_share_warning_already_fired() -> bool {
+    SYSTEM_PROMPT_SHARE_WARNING.get().is_some()
+}
+
+fn system_prompt_share_warning(split: &SystemPromptSplit, window: Option<usize>) -> Option<String> {
+    let pct = split
+        .share_percent(window)
+        .filter(|pct| *pct > SYSTEM_PROMPT_SHARE_WARN_PERCENT)?;
+    Some(format!(
+        "system prompt is at least {pct}% of the model window ({} memory tokens); prune memory or lower memory_facts_cap",
+        split.memory_tokens
+    ))
 }
 
 /// The one sentence every failure to bring up a graph agent's chat agent is
@@ -506,6 +561,10 @@ pub struct RequestContext {
     /// Runtime-only, like `last_prompt_token_usage`.
     pub valve_checkpoint_floor: Option<usize>,
 
+    /// What the last memory-injecting `extract_role` put in the system
+    /// prompt. Runtime-only; `.info` and the compression bail read it.
+    pub system_prompt_split: parking_lot::Mutex<Option<SystemPromptSplit>>,
+
     pub tool_scope: ToolScope,
 
     pub declared_function_names: HashSet<String>,
@@ -539,6 +598,10 @@ pub struct RequestContext {
     /// under. Resolved once per graph run by `ensure_child_session_root`;
     /// forks and children copy the parent's handle.
     pub(crate) child_session_root: Option<Arc<ChildSessionRoot>>,
+    /// Test seam: where `memory_config` starts workspace memory discovery
+    /// instead of the process cwd.
+    #[cfg(test)]
+    workspace_memory_root: Option<PathBuf>,
 
     pub supervisor: Option<Arc<RwLock<Supervisor>>>,
     pub parent_supervisor: Option<Arc<RwLock<Supervisor>>>,
@@ -610,6 +673,7 @@ impl RequestContext {
             last_cost: None,
             last_prompt_token_usage: None,
             valve_checkpoint_floor: None,
+            system_prompt_split: parking_lot::Mutex::default(),
             tool_scope: ToolScope::default(),
             declared_function_names: Default::default(),
             node_job_scope: None,
@@ -620,6 +684,8 @@ impl RequestContext {
             last_graph_branch: None,
             delegate: None,
             child_session_root: None,
+            #[cfg(test)]
+            workspace_memory_root: None,
             supervisor: None,
             parent_supervisor: None,
             self_agent_id: None,
@@ -692,6 +758,7 @@ impl RequestContext {
             last_cost: None,
             last_prompt_token_usage: None,
             valve_checkpoint_floor: None,
+            system_prompt_split: parking_lot::Mutex::default(),
             tool_scope: ToolScope {
                 functions,
                 mcp_runtime,
@@ -706,6 +773,8 @@ impl RequestContext {
             last_graph_branch: None,
             delegate: None,
             child_session_root: None,
+            #[cfg(test)]
+            workspace_memory_root: None,
             supervisor: None,
             parent_supervisor: None,
             self_agent_id: None,
@@ -817,6 +886,7 @@ impl RequestContext {
             last_cost: self.last_cost,
             last_prompt_token_usage: self.last_prompt_token_usage,
             valve_checkpoint_floor: self.valve_checkpoint_floor,
+            system_prompt_split: parking_lot::Mutex::new(*self.system_prompt_split.lock()),
             tool_scope,
             declared_function_names: self.declared_function_names.clone(),
             node_job_scope: None,
@@ -827,6 +897,8 @@ impl RequestContext {
             last_graph_branch: self.last_graph_branch,
             delegate,
             child_session_root: self.child_session_root.clone(),
+            #[cfg(test)]
+            workspace_memory_root: self.workspace_memory_root.clone(),
             supervisor: self.supervisor.clone(),
             parent_supervisor: self.parent_supervisor.clone(),
             self_agent_id: self.self_agent_id.clone(),
@@ -882,6 +954,7 @@ impl RequestContext {
             last_cost: None,
             last_prompt_token_usage: None,
             valve_checkpoint_floor: None,
+            system_prompt_split: parking_lot::Mutex::default(),
             tool_scope: ToolScope {
                 functions: Functions::default(),
                 mcp_runtime: McpRuntime::default(),
@@ -896,6 +969,8 @@ impl RequestContext {
             last_graph_branch: None,
             delegate: None,
             child_session_root: parent.child_session_root.clone(),
+            #[cfg(test)]
+            workspace_memory_root: parent.workspace_memory_root.clone(),
             supervisor: None,
             parent_supervisor: parent.supervisor.clone(),
             self_agent_id: Some(self_agent_id),
@@ -1215,7 +1290,7 @@ impl RequestContext {
                 )
             );
         }
-        let role = self.extract_role(&self.app.config)?;
+        let (role, _) = self.extract_role_impl(&self.app.config, false)?;
         match self.select_functions(&role) {
             None => Ok("No tools enabled for the next request.\n".to_string()),
             Some(functions) => {
@@ -1464,9 +1539,15 @@ impl RequestContext {
             .and_then(Session::compression_threshold)
             .unwrap_or(app.compression_threshold);
         let valve = app.compression_safety_valve;
-        let window = match session {
-            Some(session) => session.model().max_input_tokens(),
-            None => self.extract_role(app)?.model().max_input_tokens(),
+        let (window, system_prompt) = match session {
+            Some(session) => (
+                session.model().max_input_tokens(),
+                *self.system_prompt_split.lock(),
+            ),
+            None => {
+                let (role, split) = self.extract_role_impl(app, true)?;
+                (role.model().max_input_tokens(), split)
+            }
         };
         let keep = self.compression_keep_policy(None);
         let tail = session.map(|session| session.kept_tail(keep));
@@ -1486,6 +1567,8 @@ impl RequestContext {
                 .zip(tail)
                 .map(|(session, tail)| session.model().total_tokens(tail)),
             archived_messages: session.map(|session| session.compressed_messages().len()),
+            system_prompt,
+            max_input_tokens: window,
         })
     }
 
@@ -2143,10 +2226,31 @@ impl RequestContext {
     }
 
     pub fn extract_role(&self, app: &AppConfig) -> Result<Role> {
-        self.extract_role_impl(app, true)
+        let (role, split) = self.extract_role_impl(app, true)?;
+        if let Some(split) = split {
+            *self.system_prompt_split.lock() = Some(split);
+            if let Some(warning) =
+                system_prompt_share_warning(&split, role.model().max_input_tokens())
+                && SYSTEM_PROMPT_SHARE_WARNING.set(()).is_ok()
+            {
+                eprintln!("{warning}");
+                warn!("{warning}");
+                #[cfg(test)]
+                SYSTEM_PROMPT_SHARE_WARNINGS_PRINTED
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        Ok(role)
     }
 
-    fn extract_role_impl(&self, app: &AppConfig, inject_memory: bool) -> Result<Role> {
+    /// Builds the effective role and, when `inject_memory` is set, the split
+    /// of its system prompt. The split is not stored and the share warning is
+    /// not printed; memory injection may still log its own notices.
+    fn extract_role_impl(
+        &self,
+        app: &AppConfig,
+        inject_memory: bool,
+    ) -> Result<(Role, Option<SystemPromptSplit>)> {
         let mut role = if let Some(session) = self.session.as_ref() {
             let mut role = session.to_role();
             // A swapped-in delegate answers with its own knobs; they overlay
@@ -2233,7 +2337,12 @@ impl RequestContext {
             }
         }
 
+        let mut prompt_split = None;
         if inject_memory {
+            let mut split = SystemPromptSplit {
+                role_tokens: estimate_token_length(role.prompt()),
+                ..SystemPromptSplit::default()
+            };
             let memory_config = self.memory_config();
             if memory_config.enabled {
                 let store = MemoryStore {
@@ -2242,32 +2351,38 @@ impl RequestContext {
                 };
                 let with_tools =
                     app.function_calling_support && self.graph_chat_model_supports_fc(app, &role);
-                let cap = if with_tools {
-                    app.memory_cap_with_tools
-                        .unwrap_or(DEFAULT_MEMORY_CAP_WITH_TOOLS)
-                } else {
-                    app.memory_cap_without_tools
-                        .unwrap_or(DEFAULT_MEMORY_CAP_WITHOUT_TOOLS)
-                };
-                match memory::build_memory_section(&store, with_tools, cap) {
+                let facts_cap = app.memory_facts_cap.unwrap_or(DEFAULT_MEMORY_FACTS_CAP);
+                let drill_cap = app.memory_drill_cap.unwrap_or(DEFAULT_MEMORY_DRILL_CAP);
+                match memory::build_memory_section(&store, with_tools, facts_cap, drill_cap) {
                     Ok(Some(section)) => {
+                        if MEMORY_SECTION_NOTICE.set(()).is_ok() {
+                            warn!("{}", memory_section_notice(&section, facts_cap));
+                        }
                         let separator = if role.is_empty_prompt() { "" } else { "\n\n" };
-                        role.append_to_prompt(separator);
-                        role.append_to_prompt(&section);
-                        role.append_to_prompt("\n\n");
-                        role.append_to_prompt(if with_tools {
+                        let instructions = if with_tools {
                             prompts::DEFAULT_MEMORY_INSTRUCTIONS
                         } else {
                             prompts::DEFAULT_MEMORY_INSTRUCTIONS_READONLY
-                        });
+                        };
+                        role.append_to_prompt(separator);
+                        role.append_to_prompt(&section.text);
+                        role.append_to_prompt("\n\n");
+                        role.append_to_prompt(instructions);
+                        split.memory_tokens = estimate_token_length(&section.text);
+                        split.instructions_tokens = estimate_token_length(instructions);
+                        split.truncated = section.truncated;
                     }
                     Ok(None) => {}
                     Err(e) => warn!("memory injection failed: {}", e),
                 }
             }
+            prompt_split = Some(split);
         }
 
-        Ok(self.skill_registry.effective_role(&role, &policy))
+        Ok((
+            self.skill_registry.effective_role(&role, &policy),
+            prompt_split,
+        ))
     }
 
     /// Whether the model that answers a chat turn can call the memory tools.
@@ -2351,8 +2466,8 @@ impl RequestContext {
             return MemoryConfig::disabled();
         }
 
-        let cwd = env::current_dir().ok();
-        let store = cwd.as_deref().map(MemoryStore::new);
+        let root = self.workspace_memory_root_or_cwd();
+        let store = root.as_deref().map(MemoryStore::new);
         let workspace = store.as_ref().and_then(|s| s.workspace.clone());
 
         let global_exists = paths::global_memory_index_file().exists();
@@ -2366,6 +2481,18 @@ impl RequestContext {
             enabled: true,
             workspace,
         }
+    }
+
+    #[cfg(not(test))]
+    fn workspace_memory_root_or_cwd(&self) -> Option<PathBuf> {
+        env::current_dir().ok()
+    }
+
+    #[cfg(test)]
+    fn workspace_memory_root_or_cwd(&self) -> Option<PathBuf> {
+        self.workspace_memory_root
+            .clone()
+            .or_else(|| env::current_dir().ok())
     }
 
     pub fn should_inject_memory(&self) -> bool {
@@ -3072,7 +3199,7 @@ impl RequestContext {
             Some(rag) => rag.get_config(),
             None => (app.rag_reranker_model.clone(), app.rag_top_k),
         };
-        let role = self.extract_role(app)?;
+        let (role, _) = self.extract_role_impl(app, false)?;
         let mut items = vec![
             ("model", role.model().id()),
             (
@@ -3116,17 +3243,22 @@ impl RequestContext {
         items.extend([
             ("memory", super::format_option_value(&app.memory)),
             (
-                "memory_cap_with_tools",
-                super::format_option_value(&app.memory_cap_with_tools),
+                "memory_facts_cap",
+                super::format_option_value(&app.memory_facts_cap),
             ),
             (
-                "memory_cap_without_tools",
-                super::format_option_value(&app.memory_cap_without_tools),
+                "memory_drill_cap",
+                super::format_option_value(&app.memory_drill_cap),
             ),
             (
                 "child_sessions",
                 super::format_option_value(&app.child_sessions),
             ),
+            (
+                "memory_run_state_ttl_days",
+                super::format_option_value(&app.memory_run_state_ttl_days),
+            ),
+            ("memory_round_chains", app.memory_round_chains.to_string()),
             (
                 "workspace_instructions",
                 super::format_option_value(&app.workspace_instructions),
@@ -3325,10 +3457,13 @@ impl RequestContext {
 
     pub fn generate_prompt_context(&self, app: &AppConfig) -> HashMap<&str, String> {
         let mut output = HashMap::new();
-        let role = self.extract_role_impl(app, false).unwrap_or_else(|err| {
-            warn!("failed to compute effective role for prompt rendering: {err}");
-            Role::default()
-        });
+        let role = self
+            .extract_role_impl(app, false)
+            .map(|(role, _)| role)
+            .unwrap_or_else(|err| {
+                warn!("failed to compute effective role for prompt rendering: {err}");
+                Role::default()
+            });
         output.insert("model", role.model().id());
         output.insert("client_name", role.model().client_name().to_string());
         output.insert("model_name", role.model().name().to_string());
@@ -4303,7 +4438,7 @@ impl RequestContext {
                 names.dedup();
 
                 let active: HashSet<String> = if self.app.config.function_calling_support {
-                    let role = self.extract_role(&self.app.config)?;
+                    let (role, _) = self.extract_role_impl(&self.app.config, false)?;
                     match self.select_functions(&role) {
                         None => HashSet::new(),
                         Some(functions) => functions.iter().map(|f| f.name.clone()).collect(),
@@ -6991,10 +7126,25 @@ impl RequestContext {
             let mut message =
                 String::from("Nothing to compress: the kept tail is the whole session");
             if keep_last_override.is_none() && self.working_mode.is_repl() {
-                message
-                    .push_str(&self.render_hints(
-                        "; lower compression_keep_last or run `.compress session 0`",
-                    ));
+                let memory_tokens = self
+                    .system_prompt_split
+                    .lock()
+                    .map_or(0, |split| split.memory_tokens);
+                let system_tokens = session
+                    .messages()
+                    .first()
+                    .filter(|first| first.role == MessageRole::System)
+                    .map_or(0, |first| {
+                        session.model().total_tokens(slice::from_ref(first))
+                    });
+                let hint = if memory_tokens > session.tokens().saturating_sub(system_tokens) {
+                    format!(
+                        "; the system prompt holds {memory_tokens} memory tokens, more than the conversation - prune memory or lower memory_facts_cap"
+                    )
+                } else {
+                    String::from("; lower compression_keep_last or run `.compress session 0`")
+                };
+                message.push_str(&self.render_hints(&hint));
             }
             bail!(message);
         }
@@ -8270,6 +8420,11 @@ mod tests {
     fn create_test_ctx() -> RequestContext {
         RequestContext::new(default_app_state(), WorkingMode::Cmd)
     }
+
+    /// The split estimates each part on its own while the prompt joins them
+    /// with separators and rounds once, so the two totals drift by a few
+    /// tokens either way.
+    const SPLIT_SEPARATOR_SLACK: usize = 3;
 
     fn priced_model() -> Model {
         let mut data = ModelData::new("test");
@@ -10217,6 +10372,329 @@ mod tests {
         let session = ctx.session.as_ref().unwrap();
         assert_eq!(session.messages().len(), 1, "keep_last 0 folds everything");
         assert!(session.messages()[0].content.to_text().contains("summary"));
+    }
+
+    #[test]
+    #[serial]
+    fn compress_session_impl_bail_points_at_memory_larger_than_the_conversation() {
+        let _guard = TestConfigDirGuard::new();
+        let index = paths::global_memory_index_file();
+        create_dir_all(index.parent().unwrap()).unwrap();
+        let fact = format!("- {}\n", "x".repeat(158));
+        write(&index, fact.repeat(10_000)).unwrap();
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            compression_threshold: 0,
+            compression_keep_last: 10,
+            memory: Some(true),
+            memory_facts_cap: Some(2_000_000),
+            memory_drill_cap: Some(2_000_000),
+            ..AppConfig::default()
+        });
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Repl);
+        let app = ctx.app.config.clone();
+        let role = ctx.extract_role(&app).unwrap();
+        let memory_tokens = ctx.system_prompt_split.lock().unwrap().memory_tokens;
+        assert!(memory_tokens > 300_000, "{memory_tokens}");
+        let input = Input::from_str(&ctx, &"y".repeat(150_000), Some(role)).unwrap();
+        let mut session = Session::default();
+        session.add_message(&input, "hi").unwrap();
+        assert_eq!(session.messages()[0].role, MessageRole::System);
+        ctx.session = Some(session);
+
+        let fetch = |_: Input| async { Ok("summary".to_string()) };
+        let err = run_async(ctx.compress_session_impl(None, fetch)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Nothing to compress: the kept tail is the whole session; the system prompt holds {memory_tokens} memory tokens, more than the conversation - prune memory or lower memory_facts_cap"
+            )
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn compress_session_impl_bail_keeps_the_keep_last_hint_when_the_conversation_outweighs_memory()
+    {
+        let _guard = TestConfigDirGuard::new();
+        write_global_memory_store();
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            compression_threshold: 0,
+            compression_keep_last: 10,
+            memory: Some(true),
+            ..AppConfig::default()
+        });
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Repl);
+        let app = ctx.app.config.clone();
+        let role = ctx.extract_role(&app).unwrap();
+        assert!(ctx.system_prompt_split.lock().unwrap().memory_tokens > 0);
+        let input = Input::from_str(&ctx, &"y".repeat(150_000), Some(role)).unwrap();
+        let mut session = Session::default();
+        session.add_message(&input, "hi").unwrap();
+        assert_eq!(session.messages()[0].role, MessageRole::System);
+        ctx.session = Some(session);
+
+        let fetch = |_: Input| async { Ok("summary".to_string()) };
+        let err = run_async(ctx.compress_session_impl(None, fetch)).unwrap_err();
+        assert!(
+            err.to_string()
+                .ends_with("; lower compression_keep_last or run `.compress session 0`"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn extract_role_records_the_system_prompt_split_only_when_injecting_memory() {
+        let _guard = TestConfigDirGuard::new();
+        write_global_memory_store();
+        let ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+
+        let prompt = ctx.extract_role(&app).unwrap().prompt().to_string();
+        let split = ctx.system_prompt_split.lock().unwrap();
+        assert!(split.memory_tokens > 0, "{split:?}");
+        assert!(
+            [
+                estimate_token_length(prompts::DEFAULT_MEMORY_INSTRUCTIONS),
+                estimate_token_length(prompts::DEFAULT_MEMORY_INSTRUCTIONS_READONLY),
+            ]
+            .contains(&split.instructions_tokens),
+            "{split:?}"
+        );
+        let parts = split.role_tokens + split.memory_tokens + split.instructions_tokens;
+        let whole = estimate_token_length(&prompt);
+        assert!(
+            parts <= whole + SPLIT_SEPARATOR_SLACK && whole <= parts + SPLIT_SEPARATOR_SLACK,
+            "{split:?} for:\n{prompt}"
+        );
+        let sentinel = SystemPromptSplit {
+            role_tokens: 1,
+            memory_tokens: 2,
+            instructions_tokens: 3,
+            truncated: None,
+        };
+        *ctx.system_prompt_split.lock() = Some(sentinel);
+        ctx.generate_prompt_context(&app);
+        assert_eq!(*ctx.system_prompt_split.lock(), Some(sentinel));
+    }
+
+    #[test]
+    #[serial]
+    fn extract_role_records_a_memoryless_split_when_memory_is_off() {
+        let _guard = TestConfigDirGuard::new();
+        write_global_memory_store();
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            memory: Some(false),
+            ..AppConfig::default()
+        });
+        let ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        let app = ctx.app.config.clone();
+
+        ctx.extract_role(&app).unwrap();
+        let split = ctx.system_prompt_split.lock().unwrap();
+        assert_eq!((split.memory_tokens, split.instructions_tokens), (0, 0));
+    }
+
+    #[test]
+    #[serial]
+    fn memory_role_tokens_pins_the_role_prompt_estimate() {
+        let _guard = TestConfigDirGuard::new();
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            memory: Some(false),
+            workspace_instructions: Some(false),
+            function_calling_support: false,
+            ..AppConfig::default()
+        });
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        let prompt = "You are a careful reviewer of pull requests.";
+        ctx.role = Some(Role::new("pinned", prompt));
+        let app = ctx.app.config.clone();
+
+        assert_eq!(ctx.extract_role(&app).unwrap().prompt(), prompt);
+        let split = ctx.system_prompt_split.lock().unwrap();
+        assert_eq!(split.role_tokens, estimate_token_length(prompt));
+        assert_eq!((split.memory_tokens, split.instructions_tokens), (0, 0));
+    }
+
+    #[test]
+    fn memory_system_prompt_share_warning_fires_only_above_a_quarter_of_the_window() {
+        let split = |memory_tokens| SystemPromptSplit {
+            role_tokens: 100,
+            memory_tokens,
+            instructions_tokens: 0,
+            truncated: None,
+        };
+        assert_eq!(system_prompt_share_warning(&split(150), Some(1_000)), None);
+        assert_eq!(system_prompt_share_warning(&split(159), Some(1_000)), None);
+        assert_eq!(
+            system_prompt_share_warning(&split(160), Some(1_000)).as_deref(),
+            Some(
+                "system prompt is at least 26% of the model window (160 memory tokens); prune memory or lower memory_facts_cap"
+            )
+        );
+        assert_eq!(system_prompt_share_warning(&split(0), Some(1_000)), None);
+        assert_eq!(system_prompt_share_warning(&split(10_000), None), None);
+        assert_eq!(system_prompt_share_warning(&split(10_000), Some(0)), None);
+    }
+
+    #[test]
+    #[serial]
+    fn memory_extract_role_prints_the_share_warning_once_per_process() {
+        let _guard = TestConfigDirGuard::new();
+        write_global_memory_store();
+        let mut ctx = create_test_ctx();
+        let mut role = Role::new("windowed", "prompt");
+        role.set_model(windowed_model(100));
+        ctx.role = Some(role);
+        let app = ctx.app.config.clone();
+        let printed =
+            || SYSTEM_PROMPT_SHARE_WARNINGS_PRINTED.load(std::sync::atomic::Ordering::Relaxed);
+        let already_fired = system_prompt_share_warning_already_fired();
+        let before = printed();
+
+        ctx.extract_role(&app).unwrap();
+        let split = ctx.system_prompt_split.lock().unwrap();
+        assert!(
+            system_prompt_share_warning(&split, Some(100)).is_some(),
+            "{split:?}"
+        );
+        let expected = if already_fired { before } else { before + 1 };
+        assert_eq!(printed(), expected);
+        assert!(system_prompt_share_warning_already_fired());
+
+        ctx.extract_role(&app).unwrap();
+        assert_eq!(printed(), expected);
+    }
+
+    /// Snapshot of every side effect the share warning path can leave, so a
+    /// read-only command can be checked against it.
+    fn share_warning_state(ctx: &RequestContext) -> (bool, usize, Option<SystemPromptSplit>) {
+        (
+            system_prompt_share_warning_already_fired(),
+            SYSTEM_PROMPT_SHARE_WARNINGS_PRINTED.load(std::sync::atomic::Ordering::Relaxed),
+            *ctx.system_prompt_split.lock(),
+        )
+    }
+
+    fn assert_a_share_warning_is_due(ctx: &RequestContext, app: &AppConfig) {
+        let split = ctx.extract_role_impl(app, true).unwrap().1.unwrap();
+        assert!(
+            system_prompt_share_warning(&split, Some(100)).is_some(),
+            "{split:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn memory_info_with_a_role_does_not_store_split_or_warn() {
+        let _guard = TestConfigDirGuard::new();
+        write_global_memory_store();
+        let mut ctx = create_test_ctx();
+        let mut role = Role::new("windowed", "prompt");
+        role.set_model(windowed_model(100));
+        ctx.role = Some(role);
+        let app = ctx.app.config.clone();
+        assert_a_share_warning_is_due(&ctx, &app);
+        let before = share_warning_state(&ctx);
+        assert_eq!(before.2, None);
+
+        ctx.info(&app).unwrap();
+
+        assert_eq!(share_warning_state(&ctx), before);
+    }
+
+    #[test]
+    #[serial]
+    fn memory_info_without_session_role_agent_or_rag_does_not_store_split_or_warn() {
+        let _guard = TestConfigDirGuard::new();
+        let index = paths::global_memory_index_file();
+        create_dir_all(index.parent().unwrap()).unwrap();
+        write(index, "# Memory\n- the user prefers terse answers\n").unwrap();
+        let mut ctx = create_test_ctx();
+        ctx.model = windowed_model(100);
+        assert!(ctx.session.is_none());
+        assert!(ctx.role.is_none());
+        assert!(ctx.agent.is_none());
+        assert!(ctx.rag.is_none());
+        let app = ctx.app.config.clone();
+        assert_a_share_warning_is_due(&ctx, &app);
+        let before = share_warning_state(&ctx);
+        assert_eq!(before.2, None);
+
+        let info = ctx.info(&app).unwrap();
+
+        assert_eq!(share_warning_state(&ctx), before);
+        assert!(
+            info.lines()
+                .any(|line| line.starts_with("system_prompt_share ") && line.ends_with("% of 100")),
+            "{info}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn memory_info_with_a_session_does_not_store_split_or_warn() {
+        let _guard = TestConfigDirGuard::new();
+        write_global_memory_store();
+        let mut ctx = create_test_ctx();
+        let mut session = Session::default();
+        session.set_model(windowed_model(100));
+        ctx.session = Some(session);
+        *ctx.system_prompt_split.lock() = Some(SystemPromptSplit {
+            role_tokens: 1,
+            memory_tokens: 2,
+            instructions_tokens: 3,
+            truncated: None,
+        });
+        let app = ctx.app.config.clone();
+        assert_a_share_warning_is_due(&ctx, &app);
+        let before = share_warning_state(&ctx);
+
+        ctx.info(&app).unwrap();
+
+        assert_eq!(share_warning_state(&ctx), before);
+    }
+
+    #[test]
+    #[serial]
+    fn memory_session_info_renders_n_a_before_a_split_exists() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let mut session = Session::default();
+        session.set_model(windowed_model(20_000));
+        ctx.session = Some(session);
+        let app = ctx.app.config.clone();
+
+        let info = ctx.info(&app).unwrap();
+
+        assert!(
+            info.contains("  system_prompt_role_tokens: n/a\n"),
+            "{info}"
+        );
+        assert!(info.contains("  system_prompt_share: n/a\n"), "{info}");
+    }
+
+    #[test]
+    #[serial]
+    fn memory_tools_info_does_not_store_split_or_warn() {
+        let _guard = TestConfigDirGuard::new();
+        write_global_memory_store();
+        let mut ctx = create_test_ctx();
+        let mut role = Role::new("windowed", "prompt");
+        role.set_model(windowed_model(100));
+        ctx.role = Some(role);
+        let app = ctx.app.config.clone();
+        assert_a_share_warning_is_due(&ctx, &app);
+        let before = share_warning_state(&ctx);
+        assert_eq!(before.2, None);
+
+        ctx.tools_info().unwrap();
+
+        assert_eq!(share_warning_state(&ctx), before);
     }
 
     #[test]
@@ -14120,6 +14598,55 @@ mod tests {
         assert_eq!(*root, ChildSessionRoot::from_stamp(ProcessStamp::current()));
     }
 
+    #[test]
+    #[serial]
+    fn forks_and_children_keep_the_workspace_memory_root() {
+        let guard = TestConfigDirGuard::new();
+        let workspace_index = paths::workspace_memory_index_file_for(&guard.workspace_root);
+        create_dir_all(workspace_index.parent().unwrap()).unwrap();
+        write(workspace_index, "# Workspace Memory\n").unwrap();
+        let expected_dir = MemoryStore::new(&guard.workspace_root)
+            .workspace
+            .map(|w| w.dir);
+        assert!(expected_dir.is_some());
+
+        let mut ctx = create_test_ctx();
+        ctx.workspace_memory_root = Some(guard.workspace_root.clone());
+        let fork = ctx.fork_for_branch();
+        let child = RequestContext::new_for_child(
+            Arc::clone(&ctx.app),
+            &ctx,
+            1,
+            Arc::new(Inbox::new()),
+            "agent_child_1".to_string(),
+        );
+
+        for copy in [&ctx, &fork, &child] {
+            assert_eq!(
+                copy.workspace_memory_root,
+                Some(guard.workspace_root.clone())
+            );
+            let config = copy.memory_config();
+            assert!(config.enabled);
+            assert_eq!(config.workspace.map(|w| w.dir), expected_dir);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn without_a_workspace_memory_root_memory_resolves_from_the_current_dir() {
+        let _guard = TestConfigDirGuard::new();
+        write_global_memory_store();
+        let ctx = create_test_ctx();
+        assert_eq!(ctx.workspace_memory_root, None);
+
+        let config = ctx.memory_config();
+
+        assert!(config.enabled);
+        let expected = MemoryStore::new(&env::current_dir().unwrap()).workspace;
+        assert_eq!(config.workspace.map(|w| w.dir), expected.map(|w| w.dir));
+    }
+
     fn retention_time() -> chrono::DateTime<chrono::Utc> {
         use chrono::TimeZone;
         chrono::Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap()
@@ -17011,6 +17538,14 @@ mod tests {
         assert!(row("compression_keep_tokens").ends_with("40000"));
         assert!(row("compression_checkpoint_tokens").ends_with("50000"));
         assert!(row("compression_min_reclaim").ends_with("24691"));
+        for key in [
+            "system_prompt_role_tokens",
+            "system_prompt_memory_tokens",
+            "system_prompt_share",
+            "memory_facts_truncated",
+        ] {
+            assert!(row(key).ends_with("n/a"), "{}", row(key));
+        }
         let lines: Vec<&str> = info.lines().collect();
         let save_session = lines
             .iter()
@@ -17021,10 +17556,55 @@ mod tests {
             .position(|line| line.starts_with("memory "))
             .unwrap();
         assert!(
-            lines[save_session + 1..memory]
-                .iter()
-                .all(|line| line.starts_with("compression_")),
-            "compression rows sit between save_session and memory:\n{info}"
+            lines[save_session + 1..memory].iter().all(|line| [
+                "compression_",
+                "system_prompt_",
+                "memory_facts_truncated"
+            ]
+            .iter()
+            .any(|prefix| line.starts_with(prefix))),
+            "compression and system prompt rows sit between save_session and memory:\n{info}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn session_info_reports_the_stored_system_prompt_split() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let mut session = Session::default();
+        session.set_model(windowed_model(20_000));
+        ctx.session = Some(session);
+        *ctx.system_prompt_split.lock() = Some(SystemPromptSplit {
+            role_tokens: 1234,
+            memory_tokens: 5678,
+            instructions_tokens: 0,
+            truncated: Some(memory::Truncated {
+                lines: 9,
+                chars: 321,
+                global_lines: 4,
+                workspace_lines: 5,
+            }),
+        });
+        let app = ctx.app.config.clone();
+
+        let info = ctx.info(&app).unwrap();
+
+        assert!(
+            info.contains("  system_prompt_role_tokens: 1234\n"),
+            "{info}"
+        );
+        assert!(
+            info.contains("  system_prompt_memory_tokens: 5678\n"),
+            "{info}"
+        );
+        assert!(
+            info.contains("  system_prompt_share: 34% of 20000\n"),
+            "{info}"
+        );
+        assert!(
+            info.contains("  memory_facts_truncated: 9 lines / 321 chars\n"),
+            "{info}"
         );
     }
 
@@ -17058,7 +17638,7 @@ mod tests {
         assert_eq!(info.kept_tail_messages, None);
         assert_eq!(info.kept_tail_tokens, None);
         assert_eq!(info.archived_messages, None);
-        assert_eq!(info.rows().len(), 9);
+        assert_eq!(info.rows().len(), 13);
     }
 
     // --- usage-probe (spec-first) coverage for the workspace-sessions surface ---
@@ -19196,25 +19776,35 @@ mod tests {
     /// default when there is no agent) and, for a graph agent, its block's
     /// `chat.memory`, with no block meaning off; the prompt is the agent's
     /// interpolated instructions, a blank line, the MEMORY.md section at the
-    /// with-tools cap, a blank line, the memory tool instructions. A drift in
+    /// default facts cap, a blank line, the memory tool instructions. A drift in
     /// `chat_agent`, `memory_config`, `extract_role` or the engage path shows
     /// as a literal mismatch.
     #[test]
     #[serial]
     fn chat_agent_is_the_agent_slot_while_no_delegate_is_engaged() {
-        let _guard = TestConfigDirGuard::new();
+        let guard = TestConfigDirGuard::new();
         write_global_memory_store();
+        let workspace_index = paths::workspace_memory_index_file_for(&guard.workspace_root);
+        create_dir_all(workspace_index.parent().unwrap()).unwrap();
+        write(workspace_index, "# Workspace Memory\n").unwrap();
+        let workspace_root = Some(guard.workspace_root.clone());
         let deterministic_prompt = |app: &mut AppConfig| {
             app.workspace_instructions = Some(false);
             app.skills_enabled = false;
             app.function_calling_support = true;
             app.memory = None;
         };
-        let store = MemoryStore::new(&env::current_dir().unwrap());
-        let memory_section =
-            memory::build_memory_section(&store, true, DEFAULT_MEMORY_CAP_WITH_TOOLS)
-                .unwrap()
-                .unwrap();
+        let store = MemoryStore::new(&guard.workspace_root);
+        assert!(store.workspace.is_some());
+        let memory_section = memory::build_memory_section(
+            &store,
+            true,
+            DEFAULT_MEMORY_FACTS_CAP,
+            DEFAULT_MEMORY_DRILL_CAP,
+        )
+        .unwrap()
+        .unwrap()
+        .text;
         let memory_tail = format!(
             "{memory_section}\n\n{}",
             prompts::DEFAULT_MEMORY_INSTRUCTIONS
@@ -19224,6 +19814,7 @@ mod tests {
         let expected_workspace_dir = store.workspace.as_ref().map(|w| w.dir.clone());
 
         let mut ctx = create_test_ctx();
+        ctx.workspace_memory_root = workspace_root.clone();
         ctx.update_app_config(deterministic_prompt);
         let app = ctx.app.config.clone();
         assert!(ctx.agent.is_none());
@@ -19234,6 +19825,7 @@ mod tests {
         assert_eq!(ctx.extract_role(&app).unwrap().prompt(), memory_tail);
 
         let mut ctx = create_test_ctx();
+        ctx.workspace_memory_root = workspace_root.clone();
         ctx.update_app_config(deterministic_prompt);
         let app = ctx.app.config.clone();
         ctx.agent = Some(Agent::test_new(AgentConfig {
@@ -19260,6 +19852,7 @@ mod tests {
             let agent_name = unique_name("test_block_graph_agent");
             write_graph_agent(&agent_name, extra);
             let mut ctx = create_test_ctx();
+            ctx.workspace_memory_root = workspace_root.clone();
             ctx.update_app_config(deterministic_prompt);
             ctx.model = fc_model("agent-model");
             let app = ctx.app.config.clone();
@@ -19835,6 +20428,40 @@ mod tests {
         assert_eq!(delegate.agent.variables()["tone"], "terse");
         assert!(delegate.agent.shared_variables().is_empty());
         assert_eq!(*delegate.agent.variables(), *session.chat_agent_variables());
+    }
+
+    #[test]
+    fn memory_section_notice_counts_an_untruncated_section() {
+        let section = MemorySection {
+            text: String::new(),
+            facts_chars: 154,
+            catalogue_chars: 71,
+            truncated: None,
+        };
+        assert_eq!(
+            memory_section_notice(&section, 4_000),
+            "memory: 154 fact chars + 71 catalogue chars injected under memory_facts_cap=4000"
+        );
+    }
+
+    #[test]
+    fn memory_section_notice_reports_the_cut_and_points_at_lint() {
+        let section = MemorySection {
+            text: String::new(),
+            facts_chars: 154,
+            catalogue_chars: 24_435,
+            truncated: Some(memory::Truncated {
+                lines: 338,
+                chars: 20_618,
+                global_lines: 338,
+                workspace_lines: 0,
+            }),
+        };
+        assert_eq!(
+            memory_section_notice(&section, 4_000),
+            "memory: 154 fact chars + 24435 catalogue chars; 338 lines / 20618 chars \
+             truncated at memory_facts_cap=4000 (global 338, workspace 0); run memory__lint"
+        );
     }
 
     #[test]
@@ -25873,7 +26500,7 @@ mod tests {
             "code_review_results": ["**Verdict: MERGE-READY**"],
             "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
             "security_results": [],
-            "probe_results": ["USAGE_PROBE: INCONCLUSIVE — could not boot the stack"]
+            "probe_results": ["could not boot the stack\n\nUSAGE_PROBE: INCONCLUSIVE\n"]
         });
         let out = run_gauntlet_script("verdict_gate.py", &state);
         assert_eq!(out["gauntlet_verdict"], "BLOCKED");
@@ -28050,8 +28677,8 @@ mod tests {
         for sentinel in [
             r"Verdict:\**\s*\**\s*(MERGE-READY|NEEDS-HUMAN)",
             r"ADVERSARIAL_REVIEW:\s*(CONFORMS|DIVERGES)",
-            r"SECURITY_REVIEW:\s*(PASS|FAIL)",
-            r"USAGE_PROBE:\s*(PASS|FAIL|INCONCLUSIVE)",
+            r"^SECURITY_REVIEW:\s*(PASS|FAIL)\s*$",
+            r"^USAGE_PROBE:\s*(PASS|FAIL|INCONCLUSIVE)\s*$",
         ] {
             assert!(
                 retry.contains(sentinel),
@@ -28134,6 +28761,306 @@ mod tests {
                 "the adversary degraded predicate must stay byte-identical in both gate scripts"
             );
         }
+    }
+
+    /// The security reviewer closes its report with the sentinel on its own
+    /// line; a body that quotes `SECURITY_REVIEW: FAIL` while explaining the
+    /// rule must not outrank that closing line in either gate script.
+    #[test]
+    fn gauntlet_security_sentinel_last_whole_line_wins() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let report = "# Security review\n\nRule: a `SECURITY_REVIEW: FAIL` blocks completion.\n\
+                      No exploitable finding.\n\nSECURITY_REVIEW: PASS\n";
+        let out = run_gauntlet_script(
+            "verdict_gate.py",
+            &json!({
+                "code_review_results": ["**Verdict: MERGE-READY**"],
+                "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+                "security_results": [report],
+                "probe_results": []
+            }),
+        );
+        assert_eq!(
+            out["gauntlet_verdict"], "PASS",
+            "a quoted FAIL mid-body must not outrank the closing PASS line: {out}"
+        );
+        assert!(
+            out["gauntlet_report"]
+                .as_str()
+                .unwrap()
+                .contains("| security | GREEN | PASS |"),
+            "{out}"
+        );
+
+        let retry = run_gauntlet_script("retry_gate.py", &gauntlet_lane_ran("security", report));
+        assert_eq!(
+            retry["retry_lanes"],
+            json!([]),
+            "the closing sentinel line completes the lane: {retry}"
+        );
+
+        // Only an inline quote, no whole-line sentinel: sentinel-less to both.
+        let quoted_only = "Rule: a `SECURITY_REVIEW: FAIL` blocks completion.\n";
+        let retry =
+            run_gauntlet_script("retry_gate.py", &gauntlet_lane_ran("security", quoted_only));
+        assert_eq!(retry["retry_lanes"], json!(["security"]), "{retry}");
+    }
+
+    /// The probe closes its report with the sentinel on its own line; a body
+    /// that quotes `USAGE_PROBE: PASS` while describing the suite must not
+    /// outrank the closing FAIL line in either gate script.
+    #[test]
+    fn gauntlet_probe_sentinel_last_whole_line_wins() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let report = "# Usage probe\n\nThe suite prints USAGE_PROBE: PASS when green.\n\
+                      Observed: POST /items returned 500 where the spec says 201.\n\n\
+                      USAGE_PROBE: FAIL\n";
+        let out = run_gauntlet_script(
+            "verdict_gate.py",
+            &json!({
+                "code_review_results": ["**Verdict: MERGE-READY**"],
+                "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+                "security_results": [],
+                "probe_results": [report]
+            }),
+        );
+        assert_eq!(
+            out["gauntlet_verdict"], "BLOCKED",
+            "a quoted PASS mid-body must not outrank the closing FAIL line: {out}"
+        );
+        assert!(
+            out["gauntlet_report"]
+                .as_str()
+                .unwrap()
+                .contains("| probe | BLOCKED | FAIL |"),
+            "{out}"
+        );
+
+        let retry = run_gauntlet_script("retry_gate.py", &gauntlet_lane_ran("probe", report));
+        assert_eq!(
+            retry["retry_lanes"],
+            json!([]),
+            "the closing sentinel line completes the lane: {retry}"
+        );
+
+        // Only an inline quote, no whole-line sentinel: sentinel-less to both.
+        let quoted_only = "The suite prints USAGE_PROBE: PASS when green.\n";
+        let retry = run_gauntlet_script("retry_gate.py", &gauntlet_lane_ran("probe", quoted_only));
+        assert_eq!(retry["retry_lanes"], json!(["probe"]), "{retry}");
+    }
+
+    /// A sentinel followed by text on its own line is not a whole-line
+    /// sentinel: the retry gate re-runs the lane and the verdict gate blocks
+    /// the row as missing, in agreement.
+    #[test]
+    fn gauntlet_sentinel_with_trailing_text_is_missing_to_both_gates() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let security = "# Security review\n\nNo exploitable finding.\n\n\
+                        SECURITY_REVIEW: PASS -- see above\n";
+        let retry = run_gauntlet_script("retry_gate.py", &gauntlet_lane_ran("security", security));
+        assert_eq!(
+            retry["retry_lanes"],
+            json!(["security"]),
+            "same-line trailing text must leave the lane sentinel-less: {retry}"
+        );
+        let out = run_gauntlet_script(
+            "verdict_gate.py",
+            &json!({
+                "code_review_results": ["**Verdict: MERGE-READY**"],
+                "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+                "security_results": [security],
+                "probe_results": []
+            }),
+        );
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("| security | BLOCKED | missing verdict sentinel |"),
+            "{out}"
+        );
+
+        let probe = "# Usage probe\n\nSuites green.\n\nUSAGE_PROBE: FAIL (see notes)\n";
+        let retry = run_gauntlet_script("retry_gate.py", &gauntlet_lane_ran("probe", probe));
+        assert_eq!(
+            retry["retry_lanes"],
+            json!(["probe"]),
+            "same-line trailing text must leave the lane sentinel-less: {retry}"
+        );
+        let out = run_gauntlet_script(
+            "verdict_gate.py",
+            &json!({
+                "code_review_results": ["**Verdict: MERGE-READY**"],
+                "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+                "security_results": [],
+                "probe_results": [probe]
+            }),
+        );
+        assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+        let report = out["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.contains("| probe | BLOCKED | missing verdict sentinel |"),
+            "{out}"
+        );
+    }
+
+    /// Two whole-line sentinels in one report: the last one is the verdict.
+    /// Both orders are pinned so reading the first match cannot pass.
+    #[test]
+    fn gauntlet_verdict_gate_last_whole_line_sentinel_wins_in_both_directions() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let security = "# Security review\n\nSECURITY_REVIEW: FAIL\n\n\
+                        Retested after the fix landed; the finding no longer reproduces.\n\n\
+                        SECURITY_REVIEW: PASS\n";
+        let out = run_gauntlet_script(
+            "verdict_gate.py",
+            &json!({
+                "code_review_results": ["**Verdict: MERGE-READY**"],
+                "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+                "security_results": [security],
+                "probe_results": []
+            }),
+        );
+        assert_eq!(
+            out["gauntlet_verdict"], "PASS",
+            "an earlier whole-line FAIL must not outrank the closing PASS: {out}"
+        );
+        assert!(
+            out["gauntlet_report"]
+                .as_str()
+                .unwrap()
+                .contains("| security | GREEN | PASS |"),
+            "{out}"
+        );
+
+        let probe = "# Usage probe\n\nUSAGE_PROBE: PASS\n\n\
+                     Second pass against a cold instance: POST /items returned 500.\n\n\
+                     USAGE_PROBE: FAIL\n";
+        let out = run_gauntlet_script(
+            "verdict_gate.py",
+            &json!({
+                "code_review_results": ["**Verdict: MERGE-READY**"],
+                "adversary_results": ["ADVERSARIAL_REVIEW: CONFORMS"],
+                "security_results": [],
+                "probe_results": [probe]
+            }),
+        );
+        assert_eq!(
+            out["gauntlet_verdict"], "BLOCKED",
+            "an earlier whole-line PASS must not outrank the closing FAIL: {out}"
+        );
+        assert!(
+            out["gauntlet_report"]
+                .as_str()
+                .unwrap()
+                .contains("| probe | BLOCKED | FAIL |"),
+            "{out}"
+        );
+    }
+
+    /// The regex a Python script assigns to `name`: the raw-string pieces of
+    /// its `NAME = r"..."` line or parenthesised multi-line form, joined the
+    /// way Python's adjacent-literal concatenation joins them.
+    fn python_regex_literal(source: &str, name: &str) -> String {
+        let head = format!("\n{name} = ");
+        let start = source
+            .find(&head)
+            .unwrap_or_else(|| panic!("{name} is not assigned"))
+            + head.len();
+        let rest = &source[start..];
+        let statement = if rest.starts_with('(') {
+            &rest[..rest.find("\n)").unwrap()]
+        } else {
+            &rest[..rest.find('\n').unwrap()]
+        };
+        statement
+            .split("r\"")
+            .skip(1)
+            .map(|piece| piece.split('"').next().unwrap())
+            .collect()
+    }
+
+    /// The sentinel contract is stated the same way everywhere it is read:
+    /// the lane selector's settled-lanes line names its source, the README
+    /// states the whole-line and last-wins rules and where the line is split,
+    /// the auth-path regex the README quotes is the one signals.py runs, and
+    /// the probe's own instructions show each sentinel as a bare fenced line.
+    #[test]
+    fn gauntlet_sentinel_prose_matches_the_gate_scripts() {
+        use crate::graph::NodeType;
+        let graph = load_bundled_graph("review-gauntlet");
+        let NodeType::Llm(select) = &graph.get_node("select_lanes").unwrap().node_type else {
+            panic!("select_lanes must be an llm node");
+        };
+        assert!(
+            select
+                .prompt
+                .contains("caller-supplied `Settled lanes:` tokens"),
+            "select_lanes must label settled lanes as caller-supplied: {}",
+            select.prompt
+        );
+        assert!(
+            !select.prompt.contains("green last round"),
+            "select_lanes must not restate settled lanes as a judgement: {}",
+            select.prompt
+        );
+
+        let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents");
+        let readme = read_to_string(assets.join("review-gauntlet/README.md"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        for claim in [
+            "split in `signals.py`",
+            "`build_items.ALIASES`",
+            "A leading `none` makes the rest of the line\n  a comment",
+            "a sentinel followed by text on the same line is treated as missing and re-runs the lane",
+            "the last such line wins",
+        ] {
+            assert!(
+                readme.contains(claim),
+                "review-gauntlet README must state the sentinel contract: {claim:?}"
+            );
+        }
+        let signals = read_to_string(assets.join("review-gauntlet/scripts/signals.py")).unwrap();
+        let auth_path_re = python_regex_literal(&signals, "AUTH_PATH_RE");
+        let auth_word = auth_path_re
+            .split('|')
+            .next()
+            .expect("AUTH_PATH_RE starts with its auth alternative");
+        assert_eq!(auth_word, "auth(?!or(?!i[sz]))");
+        assert!(
+            readme.contains(&format!("over-fires (`{auth_word}` matches")),
+            "review-gauntlet README must quote signals.py's auth-path regex {auth_word}"
+        );
+
+        let probe = read_to_string(assets.join("probe/config.yaml"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        for sentinel in [
+            "USAGE_PROBE: PASS",
+            "USAGE_PROBE: FAIL",
+            "USAGE_PROBE: INCONCLUSIVE",
+        ] {
+            assert!(
+                probe.contains(&format!("  ```\n  {sentinel}\n  ```\n")),
+                "probe/config.yaml must show {sentinel} as a bare fenced whole line"
+            );
+        }
+        assert!(
+            probe.contains("nothing before or after it on that line"),
+            "probe/config.yaml must state the whole-line rule"
+        );
     }
 
     /// build_items.py's LANE_KEYS and retry_gate.py's LANES name the same
@@ -28283,6 +29210,74 @@ mod tests {
         );
     }
 
+    /// A re-review state whose primary signals select security and probe
+    /// and whose delta carries no attack-surface or consumer signals, so
+    /// settling both lanes is the only thing standing between them and a
+    /// narrowed SKIP.
+    fn gauntlet_narrowable_state(settled_lanes: &[&str]) -> serde_json::Value {
+        json!({
+            "settled_lanes": settled_lanes,
+            "delta_summary": "2 file(s) in delta (abc1234..HEAD)",
+            "signals_summary": "6 file(s) changed (diff: worktree)",
+            "touches_auth": true,
+            "consumer_surface": true,
+            "probe_context": "make run && hurl tests/"
+        })
+    }
+
+    #[test]
+    fn gauntlet_build_items_bare_settled_lane_names_narrow() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out = run_gauntlet_script(
+            "build_items.py",
+            &gauntlet_narrowable_state(&["security", "probe"]),
+        );
+        assert_eq!(out["security_items"], json!([]), "{out}");
+        assert_eq!(out["probe_items"], json!([]), "{out}");
+        let summary = out["lanes_summary"].as_str().unwrap();
+        assert!(
+            summary.contains("security: SKIPPED (narrowed)")
+                && summary.contains("probe: SKIPPED (narrowed)"),
+            "both settled lanes must narrow on a quiet delta: {summary}"
+        );
+    }
+
+    /// signals.py splits the `Settled lanes:` line on commas and whitespace,
+    /// so a trailing remark arrives as extra tokens. One token that is not a
+    /// lane name refuses the whole line: a half-parsed line would narrow on
+    /// the names while the remark goes unread.
+    #[test]
+    fn gauntlet_build_items_unrecognised_settled_token_refuses_the_line() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let out = run_gauntlet_script(
+            "build_items.py",
+            &gauntlet_narrowable_state(&["security", "probe", "(both", "PASS", "r1)"]),
+        );
+        assert_eq!(
+            out["security_items"],
+            json!([{"lane": "security"}]),
+            "{out}"
+        );
+        assert_eq!(out["probe_items"], json!([{"lane": "probe"}]), "{out}");
+        let summary = out["lanes_summary"].as_str().unwrap();
+        assert!(
+            summary.contains(
+                "settled lanes ignored: unrecognised token '(both' (bare lane names only)"
+            ),
+            "the first offending token must be named: {summary}"
+        );
+        assert!(
+            !summary.contains("SKIPPED (narrowed)"),
+            "nothing may narrow on a refused line: {summary}"
+        );
+    }
+
     #[test]
     fn gauntlet_signals_stamps_start_time_before_git_runs() {
         if !cmd_available("python3") {
@@ -28315,6 +29310,72 @@ mod tests {
             stamped.get("gauntlet_started_at").is_none(),
             "an existing start stamp must be left alone: {stamped}"
         );
+    }
+
+    /// Runs signals.py with the given `Settled lanes:` line in the initial
+    /// prompt and returns the extracted `settled_lanes` list. The prompt
+    /// fields are read before any git work, so a non-repo directory is enough.
+    fn gauntlet_settled_lanes_from_prompt(settled_line: &str) -> serde_json::Value {
+        let dir = temp_file("-gauntlet-settled-", "");
+        create_dir_all(&dir).unwrap();
+        let prompt = format!(
+            "Post-implementation review gate.\n\nDiff: worktree\nRe-review delta: abc1234\n{settled_line}\n"
+        );
+        let out = run_gauntlet_script(
+            "signals.py",
+            &json!({
+                "project_dir": dir.to_string_lossy(),
+                "diff_spec": "worktree",
+                "initial_prompt": prompt,
+            }),
+        );
+        let _ = remove_dir_all(&dir);
+        out["settled_lanes"].clone()
+    }
+
+    /// The split is deliberately dumb: a remark after the lane names arrives
+    /// as extra tokens so build_items.py can refuse the whole line instead
+    /// of narrowing on a half-read one.
+    #[test]
+    fn gauntlet_signals_settled_lanes_trailing_remark_is_tokenised() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let settled =
+            gauntlet_settled_lanes_from_prompt("Settled lanes: security, probe (both PASS r1)");
+        assert_eq!(
+            settled,
+            json!(["security", "probe", "(both", "PASS", "r1)"]),
+            "every token after the label must reach build_items.py unfiltered"
+        );
+    }
+
+    /// `none` at the head of the line means nothing settled; the remark that
+    /// follows is a comment, not a list of tokens for build_items.py to
+    /// reject.
+    #[test]
+    fn gauntlet_signals_settled_lanes_leading_none_discards_the_remark() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let settled = gauntlet_settled_lanes_from_prompt("Settled lanes: none (nothing was green)");
+        assert_eq!(
+            settled,
+            json!([]),
+            "a leading `none` must not leak its remark as settled-lane tokens"
+        );
+    }
+
+    #[test]
+    fn gauntlet_signals_settled_lanes_bare_list_passes_through() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let settled = gauntlet_settled_lanes_from_prompt("Settled lanes: security, probe");
+        assert_eq!(settled, json!(["security", "probe"]));
     }
 
     #[test]
@@ -28542,6 +29603,63 @@ mod tests {
         }
     }
 
+    // build_lock is prepended to every declared command the same shell runs,
+    // so it is held to the same rule as verification_commands.
+    #[test]
+    fn build_lock_is_a_declared_variable_never_parsed_from_the_prompt() {
+        use crate::graph::NodeType;
+        for name in ["adversary", "review-gauntlet"] {
+            let graph = load_bundled_graph(name);
+            let var = graph
+                .variables
+                .iter()
+                .find(|v| v.name == "build_lock")
+                .unwrap_or_else(|| panic!("{name} must declare the build_lock variable"));
+            assert_eq!(
+                var.default.as_deref(),
+                Some(""),
+                "{name}: an empty build_lock runs the declared commands bare"
+            );
+            assert!(
+                !graph.initial_state.contains_key("build_lock"),
+                "{name}: an initial_state key would shadow the declared variable"
+            );
+            let node = graph
+                .nodes
+                .get("parse")
+                .unwrap_or_else(|| panic!("{name} graph must have a parse node"));
+            let NodeType::Llm(parse) = &node.node_type else {
+                panic!("{name}: parse must be an llm node");
+            };
+            let schema = parse
+                .output_schema
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name}: parse must have an output_schema"));
+            assert!(
+                !schema["properties"]
+                    .as_object()
+                    .unwrap()
+                    .contains_key("build_lock"),
+                "{name}: parse must not extract build_lock: {schema}"
+            );
+            assert!(
+                !schema["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("build_lock")),
+                "{name}: parse must not require build_lock: {schema}"
+            );
+            assert!(
+                !parse
+                    .instructions
+                    .as_deref()
+                    .is_some_and(|s| s.contains("build_lock")),
+                "{name}: parse instructions must not mention build_lock: {:?}",
+                parse.instructions
+            );
+        }
+    }
+
     // ---- code-reviewer suite-script regression tests ----
     //
     // Fail-closed fault paths of the code-reviewer's verdict/fault/render
@@ -28623,6 +29741,171 @@ mod tests {
                 .is_some_and(|n| n.contains("normalized to merge-base")),
             "normalization must be surfaced in facts_note: {out}"
         );
+    }
+
+    /// A repo with one empty base commit and the given files staged, so
+    /// `diff_spec: staged` shows exactly those files as fully added.
+    fn staged_files_repo(files: &[(&str, &str)]) -> PathBuf {
+        let dir = utils::temp_file("-staged-files-", "");
+        create_dir_all(&dir).unwrap();
+        debris_git(&dir, &["init", "-q", "-b", "main"]);
+        debris_git(&dir, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        for (path, body) in files {
+            let target = dir.join(path);
+            create_dir_all(target.parent().unwrap()).unwrap();
+            write(target, body).unwrap();
+        }
+        debris_git(&dir, &["add", "."]);
+        dir
+    }
+
+    fn code_reviewer_touches_auth(files: &[(&str, &str)]) -> bool {
+        let repo = staged_files_repo(files);
+        let out = run_code_reviewer_script(
+            "facts.py",
+            &json!({"project_dir_in": repo.to_string_lossy(), "diff_spec": "staged"}),
+        );
+        let _ = remove_dir_all(&repo);
+        out["touches_auth"]
+            .as_bool()
+            .unwrap_or_else(|| panic!("touches_auth missing for {files:?}: {out}"))
+    }
+
+    /// `touches_auth` selects the security lane, so it reads only code that
+    /// can change an auth surface: tests and docs are excluded on both the
+    /// path and the content side, comment lines are skipped, and the bare
+    /// `session`/`token` vocabulary (ubiquitous in HTTP and parser code) is
+    /// not a trigger.
+    #[test]
+    fn code_reviewer_facts_touches_auth_reads_code_not_tests_docs_or_comments() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        assert!(
+            code_reviewer_touches_auth(&[("src/auth.rs", "pub fn check() {}\n")]),
+            "an auth path in src must trigger"
+        );
+        assert!(
+            code_reviewer_touches_auth(&[("src/authorization.rs", "pub fn check() {}\n")]),
+            "an authorization path in src must trigger"
+        );
+        assert!(
+            !code_reviewer_touches_auth(&[("src/author_index.rs", "pub fn by_author() {}\n")]),
+            "author is not auth vocabulary"
+        );
+        assert!(
+            !code_reviewer_touches_auth(&[("tests/auth_helpers.rs", "pub fn mk() {}\n")]),
+            "an auth path under tests must not trigger"
+        );
+        assert!(
+            !code_reviewer_touches_auth(&[("src/__tests__/auth.js", "test('x', () => {});\n")]),
+            "an auth path under __tests__ must not trigger"
+        );
+        assert!(
+            !code_reviewer_touches_auth(&[(
+                "src/auth_test.go",
+                "func TestAuth(t *testing.T) {}\n"
+            )]),
+            "an _test. suffix must not trigger"
+        );
+        assert!(
+            !code_reviewer_touches_auth(&[("spec/auth_spec.rb", "describe Auth do; end\n")]),
+            "a spec/ path must not trigger"
+        );
+        assert!(
+            code_reviewer_touches_auth(&[("src/lib.rs", "let claims = decode_jwt(raw);\n")]),
+            "an added code line with auth vocabulary must trigger"
+        );
+        assert!(
+            !code_reviewer_touches_auth(&[(
+                "tests/session_test.rs",
+                "fn t() { let session = open(); let password = \"x\"; }\n"
+            )]),
+            "a tests-only diff must not trigger, whatever it mentions"
+        );
+        assert!(
+            !code_reviewer_touches_auth(&[("docs/auth.md", "rotate the secret monthly\n")]),
+            "a docs-only diff must not trigger"
+        );
+        assert!(
+            !code_reviewer_touches_auth(&[("docs/auth.rst", "rotate the secret monthly\n")]),
+            "every docs extension signals.py knows is a docs path here too"
+        );
+        assert!(
+            !code_reviewer_touches_auth(&[("src/lib.rs", "// password handling lives upstream\n")]),
+            "a comment line must not trigger"
+        );
+        assert!(
+            !code_reviewer_touches_auth(&[(
+                "src/lib.rs",
+                "/// password rules are documented here\n"
+            )]),
+            "a doc-comment line must not trigger"
+        );
+        assert!(
+            !code_reviewer_touches_auth(&[("scripts/x.py", "# password = read()\n")]),
+            "a hash comment line must not trigger"
+        );
+        assert!(
+            !code_reviewer_touches_auth(&[("src/lib.rs", " * jwt rules live here\n")]),
+            "a block-comment continuation line must not trigger"
+        );
+        assert!(
+            !code_reviewer_touches_auth(&[("src/lib.rs", "/* credential cache */\n")]),
+            "a block-comment line must not trigger"
+        );
+        assert!(
+            !code_reviewer_touches_auth(&[("src/lib.rs", "let token = lexer.next();\n")]),
+            "bare `token` is not auth vocabulary"
+        );
+        assert!(
+            !code_reviewer_touches_auth(&[("Tests/Auth.cs", "class A {}\n")]),
+            "the tests/ exclusion must be case-insensitive like the .md one"
+        );
+        assert!(
+            code_reviewer_touches_auth(&[("src/lib.rs", "fn authorise(u: &U) {}\n")]),
+            "British spelling of authorise must trigger"
+        );
+        assert!(
+            code_reviewer_touches_auth(&[(
+                "src/http.rs",
+                "let t = oauth_client.exchange(code);\n"
+            )]),
+            "oauth is auth vocabulary"
+        );
+        assert!(
+            code_reviewer_touches_auth(&[("src/http.rs", "verify_csrf(&req)?;\n")]),
+            "csrf is auth vocabulary"
+        );
+        assert!(
+            !code_reviewer_touches_auth(&[("src/http.rs", "let cookie = jar.get(\"theme\");\n")]),
+            "bare `cookie` is not auth vocabulary"
+        );
+        assert!(
+            code_reviewer_touches_auth(&[("src/lib.rs", "let s = read_secret();\n")]),
+            "secret is auth vocabulary on a code line"
+        );
+    }
+
+    /// facts.py spells its test and docs path shapes by hand rather than
+    /// importing signals.py, so the copies are held equal here.
+    #[test]
+    fn code_reviewer_facts_path_regexes_match_gauntlet_signals() {
+        let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents");
+        let facts = read_to_string(assets.join("code-reviewer/scripts/facts.py")).unwrap();
+        let signals = read_to_string(assets.join("review-gauntlet/scripts/signals.py")).unwrap();
+        for (facts_name, signals_name) in
+            [("TEST_PATH_RE", "TESTS_RE"), ("DOCS_PATH_RE", "DOCS_RE")]
+        {
+            let twin = python_regex_literal(&signals, signals_name);
+            assert!(!twin.is_empty(), "signals.py {signals_name} is empty");
+            assert_eq!(
+                python_regex_literal(&facts, facts_name),
+                twin,
+                "facts.py {facts_name} must spell signals.py {signals_name}"
+            );
+        }
     }
 
     const REVIEW_DIFF_FLAGS: &str =
@@ -33112,6 +34395,41 @@ mod tests {
             );
         }
         let _ = remove_dir_all(&repo);
+    }
+
+    fn gauntlet_touches_auth(files: &[(&str, &str)]) -> bool {
+        let repo = staged_files_repo(files);
+        let out = run_gauntlet_script(
+            "signals.py",
+            &json!({"project_dir": repo.to_string_lossy(), "diff_spec": "worktree"}),
+        );
+        let _ = remove_dir_all(&repo);
+        out["touches_auth"]
+            .as_bool()
+            .unwrap_or_else(|| panic!("touches_auth missing for {files:?}: {out}"))
+    }
+
+    /// The hostile-config test above shows the auth trigger cannot be
+    /// forged; this shows it fires on both kinds of evidence signals.py
+    /// reads, a changed path and an added line.
+    #[test]
+    fn gauntlet_signals_touches_auth_fires_on_an_auth_path_and_on_an_added_auth_line() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        assert!(
+            gauntlet_touches_auth(&[("src/authorize.rs", "pub fn check() {}\n")]),
+            "an authorize path must trigger"
+        );
+        assert!(
+            gauntlet_touches_auth(&[("src/http.rs", "verify_csrf(&req)?;\n")]),
+            "an added csrf call must trigger"
+        );
+        assert!(
+            !gauntlet_touches_auth(&[("src/author_index.rs", "pub fn by_author() {}\n")]),
+            "author is not auth vocabulary"
+        );
     }
 
     /// `debris_exclude` is optional and "empty means none" for every shape

@@ -363,6 +363,7 @@ fn build_chat_completions_body(
         reasoning_effort,
         functions,
         stream: _,
+        prompt_cache_ttl,
     } = data;
 
     let system_message = extract_system_message(&mut messages);
@@ -606,7 +607,7 @@ fn build_chat_completions_body(
         })
     }
     if prompt_cache && is_anthropic_model(model) {
-        apply_prompt_cache_points(&mut body);
+        apply_prompt_cache_points(&mut body, prompt_cache_ttl.as_deref());
     }
     Ok(body)
 }
@@ -621,18 +622,22 @@ fn is_anthropic_model(model: &Model) -> bool {
 /// Converse counterpart of the claude client's cache_control breakpoints:
 /// a cachePoint after the tools, the system prompt, and the last two user
 /// messages. See `apply_prompt_cache_breakpoints` in claude.rs for why the
-/// last two.
-fn apply_prompt_cache_points(body: &mut Value) {
+/// last two, and why `ttl` goes on the tools and system points only.
+fn apply_prompt_cache_points(body: &mut Value, ttl: Option<&str>) {
     let cache_point = || json!({ "cachePoint": { "type": "default" } });
+    let prefix_cache_point = match ttl {
+        Some(ttl) => json!({ "cachePoint": { "type": "default", "ttl": ttl } }),
+        None => cache_point(),
+    };
     if let Some(system) = body.get_mut("system").and_then(|v| v.as_array_mut()) {
-        system.push(cache_point());
+        system.push(prefix_cache_point.clone());
     }
     if let Some(tools) = body
         .get_mut("toolConfig")
         .and_then(|v| v.get_mut("tools"))
         .and_then(|v| v.as_array_mut())
     {
-        tools.push(cache_point());
+        tools.push(prefix_cache_point);
     }
     let Some(messages) = body.get_mut("messages").and_then(|v| v.as_array_mut()) else {
         return;
@@ -916,6 +921,7 @@ mod tests {
             reasoning_effort: None,
             functions: None,
             stream: false,
+            prompt_cache_ttl: None,
         };
         build_chat_completions_body(data, &Model::new("bedrock", "test"), false).unwrap()
     }
@@ -943,6 +949,7 @@ mod tests {
             reasoning_effort: None,
             functions: None,
             stream: false,
+            prompt_cache_ttl: None,
         };
         build_chat_completions_body(data, &Model::new("bedrock", "test"), false).unwrap()
     }
@@ -969,7 +976,7 @@ mod tests {
         }
     }
 
-    fn cache_fixture() -> ChatCompletionsData {
+    fn cache_fixture(prompt_cache_ttl: Option<&str>) -> ChatCompletionsData {
         ChatCompletionsData {
             messages: vec![
                 Message::new(MessageRole::System, MessageContent::Text("sys".to_string())),
@@ -990,27 +997,22 @@ mod tests {
                 agent: false,
             }]),
             stream: false,
+            prompt_cache_ttl: prompt_cache_ttl.map(str::to_string),
         }
     }
 
-    #[test]
-    fn test_bedrock_prompt_cache_inserts_cache_points_for_anthropic_models() {
-        let body = build_chat_completions_body(
-            cache_fixture(),
-            &Model::new("bedrock", "anthropic.claude-sonnet-4-5-20250929-v1:0"),
-            true,
-        )
-        .unwrap();
-
+    /// The system and tools cache points carry `prefix_cache_point`; the two
+    /// message cache points are always the bare default.
+    fn assert_cache_points(body: &Value, prefix_cache_point: &Value) {
         let cache_point = json!({ "cachePoint": { "type": "default" } });
         assert_eq!(
             body["system"].as_array().unwrap().last(),
-            Some(&cache_point),
+            Some(prefix_cache_point),
             "body: {body}"
         );
         assert_eq!(
             body["toolConfig"]["tools"].as_array().unwrap().last(),
-            Some(&cache_point),
+            Some(prefix_cache_point),
             "body: {body}"
         );
         let messages = body["messages"].as_array().unwrap();
@@ -1032,9 +1034,86 @@ mod tests {
     }
 
     #[test]
+    fn test_bedrock_prompt_cache_inserts_cache_points_for_anthropic_models() {
+        let body = build_chat_completions_body(
+            cache_fixture(None),
+            &Model::new("bedrock", "anthropic.claude-sonnet-4-5-20250929-v1:0"),
+            true,
+        )
+        .unwrap();
+
+        assert_cache_points(&body, &json!({ "cachePoint": { "type": "default" } }));
+        assert!(!body.to_string().contains("ttl"), "body: {body}");
+    }
+
+    #[test]
+    fn test_bedrock_prompt_cache_ttl_marks_system_and_tools_points_only() {
+        let body = build_chat_completions_body(
+            cache_fixture(Some("1h")),
+            &Model::new("bedrock", "anthropic.claude-sonnet-4-5-20250929-v1:0"),
+            true,
+        )
+        .unwrap();
+
+        assert_cache_points(
+            &body,
+            &json!({ "cachePoint": { "type": "default", "ttl": "1h" } }),
+        );
+        assert_eq!(body.to_string().matches("\"ttl\"").count(), 2, "body: {body}");
+    }
+
+    fn cache_point_fixture() -> Value {
+        json!({
+            "system": [{ "text": "sys" }],
+            "toolConfig": { "tools": [{ "toolSpec": { "name": "a" } }] },
+            "messages": [
+                { "role": "user", "content": [{ "text": "hello" }] },
+                { "role": "assistant", "content": [{ "text": "hi" }] },
+                { "role": "user", "content": [{ "text": "again" }] },
+            ],
+        })
+    }
+
+    #[test]
+    fn test_bedrock_prompt_cache_points_exact_shape_without_ttl() {
+        let mut body = cache_point_fixture();
+        apply_prompt_cache_points(&mut body, None);
+        assert_eq!(
+            body,
+            json!({
+                "system": [{ "text": "sys" }, { "cachePoint": { "type": "default" } }],
+                "toolConfig": { "tools": [{ "toolSpec": { "name": "a" } }, { "cachePoint": { "type": "default" } }] },
+                "messages": [
+                    { "role": "user", "content": [{ "text": "hello" }, { "cachePoint": { "type": "default" } }] },
+                    { "role": "assistant", "content": [{ "text": "hi" }] },
+                    { "role": "user", "content": [{ "text": "again" }, { "cachePoint": { "type": "default" } }] },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn test_bedrock_prompt_cache_points_exact_shape_with_ttl() {
+        let mut body = cache_point_fixture();
+        apply_prompt_cache_points(&mut body, Some("1h"));
+        assert_eq!(
+            body,
+            json!({
+                "system": [{ "text": "sys" }, { "cachePoint": { "type": "default", "ttl": "1h" } }],
+                "toolConfig": { "tools": [{ "toolSpec": { "name": "a" } }, { "cachePoint": { "type": "default", "ttl": "1h" } }] },
+                "messages": [
+                    { "role": "user", "content": [{ "text": "hello" }, { "cachePoint": { "type": "default" } }] },
+                    { "role": "assistant", "content": [{ "text": "hi" }] },
+                    { "role": "user", "content": [{ "text": "again" }, { "cachePoint": { "type": "default" } }] },
+                ],
+            })
+        );
+    }
+
+    #[test]
     fn test_bedrock_prompt_cache_skips_non_anthropic_models() {
         let body = build_chat_completions_body(
-            cache_fixture(),
+            cache_fixture(None),
             &Model::new("bedrock", "openai.gpt-oss-120b-1:0"),
             true,
         )
@@ -1057,7 +1136,7 @@ mod tests {
                 { "role": "user", "content": [] },
             ],
         });
-        apply_prompt_cache_points(&mut body);
+        apply_prompt_cache_points(&mut body, Some("1h"));
 
         let cache_point = json!({ "cachePoint": { "type": "default" } });
         let messages = body["messages"].as_array().unwrap();
