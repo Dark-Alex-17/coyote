@@ -10049,6 +10049,68 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn extract_role_prints_the_share_warning_once_per_process() {
+        let _guard = TestConfigDirGuard::new();
+        write_global_memory_store();
+        let mut ctx = create_test_ctx();
+        let mut role = Role::new("windowed", "prompt");
+        role.set_model(windowed_model(100));
+        ctx.role = Some(role);
+        let app = ctx.app.config.clone();
+        let printed =
+            || SYSTEM_PROMPT_SHARE_WARNINGS_PRINTED.load(std::sync::atomic::Ordering::Relaxed);
+
+        ctx.extract_role(&app).unwrap();
+        let split = ctx.system_prompt_split.lock().unwrap();
+        assert!(
+            system_prompt_share_warning(&split, Some(100)).is_some(),
+            "{split:?}"
+        );
+        assert_eq!(printed(), 1);
+
+        ctx.extract_role(&app).unwrap();
+        assert_eq!(printed(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn info_without_a_session_leaves_the_stored_split_untouched() {
+        let _guard = TestConfigDirGuard::new();
+        write_global_memory_store();
+        let ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        assert_eq!(*ctx.system_prompt_split.lock(), None);
+
+        ctx.info(&app).unwrap();
+
+        assert_eq!(*ctx.system_prompt_split.lock(), None);
+    }
+
+    #[test]
+    #[serial]
+    fn info_with_a_session_leaves_the_stored_split_untouched() {
+        let _guard = TestConfigDirGuard::new();
+        write_global_memory_store();
+        let mut ctx = create_test_ctx();
+        let mut session = Session::default();
+        session.set_model(windowed_model(20_000));
+        ctx.session = Some(session);
+        let sentinel = SystemPromptSplit {
+            role_tokens: 1,
+            memory_tokens: 2,
+            instructions_tokens: 3,
+            truncated: None,
+        };
+        *ctx.system_prompt_split.lock() = Some(sentinel);
+        let app = ctx.app.config.clone();
+
+        ctx.info(&app).unwrap();
+
+        assert_eq!(*ctx.system_prompt_split.lock(), Some(sentinel));
+    }
+
+    #[test]
     fn compress_session_impl_clears_runtime_readings_on_success() {
         let mut app = AppState::test_default();
         app.config = Arc::new(AppConfig {
