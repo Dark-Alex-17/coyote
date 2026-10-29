@@ -954,12 +954,12 @@ mod tests {
 
         fx.migrate(true);
 
-        let blank = load(&fx.workspace, "blank").frontmatter;
+        let blank = load(&fx.workspace, "blank");
         assert_eq!(
-            blank.extra.get("tags"),
+            blank.source.get("tags"),
             Some(&serde_yaml::Value::Sequence(vec!["x".into()]))
         );
-        assert_eq!(blank.updated.as_deref(), Some("2026-03-01"));
+        assert_eq!(blank.frontmatter.updated.as_deref(), Some("2026-03-01"));
         let untouched = load(&fx.workspace, "drifted").frontmatter;
         assert_eq!(untouched.updated, None);
     }

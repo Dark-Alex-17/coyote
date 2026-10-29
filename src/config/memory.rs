@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::LazyLock;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::Local;
 use fancy_regex::Regex;
 use log::warn;
@@ -247,33 +247,35 @@ pub struct MemoryFrontmatter {
     pub superseded_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires: Option<String>,
-    /// Keys this struct does not model, kept so a rewrite does not drop them.
-    #[serde(
-        flatten,
-        default,
-        skip_serializing_if = "serde_yaml::Mapping::is_empty"
-    )]
-    pub extra: serde_yaml::Mapping,
 }
+
+/// The fields `MemoryFrontmatter` omits when `None`; a rewrite drops them from
+/// the source mapping in that case.
+const OPTIONAL_FRONTMATTER_KEYS: [&str; 4] = ["created", "updated", "superseded_by", "expires"];
 
 #[derive(Debug, Clone)]
 pub struct MemoryFile {
     pub path: PathBuf,
     pub frontmatter: MemoryFrontmatter,
     pub body: String,
+    /// The front matter as read from disk, empty for a file not loaded from
+    /// one. A render starts from it, so key order and keys the struct does not
+    /// model survive a rewrite.
+    pub source: serde_yaml::Mapping,
 }
 
 impl MemoryFile {
     pub fn load(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("read memory file {}", path.display()))?;
-        let (frontmatter, body) = parse_frontmatter(&raw)
+        let (frontmatter, source, body) = parse_frontmatter(&raw)
             .with_context(|| format!("parse frontmatter in {}", path.display()))?;
 
         Ok(Self {
             path: path.to_path_buf(),
             frontmatter,
             body,
+            source,
         })
     }
 
@@ -289,8 +291,26 @@ impl MemoryFile {
 
     /// The file contents `save` writes.
     pub fn render(&self) -> Result<String> {
-        let frontmatter_yaml = serde_yaml::to_string(&self.frontmatter)?;
+        let frontmatter_yaml = serde_yaml::to_string(&self.merged_frontmatter()?)?;
         Ok(format!("---\n{}---\n\n{}", frontmatter_yaml, self.body))
+    }
+
+    /// `source` with each typed field overwritten in place, appended when the
+    /// source lacks it, or removed when it is a `None` optional.
+    fn merged_frontmatter(&self) -> Result<serde_yaml::Mapping> {
+        let serde_yaml::Value::Mapping(typed) = serde_yaml::to_value(&self.frontmatter)? else {
+            bail!("front matter did not serialize to a mapping");
+        };
+        let mut merged = self.source.clone();
+        for key in OPTIONAL_FRONTMATTER_KEYS {
+            if !typed.contains_key(key) {
+                merged.shift_remove(key);
+            }
+        }
+        for (key, value) in typed {
+            merged.insert(key, value);
+        }
+        Ok(merged)
     }
 
     pub fn char_len(&self) -> usize {
@@ -307,22 +327,28 @@ impl MemoryFile {
     }
 }
 
-fn parse_frontmatter(raw: &str) -> Result<(MemoryFrontmatter, String)> {
+fn parse_frontmatter(raw: &str) -> Result<(MemoryFrontmatter, serde_yaml::Mapping, String)> {
     let trimmed = raw.trim_start();
     if !trimmed.starts_with("---") {
-        return Ok((MemoryFrontmatter::default(), raw.to_string()));
+        return Ok((Default::default(), Default::default(), raw.to_string()));
     }
 
     let after = &trimmed[3..];
     let Some(end) = after.find("\n---") else {
-        return Ok((MemoryFrontmatter::default(), raw.to_string()));
+        return Ok((Default::default(), Default::default(), raw.to_string()));
     };
     let yaml = &after[..end];
     let body = after[end + 4..].trim_start_matches('\n').to_string();
+    let source = match serde_yaml::from_str(yaml.trim()).context("parse YAML frontmatter")? {
+        serde_yaml::Value::Mapping(mapping) => mapping,
+        serde_yaml::Value::Null => serde_yaml::Mapping::new(),
+        _ => bail!("YAML frontmatter is not a mapping"),
+    };
     let frontmatter: MemoryFrontmatter =
-        serde_yaml::from_str(yaml.trim()).context("parse YAML frontmatter")?;
+        serde_yaml::from_value(serde_yaml::Value::Mapping(source.clone()))
+            .context("parse YAML frontmatter")?;
 
-    Ok((frontmatter, body))
+    Ok((frontmatter, source, body))
 }
 
 pub fn today_string() -> String {
@@ -1244,7 +1270,7 @@ mod tests {
     fn parse_frontmatter_extracts_yaml() {
         let raw = "---\nname: foo\ndescription: a thing\ntype: user\n---\nBody text\n";
 
-        let (fm, body) = parse_frontmatter(raw).unwrap();
+        let (fm, _, body) = parse_frontmatter(raw).unwrap();
 
         assert_eq!(fm.name, "foo");
         assert_eq!(fm.description.as_deref(), Some("a thing"));
@@ -1256,7 +1282,7 @@ mod tests {
     fn parse_frontmatter_handles_missing_block() {
         let raw = "# Just markdown, no frontmatter\nbody";
 
-        let (fm, body) = parse_frontmatter(raw).unwrap();
+        let (fm, _, body) = parse_frontmatter(raw).unwrap();
 
         assert_eq!(fm.name, "");
         assert_eq!(fm.kind.kind(), MemoryKind::Reference);
@@ -1268,7 +1294,7 @@ mod tests {
     fn parse_frontmatter_handles_unterminated_block() {
         let raw = "---\nname: oops\nno closing delimiter\n# rest of doc";
 
-        let (fm, body) = parse_frontmatter(raw).unwrap();
+        let (fm, _, body) = parse_frontmatter(raw).unwrap();
 
         assert_eq!(fm.name, "");
         assert_eq!(body, raw);
@@ -1287,6 +1313,7 @@ mod tests {
                 ..Default::default()
             },
             body: "Hello world\nmore text".into(),
+            source: Default::default(),
         };
         file.save().unwrap();
         let loaded = MemoryFile::load(&path).unwrap();
@@ -1320,24 +1347,25 @@ mod tests {
 
     #[test]
     fn kind_field_reads_null_and_unknown_scalars_as_reference_keeping_raw() {
-        let (null_fm, _) = parse_frontmatter("---\nname: n\ntype: null\n---\nx\n").unwrap();
+        let (null_fm, _, _) = parse_frontmatter("---\nname: n\ntype: null\n---\nx\n").unwrap();
         assert_eq!(null_fm.kind.kind(), MemoryKind::Reference);
         assert!(null_fm.kind.raw_kind().is_null());
         assert!(!null_fm.kind.is_known());
 
-        let (absent_fm, _) = parse_frontmatter("---\nname: n\n---\nx\n").unwrap();
+        let (absent_fm, _, _) = parse_frontmatter("---\nname: n\n---\nx\n").unwrap();
         assert!(absent_fm.kind.raw_kind().is_null());
 
-        let (gotcha_fm, _) = parse_frontmatter("---\nname: n\ntype: gotcha\n---\nx\n").unwrap();
+        let (gotcha_fm, _, _) = parse_frontmatter("---\nname: n\ntype: gotcha\n---\nx\n").unwrap();
         assert_eq!(gotcha_fm.kind.kind(), MemoryKind::Reference);
         assert_eq!(gotcha_fm.kind.raw_kind().as_str(), Some("gotcha"));
         assert!(!gotcha_fm.kind.is_known());
 
-        let (known_fm, _) = parse_frontmatter("---\nname: n\ntype: run-state\n---\nx\n").unwrap();
+        let (known_fm, _, _) =
+            parse_frontmatter("---\nname: n\ntype: run-state\n---\nx\n").unwrap();
         assert_eq!(known_fm.kind.kind(), MemoryKind::RunState);
         assert!(known_fm.kind.is_known());
 
-        let (number_fm, _) = parse_frontmatter("---\nname: n\ntype: 7\n---\nx\n").unwrap();
+        let (number_fm, _, _) = parse_frontmatter("---\nname: n\ntype: 7\n---\nx\n").unwrap();
         assert_eq!(number_fm.kind.kind(), MemoryKind::Reference);
         assert_eq!(number_fm.kind.raw_kind().as_u64(), Some(7));
 
@@ -1361,6 +1389,59 @@ mod tests {
             let type_line = format!("\ntype: {scalar}\n");
             assert!(saved.contains(&type_line), "{scalar}: {saved}");
         }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_render_keeps_the_source_key_order_and_unknown_keys() {
+        let root = temp_root("key_order");
+        let path = root.join("ordered.md");
+        fs::write(
+            &path,
+            "---\nupdated: 2020-01-01\ntags: [a, b]\nname: ordered\nowner: alice\n\
+             type: user\nmeta:\n  nested:\n    depth: 2\n  list: [1, 2]\n\
+             expires: 2999-01-01\ncreated: 2019-01-01\n---\n\nbody\n",
+        )
+        .unwrap();
+        let keys = |mapping: &serde_yaml::Mapping| {
+            mapping
+                .keys()
+                .map(|k| k.as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        let mut file = MemoryFile::load(&path).unwrap();
+        let source = file.source.clone();
+        file.frontmatter.updated = Some("2026-03-01".into());
+        file.frontmatter.description = Some("added".into());
+        file.frontmatter.expires = None;
+        file.save().unwrap();
+        let reloaded = MemoryFile::load(&path).unwrap();
+
+        assert_eq!(
+            keys(&reloaded.source),
+            [
+                "updated",
+                "tags",
+                "name",
+                "owner",
+                "type",
+                "meta",
+                "created",
+                "description"
+            ]
+        );
+        assert_eq!(reloaded.source["updated"], "2026-03-01");
+        assert_eq!(reloaded.source["description"], "added");
+        for key in ["tags", "name", "owner", "type", "meta", "created"] {
+            assert_eq!(reloaded.source[key], source[key], "{key}");
+        }
+
+        reloaded.save().unwrap();
+        let again = MemoryFile::load(&path).unwrap();
+        assert_eq!(again.source, reloaded.source);
+        assert_eq!(again.body, reloaded.body);
 
         let _ = fs::remove_dir_all(&root);
     }

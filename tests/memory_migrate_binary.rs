@@ -66,7 +66,7 @@ fn fixture(label: &str) -> Fixture {
         .unwrap();
         fs::write(
             store.join(format!("{slug}.md")),
-            format!("---\nname: {slug}\ntype: project\n---\n\nbody\n"),
+            format!("---\nname: {slug}\nowner: alice\ntype: project\n---\n\nbody\n"),
         )
         .unwrap();
     }
@@ -165,6 +165,7 @@ fn apply_backs_up_both_stores_and_rewrites_them() {
     );
     assert_eq!(snapshot(&fx.backups().join(&backups[1])), workspace_before);
 
+    let today = chrono::Local::now().format("%Y-%m-%d");
     for (store, slug, desc) in [
         (fx.global_store(), "g-note", "global note"),
         (fx.workspace_store(), "w-note", "workspace note"),
@@ -173,10 +174,12 @@ fn apply_backs_up_both_stores_and_rewrites_them() {
             fs::read_to_string(store.join("MEMORY.md")).unwrap(),
             "## Always-on facts\n- **Fact.** kept\n"
         );
-        let drill = fs::read_to_string(store.join(format!("{slug}.md"))).unwrap();
-        assert!(
-            drill.contains(&format!("\ndescription: {desc}\n")),
-            "{drill}"
+        assert_eq!(
+            fs::read_to_string(store.join(format!("{slug}.md"))).unwrap(),
+            format!(
+                "---\nname: {slug}\nowner: alice\ntype: project\ndescription: {desc}\n\
+                 updated: {today}\n---\n\nbody\n"
+            )
         );
     }
 }
