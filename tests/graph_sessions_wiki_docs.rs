@@ -26,8 +26,9 @@
 //! `graph.example.yaml`. The child-session pages are read against
 //! `src/config/child_sessions.rs`, the `agent__spawn` tool in
 //! `src/function/agents.rs`, the `previous_turns` budget in
-//! `src/graph/transcript.rs`, the bundled coder's `carry:` list and the
-//! resume policy sentence of `assets/skills/delegation-protocol/SKILL.md`.
+//! `src/graph/transcript.rs`, the bundled coder graph (which declares no
+//! `carry:` list) and the resume policy sentence of
+//! `assets/skills/delegation-protocol/SKILL.md`.
 
 use std::collections::BTreeSet;
 use std::env;

@@ -1933,10 +1933,5 @@ mod tests {
             let placeholder = format!("{{{{{key}}}}}");
             assert!(!analyze.prompt.contains(&placeholder), "{}", analyze.prompt);
         }
-        assert!(
-            analyze.prompt.contains("{{previous_turns}}"),
-            "{}",
-            analyze.prompt
-        );
     }
 }

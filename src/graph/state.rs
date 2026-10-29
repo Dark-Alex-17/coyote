@@ -107,6 +107,7 @@ impl StateManager {
         Some(current)
     }
 
+    /// A spilled representation is valid until the next call or `cleanup`.
     pub fn serialize_state(&mut self) -> Result<StateRepresentation> {
         let json = self.state.to_json()?;
         if spills_to_file(json.len()) {
