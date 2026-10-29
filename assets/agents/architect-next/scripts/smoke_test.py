@@ -177,6 +177,8 @@ _platform_root = _lib.runs_root()
 check("runs_root: platform cache dir/coyote/architect-next/runs when nothing is set",
       os.path.isabs(_platform_root) and (os.name == "nt" or _platform_root.startswith(os.environ["HOME"]))
       and _platform_root.endswith(os.path.join("coyote", "architect-next", "runs")), _platform_root)
+os.environ["COYOTE_CACHE_DIR"] = os.path.join(TMP, "cache")
+os.environ["XDG_CACHE_HOME"] = os.path.join(TMP, "xdg")
 os.environ["ARCHITECT_RUNS_ROOT"] = os.path.join(TMP, "override")
 check("runs_root: ARCHITECT_RUNS_ROOT wins over every cache dir", _lib.runs_root() == os.path.join(TMP, "override"))
 for _k, _v in _saved_env.items():
