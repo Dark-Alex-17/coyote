@@ -206,7 +206,7 @@ fn plan_scope(label: &'static str, dir: &Path, today: &str) -> Result<ScopeRepor
         if let Some(start) = kept.iter().position(|l| l.trim() == DRILL_FILES_HEADING) {
             let end = kept[start + 1..]
                 .iter()
-                .position(|l| l.trim_start().starts_with('#'))
+                .position(|l| ends_drill_section(l))
                 .map_or(kept.len(), |n| start + 1 + n);
             if kept[start + 1..end].iter().all(|l| l.trim().is_empty()) {
                 let at_end = end == kept.len();
@@ -284,6 +284,13 @@ fn plan_scope(label: &'static str, dir: &Path, today: &str) -> Result<ScopeRepor
 
 /// The regular `*.md` files of `dir` other than the index, keyed by file
 /// stem. Symlinks are left alone so a rewrite never lands outside the dir.
+/// A `#` or `##` heading closes the drill section; deeper headings belong to it.
+fn ends_drill_section(line: &str) -> bool {
+    let line = line.trim_start();
+    let level = line.chars().take_while(|&c| c == '#').count();
+    (1..=2).contains(&level) && line[level..].chars().next().is_none_or(char::is_whitespace)
+}
+
 fn load_drill_files(
     dir: &Path,
     unreadable: &mut Vec<String>,
@@ -1006,6 +1013,27 @@ mod tests {
             format!("{facts}{after}")
         );
         assert!(scope(&report, "global").drill_heading_dropped);
+    }
+
+    #[test]
+    fn a_drill_section_with_a_subheading_keeps_its_heading() {
+        let fx = Fixture::new("heading_keep_sub");
+        let facts = "## Always-on facts\n- **Fact.** kept\n\n";
+        let rest = "## Drill files\n### Archived\n- **Old.** note\n";
+        let index_path = fx.global.join(MEMORY_INDEX_FILE_NAME);
+        fs::write(
+            &index_path,
+            "## Always-on facts\n- **Fact.** kept\n\n## Drill files\n- [[g-note]]: global note\n### Archived\n- **Old.** note\n",
+        )
+        .unwrap();
+
+        let report = fx.migrate(true);
+
+        assert_eq!(
+            fs::read_to_string(&index_path).unwrap(),
+            format!("{facts}{rest}")
+        );
+        assert!(!scope(&report, "global").drill_heading_dropped);
     }
 
     #[test]
