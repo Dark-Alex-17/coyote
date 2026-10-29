@@ -853,6 +853,22 @@ async fn run_hook(
     // signalling hook children, which deliberately outlive coyote.
     #[cfg(unix)]
     command.process_group(0);
+    // A hook child outlives coyote, so any fd it inherits (a held file lock,
+    // say) stays open with it. std opens its fds close-on-exec, but other
+    // code and libraries may not; stdio 0-2 are already redirected above.
+    #[cfg(unix)]
+    {
+        let cap = inherited_fd_cap();
+        // SAFETY: the closure only calls close(2), which is async-signal-safe.
+        unsafe {
+            command.pre_exec(move || {
+                for fd in 3..cap {
+                    libc::close(fd);
+                }
+                Ok(())
+            });
+        }
+    }
     match command.spawn() {
         Ok(mut child) => {
             drop(ack);
@@ -870,6 +886,22 @@ async fn run_hook(
 
     if let Some(path) = payload_file {
         let _ = tokio::fs::remove_file(path).await;
+    }
+}
+
+/// The exclusive upper bound of fds a hook child closes before exec. It is
+/// computed in the parent because sysconf(3) is not async-signal-safe, and
+/// capped because macOS reports the RLIMIT_NOFILE soft limit, which can be
+/// effectively unlimited.
+#[cfg(unix)]
+fn inherited_fd_cap() -> libc::c_int {
+    const MAX_FD_CAP: libc::c_long = 65536;
+    // SAFETY: sysconf has no preconditions.
+    let max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+    if max <= 0 {
+        MAX_FD_CAP as libc::c_int
+    } else {
+        max.min(MAX_FD_CAP) as libc::c_int
     }
 }
 
@@ -2571,18 +2603,32 @@ mod tests {
         #[tokio::test(flavor = "multi_thread")]
         #[serial]
         async fn fire_spawns_detached_with_envs() {
+            use std::os::fd::AsRawFd;
+
             let guard = TestConfigDirGuard::new("hooks-dispatch");
             let out = guard.path.join("env-out");
+            let fds = guard.path.join("fds-out");
             let gate = guard.path.join("gate");
             let done = guard.path.join("done");
-            let command = r#"env > "$HOOK_OUT.tmp" && mv "$HOOK_OUT.tmp" "$HOOK_OUT"; until [ -e "$HOOK_GATE" ]; do sleep 0.05; done; : > "$HOOK_DONE""#;
+            let command = r#"if [ -e "/dev/fd/$HOOK_FD" ]; then echo open; else echo closed; fi > "$HOOK_FDS.tmp" && mv "$HOOK_FDS.tmp" "$HOOK_FDS"; env > "$HOOK_OUT.tmp" && mv "$HOOK_OUT.tmp" "$HOOK_OUT"; until [ -e "$HOOK_GATE" ]; do sleep 0.05; done; : > "$HOOK_DONE""#;
             let ctx = ctx_with_global_hooks(hooks_map("turn.completed", &[("envdump", command)]));
+            // F_DUPFD, unlike F_DUPFD_CLOEXEC, leaves the duplicate without
+            // close-on-exec, the way a careless library would.
+            let file = std::fs::File::create(guard.path.join("leaked")).unwrap();
+            let leaked = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 200) };
+            assert!(leaked >= 200, "F_DUPFD returned {leaked}");
+            assert_eq!(
+                unsafe { libc::fcntl(leaked, libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0
+            );
 
             fire(
                 HookEvent::TurnCompleted,
                 &ctx,
                 &[
                     ("HOOK_OUT", out.display().to_string()),
+                    ("HOOK_FDS", fds.display().to_string()),
+                    ("HOOK_FD", leaked.to_string()),
                     ("HOOK_GATE", gate.display().to_string()),
                     ("HOOK_DONE", done.display().to_string()),
                 ],
@@ -2590,9 +2636,15 @@ mod tests {
             );
 
             wait_for("hook env dump", || out.exists()).await;
+            unsafe { libc::close(leaked) };
             assert!(
                 !done.exists(),
                 "dispatch must return before the hook completes"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&fds).unwrap().trim(),
+                "closed",
+                "the hook child inherited a non-close-on-exec fd"
             );
 
             let env_dump = std::fs::read_to_string(&out).unwrap();
