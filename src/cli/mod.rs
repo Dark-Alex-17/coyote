@@ -147,6 +147,12 @@ pub struct Cli {
             "install_builtins", "update_bundle", "uninstall", "mcp_add", "mcp_remove", "mcp_list",
             "mcp_get", "rag", "rebuild_rag", "macro_name", "skill", "build_tools",
             "init_instructions", "acp_server",
+            "no_memory", "no_stream", "raw_markdown", "no_workspace_mcp", "no_workspace_macros",
+            "no_workspace_instructions", "workspace_instructions_file",
+            "dangerously_skip_permissions", "agent_variable", "git_host", "filter",
+            "install_force", "yes", "force", "transport", "url", "scope", "env", "header", "cwd",
+            "client_id", "client_secret", "callback_port", "redirect_host", "mcp_force",
+            "disable_log_colors",
         ]
     )]
     pub memory_migrate: Option<MigrateScope>,
@@ -700,23 +706,57 @@ mod tests {
             Cli::try_parse_from(["coyote", "--memory-migrate", "all", "--apply", "--dry-run"])
                 .is_err()
         );
-        for extra in [
-            &["--agent", "a"][..],
-            &["--session", "s"],
-            &["--role", "r"],
-            &["--model", "m"],
-            &["--empty-session"],
-            &["--save-session"],
-            &["some", "prompt"],
-            &["--list-bundles"],
-            &["--tail-logs"],
-            &["--info"],
-            &["--install", "x"],
-        ] {
-            let mut args = vec!["coyote", "--memory-migrate", "all"];
-            args.extend_from_slice(extra);
-            assert!(Cli::try_parse_from(&args).is_err(), "{extra:?}");
+        assert!(
+            Cli::try_parse_from(["coyote", "--memory-migrate", "all", "some", "prompt"]).is_err()
+        );
+    }
+
+    #[test]
+    fn memory_migrate_conflicts_with_every_other_flag() {
+        use clap::CommandFactory;
+
+        const ALLOWED_WITH_MIGRATE: &[&str] = &[
+            // The migration's own write switch.
+            "apply",
+        ];
+
+        let command = Cli::command();
+        let mut accepted = Vec::new();
+        for arg in command.get_arguments() {
+            let id = arg.get_id().as_str();
+            if arg.is_positional() || id == "memory_migrate" || ALLOWED_WITH_MIGRATE.contains(&id) {
+                continue;
+            }
+            let Some(long) = arg.get_long() else {
+                continue;
+            };
+            let flag = format!("--{long}");
+            let mut args = vec![
+                "coyote".to_string(),
+                "--memory-migrate".into(),
+                "all".into(),
+                flag,
+            ];
+            if arg.get_action().takes_values() {
+                let value = arg
+                    .get_possible_values()
+                    .first()
+                    .map(|v| v.get_name().to_string())
+                    .unwrap_or_else(|| "1".into());
+                let count = arg
+                    .get_num_args()
+                    .map_or(1, |range| range.min_values().max(1));
+                args.extend(std::iter::repeat_n(value, count));
+            }
+            match Cli::try_parse_from(&args) {
+                Err(err) if err.kind() == clap::error::ErrorKind::ArgumentConflict => {}
+                other => accepted.push(format!("{id}: {:?}", other.err().map(|e| e.kind()))),
+            }
         }
+        assert!(
+            accepted.is_empty(),
+            "not rejected as a conflict: {accepted:#?}"
+        );
     }
 
     #[test]
