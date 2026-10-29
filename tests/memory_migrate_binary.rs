@@ -54,7 +54,7 @@ fn fixture(label: &str) -> Fixture {
         dir,
     };
     fs::create_dir_all(fx.dir.join("home")).unwrap();
-    fs::write(fx.dir.join("config.yaml"), "model: [unclosed\n").unwrap();
+    fs::write(fx.dir.join("config.yaml"), "model: [not, a, string]\n").unwrap();
     for (store, slug, desc, extra_line) in [
         (fx.global_store(), "g-note", "global note", ""),
         (fx.workspace_store(), "w-note", "workspace note", GHOST_LINE),
@@ -155,6 +155,32 @@ fn report_only_leaves_the_stores_and_the_backups_untouched() {
     let stdout = assert_success(&run(&fx, &["--memory-migrate", "all"]));
 
     assert!(stdout.contains("rerun with --apply to migrate"), "{stdout}");
+    assert_eq!(snapshot(&fx.global_store()), global_before);
+    assert_eq!(snapshot(&fx.workspace_store()), workspace_before);
+    assert!(!fx.backups().exists());
+}
+
+#[test]
+fn an_invalid_round_chains_setting_fails_the_run_untouched() {
+    let fx = fixture("bad_round_chains");
+    fs::write(fx.dir.join("config.yaml"), "memory_round_chains: bogus\n").unwrap();
+    let global_before = snapshot(&fx.global_store());
+    let workspace_before = snapshot(&fx.workspace_store());
+
+    for args in [
+        &["--memory-migrate", "all"][..],
+        &["--memory-migrate", "all", "--apply"][..],
+    ] {
+        let output = run(&fx, args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{args:?}\nstderr:\n{stderr}");
+        assert!(
+            stderr.contains(
+                "memory_round_chains could not be read; fix the config and rerun --memory-migrate"
+            ),
+            "{args:?}\nstderr:\n{stderr}"
+        );
+    }
     assert_eq!(snapshot(&fx.global_store()), global_before);
     assert_eq!(snapshot(&fx.workspace_store()), workspace_before);
     assert!(!fx.backups().exists());

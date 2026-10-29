@@ -282,7 +282,13 @@ fn plan_scope(
         ..Default::default()
     };
     let mut on_disk = BTreeMap::new();
-    let mut files = load_drill_files(dir, &mut on_disk, &mut report.unreadable)?;
+    let mut unreadable_slugs = BTreeSet::new();
+    let mut files = load_drill_files(
+        dir,
+        &mut on_disk,
+        &mut unreadable_slugs,
+        &mut report.unreadable,
+    )?;
     let mut changed: BTreeSet<String> = BTreeSet::new();
 
     let index_path = dir.join(MEMORY_INDEX_FILE_NAME);
@@ -375,7 +381,14 @@ fn plan_scope(
     }
     report.index = index;
 
-    stamp_round_chains(dir, round_chains, &mut files, &mut report, &mut changed)?;
+    stamp_round_chains(
+        dir,
+        round_chains,
+        &mut files,
+        &unreadable_slugs,
+        &mut report,
+        &mut changed,
+    )?;
     for slug in &changed {
         if let Some(file) = files.get_mut(slug) {
             file.frontmatter.updated = Some(today.to_string());
@@ -407,7 +420,7 @@ fn plan_scope(
         }
         if let Some(target) = &frontmatter.superseded_by
             && !files.contains_key(target)
-            && !dir.join(format!("{target}.md")).exists()
+            && !unreadable_slugs.contains(target)
         {
             report.missing_targets.push((slug.clone(), target.clone()));
         }
@@ -443,11 +456,13 @@ fn irregular_index(path: &Path) -> anyhow::Error {
 }
 
 /// The regular `*.md` files of `dir` other than the index, keyed by file
-/// stem, with the bytes each was loaded from in `on_disk`. Symlinks are left
-/// alone so a rewrite never lands outside the dir.
+/// stem, with the bytes each was loaded from in `on_disk` and the stems that
+/// failed to load in `unreadable_slugs`. Symlinks are left alone so a rewrite
+/// never lands outside the dir.
 fn load_drill_files(
     dir: &Path,
     on_disk: &mut BTreeMap<String, Vec<u8>>,
+    unreadable_slugs: &mut BTreeSet<String>,
     unreadable: &mut Vec<String>,
 ) -> Result<BTreeMap<String, MemoryFile>> {
     let mut files = BTreeMap::new();
@@ -474,7 +489,10 @@ fn load_drill_files(
                 files.insert(slug.to_string(), file);
                 on_disk.insert(slug.to_string(), bytes);
             }
-            Err(e) => unreadable.push(format!("{}: {e:#}", path.display())),
+            Err(e) => {
+                unreadable_slugs.insert(slug.to_string());
+                unreadable.push(format!("{}: {e:#}", path.display()));
+            }
         }
     }
     Ok(files)
@@ -503,11 +521,14 @@ fn drop_empty_fields(frontmatter: &mut MemoryFrontmatter) {
 /// Within each `<base>-r<N>` chain, points every unmarked round below the
 /// highest at it unless `round_chains` keeps them, and types each member
 /// without a `type` as run-state. The highest round comes from the directory
-/// listing, so it heads the chain even when its file is unreadable.
+/// listing, so it heads the chain even when its file is unreadable. Only
+/// regular files take part, and a readable member whose front matter names
+/// another memory is left out and reported, as `memory__write` refuses it.
 fn stamp_round_chains(
     dir: &Path,
     round_chains: RoundChains,
     files: &mut BTreeMap<String, MemoryFile>,
+    unreadable_slugs: &BTreeSet<String>,
     report: &mut ScopeReport,
     changed: &mut BTreeSet<String>,
 ) -> Result<()> {
@@ -517,7 +538,25 @@ fn stamp_round_chains(
         .map(|(base, _)| base.to_string())
         .collect();
     for base in &bases {
-        let members = scan_round_siblings(dir, base)?;
+        let mut members = Vec::new();
+        for member in scan_round_siblings(dir, base)? {
+            let path = dir.join(format!("{}.md", member.name));
+            let regular = fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file());
+            if !regular && !unreadable_slugs.contains(&member.name) {
+                continue;
+            }
+            if let Some(file) = files.get(&member.name)
+                && file.frontmatter.name != member.name
+            {
+                report.unreadable.push(format!(
+                    "{}: front matter name '{}' does not match the file name",
+                    path.display(),
+                    file.frontmatter.name
+                ));
+                continue;
+            }
+            members.push(member);
+        }
         let Some(head) = members.last().map(|m| m.name.clone()) else {
             continue;
         };
@@ -612,6 +651,17 @@ fn render_rewrite(file: &MemoryFile) -> Result<String> {
 }
 
 fn apply_scope(report: &mut ScopeReport, backup_root: &Path, stamp: &str) -> Result<()> {
+    apply_scope_with(report, backup_root, stamp, || {})
+}
+
+/// `before_index_write` runs after the drill files are written, so a test can
+/// edit the index in the window the second index check guards.
+fn apply_scope_with(
+    report: &mut ScopeReport,
+    backup_root: &Path,
+    stamp: &str,
+    before_index_write: impl FnOnce(),
+) -> Result<()> {
     let backup = unused_backup_dir(backup_root, report.label, stamp);
     copy_dir_all(&report.dir, &backup, &|name| {
         name.to_string_lossy().starts_with(".catalogue.")
@@ -637,6 +687,7 @@ fn apply_scope(report: &mut ScopeReport, backup_root: &Path, stamp: &str) -> Res
                 backup.display()
             )
         })?;
+        // An edit landing between this check and the write is still lost.
         ensure_rewrite_unchanged(rewrite, STALE_DURING_APPLY)
             .and_then(|()| Ok(write_private_atomic(path, &rendered)?))
             .with_context(|| {
@@ -648,6 +699,7 @@ fn apply_scope(report: &mut ScopeReport, backup_root: &Path, stamp: &str) -> Res
             })?;
         report.written.push(path.clone());
     }
+    before_index_write();
     if let Some(index) = &report.new_index {
         let index_path = report.dir.join(MEMORY_INDEX_FILE_NAME);
         ensure_index_unchanged(report, STALE_DURING_APPLY)
@@ -1852,6 +1904,116 @@ mod tests {
             "{:?}",
             workspace.missing_targets
         );
+    }
+
+    #[test]
+    fn a_directory_named_like_a_newer_round_does_not_head_its_chain() {
+        let fx = Fixture::new("dir_round");
+        fs::create_dir(fx.workspace.join("plan-r5.md")).unwrap();
+
+        let report = fx.migrate(false);
+
+        assert_eq!(
+            scope(&report, "workspace").superseded_stamps,
+            vec![
+                ("plan-r1".to_string(), "plan-r3".to_string()),
+                ("plan-r2".to_string(), "plan-r3".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_round_whose_front_matter_names_another_memory_is_left_out_and_reported() {
+        let fx = Fixture::new("misnamed_round");
+        fs::write(
+            fx.workspace.join("plan-r4.md"),
+            "---\nname: elsewhere\ntype: project\n---\n\nr4\n",
+        )
+        .unwrap();
+
+        let report = fx.migrate(false);
+
+        let workspace = scope(&report, "workspace");
+        assert_eq!(
+            workspace.superseded_stamps,
+            vec![
+                ("plan-r1".to_string(), "plan-r3".to_string()),
+                ("plan-r2".to_string(), "plan-r3".to_string()),
+            ]
+        );
+        assert!(
+            workspace.unreadable.contains(&format!(
+                "{}: front matter name 'elsewhere' does not match the file name",
+                fx.workspace.join("plan-r4.md").display()
+            )),
+            "{:?}",
+            workspace.unreadable
+        );
+    }
+
+    #[test]
+    fn only_an_unreadable_drill_file_excuses_a_missing_supersede_target() {
+        let fx = Fixture::new("missing_targets");
+        fs::create_dir(fx.global.join("a-dir.md")).unwrap();
+        let outside = fx._root.0.join("outside.md");
+        fs::write(&outside, "---\nname: a-link\n---\n\nl\n").unwrap();
+        std::os::unix::fs::symlink(&outside, fx.global.join("a-link.md")).unwrap();
+        fs::write(fx.global.join("a-broken.md"), "---\nname: [unclosed\n---\n").unwrap();
+        for (name, target) in [
+            ("to-dir", "a-dir"),
+            ("to-link", "a-link"),
+            ("to-broken", "a-broken"),
+        ] {
+            write_file(
+                &fx.global,
+                name,
+                &format!("description: d\ntype: user\nsuperseded_by: {target}\n"),
+                "x",
+            );
+        }
+
+        let report = fx.migrate(false);
+
+        assert_eq!(
+            scope(&report, "global").missing_targets,
+            vec![
+                ("to-dir".to_string(), "a-dir".to_string()),
+                ("to-link".to_string(), "a-link".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_index_edited_during_apply_is_not_overwritten() {
+        let fx = Fixture::new("index_mid_apply");
+        let scopes = plan_all(
+            &fx.targets(MigrateScope::Workspace),
+            "2026-03-01",
+            RoundChains::default(),
+        )
+        .unwrap();
+        let Some(ScopeOutcome::Migrated(mut report)) = scopes.into_iter().next() else {
+            panic!("the workspace scope plans");
+        };
+        assert!(report.new_index.is_some());
+        let index_path = fx.workspace.join(MEMORY_INDEX_FILE_NAME);
+        let edited = format!("{}- [[late]]: added meanwhile\n", workspace_index());
+
+        let err = apply_scope_with(&mut report, &fx.backups, "20260301T123045", || {
+            fs::write(&index_path, &edited).unwrap();
+        })
+        .expect_err("an index edited during apply is refused");
+
+        assert!(
+            format!("{err:#}").contains(&format!(
+                "{} changed since the migration was planned, so it was not rewritten",
+                index_path.display()
+            )),
+            "{err:#}"
+        );
+        assert_eq!(fs::read_to_string(&index_path).unwrap(), edited);
+        assert!(!report.written.contains(&index_path));
+        assert!(!report.written.is_empty());
     }
 
     #[test]
