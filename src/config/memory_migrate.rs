@@ -46,8 +46,9 @@ struct RoundChainsSetting {
     memory_round_chains: RoundChains,
 }
 
-/// The config file's `memory_round_chains`, read on its own so a config that
-/// fails to load over some other key does not block a migration.
+/// The config file's `memory_round_chains`, read on its own so other keys that
+/// are invalid but still well-formed YAML do not block a migration. A file
+/// that does not parse as YAML fails the run.
 pub fn configured_round_chains() -> Result<RoundChains> {
     round_chains_in(&paths::config_file())
 }
@@ -702,6 +703,7 @@ fn apply_scope_with(
     before_index_write();
     if let Some(index) = &report.new_index {
         let index_path = report.dir.join(MEMORY_INDEX_FILE_NAME);
+        // An edit landing between this check and the write is still lost.
         ensure_index_unchanged(report, STALE_DURING_APPLY)
             .and_then(|()| Ok(write_private_atomic(&index_path, index)?))
             .with_context(|| {
@@ -1955,14 +1957,12 @@ mod tests {
     fn only_an_unreadable_drill_file_excuses_a_missing_supersede_target() {
         let fx = Fixture::new("missing_targets");
         fs::create_dir(fx.global.join("a-dir.md")).unwrap();
-        let outside = fx._root.0.join("outside.md");
-        fs::write(&outside, "---\nname: a-link\n---\n\nl\n").unwrap();
-        std::os::unix::fs::symlink(&outside, fx.global.join("a-link.md")).unwrap();
         fs::write(fx.global.join("a-broken.md"), "---\nname: [unclosed\n---\n").unwrap();
         for (name, target) in [
             ("to-dir", "a-dir"),
-            ("to-link", "a-link"),
             ("to-broken", "a-broken"),
+            ("to-sub", "sub/a-broken"),
+            ("to-parent", "../a-broken"),
         ] {
             write_file(
                 &fx.global,
@@ -1978,8 +1978,31 @@ mod tests {
             scope(&report, "global").missing_targets,
             vec![
                 ("to-dir".to_string(), "a-dir".to_string()),
-                ("to-link".to_string(), "a-link".to_string()),
+                ("to-parent".to_string(), "../a-broken".to_string()),
+                ("to-sub".to_string(), "sub/a-broken".to_string()),
             ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_drill_file_does_not_excuse_a_missing_supersede_target() {
+        let fx = Fixture::new("missing_symlink_target");
+        let outside = fx._root.0.join("outside.md");
+        fs::write(&outside, "---\nname: a-link\n---\n\nl\n").unwrap();
+        std::os::unix::fs::symlink(&outside, fx.global.join("a-link.md")).unwrap();
+        write_file(
+            &fx.global,
+            "to-link",
+            "description: d\ntype: user\nsuperseded_by: a-link\n",
+            "x",
+        );
+
+        let report = fx.migrate(false);
+
+        assert_eq!(
+            scope(&report, "global").missing_targets,
+            vec![("to-link".to_string(), "a-link".to_string())]
         );
     }
 
