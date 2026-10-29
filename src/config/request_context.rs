@@ -1506,11 +1506,11 @@ impl RequestContext {
         let (window, system_prompt) = match session {
             Some(session) => (
                 session.model().max_input_tokens(),
-                self.system_prompt_split.lock().unwrap_or_default(),
+                *self.system_prompt_split.lock(),
             ),
             None => {
                 let (role, split) = self.extract_role_impl(app, true)?;
-                (role.model().max_input_tokens(), split.unwrap_or_default())
+                (role.model().max_input_tokens(), split)
             }
         };
         let keep = self.compression_keep_policy(None);
@@ -16530,11 +16530,14 @@ mod tests {
         assert!(row("compression_keep_tokens").ends_with("40000"));
         assert!(row("compression_checkpoint_tokens").ends_with("50000"));
         assert!(row("compression_min_reclaim").ends_with("24691"));
-        assert!(row("system_prompt_role_tokens").ends_with(char::is_numeric));
-        assert!(row("system_prompt_memory_tokens").ends_with(char::is_numeric));
-        assert!(row("system_prompt_share").ends_with("% of 200000"));
-        let truncated = row("memory_facts_truncated");
-        assert!(truncated.ends_with("none") || truncated.ends_with(" chars"));
+        for key in [
+            "system_prompt_role_tokens",
+            "system_prompt_memory_tokens",
+            "system_prompt_share",
+            "memory_facts_truncated",
+        ] {
+            assert!(row(key).ends_with("n/a"), "{}", row(key));
+        }
         let lines: Vec<&str> = info.lines().collect();
         let save_session = lines
             .iter()

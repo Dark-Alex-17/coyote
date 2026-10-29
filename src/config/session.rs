@@ -96,7 +96,9 @@ pub struct CompressionInfo {
     pub kept_tail_messages: Option<usize>,
     pub kept_tail_tokens: Option<usize>,
     pub archived_messages: Option<usize>,
-    pub system_prompt: SystemPromptSplit,
+    /// `None` inside a session that has not built a memory-injecting role
+    /// yet, so the split rows read `n/a` rather than zeros.
+    pub system_prompt: Option<SystemPromptSplit>,
     pub max_input_tokens: Option<usize>,
 }
 
@@ -126,7 +128,14 @@ impl SystemPromptSplit {
 
 impl CompressionInfo {
     fn system_prompt_rows(&self) -> [(&'static str, String); 4] {
-        let split = &self.system_prompt;
+        let Some(split) = &self.system_prompt else {
+            return [
+                ("system_prompt_role_tokens", "n/a".to_string()),
+                ("system_prompt_memory_tokens", "n/a".to_string()),
+                ("system_prompt_share", "n/a".to_string()),
+                ("memory_facts_truncated", "n/a".to_string()),
+            ];
+        };
         [
             ("system_prompt_role_tokens", split.role_tokens.to_string()),
             (
@@ -213,8 +222,16 @@ impl CompressionInfo {
             "last_prompt_tokens": self.last_prompt_tokens,
         });
         let [role, memory, share, truncated] = self.system_prompt_rows();
-        data[role.0] = self.system_prompt.role_tokens.into();
-        data[memory.0] = self.system_prompt.memory_tokens.into();
+        match self.system_prompt {
+            Some(split) => {
+                data[role.0] = split.role_tokens.into();
+                data[memory.0] = split.memory_tokens.into();
+            }
+            None => {
+                data[role.0] = role.1.into();
+                data[memory.0] = memory.1.into();
+            }
+        }
         data[share.0] = share.1.into();
         data[truncated.0] = truncated.1.into();
         let live = [
@@ -2395,7 +2412,7 @@ last_run:
             kept_tail_messages: Some(3),
             kept_tail_tokens: Some(5_000),
             archived_messages: Some(12),
-            system_prompt: SystemPromptSplit {
+            system_prompt: Some(SystemPromptSplit {
                 role_tokens: 1_000,
                 memory_tokens: 39_000,
                 instructions_tokens: 0,
@@ -2405,7 +2422,7 @@ last_run:
                     global_lines: 2,
                     workspace_lines: 5,
                 }),
-            },
+            }),
             max_input_tokens: Some(200_000),
         }
     }
@@ -2458,7 +2475,7 @@ last_run:
             kept_tail_messages: None,
             kept_tail_tokens: None,
             archived_messages: None,
-            system_prompt: SystemPromptSplit::default(),
+            system_prompt: Some(SystemPromptSplit::default()),
             max_input_tokens: None,
         };
 
@@ -2490,6 +2507,23 @@ last_run:
         assert_eq!(json["last_prompt_tokens"], serde_json::Value::Null);
         assert!(json.get("reclaimable").is_none());
         assert!(json.get("archived_messages").is_none());
+
+        let unbuilt = CompressionInfo {
+            system_prompt: None,
+            ..info
+        };
+        let rows = unbuilt.rows();
+        for key in [
+            "system_prompt_role_tokens",
+            "system_prompt_memory_tokens",
+            "system_prompt_share",
+            "memory_facts_truncated",
+        ] {
+            assert!(rows.contains(&(key, "n/a".to_string())), "{key}: {rows:?}");
+        }
+        let json = unbuilt.to_json();
+        assert_eq!(json["system_prompt_role_tokens"], json!("n/a"));
+        assert_eq!(json["system_prompt_memory_tokens"], json!("n/a"));
     }
 
     #[test]
