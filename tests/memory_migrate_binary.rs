@@ -52,15 +52,17 @@ fn fixture(label: &str) -> Fixture {
         dir,
     };
     fs::create_dir_all(fx.dir.join("home")).unwrap();
-    for (store, slug, desc) in [
-        (fx.global_store(), "g-note", "global note"),
-        (fx.workspace_store(), "w-note", "workspace note"),
+    fs::write(fx.dir.join("config.yaml"), "model: [unclosed\n").unwrap();
+    for (store, slug, desc, extra_line) in [
+        (fx.global_store(), "g-note", "global note", ""),
+        (fx.workspace_store(), "w-note", "workspace note", GHOST_LINE),
     ] {
         fs::create_dir_all(&store).unwrap();
         fs::write(
             store.join("MEMORY.md"),
             format!(
-                "## Always-on facts\n- **Fact.** kept\n\n## Drill files\n- [[{slug}]]: {desc}\n"
+                "## Always-on facts\n- **Fact.** kept\n\n## Drill files\n- [[{slug}]]: {desc}\n\
+                 {extra_line}"
             ),
         )
         .unwrap();
@@ -72,6 +74,8 @@ fn fixture(label: &str) -> Fixture {
     }
     fx
 }
+
+const GHOST_LINE: &str = "- [[ghost]]: missing\n";
 
 fn run(fx: &Fixture, args: &[&str]) -> Output {
     let home = fx.dir.join("home");
@@ -131,14 +135,12 @@ fn report_only_leaves_the_stores_and_the_backups_untouched() {
     let fx = fixture("report");
     let global_before = snapshot(&fx.global_store());
     let workspace_before = snapshot(&fx.workspace_store());
-    let backups_before = snapshot(&fx.backups());
 
     let stdout = assert_success(&run(&fx, &["--memory-migrate", "all"]));
 
     assert!(stdout.contains("rerun with --apply to migrate"), "{stdout}");
     assert_eq!(snapshot(&fx.global_store()), global_before);
     assert_eq!(snapshot(&fx.workspace_store()), workspace_before);
-    assert_eq!(snapshot(&fx.backups()), backups_before);
     assert!(!fx.backups().exists());
 }
 
@@ -148,7 +150,9 @@ fn apply_backs_up_both_stores_and_rewrites_them() {
     let global_before = snapshot(&fx.global_store());
     let workspace_before = snapshot(&fx.workspace_store());
 
+    let date_before = chrono::Local::now().format("%Y-%m-%d").to_string();
     let stdout = assert_success(&run(&fx, &["--memory-migrate", "all", "--apply"]));
+    let date_after = chrono::Local::now().format("%Y-%m-%d").to_string();
 
     let mut backups: Vec<String> = fs::read_dir(fx.backups())
         .unwrap()
@@ -165,21 +169,35 @@ fn apply_backs_up_both_stores_and_rewrites_them() {
     );
     assert_eq!(snapshot(&fx.backups().join(&backups[1])), workspace_before);
 
-    let today = chrono::Local::now().format("%Y-%m-%d");
-    for (store, slug, desc) in [
-        (fx.global_store(), "g-note", "global note"),
-        (fx.workspace_store(), "w-note", "workspace note"),
+    for (store, slug, desc, index) in [
+        (
+            fx.global_store(),
+            "g-note",
+            "global note",
+            "## Always-on facts\n- **Fact.** kept\n".to_string(),
+        ),
+        (
+            fx.workspace_store(),
+            "w-note",
+            "workspace note",
+            format!("## Always-on facts\n- **Fact.** kept\n\n## Drill files\n{GHOST_LINE}"),
+        ),
     ] {
-        assert_eq!(
-            fs::read_to_string(store.join("MEMORY.md")).unwrap(),
-            "## Always-on facts\n- **Fact.** kept\n"
-        );
-        assert_eq!(
-            fs::read_to_string(store.join(format!("{slug}.md"))).unwrap(),
+        assert_eq!(fs::read_to_string(store.join("MEMORY.md")).unwrap(), index);
+        let drill = fs::read_to_string(store.join(format!("{slug}.md"))).unwrap();
+        let expected = |today: &str| {
             format!(
                 "---\nname: {slug}\nowner: alice\ntype: project\ndescription: {desc}\n\
                  updated: {today}\n---\n\nbody\n"
             )
+        };
+        assert_eq!(
+            drill,
+            if drill == expected(&date_after) {
+                expected(&date_after)
+            } else {
+                expected(&date_before)
+            }
         );
     }
 }
