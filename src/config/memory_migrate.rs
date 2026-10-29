@@ -106,7 +106,8 @@ struct ScopeReport {
     dir: PathBuf,
     facts_lines: Vec<String>,
     catalogue_lines_dropped: usize,
-    dangling: Vec<(String, String)>,
+    kept_no_file: Vec<(String, String)>,
+    kept_unreadable_file: Vec<(String, String)>,
     drill_heading_dropped: bool,
     backfilled: Vec<String>,
     drift: Vec<Drift>,
@@ -165,15 +166,16 @@ fn plan_scope(label: &'static str, dir: &Path, today: &str) -> Result<ScopeRepor
             };
             let entry = (slug.to_string(), line_desc.to_string());
             if !dir.join(format!("{slug}.md")).exists() {
-                report.dangling.push(entry);
+                report.kept_no_file.push(entry);
                 kept.push(raw);
                 continue;
             }
-            report.catalogue_lines_dropped += 1;
             let Some(file) = files.get_mut(slug) else {
-                report.dangling.push(entry);
+                report.kept_unreadable_file.push(entry);
+                kept.push(raw);
                 continue;
             };
+            report.catalogue_lines_dropped += 1;
             catalogued.insert(slug.to_string());
             let file_desc = file
                 .frontmatter
@@ -431,8 +433,14 @@ fn write_scope(f: &mut fmt::Formatter<'_>, report: &ScopeReport, apply: bool) ->
     }
     write_section(
         f,
-        "dangling catalogue lines, no readable drill file",
-        pairs(&report.dangling, ": "),
+        "catalogue lines kept, no drill file",
+        pairs(&report.kept_no_file, ": "),
+        SECTION_LIST_CAP,
+    )?;
+    write_section(
+        f,
+        "catalogue lines kept, drill file unreadable",
+        pairs(&report.kept_unreadable_file, ": "),
         SECTION_LIST_CAP,
     )?;
     write_section(
@@ -878,7 +886,7 @@ mod tests {
             workspace_index,
             format!(
                 "# Workspace Memory Index\n\n{WORKSPACE_FACTS}\n## Drill files\n\
-                 - [[deleted]]: file removed\n"
+                 - [[deleted]]: file removed\n- [[broken]]: unreadable file\n"
             )
         );
         let global_index = fs::read_to_string(fx.global.join(MEMORY_INDEX_FILE_NAME)).unwrap();
@@ -891,34 +899,64 @@ mod tests {
             .chain(global_index.lines())
             .filter_map(catalogue_slug)
             .collect();
-        assert_eq!(catalogued, vec!["deleted"]);
+        assert_eq!(catalogued, vec!["deleted", "broken"]);
 
         let workspace = scope(&report, "workspace");
         assert!(!workspace.drill_heading_dropped);
-        assert_eq!(workspace.catalogue_lines_dropped, 8);
+        assert_eq!(workspace.catalogue_lines_dropped, 7);
         assert_eq!(
-            workspace.dangling,
-            vec![
-                ("deleted".to_string(), "file removed".to_string()),
-                ("broken".to_string(), "unreadable file".to_string()),
-            ]
+            workspace.kept_no_file,
+            vec![("deleted".to_string(), "file removed".to_string())]
+        );
+        assert_eq!(
+            workspace.kept_unreadable_file,
+            vec![("broken".to_string(), "unreadable file".to_string())]
         );
         assert_eq!(workspace.unreadable.len(), 1, "{:?}", workspace.unreadable);
+        let text = report.to_string();
         assert!(
-            report.to_string().contains(
-                "  dangling catalogue lines, no readable drill file: 2\n\
-                 \x20   deleted: file removed\n    broken: unreadable file\n"
+            text.contains(
+                "  catalogue lines kept, no drill file: 1\n    deleted: file removed\n\
+                 \x20 catalogue lines kept, drill file unreadable: 1\n    broken: unreadable file\n"
             ),
-            "{report_text}",
-            report_text = report
+            "{text}"
         );
-        assert_eq!(workspace.facts_lines.len(), 8);
+        assert_eq!(workspace.facts_lines.len(), 9);
         let global = scope(&report, "global");
         assert_eq!(
             global.facts_lines,
             vec!["PLACEHOLDER_CHECK", "artefact line left by an old tool"]
         );
         assert!(!global.drill_heading_dropped);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_line_whose_drill_file_is_a_symlink_stays_in_the_index() {
+        let fx = Fixture::new("symlinked_drill");
+        let outside = fx._root.0.join("outside.md");
+        fs::write(&outside, "---\nname: linked\n---\n\nl\n").unwrap();
+        std::os::unix::fs::symlink(&outside, fx.global.join("linked.md")).unwrap();
+        let index_path = fx.global.join(MEMORY_INDEX_FILE_NAME);
+        fs::write(
+            &index_path,
+            format!("{GLOBAL_INDEX}- [[linked]]: symlinked file\n"),
+        )
+        .unwrap();
+
+        let report = fx.migrate(true);
+
+        assert_eq!(
+            fs::read_to_string(&index_path).unwrap(),
+            "PLACEHOLDER_CHECK\nartefact line left by an old tool\n\
+             - [[linked]]: symlinked file\n"
+        );
+        let global = scope(&report, "global");
+        assert_eq!(global.catalogue_lines_dropped, 1);
+        assert_eq!(
+            global.kept_unreadable_file,
+            vec![("linked".to_string(), "symlinked file".to_string())]
+        );
     }
 
     #[test]
