@@ -1733,6 +1733,41 @@ mod tests {
     }
 
     #[test]
+    fn optional_frontmatter_keys_are_the_fields_skipped_when_none() {
+        assert_eq!(
+            OPTIONAL_FRONTMATTER_KEYS,
+            ["created", "updated", "superseded_by", "expires"]
+        );
+
+        let keys = |frontmatter: &MemoryFrontmatter| match serde_yaml::to_value(frontmatter) {
+            Ok(serde_yaml::Value::Mapping(mapping)) => mapping
+                .keys()
+                .map(|k| k.as_str().unwrap().to_string())
+                .collect::<Vec<_>>(),
+            other => panic!("front matter did not serialize to a mapping: {other:?}"),
+        };
+        let date = Some("2024-01-01".to_string());
+        // Exhaustive on purpose: a new field fails to compile here until it is
+        // set, so a new optional cannot hide from the key difference.
+        let all_some = MemoryFrontmatter {
+            name: String::new(),
+            description: Some(String::new()),
+            kind: KindField::default(),
+            created: date.clone(),
+            updated: date.clone(),
+            superseded_by: date.clone(),
+            expires: date,
+        };
+        let required = keys(&MemoryFrontmatter::default());
+        let optional: Vec<String> = keys(&all_some)
+            .into_iter()
+            .filter(|key| !required.contains(key))
+            .collect();
+
+        assert_eq!(optional, OPTIONAL_FRONTMATTER_KEYS);
+    }
+
+    #[test]
     fn catalogue_slug_accepts_only_catalogue_lines() {
         assert_eq!(
             catalogue_slug("- [[auth-flow]]: how auth works"),
