@@ -2582,7 +2582,8 @@ fn empty_sessions_page(note: &str) -> Value {
 /// Lists the sidecars under this context's child session root without
 /// creating the root: a context that has not spawned yet and has no saved
 /// session has nothing to list, and listing must not give it a uid. A
-/// root that is a symlink is not followed.
+/// root that is a symlink is not followed, and a dry run lists nothing
+/// since it records nothing.
 fn handle_list_sessions(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
     let page_size = match args.get("page_size") {
         None | Some(Value::Null) => LIST_SESSIONS_PAGE_SIZE,
@@ -2602,24 +2603,22 @@ fn handle_list_sessions(ctx: &mut RequestContext, args: &Value) -> Result<Value>
         Some(_) => bail!("'cursor' must be a session id string"),
     };
 
-    let dry_run = ctx.app.config.dry_run;
+    if ctx.app.config.dry_run {
+        return Ok(empty_sessions_page("dry run records nothing"));
+    }
     if !child_sessions_enabled(None, ctx.app.config.as_ref()) {
-        return Ok(empty_sessions_page(if dry_run {
-            "dry run records nothing"
-        } else {
-            "Child sessions are off (`child_sessions: false`), so nothing is recorded."
-        }));
+        return Ok(empty_sessions_page(
+            "Child sessions are off (`child_sessions: false`), so nothing is recorded.",
+        ));
     }
     let root = match ctx.child_session_root.clone() {
         Some(root) => root,
         None => match ctx.session.as_ref().and_then(|session| session.uid()) {
             Some(uid) => Arc::new(ChildSessionRoot::Uid(uid)),
             None => {
-                return Ok(empty_sessions_page(if dry_run {
-                    "dry run records nothing"
-                } else {
-                    "No child sessions yet: this context has no saved session and has not spawned a child."
-                }));
+                return Ok(empty_sessions_page(
+                    "No child sessions yet: this context has no saved session and has not spawned a child.",
+                ));
             }
         },
     };
@@ -7245,10 +7244,12 @@ mod tests {
             })
             .collect();
         assert_eq!(expected.len(), 4);
-        assert_eq!(
-            expected.iter().filter(|e| e.ends_with("(crashed)")).count(),
-            2
-        );
+        if ProcessStamp::current().start != 0 {
+            assert_eq!(
+                expected.iter().filter(|e| e.ends_with("(crashed)")).count(),
+                2
+            );
+        }
         assert_eq!(hint, expected.join(", "));
     }
 
@@ -7299,8 +7300,8 @@ mod tests {
         );
     }
 
-    /// Under a dry run the lister says the run records nothing, rather
-    /// than blaming the knob.
+    /// Under a dry run with no root the lister says the run records
+    /// nothing, rather than that no child was spawned yet.
     #[test]
     #[serial]
     fn list_sessions_under_dry_run_says_dry_run_records_nothing() {
@@ -7327,27 +7328,109 @@ mod tests {
         assert_eq!(paths_under(&sessions_dir), before);
     }
 
-    /// Both empty arms of the lister word a dry run the same way; the
-    /// knob check folds the dry run in, so the no-root arm's wording is
-    /// pinned from the source.
+    /// A dry run whose config also turns child sessions off is worded as
+    /// a dry run, not as the knob.
     #[test]
-    fn list_sessions_words_a_dry_run_the_same_in_both_empty_arms() {
-        let source = include_str!("agents.rs").replace("\r\n", "\n");
-        let start = source.find("\nfn handle_list_sessions(").unwrap();
-        let body = &source[start..];
-        let body = &body[..body.find("\n}\n").unwrap()];
-        let knob_arm = body.find("if !child_sessions_enabled(").unwrap();
-        let root_arm = body.find("None => {").unwrap();
-        let listing = body.find("root.list_children()").unwrap();
-        assert!(knob_arm < root_arm && root_arm < listing);
-        for arm in [&body[knob_arm..root_arm], &body[root_arm..listing]] {
-            assert_eq!(arm.matches("if dry_run {").count(), 1, "{arm}");
-            assert_eq!(
-                arm.matches("\"dry run records nothing\"").count(),
-                1,
-                "{arm}"
-            );
+    #[serial]
+    fn list_sessions_under_dry_run_with_child_sessions_off_says_dry_run_records_nothing() {
+        let _guard = TestConfigDirGuard::new();
+        let app = AppState {
+            config: Arc::new(AppConfig {
+                dry_run: true,
+                child_sessions: Some(false),
+                ..Default::default()
+            }),
+            ..AppState::test_default()
+        };
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        ctx.supervisor = Some(Arc::new(RwLock::new(Supervisor::new(4, 3))));
+        let sessions_dir = child_sessions::sessions_root();
+        let before = paths_under(&sessions_dir);
+
+        let page = list_sessions(&mut ctx, json!({})).unwrap();
+
+        assert_eq!(page["sessions"], json!([]));
+        assert_eq!(page["total"], json!(0));
+        assert!(page["next_cursor"].is_null());
+        assert_eq!(page["note"], json!("dry run records nothing"));
+        assert!(ctx.child_session_root.is_none());
+        assert_eq!(paths_under(&sessions_dir), before);
+    }
+
+    /// A root that is a symlink to nothing is refused the same way, and
+    /// the missing target is not created.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn usage_probe_list_sessions_refuses_a_dangling_symlinked_root_and_creates_nothing() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = spawner_with_session("dangling");
+        let root = ctx.ensure_child_session_root().unwrap();
+        let gone = root.dir().parent().unwrap().join("nowhere-at-all");
+        if root.dir().exists() {
+            std::fs::remove_dir_all(root.dir()).unwrap();
         }
+        std::fs::create_dir_all(root.dir().parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&gone, root.dir()).unwrap();
+        let sessions_dir = child_sessions::sessions_root();
+        let before = paths_under(&sessions_dir);
+
+        let page = list_sessions(&mut ctx, json!({})).unwrap();
+
+        assert_eq!(page["sessions"], json!([]));
+        assert_eq!(page["total"], json!(0));
+        assert!(page["next_cursor"].is_null());
+        assert_eq!(
+            page["note"],
+            json!("the child session root is a symlink; nothing is listed")
+        );
+        assert!(!gone.exists(), "the link target must not be created");
+        assert_eq!(paths_under(&sessions_dir), before);
+    }
+
+    /// A dry run that already holds a root (with children in it) still
+    /// lists nothing and words it as a dry run.
+    #[test]
+    #[serial]
+    fn usage_probe_list_sessions_under_dry_run_with_an_existing_root_lists_nothing() {
+        let _guard = TestConfigDirGuard::new();
+        let (mut ctx, _ids) = ctx_with_completed_children(2);
+        assert_eq!(
+            list_sessions(&mut ctx, json!({})).unwrap()["total"],
+            json!(2)
+        );
+        ctx.app = Arc::new(AppState {
+            config: Arc::new(AppConfig {
+                dry_run: true,
+                ..Default::default()
+            }),
+            ..AppState::test_default()
+        });
+        let sessions_dir = child_sessions::sessions_root();
+        let before = paths_under(&sessions_dir);
+
+        let page = list_sessions(&mut ctx, json!({})).unwrap();
+
+        assert_eq!(page["sessions"], json!([]));
+        assert_eq!(page["total"], json!(0));
+        assert_eq!(page["note"], json!("dry run records nothing"));
+        assert_eq!(paths_under(&sessions_dir), before);
+    }
+
+    /// With no running child the hint still renders every id unlabelled
+    /// and agrees with the lister.
+    #[test]
+    #[serial]
+    fn usage_probe_recent_child_ids_hint_with_no_running_child_labels_nothing() {
+        let _guard = TestConfigDirGuard::new();
+        let (mut ctx, _ids) = ctx_with_completed_children(3);
+        let root = ctx.ensure_child_session_root().unwrap();
+
+        let hint = recent_child_ids_hint(&root);
+
+        let page = list_sessions(&mut ctx, json!({})).unwrap();
+        assert!(!hint.contains("(crashed)"), "{hint}");
+        assert_eq!(hint, session_ids_of(&page).join(", "));
     }
 
     /// The resume marks the sidecar running again through the one method

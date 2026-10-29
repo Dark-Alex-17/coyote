@@ -1664,6 +1664,102 @@ updated_at: 2026-01-02T03:04:05Z
         assert_eq!(meta.runs[0], before);
     }
 
+    /// Back-to-back resumes over runs that never closed leave at most one
+    /// open run, even across the history cap, and the run closed last
+    /// survives the trim as the one before the open run.
+    #[test]
+    fn usage_probe_restamp_over_open_runs_keeps_one_open_run_across_the_cap() {
+        let mut meta = ChildMeta::new_running_at(
+            fixture_time(),
+            "sess_coder_0123456789ab",
+            "coder",
+            "agent-0",
+            fixture_stamp(),
+            None,
+            None,
+            "do the thing",
+            None,
+        );
+        let total = CHILD_RUN_HISTORY as i64 + 5;
+        for n in 1..=total {
+            meta.restamp(
+                fixture_stamp(),
+                &format!("agent-{n}"),
+                fixture_time() + Duration::minutes(n),
+            );
+            let open = meta
+                .runs
+                .iter()
+                .filter(|run| run.finished_at.is_none())
+                .count();
+            assert_eq!(open, 1, "after resume {n}");
+            assert!(meta.runs.len() <= CHILD_RUN_HISTORY);
+        }
+        let n = meta.runs.len();
+        assert_eq!(n, CHILD_RUN_HISTORY);
+        let closed = &meta.runs[n - 2];
+        assert_eq!(closed.agent_id, format!("agent-{}", total - 1));
+        assert_eq!(
+            closed.finished_at,
+            Some(fixture_time() + Duration::minutes(total))
+        );
+        assert_eq!(closed.status, Some(ChildStatus::Failed));
+        assert_eq!(
+            closed.error.as_deref(),
+            Some("superseded by a resume while still marked running")
+        );
+        assert!(
+            meta.runs[..n - 1]
+                .iter()
+                .all(|run| run.status == Some(ChildStatus::Failed) && run.finished_at.is_some())
+        );
+        assert_eq!(meta.status, ChildStatus::Running);
+        assert_eq!(meta.error, None);
+    }
+
+    /// The closed superseded run survives a sidecar write and read.
+    #[test]
+    #[serial]
+    fn usage_probe_restamp_superseded_run_round_trips_through_the_sidecar() {
+        let _guard = TestConfigDirGuard::new("child-sessions-probe-superseded");
+        let root = ChildSessionRoot::Uid(Uuid::new_v4());
+        root.ensure_dir(&RootFile::seed(fixture_stamp(), None))
+            .unwrap();
+        let mut meta = ChildMeta::new_running_at(
+            fixture_time(),
+            "sess_coder_0123456789ab",
+            "coder",
+            "agent-0",
+            fixture_stamp(),
+            None,
+            None,
+            "do the thing",
+            None,
+        );
+        root.save_child_meta(&meta).unwrap();
+        let mut loaded = root
+            .load_child_meta("sess_coder_0123456789ab")
+            .unwrap()
+            .unwrap();
+        let later = fixture_time() + Duration::minutes(3);
+        loaded.restamp(fixture_stamp(), "agent-1", later);
+        root.save_child_meta(&loaded).unwrap();
+
+        let back = root
+            .load_child_meta("sess_coder_0123456789ab")
+            .unwrap()
+            .unwrap();
+
+        meta.restamp(fixture_stamp(), "agent-1", later);
+        assert_eq!(back, meta);
+        assert_eq!(back.runs[0].status, Some(ChildStatus::Failed));
+        assert_eq!(back.runs[0].finished_at, Some(later));
+        assert_eq!(
+            back.runs[0].error.as_deref(),
+            Some("superseded by a resume while still marked running")
+        );
+    }
+
     #[test]
     fn effective_status_reconciles_liveness() {
         let running = fixture_meta(ChildStatus::Running);
