@@ -204,7 +204,9 @@ pub fn memory_function_declarations() -> Vec<FunctionDeclaration> {
                         "k".to_string(),
                         JsonSchema {
                             type_value: Some("integer".to_string()),
-                            description: Some("Most files to return (default 50)".into()),
+                            description: Some(format!(
+                                "Most files to return (default {DEFAULT_LIST_K})"
+                            )),
                             ..Default::default()
                         },
                     ),
