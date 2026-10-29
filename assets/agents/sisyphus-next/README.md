@@ -31,27 +31,33 @@ below. Later landings add their own rows (grammar reconciliation, fast-path re-e
 | Adjustment | Where | What changed |
 |---|---|---|
 | em dashes | `graph.yaml` (2 lines in the `git_ops` instructions) | replaced with ASCII ` - ` so the repo's punctuation lint stays clean |
-| `build_lock` variable | `graph.yaml` `variables:` | declared after `escalation_policy` with default `''`, mirroring the prose `sisyphus/config.yaml`; `scripts/check_session_block.sh` asserts the two variable lists match name-for-name, default-for-default (threading it to child spawns is a separate adjustment) |
+| `build_lock` variable | `graph.yaml` `variables:` | declared after `escalation_policy` with default `''`, mirroring the prose `sisyphus/config.yaml`; `scripts/check_session_block.sh` asserts the two variable lists match name-for-name, default-for-default (threaded to the child spawns in the `build_lock` threading row below) |
 | run dir | `scripts/_lib.py` `cache_dir()` / `runs_root()`, this README | moved from `$XDG_STATE_HOME/coyote/sisyphus/runs` to `<cache dir>/sisyphus-next/runs` (precedence above); `scripts/smoke_test.py` pins each resolution tier |
 | debris exemptions ledger merge | `graph.yaml` `triage_findings` output_schema + initial_state, `scripts/gates.py` `triage_route` | the schema emitted `debris_exemptions`, and the engine merges every schema property into state, so each triage round overwrote the run-wide ledger; the property is now `debris_exemptions_new` (seeded `[]` in initial_state), `triage_route` merges it into the ledger (staging's own merge line) and resets it to `[]` so a round that omits the property cannot re-merge a stale list; the smoke battery pins three rounds |
 | smoke summary | `scripts/smoke_test.py` | the failure tally is taken after the last check so the summary line and exit code cover every check (the three `ci_gate` checks were recorded after it) |
 | `debt_scan` fallback | `graph.yaml` `debt_scan` node, `scripts/debt_scan.py`, `scripts/gates.py` `bookkeeping_scan` | `fallback: bookkeeping_scan` added next to `next:` - the engine forwards a script crash only along `fallback:`, so the shim's crash-forward sentence now names that edge; the validator baseline is unchanged because `debt_scan` itself is entered only through a script `_next` edge, so nothing downstream becomes declared-edge reachable; `bookkeeping_scan` treats `debt_hits` as untrusted after a crash (the engine leaves the key as it was and `route_coder_result` re-enters `debt_scan` every coder round, so a later round's crash discards the previous report and substitutes a short DEBT_SCAN_FAILED note that the judge sees; the first pass keeps the initial_state default) |
 | `triage` reset | `scripts/gates.py` `triage_route` | the update dict resets `triage` to `[]` beside `debris_exemptions_new` (both are schema properties of `triage_findings`; the engine merges nothing when an llm node fails, so without the reset a crashed round 2+ replayed round 1's verdicts); the fail-safe stays keyed on an empty list because an llm failure never sets `last_script_error` - it lands in `last_node_output`, which `note_script_error` already ledgers |
+| gauntlet grammar | `scripts/gates.py` `build_gauntlet_prompt` / `_parse_gauntlet` / `route_gauntlet` / `final_report`, `scripts/smoke_test.py` | settled lanes are the lanes whose whole status cell is exactly `GREEN` (`GREEN (attention)`, `BLOCKED`, `SKIPPED` and the `debris` lane never settle; lanes with findings last round are excluded); `Settled lanes:` is emitted only when non-empty and `Re-review delta: <sha>..HEAD` stays bare; `GAUNTLET:` and `GAUNTLET_REVIEW_INCOMPLETE:` are read as column-0 whole lines with the last match winning (prose-quoted or trailing-text sentinels are ignored, so a missing whole-line verdict is BLOCKED); the lane table is read as `\| lane \| status \| detail \|` with the whole status cell kept and the detail cell carried into the per-round ledger (`lane_details`, rendered on the report's round lines); the smoke fixtures use that table shape with one row per status value |
+| `build_lock` threading | `graph.yaml` `run_coder`, `run_gauntlet`, `run_step` | `inputs: build_lock: '{{build_lock}}'` on the three graph-agent children (coder, review-gauntlet and step-runner all declare the variable; the gauntlet forwards it to the adversary the same way). Config-agent children (explore, librarian, oracle, architecture-reviewer, whetstone, engineer) get it by variable inheritance and must not carry `inputs:`. Not a schema change: no node, prompt, bound or timeout moved |
+| V1: session-resume replacement (artifact re-entry) - the contract | this README | fix rounds and later re-entries hand the delegate the run's artifact paste (brief, state, context pack, decisions) by `Sisyphus run id`; nothing is ever resumed by a child session id, so there is no resume plumbing and no session-id ledger |
+| engine facts | this README | agent-node resume: not available by decision (2026-10-28); E1 stays as the artifact contract; G6 escalation_timeout open |
+| battery env hygiene | `scripts/smoke_test.py` | every `LLM_AGENT_VAR_*` variable is dropped from the environment at start so the battery cannot inherit the agent variables of the process running it (the standalone-brief intake check reads `LLM_AGENT_VAR_PARALLEL` through `_lib.var`) |
 
 Recorded census against the staging tree (files that differ; hunks per file as counted by
 `diff -u <staging file> <file> | grep -c '^@@'`):
 
 ```
-graph.yaml              6 hunks  (variables: build_lock; initial_state debt_hits comment; initial_state debris_exemptions_new; debt_scan fallback; triage_findings schema property rename; git_ops instructions em dashes, 2 lines)
+graph.yaml              9 hunks  (variables: build_lock; initial_state debt_hits comment; initial_state debris_exemptions_new; debt_scan fallback; triage_findings schema property rename; git_ops instructions em dashes, 2 lines; build_lock inputs on run_coder, run_gauntlet and run_step, 3 hunks)
 scripts/_lib.py         1 hunk   (new cache_dir; runs_root docstring; runs_root base path - three edits close enough to share one hunk)
-scripts/smoke_test.py   6 hunks  (import _lib; run dir resolution checks; bookkeeping_scan crash rows; triage reset rows + three-round exemptions ledger pin; the failure tally moved below the last check, 2 hunks)
-scripts/gates.py        3 hunks  (the DEBT_HITS_STALE constant; bookkeeping_scan: debt_hits untrusted after a crash; triage_route: the debris_exemptions_new + triage resets in the update dict, the merge line itself byte-equal to staging)
+scripts/smoke_test.py   7 hunks  (LLM_AGENT_VAR_* scrub + import _lib, one hunk; run dir resolution checks; bookkeeping_scan crash rows; gauntlet grammar fixtures: composer settled-lanes rows, dirty-tree row, table-shaped parser rows and the sentinel matrix; triage reset rows + three-round exemptions ledger pin; the failure tally moved below the last check, 2 hunks)
+scripts/gates.py        8 hunks  (the DEBT_HITS_STALE constant; bookkeeping_scan: debt_hits untrusted after a crash; build_gauntlet_prompt: whole-cell GREEN settling; _parse_gauntlet: column-0 last-match sentinels and whole status cell + detail cell, 2 hunks; route_gauntlet: six-tuple, lane_details and the GREEN-based lanes_with_findings; triage_route: the debris_exemptions_new + triage resets in the update dict, the merge line itself byte-equal to staging; final_report: lane details on the round lines)
 scripts/debt_scan.py    1 hunk   (docstring: the crash-forward sentence names the fallback edge and what bookkeeping_scan does with debt_hits)
 README.md               this section, the run-state bullet above, the Verify section
 ```
 
 Every other file is byte-identical to staging; the graph's node set, prompts, loop bounds
-and node timeouts are unchanged, and the one schema change is the property rename above.
+and node timeouts are unchanged, and the one schema change is the property rename above
+(the `inputs:` additions pass a variable down, they change no schema).
 
 Toolchain census (the gates must stay project-agnostic; verification commands come
 from the brief, never from a hard-coded toolchain):
@@ -78,6 +84,9 @@ bash scripts/check_session_block.sh     # session block + variable mirror vs sis
 cargo test --test candidate_sisyphus_next   # the Rust wrapper: runs all three from the asset path
 ```
 
+The wrapper also drives the composed re-review prompt through the real
+`review-gauntlet/scripts/signals.py` and `build_items.py`, so a drift between what the
+composer writes and what the gauntlet reads fails here rather than in a live run.
 The Rust wrapper runs the batteries with `HOME`, `LLM_ROOT_DIR`, `COYOTE_CACHE_DIR`,
 `TMPDIR` and `SISYPHUS_RUNS_ROOT` pointed at a scratch directory and
 `PYTHONDONTWRITEBYTECODE=1`, so nothing under this directory or `~/.config/coyote` is
@@ -89,5 +98,5 @@ key naming `sisyphus-next` or `architect-next`, and every `instructions.md` and
 `config.yaml` for prose containing either name, pinning the candidate status above.
 
 Measured 2026-10-28 after the adjustments above, from a fresh scratch dir: audit
-`PROBLEMS: none`; smoke `205/205 checks passed`; session check ok (mikefarah yq
+`PROBLEMS: none`; smoke `217/217 checks passed`; session check ok (mikefarah yq
 v4.53.3).
