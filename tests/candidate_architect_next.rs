@@ -1321,8 +1321,8 @@ fn readme_build_lock_row_names_shipped_nodes_agents_and_pins() {
         assert!(
             nodes[node].get("inputs").is_none()
                 || !nodes[node]["inputs"]
-                    .as_sequence()
-                    .is_some_and(|s| s.iter().any(|i| i.as_str() == Some("build_lock"))),
+                    .as_mapping()
+                    .is_some_and(|m| m.contains_key(serde_yaml::Value::from("build_lock"))),
             "README says no `inputs: build_lock` is needed on {node}; one appeared"
         );
     }

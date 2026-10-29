@@ -31,10 +31,14 @@ fn every_binary_spawn_in_the_harnesses_pins_the_config_dir_and_the_cache_dir() {
         if spawn_sites == 0 && config_sites == 0 && cache_sites == 0 {
             continue;
         }
+        // A surplus of pin sites is fine: the candidate harnesses also pin
+        // the cache dir on the python battery `Command`s they spawn, which
+        // never run the binary.
         assert!(
-            spawn_sites == config_sites && config_sites == cache_sites,
+            config_sites >= spawn_sites && cache_sites >= spawn_sites,
             "{}: {spawn_sites} binary spawn(s), {config_sites} COYOTE_CONFIG_DIR site(s), \
-             {cache_sites} COYOTE_CACHE_DIR site(s); every spawn of the binary must pin both dirs",
+             {cache_sites} COYOTE_CACHE_DIR site(s); every spawn of the binary must pin both \
+             dirs, so each pin count must be at least the spawn count",
             path.display()
         );
         pinned.push(path.file_name().unwrap().to_string_lossy().into_owned());
