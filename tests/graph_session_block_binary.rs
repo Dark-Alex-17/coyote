@@ -3103,8 +3103,25 @@ fn usage_probe_a_script_node_runs_with_only_the_binary_dir_and_the_system_shells
         "beyond the engine's own shim dirs under the fixture, the child PATH is the binary dir plus /usr/bin:/bin:\n{text}"
     );
     assert!(
-        seen.contains("/usr/bin:/bin"),
+        seen.ends_with("/usr/bin:/bin"),
         "the system shell directories come last and in order:\n{line}"
+    );
+}
+
+/// `TEST_WORKSPACE_MEMORY_ROOT_ENV` is a copy of the source const, so a
+/// rename there would leave the probe below setting (and the harness
+/// scrubbing) a variable the binary never reads; this keeps the two equal.
+#[test]
+fn the_test_memory_root_env_name_matches_the_source_const() {
+    let source_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/config/memory.rs");
+    let source = fs::read_to_string(&source_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", source_path.display()));
+    let needle =
+        format!("WORKSPACE_MEMORY_ROOT_TEST_ENV: &str = \"{TEST_WORKSPACE_MEMORY_ROOT_ENV}\"");
+    assert!(
+        source.contains(&needle),
+        "{} no longer declares {needle}",
+        source_path.display()
     );
 }
 

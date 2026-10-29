@@ -101,7 +101,7 @@ fn agent_events() -> Vec<String> {
 }
 
 /// The `agent.*` string literals of the `as_str` function in `source`, in
-/// arm order with repeats dropped.
+/// arm order with adjacent repeats dropped.
 fn agent_events_in(source: &str) -> Vec<String> {
     let body = fn_body(source, "pub fn as_str(");
     let mut events: Vec<String> = string_literals(&body)
