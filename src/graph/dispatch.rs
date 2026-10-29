@@ -1878,27 +1878,15 @@ mod tests {
         assert!(last_run.is_none(), "{:?}", last_run.map(|run| run.prompt));
     }
 
-    /// The bundled coder carries its plan between runs and tells both model
-    /// nodes about the earlier turns in their prompts, not their standing
-    /// instructions.
+    /// The bundled coder carries no state between runs: its orchestrator
+    /// sends a fresh request each time, and both model nodes read the
+    /// earlier turns in their prompts, not their standing instructions.
     #[test]
-    fn bundled_coder_carries_its_plan_and_reads_the_earlier_turns_in_its_prompts() {
+    fn bundled_coder_carries_nothing_and_reads_the_earlier_turns_in_its_prompts() {
         let graph: Graph =
             serde_yaml::from_str(include_str!("../../assets/agents/coder/graph.yaml")).unwrap();
 
-        assert_eq!(
-            graph.carry,
-            ["plan_summary", "files_to_modify", "files_to_create"]
-        );
-        // design_trail accumulates every implement pass's Design lines;
-        // carrying it across runs would re-raise questions already answered.
-        assert!(!graph.carry.iter().any(|key| key == "design_trail"));
-        for key in &graph.carry {
-            assert!(
-                graph.initial_state.contains_key(key),
-                "carry key '{key}' is not declared in initial_state"
-            );
-        }
+        assert!(graph.carry.is_empty(), "{:?}", graph.carry);
 
         let turns_heading = "## Earlier turns with this agent (empty on a first run)";
         for node_id in ["analyze_request", "implement"] {
@@ -1932,23 +1920,23 @@ mod tests {
             panic!("analyze_request is not an llm node");
         };
         assert!(
-            analyze
-                .prompt
-                .contains("## Plan carried from the earlier run (empty on a first run)"),
+            !analyze.prompt.contains("Plan carried from the earlier run"),
             "{}",
             analyze.prompt
         );
         assert!(
-            analyze.prompt.contains("may not have been applied"),
+            !analyze.prompt.contains("may not have been applied"),
             "{}",
             analyze.prompt
         );
-        // analyze_request overwrites these carried keys through its required
-        // output_schema fields, so the prompt must show the earlier values or
-        // the carry is lost on the second turn.
         for key in ["plan_summary", "files_to_modify", "files_to_create"] {
             let placeholder = format!("{{{{{key}}}}}");
-            assert!(analyze.prompt.contains(&placeholder), "{}", analyze.prompt);
+            assert!(!analyze.prompt.contains(&placeholder), "{}", analyze.prompt);
         }
+        assert!(
+            analyze.prompt.contains("{{previous_turns}}"),
+            "{}",
+            analyze.prompt
+        );
     }
 }

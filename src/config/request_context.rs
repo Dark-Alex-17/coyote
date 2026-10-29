@@ -22851,23 +22851,15 @@ mod tests {
 
         // Warning baseline for the shipped graphs: `_next`-routed unreachable
         // nodes, plus variable-shadowing on `coder` and `step-runner` (they
-        // declare variables whose names are also `initial_state` keys) and
-        // the carry-without-session notice on `coder` (it carries its plan
-        // but declares no session block of its own). A new rule that fires
-        // on a shipped asset (or a new bundled graph) must be
-        // recorded here deliberately.
+        // declare variables whose names are also `initial_state` keys). A
+        // new rule that fires on a shipped asset (or a new bundled graph)
+        // must be recorded here deliberately.
         let expected_warnings = BTreeMap::from([
             ("adversary".to_string(), Vec::new()),
             ("code-reviewer".to_string(), Vec::new()),
             (
                 "coder".to_string(),
                 [
-                    vec![
-                        "-: carry: is declared but the graph has no session: block; nothing is \
-                         carried between REPL turns until one exists (a child resumed by \
-                         session_id still carries)"
-                            .to_string(),
-                    ],
                     shadowed(&["project_dir"]),
                     unreachable(&[
                         "analyze_request",
