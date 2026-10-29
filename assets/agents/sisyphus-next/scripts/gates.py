@@ -1109,27 +1109,32 @@ def build_gauntlet_prompt(state):
 
 
 def _parse_gauntlet(text):
+    header = text
+    if m := re.search(r"^## Full lane reports[ \t]*$", text, re.M):
+        header = text[:m.start()]
+    elif (i := text.find("<details>")) >= 0:
+        header = text[:i]
     verdict = "BLOCKED"
-    if found := re.findall(r"^GAUNTLET:\s*(PASS|BLOCKED)\s*$", text, re.M):
-        verdict = found[-1]
+    if m := re.search(r"^GAUNTLET:[ \t]*(PASS|BLOCKED)[ \t]*$", header, re.M):
+        verdict = m.group(1)
     incomplete = []
-    if found := re.findall(r"^GAUNTLET_REVIEW_INCOMPLETE:\s*([^\n]+?)\s*$", text, re.M):
-        incomplete = [x.strip() for x in found[-1].split(",") if x.strip()]
+    if m := re.search(r"^GAUNTLET_REVIEW_INCOMPLETE:[ \t]*([^\n]+?)[ \t]*$", header, re.M):
+        incomplete = [x.strip() for x in m.group(1).split(",") if x.strip()]
     lanes = {}
     details = {}
-    for line in text.splitlines():
+    for line in header.splitlines():
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
         if len(cells) >= 2 and cells[0].lower() in GAUNTLET_LANES:
             lanes[cells[0].lower()] = cells[1]
             if len(cells) >= 3 and cells[2]:
                 details[cells[0].lower()] = cells[2]
     blockers = []
-    sec = re.search(r"(?ims)^#+\s*Blockers?\s*\n(.*?)(?=^#+\s|\Z)", text)
+    sec = re.search(r"(?ims)^#+\s*Blockers?\s*\n(.*?)(?=^#+\s|\Z)", header)
     if sec:
         blockers = [l.strip()[1:].strip() for l in sec.group(1).splitlines() if l.strip().startswith(("-", "*"))]
-    blockers += [l.strip() for l in text.splitlines() if l.strip().startswith("debris: Implementation debris")]
+    blockers += [l.strip() for l in header.splitlines() if l.strip().startswith("debris: Implementation debris")]
     attention = ""
-    if m := re.search(r"(?ims)^#+\s*Human attention required\s*\n(.*?)(?=^#+\s|\Z)", text):
+    if m := re.search(r"(?ims)^#+\s*Human attention required\s*\n(.*?)(?=^#+\s|\Z)", header):
         attention = m.group(1).strip()
     return verdict, incomplete, lanes, details, blockers, attention
 
