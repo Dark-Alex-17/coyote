@@ -325,18 +325,18 @@ fn session_file(dir: &Path) -> PathBuf {
 
 /// A sidecar as the binary writes it (version 1, every field spelled), with
 /// `runs` left to the caller: `None` writes a sidecar from before run
-/// history was kept, `Some(n)` writes `n` closed runs.
-#[allow(clippy::too_many_arguments)]
+/// history was kept, `Some(n)` writes `n` closed runs. Every run names
+/// `DEAD_PID`, so no seeded child reads as live.
 fn seed_sidecar(
     children: &Path,
     session_id: &str,
     status: &str,
     created_at: &str,
-    pid: u32,
-    pid_start: u64,
     prompt_head: &str,
     runs: Option<usize>,
 ) {
+    let pid = DEAD_PID;
+    let pid_start = 1;
     let mut text = format!(
         "version: 1\n\
          session_id: {session_id}\n\
@@ -468,8 +468,6 @@ fn list_sessions_through_the_binary_lists_a_saved_sessions_children_read_only() 
         MIDDLE,
         "completed",
         "2026-01-01T00:02:00Z",
-        DEAD_PID,
-        1,
         "middle task",
         Some(2),
     );
@@ -478,8 +476,6 @@ fn list_sessions_through_the_binary_lists_a_saved_sessions_children_read_only() 
         NEWEST,
         "running",
         "2026-01-01T00:03:00Z",
-        DEAD_PID,
-        1,
         "newest task",
         Some(1),
     );
@@ -488,8 +484,6 @@ fn list_sessions_through_the_binary_lists_a_saved_sessions_children_read_only() 
         OLDEST,
         "completed",
         "2026-01-01T00:01:00Z",
-        DEAD_PID,
-        1,
         "oldest task",
         None,
     );
