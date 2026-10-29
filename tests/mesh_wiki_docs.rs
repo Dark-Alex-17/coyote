@@ -8318,3 +8318,173 @@ fn no_user_facing_mesh_string_spells_the_banned_vocabulary_of_the_message_standa
         hits.join("\n")
     );
 }
+
+/// The commented `port:` and `instance:` keys under the `local` entry say which one is
+/// inert where, on every surface that carries the `interfaces:` block: `port` is
+/// `ignored on Linux and Android` (the abstract socket is dialed there), `instance` is
+/// `ignored elsewhere` (TCP `127.0.0.1:<port>` is dialed there), and neither keeps the
+/// older `where the abstract socket is (not) used` wording. The template/example half
+/// runs on every run; the Configuration page only with `COYOTE_WIKI_DIR`.
+#[test]
+fn usage_probe_the_interfaces_twins_say_which_local_key_is_inert_where() {
+    fn check(label: &str, text: &str) {
+        let block = interfaces_block(label, text);
+        let entry = |key: &str| {
+            comment_text(&commented_entry(
+                label,
+                &block,
+                &format!("`#   {key}` line"),
+                |line| line.trim_start().starts_with(&format!("#   {key}")),
+            ))
+        };
+        let port = entry("port: 37428");
+        let instance = entry("instance: default");
+        assert!(
+            port.contains("ignored on Linux and Android"),
+            "{label}'s `port:` comment does not say the key is ignored on Linux and Android: {port}"
+        );
+        assert!(
+            port.contains("macOS, BSD, Windows"),
+            "{label}'s `port:` comment does not name where the TCP port is used: {port}"
+        );
+        assert!(
+            instance.contains("ignored elsewhere"),
+            "{label}'s `instance:` comment does not say the key is ignored elsewhere: {instance}"
+        );
+        assert!(
+            instance.contains("Linux and Android"),
+            "{label}'s `instance:` comment does not name where the abstract socket is dialed: {instance}"
+        );
+        for stale in [
+            "where the abstract socket is not used",
+            "where the abstract socket is used",
+            "loopback hop",
+        ] {
+            assert!(
+                !block.contains(stale),
+                "{label}'s `interfaces:` block still says {stale:?}:\n{block}"
+            );
+        }
+        assert!(
+            block.contains("reached through the local rnsd above"),
+            "{label}'s `interfaces:` block does not route the other transports through the local rnsd:\n{block}"
+        );
+    }
+
+    check(
+        "assets/config-template.yaml",
+        &read(repo_root().join("assets/config-template.yaml")),
+    );
+    check(
+        "config.example.yaml",
+        &read(repo_root().join("config.example.yaml")),
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    check(
+        "Mesh-Configuration.md",
+        &read(wiki.join("Mesh-Configuration.md")),
+    );
+}
+
+/// A first-time reader of `Mesh-Deployment.md` climbs rung 1 and the two-laptop walk
+/// as a client of the host rnsd: the rung is headed `Coyote is a client of your rnsd`,
+/// its `reach` row is the one `reach_line` prints for a local rnsd, it keeps the daemon's
+/// 4242 listener for other hosts and says sessions on this host do not use it; the
+/// two-laptop walk says it is stage 1 of the mesh test plan and now runs through
+/// `type: local` with no `private` entry at 4242, its yaml block is the `local` entry
+/// under `enabled: true`, and its `Mesh is on for this session.` block is
+/// `render_on_summary`'s shape with `local rnsd at 127.0.0.1:37428` on the
+/// `interfaces:` row. The source-side checks run on every run.
+#[test]
+fn usage_probe_the_deployment_page_rung_one_and_the_two_laptop_walk_run_through_type_local() {
+    let summary = string_literals(&fn_body("src/repl/mesh.rs", "render_on_summary"))
+        .into_iter()
+        .find(|literal| literal.starts_with("Mesh is on for this session"))
+        .expect("render_on_summary formats the `Mesh is on for this session` block");
+    let summary_lines: Vec<String> = summary
+        .replace("{suffix}", "")
+        .split('\n')
+        .map(|line| line.replace("{}", "<32 hex>"))
+        .collect();
+    assert_eq!(summary_lines.len(), 6, "{summary_lines:?}");
+    assert_eq!(summary_lines[5], "Turn it off with `.mesh off`.");
+    let reach = string_literals(&fn_body("src/repl/mesh.rs", "reach_line"))
+        .into_iter()
+        .find(|literal| literal.starts_with("via rnsd at {}"))
+        .expect("reach_line formats `via rnsd at {} - rnstatus shows what it reaches`")
+        .replace("{}", "127.0.0.1:37428");
+    let autostart = string_literals(&fn_body("src/repl/mesh.rs", "autostart"))
+        .into_iter()
+        .find(|literal| literal.starts_with("mesh.enabled is true in config.yaml:"))
+        .expect("autostart prints the `mesh.enabled is true in config.yaml:` notice");
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Mesh-Deployment.md"));
+    let rung_heading = "### 1. The host: Coyote is a client of your `rnsd`";
+    let rung = flat(&section("Mesh-Deployment.md", &page, rung_heading));
+    for needle in [
+        "`local` makes Coyote a shared-instance client of the host's own `rnsd`",
+        &format!("the `reach` row of `.mesh info` reads `{reach}`"),
+        "The daemon's own 4242 listener stays for other hosts that dial this one as their relay; sessions on this host do not use it.",
+    ] {
+        assert!(
+            rung.contains(needle),
+            "Mesh-Deployment.md's rung 1 does not say {needle:?}:\n{rung}"
+        );
+    }
+    assert!(
+        !rung.contains("127.0.0.1:4242"),
+        "Mesh-Deployment.md's rung 1 points sessions on this host at the 4242 listener again:\n{rung}"
+    );
+
+    let walk = section("Mesh-Deployment.md", &page, "## Two laptops on one network");
+    let prose = flat(&walk);
+    for needle in [
+        "This walkthrough is stage 1 of the mesh test plan and now runs through `type: local`",
+        "both sessions attach to their host's rnsd over its shared instance",
+        "no `private` entry pointing at the daemon's 4242 listener is needed",
+        &format!("printing `{autostart}` and then:"),
+        "`Local rnsd at 127.0.0.1:37428 (type: local) is not reachable`",
+    ] {
+        assert!(
+            prose.contains(needle),
+            "Mesh-Deployment.md's `## Two laptops on one network` does not say {needle:?}:\n{prose}"
+        );
+    }
+    let fence = |language: &str| -> Vec<String> {
+        walk.lines()
+            .skip_while(|line| line.trim() != format!("```{language}"))
+            .skip(1)
+            .take_while(|line| line.trim() != "```")
+            .map(|line| line.trim().to_string())
+            .collect()
+    };
+    assert_eq!(
+        fence("yaml"),
+        ["mesh:", "enabled: true", "interfaces:", "- type: local"],
+        "the two-laptop walk's `mesh:` block is not the local entry under `enabled: true`"
+    );
+    let block = fence("text");
+    assert_eq!(
+        block,
+        summary_lines
+            .iter()
+            .map(|line| line.trim().to_string())
+            .collect::<Vec<_>>()
+            .iter()
+            .map(|line| {
+                if line.starts_with("interfaces: ") {
+                    "interfaces: local rnsd at 127.0.0.1:37428".to_string()
+                } else {
+                    line.clone()
+                }
+            })
+            .collect::<Vec<_>>(),
+        "the two-laptop walk's `Mesh is on for this session.` block is not render_on_summary's shape with the local rnsd on its interfaces row"
+    );
+    assert!(
+        !prose.contains("type: private") && !prose.contains("127.0.0.1:4242"),
+        "the two-laptop walk still points a `private` entry at the loopback daemon:\n{prose}"
+    );
+}
