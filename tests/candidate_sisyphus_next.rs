@@ -20,6 +20,8 @@
 
 #![cfg(unix)]
 
+use serde_json::json;
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -28,7 +30,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "sisyphus-next";
 const CANDIDATE_NAMES: [&str; 2] = ["sisyphus-next", "architect-next"];
-const SMOKE_FLOOR: usize = 190;
+const SMOKE_FLOOR: usize = 217;
 
 fn agents_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents")
@@ -1395,6 +1397,390 @@ fn gates_carry_exactly_the_recorded_divergences_from_staging() {
             shipped["initial_state"][key],
             serde_yaml::Value::Sequence(vec![]),
             "and is seeded as an empty list: {key}"
+        );
+    }
+}
+
+/// The gates read `LLM_AGENT_VAR_*` through `_lib.var`, so a developer's own
+/// agent variables would leak into every fixture.
+fn without_agent_vars(cmd: &mut Command) {
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("LLM_AGENT_VAR_") {
+            cmd.env_remove(key);
+        }
+    }
+}
+
+fn parse_json_stdout(label: &str, out: &Output) -> serde_json::Value {
+    assert!(out.status.success(), "{label}:\n{}", transcript(out));
+    serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("{label} stdout is not JSON ({e}):\n{}", transcript(out)))
+}
+
+/// Runs one candidate gate the way the engine does: the entry script under
+/// `scripts/`, the state in `GRAPH_STATE`, one JSON object on stdout.
+fn gate_json(gate: &str, state: &serde_json::Value, scratch: &TempDirGuard) -> serde_json::Value {
+    let python = python3().expect("callers skip without python3");
+    let mut cmd = battery(&python, scratch);
+    cmd.arg(Path::new("scripts").join(format!("{gate}.py")))
+        .env("GRAPH_STATE", state.to_string());
+    without_agent_vars(&mut cmd);
+    let out = cmd.output().unwrap();
+    assert_no_bytecode_under_candidate();
+    parse_json_stdout(gate, &out)
+}
+
+/// Runs one of the review gauntlet's own scripts on `state`, exactly as the
+/// engine invokes them (no path adjustments; only bytecode writing is turned
+/// off so the shared module it imports leaves no cache under `assets/`), so
+/// the test reads the composed prompt with the real consumer.
+fn gauntlet_script(script: &str, state: &serde_json::Value) -> serde_json::Value {
+    let path = agents_dir().join("review-gauntlet/scripts").join(script);
+    let out = Command::new("python3")
+        .arg(&path)
+        .env("GRAPH_STATE", state.to_string())
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env_remove("GRAPH_STATE_FILE")
+        .output()
+        .unwrap_or_else(|e| panic!("failed to invoke python3 {script}: {e}"));
+    parse_json_stdout(script, &out)
+}
+
+/// A clean repository with two commits, so a prior round can be pinned at
+/// the first sha while HEAD sits on the second.
+fn two_commit_repo(scratch: &TempDirGuard) -> (PathBuf, String, String) {
+    let git = which::which("git").expect("callers skip without git");
+    let project = scratch.0.join("project");
+    fs::create_dir_all(&project).unwrap();
+    let run = |args: &[&str]| -> String {
+        let out = Command::new(&git)
+            .args(args)
+            .current_dir(&project)
+            .env("HOME", scratch.0.join("home"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}\n{}", transcript(&out));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let commit = |message: &str| -> String {
+        run(&[
+            "-c",
+            "user.name=probe",
+            "-c",
+            "user.email=probe@example.invalid",
+            "add",
+            ".",
+        ]);
+        run(&[
+            "-c",
+            "user.name=probe",
+            "-c",
+            "user.email=probe@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            message,
+        ]);
+        run(&["rev-parse", "HEAD"])
+    };
+    run(&["init", "-q"]);
+    fs::write(project.join("README.md"), "# demo\n").unwrap();
+    let first = commit("base");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(project.join("src/lib.txt"), "hello\n").unwrap();
+    let second = commit("feature");
+    assert_eq!(
+        run(&["status", "--porcelain"]),
+        "",
+        "the tree must be clean"
+    );
+    (project, first, second)
+}
+
+/// The state a re-review composition starts from: the previous round pinned
+/// at `prior_head` with `finding_lanes` still open, and the lane statuses the
+/// previous report left in `gauntlet_lanes`.
+fn re_review_state(
+    repo: &Path,
+    prior_head: &str,
+    finding_lanes: &[&str],
+    lanes: serde_json::Value,
+    scratch: &TempDirGuard,
+) -> serde_json::Value {
+    json!({
+        "project_dir": repo,
+        "git_root": repo,
+        "base_sha": prior_head,
+        "head_sha": prior_head,
+        "run_dir": scratch.0.join("runs").join("x"),
+        "decisions": [],
+        "anomalies": [],
+        "anomalies_log": [],
+        "spec_text": "AC1: hello endpoint",
+        "quality_rigor": "production",
+        "round_heads": [{"round": 1, "head": prior_head, "lanes_with_findings": finding_lanes}],
+        "gauntlet_lanes": lanes,
+        "rejected_findings": [],
+    })
+}
+
+/// A re-review state whose primary signals select security and probe and
+/// whose delta carries no attack-surface or consumer signals, so settling
+/// both lanes is the only thing standing between them and a narrowed SKIP.
+fn gauntlet_narrowable_state(settled_lanes: &serde_json::Value) -> serde_json::Value {
+    json!({
+        "settled_lanes": settled_lanes,
+        "delta_summary": "2 file(s) in delta (abc1234..HEAD)",
+        "signals_summary": "6 file(s) changed (diff: worktree)",
+        "touches_auth": true,
+        "consumer_surface": true,
+        "probe_context": "make run && hurl tests/"
+    })
+}
+
+fn prompt_lines_starting_with<'a>(prompt: &'a str, prefix: &str) -> Vec<&'a str> {
+    prompt.lines().filter(|l| l.starts_with(prefix)).collect()
+}
+
+/// The composer's `Re-review delta:` and `Settled lanes:` lines are read by
+/// the gauntlet's `signals.py` with strict regexes and narrowed by
+/// `build_items.py` on bare lane names, so the whole chain runs here: a
+/// prompt composed from a previous round with one open lane narrows exactly
+/// the lanes that were whole-cell GREEN.
+#[test]
+fn composed_re_review_prompt_narrows_through_the_real_gauntlet_scripts() {
+    if python3().is_none() || which::which("git").is_err() {
+        return;
+    }
+    let scratch = scratch_dir("rereview-narrow");
+    let (repo, first, _second) = two_commit_repo(&scratch);
+    let lanes = json!({
+        "code-review": "GREEN",
+        "adversary": "BLOCKED",
+        "security": "GREEN",
+        "probe": "GREEN",
+        "debris": "GREEN"
+    });
+    let state = re_review_state(&repo, &first, &["adversary"], lanes, &scratch);
+    let composed = gate_json("build_gauntlet_prompt", &state, &scratch);
+    let prompt = composed["gauntlet_prompt"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no gauntlet_prompt in {composed}"));
+    let delta_line = format!("Re-review delta: {first}..HEAD");
+    assert!(
+        prompt.lines().any(|l| l == delta_line),
+        "bare delta line missing:\n{prompt}"
+    );
+    assert_eq!(
+        prompt_lines_starting_with(prompt, "Settled lanes:"),
+        vec!["Settled lanes: code-review, security, probe"],
+        "{prompt}"
+    );
+
+    let signals = gauntlet_script(
+        "signals.py",
+        &json!({"project_dir": repo, "diff_spec": first, "initial_prompt": prompt}),
+    );
+    assert_eq!(
+        signals["rereview_spec"],
+        json!(format!("{first}..HEAD")),
+        "{signals}"
+    );
+    assert_eq!(
+        signals["settled_lanes"],
+        json!(["code-review", "security", "probe"]),
+        "{signals}"
+    );
+
+    let items = gauntlet_script(
+        "build_items.py",
+        &gauntlet_narrowable_state(&signals["settled_lanes"]),
+    );
+    let summary = items["lanes_summary"].as_str().unwrap();
+    for expected in [
+        "security: SKIPPED (narrowed)",
+        "probe: SKIPPED (narrowed)",
+        "code-review: never narrowed",
+    ] {
+        assert!(summary.contains(expected), "{expected} missing:\n{summary}");
+    }
+    assert!(
+        !summary.contains("unrecognised token"),
+        "every settled name must be a bare lane name:\n{summary}"
+    );
+    assert_eq!(items["security_items"], json!([]), "{items}");
+    assert_eq!(items["probe_items"], json!([]), "{items}");
+}
+
+/// When the previous report left nothing whole-cell GREEN (an attention
+/// GREEN, a SKIPPED lane, a BLOCKED lane that carried findings) the composer
+/// writes no `Settled lanes:` line at all, and `signals.py` sees an empty
+/// settled list while the delta still narrows nothing by itself.
+#[test]
+fn blocked_after_findings_prior_report_yields_no_settled_lanes_line() {
+    if python3().is_none() || which::which("git").is_err() {
+        return;
+    }
+    let scratch = scratch_dir("rereview-unsettled");
+    let (repo, first, _second) = two_commit_repo(&scratch);
+    let lanes = json!({
+        "code-review": "BLOCKED",
+        "adversary": "GREEN (attention)",
+        "security": "SKIPPED",
+        "debris": "BLOCKED"
+    });
+    let state = re_review_state(&repo, &first, &["code-review"], lanes, &scratch);
+    let composed = gate_json("build_gauntlet_prompt", &state, &scratch);
+    let prompt = composed["gauntlet_prompt"].as_str().unwrap();
+    let delta_line = format!("Re-review delta: {first}..HEAD");
+    assert!(prompt.lines().any(|l| l == delta_line), "{prompt}");
+    assert!(
+        prompt_lines_starting_with(prompt, "Settled lanes:").is_empty(),
+        "{prompt}"
+    );
+
+    let signals = gauntlet_script(
+        "signals.py",
+        &json!({"project_dir": repo, "diff_spec": first, "initial_prompt": prompt}),
+    );
+    assert_eq!(signals["settled_lanes"], json!([]), "{signals}");
+    assert_eq!(
+        signals["rereview_spec"],
+        json!(format!("{first}..HEAD")),
+        "{signals}"
+    );
+}
+
+/// Feeds `report` to `gates._parse_gauntlet` in a fresh interpreter and
+/// returns the verdict, incomplete list, lane statuses and lane details.
+fn parse_gauntlet_report(report: &str, scratch: &TempDirGuard) -> serde_json::Value {
+    use std::io::Write;
+    let python = python3().expect("callers skip without python3");
+    let mut cmd = battery(&python, scratch);
+    cmd.current_dir(candidate_dir().join("scripts"))
+        .arg("-c")
+        .arg(
+            "import json, sys\n\
+             import gates\n\
+             v, inc, lanes, details, _b, _a = gates._parse_gauntlet(sys.stdin.read())\n\
+             print(json.dumps({\"verdict\": v, \"incomplete\": inc, \"lanes\": lanes, \"details\": details}))\n",
+        )
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    without_agent_vars(&mut cmd);
+    let mut child = cmd.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(report.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_no_bytecode_under_candidate();
+    parse_json_stdout("_parse_gauntlet", &out)
+}
+
+/// The verdict and incomplete sentinels are read the way the gauntlet's own
+/// verdict gate reads lane sentinels: a whole line at column 0, last match
+/// wins. A sentinel quoted inside a sentence or followed by a remark is not
+/// a verdict, and no whole-line verdict means BLOCKED. The lane table keeps
+/// the whole status cell and the detail cell.
+#[test]
+fn gauntlet_sentinels_are_column_zero_whole_lines_last_match_wins() {
+    if python3().is_none() {
+        return;
+    }
+    let scratch = scratch_dir("sentinels");
+    let table = "| lane | status | detail |\n|------|--------|--------|\n| security | GREEN (attention) | PASS (attention items) |\n";
+    let verdict_rows = [
+        (
+            "The lane said \"GAUNTLET: PASS\" in prose but the table disagrees.\n\nGAUNTLET: BLOCKED\n".to_string(),
+            "BLOCKED",
+        ),
+        (format!("GAUNTLET: PASS (tentative)\n{table}"), "BLOCKED"),
+        (format!("GAUNTLET: BLOCKED\n{table}GAUNTLET: PASS\n"), "PASS"),
+        (format!("GAUNTLET: PASS\n{table}GAUNTLET: BLOCKED\n"), "BLOCKED"),
+    ];
+    for (report, expected) in &verdict_rows {
+        let parsed = parse_gauntlet_report(report, &scratch);
+        assert_eq!(parsed["verdict"], json!(expected), "{report:?} -> {parsed}");
+    }
+    let incomplete_rows = [
+        (
+            "Earlier it printed \"GAUNTLET_REVIEW_INCOMPLETE: security\" by mistake.\nGAUNTLET: BLOCKED\nGAUNTLET_REVIEW_INCOMPLETE: probe, pipeline\n",
+            json!(["probe", "pipeline"]),
+        ),
+        (
+            "GAUNTLET: BLOCKED\nGAUNTLET_REVIEW_INCOMPLETE: security\nGAUNTLET_REVIEW_INCOMPLETE: probe\n",
+            json!(["probe"]),
+        ),
+    ];
+    for (report, expected) in &incomplete_rows {
+        let parsed = parse_gauntlet_report(report, &scratch);
+        assert_eq!(parsed["incomplete"], *expected, "{report:?} -> {parsed}");
+    }
+    let parsed = parse_gauntlet_report(&format!("GAUNTLET: PASS\n\n{table}"), &scratch);
+    assert_eq!(
+        parsed["lanes"]["security"],
+        json!("GREEN (attention)"),
+        "{parsed}"
+    );
+    assert_eq!(
+        parsed["details"]["security"],
+        json!("PASS (attention items)"),
+        "{parsed}"
+    );
+}
+
+/// `build_lock` reaches a graph-agent child only through `inputs:`; a
+/// config-agent child inherits it as a variable and the engine rejects
+/// `inputs:` on such a node. So exactly the coder, review-gauntlet and
+/// step-runner nodes carry it, and nothing else carries `inputs:`.
+#[test]
+fn build_lock_is_threaded_as_inputs_on_every_graph_agent_child() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let shipped: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let graph_agents: BTreeMap<&str, &str> = [
+        ("coder", "run_coder"),
+        ("review-gauntlet", "run_gauntlet"),
+        ("step-runner", "run_step"),
+    ]
+    .into_iter()
+    .collect();
+    let mut seen = Vec::new();
+    for (id, node) in shipped["nodes"].as_mapping().unwrap() {
+        if node["type"].as_str() != Some("agent") {
+            continue;
+        }
+        let id = id.as_str().unwrap();
+        let agent = node["agent"].as_str().unwrap();
+        match graph_agents.get(agent) {
+            Some(expected_id) => {
+                assert_eq!(id, *expected_id, "{agent} is spawned from one node");
+                assert_eq!(
+                    node["inputs"]["build_lock"].as_str(),
+                    Some("{{build_lock}}"),
+                    "{id} must forward build_lock: {node:?}"
+                );
+                seen.push(id);
+            }
+            None => assert!(
+                node.get("inputs").is_none(),
+                "{id} targets config agent {agent} and must not carry inputs: {node:?}"
+            ),
+        }
+    }
+    seen.sort_unstable();
+    assert_eq!(seen, ["run_coder", "run_gauntlet", "run_step"]);
+    let gauntlet_inputs = shipped["nodes"]["run_gauntlet"]["inputs"]
+        .as_mapping()
+        .unwrap();
+    for key in ["verification_commands", "debris_exclude"] {
+        assert!(
+            gauntlet_inputs.contains_key(key),
+            "run_gauntlet still forwards {key}: {gauntlet_inputs:?}"
         );
     }
 }
