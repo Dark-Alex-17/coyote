@@ -141,6 +141,12 @@ pub struct Cli {
         conflicts_with_all = [
             "agent", "session", "role", "temp_role", "model", "empty_session", "save_session",
             "init_memory", "text", "file", "execute", "code", "dry_run",
+            "completions", "tail_logs", "generate_models", "update", "list_bundles", "headless",
+            "info", "list_models", "list_roles", "list_sessions", "list_agents", "list_rags",
+            "list_macros", "list_skills", "list_secrets", "sync_models", "install",
+            "install_builtins", "update_bundle", "uninstall", "mcp_add", "mcp_remove", "mcp_list",
+            "mcp_get", "rag", "rebuild_rag", "macro_name", "skill", "build_tools",
+            "init_instructions", "acp_server",
         ]
     )]
     pub memory_migrate: Option<MigrateScope>,
@@ -702,6 +708,10 @@ mod tests {
             &["--empty-session"],
             &["--save-session"],
             &["some", "prompt"],
+            &["--list-bundles"],
+            &["--tail-logs"],
+            &["--info"],
+            &["--install", "x"],
         ] {
             let mut args = vec!["coyote", "--memory-migrate", "all"];
             args.extend_from_slice(extra);
