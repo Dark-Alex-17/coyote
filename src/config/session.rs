@@ -105,6 +105,8 @@ pub struct CompressionInfo {
 /// itself and the memory instructions that follow it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SystemPromptSplit {
+    /// Measured before loaded skill bodies are appended, so it excludes
+    /// skill text.
     pub role_tokens: usize,
     pub memory_tokens: usize,
     pub instructions_tokens: usize,
