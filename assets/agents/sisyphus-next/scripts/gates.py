@@ -1116,10 +1116,17 @@ def _gauntlet_header(text):
     return text
 
 
+_GAUNTLET_VERDICT_RE = re.compile(r"^GAUNTLET:[ \t]*(PASS|BLOCKED)[ \t]*$", re.M)
+
+
+def _has_verdict(header):
+    return bool(_GAUNTLET_VERDICT_RE.search(header))
+
+
 def _parse_gauntlet(text):
     header = _gauntlet_header(text)
     verdict = "BLOCKED"
-    if m := re.search(r"^GAUNTLET:[ \t]*(PASS|BLOCKED)[ \t]*$", header, re.M):
+    if m := _GAUNTLET_VERDICT_RE.search(header):
         verdict = m.group(1)
     incomplete = []
     if m := re.search(r"^GAUNTLET_REVIEW_INCOMPLETE:[ \t]*([^\n]+?)[ \t]*$", header, re.M):
@@ -1142,7 +1149,7 @@ def _parse_gauntlet(text):
         blockers = [l[2:].strip() for l in sec.group(1).splitlines() if l.startswith(("- ", "* "))]
     blockers += [l.rstrip() for l in header_lines if l.startswith("debris: Implementation debris")]
     attention = ""
-    if m := re.search(r"(?ims)^#+\s*Human attention required\s*\n(.*?)(?=^#+\s|\Z)", header):
+    if m := re.search(r"(?ims)^#+[ \t]*Human attention required[ \t]*\n(.*?)(?=^#+\s|\Z)", header):
         attention = m.group(1).strip()
     return verdict, incomplete, lanes, details, blockers, attention
 
@@ -1151,7 +1158,7 @@ def route_gauntlet(state):
     u = {}
     note_script_error(state, u, "run_gauntlet")
     text = state.get("gauntlet_result") or ""
-    if not text or text.startswith("Agent node failed") or "GAUNTLET:" not in _gauntlet_header(text):
+    if not text or text.startswith("Agent node failed") or not _has_verdict(_gauntlet_header(text)):
         verdict, incomplete, lanes, details, blockers, attention = "BLOCKED", ["pipeline"], {}, {}, [], ""
     else:
         verdict, incomplete, lanes, details, blockers, attention = _parse_gauntlet(text)
