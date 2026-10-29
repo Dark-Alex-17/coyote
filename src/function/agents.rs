@@ -1705,17 +1705,15 @@ async fn resume_child_session(
         // A stamp with no start time under a pid that still exists cannot
         // be told apart from the live child, so it is refused like one
         // rather than resumed over a child that may still be writing the
-        // session. A pid sysinfo no longer lists is dead like any other
-        // dead stamp and the child resumes.
-        if meta.status == ChildStatus::Running {
-            if meta.pid_start == 0 && ProcessStamp::pid_exists(meta.pid) {
+        // session, with a message that says why. A pid sysinfo no longer
+        // lists is dead like any other dead stamp and the child resumes.
+        if meta.status == ChildStatus::Running && meta.stamp().is_alive_or_start_unknown() {
+            if meta.pid_start == 0 {
                 bail!(
                     "'{id}' may still be running (its process start time is unknown); collect or cancel it first"
                 );
             }
-            if meta.stamp().is_alive() {
-                bail!("'{id}' is still running; collect or cancel it first");
-            }
+            bail!("'{id}' is still running; collect or cancel it first");
         }
         let saved_bytes = std::fs::read_to_string(&sidecar)
             .with_context(|| format!("Failed to read {}", sidecar.display()))?;
@@ -7192,6 +7190,19 @@ mod tests {
         assert!(!body.contains("meta.pid_start = "));
         assert!(!body.contains("meta.pid = "));
         assert!(!body.contains("meta.agent_id = "));
+    }
+
+    /// The resume refusal asks the same liveness question the orphan sweep
+    /// asks, so a root the sweep keeps is never resumed over.
+    #[test]
+    fn resume_child_session_refuses_through_the_shared_liveness_check() {
+        let source = include_str!("agents.rs").replace("\r\n", "\n");
+        let start = source.find("\nasync fn resume_child_session(").unwrap();
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert_eq!(body.matches(".is_alive_or_start_unknown(").count(), 1);
+        assert!(!body.contains(".is_alive("));
+        assert!(!body.contains("pid_exists("));
     }
 
     fn paths_under(dir: &Path) -> std::collections::BTreeSet<PathBuf> {

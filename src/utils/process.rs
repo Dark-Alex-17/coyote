@@ -30,9 +30,19 @@ impl ProcessStamp {
     /// well, so such a child is listed as crashed. When that pid is also
     /// absent the child is dead everywhere. When the pid still exists it
     /// reads dead here as well (and is listed crashed), but a resume refuses
-    /// it, since the process under that pid may be the live child.
+    /// it and the orphan sweep keeps it, through
+    /// [`Self::is_alive_or_start_unknown`], since the process under that pid
+    /// may be the live child.
     pub(crate) fn is_alive(&self) -> bool {
         lookup_start_time(self.pid) == Some(self.start)
+    }
+
+    /// True when [`Self::is_alive`] holds, or when the stamp was recorded
+    /// with `start` 0 and its pid is still in use. A start-0 stamp under a
+    /// live pid cannot be told from the process that wrote it, so callers
+    /// that would destroy or overwrite its state treat it as possibly alive.
+    pub(crate) fn is_alive_or_start_unknown(&self) -> bool {
+        self.is_alive() || (self.start == 0 && Self::pid_exists(self.pid))
     }
 
     /// True when sysinfo lists a process under this pid, whatever its start
@@ -162,6 +172,45 @@ mod tests {
     fn pid_exists_tracks_the_process_table() {
         assert!(ProcessStamp::pid_exists(std::process::id()));
         assert!(!ProcessStamp::pid_exists(u32::MAX - 1));
+    }
+
+    #[test]
+    fn current_process_is_alive_or_start_unknown() {
+        assert!(ProcessStamp::current().is_alive_or_start_unknown());
+    }
+
+    #[test]
+    fn unknown_pid_with_an_unknown_start_is_not_alive_or_start_unknown() {
+        let stamp = ProcessStamp {
+            pid: u32::MAX - 1,
+            start: 0,
+        };
+        assert!(!stamp.is_alive_or_start_unknown());
+    }
+
+    #[test]
+    fn live_pid_with_an_unknown_start_is_alive_or_start_unknown() {
+        let unreported = ProcessStamp {
+            pid: std::process::id(),
+            start: 0,
+        };
+        assert!(unreported.is_alive_or_start_unknown());
+    }
+
+    #[test]
+    fn recycled_pid_with_a_known_start_is_not_alive_or_start_unknown() {
+        let current = ProcessStamp::current();
+        if current.start == 0 {
+            eprintln!(
+                "sysinfo cannot report this process's start time; the start discriminator goes untested"
+            );
+            return;
+        }
+        let recycled = ProcessStamp {
+            pid: current.pid,
+            start: current.start + 1,
+        };
+        assert!(!recycled.is_alive_or_start_unknown());
     }
 
     #[test]
