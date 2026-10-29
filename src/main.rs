@@ -110,7 +110,11 @@ async fn async_main() -> Result<()> {
         return Ok(());
     }
 
-    let text = if cli.acp_server { None } else { cli.text()? };
+    let text = if cli.acp_server || cli.memory_migrate.is_some() {
+        None
+    } else {
+        cli.text()?
+    };
     let working_mode = if !cli.acp_server && text.is_none() && cli.file.is_empty() {
         WorkingMode::Repl
     } else {

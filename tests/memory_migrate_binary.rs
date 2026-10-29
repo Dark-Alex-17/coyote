@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -77,9 +78,10 @@ fn fixture(label: &str) -> Fixture {
 
 const GHOST_LINE: &str = "- [[ghost]]: missing\n";
 
-fn run(fx: &Fixture, args: &[&str]) -> Output {
+fn command(fx: &Fixture, args: &[&str]) -> Command {
     let home = fx.dir.join("home");
-    Command::new(env!("CARGO_BIN_EXE_coyote"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_coyote"));
+    command
         .args(args)
         .current_dir(&fx.workspace)
         .env("COYOTE_CONFIG_DIR", &fx.dir)
@@ -91,10 +93,12 @@ fn run(fx: &Fixture, args: &[&str]) -> Output {
         .env_remove("COYOTE_WORKSPACE_CONFIG_DIR")
         .env_remove("IS_SANDBOX")
         .env_remove("COYOTE_PROVIDER")
-        .env_remove("COYOTE_PLATFORM")
-        .stdin(Stdio::null())
-        .output()
-        .unwrap()
+        .env_remove("COYOTE_PLATFORM");
+    command
+}
+
+fn run(fx: &Fixture, args: &[&str]) -> Output {
+    command(fx, args).stdin(Stdio::null()).output().unwrap()
 }
 
 /// Every file under `dir` keyed by its path relative to `dir`; empty when
@@ -142,6 +146,24 @@ fn report_only_leaves_the_stores_and_the_backups_untouched() {
     assert_eq!(snapshot(&fx.global_store()), global_before);
     assert_eq!(snapshot(&fx.workspace_store()), workspace_before);
     assert!(!fx.backups().exists());
+}
+
+#[test]
+fn piped_stdin_is_not_read_as_a_prompt() {
+    let fx = fixture("stdin");
+    let mut child = command(&fx, &["--memory-migrate", "all"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"summarise this\n").unwrap();
+    drop(stdin);
+
+    let stdout = assert_success(&child.wait_with_output().unwrap());
+
+    assert!(stdout.contains("rerun with --apply to migrate"), "{stdout}");
 }
 
 #[test]
