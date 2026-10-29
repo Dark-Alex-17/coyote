@@ -1090,7 +1090,7 @@ def build_gauntlet_prompt(state):
         if last.get("head") and last["head"] != head and not dirty:
             lines += [f"Re-review delta: {last['head']}..HEAD"]
             green = [l for l, v in as_dict(state.get("gauntlet_lanes")).items()
-                     if l != "debris" and v in ("PASS", "CONFORMS", "MERGE-READY") and l not in as_list(last.get("lanes_with_findings"))]
+                     if l != "debris" and str(v).strip() == "GREEN" and l not in as_list(last.get("lanes_with_findings"))]
             if green:
                 lines += [f"Settled lanes: {', '.join(green)}"]
     recipe = (state.get("local_run_recipe") or "").strip()
@@ -1110,16 +1110,19 @@ def build_gauntlet_prompt(state):
 
 def _parse_gauntlet(text):
     verdict = "BLOCKED"
-    if m := re.search(r"GAUNTLET:\s*(PASS|BLOCKED)", text):
-        verdict = m.group(1)
+    if found := re.findall(r"^GAUNTLET:\s*(PASS|BLOCKED)\s*$", text, re.M):
+        verdict = found[-1]
     incomplete = []
-    if m := re.search(r"GAUNTLET_REVIEW_INCOMPLETE:\s*([^\n]+)", text):
-        incomplete = [x.strip() for x in m.group(1).split(",") if x.strip()]
+    if found := re.findall(r"^GAUNTLET_REVIEW_INCOMPLETE:\s*([^\n]+?)\s*$", text, re.M):
+        incomplete = [x.strip() for x in found[-1].split(",") if x.strip()]
     lanes = {}
+    details = {}
     for line in text.splitlines():
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
         if len(cells) >= 2 and cells[0].lower() in GAUNTLET_LANES:
-            lanes[cells[0].lower()] = cells[1].split()[0] if cells[1] else ""
+            lanes[cells[0].lower()] = cells[1]
+            if len(cells) >= 3 and cells[2]:
+                details[cells[0].lower()] = cells[2]
     blockers = []
     sec = re.search(r"(?ims)^#+\s*Blockers?\s*\n(.*?)(?=^#+\s|\Z)", text)
     if sec:
@@ -1128,7 +1131,7 @@ def _parse_gauntlet(text):
     attention = ""
     if m := re.search(r"(?ims)^#+\s*Human attention required\s*\n(.*?)(?=^#+\s|\Z)", text):
         attention = m.group(1).strip()
-    return verdict, incomplete, lanes, blockers, attention
+    return verdict, incomplete, lanes, details, blockers, attention
 
 
 def route_gauntlet(state):
@@ -1136,13 +1139,13 @@ def route_gauntlet(state):
     note_script_error(state, u, "run_gauntlet")
     text = state.get("gauntlet_result") or ""
     if not text or text.startswith("Agent node failed") or "GAUNTLET:" not in text:
-        verdict, incomplete, lanes, blockers, attention = "BLOCKED", ["pipeline"], {}, [], ""
+        verdict, incomplete, lanes, details, blockers, attention = "BLOCKED", ["pipeline"], {}, {}, [], ""
     else:
-        verdict, incomplete, lanes, blockers, attention = _parse_gauntlet(text)
+        verdict, incomplete, lanes, details, blockers, attention = _parse_gauntlet(text)
     rounds = as_list(state.get("round_heads"))
     if rounds and isinstance(rounds[-1], dict):
-        rounds[-1].update({"verdict": verdict, "lanes": lanes, "incomplete": incomplete,
-                           "lanes_with_findings": [l for l, v in lanes.items() if v not in ("PASS", "CONFORMS", "MERGE-READY", "SKIPPED", "")]})
+        rounds[-1].update({"verdict": verdict, "lanes": lanes, "lane_details": details, "incomplete": incomplete,
+                           "lanes_with_findings": [l for l, v in lanes.items() if v not in ("GREEN", "GREEN (attention)", "SKIPPED", "")]})
     merged_lanes = dict(as_dict(state.get("gauntlet_lanes")))
     merged_lanes.update(lanes)
     u.update({"gauntlet_verdict": verdict, "gauntlet_incomplete": incomplete, "gauntlet_lanes": merged_lanes,
@@ -1584,7 +1587,9 @@ def _assemble_report(state, u, pre_publish=False):
                      + (f"; lanes: " + ", ".join(f"{k}={v}" for k, v in lanes.items()) if lanes else ""))
         for r in as_list(g("round_heads", [])):
             if isinstance(r, dict):
-                lines.append(f"  - round {r.get('round')} @ {r.get('head')}: {r.get('verdict', '(running)')}")
+                details = as_dict(r.get("lane_details"))
+                lines.append(f"  - round {r.get('round')} @ {r.get('head')}: {r.get('verdict', '(running)')}"
+                             + (" [" + "; ".join(f"{k}: {v}" for k, v in details.items()) + "]" if details else ""))
     if g("ci_status"):
         lines.append(f"- CI: {g('ci_status')}" + (" (flipped to ready)" if truthy(g("flip_ready", False)) else ""))
     lines.append("")

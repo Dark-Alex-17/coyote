@@ -1166,6 +1166,8 @@ nodes:
     description: The implement -> verify build+tests -> self_review -> bounded fix-loop island, exactly as shipped.
     prompt: |
       {{coder_prompt}}
+    inputs:
+      build_lock: '{{build_lock}}'
     timeout: 0
     max_attempts: 1
     state_updates:
@@ -1370,6 +1372,7 @@ nodes:
     inputs:
       verification_commands: '{{verification_commands}}'
       debris_exclude: '{{debris_exclude}}'
+      build_lock: '{{build_lock}}'
     timeout: 0
     max_attempts: 1
     state_updates:
@@ -1780,6 +1783,8 @@ nodes:
     description: Phase 8 execution lifecycle - the step protocol enforced as the step-runner's own edges.
     prompt: |
       {{brief}}
+    inputs:
+      build_lock: '{{build_lock}}'
     timeout: 0
     max_attempts: 1
     state_updates:
