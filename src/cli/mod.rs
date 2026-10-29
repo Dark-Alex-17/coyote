@@ -751,12 +751,13 @@ mod tests {
             }
             match Cli::try_parse_from(&args) {
                 Err(err) if err.kind() == clap::error::ErrorKind::ArgumentConflict => {}
-                other => accepted.push(format!("{id}: {:?}", other.err().map(|e| e.kind()))),
+                Err(err) => accepted.push(format!("{id}: failed with ErrorKind::{:?}", err.kind())),
+                Ok(_) => accepted.push(format!("{id}: parsed without an error")),
             }
         }
         assert!(
             accepted.is_empty(),
-            "not rejected as a conflict: {accepted:#?}"
+            "expected ErrorKind::ArgumentConflict next to --memory-migrate: {accepted:#?}"
         );
     }
 
