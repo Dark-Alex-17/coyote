@@ -114,6 +114,7 @@ pub enum HookEvent {
     SessionResumed,
     SessionEnded,
     SessionCompressed,
+    SessionDeleted,
     ToolStarted,
     ToolCompleted,
     ToolFailed,
@@ -150,6 +151,7 @@ impl HookEvent {
             HookEvent::SessionResumed => "session.resumed",
             HookEvent::SessionEnded => "session.ended",
             HookEvent::SessionCompressed => "session.compressed",
+            HookEvent::SessionDeleted => "session.deleted",
             HookEvent::ToolStarted => "tool.started",
             HookEvent::ToolCompleted => "tool.completed",
             HookEvent::ToolFailed => "tool.failed",
@@ -176,7 +178,7 @@ impl HookEvent {
         }
     }
 
-    const ALL: [HookEvent; 31] = [
+    const ALL: [HookEvent; 32] = [
         HookEvent::TurnStarted,
         HookEvent::TurnCompleted,
         HookEvent::TurnInterrupted,
@@ -185,6 +187,7 @@ impl HookEvent {
         HookEvent::SessionResumed,
         HookEvent::SessionEnded,
         HookEvent::SessionCompressed,
+        HookEvent::SessionDeleted,
         HookEvent::ToolStarted,
         HookEvent::ToolCompleted,
         HookEvent::ToolFailed,
@@ -1571,6 +1574,7 @@ mod tests {
             (HookEvent::SessionResumed, "session.resumed"),
             (HookEvent::SessionEnded, "session.ended"),
             (HookEvent::SessionCompressed, "session.compressed"),
+            (HookEvent::SessionDeleted, "session.deleted"),
             (HookEvent::ToolStarted, "tool.started"),
             (HookEvent::ToolCompleted, "tool.completed"),
             (HookEvent::ToolFailed, "tool.failed"),
@@ -1603,6 +1607,26 @@ mod tests {
             );
         }
         assert_eq!(HookEvent::ALL.len(), cases.len());
+    }
+
+    #[test]
+    fn readme_event_count_matches_hook_event_all() {
+        let readme =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
+                .unwrap();
+        let counts: Vec<usize> = readme
+            .match_indices(" events)")
+            .filter_map(|(end, _)| {
+                let open = readme[..end].rfind('(')?;
+                readme[open + 1..end].parse().ok()
+            })
+            .collect();
+        assert_eq!(
+            counts.len(),
+            1,
+            "README.md must name the hook event count exactly once as `(<n> events)`, found {counts:?}"
+        );
+        assert_eq!(counts[0], HookEvent::ALL.len());
     }
 
     #[test]

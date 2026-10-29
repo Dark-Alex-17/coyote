@@ -51,6 +51,13 @@ const GRAPH_BRANCH: &str = "COYOTE_GRAPH_BRANCH";
 const GRAPH_ROUTE: &str = "COYOTE_GRAPH_ROUTE";
 const GRAPH_CHAT_AGENT: &str = "COYOTE_GRAPH_CHAT_AGENT";
 const GRAPH_TURN_VARS: [&str; 3] = [GRAPH_BRANCH, GRAPH_ROUTE, GRAPH_CHAT_AGENT];
+/// The `session.*` events the child-session pages document, each with a
+/// Hooks.md event row; every one must be a `HookEvent::as_str` name.
+const SESSION_EVENTS: &[&str] = &["session.deleted"];
+/// What the Hooks.md `session.deleted` row says fires it.
+const SESSION_DELETED_DEFINITION: &str =
+    "an operator command removed a session file or a session's child-session directory";
+const SESSION_PATH: &str = "COYOTE_SESSION_PATH";
 /// The lead of the sentence that lists every denied `chat.tools` entry.
 const DENY_LEAD: &str = "Denied in `chat.tools`:";
 /// The `# Sessions` subsection that documents `chat.agent` and `chat.variables`.
@@ -1870,12 +1877,13 @@ fn edited_sections(wiki: &Path) -> Vec<(&'static str, String)> {
 
 /// The label prefix of the Hooks.md rows in `edited_rows`; the ASCII sweep
 /// treats those rows' footnote marker specially.
-const HOOKS_ROWS_LABEL: &str = "Hooks.md turn row";
+const HOOKS_ROWS_LABEL: &str = "Hooks.md footnoted row";
 
 /// The Hooks.md turn rows that gained the graph variables, the
 /// Environment-Variables.md graph rows, and the rows the child-session
 /// pages touched (the Hooks.md agent and base-env rows carry no footnote
-/// dagger, so they are labelled apart from the turn rows), one string each.
+/// dagger, so they are labelled apart from the turn and session rows), one
+/// string each.
 fn edited_rows(wiki: &Path) -> Vec<(String, String)> {
     let hooks = read(wiki.join("Hooks.md"));
     let env = read(wiki.join("Environment-Variables.md"));
@@ -1883,6 +1891,7 @@ fn edited_rows(wiki: &Path) -> Vec<(String, String)> {
     let agents = read(wiki.join("Agents.md"));
     let mut rows: Vec<(String, String)> = ["turn.completed", "turn.interrupted", "turn.failed"]
         .iter()
+        .chain(SESSION_EVENTS)
         .map(|event| {
             (
                 format!("{HOOKS_ROWS_LABEL} `{event}`"),
@@ -1896,6 +1905,15 @@ fn edited_rows(wiki: &Path) -> Vec<(String, String)> {
             table_row("Environment-Variables.md", &env, &format!("`{var}`")).join(" "),
         )
     }));
+    rows.push((
+        format!("Environment-Variables.md `{SESSION_PATH}` row"),
+        table_row(
+            "Environment-Variables.md",
+            &env,
+            &format!("`{SESSION_PATH}`"),
+        )
+        .join(" "),
+    ));
     rows.extend(agent_events().into_iter().map(|event| {
         (
             format!("Hooks.md agent row `{event}`"),
@@ -1980,9 +1998,9 @@ fn no_edited_doc_or_this_lint_carries_a_planning_label() {
     assert!(hits.is_empty(), "{}", hits.join("\n"));
 }
 
-/// Every edited section and row is ASCII. The Hooks.md turn rows are checked
-/// with their one pre-existing U+2020 footnote marker removed; the marker
-/// predates the rows' graph variables and is counted so a second one trips.
+/// Every edited section and row is ASCII. The Hooks.md turn and session rows
+/// are checked with their one U+2020 `COYOTE_ROLE` footnote marker removed;
+/// the marker is counted so a second one trips.
 #[test]
 fn edited_prose_is_ascii() {
     assert!(!run_command_description().is_empty());
@@ -2252,6 +2270,46 @@ fn hook_pages_carry_the_child_session_variable() {
     assert!(
         session_row[1].contains("the child's session id"),
         "the Environment-Variables.md `COYOTE_SESSION_ID` row does not say what a child sees: {session_row:?}"
+    );
+}
+
+/// `session.deleted` is a real event name, and the hook pages define it,
+/// list the path variable it carries, and the Sessions page names it.
+#[test]
+fn hook_pages_document_the_session_deleted_event() {
+    let names = string_literals(&fn_body(&src(&["hooks.rs"]), "pub fn as_str("));
+    for event in SESSION_EVENTS {
+        assert!(
+            names.iter().any(|name| name == event),
+            "HookEvent::as_str does not name {event}: {names:?}"
+        );
+    }
+
+    let Some(wiki) = wiki_dir() else { return };
+    let hooks = read(wiki.join("Hooks.md"));
+    let row = table_row("Hooks.md", &hooks, "`session.deleted`").join(" ");
+    assert!(
+        row.contains(SESSION_DELETED_DEFINITION),
+        "the Hooks.md `session.deleted` row does not say {SESSION_DELETED_DEFINITION:?}: {row}"
+    );
+    assert!(
+        row.contains(&format!("`{SESSION_PATH}`")),
+        "the Hooks.md `session.deleted` row does not list `{SESSION_PATH}`: {row}"
+    );
+    let env = read(wiki.join("Environment-Variables.md"));
+    let env_row = table_row(
+        "Environment-Variables.md",
+        &env,
+        &format!("`{SESSION_PATH}`"),
+    );
+    assert!(
+        env_row[1].contains("`session.deleted`"),
+        "the Environment-Variables.md `{SESSION_PATH}` row does not name `session.deleted`: {env_row:?}"
+    );
+    let sessions = read(wiki.join("Sessions.md"));
+    assert!(
+        sessions.contains("`session.deleted`"),
+        "Sessions.md does not mention `session.deleted`"
     );
 }
 

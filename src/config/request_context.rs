@@ -1704,6 +1704,7 @@ impl RequestContext {
     pub fn empty_session(&mut self) -> Result<()> {
         // Between turns the graph agent owns the slot; the leave makes sure.
         self.leave_delegate_turn();
+        let mut removed_dir = None;
         if let Some(session) = self.session.as_mut() {
             if let Some(agent) = self.agent.as_ref() {
                 session.sync_agent(agent);
@@ -1722,6 +1723,13 @@ impl RequestContext {
                         Ok(lock) => {
                             drop(lock);
                             child_sessions::remove_dir(&dir, "session emptied");
+                            // `remove_dir` only logs a failure, so the dir's
+                            // absence is what says it went.
+                            if fs::symlink_metadata(&dir)
+                                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                            {
+                                removed_dir = Some(dir);
+                            }
                         }
                         Err(error) => warn!("Keeping {}: {error:#}", dir.display()),
                     }
@@ -1729,6 +1737,11 @@ impl RequestContext {
             }
         } else {
             bail!("No session")
+        }
+        if let Some(dir) = removed_dir {
+            let mut extras = hooks::role_extras(self);
+            extras.push(("COYOTE_SESSION_PATH", dir.display().to_string()));
+            hooks::fire(HookEvent::SessionDeleted, self, &extras, None);
         }
         self.discontinuous_last_message();
         Ok(())
@@ -4517,7 +4530,9 @@ impl RequestContext {
     /// Deletes the selected agent data directories. The batch is refused
     /// whole when one of them holds the attached session's file: deleting
     /// that would settle the child session root this process still writes
-    /// under, and the next flush would re-create the file anyway.
+    /// under, and the next flush would re-create the file anyway. Every
+    /// session file unlinked is announced, including those removed before a
+    /// later failure stopped the batch.
     fn delete_agent_data_selection(&self, dir: &Path, names: &[String]) -> Result<()> {
         if let Some(attached) = self.attached_session_file() {
             for name in names {
@@ -4526,17 +4541,24 @@ impl RequestContext {
                 }
             }
         }
-        for name in names {
-            Self::delete_agent_data_dir(&dir.join(name))?;
+        let mut unlinked = Vec::new();
+        let result = names
+            .iter()
+            .try_for_each(|name| Self::delete_agent_data_dir(&dir.join(name), &mut unlinked));
+        for path in &unlinked {
+            let mut extras = hooks::role_extras(self);
+            extras.push(("COYOTE_SESSION_PATH", path.display().to_string()));
+            hooks::fire(HookEvent::SessionDeleted, self, &extras, None);
         }
-        Ok(())
+        result
     }
 
     /// Removes an agent's data directory, first unlinking every session file
     /// it holds one by one so each one's child session root forgets it (and
     /// goes when that was its last parent). A bare `remove_dir_all` would
-    /// leave those roots pointing at files that no longer exist.
-    fn delete_agent_data_dir(path: &Path) -> Result<()> {
+    /// leave those roots pointing at files that no longer exist. Each session
+    /// file unlinked is pushed onto `unlinked`, even when an error follows.
+    fn delete_agent_data_dir(path: &Path, unlinked: &mut Vec<PathBuf>) -> Result<()> {
         let dir_is_symlink = std::fs::symlink_metadata(path)
             .map(|metadata| metadata.file_type().is_symlink())
             .unwrap_or(false);
@@ -4558,7 +4580,7 @@ impl RequestContext {
                 sessions.display()
             );
         } else {
-            Self::unlink_session_yamls_under(&sessions)?;
+            Self::unlink_session_yamls_under(&sessions, unlinked)?;
         }
         remove_dir_all(path)
             .with_context(|| format!("Failed to delete agent-data at '{}'", path.display()))
@@ -4566,8 +4588,9 @@ impl RequestContext {
 
     /// Routes every session file below `dir`, however deep, through
     /// `unlink_parent_yaml`. Symlinks are never followed: their targets'
-    /// session files and uid roots belong to whoever owns the target.
-    fn unlink_session_yamls_under(dir: &Path) -> Result<()> {
+    /// session files and uid roots belong to whoever owns the target. Each
+    /// file unlinked is pushed onto `unlinked`.
+    fn unlink_session_yamls_under(dir: &Path, unlinked: &mut Vec<PathBuf>) -> Result<()> {
         let entries = match read_dir(dir) {
             Ok(entries) => entries,
             Err(error)
@@ -4594,7 +4617,7 @@ impl RequestContext {
                     file.display()
                 );
             } else if file_type.is_dir() {
-                Self::unlink_session_yamls_under(&file)?;
+                Self::unlink_session_yamls_under(&file, unlinked)?;
             } else if file_type.is_file()
                 && file
                     .extension()
@@ -4603,6 +4626,7 @@ impl RequestContext {
                 child_sessions::unlink_parent_yaml(&file).with_context(|| {
                     format!("Failed to delete session file '{}'", file.display())
                 })?;
+                unlinked.push(file);
             }
         }
         Ok(())
@@ -4733,6 +4757,9 @@ impl RequestContext {
                 path.display()
             )
         })?;
+        let mut extras = hooks::role_extras(self);
+        extras.push(("COYOTE_SESSION_PATH", path.display().to_string()));
+        hooks::fire(HookEvent::SessionDeleted, self, &extras, None);
         println!("Deleted {scope} session '{shown}'");
         Ok(())
     }
@@ -14770,7 +14797,7 @@ mod tests {
         let alias = paths::agents_data_dir().join("alias");
         std::os::unix::fs::symlink(&agent_dir, &alias).unwrap();
 
-        let err = RequestContext::delete_agent_data_dir(&alias).unwrap_err();
+        let err = RequestContext::delete_agent_data_dir(&alias, &mut Vec::new()).unwrap_err();
 
         assert!(format!("{err:#}").contains("it is a symlink"), "{err:#}");
         assert!(
@@ -15002,7 +15029,10 @@ mod tests {
     #[serial]
     fn fork_session_removes_the_new_uid_dir_when_a_child_cannot_be_copied() {
         let _config = TestConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "fork-uncopied-quiet-e3g";
         let (mut ctx, path) = loaded_session_ctx("fork-unreadable-child");
+        ctx.update_app_config(|app| app.hooks = hooks_map_of(&["session.deleted"], marker));
         let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
         let old_uid = root_uid(&root);
         let sid = "sess_coder_0123456789ab";
@@ -15038,13 +15068,20 @@ mod tests {
             "fork-unreadable-child"
         );
         assert_eq!(session_uid(&ctx), Some(old_uid));
+        assert!(
+            marker_captures(marker).is_empty(),
+            "a failed fork's cleanup is not an operator delete"
+        );
     }
 
     #[test]
     #[serial]
     fn fork_session_removes_the_new_uid_dir_when_the_fork_cannot_be_saved() {
         let _config = TestConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "fork-unsaved-quiet-u7d";
         let (mut ctx, path) = loaded_session_ctx("fork-unsaveable");
+        ctx.update_app_config(|app| app.hooks = hooks_map_of(&["session.deleted"], marker));
         let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
         let old_uid = root_uid(&root);
         let sid = "sess_coder_0123456789ab";
@@ -15077,6 +15114,10 @@ mod tests {
         assert_eq!(ctx.session.as_ref().unwrap().name(), "fork-unsaveable");
         assert_eq!(session_uid(&ctx), Some(old_uid));
         assert!(ctx.child_session_root.is_some());
+        assert!(
+            marker_captures(marker).is_empty(),
+            "a failed fork's cleanup is not an operator delete"
+        );
     }
 
     #[test]
@@ -15168,7 +15209,7 @@ mod tests {
         let _config = TestConfigDirGuard::new();
         let (agent_dir, root) = agent_data_with_session("coder", "main.yaml", None);
 
-        RequestContext::delete_agent_data_dir(&agent_dir).unwrap();
+        RequestContext::delete_agent_data_dir(&agent_dir, &mut Vec::new()).unwrap();
 
         assert!(!agent_dir.exists());
         assert!(!root.dir().exists());
@@ -15180,7 +15221,7 @@ mod tests {
         let _config = TestConfigDirGuard::new();
         let (agent_dir, root) = agent_data_with_session("coder", "_/20260102-auto.yaml", None);
 
-        RequestContext::delete_agent_data_dir(&agent_dir).unwrap();
+        RequestContext::delete_agent_data_dir(&agent_dir, &mut Vec::new()).unwrap();
 
         assert!(!agent_dir.exists());
         assert!(!root.dir().exists());
@@ -15192,7 +15233,7 @@ mod tests {
         let _config = TestConfigDirGuard::new();
         let (agent_dir, root) = agent_data_with_session("coder", "proj/run.yaml", None);
 
-        RequestContext::delete_agent_data_dir(&agent_dir).unwrap();
+        RequestContext::delete_agent_data_dir(&agent_dir, &mut Vec::new()).unwrap();
 
         assert!(!agent_dir.exists());
         assert!(!root.dir().exists());
@@ -15209,7 +15250,7 @@ mod tests {
         )
         .unwrap();
 
-        RequestContext::delete_agent_data_dir(&agent_dir).unwrap();
+        RequestContext::delete_agent_data_dir(&agent_dir, &mut Vec::new()).unwrap();
 
         assert!(!agent_dir.exists());
         assert!(!root.dir().exists());
@@ -15225,7 +15266,7 @@ mod tests {
             std::fs::canonicalize(ctx.session_file_for("other", SessionScope::Workspace)).unwrap();
         let (agent_dir, root) = agent_data_with_session("coder", "main.yaml", Some(other.clone()));
 
-        RequestContext::delete_agent_data_dir(&agent_dir).unwrap();
+        RequestContext::delete_agent_data_dir(&agent_dir, &mut Vec::new()).unwrap();
 
         assert!(!agent_dir.exists());
         assert!(root.dir().is_dir());
@@ -15242,7 +15283,7 @@ mod tests {
         create_dir_all(&agent_dir).unwrap();
         write(agent_dir.join("config.yaml"), "name: plain\n").unwrap();
 
-        RequestContext::delete_agent_data_dir(&agent_dir).unwrap();
+        RequestContext::delete_agent_data_dir(&agent_dir, &mut Vec::new()).unwrap();
 
         assert!(!agent_dir.exists());
     }
@@ -15270,7 +15311,7 @@ mod tests {
         create_dir_all(&agent_dir).unwrap();
         std::os::unix::fs::symlink(&target, agent_dir.join(SESSIONS_DIR_NAME)).unwrap();
 
-        RequestContext::delete_agent_data_dir(&agent_dir).unwrap();
+        RequestContext::delete_agent_data_dir(&agent_dir, &mut Vec::new()).unwrap();
 
         assert!(!agent_dir.exists());
         assert!(yaml.is_file());
@@ -15300,7 +15341,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, agent_dir.join(SESSIONS_DIR_NAME).join("proj"))
             .unwrap();
 
-        RequestContext::delete_agent_data_dir(&agent_dir).unwrap();
+        RequestContext::delete_agent_data_dir(&agent_dir, &mut Vec::new()).unwrap();
 
         assert!(!agent_dir.exists());
         assert!(!own_root.dir().exists());
@@ -17624,6 +17665,316 @@ mod tests {
             resumed[0].envs.get("COYOTE_ROLE").map(String::as_str),
             Some("resumed-role"),
             "session.resumed must carry the session-held role"
+        );
+    }
+
+    fn session_paths_of(captures: &[test_sink::Capture]) -> BTreeSet<String> {
+        captures
+            .iter()
+            .map(|capture| capture.envs["COYOTE_SESSION_PATH"].clone())
+            .collect()
+    }
+
+    #[test]
+    #[serial]
+    fn delete_session_at_fires_session_deleted_with_the_yaml_path() {
+        let _config = TestConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "sess-deleted-plain-w3c";
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.hooks = hooks_map_of(&["session.deleted"], marker));
+        ctx.role = Some(Role::new("deleting-role", "Prompt"));
+        write_session_file(&ctx, "doomed", SessionScope::Workspace, "messages: []\n");
+        let path = ctx.session_file_for("doomed", SessionScope::Workspace);
+
+        ctx.delete_session_at("doomed", SessionScope::Workspace)
+            .unwrap();
+
+        let captures = marker_captures(marker);
+        assert_eq!(captures.len(), 1, "{captures:?}");
+        assert_eq!(captures[0].event, HookEvent::SessionDeleted);
+        assert_eq!(
+            captures[0].envs["COYOTE_SESSION_PATH"],
+            path.display().to_string()
+        );
+        assert_eq!(
+            captures[0].envs.get("COYOTE_ROLE").map(String::as_str),
+            Some("deleting-role")
+        );
+    }
+
+    /// The uid root that goes with its last parent file is not announced
+    /// on its own: the one event names the session file.
+    #[test]
+    #[serial]
+    fn delete_session_at_fires_once_when_the_uid_root_goes_too() {
+        let _config = TestConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "sess-deleted-uid-r7m";
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.hooks = hooks_map_of(&["session.deleted"], marker));
+        let uid = Uuid::new_v4();
+        write_session_file(
+            &ctx,
+            "rooted",
+            SessionScope::Workspace,
+            &uid_session_body(uid),
+        );
+        let path = ctx.session_file_for("rooted", SessionScope::Workspace);
+        let root = ChildSessionRoot::Uid(uid);
+        root.ensure_dir(&retention_root_file(
+            vec![std::fs::canonicalize(&path).unwrap()],
+            Some(retention_time()),
+        ))
+        .unwrap();
+        write_child(&root, "sess_coder_0123456789ab", retention_time());
+
+        ctx.delete_session_at("rooted", SessionScope::Workspace)
+            .unwrap();
+
+        assert!(!root.dir().exists());
+        let captures = marker_captures(marker);
+        assert_eq!(captures.len(), 1, "{captures:?}");
+        assert_eq!(
+            captures[0].envs["COYOTE_SESSION_PATH"],
+            path.display().to_string()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn delete_session_at_fires_nothing_when_refused_or_failed() {
+        let _config = TestConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "sess-deleted-refused-k2p";
+        let (mut ctx, path) = loaded_session_ctx("deleted-live");
+        ctx.update_app_config(|app| app.hooks = hooks_map_of(&["session.deleted"], marker));
+
+        assert!(
+            ctx.delete_session_at("deleted-live", SessionScope::Workspace)
+                .is_err()
+        );
+        assert!(
+            ctx.delete_session_at("never-written", SessionScope::Workspace)
+                .is_err()
+        );
+
+        assert!(path.is_file());
+        assert!(marker_captures(marker).is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn delete_agent_data_selection_fires_session_deleted_once_per_session_file() {
+        let _config = TestConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "sess-deleted-agent-data-h5t";
+        let (coder_dir, _) = agent_data_with_session("coder", "main.yaml", None);
+        agent_data_with_session("coder", "proj/run.yaml", None);
+        write(coder_dir.join("config.yaml"), "name: coder\n").unwrap();
+        let (other_dir, _) = agent_data_with_session("other", "_/20260102-auto.yaml", None);
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.hooks = hooks_map_of(&["session.deleted"], marker));
+        let names = ["coder".to_string(), "other".to_string()];
+
+        ctx.delete_agent_data_selection(&paths::agents_data_dir(), &names)
+            .unwrap();
+
+        let captures = marker_captures(marker);
+        assert_eq!(captures.len(), 3, "{captures:?}");
+        let expected: BTreeSet<String> = [
+            coder_dir.join(SESSIONS_DIR_NAME).join("main.yaml"),
+            coder_dir
+                .join(SESSIONS_DIR_NAME)
+                .join("proj")
+                .join("run.yaml"),
+            other_dir
+                .join(SESSIONS_DIR_NAME)
+                .join("_")
+                .join("20260102-auto.yaml"),
+        ]
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect();
+        assert_eq!(session_paths_of(&captures), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn delete_agent_data_selection_fires_nothing_for_symlinked_session_files() {
+        let _config = TestConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "sess-deleted-agent-link-z9q";
+        let target = _config.path.join("linked-proj");
+        create_dir_all(&target).unwrap();
+        let yaml = target.join("x.yaml");
+        write(&yaml, "messages: []\n").unwrap();
+        let (agent_dir, _) = agent_data_with_session("coder", "main.yaml", None);
+        let sessions = agent_dir.join(SESSIONS_DIR_NAME);
+        std::os::unix::fs::symlink(&target, sessions.join("proj")).unwrap();
+        std::os::unix::fs::symlink(&yaml, sessions.join("link.yaml")).unwrap();
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.hooks = hooks_map_of(&["session.deleted"], marker));
+
+        ctx.delete_agent_data_selection(&paths::agents_data_dir(), &["coder".to_string()])
+            .unwrap();
+
+        assert!(yaml.is_file());
+        let captures = marker_captures(marker);
+        assert_eq!(
+            session_paths_of(&captures),
+            BTreeSet::from([sessions.join("main.yaml").display().to_string()])
+        );
+        assert_eq!(captures.len(), 1, "{captures:?}");
+    }
+
+    /// A session file unlinked before the batch fails is still announced:
+    /// the read-only `locked/` lets the walk through `sessions/` finish and
+    /// then stops the directory's removal, so `other` is never reached.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn delete_agent_data_selection_fires_for_files_unlinked_before_a_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let _config = TestConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "sess-deleted-agent-partial-b4n";
+        let (coder_dir, _) = agent_data_with_session("coder", "main.yaml", None);
+        let (other_dir, other_root) = agent_data_with_session("other", "main.yaml", None);
+        let locked = coder_dir.join("locked");
+        create_dir_all(&locked).unwrap();
+        write(locked.join("notes.txt"), "kept\n").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let _restore = crate::testing::RestoreMode(locked.clone(), 0o700);
+        if crate::testing::mode_bits_are_ignored_in(&locked) {
+            return;
+        }
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.hooks = hooks_map_of(&["session.deleted"], marker));
+        let names = ["coder".to_string(), "other".to_string()];
+
+        let err = ctx
+            .delete_agent_data_selection(&paths::agents_data_dir(), &names)
+            .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("Failed to delete agent-data"),
+            "{err:#}"
+        );
+        let unlinked = coder_dir.join(SESSIONS_DIR_NAME).join("main.yaml");
+        assert!(!unlinked.exists());
+        assert!(
+            other_dir
+                .join(SESSIONS_DIR_NAME)
+                .join("main.yaml")
+                .is_file()
+        );
+        assert!(other_root.dir().is_dir());
+        let captures = marker_captures(marker);
+        assert_eq!(captures.len(), 1, "{captures:?}");
+        assert_eq!(
+            captures[0].envs["COYOTE_SESSION_PATH"],
+            unlinked.display().to_string()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn empty_session_fires_session_deleted_with_the_removed_uid_dir() {
+        let _config = TestConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "sess-deleted-empty-f6v";
+        let (mut ctx, path) = loaded_session_ctx("empty-fires");
+        let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
+        write_child(&root, "sess_coder_0123456789ab", retention_time());
+        ctx.update_app_config(|app| app.hooks = hooks_map_of(&["session.deleted"], marker));
+
+        ctx.empty_session().unwrap();
+
+        assert!(!root.dir().exists());
+        let captures = marker_captures(marker);
+        assert_eq!(captures.len(), 1, "{captures:?}");
+        assert_eq!(
+            captures[0].envs["COYOTE_SESSION_PATH"],
+            root.dir().display().to_string()
+        );
+        assert_eq!(
+            captures[0]
+                .envs
+                .get("COYOTE_SESSION_ID")
+                .map(String::as_str),
+            Some("empty-fires"),
+            "the event names the attached session, which outlives the empty"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn empty_session_fires_nothing_while_another_holder_keeps_the_lock() {
+        let _config = TestConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "sess-deleted-empty-locked-j1s";
+        let (mut ctx, path) = loaded_session_ctx("empty-locked-quiet");
+        let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
+        write_child(&root, "sess_coder_0123456789ab", retention_time());
+        ctx.update_app_config(|app| app.hooks = hooks_map_of(&["session.deleted"], marker));
+        let held =
+            crate::utils::fs::ExclusiveLock::acquire(&root.lock_file(), "test", Duration::ZERO)
+                .unwrap();
+
+        child_sessions::with_short_root_lock_wait(|| ctx.empty_session()).unwrap();
+
+        assert!(root.dir().is_dir());
+        assert!(marker_captures(marker).is_empty());
+        drop(held);
+    }
+
+    #[test]
+    #[serial]
+    fn empty_session_fires_nothing_without_a_uid_dir() {
+        let _config = TestConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "sess-deleted-empty-none-c8x";
+        let (mut ctx, _) = loaded_session_ctx("empty-no-uid");
+        ctx.update_app_config(|app| app.hooks = hooks_map_of(&["session.deleted"], marker));
+
+        ctx.empty_session().unwrap();
+        ctx.session.as_mut().unwrap().set_uid(Some(Uuid::new_v4()));
+        ctx.empty_session().unwrap();
+
+        assert!(marker_captures(marker).is_empty());
+    }
+
+    /// Only operator commands announce a deletion. Retention's own removals
+    /// (a root settled at parent exit, the startup sweep) and a failed
+    /// fork's cleanup have no context to fire from or must stay quiet.
+    #[test]
+    fn session_deleted_fires_only_from_the_operator_delete_paths() {
+        let child_sessions = include_str!("child_sessions.rs");
+        assert!(!child_sessions.contains("SessionDeleted"));
+        assert!(!child_sessions.contains("session.deleted"));
+        let source = include_str!("request_context.rs").replace("\r\n", "\n");
+        let production = &source[..source.find("\n#[cfg(test)]\nmod tests {").unwrap()];
+        assert!(!production.contains("\"session.deleted\""));
+        let heads = [
+            "\n    pub fn empty_session(",
+            "\n    fn delete_agent_data_selection(",
+            "\n    fn delete_session_at(",
+        ];
+        for head in heads {
+            let start = production.find(head).unwrap();
+            let body = &production[start..];
+            let body = &body[..body.find("\n    }\n").unwrap()];
+            assert_eq!(
+                body.matches("HookEvent::SessionDeleted").count(),
+                1,
+                "{head}"
+            );
+        }
+        assert_eq!(
+            production.matches("HookEvent::SessionDeleted").count(),
+            heads.len()
         );
     }
 
