@@ -2150,8 +2150,8 @@ impl RequestContext {
     }
 
     /// Builds the effective role and, when `inject_memory` is set, the split
-    /// of its system prompt. Nothing is stored and no warning is printed, so
-    /// read-only views such as `.info` can call it freely.
+    /// of its system prompt. The split is not stored and the share warning is
+    /// not printed; memory injection may still log its own notices.
     fn extract_role_impl(
         &self,
         app: &AppConfig,
