@@ -467,8 +467,10 @@ fn ensure_index_unchanged(report: &ScopeReport) -> Result<()> {
 
 fn apply_scope(report: &mut ScopeReport, backup_root: &Path, stamp: &str) -> Result<()> {
     let backup = unused_backup_dir(backup_root, report.label, stamp);
-    copy_dir_all(&report.dir, &backup)
-        .with_context(|| format!("back up {} to {}", report.dir.display(), backup.display()))?;
+    copy_dir_all(&report.dir, &backup, &|name| {
+        name.to_string_lossy().starts_with(".catalogue.")
+    })
+    .with_context(|| format!("back up {} to {}", report.dir.display(), backup.display()))?;
     report.backup = Some(backup.clone());
     for file in &report.rewrites {
         write_private_atomic(&file.path, &file.render()?).with_context(|| {
@@ -946,10 +948,12 @@ mod tests {
             Some(fx.backups.join("global-20260301T123045").as_path())
         );
         assert_eq!(snapshot(global.backup.as_ref().unwrap()), global_before);
-        assert_eq!(
-            snapshot(workspace.backup.as_ref().unwrap()),
-            workspace_before
-        );
+        let catalogue = PathBuf::from(".catalogue.yaml");
+        let mut workspace_backup = snapshot(workspace.backup.as_ref().unwrap());
+        assert!(!workspace_backup.contains_key(&catalogue));
+        assert!(fx.workspace.join(&catalogue).exists());
+        workspace_backup.insert(catalogue, b"cache".to_vec());
+        assert_eq!(workspace_backup, workspace_before);
         assert_ne!(snapshot(&fx.workspace), workspace_before);
         assert_eq!(workspace.written.len(), 5);
 
