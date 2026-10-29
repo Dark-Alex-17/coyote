@@ -275,6 +275,73 @@ fn mode_matrix_walks_every_combination() {
     assert_no_bytecode_under_candidate();
 }
 
+/// The matrix has no stub branch left: when the repo asset `.shared/utils.sh`
+/// is missing, or is present but lacks `set -euo pipefail`, `mode_matrix.py`
+/// exits non-zero with a loud message before the first combination runs and
+/// never prints the `utils.sh: real asset` confirmation. Exercised on a
+/// scratch copy of the three agent dirs the matrix reaches (the candidate,
+/// the prose `architect` it copies, and a doctored `.shared`), so the shipped
+/// tree is never touched. The exit sits before `load_graph()`, so this path
+/// needs no `yq`.
+#[test]
+fn mode_matrix_exits_before_the_walk_when_the_shared_utils_sh_is_missing_or_a_stub() {
+    let Some(python) = python3() else { return };
+    for (case, doctor) in [("stub", Some("# stub\n")), ("missing", None::<&str>)] {
+        let scratch = scratch_dir(&format!("matrix-{case}"));
+        let agents = scratch.0.join("agents");
+        for name in [".shared", "architect", CANDIDATE] {
+            copy_tree(&agents_dir().join(name), &agents.join(name));
+        }
+        let utils = agents.join(".shared").join("utils.sh");
+        match doctor {
+            Some(body) => fs::write(&utils, body).unwrap(),
+            None => fs::remove_file(&utils).unwrap(),
+        }
+        let output = Command::new(&python)
+            .current_dir(agents.join(CANDIDATE))
+            .env("HOME", scratch.0.join("home"))
+            .env("LLM_ROOT_DIR", scratch.0.join("root"))
+            .env("COYOTE_CACHE_DIR", scratch.0.join("cache"))
+            .env("TMPDIR", scratch.0.join("tmp"))
+            .env("ARCHITECT_RUNS_ROOT", scratch.0.join("runs"))
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .env_remove("GRAPH_STATE")
+            .env_remove("GRAPH_STATE_FILE")
+            .arg("scripts/mode_matrix.py")
+            .output()
+            .unwrap();
+        let report = transcript(&output);
+        assert!(
+            !output.status.success(),
+            "{case}: the matrix must fail loud without the real utils.sh\n{report}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("utils.sh: the repo asset is missing or is not the real file"),
+            "{case}: the failure must name utils.sh\n{report}"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains("utils.sh: real asset"),
+            "{case}: a stubbed or missing utils.sh was reported as the real asset\n{report}"
+        );
+        assert!(
+            !stdout.contains("combination walk"),
+            "{case}: the walk started despite the missing utils.sh\n{report}"
+        );
+        assert!(
+            !stdout.lines().any(|l| l.starts_with("FAIL ")),
+            "{case}: the marker-map checks that run before the exit must still pass\n{report}"
+        );
+        assert!(
+            fs::read_to_string(agents_dir().join(".shared").join("utils.sh"))
+                .unwrap()
+                .contains("set -euo pipefail"),
+            "{case}: the shipped .shared/utils.sh was altered"
+        );
+    }
+}
+
 /// Lists every regular file under `root` as a path relative to it, sorted.
 fn files_under(root: &Path) -> Vec<String> {
     let mut found = Vec::new();
@@ -695,6 +762,9 @@ fn dry_run_config_dir_with(scratch: &TempDirGuard, copy_agents: bool) -> PathBuf
     project
 }
 
+/// The brief every dry run below starts from unless it re-enters a run.
+const DRY_RUN_PROMPT: &str = "Implement the plan at plans/PLAN-x.md";
+
 /// Dry-runs the candidate by name through the real binary until the trace
 /// reaches `ask_user` (an input node that waits on a terminal, so the child
 /// is killed there) and returns the trace lines seen. `extra_env` lays
@@ -705,30 +775,36 @@ fn dry_run_until_ask_user(
     extra_env: &[(&str, PathBuf)],
     label: &str,
 ) -> Vec<String> {
+    dry_run_until_ask_user_with_prompt(scratch, project, extra_env, label, DRY_RUN_PROMPT)
+}
+
+/// `dry_run_until_ask_user` with the prompt chosen by the caller.
+fn dry_run_until_ask_user_with_prompt(
+    scratch: &TempDirGuard,
+    project: &Path,
+    extra_env: &[(&str, PathBuf)],
+    label: &str,
+    prompt: &str,
+) -> Vec<String> {
     let dir = &scratch.0;
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_coyote"));
-    cmd.args([
-        "--agent",
-        CANDIDATE,
-        "--dry-run",
-        "Implement the plan at plans/PLAN-x.md",
-    ])
-    .current_dir(project)
-    .env("HOME", dir.join("home"))
-    .env("COYOTE_CONFIG_DIR", dir)
-    .env("COYOTE_CACHE_DIR", dir.join("cache"))
-    .env("TMPDIR", dir.join("tmp"))
-    .env("PYTHONDONTWRITEBYTECODE", "1")
-    .env("NO_COLOR", "1")
-    .env_remove("ARCHITECT_RUNS_ROOT")
-    .env_remove("XDG_CACHE_HOME")
-    .env_remove("COYOTE_LOG_PATH")
-    .env_remove("IS_SANDBOX")
-    .env_remove("GRAPH_STATE")
-    .env_remove("GRAPH_STATE_FILE")
-    .stdin(Stdio::null())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped());
+    cmd.args(["--agent", CANDIDATE, "--dry-run", prompt])
+        .current_dir(project)
+        .env("HOME", dir.join("home"))
+        .env("COYOTE_CONFIG_DIR", dir)
+        .env("COYOTE_CACHE_DIR", dir.join("cache"))
+        .env("TMPDIR", dir.join("tmp"))
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env("NO_COLOR", "1")
+        .env_remove("ARCHITECT_RUNS_ROOT")
+        .env_remove("XDG_CACHE_HOME")
+        .env_remove("COYOTE_LOG_PATH")
+        .env_remove("IS_SANDBOX")
+        .env_remove("GRAPH_STATE")
+        .env_remove("GRAPH_STATE_FILE")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     for (key, value) in extra_env {
         cmd.env(key, value);
     }
@@ -911,15 +987,87 @@ fn dry_run_by_name_from_an_empty_config_dir_installs_the_candidate_and_walks_to_
         });
         cursor += idx + 1;
     }
-    for file in ["graph.yaml", "README.md", "scripts/gates.py"] {
-        assert!(
-            dir.join("agents").join(CANDIDATE).join(file).is_file(),
-            "cold start: the engine did not install {CANDIDATE}/{file} into the config dir"
+    // What the engine installs is the shipped candidate, file for file and
+    // byte for byte; the engine-managed `bin/` functions dir is its own.
+    let installed = dir.join("agents").join(CANDIDATE);
+    let shipped_files = files_under(&candidate_dir());
+    let installed_files: Vec<String> = files_under(&installed)
+        .into_iter()
+        .filter(|rel| !rel.starts_with("bin/"))
+        .collect();
+    assert_eq!(
+        installed_files, shipped_files,
+        "cold start: the installed {CANDIDATE} file set differs from the shipped one"
+    );
+    for rel in &shipped_files {
+        assert_eq!(
+            fs::read(installed.join(rel)).unwrap(),
+            fs::read(candidate_dir().join(rel)).unwrap(),
+            "cold start: installed {CANDIDATE}/{rel} differs from the shipped file"
         );
     }
     single_run_under(
         &dir.join("cache").join(CANDIDATE).join("runs"),
         "cold start",
+    );
+    assert_no_bytecode_under_candidate();
+}
+
+/// The README's run-state bullet: "A prompt containing `Architect run id:
+/// <id>` re-enters that run." After a first dry run has created
+/// `<cache>/architect-next/runs/<id>/`, a second dry run whose prompt names
+/// that id walks `intake -> resume_route -> ...` (no fresh `orient_read`),
+/// reaches `ask_user`, and leaves exactly the one run dir in place.
+#[test]
+fn dry_run_with_the_run_id_in_the_prompt_re_enters_the_run_instead_of_starting_another() {
+    if python3().is_none() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let scratch = scratch_dir("reenter");
+    let project = dry_run_config_dir(&scratch);
+    let runs_root = scratch.0.join("cache").join(CANDIDATE).join("runs");
+
+    dry_run_until_ask_user(&scratch, &project, &[], "first run");
+    let run = single_run_under(&runs_root, "first run");
+    let run_id = run.file_name().unwrap().to_string_lossy().into_owned();
+
+    let lines = dry_run_until_ask_user_with_prompt(
+        &scratch,
+        &project,
+        &[],
+        "re-entry",
+        &format!("Architect run id: {run_id} -- continue"),
+    );
+    let mut cursor = 0;
+    for needle in [
+        "graph: architect-next (start: intake)",
+        "intake (script) done",
+        "resume_route (script) done",
+        "ask_user (input) start",
+    ] {
+        let hit = lines[cursor..].iter().position(|l| l.contains(needle));
+        let idx = hit.unwrap_or_else(|| {
+            panic!(
+                "re-entry: {needle:?} missing after line {cursor}:\n{}",
+                lines.join("\n")
+            )
+        });
+        cursor += idx + 1;
+    }
+    assert!(
+        !lines.iter().any(|l| l.contains("orient_read (llm) start")),
+        "re-entry: the run was re-oriented from scratch instead of resumed:\n{}",
+        lines.join("\n")
+    );
+    let runs: Vec<String> = fs::read_dir(&runs_root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        runs,
+        vec![run_id.clone()],
+        "re-entry: naming the run id must not start a second run"
     );
     assert_no_bytecode_under_candidate();
 }
@@ -945,6 +1093,58 @@ fn readme_number(pattern: &str) -> usize {
         .unwrap()
         .unwrap_or_else(|| panic!("README no longer states {pattern:?}"));
     caps[1].parse().unwrap()
+}
+
+/// The README's `description provenance` row: the shipped `description:`
+/// names no file that lives outside this repo. Every path-shaped token in it
+/// (a `dir/name` or a `name.ext` for the extensions the planning store uses)
+/// resolves under `assets/agents/`, and the planning-store prefix `plans/`
+/// does not appear at all.
+#[test]
+fn description_names_no_file_outside_the_repo() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let doc: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let description = doc["description"]
+        .as_str()
+        .expect("graph.yaml carries a string description");
+    assert!(
+        !description.contains("plans/"),
+        "description points into the planning store:\n{description}"
+    );
+    for dropped in ["architect-graph-design", "suite-performance-draft"] {
+        assert!(
+            !description.contains(dropped),
+            "description still cites the out-of-repo file {dropped}"
+        );
+    }
+    let token_re = fancy_regex::Regex::new(
+        r"\b[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+\b|\b[A-Za-z0-9_-]+\.(?:md|ya?ml|py|sh|json)\b",
+    )
+    .unwrap();
+    let mut checked = 0;
+    for cap in token_re.captures_iter(description) {
+        let token = cap.unwrap()[0].to_string();
+        // Prose slashes like `author/amend` or `oracle / explore` are not paths;
+        // only tokens whose first segment is a shipped agent dir or `.shared`
+        // count, and those must resolve.
+        let first = token.split('/').next().unwrap();
+        let base = if first == "agents" {
+            agents_dir().join(token.trim_start_matches("agents/"))
+        } else if agents_dir().join(first).is_dir() || token.contains('.') {
+            agents_dir().join(&token)
+        } else {
+            continue;
+        };
+        checked += 1;
+        assert!(
+            base.exists(),
+            "description cites {token}, which is not under assets/agents/"
+        );
+    }
+    assert!(
+        checked >= 1,
+        "the description no longer names the facade agents/architect; update this pin"
+    );
 }
 
 /// Every shipped file is ASCII on disk (the README's em-dash row), and the
