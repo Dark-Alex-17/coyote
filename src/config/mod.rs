@@ -14,11 +14,13 @@ mod macros;
 mod mcp_factory;
 mod mcp_tool_policy;
 pub(crate) mod memory;
+pub(crate) mod memory_migrate;
 pub(crate) mod paths;
 pub(crate) mod prompts;
 mod rag_cache;
 mod request_context;
 mod role;
+mod round_chains;
 mod session;
 mod skill;
 mod skill_policy;
@@ -64,6 +66,7 @@ pub use self::request_context::{
 pub use self::role::{
     CODE_ROLE, CREATE_TITLE_ROLE, EXPLAIN_SHELL_ROLE, INPUT_PLACEHOLDER, Role, RoleLike, SHELL_ROLE,
 };
+pub use self::round_chains::RoundChains;
 pub use self::session::{
     Session, SessionScope, TURN_INTERRUPTED_TEXT, labeled_session_names, session_scope_dirs,
 };
@@ -304,8 +307,12 @@ pub struct Config {
     pub prompt_cache_ttl: Option<String>,
 
     pub memory: Option<bool>,
-    pub memory_cap_with_tools: Option<usize>,
-    pub memory_cap_without_tools: Option<usize>,
+    #[serde(alias = "memory_cap_with_tools")]
+    pub memory_facts_cap: Option<usize>,
+    #[serde(alias = "memory_cap_without_tools")]
+    pub memory_drill_cap: Option<usize>,
+    pub memory_run_state_ttl_days: Option<u32>,
+    pub memory_round_chains: RoundChains,
 
     pub workspace_instructions: Option<bool>,
     pub workspace_instructions_files: Option<Vec<String>>,
@@ -398,8 +405,10 @@ impl Default for Config {
             prompt_cache_ttl: None,
 
             memory: None,
-            memory_cap_with_tools: None,
-            memory_cap_without_tools: None,
+            memory_facts_cap: None,
+            memory_drill_cap: None,
+            memory_run_state_ttl_days: None,
+            memory_round_chains: RoundChains::default(),
 
             workspace_instructions: None,
             workspace_instructions_files: None,
@@ -482,6 +491,13 @@ impl AssetCategory {
 pub enum MemoryScope {
     Global,
     Workspace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum MigrateScope {
+    Global,
+    Workspace,
+    All,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -1511,11 +1527,41 @@ clients:
 
     #[test]
     fn config_template_documents_memory_cap_as_enforced() {
-        assert!(CONFIG_TEMPLATE.contains("they are truncated to this cap"));
-        assert!(CONFIG_TEMPLATE.contains("Indexes are truncated to this cap the same way"));
+        let facts_default = format!("null = {}", memory::DEFAULT_MEMORY_FACTS_CAP);
+        let drill_default = format!("null = {}", memory::DEFAULT_MEMORY_DRILL_CAP);
+        assert!(CONFIG_TEMPLATE.contains("\nmemory_facts_cap: null"));
+        assert!(CONFIG_TEMPLATE.contains("\nmemory_drill_cap: null"));
+        assert!(CONFIG_TEMPLATE.contains(&facts_default));
+        assert!(CONFIG_TEMPLATE.contains(&drill_default));
+        assert!(CONFIG_TEMPLATE.contains("facts first, then the drill-file catalogue"));
+        assert!(CONFIG_TEMPLATE.contains("Old key memory_cap_with_tools still loads"));
+        assert!(CONFIG_TEMPLATE.contains("the facts section counts against it"));
+        assert!(CONFIG_TEMPLATE.contains("Old key memory_cap_without_tools still loads"));
+        assert!(!CONFIG_TEMPLATE.contains("\nmemory_cap_with_tools:"));
+        assert!(!CONFIG_TEMPLATE.contains("\nmemory_cap_without_tools:"));
         let example = include_str!("../../config.example.yaml");
-        assert!(example.contains("they are truncated to this cap"));
-        assert!(example.contains("Indexes are truncated to this cap the same way"));
+        assert!(example.contains("\nmemory_facts_cap: null"));
+        assert!(example.contains("\nmemory_drill_cap: null"));
+        assert!(example.contains(&facts_default));
+        assert!(example.contains(&drill_default));
+        assert!(example.contains("facts first, then the drill-file catalogue"));
+        assert!(example.contains("Old key memory_cap_with_tools still loads"));
+        assert!(example.contains("the facts section counts against it"));
+        assert!(example.contains("Old key memory_cap_without_tools still loads"));
+        assert!(!example.contains("\nmemory_cap_with_tools:"));
+        assert!(!example.contains("\nmemory_cap_without_tools:"));
+    }
+
+    #[test]
+    fn memory_cap_keys_load_under_their_old_and_new_names() {
+        let old = "memory_cap_with_tools: 123\nmemory_cap_without_tools: 456\n";
+        let cfg = Config::load_from_str(old).unwrap();
+        assert_eq!(cfg.memory_facts_cap, Some(123));
+        assert_eq!(cfg.memory_drill_cap, Some(456));
+        let new = "memory_facts_cap: 123\nmemory_drill_cap: 456\n";
+        let cfg = Config::load_from_str(new).unwrap();
+        assert_eq!(cfg.memory_facts_cap, Some(123));
+        assert_eq!(cfg.memory_drill_cap, Some(456));
     }
 
     #[test]
@@ -1537,11 +1583,28 @@ clients:
     }
 
     #[test]
+    fn config_template_documents_memory_run_state_ttl() {
+        assert!(CONFIG_TEMPLATE.contains("\nmemory_run_state_ttl_days: null"));
+        assert!(CONFIG_TEMPLATE.contains("null = 14"));
+    }
+
+    #[test]
+    fn config_template_documents_memory_round_chains() {
+        assert!(CONFIG_TEMPLATE.contains("\nmemory_round_chains: supersede"));
+        assert!(CONFIG_TEMPLATE.contains("keep leaves them alone"));
+        assert!(CONFIG_TEMPLATE.contains(
+            "# Either way, a round written below an existing one keeps superseded_by pointing at the round above."
+        ));
+    }
+
+    #[test]
     fn config_example_parses_with_dot_command_prefix() {
         let example = include_str!("../../config.example.yaml");
         assert!(example.contains("command_prefix: dot"));
+        assert!(example.contains("\nmemory_round_chains: supersede"));
         let cfg = Config::load_from_str(example).unwrap();
         assert_eq!(cfg.command_prefix, CommandPrefix::Dot);
+        assert_eq!(cfg.memory_round_chains, RoundChains::Supersede);
     }
 
     #[test]

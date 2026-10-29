@@ -3,7 +3,7 @@ use crate::hooks::HooksMap;
 use crate::render::{MarkdownRender, RenderOptions};
 use crate::utils::{IS_STDOUT_TERMINAL, NO_COLOR, decode_bin, drain_stale_tty_input, get_env_name};
 
-use super::{CommandPrefix, paths};
+use super::{CommandPrefix, RoundChains, paths};
 use anyhow::{Context, Result, anyhow, bail};
 use gman::providers::SupportedProvider;
 use indexmap::IndexMap;
@@ -82,8 +82,12 @@ pub struct AppConfig {
     pub prompt_cache_ttl: Option<String>,
 
     pub memory: Option<bool>,
-    pub memory_cap_with_tools: Option<usize>,
-    pub memory_cap_without_tools: Option<usize>,
+    #[serde(alias = "memory_cap_with_tools")]
+    pub memory_facts_cap: Option<usize>,
+    #[serde(alias = "memory_cap_without_tools")]
+    pub memory_drill_cap: Option<usize>,
+    pub memory_run_state_ttl_days: Option<u32>,
+    pub memory_round_chains: RoundChains,
 
     pub workspace_instructions: Option<bool>,
     pub workspace_instructions_files: Option<Vec<String>>,
@@ -179,8 +183,10 @@ impl Default for AppConfig {
             prompt_cache_ttl: None,
 
             memory: None,
-            memory_cap_with_tools: None,
-            memory_cap_without_tools: None,
+            memory_facts_cap: None,
+            memory_drill_cap: None,
+            memory_run_state_ttl_days: None,
+            memory_round_chains: RoundChains::default(),
 
             workspace_instructions: None,
             workspace_instructions_files: None,
@@ -289,8 +295,10 @@ impl AppConfig {
             prompt_cache_ttl: config.prompt_cache_ttl,
 
             memory: config.memory,
-            memory_cap_with_tools: config.memory_cap_with_tools,
-            memory_cap_without_tools: config.memory_cap_without_tools,
+            memory_facts_cap: config.memory_facts_cap,
+            memory_drill_cap: config.memory_drill_cap,
+            memory_run_state_ttl_days: config.memory_run_state_ttl_days,
+            memory_round_chains: config.memory_round_chains,
 
             workspace_instructions: config.workspace_instructions,
             workspace_instructions_files: config.workspace_instructions_files,

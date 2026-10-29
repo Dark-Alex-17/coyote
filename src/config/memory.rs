@@ -1,17 +1,50 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::sync::{Arc, LazyLock};
+use std::time::SystemTime;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
+use bm25::{Language, SearchEngine, SearchEngineBuilder};
+use chrono::Local;
+use fancy_regex::Regex;
 use log::warn;
-use serde::{Deserialize, Serialize};
+use parking_lot::Mutex;
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::config::{
     GIT_DIR_NAME, GITIGNORE_FILE_NAME, MEMORY_DIR_NAME, MEMORY_INDEX_FILE_NAME,
     WORKSPACE_COYOTE_DIR_NAME, paths,
 };
 
-pub const DEFAULT_MEMORY_CAP_WITH_TOOLS: usize = 6_000;
-pub const DEFAULT_MEMORY_CAP_WITHOUT_TOOLS: usize = 12_000;
+pub const DEFAULT_MEMORY_FACTS_CAP: usize = 4_000;
+pub const DEFAULT_MEMORY_DRILL_CAP: usize = 12_000;
+pub const DEFAULT_MEMORY_RUN_STATE_TTL_DAYS: u32 = 14;
+/// Chars a `description` may hold; it is one MEMORY.md index line.
+pub const MEMORY_DESCRIPTION_CAP: usize = 160;
+/// Chars a memory body may hold at write; `memory__lint` flags bodies over 2000 chars.
+pub const MEMORY_FILE_HARD_CAP: usize = 4_000;
+
+/// A MEMORY.md line that catalogues a drill file. Only lines of this exact shape
+/// count as indexing a file; a wikilink cited mid-sentence in a FACTS line does not.
+/// The slug class is deliberately wider than the write-side slug grammar so legacy
+/// index lines with dots or uppercase are still recognised.
+pub static CATALOGUE_LINE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^- \[\[(?P<slug>[A-Za-z0-9_.-]+)\]\]:\s*(?P<desc>.*)$").unwrap());
+
+pub fn catalogue_slug(line: &str) -> Option<&str> {
+    catalogue_entry(line).map(|(slug, _)| slug)
+}
+
+/// The `(slug, description)` of a catalogue line; `None` for any other line.
+pub fn catalogue_entry(line: &str) -> Option<(&str, &str)> {
+    let caps = CATALOGUE_LINE_RE.captures(line).ok().flatten()?;
+    Some((
+        caps.name("slug")?.as_str(),
+        caps.name("desc")?.as_str().trim(),
+    ))
+}
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceMemory {
@@ -43,7 +76,11 @@ pub fn find_git_root(start: &Path) -> Option<PathBuf> {
 }
 
 pub fn bootstrap_workspace_memory(git_root: &Path) -> Result<PathBuf> {
-    let mem_dir = paths::workspace_memory_dir_for(git_root);
+    create_workspace_memory(git_root, true)
+}
+
+pub fn create_workspace_memory(root: &Path, gitignore: bool) -> Result<PathBuf> {
+    let mem_dir = paths::workspace_memory_dir_for(root);
     fs::create_dir_all(&mem_dir)
         .with_context(|| format!("create memory dir {}", mem_dir.display()))?;
 
@@ -53,7 +90,7 @@ pub fn bootstrap_workspace_memory(git_root: &Path) -> Result<PathBuf> {
             .with_context(|| format!("write {}", index_path.display()))?;
     }
 
-    let gitignore_appended = append_gitignore_entry(git_root)?;
+    let gitignore_appended = gitignore && append_gitignore_entry(root)?;
     let suffix = if gitignore_appended {
         " (appended .coyote/memory/ to .gitignore)"
     } else {
@@ -66,6 +103,24 @@ pub fn bootstrap_workspace_memory(git_root: &Path) -> Result<PathBuf> {
     );
 
     Ok(mem_dir)
+}
+
+/// Where `coyote --init-memory workspace` roots the store: the git root, else `cwd`.
+pub fn init_workspace_root(cwd: &Path) -> PathBuf {
+    find_git_root(cwd).unwrap_or_else(|| cwd.to_path_buf())
+}
+
+/// Writes the `--init-memory workspace` index, appending the .gitignore entry only inside a git repo.
+pub fn write_workspace_memory_index(index_path: &Path, content: &str) -> Result<()> {
+    if let Some(parent) = index_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create memory dir {}", parent.display()))?;
+    }
+    fs::write(index_path, content).with_context(|| format!("write {}", index_path.display()))?;
+    if let Some(git_root) = find_git_root(index_path) {
+        append_gitignore_entry(&git_root)?;
+    }
+    Ok(())
 }
 
 pub fn append_gitignore_entry(git_root: &Path) -> Result<bool> {
@@ -96,6 +151,112 @@ pub fn append_gitignore_entry(git_root: &Path) -> Result<bool> {
     Ok(true)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MemoryKind {
+    User,
+    Feedback,
+    Project,
+    #[default]
+    Reference,
+    RunState,
+}
+
+impl MemoryKind {
+    pub const NAMES: [&'static str; 5] = ["user", "feedback", "project", "reference", "run-state"];
+
+    const ALL: [MemoryKind; 5] = [
+        Self::User,
+        Self::Feedback,
+        Self::Project,
+        Self::Reference,
+        Self::RunState,
+    ];
+
+    pub fn name(self) -> &'static str {
+        Self::NAMES[self as usize]
+    }
+}
+
+impl FromStr for MemoryKind {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::NAMES
+            .iter()
+            .position(|name| *name == value)
+            .map(|i| Self::ALL[i])
+            .ok_or_else(|| {
+                anyhow!(
+                    "Invalid value '{value}', expected one of: {}",
+                    Self::NAMES.join(", ")
+                )
+            })
+    }
+}
+
+/// The `type:` front-matter field as both the kind Coyote acts on and the scalar
+/// actually on disk. Unknown or missing values act as `Reference` but are written
+/// back unchanged, so loading and re-saving a file never rewrites its `type:` line.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KindField {
+    parsed: MemoryKind,
+    raw: serde_yaml::Value,
+}
+
+impl KindField {
+    pub fn kind(&self) -> MemoryKind {
+        self.parsed
+    }
+
+    pub fn raw_kind(&self) -> &serde_yaml::Value {
+        &self.raw
+    }
+
+    pub fn is_known(&self) -> bool {
+        self.raw
+            .as_str()
+            .is_some_and(|s| MemoryKind::from_str(s).is_ok())
+    }
+}
+
+impl Default for KindField {
+    fn default() -> Self {
+        Self {
+            parsed: MemoryKind::default(),
+            raw: serde_yaml::Value::Null,
+        }
+    }
+}
+
+impl From<MemoryKind> for KindField {
+    fn from(kind: MemoryKind) -> Self {
+        Self {
+            parsed: kind,
+            raw: serde_yaml::Value::String(kind.name().to_string()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for KindField {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = serde_yaml::Value::deserialize(deserializer)?;
+        if raw.is_mapping() || raw.is_sequence() {
+            return Err(de::Error::custom("`type` must be a scalar"));
+        }
+        let parsed = raw
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_default();
+        Ok(Self { parsed, raw })
+    }
+}
+
+impl Serialize for KindField {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.raw.serialize(serializer)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct MemoryFrontmatter {
     #[serde(default)]
@@ -103,7 +264,7 @@ pub struct MemoryFrontmatter {
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default, rename = "type")]
-    pub kind: Option<String>,
+    pub kind: KindField,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -114,24 +275,33 @@ pub struct MemoryFrontmatter {
     pub expires: Option<String>,
 }
 
+/// The fields `MemoryFrontmatter` omits when `None`; a rewrite drops them from
+/// the source mapping in that case.
+const OPTIONAL_FRONTMATTER_KEYS: [&str; 4] = ["created", "updated", "superseded_by", "expires"];
+
 #[derive(Debug, Clone)]
 pub struct MemoryFile {
     pub path: PathBuf,
     pub frontmatter: MemoryFrontmatter,
     pub body: String,
+    /// The front matter as read from disk, empty for a file not loaded from
+    /// one. A render starts from it, so key order and keys the struct does not
+    /// model survive a rewrite.
+    pub source: serde_yaml::Mapping,
 }
 
 impl MemoryFile {
     pub fn load(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("read memory file {}", path.display()))?;
-        let (frontmatter, body) = parse_frontmatter(&raw)
+        let (frontmatter, source, body) = parse_frontmatter(&raw)
             .with_context(|| format!("parse frontmatter in {}", path.display()))?;
 
         Ok(Self {
             path: path.to_path_buf(),
             frontmatter,
             body,
+            source,
         })
     }
 
@@ -140,35 +310,101 @@ impl MemoryFile {
             fs::create_dir_all(parent)?;
         }
 
-        let frontmatter_yaml = serde_yaml::to_string(&self.frontmatter)?;
-        let content = format!("---\n{}---\n\n{}", frontmatter_yaml, self.body);
-
-        fs::write(&self.path, content)?;
+        fs::write(&self.path, self.render()?)?;
 
         Ok(())
+    }
+
+    /// The file contents `save` writes.
+    pub fn render(&self) -> Result<String> {
+        let frontmatter_yaml = serde_yaml::to_string(&self.merged_frontmatter()?)?;
+        Ok(format!("---\n{}---\n\n{}", frontmatter_yaml, self.body))
+    }
+
+    /// `source` with each typed field overwritten in place, appended when the
+    /// source lacks it, or removed when it is a `None` optional.
+    fn merged_frontmatter(&self) -> Result<serde_yaml::Mapping> {
+        let serde_yaml::Value::Mapping(typed) = serde_yaml::to_value(&self.frontmatter)? else {
+            bail!("front matter did not serialize to a mapping");
+        };
+        let mut merged = self.source.clone();
+        for key in OPTIONAL_FRONTMATTER_KEYS {
+            if !typed.contains_key(key) {
+                merged.shift_remove(key);
+            }
+        }
+        for (key, value) in typed {
+            merged.insert(key, value);
+        }
+        Ok(merged)
     }
 
     pub fn char_len(&self) -> usize {
         self.body.chars().count()
     }
+
+    pub fn is_stale(&self, today: &str) -> bool {
+        is_stale_by(
+            self.frontmatter.superseded_by.as_deref(),
+            self.frontmatter.expires.as_deref(),
+            today,
+        )
+    }
 }
 
-fn parse_frontmatter(raw: &str) -> Result<(MemoryFrontmatter, String)> {
+fn is_stale_by(superseded_by: Option<&str>, expires: Option<&str>, today: &str) -> bool {
+    superseded_by.is_some() || expires.is_some_and(|expires| expires < today)
+}
+
+fn parse_frontmatter(raw: &str) -> Result<(MemoryFrontmatter, serde_yaml::Mapping, String)> {
     let trimmed = raw.trim_start();
     if !trimmed.starts_with("---") {
-        return Ok((MemoryFrontmatter::default(), raw.to_string()));
+        return Ok((Default::default(), Default::default(), raw.to_string()));
     }
 
     let after = &trimmed[3..];
     let Some(end) = after.find("\n---") else {
-        return Ok((MemoryFrontmatter::default(), raw.to_string()));
+        return Ok((Default::default(), Default::default(), raw.to_string()));
     };
-    let yaml = &after[..end];
+    let yaml = after[..end].trim();
     let body = after[end + 4..].trim_start_matches('\n').to_string();
-    let frontmatter: MemoryFrontmatter =
-        serde_yaml::from_str(yaml.trim()).context("parse YAML frontmatter")?;
+    let source = match serde_yaml::from_str(yaml).context("parse YAML frontmatter")? {
+        serde_yaml::Value::Mapping(mapping) => mapping,
+        serde_yaml::Value::Null => serde_yaml::Mapping::new(),
+        _ => bail!("YAML frontmatter is not a mapping"),
+    };
+    // Deserializing from text rather than from `source` lets a plain scalar such as
+    // `description: 42` or `name: 2024` load into a String field.
+    let frontmatter: MemoryFrontmatter = if source.is_empty() {
+        MemoryFrontmatter::default()
+    } else {
+        serde_yaml::from_str(yaml).context("parse YAML frontmatter")?
+    };
 
-    Ok((frontmatter, body))
+    Ok((frontmatter, source, body))
+}
+
+pub fn today_string() -> String {
+    Local::now().format("%Y-%m-%d").to_string()
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Retention {
+    pub include_stale: bool,
+}
+
+impl Retention {
+    pub fn live() -> Self {
+        Self {
+            include_stale: false,
+        }
+    }
+
+    pub fn all() -> Self {
+        Self {
+            include_stale: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -209,7 +445,7 @@ impl MemoryStore {
         }
     }
 
-    pub fn list_files(&self) -> Result<Vec<MemoryFile>> {
+    pub fn list_files(&self, retention: Retention) -> Result<Vec<MemoryFile>> {
         let mut out = Vec::new();
 
         if self.global_dir.exists() {
@@ -220,15 +456,278 @@ impl MemoryStore {
             collect_md_files(&ws.dir, &mut out)?;
         }
 
+        if !retention.include_stale {
+            let today = today_string();
+            out.retain(|f| !f.is_stale(&today));
+        }
+
         Ok(out)
+    }
+
+    fn scope_dirs(&self) -> Vec<(Scope, &Path)> {
+        let mut dirs = vec![(Scope::Global, self.global_dir.as_path())];
+        if let Some(ws) = &self.workspace {
+            dirs.push((Scope::Workspace, ws.dir.as_path()));
+        }
+        dirs
+    }
+
+    /// Every drill file of both scopes, stale ones included. The result is
+    /// shared until a drill file in either scope dir is added, removed or
+    /// rewritten.
+    pub fn catalogue(&self) -> Result<Arc<Catalogue>> {
+        let dirs = self.scope_dirs();
+        let key: Vec<PathBuf> = dirs.iter().map(|(_, dir)| dir.to_path_buf()).collect();
+        let stamps = drill_file_stamps(&dirs)?;
+        if let Some((cached, catalogue)) = CATALOGUE_CACHE.lock().get(&key)
+            && *cached == stamps
+        {
+            return Ok(Arc::clone(catalogue));
+        }
+
+        let catalogue = Arc::new(Catalogue::load(&dirs)?);
+        CATALOGUE_CACHE
+            .lock()
+            .insert(key, (stamps, Arc::clone(&catalogue)));
+        Ok(catalogue)
+    }
+
+    /// Up to `limit` entries the filter admits, best bm25 score over name and
+    /// description first, ties broken by the most recent `updated`.
+    pub fn search(&self, query: &str, limit: usize, filter: &Filter) -> Result<Vec<Hit>> {
+        let catalogue = self.catalogue()?;
+        let entries = catalogue.entries();
+        let today = today_string();
+        let mut scored: Vec<(&CatalogueEntry, f32)> = catalogue
+            .engine
+            .search(query, entries.len())
+            .into_iter()
+            .filter(|result| result.score > 0.0)
+            .map(|result| (&entries[result.document.id], result.score))
+            .filter(|(entry, _)| filter.admits(entry, &today))
+            .collect();
+        scored.sort_by(|(a, a_score), (b, b_score)| {
+            b_score
+                .total_cmp(a_score)
+                .then_with(|| b.updated.cmp(&a.updated))
+        });
+        Ok(scored
+            .into_iter()
+            .take(limit)
+            .map(|(entry, score)| Hit {
+                entry: entry.clone(),
+                score,
+            })
+            .collect())
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Filter {
+    pub kind: Option<MemoryKind>,
+    pub scope: Option<Scope>,
+    pub include_stale: bool,
+}
+
+impl Filter {
+    pub fn admits(&self, entry: &CatalogueEntry, today: &str) -> bool {
+        self.kind.is_none_or(|kind| entry.kind.kind() == kind)
+            && self.scope.is_none_or(|scope| entry.scope == scope)
+            && (self.include_stale || !entry.is_stale(today))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Hit {
+    pub entry: CatalogueEntry,
+    pub score: f32,
+}
+
+/// A drill file's front matter as the catalogue holds it; the body is not kept.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CatalogueEntry {
+    pub name: String,
+    pub description: Option<String>,
+    pub kind: KindField,
+    pub scope: Scope,
+    pub path: PathBuf,
+    pub char_len: usize,
+    pub updated: Option<String>,
+    pub superseded_by: Option<String>,
+    pub expires: Option<String>,
+}
+
+impl CatalogueEntry {
+    fn new(file: MemoryFile, scope: Scope) -> Self {
+        let char_len = file.char_len();
+        let fm = file.frontmatter;
+        Self {
+            name: fm.name,
+            description: fm.description,
+            kind: fm.kind,
+            scope,
+            path: file.path,
+            char_len,
+            updated: fm.updated,
+            superseded_by: fm.superseded_by,
+            expires: fm.expires,
+        }
+    }
+
+    pub fn is_stale(&self, today: &str) -> bool {
+        is_stale_by(
+            self.superseded_by.as_deref(),
+            self.expires.as_deref(),
+            today,
+        )
+    }
+}
+
+/// The global scope's entries, then the workspace's, each in path order.
+pub struct Catalogue {
+    entries: Vec<CatalogueEntry>,
+    engine: SearchEngine<usize>,
+}
+
+impl Catalogue {
+    fn load(dirs: &[(Scope, &Path)]) -> Result<Self> {
+        let mut entries = Vec::new();
+        for (scope, dir) in dirs {
+            if !dir.exists() {
+                continue;
+            }
+            let mut files = Vec::new();
+            collect_md_files(dir, &mut files)?;
+            files.sort_by(|a, b| a.path.cmp(&b.path));
+            entries.extend(files.into_iter().map(|f| CatalogueEntry::new(f, *scope)));
+        }
+        let documents = entries.iter().enumerate().map(|(id, entry)| {
+            bm25::Document::new(
+                id,
+                format!(
+                    "{} {}",
+                    entry.name,
+                    entry.description.as_deref().unwrap_or_default()
+                ),
+            )
+        });
+        let engine = SearchEngineBuilder::<usize>::with_documents(Language::English, documents)
+            .k1(1.5)
+            .b(0.75)
+            .build();
+        Ok(Self { entries, engine })
+    }
+
+    pub fn entries(&self) -> &[CatalogueEntry] {
+        &self.entries
+    }
+}
+
+/// Size and mtime of one drill file. A cached catalogue is reused only while
+/// every stamp still matches, so an in-place rewrite invalidates it even when
+/// the directory's own mtime does not move.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileStamp {
+    path: PathBuf,
+    modified: Option<SystemTime>,
+    len: u64,
+}
+
+type CatalogueCache = HashMap<Vec<PathBuf>, (Vec<FileStamp>, Arc<Catalogue>)>;
+
+static CATALOGUE_CACHE: LazyLock<Mutex<CatalogueCache>> = LazyLock::new(Default::default);
+
+fn drill_file_stamps(dirs: &[(Scope, &Path)]) -> Result<Vec<FileStamp>> {
+    let mut stamps = Vec::new();
+    for (_, dir) in dirs {
+        if !dir.exists() {
+            continue;
+        }
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !is_drill_file(&path) {
+                continue;
+            }
+            let meta = entry.metadata()?;
+            stamps.push(FileStamp {
+                path,
+                modified: meta.modified().ok(),
+                len: meta.len(),
+            });
+        }
+    }
+    stamps.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(stamps)
+}
+
+/// The rendered `<memory>` block plus the figures behind it: how many chars
+/// the facts and catalogue lines held before the cap, and what the cap cut.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemorySection {
+    pub text: String,
+    pub facts_chars: usize,
+    pub catalogue_chars: usize,
+    pub truncated: Option<Truncated>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Lines and chars a cap omitted, across facts and catalogue together;
+/// `global_lines + workspace_lines == lines` always holds.
+pub struct Truncated {
+    pub lines: usize,
+    pub chars: usize,
+    pub global_lines: usize,
+    pub workspace_lines: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    Global,
+    Workspace,
+}
+
+impl Scope {
+    pub const NAMES: [&'static str; 2] = ["global", "workspace"];
+
+    const ALL: [Scope; 2] = [Self::Global, Self::Workspace];
+
+    pub fn name(self) -> &'static str {
+        Self::NAMES[self as usize]
+    }
+}
+
+impl FromStr for Scope {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::NAMES
+            .iter()
+            .position(|name| *name == value)
+            .map(|i| Self::ALL[i])
+            .ok_or_else(|| {
+                anyhow!(
+                    "Invalid scope '{value}', expected one of: {}",
+                    Self::NAMES.join(", ")
+                )
+            })
+    }
+}
+
+/// Renders both MEMORY.md indexes facts first: every non-catalogue line of
+/// the global index, then of the workspace index, under `<facts>`; the
+/// catalogue lines of the workspace index, then of the global index, under
+/// `<catalogue>`. The whole is cut at a line boundary to `facts_cap` chars,
+/// so a catalogue too long for the cap loses its tail before any fact does,
+/// and a workspace index too long for the cap loses its own facts before any
+/// global one. Without tools, drill file bodies follow inside whatever
+/// `drill_cap` leaves after the section so far.
 pub fn build_memory_section(
     store: &MemoryStore,
     with_tools: bool,
-    cap: usize,
-) -> Result<Option<String>> {
+    facts_cap: usize,
+    drill_cap: usize,
+) -> Result<Option<MemorySection>> {
     let global_index = store.load_global_index()?;
     let workspace_index = store.load_workspace_index()?;
 
@@ -236,43 +735,51 @@ pub fn build_memory_section(
         return Ok(None);
     }
 
-    let global_len = global_index.as_deref().map_or(0, count_chars);
-    let workspace_len = workspace_index.as_deref().map_or(0, count_chars);
-    let present = global_index.is_some() as usize + workspace_index.is_some() as usize;
-    let share = cap / present;
+    let mut global_facts: Vec<(Scope, &str)> = Vec::new();
+    let mut workspace_facts: Vec<(Scope, &str)> = Vec::new();
+    let mut catalogue: Vec<(Scope, &str)> = Vec::new();
+    for (scope, index) in [
+        (Scope::Workspace, &workspace_index),
+        (Scope::Global, &global_index),
+    ] {
+        let Some(index) = index else {
+            continue;
+        };
+        let scope_facts = match scope {
+            Scope::Global => &mut global_facts,
+            Scope::Workspace => &mut workspace_facts,
+        };
+        for line in index.lines() {
+            if catalogue_entry(line).is_some() {
+                catalogue.push((scope, line));
+            } else {
+                scope_facts.push((scope, line));
+            }
+        }
+        while scope_facts.last().is_some_and(|(_, l)| l.trim().is_empty()) {
+            scope_facts.pop();
+        }
+    }
+    let facts: Vec<(Scope, &str)> = global_facts.into_iter().chain(workspace_facts).collect();
+    let facts_chars = joined_chars(&facts);
+    let catalogue_chars = joined_chars(&catalogue);
+    let (facts_body, catalogue_body, truncated) =
+        cut_at_line_boundary(&facts, &catalogue, facts_cap);
 
     let mut buf = String::from("<memory>\n");
-    let mut consumed = 0usize;
-
-    if let Some(s) = &global_index {
-        // An even share each, except that a workspace index which fits in its
-        // share hands the rest to the global one.
-        let budget = if workspace_len <= share {
-            cap - workspace_len
-        } else {
-            share
-        };
-        consumed += push_index(&mut buf, "global_index", s, budget, with_tools);
-    }
-
-    if let Some(s) = &workspace_index {
-        // Includes the tail the global index lost to its line-boundary cut.
-        let budget = cap.saturating_sub(consumed);
-        consumed += push_index(&mut buf, "workspace_index", s, budget, with_tools);
-    }
-
-    if consumed < global_len + workspace_len {
-        warn!(
-            "memory indexes ({} chars) exceed cap ({} chars); truncated to the head of each index - \
-             raise memory_cap_* in config or shrink MEMORY.md",
-            global_len + workspace_len,
-            cap
-        );
+    push_block(&mut buf, "facts", &facts_body);
+    push_block(&mut buf, "catalogue", &catalogue_body);
+    if let Some(cut) = &truncated {
+        buf.push_str(&format!(
+            "<!-- memory facts truncated: {} lines / {} chars omitted (global {}, workspace {}); run memory__lint -->\n",
+            cut.lines, cut.chars, cut.global_lines, cut.workspace_lines
+        ));
     }
 
     if !with_tools {
-        let mut budget = cap.saturating_sub(consumed);
-        let mut files = store.list_files()?;
+        let mut budget = drill_cap.saturating_sub(count_chars(&buf));
+        let mut files = store.list_files(Retention::live())?;
+        files.retain(|f| f.frontmatter.kind.kind() != MemoryKind::RunState);
         files.sort_by(|a, b| a.frontmatter.name.cmp(&b.frontmatter.name));
         let mut omitted = 0usize;
         for f in files {
@@ -296,63 +803,102 @@ pub fn build_memory_section(
     }
 
     buf.push_str("</memory>");
-    Ok(Some(buf))
+    Ok(Some(MemorySection {
+        text: buf,
+        facts_chars,
+        catalogue_chars,
+        truncated,
+    }))
 }
 
 fn count_chars(s: &str) -> usize {
     s.chars().count()
 }
 
-/// Appends `index` wrapped in `<tag>`, cut to the head that fits `budget`,
-/// and returns the number of index chars injected. A truncated index is
-/// followed by a comment telling the model how to reach the rest.
-fn push_index(buf: &mut String, tag: &str, index: &str, budget: usize, with_tools: bool) -> usize {
-    let total = count_chars(index);
-    let shown = if total <= budget {
-        index
-    } else {
-        head_at_line_boundary(index, budget)
-    };
-    buf.push_str(&format!("<{tag}>\n"));
-    buf.push_str(shown);
-    buf.push_str(&format!("\n</{tag}>\n"));
-    let shown_len = count_chars(shown);
-    if shown_len < total {
-        let how = if with_tools {
-            "call memory__list for the full catalogue and memory__read <name> for a file"
-        } else {
-            "enable function calling for full access"
-        };
-        buf.push_str(&format!(
-            "<!-- {tag} truncated: {shown_len} of {total} chars; {how} -->\n"
-        ));
-    }
-    shown_len
+/// Chars of `lines` once joined by newlines.
+fn joined_chars(lines: &[(Scope, &str)]) -> usize {
+    lines.iter().map(|(_, l)| count_chars(l)).sum::<usize>() + lines.len().saturating_sub(1)
 }
 
-/// The first `budget` chars of `s`, pulled back to the last newline so no
-/// line is cut in half. A single line longer than the budget is cut at the
-/// budget rather than dropped.
-fn head_at_line_boundary(s: &str, budget: usize) -> &str {
-    let end = s
-        .char_indices()
-        .nth(budget)
-        .map_or(s.len(), |(byte, _)| byte);
-    match s[..end].rfind('\n') {
-        Some(newline) => &s[..newline],
-        None => &s[..end],
+fn join_lines(lines: &[(Scope, &str)]) -> String {
+    lines.iter().map(|(_, l)| *l).collect::<Vec<_>>().join("\n")
+}
+
+/// The facts and catalogue bodies once the line sequence `facts ++ catalogue`
+/// is cut at the last line boundary within `cap` chars (counted as joined by
+/// newlines). A first line longer than the cap is cut at the cap rather than
+/// dropped, and counts as one omitted line of its own scope.
+fn cut_at_line_boundary(
+    facts: &[(Scope, &str)],
+    catalogue: &[(Scope, &str)],
+    cap: usize,
+) -> (String, String, Option<Truncated>) {
+    let total_lines = facts.len() + catalogue.len();
+    let mut kept = 0usize;
+    let mut used = 0usize;
+    for (i, (_, line)) in facts.iter().chain(catalogue).enumerate() {
+        let next = used + count_chars(line) + usize::from(i > 0);
+        if next > cap {
+            break;
+        }
+        used = next;
+        kept += 1;
     }
+    if kept == total_lines {
+        return (join_lines(facts), join_lines(catalogue), None);
+    }
+    let total_chars = joined_chars(facts)
+        + joined_chars(catalogue)
+        + usize::from(!facts.is_empty() && !catalogue.is_empty());
+    let omitted = |chars: usize| {
+        let global_lines = facts
+            .iter()
+            .chain(catalogue)
+            .skip(kept)
+            .filter(|(scope, _)| *scope == Scope::Global)
+            .count();
+        Truncated {
+            lines: total_lines - kept,
+            chars,
+            global_lines,
+            workspace_lines: total_lines - kept - global_lines,
+        }
+    };
+    if kept == 0 {
+        let first = facts
+            .first()
+            .or(catalogue.first())
+            .map_or("", |(_, line)| line);
+        let head: String = first.chars().take(cap).collect();
+        let cut = Some(omitted(total_chars - cap));
+        return if facts.is_empty() {
+            (String::new(), head, cut)
+        } else {
+            (head, String::new(), cut)
+        };
+    }
+    let kept_facts = kept.min(facts.len());
+    (
+        join_lines(&facts[..kept_facts]),
+        join_lines(&catalogue[..kept - kept_facts]),
+        Some(omitted(total_chars - used)),
+    )
+}
+
+fn push_block(buf: &mut String, tag: &str, body: &str) {
+    buf.push_str(&format!("<{tag}>\n"));
+    if !body.is_empty() {
+        buf.push_str(body);
+        buf.push('\n');
+    }
+    buf.push_str(&format!("</{tag}>\n"));
 }
 
 fn collect_md_files(dir: &Path, out: &mut Vec<MemoryFile>) -> Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
-            continue;
-        }
-
-        if path.file_name().and_then(|n| n.to_str()) == Some(MEMORY_INDEX_FILE_NAME) {
+        if !is_drill_file(&path) {
             continue;
         }
 
@@ -363,6 +909,11 @@ fn collect_md_files(dir: &Path, out: &mut Vec<MemoryFile>) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn is_drill_file(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("md")
+        && path.file_name().and_then(|n| n.to_str()) != Some(MEMORY_INDEX_FILE_NAME)
 }
 
 #[cfg(test)]
@@ -439,7 +990,11 @@ mod tests {
             workspace: discover_workspace_memory(&workspace),
         };
 
-        assert!(build_memory_section(&store, true, 6_000).unwrap().is_none());
+        assert!(
+            build_memory_section(&store, true, 4_000, 12_000)
+                .unwrap()
+                .is_none()
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -468,9 +1023,10 @@ mod tests {
             workspace: discover_workspace_memory(&workspace),
         };
 
-        let section = build_memory_section(&store, true, 6_000)
+        let section = build_memory_section(&store, true, 4_000, 12_000)
             .unwrap()
-            .expect("memory section should exist");
+            .expect("memory section should exist")
+            .text;
         assert!(section.contains("workspace-index-content"));
         assert!(!section.contains("foo body that should not appear"));
         assert!(section.starts_with("<memory>"));
@@ -504,9 +1060,10 @@ mod tests {
             workspace: discover_workspace_memory(&workspace),
         };
 
-        let section = build_memory_section(&store, false, 6_000)
+        let section = build_memory_section(&store, false, 4_000, 12_000)
             .unwrap()
-            .expect("memory section should exist");
+            .expect("memory section should exist")
+            .text;
         let alpha_pos = section.find("alpha body").expect("alpha body missing");
         let zebra_pos = section.find("zebra body").expect("zebra body missing");
         assert!(alpha_pos < zebra_pos, "drill bodies must be alphabetical");
@@ -535,9 +1092,10 @@ mod tests {
             workspace: discover_workspace_memory(&workspace),
         };
 
-        let section = build_memory_section(&store, false, 100)
+        let section = build_memory_section(&store, false, 4_000, 100)
             .unwrap()
-            .expect("memory section should exist");
+            .expect("memory section should exist")
+            .text;
         assert!(!section.contains(&big_body));
         assert!(section.contains("memory file(s) omitted"));
 
@@ -576,140 +1134,386 @@ mod tests {
         (root, store)
     }
 
-    /// Forty 11-char lines joined by newlines (479 chars), each starting with `prefix`.
-    fn index_lines(prefix: &str) -> String {
-        (0..40)
-            .map(|_| format!("{prefix}0123456789"))
+    /// A global index with one non-catalogue line plus two drill files.
+    const GLOBAL_INDEX: &str = "PLACEHOLDER_CHECK\n- [[g-one]]: desc\n- [[g-two]]: desc";
+    /// A workspace index with headings, four facts and two drill files.
+    const WORKSPACE_INDEX: &str = "# Workspace Memory Index\n\n## Always-on facts\n\
+        - **Fact A.** text\n- **Fact B.** text\n- **Fact C.** text\n- **Fact D.** text\n\n\
+        ## Drill files\n- [[w-one]]: desc\n- [[w-two]]: desc";
+    /// The facts lines of both, global first (154 chars).
+    const GLOBAL_THEN_WORKSPACE_FACTS: &str = "PLACEHOLDER_CHECK\n# Workspace Memory Index\n\n\
+        ## Always-on facts\n- **Fact A.** text\n- **Fact B.** text\n- **Fact C.** text\n\
+        - **Fact D.** text\n\n## Drill files";
+
+    /// `count` catalogue lines of 60 chars each, slugs `{prefix}-NNN`, joined by newlines.
+    fn catalogue_lines(prefix: &str, count: usize) -> String {
+        (0..count)
+            .map(|i| format!("- [[{prefix}-{i:03}]]: {}", "d".repeat(48 - prefix.len())))
             .collect::<Vec<_>>()
             .join("\n")
     }
 
     fn tag_body<'a>(section: &'a str, tag: &str) -> &'a str {
         let open = format!("<{tag}>\n");
-        let close = format!("\n</{tag}>\n");
+        let close = format!("</{tag}>\n");
         let start = section.find(&open).expect("open tag") + open.len();
         let end = section[start..].find(&close).expect("close tag") + start;
-        &section[start..end]
+        section[start..end].strip_suffix('\n').unwrap_or("")
     }
 
     #[test]
-    fn build_memory_section_truncates_both_indexes_to_an_even_share_of_the_cap() {
-        let (root, store) =
-            two_index_store("even_share", &index_lines("g"), &index_lines("w"), &[]);
+    fn facts_render_before_the_catalogue_across_both_scopes() {
+        let (root, store) = two_index_store("facts_first", GLOBAL_INDEX, WORKSPACE_INDEX, &[]);
 
-        let section = build_memory_section(&store, true, 200)
+        let section = build_memory_section(&store, true, 4_000, 12_000)
             .unwrap()
             .expect("memory section should exist");
 
-        let global = tag_body(&section, "global_index");
-        let workspace = tag_body(&section, "workspace_index");
-        for (body, prefix) in [(global, "g"), (workspace, "w")] {
-            assert!(
-                body.lines().all(|l| l == format!("{prefix}0123456789")),
-                "index must be cut at a line boundary: {body:?}"
-            );
-            assert!(
-                body.chars().count() <= 100,
-                "each index gets cap/2: {body:?}"
-            );
-        }
-        assert!(global.chars().count() + workspace.chars().count() <= 200);
+        let facts = tag_body(&section.text, "facts");
+        assert_eq!(facts, GLOBAL_THEN_WORKSPACE_FACTS);
         assert!(
-            section.find("<global_index>").unwrap() < section.find("<workspace_index>").unwrap()
+            facts.lines().all(|l| catalogue_entry(l).is_none()),
+            "{facts}"
         );
-        assert!(section.contains(
-            "</global_index>\n<!-- global_index truncated: 95 of 479 chars; \
-             call memory__list for the full catalogue and memory__read <name> for a file -->\n"
-        ));
-        assert!(section.contains(
-            "</workspace_index>\n<!-- workspace_index truncated: 95 of 479 chars; \
-             call memory__list for the full catalogue and memory__read <name> for a file -->\n"
-        ));
-        assert!(section.ends_with("</memory>"));
+        assert_eq!(
+            tag_body(&section.text, "catalogue"),
+            "- [[w-one]]: desc\n- [[w-two]]: desc\n- [[g-one]]: desc\n- [[g-two]]: desc"
+        );
+        assert!(section.text.find("<facts>").unwrap() < section.text.find("<catalogue>").unwrap());
+        assert_eq!(section.facts_chars, 154);
+        assert_eq!(section.catalogue_chars, 4 * 17 + 3);
+        assert_eq!(section.truncated, None);
+        assert!(!section.text.contains("truncated"), "{}", section.text);
 
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn build_memory_section_gives_a_short_indexes_leftover_to_the_other() {
-        let (root, store) = two_index_store("leftover", "short", &index_lines("w"), &[]);
+    fn four_workspace_facts_survive_a_4000_char_cap_with_a_huge_catalogue() {
+        let global = format!("PLACEHOLDER_CHECK\n{}", catalogue_lines("g", 400));
+        let (root, store) = two_index_store("huge_catalogue", &global, WORKSPACE_INDEX, &[]);
 
-        let section = build_memory_section(&store, true, 200)
+        let section = build_memory_section(&store, true, 4_000, 12_000)
             .unwrap()
             .expect("memory section should exist");
 
-        assert_eq!(tag_body(&section, "global_index"), "short");
-        assert!(!section.contains("global_index truncated"));
-        let workspace = tag_body(&section, "workspace_index");
+        let facts = tag_body(&section.text, "facts");
+        assert_eq!(facts, GLOBAL_THEN_WORKSPACE_FACTS);
+        let catalogue = tag_body(&section.text, "catalogue");
+        assert!(catalogue.starts_with("- [[w-one]]: desc\n- [[w-two]]: desc\n- [[g-000]]:"));
+        assert!(facts.chars().count() + 1 + catalogue.chars().count() <= 4_000);
+        // 154 fact chars and the two 17-char workspace lines (36 with their
+        // newlines) leave room for 62 of the 400 global lines at 61 each.
+        assert_eq!(catalogue.lines().count(), 64);
+        let kept_chars = 154 + 36 + 62 * 61;
+        let total_chars = 154 + 1 + 35 + 1 + (400 * 60 + 399);
+        assert_eq!(section.facts_chars, 154);
+        assert_eq!(section.catalogue_chars, 35 + 1 + 400 * 60 + 399);
         assert_eq!(
-            workspace.chars().count(),
-            191,
-            "cap minus the short index, cut at a line: {workspace:?}"
+            section.truncated,
+            Some(Truncated {
+                lines: 338,
+                chars: total_chars - kept_chars,
+                global_lines: 338,
+                workspace_lines: 0,
+            })
         );
-        assert!(section.contains("<!-- workspace_index truncated: 191 of 479 chars;"));
+        assert!(section.text.ends_with(&format!(
+            "</catalogue>\n<!-- memory facts truncated: 338 lines / {} chars omitted \
+             (global 338, workspace 0); run memory__lint -->\n</memory>",
+            total_chars - kept_chars
+        )));
 
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn build_memory_section_under_cap_is_untouched() {
-        let (root, store) =
-            two_index_store("under_cap", "global-content", "workspace-content", &[]);
+    fn global_facts_survive_a_workspace_facts_overflow() {
+        let global_facts = [
+            "- **G one.** text",
+            "- **G two.** text",
+            "- **G three.** text",
+        ];
+        let workspace_facts: Vec<String> = (0..70)
+            .map(|i| format!("- **Workspace fact {i:02}.** {}", "w".repeat(33)))
+            .collect();
+        let workspace = workspace_facts.join("\n");
+        assert!(workspace.chars().count() > 4_000);
+        let (root, store) = two_index_store(
+            "workspace_overflow",
+            &global_facts.join("\n"),
+            &workspace,
+            &[],
+        );
 
-        let section = build_memory_section(&store, true, 6_000)
+        let section = build_memory_section(&store, true, 4_000, 12_000)
+            .unwrap()
+            .expect("memory section should exist");
+
+        let facts = tag_body(&section.text, "facts");
+        assert!(facts.starts_with(&global_facts.join("\n")), "{facts}");
+        assert!(
+            !facts.contains(workspace_facts.last().unwrap().as_str()),
+            "{facts}"
+        );
+        assert_eq!(tag_body(&section.text, "catalogue"), "");
+        let cut = section.truncated.as_ref().expect("truncated");
+        assert!(cut.lines >= 1);
+        assert_eq!(cut.global_lines, 0);
+        assert_eq!(cut.workspace_lines, cut.lines);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cut_falls_on_a_line_boundary() {
+        let (root, store) = two_index_store(
+            "line_boundary",
+            &catalogue_lines("g", 40),
+            &catalogue_lines("w", 40),
+            &[],
+        );
+
+        let section = build_memory_section(&store, true, 200, 12_000)
+            .unwrap()
+            .expect("memory section should exist");
+
+        assert!(section.text.contains("<facts>\n</facts>\n<catalogue>\n"));
+        let catalogue = tag_body(&section.text, "catalogue");
+        assert!(
+            catalogue
+                .lines()
+                .all(|l| l.chars().count() == 60 && catalogue_entry(l).is_some()),
+            "{catalogue:?}"
+        );
+        // Three 60-char lines and two newlines; a fourth line would need 243.
+        assert_eq!(catalogue.chars().count(), 182);
+        assert!(catalogue.starts_with("- [[w-000]]:"));
+        assert_eq!(section.facts_chars, 0);
+        assert_eq!(section.catalogue_chars, 80 * 60 + 79);
+        assert_eq!(
+            section.truncated,
+            Some(Truncated {
+                lines: 77,
+                chars: 80 * 60 + 79 - 182,
+                global_lines: 40,
+                workspace_lines: 37,
+            })
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn under_cap_is_untouched() {
+        let (root, store) = two_index_store(
+            "under_cap",
+            "global-content\n- [[g]]: desc",
+            "workspace-content\n- [[w]]: desc",
+            &[],
+        );
+
+        let section = build_memory_section(&store, true, 4_000, 12_000)
             .unwrap()
             .expect("memory section should exist");
 
         assert_eq!(
             section,
-            "<memory>\n<global_index>\nglobal-content\n</global_index>\n\
-             <workspace_index>\nworkspace-content\n</workspace_index>\n</memory>"
+            MemorySection {
+                text: "<memory>\n<facts>\nglobal-content\nworkspace-content\n</facts>\n\
+                       <catalogue>\n- [[w]]: desc\n- [[g]]: desc\n</catalogue>\n</memory>"
+                    .into(),
+                facts_chars: 32,
+                catalogue_chars: 27,
+                truncated: None,
+            }
         );
 
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn build_memory_section_at_an_odd_cap_keeps_an_index_exactly_its_share_plus_one() {
-        // 109 chars and 110 chars; cap 219 gives each a share of 109, so the
-        // workspace index needs one char more than its share and the total
-        // sits exactly on the cap.
-        let global = (0..10).map(|_| "g012345678").collect::<Vec<_>>().join("\n");
-        let workspace = format!("{}x", global.replace('g', "w"));
-        assert_eq!(global.chars().count(), 109);
-        assert_eq!(workspace.chars().count(), 110);
-        let (root, store) = two_index_store("odd_cap", &global, &workspace, &[]);
+    fn a_body_exactly_at_the_cap_is_untouched_and_one_under_loses_a_line() {
+        let (root, store) = two_index_store(
+            "exact_cap",
+            "global-content\n- [[g]]: desc",
+            "workspace-content\n- [[w]]: desc",
+            &[],
+        );
 
-        let section = build_memory_section(&store, true, 219)
+        let exact = build_memory_section(&store, true, 60, 12_000)
             .unwrap()
             .expect("memory section should exist");
+        assert_eq!(exact.truncated, None);
+        assert_eq!(
+            tag_body(&exact.text, "catalogue"),
+            "- [[w]]: desc\n- [[g]]: desc"
+        );
 
-        assert_eq!(tag_body(&section, "global_index"), global);
-        assert_eq!(tag_body(&section, "workspace_index"), workspace);
-        assert!(!section.contains("truncated"), "{section}");
+        let short = build_memory_section(&store, true, 59, 12_000)
+            .unwrap()
+            .expect("memory section should exist");
+        assert_eq!(tag_body(&short.text, "catalogue"), "- [[w]]: desc");
+        assert_eq!(
+            short.truncated,
+            Some(Truncated {
+                lines: 1,
+                chars: 14,
+                global_lines: 1,
+                workspace_lines: 0,
+            })
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn build_memory_section_without_tools_truncates_indexes_and_omits_drill_bodies() {
+    fn a_first_line_longer_than_the_cap_is_cut_at_the_cap() {
+        let (root, store) = two_index_store("long_line", "- [[g]]: desc", &"x".repeat(50), &[]);
+
+        let section = build_memory_section(&store, true, 20, 12_000)
+            .unwrap()
+            .expect("memory section should exist");
+
+        assert_eq!(tag_body(&section.text, "facts"), "x".repeat(20));
+        assert_eq!(tag_body(&section.text, "catalogue"), "");
+        assert_eq!(
+            section.truncated,
+            Some(Truncated {
+                lines: 2,
+                chars: 50 + 1 + 13 - 20,
+                global_lines: 1,
+                workspace_lines: 1,
+            })
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_first_catalogue_line_longer_than_the_cap_is_cut_at_the_cap_when_there_are_no_facts() {
+        let row = format!("- [[g]]: {}", "d".repeat(60));
+        let (root, store) = two_index_store("long_catalogue_line", &row, "", &[]);
+
+        let section = build_memory_section(&store, true, 20, 12_000)
+            .unwrap()
+            .expect("memory section should exist");
+
+        assert_eq!(tag_body(&section.text, "facts"), "");
+        assert_eq!(tag_body(&section.text, "catalogue"), &row[..20]);
+        assert_eq!(section.facts_chars, 0);
+        assert_eq!(section.catalogue_chars, row.len());
+        assert_eq!(
+            section.truncated,
+            Some(Truncated {
+                lines: 1,
+                chars: row.len() - 20,
+                global_lines: 1,
+                workspace_lines: 0,
+            })
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_trailing_blank_line_in_an_index_is_not_carried_into_the_facts() {
+        let (root, store) = two_index_store(
+            "trailing_blank",
+            GLOBAL_INDEX,
+            "# Workspace Memory Index\n\n",
+            &[],
+        );
+
+        let section = build_memory_section(&store, true, 4_000, 12_000)
+            .unwrap()
+            .expect("memory section should exist");
+
+        let facts = tag_body(&section.text, "facts");
+        assert_eq!(facts, "PLACEHOLDER_CHECK\n# Workspace Memory Index");
+        assert_eq!(section.facts_chars, count_chars(facts));
+        assert_eq!(section.truncated, None);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_one_megabyte_index_renders_within_cap_plus_notice() {
+        let global = catalogue_lines("g", 17_200);
+        assert!(global.len() >= 1 << 20);
+        let (root, store) = two_index_store("one_megabyte", &global, WORKSPACE_INDEX, &[]);
+
+        let section = build_memory_section(&store, true, 4_000, 12_000)
+            .unwrap()
+            .expect("memory section should exist");
+
+        let notice_start = section
+            .text
+            .find("<!-- memory facts truncated:")
+            .expect("notice");
+        let notice_len = section.text[notice_start..].find("-->\n").unwrap() + 4;
+        let tag_overhead =
+            "<memory>\n<facts>\n\n</facts>\n<catalogue>\n\n</catalogue>\n</memory>".len();
+        assert!(
+            section.text.chars().count() <= 4_000 + notice_len + tag_overhead,
+            "{}",
+            section.text.chars().count()
+        );
+        assert!(tag_body(&section.text, "facts").contains("- **Fact D.** text"));
+        assert!(section.truncated.is_some());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn drill_bodies_fill_what_the_drill_cap_leaves_after_the_section() {
+        // "<memory>\n<facts>\nidx\n</facts>\n<catalogue>\n</catalogue>\n" is 55
+        // chars; the body is stored with its trailing newline, 101 chars, and
+        // costs 151 of what is left.
+        let body = "y".repeat(100);
+        let (root, store) = two_index_store("drill_budget", "", "idx", &[("small", &body)]);
+
+        let fits = build_memory_section(&store, false, 4_000, 206)
+            .unwrap()
+            .expect("memory section should exist");
+        assert!(
+            fits.text.contains("<file name=\"small\">\n"),
+            "{}",
+            fits.text
+        );
+        assert!(!fits.text.contains("memory file(s) omitted"));
+
+        let short = build_memory_section(&store, false, 4_000, 205)
+            .unwrap()
+            .expect("memory section should exist");
+        assert!(!short.text.contains(&body));
+        assert!(
+            short.text.contains("1 memory file(s) omitted"),
+            "{}",
+            short.text
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn without_tools_truncates_facts_and_omits_drill_bodies() {
         let big_body = "x".repeat(200);
         let (root, store) = two_index_store(
             "no_tools_cap",
-            &index_lines("g"),
-            &index_lines("w"),
+            &catalogue_lines("g", 40),
+            &catalogue_lines("w", 40),
             &[("big", &big_body)],
         );
 
-        let section = build_memory_section(&store, false, 200)
+        let section = build_memory_section(&store, false, 200, 300)
             .unwrap()
-            .expect("memory section should exist");
+            .expect("memory section should exist")
+            .text;
 
         assert!(section.contains(
-            "<!-- global_index truncated: 95 of 479 chars; enable function calling for full access -->"
-        ));
-        assert!(section.contains(
-            "<!-- workspace_index truncated: 95 of 479 chars; enable function calling for full access -->"
+            "</catalogue>\n<!-- memory facts truncated: 77 lines / 4697 chars omitted \
+             (global 40, workspace 37); run memory__lint -->\n"
         ));
         assert!(!section.contains(&big_body));
         assert!(
@@ -723,11 +1527,11 @@ mod tests {
     fn parse_frontmatter_extracts_yaml() {
         let raw = "---\nname: foo\ndescription: a thing\ntype: user\n---\nBody text\n";
 
-        let (fm, body) = parse_frontmatter(raw).unwrap();
+        let (fm, _, body) = parse_frontmatter(raw).unwrap();
 
         assert_eq!(fm.name, "foo");
         assert_eq!(fm.description.as_deref(), Some("a thing"));
-        assert_eq!(fm.kind.as_deref(), Some("user"));
+        assert_eq!(fm.kind.kind(), MemoryKind::User);
         assert_eq!(body, "Body text\n");
     }
 
@@ -735,10 +1539,11 @@ mod tests {
     fn parse_frontmatter_handles_missing_block() {
         let raw = "# Just markdown, no frontmatter\nbody";
 
-        let (fm, body) = parse_frontmatter(raw).unwrap();
+        let (fm, _, body) = parse_frontmatter(raw).unwrap();
 
         assert_eq!(fm.name, "");
-        assert!(fm.kind.is_none());
+        assert_eq!(fm.kind.kind(), MemoryKind::Reference);
+        assert!(fm.kind.raw_kind().is_null());
         assert_eq!(body, raw);
     }
 
@@ -746,10 +1551,61 @@ mod tests {
     fn parse_frontmatter_handles_unterminated_block() {
         let raw = "---\nname: oops\nno closing delimiter\n# rest of doc";
 
-        let (fm, body) = parse_frontmatter(raw).unwrap();
+        let (fm, _, body) = parse_frontmatter(raw).unwrap();
 
         assert_eq!(fm.name, "");
         assert_eq!(body, raw);
+    }
+
+    #[test]
+    fn parse_frontmatter_reads_an_empty_block_as_the_defaults() {
+        let (fm, source, body) = parse_frontmatter("---\n---").unwrap();
+
+        assert_eq!(fm.name, "");
+        assert!(fm.description.is_none());
+        assert!(fm.kind.raw_kind().is_null());
+        assert!(source.is_empty());
+        assert_eq!(body, "");
+    }
+
+    #[test]
+    fn parse_frontmatter_rejects_a_block_that_is_not_a_mapping() {
+        let err = parse_frontmatter("---\n- a\n---").unwrap_err();
+
+        assert_eq!(err.to_string(), "YAML frontmatter is not a mapping");
+    }
+
+    #[test]
+    fn parse_frontmatter_reads_plain_scalars_as_text() {
+        let (fm, _, _) =
+            parse_frontmatter("---\nname: 2024\ndescription: 42\ncreated: 2026\n---\nbody\n")
+                .unwrap();
+        assert_eq!(fm.name, "2024");
+        assert_eq!(fm.description.as_deref(), Some("42"));
+
+        let (fm, _, _) = parse_frontmatter("---\nname: flag\ndescription: yes\n---\n").unwrap();
+        assert_eq!(fm.description.as_deref(), Some("yes"));
+    }
+
+    #[test]
+    fn a_file_with_plain_scalar_front_matter_survives_a_render_round_trip() {
+        let root = temp_root("scalar-roundtrip");
+        let path = root.join("2024.md");
+        fs::write(
+            &path,
+            "---\nname: 2024\ndescription: 42\ntype: user\n---\nbody\n",
+        )
+        .unwrap();
+
+        let loaded = MemoryFile::load(&path).unwrap();
+        fs::write(&path, loaded.render().unwrap()).unwrap();
+        let reloaded = MemoryFile::load(&path).unwrap();
+
+        assert_eq!(reloaded.frontmatter.name, "2024");
+        assert_eq!(reloaded.frontmatter.description.as_deref(), Some("42"));
+        assert_eq!(reloaded.body, "body\n");
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -761,20 +1617,265 @@ mod tests {
             frontmatter: MemoryFrontmatter {
                 name: "test".into(),
                 description: Some("a test".into()),
-                kind: Some("user".into()),
+                kind: MemoryKind::User.into(),
                 ..Default::default()
             },
             body: "Hello world\nmore text".into(),
+            source: Default::default(),
         };
         file.save().unwrap();
         let loaded = MemoryFile::load(&path).unwrap();
         assert_eq!(loaded.frontmatter.name, "test");
         assert_eq!(loaded.frontmatter.description.as_deref(), Some("a test"));
-        assert_eq!(loaded.frontmatter.kind.as_deref(), Some("user"));
+        assert_eq!(loaded.frontmatter.kind.kind(), MemoryKind::User);
         assert_eq!(loaded.body, "Hello world\nmore text");
 
         let raw = fs::read_to_string(&path).unwrap();
         assert!(raw.contains("type: user"), "kind must serialize as 'type:'");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn memory_kind_parses_its_names_and_teaches_on_bad_input() {
+        for name in MemoryKind::NAMES {
+            assert_eq!(name.parse::<MemoryKind>().unwrap().name(), name);
+        }
+        assert_eq!(
+            "run-state".parse::<MemoryKind>().unwrap(),
+            MemoryKind::RunState
+        );
+
+        let err = "bogus".parse::<MemoryKind>().unwrap_err().to_string();
+        assert!(err.starts_with("Invalid value 'bogus'"), "{err}");
+        for name in MemoryKind::NAMES {
+            assert!(err.contains(name), "{err} should list {name}");
+        }
+    }
+
+    #[test]
+    fn kind_field_reads_null_and_unknown_scalars_as_reference_keeping_raw() {
+        let (null_fm, _, _) = parse_frontmatter("---\nname: n\ntype: null\n---\nx\n").unwrap();
+        assert_eq!(null_fm.kind.kind(), MemoryKind::Reference);
+        assert!(null_fm.kind.raw_kind().is_null());
+        assert!(!null_fm.kind.is_known());
+
+        let (absent_fm, _, _) = parse_frontmatter("---\nname: n\n---\nx\n").unwrap();
+        assert!(absent_fm.kind.raw_kind().is_null());
+
+        let (gotcha_fm, _, _) = parse_frontmatter("---\nname: n\ntype: gotcha\n---\nx\n").unwrap();
+        assert_eq!(gotcha_fm.kind.kind(), MemoryKind::Reference);
+        assert_eq!(gotcha_fm.kind.raw_kind().as_str(), Some("gotcha"));
+        assert!(!gotcha_fm.kind.is_known());
+
+        let (known_fm, _, _) =
+            parse_frontmatter("---\nname: n\ntype: run-state\n---\nx\n").unwrap();
+        assert_eq!(known_fm.kind.kind(), MemoryKind::RunState);
+        assert!(known_fm.kind.is_known());
+
+        let (number_fm, _, _) = parse_frontmatter("---\nname: n\ntype: 7\n---\nx\n").unwrap();
+        assert_eq!(number_fm.kind.kind(), MemoryKind::Reference);
+        assert_eq!(number_fm.kind.raw_kind().as_u64(), Some(7));
+
+        assert!(parse_frontmatter("---\nname: n\ntype: [a, b]\n---\nx\n").is_err());
+    }
+
+    #[test]
+    fn resaving_a_loaded_file_keeps_its_type_line_byte_identical() {
+        let root = temp_root("type_roundtrip");
+        for scalar in ["null", "gotcha", "user"] {
+            let path = root.join(format!("{scalar}.md"));
+            fs::write(
+                &path,
+                format!("---\nname: f\ndescription: d\ntype: {scalar}\n---\n\nbody\n"),
+            )
+            .unwrap();
+
+            MemoryFile::load(&path).unwrap().save().unwrap();
+
+            let saved = fs::read_to_string(&path).unwrap();
+            let type_line = format!("\ntype: {scalar}\n");
+            assert!(saved.contains(&type_line), "{scalar}: {saved}");
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_render_keeps_the_source_key_order_and_unknown_keys() {
+        let root = temp_root("key_order");
+        let path = root.join("ordered.md");
+        fs::write(
+            &path,
+            "---\nupdated: 2020-01-01\ntags: [a, b]\nname: ordered\nowner: alice\n\
+             type: user\nmeta:\n  nested:\n    depth: 2\n  list: [1, 2]\n\
+             expires: 2999-01-01\ncreated: 2019-01-01\n---\n\nbody\n",
+        )
+        .unwrap();
+        let keys = |mapping: &serde_yaml::Mapping| {
+            mapping
+                .keys()
+                .map(|k| k.as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        let mut file = MemoryFile::load(&path).unwrap();
+        let source = file.source.clone();
+        file.frontmatter.updated = Some("2026-03-01".into());
+        file.frontmatter.description = Some("added".into());
+        file.frontmatter.expires = None;
+        file.save().unwrap();
+        let reloaded = MemoryFile::load(&path).unwrap();
+
+        assert_eq!(
+            keys(&reloaded.source),
+            [
+                "updated",
+                "tags",
+                "name",
+                "owner",
+                "type",
+                "meta",
+                "created",
+                "description"
+            ]
+        );
+        assert_eq!(reloaded.source["updated"], "2026-03-01");
+        assert_eq!(reloaded.source["description"], "added");
+        for key in ["tags", "name", "owner", "type", "meta", "created"] {
+            assert_eq!(reloaded.source[key], source[key], "{key}");
+        }
+
+        reloaded.save().unwrap();
+        let again = MemoryFile::load(&path).unwrap();
+        assert_eq!(again.source, reloaded.source);
+        assert_eq!(again.body, reloaded.body);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn optional_frontmatter_keys_are_the_fields_skipped_when_none() {
+        assert_eq!(
+            OPTIONAL_FRONTMATTER_KEYS,
+            ["created", "updated", "superseded_by", "expires"]
+        );
+
+        let keys = |frontmatter: &MemoryFrontmatter| match serde_yaml::to_value(frontmatter) {
+            Ok(serde_yaml::Value::Mapping(mapping)) => mapping
+                .keys()
+                .map(|k| k.as_str().unwrap().to_string())
+                .collect::<Vec<_>>(),
+            other => panic!("front matter did not serialize to a mapping: {other:?}"),
+        };
+        let date = Some("2024-01-01".to_string());
+        // Exhaustive on purpose: a new field fails to compile here until it is
+        // set, so a new optional cannot hide from the key difference.
+        let all_some = MemoryFrontmatter {
+            name: String::new(),
+            description: Some(String::new()),
+            kind: KindField::default(),
+            created: date.clone(),
+            updated: date.clone(),
+            superseded_by: date.clone(),
+            expires: date,
+        };
+        let required = keys(&MemoryFrontmatter::default());
+        let optional: Vec<String> = keys(&all_some)
+            .into_iter()
+            .filter(|key| !required.contains(key))
+            .collect();
+
+        assert_eq!(optional, OPTIONAL_FRONTMATTER_KEYS);
+    }
+
+    #[test]
+    fn catalogue_slug_accepts_only_catalogue_lines() {
+        assert_eq!(
+            catalogue_slug("- [[auth-flow]]: how auth works"),
+            Some("auth-flow")
+        );
+        assert_eq!(catalogue_slug("- [[a.b_c]]:"), Some("a.b_c"));
+        assert_eq!(
+            catalogue_slug("- Prefer [[auth-flow]] over passwords"),
+            None
+        );
+        assert_eq!(catalogue_slug("  - [[auth-flow]]: indented"), None);
+        assert_eq!(catalogue_slug("- [[auth-flow]] no colon"), None);
+        assert_eq!(catalogue_slug("- auth-flow"), None);
+    }
+
+    fn write_store_file(dir: &Path, name: &str, extra_frontmatter: &str) {
+        fs::write(
+            dir.join(format!("{name}.md")),
+            format!("---\nname: {name}\n{extra_frontmatter}---\n{name} body\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn list_files_live_hides_stale_files_while_all_keeps_them() {
+        let root = temp_root("retention");
+        let global = root.join("global");
+        fs::create_dir_all(&global).unwrap();
+        fs::write(global.join(MEMORY_INDEX_FILE_NAME), "idx").unwrap();
+        write_store_file(&global, "fresh", "");
+        write_store_file(&global, "future", "expires: 2999-01-01\n");
+        write_store_file(&global, "bygone", "expires: 2000-01-01\n");
+        write_store_file(&global, "replaced", "superseded_by: fresh\n");
+
+        let store = MemoryStore {
+            global_dir: global,
+            workspace: None,
+        };
+
+        let mut live: Vec<String> = store
+            .list_files(Retention::live())
+            .unwrap()
+            .into_iter()
+            .map(|f| f.frontmatter.name)
+            .collect();
+        live.sort();
+        assert_eq!(live, vec!["fresh", "future"]);
+
+        let mut all: Vec<String> = store
+            .list_files(Retention::all())
+            .unwrap()
+            .into_iter()
+            .map(|f| f.frontmatter.name)
+            .collect();
+        all.sort();
+        assert_eq!(all, vec!["bygone", "fresh", "future", "replaced"]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn build_memory_section_without_tools_skips_run_state_and_stale_files() {
+        let root = temp_root("drill_skips");
+        let workspace = root.join("ws");
+        let structured = workspace
+            .join(WORKSPACE_COYOTE_DIR_NAME)
+            .join(MEMORY_DIR_NAME);
+        fs::create_dir_all(&structured).unwrap();
+        fs::write(structured.join(MEMORY_INDEX_FILE_NAME), "idx").unwrap();
+        write_store_file(&structured, "durable", "type: user\n");
+        write_store_file(&structured, "scratch", "type: run-state\n");
+        write_store_file(&structured, "bygone", "expires: 2000-01-01\n");
+
+        let store = MemoryStore {
+            global_dir: root.join("global"),
+            workspace: discover_workspace_memory(&workspace),
+        };
+
+        let section = build_memory_section(&store, false, 4_000, 12_000)
+            .unwrap()
+            .expect("memory section should exist")
+            .text;
+        assert!(section.contains("durable body"));
+        assert!(!section.contains("scratch body"));
+        assert!(!section.contains("bygone body"));
+        assert!(!section.contains("memory file(s) omitted"));
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -945,6 +2046,295 @@ mod tests {
 
         let body = fs::read_to_string(mem_dir.join(MEMORY_INDEX_FILE_NAME)).unwrap();
         assert_eq!(body, preserved);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn create_workspace_memory_without_gitignore_leaves_gitignore_alone() {
+        let root = temp_root("create_no_gitignore");
+        let repo = root.join("repo");
+        fs::create_dir_all(repo.join(GIT_DIR_NAME)).unwrap();
+
+        let mem_dir = create_workspace_memory(&repo, false).unwrap();
+
+        assert!(mem_dir.join(MEMORY_INDEX_FILE_NAME).exists());
+        assert!(!repo.join(GITIGNORE_FILE_NAME).exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn init_workspace_root_outside_git_creates_store_under_cwd() {
+        let root = temp_root("init_no_git");
+        let cwd = root.join("proj");
+        fs::create_dir_all(&cwd).unwrap();
+        assert_eq!(find_git_root(&cwd), None);
+
+        let index = paths::workspace_memory_index_file_for(&init_workspace_root(&cwd));
+        assert_eq!(
+            index,
+            cwd.join(WORKSPACE_COYOTE_DIR_NAME)
+                .join(MEMORY_DIR_NAME)
+                .join(MEMORY_INDEX_FILE_NAME)
+        );
+        assert!(!cwd.join(WORKSPACE_COYOTE_DIR_NAME).exists());
+
+        write_workspace_memory_index(&index, "# Workspace Memory Index\n\n").unwrap();
+
+        assert!(cwd.join(WORKSPACE_COYOTE_DIR_NAME).is_dir());
+        assert!(index.exists());
+        assert!(!cwd.join(GITIGNORE_FILE_NAME).exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn init_workspace_root_prefers_git_root() {
+        let root = temp_root("init_git");
+        let repo = root.join("repo");
+        fs::create_dir_all(repo.join(GIT_DIR_NAME)).unwrap();
+        let nested = repo.join("a").join("b");
+        fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(init_workspace_root(&nested), repo);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn catalogue_names(store: &MemoryStore) -> Vec<String> {
+        store
+            .catalogue()
+            .unwrap()
+            .entries()
+            .iter()
+            .map(|e| e.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn catalogue_reads_front_matter_of_both_scopes_but_never_the_index() {
+        let (root, store) = two_index_store(
+            "catalogue_scopes",
+            "- [[listed]]: from the index",
+            "idx",
+            &[("unindexed", "w body")],
+        );
+        write_store_file(
+            &store.global_dir,
+            "listed",
+            "description: front matter wins\ntype: user\nupdated: 2024-01-02\nexpires: 2000-01-01\n",
+        );
+
+        let catalogue = store.catalogue().unwrap();
+
+        let entries = catalogue.entries();
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(entries[0].name, "listed");
+        assert_eq!(entries[0].scope, Scope::Global);
+        assert_eq!(entries[0].description.as_deref(), Some("front matter wins"));
+        assert_eq!(entries[0].kind.kind(), MemoryKind::User);
+        assert_eq!(entries[0].updated.as_deref(), Some("2024-01-02"));
+        assert!(entries[0].is_stale("2024-01-01"));
+        assert_eq!(entries[1].name, "unindexed");
+        assert_eq!(entries[1].scope, Scope::Workspace);
+        assert_eq!(entries[1].char_len, "w body\n".len());
+        assert!(!entries[1].is_stale("2024-01-01"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn catalogue_is_reused_until_a_drill_file_is_added_rewritten_or_removed() {
+        let (root, store) = two_index_store("catalogue_cache", "", "idx", &[("one", "body")]);
+        let dir = store.workspace.as_ref().unwrap().dir.clone();
+
+        let first = store.catalogue().unwrap();
+        assert!(Arc::ptr_eq(&first, &store.catalogue().unwrap()), "hit");
+
+        fs::write(dir.join(MEMORY_INDEX_FILE_NAME), "idx edited").unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &store.catalogue().unwrap()),
+            "an index edit is no catalogue change"
+        );
+
+        write_store_file(&dir, "two", "");
+        let added = store.catalogue().unwrap();
+        assert!(!Arc::ptr_eq(&first, &added), "a new file is a miss");
+        assert_eq!(catalogue_names(&store), vec!["one", "two"]);
+
+        write_store_file(&dir, "two", "description: rewritten in place\n");
+        let rewritten = store.catalogue().unwrap();
+        assert!(!Arc::ptr_eq(&added, &rewritten), "an overwrite is a miss");
+        assert_eq!(
+            rewritten.entries()[1].description.as_deref(),
+            Some("rewritten in place")
+        );
+
+        fs::remove_file(dir.join("one.md")).unwrap();
+        assert_eq!(catalogue_names(&store), vec!["two"]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn hit_names(hits: &[Hit]) -> Vec<&str> {
+        hits.iter().map(|h| h.entry.name.as_str()).collect()
+    }
+
+    #[test]
+    fn search_ranks_a_description_match_above_a_slug_only_match() {
+        let (root, store) = two_index_store("search_rank", "", "idx", &[]);
+        let dir = store.workspace.as_ref().unwrap().dir.clone();
+        write_store_file(&dir, "deploy", "description: unrelated words\n");
+        write_store_file(
+            &dir,
+            "release-notes",
+            "description: how we deploy the release train\n",
+        );
+        write_store_file(&dir, "cooking", "description: pasta recipes\n");
+
+        let hits = store
+            .search("deploy release", 10, &Filter::default())
+            .unwrap();
+
+        assert_eq!(hit_names(&hits), vec!["release-notes", "deploy"]);
+        assert!(hits[0].score > hits[1].score);
+        let top = store
+            .search("deploy release", 1, &Filter::default())
+            .unwrap();
+        assert_eq!(hit_names(&top), vec!["release-notes"]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn search_breaks_score_ties_by_most_recent_update() {
+        let (root, store) = two_index_store("search_ties", "", "idx", &[]);
+        let dir = store.workspace.as_ref().unwrap().dir.clone();
+        write_store_file(
+            &dir,
+            "alpha",
+            "description: shared topic\nupdated: 2024-01-01\n",
+        );
+        write_store_file(
+            &dir,
+            "bravo",
+            "description: shared topic\nupdated: 2024-06-01\n",
+        );
+
+        let hits = store.search("topic", 10, &Filter::default()).unwrap();
+
+        assert_eq!(hit_names(&hits), vec!["bravo", "alpha"]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn search_excludes_stale_entries_unless_asked() {
+        let (root, store) = two_index_store("search_stale", "", "idx", &[]);
+        let dir = store.workspace.as_ref().unwrap().dir.clone();
+        write_store_file(&dir, "live", "description: widget facts\n");
+        write_store_file(
+            &dir,
+            "bygone",
+            "description: widget facts\nexpires: 2000-01-01\n",
+        );
+        write_store_file(
+            &dir,
+            "replaced",
+            "description: widget facts\nsuperseded_by: live\n",
+        );
+
+        let live = store.search("widget", 10, &Filter::default()).unwrap();
+        assert_eq!(hit_names(&live), vec!["live"]);
+
+        let all = Filter {
+            include_stale: true,
+            ..Filter::default()
+        };
+        let mut names = hit_names(&store.search("widget", 10, &all).unwrap())
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, vec!["bygone", "live", "replaced"]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn search_filters_by_type_and_scope() {
+        let (root, store) = two_index_store("search_filters", "", "idx", &[]);
+        let dir = store.workspace.as_ref().unwrap().dir.clone();
+        write_store_file(
+            &store.global_dir,
+            "g-user",
+            "description: gadget\ntype: user\n",
+        );
+        write_store_file(&dir, "w-user", "description: gadget\ntype: user\n");
+        write_store_file(&dir, "w-project", "description: gadget\ntype: project\n");
+
+        let search = |filter: Filter| {
+            let mut names: Vec<String> = store
+                .search("gadget", 10, &filter)
+                .unwrap()
+                .into_iter()
+                .map(|h| h.entry.name)
+                .collect();
+            names.sort();
+            names
+        };
+
+        assert_eq!(
+            search(Filter {
+                kind: Some(MemoryKind::User),
+                ..Filter::default()
+            }),
+            vec!["g-user", "w-user"]
+        );
+        assert_eq!(
+            search(Filter {
+                scope: Some(Scope::Workspace),
+                ..Filter::default()
+            }),
+            vec!["w-project", "w-user"]
+        );
+        assert_eq!(
+            search(Filter {
+                kind: Some(MemoryKind::User),
+                scope: Some(Scope::Global),
+                include_stale: false,
+            }),
+            vec!["g-user"]
+        );
+        assert_eq!(search(Filter::default()).len(), 3);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn search_over_five_thousand_entries_is_fast_once_warm() {
+        let (root, store) = two_index_store("search_5k", "", "idx", &[]);
+        let dir = store.workspace.as_ref().unwrap().dir.clone();
+        for i in 0..5_000 {
+            write_store_file(
+                &dir,
+                &format!("note-{i:04}"),
+                &format!("description: topic{} detail{i}\n", i % 50),
+            );
+        }
+        assert_eq!(store.catalogue().unwrap().entries().len(), 5_000);
+        store.search("topic3", 10, &Filter::default()).unwrap();
+
+        let started = time::Instant::now();
+        let hits = store
+            .search("topic7 detail4207", 10, &Filter::default())
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(hits[0].entry.name, "note-4207");
+        assert_eq!(hits.len(), 10);
+        assert!(elapsed < time::Duration::from_millis(200), "{elapsed:?}");
 
         let _ = fs::remove_dir_all(&root);
     }
