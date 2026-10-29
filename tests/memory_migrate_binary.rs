@@ -190,16 +190,13 @@ fn apply_backs_up_both_stores_and_rewrites_them() {
         "{stdout}"
     );
     assert_eq!(snapshot(&fx.backups().join(&backups[1])), workspace_before);
-    for name in &backups {
-        let line = format!("  backup: {}\n", fx.backups().join(name).display());
-        assert!(stdout.contains(&line), "{line:?} missing from\n{stdout}");
-    }
-    assert!(
-        stdout.ends_with(
-            "next: review the remaining sections by hand; migrate leaves them as they are\n"
-        ),
-        "{stdout}"
+    let tail = format!(
+        "\nbackup: {}\nbackup: {}\n\
+         next: review the remaining sections by hand; migrate leaves them as they are\n",
+        fx.backups().join(&backups[0]).display(),
+        fx.backups().join(&backups[1]).display()
     );
+    assert!(stdout.ends_with(&tail), "{tail:?} does not end\n{stdout}");
 
     for (store, slug, desc, index) in [
         (

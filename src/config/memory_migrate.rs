@@ -98,9 +98,9 @@ fn plan_all(targets: &[Target], today: &str) -> Result<Vec<ScopeOutcome>> {
 /// Every scope's index is checked before the first backup, so one stale scope
 /// refuses the whole run with nothing written. A failure after that stops at
 /// the failing scope, whose report keeps the backup and the files already
-/// written; the scopes after it are dropped unapplied.
+/// written; the scopes after it are marked not applied.
 fn apply_all(
-    scopes: &mut Vec<ScopeOutcome>,
+    scopes: &mut [ScopeOutcome],
     backup_root: &Path,
     stamp: &str,
 ) -> Result<Option<ScopeFailure>> {
@@ -131,7 +131,11 @@ fn apply_all(
     let Some((i, failure)) = failed else {
         return Ok(None);
     };
-    scopes.truncate(i + 1);
+    for scope in &mut scopes[i + 1..] {
+        if let ScopeOutcome::Migrated(report) = scope {
+            report.not_applied = report.change_count() > 0;
+        }
+    }
     Ok(Some(failure))
 }
 
@@ -155,7 +159,7 @@ impl Report {
                 shown(backup)
             ),
             None => format!(
-                "{} migration failed before its backup was taken; nothing in it was written",
+                "{} migration failed before any of its files were written",
                 failure.label
             ),
         };
@@ -208,6 +212,7 @@ struct ScopeReport {
     rewrites: Vec<MemoryFile>,
     backup: Option<PathBuf>,
     written: Vec<PathBuf>,
+    not_applied: bool,
 }
 
 impl ScopeReport {
@@ -470,10 +475,27 @@ fn apply_scope(report: &mut ScopeReport, backup_root: &Path, stamp: &str) -> Res
     copy_dir_all(&report.dir, &backup, &|name| {
         name.to_string_lossy().starts_with(".catalogue.")
     })
-    .with_context(|| format!("back up {} to {}", report.dir.display(), backup.display()))?;
+    .with_context(|| {
+        if backup.exists() {
+            format!(
+                "back up {}: its backup did not complete (partial copy at {})",
+                report.dir.display(),
+                backup.display()
+            )
+        } else {
+            format!("back up {} to {}", report.dir.display(), backup.display())
+        }
+    })?;
     report.backup = Some(backup.clone());
     for file in &report.rewrites {
-        write_private_atomic(&file.path, &file.render()?).with_context(|| {
+        let rendered = file.render().with_context(|| {
+            format!(
+                "render memory file {} (backup at {})",
+                file.path.display(),
+                backup.display()
+            )
+        })?;
+        write_private_atomic(&file.path, &rendered).with_context(|| {
             format!(
                 "write memory file {} (backup at {})",
                 file.path.display(),
@@ -523,21 +545,37 @@ impl fmt::Display for Report {
                 ScopeOutcome::Migrated(report) => write_scope(f, report, self.apply)?,
             }
         }
+        if !self.apply {
+            return writeln!(
+                f,
+                "report only, nothing written; rerun with --apply to migrate"
+            );
+        }
         if let Some(failure) = &self.failure {
             writeln!(
                 f,
-                "stopped: the {} migration failed; the error follows",
-                failure.label
-            )
-        } else if self.apply {
+                "stopped: {}: {}",
+                failure.label,
+                sanitize_display_text(&format!("{:#}", failure.error))
+            )?;
+        }
+        for scope in &self.scopes {
+            if let ScopeOutcome::Migrated(report) = scope
+                && let Some(backup) = &report.backup
+            {
+                writeln!(f, "backup: {}", shown(backup))?;
+            }
+        }
+        if self.failure.is_some() {
             writeln!(
                 f,
-                "next: review the remaining sections by hand; migrate leaves them as they are"
+                "next: fix the error and rerun --memory-migrate; each backup above holds its \
+                 store as it was before this run"
             )
         } else {
             writeln!(
                 f,
-                "report only, nothing written; rerun with --apply to migrate"
+                "next: review the remaining sections by hand; migrate leaves them as they are"
             )
         }
     }
@@ -650,6 +688,9 @@ fn write_scope(f: &mut fmt::Formatter<'_>, report: &ScopeReport, apply: bool) ->
         SECTION_LIST_CAP,
     )?;
     if apply {
+        if report.not_applied {
+            return writeln!(f, "  not applied: an earlier scope failed");
+        }
         write_section(
             f,
             "written",
@@ -660,10 +701,10 @@ fn write_scope(f: &mut fmt::Formatter<'_>, report: &ScopeReport, apply: bool) ->
                 .collect(),
             SECTION_LIST_CAP,
         )?;
-        match &report.backup {
-            Some(backup) => writeln!(f, "  backup: {}", shown(backup)),
-            None => writeln!(f, "  backup: none, nothing to write"),
+        if report.change_count() == 0 {
+            writeln!(f, "  backup: none, nothing to write")?;
         }
+        Ok(())
     } else {
         let mut pending: Vec<String> = report
             .rewrites
@@ -965,19 +1006,40 @@ mod tests {
             )),
             "{text}"
         );
-        assert!(text.contains("  backup: "), "{text}");
-        assert!(
-            text.ends_with(
-                "next: review the remaining sections by hand; migrate leaves them as they are\n"
-            ),
-            "{text}"
-        );
         assert!(
             text.contains(
                 "  type set to run-state: 2\n    plan-r1\n    plan-r3\n    these are now run-state"
             ),
             "{text}"
         );
+    }
+
+    #[test]
+    fn an_applied_report_ends_with_every_backup_then_next() {
+        let fx = Fixture::new("apply_tail");
+
+        let text = fx.migrate(true).to_string();
+
+        let lines: Vec<&str> = text.lines().collect();
+        let tail = [
+            format!(
+                "backup: {}",
+                fx.backups.join("global-20260301T123045").display()
+            ),
+            format!(
+                "backup: {}",
+                fx.backups.join("workspace-20260301T123045").display()
+            ),
+            "next: review the remaining sections by hand; migrate leaves them as they are"
+                .to_string(),
+        ];
+        assert_eq!(lines[lines.len() - tail.len()..], tail, "{text}");
+        assert_eq!(
+            lines.iter().filter(|l| l.starts_with("backup: ")).count(),
+            2,
+            "{text}"
+        );
+        assert!(!text.contains("  backup: "), "{text}");
     }
 
     #[test]
@@ -1252,17 +1314,34 @@ mod tests {
                 "    wrote {}\n",
                 fx.global.join(MEMORY_INDEX_FILE_NAME).display()
             ),
-            format!("  backup: {}\n", global_backup.display()),
             format!("    wrote {}\n", fx.workspace.join("blank.md").display()),
-            format!("  backup: {}\n", workspace_backup.display()),
         ] {
             assert!(
                 text.contains(&expected),
                 "{expected:?} missing from\n{text}"
             );
         }
+        let lines: Vec<&str> = text.lines().collect();
+        let [stopped, tail @ ..] = &lines[lines.len() - 4..] else {
+            unreachable!()
+        };
         assert!(
-            text.ends_with("stopped: the workspace migration failed; the error follows\n"),
+            stopped.starts_with(&format!(
+                "stopped: workspace: write memory file {} (backup at {}): ",
+                blocked.display(),
+                workspace_backup.display()
+            )),
+            "{text}"
+        );
+        assert_eq!(
+            tail,
+            [
+                format!("backup: {}", global_backup.display()),
+                format!("backup: {}", workspace_backup.display()),
+                "next: fix the error and rerun --memory-migrate; each backup above holds its \
+                 store as it was before this run"
+                    .to_string(),
+            ],
             "{text}"
         );
         let err = format!("{:#}", report.into_result().unwrap_err());
@@ -1274,6 +1353,35 @@ mod tests {
                 blocked.display(),
                 workspace_backup.display()
             )),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_global_failure_leaves_the_workspace_unapplied_and_says_so() {
+        let fx = Fixture::new("global_fails");
+        let workspace_before = snapshot(&fx.workspace);
+        fs::create_dir_all(fx.backups.parent().unwrap()).unwrap();
+        fs::write(&fx.backups, "not a dir").unwrap();
+
+        let report = migrate(&fx.targets(MigrateScope::All), &fx.backups, true, now()).unwrap();
+
+        assert_eq!(snapshot(&fx.workspace), workspace_before);
+        assert!(scope(&report, "workspace").not_applied);
+        let text = report.to_string();
+        let workspace_section = text
+            .split_once(&format!("workspace: {}\n", fx.workspace.display()))
+            .map(|(_, rest)| rest)
+            .expect("the workspace section is reported");
+        assert!(
+            workspace_section.contains("  not applied: an earlier scope failed\n"),
+            "{text}"
+        );
+        assert!(!text.lines().any(|l| l.starts_with("backup: ")), "{text}");
+        assert!(text.contains("\nstopped: global: back up "), "{text}");
+        let err = format!("{:#}", report.into_result().unwrap_err());
+        assert!(
+            err.starts_with("global migration failed before any of its files were written: "),
             "{err}"
         );
     }
