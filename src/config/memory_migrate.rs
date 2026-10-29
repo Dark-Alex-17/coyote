@@ -1028,6 +1028,51 @@ mod tests {
     }
 
     #[test]
+    fn apply_writes_private_files_and_leaves_no_temp_files() {
+        let fx = Fixture::new("atomic");
+
+        let report = fx.migrate(true);
+
+        for dir in [&fx.global, &fx.workspace] {
+            let temps: Vec<PathBuf> = snapshot(dir)
+                .into_keys()
+                .filter(|p| p.extension().is_some_and(|e| e == "tmp"))
+                .collect();
+            assert!(temps.is_empty(), "{temps:?}");
+        }
+        let written: Vec<&PathBuf> = ["global", "workspace"]
+            .iter()
+            .flat_map(|label| &scope(&report, label).written)
+            .collect();
+        assert_eq!(written.len(), 6, "{written:?}");
+        #[cfg(unix)]
+        for path in written {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{}", path.display());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_planted_at_a_rewritten_path_is_replaced_not_followed() {
+        let fx = Fixture::new("symlink_swap");
+        let mut plan = plan_scope("workspace", &fx.workspace, "2026-03-01").unwrap();
+        let drill = fx.workspace.join("blank.md");
+        assert!(plan.rewrites.iter().any(|f| f.path == drill));
+        let outside = fx._root.0.join("outside.md");
+        fs::write(&outside, "outside bytes\n").unwrap();
+        fs::remove_file(&drill).unwrap();
+        std::os::unix::fs::symlink(&outside, &drill).unwrap();
+
+        apply_scope(&mut plan, &fx.backups, "20260301T123045").unwrap();
+
+        assert!(fs::symlink_metadata(&drill).unwrap().file_type().is_file());
+        assert!(fs::read_to_string(&drill).unwrap().contains("\ntags:"));
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "outside bytes\n");
+    }
+
+    #[test]
     fn round_chains_point_at_the_highest_round_and_untyped_members_become_run_state() {
         let fx = Fixture::new("chains");
 
