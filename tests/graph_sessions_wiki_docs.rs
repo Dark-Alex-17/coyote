@@ -2528,6 +2528,91 @@ fn usage_probe_sessions_sweep_bullets_match_the_sweep_arms() {
     }
 }
 
+/// The REPL's Ctrl-C wording and the wiki agree on the session split: in a
+/// session the press that interrupts a turn leaves its background work
+/// running for a second press at the idle prompt, and without one that
+/// first press cancels it. The repo half pins the welcome hint, the `.help`
+/// footer and both sessionless notices; the wiki half pins the Sessions.md
+/// section, the REPL.md bullet and the Agents.md sentence.
+#[test]
+fn ctrl_c_wording_names_the_session_split() {
+    let repl = src(&["repl", "mod.rs"]);
+    let welcome = const_str(&repl, "WELCOME_INTERRUPT_HINT");
+    assert!(
+        welcome
+            .lines()
+            .nth(1)
+            .is_some_and(|line| line.starts_with("In a session, press it again at the idle prompt")),
+        "{welcome:?}"
+    );
+    // The `.help` text is one raw string, which `string_literals` does not
+    // parse, so its footer is matched in the source.
+    assert!(
+        repl.contains(
+            "interrupt the turn; in a session, press it again at the idle prompt to cancel background work it left running (without a session, the first press cancels it)."
+        ),
+        "the .help footer lost its session qualifier"
+    );
+    let literals = string_literals(&fn_body(&repl, "fn sessionless_cancel_notice("));
+    for notice in [
+        "Turn interrupted; cancelled {unfinished} background task(s).",
+        "Turn interrupted; cancelled the background work.",
+    ] {
+        assert!(
+            literals.iter().any(|literal| literal == notice),
+            "the REPL no longer prints {notice:?}"
+        );
+    }
+
+    let Some(wiki) = wiki_dir() else { return };
+    let sessions = read(wiki.join("Sessions.md"));
+    let section = flat(&section(
+        "Sessions.md",
+        &sessions,
+        "## Interrupting a turn with background work",
+    ));
+    for needle in [
+        "In a session, Ctrl+C works in two stages",
+        "the second press, at the idle prompt, cancels whatever the turn left running",
+        "**Without a session, the first press cancels.**",
+        "the press that interrupts the turn, during a tool round or while the model is still answering, also cancels every background agent",
+        "waits up to 5 s for the agents to finish; jobs are signalled, not waited on",
+        "`Turn interrupted; cancelled N background task(s).`, with N the number of tasks still running at the press",
+        "`Turn interrupted; cancelled the background work.` when only a sub-agent's own children were alive",
+    ] {
+        assert!(
+            section.contains(needle),
+            "the Sessions.md Ctrl+C section does not say {needle:?}"
+        );
+    }
+    let repl_page = read(wiki.join("REPL.md"));
+    let bullet = flat(&paragraph("REPL.md", &repl_page, "* **Two-stage Ctrl-C:**"));
+    for needle in [
+        "In a session, pressing it again at the idle prompt cancels any background work",
+        "without a session, the first press cancels that work as well",
+    ] {
+        assert!(
+            bullet.contains(needle),
+            "the REPL.md Ctrl-C bullet does not say {needle:?}"
+        );
+    }
+    let agents = read(wiki.join("Agents.md"));
+    let sentence = flat(&paragraph(
+        "Agents.md",
+        &agents,
+        "Ctrl-C in the REPL is two-stage",
+    ));
+    for needle in [
+        "Ctrl-C in the REPL is two-stage around spawned children in a session:",
+        "Without a session, the first press cancels them too",
+    ] {
+        assert!(
+            sentence.contains(needle),
+            "the Agents.md Ctrl-C sentence does not say {needle:?}"
+        );
+    }
+}
+
 /// `paragraph` hands back the lead line and its continuation lines only: a
 /// blank line ends it, and so does a list item set directly under it (both
 /// `-` and `*` bullets, at any indent), so a lead that is itself a bullet
