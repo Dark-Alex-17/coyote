@@ -2968,3 +2968,74 @@ fn usage_probe_child_sessions_shows_in_info_and_is_refused_by_set_from_a_cold_st
         "the macro stops at the refused step:\n{text}"
     );
 }
+
+/// The refusal does not depend on the value: `.set child_sessions` with the
+/// value the config file already holds, with `null` (the `.set` spelling for
+/// "unset"), and with `true` all end in the same `Unknown key` line and a
+/// failed run, and none of them touches the config file. The `.info` row
+/// tracks the file alone: `true` when the file says so, `null` when the key
+/// is absent.
+#[test]
+fn usage_probe_set_refuses_child_sessions_for_every_value_shape_and_info_tracks_the_file() {
+    let dir = fresh_config_dir("child-sessions-shapes");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, "");
+    let config = dir.join("config.yaml");
+    let base = fs::read_to_string(&config).unwrap();
+    assert!(
+        !base.contains("child_sessions"),
+        "the fixture config leaves the knob unset:\n{base}"
+    );
+
+    // Key absent: the row reports null.
+    write_macro(&dir, "info", &[".info"]);
+    let absent = run_coyote(&dir, &["--macro", "info"]);
+    let row = |output: &Output| -> String {
+        let text = combined(output);
+        assert!(
+            output.status.success() && !text.contains("panicked"),
+            "`.info` run: exit {:?}\n{text}",
+            output.status
+        );
+        stdout_of(output)
+            .lines()
+            .find(|line| line.starts_with("child_sessions"))
+            .unwrap_or_else(|| panic!("`.info` lists a child_sessions row:\n{text}"))
+            .trim_end()
+            .to_string()
+    };
+    assert!(row(&absent).ends_with("null"), "{}", row(&absent));
+
+    // Key true in the file: the row reports true.
+    fs::write(&config, format!("{base}child_sessions: true\n")).unwrap();
+    assert!(
+        row(&run_coyote(&dir, &["--macro", "info"])).ends_with("true"),
+        "the row follows the file's value"
+    );
+
+    // Every value shape is refused the same way and leaves the file alone.
+    let with_true = fs::read_to_string(&config).unwrap();
+    for (label, value) in [
+        ("the value the file already holds", "true"),
+        ("the opposite value", "false"),
+        ("the unset spelling", "null"),
+    ] {
+        write_macro(&dir, "shape", &[&format!(".set child_sessions {value}")]);
+        let output = run_coyote(&dir, &["--macro", "shape"]);
+        let text = combined(&output);
+        assert!(
+            !output.status.success() && !text.contains("panicked"),
+            "{label}: a refused `.set` fails the run without a panic: exit {:?}\n{text}",
+            output.status
+        );
+        assert!(
+            text.contains("Unknown key 'child_sessions'"),
+            "{label}: the refusal names the key:\n{text}"
+        );
+        assert_eq!(
+            fs::read_to_string(&config).unwrap(),
+            with_true,
+            "{label}: a refused `.set` never rewrites the config file"
+        );
+    }
+}
