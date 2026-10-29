@@ -163,11 +163,15 @@ fn plan_scope(label: &'static str, dir: &Path, today: &str) -> Result<ScopeRepor
                 kept.push(raw);
                 continue;
             };
+            let entry = (slug.to_string(), line_desc.to_string());
+            if !dir.join(format!("{slug}.md")).exists() {
+                report.dangling.push(entry);
+                kept.push(raw);
+                continue;
+            }
             report.catalogue_lines_dropped += 1;
             let Some(file) = files.get_mut(slug) else {
-                report
-                    .dangling
-                    .push((slug.to_string(), line_desc.to_string()));
+                report.dangling.push(entry);
                 continue;
             };
             catalogued.insert(slug.to_string());
@@ -571,6 +575,7 @@ fn write_section(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::memory::catalogue_slug;
     use crate::config::{MEMORY_DIR_NAME, WORKSPACE_COYOTE_DIR_NAME};
     use chrono::NaiveDate;
 
@@ -862,7 +867,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_keeps_the_facts_byte_identical_and_drops_the_empty_drill_heading() {
+    fn apply_keeps_the_facts_and_lines_without_a_drill_file_byte_identical() {
         let fx = Fixture::new("facts");
 
         let report = fx.migrate(true);
@@ -871,23 +876,26 @@ mod tests {
             fs::read_to_string(fx.workspace.join(MEMORY_INDEX_FILE_NAME)).unwrap();
         assert_eq!(
             workspace_index,
-            format!("# Workspace Memory Index\n\n{WORKSPACE_FACTS}")
+            format!(
+                "# Workspace Memory Index\n\n{WORKSPACE_FACTS}\n## Drill files\n\
+                 - [[deleted]]: file removed\n"
+            )
         );
         let global_index = fs::read_to_string(fx.global.join(MEMORY_INDEX_FILE_NAME)).unwrap();
         assert_eq!(
             global_index,
             "PLACEHOLDER_CHECK\nartefact line left by an old tool\n"
         );
-        for index in [&workspace_index, &global_index] {
-            assert!(
-                index.lines().all(|l| catalogue_entry(l).is_none()),
-                "{index}"
-            );
-        }
+        let catalogued: Vec<&str> = workspace_index
+            .lines()
+            .chain(global_index.lines())
+            .filter_map(catalogue_slug)
+            .collect();
+        assert_eq!(catalogued, vec!["deleted"]);
 
         let workspace = scope(&report, "workspace");
-        assert!(workspace.drill_heading_dropped);
-        assert_eq!(workspace.catalogue_lines_dropped, 9);
+        assert!(!workspace.drill_heading_dropped);
+        assert_eq!(workspace.catalogue_lines_dropped, 8);
         assert_eq!(
             workspace.dangling,
             vec![
@@ -904,7 +912,7 @@ mod tests {
             "{report_text}",
             report_text = report
         );
-        assert_eq!(workspace.facts_lines.len(), 6);
+        assert_eq!(workspace.facts_lines.len(), 8);
         let global = scope(&report, "global");
         assert_eq!(
             global.facts_lines,
