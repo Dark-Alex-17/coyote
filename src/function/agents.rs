@@ -1705,17 +1705,15 @@ async fn resume_child_session(
         // A stamp with no start time under a pid that still exists cannot
         // be told apart from the live child, so it is refused like one
         // rather than resumed over a child that may still be writing the
-        // session. A pid sysinfo no longer lists is dead like any other
-        // dead stamp and the child resumes.
-        if meta.status == ChildStatus::Running {
-            if meta.pid_start == 0 && ProcessStamp::pid_exists(meta.pid) {
+        // session, with a message that says why. A pid sysinfo no longer
+        // lists is dead like any other dead stamp and the child resumes.
+        if meta.status == ChildStatus::Running && meta.stamp().is_alive_or_start_unknown() {
+            if meta.pid_start == 0 {
                 bail!(
                     "'{id}' may still be running (its process start time is unknown); collect or cancel it first"
                 );
             }
-            if meta.stamp().is_alive() {
-                bail!("'{id}' is still running; collect or cancel it first");
-            }
+            bail!("'{id}' is still running; collect or cancel it first");
         }
         let saved_bytes = std::fs::read_to_string(&sidecar)
             .with_context(|| format!("Failed to read {}", sidecar.display()))?;
@@ -7194,6 +7192,19 @@ mod tests {
         assert!(!body.contains("meta.agent_id = "));
     }
 
+    /// The resume refusal asks the same liveness question the orphan sweep
+    /// asks, so a root the sweep keeps is never resumed over.
+    #[test]
+    fn resume_child_session_refuses_through_the_shared_liveness_check() {
+        let source = include_str!("agents.rs").replace("\r\n", "\n");
+        let start = source.find("\nasync fn resume_child_session(").unwrap();
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert_eq!(body.matches(".is_alive_or_start_unknown(").count(), 1);
+        assert!(!body.contains(".is_alive("));
+        assert!(!body.contains("pid_exists("));
+    }
+
     fn paths_under(dir: &Path) -> std::collections::BTreeSet<PathBuf> {
         let mut found = std::collections::BTreeSet::new();
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -9338,6 +9349,38 @@ mod tests {
             error.contains(&format!("recent ids: {sid} (crashed)")),
             "{error}"
         );
+
+        let spawn = build_ready_spawn(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+
+        assert_eq!(spawn.session_id.as_deref(), Some(sid.as_str()));
+        let meta = child_meta_of(&ctx, &sid);
+        assert_eq!(meta.status, ChildStatus::Running);
+        assert_eq!(meta.agent_id, spawn.agent_id);
+        assert_eq!(meta.pid, live.pid);
+        assert_eq!(meta.pid_start, live.start);
+    }
+
+    /// A running sidecar whose record reads pid 0 resumes on every host,
+    /// including those whose process table lists pid 0 with a start time of
+    /// 0: no child of ours ever ran as pid 0.
+    #[test]
+    #[serial]
+    fn a_running_child_stamped_with_pid_zero_resumes() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_pid_zero");
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let (sid, _) = seed_completed_config_child(&mut ctx, &agent_name, json!({}));
+        let live = ProcessStamp::current();
+        let root = spawner_root(&ctx);
+        let mut meta = root.load_child_meta(&sid).unwrap().unwrap();
+        meta.status = ChildStatus::Running;
+        meta.pid = 0;
+        meta.pid_start = 0;
+        root.save_child_meta(&meta).unwrap();
 
         let spawn = build_ready_spawn(
             &mut ctx,

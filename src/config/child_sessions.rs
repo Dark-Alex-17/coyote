@@ -135,8 +135,9 @@ impl ChildSessionRoot {
             .with_context(|| format!("Failed to create {}", children.display()))
     }
 
-    /// Every readable sidecar under `children/`, newest first. One corrupt
-    /// sidecar is skipped with a warning so it cannot hide the others.
+    /// Every readable sidecar under `children/`, newest first, ties by
+    /// session id. One corrupt sidecar is skipped with a warning so it
+    /// cannot hide the others.
     pub(crate) fn list_children(&self) -> Result<Vec<ChildMeta>> {
         let dir = self.children_dir();
         let entries = match std::fs::read_dir(&dir) {
@@ -166,7 +167,11 @@ impl ChildSessionRoot {
                 ),
             }
         }
-        children.sort_by_key(|meta| std::cmp::Reverse(meta.created_at));
+        children.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| a.session_id.cmp(&b.session_id))
+        });
         Ok(children)
     }
 
@@ -645,7 +650,11 @@ pub(crate) fn sweep_orphans_with_before_remove(hook: &dyn Fn(&Path)) {
 
 /// What one pass of the orphan sweep decided for a directory before any
 /// process was looked up. Liveness is settled for every candidate at once
-/// so a pass costs one process-table refresh, not one per directory.
+/// so a pass costs one process-table refresh, not one per directory; only
+/// a stamp with no start time is looked up again on its own, since its pid
+/// still in use may be the process that wrote it.
+/// A pid-0 stamp is dead whatever the process table says: no process of
+/// ours runs as pid 0, though some hosts list it with a start time of 0.
 enum SweepAction {
     Keep,
     Remove(&'static str),
@@ -657,7 +666,10 @@ impl SweepAction {
         match self {
             Self::Keep => None,
             Self::Remove(reason) => Some(reason),
-            Self::RemoveIfDead(stamp, reason) => (!alive.contains(&stamp)).then_some(reason),
+            Self::RemoveIfDead(stamp, reason) => (stamp.pid == 0
+                || !(alive.contains(&stamp)
+                    || (stamp.start == 0 && ProcessStamp::pid_exists(stamp.pid))))
+            .then_some(reason),
         }
     }
 }
@@ -880,9 +892,10 @@ fn parse_process_root_name(name: &str) -> Option<ProcessStamp> {
     })
 }
 
-/// Removes `dir` unless its `root.yaml` now names a live process: between
-/// the sweep's decision and the delete a second REPL may have adopted the
-/// uid and written itself in. An identity that cannot be read is not
+/// Removes `dir` unless its `root.yaml` now names a live process, or a
+/// stamp with no start time under a pid still in use: between the sweep's
+/// decision and the delete a second REPL may have adopted the uid and
+/// written itself in. An identity that cannot be read is not
 /// evidence either way, so the directory stays. The re-read happens under
 /// the root lock, so an adopter mid-write is seen whole or not at all; the
 /// lock is released before the delete because its file is inside `dir`.
@@ -896,7 +909,7 @@ fn remove_unless_adopted(dir: &Path, reason: &str, before_remove: &dyn Fn(&Path)
         }
     };
     let adopted = match read_root_identity(dir) {
-        Ok(root) => root.is_some_and(|root| last_process(&root).is_alive()),
+        Ok(root) => root.is_some_and(|root| last_process(&root).is_alive_or_start_unknown()),
         Err(error) => {
             warn!(
                 "Keeping {} ({reason}): cannot read its root.yaml: {error}",
@@ -1992,6 +2005,26 @@ updated_at: 2026-01-02T03:04:05Z
 
     #[test]
     #[serial]
+    fn list_children_breaks_created_at_ties_by_session_id() {
+        let _guard = TestConfigDirGuard::new("child-sessions-list-ties");
+        let root = ChildSessionRoot::Uid(Uuid::new_v4());
+        root.ensure_dir(&fixture_root()).unwrap();
+        let tied_c = fixture_meta_at("sess_c_0123456789ab", 0);
+        let tied_a = fixture_meta_at("sess_a_0123456789ab", 0);
+        let tied_b = fixture_meta_at("sess_b_0123456789ab", 0);
+        let newer = fixture_meta_at("sess_d_0123456789ab", 10);
+        for meta in [&tied_c, &tied_a, &newer, &tied_b] {
+            root.save_child_meta(meta).unwrap();
+        }
+
+        assert_eq!(
+            root.list_children().unwrap(),
+            vec![newer, tied_a, tied_b, tied_c]
+        );
+    }
+
+    #[test]
+    #[serial]
     fn recent_children_returns_newest_and_counts_the_rest() {
         let _cache = CacheDirGuard::new("child-sessions-recent");
         let root = ChildSessionRoot::Uid(Uuid::new_v4());
@@ -2875,6 +2908,33 @@ updated_at: 2026-01-02T03:04:05Z
         );
     }
 
+    /// A root.yaml cut short or edited by hand parses with a zero pid, and
+    /// sysinfo lists pid 0 on some hosts; such a root is still swept.
+    #[test]
+    #[serial]
+    fn sweep_removes_a_parentless_root_whose_record_has_no_pid() {
+        install_log_collector();
+        let _guard = TestConfigDirGuard::new("child-sessions-sweep-pid-zero");
+        let mut roots = Vec::new();
+        for text in ["version: 1\n", "{}"] {
+            let (dir, uid) = bare_uid_dir();
+            fs::write(dir.join("root.yaml"), text).unwrap();
+            age_past_grace(&dir);
+            roots.push((dir, uid));
+        }
+
+        sweep_orphans();
+
+        for (dir, uid) in &roots {
+            assert!(!dir.exists(), "{uid}");
+            assert!(
+                removal_logged(uid, "orphan sweep arm 2"),
+                "{:?}",
+                info_snapshot()
+            );
+        }
+    }
+
     #[test]
     #[serial]
     fn sweep_removes_a_uid_root_without_a_usable_identity_only_after_an_hour() {
@@ -2998,6 +3058,118 @@ updated_at: 2026-01-02T03:04:05Z
 
         sweep_orphans_with_before_remove(&adopt);
         assert!(dir.is_dir());
+
+        write_root(&dir, &sweep_record(Vec::new(), dead_stamp()));
+        sweep_orphans();
+        assert!(!dir.exists());
+    }
+
+    /// The current pid stamped with no start time, or `None` when sysinfo
+    /// cannot report this process's start either, since that stamp would
+    /// then be the exact live self and discriminate nothing.
+    fn start_unknown_live_stamp() -> Option<ProcessStamp> {
+        let current = ProcessStamp::current();
+        if current.start == 0 {
+            eprintln!(
+                "sysinfo cannot report this process's start time; the start discriminator goes untested"
+            );
+            return None;
+        }
+        Some(ProcessStamp {
+            pid: current.pid,
+            start: 0,
+        })
+    }
+
+    #[test]
+    #[serial]
+    fn sweep_keeps_a_parentless_uid_root_stamped_with_no_start_while_its_pid_exists() {
+        install_log_collector();
+        let _guard = TestConfigDirGuard::new("child-sessions-sweep-parentless-start-zero");
+        let Some(start_unknown) = start_unknown_live_stamp() else {
+            return;
+        };
+        assert!(ProcessStamp::alive_set(&[start_unknown]).is_empty());
+        let (dir, uid) = uid_dir_with(&sweep_record(Vec::new(), start_unknown));
+
+        sweep_orphans();
+        assert!(dir.is_dir());
+        assert!(
+            !removal_logged(&uid, "orphan sweep arm 2"),
+            "{:?}",
+            info_snapshot()
+        );
+
+        write_root(&dir, &sweep_record(Vec::new(), dead_stamp()));
+        sweep_orphans();
+        assert!(!dir.exists());
+        assert!(
+            removal_logged(&uid, "orphan sweep arm 2"),
+            "{:?}",
+            info_snapshot()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn sweep_keeps_a_process_root_stamped_with_no_start_while_its_pid_exists() {
+        install_log_collector();
+        let _guard = TestConfigDirGuard::new("child-sessions-sweep-proc-start-zero");
+        let Some(start_unknown) = start_unknown_live_stamp() else {
+            return;
+        };
+        let live_dir = ChildSessionRoot::from_stamp(start_unknown).dir();
+        let dead = dead_stamp();
+        let dead_dir = ChildSessionRoot::from_stamp(dead).dir();
+        for dir in [&live_dir, &dead_dir] {
+            fs::create_dir_all(dir).unwrap();
+        }
+
+        sweep_orphans();
+
+        assert!(live_dir.is_dir());
+        assert!(!dead_dir.exists());
+        assert!(
+            !removal_logged(
+                &format!("{}-{}", start_unknown.pid, start_unknown.start),
+                "orphan sweep arm 3"
+            ),
+            "{:?}",
+            info_snapshot()
+        );
+        assert!(
+            removal_logged(
+                &format!("{}-{}", dead.pid, dead.start),
+                "orphan sweep arm 3"
+            ),
+            "{:?}",
+            info_snapshot()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn sweep_keeps_a_uid_root_adopted_under_a_pid_with_no_start_before_the_delete() {
+        install_log_collector();
+        let _guard = TestConfigDirGuard::new("child-sessions-sweep-adopted-start-zero");
+        let Some(start_unknown) = start_unknown_live_stamp() else {
+            return;
+        };
+        let (dir, uid) = uid_dir_with(&sweep_record(Vec::new(), dead_stamp()));
+        let adopt = |about_to_go: &Path| {
+            write_root(about_to_go, &sweep_record(Vec::new(), start_unknown));
+        };
+
+        sweep_orphans_with_before_remove(&adopt);
+        assert!(dir.is_dir());
+        assert!(
+            debug_snapshot()
+                .iter()
+                .any(|message| message.contains(&uid)
+                    && message.contains("a live process adopted it")),
+            "{:?}",
+            debug_snapshot()
+        );
 
         write_root(&dir, &sweep_record(Vec::new(), dead_stamp()));
         sweep_orphans();
@@ -3218,9 +3390,9 @@ updated_at: 2026-01-02T03:04:05Z
         );
     }
 
-    /// The classifying pass never asks after a single process; only the
-    /// re-read guarding the delete still does, since it checks one record
-    /// under one lock.
+    /// The classifying pass never asks after a single process except to
+    /// look up the pid of a stamp with no start time; the re-read guarding
+    /// the delete still does, since it checks one record under one lock.
     #[test]
     fn only_the_adoption_recheck_asks_after_a_single_process() {
         let source = include_str!("child_sessions.rs").replace("\r\n", "\n");
@@ -3235,9 +3407,21 @@ updated_at: 2026-01-02T03:04:05Z
             "\nfn orphan_reason(",
             "\nfn sweep_dead_process_roots(",
         ] {
-            assert!(!fn_body(head).contains(".is_alive("), "{head}");
+            let body = fn_body(head);
+            assert!(!body.contains(".is_alive("), "{head}");
+            assert!(!body.contains(".is_alive_or_start_unknown("), "{head}");
+            assert!(!body.contains("pid_exists("), "{head}");
         }
-        assert!(fn_body("\nfn remove_unless_adopted(").contains(".is_alive("));
+        assert!(fn_body("\nfn remove_unless_adopted(").contains(".is_alive_or_start_unknown("));
+        let reason = {
+            let start = production.find("\n    fn reason(").unwrap();
+            let body = &production[start..];
+            &body[..body.find("\n    }\n").unwrap()]
+        };
+        assert!(reason.contains("pid_exists("));
+        assert!(reason.contains("stamp.pid == 0"));
+        assert!(!reason.contains(".is_alive("));
+        assert!(!reason.contains(".is_alive_or_start_unknown("));
         assert_eq!(
             fn_body("\nfn sweep_orphans_with(")
                 .matches("alive_set(")
@@ -3245,6 +3429,46 @@ updated_at: 2026-01-02T03:04:05Z
             1
         );
         assert_eq!(production.matches("alive_set(").count(), 1);
+    }
+
+    fn rust_sources_under(dir: &Path, found: &mut Vec<(PathBuf, String)>) {
+        for entry in fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                rust_sources_under(&path, found);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let text = fs::read_to_string(&path).unwrap().replace("\r\n", "\n");
+                found.push((path, text));
+            }
+        }
+    }
+
+    /// Every caller that must not act on a possibly live process asks
+    /// `is_alive_or_start_unknown`; the sweep's batched check is the one
+    /// place that spells the start-0 fallback out, so it can reuse the
+    /// alive set for the exact half.
+    #[test]
+    fn the_start_unknown_fallback_is_spelled_out_only_in_the_sweep() {
+        let retired = concat!("pid_start == 0 && ", "ProcessStamp::pid_exists(meta.pid)");
+        let prescribed = concat!(
+            "stamp.start == 0 && ",
+            "ProcessStamp::pid_exists(stamp.pid)"
+        );
+        let mut sources = Vec::new();
+        rust_sources_under(
+            Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")),
+            &mut sources,
+        );
+
+        for (path, text) in &sources {
+            assert!(!text.contains(retired), "{}", path.display());
+        }
+        let sites: Vec<_> = sources
+            .iter()
+            .flat_map(|(path, text)| text.matches(prescribed).map(move |_| path))
+            .collect();
+        assert_eq!(sites.len(), 1, "{sites:?}");
+        assert!(sites[0].ends_with("child_sessions.rs"), "{sites:?}");
     }
 
     /// A regular file at a root's path is not a root: settling it neither
