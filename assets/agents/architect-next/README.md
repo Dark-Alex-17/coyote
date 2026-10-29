@@ -38,7 +38,7 @@ below. Later landings add their own rows.
 | Adjustment | Where | What changed |
 |---|---|---|
 | em dashes | `graph.yaml` (3 lines: the `project_dir`, `pr_strategy` and `task_granularity` variable descriptions) | replaced with ASCII ` - ` so the repo's punctuation lint stays clean |
-| `build_lock` variable | `graph.yaml` `variables:` | declared after `pr_strategy` with default `''`, mirroring the prose `architect/config.yaml`; `scripts/check_session_block.sh` asserts the two variable lists match name-for-name, default-for-default (threading it to child spawns is a separate adjustment) |
+| `build_lock` variable | `graph.yaml` `variables:` | declared after `pr_strategy` with default `''`, mirroring the prose `architect/config.yaml`; `scripts/check_session_block.sh` asserts the two variable lists match name-for-name, default-for-default. Recorded as a gap: the graph does not yet thread the variable to its graph-agent children, so `run_gauntlet` and `wave_gauntlet` (`review-gauntlet`) and `run_adversary` (`adversary`) carry no `inputs: build_lock`. The config-agent children `delegate` and `wave_delegate` (`sisyphus`) already receive it by variable inheritance (the child context carries the parent's agent variables), so they need no `inputs:` and no delegation-text carry. The next adjustment to this agent threads it to the three graph nodes and removes this gap |
 | run dir | `scripts/_lib.py` `cache_dir()` / `runs_root()`, this README | moved from `$XDG_STATE_HOME/coyote/architect/runs` to `<cache dir>/architect-next/runs` (precedence above); `scripts/smoke_test.py` pins each resolution tier |
 | `utils.sh` source | `scripts/smoke_test.py`, `scripts/mode_matrix.py` | both batteries copy the repo asset `.shared/utils.sh` into the scratch `LLM_ROOT_DIR` instead of the user-config copy, which never existed under the re-pointed `HOME`, so the stub branch always ran; the real `set -euo pipefail` is now live inside `architect/tools.sh` under both batteries, with no unset-variable fallout, and a smoke check pins that the copy is the real file |
 | marker map | `scripts/marker_map.json` | regenerated against the landed `architect/instructions.md`, which carries 62 marker regions (staging mapped 60): the two regions added since staging are the micro-mode `review_cadence: batch` line on the parallel wave spawn (mapped to the `## MODE` block `_delegation_text` builds for `compose_delegation` and `wave_claim`) and the multi-PR `--tasks <group members>` line for `assemble_pr_body` (mapped to `pr_body` and recorded as a gap: the graph still calls the tool without `--tasks`, so a group body covers every complete task of the plan). The 60 known regions keep their mechanism and home; four recorded first-lines changed because upstream reworded or ASCII-normalised those lines; `first` keeps `\u2014` JSON escapes for 13 lines of the prose file |
@@ -67,8 +67,8 @@ from the brief, never from a hard-coded toolchain):
 $ grep -nE '\b(cargo|npm|pnpm|yarn|go (test|build)|pytest|mvn|gradle|make)\b' scripts/*.py
 scripts/_lib.py:546:    r"`[^`]+`|\b(go|cargo|npm|pnpm|yarn|make|pytest|python3?|bash|sh|grep|rg|curl|task|just|mvn|gradle|dotnet|bun)\b\s",
 scripts/gates.py:42:    r"yarn\.lock$|pnpm-lock\.yaml$|Cargo\.(toml|lock)$|requirements.*\.txt$|poetry\.lock$",
-scripts/gates.py:2513:        "file:line, at most 25 per run so iterate); identifiers that only make sense with the plan open; ...
-scripts/gates.py:2522:        "failing test to make it pass; you still do NOT edit the plan or task files -- report instead.\n\n"
+scripts/gates.py:2511:        "file:line, at most 25 per run so iterate); identifiers that only make sense with the plan open; ...
+scripts/gates.py:2520:        "failing test to make it pass; you still do NOT edit the plan or task files -- report instead.\n\n"
 scripts/mode_matrix.py:158:`make run`
 scripts/mode_matrix.py:253:            ... "local_run_recipe": "`make run`",
 scripts/smoke_test.py:84:CODE_BASE = make_repo(CODE, {..., "CLAUDE.md": "Run `go test ./...` before committing.\n", ...
@@ -81,7 +81,7 @@ scripts/smoke_test.py:749:u = AA("probe_gap", "Supply the recipe: make run", ...
 None of these runs a toolchain: `_lib.py:546` is the alternation of the executable-criterion
 classifier (`EXECUTABLE_RE` recognises a command-shaped acceptance criterion; it hardcodes no
 command), `gates.py:42` is the dependency-manifest regex (the hits are `yarn`/`pnpm` inside
-lockfile names), `gates.py:2513` and `:2522` are the English verb `make` in prompt prose, and
+lockfile names), `gates.py:2511` and `:2520` are the English verb `make` in prompt prose, and
 the `mode_matrix.py` and `smoke_test.py` lines are battery fixtures. The wrapper test
 `no_gate_names_a_toolchain_command` keeps it that way with a `make`-less variant of the
 pattern: it matches `\b(cargo|rustc|npm|pnpm|yarn|pytest|mvn|gradle|just)\b|\bgo (test|build|run)\b`
