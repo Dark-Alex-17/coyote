@@ -94,8 +94,23 @@ just ran`) and in a `gates.py` prompt sentence (`just do not write to them`).
 ## Verify
 
 ```
-python3 scripts/audit_graph.py .        # static edges + script _next edges, cycles vs bounds
-bash scripts/check_session_block.sh     # session/schema rules via yq; variable mirror
+python3 scripts/audit_graph.py .        # static edges + script _next edges, cycles vs bounds (needs mikefarah yq)
+bash scripts/check_session_block.sh     # session/schema rules; variable mirror vs architect/config.yaml (needs mikefarah yq)
 python3 scripts/smoke_test.py           # every gate, both sides of every bound, fail-open paths
 python3 scripts/mode_matrix.py          # marker regions mapped + all 48 mode combinations walk to end_complete
+cargo test --test candidate_architect_next              # the Rust wrapper: audit, smoke, session check, poison and precedence tests
+cargo test --test candidate_architect_next -- --ignored # the mode matrix through the wrapper (three to five minutes; opt-in)
 ```
+
+The Rust wrapper runs the batteries with `HOME`, `LLM_ROOT_DIR`, `COYOTE_CACHE_DIR`,
+`TMPDIR` and `ARCHITECT_RUNS_ROOT` pointed at a scratch directory and
+`PYTHONDONTWRITEBYTECODE=1`, so nothing under this directory or `~/.config/coyote` is
+touched. `audit_graph.py` and `check_session_block.sh` need the Go `yq` by mikefarah
+(`yq --version` names it); the wrapper skips both of those tests when a different `yq`
+(or none) is on `PATH`. The sweep that keeps every bundled agent from naming this
+candidate lives in `tests/candidate_sisyphus_next.rs` and covers both candidate names.
+
+Measured 2026-10-28 after the adjustments above, from a fresh scratch dir: audit
+`PROBLEMS: none`; smoke `304/304 checks passed`; mode matrix `53/53 checks passed`
+(`62 live regions == 62 mapped`) in 3m53s wall clock; session check ok (mikefarah yq
+v4.53.3); no unset-variable failure from `architect/tools.sh` under the real `utils.sh`.
