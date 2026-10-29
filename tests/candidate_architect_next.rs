@@ -443,37 +443,37 @@ fn poison_user_config(scratch: &TempDirGuard) -> Vec<(String, Vec<u8>)> {
 
 /// The batteries resolve everything from the asset tree they run in: a user
 /// config dir under `HOME` that would break them if consulted changes
-/// nothing, and nothing is written under `HOME` either.
+/// nothing, and nothing is written under `HOME` either. The audit and the
+/// session check are the legs that prove the poison is ignored, so the test
+/// skips without the mikefarah `yq` or `bash`. `smoke_test.py` re-points
+/// `HOME` at its own temp dir before importing anything and never sees the
+/// poison; its leg only adds the check that nothing lands under the scratch
+/// `HOME`.
 #[test]
 fn batteries_never_consult_the_user_config_dir() {
     let Some(python) = python3() else { return };
+    let Some(yq) = mikefarah_yq() else { return };
+    let Ok(bash) = which::which("bash") else {
+        eprintln!("skipping: bash not available");
+        return;
+    };
     let scratch = scratch_dir("poison");
     let planted = poison_user_config(&scratch);
     let home = scratch.0.join("home");
 
-    let yq = mikefarah_yq();
-    if yq.is_none() {
-        eprintln!("skipping: the audit and session legs need the mikefarah yq");
-    }
-    let bash = which::which("bash").ok();
-    if bash.is_none() {
-        eprintln!("skipping: bash not available");
-    }
-    if let Some(yq) = &yq {
-        let audit = battery(&python, &scratch)
-            .env("PATH", path_with(yq.parent().unwrap()))
-            .args(["scripts/audit_graph.py", "."])
-            .output()
-            .unwrap();
-        assert!(audit.status.success(), "{}", transcript(&audit));
-        assert!(
-            String::from_utf8_lossy(&audit.stdout)
-                .lines()
-                .any(|l| l.trim() == "PROBLEMS: none"),
-            "{}",
-            transcript(&audit)
-        );
-    }
+    let audit = battery(&python, &scratch)
+        .env("PATH", path_with(yq.parent().unwrap()))
+        .args(["scripts/audit_graph.py", "."])
+        .output()
+        .unwrap();
+    assert!(audit.status.success(), "{}", transcript(&audit));
+    assert!(
+        String::from_utf8_lossy(&audit.stdout)
+            .lines()
+            .any(|l| l.trim() == "PROBLEMS: none"),
+        "{}",
+        transcript(&audit)
+    );
 
     let smoke = battery(&python, &scratch)
         .arg("scripts/smoke_test.py")
@@ -487,23 +487,21 @@ fn batteries_never_consult_the_user_config_dir() {
         transcript(&smoke)
     );
 
-    if let (Some(yq), Some(bash)) = (&yq, &bash) {
-        let session = battery(bash, &scratch)
-            .env("PATH", path_with(yq.parent().unwrap()))
-            .arg("scripts/check_session_block.sh")
-            .output()
-            .unwrap();
-        let out = String::from_utf8_lossy(&session.stdout);
-        assert!(session.status.success(), "{}", transcript(&session));
-        // The mirror is taken against the bundled prose config, not the
-        // drifted one planted under HOME.
-        assert!(
-            out.lines()
-                .any(|l| l.starts_with("ok variables mirror architect")),
-            "{}",
-            transcript(&session)
-        );
-    }
+    let session = battery(&bash, &scratch)
+        .env("PATH", path_with(yq.parent().unwrap()))
+        .arg("scripts/check_session_block.sh")
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&session.stdout);
+    assert!(session.status.success(), "{}", transcript(&session));
+    // The mirror is taken against the bundled prose config, not the
+    // drifted one planted under HOME.
+    assert!(
+        out.lines()
+            .any(|l| l.starts_with("ok variables mirror architect")),
+        "{}",
+        transcript(&session)
+    );
 
     let mut expected: Vec<String> = planted.iter().map(|(rel, _)| rel.clone()).collect();
     expected.sort();
@@ -675,6 +673,36 @@ fn build_lock_is_declared_at_the_prose_twins_position() {
     );
 }
 
+/// The candidate declares the prose twin's variables in the same order, name
+/// for name and `default` for `default`, with a missing default counted as
+/// null on both sides. `check_session_block.sh` runs the same comparison but
+/// needs the mikefarah `yq`; this one runs without it.
+#[test]
+fn variables_mirror_the_prose_twin_name_for_name_and_default_for_default() {
+    let candidate = variable_list(&candidate_dir().join("graph.yaml"));
+    let prose = variable_list(&agents_dir().join("architect/config.yaml"));
+    assert_eq!(
+        names_of(&candidate),
+        names_of(&prose),
+        "the candidate's variable names drifted from the prose twin's"
+    );
+    let defaults = |vars: &[serde_yaml::Value]| -> Vec<serde_yaml::Value> {
+        vars.iter()
+            .map(|v| v.get("default").cloned().unwrap_or(serde_yaml::Value::Null))
+            .collect()
+    };
+    for ((name, ours), theirs) in names_of(&candidate)
+        .iter()
+        .zip(defaults(&candidate))
+        .zip(defaults(&prose))
+    {
+        assert_eq!(
+            ours, theirs,
+            "{name}: the default drifted from the prose twin's"
+        );
+    }
+}
+
 /// Lines the toolchain pattern matches without naming a toolchain command,
 /// as (file name, substring the line must carry): the executable-criterion
 /// classifier regex in `_lib.py` (its alternation lists toolchain words to
@@ -744,10 +772,12 @@ fn no_gate_names_a_toolchain_command() {
 /// Every `scripts/*.py` shaped like a script-node shim (docstring naming the
 /// node, `from gates import run`, a single `run("<name>")` call) names its
 /// own file stem in both places, and the shims map one-to-one onto the
-/// `type: script` nodes of `graph.yaml`. `audit_graph.py` checks `GATES`
-/// membership by node id, not by shim body, so a shim that called
-/// `run("other")` would pass the audit and silently run the wrong gate; this
-/// is the pin that catches it.
+/// `type: script` nodes of `graph.yaml`, and every `run()` literal is a key of
+/// the `GATES` dict in `gates.py`. `audit_graph.py` only extracts the first
+/// `run()` literal of a shim and never checks it against `GATES`, so a shim
+/// that called `run("other")` would pass the audit and silently run the wrong
+/// gate, and a misspelt literal would pass it too and raise `KeyError` in
+/// `gates.run` at runtime; this is the pin that catches both.
 #[test]
 fn every_script_shim_runs_the_gate_named_by_its_file_and_graph_node() {
     let scripts = candidate_dir().join("scripts");
@@ -813,6 +843,28 @@ fn every_script_shim_runs_the_gate_named_by_its_file_and_graph_node() {
     assert_eq!(
         shims, script_nodes,
         "shims and script nodes are not one-to-one"
+    );
+
+    let gates = fs::read_to_string(scripts.join("gates.py")).unwrap();
+    let dict = gates
+        .split_once("\nGATES = {\n")
+        .and_then(|(_, rest)| rest.split_once("\n}\n"))
+        .expect("gates.py has a `GATES = {` dict closed by a `}` line")
+        .0;
+    let key_re = fancy_regex::Regex::new(r#""([a-z_0-9]+)":"#).unwrap();
+    let keys: Vec<String> = key_re
+        .captures_iter(dict)
+        .map(|c| c.unwrap()[1].to_string())
+        .collect();
+    assert!(
+        keys.len() >= 70,
+        "the GATES parse found only {} keys: {keys:?}",
+        keys.len()
+    );
+    let missing: Vec<&String> = shims.iter().filter(|s| !keys.contains(s)).collect();
+    assert!(
+        missing.is_empty(),
+        "shims call run() with a name that is not a GATES key: {missing:?}"
     );
 }
 
@@ -1371,6 +1423,123 @@ fn dry_run_with_an_unknown_run_id_in_the_prompt_starts_a_fresh_run() {
         Some(true),
         "unknown id: state.json records a resume that never happened"
     );
+    assert_no_bytecode_under_candidate();
+}
+
+/// A brief that names no readable design doc is the protocol's first
+/// escalation, not a crash and not an orientation attempt. Whether the brief
+/// points at a `.md` path that does not exist or carries no path at all, the
+/// real binary walks `intake -> escalate_gate -> ask_dispatch -> ask_user`
+/// (never `orient_read`: there is nothing to orient), the run dir still
+/// lands under `$COYOTE_CACHE_DIR/architect-next/runs/<run_id>/` with the
+/// brief, `state.json` and the decisions ledger, and `state.json` records the
+/// run as parked on a `need_design_doc` escalation whose question asks for
+/// the path and whose only fixed option aborts. The ledger carries the mode
+/// line and the escalation, so a consumer who re-enters the run by id finds
+/// the question that stopped it.
+#[test]
+fn dry_run_without_a_readable_design_doc_parks_on_need_design_doc_before_orienting() {
+    if python3().is_none() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    for (label, prompt) in [
+        ("missing doc", "Implement the plan at plans/PLAN-missing.md"),
+        ("no path", "Implement the plan"),
+    ] {
+        let scratch = scratch_dir(&format!("nodoc-{}", label.replace(' ', "-")));
+        let project = dry_run_config_dir(&scratch);
+        // The fixture seeds one readable design doc under `plans/`; neither
+        // prompt names it, so the project holds no doc the brief resolves to.
+        let runs_root = scratch.0.join("cache").join(CANDIDATE).join("runs");
+
+        let lines = dry_run_until_ask_user_with_prompt(&scratch, &project, &[], label, prompt);
+        let mut cursor = 0;
+        for needle in [
+            "graph: architect-next (start: intake)",
+            "intake (script) done",
+            "escalate_gate (script) done",
+            "ask_dispatch (script) done",
+            "ask_user (input) start",
+        ] {
+            let hit = lines[cursor..].iter().position(|l| l.contains(needle));
+            let idx = hit.unwrap_or_else(|| {
+                panic!(
+                    "{label}: {needle:?} missing after line {cursor}:\n{}",
+                    lines.join("\n")
+                )
+            });
+            cursor += idx + 1;
+        }
+        assert!(
+            !lines.iter().any(|l| l.contains("orient_read (llm)")),
+            "{label}: the graph tried to orient a design doc it never had:\n{}",
+            lines.join("\n")
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("Traceback") || l.contains("panicked")),
+            "{label}: the gates crashed instead of parking the run:\n{}",
+            lines.join("\n")
+        );
+
+        let runs: Vec<PathBuf> = fs::read_dir(&runs_root)
+            .unwrap_or_else(|e| {
+                panic!("{label}: runs root {} unreadable: {e}", runs_root.display())
+            })
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(
+            runs.len(),
+            1,
+            "{label}: exactly one run dir under {}: {runs:?}",
+            runs_root.display()
+        );
+        let run = &runs[0];
+        for file in ["state.json", "brief.md", "decisions.md"] {
+            assert!(
+                run.join(file).is_file(),
+                "{label}: {file} missing under {}",
+                run.display()
+            );
+        }
+        let brief = fs::read_to_string(run.join("brief.md")).unwrap();
+        assert!(
+            brief.contains(prompt),
+            "{label}: brief.md does not carry the prompt: {brief:?}"
+        );
+
+        let state = fs::read_to_string(run.join("state.json")).unwrap();
+        let state: serde_json::Value = serde_json::from_str(&state).unwrap();
+        assert_eq!(state["phase"].as_str(), Some("parked"), "{label}: phase");
+        let escalation = &state["escalation"];
+        assert_eq!(
+            escalation["kind"].as_str(),
+            Some("need_design_doc"),
+            "{label}: escalation kind: {escalation}"
+        );
+        let question = escalation["question"].as_str().unwrap_or_default();
+        assert!(
+            question.contains("design doc") && question.contains("path"),
+            "{label}: the question does not ask for the design doc path: {question:?}"
+        );
+        let options: Vec<&str> = escalation["options"]
+            .as_array()
+            .map(|o| o.iter().filter_map(|v| v["text"].as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(options, ["Abort the run"], "{label}: fixed options");
+
+        let ledger = fs::read_to_string(run.join("decisions.md")).unwrap();
+        assert!(
+            ledger.contains("escalation: need_design_doc:"),
+            "{label}: the decisions ledger does not record the escalation:\n{ledger}"
+        );
+        assert!(
+            ledger.contains("mode[pr_strategy=single parallel_tasks=0 task_granularity=standard autonomy=full escalation_policy=interactive]"),
+            "{label}: the decisions ledger does not record the default mode line:\n{ledger}"
+        );
+    }
     assert_no_bytecode_under_candidate();
 }
 
