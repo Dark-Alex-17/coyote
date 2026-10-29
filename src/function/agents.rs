@@ -9363,6 +9363,38 @@ mod tests {
         assert_eq!(meta.pid_start, live.start);
     }
 
+    /// A running sidecar whose record reads pid 0 resumes on every host,
+    /// including those whose process table lists pid 0 with a start time of
+    /// 0: no child of ours ever ran as pid 0.
+    #[test]
+    #[serial]
+    fn a_running_child_stamped_with_pid_zero_resumes() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_pid_zero");
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let (sid, _) = seed_completed_config_child(&mut ctx, &agent_name, json!({}));
+        let live = ProcessStamp::current();
+        let root = spawner_root(&ctx);
+        let mut meta = root.load_child_meta(&sid).unwrap().unwrap();
+        meta.status = ChildStatus::Running;
+        meta.pid = 0;
+        meta.pid_start = 0;
+        root.save_child_meta(&meta).unwrap();
+
+        let spawn = build_ready_spawn(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+
+        assert_eq!(spawn.session_id.as_deref(), Some(sid.as_str()));
+        let meta = child_meta_of(&ctx, &sid);
+        assert_eq!(meta.status, ChildStatus::Running);
+        assert_eq!(meta.agent_id, spawn.agent_id);
+        assert_eq!(meta.pid, live.pid);
+        assert_eq!(meta.pid_start, live.start);
+    }
+
     /// Resuming is not a one-shot: the transcript a resumed child adds is
     /// what the next resume carries, the id stays the same across every
     /// hop, each hop gets its own agent id, and a hop that ended `failed`

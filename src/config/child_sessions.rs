@@ -653,6 +653,8 @@ pub(crate) fn sweep_orphans_with_before_remove(hook: &dyn Fn(&Path)) {
 /// so a pass costs one process-table refresh, not one per directory; only
 /// a stamp with no start time is looked up again on its own, since its pid
 /// still in use may be the process that wrote it.
+/// A pid-0 stamp is dead whatever the process table says: no process of
+/// ours runs as pid 0, though some hosts list it with a start time of 0.
 enum SweepAction {
     Keep,
     Remove(&'static str),
@@ -664,8 +666,9 @@ impl SweepAction {
         match self {
             Self::Keep => None,
             Self::Remove(reason) => Some(reason),
-            Self::RemoveIfDead(stamp, reason) => (!(alive.contains(&stamp)
-                || (stamp.pid != 0 && stamp.start == 0 && ProcessStamp::pid_exists(stamp.pid))))
+            Self::RemoveIfDead(stamp, reason) => (stamp.pid == 0
+                || !(alive.contains(&stamp)
+                    || (stamp.start == 0 && ProcessStamp::pid_exists(stamp.pid))))
             .then_some(reason),
         }
     }
@@ -2003,7 +2006,7 @@ updated_at: 2026-01-02T03:04:05Z
     #[test]
     #[serial]
     fn list_children_breaks_created_at_ties_by_session_id() {
-        let _cache = CacheDirGuard::new("child-sessions-list-ties");
+        let _guard = TestConfigDirGuard::new("child-sessions-list-ties");
         let root = ChildSessionRoot::Uid(Uuid::new_v4());
         root.ensure_dir(&fixture_root()).unwrap();
         let tied_c = fixture_meta_at("sess_c_0123456789ab", 0);
@@ -3416,6 +3419,7 @@ updated_at: 2026-01-02T03:04:05Z
             &body[..body.find("\n    }\n").unwrap()]
         };
         assert!(reason.contains("pid_exists("));
+        assert!(reason.contains("stamp.pid == 0"));
         assert!(!reason.contains(".is_alive("));
         assert!(!reason.contains(".is_alive_or_start_unknown("));
         assert_eq!(
