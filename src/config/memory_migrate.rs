@@ -3,7 +3,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::{env, fs, io};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{Local, NaiveDateTime};
 
 use crate::config::memory::{
@@ -63,27 +63,110 @@ fn migrate(
 ) -> Result<Report> {
     let today = now.format("%Y-%m-%d").to_string();
     let stamp = now.format("%Y%m%dT%H%M%S").to_string();
-    let mut scopes = Vec::new();
-    for target in targets {
-        let Some(dir) = target.dir.as_ref().filter(|dir| dir.is_dir()) else {
-            scopes.push(ScopeOutcome::Skipped {
-                label: target.label,
-                dir: target.dir.clone(),
-            });
-            continue;
-        };
-        let mut scope = plan_scope(target.label, dir, &today)?;
-        if apply && scope.change_count() > 0 {
-            apply_scope(&mut scope, backup_root, &stamp)?;
+    let mut scopes = plan_all(targets, &today)?;
+    let failure = if apply {
+        apply_all(&mut scopes, backup_root, &stamp)?
+    } else {
+        None
+    };
+    Ok(Report {
+        apply,
+        scopes,
+        failure,
+    })
+}
+
+fn plan_all(targets: &[Target], today: &str) -> Result<Vec<ScopeOutcome>> {
+    targets
+        .iter()
+        .map(
+            |target| match target.dir.as_ref().filter(|dir| dir.is_dir()) {
+                Some(dir) => Ok(ScopeOutcome::Migrated(Box::new(plan_scope(
+                    target.label,
+                    dir,
+                    today,
+                )?))),
+                None => Ok(ScopeOutcome::Skipped {
+                    label: target.label,
+                    dir: target.dir.clone(),
+                }),
+            },
+        )
+        .collect()
+}
+
+/// Every scope's index is checked before the first backup, so one stale scope
+/// refuses the whole run with nothing written. A failure after that stops at
+/// the failing scope, whose report keeps the backup and the files already
+/// written; the scopes after it are dropped unapplied.
+fn apply_all(
+    scopes: &mut Vec<ScopeOutcome>,
+    backup_root: &Path,
+    stamp: &str,
+) -> Result<Option<ScopeFailure>> {
+    for scope in scopes.iter() {
+        if let ScopeOutcome::Migrated(report) = scope
+            && report.change_count() > 0
+        {
+            ensure_index_unchanged(report)?;
         }
-        scopes.push(ScopeOutcome::Migrated(Box::new(scope)));
     }
-    Ok(Report { apply, scopes })
+    let failed = scopes.iter_mut().enumerate().find_map(|(i, scope)| {
+        let ScopeOutcome::Migrated(report) = scope else {
+            return None;
+        };
+        if report.change_count() == 0 {
+            return None;
+        }
+        let error = apply_scope(report, backup_root, stamp).err()?;
+        Some((
+            i,
+            ScopeFailure {
+                label: report.label,
+                backup: report.backup.clone(),
+                error,
+            },
+        ))
+    });
+    let Some((i, failure)) = failed else {
+        return Ok(None);
+    };
+    scopes.truncate(i + 1);
+    Ok(Some(failure))
 }
 
 pub struct Report {
     apply: bool,
     scopes: Vec<ScopeOutcome>,
+    failure: Option<ScopeFailure>,
+}
+
+impl Report {
+    /// The error of a scope that failed partway through `--apply`, naming
+    /// its backup. Print the report first: it lists what was already written.
+    pub fn into_result(self) -> Result<()> {
+        let Some(failure) = self.failure else {
+            return Ok(());
+        };
+        let summary = match &failure.backup {
+            Some(backup) => format!(
+                "{} migration stopped partway; its backup is at {}",
+                failure.label,
+                shown(backup)
+            ),
+            None => format!(
+                "{} migration failed before its backup was taken; nothing in it was written",
+                failure.label
+            ),
+        };
+        Err(failure.error.context(summary))
+    }
+}
+
+struct ScopeFailure {
+    label: &'static str,
+    backup: Option<PathBuf>,
+    error: anyhow::Error,
 }
 
 enum ScopeOutcome {
@@ -144,10 +227,7 @@ fn plan_scope(label: &'static str, dir: &Path, today: &str) -> Result<ScopeRepor
 
     let index_path = dir.join(MEMORY_INDEX_FILE_NAME);
     let index = match fs::symlink_metadata(&index_path) {
-        Ok(meta) if !meta.is_file() => bail!(
-            "{} is not a regular file; migrate only rewrites a plain index",
-            index_path.display()
-        ),
+        Ok(meta) if !meta.is_file() => return Err(irregular_index(&index_path)),
         Ok(_) => Some(
             fs::read_to_string(&index_path)
                 .with_context(|| format!("read {}", index_path.display()))?,
@@ -282,8 +362,6 @@ fn plan_scope(label: &'static str, dir: &Path, today: &str) -> Result<ScopeRepor
     Ok(report)
 }
 
-/// The regular `*.md` files of `dir` other than the index, keyed by file
-/// stem. Symlinks are left alone so a rewrite never lands outside the dir.
 /// A `#` or `##` heading closes the drill section; deeper headings belong to it.
 fn ends_drill_section(line: &str) -> bool {
     let line = line.trim_start();
@@ -291,6 +369,15 @@ fn ends_drill_section(line: &str) -> bool {
     (1..=2).contains(&level) && line[level..].chars().next().is_none_or(char::is_whitespace)
 }
 
+fn irregular_index(path: &Path) -> anyhow::Error {
+    anyhow!(
+        "{} is not a regular file; migrate only rewrites a plain index",
+        path.display()
+    )
+}
+
+/// The regular `*.md` files of `dir` other than the index, keyed by file
+/// stem. Symlinks are left alone so a rewrite never lands outside the dir.
 fn load_drill_files(
     dir: &Path,
     unreadable: &mut Vec<String>,
@@ -356,31 +443,52 @@ fn stamp_round_chains(
     }
 }
 
-fn apply_scope(report: &mut ScopeReport, backup_root: &Path, stamp: &str) -> Result<()> {
-    let index_path = report.dir.join(MEMORY_INDEX_FILE_NAME);
-    if report.new_index.is_some() {
-        let current = fs::read_to_string(&index_path)
-            .with_context(|| format!("read {}", index_path.display()))?;
-        if report.index.as_ref() != Some(&current) {
-            bail!(
-                "{} changed since the migration was planned, so nothing was rewritten. \
-                 Rerun --memory-migrate",
-                index_path.display(),
-            );
-        }
+fn ensure_index_unchanged(report: &ScopeReport) -> Result<()> {
+    if report.new_index.is_none() {
+        return Ok(());
     }
+    let index_path = report.dir.join(MEMORY_INDEX_FILE_NAME);
+    let meta = fs::symlink_metadata(&index_path)
+        .with_context(|| format!("stat {}", index_path.display()))?;
+    if !meta.is_file() {
+        return Err(irregular_index(&index_path));
+    }
+    let current = fs::read_to_string(&index_path)
+        .with_context(|| format!("read {}", index_path.display()))?;
+    if report.index.as_ref() != Some(&current) {
+        bail!(
+            "{} changed since the migration was planned, so nothing was rewritten. \
+             Rerun --memory-migrate",
+            index_path.display(),
+        );
+    }
+    Ok(())
+}
+
+fn apply_scope(report: &mut ScopeReport, backup_root: &Path, stamp: &str) -> Result<()> {
     let backup = unused_backup_dir(backup_root, report.label, stamp);
     copy_dir_all(&report.dir, &backup)
         .with_context(|| format!("back up {} to {}", report.dir.display(), backup.display()))?;
-    report.backup = Some(backup);
+    report.backup = Some(backup.clone());
     for file in &report.rewrites {
-        write_private_atomic(&file.path, &file.render()?)
-            .with_context(|| format!("write memory file {}", file.path.display()))?;
+        write_private_atomic(&file.path, &file.render()?).with_context(|| {
+            format!(
+                "write memory file {} (backup at {})",
+                file.path.display(),
+                backup.display()
+            )
+        })?;
         report.written.push(file.path.clone());
     }
     if let Some(index) = &report.new_index {
-        write_private_atomic(&index_path, index)
-            .with_context(|| format!("write {}", index_path.display()))?;
+        let index_path = report.dir.join(MEMORY_INDEX_FILE_NAME);
+        write_private_atomic(&index_path, index).with_context(|| {
+            format!(
+                "write {} (backup at {})",
+                index_path.display(),
+                backup.display()
+            )
+        })?;
         report.written.push(index_path);
     }
     Ok(())
@@ -413,7 +521,13 @@ impl fmt::Display for Report {
                 ScopeOutcome::Migrated(report) => write_scope(f, report, self.apply)?,
             }
         }
-        if self.apply {
+        if let Some(failure) = &self.failure {
+            writeln!(
+                f,
+                "stopped: the {} migration failed; the error follows",
+                failure.label
+            )
+        } else if self.apply {
             writeln!(
                 f,
                 "next: review the remaining sections by hand; migrate leaves them as they are"
@@ -1088,14 +1202,17 @@ mod tests {
     }
 
     #[test]
-    fn an_index_edited_after_planning_is_left_alone() {
+    fn an_edited_workspace_index_refuses_the_whole_run() {
         let fx = Fixture::new("index_race");
-        let mut plan = plan_scope("workspace", &fx.workspace, "2026-03-01").unwrap();
+        let global_before = snapshot(&fx.global);
+        let mut scopes = plan_all(&fx.targets(MigrateScope::All), "2026-03-01").unwrap();
         let index_path = fx.workspace.join(MEMORY_INDEX_FILE_NAME);
         let edited = format!("{}- [[late]]: added meanwhile\n", workspace_index());
         fs::write(&index_path, &edited).unwrap();
 
-        let err = apply_scope(&mut plan, &fx.backups, "20260301T123045").unwrap_err();
+        let err = apply_all(&mut scopes, &fx.backups, "20260301T123045")
+            .err()
+            .expect("a stale index refuses the run");
 
         assert!(
             err.to_string()
@@ -1103,9 +1220,58 @@ mod tests {
             "{err:#}"
         );
         assert_eq!(fs::read_to_string(&index_path).unwrap(), edited);
-        assert!(plan.written.is_empty(), "{:?}", plan.written);
-        assert!(plan.backup.is_none());
+        assert_eq!(snapshot(&fx.global), global_before);
         assert!(!fx.backups.exists());
+    }
+
+    #[test]
+    fn a_workspace_failing_after_global_applied_still_reports_both() {
+        let fx = Fixture::new("partial_apply");
+        let mut scopes = plan_all(&fx.targets(MigrateScope::All), "2026-03-01").unwrap();
+        let blocked = fx.workspace.join("plan-r3.md");
+        fs::remove_file(&blocked).unwrap();
+        fs::create_dir(&blocked).unwrap();
+        fs::write(blocked.join("keep"), "x").unwrap();
+
+        let failure = apply_all(&mut scopes, &fx.backups, "20260301T123045").unwrap();
+        let report = Report {
+            apply: true,
+            scopes,
+            failure,
+        };
+
+        let global_backup = fx.backups.join("global-20260301T123045");
+        let workspace_backup = fx.backups.join("workspace-20260301T123045");
+        let text = report.to_string();
+        for expected in [
+            format!(
+                "    wrote {}\n",
+                fx.global.join(MEMORY_INDEX_FILE_NAME).display()
+            ),
+            format!("  backup: {}\n", global_backup.display()),
+            format!("    wrote {}\n", fx.workspace.join("blank.md").display()),
+            format!("  backup: {}\n", workspace_backup.display()),
+        ] {
+            assert!(
+                text.contains(&expected),
+                "{expected:?} missing from\n{text}"
+            );
+        }
+        assert!(
+            text.ends_with("stopped: the workspace migration failed; the error follows\n"),
+            "{text}"
+        );
+        let err = format!("{:#}", report.into_result().unwrap_err());
+        assert!(
+            err.starts_with(&format!(
+                "workspace migration stopped partway; its backup is at {}: write memory file {} \
+                 (backup at {})",
+                workspace_backup.display(),
+                blocked.display(),
+                workspace_backup.display()
+            )),
+            "{err}"
+        );
     }
 
     #[test]

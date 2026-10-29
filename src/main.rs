@@ -179,8 +179,9 @@ async fn async_main() -> Result<()> {
     }
 
     if let Some(scope) = cli.memory_migrate {
-        print!("{}", memory_migrate::run(scope, cli.apply)?);
-        return Ok(());
+        let report = memory_migrate::run(scope, cli.apply)?;
+        print!("{report}");
+        return report.into_result();
     }
 
     let mcp_inspect =
