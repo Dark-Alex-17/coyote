@@ -70,16 +70,60 @@ const CARRY_BULLET_LEAD: &str = "- **`carry`:**";
 /// The lead of the script Environment note on what `previous_turns` does
 /// to the state size.
 const SCRIPT_TURNS_LEAD: &str = "Under a session, [`previous_turns`]";
-/// The `agent.*` events a spawned child fires.
-const AGENT_EVENTS: [&str; 4] = [
-    "agent.started",
-    "agent.completed",
-    "agent.failed",
-    "agent.interrupted",
-];
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// The `agent.*` events a spawned child fires, scraped from the
+/// `HookEvent::as_str` arms in `src/hooks.rs` so a renamed or added event
+/// reaches the wiki checks without a hand-kept copy. The four lifecycle
+/// events every child fires today must stay among them.
+///
+/// The arms are read instead of `HookEvent::ALL` because that list is a
+/// private const of the binary crate, which an integration test cannot
+/// import, and it holds the enum variants rather than the dotted event
+/// names the wiki spells; `as_str` is the one place those names live.
+fn agent_events() -> Vec<String> {
+    let events = agent_events_in(&src(&["hooks.rs"]));
+    for known in [
+        "agent.started",
+        "agent.completed",
+        "agent.interrupted",
+        "agent.failed",
+    ] {
+        assert!(
+            events.iter().any(|event| event == known),
+            "HookEvent::as_str no longer names {known}: {events:?}"
+        );
+    }
+    events
+}
+
+/// The `agent.*` string literals of the `as_str` function in `source`, in
+/// arm order with adjacent repeats dropped.
+fn agent_events_in(source: &str) -> Vec<String> {
+    let body = fn_body(source, "pub fn as_str(");
+    let mut events: Vec<String> = string_literals(&body)
+        .into_iter()
+        .filter(|literal| literal.starts_with("agent."))
+        .collect();
+    events.dedup();
+    events
+}
+
+/// The regular `*.md` files directly under `dir`, sorted. A directory whose
+/// name ends in `.md` is skipped, so reading the pages never trips on one.
+fn markdown_pages(dir: &Path) -> Vec<PathBuf> {
+    let mut pages: Vec<PathBuf> = fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        .map(|entry| entry.expect("directory entry"))
+        .filter(|entry| entry.file_type().expect("entry type").is_file())
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+        .collect();
+    pages.sort();
+    pages
 }
 
 /// Every edited section and row together.
@@ -566,14 +610,19 @@ fn workspace_agent_session_dir_literal() -> String {
 }
 
 /// The paragraph of `page` whose first line starts with `lead`: that line
-/// and every following line up to the next blank one.
+/// and every following line up to the next blank one or the next bullet,
+/// so a list item set directly under the paragraph is not read as part of
+/// it.
 fn paragraph(label: &str, page: &str, lead: &str) -> String {
     let mut lines = page.lines().skip_while(|line| !line.starts_with(lead));
     let first = lines
         .next()
         .unwrap_or_else(|| panic!("{label} has no paragraph opening {lead:?}"));
     let mut out = vec![first];
-    out.extend(lines.take_while(|line| !line.trim().is_empty()));
+    out.extend(lines.take_while(|line| {
+        let line = line.trim();
+        !line.is_empty() && !line.starts_with("- ") && !line.starts_with("* ")
+    }));
     out.join("\n")
 }
 
@@ -714,6 +763,68 @@ fn string_literals_drops_line_continuations_like_rustc() {
     assert_eq!(string_literals(r#"a "x\"y" b "\\n" c"#), ["x\"y", "\\n"]);
 }
 
+/// The scraper behind `agent_events` returns every `agent.*` arm of an
+/// `as_str`, a newly added one included, and nothing from other families.
+/// Runs without a wiki checkout.
+#[test]
+fn agent_events_in_returns_a_newly_added_agent_arm() {
+    let source = "impl HookEvent {\n\
+                  \x20   pub fn as_str(&self) -> &'static str {\n\
+                  \x20       match self {\n\
+                  \x20           Self::AgentStarted => \"agent.started\",\n\
+                  \x20           Self::AgentCompleted => \"agent.completed\",\n\
+                  \x20           Self::AgentInterrupted => \"agent.interrupted\",\n\
+                  \x20           Self::AgentFailed => \"agent.failed\",\n\
+                  \x20           Self::AgentPaused => \"agent.paused\",\n\
+                  \x20           Self::ToolCalled => \"tool.called\",\n\
+                  \x20       }\n\
+                  \x20   }\n\
+                  \n\
+                  \x20   pub fn other(&self) -> &'static str {\n\
+                  \x20       \"agent.not_an_arm\"\n\
+                  \x20   }\n\
+                  }\n";
+    assert_eq!(
+        agent_events_in(source),
+        [
+            "agent.started",
+            "agent.completed",
+            "agent.interrupted",
+            "agent.failed",
+            "agent.paused",
+        ]
+    );
+}
+
+/// The retired-wording walk reads regular `*.md` files only: a directory
+/// named like a page is skipped rather than read. Runs without a wiki
+/// checkout.
+#[test]
+fn markdown_pages_skips_a_directory_named_like_a_page() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir =
+        std::env::temp_dir().join(format!("coyote-wiki-pages-{}-{unique}", std::process::id()));
+    fs::create_dir_all(dir.join("Folder.md")).unwrap();
+    fs::write(dir.join("Page.md"), "page\n").unwrap();
+    fs::write(dir.join("notes.txt"), "notes\n").unwrap();
+
+    let pages = markdown_pages(&dir);
+    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(pages, [dir.join("Page.md")]);
+}
+
+/// The gated graph agent the child-session tests hold mid-run relies on the
+/// script node runner killing its child when the run is dropped; pin that
+/// the runner still asks for it.
+#[test]
+fn script_node_runner_kills_its_child_on_drop() {
+    let body = fn_body(&src(&["graph", "script.rs"]), "pub async fn execute(");
+    assert!(body.contains("kill_on_drop(true)"), "{body}");
+}
+
 #[test]
 fn section_scopes_level_one_and_level_two_headings() {
     let page = "intro\n\n# A\n\na body\n\n## A1\n\na1 body\n\n# B\n\nb body\n";
@@ -741,14 +852,11 @@ fn wording_for_graph_agents_without_sessions_is_gone() {
         "runs the graph fresh",
     ];
     let mut hits = Vec::new();
-    for entry in fs::read_dir(&wiki).expect("read the wiki checkout") {
-        let path = entry.expect("wiki entry").path();
-        if path.extension().is_some_and(|ext| ext == "md") {
-            let text = flat(&read(&path));
-            for needle in retired {
-                if text.contains(needle) {
-                    hits.push(format!("{}: {needle:?}", path.display()));
-                }
+    for path in markdown_pages(&wiki) {
+        let text = flat(&read(&path));
+        for needle in retired {
+            if text.contains(needle) {
+                hits.push(format!("{}: {needle:?}", path.display()));
             }
         }
     }
@@ -1788,7 +1896,7 @@ fn edited_rows(wiki: &Path) -> Vec<(String, String)> {
             table_row("Environment-Variables.md", &env, &format!("`{var}`")).join(" "),
         )
     }));
-    rows.extend(AGENT_EVENTS.iter().map(|event| {
+    rows.extend(agent_events().into_iter().map(|event| {
         (
             format!("Hooks.md agent row `{event}`"),
             table_row("Hooks.md", &hooks, &format!("`{event}`")).join(" "),
@@ -2119,9 +2227,10 @@ fn hook_pages_carry_the_child_session_variable() {
         .expect("spawned_agent_hook_extras pushes a session id variable");
     assert_eq!(var, "COYOTE_AGENT_SESSION_ID");
 
+    let events = agent_events();
     let Some(wiki) = wiki_dir() else { return };
     let hooks = read(wiki.join("Hooks.md"));
-    for event in AGENT_EVENTS {
+    for event in events {
         let row = table_row("Hooks.md", &hooks, &format!("`{event}`")).join(" ");
         assert!(
             row.contains(&format!("`{var}`")),
@@ -2417,4 +2526,35 @@ fn usage_probe_sessions_sweep_bullets_match_the_sweep_arms() {
             "the sweep section does not say {needle:?}"
         );
     }
+}
+
+/// `paragraph` hands back the lead line and its continuation lines only: a
+/// blank line ends it, and so does a list item set directly under it (both
+/// `-` and `*` bullets, at any indent), so a lead that is itself a bullet
+/// never swallows the bullets that follow it in the same list. Runs without
+/// a wiki checkout.
+#[test]
+fn paragraph_stops_at_a_blank_line_or_the_next_bullet() {
+    let page = "intro\n\
+                - **`carry`:** Optional. A list of state keys\n\
+                \x20 remembered into the record.\n\
+                - **`max_concurrency`:** Caps the branches.\n\
+                \x20 Default 8.\n\
+                \n\
+                Under a session, the key is seeded\n\
+                before any node runs.\n\
+                  * nested bullet after the note\n\
+                tail\n";
+    assert_eq!(
+        paragraph("page", page, "- **`carry`:**"),
+        "- **`carry`:** Optional. A list of state keys\n  remembered into the record."
+    );
+    assert_eq!(
+        paragraph("page", page, "- **`max_concurrency`:**"),
+        "- **`max_concurrency`:** Caps the branches.\n  Default 8."
+    );
+    assert_eq!(
+        paragraph("page", page, "Under a session,"),
+        "Under a session, the key is seeded\nbefore any node runs."
+    );
 }

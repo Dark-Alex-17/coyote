@@ -13,6 +13,12 @@ use crate::config::{
 pub const DEFAULT_MEMORY_CAP_WITH_TOOLS: usize = 6_000;
 pub const DEFAULT_MEMORY_CAP_WITHOUT_TOOLS: usize = 12_000;
 
+/// Test-only override of where `MemoryStore::new` starts the workspace
+/// memory walk. Without it, a test running from the repo root discovers the
+/// developer's real `.coyote/memory/MEMORY.md` and injects it into prompts.
+#[cfg(test)]
+pub(crate) const WORKSPACE_MEMORY_ROOT_TEST_ENV: &str = "COYOTE_TEST_WORKSPACE_MEMORY_ROOT";
+
 #[derive(Debug, Clone)]
 pub struct WorkspaceMemory {
     pub workspace_root: PathBuf,
@@ -181,7 +187,7 @@ impl MemoryStore {
     pub fn new(cwd: &Path) -> Self {
         Self {
             global_dir: paths::global_memory_dir(),
-            workspace: discover_workspace_memory(cwd),
+            workspace: discover_workspace_memory(&workspace_memory_root(cwd)),
         }
     }
 
@@ -222,6 +228,18 @@ impl MemoryStore {
 
         Ok(out)
     }
+}
+
+#[cfg(not(test))]
+fn workspace_memory_root(cwd: &Path) -> PathBuf {
+    cwd.to_path_buf()
+}
+
+#[cfg(test)]
+fn workspace_memory_root(cwd: &Path) -> PathBuf {
+    std::env::var_os(WORKSPACE_MEMORY_ROOT_TEST_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| cwd.to_path_buf())
 }
 
 pub fn build_memory_section(
@@ -314,6 +332,8 @@ fn collect_md_files(dir: &Path, out: &mut Vec<MemoryFile>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::EnvVarGuard;
+    use serial_test::serial;
     use std::{env, time};
     use time::SystemTime;
 
@@ -564,6 +584,96 @@ mod tests {
 
         let found = discover_workspace_memory(&nested).expect("workspace memory should be found");
         assert_eq!(found.dir, mem_dir);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn workspace_with_index(root: &Path, name: &str) -> PathBuf {
+        let workspace = root.join(name);
+        let mem_dir = workspace
+            .join(WORKSPACE_COYOTE_DIR_NAME)
+            .join(MEMORY_DIR_NAME);
+        fs::create_dir_all(&mem_dir).unwrap();
+        fs::write(mem_dir.join(MEMORY_INDEX_FILE_NAME), name).unwrap();
+        workspace
+    }
+
+    #[test]
+    #[serial]
+    fn store_new_discovers_from_cwd_without_the_test_root_override() {
+        let _unset = EnvVarGuard::unset(WORKSPACE_MEMORY_ROOT_TEST_ENV);
+        let root = temp_root("new_from_cwd");
+        let workspace = workspace_with_index(&root, "ws");
+
+        let store = MemoryStore::new(&workspace);
+        let found = store.workspace.expect("workspace memory should be found");
+        assert_eq!(found.workspace_root, workspace);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[serial]
+    fn store_new_starts_the_walk_at_the_test_root_override() {
+        let root = temp_root("new_override");
+        let cwd_workspace = workspace_with_index(&root, "cwd");
+        let override_workspace = workspace_with_index(&root, "override");
+        let _env = EnvVarGuard::set(WORKSPACE_MEMORY_ROOT_TEST_ENV, &override_workspace);
+
+        let store = MemoryStore::new(&cwd_workspace);
+        let found = store.workspace.expect("workspace memory should be found");
+        assert_eq!(found.workspace_root, override_workspace);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The shared test guard points the override at its own temp workspace
+    /// root (the parent of the directory it hands out as the workspace
+    /// config dir), which holds no memory index, so a store built from any
+    /// cwd under the guard carries no workspace memory even when that cwd
+    /// sits inside a workspace that has one. Dropping the guard puts the cwd
+    /// walk back.
+    #[test]
+    #[serial]
+    fn usage_probe_the_test_config_dir_guard_pins_the_workspace_memory_root_to_its_own_workspace() {
+        let _unset = EnvVarGuard::unset(WORKSPACE_MEMORY_ROOT_TEST_ENV);
+        let root = temp_root("guard_pins_memory_root");
+        let indexed = workspace_with_index(&root, "indexed");
+        let cwd = indexed.join("src").join("deep");
+        fs::create_dir_all(&cwd).unwrap();
+
+        let guard = crate::testing::TestConfigDirGuard::new("memory-root-pin");
+        let pinned = PathBuf::from(
+            env::var_os(WORKSPACE_MEMORY_ROOT_TEST_ENV).expect("the guard sets the override"),
+        );
+        let workspace_config_dir = PathBuf::from(
+            env::var_os(crate::utils::get_env_name("workspace_config_dir"))
+                .expect("the guard sets the workspace config dir"),
+        );
+        assert_eq!(
+            pinned.join(WORKSPACE_COYOTE_DIR_NAME),
+            workspace_config_dir,
+            "the override is the guard's workspace root"
+        );
+        assert!(
+            !pinned
+                .join(WORKSPACE_COYOTE_DIR_NAME)
+                .join(MEMORY_DIR_NAME)
+                .join(MEMORY_INDEX_FILE_NAME)
+                .exists(),
+            "the guard's workspace carries no memory index"
+        );
+        assert!(
+            MemoryStore::new(&cwd).workspace.is_none(),
+            "under the guard the indexed workspace around the cwd is never discovered"
+        );
+
+        drop(guard);
+        assert!(env::var_os(WORKSPACE_MEMORY_ROOT_TEST_ENV).is_none());
+        let found = MemoryStore::new(&cwd)
+            .workspace
+            .expect("without the guard the cwd walk finds the index again");
+        assert_eq!(found.workspace_root, indexed);
 
         let _ = fs::remove_dir_all(&root);
     }

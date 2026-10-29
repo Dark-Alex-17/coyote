@@ -1197,7 +1197,8 @@ pub(crate) fn prompt_head(prompt: &str) -> String {
 mod tests {
     use super::*;
     use crate::testing::{
-        CacheDirGuard, TestConfigDirGuard, info_snapshot, install_log_collector, warn_snapshot,
+        CacheDirGuard, TestConfigDirGuard, debug_snapshot, info_snapshot, install_log_collector,
+        warn_snapshot,
     };
     use chrono::{Duration, TimeZone};
     use fancy_regex::Regex;
@@ -2785,6 +2786,71 @@ updated_at: 2026-01-02T03:04:05Z
             "{:?}",
             info_snapshot()
         );
+    }
+
+    /// A directory whose every parent file is gone is still kept when a
+    /// live process stamps its `root.yaml` between the decision and the
+    /// delete; the same directory goes once that stamp is dead again.
+    #[test]
+    #[serial]
+    fn sweep_keeps_a_uid_root_with_every_parent_gone_once_a_live_process_adopts_it() {
+        install_log_collector();
+        let guard = TestConfigDirGuard::new("child-sessions-sweep-parents-adopted");
+        let parents = guard.cache_root().join("parents");
+        fs::create_dir_all(&parents).unwrap();
+        let missing = vec![parents.join("missing.yaml")];
+        let (dir, uid) = uid_dir_with(&sweep_record(missing.clone(), dead_stamp()));
+        let adopt = |about_to_go: &Path| {
+            write_root(
+                about_to_go,
+                &sweep_record(missing.clone(), ProcessStamp::current()),
+            );
+        };
+
+        sweep_orphans_with_before_remove(&adopt);
+        assert!(dir.is_dir());
+        assert!(!removal_logged(&uid, "orphan sweep arm 1"));
+        assert!(
+            debug_snapshot()
+                .iter()
+                .any(|message| message.contains(&uid)
+                    && message.contains("a live process adopted it")),
+            "{:?}",
+            debug_snapshot()
+        );
+
+        write_root(&dir, &sweep_record(missing, dead_stamp()));
+        sweep_orphans();
+        assert!(!dir.exists());
+        assert!(
+            removal_logged(&uid, "orphan sweep arm 1"),
+            "{:?}",
+            info_snapshot()
+        );
+    }
+
+    /// A sessions root that cannot be listed skips the whole sweep with one
+    /// debug line naming the root and leaves the root as it found it.
+    #[test]
+    #[serial]
+    fn sweep_skips_a_sessions_root_it_cannot_read_with_a_debug_line() {
+        install_log_collector();
+        let _guard = TestConfigDirGuard::new("child-sessions-sweep-unreadable-root");
+        let root = sessions_root();
+        fs::write(&root, "").unwrap();
+
+        sweep_orphans();
+
+        let root_text = root.display().to_string();
+        assert!(
+            debug_snapshot().iter().any(|message| {
+                message.contains("Skipping the child session sweep in")
+                    && message.contains(&root_text)
+            }),
+            "{:?}",
+            debug_snapshot()
+        );
+        assert!(root.is_file());
     }
 
     #[test]

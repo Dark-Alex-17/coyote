@@ -1,6 +1,6 @@
 //! Test-only helpers shared across modules' unit tests.
 
-use crate::config::WORKSPACE_COYOTE_DIR_NAME;
+use crate::config::{WORKSPACE_COYOTE_DIR_NAME, memory};
 use crate::utils;
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use std::ffi::{OsStr, OsString};
@@ -17,9 +17,10 @@ static INFO_MESSAGES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 /// on that output so the buffers are not flooded by the rest of the crate.
 /// Matching is module-boundary-aware: only these exact modules or their `::`
 /// submodules qualify, so a sibling like `hooks_registry` would not.
-const DEBUG_TARGET_PREFIXES: [&str; 3] = [
+const DEBUG_TARGET_PREFIXES: [&str; 4] = [
     concat!(env!("CARGO_CRATE_NAME"), "::hooks"),
     concat!(env!("CARGO_CRATE_NAME"), "::config::agent"),
+    concat!(env!("CARGO_CRATE_NAME"), "::config::child_sessions"),
     concat!(env!("CARGO_CRATE_NAME"), "::function"),
 ];
 
@@ -191,12 +192,16 @@ impl Drop for EnvVarGuard {
 /// land under the temp config dir rather than the developer's real one, and
 /// the cache dir is pinned to a fresh temp dir so nothing a test spawns can
 /// write into the developer's real cache.
+/// Workspace memory discovery starts at the temp workspace root (which has
+/// no `memory/MEMORY.md`), so the repo's own memory index never reaches a
+/// test prompt.
 /// Tests using it must serialize (`#[serial]`) — the env vars are
 /// process-global.
 pub(crate) struct TestConfigDirGuard {
     _env: EnvVarGuard,
     _workspace_env: EnvVarGuard,
     _sessions_env: EnvVarGuard,
+    _workspace_memory_root_env: EnvVarGuard,
     pub(crate) path: PathBuf,
     workspace_path: PathBuf,
     cache_root: PathBuf,
@@ -217,6 +222,9 @@ impl TestConfigDirGuard {
         std::fs::create_dir_all(&workspace_path).unwrap();
         let cache_root = std::env::temp_dir().join(format!("coyote-{label}-cache-{unique}"));
         std::fs::create_dir_all(&cache_root).unwrap();
+        let workspace_root = workspace_path
+            .parent()
+            .expect("workspace config dir sits inside its workspace root");
         Self {
             _env: EnvVarGuard::set(utils::get_env_name("config_dir"), &path),
             _workspace_env: EnvVarGuard::set(
@@ -224,6 +232,10 @@ impl TestConfigDirGuard {
                 &workspace_path,
             ),
             _sessions_env: EnvVarGuard::unset(utils::get_env_name("sessions_dir")),
+            _workspace_memory_root_env: EnvVarGuard::set(
+                memory::WORKSPACE_MEMORY_ROOT_TEST_ENV,
+                workspace_root,
+            ),
             path,
             workspace_path,
             _cache_env: EnvVarGuard::set(utils::get_env_name("cache_dir"), &cache_root),

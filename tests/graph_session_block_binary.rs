@@ -25,6 +25,15 @@ impl Drop for TempDirGuard {
 
 const AGENT: &str = "echo-graph";
 
+/// The built binary every run here spawns; the one place the harness
+/// names it, so a test that needs its directory reads it from here.
+const COYOTE_BIN: &str = env!("CARGO_BIN_EXE_coyote");
+
+/// The workspace-memory root override the unit-test guards set; it mirrors
+/// `WORKSPACE_MEMORY_ROOT_TEST_ENV` in `src/config/memory.rs`, which an
+/// integration test cannot import from the binary crate.
+const TEST_WORKSPACE_MEMORY_ROOT_ENV: &str = "COYOTE_TEST_WORKSPACE_MEMORY_ROOT";
+
 /// The `name:` the fixture graph declares; the run-time logger keys its
 /// `[graph:<name>]` prefix on `graph.name`, not on the agent directory.
 const GRAPH_NAME: &str = "echo-graph";
@@ -136,24 +145,50 @@ fn run_with(dir: &Path, args: &[&str]) -> Output {
 /// `run_with` plus extra environment pairs applied after the scrub, for
 /// cases that pin a host knob (the log level) rather than inherit it.
 fn run_with_env(dir: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
+    run_from(dir, dir, args, extra_env)
+}
+
+/// `run_with_env` with the process started in `cwd` instead of the config
+/// dir, for cases where the directory the binary runs from is the lever
+/// (workspace discovery walks up from it).
+fn run_from(cwd: &Path, dir: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
     let home = dir.join("home");
-    Command::new(env!("CARGO_BIN_EXE_coyote"))
+    let binary = Path::new(COYOTE_BIN);
+    Command::new(binary)
         .args(args)
-        .current_dir(dir)
+        .current_dir(cwd)
         .env("COYOTE_CONFIG_DIR", dir)
         .env("COYOTE_CACHE_DIR", dir.join("cache"))
         .env("HOME", &home)
         .env("USERPROFILE", &home)
         .env("NO_COLOR", "1")
+        .env("PATH", pinned_path(binary.parent().unwrap()))
         .env_remove("COYOTE_LOG_PATH")
         .env_remove("COYOTE_WORKSPACE_CONFIG_DIR")
         .env_remove("IS_SANDBOX")
         .env_remove("COYOTE_PROVIDER")
         .env_remove("COYOTE_PLATFORM")
+        // The unit-test guard's workspace-memory pin; a shipped binary
+        // ignores it, and a run here starts without it unless a case sets it.
+        .env_remove(TEST_WORKSPACE_MEMORY_ROOT_ENV)
         .envs(extra_env.iter().copied())
         .stdin(Stdio::null())
         .output()
         .unwrap()
+}
+
+/// A PATH holding only `bin_dir` (the built binary's own directory) and the
+/// system shell directories, so the fixture's `sh`/`bash` hooks and tool
+/// scripts resolve the same way on every host and nothing else on the
+/// developer's PATH can leak into a run.
+fn pinned_path(bin_dir: &Path) -> std::ffi::OsString {
+    let system_dirs: Vec<PathBuf> = if cfg!(windows) {
+        let system_root = env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+        vec![Path::new(&system_root).join("System32")]
+    } else {
+        vec![PathBuf::from("/usr/bin"), PathBuf::from("/bin")]
+    };
+    env::join_paths(std::iter::once(bin_dir.to_path_buf()).chain(system_dirs)).unwrap()
 }
 
 fn stdout_of(output: &Output) -> String {
@@ -2545,7 +2580,7 @@ fn usage_probe_example_carry_fixture_is_line_ending_independent() {
     );
     let crlf = lf.replace('\n', "\r\n");
     assert!(
-        crlf.contains("\r\n# carry:\r\n#   - final_report\r\n"),
+        crlf.contains(&COMMENTED_CARRY.replace('\n', "\r\n")),
         "CRLF fixture must present the carry block with CRLF bytes"
     );
     assert!(
@@ -2624,6 +2659,67 @@ fn usage_probe_uncommenting_the_example_carry_block_loads_from_a_cold_start() {
                 &["carry key 'nope' is not declared anywhere"],
             );
         }
+    }
+}
+
+/// Graph-Agents.md says `previous_turns` is reserved like `initial_prompt`:
+/// declaring it in `initial_state` or as a `variables[]` name fails at graph
+/// load with the quoted text, from a cold start, before any model or script
+/// runs. The same graph with the declaration dropped loads and runs.
+#[test]
+fn usage_probe_a_reserved_previous_turns_declaration_fails_at_graph_load() {
+    const GRAPH_TAIL: &str = "start: done\n\
+        nodes:\n\
+        \x20 done: { type: end, output: \"{{initial_prompt}}\" }\n";
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "previous_turns in initial_state",
+            "initial_state: { said: \"\", previous_turns: x }\n",
+            "initial_state key 'previous_turns' is reserved (the dispatcher seeds it)",
+        ),
+        (
+            "previous_turns as a variable name",
+            "initial_state: { said: \"\" }\n\
+             variables:\n\
+             \x20 - name: previous_turns\n\
+             \x20   description: the earlier turns\n\
+             \x20   default: none\n",
+            "variables[] name 'previous_turns' is reserved",
+        ),
+    ];
+    for (label, head, expected) in cases {
+        let dir = fresh_config_dir("reserved-turns");
+        let _guard = TempDirGuard(dir.clone());
+        write_fixture(&dir, "");
+        let graph = dir.join("agents").join(AGENT).join("graph.yaml");
+        fs::write(
+            &graph,
+            format!(
+                "name: echo-graph\nversion: \"1.0\"\ndescription: Echoes the prompt.\n{head}{GRAPH_TAIL}"
+            ),
+        )
+        .unwrap();
+        let output = run_echo(&dir);
+        assert_fails_at_graph_load(label, &output, &[expected]);
+        // The run never reached the graph: the dry-run echo is absent.
+        assert!(
+            !stdout_of(&output).lines().any(|line| line == "hello"),
+            "{label}: the graph ran despite the reserved key:\n{}",
+            stdout_of(&output)
+        );
+
+        // Control: the same graph without the reserved declaration runs.
+        let clean = head
+            .replace(", previous_turns: x", "")
+            .replace("previous_turns", "earlier_turns");
+        fs::write(
+            &graph,
+            format!(
+                "name: echo-graph\nversion: \"1.0\"\ndescription: Echoes the prompt.\n{clean}{GRAPH_TAIL}"
+            ),
+        )
+        .unwrap();
+        assert_echoes_hello(&format!("{label} (control)"), &run_echo(&dir));
     }
 }
 
@@ -2942,4 +3038,193 @@ fn usage_probe_a_role_prefixed_prompt_runs_the_graph_unrecorded_while_a_plain_on
         2,
         "`.run` is forced and never asks the classifier"
     );
+}
+
+/// Every run of the real binary here gets a PATH of exactly the built
+/// binary's own directory followed by the system shell directories, so a
+/// script node (which the engine runs through the `bash` on PATH) sees that
+/// value and nothing from the developer's PATH. The only other entries are
+/// the ones the engine itself prepends from inside the fixture's config dir
+/// (its tool shim directories). The script reports the PATH it ran with
+/// through its JSON stdout and the end node echoes it; the expectation is
+/// spelled from the documented shape, not read back from the fixture helper.
+#[cfg(unix)]
+#[test]
+fn usage_probe_a_script_node_runs_with_only_the_binary_dir_and_the_system_shells_on_path() {
+    let dir = fresh_config_dir("pinned-path");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, "");
+    let agent_dir = dir.join("agents").join(AGENT);
+    let scripts = agent_dir.join("scripts");
+    fs::create_dir_all(&scripts).unwrap();
+    fs::write(
+        scripts.join("path.sh"),
+        "#!/usr/bin/env bash\n\
+         printf '{\"seen\":\"%s\"}' \"$PATH\"\n",
+    )
+    .unwrap();
+    fs::write(
+        agent_dir.join("graph.yaml"),
+        "name: echo-graph\n\
+         version: \"1.0\"\n\
+         initial_state: { said: \"\", seen: \"\" }\n\
+         start: probe\n\
+         nodes:\n\
+         \x20 probe: { type: script, script: scripts/path.sh, next: done }\n\
+         \x20 done: { type: end, output: \"path=<{{seen}}>\" }\n",
+    )
+    .unwrap();
+
+    let output = run_with(&dir, &["-a", AGENT, "hello"]);
+    let text = format!("{}\n{}", stderr_of(&output), stdout_of(&output));
+    assert!(
+        output.status.success() && !text.contains("panicked"),
+        "path run: exit {:?}\n{text}",
+        output.status
+    );
+    let bin_dir = Path::new(COYOTE_BIN).parent().unwrap();
+    let line = stdout_of(&output)
+        .lines()
+        .rev()
+        .find(|l| l.starts_with("path=<"))
+        .unwrap_or_else(|| panic!("the end node reports the script's PATH:\n{text}"))
+        .to_string();
+    let seen = line
+        .strip_prefix("path=<")
+        .and_then(|rest| rest.strip_suffix('>'))
+        .unwrap_or_else(|| panic!("unexpected report shape {line:?}"));
+    let from_outside_the_fixture: Vec<&str> = seen
+        .split(':')
+        .filter(|entry| !Path::new(entry).starts_with(&dir))
+        .collect();
+    assert_eq!(
+        from_outside_the_fixture,
+        [bin_dir.to_str().unwrap(), "/usr/bin", "/bin"],
+        "beyond the engine's own shim dirs under the fixture, the child PATH is the binary dir plus /usr/bin:/bin:\n{text}"
+    );
+    assert!(
+        seen.ends_with("/usr/bin:/bin"),
+        "the system shell directories come last and in order:\n{line}"
+    );
+}
+
+/// `TEST_WORKSPACE_MEMORY_ROOT_ENV` is a copy of the source const, so a
+/// rename there would leave the probe below setting (and the harness
+/// scrubbing) a variable the binary never reads; this keeps the two equal.
+#[test]
+fn the_test_memory_root_env_name_matches_the_source_const() {
+    let source_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/config/memory.rs");
+    let source = fs::read_to_string(&source_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", source_path.display()));
+    let needle =
+        format!("WORKSPACE_MEMORY_ROOT_TEST_ENV: &str = \"{TEST_WORKSPACE_MEMORY_ROOT_ENV}\"");
+    assert!(
+        source.contains(&needle),
+        "{} no longer declares {needle}",
+        source_path.display()
+    );
+}
+
+/// The shipped binary discovers workspace memory by walking up from the
+/// directory it runs in, and the `TEST_WORKSPACE_MEMORY_ROOT_ENV` pin
+/// the unit-test guards set is a test-build seam: a real run that carries
+/// it still reads the index above its cwd. The dry-run model echoes the
+/// whole system prompt, so the `<workspace_index>` block is observable on
+/// stdout.
+#[test]
+fn usage_probe_the_shipped_binary_walks_up_from_its_cwd_for_workspace_memory_and_ignores_the_test_root_pin()
+ {
+    const GLOBAL_LINE: &str = "- global fact from the fixture";
+    const WORKSPACE_LINE: &str = "- workspace fact planted by the probe";
+    let dir = fresh_config_dir("workspace-memory");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture_on(
+        &dir,
+        "",
+        Host {
+            memory: true,
+            ..RECIPE_HOST
+        },
+    );
+    fs::create_dir_all(dir.join("memory")).unwrap();
+    fs::write(
+        dir.join("memory").join("MEMORY.md"),
+        format!("{GLOBAL_LINE}\n"),
+    )
+    .unwrap();
+    // The index sits one level above the cwd so the walk has to climb.
+    let workspace = dir.join("ws");
+    let nested = workspace.join("nested");
+    let index_dir = workspace.join(".coyote").join("memory");
+    fs::create_dir_all(&nested).unwrap();
+    fs::create_dir_all(&index_dir).unwrap();
+    fs::write(
+        index_dir.join("MEMORY.md"),
+        format!("# Workspace Memory Index\n{WORKSPACE_LINE}\n"),
+    )
+    .unwrap();
+    // A sibling with no index anywhere above it short of the temp root.
+    let elsewhere = dir.join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+
+    let memory_block = |output: &Output, label: &str| -> String {
+        let text = format!("{}\n{}", stderr_of(output), stdout_of(output));
+        assert!(
+            output.status.success() && !text.contains("panicked"),
+            "{label}: exit {:?}\n{text}",
+            output.status
+        );
+        let stdout = stdout_of(output);
+        let start = stdout.find("<memory>").unwrap_or_else(|| {
+            panic!("{label}: the dry-run echo carries the memory section:\n{text}")
+        });
+        let end = stdout[start..]
+            .find("</memory>")
+            .unwrap_or_else(|| panic!("{label}: the memory section closes:\n{text}"));
+        stdout[start..start + end].to_string()
+    };
+
+    // 1. From under the workspace: both indexes ride the prompt.
+    let from_workspace = memory_block(
+        &run_from(&nested, &dir, &["-e", "hello"], &[]),
+        "walk from the nested cwd",
+    );
+    assert!(
+        from_workspace.contains("<global_index>"),
+        "{from_workspace}"
+    );
+    assert!(from_workspace.contains(GLOBAL_LINE), "{from_workspace}");
+    assert!(
+        from_workspace.contains("<workspace_index>"),
+        "{from_workspace}"
+    );
+    assert!(from_workspace.contains(WORKSPACE_LINE), "{from_workspace}");
+
+    // 2. Same cwd with the test pin aimed at an index-less dir: the shipped
+    //    binary renders the very same block, so the pin changed nothing.
+    let with_pin = memory_block(
+        &run_from(
+            &nested,
+            &dir,
+            &["-e", "hello"],
+            &[(TEST_WORKSPACE_MEMORY_ROOT_ENV, elsewhere.to_str().unwrap())],
+        ),
+        "the test pin on a real run",
+    );
+    assert_eq!(
+        with_pin, from_workspace,
+        "the pin is inert outside test builds"
+    );
+
+    // 3. From the index-less sibling: the global index alone.
+    let from_elsewhere = memory_block(
+        &run_from(&elsewhere, &dir, &["-e", "hello"], &[]),
+        "walk from a cwd with no index above it",
+    );
+    assert!(from_elsewhere.contains(GLOBAL_LINE), "{from_elsewhere}");
+    assert!(
+        !from_elsewhere.contains("<workspace_index>"),
+        "{from_elsewhere}"
+    );
+    assert!(!from_elsewhere.contains(WORKSPACE_LINE), "{from_elsewhere}");
 }

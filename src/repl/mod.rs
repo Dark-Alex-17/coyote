@@ -5114,6 +5114,7 @@ local_hello() {\n\
             let prompt = born_by_run["content"].as_str().unwrap();
             assert!(prompt.starts_with("Be brief."), "{prompt}");
             assert!(prompt.contains("<global_index>"), "{prompt}");
+            assert!(!prompt.contains("<workspace_index>"), "{prompt}");
             assert!(prompt.contains("## Memory\n"), "{prompt}");
             assert!(!prompt.contains("## Memory (read-only)"), "{prompt}");
             assert_graph_agent_restored(&run_first, &name, &chat_agent);

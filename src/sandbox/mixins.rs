@@ -449,6 +449,10 @@ capabilities:
             VALID_MIXIN,
         );
         write_kit(&workspace_kits, "w", VALID_MIXIN);
+        assert!(
+            paths::sbx_kits_dir().starts_with(config.cache_root()),
+            "the guard pins the sbx kit cache under its cache root, or the next write lands in the real cache"
+        );
         write_kit(&paths::sbx_kits_dir(), "cached", VALID_MIXIN);
 
         let kits = ws.discover().unwrap();
