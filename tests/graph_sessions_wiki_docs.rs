@@ -2575,7 +2575,7 @@ fn ctrl_c_wording_names_the_session_split() {
         "In a session, Ctrl+C works in two stages",
         "the second press, at the idle prompt, cancels whatever the turn left running",
         "**Without a session, the first press cancels.**",
-        "the press that interrupts the turn also cancels every background agent",
+        "the press that interrupts the turn, during a tool round or while the model is still answering, also cancels every background agent",
         "waits up to 5 s for the agents to finish; jobs are signalled, not waited on",
         "`Turn interrupted; cancelled N background task(s).`, with N the number of tasks still running at the press",
         "`Turn interrupted; cancelled the background work.` when only a sub-agent's own children were alive",

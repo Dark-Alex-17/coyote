@@ -2004,6 +2004,13 @@ async fn ask_loop(
                         retried_after_compress = true;
                         continue;
                     }
+                    // A sessionless request aborted by Ctrl-C ends here rather
+                    // than in the interrupted arm below, and its press cancels
+                    // the same background work.
+                    if abort_signal.aborted_ctrlc() && ctx.session.is_none() {
+                        let notice = cancel_sessionless_turn_tasks(ctx, &abort_signal).await;
+                        print_turn_notice(ctx, notice);
+                    }
                     ctx.on_chat_completion_error(app.as_ref(), &input);
                     return Err(err);
                 }
@@ -2049,8 +2056,9 @@ async fn ask_loop(
         }
 
         // The guardrail must not run on an interrupted turn: its reminders
-        // would be saved as phantom exchanges and its force-terminate would
-        // cancel the background tasks the user chose to leave running.
+        // would be saved as phantom exchanges and, in a session, its
+        // force-terminate would cancel the background tasks the user chose to
+        // leave running; without one, the arm cancels them itself.
         if interrupted {
             if ctx.session.is_none() {
                 let notice = cancel_sessionless_turn_tasks(ctx, &abort_signal).await;
@@ -9650,6 +9658,86 @@ local_hello() {\n\
         });
     }
 
+    /// Latches Ctrl-C during the first completion and fails it the way the
+    /// client does when a request is aborted mid-stream or before the first
+    /// token.
+    fn ctrl_c_aborts_the_request_runner(
+        seen: SeenInputs,
+    ) -> impl for<'a> FnMut(&'a Input, &'a mut RequestContext, AbortSignal) -> CompletionFuture<'a> + Send
+    {
+        completion_runner(move |input, _ctx, abort| {
+            seen.lock().push(input.clone());
+            abort.set_ctrlc();
+            boxed_completion(async move { Err(anyhow!("Aborted.")) })
+        })
+    }
+
+    /// Drives one request that Ctrl-C aborts, with an abort-aware agent `a1`
+    /// and job `j1` registered on `ctx`; returns their signals.
+    async fn abort_a_request_over_agent_and_job(
+        ctx: &mut RequestContext,
+    ) -> (AbortSignal, AbortSignal) {
+        let agent_abort = register_abort_aware_agent(ctx, "a1");
+        let job_abort = register_abort_aware_job(ctx, "j1");
+        let seen: SeenInputs = Default::default();
+        let mut runner = ctrl_c_aborts_the_request_runner(Arc::clone(&seen));
+        let input = Input::from_str(ctx, "tell me", None).unwrap();
+
+        let err = ask_with_branch_with_runner(
+            ctx,
+            create_abort_signal(),
+            input,
+            false,
+            None,
+            &mut runner,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.to_string(), "Aborted.");
+        assert_eq!(seen.lock().len(), 1, "an aborted request is not retried");
+        (agent_abort, job_abort)
+    }
+
+    #[test]
+    #[serial]
+    fn sessionless_ctrl_c_that_aborts_the_request_cancels_background_tasks() {
+        let _sink = test_sink::install();
+        let marker = "sessionless-ctrlc-request-k7p";
+        run_async(async {
+            let mut ctx = sessionless_interruptible_ctx(marker);
+
+            let (agent_abort, job_abort) = abort_a_request_over_agent_and_job(&mut ctx).await;
+
+            assert!(agent_abort.aborted_ctrlc(), "the agent must be cancelled");
+            assert!(job_abort.aborted_ctrlc(), "the job must be cancelled");
+            assert_eq!(
+                ctx.supervisor.as_ref().unwrap().read().is_finished("a1"),
+                Some(true),
+                "the turn waits for the cancelled agent before it returns"
+            );
+            yield_until_no_active_tasks(&ctx).await;
+        });
+        assert_eq!(hook_count(marker, "turn.interrupted"), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn session_ctrl_c_that_aborts_the_request_leaves_background_tasks_alive() {
+        let _sink = test_sink::install();
+        let marker = "session-ctrlc-request-b2x";
+        run_async(async {
+            let mut ctx = interruptible_ctx(marker);
+
+            let (agent_abort, job_abort) = abort_a_request_over_agent_and_job(&mut ctx).await;
+
+            assert!(!agent_abort.aborted(), "the agent must be left running");
+            assert!(!job_abort.aborted(), "the job must be left running");
+            assert!(ctx.supervisor.as_ref().unwrap().read().has_active_tasks());
+        });
+        assert_eq!(hook_count(marker, "turn.interrupted"), 1);
+    }
+
     #[test]
     fn sessionless_cancel_is_silent_with_nothing_running() {
         let ctx = banner_ctx();
@@ -9722,16 +9810,25 @@ local_hello() {\n\
         });
     }
 
-    /// Both arms of the interrupted turn print through the one notice
-    /// helper, so the sessionless notice reaches the same stderr channel as
-    /// the two-stage one, and the idle-prompt second press keeps its hint.
+    /// Both arms of the interrupted turn, and the sessionless cancel on an
+    /// aborted request, print through the one notice helper, so the
+    /// sessionless notice reaches the same stderr channel as the two-stage
+    /// one, and the idle-prompt second press keeps its hint.
     #[test]
     fn interrupted_arm_branches_on_the_session_through_one_notice_channel() {
         let source = include_str!("mod.rs").replace("\r\n", "\n");
         let production = &source[..source.find("\n#[cfg(test)]\nmod tests {").unwrap()];
         let arm = "        if interrupted {\n            if ctx.session.is_none() {\n                let notice = cancel_sessionless_turn_tasks(ctx, &abort_signal).await;\n                print_turn_notice(ctx, notice);\n            } else {\n                print_turn_notice(ctx, interrupted_turn_notice(ctx));\n            }\n        } else {\n";
         assert_eq!(production.matches(arm).count(), 1);
-        assert_eq!(production.matches("print_turn_notice(").count(), 3);
+        let aborted = "                    if abort_signal.aborted_ctrlc() && ctx.session.is_none() {\n                        let notice = cancel_sessionless_turn_tasks(ctx, &abort_signal).await;\n                        print_turn_notice(ctx, notice);\n                    }\n                    ctx.on_chat_completion_error(app.as_ref(), &input);\n                    return Err(err);\n";
+        assert_eq!(production.matches(aborted).count(), 1);
+        assert_eq!(production.matches("print_turn_notice(").count(), 4);
+        assert_eq!(
+            production
+                .matches("cancel_sessionless_turn_tasks(ctx, &abort_signal).await")
+                .count(),
+            2
+        );
         let printer = &production[production.find("fn print_turn_notice(").unwrap()..];
         let printer = &printer[..printer.find("\n}\n").unwrap()];
         assert!(printer.contains("eprintln!("), "{printer}");
