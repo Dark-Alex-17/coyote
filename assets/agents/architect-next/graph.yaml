@@ -1,8 +1,7 @@
 name: architect-next
 description: |
-  CANDIDATE decomposition of the architect orchestrator into a session graph
-  (plans/architect-graph-design.md; plans/suite-performance-draft.md section 10.18
-  step 4). The protocol the prose architect enforces becomes edges: script nodes
+  CANDIDATE decomposition of the architect orchestrator into a session graph.
+  The protocol the prose architect enforces becomes edges: script nodes
   own the mode routing (pr_strategy x parallel_tasks x task_granularity x autonomy x
   escalation_policy), the task scheduler, every bound, the ledgers and sentinel
   parsing; short single-question llm nodes own the judgment (orient, author/amend the

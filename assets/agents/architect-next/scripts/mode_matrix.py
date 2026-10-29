@@ -426,8 +426,11 @@ def main():
     root = os.path.join(tmp_home, "coyote")
     core = CORE_TOOLS_REL
     shutil.copytree(os.path.join(HERE, "..", "..", core), os.path.join(root, "agents", core))
-    utils = os.path.join(HERE, "..", "..", ".shared", "utils.sh")
-    write(os.path.join(root, "agents", ".shared", "utils.sh"), open(utils).read() if os.path.isfile(utils) else "# stub\n")
+    utils_src = os.path.join(HERE, "..", "..", ".shared", "utils.sh")
+    if not os.path.isfile(utils_src) or "set -euo pipefail" not in open(utils_src).read():
+        sys.exit(f"utils.sh: the repo asset is missing or is not the real file ({utils_src}); the walk needs it, not a stub")
+    write(os.path.join(root, "agents", ".shared", "utils.sh"), open(utils_src).read())
+    print("utils.sh: real asset")
     write(os.path.join(root, "agents", ".shared", "debris.py"), "import sys\nsys.exit(0)\n")
     os.environ["LLM_ROOT_DIR"] = root
     ghbin = os.path.join(tmp_home, "bin")
