@@ -29,6 +29,8 @@ pub(crate) const DEFAULT_MEMORY_INSTRUCTIONS: &str = indoc! {"
         - `memory__edit_index(scope, content)`: Replace the entire MEMORY.md at the given scope.
           Use this to add always-on facts, reorganize, prune stale entries, or fix descriptions.
         - `memory__list()`: See all known drill files and their metadata.
+        - `memory__search(query)`: Rank drill files by relevance to a query. Search here before
+          minting a new slug, so an existing file gets updated instead of duplicated.
         - `memory__lint()`: Health-check memory for orphans, broken links, oversized files,
           stale (superseded/expired) files, and index descriptions that drifted from the files.
 
@@ -272,6 +274,8 @@ mod tests {
                 .contains("give it `type: run-state` with an `expires` date")
         );
         assert!(DEFAULT_MEMORY_INSTRUCTIONS.contains("look for an existing slug to update"));
+        assert!(DEFAULT_MEMORY_INSTRUCTIONS.contains("Search here before"));
+        assert!(DEFAULT_MEMORY_INSTRUCTIONS.contains("`memory__search(query)`"));
         assert!(DEFAULT_MEMORY_INSTRUCTIONS.contains("Never mint a `-rN` sibling"));
         assert!(
             DEFAULT_MEMORY_INSTRUCTIONS
