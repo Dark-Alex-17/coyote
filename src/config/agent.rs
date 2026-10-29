@@ -1344,18 +1344,23 @@ fn append_replacing_roster(base: &str, appendix: &str) -> String {
 }
 
 /// `text` up to its trailing roster section, trailing whitespace trimmed.
+fn without_roster(text: &str) -> &str {
+    roster_line(text)
+        .map_or(text, |start| &text[..start])
+        .trim_end()
+}
+
+/// Where the first roster heading line of `text` starts, if it has one.
 /// The heading counts only as a whole line: at the start of the text or
 /// behind a blank line, and ending the line.
-fn without_roster(text: &str) -> &str {
-    let roster_start = text
-        .match_indices(TEAMMATE_ROSTER_HEADING)
+pub(crate) fn roster_line(text: &str) -> Option<usize> {
+    text.match_indices(TEAMMATE_ROSTER_HEADING)
         .map(|(start, _)| start)
         .find(|&start| {
             let tail = &text[start + TEAMMATE_ROSTER_HEADING.len()..];
             (start == 0 || text[..start].ends_with("\n\n"))
                 && (tail.is_empty() || tail.starts_with('\n'))
-        });
-    roster_start.map_or(text, |start| &text[..start]).trim_end()
+        })
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -2335,6 +2340,33 @@ nodes: {}
                 2,
                 "one mention in the sentence, one real section:\n{output}"
             );
+        }
+    }
+
+    /// `roster_line` finds a heading only as a whole line, and the cut
+    /// `without_roster` makes starts exactly there.
+    #[test]
+    fn roster_line_finds_the_heading_only_as_a_whole_line() {
+        let section = format!("{TEAMMATE_ROSTER_HEADING}\nYou are `p1`.");
+        for (text, expected) in [
+            (section.clone(), Some(0)),
+            (TEAMMATE_ROSTER_HEADING.to_string(), Some(0)),
+            (format!("Be brief.\n\n{section}"), Some(11)),
+            (
+                format!("Keep the {TEAMMATE_ROSTER_HEADING} short.\n\n{section}"),
+                Some(TEAMMATE_ROSTER_HEADING.len() + 18),
+            ),
+            (format!("Be brief.\n{section}"), None),
+            (
+                format!("Be brief.\n\n{TEAMMATE_ROSTER_HEADING} is a myth."),
+                None,
+            ),
+            (format!("Be brief.\n\n{TEAMMATE_ROSTER_HEADING}:\nno"), None),
+            ("Be brief.".to_string(), None),
+        ] {
+            assert_eq!(roster_line(&text), expected, "{text:?}");
+            let kept = expected.map_or(text.as_str(), |start| &text[..start]);
+            assert_eq!(without_roster(&text), kept.trim_end(), "{text:?}");
         }
     }
 

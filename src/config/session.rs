@@ -934,19 +934,16 @@ impl Session {
     /// compressed session keeps its summary: only the original prompt at
     /// the head of the summary row is replaced. `compress` is what keeps
     /// that row and `compressed_system_prompt` in step; a row that does not
-    /// start with the stored prompt is left as it is and logged.
+    /// start with the stored prompt is left as it is and logged, and so is
+    /// the rest of the session: that check runs before any field is written.
     pub fn readopt_agent_prompt(&mut self, agent: &Agent) {
-        self.sync_agent(agent);
-        let prompt = self.role_prompt.clone();
-        let Some(first) = self
+        let head = self
             .messages
-            .first_mut()
-            .filter(|message| message.role == MessageRole::System)
-        else {
-            return;
-        };
-        let text = match self.compressed_system_prompt.as_deref() {
-            Some(stored) => {
+            .first()
+            .filter(|message| message.role == MessageRole::System);
+        let summary = match (head, self.compressed_system_prompt.as_deref()) {
+            (None, _) => None,
+            (Some(first), Some(stored)) => {
                 let current = first.content.to_text();
                 let Some(summary) = current.strip_prefix(stored) else {
                     log::warn!(
@@ -955,11 +952,19 @@ impl Session {
                     );
                     return;
                 };
-                format!("{prompt}{summary}")
+                Some(summary.to_string())
             }
-            None => prompt.clone(),
+            (Some(_), None) => Some(String::new()),
         };
-        first.content = MessageContent::Text(text);
+        self.sync_agent(agent);
+        let Some(summary) = summary else {
+            return;
+        };
+        let prompt = self.role_prompt.clone();
+        let text = format!("{prompt}{summary}");
+        if let Some(first) = self.messages.first_mut() {
+            first.content = MessageContent::Text(text);
+        }
         if self.compressed_system_prompt.is_some() {
             self.compressed_system_prompt = Some(prompt);
         }
@@ -2134,6 +2139,14 @@ mod tests {
             ..AgentConfig::default()
         });
         agent.set_instructions_appendix("## Teammate roster\nnew seat");
+        session
+            .agent_variables
+            .insert("tone".to_string(), "quiet".to_string());
+        session.chat_agent = Some("helper".to_string());
+        let role_prompt = session.role_prompt.clone();
+        let agent_instructions = session.agent_instructions.clone();
+        let agent_variables = session.agent_variables.clone();
+        assert_ne!(role_prompt, agent.interpolated_instructions());
 
         session.readopt_agent_prompt(&agent);
 
@@ -2145,7 +2158,11 @@ mod tests {
             session.compressed_system_prompt.as_deref(),
             Some("Say loud")
         );
-        assert_eq!(session.role_prompt, agent.interpolated_instructions());
+        assert_eq!(session.role_prompt, role_prompt);
+        assert_eq!(session.agent_instructions, agent_instructions);
+        assert_eq!(session.agent_variables, agent_variables);
+        assert_eq!(session.chat_agent.as_deref(), Some("helper"));
+        assert!(!session.dirty);
     }
 
     #[test]

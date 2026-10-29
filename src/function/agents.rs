@@ -8,7 +8,7 @@ use crate::config::{
     Agent, AgentVariable, AgentVariables, AppConfig, AppState, Input, RequestContext, Role,
     RoleLike, Session, TEMP_SESSION_NAME, child_sessions_enabled, default_max_agent_depth,
     effective_max_concurrent_jobs, jobs_enabled, list_agents_with_descriptions,
-    load_agent_variables, paths,
+    load_agent_variables, paths, roster_line,
 };
 use crate::hooks::{self, HookEvent, ResolvedHook};
 use crate::mcp::is_auth_required_error;
@@ -1167,11 +1167,10 @@ pub async fn run_agent_for_graph(
         // the stored row names one, the prompt and the row are re-adopted
         // from the agent, whose appendix is this run's roster or nothing;
         // the session keeps the variables it was resumed with.
-        let stored_roster = child_ctx.session.as_ref().is_some_and(|session| {
-            session
-                .agent_instructions()
-                .contains(TEAMMATE_ROSTER_HEADING)
-        });
+        let stored_roster = child_ctx
+            .session
+            .as_ref()
+            .is_some_and(|session| roster_line(session.agent_instructions()).is_some());
         if (seats_a_teammate || stored_roster)
             && let (Some(session), Some(agent)) =
                 (child_ctx.session.as_mut(), child_ctx.agent.as_ref())
@@ -13851,6 +13850,41 @@ mod tests {
         assert!(system.starts_with("Say loud to them"), "{system}");
         assert!(!output.contains("Teammate roster"), "{output}");
         assert!(!output.contains("deadbeef"), "{output}");
+        assert_eq!(users, ["earlier", "hi"], "{output}");
+    }
+
+    /// A stored prompt that only mentions the roster heading inside a line
+    /// names no roster, so an unseated resume does not re-adopt the prompt:
+    /// the session speaks with the System row it was stored under.
+    #[test]
+    #[serial]
+    fn an_unseated_resume_keeps_a_stored_prompt_that_only_mentions_the_roster() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_teammate_roster_mention");
+        write_agent_with_a_stale_roster_session(&agent_name);
+        let stored = format!("Keep the {TEAMMATE_ROSTER_HEADING} short.");
+        write(
+            paths::agent_sessions_dir(&agent_name).join("teammate.yaml"),
+            format!(
+                "model: test-seeded:test-chat\n\
+                 agent_instructions: {stored:?}\n\
+                 messages:\n\
+                 \x20 - role: system\n\
+                 \x20   content: {stored:?}\n\
+                 \x20 - role: user\n\
+                 \x20   content: earlier\n\
+                 \x20 - role: assistant\n\
+                 \x20   content: noted\n"
+            ),
+        )
+        .unwrap();
+        let mut ctx = RequestContext::new(echoing_app_state("test-seeded"), WorkingMode::Cmd);
+        ctx.model = Model::new("test-seeded", "test-chat");
+
+        let output = run_async(run_agent_for_graph(&mut ctx, &agent_name, "hi", None)).unwrap();
+
+        let (system, users) = system_and_users(&output);
+        assert_eq!(system, stored, "{output}");
         assert_eq!(users, ["earlier", "hi"], "{output}");
     }
 
