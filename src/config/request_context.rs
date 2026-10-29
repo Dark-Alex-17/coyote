@@ -265,28 +265,20 @@ const SYSTEM_PROMPT_SHARE_WARN_PERCENT: usize = 25;
 /// is printed once rather than on every turn.
 static SYSTEM_PROMPT_SHARE_WARNING: OnceLock<()> = OnceLock::new();
 
+/// Counts the share warnings actually printed, so a test can observe the
+/// once-per-process gate without being able to reset it.
+#[cfg(test)]
+static SYSTEM_PROMPT_SHARE_WARNINGS_PRINTED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 fn system_prompt_share_warning(split: &SystemPromptSplit, window: Option<usize>) -> Option<String> {
-    let window = window.filter(|window| *window > 0)?;
-    let total = split.role_tokens + split.memory_tokens + split.instructions_tokens;
-    if total * 100 <= window * SYSTEM_PROMPT_SHARE_WARN_PERCENT {
-        return None;
-    }
-    let head = format!(
-        "system prompt is over {SYSTEM_PROMPT_SHARE_WARN_PERCENT}% of the model window ({total} of {window} tokens"
-    );
-    Some(
-        if split.memory_tokens >= split.role_tokens.max(split.instructions_tokens) {
-            format!(
-                "{head}, {} from memory); prune memory or lower memory_facts_cap",
-                split.memory_tokens
-            )
-        } else {
-            format!(
-                "{head}, {} from the role and {} from instructions); shorten the role prompt or instructions",
-                split.role_tokens, split.instructions_tokens
-            )
-        },
-    )
+    let pct = split
+        .share_percent(window)
+        .filter(|pct| *pct > SYSTEM_PROMPT_SHARE_WARN_PERCENT)?;
+    Some(format!(
+        "system prompt is at least {pct}% of the model window ({} memory tokens); prune memory or lower memory_facts_cap",
+        split.memory_tokens
+    ))
 }
 
 /// The one sentence every failure to bring up a graph agent's chat agent is
@@ -1506,9 +1498,15 @@ impl RequestContext {
             .and_then(Session::compression_threshold)
             .unwrap_or(app.compression_threshold);
         let valve = app.compression_safety_valve;
-        let window = match session {
-            Some(session) => session.model().max_input_tokens(),
-            None => self.extract_role(app)?.model().max_input_tokens(),
+        let (window, system_prompt) = match session {
+            Some(session) => (
+                session.model().max_input_tokens(),
+                self.system_prompt_split.lock().unwrap_or_default(),
+            ),
+            None => {
+                let (role, split) = self.extract_role_impl(app, true)?;
+                (role.model().max_input_tokens(), split.unwrap_or_default())
+            }
         };
         let keep = self.compression_keep_policy(None);
         let tail = session.map(|session| session.kept_tail(keep));
@@ -1528,7 +1526,7 @@ impl RequestContext {
                 .zip(tail)
                 .map(|(session, tail)| session.model().total_tokens(tail)),
             archived_messages: session.map(|session| session.compressed_messages().len()),
-            system_prompt: self.system_prompt_split.lock().unwrap_or_default(),
+            system_prompt,
             max_input_tokens: window,
         })
     }
@@ -2134,10 +2132,31 @@ impl RequestContext {
     }
 
     pub fn extract_role(&self, app: &AppConfig) -> Result<Role> {
-        self.extract_role_impl(app, true)
+        let (role, split) = self.extract_role_impl(app, true)?;
+        if let Some(split) = split {
+            *self.system_prompt_split.lock() = Some(split);
+            if let Some(warning) =
+                system_prompt_share_warning(&split, role.model().max_input_tokens())
+                && SYSTEM_PROMPT_SHARE_WARNING.set(()).is_ok()
+            {
+                eprintln!("{warning}");
+                warn!("{warning}");
+                #[cfg(test)]
+                SYSTEM_PROMPT_SHARE_WARNINGS_PRINTED
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        Ok(role)
     }
 
-    fn extract_role_impl(&self, app: &AppConfig, inject_memory: bool) -> Result<Role> {
+    /// Builds the effective role and, when `inject_memory` is set, the split
+    /// of its system prompt. Nothing is stored and no warning is printed, so
+    /// read-only views such as `.info` can call it freely.
+    fn extract_role_impl(
+        &self,
+        app: &AppConfig,
+        inject_memory: bool,
+    ) -> Result<(Role, Option<SystemPromptSplit>)> {
         let mut role = if let Some(session) = self.session.as_ref() {
             let mut role = session.to_role();
             // A swapped-in delegate answers with its own knobs; they overlay
@@ -2224,6 +2243,7 @@ impl RequestContext {
             }
         }
 
+        let mut prompt_split = None;
         if inject_memory {
             let mut split = SystemPromptSplit {
                 role_tokens: estimate_token_length(role.prompt()),
@@ -2262,17 +2282,13 @@ impl RequestContext {
                     Err(e) => warn!("memory injection failed: {}", e),
                 }
             }
-            *self.system_prompt_split.lock() = Some(split);
-            if let Some(warning) =
-                system_prompt_share_warning(&split, role.model().max_input_tokens())
-                && SYSTEM_PROMPT_SHARE_WARNING.set(()).is_ok()
-            {
-                eprintln!("{warning}");
-                warn!("{warning}");
-            }
+            prompt_split = Some(split);
         }
 
-        Ok(self.skill_registry.effective_role(&role, &policy))
+        Ok((
+            self.skill_registry.effective_role(&role, &policy),
+            prompt_split,
+        ))
     }
 
     /// Whether the model that answers a chat turn can call the memory tools.
@@ -3075,7 +3091,7 @@ impl RequestContext {
             Some(rag) => rag.get_config(),
             None => (app.rag_reranker_model.clone(), app.rag_top_k),
         };
-        let role = self.extract_role(app)?;
+        let (role, _) = self.extract_role_impl(app, false)?;
         let mut items = vec![
             ("model", role.model().id()),
             (
@@ -3329,10 +3345,13 @@ impl RequestContext {
 
     pub fn generate_prompt_context(&self, app: &AppConfig) -> HashMap<&str, String> {
         let mut output = HashMap::new();
-        let role = self.extract_role_impl(app, false).unwrap_or_else(|err| {
-            warn!("failed to compute effective role for prompt rendering: {err}");
-            Role::default()
-        });
+        let role = self
+            .extract_role_impl(app, false)
+            .map(|(role, _)| role)
+            .unwrap_or_else(|err| {
+                warn!("failed to compute effective role for prompt rendering: {err}");
+                Role::default()
+            });
         output.insert("model", role.model().id());
         output.insert("client_name", role.model().client_name().to_string());
         output.insert("model_name", role.model().name().to_string());
@@ -10016,28 +10035,17 @@ mod tests {
             instructions_tokens: 0,
             truncated: None,
         };
+        assert_eq!(system_prompt_share_warning(&split(150), Some(1_000)), None);
+        assert_eq!(system_prompt_share_warning(&split(159), Some(1_000)), None);
         assert_eq!(
             system_prompt_share_warning(&split(160), Some(1_000)).as_deref(),
             Some(
-                "system prompt is over 25% of the model window (260 of 1000 tokens, 160 from memory); prune memory or lower memory_facts_cap"
-            )
-        );
-        assert_eq!(system_prompt_share_warning(&split(150), Some(1_000)), None);
-        assert_eq!(
-            system_prompt_share_warning(&split(159), Some(1_000)).as_deref(),
-            Some(
-                "system prompt is over 25% of the model window (259 of 1000 tokens, 159 from memory); prune memory or lower memory_facts_cap"
+                "system prompt is at least 26% of the model window (160 memory tokens); prune memory or lower memory_facts_cap"
             )
         );
         assert_eq!(system_prompt_share_warning(&split(0), Some(1_000)), None);
         assert_eq!(system_prompt_share_warning(&split(10_000), None), None);
         assert_eq!(system_prompt_share_warning(&split(10_000), Some(0)), None);
-        assert_eq!(
-            system_prompt_share_warning(&split(0), Some(300)).as_deref(),
-            Some(
-                "system prompt is over 25% of the model window (100 of 300 tokens, 100 from the role and 0 from instructions); shorten the role prompt or instructions"
-            )
-        );
     }
 
     #[test]
