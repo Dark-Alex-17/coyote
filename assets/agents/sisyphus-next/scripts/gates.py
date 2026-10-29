@@ -1108,12 +1108,16 @@ def build_gauntlet_prompt(state):
     return u
 
 
-def _parse_gauntlet(text):
-    header = text
+def _gauntlet_header(text):
     if m := re.search(r"^## Full lane reports[ \t]*$", text, re.M):
-        header = text[:m.start()]
-    elif (i := text.find("<details>")) >= 0:
-        header = text[:i]
+        return text[:m.start()]
+    if (i := text.find("<details>")) >= 0:
+        return text[:i]
+    return text
+
+
+def _parse_gauntlet(text):
+    header = _gauntlet_header(text)
     verdict = "BLOCKED"
     if m := re.search(r"^GAUNTLET:[ \t]*(PASS|BLOCKED)[ \t]*$", header, re.M):
         verdict = m.group(1)
@@ -1122,17 +1126,21 @@ def _parse_gauntlet(text):
         incomplete = [x.strip() for x in m.group(1).split(",") if x.strip()]
     lanes = {}
     details = {}
-    for line in header.splitlines():
-        cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        if len(cells) >= 2 and cells[0].lower() in GAUNTLET_LANES:
-            lanes[cells[0].lower()] = cells[1]
+    header_lines = header.splitlines()
+    first_row = next((i for i, l in enumerate(header_lines) if l.startswith("|")), len(header_lines))
+    for line in header_lines[first_row:]:
+        if not line.startswith("|"):
+            break
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        lane = cells[0].lower()
+        if len(cells) >= 2 and lane in GAUNTLET_LANES and lane not in lanes:
+            lanes[lane] = cells[1]
             if len(cells) >= 3 and cells[2]:
-                details[cells[0].lower()] = cells[2]
+                details[lane] = cells[2]
     blockers = []
-    sec = re.search(r"(?ims)^#+\s*Blockers?\s*\n(.*?)(?=^#+\s|\Z)", header)
-    if sec:
-        blockers = [l.strip()[1:].strip() for l in sec.group(1).splitlines() if l.strip().startswith(("-", "*"))]
-    blockers += [l.strip() for l in header.splitlines() if l.strip().startswith("debris: Implementation debris")]
+    if sec := re.search(r"(?ims)^#+[ \t]*Blockers?[ \t]*$\n?(.*?)(?=^#+\s|\Z)", header):
+        blockers = [l[2:].strip() for l in sec.group(1).splitlines() if l.startswith(("- ", "* "))]
+    blockers += [l.rstrip() for l in header_lines if l.startswith("debris: Implementation debris")]
     attention = ""
     if m := re.search(r"(?ims)^#+\s*Human attention required\s*\n(.*?)(?=^#+\s|\Z)", header):
         attention = m.group(1).strip()
@@ -1143,7 +1151,7 @@ def route_gauntlet(state):
     u = {}
     note_script_error(state, u, "run_gauntlet")
     text = state.get("gauntlet_result") or ""
-    if not text or text.startswith("Agent node failed") or "GAUNTLET:" not in text:
+    if not text or text.startswith("Agent node failed") or "GAUNTLET:" not in _gauntlet_header(text):
         verdict, incomplete, lanes, details, blockers, attention = "BLOCKED", ["pipeline"], {}, {}, [], ""
     else:
         verdict, incomplete, lanes, details, blockers, attention = _parse_gauntlet(text)

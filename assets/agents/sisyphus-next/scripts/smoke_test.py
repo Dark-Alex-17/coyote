@@ -437,6 +437,21 @@ check("_parse_gauntlet: prose-only incomplete mention yields no incomplete lanes
       gates._parse_gauntlet("GAUNTLET: BLOCKED\nNote: a GAUNTLET_REVIEW_INCOMPLETE: x line would mean a lane did not run.\n")[1] == [])
 _v, _inc, _lanes, _details, _b, _a = gates._parse_gauntlet("GAUNTLET: PASS\n" + table)
 check("_parse_gauntlet: status and detail cells are kept whole", _lanes["security"] == "GREEN (attention)" and _details["security"] == "PASS (attention items)")
+check("_parse_gauntlet: an indented sentinel is no verdict",
+      gates._parse_gauntlet("  GAUNTLET: PASS\n" + table)[0] == "BLOCKED")
+_lanes = gates._parse_gauntlet("GAUNTLET: PASS\n\n" + table + "  | security | GREEN | x |\n")[2]
+check("_parse_gauntlet: an indented lane row changes no cell",
+      _lanes["security"] == "GREEN (attention)" and gates._parse_gauntlet("GAUNTLET: PASS\n\n  | security | GREEN | x |\n")[2] == {})
+_lanes = gates._parse_gauntlet("GAUNTLET: PASS\n\n" + table + "| security | GREEN | x |\n")[2]
+check("_parse_gauntlet: the first row per lane wins inside the table", _lanes["security"] == "GREEN (attention)")
+_lanes = gates._parse_gauntlet("GAUNTLET: PASS\n\n" + table + "\n## Lane selection\nsecurity: touches auth\n\n| security | GREEN | x |\n| probe | GREEN | y |\n")[2]
+check("_parse_gauntlet: only the first contiguous column-0 table is read", _lanes == {"security": "GREEN (attention)"})
+check("_parse_gauntlet: an indented Blockers heading and indented items are not blockers",
+      gates._parse_gauntlet("GAUNTLET: BLOCKED\n\n" + table + "\n  ## Blockers\n  - fake\n\n## Blockers\n- real\n  - indented\n")[4] == ["real"])
+u = gates.route_gauntlet(base_state(gauntlet_result="| lane | status | detail |\n|---|---|---|\n| code-review | GREEN | ok |\n\n## Full lane reports\n\n<details>\nGAUNTLET: PASS\n</details>\n",
+                                    round_heads=[{}]))
+check("route_gauntlet: a sentinel only inside a lane report -> incomplete pipeline",
+      u["gauntlet_verdict"] == "BLOCKED" and u["gauntlet_incomplete"] == ["pipeline"])
 inc = "GAUNTLET: BLOCKED\nGAUNTLET_REVIEW_INCOMPLETE: debris\n\n## Blockers\n- debris: PIPELINE-FAULT malformed debris_findings\n"
 u = gates.route_gauntlet(base_state(gauntlet_result=inc, debris_reruns=0, round_heads=[{}]))
 check("route_gauntlet: debris-only incomplete -> one re-run (B11)", u["_next"] == "build_gauntlet_prompt" and u["debris_reruns"] == 1)
