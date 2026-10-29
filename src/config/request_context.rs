@@ -592,10 +592,10 @@ pub struct RequestContext {
     /// under. Resolved once per graph run by `ensure_child_session_root`;
     /// forks and children copy the parent's handle.
     pub(crate) child_session_root: Option<Arc<ChildSessionRoot>>,
-    /// Where `memory_config` starts workspace memory discovery for the
-    /// prompt. `None` means the process cwd, read at each lookup. The memory
-    /// tools do not read this and always resolve from the cwd.
-    pub(crate) workspace_memory_root: Option<PathBuf>,
+    /// Test seam: where `memory_config` starts workspace memory discovery
+    /// instead of the process cwd.
+    #[cfg(test)]
+    workspace_memory_root: Option<PathBuf>,
 
     pub supervisor: Option<Arc<RwLock<Supervisor>>>,
     pub parent_supervisor: Option<Arc<RwLock<Supervisor>>>,
@@ -672,6 +672,7 @@ impl RequestContext {
             last_graph_branch: None,
             delegate: None,
             child_session_root: None,
+            #[cfg(test)]
             workspace_memory_root: None,
             supervisor: None,
             parent_supervisor: None,
@@ -758,6 +759,7 @@ impl RequestContext {
             last_graph_branch: None,
             delegate: None,
             child_session_root: None,
+            #[cfg(test)]
             workspace_memory_root: None,
             supervisor: None,
             parent_supervisor: None,
@@ -879,6 +881,7 @@ impl RequestContext {
             last_graph_branch: self.last_graph_branch,
             delegate,
             child_session_root: self.child_session_root.clone(),
+            #[cfg(test)]
             workspace_memory_root: self.workspace_memory_root.clone(),
             supervisor: self.supervisor.clone(),
             parent_supervisor: self.parent_supervisor.clone(),
@@ -948,6 +951,7 @@ impl RequestContext {
             last_graph_branch: None,
             delegate: None,
             child_session_root: parent.child_session_root.clone(),
+            #[cfg(test)]
             workspace_memory_root: parent.workspace_memory_root.clone(),
             supervisor: None,
             parent_supervisor: parent.supervisor.clone(),
@@ -2385,10 +2389,7 @@ impl RequestContext {
             return MemoryConfig::disabled();
         }
 
-        let root = self
-            .workspace_memory_root
-            .clone()
-            .or_else(|| env::current_dir().ok());
+        let root = self.workspace_memory_root_or_cwd();
         let store = root.as_deref().map(MemoryStore::new);
         let workspace = store.as_ref().and_then(|s| s.workspace.clone());
 
@@ -2403,6 +2404,18 @@ impl RequestContext {
             enabled: true,
             workspace,
         }
+    }
+
+    #[cfg(not(test))]
+    fn workspace_memory_root_or_cwd(&self) -> Option<PathBuf> {
+        env::current_dir().ok()
+    }
+
+    #[cfg(test)]
+    fn workspace_memory_root_or_cwd(&self) -> Option<PathBuf> {
+        self.workspace_memory_root
+            .clone()
+            .or_else(|| env::current_dir().ok())
     }
 
     pub fn should_inject_memory(&self) -> bool {

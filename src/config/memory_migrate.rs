@@ -652,17 +652,6 @@ fn render_rewrite(file: &MemoryFile) -> Result<String> {
 }
 
 fn apply_scope(report: &mut ScopeReport, backup_root: &Path, stamp: &str) -> Result<()> {
-    apply_scope_with(report, backup_root, stamp, || {})
-}
-
-/// `before_index_write` runs after the drill files are written, so a test can
-/// edit the index in the window the second index check guards.
-fn apply_scope_with(
-    report: &mut ScopeReport,
-    backup_root: &Path,
-    stamp: &str,
-    before_index_write: impl FnOnce(),
-) -> Result<()> {
     let backup = unused_backup_dir(backup_root, report.label, stamp);
     copy_dir_all(&report.dir, &backup, &|name| {
         name.to_string_lossy().starts_with(".catalogue.")
@@ -716,6 +705,39 @@ fn apply_scope_with(
         report.written.push(index_path);
     }
     Ok(())
+}
+
+/// Runs after the drill files are written, so a test can edit the index in
+/// the window the second index check guards. A no-op outside tests.
+#[cfg(not(test))]
+fn before_index_write() {}
+
+#[cfg(test)]
+fn before_index_write() {
+    if let Some(hook) = BEFORE_INDEX_WRITE.with(|slot| slot.take()) {
+        hook();
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_INDEX_WRITE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `apply_scope` with `hook` armed to run once on this thread at
+/// `before_index_write`.
+#[cfg(test)]
+fn apply_scope_with(
+    report: &mut ScopeReport,
+    backup_root: &Path,
+    stamp: &str,
+    hook: impl FnOnce() + 'static,
+) -> Result<()> {
+    BEFORE_INDEX_WRITE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    let result = apply_scope(report, backup_root, stamp);
+    BEFORE_INDEX_WRITE.with(|slot| slot.borrow_mut().take());
+    result
 }
 
 /// A second migration within the same second gets its own backup dir
@@ -2022,8 +2044,9 @@ mod tests {
         let index_path = fx.workspace.join(MEMORY_INDEX_FILE_NAME);
         let edited = format!("{}- [[late]]: added meanwhile\n", workspace_index());
 
-        let err = apply_scope_with(&mut report, &fx.backups, "20260301T123045", || {
-            fs::write(&index_path, &edited).unwrap();
+        let (path, text) = (index_path.clone(), edited.clone());
+        let err = apply_scope_with(&mut report, &fx.backups, "20260301T123045", move || {
+            fs::write(&path, &text).unwrap();
         })
         .expect_err("an index edited during apply is refused");
 
