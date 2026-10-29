@@ -8424,6 +8424,75 @@ mod tests {
         assert_eq!(meta.pid, live.pid);
     }
 
+    /// Resuming a child whose process died with its run still open closes
+    /// that run as superseded, opens a new one, and the lister then shows
+    /// the child running with both runs counted.
+    #[test]
+    #[serial]
+    fn usage_probe_resume_over_a_crashed_open_run_closes_it_and_lists_two_runs() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_name = unique_agent_name("test_resume_open_run");
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let (sid, _) = seed_completed_config_child(&mut ctx, &agent_name, json!({}));
+        let root = spawner_root(&ctx);
+        let mut meta = root.load_child_meta(&sid).unwrap().unwrap();
+        let dead = ProcessStamp {
+            pid: u32::MAX - 1,
+            start: 1,
+        };
+        meta.status = ChildStatus::Running;
+        meta.pid = dead.pid;
+        meta.pid_start = dead.start;
+        let last = meta.runs.last_mut().unwrap();
+        last.finished_at = None;
+        last.status = None;
+        last.error = None;
+        let runs_before = meta.runs.len();
+        let crashed_agent_id = meta.runs.last().unwrap().agent_id.clone();
+        root.save_child_meta(&meta).unwrap();
+
+        let spawn = build_ready_spawn(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+
+        let after = child_meta_of(&ctx, &sid);
+        assert_eq!(after.runs.len(), runs_before + 1);
+        let closed = &after.runs[after.runs.len() - 2];
+        assert_eq!(closed.agent_id, crashed_agent_id);
+        assert!(closed.finished_at.is_some());
+        assert_eq!(closed.status, Some(ChildStatus::Failed));
+        assert_eq!(
+            closed.error.as_deref(),
+            Some("superseded by a resume while still marked running")
+        );
+        let open = after.runs.last().unwrap();
+        assert_eq!(open.agent_id, spawn.agent_id);
+        assert!(open.finished_at.is_none());
+        assert_eq!(
+            after
+                .runs
+                .iter()
+                .filter(|r| r.finished_at.is_none())
+                .count(),
+            1
+        );
+        assert_eq!(after.status, ChildStatus::Running);
+        assert_eq!(after.agent_id, spawn.agent_id);
+
+        let page = list_sessions(&mut ctx, json!({})).unwrap();
+        let row = page["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["session_id"] == json!(sid))
+            .unwrap()
+            .clone();
+        assert_eq!(row["status"], json!("running"));
+        assert_eq!(row["runs"], json!(runs_before + 1));
+    }
+
     #[test]
     #[serial]
     fn resume_refuses_differing_variables_and_accepts_equal_or_omitted_ones() {
