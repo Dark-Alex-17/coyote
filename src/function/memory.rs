@@ -685,6 +685,7 @@ fn write_memory(
             expires,
         },
         body: content,
+        source: Default::default(),
     };
     file.save()?;
 
@@ -734,7 +735,7 @@ fn slug_grammar() -> String {
 }
 
 /// Splits `<base>-r<N>` into `(base, N)`; any other shape is not a round name.
-fn round_chain_name(name: &str) -> Option<(&str, u32)> {
+pub(crate) fn round_chain_name(name: &str) -> Option<(&str, u32)> {
     let (base, digits) = name.rsplit_once("-r")?;
     if base.is_empty() || digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
