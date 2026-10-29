@@ -350,10 +350,6 @@ fn stamp_round_chains(
 }
 
 fn apply_scope(report: &mut ScopeReport, backup_root: &Path, stamp: &str) -> Result<()> {
-    let backup = unused_backup_dir(backup_root, report.label, stamp);
-    copy_dir_all(&report.dir, &backup)
-        .with_context(|| format!("back up {} to {}", report.dir.display(), backup.display()))?;
-    report.backup = Some(backup.clone());
     let index_path = report.dir.join(MEMORY_INDEX_FILE_NAME);
     if report.new_index.is_some() {
         let current = fs::read_to_string(&index_path)
@@ -361,12 +357,15 @@ fn apply_scope(report: &mut ScopeReport, backup_root: &Path, stamp: &str) -> Res
         if report.index.as_ref() != Some(&current) {
             bail!(
                 "{} changed since the migration was planned, so nothing was rewritten. \
-                 Rerun --memory-migrate; the pre-run copy is in {}",
+                 Rerun --memory-migrate",
                 index_path.display(),
-                backup.display()
             );
         }
     }
+    let backup = unused_backup_dir(backup_root, report.label, stamp);
+    copy_dir_all(&report.dir, &backup)
+        .with_context(|| format!("back up {} to {}", report.dir.display(), backup.display()))?;
+    report.backup = Some(backup);
     for file in &report.rewrites {
         write_private_atomic(&file.path, &file.render()?)
             .with_context(|| format!("write memory file {}", file.path.display()))?;
@@ -1077,6 +1076,8 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(&index_path).unwrap(), edited);
         assert!(plan.written.is_empty(), "{:?}", plan.written);
+        assert!(plan.backup.is_none());
+        assert!(!fx.backups.exists());
     }
 
     #[test]
