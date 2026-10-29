@@ -152,7 +152,7 @@ pub struct Cli {
             "dangerously_skip_permissions", "agent_variable", "git_host", "filter",
             "install_force", "yes", "force", "transport", "url", "scope", "env", "header", "cwd",
             "client_id", "client_secret", "callback_port", "redirect_host", "mcp_force",
-            "disable_log_colors",
+            "disable_log_colors", "mcp_command",
         ]
     )]
     pub memory_migrate: Option<MigrateScope>,
@@ -708,6 +708,12 @@ mod tests {
         );
         assert!(
             Cli::try_parse_from(["coyote", "--memory-migrate", "all", "some", "prompt"]).is_err()
+        );
+        assert_eq!(
+            Cli::try_parse_from(["coyote", "--memory-migrate", "all", "--", "x"])
+                .err()
+                .map(|err| err.kind()),
+            Some(clap::error::ErrorKind::ArgumentConflict)
         );
     }
 
