@@ -26,8 +26,9 @@
 //! `graph.example.yaml`. The child-session pages are read against
 //! `src/config/child_sessions.rs`, the `agent__spawn` tool in
 //! `src/function/agents.rs`, the `previous_turns` budget in
-//! `src/graph/transcript.rs`, the bundled coder's `carry:` list and the
-//! resume policy sentence of `assets/skills/delegation-protocol/SKILL.md`.
+//! `src/graph/transcript.rs`, the bundled coder graph (which declares no
+//! `carry:` list) and the resume policy sentence of
+//! `assets/skills/delegation-protocol/SKILL.md`.
 
 use std::collections::BTreeSet;
 use std::env;
@@ -2316,8 +2317,8 @@ fn hook_pages_document_the_session_deleted_event() {
 /// Graph-Agents.md documents `carry:` as a top-level field and
 /// `previous_turns` as a seeded key: the reserved-key errors are the
 /// parser's literals, the byte budget is `PREVIOUS_TURNS_BYTES`, and the
-/// keys the `carry` bullet says the bundled coder carries are exactly the
-/// ones its graph lists.
+/// `carry` bullet says the bundled coder carries nothing, matching its
+/// graph, which declares no `carry:` list.
 #[test]
 fn graph_page_documents_carry_and_previous_turns() {
     let parser = src(&["graph", "parser.rs"]);
@@ -2337,32 +2338,29 @@ fn graph_page_documents_carry_and_previous_turns() {
         "PREVIOUS_TURNS_BYTES changed; update the `24 KiB` figure on Graph-Agents.md and this pin"
     );
     let coder = read(repo_root().join("assets/agents/coder/graph.yaml"));
-    let carry: BTreeSet<String> = coder
-        .split("\ncarry:\n")
-        .nth(1)
-        .expect("the coder graph has a top-level carry: list")
-        .lines()
-        .take_while(|line| line.starts_with("  - "))
-        .map(|line| line["  - ".len()..].trim().to_string())
-        .collect();
-    assert!(!carry.is_empty(), "the coder carries at least one key");
+    assert!(
+        !coder.contains("\ncarry:") && !coder.starts_with("carry:"),
+        "the coder graph declares a top-level carry: list; update the carry bullet and this pin"
+    );
 
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join(SENTINEL_PAGE));
     let bullet = flat(&paragraph(SENTINEL_PAGE, &page, CARRY_BULLET_LEAD));
-    let lead = "The bundled `coder` carries";
-    let at = bullet
-        .find(lead)
-        .unwrap_or_else(|| panic!("the carry bullet does not say {lead:?}: {bullet}"));
-    let carried = &bullet[at + lead.len()..];
-    let end = carried
-        .find(" and renders")
-        .unwrap_or_else(|| panic!("the carry bullet goes on to what the coder renders: {bullet}"));
-    let documented: BTreeSet<String> = code_spans(&carried[..end]).into_iter().collect();
-    assert_eq!(
-        documented, carry,
-        "the carry bullet's coder keys differ from the coder graph's carry: list"
+    let lead = "The bundled `coder` carries nothing";
+    assert!(
+        bullet.contains(lead),
+        "the carry bullet does not say {lead:?}: {bullet}"
     );
+    assert!(
+        bullet.contains("`{{previous_turns}}`"),
+        "the carry bullet does not say the coder reads `{{{{previous_turns}}}}` instead: {bullet}"
+    );
+    for key in ["plan_summary", "files_to_modify", "files_to_create"] {
+        assert!(
+            !bullet.contains(&format!("`{key}`")),
+            "the carry bullet still names `{key}` as a coder key: {bullet}"
+        );
+    }
     let turns = flat(&section(SENTINEL_PAGE, &page, PREVIOUS_TURNS_HEADING));
     for literal in &reserved {
         assert!(

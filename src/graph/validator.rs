@@ -2485,6 +2485,25 @@ mod tests {
     }
 
     #[test]
+    fn the_bundled_coder_graph_does_not_warn_about_carry() {
+        let graph: Graph =
+            serde_yaml::from_str(include_str!("../../assets/agents/coder/graph.yaml")).unwrap();
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/agents/coder");
+
+        let result = GraphValidator::new(dir)
+            .with_skill_exists(|_: &str| true)
+            .validate(&graph);
+
+        assert!(graph.carry.is_empty(), "{:?}", graph.carry);
+        assert!(result.is_valid(), "{:?}", result.errors);
+        assert!(
+            !messages(&result.warnings).contains(&CARRY_WITHOUT_SESSION),
+            "{:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
     #[serial]
     fn the_engage_pass_reports_carry_without_a_session_block() {
         let _guard = TestConfigDirGuard::new();

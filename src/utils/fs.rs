@@ -387,6 +387,63 @@ mod tests {
         releaser.join().unwrap();
     }
 
+    /// Measures acquire latency under contention without asserting on it,
+    /// so the retry interval's cost shows up in `--nocapture` output and
+    /// never as a flaky failure.
+    #[test]
+    fn exclusive_lock_contention_stays_exclusive_and_reports_acquire_latency() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::{Arc, Barrier};
+
+        const THREADS: usize = 10;
+        const HOLD: Duration = Duration::from_millis(20);
+        let dir = TempDir::new("lock-contention");
+        let path = Arc::new(dir.0.join("record.lock"));
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let holders = Arc::new(AtomicUsize::new(0));
+        let most_holders = Arc::new(AtomicUsize::new(0));
+
+        let workers: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let (path, barrier) = (Arc::clone(&path), Arc::clone(&barrier));
+                let (holders, most_holders) = (Arc::clone(&holders), Arc::clone(&most_holders));
+                thread::spawn(move || {
+                    barrier.wait();
+                    let started = Instant::now();
+                    let lock = ExclusiveLock::acquire(&path, LOCK_WHAT, Duration::from_secs(30))
+                        .unwrap_or_else(|error| panic!("a contended acquire failed: {error:#}"));
+                    let latency = started.elapsed();
+                    let now_holding = holders.fetch_add(1, Ordering::SeqCst) + 1;
+                    most_holders.fetch_max(now_holding, Ordering::SeqCst);
+                    thread::sleep(HOLD);
+                    holders.fetch_sub(1, Ordering::SeqCst);
+                    drop(lock);
+                    latency
+                })
+            })
+            .collect();
+        let mut latencies: Vec<Duration> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+
+        assert_eq!(most_holders.load(Ordering::SeqCst), 1);
+        latencies.sort();
+        let percentile = |p: f64| {
+            let rank = (p * latencies.len() as f64).ceil() as usize;
+            latencies[rank.saturating_sub(1)].as_millis()
+        };
+        // The last waiter queues behind every other hold, so only the excess
+        // over that floor is the retry spin's own cost.
+        let floor = HOLD.as_millis() * (THREADS as u128 - 1);
+        println!(
+            "exclusive lock contention: {THREADS} threads x {} ms hold, p99 acquire latency {} ms (the max at n={THREADS}; queueing floor {floor} ms; p50 {} ms)",
+            HOLD.as_millis(),
+            percentile(0.99),
+            percentile(0.50),
+        );
+    }
+
     #[test]
     fn exclusive_lock_records_the_holder_pid_in_a_pre_created_parent() {
         let dir = TempDir::new("lock-parent");
