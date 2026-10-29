@@ -104,11 +104,16 @@ cargo test --test candidate_architect_next              # the Rust wrapper (live
 cargo test --test candidate_architect_next -- --ignored # the mode matrix through the wrapper (three to five minutes; opt-in; needs mikefarah yq)
 ```
 
-The wrapper's live test groups: audit, smoke, session check, poison (the batteries never
+The wrapper's live test groups: audit, smoke (plus a tally check that a failure recorded by
+the battery's last check still fails the run), session check, poison (the batteries never
 consult the user config dir), run-dir precedence, `build_lock` position, toolchain census,
-ASCII sweep, README ground-truth pins, and two real-binary dry runs (by name from a seeded
-config dir, and from an empty one that installs the candidate). The mode-matrix run is the
-one ignored test.
+ASCII sweep, README ground-truth pins, the shim pin (every `scripts/<name>.py` shim calls
+`run("<name>")`, names `<name>` in its docstring, and the shims map one-to-one onto the
+`type: script` nodes of `graph.yaml`), the mode-matrix fail-loud test (`mode_matrix.py` exits
+before the walk when `.shared/utils.sh` is missing or a stub), three real-binary dry runs (by
+name from a seeded config dir; from an empty config dir that installs the candidate; re-entry
+by run id in the prompt) and the XDG-tier dry run (only `XDG_CACHE_HOME` set, the run lands
+under the engine's cache dir). The mode-matrix run is the one ignored test.
 
 The Rust wrapper runs the batteries with `HOME`, `LLM_ROOT_DIR`, `COYOTE_CACHE_DIR`,
 `TMPDIR` and `ARCHITECT_RUNS_ROOT` pointed at a scratch directory and
