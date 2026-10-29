@@ -604,6 +604,23 @@ check("ci_gate: inbox-final schema anomalies harvested through git_ops", any("in
 u = gates.ci_gate({"git_report": "clean exit 0", "git_task": {"kind": "flip_ready"}, "run_dir": TMP, "anomalies_log": []})
 check("ci_gate: clean case adds nothing", u.get("anomalies_log", []) == [] and u["_next"] == "final_report")
 
+# --- route_gauntlet pre-check is the parser's verdict regex; report round lines carry lane details ---
+u = gates.route_gauntlet(base_state(gauntlet_result='The lane said "GAUNTLET: PASS" in its summary.\n\n| lane | status | detail |\n|---|---|---|\n| code-review | GREEN | ok |\n',
+                                    round_heads=[{}]))
+check("route_gauntlet: a prose-quoted sentinel in the header -> incomplete pipeline",
+      u["gauntlet_verdict"] == "BLOCKED" and u["gauntlet_incomplete"] == ["pipeline"])
+u = gates.route_gauntlet(base_state(gauntlet_result="  GAUNTLET: PASS\n\n| lane | status | detail |\n|---|---|---|\n| code-review | GREEN | ok |\n", round_heads=[{}]))
+check("route_gauntlet: an indented sentinel in the header -> incomplete pipeline",
+      u["gauntlet_verdict"] == "BLOCKED" and u["gauntlet_incomplete"] == ["pipeline"])
+check("_has_verdict: column-0 whole line only, the parser's own regex",
+      gates._has_verdict("GAUNTLET: PASS\n") and not gates._has_verdict("x GAUNTLET: PASS\n") and not gates._has_verdict("GAUNTLET: PASS trailing\n"))
+check("_parse_gauntlet: attention heading read with [ \\t]* gaps",
+      gates._parse_gauntlet("GAUNTLET: PASS\n\n## Human attention required\n- item one\n")[5] == "- item one"
+      and gates._parse_gauntlet("GAUNTLET: PASS\n\n## Human attention required\n\n- item two\n")[5] == "- item two")
+u = gates.final_report(base_state(coder_result=done, coder_sentinel="CODER_COMPLETE", gauntlet_verdict="BLOCKED",
+                                  round_heads=[{"round": 1, "head": "h", "verdict": "BLOCKED", "lane_details": {"adversary": "DIVERGES"}}]))
+check("final_report: round line carries the lane details", "  - round 1 @ h: BLOCKED [adversary: DIVERGES]" in u["report"])
+
 failed = [n for n, ok, _ in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")
 shutil.rmtree(TMP, ignore_errors=True)
