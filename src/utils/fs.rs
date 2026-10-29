@@ -433,12 +433,14 @@ mod tests {
             let rank = (p * latencies.len() as f64).ceil() as usize;
             latencies[rank.saturating_sub(1)].as_millis()
         };
+        // The last waiter queues behind every other hold, so only the excess
+        // over that floor is the retry spin's own cost.
+        let floor = HOLD.as_millis() * (THREADS as u128 - 1);
         println!(
-            "exclusive lock contention: {THREADS} threads x {} ms hold, p99 acquire latency {} ms (p50 {} ms, max {} ms)",
+            "exclusive lock contention: {THREADS} threads x {} ms hold, p99 acquire latency {} ms (the max at n={THREADS}; queueing floor {floor} ms; p50 {} ms)",
             HOLD.as_millis(),
             percentile(0.99),
             percentile(0.50),
-            latencies[latencies.len() - 1].as_millis()
         );
     }
 

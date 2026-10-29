@@ -895,9 +895,15 @@ async fn run_hook(
 /// effectively unlimited.
 #[cfg(unix)]
 fn inherited_fd_cap() -> libc::c_int {
-    const MAX_FD_CAP: libc::c_long = 65536;
     // SAFETY: sysconf has no preconditions.
-    let max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+    clamp_fd_cap(unsafe { libc::sysconf(libc::_SC_OPEN_MAX) })
+}
+
+/// Clamps a `sysconf(_SC_OPEN_MAX)` result to `1..=MAX_FD_CAP`; a failed or
+/// non-positive answer falls back to the cap itself.
+#[cfg(unix)]
+fn clamp_fd_cap(max: libc::c_long) -> libc::c_int {
+    const MAX_FD_CAP: libc::c_long = 65536;
     if max <= 0 {
         MAX_FD_CAP as libc::c_int
     } else {
@@ -2603,22 +2609,29 @@ mod tests {
         #[tokio::test(flavor = "multi_thread")]
         #[serial]
         async fn fire_spawns_detached_with_envs() {
-            use std::os::fd::AsRawFd;
+            use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
             let guard = TestConfigDirGuard::new("hooks-dispatch");
             let out = guard.path.join("env-out");
             let fds = guard.path.join("fds-out");
             let gate = guard.path.join("gate");
             let done = guard.path.join("done");
-            let command = r#"if [ -e "/dev/fd/$HOOK_FD" ]; then echo open; else echo closed; fi > "$HOOK_FDS.tmp" && mv "$HOOK_FDS.tmp" "$HOOK_FDS"; env > "$HOOK_OUT.tmp" && mv "$HOOK_OUT.tmp" "$HOOK_OUT"; until [ -e "$HOOK_GATE" ]; do sleep 0.05; done; : > "$HOOK_DONE""#;
+            // The stderr probe is the positive control: /dev/fd must report
+            // an fd the child does hold, or a "closed" answer proves nothing.
+            let command = r#"{ for fd in 2 "$HOOK_FD"; do if [ -e "/dev/fd/$fd" ]; then echo open; else echo closed; fi; done; } > "$HOOK_FDS.tmp" && mv "$HOOK_FDS.tmp" "$HOOK_FDS"; env > "$HOOK_OUT.tmp" && mv "$HOOK_OUT.tmp" "$HOOK_OUT"; until [ -e "$HOOK_GATE" ]; do sleep 0.05; done; : > "$HOOK_DONE""#;
             let ctx = ctx_with_global_hooks(hooks_map("turn.completed", &[("envdump", command)]));
             // F_DUPFD, unlike F_DUPFD_CLOEXEC, leaves the duplicate without
             // close-on-exec, the way a careless library would.
             let file = std::fs::File::create(guard.path.join("leaked")).unwrap();
-            let leaked = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 200) };
-            assert!(leaked >= 200, "F_DUPFD returned {leaked}");
+            // SAFETY: fcntl on an fd this test owns; the result is checked.
+            let raw = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 200) };
+            assert!(raw >= 200, "F_DUPFD returned {raw}");
+            // SAFETY: `raw` is a fresh fd nothing else owns, so the guard
+            // closes it even when an assertion below panics.
+            let leaked = unsafe { OwnedFd::from_raw_fd(raw) };
             assert_eq!(
-                unsafe { libc::fcntl(leaked, libc::F_GETFD) } & libc::FD_CLOEXEC,
+                // SAFETY: F_GETFD only reads the flags of an open fd.
+                unsafe { libc::fcntl(leaked.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
                 0
             );
 
@@ -2628,7 +2641,7 @@ mod tests {
                 &[
                     ("HOOK_OUT", out.display().to_string()),
                     ("HOOK_FDS", fds.display().to_string()),
-                    ("HOOK_FD", leaked.to_string()),
+                    ("HOOK_FD", raw.to_string()),
                     ("HOOK_GATE", gate.display().to_string()),
                     ("HOOK_DONE", done.display().to_string()),
                 ],
@@ -2636,15 +2649,18 @@ mod tests {
             );
 
             wait_for("hook env dump", || out.exists()).await;
-            unsafe { libc::close(leaked) };
+            drop(leaked);
             assert!(
                 !done.exists(),
                 "dispatch must return before the hook completes"
             );
             assert_eq!(
-                std::fs::read_to_string(&fds).unwrap().trim(),
-                "closed",
-                "the hook child inherited a non-close-on-exec fd"
+                std::fs::read_to_string(&fds)
+                    .unwrap()
+                    .lines()
+                    .collect::<Vec<_>>(),
+                ["open", "closed"],
+                "stderr must be visible and the non-close-on-exec fd must not be"
             );
 
             let env_dump = std::fs::read_to_string(&out).unwrap();
@@ -2663,6 +2679,20 @@ mod tests {
 
             std::fs::write(&gate, "").unwrap();
             wait_for("hook completion", || done.exists()).await;
+        }
+
+        #[test]
+        fn the_fd_close_bound_is_sysconf_capped_at_65536() {
+            assert_eq!(clamp_fd_cap(-1), 65536);
+            assert_eq!(clamp_fd_cap(0), 65536);
+            assert_eq!(clamp_fd_cap(1024), 1024);
+            assert_eq!(clamp_fd_cap(65536), 65536);
+            assert_eq!(clamp_fd_cap(1 << 20), 65536);
+
+            // SAFETY: sysconf has no preconditions.
+            let host = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+            let expected = if host <= 0 { 65536 } else { host.min(65536) };
+            assert_eq!(libc::c_long::from(inherited_fd_cap()), expected);
         }
 
         #[tokio::test(flavor = "multi_thread")]

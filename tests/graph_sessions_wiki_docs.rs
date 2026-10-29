@@ -2350,6 +2350,10 @@ fn graph_page_documents_carry_and_previous_turns() {
         bullet.contains(lead),
         "the carry bullet does not say {lead:?}: {bullet}"
     );
+    assert!(
+        bullet.contains("`{{previous_turns}}`"),
+        "the carry bullet does not say the coder reads `{{{{previous_turns}}}}` instead: {bullet}"
+    );
     for key in ["plan_summary", "files_to_modify", "files_to_create"] {
         assert!(
             !bullet.contains(&format!("`{key}`")),
