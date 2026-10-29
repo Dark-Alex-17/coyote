@@ -7,12 +7,12 @@
 //! `check_session_block.sh` (session block rules plus the variable mirror
 //! against the prose `architect/config.yaml`) and `mode_matrix.py` (the
 //! marker map against the prose `architect/instructions.md` plus all 48 mode
-//! combinations walked to `end_complete`; several minutes, so opt-in). Both
-//! `audit_graph.py` and `check_session_block.sh` need the Go `yq` by mikefarah
-//! and skip without it. Every run points `HOME`, `LLM_ROOT_DIR`,
-//! `COYOTE_CACHE_DIR`, `TMPDIR` and `ARCHITECT_RUNS_ROOT` at a scratch
-//! directory and sets `PYTHONDONTWRITEBYTECODE=1`, so nothing under `assets/`
-//! or `~/.config/coyote` is read or written.
+//! combinations walked to `end_complete`; several minutes, so opt-in).
+//! `audit_graph.py`, `check_session_block.sh` and `mode_matrix.py` need the
+//! Go `yq` by mikefarah and skip without it. Every run points `HOME`,
+//! `LLM_ROOT_DIR`, `COYOTE_CACHE_DIR`, `TMPDIR` and `ARCHITECT_RUNS_ROOT` at a
+//! scratch directory and sets `PYTHONDONTWRITEBYTECODE=1`, so nothing under
+//! `assets/` or `~/.config/coyote` is read or written.
 //!
 //! The reachability sweep that keeps both candidates out of every bundled
 //! agent lives in `candidate_sisyphus_next.rs` and already covers this name.
@@ -214,6 +214,57 @@ fn smoke_battery_passes_every_check() {
     assert_no_bytecode_under_candidate();
 }
 
+/// The summary line and the exit code are taken after the last check, so a
+/// failure recorded by the final check of the battery is neither hidden from
+/// the `N/N` tally nor from the exit code. Driven on a scratch copy with one
+/// failing check appended after the battery's last `check(` call.
+#[test]
+fn smoke_summary_and_exit_code_cover_a_check_recorded_last() {
+    let Some(python) = python3() else { return };
+    let scratch = scratch_dir("tally");
+    let copy = scratch_candidate_copy(&scratch);
+    let run = |copy: &Path| {
+        let mut cmd = battery(&python, &scratch);
+        cmd.current_dir(copy).arg("scripts/smoke_test.py");
+        cmd.output().unwrap()
+    };
+
+    let pristine = run(&copy);
+    let report = transcript(&pristine);
+    assert!(pristine.status.success(), "{report}");
+    let (passed, total) = summary_counts(&String::from_utf8_lossy(&pristine.stdout), &report);
+    assert_eq!(passed, total, "{report}");
+
+    let script = copy.join("scripts").join("smoke_test.py");
+    let text = fs::read_to_string(&script).unwrap();
+    let mut lines: Vec<&str> = text.lines().collect();
+    let last_check = lines
+        .iter()
+        .rposition(|l| l.starts_with("check("))
+        .expect("the battery has a check( call");
+    let forced = "check(\"probe: a failure recorded after the last battery check\", False)";
+    lines.insert(last_check + 1, forced);
+    fs::write(&script, lines.join("\n") + "\n").unwrap();
+
+    let broken = run(&copy);
+    let report = transcript(&broken);
+    let stdout = String::from_utf8_lossy(&broken.stdout);
+    assert!(
+        stdout.lines().any(|l| l.starts_with("FAIL probe:")),
+        "the forced check did not run:\n{report}"
+    );
+    assert_eq!(
+        summary_counts(&stdout, &report),
+        (total, total + 1),
+        "the summary must count the check recorded last:\n{report}"
+    );
+    assert!(
+        !broken.status.success(),
+        "a failure recorded last must fail the battery:\n{report}"
+    );
+    assert_no_bytecode_under_candidate();
+}
+
 #[test]
 fn session_block_check_passes_under_mikefarah_yq() {
     let Some(yq) = mikefarah_yq() else { return };
@@ -297,16 +348,8 @@ fn mode_matrix_exits_before_the_walk_when_the_shared_utils_sh_is_missing_or_a_st
             Some(body) => fs::write(&utils, body).unwrap(),
             None => fs::remove_file(&utils).unwrap(),
         }
-        let output = Command::new(&python)
+        let output = battery(&python, &scratch)
             .current_dir(agents.join(CANDIDATE))
-            .env("HOME", scratch.0.join("home"))
-            .env("LLM_ROOT_DIR", scratch.0.join("root"))
-            .env("COYOTE_CACHE_DIR", scratch.0.join("cache"))
-            .env("TMPDIR", scratch.0.join("tmp"))
-            .env("ARCHITECT_RUNS_ROOT", scratch.0.join("runs"))
-            .env("PYTHONDONTWRITEBYTECODE", "1")
-            .env_remove("GRAPH_STATE")
-            .env_remove("GRAPH_STATE_FILE")
             .arg("scripts/mode_matrix.py")
             .output()
             .unwrap();
@@ -698,6 +741,81 @@ fn no_gate_names_a_toolchain_command() {
     }
 }
 
+/// Every `scripts/*.py` shaped like a script-node shim (docstring naming the
+/// node, `from gates import run`, a single `run("<name>")` call) names its
+/// own file stem in both places, and the shims map one-to-one onto the
+/// `type: script` nodes of `graph.yaml`. `audit_graph.py` checks `GATES`
+/// membership by node id, not by shim body, so a shim that called
+/// `run("other")` would pass the audit and silently run the wrong gate; this
+/// is the pin that catches it.
+#[test]
+fn every_script_shim_runs_the_gate_named_by_its_file_and_graph_node() {
+    let scripts = candidate_dir().join("scripts");
+    let run_re = fancy_regex::Regex::new(r#"(?m)^run\("([a-z_0-9]+)"\)$"#).unwrap();
+    let doc_re =
+        fancy_regex::Regex::new(r#"^"""Entry point for the `([a-z_0-9]+)` script node"#).unwrap();
+    let mut shims = Vec::new();
+    for entry in fs::read_dir(&scripts).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|ext| ext != "py") {
+            continue;
+        }
+        let body = fs::read_to_string(&path).unwrap();
+        if !body.contains("from gates import run") {
+            continue;
+        }
+        let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+        let calls: Vec<String> = run_re
+            .captures_iter(&body)
+            .map(|c| c.unwrap()[1].to_string())
+            .collect();
+        assert_eq!(
+            calls,
+            vec![stem.clone()],
+            "{stem}.py must call run(\"{stem}\") exactly once"
+        );
+        let doc_line = body.lines().nth(1).unwrap_or_default();
+        let documented = doc_re.captures(doc_line).unwrap().unwrap_or_else(|| {
+            panic!("{stem}.py: the docstring does not name a script node: {doc_line:?}")
+        });
+        assert_eq!(
+            &documented[1], stem,
+            "{stem}.py: the docstring names another node"
+        );
+        shims.push(stem);
+    }
+    shims.sort();
+    assert!(
+        shims.len() >= 70,
+        "the shim sweep found only {} shims: {shims:?}",
+        shims.len()
+    );
+
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let doc: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let mut script_nodes = Vec::new();
+    for (id, node) in doc["nodes"]
+        .as_mapping()
+        .expect("graph.yaml has a nodes mapping")
+    {
+        if node["type"].as_str() != Some("script") {
+            continue;
+        }
+        let id = id.as_str().unwrap().to_string();
+        assert_eq!(
+            node["script"].as_str(),
+            Some(format!("scripts/{id}.py").as_str()),
+            "script node {id} does not run scripts/{id}.py"
+        );
+        script_nodes.push(id);
+    }
+    script_nodes.sort();
+    assert_eq!(
+        shims, script_nodes,
+        "shims and script nodes are not one-to-one"
+    );
+}
+
 fn copy_tree(src: &Path, dst: &Path) {
     fs::create_dir_all(dst).unwrap();
     for entry in fs::read_dir(src).unwrap() {
@@ -709,6 +827,19 @@ fn copy_tree(src: &Path, dst: &Path) {
             fs::copy(entry.path(), &target).unwrap();
         }
     }
+}
+
+/// A scratch tree holding the three agent dirs the batteries reach: the
+/// candidate, the prose `architect` it reads core tools from, and `.shared`.
+/// Returns the candidate copy.
+fn scratch_candidate_copy(scratch: &TempDirGuard) -> PathBuf {
+    let agents = scratch.0.join("tree").join("agents");
+    for name in [".shared", "architect"] {
+        copy_tree(&agents_dir().join(name), &agents.join(name));
+    }
+    let copy = agents.join(CANDIDATE);
+    copy_tree(&candidate_dir(), &copy);
+    copy
 }
 
 /// The node trace of one real-binary dry run of the candidate, in order,
@@ -808,6 +939,13 @@ fn dry_run_until_ask_user_with_prompt(
     for (key, value) in extra_env {
         cmd.env(key, value);
     }
+    run_until_ask_user(cmd, label)
+}
+
+/// Spawns a fully configured dry-run command and reads its trace until
+/// `ask_user` starts (or the binary exits / the deadline passes), then kills
+/// the child and returns the lines seen.
+fn run_until_ask_user(mut cmd: Command, label: &str) -> Vec<String> {
     let mut child = cmd.spawn().unwrap();
 
     let (tx, rx) = mpsc::channel::<String>();
@@ -848,7 +986,18 @@ fn dry_run_until_ask_user_with_prompt(
                     );
                 }
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            // Both pipes closed: the binary is gone, whatever its status. The
+            // kill is a no-op on a child that has already exited and keeps one
+            // that closed its output while still running from hanging the
+            // test; `wait` then reports the real exit status.
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = child.kill();
+                let status = child.wait().unwrap();
+                panic!(
+                    "{label}: the binary exited ({status}) before ask_user:\n{}",
+                    lines.join("\n")
+                );
+            }
         }
     }
     let _ = child.kill();
@@ -884,7 +1033,7 @@ fn single_run_under(root: &Path, label: &str) -> PathBuf {
     }
     let brief = fs::read_to_string(run.join("brief.md")).unwrap();
     assert!(
-        brief.contains("Implement the plan at plans/PLAN-x.md"),
+        brief.contains(DRY_RUN_PROMPT),
         "{label}: brief.md does not carry the prompt: {brief:?}"
     );
     run
@@ -1013,6 +1162,76 @@ fn dry_run_by_name_from_an_empty_config_dir_installs_the_candidate_and_walks_to_
     assert_no_bytecode_under_candidate();
 }
 
+/// The README's run-state bullet, middle tier, through the real binary: with
+/// `COYOTE_CACHE_DIR` and `ARCHITECT_RUNS_ROOT` both unset and
+/// `XDG_CACHE_HOME` set, a cold-start dry run walks to `ask_user` and puts
+/// the run dir under `$XDG_CACHE_HOME/coyote/architect-next/runs/`, the same
+/// `coyote` cache dir the engine itself writes to, so the candidate and the
+/// engine never disagree about where the cache is. Nothing architect-shaped
+/// lands under `HOME`.
+#[test]
+fn dry_run_with_only_xdg_cache_home_puts_the_run_under_the_engines_cache_dir() {
+    if python3().is_none() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let scratch = scratch_dir("xdgtier");
+    let project = dry_run_config_dir_with(&scratch, false);
+    let dir = scratch.0.clone();
+    let xdg = dir.join("xdg");
+    fs::create_dir_all(&xdg).unwrap();
+
+    // `dry_run_until_ask_user` pins `COYOTE_CACHE_DIR` to the scratch dir;
+    // this tier needs it absent, so drive the same command line by hand.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_coyote"));
+    cmd.args(["--agent", CANDIDATE, "--dry-run", DRY_RUN_PROMPT])
+        .current_dir(&project)
+        .env("HOME", dir.join("home"))
+        .env("COYOTE_CONFIG_DIR", &dir)
+        .env("XDG_CACHE_HOME", &xdg)
+        .env("TMPDIR", dir.join("tmp"))
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env("NO_COLOR", "1")
+        .env_remove("COYOTE_CACHE_DIR")
+        .env_remove("ARCHITECT_RUNS_ROOT")
+        .env_remove("COYOTE_LOG_PATH")
+        .env_remove("IS_SANDBOX")
+        .env_remove("GRAPH_STATE")
+        .env_remove("GRAPH_STATE_FILE")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let lines = run_until_ask_user(cmd, "xdg tier");
+    let mut cursor = 0;
+    for needle in EXPECTED_WALK {
+        let hit = lines[cursor..].iter().position(|l| l.contains(needle));
+        let idx = hit.unwrap_or_else(|| {
+            panic!(
+                "xdg tier: {needle:?} missing after line {cursor}:\n{}",
+                lines.join("\n")
+            )
+        });
+        cursor += idx + 1;
+    }
+
+    let engine_cache = xdg.join("coyote");
+    single_run_under(&engine_cache.join(CANDIDATE).join("runs"), "xdg tier");
+    // `scratch_dir` pre-creates `cache/`; the run must not have used it.
+    assert!(
+        fs::read_dir(dir.join("cache")).unwrap().next().is_none(),
+        "xdg tier: a run landed in the scratch cache dir although COYOTE_CACHE_DIR was unset"
+    );
+    let leaked: Vec<String> = files_under(&dir.join("home"))
+        .into_iter()
+        .filter(|rel| rel.contains("architect"))
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "xdg tier: run state leaked under HOME: {leaked:?}"
+    );
+    assert_no_bytecode_under_candidate();
+}
+
 /// The README's run-state bullet: "A prompt containing `Architect run id:
 /// <id>` re-enters that run." After a first dry run has created
 /// `<cache>/architect-next/runs/<id>/`, a second dry run whose prompt names
@@ -1104,6 +1323,10 @@ fn readme_number(pattern: &str) -> usize {
 fn description_names_no_file_outside_the_repo() {
     let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
     let doc: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    assert!(
+        readme().contains("| description provenance |"),
+        "the README no longer carries the description provenance row"
+    );
     let description = doc["description"]
         .as_str()
         .expect("graph.yaml carries a string description");
@@ -1301,6 +1524,11 @@ fn readme_build_lock_row_names_shipped_nodes_agents_and_pins() {
     let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
     let doc: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
     let nodes = &doc["nodes"];
+    let readme = readme();
+    assert!(
+        readme.contains("| `build_lock` variable |"),
+        "the README lost its build_lock row"
+    );
     for (node, agent) in [
         ("delegate", "sisyphus"),
         ("wave_delegate", "sisyphus"),
@@ -1308,6 +1536,10 @@ fn readme_build_lock_row_names_shipped_nodes_agents_and_pins() {
         ("wave_gauntlet", "review-gauntlet"),
         ("run_adversary", "adversary"),
     ] {
+        assert!(
+            readme.contains(&format!("`{node}`")) && readme.contains(&format!("`{agent}`")),
+            "the README build_lock row no longer names {node} running {agent}"
+        );
         assert_eq!(
             nodes[node]["type"].as_str(),
             Some("agent"),
@@ -1348,6 +1580,10 @@ fn readme_build_lock_row_names_shipped_nodes_agents_and_pins() {
         ("graph/executor.rs", "fn seed_variables"),
         ("config/request_context.rs", "fn new_for_child"),
     ] {
+        assert!(
+            readme.contains(needle.trim_start_matches("fn ")),
+            "the README no longer cites {needle} from `{file}`"
+        );
         let source = fs::read_to_string(src.join(file)).unwrap();
         assert!(
             source.contains(needle),
