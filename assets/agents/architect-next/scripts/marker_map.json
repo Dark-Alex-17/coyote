@@ -1,0 +1,498 @@
+[
+ {
+  "ordinal": 1,
+  "line": 4,
+  "condition": "pr_strategy=single",
+  "first": "disk, and finish with a single draft PR \u2014 repeating until th",
+  "mechanism": "I",
+  "home": "`final_report` / description prose (single PR)"
+ },
+ {
+  "ordinal": 2,
+  "line": 7,
+  "condition": "pr_strategy=multi",
+  "first": "disk, and finish each PR group with its own draft PR \u2014 repea",
+  "mechanism": "I",
+  "home": "`final_report` (per-group PRs)"
+ },
+ {
+  "ordinal": 3,
+  "line": 19,
+  "condition": "pr_strategy=single",
+  "first": "**Git model \u2014 one run branch, one draft PR.** All work lands",
+  "mechanism": "R",
+  "home": "`branch_setup` (run branch), `open_pr`"
+ },
+ {
+  "ordinal": 4,
+  "line": 25,
+  "condition": "pr_strategy=multi",
+  "first": "**Git model \u2014 PR groups: one branch + one draft PR per group",
+  "mechanism": "R",
+  "home": "`branch_setup` (group branches), `select_tasks` group boundary, `open_pr` target"
+ },
+ {
+  "ordinal": 5,
+  "line": 46,
+  "condition": "autonomy=full",
+  "first": "- **full** \u2014 run the entire pipeline with no approval gates.",
+  "mechanism": "R",
+  "home": "`autonomy_gate` -> `promote_tasks`; `task_done_route` -> `select_tasks`"
+ },
+ {
+  "ordinal": 6,
+  "line": 51,
+  "condition": "autonomy=plan-gate",
+  "first": "- **plan-gate** \u2014 after the breakdown is SEALED + OKAY'd, pr",
+  "mechanism": "N",
+  "home": "`approve_breakdown`"
+ },
+ {
+  "ordinal": 7,
+  "line": 55,
+  "condition": "autonomy=phase-gate",
+  "first": "- **phase-gate** \u2014 present each task's result via `user__con",
+  "mechanism": "N",
+  "home": "`approve_next`"
+ },
+ {
+  "ordinal": 8,
+  "line": 62,
+  "condition": "parallel_tasks",
+  "first": "Exception: in parallel mode, removing a task's worktree and ",
+  "mechanism": "R",
+  "home": "`wave_cleanup` (post-merge worktree/branch cleanup is the only unasked destructive op)"
+ },
+ {
+  "ordinal": 9,
+  "line": 73,
+  "condition": "escalation_policy=interactive",
+  "first": "- **interactive** (default) \u2014 escalate to the user exactly a",
+  "mechanism": "R",
+  "home": "`escalate_gate` -> `ask_dispatch`"
+ },
+ {
+  "ordinal": 10,
+  "line": 76,
+  "condition": "escalation_policy=autonomous",
+  "first": "- **autonomous** \u2014 the user pre-delegated decision-making. B",
+  "mechanism": "N",
+  "home": "`ladder_judge`, `ladder_route`, `consult_navigator`; digest in `final_report`; child relays: V4"
+ },
+ {
+  "ordinal": 11,
+  "line": 110,
+  "condition": "pr_strategy=single",
+  "first": "- **single** (default) \u2014 the whole run lands as ONE draft PR",
+  "mechanism": "R",
+  "home": "`pr_units` (unit = run), `branch_setup`, `open_pr`"
+ },
+ {
+  "ordinal": 12,
+  "line": 114,
+  "condition": "pr_strategy=multi",
+  "first": "- **multi** \u2014 for larger plans where one PR would be unrevie",
+  "mechanism": "R",
+  "home": "`pr_units` (unit = PLAN group), `group_closeout`, `branch_setup`, `open_pr` retarget"
+ },
+ {
+  "ordinal": 13,
+  "line": 139,
+  "condition": "task_granularity=micro",
+  "first": "## Task granularity: micro",
+  "mechanism": "N",
+  "home": "`verify_gate` scope, `batch_*` nodes, `task_done_route`"
+ },
+ {
+  "ordinal": 14,
+  "line": 194,
+  "condition": "task_granularity!=micro",
+  "first": "Open questions, and a **Task breakdown** where **each task i",
+  "mechanism": "I",
+  "home": "`author_plan` `{{sizing_rule}}`"
+ },
+ {
+  "ordinal": 15,
+  "line": 198,
+  "condition": "task_granularity=micro",
+  "first": "Open questions, and a **Task breakdown** where **each task i",
+  "mechanism": "I",
+  "home": "`author_plan` `{{sizing_rule}}`; `plan_route` checks"
+ },
+ {
+  "ordinal": 16,
+  "line": 211,
+  "condition": "pr_strategy=multi",
+  "first": "Also partition the Task breakdown into PR groups per the PR-",
+  "mechanism": "I",
+  "home": "`author_plan` PR-groups partition sentence"
+ },
+ {
+  "ordinal": 17,
+  "line": 239,
+  "condition": "autonomy=full",
+  "first": "In `full` autonomy, if the design session surfaces open ques",
+  "mechanism": "R",
+  "home": "`open_questions_gate` (B1; `changes_scope` -> `end_blocked`)"
+ },
+ {
+  "ordinal": 18,
+  "line": 256,
+  "condition": "task_granularity=micro",
+  "first": "Append to the gatekeeper prompt: \"Audit to the **Micro-grain",
+  "mechanism": "I",
+  "home": "`gate1_build`"
+ },
+ {
+  "ordinal": 19,
+  "line": 280,
+  "condition": "task_granularity=micro",
+  "first": "In the oracle prompt replace \"one-engineer-day sizing\" with ",
+  "mechanism": "I",
+  "home": "`gate2_build`"
+ },
+ {
+  "ordinal": 20,
+  "line": 290,
+  "condition": "pr_strategy=multi",
+  "first": "Both gate prompts must explicitly name the PLAN's `## PR gro",
+  "mechanism": "I",
+  "home": "`gate1_build` + `gate2_build` PR-groups sentence"
+ },
+ {
+  "ordinal": 21,
+  "line": 295,
+  "condition": "autonomy=plan-gate",
+  "first": "(`plan-gate` autonomy: present the SEALED+OKAY'd breakdown t",
+  "mechanism": "N",
+  "home": "`approve_breakdown`"
+ },
+ {
+  "ordinal": 22,
+  "line": 307,
+  "condition": "task_granularity=micro",
+  "first": "Micro mode: every task's `index.md` frontmatter carries `bat",
+  "mechanism": "I",
+  "home": "`promote_tasks` prompt; `promote_verify` checks"
+ },
+ {
+  "ordinal": 23,
+  "line": 312,
+  "condition": "pr_strategy=single",
+  "first": "If {{plans_dir}} is inside {{project_dir}}, commit the plann",
+  "mechanism": "R",
+  "home": "`promote_verify` / `commit_planning` (chore(plan) when plans ride the repo)"
+ },
+ {
+  "ordinal": 24,
+  "line": 316,
+  "condition": "pr_strategy=multi",
+  "first": "If {{plans_dir}} is inside {{project_dir}}, commit the plann",
+  "mechanism": "R",
+  "home": "`promote_verify` / `commit_planning` (group 1 branch)"
+ },
+ {
+  "ordinal": 25,
+  "line": 327,
+  "condition": "pr_strategy=single",
+  "first": "0. **Create the RUN BRANCH (once, before the FIRST task).** ",
+  "mechanism": "R",
+  "home": "`branch_setup` (run branch; resumed -> checkout)"
+ },
+ {
+  "ordinal": 26,
+  "line": 333,
+  "condition": "pr_strategy=multi",
+  "first": "0. **Create the GROUP BRANCH (once, before the group's FIRST",
+  "mechanism": "R",
+  "home": "`branch_setup` (group N+1 from group N's tip, or base when merged); `unit_base_sha`"
+ },
+ {
+  "ordinal": 27,
+  "line": 350,
+  "condition": "task_granularity=micro",
+  "first": "Micro mode: add `\"review_cadence\": \"batch\"` to the spawn's `",
+  "mechanism": "I",
+  "home": "`compose_delegation` `## MODE` block (E9/V9)"
+ },
+ {
+  "ordinal": 28,
+  "line": 372,
+  "condition": "pr_strategy=single",
+  "first": "Every acceptance criterion met; build + full test suite gree",
+  "mechanism": "I",
+  "home": "`compose_delegation`"
+ },
+ {
+  "ordinal": 29,
+  "line": 378,
+  "condition": "pr_strategy=multi",
+  "first": "Every acceptance criterion met; build + full test suite gree",
+  "mechanism": "I",
+  "home": "`compose_delegation` (group branch)"
+ },
+ {
+  "ordinal": 30,
+  "line": 385,
+  "condition": "pr_strategy=single",
+  "first": "- Work on the CURRENT branch (feat/PLAN-<slug>). git pull be",
+  "mechanism": "I",
+  "home": "`compose_delegation` MUST DO"
+ },
+ {
+  "ordinal": 31,
+  "line": 388,
+  "condition": "pr_strategy=multi",
+  "first": "- Work on the CURRENT branch (feat/PLAN-<slug>-g<N>). git pu",
+  "mechanism": "I",
+  "home": "`compose_delegation` MUST DO (group branch)"
+ },
+ {
+  "ordinal": 32,
+  "line": 393,
+  "condition": "pr_strategy=single",
+  "first": "- Commit with messages referencing the task ID (e.g. \"feat(T",
+  "mechanism": "I",
+  "home": "`compose_delegation` MUST DO"
+ },
+ {
+  "ordinal": 33,
+  "line": 397,
+  "condition": "pr_strategy=multi",
+  "first": "- Commit with messages referencing the task ID (e.g. \"feat(T",
+  "mechanism": "I",
+  "home": "`compose_delegation` MUST DO"
+ },
+ {
+  "ordinal": 34,
+  "line": 438,
+  "condition": "task_granularity=micro",
+  "first": "<paste the task's Context pack VERBATIM - it exists precisel",
+  "mechanism": "I",
+  "home": "`compose_delegation` (reads the task's Context pack)"
+ },
+ {
+  "ordinal": 35,
+  "line": 456,
+  "condition": "task_granularity=micro",
+  "first": "**Micro cadence - read this before the lane descriptions bel",
+  "mechanism": "N",
+  "home": "`verify_gate`, `batch_gauntlet_build`, `batch_triage`, `batch_fix_route`, `batch_close`, `post_round`"
+ },
+ {
+  "ordinal": 36,
+  "line": 530,
+  "condition": "escalation_policy=autonomous",
+  "first": "Under `escalation_policy: autonomous` the standard ladder ap",
+  "mechanism": "R",
+  "home": "`escalate_gate` policy branch (generic)"
+ },
+ {
+  "ordinal": 37,
+  "line": 646,
+  "condition": "!parallel_tasks",
+  "first": "**Sequential mode (parallel_tasks=0).** Tasks run SEQUENTIAL",
+  "mechanism": "R",
+  "home": "`select_tasks` (one task at a time; `wave_*` unreachable)"
+ },
+ {
+  "ordinal": 38,
+  "line": 653,
+  "condition": "parallel_tasks",
+  "first": "### Parallel mode (parallel_tasks=1)",
+  "mechanism": "N",
+  "home": "`select_tasks` eligibility; `wave_claim`, `wave_map`, `wave_integrate`, `integration_test`, `wave_cleanup`"
+ },
+ {
+  "ordinal": 39,
+  "line": 658,
+  "condition": "pr_strategy=multi",
+  "first": "In multi-PR mode every \"run branch\" reference in this sectio",
+  "mechanism": "R",
+  "home": "`select_tasks` (a wave never crosses the group in flight); `wave_claim` forks from the group branch"
+ },
+ {
+  "ordinal": 40,
+  "line": 672,
+  "condition": "task_granularity=micro",
+  "first": "5. Micro tasks are naturally file-disjoint (one seam each) s",
+  "mechanism": "R",
+  "home": "`select_tasks`"
+ },
+ {
+  "ordinal": 41,
+  "line": 691,
+  "condition": "task_granularity=micro",
+  "first": "In micro mode add `\"review_cadence\": \"batch\"` to that same o",
+  "mechanism": "I",
+  "home": "`_delegation_text` `## MODE` block (shared by `compose_delegation` and `wave_claim`)"
+ },
+ {
+  "ordinal": 42,
+  "line": 749,
+  "condition": "pr_strategy=single",
+  "first": "Phase F is UNCHANGED (same single draft PR from the run bran",
+  "mechanism": "R",
+  "home": "`phase_f_gate` (single; stale-worktree sweep)"
+ },
+ {
+  "ordinal": 43,
+  "line": 755,
+  "condition": "pr_strategy=multi",
+  "first": "Group close-out and Phase F are UNCHANGED by parallel mode (",
+  "mechanism": "R",
+  "home": "`group_closeout` -> `phase_f_gate` (scope group; worktree sweep; hygiene on the group branch)"
+ },
+ {
+  "ordinal": 44,
+  "line": 763,
+  "condition": "pr_strategy=single",
+  "first": "### Phase F \u2014 Finish (single draft PR for the whole design d",
+  "mechanism": "N",
+  "home": "`phase_f_gate`, `integration_check`, `hygiene_create`, `pr_body`, `open_pr`, `ci_*`, `flip_ready`, `finish_plan`"
+ },
+ {
+  "ordinal": 45,
+  "line": 768,
+  "condition": "pr_strategy=multi",
+  "first": "### Phase F \u2014 Close out each group; finish after the last (o",
+  "mechanism": "N",
+  "home": "`group_closeout` + the same Phase F nodes with `closeout_scope=group`; `flip_ready` -> next group"
+ },
+ {
+  "ordinal": 46,
+  "line": 897,
+  "condition": "escalation_policy=autonomous",
+  "first": "- a **`## Decisions taken autonomously`** section (only when",
+  "mechanism": "R",
+  "home": "`final_report` (digest non-empty) / `pr_body` quality note"
+ },
+ {
+  "ordinal": 47,
+  "line": 914,
+  "condition": "pr_strategy=multi",
+  "first": "Pass `--tasks <this group's member task ids, comma-separated",
+  "mechanism": "R",
+  "home": "`pr_body` (gap: `assemble_pr_body` is called without `--tasks`, so a group body still covers every complete task of the plan)"
+ },
+ {
+  "ordinal": 48,
+  "line": 923,
+  "condition": "task_granularity=micro",
+  "first": "Micro runs produce 3-5x the tasks. The tool's `## Tasks` che",
+  "mechanism": "I",
+  "home": "`final_report`"
+ },
+ {
+  "ordinal": 49,
+  "line": 954,
+  "condition": "escalation_policy=autonomous",
+  "first": "Include the `## Decisions taken autonomously` rollup when th",
+  "mechanism": "R",
+  "home": "`final_report`"
+ },
+ {
+  "ordinal": 50,
+  "line": 998,
+  "condition": "escalation_policy=autonomous",
+  "first": "In `autonomous` escalation policy, work the Escalation-polic",
+  "mechanism": "V",
+  "home": "V4 (G4)"
+ },
+ {
+  "ordinal": 51,
+  "line": 1012,
+  "condition": "task_granularity=micro",
+  "first": "- A micro task whose acceptance criteria cannot be run by a ",
+  "mechanism": "R",
+  "home": "`plan_route`, `phase_f_gate`"
+ },
+ {
+  "ordinal": 52,
+  "line": 1019,
+  "condition": "pr_strategy=single",
+  "first": "- Opening a PER-TASK PR \u2192 the design doc gets exactly ONE PR",
+  "mechanism": "R",
+  "home": "`compose_delegation` MUST NOT; `phase_f_gate`"
+ },
+ {
+  "ordinal": 53,
+  "line": 1024,
+  "condition": "pr_strategy=multi",
+  "first": "- Opening a PER-TASK PR, or one PR spanning several groups \u2192",
+  "mechanism": "R",
+  "home": "`compose_delegation` MUST NOT; `select_tasks` group boundary"
+ },
+ {
+  "ordinal": 54,
+  "line": 1036,
+  "condition": "!parallel_tasks",
+  "first": "- Pushing to {{base_branch}}, or creating branches beyond th",
+  "mechanism": "R",
+  "home": "`branch_setup` creates nothing else; `wave_*` unreachable"
+ },
+ {
+  "ordinal": 55,
+  "line": 1037,
+  "condition": "pr_strategy=single",
+  "first": "- Pushing to {{base_branch}}, or creating branches beyond th",
+  "mechanism": "R",
+  "home": "`branch_setup`"
+ },
+ {
+  "ordinal": 56,
+  "line": 1040,
+  "condition": "pr_strategy=multi",
+  "first": "- Pushing to {{base_branch}}, or creating branches beyond th",
+  "mechanism": "R",
+  "home": "`branch_setup` (group branches)"
+ },
+ {
+  "ordinal": 57,
+  "line": 1044,
+  "condition": "parallel_tasks",
+  "first": "- Pushing to {{base_branch}}, or creating branches beyond th",
+  "mechanism": "R",
+  "home": "`wave_claim`"
+ },
+ {
+  "ordinal": 58,
+  "line": 1045,
+  "condition": "pr_strategy=single",
+  "first": "- Pushing to {{base_branch}}, or creating branches beyond th",
+  "mechanism": "R",
+  "home": "`wave_claim` (task branches from the run branch)"
+ },
+ {
+  "ordinal": 59,
+  "line": 1049,
+  "condition": "pr_strategy=multi",
+  "first": "- Pushing to {{base_branch}}, or creating branches beyond th",
+  "mechanism": "R",
+  "home": "`wave_claim` (task branches from the group branch)"
+ },
+ {
+  "ordinal": 60,
+  "line": 1085,
+  "condition": "!parallel_tasks",
+  "first": "- Destructive/irreversible actions (`rm -rf`, force-push, dr",
+  "mechanism": "R",
+  "home": "no unasked destructive op exists outside `wave_cleanup`"
+ },
+ {
+  "ordinal": 61,
+  "line": 1089,
+  "condition": "parallel_tasks",
+  "first": "- Destructive/irreversible actions (`rm -rf`, force-push, dr",
+  "mechanism": "R",
+  "home": "`wave_cleanup`"
+ },
+ {
+  "ordinal": 62,
+  "line": 1110,
+  "condition": "task_granularity=micro",
+  "first": "- Task granularity: micro (one-seam tasks, executable criter",
+  "mechanism": "I",
+  "home": "`final_report` header `{{mode_line}}`"
+ }
+]

@@ -1,0 +1,2124 @@
+name: architect-next
+description: |
+  CANDIDATE decomposition of the architect orchestrator into a session graph
+  (plans/architect-graph-design.md; plans/suite-performance-draft.md section 10.18
+  step 4). The protocol the prose architect enforces becomes edges: script nodes
+  own the mode routing (pr_strategy x parallel_tasks x task_granularity x autonomy x
+  escalation_policy), the task scheduler, every bound, the ledgers and sentinel
+  parsing; short single-question llm nodes own the judgment (orient, author/amend the
+  plan, answer leaks, integrate findings, task-done edits, batch triage, CI diagnosis);
+  gatekeeper / oracle / explore / librarian / review-gauntlet / adversary /
+  whetstone / engineer and the sisyphus delegate run as agent-node islands exactly
+  as they ship. Candidate status: no agent lists this as spawnable, the facade
+  agents/architect is untouched, and this directory is replaced by the facade at
+  cutover (D1) once the A9 artifact-equivalence replay passes. The run-or-chat session
+  surface is the facade's: work routes to the graph, conversation to the engineer.
+version: '1.0'
+
+# Dynamic spawning from llm nodes (answer_leaks fans out explore/librarian)
+# plus the agent-node islands. Limits mirror architect/config.yaml.
+can_spawn_agents: true
+max_concurrent_agents: 10
+max_agent_depth: 10
+
+global_tools:
+  - ast_grep.sh
+  - fs_read.sh
+  - fs_grep.sh
+  - fs_glob.sh
+  - fs_ls.sh
+  - fs_write.sh
+  - fs_patch.sh
+  - execute_command.sh
+  - web_search_coyote.sh
+
+skills_enabled: true
+enabled_skills:
+  - design-session
+  - grilling
+  - task-tracking
+  - plan-authoring
+  - delegation-protocol
+  - git-master
+  - parallel-research
+
+variables:
+  # Mirror of architect's variables: names AND defaults identical, so an
+  # explicit spawn override and an unset variable both behave as they do today.
+  - name: project_dir
+    description: Absolute path to the target project repo - the ONLY write target for feature code
+    default: '.'
+  - name: plans_dir
+    description: Where the PLAN file and task dirs live. Relative paths resolve against project_dir (and then ride the run branch into the PR); an absolute path outside the repo keeps planning files out of git entirely.
+    default: 'plans'
+  - name: design_doc
+    description: Path to the high-level design doc to implement (absolute, or relative to project_dir)
+    default: ''
+  - name: base_branch
+    description: The branch the run branch forks from and the PR targets
+    default: 'main'
+  - name: autonomy
+    description: 'How autonomous the run is: full (no gates), plan-gate (approve breakdown once, then autonomous), phase-gate (approve each task)'
+    default: full
+  - name: escalation_policy
+    description: "How escalation-worthy decisions (yours and relayed child escalations) are handled: 'interactive' pauses and asks the user; 'autonomous' self-resolves decisions covered by a standing ruling or a clearly recommended option, reports them in the Phase F digest, and only pings on hard triggers or novel conflicts"
+    default: 'interactive'
+  - name: auto_confirm
+    description: Auto-confirm command execution (1 = skip the shell guard_operation TTY prompt, needed for non-interactive autonomous runs)
+    default: '1'
+  - name: parallel_tasks
+    description: 'Opt-in worktree-based parallel task execution: 0 = sequential (default, one task at a time on the run branch), 1 = eligible tasks run as concurrent Sisyphus agents in isolated git worktrees, merged back one at a time'
+    default: '0'
+  - name: pr_strategy
+    description: "PR packaging: 'single' = the whole design doc lands as ONE draft PR opened in Phase F (default); 'multi' = the plan partitions tasks into PR groups, each landing as its own stacked draft PR opened at group close-out - for larger plans where one PR would be unreviewable"
+    default: 'single'
+  - name: build_lock
+    description: "Command prefix forwarded to every Sisyphus spawn and on to its coder/step-runner build/test/lint gates and to the review-gauntlet/adversary verification runs, e.g. `flock -w 240 /path/to/lock`; empty runs gates bare. It is substituted raw into a JSON string on every hop, so it must be free of double quotes and backslashes; quote paths with single quotes (`flock '/tmp/my lock'`)"
+    default: ''
+  - name: task_granularity
+    description: "Task sizing for the plan: 'standard' (default, ~1 engineer-day tasks - today's behavior, unchanged) or 'micro' (tasks sized to one file/seam with exact signatures and EXECUTABLE acceptance criteria, grouped into plan-section batches; per task only coder verify + the adversary criteria check run, the full review gauntlet runs once per batch; designed for small/local implementer models and for runs where per-task blast radius must be minimal)"
+    default: 'standard'
+
+settings:
+  # Engine backstop only: every cycle carries its own named bound in a script. It counts visits per node per RUN, so for an
+  # orchestration it is a defect detector, not a budget (engine-ask G10).
+  max_loop_iterations: 100
+  log_state_snapshots: true
+  validate_before_run: true
+  # Architect runs span hours-to-days (the facade's choice); the delegate and the
+  # gauntlet islands run to completion under their own budgets.
+  timeout: 0
+
+session:
+  expose:
+    - run_id
+    - run_dir
+    - plan_path
+    - plan_slug
+    - sealed
+    - gate2_verdict
+    - run_branch
+    - pr_url
+    - ci_status
+    - report
+  route:
+    instructions: |
+      Route RUN when the message asks for WORK to be executed: run a plan or
+      design doc end-to-end, materialize or execute tasks, resume or continue a
+      run, execute fix rounds, open/finish the run's PR flow, or "execute the
+      handoff at <path>". Route CHAT for everything conversational: questions
+      about the codebase or the run ("how does X work", "what's the status of
+      task 3", "why did the gauntlet block"), design and research discussions,
+      plan brainstorming, and anything about UNDERSTANDING rather than doing -
+      the chat lane is the engineer, a read-only staff-engineer companion with
+      its own explore/librarian/oracle research fan-out; it writes design-doc
+      seeds, handoffs, and amendment artifacts (plans/amendments/) instead of
+      executing, and plan-shaped changes it records flow through the run's amend
+      path rather than bypassing the gatekeeper. When uncertain or the message
+      mixes both, route CHAT: the engineer can always conclude with an artifact
+      the user explicitly runs, but a wrongly-routed RUN performs writes nobody
+      asked for.
+  chat:
+    agent: engineer
+    variables:
+      chat_agent_for: architect
+
+initial_state:
+  # --- run identity / A2 artifacts / normalized fork vocabulary ---
+  run_id: ''
+  run_dir: ''
+  brief: ''
+  resume_mode: false
+  resume_phase: ''
+  resume_note: ''
+  mode_vector: {}
+  mode_line: ''
+  sizing_rule: ''
+  code_repo_path: ''
+  git_root: ''
+  plans_root: ''
+  tasks_root: ''
+  base_branch_name: ''
+  owner_name: ''
+  owner_note: ''
+  reference_root_path: ''
+  core_tools: ''
+  design_doc_path: ''
+  design_title: ''
+  owner_away: false
+  top_level: true
+  anomalies: []
+  anomalies_log: []
+  decisions: []
+  last_script_error: ''
+  last_node_output: ''
+  # --- orient ---
+  conventions_summary: ''
+  verification_commands: '[]'
+  local_run_recipe: ''
+  consumer_surfaces: []
+  convention_discrepancies: []
+  # --- research ---
+  explore_slices: []
+  archivist_questions: []
+  librarian_questions: []
+  team_mode: false
+  explore_findings: []
+  archivist_findings: []
+  librarian_findings: []
+  carried_questions: []
+  # --- plan ---
+  plan_path: ''
+  plan_slug: ''
+  plan_revision: ''
+  breakdown_rows: []
+  acceptance_criteria: []
+  open_questions: []
+  design_rounds: 0
+  author_retries: 0
+  author_defects: ''
+  rigor_proposal: ''
+  surfaces_proposal: ''
+  quality_evidence: ''
+  quality_rigor: ''
+  quality_surfaces: ''
+  quality_recorded: false
+  quality_note: ''
+  checklist_labels: []
+  checklist_findings: []
+  checklist_items: []
+  checklist_done: []
+  pending_amendments: []
+  amend_cycles: 0
+  amend_summary: ''
+  amended: false
+  after_reseal: ''
+  # --- gates ---
+  sealed: false
+  gate1_prompt: ''
+  gate1_result: ''
+  gate1_verdict: ''
+  leak_fingerprints: []
+  leak_questions: []
+  leak_answers: []
+  leak_unanswerable: []
+  leak_pending_answers: []
+  gate2_prompt: ''
+  gate2_result: ''
+  gate2_verdict: ''
+  oracle_rejects: 0
+  gate_fault_retries: 0
+  # --- promote ---
+  promote_report: ''
+  promote_defects: ''
+  promote_retries: 0
+  promoted_plan_path: ''
+  skip_promote_defects: false
+  tasks: []
+  # --- per-task loop ---
+  run_branch: ''
+  unit_base_branch: ''
+  unit_base_sha: ''
+  group_index: 0
+  closeout_scope: ''
+  closeout_unit: ''
+  closeout_done_for: ''
+  current_task: ''
+  current_unit: ''
+  delegation_kind: 'implement'
+  delegation_prompt: ''
+  delegate_result: ''
+  delegate_review_cadence: 'task'
+  delegate_parallel: '0'
+  delegate_project_dir: ''
+  report_parsed: {}
+  failure_evidence: ''
+  oracle_result: ''
+  task_rounds: {}
+  pending_fixes: []
+  fix_request: {}
+  fix_items: []
+  fix_source: ''
+  fix_return_to: ''
+  fix_note: ''
+  verify_scope: 'task'
+  verify_unit: ''
+  verify_lane: ''
+  gauntlet_prompt: ''
+  adversary_prompt: ''
+  gauntlet_result: ''
+  adversary_result: ''
+  gauntlet_blockers: []
+  verification_commands_json: '[]'
+  debris_exclude: ''
+  round_log: {}
+  last_verdict: ''
+  pending_pr_comments: []
+  ledger_lines: []
+  design_asks: []
+  debt_items: []
+  task_done_report: ''
+  rejected_findings: []
+  deferred_findings: []
+  skipped_reviews: []
+  design_decisions: []
+  follow_ups: []
+  linked_chains: []
+  # --- parallel ---
+  wave_ids: []
+  wave: []
+  wtask: {}
+  wave_fix_rounds: 0
+  wave_delegate_result: ''
+  wave_gauntlet_result: ''
+  wave_report: ''
+  wave_result: {}
+  wave_results: []
+  wave_index: 0
+  integration_task: ''
+  # --- micro batches ---
+  batch_state: {}
+  current_batch: ''
+  batch_base_sha: ''
+  finding_routes: []
+  cross_task_fix: {}
+  # --- escalation ladder ---
+  escalation: {}
+  ask_question: ''
+  last_answer: ''
+  last_answer_text: ''
+  parked: ''
+  standing_rulings: ''
+  ladder_resolution: ''
+  ladder_choice: ''
+  ladder_basis: ''
+  consult_result: ''
+  owner_poll_result: ''
+  owner_polls: 0
+  reask_rounds: 0
+  autonomous_digest: []
+  autonomous_kinds: []
+  # --- phase F ---
+  integration_checked: false
+  final_integration_strikes: 0
+  integration_follow_ups: []
+  integration_amendments: []
+  integration_amended: false
+  hygiene_units: []
+  hygiene_done: []
+  hygiene_skipped: false
+  hygiene_base: ''
+  hygiene_lint_cmd: ''
+  hygiene_criteria: ''
+  hygiene_brief: ''
+  hygiene_items: []
+  pr_summary_text: ''
+  pr_body_path: ''
+  pr_body_notes: ''
+  pr_body_fix_report: ''
+  body_fix_rounds: 0
+  pr_number: ''
+  pr_url: ''
+  pr_numbers: {}
+  flipped_ready: false
+  ci_polls: 0
+  ci_rounds: 0
+  ci_poll_fails: 0
+  ci_status: ''
+  ci_started_at: 0
+  ci_checks: []
+  ci_failing: []
+  ci_evidence: ''
+  ci_evidence_trimmed: false
+  ci_signatures: []
+  ci_infra_hint: []
+  ci_diagnosis: ''
+  ci_verdict: ''
+  failing_checks: []
+  ci_owning_task_llm: ''
+  ci_owning_task: ''
+  ci_reruns: {}
+  ci_fix_strikes: {}
+  validate_note: ''
+  followup_tasks: []
+  external_feedback: []
+  whetstone_result: ''
+  whetstone_note: ''
+  # --- report ---
+  report: ''
+  summary: ''
+  failure_reason: ''
+
+start: intake
+
+nodes:
+  # =====================================================================
+  # 2.1 Orient
+  # =====================================================================
+  intake:
+    id: intake
+    type: script
+    description: >-
+      Normalize the fork's variables into one vocabulary, validate the mode vector
+      (fail-safe: an unknown value asks), resolve the design doc, create the A2 run
+      directory (outside both repos), write the brief, detect re-entry
+      ("Architect run id:"), confirm the owner identity, and pull the planning repo.
+    script: scripts/intake.py
+    timeout: 120
+    fallback: end_failure
+
+  resume_route:
+    id: resume_route
+    type: script
+    description: Re-entry switch on the phase recorded at exit (A2/A14).
+    script: scripts/resume_route.py
+    fallback: end_failure
+
+  orient_read:
+    id: orient_read
+    type: llm
+    description: >-
+      Phase A judgment - read the design doc and the conventions files; extract the
+      title, verification commands (never guessed), consumer surfaces, prior-discussion
+      references and convention discrepancies.
+    instructions: |
+      You are the orientation step of an orchestrator that drives a design doc to
+      implementation by delegating. You read; you never edit files and never run
+      build or test commands here.
+
+      Read the design doc and the conventions files with the tools (fs_read /
+      fs_grep). Produce:
+      - design_title: the doc's title (one line).
+      - conventions_summary: the rules from the conventions files that bind the
+        run (commit discipline, test commands, layout rules), 5-15 lines.
+      - verification_commands: a JSON array string of the project's exact
+        build/test/lint commands taken ONLY from the repo's own docs (CLAUDE.md,
+        AGENTS.md, CONTRIBUTING.md, Makefile, package scripts) - never guessed;
+        "[]" when none are documented. Targeted build/unit/lint commands only,
+        never commands that boot shared stacks or services.
+      - local_run_recipe: the documented way to run the service locally for a
+        consumer-facing probe, verbatim, or "" when none is documented.
+      - consumer_surfaces: endpoints / RPCs / CLI commands / contract shapes the
+        design touches (short strings).
+      - archivist_questions: one per prior discussion, decision, PRD, or meeting
+        the design doc references or clearly presupposes ("what was decided about
+        X?"); empty when none.
+      - convention_discrepancies: places where the orchestrator's protocol and the
+        conventions files disagree (reported, never silently resolved).
+      - anomalies: anything outside this step's job someone should know (a stale
+        downstream doc, a contradictory design); empty is the normal case.
+
+      Design doc: {{design_doc_path}}
+      Code repo: {{code_repo_path}}
+      Planning repo / plans dir: {{plans_root}}
+      Reference repos root (read-only; may be empty): {{reference_root_path}}
+      Mode: {{mode_line}}
+    prompt: |
+      ## Message
+      {{brief}}
+
+      ## Re-entry note (empty for a fresh run)
+      {{resume_note}}
+    tools: [fs_read, fs_grep, fs_glob, fs_ls]
+    max_iterations: 20
+    timeout: 900
+    output_schema:
+      type: object
+      properties:
+        design_title: { type: string }
+        conventions_summary: { type: string }
+        verification_commands: { type: string }
+        local_run_recipe: { type: string }
+        consumer_surfaces:
+          type: array
+          items: { type: string }
+        archivist_questions:
+          type: array
+          items: { type: string }
+        convention_discrepancies:
+          type: array
+          items: { type: string }
+        anomalies:
+          type: array
+          items: { type: string }
+      required: [design_title, verification_commands]
+    state_updates:
+      last_node_output: '{{output}}'
+    fallback: orient_fault
+    next: plan_research
+
+  orient_fault:
+    id: orient_fault
+    type: script
+    description: Fail-safe when orientation died - ask for the doc instead of guessing.
+    script: scripts/orient_fault.py
+    fallback: end_failure
+
+  # =====================================================================
+  # 2.2 Design decomposition
+  # =====================================================================
+  plan_research:
+    id: plan_research
+    type: llm
+    description: Plan the grounding burst - explore slices over the code repo and the reference siblings, librarian questions, team mode.
+    instructions: |
+      You plan a parallel research burst that grounds a design doc's task breakdown
+      in real code. Produce explore_slices: one NARROW slice per design assumption
+      to confirm (a file, symbol, call site, convention or module boundary the
+      breakdown will name) in the code repo - and, when the design uses an
+      internal library or mirrors a legacy pattern, a slice over the relevant
+      sibling repo under the reference root (read-only). Never guess file/symbol
+      names: the slices exist to verify them. Scale to the design: 3-6 for a
+      contained feature, 7-12 for a cross-cutting change; never artificially cap.
+      librarian_questions: one per unfamiliar external library / spec; empty when
+      everything is internal. team_mode=true when slices are likely to FEED each
+      other (an archivist's "the team decided X" should redirect an explore lane).
+    prompt: |
+      ## Design doc
+      {{design_doc_path}}
+
+      ## Conventions summary
+      {{conventions_summary}}
+
+      ## Consumer surfaces
+      {{consumer_surfaces}}
+
+      Code repo: {{code_repo_path}}
+      Reference root: {{reference_root_path}}
+      Sizing rule: {{sizing_rule}}
+    tools: [fs_read]
+    timeout: 600
+    output_schema:
+      type: object
+      properties:
+        explore_slices:
+          type: array
+          items: { type: string }
+        librarian_questions:
+          type: array
+          items: { type: string }
+        team_mode: { type: boolean }
+        anomalies:
+          type: array
+          items: { type: string }
+      required: [explore_slices]
+    state_updates:
+      last_node_output: '{{output}}'
+    fallback: research_dispatch
+    next: research_dispatch
+
+  research_dispatch:
+    id: research_dispatch
+    type: script
+    description: Team or solo explore map (a dead plan_research degrades to one grounding slice); the archivist lane only where the fork has one.
+    script: scripts/research_dispatch.py
+    fallback: end_failure
+
+  explore_fanout_team:
+    id: explore_fanout_team
+    type: map
+    description: Grounding burst in team mode - native roster + peer messaging replaces the orchestrator's roster broadcast.
+    over: '{{explore_slices}}'
+    as: slice
+    branch: explore_slice_team
+    output_key: finding
+    collect_into: explore_findings
+    next: archivist_fanout
+
+  explore_slice_team:
+    id: explore_slice_team
+    type: agent
+    agent: explore
+    teammates: true
+    prompt: |
+      Grounding slice for a design decomposition. Code repo: {{code_repo_path}}
+      (read-only reference siblings may live under {{reference_root_path}}).
+
+      Slice: {{slice}}
+
+      Design doc: {{design_doc_path}}
+
+      Return exact file paths, symbol names and 5-20 line snippets that confirm or
+      refute the design's assumption; name the conventions in force. You are one
+      of several explorers; message a teammate directly when you find a fact in
+      THEIR slice, and check your inbox before finalizing. End with an optional
+      "Anomalies:" line for anything outside this design's scope someone should know.
+    timeout: 1800
+    max_attempts: 2
+    state_updates:
+      finding: '{{output}}'
+    fallback: explore_fault
+
+  explore_fanout_solo:
+    id: explore_fanout_solo
+    type: map
+    description: Grounding burst, independent lanes.
+    over: '{{explore_slices}}'
+    as: slice
+    branch: explore_slice_solo
+    output_key: finding
+    collect_into: explore_findings
+    next: archivist_fanout
+
+  explore_slice_solo:
+    id: explore_slice_solo
+    type: agent
+    agent: explore
+    prompt: |
+      Grounding slice for a design decomposition. Code repo: {{code_repo_path}}
+      (read-only reference siblings may live under {{reference_root_path}}).
+
+      Slice: {{slice}}
+
+      Design doc: {{design_doc_path}}
+
+      Return exact file paths, symbol names and 5-20 line snippets that confirm or
+      refute the design's assumption; name the conventions in force. End with an
+      optional "Anomalies:" line for anything outside this design's scope someone
+      should know.
+    timeout: 1800
+    max_attempts: 2
+    state_updates:
+      finding: '{{output}}'
+    fallback: explore_fault
+
+  explore_fault:
+    id: explore_fault
+    type: script
+    description: Branch-local fallback - a dead slice yields a visible PIPELINE-FAULT finding (fail-open, declared).
+    script: scripts/explore_fault.py
+    state_updates: {}
+
+  archivist_fanout:
+    id: archivist_fanout
+    type: map
+    description: Org context (prior decisions, PRDs, meetings), one per question; findings are distilled INTO the plan.
+    over: '{{archivist_questions}}'
+    as: question
+    branch: archivist_question
+    output_key: finding
+    collect_into: archivist_findings
+    next: librarian_fanout
+
+  archivist_question:
+    id: archivist_question
+    type: agent
+    agent: explore
+    prompt: |
+      {{question}}
+
+      Context: this grounds the decomposition of the design doc at
+      {{design_doc_path}}. Quote and cite what was decided; the substance will be
+      distilled into the plan text (links alone are dead pointers for implementers).
+    timeout: 1800
+    max_attempts: 2
+    state_updates:
+      finding: '{{output}}'
+    fallback: archivist_fault
+
+  archivist_fault:
+    id: archivist_fault
+    type: script
+    description: Branch-local fallback for a dead archivist lane.
+    script: scripts/archivist_fault.py
+    state_updates: {}
+
+  librarian_fanout:
+    id: librarian_fanout
+    type: map
+    description: External docs / OSS examples, one librarian per question.
+    over: '{{librarian_questions}}'
+    as: question
+    branch: librarian_question
+    output_key: finding
+    collect_into: librarian_findings
+    next: author_plan
+
+  librarian_question:
+    id: librarian_question
+    type: agent
+    agent: librarian
+    prompt: |
+      {{question}}
+
+      Context: this answers a question raised while decomposing the design doc at
+      {{design_doc_path}} for the project at {{code_repo_path}}; prefer official docs
+      and cite sources.
+    timeout: 1800
+    max_attempts: 2
+    state_updates:
+      finding: '{{output}}'
+    fallback: librarian_fault
+
+  librarian_fault:
+    id: librarian_fault
+    type: script
+    description: Branch-local fallback for a dead librarian lane.
+    script: scripts/librarian_fault.py
+    state_updates: {}
+
+  author_plan:
+    id: author_plan
+    type: llm
+    description: >-
+      Phase B judgment over the FULL artifact set (section 10.5): write the intake
+      packet / plan file and return the structured breakdown, open questions and the
+      quality-bar proposal.
+    instructions: |
+      You author the plan for a design doc following the `design-session` and
+      `plan-authoring` skills (load them). You hold the design doc and EVERY
+      research finding below - distill them; archivist substance goes INTO the plan
+      text (a Notion/Slack/Granola link is provenance, never load-bearing content).
+      Ground every file/symbol name in a finding; never guess.
+
+      Write the plan file with fs_write and return its path as plan_path:
+      `{{plans_root}}/PLAN-<slug>.md` (frontmatter per `task-tracking`: `status: draft`,
+      `title`, `slug`). Body: Problem, Approach, Alternatives, Constraints/risks, Open
+      questions, and a `## Task breakdown` table (one row per task: title, points,
+      blocked_by, declared files, surfaces) where {{sizing_rule}}
+      When the mode is multi-PR (PR groups), also partition the
+      breakdown into a `## PR groups` section (group id, title, members, order) with
+      every blocker in the same or an earlier group.
+
+      If a previous attempt had structural defects they are listed below - fix
+      exactly those.
+
+      Return, besides plan_path and plan_slug:
+      - breakdown_rows: the table rows as objects.
+      - acceptance_criteria: every acceptance criterion you wrote (flat list; in
+        micro mode each must be an executable command).
+      - open_questions: the design's genuinely open questions you could NOT settle
+        from the doc or the findings, each with 2-4 options, exactly one
+        recommended with its evidence, and changes_scope=true when the answer
+        changes the plan's scope (grilling frontier-round shape).
+      - rigor_proposal (poc|prototype|production) + surfaces_proposal (comma list;
+        `other:<label>` for surfaces needing a best-practice checklist) +
+        quality_evidence: the design doc signals behind the proposal.
+      - anomalies: things outside this plan's scope someone should know.
+
+      Mode: {{mode_line}}
+      Code repo: {{code_repo_path}}   Planning root: {{plans_root}}
+    prompt: |
+      ## Design doc path
+      {{design_doc_path}}
+
+      ## Conventions summary
+      {{conventions_summary}}
+
+      ## Explore findings (one per slice)
+      {{explore_findings}}
+
+      ## Archivist findings (one per question)
+      {{archivist_findings}}
+
+      ## Librarian findings (one per question)
+      {{librarian_findings}}
+
+      ## Structural defects from the previous attempt (empty on the first)
+      {{author_defects}}
+    tools: [fs_read, fs_grep, fs_glob, fs_ls, fs_write, fs_patch]
+    skills_enabled: true
+    enabled_skills: [design-session, plan-authoring]
+    max_iterations: 45
+    timeout: 3600
+    output_schema:
+      type: object
+      properties:
+        plan_path: { type: string }
+        plan_slug: { type: string }
+        breakdown_rows:
+          type: array
+          items: { type: object }
+        acceptance_criteria:
+          type: array
+          items: { type: string }
+        open_questions:
+          type: array
+          items:
+            type: object
+            properties:
+              question: { type: string }
+              options:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    text: { type: string }
+                    recommended: { type: boolean }
+                    evidence: { type: string }
+                  required: [text]
+              changes_scope: { type: boolean }
+            required: [question]
+        rigor_proposal: { type: string }
+        surfaces_proposal: { type: string }
+        quality_evidence: { type: string }
+        anomalies:
+          type: array
+          items: { type: string }
+      required: [plan_path]
+    state_updates:
+      last_node_output: '{{output}}'
+    fallback: plan_route
+    next: plan_route
+
+  plan_route:
+    id: plan_route
+    type: script
+    description: Plan file exists and parses; micro structural checks (Batch column, executable criteria; one author re-run, B4); open questions next.
+    script: scripts/plan_route.py
+    fallback: end_failure
+
+  open_questions_gate:
+    id: open_questions_gate
+    type: script
+    description: Grilling frontier rounds as ONE escalation per round (B1 - 3 rounds); an unresolved scope-changing question is a hard stop.
+    script: scripts/open_questions_gate.py
+    fallback: end_failure
+
+  quality_bar_gate:
+    id: quality_bar_gate
+    type: script
+    description: Settle rigor + surfaces with the user (the proposal recommended).
+    script: scripts/quality_bar_gate.py
+    fallback: end_failure
+
+  record_quality_bar:
+    id: record_quality_bar
+    type: script
+    description: Deterministic frontmatter + `## Quality bar` section write.
+    script: scripts/record_quality_bar.py
+    fallback: end_failure
+
+  checklist_gate:
+    id: checklist_gate
+    type: script
+    description: One best-practice checklist librarian per `other:<label>` surface.
+    script: scripts/checklist_gate.py
+    fallback: end_failure
+
+  checklist_fanout:
+    id: checklist_fanout
+    type: map
+    description: Deep-research librarians (checklist distillation is broad-topic research).
+    over: '{{checklist_labels}}'
+    as: label
+    branch: checklist_librarian
+    output_key: finding
+    collect_into: checklist_findings
+    next: checklist_round
+
+  checklist_librarian:
+    id: checklist_librarian
+    type: agent
+    agent: librarian
+    prompt: |
+      Established best practices and common review checklist for {{label}};
+      authoritative sources preferred; return a distilled, deduplicated checklist
+      (one item per line, numbered).
+    inputs:
+      research_depth: deep
+    timeout: 3600
+    max_attempts: 2
+    state_updates:
+      finding: '{{output}}'
+    fallback: checklist_fault
+
+  checklist_fault:
+    id: checklist_fault
+    type: script
+    description: Branch-local fallback for a dead checklist lane.
+    script: scripts/checklist_fault.py
+    state_updates: {}
+
+  checklist_round:
+    id: checklist_round
+    type: script
+    description: The accept/drop round over the returned items (one escalation).
+    script: scripts/checklist_round.py
+    fallback: end_failure
+
+  amend_plan:
+    id: amend_plan
+    type: llm
+    description: Apply a list of amendments to the plan file; every exit re-seals (A3).
+    instructions: |
+      You amend an existing plan file in place (fs_read, then fs_patch/fs_write).
+      Apply EXACTLY the amendments listed below - design-round answers, accepted
+      checklist items (as measurable acceptance criteria on the relevant tasks
+      where possible, otherwise under `## Quality bar -> Long-tail criteria`),
+      gatekeeper leak answers (inline, or as verified pointers to code/docs),
+      oracle complaints (fix the specific line-referenced issues), the owner's
+      amendments, plan defects found during implementation (rewrite the criterion
+      TEXT; never change scope silently), supplied local-run recipes. Keep
+      frontmatter valid. Follow `plan-authoring`. Return amended=true when the
+      file changed, a 3-10 line summary of what changed, and anomalies you noticed
+      outside this amendment's scope.
+    prompt: |
+      ## Plan file
+      {{plan_path}}
+
+      ## Amendments to apply (verbatim)
+      {{pending_amendments}}
+
+      ## Quality bar
+      rigor={{quality_rigor}} surfaces={{quality_surfaces}}
+      Mode: {{mode_line}}
+    tools: [fs_read, fs_grep, fs_write, fs_patch]
+    skills_enabled: true
+    enabled_skills: [plan-authoring]
+    max_iterations: 20
+    timeout: 1800
+    output_schema:
+      type: object
+      properties:
+        amended: { type: boolean }
+        amend_summary: { type: string }
+        anomalies:
+          type: array
+          items: { type: string }
+      required: [amended, amend_summary]
+    state_updates:
+      last_node_output: '{{output}}'
+    fallback: reseal_gate
+    next: reseal_gate
+
+  # =====================================================================
+  # 2.3 Plan quality gates
+  # =====================================================================
+  reseal_gate:
+    id: reseal_gate
+    type: script
+    description: A1 - count amendment cycles (3 per run -> owner); a mutated plan is unsealed and unreviewed; then Gate 1 over the FULL plan.
+    script: scripts/reseal_gate.py
+    fallback: end_failure
+
+  gate1_build:
+    id: gate1_build
+    type: script
+    description: The gatekeeper prompt verbatim (micro-grain addendum when micro; PR-groups sentence upstream multi; prior verdict on re-seals).
+    script: scripts/gate1_build.py
+    fallback: end_failure
+    next: gate1
+
+  gate1:
+    id: gate1
+    type: agent
+    agent: gatekeeper
+    description: Gate 1 - self-containedness (SEALED/LEAKY), blocking by construction.
+    prompt: |
+      {{gate1_prompt}}
+    timeout: 3600
+    max_attempts: 2
+    state_updates:
+      gate1_result: '{{output}}'
+    fallback: gate1_route
+    next: gate1_route
+
+  gate1_route:
+    id: gate1_route
+    type: script
+    description: Parse PLAN_GATE; SEALED/FRICTION -> Gate 2; LEAKY -> answer the leaks, or the owner when the same questions recur (B3, A1).
+    script: scripts/gate1_route.py
+    fallback: end_failure
+
+  answer_leaks:
+    id: answer_leaks
+    type: llm
+    description: Island - answer every gatekeeper question from code/docs/the org record with a research fan-out; name what only the owner can answer.
+    instructions: |
+      Gate 1 returned LEAKY. Answer EVERY missing question yourself from code and
+      docs: load parallel-research and fan out explore agents (over the code repo
+      and the read-only reference siblings), librarian agents (external docs) and,
+      when available in this suite, archivist agents (Notion/Granola/Slack/Jira) -
+      one per question - then collect every agent you spawned. Read the referenced
+      docs with fs_read. Return leak_answers (question -> answer with its verified
+      pointer or inline text) and leak_unanswerable: ONLY questions that genuinely
+      cannot be answered from code or docs (business rules, priority calls).
+      Never edit the plan here; the amend step applies your answers.
+    prompt: |
+      ## Gatekeeper verdict (verbatim)
+      {{gate1_result}}
+
+      ## Question lines (parsed)
+      {{leak_questions}}
+
+      ## Plan
+      {{plan_path}}
+
+      Code repo: {{code_repo_path}}   Reference root: {{reference_root_path}}
+      Planning root: {{plans_root}}
+    tools: [fs_read, fs_grep, fs_glob, fs_ls, ast_grep]
+    skills_enabled: true
+    enabled_skills: [parallel-research]
+    max_iterations: 45
+    timeout: 3600
+    output_schema:
+      type: object
+      properties:
+        leak_answers:
+          type: array
+          items:
+            type: object
+            properties:
+              question: { type: string }
+              answer: { type: string }
+            required: [question, answer]
+        leak_unanswerable:
+          type: array
+          items: { type: string }
+        anomalies:
+          type: array
+          items: { type: string }
+      required: [leak_answers, leak_unanswerable]
+    state_updates:
+      last_node_output: '{{output}}'
+    fallback: leak_route
+    next: leak_route
+
+  leak_route:
+    id: leak_route
+    type: script
+    description: Unanswerable questions -> the owner (one round); answers -> amend_plan (-> re-seal).
+    script: scripts/leak_route.py
+    fallback: end_failure
+
+  gate2_build:
+    id: gate2_build
+    type: script
+    description: The oracle prompt verbatim (sizing criterion per granularity; prior verdict on re-reviews).
+    script: scripts/gate2_build.py
+    fallback: end_failure
+    next: gate2
+
+  gate2:
+    id: gate2
+    type: agent
+    agent: oracle
+    description: Gate 2 - executability (PLAN_REVIEW OKAY/REJECT) over the sealed plan.
+    prompt: |
+      {{gate2_prompt}}
+    timeout: 3600
+    max_attempts: 2
+    state_updates:
+      gate2_result: '{{output}}'
+    fallback: gate2_route
+    next: gate2_route
+
+  gate2_route:
+    id: gate2_route
+    type: script
+    description: Parse PLAN_REVIEW; REJECT -> amend (-> re-seal, A3), 3 rounds (B5) -> owner; OKAY -> continue where the amendment came from.
+    script: scripts/gate2_route.py
+    fallback: end_failure
+
+  reseal_return:
+    id: reseal_return
+    type: script
+    description: After a sealed + reviewed plan - promote (first time), or return to the mid-run point that amended it.
+    script: scripts/reseal_return.py
+    fallback: end_failure
+
+  autonomy_gate:
+    id: autonomy_gate
+    type: script
+    description: plan-gate autonomy presents the SEALED+OKAY'd breakdown once; otherwise promote.
+    script: scripts/autonomy_gate.py
+    fallback: end_failure
+
+  approve_breakdown:
+    id: approve_breakdown
+    type: approval
+    description: plan-gate - approve the breakdown before any task exists.
+    question: |
+      {{ask_question}}
+    options:
+      - 'Approve the breakdown'
+      - 'Revise the breakdown (describe the change)'
+      - 'Abort the run'
+    routes:
+      'Approve the breakdown': apply_answer
+      'Revise the breakdown (describe the change)': apply_answer
+      'Abort the run': apply_answer
+    on_other: parse_answer
+    state_updates:
+      last_answer: '{{choice}}'
+      last_answer_text: '{{choice}}'
+
+  # =====================================================================
+  # 2.4 Promote
+  # =====================================================================
+  promote_tasks:
+    id: promote_tasks
+    type: llm
+    description: Island - materialize the task files under the plans dir per task-tracking, fleshed out from the plan.
+    instructions: |
+      You materialize a SEALED and OKAY'd plan into tasks, following the
+      `task-tracking` skill (load it). Set the PLAN's frontmatter `status: active` and
+      create ONE task dir per breakdown row at `{{plans_root}}/tasks/TASK-NNN-<slug>/`
+      (numbering per the skill: scan max+1; never reuse a number); write each
+      index.md (frontmatter `status: pending`, `plan:`, `title:`, What / Steps / Acceptance criteria from the plan,
+      `blocked_by: [TASK-...]` resolved to the real ids, `files:` the declared files,
+      `surfaces:` when the row names any) and log.md (a `created` entry). In micro
+      mode every task's frontmatter also carries `batch: <slug>` from the Batch
+      column and `protected: true` when its Protected column is set, and its body
+      carries the plan's Context pack for that task VERBATIM. Do NOT commit - the
+      next step validates and commits the planning files (`chore(plan): ...`).
+
+      If a previous attempt left mechanical defects they are listed below - fix
+      exactly those (re-use the existing task dirs; create only what is missing).
+
+      Report every task id you created with its title, and the promoted PLAN path
+      on a line `PLAN: <path>`. Anomalies (A10): add a line starting exactly
+      "ANOMALY: " for anything wrong you observe outside this step; never invent one.
+    prompt: |
+      ## Plan
+      {{plan_path}}
+
+      ## Mode
+      {{mode_line}}
+
+      ## Defects from the previous attempt (empty on the first)
+      {{promote_defects}}
+    tools: [fs_read, fs_grep, fs_glob, fs_ls, fs_write, fs_patch, execute_command]
+    skills_enabled: true
+    enabled_skills: [task-tracking]
+    max_iterations: 45
+    timeout: 3600
+    state_updates:
+      promote_report: '{{output}}'
+    fallback: promote_verify
+    next: promote_verify
+
+  promote_verify:
+    id: promote_verify
+    type: script
+    description: Mechanical - every row has a task dir, frontmatter present, validate green, planning commit; one retry (B6); writes tasks.json.
+    script: scripts/promote_verify.py
+    timeout: 600
+    fallback: end_failure
+
+  # =====================================================================
+  # 2.5 Per-task loop
+  # =====================================================================
+  branch_setup:
+    id: branch_setup
+    type: script
+    description: single - the run branch once (resumed -> checkout); PR-group multi - the group branch; per-task-stack multi - nothing.
+    script: scripts/branch_setup.py
+    timeout: 300
+    fallback: end_failure
+
+  select_tasks:
+    id: select_tasks
+    type: script
+    description: THE SCHEDULER - fix queue first, then the next unblocked task (batch order in micro); parallel eligibility -> a wave; none -> Phase F; stuck -> owner.
+    script: scripts/select_tasks.py
+    fallback: end_failure
+
+  claim_task:
+    id: claim_task
+    type: script
+    description: Claim through the task store (claim tool / status field), resolve the PR base, record the BASE SHA, log `started`.
+    script: scripts/claim_task.py
+    timeout: 600
+    fallback: end_failure
+
+  compose_delegation:
+    id: compose_delegation
+    type: script
+    description: Deterministic assembly of the delegation template per pr_strategy; pastes the task file, plan section, quality bar, context pack; fix rounds append the prior report + findings (V1).
+    script: scripts/compose_delegation.py
+    timeout: 60
+    fallback: end_failure
+    next: delegate
+
+  delegate:
+    id: delegate
+    type: agent
+    agent: sisyphus
+    description: The per-task implementer island - the ONE config value that swaps at sisyphus cutover.
+    prompt: |
+      {{delegation_prompt}}
+    timeout: 0
+    max_attempts: 1
+    state_updates:
+      delegate_result: '{{output}}'
+    fallback: route_delegate
+    next: route_delegate
+
+  route_delegate:
+    id: route_delegate
+    type: script
+    description: Parse the report (SHAs, PR, ledger sections, Sisyphus run id); failure after recovery -> oracle diagnosis; else conformance.
+    script: scripts/route_delegate.py
+    fallback: end_failure
+
+  oracle_diagnose:
+    id: oracle_diagnose
+    type: agent
+    agent: oracle
+    description: Consult the oracle for diagnosis before deciding to retry, re-scope or escalate a failed task.
+    prompt: |
+      A delegated implementation task failed after the implementer's own recovery.
+      Diagnose the failure from the evidence and propose ONE of: a concrete
+      direction a retry round can apply, a re-scope of the task, or stopping -
+      with your reasoning.
+
+      ## Task
+      {{current_task}}
+
+      ## Evidence (the implementer's report, tail)
+      {{failure_evidence}}
+
+      Plan: {{plan_path}}   Code repo: {{code_repo_path}}
+    timeout: 1800
+    max_attempts: 2
+    state_updates:
+      oracle_result: '{{output}}'
+    fallback: task_failed_route
+    next: task_failed_route
+
+  task_failed_route:
+    id: task_failed_route
+    type: script
+    description: Escalation task_failed - one oracle-directed retry (B8), re-scope (amendment), or abort.
+    script: scripts/task_failed_route.py
+    fallback: end_failure
+
+  verify_gate:
+    id: verify_gate
+    type: script
+    description: Conformance lane set per mode (gauntlet with forced lanes; adversary at micro task scope; batch/hygiene scopes); diff spec per strategy; records the round HEAD.
+    script: scripts/verify_gate.py
+    timeout: 60
+    fallback: end_failure
+
+  run_gauntlet:
+    id: run_gauntlet
+    type: agent
+    agent: review-gauntlet
+    description: The review panel, machine-parsed (verification commands via inputs - the trust boundary).
+    prompt: |
+      {{gauntlet_prompt}}
+    inputs:
+      verification_commands: '{{verification_commands_json}}'
+      debris_exclude: '{{debris_exclude}}'
+    timeout: 0
+    max_attempts: 1
+    state_updates:
+      gauntlet_result: '{{output}}'
+    fallback: route_verdict
+    next: route_verdict
+
+  run_adversary:
+    id: run_adversary
+    type: agent
+    agent: adversary
+    description: Micro task scope - the direct conformance verdict (criteria are executable commands).
+    prompt: |
+      {{adversary_prompt}}
+    inputs:
+      verification_commands: '{{verification_commands_json}}'
+    timeout: 7200
+    max_attempts: 1
+    state_updates:
+      adversary_result: '{{output}}'
+    fallback: route_verdict
+    next: route_verdict
+
+  route_verdict:
+    id: route_verdict
+    type: script
+    description: Parse GAUNTLET / ADVERSARIAL_REVIEW / USAGE_PROBE; PASS on (probe adopt once, B9); findings -> one fix + one re-run (B10) / batch triage / plan defect; incomplete -> debris once (B11) or the three options.
+    script: scripts/route_verdict.py
+    fallback: end_failure
+
+  fix_round:
+    id: fix_round
+    type: script
+    description: Externally-queued fix rounds (integration / CI) set the delegation context (artifact re-entry, V1).
+    script: scripts/fix_round.py
+    fallback: end_failure
+
+  post_round:
+    id: post_round
+    type: script
+    description: Review-round comment on the task PR (multi) or deferred for the run PR (single); fix rounds on closed tasks -> fix_done.
+    script: scripts/post_round.py
+    timeout: 120
+    fallback: end_failure
+
+  fix_done:
+    id: fix_done
+    type: script
+    description: A fix round on a closed task landed - log it and return to the loop that requested it.
+    script: scripts/fix_done.py
+    fallback: end_failure
+
+  harvest_report:
+    id: harvest_report
+    type: script
+    description: Deterministic ledger extraction - rejected-finding (cited only), deferred, debris-exempt, design-decision, FOLLOW-UPS, Design ASK lines.
+    script: scripts/harvest_report.py
+    fallback: end_failure
+
+  design_ask_gate:
+    id: design_ask_gate
+    type: script
+    description: >-
+      Each `Design: ASK --` line is a hard-trigger escalation with the
+      `Design question:` prefix (an adopting answer is one fix round, B12).
+    script: scripts/design_ask_gate.py
+    fallback: end_failure
+
+  debt_assign:
+    id: debt_assign
+    type: script
+    description: Debt left behind -> the owning task's criteria + debt-assigned logs; no owner -> a chore task through the task store first.
+    script: scripts/debt_assign.py
+    timeout: 300
+    fallback: end_failure
+
+  task_done:
+    id: task_done
+    type: llm
+    description: Island - the task-done skill's judgment edits with the ledger lines supplied verbatim by the script.
+    instructions: |
+      You close a task following the `task-tracking` skill (load it). Make the judgment
+      edits only: in the task's index.md check off the Steps and Acceptance criteria
+      that are VERIFIED (the conformance verdict below is the evidence), fill
+      `points_actual` (engineer-days); append a `## <date> - completed` entry to
+      log.md carrying the PR link (multi) or the run-branch commit SHAs (single)
+      and EVERY ledger line listed below VERBATIM (rejected-finding / debris-exempt
+      / design-decision / Follow-ups / debt-assigned); update the plan's status line
+      (In Progress / Implemented when every task is done).
+      Do NOT move the task directory and do NOT commit - the next step closes
+      through the sanctioned path (store close / status: complete). Never write
+      `status: done`. Report what you edited. Anomalies (A10): a line starting
+      exactly "ANOMALY: " per observation outside this step; never invent one.
+    prompt: |
+      ## Task
+      {{current_task}}
+
+      ## Parsed implementer report
+      {{report_parsed}}
+
+      ## Conformance verdict
+      {{last_verdict}}
+
+      ## Ledger lines to carry VERBATIM
+      {{ledger_lines}}
+
+      Plan: {{plan_path}}   Planning root: {{plans_root}}   Owner: {{owner_name}}
+      Mode: {{mode_line}}
+    tools: [fs_read, fs_grep, fs_glob, fs_ls, fs_write, fs_patch, execute_command]
+    skills_enabled: true
+    enabled_skills: [task-tracking]
+    max_iterations: 20
+    timeout: 1800
+    state_updates:
+      task_done_report: '{{output}}'
+    fallback: task_done_verify
+    next: task_done_verify
+
+  task_done_verify:
+    id: task_done_verify
+    type: script
+    description: Mechanical - completed entry + every ledger line present (re-appended, never dropped); store close / status complete; tasks.json.
+    script: scripts/task_done_verify.py
+    timeout: 600
+    fallback: end_failure
+
+  stack_gate:
+    id: stack_gate
+    type: script
+    description: Per-task-stack multi - link a chain that stopped growing ONCE (link_stack core tool); verdict ledgered.
+    script: scripts/stack_gate.py
+    timeout: 300
+    fallback: end_failure
+
+  task_done_route:
+    id: task_done_route
+    type: script
+    description: Micro batch boundary -> batch gauntlet; phase-gate -> approval; else the next task.
+    script: scripts/task_done_route.py
+    fallback: end_failure
+
+  approve_next:
+    id: approve_next
+    type: approval
+    description: phase-gate - present each task's result before the next.
+    question: |
+      {{ask_question}}
+    options:
+      - 'Continue'
+      - 'Stop here (park the run)'
+      - 'Abort the run'
+    routes:
+      'Continue': apply_answer
+      'Stop here (park the run)': apply_answer
+      'Abort the run': apply_answer
+    on_other: parse_answer
+    state_updates:
+      last_answer: '{{choice}}'
+      last_answer_text: '{{choice}}'
+
+  # =====================================================================
+  # 2.6 Parallel mode
+  # =====================================================================
+  wave_claim:
+    id: wave_claim
+    type: script
+    description: Claim every wave member, create its worktree + branch per strategy, render its delegation prompt with the roster.
+    script: scripts/wave_claim.py
+    timeout: 600
+    fallback: end_failure
+    next: wave_map
+
+  wave_map:
+    id: wave_map
+    type: map
+    description: One branch per wave member (cap 3 - the protocol's own); teammates form a messaging team; results collect for post-wave integration.
+    over: '{{wave}}'
+    as: wtask
+    branch: wave_delegate
+    output_key: wave_result
+    collect_into: wave_results
+    max_concurrency: 3
+    next: wave_integrate
+
+  wave_delegate:
+    id: wave_delegate
+    type: agent
+    agent: sisyphus
+    teammates: true
+    description: The per-task implementer in its worktree (same swap point as `delegate`).
+    prompt: |
+      {{wtask.prompt}}
+    timeout: 0
+    max_attempts: 1
+    state_updates:
+      wave_delegate_result: '{{output}}'
+    fallback: wave_fault
+    next: wave_verify_build
+
+  wave_verify_build:
+    id: wave_verify_build
+    type: script
+    description: Fork-local - the member's conformance prompt (task scope, worktree diff).
+    script: scripts/wave_verify_build.py
+    timeout: 60
+    fallback: wave_fault
+    next: wave_gauntlet
+
+  wave_gauntlet:
+    id: wave_gauntlet
+    type: agent
+    agent: review-gauntlet
+    description: The member's conformance panel (independent verdict; no teammates flag).
+    prompt: |
+      {{gauntlet_prompt}}
+    inputs:
+      verification_commands: '{{verification_commands_json}}'
+      debris_exclude: '{{debris_exclude}}'
+    timeout: 0
+    max_attempts: 1
+    state_updates:
+      wave_gauntlet_result: '{{output}}'
+    fallback: wave_route
+    next: wave_route
+
+  wave_route:
+    id: wave_route
+    type: script
+    description: CONFORMS -> result; findings -> one in-branch fix round (B13); anything else -> needs_escalation (raised after the collect, E7).
+    script: scripts/wave_route.py
+    fallback: wave_fault
+
+  wave_fault:
+    id: wave_fault
+    type: script
+    description: Branch-local fallback - a dead member yields a `failed` result with the error (fail-open, declared).
+    script: scripts/wave_fault.py
+    state_updates: {}
+
+  wave_integrate:
+    id: wave_integrate
+    type: script
+    description: >-
+      One result at a time - escalations raised here (V7); single merges into the
+      run branch; multi finds the PR already open and closes the task.
+    script: scripts/wave_integrate.py
+    timeout: 120
+    fallback: end_failure
+
+  integration_test:
+    id: integration_test
+    type: script
+    description: merge --no-ff, full suite after EVERY merge (B14 3-strike), conflict -> rebase round (B15 2 cycles), green -> push.
+    script: scripts/integration_test.py
+    timeout: 3600
+    fallback: end_failure
+
+  wave_cleanup:
+    id: wave_cleanup
+    type: script
+    description: The four cleanup rules (worktree removed; branch kept in multi, deleted after a clean merge in single) - the only unasked destructive ops.
+    script: scripts/wave_cleanup.py
+    timeout: 300
+    fallback: end_failure
+
+  # =====================================================================
+  # 2.7 Micro batch cadence
+  # =====================================================================
+  batch_gauntlet_build:
+    id: batch_gauntlet_build
+    type: script
+    description: Full panel over the batch delta (first member's BASE SHA..HEAD); narrowed on re-rounds.
+    script: scripts/batch_gauntlet_build.py
+    fallback: end_failure
+
+  batch_triage:
+    id: batch_triage
+    type: llm
+    description: Route each batch finding to its owning task by file:line; interaction findings -> ONE fix micro-task spec.
+    instructions: |
+      A batch review gauntlet BLOCKED over several micro-tasks. For EACH finding
+      below decide its owning task: findings carry file:line, and in micro mode
+      file -> task is nearly bijective (each task declares its files - see the
+      tasks table). Return finding_routes: {finding (verbatim), task}. A finding no
+      single task owns - an interaction defect between tasks - goes to task "" and
+      is described in cross_task_fix: ONE fix micro-task spec for the batch (title,
+      outcome, executable acceptance_criteria, files). Never fix anything yourself.
+      You may read the diff/files with the tools to settle ownership.
+    prompt: |
+      ## Batch
+      {{current_batch}}
+
+      ## Findings (verbatim)
+      {{gauntlet_blockers}}
+
+      ## Tasks (id, title, declared files, batch)
+      {{tasks}}
+
+      Code repo: {{code_repo_path}}
+    tools: [fs_read, fs_grep]
+    max_iterations: 10
+    timeout: 900
+    output_schema:
+      type: object
+      properties:
+        finding_routes:
+          type: array
+          items:
+            type: object
+            properties:
+              finding: { type: string }
+              task: { type: string }
+            required: [finding]
+        cross_task_fix:
+          type: object
+          properties:
+            title: { type: string }
+            outcome: { type: string }
+            acceptance_criteria:
+              type: array
+              items: { type: string }
+            files:
+              type: array
+              items: { type: string }
+        anomalies:
+          type: array
+          items: { type: string }
+      required: [finding_routes]
+    state_updates:
+      last_node_output: '{{output}}'
+    fallback: batch_fix_route
+    next: batch_fix_route
+
+  batch_fix_route:
+    id: batch_fix_route
+    type: script
+    description: Owned findings -> fix rounds (artifact re-entry); cross-task spec -> a fix micro-task; 3 strikes per batch (B16).
+    script: scripts/batch_fix_route.py
+    timeout: 300
+    fallback: end_failure
+
+  batch_close:
+    id: batch_close
+    type: script
+    description: PASS -> `batch-closed @ <sha>` on every member; the batch round comment.
+    script: scripts/batch_close.py
+    timeout: 300
+    fallback: end_failure
+
+  # =====================================================================
+  # 2.8 Escalation ladder (section 10.6 / A5 / A14 / escalation policy)
+  # =====================================================================
+  escalate_gate:
+    id: escalate_gate
+    type: script
+    description: Ledger the escalation; interactive or hard trigger -> tier 4; autonomous -> the ladder.
+    script: scripts/escalate_gate.py
+    fallback: end_failure
+
+  ladder_judge:
+    id: ladder_judge
+    type: llm
+    description: Autonomous ladder steps 2-3 - standing rulings, then a clearly recommended option; else consult or escalate.
+    instructions: |
+      The user pre-delegated decision-making for this run. Work this ladder IN
+      ORDER for the decision below and answer with the first step that applies:
+
+      1. Hard triggers were already excluded by the gate; if the decision
+         nevertheless concerns secrets/credentials, money movement, destructive
+         or irreversible actions, a child's `Design question:`, or restructuring
+         code outside a task's scope, answer "escalate".
+      2. Standing rulings (pasted below, possibly empty): if a ruling's trigger
+         GENUINELY matches this decision, apply its resolution - resolution
+         "ruling", basis "ruling: <id/title>". Match on substance, not
+         resemblance. Unsure whether it matches? Then it does not.
+      3. Clearly recommended option: if exactly one option is marked recommended
+         AND backed by concrete evidence (a reviewer's proposed fix, a repo
+         convention, the design doc's own signal), take it - resolution
+         "recommended". A design/scope escalation is excluded.
+      4. Otherwise: "consult" when the decision is preference-laden or novel but
+         low-stakes enough that a staff engineer with the design ledger could
+         settle it; "escalate" for anything high-stakes or with no defensible
+         recommendation. Autonomy never converts "I don't know" into a guess.
+      When a resolution amends a plan/task's acceptance criteria, say so in
+      ladder_basis: the criterion TEXT is rewritten before any conformance re-run.
+    prompt: |
+      ## Decision
+      {{ask_question}}
+
+      ## Escalation record (kind, options, evidence)
+      {{escalation}}
+
+      ## Standing rulings file
+      {{standing_rulings}}
+    tools: []
+    timeout: 300
+    output_schema:
+      type: object
+      properties:
+        ladder_resolution:
+          type: string
+          enum: [ruling, recommended, consult, escalate]
+        ladder_choice: { type: string }
+        ladder_basis: { type: string }
+        anomalies:
+          type: array
+          items: { type: string }
+      required: [ladder_resolution]
+    state_updates:
+      last_node_output: '{{output}}'
+    fallback: ask_dispatch
+    next: ladder_route
+
+  ladder_route:
+    id: ladder_route
+    type: script
+    description: ruling/recommended -> digest + ledger + continue; consult -> navigator; escalate -> owner.
+    script: scripts/ladder_route.py
+    fallback: end_failure
+
+  consult_navigator:
+    id: consult_navigator
+    type: agent
+    agent: engineer
+    description: >-
+      Tier 3 - one bounded request/response edge to the navigator (A5: retries 0,
+      timeout -> tier 4). Rehydrates from artifacts, never a transcript.
+    prompt: |
+      Consult request from a running architect orchestration (you are the
+      navigator the run defers preference-laden or novel decisions to; answer
+      from the run's artifacts and your judgment, and defer when unconfident).
+
+      ## Decision
+      {{ask_question}}
+
+      ## Escalation record (kind, options with evidence)
+      {{escalation}}
+
+      ## Artifacts (read them; do not edit code or plans)
+      Run directory: {{run_dir}}
+      Plan: {{plan_path}}
+      Decisions ledger: {{run_dir}}/decisions.md
+      Research findings: {{run_dir}}/research.md
+
+      End your reply with EXACTLY one line:
+      CONSULT: ANSWER <option number or text>   (confident, within the plan's scope)
+      CONSULT: DEFER <one-line reason>          (owner's call)
+    timeout: 1800
+    max_attempts: 1
+    state_updates:
+      consult_result: '{{output}}'
+    fallback: ask_dispatch
+    next: consult_route
+
+  consult_route:
+    id: consult_route
+    type: script
+    description: Parse the consult; an answer is ledgered and applied, a defer or a fault goes to the owner.
+    script: scripts/consult_route.py
+    fallback: end_failure
+
+  ask_dispatch:
+    id: ask_dispatch
+    type: script
+    description: >-
+      Tier 4. Parks the run (A14), pings the owner ONCE (where the fork has a channel;
+      top-level) and picks the terminal prompt; away top-level runs go through the
+      owner-remote-input tool first.
+    script: scripts/ask_dispatch.py
+    fallback: end_failure
+
+  ask_owner_poll:
+    id: ask_owner_poll
+    type: script
+    description: One ask_owner call (question + options verbatim); PENDING re-enters within the tool budget (B21); never re-pings.
+    script: scripts/ask_owner_poll.py
+    timeout: 0
+    fallback: ask_user
+
+  ask_owner_route:
+    id: ask_owner_route
+    type: script
+    description: ANSWERED -> apply (recorded as answered via Slack); TIMEOUT / NOT_DELIVERED -> the terminal prompt.
+    script: scripts/ask_owner_route.py
+    fallback: ask_user
+
+  ask_user:
+    id: ask_user
+    type: input
+    description: The structured escalation at the terminal (or surfaced to the parent when this run is a child).
+    question: |
+      {{ask_question}}
+    validation: 'len(input) > 0'
+    state_updates:
+      last_answer_text: '{{input}}'
+    next: parse_answer
+
+  ask_review_incomplete:
+    id: ask_review_incomplete
+    type: approval
+    description: The one fixed-option escalation - exactly the protocol's three options.
+    question: |
+      {{ask_question}}
+    options:
+      - 'Retry the review again'
+      - 'Accept NEEDS-HUMAN: proceed without the incomplete review (recorded in the report / PR body)'
+      - 'Abort this task'
+    routes:
+      'Retry the review again': apply_answer
+      'Accept NEEDS-HUMAN: proceed without the incomplete review (recorded in the report / PR body)': apply_answer
+      'Abort this task': apply_answer
+    on_other: parse_answer
+    state_updates:
+      last_answer: '{{choice}}'
+      last_answer_text: '{{choice}}'
+
+  parse_answer:
+    id: parse_answer
+    type: script
+    description: Number or text -> option; unparseable re-asks (B22) then the free text stands; clears the parked marker; ledgers the decision.
+    script: scripts/parse_answer.py
+    fallback: end_failure
+
+  apply_answer:
+    id: apply_answer
+    type: script
+    description: The continuation switch on the escalation kind (design doc 2.8).
+    script: scripts/apply_answer.py
+    timeout: 120
+    fallback: end_failure
+
+  # =====================================================================
+  # 2.9 Finish (Phase F; section 10.12)
+  # =====================================================================
+  phase_f_gate:
+    id: phase_f_gate
+    type: script
+    description: >-
+      Every task complete (micro - every batch PASSed); integration check first
+      (single/groups); hygiene units per strategy.
+    script: scripts/phase_f_gate.py
+    fallback: end_failure
+
+  integration_check:
+    id: integration_check
+    type: script
+    description: Full suite on the run/group branch (verification commands); red -> fix round (B14).
+    script: scripts/integration_check.py
+    timeout: 3600
+    fallback: end_failure
+
+  integrate_findings:
+    id: integrate_findings
+    type: llm
+    description: Section 10.5 - one mind over the plan + every anomaly, report and follow-up; what breaks, what becomes a follow-up, what amends the plan.
+    instructions: |
+      You are the integration judgment at a phase boundary of an orchestration
+      run. You hold the plan and EVERY anomaly the run's nodes noticed, every
+      follow-up the implementers reported, and the decisions ledger. Decide:
+      - integration_amendments: plan changes the evidence demands (a stale
+        downstream task, a criterion contradicted by what landed) - each a
+        concrete amendment; the plan is re-sealed after. Empty when nothing needs
+        amending (the normal case).
+      - integration_follow_ups: items that are real but out of scope now
+        (WHAT, WHERE, WHY, WHEN) - ledgered, never dropped.
+      - integration_notes: what you dismissed and why (one line each).
+      - anomalies: anything new you noticed.
+      You may read the plan, the run directory artifacts and the repo with the tools.
+    prompt: |
+      ## Plan
+      {{plan_path}}
+
+      ## Anomalies observed during the run
+      {{anomalies_log}}
+
+      ## Follow-ups reported so far
+      {{follow_ups}}
+
+      ## Decisions ledger (this run)
+      {{decisions}}
+
+      ## Tasks
+      {{tasks}}
+
+      Run directory (reports/, rounds/, research.md): {{run_dir}}
+      Code repo: {{code_repo_path}}
+    tools: [fs_read, fs_grep, fs_glob, fs_ls]
+    max_iterations: 20
+    timeout: 1800
+    output_schema:
+      type: object
+      properties:
+        integration_amendments:
+          type: array
+          items: { type: string }
+        integration_follow_ups:
+          type: array
+          items: { type: string }
+        integration_notes:
+          type: array
+          items: { type: string }
+        anomalies:
+          type: array
+          items: { type: string }
+      required: [integration_amendments, integration_follow_ups]
+    state_updates:
+      last_node_output: '{{output}}'
+    fallback: integrate_route
+    next: integrate_route
+
+  integrate_route:
+    id: integrate_route
+    type: script
+    description: Amendments -> amend_plan (re-seal, once per Phase F); follow-ups -> ledger; else hygiene.
+    script: scripts/integrate_route.py
+    fallback: end_failure
+
+  hygiene_create:
+    id: hygiene_create
+    type: script
+    description: ONE chore task per hygiene unit (run / chain >= 2 PRs), claimed; base = merge-base (empty -> STOP); starting ledger via collect_ledger_lines; the brief.
+    script: scripts/hygiene_create.py
+    timeout: 600
+    fallback: end_failure
+
+  stack_gate_final:
+    id: stack_gate_final
+    type: script
+    description: Per-task-stack multi Phase F tail - link every complete chain with its hygiene PR on top, then finish.
+    script: scripts/stack_gate_final.py
+    timeout: 600
+    fallback: end_failure
+
+  pr_summary:
+    id: pr_summary
+    type: llm
+    description: The Problem/Approach summary - the ONLY prose the architect writes into the PR body.
+    instructions: |
+      Write the Problem / Approach summary for the draft PR body of an implemented
+      plan: 2-4 short paragraphs a reviewer reads first - the problem the design
+      solves, the approach taken, and what a reviewer should look at first. Plain
+      prose from the plan; no checklists (the tool appends them), no new facts.
+      Read the plan with fs_read.
+    prompt: |
+      Plan: {{plan_path}}
+      Tasks shipped: {{tasks}}
+    tools: [fs_read]
+    max_iterations: 10
+    timeout: 600
+    output_schema:
+      type: object
+      properties:
+        pr_summary_text: { type: string }
+        anomalies:
+          type: array
+          items: { type: string }
+      required: [pr_summary_text]
+    state_updates:
+      last_node_output: '{{output}}'
+    fallback: pr_body
+    next: pr_body
+
+  pr_body:
+    id: pr_body
+    type: script
+    description: assemble_pr_body (core tool) over the plan + tasks tree; NOTE lines -> one fix round (B17).
+    script: scripts/pr_body.py
+    timeout: 300
+    fallback: end_failure
+
+  pr_body_fix:
+    id: pr_body_fix
+    type: llm
+    description: Fix exactly what the assemble_pr_body NOTE lines name, in the body file.
+    instructions: |
+      The PR body at the path below was assembled by a tool that printed NOTE lines
+      for what it could not derive. Fix EXACTLY what the NOTEs name (e.g. add a
+      task's commit SHAs from its log, add a missing Quality bar line) by editing
+      the body file in place with fs_read + fs_write. Change nothing else. Report
+      what you changed; a line starting exactly "ANOMALY: " for anything wrong you
+      observed outside this step (never invent one).
+    prompt: |
+      ## Body file
+      {{pr_body_path}}
+
+      ## NOTE lines
+      {{pr_body_notes}}
+
+      Plan: {{plan_path}}   Tasks root: {{tasks_root}}
+    tools: [fs_read, fs_grep, fs_write]
+    max_iterations: 10
+    timeout: 600
+    state_updates:
+      pr_body_fix_report: '{{output}}'
+    fallback: open_pr
+    next: open_pr
+
+  open_pr:
+    id: open_pr
+    type: script
+    description: gh pr create --draft from the run/group branch (deterministic); records the PR number; arms the CI watch.
+    script: scripts/open_pr.py
+    timeout: 300
+    fallback: end_failure
+
+  pr_round_comments:
+    id: pr_round_comments
+    type: script
+    description: Post the review-round comments deferred while no PR existed (append-only review log).
+    script: scripts/pr_round_comments.py
+    timeout: 300
+    fallback: end_failure
+
+  ci_poll:
+    id: ci_poll
+    type: script
+    description: Bounded self-loop over gh pr checks (pr-watch poll precedent); A6 total-watch bound = rounds cap + wall clock owned here (B20).
+    script: scripts/ci_poll.py
+    timeout: 120
+    fallback: ci_route
+
+  ci_route:
+    id: ci_route
+    type: script
+    description: green -> flip; red -> evidence pack; exhausted -> owner with the evidence.
+    script: scripts/ci_route.py
+    fallback: end_failure
+
+  ci_evidence:
+    id: ci_evidence
+    type: script
+    description: Section 10.12 (1) - failing jobs + log-failed, trimmed; failure signatures; deterministic infra pre-classification.
+    script: scripts/ci_evidence.py
+    timeout: 300
+    fallback: ci_diagnose
+    next: ci_diagnose
+
+  ci_diagnose:
+    id: ci_diagnose
+    type: llm
+    description: Section 10.12 (2) - flake / real (+ owning task) / infra / unsure over the evidence pack; unsure defaults UP.
+    instructions: |
+      Diagnose a red CI run for a PR this run authored. Verdict enum:
+      - flake: transient (re-run; bounded per check-name per PR and ledgered - a
+        third red is real).
+      - real: the change broke it; name the owning task in ci_owning_task_llm
+        (the task whose declared files / subject the failure names).
+      - infra: runner lost, timeout, 429, concurrency-cancelled (wait or escalate);
+        the pre-classification hint below is evidence, not a verdict.
+      - unsure: ESCALATE. Unsure defaults up, never to re-run - flakiness is not
+        a laundering channel for real failures.
+      Name the failing check(s) in failing_checks and quote the failure signature
+      in ci_diagnosis. When the evidence pack is marked trimmed, say so in the
+      diagnosis (declared degradation).
+    prompt: |
+      ## Evidence pack (trimmed={{ci_evidence_trimmed}})
+      {{ci_evidence}}
+
+      ## Failure signatures
+      {{ci_signatures}}
+
+      ## Infra pre-classification hint
+      {{ci_infra_hint}}
+
+      ## Tasks (id, title, declared files)
+      {{tasks}}
+    tools: []
+    timeout: 600
+    output_schema:
+      type: object
+      properties:
+        ci_diagnosis: { type: string }
+        ci_verdict:
+          type: string
+          enum: [flake, real, infra, unsure]
+        failing_checks:
+          type: array
+          items: { type: string }
+        ci_owning_task_llm: { type: string }
+        anomalies:
+          type: array
+          items: { type: string }
+      required: [ci_verdict]
+    state_updates:
+      last_node_output: '{{output}}'
+    fallback: ci_apply
+    next: ci_apply
+
+  ci_apply:
+    id: ci_apply
+    type: script
+    description: The enum as edges with A6 keying (flake re-runs B19 and fix strikes B18 per check-name per PR - a fix push never re-arms a budget).
+    script: scripts/ci_apply.py
+    timeout: 120
+    fallback: end_failure
+
+  flip_ready:
+    id: flip_ready
+    type: script
+    description: gh pr ready ONLY on green; every still-draft PR reported with its blocker; upstream groups -> next group.
+    script: scripts/flip_ready.py
+    timeout: 300
+    fallback: end_failure
+
+  finish_plan:
+    id: finish_plan
+    type: script
+    description: validate; PLAN status Implemented + PR link + follow-ups; follow-up tasks (upstream); pr-opened log entries; final planning commit.
+    script: scripts/finish_plan.py
+    timeout: 600
+    fallback: end_failure
+
+  final_report:
+    id: final_report
+    type: script
+    description: Grep-complete rollups via collect_ledger_lines; batch/stack grouping per mode; writes report.md; completion ping.
+    script: scripts/final_report.py
+    timeout: 300
+    fallback: end_failure
+
+  whetstone_gate:
+    id: whetstone_gate
+    type: script
+    description: Whetstone only when this run addressed feedback that did NOT come from its own lanes.
+    script: scripts/whetstone_gate.py
+    fallback: summarize_run
+
+  run_whetstone:
+    id: run_whetstone
+    type: agent
+    agent: whetstone
+    description: Continuous improvement; its proposals go to the user; never blocks completion.
+    prompt: |
+      Classify the human / third-party review feedback this run addressed
+      against what its own review passes flagged for the same change.
+
+      ## Feedback items addressed (verbatim)
+      {{external_feedback}}
+
+      ## PR / run context
+      {{pr_url}}
+      {{report}}
+    timeout: 3600
+    max_attempts: 1
+    state_updates:
+      whetstone_result: '{{output}}'
+    fallback: summarize_run
+    next: summarize_run
+
+  summarize_run:
+    id: summarize_run
+    type: llm
+    description: The prose summary paragraph only - the structured sections are already final.
+    instructions: |
+      Write the 3-6 sentence summary paragraph of an orchestration run for its
+      final report: what the plan set out to do, how many tasks shipped and where
+      (PRs / branch), how it was verified (name the gates that ran and their
+      verdicts - never claim a gate passed unless the report shows it ran), and
+      what the user must still decide or do. Plain prose, no headings, no new facts.
+    prompt: |
+      {{report}}
+    tools: []
+    timeout: 300
+    state_updates:
+      summary: '{{output}}'
+    fallback: end_complete
+    next: end_complete
+
+  group_closeout:
+    id: group_closeout
+    type: script
+    description: Upstream multi - a PR group's last task completed; Phase F steps 1-4 scoped to the group.
+    script: scripts/group_closeout.py
+    fallback: end_failure
+
+  # =====================================================================
+  # Ends
+  # =====================================================================
+  end_complete:
+    id: end_complete
+    type: end
+    output: |
+      {{summary}}
+
+      {{report}}
+
+  end_blocked:
+    id: end_blocked
+    type: end
+    output: |
+      ARCHITECT_BLOCKED
+      {{failure_reason}}
+
+      {{report}}
+
+      Architect run id: {{run_id}}
+
+  end_aborted:
+    id: end_aborted
+    type: end
+    output: |
+      ARCHITECT_ABORTED
+      {{failure_reason}}
+
+      {{report}}
+
+      Architect run id: {{run_id}}
+
+  end_failure:
+    id: end_failure
+    type: end
+    output: |
+      ARCHITECT_FAILED
+      {{failure_reason}}
+
+      Last script error:
+      {{last_script_error}}
+
+      Architect run id: {{run_id}}
