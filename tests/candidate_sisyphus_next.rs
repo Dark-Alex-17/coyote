@@ -701,6 +701,54 @@ fn no_gate_names_a_toolchain_command() {
     );
 }
 
+/// The README's toolchain census block is the live output of the grep it
+/// shows: the same `file:line` set, no more and no fewer, and the lone
+/// `gates.py` hit is the prose line the README explains.
+#[test]
+fn readme_toolchain_census_matches_the_live_grep() {
+    let re = fancy_regex::Regex::new(
+        r"\b(cargo|npm|pnpm|yarn|go (test|build)|pytest|mvn|gradle|make)\b",
+    )
+    .unwrap();
+    let mut paths: Vec<PathBuf> = fs::read_dir(candidate_dir().join("scripts"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "py"))
+        .collect();
+    paths.sort();
+    let mut live = Vec::new();
+    let mut gates_lines = Vec::new();
+    for path in paths {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let text = fs::read_to_string(&path).unwrap();
+        for (idx, line) in text.lines().enumerate() {
+            if re.is_match(line).unwrap() {
+                live.push(format!("scripts/{name}:{}", idx + 1));
+                if name == "gates.py" {
+                    gates_lines.push(idx + 1);
+                }
+            }
+        }
+    }
+
+    let cited_re = fancy_regex::Regex::new(r"(?m)^(scripts/[\w.]+\.py:\d+):").unwrap();
+    let readme = fs::read_to_string(candidate_dir().join("README.md")).unwrap();
+    let cited: Vec<String> = cited_re
+        .captures_iter(&readme)
+        .map(|c| c.unwrap()[1].to_string())
+        .collect();
+    assert!(!cited.is_empty(), "the README census block is gone");
+    assert_eq!(
+        live, cited,
+        "the README census block no longer matches the live grep (left: live, right: README)"
+    );
+    assert_eq!(
+        gates_lines,
+        vec![904],
+        "the gates.py toolchain hit moved; update the README census block"
+    );
+}
+
 /// Copies `src` into `dst` recursively (regular files and directories only).
 fn copy_tree(src: &Path, dst: &Path) {
     fs::create_dir_all(dst).unwrap();
