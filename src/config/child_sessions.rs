@@ -1071,8 +1071,15 @@ impl ChildMeta {
     }
 
     /// Marks the child running again under `agent_id` and `stamp` for a
-    /// resume, opening a new run.
+    /// resume, opening a new run. A last run still open (its process
+    /// crashed without closing it) is closed first as failed, so the
+    /// history never holds two open runs.
     pub(crate) fn restamp(&mut self, stamp: ProcessStamp, agent_id: &str, now: DateTime<Utc>) {
+        if let Some(open) = self.runs.last_mut().filter(|run| run.finished_at.is_none()) {
+            open.finished_at = Some(now);
+            open.status = Some(ChildStatus::Failed);
+            open.error = Some("superseded by a resume while still marked running".to_string());
+        }
         self.status = ChildStatus::Running;
         self.agent_id = agent_id.to_string();
         self.pid = stamp.pid;
@@ -1120,6 +1127,7 @@ impl ChildMeta {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn effective_status(&self) -> EffectiveStatus {
         self.effective_status_with(|stamp| stamp.is_alive())
     }
@@ -1576,6 +1584,84 @@ updated_at: 2026-01-02T03:04:05Z
         assert_eq!(meta.pid, stamp_at(last).pid);
         assert_eq!(meta.pid_start, stamp_at(last).start);
         assert_eq!(meta.updated_at, time_at(last));
+    }
+
+    /// A resume over a run its crashed process never closed closes that
+    /// run as failed before opening the new one; the top-level fields
+    /// still mirror the new run.
+    #[test]
+    fn restamp_closes_an_open_last_run_as_superseded() {
+        let mut meta = ChildMeta::new_running_at(
+            fixture_time(),
+            "sess_coder_0123456789ab",
+            "coder",
+            "agent-0",
+            fixture_stamp(),
+            None,
+            None,
+            "do the thing",
+            None,
+        );
+        let later = fixture_time() + Duration::minutes(5);
+        let stamp = ProcessStamp {
+            pid: 4242,
+            start: 1_700_000_042,
+        };
+
+        meta.restamp(stamp, "agent-1", later);
+
+        assert_eq!(meta.runs.len(), 2);
+        let closed = &meta.runs[meta.runs.len() - 2];
+        assert_eq!(closed.agent_id, "agent-0");
+        assert_eq!(closed.started_at, fixture_time());
+        assert_eq!(closed.finished_at, Some(later));
+        assert_eq!(closed.status, Some(ChildStatus::Failed));
+        assert_eq!(
+            closed.error.as_deref(),
+            Some("superseded by a resume while still marked running")
+        );
+        assert_eq!(
+            meta.runs[1],
+            ChildRun {
+                agent_id: "agent-1".into(),
+                pid: stamp.pid,
+                pid_start: stamp.start,
+                started_at: later,
+                finished_at: None,
+                status: None,
+                error: None,
+            }
+        );
+        assert_eq!(meta.status, ChildStatus::Running);
+        assert_eq!(meta.agent_id, "agent-1");
+        assert_eq!(meta.pid, stamp.pid);
+        assert_eq!(meta.pid_start, stamp.start);
+        assert_eq!(meta.error, None);
+        assert_eq!(meta.updated_at, later);
+    }
+
+    /// A last run that already finished is left exactly as it was.
+    #[test]
+    fn restamp_leaves_a_closed_last_run_untouched() {
+        let mut meta = ChildMeta::new_running_at(
+            fixture_time(),
+            "sess_coder_0123456789ab",
+            "coder",
+            "agent-0",
+            fixture_stamp(),
+            None,
+            None,
+            "do the thing",
+            None,
+        );
+        let finished = fixture_time() + Duration::minutes(1);
+        meta.finish_at(finished, ChildStatus::Cancelled, Some("stopped".into()));
+        let before = meta.runs[0].clone();
+
+        meta.restamp(fixture_stamp(), "agent-1", finished + Duration::minutes(1));
+
+        assert_eq!(meta.runs.len(), 2);
+        assert_eq!(meta.runs[0], before);
     }
 
     #[test]
