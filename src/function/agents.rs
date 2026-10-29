@@ -7264,11 +7264,13 @@ mod tests {
         let root = ctx.ensure_child_session_root().unwrap();
         root.ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
             .unwrap();
-        let dead = ProcessStamp {
-            pid: u32::MAX - 1,
-            start: 1,
-        };
-        seed_sidecar(&root, "behindlink", 0, ChildStatus::Completed, dead);
+        seed_sidecar(
+            &root,
+            "behindlink",
+            0,
+            ChildStatus::Running,
+            ProcessStamp::current(),
+        );
         let real = root.dir().parent().unwrap().join("real-root");
         std::fs::rename(root.dir(), &real).unwrap();
         std::os::unix::fs::symlink(&real, root.dir()).unwrap();
