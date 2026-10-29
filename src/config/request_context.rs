@@ -10110,41 +10110,103 @@ mod tests {
         assert_eq!(printed(), expected);
     }
 
-    #[test]
-    #[serial]
-    fn info_without_a_session_leaves_the_stored_split_untouched() {
-        let _guard = TestConfigDirGuard::new();
-        write_global_memory_store();
-        let ctx = create_test_ctx();
-        let app = ctx.app.config.clone();
-        assert_eq!(*ctx.system_prompt_split.lock(), None);
+    /// Snapshot of every side effect the share warning path can leave, so a
+    /// read-only command can be checked against it.
+    fn share_warning_state(ctx: &RequestContext) -> (bool, usize, Option<SystemPromptSplit>) {
+        (
+            system_prompt_share_warning_already_fired(),
+            SYSTEM_PROMPT_SHARE_WARNINGS_PRINTED.load(std::sync::atomic::Ordering::Relaxed),
+            *ctx.system_prompt_split.lock(),
+        )
+    }
 
-        ctx.info(&app).unwrap();
-
-        assert_eq!(*ctx.system_prompt_split.lock(), None);
+    fn assert_a_share_warning_is_due(ctx: &RequestContext, app: &AppConfig) {
+        let split = ctx.extract_role_impl(app, true).unwrap().1.unwrap();
+        assert!(
+            system_prompt_share_warning(&split, Some(100)).is_some(),
+            "{split:?}"
+        );
     }
 
     #[test]
     #[serial]
-    fn info_with_a_session_leaves_the_stored_split_untouched() {
+    fn memory_info_without_a_session_does_not_store_split_or_warn() {
+        let _guard = TestConfigDirGuard::new();
+        write_global_memory_store();
+        let mut ctx = create_test_ctx();
+        let mut role = Role::new("windowed", "prompt");
+        role.set_model(windowed_model(100));
+        ctx.role = Some(role);
+        let app = ctx.app.config.clone();
+        assert_a_share_warning_is_due(&ctx, &app);
+        let before = share_warning_state(&ctx);
+        assert_eq!(before.2, None);
+
+        ctx.info(&app).unwrap();
+
+        assert_eq!(share_warning_state(&ctx), before);
+    }
+
+    #[test]
+    #[serial]
+    fn memory_info_with_a_session_does_not_store_split_or_warn() {
         let _guard = TestConfigDirGuard::new();
         write_global_memory_store();
         let mut ctx = create_test_ctx();
         let mut session = Session::default();
-        session.set_model(windowed_model(20_000));
+        session.set_model(windowed_model(100));
         ctx.session = Some(session);
-        let sentinel = SystemPromptSplit {
+        *ctx.system_prompt_split.lock() = Some(SystemPromptSplit {
             role_tokens: 1,
             memory_tokens: 2,
             instructions_tokens: 3,
             truncated: None,
-        };
-        *ctx.system_prompt_split.lock() = Some(sentinel);
+        });
         let app = ctx.app.config.clone();
+        assert_a_share_warning_is_due(&ctx, &app);
+        let before = share_warning_state(&ctx);
 
         ctx.info(&app).unwrap();
 
-        assert_eq!(*ctx.system_prompt_split.lock(), Some(sentinel));
+        assert_eq!(share_warning_state(&ctx), before);
+    }
+
+    #[test]
+    #[serial]
+    fn memory_session_info_renders_n_a_before_a_split_exists() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let mut session = Session::default();
+        session.set_model(windowed_model(20_000));
+        ctx.session = Some(session);
+        let app = ctx.app.config.clone();
+
+        let info = ctx.info(&app).unwrap();
+
+        assert!(
+            info.contains("  system_prompt_role_tokens: n/a\n"),
+            "{info}"
+        );
+        assert!(info.contains("  system_prompt_share: n/a\n"), "{info}");
+    }
+
+    #[test]
+    #[serial]
+    fn memory_tools_info_does_not_store_split_or_warn() {
+        let _guard = TestConfigDirGuard::new();
+        write_global_memory_store();
+        let mut ctx = create_test_ctx();
+        let mut role = Role::new("windowed", "prompt");
+        role.set_model(windowed_model(100));
+        ctx.role = Some(role);
+        let app = ctx.app.config.clone();
+        assert_a_share_warning_is_due(&ctx, &app);
+        let before = share_warning_state(&ctx);
+        assert_eq!(before.2, None);
+
+        ctx.tools_info().unwrap();
+
+        assert_eq!(share_warning_state(&ctx), before);
     }
 
     #[test]
