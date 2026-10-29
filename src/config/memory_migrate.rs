@@ -689,7 +689,8 @@ fn write_scope(f: &mut fmt::Formatter<'_>, report: &ScopeReport, apply: bool) ->
     )?;
     if apply {
         if report.not_applied {
-            return writeln!(f, "  not applied: an earlier scope failed");
+            writeln!(f, "  not applied: an earlier scope failed")?;
+            return write_section(f, "files to rewrite", pending(report), SECTION_LIST_CAP);
         }
         write_section(
             f,
@@ -706,22 +707,26 @@ fn write_scope(f: &mut fmt::Formatter<'_>, report: &ScopeReport, apply: bool) ->
         }
         Ok(())
     } else {
-        let mut pending: Vec<String> = report
-            .rewrites
-            .iter()
-            .map(|file| file.path.display().to_string())
-            .collect();
-        if report.new_index.is_some() {
-            pending.push(
-                report
-                    .dir
-                    .join(MEMORY_INDEX_FILE_NAME)
-                    .display()
-                    .to_string(),
-            );
-        }
-        write_section(f, "files to rewrite", pending, SECTION_LIST_CAP)
+        write_section(f, "files to rewrite", pending(report), SECTION_LIST_CAP)
     }
+}
+
+fn pending(report: &ScopeReport) -> Vec<String> {
+    let mut pending: Vec<String> = report
+        .rewrites
+        .iter()
+        .map(|file| file.path.display().to_string())
+        .collect();
+    if report.new_index.is_some() {
+        pending.push(
+            report
+                .dir
+                .join(MEMORY_INDEX_FILE_NAME)
+                .display()
+                .to_string(),
+        );
+    }
+    pending
 }
 
 fn pairs<A: fmt::Display, B: fmt::Display>(items: &[(A, B)], sep: &str) -> Vec<String> {
@@ -1374,7 +1379,15 @@ mod tests {
             .map(|(_, rest)| rest)
             .expect("the workspace section is reported");
         assert!(
-            workspace_section.contains("  not applied: an earlier scope failed\n"),
+            workspace_section
+                .contains("  not applied: an earlier scope failed\n  files to rewrite: 5\n"),
+            "{text}"
+        );
+        assert!(
+            workspace_section.contains(&format!(
+                "    {}\n",
+                fx.workspace.join(MEMORY_INDEX_FILE_NAME).display()
+            )),
             "{text}"
         );
         assert!(!text.lines().any(|l| l.starts_with("backup: ")), "{text}");
