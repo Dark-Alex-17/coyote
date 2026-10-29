@@ -8,7 +8,7 @@ use crate::config::{
     Agent, AgentVariable, AgentVariables, AppConfig, AppState, Input, RequestContext, Role,
     RoleLike, Session, TEMP_SESSION_NAME, child_sessions_enabled, default_max_agent_depth,
     effective_max_concurrent_jobs, jobs_enabled, list_agents_with_descriptions,
-    load_agent_variables, paths,
+    load_agent_variables, paths, roster_line,
 };
 use crate::hooks::{self, HookEvent, ResolvedHook};
 use crate::mcp::is_auth_required_error;
@@ -1167,11 +1167,10 @@ pub async fn run_agent_for_graph(
         // the stored row names one, the prompt and the row are re-adopted
         // from the agent, whose appendix is this run's roster or nothing;
         // the session keeps the variables it was resumed with.
-        let stored_roster = child_ctx.session.as_ref().is_some_and(|session| {
-            session
-                .agent_instructions()
-                .contains(TEAMMATE_ROSTER_HEADING)
-        });
+        let stored_roster = child_ctx
+            .session
+            .as_ref()
+            .is_some_and(|session| roster_line(session.agent_instructions()).is_some());
         if (seats_a_teammate || stored_roster)
             && let (Some(session), Some(agent)) =
                 (child_ctx.session.as_mut(), child_ctx.agent.as_ref())
