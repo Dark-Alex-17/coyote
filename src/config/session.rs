@@ -2139,8 +2139,13 @@ mod tests {
             ..AgentConfig::default()
         });
         agent.set_instructions_appendix("## Teammate roster\nnew seat");
+        session
+            .agent_variables
+            .insert("tone".to_string(), "quiet".to_string());
+        session.chat_agent = Some("helper".to_string());
         let role_prompt = session.role_prompt.clone();
         let agent_instructions = session.agent_instructions.clone();
+        let agent_variables = session.agent_variables.clone();
         assert_ne!(role_prompt, agent.interpolated_instructions());
 
         session.readopt_agent_prompt(&agent);
@@ -2155,6 +2160,8 @@ mod tests {
         );
         assert_eq!(session.role_prompt, role_prompt);
         assert_eq!(session.agent_instructions, agent_instructions);
+        assert_eq!(session.agent_variables, agent_variables);
+        assert_eq!(session.chat_agent.as_deref(), Some("helper"));
         assert!(!session.dirty);
     }
 
