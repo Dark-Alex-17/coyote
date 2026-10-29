@@ -74,10 +74,12 @@ fn fixture(label: &str) -> Fixture {
         )
         .unwrap();
     }
+    fs::write(fx.global_store().join(CATALOGUE_CACHE), "cache\n").unwrap();
     fx
 }
 
 const GHOST_LINE: &str = "- [[ghost]]: missing\n";
+const CATALOGUE_CACHE: &str = ".catalogue.yaml";
 
 fn command(fx: &Fixture, args: &[&str]) -> Command {
     let home = fx.dir.join("home");
@@ -133,6 +135,15 @@ fn assert_success(output: &Output) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     stdout
+}
+
+/// The directory text the report prints on its `<scope>: <dir>` header line.
+fn header_dir<'a>(stdout: &'a str, scope: &str) -> &'a str {
+    let prefix = format!("{scope}: ");
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("no {scope} header in\n{stdout}"))
 }
 
 #[test]
@@ -195,7 +206,6 @@ fn piped_stdin_is_not_read_as_a_prompt() {
 
     assert!(status.success(), "status {status:?}\nstdout:\n{stdout}");
     assert!(stdout.contains("rerun with --apply to migrate"), "{stdout}");
-    drop(stdin);
 }
 
 #[test]
@@ -216,9 +226,15 @@ fn apply_backs_up_both_stores_and_rewrites_them() {
     assert_eq!(backups.len(), 2, "{backups:?}");
     assert!(backups[0].starts_with("global-"), "{backups:?}");
     assert!(backups[1].starts_with("workspace-"), "{backups:?}");
+    let mut global_backed_up = global_before.clone();
+    assert!(
+        global_backed_up
+            .remove(Path::new(CATALOGUE_CACHE))
+            .is_some()
+    );
     assert_eq!(
         snapshot(&fx.backups().join(&backups[0])),
-        global_before,
+        global_backed_up,
         "{stdout}"
     );
     assert_eq!(snapshot(&fx.backups().join(&backups[1])), workspace_before);
@@ -229,26 +245,31 @@ fn apply_backs_up_both_stores_and_rewrites_them() {
         fx.backups().join(&backups[1]).display()
     );
     assert!(stdout.ends_with(&tail), "{tail:?} does not end\n{stdout}");
+    let global_backup = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("backup: "))
+        .unwrap();
+    assert!(!Path::new(global_backup).join(CATALOGUE_CACHE).exists());
+    assert!(fx.global_store().join(CATALOGUE_CACHE).exists());
 
-    // The workspace store is found from the cwd, which the OS reports with
-    // symlinks resolved (/var is /private/var on macOS).
-    for (store, printed, slug, desc, index) in [
+    for (store, label, slug, desc, index) in [
         (
             fx.global_store(),
-            fx.global_store(),
+            "global",
             "g-note",
             "global note",
             "## Always-on facts\n- **Fact.** kept\n".to_string(),
         ),
         (
             fx.workspace_store(),
-            fs::canonicalize(fx.workspace_store()).unwrap(),
+            "workspace",
             "w-note",
             "workspace note",
             format!("## Always-on facts\n- **Fact.** kept\n\n## Drill files\n{GHOST_LINE}"),
         ),
     ] {
         assert_eq!(fs::read_to_string(store.join("MEMORY.md")).unwrap(), index);
+        let printed = Path::new(header_dir(&stdout, label));
         for written in [
             printed.join("MEMORY.md"),
             printed.join(format!("{slug}.md")),
@@ -294,6 +315,7 @@ fn a_workspace_that_cannot_be_written_stops_after_global_and_names_both_backups(
         eprintln!("skipped: this user can write a 0500 dir, so the failure cannot be staged");
         return;
     }
+    let workspace_before = snapshot(&store);
 
     let output = run(&fx, &["--memory-migrate", "all", "--apply"]);
 
@@ -303,6 +325,10 @@ fn a_workspace_that_cannot_be_written_stops_after_global_and_names_both_backups(
         !output.status.success(),
         "stdout:\n{stdout}\nstderr:\n{stderr}"
     );
+    assert_eq!(snapshot(&store), workspace_before, "{stdout}");
+    let global_index = Path::new(header_dir(&stdout, "global")).join("MEMORY.md");
+    let line = format!("    wrote {}\n", global_index.display());
+    assert!(stdout.contains(&line), "{line:?} missing from\n{stdout}");
     let backup = |label: &str| {
         let name = fs::read_dir(fx.backups())
             .unwrap()
