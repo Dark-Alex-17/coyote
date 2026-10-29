@@ -3253,3 +3253,240 @@ fn the_readiness_failure_names_the_config_dir_and_the_log_tail() {
     );
     assert!(!out.contains("Next: start coyote"), "{out}");
 }
+
+/// The lines of the Reticulum config the plan (or a real run) prints, from the
+/// `# Reticulum configuration written by` header to the line before the next
+/// `[coyote-mesh]` log line, each trimmed, blank lines dropped: the shape a reader
+/// compares against the wiki's fenced block.
+fn planned_config_lines(plan: &str) -> Vec<String> {
+    plan.lines()
+        .skip_while(|line| !line.starts_with("# Reticulum configuration written by"))
+        .take_while(|line| !line.starts_with("[coyote-mesh]"))
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The fenced ```text blocks of a wiki section, each as trimmed non-blank lines, in
+/// page order.
+fn fenced_text_blocks(section: &str) -> Vec<Vec<String>> {
+    let mut blocks = Vec::new();
+    let mut current: Option<Vec<String>> = None;
+    for line in section.lines() {
+        let trimmed = line.trim();
+        match current.as_mut() {
+            None if trimmed == "```text" => current = Some(Vec::new()),
+            None => {}
+            Some(_) if trimmed == "```" => blocks.push(current.take().unwrap()),
+            Some(block) if !trimmed.is_empty() => block.push(trimmed.to_string()),
+            Some(_) => {}
+        }
+    }
+    blocks
+}
+
+/// The wiki checkout named by `COYOTE_WIKI_DIR` (relative to the repo root), or `None`
+/// after the conventional `skipping:` line; a set variable that is not a wiki is a failure.
+fn wiki_dir() -> Option<PathBuf> {
+    let value = env::var_os("COYOTE_WIKI_DIR")
+        .map(|value| value.to_string_lossy().trim().to_string())
+        .filter(|value| !value.is_empty())?;
+    let dir = repo_root().join(value);
+    assert!(
+        dir.join("Mesh-Deployment.md").is_file(),
+        "COYOTE_WIKI_DIR={} has no Mesh-Deployment.md; point it at a coyote.wiki checkout",
+        dir.display()
+    );
+    Some(dir)
+}
+
+/// The text under `heading`, an `## ` line of `page`, up to the next `## ` heading.
+fn wiki_section(page: &str, heading: &str) -> String {
+    let marker = format!("\n{heading}\n");
+    let at = page
+        .find(&marker)
+        .unwrap_or_else(|| panic!("Mesh-Deployment.md has no `{heading}` heading"));
+    let body = &page[at + marker.len()..];
+    let end = body.find("\n## ").unwrap_or(body.len());
+    body[..end].to_string()
+}
+
+/// A first-time reader follows `Mesh-Deployment.md`'s "Setting up rnsd" with the dry
+/// run: the config the plan prints is the page's fenced block line for line (trimmed,
+/// in order), it pins the shared instance Coyote's shipped `type: local` entry attaches
+/// through (`share_instance = Yes`, `shared_instance_port = 37428`,
+/// `instance_name = default`, consecutive) and keeps the 4242 listener for the remote
+/// rungs, the `[[Coyote Sessions]]` comment says sessions on this host attach over the
+/// shared instance instead, and the matching-config snippet after the diagnostics line
+/// is the bare `type: local` entry with no `private`/`host`/`port` left in it. With
+/// `--relay HOST:PORT` the only added lines are the page's second fenced block. The
+/// script-side checks run on every run; the page comparison needs `COYOTE_WIKI_DIR`.
+#[test]
+fn usage_probe_the_dry_run_plan_is_the_config_block_the_deployment_page_quotes_line_for_line() {
+    let bash = bash_or_skip!();
+    let home = Home::new("plan-vs-wiki");
+
+    let (code, out, err) = run(&mut home.relay(&bash, &["--no-service", "--dry-run"]));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    let plain = planned_config_lines(&out);
+    assert!(
+        plain.first().is_some_and(|line| {
+            line == "# Reticulum configuration written by scripts/mesh-relay.sh for Coyote mesh."
+        }),
+        "the plan does not open with the config header:\n{out}"
+    );
+    let at = |needle: &str| {
+        plain
+            .iter()
+            .position(|line| line == needle)
+            .unwrap_or_else(|| panic!("the planned config has no line {needle:?}:\n{out}"))
+    };
+    let share = at("share_instance = Yes");
+    assert_eq!(
+        &plain[share..share + 3],
+        [
+            "share_instance = Yes",
+            "shared_instance_port = 37428",
+            "instance_name = default",
+        ],
+        "the three shared-instance keys are not consecutive:\n{out}"
+    );
+    assert!(
+        at("[reticulum]") < share && share < at("[logging]"),
+        "the shared-instance keys are not in the [reticulum] section:\n{out}"
+    );
+    let sessions = at("[[Coyote Sessions]]");
+    assert_eq!(
+        &plain[sessions..sessions + 5],
+        [
+            "[[Coyote Sessions]]",
+            "type = TCPServerInterface",
+            "enabled = Yes",
+            "listen_ip = 127.0.0.1",
+            "listen_port = 4242",
+        ],
+        "the 4242 listener for the remote rungs changed:\n{out}"
+    );
+    assert_eq!(
+        plain[sessions - 1],
+        "# attach over the shared instance instead.",
+        "the [[Coyote Sessions]] comment no longer says sessions on this host attach over the shared instance:\n{out}"
+    );
+    assert!(
+        !plain.iter().any(|line| line.contains("loopback hop")),
+        "the planned config still calls the 4242 listener the loopback hop:\n{out}"
+    );
+
+    let diagnostics = out
+        .find("[coyote-mesh] Diagnostics: 'rnstatus' attaches to the shared instance and lists its interfaces\n")
+        .unwrap_or_else(|| panic!("the plan lacks the rnstatus diagnostics line:\n{out}"));
+    let tail = &out[diagnostics..];
+    let snippet_at = tail
+        .find("\nmesh:\n")
+        .unwrap_or_else(|| panic!("no `mesh:` snippet after the diagnostics line:\n{tail}"));
+    let snippet = &tail[snippet_at + 1..];
+    assert!(
+        snippet.starts_with("mesh:\n  interfaces:\n    - type: local\n\n[coyote-mesh] Next: start coyote and run `.mesh on`\n"),
+        "the matching-config snippet is not the bare `type: local` entry followed by the Next line:\n{snippet}"
+    );
+    for stale in ["type: private", "host: 127.0.0.1", "port: 4242"] {
+        assert!(
+            !snippet.contains(stale),
+            "the matching-config snippet still carries {stale:?}:\n{snippet}"
+        );
+    }
+    assert_eq!(
+        home.entries(),
+        Vec::<String>::new(),
+        "the dry run created files"
+    );
+
+    // The page writes the stanza with `HOST`/`PORT` placeholders; the script wants a real
+    // numeric port, so the probe dials a concrete pair and substitutes when comparing.
+    let (code, relay_out, err) = run(&mut home.relay(
+        &bash,
+        &[
+            "--no-service",
+            "--dry-run",
+            "--relay",
+            "relay.example.org:4242",
+        ],
+    ));
+    assert_eq!(code, 0, "stdout:\n{relay_out}\nstderr:\n{err}");
+    let with_relay = planned_config_lines(&relay_out);
+    assert_eq!(
+        &with_relay[..plain.len()],
+        &plain[..],
+        "the relay plan does not start with the plain plan's config:\n{relay_out}"
+    );
+    let relay_stanza = &with_relay[plain.len()..];
+    assert_eq!(
+        relay_stanza,
+        [
+            "# Your team's relay (a propagation node or another rnsd reachable over the network).",
+            "[[Team Relay]]",
+            "type = TCPClientInterface",
+            "enabled = Yes",
+            "target_host = relay.example.org",
+            "target_port = 4242",
+        ],
+        "the relay stanza changed:\n{relay_out}"
+    );
+    assert_eq!(
+        home.entries(),
+        Vec::<String>::new(),
+        "the relay dry run created files"
+    );
+
+    let Some(wiki) = wiki_dir() else {
+        eprintln!("skipping the page comparison: COYOTE_WIKI_DIR unset");
+        return;
+    };
+    let page = fs::read_to_string(wiki.join("Mesh-Deployment.md")).unwrap();
+    let setup = wiki_section(&page, "## Setting up rnsd");
+    let blocks = fenced_text_blocks(&setup);
+    assert!(
+        blocks.len() >= 2,
+        "Mesh-Deployment.md's `## Setting up rnsd` has fewer than two fenced text blocks"
+    );
+    assert_eq!(
+        plain, blocks[0],
+        "the config the dry run prints is not Mesh-Deployment.md's first fenced block, line for line"
+    );
+    let page_stanza: Vec<String> = blocks[1]
+        .iter()
+        .map(|line| {
+            line.replace("= HOST", "= relay.example.org")
+                .replace("= PORT", "= 4242")
+        })
+        .collect();
+    assert_eq!(
+        relay_stanza, page_stanza,
+        "the `--relay` stanza the dry run appends is not Mesh-Deployment.md's second fenced block"
+    );
+
+    let two_laptops = wiki_section(&page, "## Two laptops on one network");
+    let snippet_lines: Vec<&str> = snippet.lines().take(3).collect();
+    let yaml: Vec<String> = two_laptops
+        .lines()
+        .skip_while(|line| line.trim() != "```yaml")
+        .skip(1)
+        .take_while(|line| line.trim() != "```")
+        .map(|line| line.trim_end().to_string())
+        .collect();
+    let yaml_trimmed: Vec<&str> = yaml.iter().map(|line| line.trim()).collect();
+    assert_eq!(
+        yaml_trimmed,
+        ["mesh:", "enabled: true", "interfaces:", "- type: local"],
+        "Mesh-Deployment.md's `## Two laptops on one network` yaml block is not the local entry under enabled: true"
+    );
+    assert_eq!(
+        snippet_lines
+            .iter()
+            .map(|line| line.trim())
+            .collect::<Vec<_>>(),
+        ["mesh:", "interfaces:", "- type: local"],
+        "the script's matching-config snippet and the page's yaml block disagree on the interfaces entry"
+    );
+}
