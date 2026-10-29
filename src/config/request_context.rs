@@ -1258,7 +1258,7 @@ impl RequestContext {
                 )
             );
         }
-        let role = self.extract_role(&self.app.config)?;
+        let (role, _) = self.extract_role_impl(&self.app.config, false)?;
         match self.select_functions(&role) {
             None => Ok("No tools enabled for the next request.\n".to_string()),
             Some(functions) => {
@@ -4331,7 +4331,7 @@ impl RequestContext {
                 names.dedup();
 
                 let active: HashSet<String> = if self.app.config.function_calling_support {
-                    let role = self.extract_role(&self.app.config)?;
+                    let (role, _) = self.extract_role_impl(&self.app.config, false)?;
                     match self.select_functions(&role) {
                         None => HashSet::new(),
                         Some(functions) => functions.iter().map(|f| f.name.clone()).collect(),
