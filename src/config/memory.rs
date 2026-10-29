@@ -1301,6 +1301,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_frontmatter_reads_an_empty_block_as_the_defaults() {
+        let (fm, source, body) = parse_frontmatter("---\n---").unwrap();
+
+        assert_eq!(fm.name, "");
+        assert!(fm.description.is_none());
+        assert!(fm.kind.raw_kind().is_null());
+        assert!(source.is_empty());
+        assert_eq!(body, "");
+    }
+
+    #[test]
+    fn parse_frontmatter_rejects_a_block_that_is_not_a_mapping() {
+        let err = parse_frontmatter("---\n- a\n---").unwrap_err();
+
+        assert_eq!(err.to_string(), "YAML frontmatter is not a mapping");
+    }
+
+    #[test]
     fn memory_file_save_and_load_roundtrip() {
         let root = temp_root("roundtrip");
         let path = root.join("test.md");
