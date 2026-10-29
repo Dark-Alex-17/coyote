@@ -406,7 +406,7 @@ pub struct MemorySection {
     pub truncated: Option<Truncated>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Lines and chars a cap omitted, across facts and catalogue together;
 /// `global_lines + workspace_lines == lines` always holds.
 pub struct Truncated {

@@ -5,8 +5,8 @@ use super::mcp_tool_policy::{McpToolPolicy, SkillMcpLayer, ToolFilter, expand_mc
 use super::rag_cache::{RagCache, RagKey};
 use super::session::{
     CompressionInfo, INTERRUPTED_RESPONSE_TEXT, KeepPolicy, Session, SessionScope,
-    keep_token_budget, labeled_session_names, merged_session_names, min_reclaim_tokens,
-    session_scope_dirs, valve_limit,
+    SystemPromptSplit, keep_token_budget, labeled_session_names, merged_session_names,
+    min_reclaim_tokens, session_scope_dirs, valve_limit,
 };
 use super::skill::{SKILL_SCAFFOLD, Skill};
 use super::skill_policy::SkillPolicy;
@@ -256,6 +256,34 @@ fn memory_section_notice(section: &MemorySection, cap: usize) -> String {
             "memory: {facts_chars} fact chars + {catalogue_chars} catalogue chars injected under memory_facts_cap={cap}"
         ),
     }
+}
+
+/// Above this share of the model window the system prompt draws a warning.
+const SYSTEM_PROMPT_SHARE_WARN_PERCENT: usize = 25;
+
+/// Set by the first oversized system prompt of the process, so the warning
+/// is printed once rather than on every turn.
+static SYSTEM_PROMPT_SHARE_WARNING: OnceLock<()> = OnceLock::new();
+
+/// Counts the share warnings actually printed, so a test can observe the
+/// once-per-process gate without being able to reset it.
+#[cfg(test)]
+static SYSTEM_PROMPT_SHARE_WARNINGS_PRINTED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn system_prompt_share_warning_already_fired() -> bool {
+    SYSTEM_PROMPT_SHARE_WARNING.get().is_some()
+}
+
+fn system_prompt_share_warning(split: &SystemPromptSplit, window: Option<usize>) -> Option<String> {
+    let pct = split
+        .share_percent(window)
+        .filter(|pct| *pct > SYSTEM_PROMPT_SHARE_WARN_PERCENT)?;
+    Some(format!(
+        "system prompt is at least {pct}% of the model window ({} memory tokens); prune memory or lower memory_facts_cap",
+        split.memory_tokens
+    ))
 }
 
 /// The one sentence every failure to bring up a graph agent's chat agent is
@@ -527,6 +555,10 @@ pub struct RequestContext {
     /// Runtime-only, like `last_prompt_token_usage`.
     pub valve_checkpoint_floor: Option<usize>,
 
+    /// What the last memory-injecting `extract_role` put in the system
+    /// prompt. Runtime-only; `.info` and the compression bail read it.
+    pub system_prompt_split: parking_lot::Mutex<Option<SystemPromptSplit>>,
+
     pub tool_scope: ToolScope,
 
     pub declared_function_names: HashSet<String>,
@@ -625,6 +657,7 @@ impl RequestContext {
             last_cost: None,
             last_prompt_token_usage: None,
             valve_checkpoint_floor: None,
+            system_prompt_split: parking_lot::Mutex::default(),
             tool_scope: ToolScope::default(),
             declared_function_names: Default::default(),
             node_job_scope: None,
@@ -705,6 +738,7 @@ impl RequestContext {
             last_cost: None,
             last_prompt_token_usage: None,
             valve_checkpoint_floor: None,
+            system_prompt_split: parking_lot::Mutex::default(),
             tool_scope: ToolScope {
                 functions,
                 mcp_runtime,
@@ -828,6 +862,7 @@ impl RequestContext {
             last_cost: self.last_cost,
             last_prompt_token_usage: self.last_prompt_token_usage,
             valve_checkpoint_floor: self.valve_checkpoint_floor,
+            system_prompt_split: parking_lot::Mutex::new(*self.system_prompt_split.lock()),
             tool_scope,
             declared_function_names: self.declared_function_names.clone(),
             node_job_scope: None,
@@ -891,6 +926,7 @@ impl RequestContext {
             last_cost: None,
             last_prompt_token_usage: None,
             valve_checkpoint_floor: None,
+            system_prompt_split: parking_lot::Mutex::default(),
             tool_scope: ToolScope {
                 functions: Functions::default(),
                 mcp_runtime: McpRuntime::default(),
@@ -1222,7 +1258,7 @@ impl RequestContext {
                 )
             );
         }
-        let role = self.extract_role(&self.app.config)?;
+        let (role, _) = self.extract_role_impl(&self.app.config, false)?;
         match self.select_functions(&role) {
             None => Ok("No tools enabled for the next request.\n".to_string()),
             Some(functions) => {
@@ -1467,9 +1503,15 @@ impl RequestContext {
             .and_then(Session::compression_threshold)
             .unwrap_or(app.compression_threshold);
         let valve = app.compression_safety_valve;
-        let window = match session {
-            Some(session) => session.model().max_input_tokens(),
-            None => self.extract_role(app)?.model().max_input_tokens(),
+        let (window, system_prompt) = match session {
+            Some(session) => (
+                session.model().max_input_tokens(),
+                *self.system_prompt_split.lock(),
+            ),
+            None => {
+                let (role, split) = self.extract_role_impl(app, true)?;
+                (role.model().max_input_tokens(), split)
+            }
         };
         let keep = self.compression_keep_policy(None);
         let tail = session.map(|session| session.kept_tail(keep));
@@ -1489,6 +1531,8 @@ impl RequestContext {
                 .zip(tail)
                 .map(|(session, tail)| session.model().total_tokens(tail)),
             archived_messages: session.map(|session| session.compressed_messages().len()),
+            system_prompt,
+            max_input_tokens: window,
         })
     }
 
@@ -2093,10 +2137,31 @@ impl RequestContext {
     }
 
     pub fn extract_role(&self, app: &AppConfig) -> Result<Role> {
-        self.extract_role_impl(app, true)
+        let (role, split) = self.extract_role_impl(app, true)?;
+        if let Some(split) = split {
+            *self.system_prompt_split.lock() = Some(split);
+            if let Some(warning) =
+                system_prompt_share_warning(&split, role.model().max_input_tokens())
+                && SYSTEM_PROMPT_SHARE_WARNING.set(()).is_ok()
+            {
+                eprintln!("{warning}");
+                warn!("{warning}");
+                #[cfg(test)]
+                SYSTEM_PROMPT_SHARE_WARNINGS_PRINTED
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        Ok(role)
     }
 
-    fn extract_role_impl(&self, app: &AppConfig, inject_memory: bool) -> Result<Role> {
+    /// Builds the effective role and, when `inject_memory` is set, the split
+    /// of its system prompt. The split is not stored and the share warning is
+    /// not printed; memory injection may still log its own notices.
+    fn extract_role_impl(
+        &self,
+        app: &AppConfig,
+        inject_memory: bool,
+    ) -> Result<(Role, Option<SystemPromptSplit>)> {
         let mut role = if let Some(session) = self.session.as_ref() {
             let mut role = session.to_role();
             // A swapped-in delegate answers with its own knobs; they overlay
@@ -2183,7 +2248,12 @@ impl RequestContext {
             }
         }
 
+        let mut prompt_split = None;
         if inject_memory {
+            let mut split = SystemPromptSplit {
+                role_tokens: estimate_token_length(role.prompt()),
+                ..SystemPromptSplit::default()
+            };
             let memory_config = self.memory_config();
             if memory_config.enabled {
                 let store = MemoryStore {
@@ -2200,22 +2270,30 @@ impl RequestContext {
                             warn!("{}", memory_section_notice(&section, facts_cap));
                         }
                         let separator = if role.is_empty_prompt() { "" } else { "\n\n" };
-                        role.append_to_prompt(separator);
-                        role.append_to_prompt(&section.text);
-                        role.append_to_prompt("\n\n");
-                        role.append_to_prompt(if with_tools {
+                        let instructions = if with_tools {
                             prompts::DEFAULT_MEMORY_INSTRUCTIONS
                         } else {
                             prompts::DEFAULT_MEMORY_INSTRUCTIONS_READONLY
-                        });
+                        };
+                        role.append_to_prompt(separator);
+                        role.append_to_prompt(&section.text);
+                        role.append_to_prompt("\n\n");
+                        role.append_to_prompt(instructions);
+                        split.memory_tokens = estimate_token_length(&section.text);
+                        split.instructions_tokens = estimate_token_length(instructions);
+                        split.truncated = section.truncated;
                     }
                     Ok(None) => {}
                     Err(e) => warn!("memory injection failed: {}", e),
                 }
             }
+            prompt_split = Some(split);
         }
 
-        Ok(self.skill_registry.effective_role(&role, &policy))
+        Ok((
+            self.skill_registry.effective_role(&role, &policy),
+            prompt_split,
+        ))
     }
 
     /// Whether the model that answers a chat turn can call the memory tools.
@@ -3018,7 +3096,7 @@ impl RequestContext {
             Some(rag) => rag.get_config(),
             None => (app.rag_reranker_model.clone(), app.rag_top_k),
         };
-        let role = self.extract_role(app)?;
+        let (role, _) = self.extract_role_impl(app, false)?;
         let mut items = vec![
             ("model", role.model().id()),
             (
@@ -3272,10 +3350,13 @@ impl RequestContext {
 
     pub fn generate_prompt_context(&self, app: &AppConfig) -> HashMap<&str, String> {
         let mut output = HashMap::new();
-        let role = self.extract_role_impl(app, false).unwrap_or_else(|err| {
-            warn!("failed to compute effective role for prompt rendering: {err}");
-            Role::default()
-        });
+        let role = self
+            .extract_role_impl(app, false)
+            .map(|(role, _)| role)
+            .unwrap_or_else(|err| {
+                warn!("failed to compute effective role for prompt rendering: {err}");
+                Role::default()
+            });
         output.insert("model", role.model().id());
         output.insert("client_name", role.model().client_name().to_string());
         output.insert("model_name", role.model().name().to_string());
@@ -4250,7 +4331,7 @@ impl RequestContext {
                 names.dedup();
 
                 let active: HashSet<String> = if self.app.config.function_calling_support {
-                    let role = self.extract_role(&self.app.config)?;
+                    let (role, _) = self.extract_role_impl(&self.app.config, false)?;
                     match self.select_functions(&role) {
                         None => HashSet::new(),
                         Some(functions) => functions.iter().map(|f| f.name.clone()).collect(),
@@ -6871,10 +6952,25 @@ impl RequestContext {
             let mut message =
                 String::from("Nothing to compress: the kept tail is the whole session");
             if keep_last_override.is_none() && self.working_mode.is_repl() {
-                message
-                    .push_str(&self.render_hints(
-                        "; lower compression_keep_last or run `.compress session 0`",
-                    ));
+                let memory_tokens = self
+                    .system_prompt_split
+                    .lock()
+                    .map_or(0, |split| split.memory_tokens);
+                let system_tokens = session
+                    .messages()
+                    .first()
+                    .filter(|first| first.role == MessageRole::System)
+                    .map_or(0, |first| {
+                        session.model().total_tokens(slice::from_ref(first))
+                    });
+                let hint = if memory_tokens > session.tokens().saturating_sub(system_tokens) {
+                    format!(
+                        "; the system prompt holds {memory_tokens} memory tokens, more than the conversation - prune memory or lower memory_facts_cap"
+                    )
+                } else {
+                    String::from("; lower compression_keep_last or run `.compress session 0`")
+                };
+                message.push_str(&self.render_hints(&hint));
             }
             bail!(message);
         }
@@ -8042,6 +8138,11 @@ mod tests {
     fn create_test_ctx() -> RequestContext {
         RequestContext::new(default_app_state(), WorkingMode::Cmd)
     }
+
+    /// The split estimates each part on its own while the prompt joins them
+    /// with separators and rounds once, so the two totals drift by a few
+    /// tokens either way.
+    const SPLIT_SEPARATOR_SLACK: usize = 3;
 
     fn priced_model() -> Model {
         let mut data = ModelData::new("test");
@@ -9811,6 +9912,329 @@ mod tests {
         let session = ctx.session.as_ref().unwrap();
         assert_eq!(session.messages().len(), 1, "keep_last 0 folds everything");
         assert!(session.messages()[0].content.to_text().contains("summary"));
+    }
+
+    #[test]
+    #[serial]
+    fn compress_session_impl_bail_points_at_memory_larger_than_the_conversation() {
+        let _guard = TestConfigDirGuard::new();
+        let index = paths::global_memory_index_file();
+        create_dir_all(index.parent().unwrap()).unwrap();
+        let fact = format!("- {}\n", "x".repeat(158));
+        write(&index, fact.repeat(10_000)).unwrap();
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            compression_threshold: 0,
+            compression_keep_last: 10,
+            memory: Some(true),
+            memory_facts_cap: Some(2_000_000),
+            memory_drill_cap: Some(2_000_000),
+            ..AppConfig::default()
+        });
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Repl);
+        let app = ctx.app.config.clone();
+        let role = ctx.extract_role(&app).unwrap();
+        let memory_tokens = ctx.system_prompt_split.lock().unwrap().memory_tokens;
+        assert!(memory_tokens > 300_000, "{memory_tokens}");
+        let input = Input::from_str(&ctx, &"y".repeat(150_000), Some(role)).unwrap();
+        let mut session = Session::default();
+        session.add_message(&input, "hi").unwrap();
+        assert_eq!(session.messages()[0].role, MessageRole::System);
+        ctx.session = Some(session);
+
+        let fetch = |_: Input| async { Ok("summary".to_string()) };
+        let err = run_async(ctx.compress_session_impl(None, fetch)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Nothing to compress: the kept tail is the whole session; the system prompt holds {memory_tokens} memory tokens, more than the conversation - prune memory or lower memory_facts_cap"
+            )
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn compress_session_impl_bail_keeps_the_keep_last_hint_when_the_conversation_outweighs_memory()
+    {
+        let _guard = TestConfigDirGuard::new();
+        write_global_memory_store();
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            compression_threshold: 0,
+            compression_keep_last: 10,
+            memory: Some(true),
+            ..AppConfig::default()
+        });
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Repl);
+        let app = ctx.app.config.clone();
+        let role = ctx.extract_role(&app).unwrap();
+        assert!(ctx.system_prompt_split.lock().unwrap().memory_tokens > 0);
+        let input = Input::from_str(&ctx, &"y".repeat(150_000), Some(role)).unwrap();
+        let mut session = Session::default();
+        session.add_message(&input, "hi").unwrap();
+        assert_eq!(session.messages()[0].role, MessageRole::System);
+        ctx.session = Some(session);
+
+        let fetch = |_: Input| async { Ok("summary".to_string()) };
+        let err = run_async(ctx.compress_session_impl(None, fetch)).unwrap_err();
+        assert!(
+            err.to_string()
+                .ends_with("; lower compression_keep_last or run `.compress session 0`"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn extract_role_records_the_system_prompt_split_only_when_injecting_memory() {
+        let _guard = TestConfigDirGuard::new();
+        write_global_memory_store();
+        let ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+
+        let prompt = ctx.extract_role(&app).unwrap().prompt().to_string();
+        let split = ctx.system_prompt_split.lock().unwrap();
+        assert!(split.memory_tokens > 0, "{split:?}");
+        assert!(
+            [
+                estimate_token_length(prompts::DEFAULT_MEMORY_INSTRUCTIONS),
+                estimate_token_length(prompts::DEFAULT_MEMORY_INSTRUCTIONS_READONLY),
+            ]
+            .contains(&split.instructions_tokens),
+            "{split:?}"
+        );
+        let parts = split.role_tokens + split.memory_tokens + split.instructions_tokens;
+        let whole = estimate_token_length(&prompt);
+        assert!(
+            parts <= whole + SPLIT_SEPARATOR_SLACK && whole <= parts + SPLIT_SEPARATOR_SLACK,
+            "{split:?} for:\n{prompt}"
+        );
+        let sentinel = SystemPromptSplit {
+            role_tokens: 1,
+            memory_tokens: 2,
+            instructions_tokens: 3,
+            truncated: None,
+        };
+        *ctx.system_prompt_split.lock() = Some(sentinel);
+        ctx.generate_prompt_context(&app);
+        assert_eq!(*ctx.system_prompt_split.lock(), Some(sentinel));
+    }
+
+    #[test]
+    #[serial]
+    fn extract_role_records_a_memoryless_split_when_memory_is_off() {
+        let _guard = TestConfigDirGuard::new();
+        write_global_memory_store();
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            memory: Some(false),
+            ..AppConfig::default()
+        });
+        let ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        let app = ctx.app.config.clone();
+
+        ctx.extract_role(&app).unwrap();
+        let split = ctx.system_prompt_split.lock().unwrap();
+        assert_eq!((split.memory_tokens, split.instructions_tokens), (0, 0));
+    }
+
+    #[test]
+    #[serial]
+    fn memory_role_tokens_pins_the_role_prompt_estimate() {
+        let _guard = TestConfigDirGuard::new();
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            memory: Some(false),
+            workspace_instructions: Some(false),
+            function_calling_support: false,
+            ..AppConfig::default()
+        });
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        let prompt = "You are a careful reviewer of pull requests.";
+        ctx.role = Some(Role::new("pinned", prompt));
+        let app = ctx.app.config.clone();
+
+        assert_eq!(ctx.extract_role(&app).unwrap().prompt(), prompt);
+        let split = ctx.system_prompt_split.lock().unwrap();
+        assert_eq!(split.role_tokens, estimate_token_length(prompt));
+        assert_eq!((split.memory_tokens, split.instructions_tokens), (0, 0));
+    }
+
+    #[test]
+    fn memory_system_prompt_share_warning_fires_only_above_a_quarter_of_the_window() {
+        let split = |memory_tokens| SystemPromptSplit {
+            role_tokens: 100,
+            memory_tokens,
+            instructions_tokens: 0,
+            truncated: None,
+        };
+        assert_eq!(system_prompt_share_warning(&split(150), Some(1_000)), None);
+        assert_eq!(system_prompt_share_warning(&split(159), Some(1_000)), None);
+        assert_eq!(
+            system_prompt_share_warning(&split(160), Some(1_000)).as_deref(),
+            Some(
+                "system prompt is at least 26% of the model window (160 memory tokens); prune memory or lower memory_facts_cap"
+            )
+        );
+        assert_eq!(system_prompt_share_warning(&split(0), Some(1_000)), None);
+        assert_eq!(system_prompt_share_warning(&split(10_000), None), None);
+        assert_eq!(system_prompt_share_warning(&split(10_000), Some(0)), None);
+    }
+
+    #[test]
+    #[serial]
+    fn memory_extract_role_prints_the_share_warning_once_per_process() {
+        let _guard = TestConfigDirGuard::new();
+        write_global_memory_store();
+        let mut ctx = create_test_ctx();
+        let mut role = Role::new("windowed", "prompt");
+        role.set_model(windowed_model(100));
+        ctx.role = Some(role);
+        let app = ctx.app.config.clone();
+        let printed =
+            || SYSTEM_PROMPT_SHARE_WARNINGS_PRINTED.load(std::sync::atomic::Ordering::Relaxed);
+        let already_fired = system_prompt_share_warning_already_fired();
+        let before = printed();
+
+        ctx.extract_role(&app).unwrap();
+        let split = ctx.system_prompt_split.lock().unwrap();
+        assert!(
+            system_prompt_share_warning(&split, Some(100)).is_some(),
+            "{split:?}"
+        );
+        let expected = if already_fired { before } else { before + 1 };
+        assert_eq!(printed(), expected);
+        assert!(system_prompt_share_warning_already_fired());
+
+        ctx.extract_role(&app).unwrap();
+        assert_eq!(printed(), expected);
+    }
+
+    /// Snapshot of every side effect the share warning path can leave, so a
+    /// read-only command can be checked against it.
+    fn share_warning_state(ctx: &RequestContext) -> (bool, usize, Option<SystemPromptSplit>) {
+        (
+            system_prompt_share_warning_already_fired(),
+            SYSTEM_PROMPT_SHARE_WARNINGS_PRINTED.load(std::sync::atomic::Ordering::Relaxed),
+            *ctx.system_prompt_split.lock(),
+        )
+    }
+
+    fn assert_a_share_warning_is_due(ctx: &RequestContext, app: &AppConfig) {
+        let split = ctx.extract_role_impl(app, true).unwrap().1.unwrap();
+        assert!(
+            system_prompt_share_warning(&split, Some(100)).is_some(),
+            "{split:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn memory_info_with_a_role_does_not_store_split_or_warn() {
+        let _guard = TestConfigDirGuard::new();
+        write_global_memory_store();
+        let mut ctx = create_test_ctx();
+        let mut role = Role::new("windowed", "prompt");
+        role.set_model(windowed_model(100));
+        ctx.role = Some(role);
+        let app = ctx.app.config.clone();
+        assert_a_share_warning_is_due(&ctx, &app);
+        let before = share_warning_state(&ctx);
+        assert_eq!(before.2, None);
+
+        ctx.info(&app).unwrap();
+
+        assert_eq!(share_warning_state(&ctx), before);
+    }
+
+    #[test]
+    #[serial]
+    fn memory_info_without_session_role_agent_or_rag_does_not_store_split_or_warn() {
+        let _guard = TestConfigDirGuard::new();
+        let index = paths::global_memory_index_file();
+        create_dir_all(index.parent().unwrap()).unwrap();
+        write(index, "# Memory\n- the user prefers terse answers\n").unwrap();
+        let mut ctx = create_test_ctx();
+        ctx.model = windowed_model(100);
+        assert!(ctx.session.is_none());
+        assert!(ctx.role.is_none());
+        assert!(ctx.agent.is_none());
+        assert!(ctx.rag.is_none());
+        let app = ctx.app.config.clone();
+        assert_a_share_warning_is_due(&ctx, &app);
+        let before = share_warning_state(&ctx);
+        assert_eq!(before.2, None);
+
+        let info = ctx.info(&app).unwrap();
+
+        assert_eq!(share_warning_state(&ctx), before);
+        assert!(
+            info.lines()
+                .any(|line| line.starts_with("system_prompt_share ") && line.ends_with("% of 100")),
+            "{info}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn memory_info_with_a_session_does_not_store_split_or_warn() {
+        let _guard = TestConfigDirGuard::new();
+        write_global_memory_store();
+        let mut ctx = create_test_ctx();
+        let mut session = Session::default();
+        session.set_model(windowed_model(100));
+        ctx.session = Some(session);
+        *ctx.system_prompt_split.lock() = Some(SystemPromptSplit {
+            role_tokens: 1,
+            memory_tokens: 2,
+            instructions_tokens: 3,
+            truncated: None,
+        });
+        let app = ctx.app.config.clone();
+        assert_a_share_warning_is_due(&ctx, &app);
+        let before = share_warning_state(&ctx);
+
+        ctx.info(&app).unwrap();
+
+        assert_eq!(share_warning_state(&ctx), before);
+    }
+
+    #[test]
+    #[serial]
+    fn memory_session_info_renders_n_a_before_a_split_exists() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let mut session = Session::default();
+        session.set_model(windowed_model(20_000));
+        ctx.session = Some(session);
+        let app = ctx.app.config.clone();
+
+        let info = ctx.info(&app).unwrap();
+
+        assert!(
+            info.contains("  system_prompt_role_tokens: n/a\n"),
+            "{info}"
+        );
+        assert!(info.contains("  system_prompt_share: n/a\n"), "{info}");
+    }
+
+    #[test]
+    #[serial]
+    fn memory_tools_info_does_not_store_split_or_warn() {
+        let _guard = TestConfigDirGuard::new();
+        write_global_memory_store();
+        let mut ctx = create_test_ctx();
+        let mut role = Role::new("windowed", "prompt");
+        role.set_model(windowed_model(100));
+        ctx.role = Some(role);
+        let app = ctx.app.config.clone();
+        assert_a_share_warning_is_due(&ctx, &app);
+        let before = share_warning_state(&ctx);
+        assert_eq!(before.2, None);
+
+        ctx.tools_info().unwrap();
+
+        assert_eq!(share_warning_state(&ctx), before);
     }
 
     #[test]
@@ -16196,6 +16620,14 @@ mod tests {
         assert!(row("compression_keep_tokens").ends_with("40000"));
         assert!(row("compression_checkpoint_tokens").ends_with("50000"));
         assert!(row("compression_min_reclaim").ends_with("24691"));
+        for key in [
+            "system_prompt_role_tokens",
+            "system_prompt_memory_tokens",
+            "system_prompt_share",
+            "memory_facts_truncated",
+        ] {
+            assert!(row(key).ends_with("n/a"), "{}", row(key));
+        }
         let lines: Vec<&str> = info.lines().collect();
         let save_session = lines
             .iter()
@@ -16206,10 +16638,55 @@ mod tests {
             .position(|line| line.starts_with("memory "))
             .unwrap();
         assert!(
-            lines[save_session + 1..memory]
-                .iter()
-                .all(|line| line.starts_with("compression_")),
-            "compression rows sit between save_session and memory:\n{info}"
+            lines[save_session + 1..memory].iter().all(|line| [
+                "compression_",
+                "system_prompt_",
+                "memory_facts_truncated"
+            ]
+            .iter()
+            .any(|prefix| line.starts_with(prefix))),
+            "compression and system prompt rows sit between save_session and memory:\n{info}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn session_info_reports_the_stored_system_prompt_split() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let mut session = Session::default();
+        session.set_model(windowed_model(20_000));
+        ctx.session = Some(session);
+        *ctx.system_prompt_split.lock() = Some(SystemPromptSplit {
+            role_tokens: 1234,
+            memory_tokens: 5678,
+            instructions_tokens: 0,
+            truncated: Some(memory::Truncated {
+                lines: 9,
+                chars: 321,
+                global_lines: 4,
+                workspace_lines: 5,
+            }),
+        });
+        let app = ctx.app.config.clone();
+
+        let info = ctx.info(&app).unwrap();
+
+        assert!(
+            info.contains("  system_prompt_role_tokens: 1234\n"),
+            "{info}"
+        );
+        assert!(
+            info.contains("  system_prompt_memory_tokens: 5678\n"),
+            "{info}"
+        );
+        assert!(
+            info.contains("  system_prompt_share: 34% of 20000\n"),
+            "{info}"
+        );
+        assert!(
+            info.contains("  memory_facts_truncated: 9 lines / 321 chars\n"),
+            "{info}"
         );
     }
 
@@ -16243,7 +16720,7 @@ mod tests {
         assert_eq!(info.kept_tail_messages, None);
         assert_eq!(info.kept_tail_tokens, None);
         assert_eq!(info.archived_messages, None);
-        assert_eq!(info.rows().len(), 9);
+        assert_eq!(info.rows().len(), 13);
     }
 
     // --- usage-probe (spec-first) coverage for the workspace-sessions surface ---
