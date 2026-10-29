@@ -6937,10 +6937,10 @@ impl RequestContext {
                 match Model::retrieve_model(self.app.config.as_ref(), &model_id, ModelType::Chat) {
                     Ok(model) => Some(model),
                     Err(err) => {
-                        eprintln!(
-                            "Warning: compression model '{model_id}' could not be used ({err}); falling back to the current model '{}' for session compression",
+                        self.compression_notice(format!(
+                            "compression model '{model_id}' could not be used ({err}); falling back to the current model '{}' for session compression",
                             self.current_model().id()
-                        );
+                        ));
                         None
                     }
                 }
@@ -7028,9 +7028,9 @@ impl RequestContext {
                         start += first_message;
                         let previous = budget;
                         budget /= 2;
-                        eprintln!(
-                            "Warning: the summarizer rejected a ~{previous}-token chunk as too long ({err:#}); retrying with chunks of ~{budget} tokens or fewer"
-                        );
+                        self.compression_notice(format!(
+                            "the summarizer rejected a ~{previous}-token chunk as too long ({err:#}); retrying with chunks of ~{budget} tokens or fewer"
+                        ));
                         rejected = Some((chunk, err));
                         continue 'fold;
                     }
@@ -7103,14 +7103,47 @@ impl RequestContext {
                 Err(err)
             }
             Err(err) => {
-                eprintln!(
-                    "Warning: compression model '{}' failed: {err}; falling back to the current model '{}' for session compression",
+                self.compression_notice(format!(
+                    "compression model '{}' failed: {err}; falling back to the current model '{}' for session compression",
                     model.id(),
                     self.current_model().id()
-                );
+                ));
                 fetch(Input::detached_text(self, request)).await
             }
         }
+    }
+
+    /// A child agent has no terminal of its own, so its compression notices
+    /// go to the log rather than onto the parent's stderr.
+    fn compression_notice(&self, text: String) {
+        if self.self_agent_id.is_some() {
+            warn!("{text}");
+            return;
+        }
+        let line = format!("Warning: {text}");
+        eprintln!("{line}");
+        #[cfg(test)]
+        Self::stderr_notices()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(line);
+    }
+
+    /// Every line `compression_notice` wrote to stderr. A global rather than
+    /// a thread-local because compression is async and may resume on another
+    /// thread; tests filter on a marker unique to them.
+    #[cfg(test)]
+    fn stderr_notices() -> &'static std::sync::Mutex<Vec<String>> {
+        static NOTICES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        &NOTICES
+    }
+
+    #[cfg(test)]
+    fn stderr_notices_snapshot() -> Vec<String> {
+        Self::stderr_notices()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     pub async fn autoname_session(&mut self, app: &AppConfig) -> Result<()> {
@@ -9953,6 +9986,134 @@ mod tests {
             .unwrap_err();
         assert!(graph::is_context_overflow_error(&err));
         assert_eq!(calls.get(), 2, "compression model, then the current model");
+    }
+
+    /// Raises each compression notice once on contexts carrying
+    /// `self_agent_id`, returning the start of each notice's text (without
+    /// the `Warning: ` prefix); `tag` makes every start unique to the caller.
+    fn raise_compression_notices(self_agent_id: Option<&str>, tag: &str) -> Vec<String> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let with_identity = |mut ctx: RequestContext| {
+            ctx.self_agent_id = self_agent_id.map(str::to_string);
+            if self_agent_id.is_none() {
+                ctx.working_mode = WorkingMode::Repl;
+            }
+            ctx
+        };
+
+        let unusable = format!("nowhere-{tag}:model");
+        let mut ctx = with_identity(ctx_with_text_exchanges(1, 10));
+        ctx.app = Arc::new(AppState {
+            config: Arc::new(AppConfig {
+                compression_model: Some(unusable.clone()),
+                ..(*ctx.app.config).clone()
+            }),
+            ..(*ctx.app).clone()
+        });
+        runtime
+            .block_on(
+                ctx.compress_session_impl(Some(0), |_: Input| async { Ok("summary".to_string()) }),
+            )
+            .unwrap();
+
+        // ~8 x 150 estimated tokens against the 1_200-token budget; the
+        // summarizer rejects only the first chunk.
+        let overflow = format!("prompt is too long: rejected-{tag}");
+        let mut ctx = with_identity(ctx_with_text_exchanges(4, 600));
+        let calls = std::cell::Cell::new(0usize);
+        let calls_ref = &calls;
+        let overflow_ref = &overflow;
+        runtime
+            .block_on(
+                ctx.compress_session_impl(Some(0), move |_: Input| async move {
+                    calls_ref.set(calls_ref.get() + 1);
+                    if calls_ref.get() == 1 {
+                        return Err(anyhow!("{overflow_ref}"));
+                    }
+                    Ok("summary".to_string())
+                }),
+            )
+            .unwrap();
+
+        let failing =
+            Model::from_config("openai", &[ModelData::new(&format!("failing-{tag}"))]).remove(0);
+        let ctx = with_identity(ctx_with_text_exchanges(1, 10));
+        runtime
+            .block_on(
+                ctx.fetch_summary(Some(&failing), "request", &|_: Input| async {
+                    Err::<String, _>(anyhow!("rate limit reached"))
+                }),
+            )
+            .unwrap_err();
+
+        vec![
+            format!("compression model '{unusable}' could not be used ("),
+            format!(
+                "the summarizer rejected a ~1200-token chunk as too long ({overflow}); retrying with chunks of ~600 tokens or fewer"
+            ),
+            format!(
+                "compression model 'openai:failing-{tag}' failed: rate limit reached; falling back to the current model '"
+            ),
+        ]
+    }
+
+    #[test]
+    #[serial]
+    fn compression_notices_in_a_child_go_to_the_warn_log_not_stderr() {
+        install_log_collector();
+        let _guard = TestConfigDirGuard::new();
+        let warns_before = warn_snapshot().len();
+        let stderr_before = RequestContext::stderr_notices_snapshot().len();
+
+        let notices = raise_compression_notices(Some("child"), "child-k3v");
+
+        let warns: Vec<String> = warn_snapshot().into_iter().skip(warns_before).collect();
+        let stderr: Vec<String> = RequestContext::stderr_notices_snapshot()
+            .into_iter()
+            .skip(stderr_before)
+            .collect();
+        for notice in &notices {
+            assert_eq!(
+                warns.iter().filter(|line| line.starts_with(notice)).count(),
+                1,
+                "{notice}: {warns:?}"
+            );
+            assert!(
+                !stderr.iter().any(|line| line.contains(notice)),
+                "{notice}: {stderr:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn compression_notices_in_the_repl_go_to_stderr_not_the_warn_log() {
+        install_log_collector();
+        let warns_before = warn_snapshot().len();
+        let stderr_before = RequestContext::stderr_notices_snapshot().len();
+
+        let notices = raise_compression_notices(None, "repl-k3v");
+
+        let warns: Vec<String> = warn_snapshot().into_iter().skip(warns_before).collect();
+        let stderr: Vec<String> = RequestContext::stderr_notices_snapshot()
+            .into_iter()
+            .skip(stderr_before)
+            .collect();
+        for notice in &notices {
+            let line = format!("Warning: {notice}");
+            assert_eq!(
+                stderr.iter().filter(|l| l.starts_with(&line)).count(),
+                1,
+                "{notice}: {stderr:?}"
+            );
+            assert!(
+                !warns.iter().any(|l| l.contains(notice)),
+                "{notice}: {warns:?}"
+            );
+        }
     }
 
     #[test]

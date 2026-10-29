@@ -868,8 +868,9 @@ fn run_child_agent_with_graph_inputs(
 /// Compresses the child's session over its committed transcript when that
 /// crosses the configured threshold or the safety valve. The turn itself
 /// was already flushed, so a failed compression or a failed write-back is
-/// logged and the child continues on what is on disk. Returns whether a
-/// compression ran and succeeded, so the caller knows to reseat its input.
+/// logged and the child continues on what is on disk; the write-back
+/// failure is logged by `checkpoint_session_to_disk` itself. Returns whether
+/// a compression ran and succeeded, so the caller knows to reseat its input.
 async fn maybe_compress_child_turn(child_ctx: &mut RequestContext, app: &AppConfig) -> bool {
     let keep = child_ctx.compression_keep_policy(None);
     let should_compress = child_ctx.session.as_ref().is_some_and(|session| {
@@ -890,12 +891,9 @@ async fn maybe_compress_child_turn(child_ctx: &mut RequestContext, app: &AppConf
         );
         return false;
     }
-    if let Err(err) = child_ctx.checkpoint_session_to_disk(app.dry_run) {
-        warn!(
-            "Compressed child session was not written back{}; the previous turn's copy stays on disk: {err:#}",
-            child_for(child_ctx)
-        );
-    }
+    // checkpoint_session_to_disk already logged a failed write-back, and the
+    // in-memory session is compressed either way, so the caller still reseats.
+    let _ = child_ctx.checkpoint_session_to_disk(app.dry_run);
     true
 }
 
@@ -4667,12 +4665,14 @@ mod tests {
         assert!(!session.compressing());
         assert_eq!(read_to_string(&path).unwrap(), stored_before);
         assert!(!has_summary(&read_yaml::<Session>(&path)));
-        let warns = warns_since(warned_before);
+        let warns: Vec<String> = warn_snapshot()
+            .into_iter()
+            .skip(warned_before)
+            .filter(|m| m.contains("hild session") || m.contains("Failed to checkpoint session"))
+            .collect();
         assert_eq!(warns.len(), 1, "{warns:?}");
         assert!(
-            warns[0].contains(&format!(
-                "Compressed child session was not written back{for_child}; the previous turn's copy stays on disk: "
-            )),
+            warns[0].starts_with(&format!("Failed to checkpoint session '{sid}': ")),
             "{warns:?}"
         );
 
@@ -5716,8 +5716,12 @@ mod tests {
         }
         let warned_before = crate::testing::warn_snapshot().len();
 
-        run_async(maybe_compress_child_turn(&mut child_ctx, app.as_ref()));
+        let compressed = run_async(maybe_compress_child_turn(&mut child_ctx, app.as_ref()));
 
+        assert!(
+            compressed,
+            "the caller still reseats on the compressed copy"
+        );
         let session = child_ctx.session.as_ref().unwrap();
         assert!(
             session.messages()[0]
@@ -5733,14 +5737,23 @@ mod tests {
             on_disk_before,
             "the previous turn's copy is the resume record"
         );
-        let warns: Vec<String> = crate::testing::warn_snapshot()
+        let window: Vec<String> = crate::testing::warn_snapshot()
             .into_iter()
             .skip(warned_before)
-            .filter(|m| m.contains("Compressed child session was not written back"))
+            .collect();
+        assert!(
+            !window
+                .iter()
+                .any(|m| m.contains("Compressed child session was not written back")),
+            "{window:?}"
+        );
+        let warns: Vec<&String> = window
+            .iter()
+            .filter(|m| m.contains("Failed to checkpoint session"))
             .collect();
         assert_eq!(warns.len(), 1, "{warns:?}");
         assert!(
-            warns[0].contains("the previous turn's copy stays on disk"),
+            warns[0].starts_with("Failed to checkpoint session '") && warns[0].contains("': "),
             "{warns:?}"
         );
     }
