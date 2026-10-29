@@ -186,6 +186,32 @@ fn an_invalid_round_chains_setting_fails_the_run_untouched() {
     assert!(!fx.backups().exists());
 }
 
+#[test]
+fn a_keep_round_chains_setting_leaves_older_rounds_unmarked() {
+    let fx = fixture("keep_round_chains");
+    fs::write(
+        fx.dir.join("config.yaml"),
+        "memory_round_chains: keep\nmodel: [not, a, string]\n",
+    )
+    .unwrap();
+    let store = fx.workspace_store();
+    for round in ["plan-r1", "plan-r2"] {
+        fs::write(
+            store.join(format!("{round}.md")),
+            format!("---\nname: {round}\ndescription: {round}\ntype: run-state\n---\n\nbody\n"),
+        )
+        .unwrap();
+    }
+
+    let stdout = assert_success(&run(&fx, &["--memory-migrate", "all", "--apply"]));
+
+    let older = fs::read_to_string(store.join("plan-r1.md")).unwrap();
+    assert!(
+        !older.contains("superseded_by"),
+        "{older}\nstdout:\n{stdout}"
+    );
+}
+
 struct KillOnDrop(Child);
 
 impl Drop for KillOnDrop {

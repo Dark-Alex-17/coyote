@@ -14049,6 +14049,55 @@ mod tests {
         assert_eq!(*root, ChildSessionRoot::from_stamp(ProcessStamp::current()));
     }
 
+    #[test]
+    #[serial]
+    fn forks_and_children_keep_the_workspace_memory_root() {
+        let guard = TestConfigDirGuard::new();
+        let workspace_index = paths::workspace_memory_index_file_for(&guard.workspace_root);
+        create_dir_all(workspace_index.parent().unwrap()).unwrap();
+        write(workspace_index, "# Workspace Memory\n").unwrap();
+        let expected_dir = MemoryStore::new(&guard.workspace_root)
+            .workspace
+            .map(|w| w.dir);
+        assert!(expected_dir.is_some());
+
+        let mut ctx = create_test_ctx();
+        ctx.workspace_memory_root = Some(guard.workspace_root.clone());
+        let fork = ctx.fork_for_branch();
+        let child = RequestContext::new_for_child(
+            Arc::clone(&ctx.app),
+            &ctx,
+            1,
+            Arc::new(Inbox::new()),
+            "agent_child_1".to_string(),
+        );
+
+        for copy in [&ctx, &fork, &child] {
+            assert_eq!(
+                copy.workspace_memory_root,
+                Some(guard.workspace_root.clone())
+            );
+            let config = copy.memory_config();
+            assert!(config.enabled);
+            assert_eq!(config.workspace.map(|w| w.dir), expected_dir);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn without_a_workspace_memory_root_memory_resolves_from_the_current_dir() {
+        let _guard = TestConfigDirGuard::new();
+        write_global_memory_store();
+        let ctx = create_test_ctx();
+        assert_eq!(ctx.workspace_memory_root, None);
+
+        let config = ctx.memory_config();
+
+        assert!(config.enabled);
+        let expected = MemoryStore::new(&env::current_dir().unwrap()).workspace;
+        assert_eq!(config.workspace.map(|w| w.dir), expected.map(|w| w.dir));
+    }
+
     fn retention_time() -> chrono::DateTime<chrono::Utc> {
         use chrono::TimeZone;
         chrono::Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap()
