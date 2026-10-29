@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use super::{FunctionDeclaration, JsonSchema};
 use crate::config::memory::{
-    DEFAULT_MEMORY_RUN_STATE_TTL_DAYS, Filter, KindField, MEMORY_DESCRIPTION_CAP,
+    CatalogueEntry, DEFAULT_MEMORY_RUN_STATE_TTL_DAYS, Filter, KindField, MEMORY_DESCRIPTION_CAP,
     MEMORY_FILE_HARD_CAP, MemoryFile, MemoryFrontmatter, MemoryKind, MemoryStore, Retention, Scope,
     WorkspaceMemory, bootstrap_workspace_memory, catalogue_entry, catalogue_slug, find_git_root,
     today_string,
@@ -481,22 +481,42 @@ fn scope_filter_schema() -> (String, JsonSchema) {
 fn search_memory(store: &MemoryStore, args: &Value) -> Result<Value> {
     let query = arg_str(args, "query")?;
     let k = count_arg(args, "k", DEFAULT_SEARCH_K)?;
+    let filter = filter_arg(args)?;
+    let today = today_string();
     let hits: Vec<Value> = store
-        .search(&query, k, &filter_arg(args)?)?
+        .search(&query, k, &filter)?
         .into_iter()
         .map(|hit| {
-            json!({
+            let mut row = json!({
                 "name": hit.entry.name,
                 "description": hit.entry.description,
                 "type": hit.entry.kind.kind().name(),
                 "updated": hit.entry.updated,
                 "scope": hit.entry.scope.name(),
                 "score": hit.score,
-            })
+            });
+            mark_raw_type_and_staleness(&mut row, &hit.entry, filter.include_stale, &today)?;
+            Ok(row)
         })
-        .collect();
+        .collect::<Result<_>>()?;
 
     Ok(json!({ "count": hits.len(), "hits": hits }))
+}
+
+fn mark_raw_type_and_staleness(
+    row: &mut Value,
+    entry: &CatalogueEntry,
+    include_stale: bool,
+    today: &str,
+) -> Result<()> {
+    let kind = &entry.kind;
+    if !kind.raw_kind().is_null() && !kind.is_known() {
+        row["raw_type"] = serde_json::to_value(kind.raw_kind())?;
+    }
+    if include_stale && entry.is_stale(today) {
+        row["stale"] = Value::Bool(true);
+    }
+    Ok(())
 }
 
 fn filter_arg(args: &Value) -> Result<Filter> {
@@ -544,21 +564,15 @@ fn list_entries(store: &MemoryStore, args: &Value) -> Result<Value> {
         .skip(offset)
         .take(limit)
         .map(|f| {
-            let kind = &f.kind;
             let mut entry = json!({
                 "name": f.name,
                 "description": f.description,
-                "type": kind.kind().name(),
+                "type": f.kind.kind().name(),
                 "scope": f.scope.name(),
                 "char_len": f.char_len,
                 "path": f.path.display().to_string(),
             });
-            if !kind.raw_kind().is_null() && !kind.is_known() {
-                entry["raw_type"] = serde_json::to_value(kind.raw_kind())?;
-            }
-            if filter.include_stale && f.is_stale(&today) {
-                entry["stale"] = Value::Bool(true);
-            }
+            mark_raw_type_and_staleness(&mut entry, f, filter.include_stale, &today)?;
             Ok(entry)
         })
         .collect::<Result<Vec<Value>>>()?;
@@ -3439,6 +3453,15 @@ mod tests {
         let mut found = names(&projects);
         found.sort();
         assert_eq!(found, ["habitat-notes", "quokka-habitat-r1"], "{projects}");
+        let draft = projects["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|hit| hit["name"] == "quokka-habitat-r1")
+            .unwrap();
+        assert_eq!(draft["stale"], true, "{projects}");
+        assert!(draft.get("raw_type").is_none(), "{projects}");
+        assert!(live["hits"][0].get("stale").is_none(), "{live}");
     }
 
     fn list_names(page: &Value) -> Vec<&str> {
