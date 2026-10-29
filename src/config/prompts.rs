@@ -28,7 +28,8 @@ pub(crate) const DEFAULT_MEMORY_INSTRUCTIONS: &str = indoc! {"
           [[wikilinks]] left dangling in other files.
         - `memory__edit_index(scope, content)`: Replace the entire MEMORY.md at the given scope.
           Use this to add always-on facts, reorganize, prune stale entries, or fix descriptions.
-        - `memory__list()`: See all known drill files and their metadata.
+        - `memory__list(type?, scope?, k?, offset?)`: Page through drill files and their metadata
+          (50 per page by default; `total` counts every match).
         - `memory__search(query)`: Rank drill files by relevance to a query. Search here before
           minting a new slug, so an existing file gets updated instead of duplicated.
         - `memory__lint()`: Health-check memory for orphans, broken links, oversized files,
@@ -40,7 +41,8 @@ pub(crate) const DEFAULT_MEMORY_INSTRUCTIONS: &str = indoc! {"
         - Run and round state belongs in the session, the todo list or the plan repo. If it must be
           a memory, give it `type: run-state` with an `expires` date.
         - Before writing, look for an existing slug to update: scan the `<catalogue>` block in your
-          prompt (`memory__read` is slug-exact and cannot read the index). Never mint a `-rN` sibling
+          prompt (`memory__read` is slug-exact and cannot read the index), or call `memory__search`
+          when the slug is not there, since the catalogue can be cut. Never mint a `-rN` sibling
           when the base slug can be rewritten. Writing `<base>-r<N>` applies the `memory_round_chains`
           key to the older rounds (default `supersede` marks them superseded_by; `keep` leaves them
           alone).
@@ -274,6 +276,19 @@ mod tests {
                 .contains("give it `type: run-state` with an `expires` date")
         );
         assert!(DEFAULT_MEMORY_INSTRUCTIONS.contains("look for an existing slug to update"));
+        assert!(DEFAULT_MEMORY_INSTRUCTIONS.contains("or call `memory__search`"));
+        assert!(
+            DEFAULT_MEMORY_INSTRUCTIONS
+                .contains("when the slug is not there, since the catalogue can be cut")
+        );
+        assert!(DEFAULT_MEMORY_INSTRUCTIONS.contains(
+            "`memory__list(type?, scope?, k?, offset?)`: Page through drill files and their metadata"
+        ));
+        assert!(
+            DEFAULT_MEMORY_INSTRUCTIONS
+                .contains("(50 per page by default; `total` counts every match)")
+        );
+        assert!(!DEFAULT_MEMORY_INSTRUCTIONS.contains("See all known drill files"));
         assert!(DEFAULT_MEMORY_INSTRUCTIONS.contains("Search here before"));
         assert!(DEFAULT_MEMORY_INSTRUCTIONS.contains("`memory__search(query)`"));
         assert!(DEFAULT_MEMORY_INSTRUCTIONS.contains("Never mint a `-rN` sibling"));
