@@ -856,14 +856,19 @@ async fn run_hook(
     // A hook child outlives coyote, so any fd it inherits (a held file lock,
     // say) stays open with it. std opens its fds close-on-exec, but other
     // code and libraries may not; stdio 0-2 are already redirected above.
+    // The fds are marked close-on-exec rather than closed so std's own
+    // exec-error pipe survives and an exec failure still reaches spawn().
     #[cfg(unix)]
     {
         let cap = inherited_fd_cap();
-        // SAFETY: the closure only calls close(2), which is async-signal-safe.
+        // SAFETY: the closure only calls fcntl(2), which is async-signal-safe.
         unsafe {
             command.pre_exec(move || {
                 for fd in 3..cap {
-                    libc::close(fd);
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+                        libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                    }
                 }
                 Ok(())
             });
@@ -889,10 +894,10 @@ async fn run_hook(
     }
 }
 
-/// The exclusive upper bound of fds a hook child closes before exec. It is
+/// The exclusive upper bound of fds a hook child marks close-on-exec. It is
 /// computed in the parent because sysconf(3) is not async-signal-safe, and
 /// capped because macOS reports the RLIMIT_NOFILE soft limit, which can be
-/// effectively unlimited.
+/// effectively unlimited. Fds at or above 65536 are deliberately left alone.
 #[cfg(unix)]
 fn inherited_fd_cap() -> libc::c_int {
     // SAFETY: sysconf has no preconditions.
@@ -2605,6 +2610,39 @@ mod tests {
         use std::fs::create_dir_all;
         use std::path::PathBuf;
         use std::time::Duration;
+
+        #[tokio::test(flavor = "multi_thread")]
+        #[serial]
+        async fn exec_failure_reaches_the_spawn_error_branch() {
+            testing::install_log_collector();
+            let guard = TestConfigDirGuard::new("hooks-dispatch");
+            // An empty PATH directory leaves `sh` unresolvable, so the
+            // failure happens at exec time, after the pre_exec closure.
+            let empty_path = guard.path.join("empty-path");
+            create_dir_all(&empty_path).unwrap();
+            let hooks = vec![ResolvedHook {
+                name: "execfail-marker-a7e".to_string(),
+                full_name: "turn.failed.execfail-marker-a7e".to_string(),
+                command: "true".to_string(),
+                cwd: guard.path.clone(),
+            }];
+
+            fire_resolved(
+                HookEvent::TurnFailed,
+                hooks,
+                vec![("PATH".to_string(), empty_path.display().to_string())],
+                &[],
+                None,
+            );
+            drain_pending(Duration::from_secs(10)).await;
+
+            assert!(
+                testing::debug_snapshot().iter().any(|message| {
+                    message.contains("Failed to spawn hook 'turn.failed.execfail-marker-a7e'")
+                }),
+                "an exec failure must surface as a spawn error"
+            );
+        }
 
         #[tokio::test(flavor = "multi_thread")]
         #[serial]
