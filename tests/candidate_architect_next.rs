@@ -1291,6 +1291,89 @@ fn dry_run_with_the_run_id_in_the_prompt_re_enters_the_run_instead_of_starting_a
     assert_no_bytecode_under_candidate();
 }
 
+/// The converse of re-entry: the README promises that a prompt naming a run
+/// id re-enters *that* run, so an id with no durable state behind it must
+/// not be treated as one. A first dry run whose prompt names an id nobody
+/// minted still reaches `ask_user` (the binary neither exits nor hangs on
+/// the missing state), takes the fresh-run path (`resume_route` never
+/// runs), and leaves exactly one run dir whose id is the engine's own, not
+/// the one the prompt named.
+#[test]
+fn dry_run_with_an_unknown_run_id_in_the_prompt_starts_a_fresh_run() {
+    if python3().is_none() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let scratch = scratch_dir("unknownid");
+    let project = dry_run_config_dir(&scratch);
+    let runs_root = scratch.0.join("cache").join(CANDIDATE).join("runs");
+    let bogus = "20991231T235959-deadbeef";
+
+    let lines = dry_run_until_ask_user_with_prompt(
+        &scratch,
+        &project,
+        &[],
+        "unknown id",
+        &format!("Architect run id: {bogus} -- continue"),
+    );
+    let mut cursor = 0;
+    for needle in [
+        "graph: architect-next (start: intake)",
+        "intake (script) done",
+        "ask_user (input) start",
+    ] {
+        let hit = lines[cursor..].iter().position(|l| l.contains(needle));
+        let idx = hit.unwrap_or_else(|| {
+            panic!(
+                "unknown id: {needle:?} missing after line {cursor}:\n{}",
+                lines.join("\n")
+            )
+        });
+        cursor += idx + 1;
+    }
+    assert!(
+        !lines.iter().any(|l| l.contains("resume_route (script)")),
+        "unknown id: an id with no durable state was resumed:\n{}",
+        lines.join("\n")
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.contains("Traceback") || l.contains("panicked")),
+        "unknown id: the gates crashed instead of starting a fresh run:\n{}",
+        lines.join("\n")
+    );
+
+    let runs: Vec<String> = fs::read_dir(&runs_root)
+        .unwrap_or_else(|e| {
+            panic!(
+                "unknown id: runs root {} unreadable: {e}",
+                runs_root.display()
+            )
+        })
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        runs.len(),
+        1,
+        "unknown id: exactly one fresh run dir under {}: {runs:?}",
+        runs_root.display()
+    );
+    assert_ne!(
+        runs[0], bogus,
+        "unknown id: the run dir took the prompt's id instead of a minted one"
+    );
+    let state = fs::read_to_string(runs_root.join(&runs[0]).join("state.json")).unwrap();
+    let state: serde_json::Value = serde_json::from_str(&state).unwrap();
+    assert_eq!(state["run_id"].as_str(), Some(runs[0].as_str()));
+    assert_ne!(
+        state["resume_mode"].as_bool(),
+        Some(true),
+        "unknown id: state.json records a resume that never happened"
+    );
+    assert_no_bytecode_under_candidate();
+}
+
 // ---------------------------------------------------------------------------
 // README ground truth. The candidate's README is user documentation: every
 // file:line it cites, every count it states and every node, agent and pin it
@@ -1620,5 +1703,53 @@ fn readme_documented_gap_assemble_pr_body_runs_without_tasks() {
         !passes_tasks && readme_owns_gap,
         "README gap row and gates.py disagree: call passes tasks = {passes_tasks}, \
          README documents the gap = {readme_owns_gap}\n{call}"
+    );
+}
+
+/// The README's `dead hygiene_pending_for_chain guard` row and its
+/// `gates.py 1 hunk` census line describe one deletion: `stack_gate` no
+/// longer reads a state key nothing writes. The staging tree is not in this
+/// repo, so this pins the shape the row describes: the key appears nowhere
+/// in the shipped scripts or graph (no reader was kept, no writer was
+/// invented), and the guard that survives in `stack_gate` is the
+/// `closeout_scope != "run"` one the row says stays. The README row itself
+/// must still be present while the deletion is the recorded divergence.
+#[test]
+fn readme_census_row_dead_hygiene_guard_matches_the_shipped_gates() {
+    let key = "hygiene_pending_for_chain";
+    let mut carriers = Vec::new();
+    let mut pending = vec![
+        candidate_dir().join("scripts"),
+        candidate_dir().join("graph.yaml"),
+    ];
+    while let Some(path) = pending.pop() {
+        if path.is_dir() {
+            pending.extend(fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
+            continue;
+        }
+        if fs::read_to_string(&path).is_ok_and(|text| text.contains(key)) {
+            carriers.push(path.strip_prefix(candidate_dir()).unwrap().to_path_buf());
+        }
+    }
+    assert!(
+        carriers.is_empty(),
+        "README says `{key}` has no reader and no writer; found in {carriers:?}"
+    );
+
+    let gates = fs::read_to_string(candidate_dir().join("scripts/gates.py")).unwrap();
+    let start = gates
+        .find("def stack_gate(")
+        .expect("gates.py defines stack_gate");
+    let end = gates[start..]
+        .find("\ndef ")
+        .map_or(gates.len(), |i| start + i);
+    let body = &gates[start..end];
+    assert!(
+        body.contains("state.get(\"closeout_scope\") != \"run\""),
+        "stack_gate lost the closeout_scope guard the README row says survives:\n{body}"
+    );
+    assert!(
+        readme().contains("| dead `hygiene_pending_for_chain` guard |"),
+        "the README lost its dead-guard census row while gates.py still carries the deletion"
     );
 }
