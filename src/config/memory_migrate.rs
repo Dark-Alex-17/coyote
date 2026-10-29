@@ -203,16 +203,23 @@ fn plan_scope(label: &'static str, dir: &Path, today: &str) -> Result<ScopeRepor
             }
         }
 
-        let mut tail = kept.len();
-        while tail > 0 && kept[tail - 1].trim().is_empty() {
-            tail -= 1;
-        }
-        if tail > 0 && kept[tail - 1].trim() == DRILL_FILES_HEADING {
-            kept.truncate(tail - 1);
-            while kept.last().is_some_and(|l| l.trim().is_empty()) {
-                kept.pop();
+        if let Some(start) = kept.iter().position(|l| l.trim() == DRILL_FILES_HEADING) {
+            let end = kept[start + 1..]
+                .iter()
+                .position(|l| l.trim_start().starts_with('#'))
+                .map_or(kept.len(), |n| start + 1 + n);
+            if kept[start + 1..end].iter().all(|l| l.trim().is_empty()) {
+                let at_end = end == kept.len();
+                kept.drain(start..end);
+                // Mid-index, the blank line before the heading now separates the
+                // previous section from the next one; at the end it is stray.
+                if at_end {
+                    while kept.last().is_some_and(|l| l.trim().is_empty()) {
+                        kept.pop();
+                    }
+                }
+                report.drill_heading_dropped = true;
             }
-            report.drill_heading_dropped = true;
         }
 
         report.facts_lines = kept
@@ -979,6 +986,27 @@ mod tests {
             text.contains("  empty `## Drill files` heading dropped\n"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn an_emptied_drill_section_mid_index_is_dropped_and_the_next_section_kept() {
+        let fx = Fixture::new("heading_drop_mid");
+        let facts = "## Always-on facts\n- **Fact.** kept\n\n";
+        let after = "## Later notes\n- **Other.** stays put\n\n# Appendix\ntext\n";
+        let index_path = fx.global.join(MEMORY_INDEX_FILE_NAME);
+        fs::write(
+            &index_path,
+            format!("{facts}## Drill files\n- [[g-note]]: global note\n\n{after}"),
+        )
+        .unwrap();
+
+        let report = fx.migrate(true);
+
+        assert_eq!(
+            fs::read_to_string(&index_path).unwrap(),
+            format!("{facts}{after}")
+        );
+        assert!(scope(&report, "global").drill_heading_dropped);
     }
 
     #[test]
