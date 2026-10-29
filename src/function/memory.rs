@@ -24,6 +24,7 @@ pub const MEMORY_FUNCTION_PREFIX: &str = "memory__";
 const PER_FILE_SOFT_CAP: usize = 2_000;
 const MEMORY_SLUG_MAX_LEN: usize = 64;
 const DEFAULT_SEARCH_K: usize = 10;
+const DEFAULT_LIST_K: usize = 50;
 
 pub fn memory_function_declarations() -> Vec<FunctionDeclaration> {
     vec![
@@ -200,10 +201,10 @@ pub fn memory_function_declarations() -> Vec<FunctionDeclaration> {
                         },
                     ),
                     (
-                        "limit".to_string(),
+                        "k".to_string(),
                         JsonSchema {
                             type_value: Some("integer".to_string()),
-                            description: Some("Most files to return (default all)".into()),
+                            description: Some("Most files to return (default 50)".into()),
                             ..Default::default()
                         },
                     ),
@@ -530,7 +531,7 @@ fn count_arg(args: &Value, key: &str, default: usize) -> Result<usize> {
 fn list_entries(store: &MemoryStore, args: &Value) -> Result<Value> {
     let filter = filter_arg(args)?;
     let offset = count_arg(args, "offset", 0)?;
-    let limit = count_arg(args, "limit", usize::MAX)?;
+    let limit = count_arg(args, "k", DEFAULT_LIST_K)?;
     let today = today_string();
     let catalogue = store.catalogue()?;
     let admitted: Vec<_> = catalogue
@@ -3469,34 +3470,43 @@ mod tests {
             handle_memory_tool(ctx, "memory__list", &args).unwrap()
         };
 
-        let first = list(&mut ctx, json!({"scope": "global", "limit": 2}));
+        let first = list(&mut ctx, json!({"scope": "global", "k": 2}));
         assert_eq!(list_names(&first), ["note-1", "note-2"], "{first}");
         assert_eq!(first["total"], 5);
         assert_eq!(first["offset"], 0);
         assert_eq!(first["returned"], 2);
 
-        let middle = list(
-            &mut ctx,
-            json!({"scope": "global", "offset": 2, "limit": 2}),
-        );
+        let middle = list(&mut ctx, json!({"scope": "global", "offset": 2, "k": 2}));
         assert_eq!(list_names(&middle), ["note-3", "note-5"], "{middle}");
         assert_eq!(middle["total"], 5);
         assert_eq!(middle["offset"], 2);
         assert_eq!(middle["returned"], 2);
 
-        let past_end = list(
-            &mut ctx,
-            json!({"scope": "global", "offset": 9, "limit": 2}),
-        );
+        let past_end = list(&mut ctx, json!({"scope": "global", "offset": 9, "k": 2}));
         assert!(list_names(&past_end).is_empty(), "{past_end}");
         assert_eq!(past_end["total"], 5);
         assert_eq!(past_end["offset"], 9);
         assert_eq!(past_end["returned"], 0);
 
-        let err = handle_memory_tool(&mut ctx, "memory__list", &json!({"limit": -1}))
+        let err = handle_memory_tool(&mut ctx, "memory__list", &json!({"k": -1}))
             .unwrap_err()
             .to_string();
-        assert_eq!(err, "limit must be a non-negative integer");
+        assert_eq!(err, "k must be a non-negative integer");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn memory_list_returns_fifty_files_when_no_page_is_given() {
+        let _guard = crate::testing::TestConfigDirGuard::new("memory-list-default-k");
+        let names: Vec<String> = (0..60).map(|i| format!("note-{i:02}")).collect();
+        let files: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "")).collect();
+        let mut ctx = global_memory_ctx(&files);
+
+        let page =
+            handle_memory_tool(&mut ctx, "memory__list", &json!({"scope": "global"})).unwrap();
+        assert_eq!(page["returned"], 50, "{page}");
+        assert_eq!(page["total"], 60, "{page}");
+        assert_eq!(list_names(&page).len(), 50);
     }
 
     #[test]
@@ -3508,7 +3518,7 @@ mod tests {
         let users = handle_memory_tool(
             &mut ctx,
             "memory__list",
-            &json!({"scope": "global", "type": "user", "offset": 1, "limit": 5}),
+            &json!({"scope": "global", "type": "user", "offset": 1, "k": 5}),
         )
         .unwrap();
         assert_eq!(list_names(&users), ["note-3", "note-6"], "{users}");
@@ -3519,7 +3529,7 @@ mod tests {
         let with_stale = handle_memory_tool(
             &mut ctx,
             "memory__list",
-            &json!({"scope": "global", "type": "user", "include_stale": true, "offset": 2, "limit": 1}),
+            &json!({"scope": "global", "type": "user", "include_stale": true, "offset": 2, "k": 1}),
         )
         .unwrap();
         assert_eq!(list_names(&with_stale), ["note-4"], "{with_stale}");
