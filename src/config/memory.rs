@@ -337,16 +337,20 @@ fn parse_frontmatter(raw: &str) -> Result<(MemoryFrontmatter, serde_yaml::Mappin
     let Some(end) = after.find("\n---") else {
         return Ok((Default::default(), Default::default(), raw.to_string()));
     };
-    let yaml = &after[..end];
+    let yaml = after[..end].trim();
     let body = after[end + 4..].trim_start_matches('\n').to_string();
-    let source = match serde_yaml::from_str(yaml.trim()).context("parse YAML frontmatter")? {
+    let source = match serde_yaml::from_str(yaml).context("parse YAML frontmatter")? {
         serde_yaml::Value::Mapping(mapping) => mapping,
         serde_yaml::Value::Null => serde_yaml::Mapping::new(),
         _ => bail!("YAML frontmatter is not a mapping"),
     };
-    let frontmatter: MemoryFrontmatter =
-        serde_yaml::from_value(serde_yaml::Value::Mapping(source.clone()))
-            .context("parse YAML frontmatter")?;
+    // Deserializing from text rather than from `source` lets a plain scalar such as
+    // `description: 42` or `name: 2024` load into a String field.
+    let frontmatter: MemoryFrontmatter = if source.is_empty() {
+        MemoryFrontmatter::default()
+    } else {
+        serde_yaml::from_str(yaml).context("parse YAML frontmatter")?
+    };
 
     Ok((frontmatter, source, body))
 }
@@ -1316,6 +1320,39 @@ mod tests {
         let err = parse_frontmatter("---\n- a\n---").unwrap_err();
 
         assert_eq!(err.to_string(), "YAML frontmatter is not a mapping");
+    }
+
+    #[test]
+    fn parse_frontmatter_reads_plain_scalars_as_text() {
+        let (fm, _, _) =
+            parse_frontmatter("---\nname: 2024\ndescription: 42\ncreated: 2026\n---\nbody\n")
+                .unwrap();
+        assert_eq!(fm.name, "2024");
+        assert_eq!(fm.description.as_deref(), Some("42"));
+
+        let (fm, _, _) = parse_frontmatter("---\nname: flag\ndescription: yes\n---\n").unwrap();
+        assert_eq!(fm.description.as_deref(), Some("yes"));
+    }
+
+    #[test]
+    fn a_file_with_plain_scalar_front_matter_survives_a_render_round_trip() {
+        let root = temp_root("scalar-roundtrip");
+        let path = root.join("2024.md");
+        fs::write(
+            &path,
+            "---\nname: 2024\ndescription: 42\ntype: user\n---\nbody\n",
+        )
+        .unwrap();
+
+        let loaded = MemoryFile::load(&path).unwrap();
+        fs::write(&path, loaded.render().unwrap()).unwrap();
+        let reloaded = MemoryFile::load(&path).unwrap();
+
+        assert_eq!(reloaded.frontmatter.name, "2024");
+        assert_eq!(reloaded.frontmatter.description.as_deref(), Some("42"));
+        assert_eq!(reloaded.body, "body\n");
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
