@@ -21,9 +21,12 @@
 
 use std::ffi::OsString;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Output, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "architect-next";
 const SMOKE_FLOOR: usize = 304;
@@ -615,4 +618,244 @@ fn no_gate_names_a_toolchain_command() {
             "exemption {file}: {needle:?} must match exactly one line"
         );
     }
+}
+
+fn copy_tree(src: &Path, dst: &Path) {
+    fs::create_dir_all(dst).unwrap();
+    for entry in fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let target = dst.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+/// The node trace of one real-binary dry run of the candidate, in order,
+/// from `graph: architect-next` to the moment `ask_user` starts.
+const EXPECTED_WALK: [&str; 7] = [
+    "graph: architect-next (start: intake)",
+    "intake (script) done",
+    "orient_read (llm) done",
+    "orient_fault (script) done",
+    "escalate_gate (script) done",
+    "ask_dispatch (script) done",
+    "ask_user (input) start",
+];
+
+/// A scratch `COYOTE_CONFIG_DIR` holding the three agent dirs the candidate
+/// reaches at run time (`.shared`, the prose `architect` whose `tools.sh` the
+/// gates call, and the candidate itself), a dry-run `config.yaml`, and a
+/// project dir with one readable design doc. Returns the project dir.
+fn dry_run_config_dir(scratch: &TempDirGuard) -> PathBuf {
+    let dir = &scratch.0;
+    let agents = dir.join("agents");
+    for name in [".shared", "architect", CANDIDATE] {
+        copy_tree(&agents_dir().join(name), &agents.join(name));
+    }
+    let vault_pass = dir.join("vault-pass");
+    fs::write(&vault_pass, "test-password\n").unwrap();
+    fs::write(
+        dir.join("config.yaml"),
+        format!(
+            "model: dryrun:dry-model\ndry_run: true\nvault_password_file: '{}'\nclients:\n  - type: openai\n    name: dryrun\n    auth: none\n    api_key: 'unused'\n    models:\n      - name: dry-model\n        max_input_tokens: 100000\n        supports_function_calling: true\nsave: false\nmemory: false\nstream: false\n",
+            vault_pass.display()
+        ),
+    )
+    .unwrap();
+    let project = dir.join("project");
+    fs::create_dir_all(project.join("plans")).unwrap();
+    fs::write(
+        project.join("plans").join("PLAN-x.md"),
+        "# Design: probe\n\n## Goal\nA one-task probe design.\n",
+    )
+    .unwrap();
+    project
+}
+
+/// Dry-runs the candidate by name through the real binary until the trace
+/// reaches `ask_user` (an input node that waits on a terminal, so the child
+/// is killed there) and returns the trace lines seen. `extra_env` lays
+/// run-dir variables over the scratch defaults.
+fn dry_run_until_ask_user(
+    scratch: &TempDirGuard,
+    project: &Path,
+    extra_env: &[(&str, PathBuf)],
+    label: &str,
+) -> Vec<String> {
+    let dir = &scratch.0;
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_coyote"));
+    cmd.args([
+        "--agent",
+        CANDIDATE,
+        "--dry-run",
+        "Implement the plan at plans/PLAN-x.md",
+    ])
+    .current_dir(project)
+    .env("HOME", dir.join("home"))
+    .env("COYOTE_CONFIG_DIR", dir)
+    .env("COYOTE_CACHE_DIR", dir.join("cache"))
+    .env("TMPDIR", dir.join("tmp"))
+    .env("PYTHONDONTWRITEBYTECODE", "1")
+    .env("NO_COLOR", "1")
+    .env_remove("ARCHITECT_RUNS_ROOT")
+    .env_remove("XDG_CACHE_HOME")
+    .env_remove("COYOTE_LOG_PATH")
+    .env_remove("IS_SANDBOX")
+    .env_remove("GRAPH_STATE")
+    .env_remove("GRAPH_STATE_FILE")
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+    let mut child = cmd.spawn().unwrap();
+
+    let (tx, rx) = mpsc::channel::<String>();
+    for stream in [
+        Box::new(child.stdout.take().unwrap()) as Box<dyn std::io::Read + Send>,
+        Box::new(child.stderr.take().unwrap()),
+    ] {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    drop(tx);
+
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut lines = Vec::new();
+    let mut reached_ask_user = false;
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(line) => {
+                let done = line.contains("ask_user (input) start");
+                lines.push(line);
+                if done {
+                    reached_ask_user = true;
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(status) = child.try_wait().unwrap() {
+                    lines.extend(rx.try_iter());
+                    panic!(
+                        "{label}: the binary exited ({status}) before ask_user:\n{}",
+                        lines.join("\n")
+                    );
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        reached_ask_user,
+        "{label}: ask_user never started within the deadline:\n{}",
+        lines.join("\n")
+    );
+    lines
+}
+
+/// Asserts `root` holds exactly one run dir carrying the gates' durable
+/// state and the brief the run was started with; returns the run dir.
+fn single_run_under(root: &Path, label: &str) -> PathBuf {
+    let mut runs: Vec<PathBuf> = fs::read_dir(root)
+        .unwrap_or_else(|e| panic!("{label}: runs root {} unreadable: {e}", root.display()))
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(
+        runs.len(),
+        1,
+        "{label}: exactly one run dir under {}: {runs:?}",
+        root.display()
+    );
+    let run = runs.pop().unwrap();
+    for file in ["state.json", "brief.md", "decisions.md"] {
+        assert!(
+            run.join(file).is_file(),
+            "{label}: {file} missing under {}",
+            run.display()
+        );
+    }
+    let brief = fs::read_to_string(run.join("brief.md")).unwrap();
+    assert!(
+        brief.contains("Implement the plan at plans/PLAN-x.md"),
+        "{label}: brief.md does not carry the prompt: {brief:?}"
+    );
+    run
+}
+
+/// The candidate is reachable only as `coyote -a architect-next`: run that
+/// way from a scratch config dir against a readable design doc, the real
+/// binary walks `intake -> orient_read -> orient_fault -> escalate_gate ->
+/// ask_dispatch -> ask_user` in that order (the dry-run model answers no
+/// schema, so `orient_read` falls back to `orient_fault`), and the gates put
+/// the run dir at `$COYOTE_CACHE_DIR/architect-next/runs/<run_id>/`, not
+/// anywhere under `HOME`. With `ARCHITECT_RUNS_ROOT` set the run lands
+/// directly under that root and the cache dir gets no `architect-next` at all.
+#[test]
+fn dry_run_by_name_walks_to_ask_user_and_pins_the_run_dir() {
+    if python3().is_none() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let scratch = scratch_dir("dryrun");
+    let project = dry_run_config_dir(&scratch);
+    let dir = scratch.0.clone();
+
+    let lines = dry_run_until_ask_user(&scratch, &project, &[], "cache dir");
+    let mut cursor = 0;
+    for needle in EXPECTED_WALK {
+        let hit = lines[cursor..].iter().position(|l| l.contains(needle));
+        let idx = hit.unwrap_or_else(|| {
+            panic!(
+                "cache dir: {needle:?} missing after line {cursor}:\n{}",
+                lines.join("\n")
+            )
+        });
+        cursor += idx + 1;
+    }
+    let runs_root = dir.join("cache").join(CANDIDATE).join("runs");
+    single_run_under(&runs_root, "cache dir");
+    // The engine's own tooling may populate `HOME` (uv caches and the like);
+    // what must not appear is the candidate's former run root or any run
+    // state named after it.
+    let legacy = dir.join("home").join(".local").join("state").join("coyote");
+    assert!(
+        !legacy.exists(),
+        "cache dir: legacy run root created at {}",
+        legacy.display()
+    );
+    let leaked: Vec<String> = files_under(&dir.join("home"))
+        .into_iter()
+        .filter(|rel| rel.contains("architect"))
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "cache dir: run state leaked under HOME: {leaked:?}"
+    );
+
+    let override_root = dir.join("override");
+    dry_run_until_ask_user(
+        &scratch,
+        &project,
+        &[("ARCHITECT_RUNS_ROOT", override_root.clone())],
+        "override",
+    );
+    single_run_under(&override_root, "override");
+    assert_eq!(
+        fs::read_dir(&runs_root).unwrap().count(),
+        1,
+        "override: the cache-dir root must not gain a second run"
+    );
+    assert_no_bytecode_under_candidate();
 }
