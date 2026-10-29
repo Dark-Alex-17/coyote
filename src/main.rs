@@ -183,7 +183,12 @@ async fn async_main() -> Result<()> {
     }
 
     if let Some(scope) = cli.memory_migrate {
-        let report = memory_migrate::run(scope, cli.apply)?;
+        let round_chains = memory_migrate::configured_round_chains().unwrap_or_else(|e| {
+            let fallback = Default::default();
+            eprintln!("warning: {e:#}; migrating with memory_round_chains: {fallback}");
+            fallback
+        });
+        let report = memory_migrate::run(scope, cli.apply, round_chains)?;
         print!("{report}");
         return report.into_result();
     }

@@ -743,9 +743,9 @@ pub(crate) fn round_chain_name(name: &str) -> Option<(&str, u32)> {
     Some((base, digits.parse().ok()?))
 }
 
-struct RoundSibling {
+pub(crate) struct RoundSibling {
     round: u32,
-    name: String,
+    pub(crate) name: String,
     path: PathBuf,
 }
 
@@ -753,7 +753,7 @@ struct RoundSibling {
 /// scanned: a chain never crosses scopes, and a symlink is never followed, so
 /// settling a round cannot rewrite a file outside the scope. A directory that
 /// does not exist yet simply has no rounds.
-fn scan_round_siblings(dir: &Path, base: &str) -> Result<Vec<RoundSibling>> {
+pub(crate) fn scan_round_siblings(dir: &Path, base: &str) -> Result<Vec<RoundSibling>> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -789,6 +789,12 @@ fn scan_round_siblings(dir: &Path, base: &str) -> Result<Vec<RoundSibling>> {
     }
     found.sort_by(|a, b| a.round.cmp(&b.round).then_with(|| a.name.cmp(&b.name)));
     Ok(found)
+}
+
+/// Whether an older round whose `superseded_by` is `mark` gets pointed at
+/// its successor: never under `Keep`, and never over an existing mark.
+pub(crate) fn marks_older_round(round_chains: RoundChains, mark: Option<&str>) -> bool {
+    round_chains != RoundChains::Keep && mark.is_none()
 }
 
 /// One row per older round, after any supersede update. A sibling that cannot
@@ -832,7 +838,7 @@ fn settle_round_sibling(
             file.frontmatter.name
         );
     }
-    if round_chains == RoundChains::Keep || mark.is_some() {
+    if !marks_older_round(round_chains, mark.as_deref()) {
         return Ok(());
     }
     file.frontmatter.superseded_by = Some(successor.to_string());
