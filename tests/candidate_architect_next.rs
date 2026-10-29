@@ -242,12 +242,16 @@ fn session_block_check_passes_under_mikefarah_yq() {
 /// Opt-in: the walk runs all 48 mode combinations through the real gates
 /// inside scratch repos and takes three to five minutes, so it is ignored by
 /// default and run with `cargo test --test candidate_architect_next -- --ignored`.
+/// `mode_matrix.py` loads the graph through `yq -o=json`, so like the audit
+/// and the session check it needs the mikefarah build and skips otherwise.
 #[test]
 #[ignore]
 fn mode_matrix_walks_every_combination() {
     let Some(python) = python3() else { return };
+    let Some(yq) = mikefarah_yq() else { return };
     let scratch = scratch_dir("matrix");
     let output = battery(&python, &scratch)
+        .env("PATH", path_with(yq.parent().unwrap()))
         .arg("scripts/mode_matrix.py")
         .output()
         .unwrap();
@@ -255,6 +259,13 @@ fn mode_matrix_walks_every_combination() {
     assert!(output.status.success(), "{report}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!stdout.lines().any(|l| l.starts_with("FAIL ")), "{report}");
+    // The walk copies the repo's `.shared/utils.sh` into the scratch root and
+    // exits before any combination runs if that file is missing or lacks
+    // `set -euo pipefail`; the confirmation line proves the real file was used.
+    assert!(
+        stdout.lines().any(|l| l == "utils.sh: real asset"),
+        "{report}"
+    );
     let (passed, total) = summary_counts(&stdout, &report);
     assert_eq!(passed, total, "{report}");
     assert!(
@@ -650,10 +661,19 @@ const EXPECTED_WALK: [&str; 7] = [
 /// gates call, and the candidate itself), a dry-run `config.yaml`, and a
 /// project dir with one readable design doc. Returns the project dir.
 fn dry_run_config_dir(scratch: &TempDirGuard) -> PathBuf {
+    dry_run_config_dir_with(scratch, true)
+}
+
+/// `dry_run_config_dir` with the agent copies optional: a consumer's first
+/// run starts from a config dir that holds nothing but `config.yaml`, and the
+/// engine installs the bundled agents (the candidate included) on that run.
+fn dry_run_config_dir_with(scratch: &TempDirGuard, copy_agents: bool) -> PathBuf {
     let dir = &scratch.0;
-    let agents = dir.join("agents");
-    for name in [".shared", "architect", CANDIDATE] {
-        copy_tree(&agents_dir().join(name), &agents.join(name));
+    if copy_agents {
+        let agents = dir.join("agents");
+        for name in [".shared", "architect", CANDIDATE] {
+            copy_tree(&agents_dir().join(name), &agents.join(name));
+        }
     }
     let vault_pass = dir.join("vault-pass");
     fs::write(&vault_pass, "test-password\n").unwrap();
@@ -858,4 +878,311 @@ fn dry_run_by_name_walks_to_ask_user_and_pins_the_run_dir() {
         "override: the cache-dir root must not gain a second run"
     );
     assert_no_bytecode_under_candidate();
+}
+
+/// A consumer's first run: a config dir holding nothing but `config.yaml`
+/// (no agent copied in), `coyote -a architect-next --dry-run ...`. The
+/// engine installs the bundled agents on that run (the candidate among
+/// them), walks the same `intake -> ... -> ask_user` path and puts the run
+/// dir under `$COYOTE_CACHE_DIR/architect-next/runs/`.
+#[test]
+fn dry_run_by_name_from_an_empty_config_dir_installs_the_candidate_and_walks_to_ask_user() {
+    if python3().is_none() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let scratch = scratch_dir("coldstart");
+    let project = dry_run_config_dir_with(&scratch, false);
+    let dir = scratch.0.clone();
+    assert!(
+        !dir.join("agents").exists(),
+        "cold start: the config dir must hold no agents before the run"
+    );
+
+    let lines = dry_run_until_ask_user(&scratch, &project, &[], "cold start");
+    let mut cursor = 0;
+    for needle in EXPECTED_WALK {
+        let hit = lines[cursor..].iter().position(|l| l.contains(needle));
+        let idx = hit.unwrap_or_else(|| {
+            panic!(
+                "cold start: {needle:?} missing after line {cursor}:\n{}",
+                lines.join("\n")
+            )
+        });
+        cursor += idx + 1;
+    }
+    for file in ["graph.yaml", "README.md", "scripts/gates.py"] {
+        assert!(
+            dir.join("agents").join(CANDIDATE).join(file).is_file(),
+            "cold start: the engine did not install {CANDIDATE}/{file} into the config dir"
+        );
+    }
+    single_run_under(
+        &dir.join("cache").join(CANDIDATE).join("runs"),
+        "cold start",
+    );
+    assert_no_bytecode_under_candidate();
+}
+
+// ---------------------------------------------------------------------------
+// README ground truth. The candidate's README is user documentation: every
+// file:line it cites, every count it states and every node, agent and pin it
+// names must match the shipped files, and the one gap it documents must still
+// be open. These flip the moment a later landing moves a line or closes the
+// gap without updating the README.
+// ---------------------------------------------------------------------------
+
+fn readme() -> String {
+    fs::read_to_string(candidate_dir().join("README.md")).unwrap()
+}
+
+/// The first integer captured by `pattern` in the README.
+fn readme_number(pattern: &str) -> usize {
+    let re = fancy_regex::Regex::new(pattern).unwrap();
+    let text = readme();
+    let caps = re
+        .captures(&text)
+        .unwrap()
+        .unwrap_or_else(|| panic!("README no longer states {pattern:?}"));
+    caps[1].parse().unwrap()
+}
+
+/// Every shipped file is ASCII on disk (the README's em-dash row), and the
+/// marker map keeps exactly the `\u2014` JSON escapes the README counts, all
+/// of them inside `first` lines.
+#[test]
+fn shipped_candidate_is_pure_ascii_and_the_marker_map_keeps_its_escapes() {
+    let mut offenders = Vec::new();
+    let mut seen = 0;
+    for rel in files_under(&candidate_dir()) {
+        if rel.contains("__pycache__") {
+            continue;
+        }
+        seen += 1;
+        let bytes = fs::read(candidate_dir().join(&rel)).unwrap();
+        if let Some(pos) = bytes.iter().position(|b| !b.is_ascii()) {
+            let line = bytes[..pos].iter().filter(|b| **b == b'\n').count() + 1;
+            offenders.push(format!("{rel}:{line}: byte 0x{:02x}", bytes[pos]));
+        }
+    }
+    assert!(seen > 80, "the ASCII sweep saw only {seen} files");
+    assert!(
+        offenders.is_empty(),
+        "non-ASCII bytes in shipped files:\n{}",
+        offenders.join("\n")
+    );
+
+    let expected = readme_number(r"JSON escapes for (\d+) lines");
+    let raw = fs::read_to_string(candidate_dir().join("scripts/marker_map.json")).unwrap();
+    assert_eq!(
+        raw.matches("\\u2014").count(),
+        expected,
+        "marker_map.json carries a different number of \\u2014 escapes than the README states"
+    );
+    let map: Vec<serde_json::Value> = serde_json::from_str(&raw).unwrap();
+    let in_first = map
+        .iter()
+        .filter(|e| e["first"].as_str().unwrap_or("").contains('\u{2014}'))
+        .count();
+    assert_eq!(
+        in_first, expected,
+        "every escape must sit in a `first` line"
+    );
+}
+
+/// The README's toolchain census block is the live output of the grep it
+/// shows: the same file:line set, no more and no fewer, and the `gates.py`
+/// hits are exactly the lockfile regex plus the two prose lines it cites.
+#[test]
+fn readme_toolchain_census_matches_the_live_grep() {
+    let re = fancy_regex::Regex::new(
+        r"\b(cargo|npm|pnpm|yarn|go (test|build)|pytest|mvn|gradle|make)\b",
+    )
+    .unwrap();
+    let mut live = Vec::new();
+    let mut gates_lines = Vec::new();
+    let mut paths: Vec<PathBuf> = fs::read_dir(candidate_dir().join("scripts"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "py"))
+        .collect();
+    paths.sort();
+    for path in paths {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let text = fs::read_to_string(&path).unwrap();
+        for (idx, line) in text.lines().enumerate() {
+            if re.is_match(line).unwrap() {
+                live.push(format!("scripts/{name}:{}", idx + 1));
+                if name == "gates.py" {
+                    gates_lines.push(idx + 1);
+                }
+            }
+        }
+    }
+
+    let cited_re = fancy_regex::Regex::new(r"(?m)^(scripts/[\w.]+\.py:\d+):").unwrap();
+    let text = readme();
+    let cited: Vec<String> = cited_re
+        .captures_iter(&text)
+        .map(|c| c.unwrap()[1].to_string())
+        .collect();
+    assert!(!cited.is_empty(), "the README census block is gone");
+    assert_eq!(
+        live, cited,
+        "the README census block no longer matches the live grep (left: live, right: README)"
+    );
+    assert_eq!(
+        gates_lines,
+        vec![42, 2511, 2520],
+        "the gates.py toolchain hits moved; update the README census and its prose"
+    );
+    for line in [2511, 2520] {
+        assert!(
+            text.contains(&format!("`gates.py:{line}`")) || text.contains(&format!("`:{line}`")),
+            "the README prose must cite gates.py:{line}"
+        );
+    }
+}
+
+/// The README's counts hold against the graph and the prose twin: two
+/// `agent: sisyphus` lines, the `chat_agent_for: architect` chat lane, and
+/// one marker region in the map per `<!-- when:` region in the landed
+/// `architect/instructions.md`.
+#[test]
+fn readme_counts_match_the_graph_and_the_prose_twin() {
+    let graph = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    assert_eq!(
+        graph
+            .lines()
+            .filter(|l| l.trim() == "agent: sisyphus")
+            .count(),
+        2,
+        "the README promises two `agent: sisyphus` lines"
+    );
+    assert!(
+        graph
+            .lines()
+            .any(|l| l.trim() == "chat_agent_for: architect"),
+        "the README promises `chat_agent_for: architect` in the session block"
+    );
+
+    let regions = readme_number(r"carries (\d+) marker regions");
+    let prose = fs::read_to_string(agents_dir().join("architect/instructions.md")).unwrap();
+    assert_eq!(
+        prose.matches("<!-- when:").count(),
+        regions,
+        "architect/instructions.md carries a different number of marker regions than the README states"
+    );
+    let map: Vec<serde_json::Value> = serde_json::from_str(
+        &fs::read_to_string(candidate_dir().join("scripts/marker_map.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        map.len(),
+        regions,
+        "marker_map.json maps a different number of regions"
+    );
+    let mut ordinals: Vec<u64> = map.iter().map(|e| e["ordinal"].as_u64().unwrap()).collect();
+    ordinals.sort_unstable();
+    let first = ordinals[0];
+    assert_eq!(
+        ordinals,
+        (first..first + regions as u64).collect::<Vec<_>>(),
+        "marker_map.json ordinals must be contiguous"
+    );
+}
+
+/// The README's `build_lock` row names five agent nodes, the agent each runs,
+/// that each of those agents declares `build_lock` itself, and the engine
+/// paths and test pin that make inheritance a fact. All of them must exist as
+/// named.
+#[test]
+fn readme_build_lock_row_names_shipped_nodes_agents_and_pins() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let doc: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let nodes = &doc["nodes"];
+    for (node, agent) in [
+        ("delegate", "sisyphus"),
+        ("wave_delegate", "sisyphus"),
+        ("run_gauntlet", "review-gauntlet"),
+        ("wave_gauntlet", "review-gauntlet"),
+        ("run_adversary", "adversary"),
+    ] {
+        assert_eq!(
+            nodes[node]["type"].as_str(),
+            Some("agent"),
+            "README names {node} as an agent node"
+        );
+        assert_eq!(
+            nodes[node]["agent"].as_str(),
+            Some(agent),
+            "README says {node} runs {agent}"
+        );
+        assert!(
+            nodes[node].get("inputs").is_none()
+                || !nodes[node]["inputs"]
+                    .as_sequence()
+                    .is_some_and(|s| s.iter().any(|i| i.as_str() == Some("build_lock"))),
+            "README says no `inputs: build_lock` is needed on {node}; one appeared"
+        );
+    }
+    for (agent, file) in [
+        ("sisyphus", "config.yaml"),
+        ("review-gauntlet", "graph.yaml"),
+        ("adversary", "graph.yaml"),
+    ] {
+        let vars = variable_list(&agents_dir().join(agent).join(file));
+        assert!(
+            names_of(&vars).contains(&"build_lock"),
+            "README says {agent} declares build_lock itself"
+        );
+    }
+
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    for (file, needle) in [
+        (
+            "function/agents.rs",
+            "fn run_agent_for_graph_child_seats_the_parents_build_lock_over_its_default",
+        ),
+        ("graph/agent.rs", "run_agent_for_graph"),
+        ("graph/executor.rs", "fn seed_variables"),
+        ("config/request_context.rs", "fn new_for_child"),
+    ] {
+        let source = fs::read_to_string(src.join(file)).unwrap();
+        assert!(
+            source.contains(needle),
+            "README cites `{file}` {needle}; it is not there"
+        );
+    }
+}
+
+/// The README records one gap: `pr_body` still calls `assemble_pr_body`
+/// without `--tasks`. While that is true the row must stay; once the call
+/// site passes the task list this test flips and the row must go.
+#[test]
+fn readme_documented_gap_assemble_pr_body_runs_without_tasks() {
+    let gates = fs::read_to_string(candidate_dir().join("scripts/gates.py")).unwrap();
+    let lines: Vec<&str> = gates.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| l.contains("core_tool(\"assemble_pr_body\""))
+        .expect("gates.py calls assemble_pr_body through core_tool");
+    let mut call = String::new();
+    for line in &lines[start..] {
+        call.push_str(line);
+        call.push('\n');
+        if line.trim_end().ends_with(')') {
+            break;
+        }
+    }
+    let passes_tasks = fancy_regex::Regex::new(r"\btasks=")
+        .unwrap()
+        .is_match(&call)
+        .unwrap();
+    let readme_owns_gap = readme().contains("without `--tasks`");
+    assert!(
+        !passes_tasks && readme_owns_gap,
+        "README gap row and gates.py disagree: call passes tasks = {passes_tasks}, \
+         README documents the gap = {readme_owns_gap}\n{call}"
+    );
 }
