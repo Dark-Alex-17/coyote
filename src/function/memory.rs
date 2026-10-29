@@ -685,7 +685,10 @@ fn write_memory(
             expires,
         },
         body: content,
-        source: Default::default(),
+        source: previous
+            .as_ref()
+            .map(|p| p.source.clone())
+            .unwrap_or_default(),
     };
     file.save()?;
 
@@ -2005,6 +2008,56 @@ mod tests {
         );
         assert!(saved.frontmatter.updated.is_some());
         assert_eq!(saved.frontmatter.expires, None);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_memory_overwrite_keeps_unknown_keys_and_key_order() {
+        let root = temp_root("write_keeps_source");
+        let workspace = root.join("ws");
+        let structured = workspace.join(".coyote").join("memory");
+        fs::create_dir_all(&structured).unwrap();
+        fs::write(structured.join("MEMORY.md"), "# Memory Index\n").unwrap();
+        fs::write(
+            structured.join("fact.md"),
+            "---\nowner: alex\nexpires: 2099-01-01\ntype: user\ncreated: 2020-01-01\n\
+             name: fact\ndescription: old\n---\n\nold body\n",
+        )
+        .unwrap();
+        let store = MemoryStore {
+            global_dir: root.join("g"),
+            workspace: discover_workspace_memory(&workspace),
+        };
+
+        let args = json!({
+            "name": "fact",
+            "description": "new",
+            "content": "new body",
+            "scope": "workspace",
+            "type": "project",
+        });
+        write_memory(
+            &store,
+            &workspace,
+            &args,
+            DEFAULT_MEMORY_RUN_STATE_TTL_DAYS,
+            RoundChains::default(),
+        )
+        .unwrap();
+
+        let saved = MemoryFile::load(&structured.join("fact.md")).unwrap();
+        let keys: Vec<&str> = saved.source.keys().map(|k| k.as_str().unwrap()).collect();
+        assert_eq!(
+            keys,
+            ["owner", "type", "created", "name", "description", "updated"]
+        );
+        assert_eq!(saved.source["owner"], "alex");
+        assert_eq!(saved.frontmatter.kind.kind(), MemoryKind::Project);
+        assert_eq!(saved.frontmatter.description.as_deref(), Some("new"));
+        assert_eq!(saved.frontmatter.created.as_deref(), Some("2020-01-01"));
+        assert_eq!(saved.frontmatter.expires, None);
+        assert_eq!(saved.body, "new body");
 
         let _ = fs::remove_dir_all(&root);
     }
