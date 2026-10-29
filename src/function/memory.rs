@@ -11,9 +11,10 @@ use serde_json::{Value, json};
 
 use super::{FunctionDeclaration, JsonSchema};
 use crate::config::memory::{
-    DEFAULT_MEMORY_RUN_STATE_TTL_DAYS, KindField, MEMORY_DESCRIPTION_CAP, MEMORY_FILE_HARD_CAP,
-    MemoryFile, MemoryFrontmatter, MemoryKind, MemoryStore, Retention, WorkspaceMemory,
-    bootstrap_workspace_memory, catalogue_entry, catalogue_slug, find_git_root, today_string,
+    CatalogueEntry, DEFAULT_MEMORY_RUN_STATE_TTL_DAYS, Filter, KindField, MEMORY_DESCRIPTION_CAP,
+    MEMORY_FILE_HARD_CAP, MemoryFile, MemoryFrontmatter, MemoryKind, MemoryStore, Retention, Scope,
+    WorkspaceMemory, bootstrap_workspace_memory, catalogue_entry, catalogue_slug, find_git_root,
+    today_string,
 };
 use crate::config::paths;
 use crate::config::{RequestContext, RoundChains};
@@ -22,6 +23,8 @@ pub const MEMORY_FUNCTION_PREFIX: &str = "memory__";
 
 const PER_FILE_SOFT_CAP: usize = 2_000;
 const MEMORY_SLUG_MAX_LEN: usize = 64;
+const DEFAULT_SEARCH_K: usize = 10;
+const DEFAULT_LIST_K: usize = 50;
 
 pub fn memory_function_declarations() -> Vec<FunctionDeclaration> {
     vec![
@@ -169,22 +172,90 @@ pub fn memory_function_declarations() -> Vec<FunctionDeclaration> {
         },
         FunctionDeclaration {
             name: format!("{MEMORY_FUNCTION_PREFIX}list"),
-            description: "List all live drill files with metadata (size, type, scope). Superseded \
-                          and expired files are hidden unless include_stale is true."
+            description: "List live drill files with metadata (size, type, scope), one page at a \
+                          time. Superseded and expired files are hidden unless include_stale is \
+                          true; `total` counts every file that passed the filters."
                 .to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
-                properties: Some(IndexMap::from([(
-                    "include_stale".to_string(),
-                    JsonSchema {
-                        type_value: Some("boolean".to_string()),
-                        description: Some(
-                            "Also list superseded and expired files, marked `stale: true` (default false)"
-                                .into(),
-                        ),
-                        ..Default::default()
-                    },
-                )])),
+                properties: Some(IndexMap::from([
+                    type_filter_schema(),
+                    scope_filter_schema(),
+                    (
+                        "include_stale".to_string(),
+                        JsonSchema {
+                            type_value: Some("boolean".to_string()),
+                            description: Some(
+                                "Also list superseded and expired files, marked `stale: true` (default false)"
+                                    .into(),
+                            ),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "offset".to_string(),
+                        JsonSchema {
+                            type_value: Some("integer".to_string()),
+                            description: Some("Files to skip before the page starts (default 0)".into()),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "k".to_string(),
+                        JsonSchema {
+                            type_value: Some("integer".to_string()),
+                            description: Some(format!(
+                                "Most files to return (default {DEFAULT_LIST_K})"
+                            )),
+                            ..Default::default()
+                        },
+                    ),
+                ])),
+                ..Default::default()
+            },
+            agent: false,
+        },
+        FunctionDeclaration {
+            name: format!("{MEMORY_FUNCTION_PREFIX}search"),
+            description: "Search drill files by relevance of their name and description to a \
+                          query, including files the MEMORY.md catalogue does not list. Superseded \
+                          and expired files are left out unless include_stale is true."
+                .to_string(),
+            parameters: JsonSchema {
+                type_value: Some("object".to_string()),
+                properties: Some(IndexMap::from([
+                    (
+                        "query".to_string(),
+                        JsonSchema {
+                            type_value: Some("string".to_string()),
+                            description: Some("Words to look for".into()),
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "k".to_string(),
+                        JsonSchema {
+                            type_value: Some("integer".to_string()),
+                            description: Some(format!(
+                                "Most hits to return (default {DEFAULT_SEARCH_K})"
+                            )),
+                            ..Default::default()
+                        },
+                    ),
+                    type_filter_schema(),
+                    scope_filter_schema(),
+                    (
+                        "include_stale".to_string(),
+                        JsonSchema {
+                            type_value: Some("boolean".to_string()),
+                            description: Some(
+                                "Also search superseded and expired files (default false)".into(),
+                            ),
+                            ..Default::default()
+                        },
+                    ),
+                ])),
+                required: Some(vec!["query".to_string()]),
                 ..Default::default()
             },
             agent: false,
@@ -356,18 +427,13 @@ pub fn handle_memory_tool(ctx: &mut RequestContext, cmd_name: &str, args: &Value
             }))
         }
         "list" => {
-            let include_stale = args
-                .get("include_stale")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-
-            Ok(json!({
-                "files": list_entries(&store, include_stale)?,
-                "global_index_exists": paths::global_memory_index_file().exists(),
-                "workspace": store.workspace.as_ref().map(workspace_label),
-            }))
+            let mut page = list_entries(&store, args)?;
+            page["global_index_exists"] = json!(paths::global_memory_index_file().exists());
+            page["workspace"] = json!(store.workspace.as_ref().map(workspace_label));
+            Ok(page)
         }
         "write" => write_memory(&store, &cwd, args, run_state_ttl_days, round_chains),
+        "search" => search_memory(&store, args),
         "rename" => rename_memory(&store, &cwd, args),
         "delete" => delete_memory(&store, &cwd, args),
         "edit_index" => {
@@ -386,34 +452,139 @@ pub fn handle_memory_tool(ctx: &mut RequestContext, cmd_name: &str, args: &Value
     }
 }
 
-fn list_entries(store: &MemoryStore, include_stale: bool) -> Result<Vec<Value>> {
-    let retention = if include_stale {
-        Retention::all()
-    } else {
-        Retention::live()
-    };
+fn type_filter_schema() -> (String, JsonSchema) {
+    (
+        "type".to_string(),
+        JsonSchema {
+            type_value: Some("string".to_string()),
+            description: Some(format!(
+                "Only files of this type: {}",
+                MemoryKind::NAMES.join(" | ")
+            )),
+            ..Default::default()
+        },
+    )
+}
+
+fn scope_filter_schema() -> (String, JsonSchema) {
+    (
+        "scope".to_string(),
+        JsonSchema {
+            type_value: Some("string".to_string()),
+            description: Some(format!(
+                "Only files of this scope: {}",
+                Scope::NAMES.join(" | ")
+            )),
+            ..Default::default()
+        },
+    )
+}
+
+fn search_memory(store: &MemoryStore, args: &Value) -> Result<Value> {
+    let query = arg_str(args, "query")?;
+    let k = count_arg(args, "k", DEFAULT_SEARCH_K)?;
+    let filter = filter_arg(args)?;
     let today = today_string();
-    store
-        .list_files(retention)?
+    let hits: Vec<Value> = store
+        .search(&query, k, &filter)?
+        .into_iter()
+        .map(|hit| {
+            let mut row = json!({
+                "name": hit.entry.name,
+                "description": hit.entry.description,
+                "type": hit.entry.kind.kind().name(),
+                "updated": hit.entry.updated,
+                "scope": hit.entry.scope.name(),
+                "score": hit.score,
+            });
+            mark_raw_type_and_staleness(&mut row, &hit.entry, filter.include_stale, &today)?;
+            Ok(row)
+        })
+        .collect::<Result<_>>()?;
+
+    Ok(json!({ "count": hits.len(), "hits": hits }))
+}
+
+fn mark_raw_type_and_staleness(
+    row: &mut Value,
+    entry: &CatalogueEntry,
+    include_stale: bool,
+    today: &str,
+) -> Result<()> {
+    let kind = &entry.kind;
+    if !kind.raw_kind().is_null() && !kind.is_known() {
+        row["raw_type"] = serde_json::to_value(kind.raw_kind())?;
+    }
+    if include_stale && entry.is_stale(today) {
+        row["stale"] = Value::Bool(true);
+    }
+    Ok(())
+}
+
+fn filter_arg(args: &Value) -> Result<Filter> {
+    Ok(Filter {
+        kind: args
+            .get("type")
+            .and_then(Value::as_str)
+            .map(MemoryKind::from_str)
+            .transpose()?,
+        scope: args
+            .get("scope")
+            .and_then(Value::as_str)
+            .map(Scope::from_str)
+            .transpose()?,
+        include_stale: args
+            .get("include_stale")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+fn count_arg(args: &Value, key: &str, default: usize) -> Result<usize> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(value) => value
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| anyhow!("{key} must be a non-negative integer")),
+    }
+}
+
+fn list_entries(store: &MemoryStore, args: &Value) -> Result<Value> {
+    let filter = filter_arg(args)?;
+    let offset = count_arg(args, "offset", 0)?;
+    let limit = count_arg(args, "k", DEFAULT_LIST_K)?;
+    let today = today_string();
+    let catalogue = store.catalogue()?;
+    let admitted: Vec<_> = catalogue
+        .entries()
         .iter()
+        .filter(|entry| filter.admits(entry, &today))
+        .collect();
+    let entries = admitted
+        .iter()
+        .skip(offset)
+        .take(limit)
         .map(|f| {
-            let kind = &f.frontmatter.kind;
             let mut entry = json!({
-                "name": f.frontmatter.name,
-                "description": f.frontmatter.description,
-                "type": kind.kind().name(),
-                "char_len": f.char_len(),
+                "name": f.name,
+                "description": f.description,
+                "type": f.kind.kind().name(),
+                "scope": f.scope.name(),
+                "char_len": f.char_len,
                 "path": f.path.display().to_string(),
             });
-            if !kind.raw_kind().is_null() && !kind.is_known() {
-                entry["raw_type"] = serde_json::to_value(kind.raw_kind())?;
-            }
-            if include_stale && f.is_stale(&today) {
-                entry["stale"] = Value::Bool(true);
-            }
+            mark_raw_type_and_staleness(&mut entry, f, filter.include_stale, &today)?;
             Ok(entry)
         })
-        .collect()
+        .collect::<Result<Vec<Value>>>()?;
+
+    Ok(json!({
+        "returned": entries.len(),
+        "files": entries,
+        "total": admitted.len(),
+        "offset": offset,
+    }))
 }
 
 fn write_memory(
@@ -3131,14 +3302,17 @@ mod tests {
         )
         .unwrap();
 
-        let by_name = |entries: Vec<Value>| -> IndexMap<String, Value> {
-            entries
-                .into_iter()
+        let by_name = |page: Value| -> IndexMap<String, Value> {
+            page["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .cloned()
                 .map(|e| (e["name"].as_str().unwrap().to_string(), e))
                 .collect()
         };
 
-        let live = by_name(list_entries(&store, false).unwrap());
+        let live = by_name(list_entries(&store, &json!({})).unwrap());
         assert_eq!(live.len(), 3, "{live:?}");
         assert!(!live.contains_key("bygone"));
         assert_eq!(live["known"]["type"], "user");
@@ -3149,11 +3323,256 @@ mod tests {
         assert!(live["untyped"].get("raw_type").is_none());
         assert!(live.values().all(|e| e.get("stale").is_none()));
 
-        let all = by_name(list_entries(&store, true).unwrap());
+        let all = by_name(list_entries(&store, &json!({"include_stale": true})).unwrap());
         assert_eq!(all.len(), 4, "{all:?}");
         assert_eq!(all["bygone"]["stale"], true);
         assert!(all["known"].get("stale").is_none());
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    fn global_memory_ctx(files: &[(&str, &str)]) -> RequestContext {
+        let dir = paths::global_memory_dir();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("MEMORY.md"), "# Memory\n").unwrap();
+        for (name, frontmatter) in files {
+            fs::write(
+                dir.join(format!("{name}.md")),
+                format!("---\nname: {name}\n{frontmatter}---\nbody\n"),
+            )
+            .unwrap();
+        }
+        let ctx = RequestContext::new(
+            std::sync::Arc::new(crate::config::AppState::test_default()),
+            crate::config::WorkingMode::Cmd,
+        );
+        assert!(ctx.should_register_memory_tools());
+        ctx
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn memory_search_tool_returns_ranked_hits_without_an_index_line() {
+        let _guard = crate::testing::TestConfigDirGuard::new("memory-search-tool");
+        let mut ctx = global_memory_ctx(&[
+            (
+                "quokka-care",
+                "description: feeding the quokka\ntype: user\nupdated: 2024-03-01\n",
+            ),
+            ("quokka-old", "description: quokka\nexpires: 2000-01-01\n"),
+            ("unrelated", "description: nothing here\n"),
+        ]);
+
+        let found = handle_memory_tool(
+            &mut ctx,
+            "memory__search",
+            &json!({"query": "quokka feeding", "scope": "global"}),
+        )
+        .unwrap();
+
+        assert_eq!(found["count"], 1, "{found}");
+        let hit = &found["hits"][0];
+        assert_eq!(hit["name"], "quokka-care");
+        assert_eq!(hit["description"], "feeding the quokka");
+        assert_eq!(hit["type"], "user");
+        assert_eq!(hit["updated"], "2024-03-01");
+        assert_eq!(hit["scope"], "global");
+        assert!(hit["score"].as_f64().unwrap() > 0.0);
+
+        let with_stale = handle_memory_tool(
+            &mut ctx,
+            "memory__search",
+            &json!({"query": "quokka", "scope": "global", "include_stale": true, "k": 1}),
+        )
+        .unwrap();
+        assert_eq!(with_stale["count"], 1, "{with_stale}");
+
+        let err = handle_memory_tool(
+            &mut ctx,
+            "memory__search",
+            &json!({"query": "quokka", "scope": "galaxy"}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("global, workspace"), "{err}");
+        let err = handle_memory_tool(&mut ctx, "memory__search", &json!({}))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "query is required");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn memory_search_tool_ranks_and_filters_by_type_and_staleness() {
+        let _guard = crate::testing::TestConfigDirGuard::new("memory-search-tool-filters");
+        let mut ctx = global_memory_ctx(&[
+            (
+                "habitat-notes",
+                "description: quokka habitat survey\ntype: project\n",
+            ),
+            ("quokka", "description: something else\ntype: user\n"),
+            (
+                "quokka-habitat-r1",
+                "description: quokka habitat draft\ntype: project\nsuperseded_by: habitat-notes\n",
+            ),
+        ]);
+        let names = |found: &Value| -> Vec<String> {
+            found["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|hit| hit["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let live = handle_memory_tool(
+            &mut ctx,
+            "memory__search",
+            &json!({"query": "quokka habitat", "scope": "global"}),
+        )
+        .unwrap();
+        assert_eq!(names(&live), ["habitat-notes", "quokka"], "{live}");
+
+        let users = handle_memory_tool(
+            &mut ctx,
+            "memory__search",
+            &json!({"query": "quokka habitat", "scope": "global", "type": "user"}),
+        )
+        .unwrap();
+        assert_eq!(names(&users), ["quokka"], "{users}");
+
+        let projects = handle_memory_tool(
+            &mut ctx,
+            "memory__search",
+            &json!({
+                "query": "quokka habitat",
+                "scope": "global",
+                "type": "project",
+                "include_stale": true
+            }),
+        )
+        .unwrap();
+        let mut found = names(&projects);
+        found.sort();
+        assert_eq!(found, ["habitat-notes", "quokka-habitat-r1"], "{projects}");
+        let draft = projects["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|hit| hit["name"] == "quokka-habitat-r1")
+            .unwrap();
+        assert_eq!(draft["stale"], true, "{projects}");
+        assert!(draft.get("raw_type").is_none(), "{projects}");
+        assert!(live["hits"][0].get("stale").is_none(), "{live}");
+    }
+
+    fn list_names(page: &Value) -> Vec<&str> {
+        page["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap())
+            .collect()
+    }
+
+    fn paging_ctx() -> RequestContext {
+        global_memory_ctx(&[
+            ("note-1", "type: user\n"),
+            ("note-2", "type: project\n"),
+            ("note-3", "type: user\n"),
+            ("note-4", "type: user\nexpires: 2000-01-01\n"),
+            ("note-5", "type: project\n"),
+            ("note-6", "type: user\n"),
+        ])
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn memory_list_pages_through_live_files_with_a_stable_total() {
+        let _guard = crate::testing::TestConfigDirGuard::new("memory-list-paging");
+        let mut ctx = paging_ctx();
+        let list = |ctx: &mut RequestContext, args: Value| {
+            handle_memory_tool(ctx, "memory__list", &args).unwrap()
+        };
+
+        let first = list(&mut ctx, json!({"scope": "global", "k": 2}));
+        assert_eq!(list_names(&first), ["note-1", "note-2"], "{first}");
+        assert_eq!(first["total"], 5);
+        assert_eq!(first["offset"], 0);
+        assert_eq!(first["returned"], 2);
+
+        let middle = list(&mut ctx, json!({"scope": "global", "offset": 2, "k": 2}));
+        assert_eq!(list_names(&middle), ["note-3", "note-5"], "{middle}");
+        assert_eq!(middle["total"], 5);
+        assert_eq!(middle["offset"], 2);
+        assert_eq!(middle["returned"], 2);
+
+        let past_end = list(&mut ctx, json!({"scope": "global", "offset": 9, "k": 2}));
+        assert!(list_names(&past_end).is_empty(), "{past_end}");
+        assert_eq!(past_end["total"], 5);
+        assert_eq!(past_end["offset"], 9);
+        assert_eq!(past_end["returned"], 0);
+
+        let err = handle_memory_tool(&mut ctx, "memory__list", &json!({"k": -1}))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "k must be a non-negative integer");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn memory_list_returns_fifty_files_when_no_page_is_given() {
+        let _guard = crate::testing::TestConfigDirGuard::new("memory-list-default-k");
+        let names: Vec<String> = (0..60).map(|i| format!("note-{i:02}")).collect();
+        let files: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "")).collect();
+        let mut ctx = global_memory_ctx(&files);
+
+        let page =
+            handle_memory_tool(&mut ctx, "memory__list", &json!({"scope": "global"})).unwrap();
+        assert_eq!(page["returned"], 50, "{page}");
+        assert_eq!(page["total"], 60, "{page}");
+        assert_eq!(list_names(&page).len(), 50);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn memory_list_filters_by_type_and_scope_before_paging() {
+        let _guard = crate::testing::TestConfigDirGuard::new("memory-list-filters");
+        let mut ctx = paging_ctx();
+
+        let users = handle_memory_tool(
+            &mut ctx,
+            "memory__list",
+            &json!({"scope": "global", "type": "user", "offset": 1, "k": 5}),
+        )
+        .unwrap();
+        assert_eq!(list_names(&users), ["note-3", "note-6"], "{users}");
+        assert_eq!(users["total"], 3);
+        assert_eq!(users["returned"], 2);
+        assert!(users["files"][0].get("stale").is_none());
+
+        let with_stale = handle_memory_tool(
+            &mut ctx,
+            "memory__list",
+            &json!({"scope": "global", "type": "user", "include_stale": true, "offset": 2, "k": 1}),
+        )
+        .unwrap();
+        assert_eq!(list_names(&with_stale), ["note-4"], "{with_stale}");
+        assert_eq!(with_stale["files"][0]["stale"], true);
+        assert_eq!(with_stale["total"], 4);
+    }
+
+    #[test]
+    fn search_is_declared_beside_the_other_memory_tools() {
+        let search = memory_function_declarations()
+            .into_iter()
+            .find(|d| d.name == "memory__search")
+            .expect("memory__search declared");
+
+        assert!(!search.agent);
+        let properties = search.parameters.properties.unwrap();
+        let keys: Vec<&str> = properties.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["query", "k", "type", "scope", "include_stale"]);
+        assert_eq!(search.parameters.required, Some(vec!["query".to_string()]));
     }
 }

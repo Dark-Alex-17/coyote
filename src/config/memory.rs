@@ -1,12 +1,16 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result, anyhow};
+use bm25::{Language, SearchEngine, SearchEngineBuilder};
 use chrono::Local;
 use fancy_regex::Regex;
 use log::warn;
+use parking_lot::Mutex;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::config::{
@@ -288,13 +292,16 @@ impl MemoryFile {
     }
 
     pub fn is_stale(&self, today: &str) -> bool {
-        self.frontmatter.superseded_by.is_some()
-            || self
-                .frontmatter
-                .expires
-                .as_deref()
-                .is_some_and(|expires| expires < today)
+        is_stale_by(
+            self.frontmatter.superseded_by.as_deref(),
+            self.frontmatter.expires.as_deref(),
+            today,
+        )
     }
+}
+
+fn is_stale_by(superseded_by: Option<&str>, expires: Option<&str>, today: &str) -> bool {
+    superseded_by.is_some() || expires.is_some_and(|expires| expires < today)
 }
 
 fn parse_frontmatter(raw: &str) -> Result<(MemoryFrontmatter, String)> {
@@ -394,6 +401,202 @@ impl MemoryStore {
 
         Ok(out)
     }
+
+    fn scope_dirs(&self) -> Vec<(Scope, &Path)> {
+        let mut dirs = vec![(Scope::Global, self.global_dir.as_path())];
+        if let Some(ws) = &self.workspace {
+            dirs.push((Scope::Workspace, ws.dir.as_path()));
+        }
+        dirs
+    }
+
+    /// Every drill file of both scopes, stale ones included. The result is
+    /// shared until a drill file in either scope dir is added, removed or
+    /// rewritten.
+    pub fn catalogue(&self) -> Result<Arc<Catalogue>> {
+        let dirs = self.scope_dirs();
+        let key: Vec<PathBuf> = dirs.iter().map(|(_, dir)| dir.to_path_buf()).collect();
+        let stamps = drill_file_stamps(&dirs)?;
+        if let Some((cached, catalogue)) = CATALOGUE_CACHE.lock().get(&key)
+            && *cached == stamps
+        {
+            return Ok(Arc::clone(catalogue));
+        }
+
+        let catalogue = Arc::new(Catalogue::load(&dirs)?);
+        CATALOGUE_CACHE
+            .lock()
+            .insert(key, (stamps, Arc::clone(&catalogue)));
+        Ok(catalogue)
+    }
+
+    /// Up to `limit` entries the filter admits, best bm25 score over name and
+    /// description first, ties broken by the most recent `updated`.
+    pub fn search(&self, query: &str, limit: usize, filter: &Filter) -> Result<Vec<Hit>> {
+        let catalogue = self.catalogue()?;
+        let entries = catalogue.entries();
+        let today = today_string();
+        let mut scored: Vec<(&CatalogueEntry, f32)> = catalogue
+            .engine
+            .search(query, entries.len())
+            .into_iter()
+            .filter(|result| result.score > 0.0)
+            .map(|result| (&entries[result.document.id], result.score))
+            .filter(|(entry, _)| filter.admits(entry, &today))
+            .collect();
+        scored.sort_by(|(a, a_score), (b, b_score)| {
+            b_score
+                .total_cmp(a_score)
+                .then_with(|| b.updated.cmp(&a.updated))
+        });
+        Ok(scored
+            .into_iter()
+            .take(limit)
+            .map(|(entry, score)| Hit {
+                entry: entry.clone(),
+                score,
+            })
+            .collect())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Filter {
+    pub kind: Option<MemoryKind>,
+    pub scope: Option<Scope>,
+    pub include_stale: bool,
+}
+
+impl Filter {
+    pub fn admits(&self, entry: &CatalogueEntry, today: &str) -> bool {
+        self.kind.is_none_or(|kind| entry.kind.kind() == kind)
+            && self.scope.is_none_or(|scope| entry.scope == scope)
+            && (self.include_stale || !entry.is_stale(today))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Hit {
+    pub entry: CatalogueEntry,
+    pub score: f32,
+}
+
+/// A drill file's front matter as the catalogue holds it; the body is not kept.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CatalogueEntry {
+    pub name: String,
+    pub description: Option<String>,
+    pub kind: KindField,
+    pub scope: Scope,
+    pub path: PathBuf,
+    pub char_len: usize,
+    pub updated: Option<String>,
+    pub superseded_by: Option<String>,
+    pub expires: Option<String>,
+}
+
+impl CatalogueEntry {
+    fn new(file: MemoryFile, scope: Scope) -> Self {
+        let char_len = file.char_len();
+        let fm = file.frontmatter;
+        Self {
+            name: fm.name,
+            description: fm.description,
+            kind: fm.kind,
+            scope,
+            path: file.path,
+            char_len,
+            updated: fm.updated,
+            superseded_by: fm.superseded_by,
+            expires: fm.expires,
+        }
+    }
+
+    pub fn is_stale(&self, today: &str) -> bool {
+        is_stale_by(
+            self.superseded_by.as_deref(),
+            self.expires.as_deref(),
+            today,
+        )
+    }
+}
+
+/// The global scope's entries, then the workspace's, each in path order.
+pub struct Catalogue {
+    entries: Vec<CatalogueEntry>,
+    engine: SearchEngine<usize>,
+}
+
+impl Catalogue {
+    fn load(dirs: &[(Scope, &Path)]) -> Result<Self> {
+        let mut entries = Vec::new();
+        for (scope, dir) in dirs {
+            if !dir.exists() {
+                continue;
+            }
+            let mut files = Vec::new();
+            collect_md_files(dir, &mut files)?;
+            files.sort_by(|a, b| a.path.cmp(&b.path));
+            entries.extend(files.into_iter().map(|f| CatalogueEntry::new(f, *scope)));
+        }
+        let documents = entries.iter().enumerate().map(|(id, entry)| {
+            bm25::Document::new(
+                id,
+                format!(
+                    "{} {}",
+                    entry.name,
+                    entry.description.as_deref().unwrap_or_default()
+                ),
+            )
+        });
+        let engine = SearchEngineBuilder::<usize>::with_documents(Language::English, documents)
+            .k1(1.5)
+            .b(0.75)
+            .build();
+        Ok(Self { entries, engine })
+    }
+
+    pub fn entries(&self) -> &[CatalogueEntry] {
+        &self.entries
+    }
+}
+
+/// Size and mtime of one drill file. A cached catalogue is reused only while
+/// every stamp still matches, so an in-place rewrite invalidates it even when
+/// the directory's own mtime does not move.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileStamp {
+    path: PathBuf,
+    modified: Option<SystemTime>,
+    len: u64,
+}
+
+type CatalogueCache = HashMap<Vec<PathBuf>, (Vec<FileStamp>, Arc<Catalogue>)>;
+
+static CATALOGUE_CACHE: LazyLock<Mutex<CatalogueCache>> = LazyLock::new(Default::default);
+
+fn drill_file_stamps(dirs: &[(Scope, &Path)]) -> Result<Vec<FileStamp>> {
+    let mut stamps = Vec::new();
+    for (_, dir) in dirs {
+        if !dir.exists() {
+            continue;
+        }
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !is_drill_file(&path) {
+                continue;
+            }
+            let meta = entry.metadata()?;
+            stamps.push(FileStamp {
+                path,
+                modified: meta.modified().ok(),
+                len: meta.len(),
+            });
+        }
+    }
+    stamps.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(stamps)
 }
 
 /// The rendered `<memory>` block plus the figures behind it: how many chars
@@ -417,9 +620,36 @@ pub struct Truncated {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Scope {
+pub enum Scope {
     Global,
     Workspace,
+}
+
+impl Scope {
+    pub const NAMES: [&'static str; 2] = ["global", "workspace"];
+
+    const ALL: [Scope; 2] = [Self::Global, Self::Workspace];
+
+    pub fn name(self) -> &'static str {
+        Self::NAMES[self as usize]
+    }
+}
+
+impl FromStr for Scope {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::NAMES
+            .iter()
+            .position(|name| *name == value)
+            .map(|i| Self::ALL[i])
+            .ok_or_else(|| {
+                anyhow!(
+                    "Invalid scope '{value}', expected one of: {}",
+                    Self::NAMES.join(", ")
+                )
+            })
+    }
 }
 
 /// Renders both MEMORY.md indexes facts first: every non-catalogue line of
@@ -606,11 +836,7 @@ fn collect_md_files(dir: &Path, out: &mut Vec<MemoryFile>) -> Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
-            continue;
-        }
-
-        if path.file_name().and_then(|n| n.to_str()) == Some(MEMORY_INDEX_FILE_NAME) {
+        if !is_drill_file(&path) {
             continue;
         }
 
@@ -621,6 +847,11 @@ fn collect_md_files(dir: &Path, out: &mut Vec<MemoryFile>) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn is_drill_file(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("md")
+        && path.file_name().and_then(|n| n.to_str()) != Some(MEMORY_INDEX_FILE_NAME)
 }
 
 #[cfg(test)]
@@ -1612,6 +1843,243 @@ mod tests {
 
         let body = fs::read_to_string(mem_dir.join(MEMORY_INDEX_FILE_NAME)).unwrap();
         assert_eq!(body, preserved);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn catalogue_names(store: &MemoryStore) -> Vec<String> {
+        store
+            .catalogue()
+            .unwrap()
+            .entries()
+            .iter()
+            .map(|e| e.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn catalogue_reads_front_matter_of_both_scopes_but_never_the_index() {
+        let (root, store) = two_index_store(
+            "catalogue_scopes",
+            "- [[listed]]: from the index",
+            "idx",
+            &[("unindexed", "w body")],
+        );
+        write_store_file(
+            &store.global_dir,
+            "listed",
+            "description: front matter wins\ntype: user\nupdated: 2024-01-02\nexpires: 2000-01-01\n",
+        );
+
+        let catalogue = store.catalogue().unwrap();
+
+        let entries = catalogue.entries();
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(entries[0].name, "listed");
+        assert_eq!(entries[0].scope, Scope::Global);
+        assert_eq!(entries[0].description.as_deref(), Some("front matter wins"));
+        assert_eq!(entries[0].kind.kind(), MemoryKind::User);
+        assert_eq!(entries[0].updated.as_deref(), Some("2024-01-02"));
+        assert!(entries[0].is_stale("2024-01-01"));
+        assert_eq!(entries[1].name, "unindexed");
+        assert_eq!(entries[1].scope, Scope::Workspace);
+        assert_eq!(entries[1].char_len, "w body\n".len());
+        assert!(!entries[1].is_stale("2024-01-01"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn catalogue_is_reused_until_a_drill_file_is_added_rewritten_or_removed() {
+        let (root, store) = two_index_store("catalogue_cache", "", "idx", &[("one", "body")]);
+        let dir = store.workspace.as_ref().unwrap().dir.clone();
+
+        let first = store.catalogue().unwrap();
+        assert!(Arc::ptr_eq(&first, &store.catalogue().unwrap()), "hit");
+
+        fs::write(dir.join(MEMORY_INDEX_FILE_NAME), "idx edited").unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &store.catalogue().unwrap()),
+            "an index edit is no catalogue change"
+        );
+
+        write_store_file(&dir, "two", "");
+        let added = store.catalogue().unwrap();
+        assert!(!Arc::ptr_eq(&first, &added), "a new file is a miss");
+        assert_eq!(catalogue_names(&store), vec!["one", "two"]);
+
+        write_store_file(&dir, "two", "description: rewritten in place\n");
+        let rewritten = store.catalogue().unwrap();
+        assert!(!Arc::ptr_eq(&added, &rewritten), "an overwrite is a miss");
+        assert_eq!(
+            rewritten.entries()[1].description.as_deref(),
+            Some("rewritten in place")
+        );
+
+        fs::remove_file(dir.join("one.md")).unwrap();
+        assert_eq!(catalogue_names(&store), vec!["two"]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn hit_names(hits: &[Hit]) -> Vec<&str> {
+        hits.iter().map(|h| h.entry.name.as_str()).collect()
+    }
+
+    #[test]
+    fn search_ranks_a_description_match_above_a_slug_only_match() {
+        let (root, store) = two_index_store("search_rank", "", "idx", &[]);
+        let dir = store.workspace.as_ref().unwrap().dir.clone();
+        write_store_file(&dir, "deploy", "description: unrelated words\n");
+        write_store_file(
+            &dir,
+            "release-notes",
+            "description: how we deploy the release train\n",
+        );
+        write_store_file(&dir, "cooking", "description: pasta recipes\n");
+
+        let hits = store
+            .search("deploy release", 10, &Filter::default())
+            .unwrap();
+
+        assert_eq!(hit_names(&hits), vec!["release-notes", "deploy"]);
+        assert!(hits[0].score > hits[1].score);
+        let top = store
+            .search("deploy release", 1, &Filter::default())
+            .unwrap();
+        assert_eq!(hit_names(&top), vec!["release-notes"]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn search_breaks_score_ties_by_most_recent_update() {
+        let (root, store) = two_index_store("search_ties", "", "idx", &[]);
+        let dir = store.workspace.as_ref().unwrap().dir.clone();
+        write_store_file(
+            &dir,
+            "alpha",
+            "description: shared topic\nupdated: 2024-01-01\n",
+        );
+        write_store_file(
+            &dir,
+            "bravo",
+            "description: shared topic\nupdated: 2024-06-01\n",
+        );
+
+        let hits = store.search("topic", 10, &Filter::default()).unwrap();
+
+        assert_eq!(hit_names(&hits), vec!["bravo", "alpha"]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn search_excludes_stale_entries_unless_asked() {
+        let (root, store) = two_index_store("search_stale", "", "idx", &[]);
+        let dir = store.workspace.as_ref().unwrap().dir.clone();
+        write_store_file(&dir, "live", "description: widget facts\n");
+        write_store_file(
+            &dir,
+            "bygone",
+            "description: widget facts\nexpires: 2000-01-01\n",
+        );
+        write_store_file(
+            &dir,
+            "replaced",
+            "description: widget facts\nsuperseded_by: live\n",
+        );
+
+        let live = store.search("widget", 10, &Filter::default()).unwrap();
+        assert_eq!(hit_names(&live), vec!["live"]);
+
+        let all = Filter {
+            include_stale: true,
+            ..Filter::default()
+        };
+        let mut names = hit_names(&store.search("widget", 10, &all).unwrap())
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, vec!["bygone", "live", "replaced"]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn search_filters_by_type_and_scope() {
+        let (root, store) = two_index_store("search_filters", "", "idx", &[]);
+        let dir = store.workspace.as_ref().unwrap().dir.clone();
+        write_store_file(
+            &store.global_dir,
+            "g-user",
+            "description: gadget\ntype: user\n",
+        );
+        write_store_file(&dir, "w-user", "description: gadget\ntype: user\n");
+        write_store_file(&dir, "w-project", "description: gadget\ntype: project\n");
+
+        let search = |filter: Filter| {
+            let mut names: Vec<String> = store
+                .search("gadget", 10, &filter)
+                .unwrap()
+                .into_iter()
+                .map(|h| h.entry.name)
+                .collect();
+            names.sort();
+            names
+        };
+
+        assert_eq!(
+            search(Filter {
+                kind: Some(MemoryKind::User),
+                ..Filter::default()
+            }),
+            vec!["g-user", "w-user"]
+        );
+        assert_eq!(
+            search(Filter {
+                scope: Some(Scope::Workspace),
+                ..Filter::default()
+            }),
+            vec!["w-project", "w-user"]
+        );
+        assert_eq!(
+            search(Filter {
+                kind: Some(MemoryKind::User),
+                scope: Some(Scope::Global),
+                include_stale: false,
+            }),
+            vec!["g-user"]
+        );
+        assert_eq!(search(Filter::default()).len(), 3);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn search_over_five_thousand_entries_is_fast_once_warm() {
+        let (root, store) = two_index_store("search_5k", "", "idx", &[]);
+        let dir = store.workspace.as_ref().unwrap().dir.clone();
+        for i in 0..5_000 {
+            write_store_file(
+                &dir,
+                &format!("note-{i:04}"),
+                &format!("description: topic{} detail{i}\n", i % 50),
+            );
+        }
+        assert_eq!(store.catalogue().unwrap().entries().len(), 5_000);
+        store.search("topic3", 10, &Filter::default()).unwrap();
+
+        let started = time::Instant::now();
+        let hits = store
+            .search("topic7 detail4207", 10, &Filter::default())
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(hits[0].entry.name, "note-4207");
+        assert_eq!(hits.len(), 10);
+        assert!(elapsed < time::Duration::from_millis(200), "{elapsed:?}");
 
         let _ = fs::remove_dir_all(&root);
     }
