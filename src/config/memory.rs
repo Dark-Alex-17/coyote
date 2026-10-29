@@ -76,7 +76,11 @@ pub fn find_git_root(start: &Path) -> Option<PathBuf> {
 }
 
 pub fn bootstrap_workspace_memory(git_root: &Path) -> Result<PathBuf> {
-    let mem_dir = paths::workspace_memory_dir_for(git_root);
+    create_workspace_memory(git_root, true)
+}
+
+pub fn create_workspace_memory(root: &Path, gitignore: bool) -> Result<PathBuf> {
+    let mem_dir = paths::workspace_memory_dir_for(root);
     fs::create_dir_all(&mem_dir)
         .with_context(|| format!("create memory dir {}", mem_dir.display()))?;
 
@@ -86,7 +90,7 @@ pub fn bootstrap_workspace_memory(git_root: &Path) -> Result<PathBuf> {
             .with_context(|| format!("write {}", index_path.display()))?;
     }
 
-    let gitignore_appended = append_gitignore_entry(git_root)?;
+    let gitignore_appended = gitignore && append_gitignore_entry(root)?;
     let suffix = if gitignore_appended {
         " (appended .coyote/memory/ to .gitignore)"
     } else {
@@ -99,6 +103,24 @@ pub fn bootstrap_workspace_memory(git_root: &Path) -> Result<PathBuf> {
     );
 
     Ok(mem_dir)
+}
+
+/// Where `coyote --init-memory workspace` roots the store: the git root, else `cwd`.
+pub fn init_workspace_root(cwd: &Path) -> PathBuf {
+    find_git_root(cwd).unwrap_or_else(|| cwd.to_path_buf())
+}
+
+/// Writes the `--init-memory workspace` index, appending the .gitignore entry only inside a git repo.
+pub fn write_workspace_memory_index(index_path: &Path, content: &str) -> Result<()> {
+    if let Some(parent) = index_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create memory dir {}", parent.display()))?;
+    }
+    fs::write(index_path, content).with_context(|| format!("write {}", index_path.display()))?;
+    if let Some(git_root) = find_git_root(index_path) {
+        append_gitignore_entry(&git_root)?;
+    }
+    Ok(())
 }
 
 pub fn append_gitignore_entry(git_root: &Path) -> Result<bool> {
@@ -2024,6 +2046,58 @@ mod tests {
 
         let body = fs::read_to_string(mem_dir.join(MEMORY_INDEX_FILE_NAME)).unwrap();
         assert_eq!(body, preserved);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn create_workspace_memory_without_gitignore_leaves_gitignore_alone() {
+        let root = temp_root("create_no_gitignore");
+        let repo = root.join("repo");
+        fs::create_dir_all(repo.join(GIT_DIR_NAME)).unwrap();
+
+        let mem_dir = create_workspace_memory(&repo, false).unwrap();
+
+        assert!(mem_dir.join(MEMORY_INDEX_FILE_NAME).exists());
+        assert!(!repo.join(GITIGNORE_FILE_NAME).exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn init_workspace_root_outside_git_creates_store_under_cwd() {
+        let root = temp_root("init_no_git");
+        let cwd = root.join("proj");
+        fs::create_dir_all(&cwd).unwrap();
+        assert_eq!(find_git_root(&cwd), None);
+
+        let index = paths::workspace_memory_index_file_for(&init_workspace_root(&cwd));
+        assert_eq!(
+            index,
+            cwd.join(WORKSPACE_COYOTE_DIR_NAME)
+                .join(MEMORY_DIR_NAME)
+                .join(MEMORY_INDEX_FILE_NAME)
+        );
+        assert!(!cwd.join(WORKSPACE_COYOTE_DIR_NAME).exists());
+
+        write_workspace_memory_index(&index, "# Workspace Memory Index\n\n").unwrap();
+
+        assert!(cwd.join(WORKSPACE_COYOTE_DIR_NAME).is_dir());
+        assert!(index.exists());
+        assert!(!cwd.join(GITIGNORE_FILE_NAME).exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn init_workspace_root_prefers_git_root() {
+        let root = temp_root("init_git");
+        let repo = root.join("repo");
+        fs::create_dir_all(repo.join(GIT_DIR_NAME)).unwrap();
+        let nested = repo.join("a").join("b");
+        fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(init_workspace_root(&nested), repo);
 
         let _ = fs::remove_dir_all(&root);
     }

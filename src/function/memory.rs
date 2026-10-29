@@ -13,11 +13,11 @@ use super::{FunctionDeclaration, JsonSchema};
 use crate::config::memory::{
     CatalogueEntry, DEFAULT_MEMORY_RUN_STATE_TTL_DAYS, Filter, KindField, MEMORY_DESCRIPTION_CAP,
     MEMORY_FILE_HARD_CAP, MemoryFile, MemoryFrontmatter, MemoryKind, MemoryStore, Retention, Scope,
-    WorkspaceMemory, bootstrap_workspace_memory, catalogue_entry, catalogue_slug, find_git_root,
-    today_string,
+    WorkspaceMemory, bootstrap_workspace_memory, catalogue_entry, catalogue_slug,
+    create_workspace_memory, find_git_root, today_string,
 };
 use crate::config::paths;
-use crate::config::{RequestContext, RoundChains};
+use crate::config::{RequestContext, RoundChains, WORKSPACE_COYOTE_DIR_NAME};
 
 pub const MEMORY_FUNCTION_PREFIX: &str = "memory__";
 
@@ -1193,16 +1193,19 @@ fn find_file(store: &MemoryStore, name: &str) -> Result<Option<MemoryFile>> {
 }
 
 fn workspace_write_dir(store: &MemoryStore, cwd: &Path) -> Result<PathBuf> {
-    match &store.workspace {
-        Some(ws) => Ok(ws.dir.clone()),
-        None => match find_git_root(cwd) {
-            Some(git_root) => bootstrap_workspace_memory(&git_root),
-            None => bail!(
-                "no workspace memory discoverable and not inside a git repository for auto-bootstrap. \
-                 If you want workspace memory, run `coyote --init-memory workspace`."
-            ),
-        },
+    if let Some(ws) = &store.workspace {
+        return Ok(ws.dir.clone());
     }
+    if let Some(git_root) = find_git_root(cwd) {
+        return bootstrap_workspace_memory(&git_root);
+    }
+    if cwd.join(WORKSPACE_COYOTE_DIR_NAME).is_dir() {
+        return create_workspace_memory(cwd, false);
+    }
+    bail!(
+        "no workspace memory discoverable, not inside a git repository, and no .coyote directory here. \
+         If you want workspace memory, run `coyote --init-memory workspace`."
+    )
 }
 
 fn workspace_label(w: &WorkspaceMemory) -> Value {
@@ -1485,7 +1488,75 @@ mod tests {
         let err = workspace_write_dir(&store, &bare).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("no workspace memory discoverable"));
+        assert!(msg.contains("no .coyote directory here"));
         assert!(msg.contains("coyote --init-memory workspace"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn workspace_write_dir_prefers_git_root_over_cwd_coyote_dir() {
+        let root = temp_root("ws_git_over_coyote");
+        let repo = root.join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let nested = repo.join("sub");
+        fs::create_dir_all(nested.join(".coyote")).unwrap();
+
+        let store = MemoryStore {
+            global_dir: root.join("g"),
+            workspace: discover_workspace_memory(&nested),
+        };
+
+        let dir = workspace_write_dir(&store, &nested).unwrap();
+        assert_eq!(dir, repo.join(".coyote").join("memory"));
+        assert!(!nested.join(".coyote").join("memory").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn workspace_write_dir_creates_memory_under_cwd_coyote_dir_without_git() {
+        let root = temp_root("ws_coyote_no_git");
+        let cwd = root.join("proj");
+        fs::create_dir_all(cwd.join(".coyote")).unwrap();
+        assert!(find_git_root(&cwd).is_none());
+
+        let store = MemoryStore {
+            global_dir: root.join("g"),
+            workspace: discover_workspace_memory(&cwd),
+        };
+        assert!(store.workspace.is_none());
+
+        let dir = workspace_write_dir(&store, &cwd).unwrap();
+        assert_eq!(dir, cwd.join(".coyote").join("memory"));
+        let index = fs::read_to_string(dir.join("MEMORY.md")).unwrap();
+        assert_eq!(index, "# Workspace Memory Index\n\n");
+        assert!(!cwd.join(".gitignore").exists());
+
+        let found = discover_workspace_memory(&cwd).expect("created store is discoverable");
+        assert_eq!(found.workspace_root, cwd);
+        assert_eq!(found.dir, dir);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn workspace_write_dir_ignores_coyote_dir_in_parent_without_git() {
+        let root = temp_root("ws_coyote_parent");
+        let parent = root.join("proj");
+        fs::create_dir_all(parent.join(".coyote")).unwrap();
+        let cwd = parent.join("child");
+        fs::create_dir_all(&cwd).unwrap();
+
+        let store = MemoryStore {
+            global_dir: root.join("g"),
+            workspace: discover_workspace_memory(&cwd),
+        };
+
+        let err = workspace_write_dir(&store, &cwd).unwrap_err();
+        assert!(err.to_string().contains("no .coyote directory here"));
+        assert!(!parent.join(".coyote").join("memory").exists());
+        assert!(!cwd.join(".coyote").exists());
 
         let _ = fs::remove_dir_all(&root);
     }

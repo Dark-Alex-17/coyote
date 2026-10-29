@@ -551,8 +551,7 @@ async fn run(
                 "# Global Memory\n\n<!-- Universal facts about you go here. The LLM uses this as always-on context. -->\n<!-- Drill files (when created) are listed below. -->\n",
             ),
             MemoryScope::Workspace => {
-                let cwd = env::current_dir()?;
-                let root = memory::find_git_root(&cwd).unwrap_or(cwd);
+                let root = memory::init_workspace_root(&env::current_dir()?);
                 (
                     paths::workspace_memory_index_file_for(&root),
                     "# Workspace Memory Index\n\n<!-- Facts about this project go here. The LLM uses this as always-on context. -->\n<!-- Drill files (when created) are listed below. -->\n",
@@ -565,15 +564,14 @@ async fn run(
             return Ok(());
         }
 
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        fs::write(&path, content)?;
-        if scope == MemoryScope::Workspace
-            && let Some(git_root) = memory::find_git_root(&path)
-        {
-            memory::append_gitignore_entry(&git_root)?;
+        match scope {
+            MemoryScope::Global => {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&path, content)?;
+            }
+            MemoryScope::Workspace => memory::write_workspace_memory_index(&path, content)?,
         }
         println!("✓ Created memory marker at '{}'.", path.display());
         return Ok(());
