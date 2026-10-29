@@ -665,7 +665,7 @@ impl SweepAction {
             Self::Keep => None,
             Self::Remove(reason) => Some(reason),
             Self::RemoveIfDead(stamp, reason) => (!(alive.contains(&stamp)
-                || (stamp.start == 0 && ProcessStamp::pid_exists(stamp.pid))))
+                || (stamp.pid != 0 && stamp.start == 0 && ProcessStamp::pid_exists(stamp.pid))))
             .then_some(reason),
         }
     }
@@ -2905,6 +2905,33 @@ updated_at: 2026-01-02T03:04:05Z
         );
     }
 
+    /// A root.yaml cut short or edited by hand parses with a zero pid, and
+    /// sysinfo lists pid 0 on some hosts; such a root is still swept.
+    #[test]
+    #[serial]
+    fn sweep_removes_a_parentless_root_whose_record_has_no_pid() {
+        install_log_collector();
+        let _guard = TestConfigDirGuard::new("child-sessions-sweep-pid-zero");
+        let mut roots = Vec::new();
+        for text in ["version: 1\n", "{}"] {
+            let (dir, uid) = bare_uid_dir();
+            fs::write(dir.join("root.yaml"), text).unwrap();
+            age_past_grace(&dir);
+            roots.push((dir, uid));
+        }
+
+        sweep_orphans();
+
+        for (dir, uid) in &roots {
+            assert!(!dir.exists(), "{uid}");
+            assert!(
+                removal_logged(uid, "orphan sweep arm 2"),
+                "{:?}",
+                info_snapshot()
+            );
+        }
+    }
+
     #[test]
     #[serial]
     fn sweep_removes_a_uid_root_without_a_usable_identity_only_after_an_hour() {
@@ -3377,7 +3404,10 @@ updated_at: 2026-01-02T03:04:05Z
             "\nfn orphan_reason(",
             "\nfn sweep_dead_process_roots(",
         ] {
-            assert!(!fn_body(head).contains(".is_alive("), "{head}");
+            let body = fn_body(head);
+            assert!(!body.contains(".is_alive("), "{head}");
+            assert!(!body.contains(".is_alive_or_start_unknown("), "{head}");
+            assert!(!body.contains("pid_exists("), "{head}");
         }
         assert!(fn_body("\nfn remove_unless_adopted(").contains(".is_alive_or_start_unknown("));
         let reason = {
@@ -3387,6 +3417,7 @@ updated_at: 2026-01-02T03:04:05Z
         };
         assert!(reason.contains("pid_exists("));
         assert!(!reason.contains(".is_alive("));
+        assert!(!reason.contains(".is_alive_or_start_unknown("));
         assert_eq!(
             fn_body("\nfn sweep_orphans_with(")
                 .matches("alive_set(")

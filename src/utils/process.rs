@@ -41,8 +41,10 @@ impl ProcessStamp {
     /// with `start` 0 and its pid is still in use. A start-0 stamp under a
     /// live pid cannot be told from the process that wrote it, so callers
     /// that would destroy or overwrite its state treat it as possibly alive.
+    /// Pid 0 never wrote a stamp; it is what a record missing its pid field
+    /// reads as, so it gets no such benefit of the doubt.
     pub(crate) fn is_alive_or_start_unknown(&self) -> bool {
-        self.is_alive() || (self.start == 0 && Self::pid_exists(self.pid))
+        self.is_alive() || (self.pid != 0 && self.start == 0 && Self::pid_exists(self.pid))
     }
 
     /// True when sysinfo lists a process under this pid, whatever its start
@@ -195,6 +197,16 @@ mod tests {
             start: 0,
         };
         assert!(unreported.is_alive_or_start_unknown());
+    }
+
+    #[test]
+    fn pid_zero_with_an_unknown_start_is_not_alive_or_start_unknown() {
+        let missing = ProcessStamp { pid: 0, start: 0 };
+        if missing.is_alive() {
+            eprintln!("sysinfo lists pid 0 with a start time of 0; the pid 0 guard goes untested");
+            return;
+        }
+        assert!(!missing.is_alive_or_start_unknown());
     }
 
     #[test]
