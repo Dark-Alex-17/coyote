@@ -3,34 +3,68 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::{env, fs, io};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use chrono::{Local, NaiveDateTime};
+use serde::Deserialize;
 
 use crate::config::memory::{
-    MEMORY_DESCRIPTION_CAP, MEMORY_FILE_HARD_CAP, MemoryFile, MemoryKind, catalogue_entry,
-    discover_workspace_memory,
+    KindField, MEMORY_DESCRIPTION_CAP, MEMORY_FILE_HARD_CAP, MemoryFile, MemoryFrontmatter,
+    MemoryKind, catalogue_entry, discover_workspace_memory,
 };
-use crate::config::{MEMORY_INDEX_FILE_NAME, MigrateScope, paths, sanitize_display_text};
-use crate::function::memory::round_chain_name;
+use crate::config::{
+    MEMORY_INDEX_FILE_NAME, MigrateScope, RoundChains, paths, sanitize_display_text,
+};
+use crate::function::memory::{marks_older_round, round_chain_name, scan_round_siblings};
 use crate::utils::fs::{copy_dir_all, write_private_atomic};
 
 const BACKUP_DIR_NAME: &str = "memory-backups";
 const DRILL_FILES_HEADING: &str = "## Drill files";
 const FACTS_PREVIEW_LINES: usize = 20;
 const SECTION_LIST_CAP: usize = 50;
+const STALE_BEFORE_APPLY: &str = "nothing was rewritten";
+const STALE_DURING_APPLY: &str = "it was not rewritten";
 
 /// Migrates the memory dirs `scope` names in place when `apply` is set, after
 /// backing each one up under the cache dir; otherwise only reports what it
-/// would change.
-pub fn run(scope: MigrateScope, apply: bool) -> Result<Report> {
+/// would change. `round_chains` decides whether older rounds of a chain are
+/// pointed at the newest, as `memory__write` does.
+pub fn run(scope: MigrateScope, apply: bool, round_chains: RoundChains) -> Result<Report> {
     let cwd = env::current_dir().context("get cwd")?;
     let targets = targets(scope, paths::global_memory_dir(), &cwd);
     migrate(
         &targets,
         &paths::cache_dir().join(BACKUP_DIR_NAME),
         apply,
+        round_chains,
         Local::now().naive_local(),
     )
+}
+
+#[derive(Deserialize)]
+struct RoundChainsSetting {
+    #[serde(default)]
+    memory_round_chains: RoundChains,
+}
+
+/// The config file's `memory_round_chains`, read on its own so other keys that
+/// are invalid but still well-formed YAML do not block a migration. A file
+/// that does not parse as YAML fails the run.
+pub fn configured_round_chains() -> Result<RoundChains> {
+    round_chains_in(&paths::config_file())
+}
+
+fn round_chains_in(config_path: &Path) -> Result<RoundChains> {
+    let content = match fs::read_to_string(config_path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(RoundChains::default()),
+        Err(e) => return Err(e).with_context(|| format!("read {}", config_path.display())),
+    };
+    if content.trim().is_empty() {
+        return Ok(RoundChains::default());
+    }
+    let setting: RoundChainsSetting = serde_yaml::from_str(&content)
+        .with_context(|| format!("read memory_round_chains from {}", config_path.display()))?;
+    Ok(setting.memory_round_chains)
 }
 
 struct Target {
@@ -59,11 +93,12 @@ fn migrate(
     targets: &[Target],
     backup_root: &Path,
     apply: bool,
+    round_chains: RoundChains,
     now: NaiveDateTime,
 ) -> Result<Report> {
     let today = now.format("%Y-%m-%d").to_string();
     let stamp = now.format("%Y%m%dT%H%M%S").to_string();
-    let mut scopes = plan_all(targets, &today)?;
+    let mut scopes = plan_all(targets, &today, round_chains)?;
     let failure = if apply {
         apply_all(&mut scopes, backup_root, &stamp)?
     } else {
@@ -76,7 +111,11 @@ fn migrate(
     })
 }
 
-fn plan_all(targets: &[Target], today: &str) -> Result<Vec<ScopeOutcome>> {
+fn plan_all(
+    targets: &[Target],
+    today: &str,
+    round_chains: RoundChains,
+) -> Result<Vec<ScopeOutcome>> {
     targets
         .iter()
         .map(
@@ -85,6 +124,7 @@ fn plan_all(targets: &[Target], today: &str) -> Result<Vec<ScopeOutcome>> {
                     target.label,
                     dir,
                     today,
+                    round_chains,
                 )?))),
                 None => Ok(ScopeOutcome::Skipped {
                     label: target.label,
@@ -95,10 +135,11 @@ fn plan_all(targets: &[Target], today: &str) -> Result<Vec<ScopeOutcome>> {
         .collect()
 }
 
-/// Every scope's index is checked before the first backup, so one stale scope
-/// refuses the whole run with nothing written. A failure after that stops at
-/// the failing scope, whose report keeps the backup and the files already
-/// written; the scopes after it are marked not applied.
+/// Every scope's index and planned rewrites are checked before the first
+/// backup, so one stale scope refuses the whole run with nothing written. A
+/// failure after that stops at the failing scope, whose report keeps the
+/// backup and the files already written; the scopes after it are marked not
+/// applied.
 fn apply_all(
     scopes: &mut [ScopeOutcome],
     backup_root: &Path,
@@ -108,7 +149,10 @@ fn apply_all(
         if let ScopeOutcome::Migrated(report) = scope
             && report.change_count() > 0
         {
-            ensure_index_unchanged(report)?;
+            ensure_index_unchanged(report, STALE_BEFORE_APPLY)?;
+            for rewrite in &report.rewrites {
+                ensure_rewrite_unchanged(rewrite, STALE_BEFORE_APPLY)?;
+            }
         }
     }
     let failed = scopes.iter_mut().enumerate().find_map(|(i, scope)| {
@@ -187,6 +231,12 @@ struct Drift {
     frontmatter_desc: String,
 }
 
+struct Rewrite {
+    file: MemoryFile,
+    /// The file's bytes when it was planned; apply replaces only these.
+    planned: Vec<u8>,
+}
+
 #[derive(Default)]
 struct ScopeReport {
     label: &'static str,
@@ -209,7 +259,7 @@ struct ScopeReport {
     unreadable: Vec<String>,
     index: Option<String>,
     new_index: Option<String>,
-    rewrites: Vec<MemoryFile>,
+    rewrites: Vec<Rewrite>,
     backup: Option<PathBuf>,
     written: Vec<PathBuf>,
     not_applied: bool,
@@ -221,13 +271,25 @@ impl ScopeReport {
     }
 }
 
-fn plan_scope(label: &'static str, dir: &Path, today: &str) -> Result<ScopeReport> {
+fn plan_scope(
+    label: &'static str,
+    dir: &Path,
+    today: &str,
+    round_chains: RoundChains,
+) -> Result<ScopeReport> {
     let mut report = ScopeReport {
         label,
         dir: dir.to_path_buf(),
         ..Default::default()
     };
-    let mut files = load_drill_files(dir, &mut report.unreadable)?;
+    let mut on_disk = BTreeMap::new();
+    let mut unreadable_slugs = BTreeSet::new();
+    let mut files = load_drill_files(
+        dir,
+        &mut on_disk,
+        &mut unreadable_slugs,
+        &mut report.unreadable,
+    )?;
     let mut changed: BTreeSet<String> = BTreeSet::new();
 
     let index_path = dir.join(MEMORY_INDEX_FILE_NAME);
@@ -320,7 +382,14 @@ fn plan_scope(label: &'static str, dir: &Path, today: &str) -> Result<ScopeRepor
     }
     report.index = index;
 
-    stamp_round_chains(&mut files, &mut report, &mut changed);
+    stamp_round_chains(
+        dir,
+        round_chains,
+        &mut files,
+        &unreadable_slugs,
+        &mut report,
+        &mut changed,
+    )?;
     for slug in &changed {
         if let Some(file) = files.get_mut(slug) {
             file.frontmatter.updated = Some(today.to_string());
@@ -352,6 +421,7 @@ fn plan_scope(label: &'static str, dir: &Path, today: &str) -> Result<ScopeRepor
         }
         if let Some(target) = &frontmatter.superseded_by
             && !files.contains_key(target)
+            && !unreadable_slugs.contains(target)
         {
             report.missing_targets.push((slug.clone(), target.clone()));
         }
@@ -362,7 +432,12 @@ fn plan_scope(label: &'static str, dir: &Path, today: &str) -> Result<ScopeRepor
 
     report.rewrites = changed
         .iter()
-        .filter_map(|slug| files.get(slug).cloned())
+        .filter_map(|slug| {
+            Some(Rewrite {
+                file: files.get(slug)?.clone(),
+                planned: on_disk.remove(slug)?,
+            })
+        })
         .collect();
     Ok(report)
 }
@@ -382,9 +457,13 @@ fn irregular_index(path: &Path) -> anyhow::Error {
 }
 
 /// The regular `*.md` files of `dir` other than the index, keyed by file
-/// stem. Symlinks are left alone so a rewrite never lands outside the dir.
+/// stem, with the bytes each was loaded from in `on_disk` and the stems that
+/// failed to load in `unreadable_slugs`. Symlinks are left alone so a rewrite
+/// never lands outside the dir.
 fn load_drill_files(
     dir: &Path,
+    on_disk: &mut BTreeMap<String, Vec<u8>>,
+    unreadable_slugs: &mut BTreeSet<String>,
     unreadable: &mut Vec<String>,
 ) -> Result<BTreeMap<String, MemoryFile>> {
     let mut files = BTreeMap::new();
@@ -400,41 +479,96 @@ fn load_drill_files(
         let Some(slug) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
-        match MemoryFile::load(&path) {
-            Ok(file) => {
+        // Read before the load, so an edit landing in between makes the bytes
+        // stale rather than the parsed file, and apply refuses it.
+        let loaded = fs::read(&path)
+            .with_context(|| format!("read memory file {}", path.display()))
+            .and_then(|bytes| Ok((bytes, MemoryFile::load(&path)?)));
+        match loaded {
+            Ok((bytes, mut file)) => {
+                drop_empty_fields(&mut file.frontmatter);
                 files.insert(slug.to_string(), file);
+                on_disk.insert(slug.to_string(), bytes);
             }
-            Err(e) => unreadable.push(format!("{}: {e:#}", path.display())),
+            Err(e) => {
+                unreadable_slugs.insert(slug.to_string());
+                unreadable.push(format!("{}: {e:#}", path.display()));
+            }
         }
     }
     Ok(files)
 }
 
+/// An empty `description` or `type` reads as absent, so it is neither
+/// reported nor written back.
+fn drop_empty_fields(frontmatter: &mut MemoryFrontmatter) {
+    if frontmatter
+        .description
+        .as_deref()
+        .is_some_and(|d| d.trim().is_empty())
+    {
+        frontmatter.description = None;
+    }
+    if frontmatter
+        .kind
+        .raw_kind()
+        .as_str()
+        .is_some_and(|k| k.trim().is_empty())
+    {
+        frontmatter.kind = KindField::default();
+    }
+}
+
 /// Within each `<base>-r<N>` chain, points every unmarked round below the
-/// highest at it, and types each member without a `type` as run-state.
+/// highest at it unless `round_chains` keeps them, and types each member
+/// without a `type` as run-state. The highest round comes from the directory
+/// listing, so it heads the chain even when its file is unreadable. Only
+/// regular files take part, and a readable member whose front matter names
+/// another memory is left out and reported, as `memory__write` refuses it.
 fn stamp_round_chains(
+    dir: &Path,
+    round_chains: RoundChains,
     files: &mut BTreeMap<String, MemoryFile>,
+    unreadable_slugs: &BTreeSet<String>,
     report: &mut ScopeReport,
     changed: &mut BTreeSet<String>,
-) {
-    let mut chains: BTreeMap<String, Vec<(u32, String)>> = BTreeMap::new();
-    for slug in files.keys() {
-        if let Some((base, round)) = round_chain_name(slug) {
-            chains
-                .entry(base.to_string())
-                .or_default()
-                .push((round, slug.clone()));
+) -> Result<()> {
+    let bases: BTreeSet<String> = files
+        .keys()
+        .filter_map(|slug| round_chain_name(slug))
+        .map(|(base, _)| base.to_string())
+        .collect();
+    for base in &bases {
+        let mut members = Vec::new();
+        for member in scan_round_siblings(dir, base)? {
+            let path = dir.join(format!("{}.md", member.name));
+            let regular = fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file());
+            if !regular && !unreadable_slugs.contains(&member.name) {
+                continue;
+            }
+            if let Some(file) = files.get(&member.name)
+                && file.frontmatter.name != member.name
+            {
+                report.unreadable.push(format!(
+                    "{}: front matter name '{}' does not match the file name",
+                    path.display(),
+                    file.frontmatter.name
+                ));
+                continue;
+            }
+            members.push(member);
         }
-    }
-    for members in chains.values() {
-        let Some((_, head)) = members.iter().max() else {
+        let Some(head) = members.last().map(|m| m.name.clone()) else {
             continue;
         };
-        for (_, slug) in members {
+        for member in &members {
+            let slug = &member.name;
             let Some(file) = files.get_mut(slug) else {
                 continue;
             };
-            if slug != head && file.frontmatter.superseded_by.is_none() {
+            if *slug != head
+                && marks_older_round(round_chains, file.frontmatter.superseded_by.as_deref())
+            {
                 file.frontmatter.superseded_by = Some(head.clone());
                 report.superseded_stamps.push((slug.clone(), head.clone()));
                 changed.insert(slug.clone());
@@ -446,9 +580,17 @@ fn stamp_round_chains(
             }
         }
     }
+    Ok(())
 }
 
-fn ensure_index_unchanged(report: &ScopeReport) -> Result<()> {
+fn changed_since_planned(path: &Path, outcome: &str) -> anyhow::Error {
+    anyhow!(
+        "{} changed since the migration was planned, so {outcome}. Rerun --memory-migrate",
+        path.display(),
+    )
+}
+
+fn ensure_index_unchanged(report: &ScopeReport, outcome: &str) -> Result<()> {
     if report.new_index.is_none() {
         return Ok(());
     }
@@ -461,16 +603,66 @@ fn ensure_index_unchanged(report: &ScopeReport) -> Result<()> {
     let current = fs::read_to_string(&index_path)
         .with_context(|| format!("read {}", index_path.display()))?;
     if report.index.as_ref() != Some(&current) {
-        bail!(
-            "{} changed since the migration was planned, so nothing was rewritten. \
-             Rerun --memory-migrate",
-            index_path.display(),
-        );
+        return Err(changed_since_planned(&index_path, outcome));
     }
     Ok(())
 }
 
+/// A rewrite target that vanished or stopped being a regular file counts as
+/// changed.
+fn ensure_rewrite_unchanged(rewrite: &Rewrite, outcome: &str) -> Result<()> {
+    let path = &rewrite.file.path;
+    let current = match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() => {
+            Some(fs::read(path).with_context(|| format!("read {}", path.display()))?)
+        }
+        Ok(_) => None,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("stat {}", path.display())),
+    };
+    if current.as_ref() != Some(&rewrite.planned) {
+        return Err(changed_since_planned(path, outcome));
+    }
+    Ok(())
+}
+
+/// `MemoryFile::render` writes `description` and `type` even when unset; a
+/// rewrite leaves an unset one out instead of writing it as null.
+fn render_rewrite(file: &MemoryFile) -> Result<String> {
+    let rendered = file.render()?;
+    if file.frontmatter.description.is_some() && !file.frontmatter.kind.raw_kind().is_null() {
+        return Ok(rendered);
+    }
+    let yaml = rendered
+        .strip_prefix("---\n")
+        .and_then(|rest| rest.strip_suffix(file.body.as_str()))
+        .and_then(|rest| rest.strip_suffix("---\n\n"))
+        .ok_or_else(|| anyhow!("rendered front matter is not delimited as expected"))?;
+    let mut frontmatter: serde_yaml::Mapping = serde_yaml::from_str(yaml)?;
+    for key in ["description", "type"] {
+        if frontmatter.get(key).is_some_and(serde_yaml::Value::is_null) {
+            frontmatter.shift_remove(key);
+        }
+    }
+    Ok(format!(
+        "---\n{}---\n\n{}",
+        serde_yaml::to_string(&frontmatter)?,
+        file.body
+    ))
+}
+
 fn apply_scope(report: &mut ScopeReport, backup_root: &Path, stamp: &str) -> Result<()> {
+    apply_scope_with(report, backup_root, stamp, || {})
+}
+
+/// `before_index_write` runs after the drill files are written, so a test can
+/// edit the index in the window the second index check guards.
+fn apply_scope_with(
+    report: &mut ScopeReport,
+    backup_root: &Path,
+    stamp: &str,
+    before_index_write: impl FnOnce(),
+) -> Result<()> {
     let backup = unused_backup_dir(backup_root, report.label, stamp);
     copy_dir_all(&report.dir, &backup, &|name| {
         name.to_string_lossy().starts_with(".catalogue.")
@@ -487,32 +679,40 @@ fn apply_scope(report: &mut ScopeReport, backup_root: &Path, stamp: &str) -> Res
         }
     })?;
     report.backup = Some(backup.clone());
-    for file in &report.rewrites {
-        let rendered = file.render().with_context(|| {
+    for rewrite in &report.rewrites {
+        let path = &rewrite.file.path;
+        let rendered = render_rewrite(&rewrite.file).with_context(|| {
             format!(
                 "render memory file {} (backup at {})",
-                file.path.display(),
+                path.display(),
                 backup.display()
             )
         })?;
-        write_private_atomic(&file.path, &rendered).with_context(|| {
-            format!(
-                "write memory file {} (backup at {})",
-                file.path.display(),
-                backup.display()
-            )
-        })?;
-        report.written.push(file.path.clone());
+        // An edit landing between this check and the write is still lost.
+        ensure_rewrite_unchanged(rewrite, STALE_DURING_APPLY)
+            .and_then(|()| Ok(write_private_atomic(path, &rendered)?))
+            .with_context(|| {
+                format!(
+                    "write memory file {} (backup at {})",
+                    path.display(),
+                    backup.display()
+                )
+            })?;
+        report.written.push(path.clone());
     }
+    before_index_write();
     if let Some(index) = &report.new_index {
         let index_path = report.dir.join(MEMORY_INDEX_FILE_NAME);
-        write_private_atomic(&index_path, index).with_context(|| {
-            format!(
-                "write {} (backup at {})",
-                index_path.display(),
-                backup.display()
-            )
-        })?;
+        // An edit landing between this check and the write is still lost.
+        ensure_index_unchanged(report, STALE_DURING_APPLY)
+            .and_then(|()| Ok(write_private_atomic(&index_path, index)?))
+            .with_context(|| {
+                format!(
+                    "write {} (backup at {})",
+                    index_path.display(),
+                    backup.display()
+                )
+            })?;
         report.written.push(index_path);
     }
     Ok(())
@@ -715,7 +915,7 @@ fn pending(report: &ScopeReport) -> Vec<String> {
     let mut pending: Vec<String> = report
         .rewrites
         .iter()
-        .map(|file| file.path.display().to_string())
+        .map(|rewrite| rewrite.file.path.display().to_string())
         .collect();
     if report.new_index.is_some() {
         pending.push(
@@ -907,6 +1107,7 @@ mod tests {
                 &self.targets(MigrateScope::All),
                 &self.backups,
                 apply,
+                RoundChains::default(),
                 now(),
             )
             .unwrap()
@@ -1276,7 +1477,12 @@ mod tests {
     fn an_edited_workspace_index_refuses_the_whole_run() {
         let fx = Fixture::new("index_race");
         let global_before = snapshot(&fx.global);
-        let mut scopes = plan_all(&fx.targets(MigrateScope::All), "2026-03-01").unwrap();
+        let mut scopes = plan_all(
+            &fx.targets(MigrateScope::All),
+            "2026-03-01",
+            RoundChains::default(),
+        )
+        .unwrap();
         let index_path = fx.workspace.join(MEMORY_INDEX_FILE_NAME);
         let edited = format!("{}- [[late]]: added meanwhile\n", workspace_index());
         fs::write(&index_path, &edited).unwrap();
@@ -1296,13 +1502,92 @@ mod tests {
     }
 
     #[test]
+    fn a_drill_file_edited_after_planning_refuses_the_whole_run() {
+        let fx = Fixture::new("drill_race");
+        let global_before = snapshot(&fx.global);
+        let mut scopes = plan_all(
+            &fx.targets(MigrateScope::All),
+            "2026-03-01",
+            RoundChains::default(),
+        )
+        .unwrap();
+        write_file(
+            &fx.workspace,
+            "plan-r2",
+            "description: edited meanwhile\ntype: project\n",
+            "late edit",
+        );
+        let workspace_before = snapshot(&fx.workspace);
+
+        let err = apply_all(&mut scopes, &fx.backups, "20260301T123045")
+            .err()
+            .expect("a stale drill file refuses the run");
+
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "{} changed since the migration was planned, so nothing was rewritten. \
+                 Rerun --memory-migrate",
+                fx.workspace.join("plan-r2.md").display()
+            )
+        );
+        assert_eq!(snapshot(&fx.workspace), workspace_before);
+        assert_eq!(snapshot(&fx.global), global_before);
+        assert!(!fx.backups.exists());
+    }
+
+    #[test]
+    fn a_drill_file_removed_after_planning_refuses_the_whole_run() {
+        let fx = Fixture::new("drill_gone");
+        let mut scopes = plan_all(
+            &fx.targets(MigrateScope::All),
+            "2026-03-01",
+            RoundChains::default(),
+        )
+        .unwrap();
+        let gone = fx.workspace.join("blank.md");
+        fs::remove_file(&gone).unwrap();
+
+        let err = apply_all(&mut scopes, &fx.backups, "20260301T123045")
+            .err()
+            .expect("a vanished drill file refuses the run");
+
+        assert!(
+            err.to_string().starts_with(&format!(
+                "{} changed since the migration was planned",
+                gone.display()
+            )),
+            "{err:#}"
+        );
+        assert!(!gone.exists());
+        assert!(!fx.backups.exists());
+    }
+
+    #[test]
     fn a_workspace_failing_after_global_applied_still_reports_both() {
         let fx = Fixture::new("partial_apply");
-        let mut scopes = plan_all(&fx.targets(MigrateScope::All), "2026-03-01").unwrap();
-        let blocked = fx.workspace.join("plan-r3.md");
-        fs::remove_file(&blocked).unwrap();
-        fs::create_dir(&blocked).unwrap();
-        fs::write(blocked.join("keep"), "x").unwrap();
+        // The name leaves no room for the temp file suffix, so the write fails
+        // although the file itself is unchanged since planning.
+        let long_base = "z".repeat(245);
+        write_file(
+            &fx.workspace,
+            &format!("{long_base}-r1"),
+            "type: user\n",
+            "1",
+        );
+        write_file(
+            &fx.workspace,
+            &format!("{long_base}-r2"),
+            "type: user\n",
+            "2",
+        );
+        let blocked = fx.workspace.join(format!("{long_base}-r1.md"));
+        let mut scopes = plan_all(
+            &fx.targets(MigrateScope::All),
+            "2026-03-01",
+            RoundChains::default(),
+        )
+        .unwrap();
 
         let failure = apply_all(&mut scopes, &fx.backups, "20260301T123045").unwrap();
         let report = Report {
@@ -1369,7 +1654,14 @@ mod tests {
         fs::create_dir_all(fx.backups.parent().unwrap()).unwrap();
         fs::write(&fx.backups, "not a dir").unwrap();
 
-        let report = migrate(&fx.targets(MigrateScope::All), &fx.backups, true, now()).unwrap();
+        let report = migrate(
+            &fx.targets(MigrateScope::All),
+            &fx.backups,
+            true,
+            RoundChains::default(),
+            now(),
+        )
+        .unwrap();
 
         assert_eq!(snapshot(&fx.workspace), workspace_before);
         assert!(scope(&report, "workspace").not_applied);
@@ -1422,7 +1714,7 @@ mod tests {
         fs::remove_file(&index_path).unwrap();
         fs::create_dir(&index_path).unwrap();
 
-        let err = plan_scope("global", &fx.global, "2026-03-01")
+        let err = plan_scope("global", &fx.global, "2026-03-01", RoundChains::default())
             .err()
             .expect("a directory index is refused");
 
@@ -1463,21 +1755,36 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_symlink_planted_at_a_rewritten_path_is_replaced_not_followed() {
+    fn a_symlink_planted_at_a_rewritten_path_is_refused_not_followed() {
         let fx = Fixture::new("symlink_swap");
-        let mut plan = plan_scope("workspace", &fx.workspace, "2026-03-01").unwrap();
+        let mut plan = plan_scope(
+            "workspace",
+            &fx.workspace,
+            "2026-03-01",
+            RoundChains::default(),
+        )
+        .unwrap();
         let drill = fx.workspace.join("blank.md");
-        assert!(plan.rewrites.iter().any(|f| f.path == drill));
+        assert!(plan.rewrites.iter().any(|r| r.file.path == drill));
+        let planned = fs::read(&drill).unwrap();
         let outside = fx._root.0.join("outside.md");
-        fs::write(&outside, "outside bytes\n").unwrap();
+        fs::write(&outside, &planned).unwrap();
         fs::remove_file(&drill).unwrap();
         std::os::unix::fs::symlink(&outside, &drill).unwrap();
 
-        apply_scope(&mut plan, &fx.backups, "20260301T123045").unwrap();
+        let err = apply_scope(&mut plan, &fx.backups, "20260301T123045")
+            .expect_err("a symlinked rewrite target is refused");
 
-        assert!(fs::symlink_metadata(&drill).unwrap().file_type().is_file());
-        assert!(fs::read_to_string(&drill).unwrap().contains("\ntags:"));
-        assert_eq!(fs::read_to_string(&outside).unwrap(), "outside bytes\n");
+        assert!(
+            format!("{err:#}").contains(&format!(
+                "{} changed since the migration was planned, so it was not rewritten",
+                drill.display()
+            )),
+            "{err:#}"
+        );
+        assert!(fs::symlink_metadata(&drill).unwrap().is_symlink());
+        assert_eq!(fs::read(&outside).unwrap(), planned);
+        assert!(plan.written.is_empty());
     }
 
     #[test]
@@ -1508,6 +1815,274 @@ mod tests {
             ]
         );
         assert_eq!(workspace.run_state_stamps, vec!["plan-r1", "plan-r3"]);
+    }
+
+    #[test]
+    fn keep_leaves_older_rounds_unmarked_while_supersede_marks_them() {
+        let marks = |round_chains| {
+            let fx = Fixture::new("chains_setting");
+            let report = migrate(
+                &fx.targets(MigrateScope::All),
+                &fx.backups,
+                true,
+                round_chains,
+                now(),
+            )
+            .unwrap();
+            let on_disk: Vec<Option<String>> = ["plan-r1", "plan-r2"]
+                .iter()
+                .map(|name| load(&fx.workspace, name).frontmatter.superseded_by)
+                .collect();
+            let workspace = scope(&report, "workspace");
+            (
+                on_disk,
+                workspace.superseded_stamps.len(),
+                workspace.run_state_stamps.clone(),
+            )
+        };
+
+        let head = Some("plan-r3".to_string());
+        assert_eq!(
+            marks(RoundChains::Supersede),
+            (
+                vec![head.clone(), head],
+                2,
+                vec!["plan-r1".to_string(), "plan-r3".to_string()]
+            )
+        );
+        assert_eq!(
+            marks(RoundChains::Keep),
+            (
+                vec![None, None],
+                0,
+                vec!["plan-r1".to_string(), "plan-r3".to_string()]
+            )
+        );
+    }
+
+    #[test]
+    fn an_unreadable_newest_round_still_heads_its_chain() {
+        let fx = Fixture::new("unreadable_head");
+        fs::write(
+            fx.workspace.join("plan-r4.md"),
+            "---\nname: [unclosed\n---\n\nr4\n",
+        )
+        .unwrap();
+
+        let report = fx.migrate(true);
+
+        for name in ["plan-r1", "plan-r2", "plan-r3"] {
+            assert_eq!(
+                load(&fx.workspace, name)
+                    .frontmatter
+                    .superseded_by
+                    .as_deref(),
+                Some("plan-r4"),
+                "{name}"
+            );
+        }
+        let workspace = scope(&report, "workspace");
+        assert_eq!(
+            workspace.superseded_stamps,
+            vec![
+                ("plan-r1".to_string(), "plan-r4".to_string()),
+                ("plan-r2".to_string(), "plan-r4".to_string()),
+                ("plan-r3".to_string(), "plan-r4".to_string()),
+            ]
+        );
+        assert!(
+            workspace
+                .unreadable
+                .iter()
+                .any(|line| line.contains("plan-r4.md")),
+            "{:?}",
+            workspace.unreadable
+        );
+        assert!(
+            !workspace
+                .missing_targets
+                .iter()
+                .any(|(_, target)| target == "plan-r4"),
+            "{:?}",
+            workspace.missing_targets
+        );
+    }
+
+    #[test]
+    fn a_directory_named_like_a_newer_round_does_not_head_its_chain() {
+        let fx = Fixture::new("dir_round");
+        fs::create_dir(fx.workspace.join("plan-r5.md")).unwrap();
+
+        let report = fx.migrate(false);
+
+        assert_eq!(
+            scope(&report, "workspace").superseded_stamps,
+            vec![
+                ("plan-r1".to_string(), "plan-r3".to_string()),
+                ("plan-r2".to_string(), "plan-r3".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_round_whose_front_matter_names_another_memory_is_left_out_and_reported() {
+        let fx = Fixture::new("misnamed_round");
+        fs::write(
+            fx.workspace.join("plan-r4.md"),
+            "---\nname: elsewhere\ntype: project\n---\n\nr4\n",
+        )
+        .unwrap();
+
+        let report = fx.migrate(false);
+
+        let workspace = scope(&report, "workspace");
+        assert_eq!(
+            workspace.superseded_stamps,
+            vec![
+                ("plan-r1".to_string(), "plan-r3".to_string()),
+                ("plan-r2".to_string(), "plan-r3".to_string()),
+            ]
+        );
+        assert!(
+            workspace.unreadable.contains(&format!(
+                "{}: front matter name 'elsewhere' does not match the file name",
+                fx.workspace.join("plan-r4.md").display()
+            )),
+            "{:?}",
+            workspace.unreadable
+        );
+    }
+
+    #[test]
+    fn only_an_unreadable_drill_file_excuses_a_missing_supersede_target() {
+        let fx = Fixture::new("missing_targets");
+        fs::create_dir(fx.global.join("a-dir.md")).unwrap();
+        fs::write(fx.global.join("a-broken.md"), "---\nname: [unclosed\n---\n").unwrap();
+        for (name, target) in [
+            ("to-dir", "a-dir"),
+            ("to-broken", "a-broken"),
+            ("to-sub", "sub/a-broken"),
+            ("to-parent", "../a-broken"),
+        ] {
+            write_file(
+                &fx.global,
+                name,
+                &format!("description: d\ntype: user\nsuperseded_by: {target}\n"),
+                "x",
+            );
+        }
+
+        let report = fx.migrate(false);
+
+        assert_eq!(
+            scope(&report, "global").missing_targets,
+            vec![
+                ("to-dir".to_string(), "a-dir".to_string()),
+                ("to-parent".to_string(), "../a-broken".to_string()),
+                ("to-sub".to_string(), "sub/a-broken".to_string()),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_drill_file_does_not_excuse_a_missing_supersede_target() {
+        let fx = Fixture::new("missing_symlink_target");
+        let outside = fx._root.0.join("outside.md");
+        fs::write(&outside, "---\nname: a-link\n---\n\nl\n").unwrap();
+        std::os::unix::fs::symlink(&outside, fx.global.join("a-link.md")).unwrap();
+        write_file(
+            &fx.global,
+            "to-link",
+            "description: d\ntype: user\nsuperseded_by: a-link\n",
+            "x",
+        );
+
+        let report = fx.migrate(false);
+
+        assert_eq!(
+            scope(&report, "global").missing_targets,
+            vec![("to-link".to_string(), "a-link".to_string())]
+        );
+    }
+
+    #[test]
+    fn an_index_edited_during_apply_is_not_overwritten() {
+        let fx = Fixture::new("index_mid_apply");
+        let scopes = plan_all(
+            &fx.targets(MigrateScope::Workspace),
+            "2026-03-01",
+            RoundChains::default(),
+        )
+        .unwrap();
+        let Some(ScopeOutcome::Migrated(mut report)) = scopes.into_iter().next() else {
+            panic!("the workspace scope plans");
+        };
+        assert!(report.new_index.is_some());
+        let index_path = fx.workspace.join(MEMORY_INDEX_FILE_NAME);
+        let edited = format!("{}- [[late]]: added meanwhile\n", workspace_index());
+
+        let err = apply_scope_with(&mut report, &fx.backups, "20260301T123045", || {
+            fs::write(&index_path, &edited).unwrap();
+        })
+        .expect_err("an index edited during apply is refused");
+
+        assert!(
+            format!("{err:#}").contains(&format!(
+                "{} changed since the migration was planned, so it was not rewritten",
+                index_path.display()
+            )),
+            "{err:#}"
+        );
+        assert_eq!(fs::read_to_string(&index_path).unwrap(), edited);
+        assert!(!report.written.contains(&index_path));
+        assert!(!report.written.is_empty());
+    }
+
+    #[test]
+    fn an_empty_description_or_type_is_dropped_quietly() {
+        let fx = Fixture::new("empty_fields");
+        fs::write(
+            fx.global.join(MEMORY_INDEX_FILE_NAME),
+            format!("{GLOBAL_INDEX}- [[hollow]]: from the index\n- [[hollow-r2]]: newer\n"),
+        )
+        .unwrap();
+        write_file(&fx.global, "hollow", "description: ''\ntype: ''\n", "h");
+        write_file(
+            &fx.global,
+            "hollow-r1",
+            "description: '  '\ntype: user\n",
+            "1",
+        );
+        write_file(
+            &fx.global,
+            "hollow-r2",
+            "description: newer\ntype: user\n",
+            "2",
+        );
+
+        let report = fx.migrate(true);
+
+        let global = scope(&report, "global");
+        assert!(
+            global.unknown_types.is_empty(),
+            "{:?}",
+            global.unknown_types
+        );
+        assert!(global.long_descriptions.is_empty());
+        assert!(global.drift.is_empty());
+        assert!(global.run_state_stamps.is_empty());
+        assert_eq!(global.backfilled, vec!["hollow"]);
+        assert!(!report.to_string().contains("''"));
+        let hollow = fs::read_to_string(fx.global.join("hollow.md")).unwrap();
+        assert!(
+            hollow.contains("\ndescription: from the index\n"),
+            "{hollow}"
+        );
+        assert!(!hollow.contains("type:"), "{hollow}");
+        let older = fs::read_to_string(fx.global.join("hollow-r1.md")).unwrap();
+        assert!(older.contains("\nsuperseded_by: hollow-r2\n"), "{older}");
+        assert!(!older.contains("description:"), "{older}");
     }
 
     #[test]
@@ -1574,7 +2149,7 @@ mod tests {
                 dir: None,
             },
         ];
-        let text = migrate(&missing, &fx.backups, true, now())
+        let text = migrate(&missing, &fx.backups, true, RoundChains::default(), now())
             .unwrap()
             .to_string();
         assert_eq!(
@@ -1599,5 +2174,37 @@ mod tests {
             unused_backup_dir(&root.0, "global", "20260301T123045"),
             root.0.join("global-20260301T123045-2")
         );
+    }
+
+    #[test]
+    fn the_round_chains_setting_is_read_past_other_invalid_keys() {
+        let root = TempDir::new("round_chains_setting");
+        let config = root.0.join("config.yaml");
+        assert_eq!(round_chains_in(&config).unwrap(), RoundChains::Supersede);
+
+        fs::write(&config, "").unwrap();
+        assert_eq!(round_chains_in(&config).unwrap(), RoundChains::Supersede);
+
+        fs::write(&config, "model: [not, a, string]\n").unwrap();
+        assert_eq!(round_chains_in(&config).unwrap(), RoundChains::Supersede);
+
+        fs::write(
+            &config,
+            "model: [not, a, string]\nmemory_round_chains: keep\n",
+        )
+        .unwrap();
+        assert_eq!(round_chains_in(&config).unwrap(), RoundChains::Keep);
+
+        for broken in ["memory_round_chains: bogus\n", "model: [unclosed\n"] {
+            fs::write(&config, broken).unwrap();
+            let err = format!("{:#}", round_chains_in(&config).unwrap_err());
+            assert!(
+                err.starts_with(&format!(
+                    "read memory_round_chains from {}",
+                    config.display()
+                )),
+                "{err}"
+            );
+        }
     }
 }

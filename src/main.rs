@@ -183,7 +183,10 @@ async fn async_main() -> Result<()> {
     }
 
     if let Some(scope) = cli.memory_migrate {
-        let report = memory_migrate::run(scope, cli.apply)?;
+        let round_chains = memory_migrate::configured_round_chains().context(
+            "memory_round_chains could not be read; fix the config and rerun --memory-migrate",
+        )?;
+        let report = memory_migrate::run(scope, cli.apply, round_chains)?;
         print!("{report}");
         return report.into_result();
     }

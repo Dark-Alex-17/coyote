@@ -592,6 +592,10 @@ pub struct RequestContext {
     /// under. Resolved once per graph run by `ensure_child_session_root`;
     /// forks and children copy the parent's handle.
     pub(crate) child_session_root: Option<Arc<ChildSessionRoot>>,
+    /// Where `memory_config` starts workspace memory discovery for the
+    /// prompt. `None` means the process cwd, read at each lookup. The memory
+    /// tools do not read this and always resolve from the cwd.
+    pub(crate) workspace_memory_root: Option<PathBuf>,
 
     pub supervisor: Option<Arc<RwLock<Supervisor>>>,
     pub parent_supervisor: Option<Arc<RwLock<Supervisor>>>,
@@ -668,6 +672,7 @@ impl RequestContext {
             last_graph_branch: None,
             delegate: None,
             child_session_root: None,
+            workspace_memory_root: None,
             supervisor: None,
             parent_supervisor: None,
             self_agent_id: None,
@@ -753,6 +758,7 @@ impl RequestContext {
             last_graph_branch: None,
             delegate: None,
             child_session_root: None,
+            workspace_memory_root: None,
             supervisor: None,
             parent_supervisor: None,
             self_agent_id: None,
@@ -873,6 +879,7 @@ impl RequestContext {
             last_graph_branch: self.last_graph_branch,
             delegate,
             child_session_root: self.child_session_root.clone(),
+            workspace_memory_root: self.workspace_memory_root.clone(),
             supervisor: self.supervisor.clone(),
             parent_supervisor: self.parent_supervisor.clone(),
             self_agent_id: self.self_agent_id.clone(),
@@ -941,6 +948,7 @@ impl RequestContext {
             last_graph_branch: None,
             delegate: None,
             child_session_root: parent.child_session_root.clone(),
+            workspace_memory_root: parent.workspace_memory_root.clone(),
             supervisor: None,
             parent_supervisor: parent.supervisor.clone(),
             self_agent_id: Some(self_agent_id),
@@ -2377,8 +2385,11 @@ impl RequestContext {
             return MemoryConfig::disabled();
         }
 
-        let cwd = env::current_dir().ok();
-        let store = cwd.as_deref().map(MemoryStore::new);
+        let root = self
+            .workspace_memory_root
+            .clone()
+            .or_else(|| env::current_dir().ok());
+        let store = root.as_deref().map(MemoryStore::new);
         let workspace = store.as_ref().and_then(|s| s.workspace.clone());
 
         let global_exists = paths::global_memory_index_file().exists();
@@ -14038,6 +14049,55 @@ mod tests {
         assert_eq!(*root, ChildSessionRoot::from_stamp(ProcessStamp::current()));
     }
 
+    #[test]
+    #[serial]
+    fn forks_and_children_keep_the_workspace_memory_root() {
+        let guard = TestConfigDirGuard::new();
+        let workspace_index = paths::workspace_memory_index_file_for(&guard.workspace_root);
+        create_dir_all(workspace_index.parent().unwrap()).unwrap();
+        write(workspace_index, "# Workspace Memory\n").unwrap();
+        let expected_dir = MemoryStore::new(&guard.workspace_root)
+            .workspace
+            .map(|w| w.dir);
+        assert!(expected_dir.is_some());
+
+        let mut ctx = create_test_ctx();
+        ctx.workspace_memory_root = Some(guard.workspace_root.clone());
+        let fork = ctx.fork_for_branch();
+        let child = RequestContext::new_for_child(
+            Arc::clone(&ctx.app),
+            &ctx,
+            1,
+            Arc::new(Inbox::new()),
+            "agent_child_1".to_string(),
+        );
+
+        for copy in [&ctx, &fork, &child] {
+            assert_eq!(
+                copy.workspace_memory_root,
+                Some(guard.workspace_root.clone())
+            );
+            let config = copy.memory_config();
+            assert!(config.enabled);
+            assert_eq!(config.workspace.map(|w| w.dir), expected_dir);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn without_a_workspace_memory_root_memory_resolves_from_the_current_dir() {
+        let _guard = TestConfigDirGuard::new();
+        write_global_memory_store();
+        let ctx = create_test_ctx();
+        assert_eq!(ctx.workspace_memory_root, None);
+
+        let config = ctx.memory_config();
+
+        assert!(config.enabled);
+        let expected = MemoryStore::new(&env::current_dir().unwrap()).workspace;
+        assert_eq!(config.workspace.map(|w| w.dir), expected.map(|w| w.dir));
+    }
+
     fn retention_time() -> chrono::DateTime<chrono::Utc> {
         use chrono::TimeZone;
         chrono::Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap()
@@ -18554,15 +18614,20 @@ mod tests {
     #[test]
     #[serial]
     fn chat_agent_is_the_agent_slot_while_no_delegate_is_engaged() {
-        let _guard = TestConfigDirGuard::new();
+        let guard = TestConfigDirGuard::new();
         write_global_memory_store();
+        let workspace_index = paths::workspace_memory_index_file_for(&guard.workspace_root);
+        create_dir_all(workspace_index.parent().unwrap()).unwrap();
+        write(workspace_index, "# Workspace Memory\n").unwrap();
+        let workspace_root = Some(guard.workspace_root.clone());
         let deterministic_prompt = |app: &mut AppConfig| {
             app.workspace_instructions = Some(false);
             app.skills_enabled = false;
             app.function_calling_support = true;
             app.memory = None;
         };
-        let store = MemoryStore::new(&env::current_dir().unwrap());
+        let store = MemoryStore::new(&guard.workspace_root);
+        assert!(store.workspace.is_some());
         let memory_section = memory::build_memory_section(
             &store,
             true,
@@ -18581,6 +18646,7 @@ mod tests {
         let expected_workspace_dir = store.workspace.as_ref().map(|w| w.dir.clone());
 
         let mut ctx = create_test_ctx();
+        ctx.workspace_memory_root = workspace_root.clone();
         ctx.update_app_config(deterministic_prompt);
         let app = ctx.app.config.clone();
         assert!(ctx.agent.is_none());
@@ -18591,6 +18657,7 @@ mod tests {
         assert_eq!(ctx.extract_role(&app).unwrap().prompt(), memory_tail);
 
         let mut ctx = create_test_ctx();
+        ctx.workspace_memory_root = workspace_root.clone();
         ctx.update_app_config(deterministic_prompt);
         let app = ctx.app.config.clone();
         ctx.agent = Some(Agent::test_new(AgentConfig {
@@ -18617,6 +18684,7 @@ mod tests {
             let agent_name = unique_name("test_block_graph_agent");
             write_graph_agent(&agent_name, extra);
             let mut ctx = create_test_ctx();
+            ctx.workspace_memory_root = workspace_root.clone();
             ctx.update_app_config(deterministic_prompt);
             ctx.model = fc_model("agent-model");
             let app = ctx.app.config.clone();
