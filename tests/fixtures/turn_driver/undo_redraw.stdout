@@ -1,0 +1,10 @@
+>> .undo
+>> .redraw
+You:
+hello
+
+Assistant:
+hi there
+
+<rule> ↑ redrawn ↑ <rule>
+
