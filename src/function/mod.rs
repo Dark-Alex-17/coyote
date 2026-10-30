@@ -1490,14 +1490,18 @@ impl ToolCall {
         let json_data = self.parse_arguments()?;
         let cmd_name = self.name.as_str();
         let call_id = self.id.clone().unwrap_or_default();
-        let line = format_call_log(cmd_name, &[json_data.to_string()], &json_data);
+        let cmd_args = [json_data.to_string()];
         if (*IS_STDOUT_TERMINAL || *SHOW_TOOL_CALLS)
             && ctx.current_depth == 0
             && !HEADLESS.load(Ordering::SeqCst)
         {
-            ctx.ui.tool_narration(&call_id, &line);
+            ctx.ui
+                .tool_narration(&call_id, cmd_name, &cmd_args, &json_data);
         }
-        events::bus().publish(Event::ToolNarration { call_id, line });
+        events::bus().publish(Event::ToolNarration {
+            call_id,
+            line: plain_call_log(cmd_name, &cmd_args),
+        });
         let result = if cmd_name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX) {
             Self::search_mcp_tools(ctx, cmd_name, &json_data)
                 .await
@@ -1619,14 +1623,17 @@ impl ToolCall {
         cmd_args.push(args_json.clone());
 
         let call_id = self.id.clone().unwrap_or_default();
-        let line = format_call_log(&cmd_name, &cmd_args, &json_data);
         if (*IS_STDOUT_TERMINAL || *SHOW_TOOL_CALLS)
             && current_depth == 0
             && !HEADLESS.load(Ordering::SeqCst)
         {
-            ctx.ui.tool_narration(&call_id, &line);
+            ctx.ui
+                .tool_narration(&call_id, &cmd_name, &cmd_args, &json_data);
         }
-        events::bus().publish(Event::ToolNarration { call_id, line });
+        events::bus().publish(Event::ToolNarration {
+            call_id,
+            line: plain_call_log(&cmd_name, &cmd_args),
+        });
 
         hooks::fire(
             HookEvent::ToolStarted,
@@ -2820,9 +2827,16 @@ impl ToolCallTracker {
     }
 }
 
-fn format_call_log(cmd_name: &str, cmd_args: &[String], json_data: &Value) -> String {
+/// The `Call <tool> <args>` narration line without any terminal styling.
+pub(crate) fn plain_call_log(cmd_name: &str, cmd_args: &[String]) -> String {
+    format!("Call {cmd_name} {}", cmd_args.join(" "))
+}
+
+/// The narration line as the terminal prints it: plain under `NO_COLOR`,
+/// otherwise with the tool name and the argument keys coloured.
+pub(crate) fn format_call_log(cmd_name: &str, cmd_args: &[String], json_data: &Value) -> String {
     if *NO_COLOR {
-        return format!("Call {cmd_name} {}", cmd_args.join(" "));
+        return plain_call_log(cmd_name, cmd_args);
     }
     let prefix_args = &cmd_args[..cmd_args.len().saturating_sub(1)];
     let prefix = if prefix_args.is_empty() {
@@ -2876,7 +2890,7 @@ mod tests {
         AgentExitStatus, AgentHandle, AgentResult, JobHandle, JobResult, JobState, JobStatus,
         Supervisor,
     };
-    use crate::turn::{NoticeProbe, StdoutSink};
+    use crate::turn::{NoticeProbe, SilentSink, StdoutSink};
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
     use jobs::RingBuf;
@@ -4873,11 +4887,15 @@ mod tests {
         });
         let result = match rx.recv_timeout(Duration::from_secs(10)) {
             Ok(result) => result,
-            Err(_) => {
+            Err(mpsc::RecvTimeoutError::Timeout) => {
                 drop(saved);
                 panic!(
                     "depth-1 tool output reached io::stdout(): the pump thread blocked on the capture lock"
                 );
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                drop(saved);
+                panic!("the helper thread panicked before reporting");
             }
         };
         drop(saved);
@@ -5734,6 +5752,7 @@ mod tests {
     fn eval_publishes_tool_narration_for_external_command_tools() {
         let recording = crate::events::RecordingSink::install();
         let mut ctx = ctx_with_tool_hooks("tool-narration-x7x", |_| {});
+        ctx.ui = Arc::new(SilentSink);
         ctx.tool_scope
             .functions
             .append_declaration(FunctionDeclaration {
@@ -5760,6 +5779,73 @@ mod tests {
         let (call_id, line) = &narrations[0];
         assert_eq!(call_id, "id1");
         assert!(line.contains("echo"), "{line:?}");
+        assert!(!line.contains('\x1b'), "{line:?}");
+    }
+
+    // A child agent's tool call still announces itself on the bus, while the
+    // terminal sink keeps fd 1 silent for it. The capture lock is held on
+    // this thread, so the call runs on a helper thread: a regression that
+    // echoed at depth 1 would block the pump on `io::stdout()` and show up
+    // here as a timeout instead of a deadlock.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn eval_at_depth_one_publishes_narration_but_keeps_fd_one_silent() {
+        let recording = crate::events::RecordingSink::install();
+        let mut ctx = ctx_with_tool_hooks("tool-narration-depth-one-x7x", |_| {});
+        ctx.current_depth = 1;
+        ctx.ui = Arc::new(StdoutSink::default());
+        ctx.tool_scope
+            .functions
+            .append_declaration(FunctionDeclaration {
+                name: "echo".to_string(),
+                description: String::new(),
+                parameters: JsonSchema::default(),
+                agent: false,
+            });
+
+        let (saved, mut reader) = crate::testing::capture_stdout();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = run_async(
+                call_with_args("echo", json!({"x": "depth-one-narration-x7x"})).eval(&mut ctx),
+            );
+            let _ = tx.send(result);
+        });
+        let result = match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                drop(saved);
+                panic!(
+                    "depth-1 tool output reached io::stdout(): the pump thread blocked on the capture lock"
+                );
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                drop(saved);
+                panic!("the helper thread panicked before reporting");
+            }
+        };
+        drop(saved);
+        let out = crate::testing::read_all(&mut reader);
+        assert!(!out.contains("depth-one-narration-x7x"), "{out:?}");
+        crate::testing::write_fd1(out.as_bytes());
+
+        assert_eq!(result.unwrap(), Value::Null);
+        let narrations: Vec<(String, String)> = recording
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::ToolNarration { call_id, line }
+                    if line.contains("depth-one-narration-x7x") =>
+                {
+                    Some((call_id, line))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(narrations.len(), 1, "{narrations:?}");
+        assert_eq!(narrations[0].0, "id1");
+        assert!(!narrations[0].1.contains('\x1b'), "{:?}", narrations[0].1);
     }
 
     #[cfg(unix)]

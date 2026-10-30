@@ -13,6 +13,7 @@ use crate::config::AppConfig;
 use crate::events::{NoticeKind, OutputStream};
 use crate::utils::AbortSignal;
 use anyhow::Result;
+use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -31,8 +32,9 @@ pub trait UiSink: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
     /// An engine notice (checkpoint, auto-continue, tool warning, ...).
     fn notice(&self, kind: NoticeKind, text: &str);
-    /// The `Call <tool> <args>` line announcing a tool call.
-    fn tool_narration(&self, call_id: &str, line: &str);
+    /// Announces a tool call; the sink decides how `Call <tool> <args>` is
+    /// styled, so producers hand over the parts rather than a painted line.
+    fn tool_narration(&self, call_id: &str, cmd_name: &str, cmd_args: &[String], json_data: &Value);
     /// A chunk a running tool wrote to its stdout or stderr.
     fn tool_output(&self, call_id: Option<&str>, stream: OutputStream, depth: usize, chunk: &[u8]);
     /// Shows (`Some(message)`) or clears (`None`) the busy indicator.
@@ -81,7 +83,7 @@ impl UiSink for NoticeProbe {
             .push((kind, text.to_string()));
     }
 
-    fn tool_narration(&self, _call_id: &str, _line: &str) {}
+    fn tool_narration(&self, _: &str, _: &str, _: &[String], _: &Value) {}
 
     fn tool_output(&self, _: Option<&str>, _: OutputStream, _: usize, _: &[u8]) {}
 

@@ -4,6 +4,7 @@ use crate::config::AppConfig;
 use crate::events::{NoticeKind, OutputStream};
 use crate::utils::AbortSignal;
 use anyhow::Result;
+use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -31,7 +32,7 @@ impl UiSink for SilentSink {
         debug!("{text}");
     }
 
-    fn tool_narration(&self, _call_id: &str, _line: &str) {}
+    fn tool_narration(&self, _: &str, _: &str, _: &[String], _: &Value) {}
 
     fn tool_output(
         &self,

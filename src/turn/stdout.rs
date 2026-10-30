@@ -2,10 +2,12 @@ use super::UiSink;
 use crate::client::SseEvent;
 use crate::config::AppConfig;
 use crate::events::{NoticeKind, OutputStream};
+use crate::function::format_call_log;
 use crate::utils::{
     AbortSignal, IS_STDOUT_TERMINAL, Spinner, dimmed_text, muted_warning_text, spawn_spinner,
 };
 use anyhow::Result;
+use serde_json::Value;
 use std::future::Future;
 use std::io::{self, Write};
 use std::pin::Pin;
@@ -55,8 +57,14 @@ impl UiSink for StdoutSink {
         }
     }
 
-    fn tool_narration(&self, _call_id: &str, line: &str) {
-        println!("{line}");
+    fn tool_narration(
+        &self,
+        _call_id: &str,
+        cmd_name: &str,
+        cmd_args: &[String],
+        json_data: &Value,
+    ) {
+        println!("{}", format_call_log(cmd_name, cmd_args, json_data));
     }
 
     // Subagent (depth > 0) tools run while the parent session owns the
@@ -109,38 +117,65 @@ impl UiSink for StdoutSink {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{capture_stdout, read_all, write_fd1};
-    use crate::turn::SilentSink;
-    use serial_test::serial;
 
-    // The harness reports from other threads on fd 1 too, so the capture
-    // is checked for our marker and then passed through to the real fd 1.
-    fn assert_marker_never_landed(sink: &dyn UiSink, depth: usize, marker: &str) {
-        let (saved, mut reader) = capture_stdout();
-        sink.tool_output(
-            Some("call-1"),
-            OutputStream::Stdout,
-            depth,
-            marker.as_bytes(),
-        );
-        drop(saved);
-        let out = read_all(&mut reader);
-        assert!(!out.contains(marker), "{out:?}");
-        write_fd1(out.as_bytes());
+    fn echoed(chunk: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        echo_chunk(&mut out, chunk);
+        out
     }
 
     #[test]
-    #[serial]
-    fn stdout_sink_at_depth_one_writes_nothing() {
-        assert_marker_never_landed(&StdoutSink::default(), 1, "stdout-sink-depth-one-x7x\n");
+    fn echo_chunk_turns_every_newline_into_crlf() {
+        assert_eq!(echoed(b"a\nb\n\nc"), b"a\r\nb\r\n\r\nc");
+        assert_eq!(echoed(b"\n"), b"\r\n");
     }
 
     #[test]
-    #[serial]
-    fn silent_sink_at_depth_zero_writes_nothing() {
-        assert_marker_never_landed(&SilentSink, 0, "silent-sink-depth-zero-x7x\n");
+    fn echo_chunk_passes_a_newline_free_chunk_through() {
+        assert_eq!(echoed(b"no newline here"), b"no newline here");
+    }
+
+    #[test]
+    fn echo_chunk_writes_nothing_for_an_empty_chunk() {
+        assert_eq!(echoed(b""), b"");
+    }
+
+    #[cfg(unix)]
+    mod fd_one {
+        use super::super::*;
+        use crate::testing::{capture_stdout, read_all, write_fd1};
+        use crate::turn::SilentSink;
+        use serial_test::serial;
+
+        // The harness reports from other threads on fd 1 too, so the capture
+        // is checked for our marker and then passed through to the real fd 1.
+        fn assert_marker_never_landed(sink: &dyn UiSink, depth: usize, marker: &str) {
+            let (saved, mut reader) = capture_stdout();
+            sink.tool_output(
+                Some("call-1"),
+                OutputStream::Stdout,
+                depth,
+                marker.as_bytes(),
+            );
+            drop(saved);
+            let out = read_all(&mut reader);
+            assert!(!out.contains(marker), "{out:?}");
+            write_fd1(out.as_bytes());
+        }
+
+        #[test]
+        #[serial]
+        fn stdout_sink_at_depth_one_writes_nothing() {
+            assert_marker_never_landed(&StdoutSink::default(), 1, "stdout-sink-depth-one-x7x\n");
+        }
+
+        #[test]
+        #[serial]
+        fn silent_sink_at_depth_zero_writes_nothing() {
+            assert_marker_never_landed(&SilentSink, 0, "silent-sink-depth-zero-x7x\n");
+        }
     }
 }
