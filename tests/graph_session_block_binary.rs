@@ -3129,12 +3129,13 @@ fn the_test_memory_root_env_name_matches_the_source_const() {
 /// directory it runs in, and the `TEST_WORKSPACE_MEMORY_ROOT_ENV` pin
 /// the unit-test guards set is a test-build seam: a real run that carries
 /// it still reads the index above its cwd. The dry-run model echoes the
-/// whole system prompt, so the `<workspace_index>` block is observable on
-/// stdout.
+/// whole system prompt, so the workspace index lines under `<facts>` are
+/// observable on stdout.
 #[test]
 fn usage_probe_the_shipped_binary_walks_up_from_its_cwd_for_workspace_memory_and_ignores_the_test_root_pin()
  {
     const GLOBAL_LINE: &str = "- global fact from the fixture";
+    const WORKSPACE_HEADER: &str = "# Workspace Memory Index";
     const WORKSPACE_LINE: &str = "- workspace fact planted by the probe";
     let dir = fresh_config_dir("workspace-memory");
     let _guard = TempDirGuard(dir.clone());
@@ -3160,7 +3161,7 @@ fn usage_probe_the_shipped_binary_walks_up_from_its_cwd_for_workspace_memory_and
     fs::create_dir_all(&index_dir).unwrap();
     fs::write(
         index_dir.join("MEMORY.md"),
-        format!("# Workspace Memory Index\n{WORKSPACE_LINE}\n"),
+        format!("{WORKSPACE_HEADER}\n{WORKSPACE_LINE}\n"),
     )
     .unwrap();
     // A sibling with no index anywhere above it short of the temp root.
@@ -3189,13 +3190,10 @@ fn usage_probe_the_shipped_binary_walks_up_from_its_cwd_for_workspace_memory_and
         &run_from(&nested, &dir, &["-e", "hello"], &[]),
         "walk from the nested cwd",
     );
-    assert!(
-        from_workspace.contains("<global_index>"),
-        "{from_workspace}"
-    );
+    assert!(from_workspace.contains("<facts>"), "{from_workspace}");
     assert!(from_workspace.contains(GLOBAL_LINE), "{from_workspace}");
     assert!(
-        from_workspace.contains("<workspace_index>"),
+        from_workspace.contains(WORKSPACE_HEADER),
         "{from_workspace}"
     );
     assert!(from_workspace.contains(WORKSPACE_LINE), "{from_workspace}");
@@ -3223,7 +3221,7 @@ fn usage_probe_the_shipped_binary_walks_up_from_its_cwd_for_workspace_memory_and
     );
     assert!(from_elsewhere.contains(GLOBAL_LINE), "{from_elsewhere}");
     assert!(
-        !from_elsewhere.contains("<workspace_index>"),
+        !from_elsewhere.contains(WORKSPACE_HEADER),
         "{from_elsewhere}"
     );
     assert!(!from_elsewhere.contains(WORKSPACE_LINE), "{from_elsewhere}");
