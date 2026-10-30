@@ -201,6 +201,7 @@ initial_state:
   design_block: ''
   design_asks: []
   design_ask_rounds: 0
+  oracle_retries: 0
   design_decisions: []
   inbox_instructions: ''
   # --- bookkeeping ---
@@ -458,6 +459,7 @@ nodes:
     description: Fail-safe default when assess died - the run asks instead of guessing.
     script: scripts/assess_fault.py
     next: route_intent
+    fallback: route_intent
 
   route_intent:
     id: route_intent

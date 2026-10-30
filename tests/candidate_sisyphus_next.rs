@@ -35,7 +35,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "sisyphus-next";
 const CANDIDATE_NAMES: [&str; 2] = ["sisyphus-next", "architect-next"];
-const SMOKE_FLOOR: usize = 237;
+const SMOKE_FLOOR: usize = 243;
 
 fn agents_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents")
@@ -280,6 +280,26 @@ fn debt_scan_declares_its_fallback_next_to_next() {
         node["fallback"].as_str(),
         Some("bookkeeping_scan"),
         "debt_scan has no fallback edge: a script crash forwards only on fallback, so the fail-open default would never reach bookkeeping_scan"
+    );
+}
+
+/// `assess_fault` is the fail-safe after `assess` dies, so a crash of the
+/// fault shim itself must still reach `route_intent`, which asks when the
+/// intent is missing.
+#[test]
+fn assess_fault_declares_its_fallback_next_to_next() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let doc: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let node = &doc["nodes"]["assess_fault"];
+    assert_eq!(
+        node["next"].as_str(),
+        Some("route_intent"),
+        "assess_fault next"
+    );
+    assert_eq!(
+        node["fallback"].as_str(),
+        Some("route_intent"),
+        "assess_fault has no fallback edge: a script crash forwards only on fallback, so the run would end instead of asking"
     );
 }
 
@@ -1495,8 +1515,19 @@ fn gates_carry_exactly_the_recorded_divergences_from_staging() {
         assert!(update.contains(reset), "{reset} missing from {update}");
     }
     assert!(
-        route.contains("for e in as_list(state.get(\"debris_exemptions\")):\n        if e not in exemptions:\n            exemptions.append(e)\n"),
-        "the merge lines stay byte-equal to staging: {route}"
+        !route.contains("for e in as_list(state.get(\"debris_exemptions\")):"),
+        "the no-op re-merge loop is gone: {route}"
+    );
+    let merges: Vec<&str> = route
+        .lines()
+        .filter(|l| l.contains("debris_exemptions\")))"))
+        .collect();
+    assert_eq!(
+        merges,
+        [
+            "    exemptions = list(as_list(state.get(\"debris_exemptions\"))) + [e for e in as_list(state.get(\"debris_exemptions_new\", [])) if e]"
+        ],
+        "the ledger is merged once, by the concatenation line"
     );
     let graph = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
     let shipped: serde_yaml::Value = serde_yaml::from_str(&graph).unwrap();
@@ -2009,6 +2040,7 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
     "fix_round",
     "fix_strikes",
     "obs_rounds",
+    "oracle_retries",
     "owner_polls",
     "reask_rounds",
     "rejected_rounds",
@@ -2797,6 +2829,25 @@ fn readme_pins_the_artifact_re_entry_and_engine_fact_rows() {
         section.lines().any(|l| l == facts_row),
         "missing row {facts_row:?}:\n{section}"
     );
+}
+
+#[test]
+fn readme_ci_budget_row_separates_per_watch_from_per_run_counters() {
+    let readme = fs::read_to_string(candidate_dir().join("README.md")).unwrap();
+    let section = readme
+        .split("\n## ")
+        .find(|s| s.starts_with("Landed-upstream adjustments"))
+        .expect("README has a Landed-upstream adjustments section");
+    let row = section
+        .lines()
+        .find(|l| l.starts_with("| CI budget nesting |"))
+        .unwrap_or_else(|| panic!("missing CI budget nesting row:\n{section}"));
+    for sentence in [
+        "Per-watch budgets are `ci_polls`, `ci_poll_fails` and `ci_started_at`: they reset every time a watch starts (`ci_gate`, the owner's re-run answer, a flake re-run).",
+        "Per-run budgets are `ci_reruns` (per check, `CI_FLAKE_RERUNS`) and `ci_fix_strikes` (`STRIKE_LIMIT`).",
+    ] {
+        assert!(row.contains(sentence), "missing {sentence:?} in {row}");
+    }
 }
 
 /// A clean one-commit repository plus the cold round-1 state a gauntlet

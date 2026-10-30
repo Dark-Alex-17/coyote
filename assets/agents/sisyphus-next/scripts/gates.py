@@ -1066,6 +1066,21 @@ def _posture(state):
     return {"poc": "prototype", "prototype": "standard", "production": "standard"}.get(rigor, posture or "standard")
 
 
+# The in-repo planning store (<project_dir>/plans) carries uncommitted handoff
+# and status edits; only changes outside it leave the re-review delta incomplete.
+def _code_tree_dirty(state, root):
+    pathspec = []
+    plans = os.path.join(state.get("project_dir") or root, "plans")
+    if os.path.isdir(plans):
+        try:
+            rel = os.path.relpath(os.path.realpath(plans), os.path.realpath(root))
+        except ValueError:
+            rel = ".."
+        if rel != "." and rel != ".." and not rel.startswith(".." + os.sep):
+            pathspec = ["--", ".", f":(exclude,literal){rel}"]
+    return bool(git_out(root, "status", "--porcelain", "--untracked-files=normal", *pathspec))
+
+
 def build_gauntlet_prompt(state):
     u = {}
     root = state.get("git_root") or state.get("project_dir") or "."
@@ -1086,7 +1101,7 @@ def build_gauntlet_prompt(state):
         if prior:
             lines += ["Prior review decisions:"] + [f"- {p}" for p in prior]
         last = rounds[-1] if isinstance(rounds[-1], dict) else {}
-        dirty = bool(git_out(root, "status", "--porcelain"))
+        dirty = _code_tree_dirty(state, root)
         if last.get("head") and last["head"] != head and not dirty:
             lines += [f"Re-review delta: {last['head']}..HEAD"]
             green = [l for l, v in as_dict(state.get("gauntlet_lanes")).items()
@@ -1278,9 +1293,6 @@ def triage_route(state):
             escalations.append(t)
         else:
             fixes.append((_lane_of(t, finding), finding))
-    for e in as_list(state.get("debris_exemptions")):
-        if e not in exemptions:
-            exemptions.append(e)
     u.update({"rejected_findings": rejected, "deferred_findings": deferred, "debris_exemptions": exemptions, "debris_exemptions_new": [], "triage": []})
 
     streak = dict(as_dict(state.get("lane_block_streak")))
@@ -1582,7 +1594,7 @@ def ci_apply(state):
                     subprocess.run(["gh", "run", "rerun", m.group(1), "--failed"], cwd=root, capture_output=True, text=True, timeout=60)
                 ledger(state, u, f"flake-rerun: {name} (re-run {reruns[name]}/{CI_FLAKE_RERUNS})")
             u["ci_reruns"] = reruns
-            u.update({"ci_polls": 0, "ci_poll_fails": 0})
+            u.update({"ci_polls": 0, "ci_poll_fails": 0, "ci_started_at": int(time.time())})
             u["_next"] = "ci_poll"
             return u
     if verdict == "real":
