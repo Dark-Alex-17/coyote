@@ -14582,6 +14582,9 @@ mod tests {
         assert_eq!(*root, ChildSessionRoot::from_stamp(ProcessStamp::current()));
     }
 
+    /// The workspace memory pin is process-global, so this passes whether
+    /// or not forks and children copy anything; it trips if per-context
+    /// memory discovery state comes back and a copy drops it.
     #[test]
     #[serial]
     fn forks_and_children_resolve_the_pinned_workspace_memory() {
@@ -14609,21 +14612,6 @@ mod tests {
             assert!(config.enabled);
             assert_eq!(config.workspace.map(|w| w.dir), expected_dir);
         }
-    }
-
-    #[test]
-    #[serial]
-    fn without_the_test_pin_memory_resolves_from_the_current_dir() {
-        let _guard = TestConfigDirGuard::new();
-        write_global_memory_store();
-        let _unpinned = crate::testing::EnvVarGuard::unset(memory::WORKSPACE_MEMORY_ROOT_TEST_ENV);
-        let ctx = create_test_ctx();
-
-        let config = ctx.memory_config();
-
-        assert!(config.enabled);
-        let expected = memory::discover_workspace_memory(&env::current_dir().unwrap());
-        assert_eq!(config.workspace.map(|w| w.dir), expected.map(|w| w.dir));
     }
 
     fn retention_time() -> chrono::DateTime<chrono::Utc> {

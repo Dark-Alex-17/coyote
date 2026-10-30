@@ -3226,3 +3226,63 @@ fn usage_probe_the_shipped_binary_walks_up_from_its_cwd_for_workspace_memory_and
     );
     assert!(!from_elsewhere.contains(WORKSPACE_LINE), "{from_elsewhere}");
 }
+
+/// The converse of the probe above: a pin aimed AT a workspace that holds
+/// an index cannot pull that index into a real run whose cwd has none.
+#[test]
+fn usage_probe_the_shipped_binary_does_not_load_workspace_memory_from_a_pinned_root() {
+    const GLOBAL_LINE: &str = "- global fact for the converse probe";
+    const WORKSPACE_LINE: &str = "- workspace fact only the pin points at";
+    let dir = fresh_config_dir("workspace-memory-pin");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture_on(
+        &dir,
+        "",
+        Host {
+            memory: true,
+            ..RECIPE_HOST
+        },
+    );
+    fs::create_dir_all(dir.join("memory")).unwrap();
+    fs::write(
+        dir.join("memory").join("MEMORY.md"),
+        format!("{GLOBAL_LINE}\n"),
+    )
+    .unwrap();
+    let pinned = dir.join("pinned");
+    let index_dir = pinned.join(".coyote").join("memory");
+    fs::create_dir_all(&index_dir).unwrap();
+    fs::write(
+        index_dir.join("MEMORY.md"),
+        format!("# Workspace Memory Index\n{WORKSPACE_LINE}\n"),
+    )
+    .unwrap();
+    let cwd = dir.join("plain");
+    fs::create_dir_all(&cwd).unwrap();
+
+    let output = run_from(
+        &cwd,
+        &dir,
+        &["-e", "hello"],
+        &[(TEST_WORKSPACE_MEMORY_ROOT_ENV, pinned.to_str().unwrap())],
+    );
+    let text = format!("{}\n{}", stderr_of(&output), stdout_of(&output));
+    assert!(
+        output.status.success() && !text.contains("panicked"),
+        "exit {:?}\n{text}",
+        output.status
+    );
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.contains(GLOBAL_LINE),
+        "the global index still rides:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains(WORKSPACE_LINE),
+        "the pinned root's index leaked into a real run:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("# Workspace Memory Index"),
+        "no workspace index header without one above the cwd:\n{stdout}"
+    );
+}
