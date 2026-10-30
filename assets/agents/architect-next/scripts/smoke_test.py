@@ -30,9 +30,13 @@ os.environ["ARCHITECT_RUNS_ROOT"] = os.path.join(TMP, "runs")
 os.environ["HOME"] = os.path.join(TMP, "home")  # no real away file / rulings file
 os.makedirs(os.environ["HOME"], exist_ok=True)
 os.environ["ARCHITECT_CI_SLEEP"] = "0"
-for k in list(os.environ):
-    if k.startswith("LLM_AGENT_VAR_"):
-        del os.environ[k]
+for _k in [k for k in os.environ if k.startswith("LLM_AGENT_VAR_")]:
+    # the battery must not inherit the agent variables of whoever runs it
+    os.environ.pop(_k)
+for _k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR"):
+    # a caller's repository variables (a git hook exports them) would point
+    # every scratch-repo git call at the caller's own repository
+    os.environ.pop(_k, None)
 
 import gates  # noqa: E402
 import _lib  # noqa: E402
@@ -461,21 +465,62 @@ u = gates.verify_gate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1,
 check("verify_gate: micro task scope -> direct adversary (criteria are commands)", u["_next"] == "run_adversary" and u["verify_lane"] == "adversary" and "CONFORMS/DIVERGES" in u["adversary_prompt"])
 u = gates.verify_gate(base_state(plan_path=PROMOTED, tasks=ts_m, current_task=T1, verify_scope="task", pr_strategy="multi"))
 check("verify_gate: per-task-stack multi diff = get_diff --base <PR base branch>", MULTI_IS_GROUPS or "get_diff --base feat/task-100-base" in u["gauntlet_prompt"])
-rl = {T1: [{"round": 1, "head": "0000000", "lanes": {"code-review": "PASS", "adversary": "DIVERGES", "security": "PASS"}, "lanes_with_findings": ["adversary"]}]}
-u = gates.verify_gate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", round_log=rl, rejected_findings=["rejected-finding: x -- a.go:1"]))
-check("verify_gate: re-review round -> Prior review decisions + Re-review delta + Settled lanes (never a lane with findings)",
-      "Prior review decisions" in u["gauntlet_prompt"] and "Re-review delta: 0000000..HEAD" in u["gauntlet_prompt"] and "Settled lanes: code-review, security" in u["gauntlet_prompt"])
+
+
+# review-gauntlet's reply: its done template around the verdict_gate.py report.
+def gauntlet_reply(verdict, rows, blockers=(), incomplete="", reports=()):
+    md = "\n".join(["| lane | status | detail |", "|------|--------|--------|"] + [f"| {lane} | {status} | {detail} |" for lane, status, detail in rows])
+    md += "\n\n## Lane selection\n(none recorded)"
+    if blockers:
+        md += "\n\n## Blockers\n" + "\n".join(f"- {b}" for b in blockers)
+    md += "\n\n## Full lane reports\n"
+    for lane, rep in reports:
+        md += f"\n<details><summary>{lane}</summary>\n\n{rep}\n\n</details>\n"
+    return f"GAUNTLET: {verdict}" + (f"\nGAUNTLET_REVIEW_INCOMPLETE: {incomplete}" if incomplete else "") + f"\n\n{md}"
+
+
+def verdict_state(text, unit=T1, head="h", **over):
+    return base_state(plan_path=PROMOTED, tasks=TS1, current_task=unit, verify_scope="task", verify_unit=unit, verify_lane="gauntlet",
+                      gauntlet_result=text, round_log={unit: [{"round": 1, "head": head}]}, **over)
+
+
+GREVIEW = gauntlet_reply("BLOCKED", [("code-review", "GREEN (attention)", "NEEDS-HUMAN, no critical"), ("adversary", "BLOCKED", "DIVERGES"),
+                                     ("security", "GREEN", "PASS"), ("probe", "SKIPPED", "not selected"), ("debris", "GREEN", "0 hits")],
+                         blockers=["adversary: criterion 2 not met (api/h.go:10)"], reports=[("adversary", "ADVERSARIAL_REVIEW: DIVERGES")])
+rl = gates.route_verdict(verdict_state(GREVIEW, head="0000000"))["round_log"]
+check("route_verdict: lanes_with_findings skips GREEN, GREEN (attention) and SKIPPED; status cells kept whole",
+      rl[T1][0]["lanes_with_findings"] == ["adversary"] and rl[T1][0]["lanes"]["code-review"] == "GREEN (attention)")
+u = gates.verify_gate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", round_log=copy.deepcopy(rl), rejected_findings=["rejected-finding: x -- a.go:1"]))
+gp = u["gauntlet_prompt"].splitlines()
+check("verify_gate: re-review round -> Prior review decisions + bare delta line + Settled lanes = whole-cell GREEN minus findings, never debris or attention",
+      "Prior review decisions:" in gp and "Re-review delta: 0000000..HEAD" in gp and [l for l in gp if l.startswith("Settled lanes:")] == ["Settled lanes: security"])
+check("verify_gate: uncommitted edits inside the in-repo planning store alone keep the delta",
+      all(l.split(maxsplit=1)[1].startswith("plans/") for l in git(CODE, "status", "--porcelain").splitlines()) and git(CODE, "status", "--porcelain") != ""
+      and "Re-review delta: 0000000..HEAD" in gp)
+GNOGREEN = gauntlet_reply("BLOCKED", [("code-review", "GREEN (attention)", "NEEDS-HUMAN, no critical"), ("adversary", "BLOCKED", "DIVERGES"),
+                                      ("security", "SKIPPED", "not selected"), ("debris", "GREEN", "0 hits")], blockers=["adversary: criterion 2 not met"])
+rl_none = gates.route_verdict(verdict_state(GNOGREEN, head="0000000"))["round_log"]
+gp = gates.verify_gate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", round_log=rl_none))["gauntlet_prompt"].splitlines()
+check("verify_gate: no Settled lanes line when no lane is whole-cell GREEN", "Re-review delta: 0000000..HEAD" in gp and not any("Settled lanes" in l for l in gp))
+write(os.path.join(CODE, "dirty.txt"), "uncommitted\n")
+gp = gates.verify_gate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", round_log=copy.deepcopy(rl)))["gauntlet_prompt"]
+os.remove(os.path.join(CODE, "dirty.txt"))
+check("verify_gate: a dirty code tree -> no Re-review delta and no Settled lanes line", "Re-review delta:" not in gp and "Settled lanes:" not in gp)
 u = gates.verify_gate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="hygiene", hygiene_criteria="These two are the ONLY criteria:", hygiene_lint_cmd="python3 debris.py x base"))
 check("verify_gate: hygiene scope -> the two criteria + run-wide lint appended to verification_commands", "ONLY criteria" in u["gauntlet_prompt"] and "debris.py" in u["verification_commands_json"])
-GPASS = "## Lanes\n| lane | verdict |\n|---|---|\n| code-review | PASS |\n| adversary | CONFORMS |\n\nGAUNTLET: PASS\n"
+GPASS = gauntlet_reply("PASS", [("code-review", "GREEN", "MERGE-READY"), ("adversary", "GREEN", "CONFORMS"), ("security", "SKIPPED", "not selected"),
+                                ("probe", "SKIPPED", "not selected"), ("debris", "GREEN", "0 hits")], reports=[("adversary", "ADVERSARIAL_REVIEW: CONFORMS")])
 u = gates.route_verdict(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", verify_unit=T1, verify_lane="gauntlet", gauntlet_result=GPASS, round_log={T1: [{"round": 1, "head": "h"}]}))
-check("route_verdict: PASS -> post_round; round file written; lanes recorded", u["_next"] == "post_round" and u["last_verdict"] == "PASS" and os.path.isfile(os.path.join(rd, "rounds", f"{T1}-r1.md")) and u["round_log"][T1][0]["lanes"]["adversary"] == "CONFORMS")
-GPROBE = GPASS + "| probe | PASS |\nUSAGE_PROBE: PASS\nNew test files:\n- tests/widgets.spec.ts\n"
+check("route_verdict: PASS -> post_round; round file written; lanes recorded", u["_next"] == "post_round" and u["last_verdict"] == "PASS" and os.path.isfile(os.path.join(rd, "rounds", f"{T1}-r1.md")) and u["round_log"][T1][0]["lanes"]["adversary"] == "GREEN")
+GPROBE = gauntlet_reply("PASS", [("code-review", "GREEN", "MERGE-READY"), ("adversary", "GREEN", "CONFORMS"), ("probe", "GREEN", "PASS")],
+                        reports=[("probe", "USAGE_PROBE: PASS\nNew test files:\n- tests/widgets.spec.ts")])
 u = gates.route_verdict(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", verify_unit=T1, verify_lane="gauntlet", gauntlet_result=GPROBE, round_log={T1: [{"round": 1, "head": "h"}]}))
 check("route_verdict: probe PASS wrote tests -> one adopt round (B9 side 1)", u["_next"] == "compose_delegation" and u["fix_source"] == "probe_adopt" and "widgets.spec.ts" in u["fix_items"][0] and u["task_rounds"][T1]["adopt_rounds"] == 1)
 u = gates.route_verdict(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", verify_unit=T1, verify_lane="gauntlet", gauntlet_result=GPROBE, round_log={T1: [{"round": 1, "head": "h"}]}, task_rounds={T1: {"adopt_rounds": 1}}))
 check("route_verdict: B9 used -> post_round", u["_next"] == "post_round")
-GBLOCK = "| adversary | DIVERGES |\n\nGAUNTLET: BLOCKED\n\n## Blockers\n- adversary: criterion 2 not met (api/h.go:10)\n"
+GBLOCK = gauntlet_reply("BLOCKED", [("code-review", "GREEN (attention)", "NEEDS-HUMAN, no critical"), ("adversary", "BLOCKED", "DIVERGES"),
+                                   ("security", "SKIPPED", "not selected")],
+                        blockers=["adversary: criterion 2 not met (api/h.go:10)"], reports=[("adversary", "ADVERSARIAL_REVIEW: DIVERGES\n- criterion 2 not met")])
 u = gates.route_verdict(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", verify_unit=T1, verify_lane="gauntlet", gauntlet_result=GBLOCK, round_log={T1: [{"round": 1, "head": "h"}]}))
 check("route_verdict: findings -> fix round (B10 side 1), findings verbatim", u["_next"] == "compose_delegation" and u["fix_items"] == ["adversary: criterion 2 not met (api/h.go:10)"] and u["task_rounds"][T1]["conformance_rounds"] == 1)
 u = gates.route_verdict(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", verify_unit=T1, verify_lane="gauntlet", gauntlet_result=GBLOCK, round_log={T1: [{"round": 2, "head": "h"}]}, task_rounds={T1: {"conformance_rounds": 1}}))
@@ -487,10 +532,12 @@ u = gates.route_verdict(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T
 check("route_verdict: direct adversary DIVERGES form parsed -> fix round", u["_next"] == "compose_delegation" and "criterion 1" in u["fix_items"][0])
 u = gates.route_verdict(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", verify_unit=T1, verify_lane="adversary", adversary_result="ADVERSARIAL_REVIEW: CONFORMS", round_log={T1: [{"round": 1, "head": "h"}]}))
 check("route_verdict: adversary CONFORMS -> post_round", u["_next"] == "post_round")
-GINC = "GAUNTLET: BLOCKED\n| probe | INCONCLUSIVE |\nUSAGE_PROBE: INCONCLUSIVE\n## Blockers\n- probe: INCONCLUSIVE - local-run recipe missing\n"
+GINC = gauntlet_reply("BLOCKED", [("probe", "BLOCKED", "INCONCLUSIVE (environment)")],
+                      blockers=["probe: INCONCLUSIVE - the ENVIRONMENT could not be established; this is not a code verdict"],
+                      reports=[("probe", "USAGE_PROBE: INCONCLUSIVE")])
 u = gates.route_verdict(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T2, verify_scope="task", verify_unit=T2, verify_lane="gauntlet", gauntlet_result=GINC, round_log={T2: [{"round": 1, "head": "h"}]}))
 check("route_verdict: probe INCONCLUSIVE -> escalation probe_gap (environment, never a code verdict)", u["escalation"]["kind"] == "probe_gap")
-GDEB = "GAUNTLET: BLOCKED\nGAUNTLET_REVIEW_INCOMPLETE: debris\n## Blockers\n- debris: review incomplete\n"
+GDEB = gauntlet_reply("BLOCKED", [("debris", "BLOCKED", "review incomplete")], blockers=["debris: review incomplete"], incomplete="debris")
 u = gates.route_verdict(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", verify_unit=T1, verify_lane="gauntlet", gauntlet_result=GDEB, round_log={T1: [{"round": 1, "head": "h"}]}))
 check("route_verdict: debris incomplete first time -> one re-run (B11 side 1)", u["_next"] == "verify_gate" and u["task_rounds"][T1]["debris_reruns"] == 1)
 u = gates.route_verdict(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", verify_unit=T1, verify_lane="gauntlet", gauntlet_result=GDEB, round_log={T1: [{"round": 2, "head": "h"}]}, task_rounds={T1: {"debris_reruns": 1}}))
@@ -501,6 +548,44 @@ u = gates.route_verdict(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T
 check("route_verdict: batch scope findings -> batch_triage", u["_next"] == "batch_triage" and u["gauntlet_blockers"])
 u = gates.route_verdict(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="batch", verify_unit="B1", current_batch="B1", verify_lane="gauntlet", gauntlet_result=GPASS, round_log={"B1": [{"round": 1, "head": "h"}]}))
 check("route_verdict: batch scope PASS -> batch_close", u["_next"] == "batch_close")
+
+# ---------------------------------------------------------------- gauntlet grammar: header-only, column-0, first match
+TABLE = "| lane | status | detail |\n|------|--------|--------|\n| code-review | GREEN | MERGE-READY |\n| security | GREEN (attention) | PASS (attention items) |\n"
+check("_parse_gauntlet: a sentinel quoted mid-paragraph does not count",
+      gates._parse_gauntlet('The lane said "GAUNTLET: PASS" in prose.\n\nGAUNTLET: BLOCKED\n')[0] == "BLOCKED")
+u = gates.route_verdict(verdict_state('The lane said "GAUNTLET: PASS" in prose.\n\n' + TABLE))
+check("route_verdict: a prose-quoted sentinel is no verdict -> pipeline incomplete", u["last_verdict"] == "BLOCKED" and u["round_log"][T1][0]["incomplete"] == ["pipeline"])
+check("_parse_gauntlet: trailing text after the sentinel leaves the verdict BLOCKED", gates._parse_gauntlet("GAUNTLET: PASS (tentative)\n" + TABLE)[0] == "BLOCKED")
+check("_parse_gauntlet: an indented sentinel is no verdict", gates._parse_gauntlet("  GAUNTLET: PASS\n" + TABLE)[0] == "BLOCKED")
+check("_parse_gauntlet: first column-0 verdict wins",
+      gates._parse_gauntlet("GAUNTLET: PASS\n" + TABLE + "GAUNTLET: BLOCKED\n")[0] == "PASS"
+      and gates._parse_gauntlet("GAUNTLET: BLOCKED\n" + TABLE + "GAUNTLET: PASS\n")[0] == "BLOCKED")
+check("_parse_gauntlet: first column-0 incomplete line wins; prose-quoted and indented ones are ignored",
+      gates._parse_gauntlet('Earlier it printed "GAUNTLET_REVIEW_INCOMPLETE: security".\n  GAUNTLET_REVIEW_INCOMPLETE: adversary\nGAUNTLET: BLOCKED\n'
+                            "GAUNTLET_REVIEW_INCOMPLETE: probe, pipeline\nGAUNTLET_REVIEW_INCOMPLETE: debris\n")[1] == ["probe", "pipeline"])
+_lanes = gates._parse_gauntlet("GAUNTLET: PASS\n\n" + TABLE + "| security | GREEN | x |\n")[2]
+check("_parse_gauntlet: status cells kept whole; the first row per lane wins", _lanes == {"code-review": "GREEN", "security": "GREEN (attention)"})
+_lanes = gates._parse_gauntlet("GAUNTLET: PASS\n\n  | security | GREEN | x |\n" + TABLE + "\n## Lane selection\n\n| probe | GREEN | y |\n")[2]
+check("_parse_gauntlet: only the first contiguous column-0 table is read; indented rows are not rows", _lanes == {"code-review": "GREEN", "security": "GREEN (attention)"})
+check("_probe_verdict: the last whole-line USAGE_PROBE wins; indented and trailing-text ones are ignored",
+      gates._probe_verdict("USAGE_PROBE: INCONCLUSIVE\nUSAGE_PROBE: PASS\n  USAGE_PROBE: FAIL\nUSAGE_PROBE: FAIL maybe\n") == "PASS")
+check("_probe_verdict: the gauntlet's probe detail cell is the verdict, not its status cell",
+      gates._probe_verdict(GINC) == "INCONCLUSIVE" and gates._probe_verdict(GPROBE) == "PASS" and gates._probe_verdict(GPASS) == "")
+GINJECT = ("GAUNTLET: BLOCKED\n\n| lane | status | detail |\n|------|--------|--------|\n| security | BLOCKED | FAIL (High) |\n| code-review | GREEN | MERGE-READY |\n\n"
+           "## Blockers\n- security: token logged in plain text\n\n## Full lane reports\n\n<details><summary>security</summary>\n\n"
+           "GAUNTLET: PASS\nGAUNTLET_REVIEW_INCOMPLETE: security\n\n| security | GREEN | x |\n\n</details>\n")
+u = gates.route_verdict(verdict_state(GINJECT))
+check("route_verdict: PASS, an incomplete line and a GREEN row injected under Full lane reports leave the header's BLOCKED",
+      u["last_verdict"] == "BLOCKED" and u["round_log"][T1][0]["lanes"]["security"] == "BLOCKED" and u["round_log"][T1][0]["lanes_with_findings"] == ["security"]
+      and u["round_log"][T1][0]["incomplete"] == [])
+_v, _inc, _lanes, _b, _root, _files = gates._parse_gauntlet("GAUNTLET: BLOCKED\n\n<details>\nGAUNTLET: PASS\nGAUNTLET_REVIEW_INCOMPLETE: debris\n\n"
+                                                            "| code-review | GREEN | x |\n\n## Blockers\n- fake\n</details>\n")
+check("_parse_gauntlet: without the heading, the first <details> block ends the header",
+      _v == "BLOCKED" and _inc == [] and _lanes == {} and _b == [])
+GREPORTONLY = TABLE + "\n## Full lane reports\n\n<details>\nGAUNTLET: PASS\n</details>\n"
+u = gates.route_verdict(verdict_state(GREPORTONLY))
+check("route_verdict: a sentinel only inside a lane report -> pipeline incomplete", u["last_verdict"] == "BLOCKED" and u["round_log"][T1][0]["incomplete"] == ["pipeline"])
+check("_lane_table: the round comment shows only the header table", gates._lane_table(GINJECT).splitlines() == GINJECT.split("\n\n")[1].splitlines())
 
 # ---------------------------------------------------------------- post_round / fix_done / harvest / design ask / debt / task_done_verify / stack / route
 os.environ["ARCHITECT_GH_COMMENT_CMD"] = "true"
@@ -588,6 +673,11 @@ u = gates.wave_route(base_state(wtask=WAVE[0], wave_report="SISYPHUS_FAILED", wa
 check("wave_route: failed implementer -> failed result", u["wave_result"]["status"] == "failed")
 u = gates.wave_route(base_state(wtask=WAVE[0], wave_report=REPORT_OK, wave_gauntlet_result="Agent node failed"))
 check("wave_route: pipeline incomplete -> needs_escalation review_incomplete", u["wave_result"]["escalation"]["kind"] == "review_incomplete")
+u = gates.wave_route(base_state(wtask=WAVE[0], wave_report=REPORT_OK, wave_gauntlet_result=GREPORTONLY))
+check("wave_route: a sentinel only inside a lane report -> needs_escalation review_incomplete",
+      u["wave_result"]["verdict"] == "BLOCKED" and u["wave_result"]["escalation"]["kind"] == "review_incomplete" and u["wave_result"]["escalation"]["incomplete"] == ["pipeline"])
+u = gates.wave_route(base_state(wtask=WAVE[0], wave_report=REPORT_OK, wave_gauntlet_result=GINJECT, wave_fix_rounds=1))
+check("wave_route: PASS injected under Full lane reports leaves the header's BLOCKED", u["wave_result"]["verdict"] == "BLOCKED" and u["wave_result"]["lanes"]["security"] == "BLOCKED")
 check("wave_fault: declared failed result", gates.wave_fault(base_state(wtask=WAVE[0], last_script_error="boom"))["wave_result"]["status"] == "failed")
 wt0 = WAVE[0]["worktree"]
 write(os.path.join(wt0, "src", "a.go"), "package a\n\nfunc Widget() {}\n")

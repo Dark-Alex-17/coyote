@@ -35,6 +35,13 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True
 sys.path.insert(0, HERE)
+for _k in [k for k in os.environ if k.startswith("LLM_AGENT_VAR_")]:
+    # the walk must not inherit the agent variables of whoever runs it
+    os.environ.pop(_k)
+for _k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR"):
+    # a caller's repository variables (a git hook exports them) would point
+    # every scratch-repo git call at the caller's own repository
+    os.environ.pop(_k, None)
 from _fixture import Store  # noqa: E402
 
 MAP_PATH = os.path.join(HERE, "marker_map.json")
@@ -272,7 +279,11 @@ def walk(combo, gates, graph, world, log):
             return {"delegate_result": world.delegate_report(gates, st, st.get("current_task"))}
         if nid in ("run_gauntlet", "wave_gauntlet"):
             key = "gauntlet_result" if nid == "run_gauntlet" else "wave_gauntlet_result"
-            return {key: "| code-review | PASS |\n| adversary | CONFORMS |\n| probe | PASS |\nUSAGE_PROBE: PASS\nGAUNTLET: PASS\n"}
+            return {key: "GAUNTLET: PASS\n\n| lane | status | detail |\n|------|--------|--------|\n"
+                         "| code-review | GREEN (attention) | NEEDS-HUMAN, no critical |\n| adversary | GREEN | CONFORMS |\n"
+                         "| security | SKIPPED | not selected |\n| probe | GREEN | PASS |\n| debris | GREEN | 0 hits |\n\n"
+                         "## Lane selection\n(none recorded)\n\n## Full lane reports\n\n"
+                         "<details><summary>probe</summary>\n\nUSAGE_PROBE: PASS\n\n</details>\n"}
         if nid == "run_adversary":
             return {"adversary_result": "ADVERSARIAL_REVIEW: CONFORMS"}
         if nid == "task_done":

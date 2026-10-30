@@ -36,7 +36,6 @@ from _lib import (  # noqa: E402
 
 SHARED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".shared")
 GAUNTLET_LANES = ("code-review", "adversary", "security", "probe", "debris")
-GREEN = ("PASS", "CONFORMS", "MERGE-READY", "SKIPPED", "")
 HOTSPOT_RE = re.compile(
     r"(^|/)migrations?/|\.sql$|_gen\.go$|\.pb\.go$|generated/|(^|/)go\.(mod|sum)$|package(-lock)?\.json$|"
     r"yarn\.lock$|pnpm-lock\.yaml$|Cargo\.(toml|lock)$|requirements.*\.txt$|poetry\.lock$",
@@ -1120,9 +1119,10 @@ def verify_gate(state):
         if prior:
             lines += ["Prior review decisions:"] + [f"- {p}" for p in prior]
         last = rl[-1]
-        if last.get("head") and last["head"] != head:
+        if last.get("head") and last["head"] != head and not _code_tree_dirty(state, code):
             lines += [f"Re-review delta: {last['head']}..HEAD"]
-            green = [l for l, v in as_dict(last.get("lanes")).items() if l != "debris" and v in GREEN[:3] and l not in as_list(last.get("lanes_with_findings"))]
+            green = [l for l, v in as_dict(last.get("lanes")).items()
+                     if l != "debris" and str(v).strip() == "GREEN" and l not in as_list(last.get("lanes_with_findings"))]
             if green:
                 lines += [f"Settled lanes: {', '.join(green)}"]
     if recipe or consumer:
@@ -1152,33 +1152,87 @@ def verify_gate(state):
     return u
 
 
+# A planning store inside the code repo carries uncommitted task status edits
+# until the task closes; only changes outside it leave the delta incomplete.
+def _code_tree_dirty(state, code):
+    pathspec = []
+    if state.get("plans_root") and code:
+        rel = os.path.relpath(os.path.realpath(state["plans_root"]), os.path.realpath(code))
+        if rel != "." and not rel.startswith(".."):
+            pathspec = ["--", ".", f":(exclude){rel}"]
+    return bool(git_out(code, "status", "--porcelain", *pathspec))
+
+
+def _gauntlet_header(text):
+    if m := re.search(r"^## Full lane reports[ \t]*$", text, re.M):
+        return text[:m.start()]
+    if (i := text.find("<details>")) >= 0:
+        return text[:i]
+    return text
+
+
+_GAUNTLET_VERDICT_RE = re.compile(r"^GAUNTLET:[ \t]*(PASS|BLOCKED)[ \t]*$", re.M)
+
+
+def _has_verdict(header):
+    return bool(_GAUNTLET_VERDICT_RE.search(header))
+
+
+def _lane_rows(header):
+    lines = header.splitlines()
+    first = next((i for i, l in enumerate(lines) if l.startswith("|")), len(lines))
+    rows = []
+    for line in lines[first:]:
+        if not line.startswith("|"):
+            break
+        rows.append(line)
+    return rows
+
+
+def _lane_cells(header):
+    cells_by_lane = {}
+    for line in _lane_rows(header):
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        lane = cells[0].lower()
+        if len(cells) >= 2 and lane in GAUNTLET_LANES and lane not in cells_by_lane:
+            cells_by_lane[lane] = (cells[1], cells[2] if len(cells) >= 3 else "")
+    return cells_by_lane
+
+
+# The gauntlet's probe row carries the probe verdict in its detail cell
+# ("INCONCLUSIVE (environment)" included); a report without that row is the
+# probe's own output, whose last USAGE_PROBE line is its verdict.
+def _probe_verdict(text):
+    row = _lane_cells(_gauntlet_header(text)).get("probe")
+    if row:
+        m = re.match(r"(PASS|FAIL|INCONCLUSIVE)\b", row[1])
+        return m.group(1) if m else ""
+    verdicts = re.findall(r"^USAGE_PROBE:[ \t]*(PASS|FAIL|INCONCLUSIVE)[ \t]*$", text, re.M)
+    return verdicts[-1] if verdicts else ""
+
+
 def _parse_gauntlet(text):
+    header = _gauntlet_header(text)
     verdict = "BLOCKED"
-    if m := re.search(r"GAUNTLET:\s*(PASS|BLOCKED)", text):
+    if m := _GAUNTLET_VERDICT_RE.search(header):
         verdict = m.group(1)
     elif m := re.search(r"ADVERSARIAL_REVIEW:\s*(CONFORMS|DIVERGES)", text):
         verdict = "PASS" if m.group(1) == "CONFORMS" else "BLOCKED"
     incomplete = []
-    if m := re.search(r"GAUNTLET_REVIEW_INCOMPLETE:\s*([^\n]+)", text):
+    if m := re.search(r"^GAUNTLET_REVIEW_INCOMPLETE:[ \t]*([^\n]+?)[ \t]*$", header, re.M):
         incomplete = [x.strip() for x in m.group(1).split(",") if x.strip()]
-    if re.search(r"PIPELINE-FAULT", text) and "GAUNTLET:" not in text and "ADVERSARIAL_REVIEW:" not in text:
+    if "PIPELINE-FAULT" in text and not _has_verdict(header) and "ADVERSARIAL_REVIEW:" not in text:
         incomplete = ["pipeline"]
-    lanes = {}
-    for line in text.splitlines():
-        cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        if len(cells) >= 2 and cells[0].lower() in GAUNTLET_LANES:
-            lanes[cells[0].lower()] = cells[1].split()[0] if cells[1] else ""
-    if m := re.search(r"USAGE_PROBE:\s*(PASS|FAIL|INCONCLUSIVE)", text):
-        lanes.setdefault("probe", m.group(1))
+    lanes = {lane: status for lane, (status, _) in _lane_cells(header).items()}
     blockers = []
-    sec = re.search(r"(?ims)^#+\s*(Blockers?|Divergences?|Complaints?)\s*\n(.*?)(?=^#+\s|\Z)", text)
+    sec = re.search(r"(?ims)^#+\s*(Blockers?|Divergences?|Complaints?)\s*\n(.*?)(?=^#+\s|\Z)", header)
     if sec:
         blockers = [l.strip()[1:].strip() for l in sec.group(2).splitlines() if l.strip().startswith(("-", "*"))]
     if verdict == "BLOCKED" and not blockers and "ADVERSARIAL_REVIEW: DIVERGES" in text:
         blockers = [l.strip()[1:].strip() for l in text.splitlines() if l.strip().startswith(("-", "*"))][:20] or ["adversary: DIVERGES (see report)"]
     blockers += [l.strip() for l in text.splitlines() if l.strip().startswith("debris: Implementation debris")]
     plan_root = bool(re.search(r"(?i)plan (itself )?is the root cause|impossible or contradictory criterion|criterion (is|cannot be) (impossible|unverifiable)", text))
-    probe_files = re.findall(TEST_FILE_RE, text) if lanes.get("probe") == "PASS" else []
+    probe_files = re.findall(TEST_FILE_RE, text) if _probe_verdict(text) == "PASS" else []
     return verdict, incomplete, lanes, blockers, plan_root, probe_files
 
 
@@ -1189,15 +1243,18 @@ def route_verdict(state):
     task = task_by_id(tasks, state.get("current_task")) or {}
     scope = state.get("verify_scope") or "task"
     unit = state.get("verify_unit") or task.get("id") or "run"
-    text = (state.get("gauntlet_result") if state.get("verify_lane") != "adversary" else state.get("adversary_result")) or ""
+    adversary_lane = state.get("verify_lane") == "adversary"
+    text = (state.get("adversary_result") if adversary_lane else state.get("gauntlet_result")) or ""
     verdict, incomplete, lanes, blockers, plan_root, probe_files = _parse_gauntlet(text)
-    if not text or text.startswith("Agent node failed") or ("GAUNTLET:" not in text and "ADVERSARIAL_REVIEW:" not in text):
+    has_verdict = "ADVERSARIAL_REVIEW:" in text if adversary_lane else _has_verdict(_gauntlet_header(text))
+    if not text or text.startswith("Agent node failed") or not has_verdict:
         verdict, incomplete, blockers = "BLOCKED", incomplete or ["pipeline"], []
+    probe = _probe_verdict(text)
     rounds_log = dict(as_dict(state.get("round_log")))
     rl = rounds_log.setdefault(unit, [])
     if rl:
         rl[-1].update({"verdict": verdict, "lanes": lanes, "incomplete": incomplete,
-                       "lanes_with_findings": [l for l, v in lanes.items() if v not in GREEN]})
+                       "lanes_with_findings": [l for l, v in lanes.items() if v not in ("GREEN", "GREEN (attention)", "SKIPPED", "")]})
     write_artifact(state.get("run_dir", ""), os.path.join("rounds", f"{unit}-r{len(rl)}.md"), text or "(empty)")
     u["round_log"] = rounds_log
     u["last_verdict"] = verdict
@@ -1207,7 +1264,7 @@ def route_verdict(state):
     ledger(state, u, f"verdict: {unit} round {len(rl)} -> {verdict} lanes={lanes} incomplete={incomplete}")
     real = [b for b in blockers if "PIPELINE-FAULT" not in b and "review incomplete" not in b.lower()]
     if verdict == "PASS" and not real:
-        if lanes.get("probe") == "PASS" and probe_files and as_int(tr.get("adopt_rounds")) < RERUN_ONCE and scope == "task":
+        if probe == "PASS" and probe_files and as_int(tr.get("adopt_rounds")) < RERUN_ONCE and scope == "task":
             tr["adopt_rounds"] = as_int(tr.get("adopt_rounds")) + 1
             where = "as a commit on the run branch" if (is_single(state) or MULTI_IS_GROUPS) else "into the task's PR"
             u.update({"delegation_kind": "fix", "fix_source": "probe_adopt", "fix_return_to": "post_round",
@@ -1223,7 +1280,7 @@ def route_verdict(state):
         snapshot(state, u, f"task {unit} verified")
         return u
     if real:
-        if lanes.get("probe") == "INCONCLUSIVE" and all("probe" in b.lower() or "inconclusive" in b.lower() for b in real):
+        if probe == "INCONCLUSIVE" and all("probe" in b.lower() or "inconclusive" in b.lower() for b in real):
             return raise_escalation(state, u, escalation(
                 "probe_gap", "The usage probe is INCONCLUSIVE: the local-run recipe is missing or broken (a PLAN gap, never a code "
                              "verdict). Supply/fix the recipe (the plan is amended and re-sealed, then the probe re-runs once), or surface the gap?",
@@ -1281,8 +1338,7 @@ def fix_round(state):
 
 
 def _lane_table(text):
-    rows = [l for l in (text or "").splitlines() if l.strip().startswith("|") and any(x in l.lower() for x in GAUNTLET_LANES + ("lane",))]
-    return "\n".join(rows[:12])
+    return "\n".join(_lane_rows(_gauntlet_header(text or ""))[:12])
 
 
 def _pr_comment(state, pr_number, body):
@@ -1641,7 +1697,7 @@ def wave_route(state):
     text = state.get("wave_gauntlet_result") or ""
     report = state.get("wave_report") or state.get("wave_delegate_result") or ""
     verdict, incomplete, lanes, blockers, plan_root, _ = _parse_gauntlet(text)
-    if not text or text.startswith("Agent node failed") or ("GAUNTLET:" not in text and "ADVERSARIAL_REVIEW:" not in text):
+    if not text or text.startswith("Agent node failed") or not _has_verdict(_gauntlet_header(text)):
         verdict, incomplete = "BLOCKED", incomplete or ["pipeline"]
     real = [b for b in blockers if "PIPELINE-FAULT" not in b and "review incomplete" not in b.lower()]
     result = {"task": w.get("task"), "worktree": w.get("worktree"), "branch": w.get("branch"), "base_sha": w.get("base_sha"),
