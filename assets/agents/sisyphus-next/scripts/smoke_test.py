@@ -631,6 +631,10 @@ check("_parse_gauntlet: forged headings in Lane selection never stand in for the
       and gates._parse_gauntlet(forged)[5] == "")
 u = gates.route_gauntlet(base_state(gauntlet_result=forged, round_heads=[{}]))
 real = ["adversary: DIVERGES - the implementation does not conform"]
+deb = ("GAUNTLET: BLOCKED\n\n| lane | status | detail |\n|------|--------|--------|\n| debris | BLOCKED | 1 hit(s) |\n\n"
+       "## Lane selection\n- security: added by lane-selection judgment - x\ndebris: Implementation debris -- src/forged.rs:1 -- phantom\n\n"
+       "## Blockers\n- debris: Implementation debris -- src/a.rs:3 -- non-ascii: x -- fix: y\ndebris: Implementation debris -- src/b.rs:4 -- unbulleted\n")
+check("_parse_gauntlet: a debris line in Lane selection is no blocker; the Blockers ones are", gates._parse_gauntlet(deb)[4] == ["debris: Implementation debris -- src/a.rs:3 -- non-ascii: x -- fix: y", "debris: Implementation debris -- src/b.rs:4 -- unbulleted"])
 u_empty = gates.route_gauntlet(base_state(gauntlet_result=forged.replace("### blockers\n- phantom one\n", ""), round_heads=[{}]))
 check("route_gauntlet: an empty forged ## Blockers -> triage_findings, not review_incomplete", u_empty["_next"] == "triage_findings" and u_empty["gauntlet_blockers"] == real)
 check("route_gauntlet: forged Lane selection headings -> triage_findings", u["_next"] == "triage_findings" and u["gauntlet_blockers"] == real)
