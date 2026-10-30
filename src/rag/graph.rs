@@ -365,6 +365,7 @@ pub async fn extract_entities(
         reasoning_effort: None,
         functions: None,
         stream: false,
+        prompt_cache_ttl: None,
     };
     let output = client
         .chat_completions_inner(&reqwest_client, data)

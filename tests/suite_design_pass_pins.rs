@@ -24,17 +24,60 @@
 //!   `step_runner_pins_mechanical_debt_sweep`, `probe_readme_pins_docs_spawn_arm`:
 //!   the hygiene pass, the lint carve-out wording, the step-runner debt
 //!   sweep and the probe README's docs arm.
+//! - `bundled_prose_leaves_resume_mechanics_to_the_tool_description`: the
+//!   orchestrator prompts and skills state the resume policy sentence once
+//!   and never restate the resume call shape (`--session_id`) or a made-up
+//!   session id; the plain `agent__spawn --agent X --prompt` template form
+//!   stays by design.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-fn agent_file(rel: &str) -> String {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("assets/agents")
-        .join(rel);
+fn assets_dir(rel: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join(rel)
+}
+
+fn asset_file(rel: &str) -> String {
+    let path = assets_dir(rel);
     fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
         .replace("\r\n", "\n")
+}
+
+fn agent_file(rel: &str) -> String {
+    asset_file(&format!("agents/{rel}"))
+}
+
+/// `text` with every whitespace run collapsed to one space, so a sentence a
+/// prompt hard-wraps is matched as prose.
+fn flat(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Every non-directory entry under `assets/<rel>`, recursively, sorted.
+/// Symlinks are not followed.
+fn asset_files(rel: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut pending = vec![assets_dir(rel)];
+    while let Some(dir) = pending.pop() {
+        for entry in
+            fs::read_dir(&dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
+        {
+            let entry = entry.unwrap();
+            let kind = entry
+                .file_type()
+                .unwrap_or_else(|e| panic!("file_type {}: {e}", entry.path().display()));
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else {
+                out.push(entry.path());
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 fn assert_anchors(rel: &str, anchors: &[&str]) {
@@ -468,4 +511,53 @@ fn probe_readme_pins_docs_spawn_arm() {
             "rewrites consumer-facing docs for such a surface and a local-run recipe exists",
         ],
     );
+}
+
+/// The `session_id` parameter's description on `agent__spawn` is the one
+/// place the resume mechanics live. The bundled prose that tells an
+/// orchestrator when to resume states the policy sentence exactly once,
+/// hard-wrapped or not, and points at the id, so a change to the call shape
+/// never leaves a stale example in a prompt: no resume call shape
+/// (`--session_id`) in the agents or skills, and no invented id of either
+/// spelling anywhere under `assets/`. The plain
+/// `agent__spawn --agent X --prompt` template form stays by design.
+#[test]
+fn bundled_prose_leaves_resume_mechanics_to_the_tool_description() {
+    let fragment = "resumes that child's `session_id`";
+    let sentence = "A fix or follow-up to a child's work resumes that child's `session_id`; a fresh spawn is for new work.";
+    for rel in [
+        "agents/sisyphus/instructions.md",
+        "agents/architect/instructions.md",
+        "skills/delegation-protocol/SKILL.md",
+        "skills/step-implementation/SKILL.md",
+    ] {
+        let text = asset_file(rel);
+        assert_eq!(
+            text.matches(fragment).count(),
+            1,
+            "{rel} states the resume policy exactly once"
+        );
+        assert_eq!(
+            flat(&text).matches(sentence).count(),
+            1,
+            "{rel} states the whole resume policy sentence exactly once"
+        );
+    }
+
+    let mut hits = Vec::new();
+    for (roots, needles) in [
+        (&["agents", "skills"][..], &["--session_id"][..]),
+        (&[""][..], &["ses_abc123", "sess_"][..]),
+    ] {
+        for path in roots.iter().flat_map(|root| asset_files(root)) {
+            let bytes = fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            let text = String::from_utf8_lossy(&bytes);
+            for needle in needles {
+                if text.contains(needle) {
+                    hits.push(format!("{}: {needle}", path.display()));
+                }
+            }
+        }
+    }
+    assert!(hits.is_empty(), "{}", hits.join("\n"));
 }

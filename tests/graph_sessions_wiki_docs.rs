@@ -23,7 +23,11 @@
 //! turn hook variables in `src/repl/mod.rs`, the chat agent's engage and
 //! resume texts in `src/config/request_context.rs`, `src/graph/dispatch.rs`
 //! and `src/config/agent.rs`, and the `session:` block of the repo-root
-//! `graph.example.yaml`.
+//! `graph.example.yaml`. The child-session pages are read against
+//! `src/config/child_sessions.rs`, the `agent__spawn` tool in
+//! `src/function/agents.rs`, the `previous_turns` budget in
+//! `src/graph/transcript.rs`, the bundled coder's `carry:` list and the
+//! resume policy sentence of `assets/skills/delegation-protocol/SKILL.md`.
 
 use std::collections::BTreeSet;
 use std::env;
@@ -35,12 +39,13 @@ const RECIPE: &str = "`COYOTE_WIKI_DIR=../coyote.wiki cargo test --test graph_se
 const SENTINEL_PAGE: &str = "Graph-Agents.md";
 /// The pages the block is documented on; every one is swept for the wording
 /// that described graph agents without sessions.
-const PAGES: [&str; 5] = [
+const PAGES: [&str; 6] = [
     "Graph-Agents.md",
     "REPL.md",
     "Sessions.md",
     "Hooks.md",
     "Environment-Variables.md",
+    "Agents.md",
 ];
 const GRAPH_BRANCH: &str = "COYOTE_GRAPH_BRANCH";
 const GRAPH_ROUTE: &str = "COYOTE_GRAPH_ROUTE";
@@ -53,6 +58,25 @@ const DELEGATE_HEADING: &str = "### Handing chat turns to a config agent";
 /// The caveat the Sessions section carries about a mistyped block name,
 /// whitespace flattened.
 const TYPO_CAVEAT: &str = "an unrecognised top-level key such as `sesion:` is ignored by the loader like any other, so a mistyped block name silently disables sessions";
+/// The Sessions.md section that documents the child session tree.
+const CHILD_SESSIONS_HEADING: &str = "# Child Sessions";
+/// The Agents.md subsection that documents resuming by `session_id`.
+const RESUME_HEADING: &str = "### Resuming a child";
+/// The Graph-Agents.md subsection that documents the seeded transcript key.
+const PREVIOUS_TURNS_HEADING: &str =
+    "### `{{previous_turns}}`: Automatically Seeded Under a Session";
+/// The lead of the Graph-Agents.md bullet that documents `carry:`.
+const CARRY_BULLET_LEAD: &str = "- **`carry`:**";
+/// The lead of the script Environment note on what `previous_turns` does
+/// to the state size.
+const SCRIPT_TURNS_LEAD: &str = "Under a session, [`previous_turns`]";
+/// The `agent.*` events a spawned child fires.
+const AGENT_EVENTS: [&str; 4] = [
+    "agent.started",
+    "agent.completed",
+    "agent.failed",
+    "agent.interrupted",
+];
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -83,6 +107,47 @@ fn src(parts: &[&str]) -> String {
         path = path.join(part);
     }
     read(path)
+}
+
+/// The one sentence of resume policy the bundled prompts and the Agents
+/// page share, read from the skill that spells it unwrapped: the line that
+/// says a follow-up resumes the child's `session_id`, from "A fix or
+/// follow-up" to the period.
+fn resume_policy_sentence() -> String {
+    let skill = read(
+        repo_root()
+            .join("assets")
+            .join("skills")
+            .join("delegation-protocol")
+            .join("SKILL.md"),
+    );
+    let line = skill
+        .lines()
+        .find(|line| line.contains("resumes that child's `session_id`"))
+        .expect("delegation-protocol/SKILL.md states the resume policy");
+    let lead = "A fix or follow-up";
+    let at = line
+        .find(lead)
+        .expect("the resume policy sentence opens with `A fix or follow-up`");
+    let end = line[at..]
+        .find('.')
+        .expect("the resume policy sentence ends with a period");
+    line[at..=at + end].to_string()
+}
+
+/// The decimal literal that follows `head` in `source`, up to `close`.
+fn number_after(source: &str, head: &str, close: char) -> usize {
+    let start = source
+        .find(head)
+        .unwrap_or_else(|| panic!("the source spells {head:?}"));
+    let rest = &source[start + head.len()..];
+    let end = rest
+        .find(close)
+        .unwrap_or_else(|| panic!("{head:?} is followed by `{close}`"));
+    rest[..end]
+        .trim()
+        .parse()
+        .unwrap_or_else(|e| panic!("{head:?} is followed by a number: {e}"))
 }
 
 /// The wiki checkout, or `None` after printing the conventional `skipping:`
@@ -216,29 +281,55 @@ fn table_row(label: &str, page: &str, first: &str) -> Vec<String> {
         .unwrap_or_else(|| panic!("{label} has no table row whose first cell is {first}"))
 }
 
-/// The field names of `pub struct {name}` in `source`, in declaration order.
-/// None of the session structs renames a field, in the body or in a struct
-/// attribute, so these are the serde names.
-fn struct_fields(source: &str, name: &str) -> Vec<String> {
+/// The body of `pub struct {name} {` in `source`, up to its closing `}` line.
+fn struct_body(source: &str, name: &str) -> String {
     let head = format!("pub struct {name} {{");
     let start = source
         .find(&head)
-        .unwrap_or_else(|| panic!("src/graph/types.rs declares {name}"));
+        .unwrap_or_else(|| panic!("the source declares {name}"));
     let body = &source[start + head.len()..];
     let end = body
         .find("\n}")
         .unwrap_or_else(|| panic!("{name} ends with a `}}` line"));
-    let body = &body[..end];
+    body[..end].to_string()
+}
+
+/// Every `pub` field of `pub struct {name}` in `source`, in declaration
+/// order, each with the attribute and doc lines directly above it.
+fn declared_fields(source: &str, name: &str) -> Vec<(Vec<String>, String)> {
+    let body = struct_body(source, name);
+    let lines: Vec<&str> = body.lines().map(str::trim).collect();
+    lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, line)| {
+            let rest = line.strip_prefix("pub ")?;
+            let field = rest.split(':').next().unwrap().trim().to_string();
+            let attributes = lines[..i]
+                .iter()
+                .rev()
+                .take_while(|l| l.starts_with("#[") || l.starts_with("///"))
+                .map(|l| l.to_string())
+                .collect();
+            Some((attributes, field))
+        })
+        .collect()
+}
+
+/// The field names of `pub struct {name}` in `source`, in declaration order.
+/// None of the session structs renames a field, in the body or in a struct
+/// attribute, so these are the serde names.
+fn struct_fields(source: &str, name: &str) -> Vec<String> {
     assert!(
-        !body.contains("rename")
+        !struct_body(source, name).contains("rename")
             && !struct_attributes(source, name)
                 .iter()
                 .any(|a| a.contains("rename")),
         "{name} renames its fields; this lint reads Rust names as serde names"
     );
-    body.lines()
-        .filter_map(|line| line.trim().strip_prefix("pub "))
-        .map(|rest| rest.split(':').next().unwrap().trim().to_string())
+    declared_fields(source, name)
+        .into_iter()
+        .map(|(_, field)| field)
         .collect()
 }
 
@@ -1177,10 +1268,65 @@ fn only_the_nested_session_keys_are_rejected() {
         );
     }
     let parser = src(&["graph", "parser.rs"]);
+    let hint = fn_body(&parser, "fn enhance_yaml_error");
     assert!(
-        parser.contains("Optional top-level block: `session` (keys: expose, route, chat)."),
+        hint.contains("Optional top-level block: `session` (keys: expose, route, chat)."),
         "the unknown-field hint names the session block"
     );
+    assert!(
+        hint.contains(
+            "Optional top-level list: `carry` (state keys remembered into the next run of a session)."
+        ),
+        "the unknown-field hint names the carry list"
+    );
+}
+
+/// The example documents `carry:` as a commented block whose figures are
+/// the ones the code enforces: the string cap and the reserved key names
+/// are scraped from their constants rather than trusted as prose.
+#[test]
+fn graph_example_documents_the_carry_list() {
+    let example = read(repo_root().join("graph.example.yaml"));
+    let block = example
+        .split("# Carried state (optional)\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\n\n").next())
+        .expect("graph.example.yaml has a `Carried state (optional)` banner");
+    for needle in [
+        "seeded back into `initial_state` on the next run",
+        "beat the `initial_state` defaults",
+        "lose to a parent node's\n# `inputs:`",
+        "must not share a name with a variable",
+        "\n# carry:\n#   - final_report",
+    ] {
+        assert!(
+            block.contains(needle),
+            "the graph.example.yaml carry block does not say {needle:?}:\n{block}"
+        );
+    }
+
+    let last_run = src(&["graph", "last_run.rs"]);
+    assert!(
+        last_run.contains("pub const CARRY_VALUE_BYTES: usize = 16 * 1024;"),
+        "CARRY_VALUE_BYTES changed; update the `16 KiB` figure in graph.example.yaml and this pin"
+    );
+    assert!(
+        block.contains("Strings over 16 KiB are cut from the front"),
+        "the carry block does not state the 16 KiB string cap:\n{block}"
+    );
+
+    let graph_mod = src(&["graph", "mod.rs"]);
+    let reserved = graph_mod
+        .split("const RESERVED_STATE_KEYS: [&str; 2] = [")
+        .nth(1)
+        .and_then(|rest| rest.split(']').next())
+        .expect("RESERVED_STATE_KEYS is a two-entry literal in graph/mod.rs");
+    for key in reserved.split(',').map(|k| k.trim().trim_matches('"')) {
+        assert!(
+            block.contains(&format!("`{key}`")),
+            "the carry block does not name the reserved key `{key}`:\n{block}"
+        );
+    }
 }
 
 #[test]
@@ -1667,12 +1813,14 @@ fn usage_probe_delegate_subsection_says_the_graph_agent_answers_once_the_key_is_
 }
 
 /// `(label, text)` for every prose section the `session:` block is
-/// documented in; the table rows it touched are `edited_rows`.
+/// documented in and every section the child-session pages added; the
+/// table rows they touched are `edited_rows`.
 fn edited_sections(wiki: &Path) -> Vec<(&'static str, String)> {
     let graph = read(wiki.join(SENTINEL_PAGE));
     let repl = read(wiki.join("REPL.md"));
     let sessions = read(wiki.join("Sessions.md"));
     let hooks = read(wiki.join("Hooks.md"));
+    let agents = read(wiki.join("Agents.md"));
     let run_heading = format!("## `.run` - {}", run_command_description());
     vec![
         (
@@ -1716,6 +1864,26 @@ fn edited_sections(wiki: &Path) -> Vec<(&'static str, String)> {
             "Hooks.md routed graph turns footnote",
             paragraph("Hooks.md", &hooks, ROUTED_FOOTNOTE_LEAD),
         ),
+        (
+            "Sessions.md # Child Sessions",
+            section("Sessions.md", &sessions, CHILD_SESSIONS_HEADING),
+        ),
+        (
+            "Graph-Agents.md previous_turns",
+            section(SENTINEL_PAGE, &graph, PREVIOUS_TURNS_HEADING),
+        ),
+        (
+            "Graph-Agents.md carry bullet",
+            paragraph(SENTINEL_PAGE, &graph, CARRY_BULLET_LEAD),
+        ),
+        (
+            "Graph-Agents.md script environment previous_turns note",
+            paragraph(SENTINEL_PAGE, &graph, SCRIPT_TURNS_LEAD),
+        ),
+        (
+            "Agents.md resuming a child",
+            section("Agents.md", &agents, RESUME_HEADING),
+        ),
     ]
 }
 
@@ -1723,11 +1891,15 @@ fn edited_sections(wiki: &Path) -> Vec<(&'static str, String)> {
 /// treats those rows' footnote marker specially.
 const HOOKS_ROWS_LABEL: &str = "Hooks.md turn row";
 
-/// The three Hooks.md turn rows that gained the graph variables and the
-/// three Environment-Variables.md graph rows, one string each.
+/// The Hooks.md turn rows that gained the graph variables, the
+/// Environment-Variables.md graph rows, and the rows the child-session
+/// pages touched (the Hooks.md agent and base-env rows carry no footnote
+/// dagger, so they are labelled apart from the turn rows), one string each.
 fn edited_rows(wiki: &Path) -> Vec<(String, String)> {
     let hooks = read(wiki.join("Hooks.md"));
     let env = read(wiki.join("Environment-Variables.md"));
+    let sessions = read(wiki.join("Sessions.md"));
+    let agents = read(wiki.join("Agents.md"));
     let mut rows: Vec<(String, String)> = ["turn.completed", "turn.interrupted", "turn.failed"]
         .iter()
         .map(|event| {
@@ -1743,6 +1915,30 @@ fn edited_rows(wiki: &Path) -> Vec<(String, String)> {
             table_row("Environment-Variables.md", &env, &format!("`{var}`")).join(" "),
         )
     }));
+    rows.extend(AGENT_EVENTS.iter().map(|event| {
+        (
+            format!("Hooks.md agent row `{event}`"),
+            table_row("Hooks.md", &hooks, &format!("`{event}`")).join(" "),
+        )
+    }));
+    rows.push((
+        "Hooks.md base env row `COYOTE_SESSION_ID`".to_string(),
+        table_row("Hooks.md", &hooks, "`COYOTE_SESSION_ID`").join(" "),
+    ));
+    rows.extend(["COYOTE_SESSION_ID", "COYOTE_AGENT_SESSION_ID"].map(|var| {
+        (
+            format!("Environment-Variables.md `{var}` row"),
+            table_row("Environment-Variables.md", &env, &format!("`{var}`")).join(" "),
+        )
+    }));
+    rows.push((
+        "Sessions.md `child_sessions` row".to_string(),
+        table_row("Sessions.md", &sessions, "`child_sessions`").join(" "),
+    ));
+    rows.push((
+        "Agents.md `agent__spawn` row".to_string(),
+        table_row("Agents.md", &agents, "`agent__spawn`").join(" "),
+    ));
     rows
 }
 
@@ -1872,4 +2068,420 @@ fn sessions_section_names_the_real_workspace_session_directory() {
         !text.contains(&wrong),
         "the Sessions section names a directory that does not exist: {wrong}"
     );
+}
+
+/// The `# Child Sessions` section draws the tree with the names the
+/// production code writes and states the rules a reader cannot infer from
+/// the tree: when the child file is flushed, what a headless parent leaves
+/// behind, what `.fork` copies, what the session commands do to children
+/// (with the exit wait read from `EXIT_CANCEL_WAIT`), how a graph child
+/// runs, and the sidecar's prompt head length from `PROMPT_HEAD_CHARS`.
+#[test]
+fn sessions_child_section_names_the_layout_and_the_lifecycle_rules() {
+    let child_sessions = src(&["config", "child_sessions.rs"]);
+    let meta_suffix = const_str(&child_sessions, "META_SUFFIX");
+    let prefix = const_str(&child_sessions, "SESSION_ID_PREFIX");
+    let prompt_head = number_after(
+        &child_sessions,
+        "pub(crate) const PROMPT_HEAD_CHARS: usize = ",
+        ';',
+    );
+    let production = child_sessions
+        .split("#[cfg(test)]")
+        .next()
+        .expect("split yields the text before the first test gate");
+    for literal in ["\"root.yaml\"", "\"children\"", "\"_proc\""] {
+        assert!(
+            production.contains(&format!(".join({literal})")),
+            "child_sessions.rs joins {literal}; the layout names on Sessions.md are read from it"
+        );
+    }
+    let exit_wait = number_after(
+        &src(&["repl", "mod.rs"]),
+        "const EXIT_CANCEL_WAIT: Duration = Duration::from_secs(",
+        ')',
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let text = flat(&section(
+        "Sessions.md",
+        &read(wiki.join("Sessions.md")),
+        CHILD_SESSIONS_HEADING,
+    ));
+    for needle in [
+        "`root.yaml`",
+        "`children/<sid>.yaml`",
+        &format!("`children/<sid>{meta_suffix}`"),
+        "`sessions/_proc/<pid>-<start>/`",
+        &format!("`{prefix}<agent>_<12 hex>`"),
+        &format!("first {prompt_head} characters"),
+        "not after every tool round",
+        "keeps `running` in its sidecar and reads `crashed` afterwards",
+        "copies as `running` and later reads `crashed` on the fork",
+        "**`.exit session`**",
+        &format!("wait up to {exit_wait} s for them to record `cancelled`"),
+        "**`.empty`** clears the transcript and removes the child directory",
+        "**`.delete session`** refuses the attached session",
+        "always runs its graph",
+        "the run is recorded into the same child session file",
+    ] {
+        assert!(
+            text.contains(needle),
+            "the Child Sessions section does not say {needle:?}"
+        );
+    }
+}
+
+/// The knob's name is read from the config template so the row, the
+/// `AppConfig` field and the `AgentConfig` field are all held to one
+/// spelling; the field carries no serde rename, so its Rust name is the
+/// yaml key.
+#[test]
+fn sessions_configuration_table_names_the_child_sessions_knob() {
+    let template = read(repo_root().join("assets").join("config-template.yaml"));
+    let field = template
+        .split("# ---- Child Sessions ----\n")
+        .nth(1)
+        .and_then(|rest| rest.lines().find(|line| !line.starts_with('#')))
+        .and_then(|line| line.split(':').next())
+        .expect("config-template.yaml has a Child Sessions banner over its key")
+        .to_string();
+    for (parts, name) in [
+        (["config", "app_config.rs"], "AppConfig"),
+        (["config", "agent.rs"], "AgentConfig"),
+    ] {
+        let fields = declared_fields(&src(&parts), name);
+        let (attributes, _) = fields
+            .iter()
+            .find(|(_, declared)| *declared == field)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{name} in src/{}/{} declares `{field}`: {:?}",
+                    parts[0],
+                    parts[1],
+                    fields
+                        .iter()
+                        .map(|(_, declared)| declared)
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            !attributes.iter().any(|a| a.contains("rename")),
+            "{name}.{field} is renamed for serde; this lint reads the Rust name as the yaml key"
+        );
+    }
+
+    let Some(wiki) = wiki_dir() else { return };
+    let sessions = read(wiki.join("Sessions.md"));
+    let config = section("Sessions.md", &sessions, "# Configuration");
+    let row = table_row(
+        "Sessions.md # Configuration",
+        &config,
+        &format!("`{field}`"),
+    );
+    assert_eq!(
+        row.len(),
+        2,
+        "the global settings table has two columns: {row:?}"
+    );
+    for needle in [
+        "`null`",
+        "`false`",
+        "`dry_run: true`",
+        "`.set`",
+        "config.yaml",
+    ] {
+        assert!(
+            row[1].contains(needle),
+            "the `{field}` row does not say {needle:?}: {}",
+            row[1]
+        );
+    }
+}
+
+/// The spawn seam's extra variable is read from `spawned_agent_hook_extras`
+/// and must appear on every `agent.*` row of Hooks.md and in the
+/// Environment-Variables.md table; the base `COYOTE_SESSION_ID` row says
+/// what it holds inside a child.
+#[test]
+fn hook_pages_carry_the_child_session_variable() {
+    let agents = src(&["function", "agents.rs"]);
+    let extras = fn_body(&agents, "fn spawned_agent_hook_extras(");
+    let var = string_literals(&extras)
+        .into_iter()
+        .find(|literal| literal.ends_with("_SESSION_ID"))
+        .expect("spawned_agent_hook_extras pushes a session id variable");
+    assert_eq!(var, "COYOTE_AGENT_SESSION_ID");
+
+    let Some(wiki) = wiki_dir() else { return };
+    let hooks = read(wiki.join("Hooks.md"));
+    for event in AGENT_EVENTS {
+        let row = table_row("Hooks.md", &hooks, &format!("`{event}`")).join(" ");
+        assert!(
+            row.contains(&format!("`{var}`")),
+            "the Hooks.md `{event}` row does not list `{var}`: {row}"
+        );
+    }
+    let base = table_row("Hooks.md", &hooks, "`COYOTE_SESSION_ID`").join(" ");
+    assert!(
+        base.contains("the child's session id"),
+        "the Hooks.md `COYOTE_SESSION_ID` row does not say what a child sees: {base}"
+    );
+    let env = read(wiki.join("Environment-Variables.md"));
+    let row = table_row("Environment-Variables.md", &env, &format!("`{var}`"));
+    assert!(
+        row[1].contains("child session") && row[1].contains("`agent.*`"),
+        "the Environment-Variables.md `{var}` row does not tie the variable to child sessions and `agent.*`: {row:?}"
+    );
+    let session_row = table_row("Environment-Variables.md", &env, "`COYOTE_SESSION_ID`");
+    assert!(
+        session_row[1].contains("the child's session id"),
+        "the Environment-Variables.md `COYOTE_SESSION_ID` row does not say what a child sees: {session_row:?}"
+    );
+}
+
+/// Graph-Agents.md documents `carry:` as a top-level field and
+/// `previous_turns` as a seeded key: the reserved-key errors are the
+/// parser's literals, the byte budget is `PREVIOUS_TURNS_BYTES`, and the
+/// keys the `carry` bullet says the bundled coder carries are exactly the
+/// ones its graph lists.
+#[test]
+fn graph_page_documents_carry_and_previous_turns() {
+    let parser = src(&["graph", "parser.rs"]);
+    let reserved: Vec<String> =
+        string_literals(&fn_body(&parser, "fn validate_structure(graph: &Graph)"))
+            .into_iter()
+            .filter(|literal| literal.contains("'previous_turns' is reserved"))
+            .collect();
+    assert_eq!(
+        reserved.len(),
+        2,
+        "validate_structure refuses previous_turns in initial_state and in variables[]: {reserved:?}"
+    );
+    let transcript = src(&["graph", "transcript.rs"]);
+    assert!(
+        transcript.contains("pub(crate) const PREVIOUS_TURNS_BYTES: usize = 24 * 1024;"),
+        "PREVIOUS_TURNS_BYTES changed; update the `24 KiB` figure on Graph-Agents.md and this pin"
+    );
+    let coder = read(repo_root().join("assets/agents/coder/graph.yaml"));
+    let carry: BTreeSet<String> = coder
+        .split("\ncarry:\n")
+        .nth(1)
+        .expect("the coder graph has a top-level carry: list")
+        .lines()
+        .take_while(|line| line.starts_with("  - "))
+        .map(|line| line["  - ".len()..].trim().to_string())
+        .collect();
+    assert!(!carry.is_empty(), "the coder carries at least one key");
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join(SENTINEL_PAGE));
+    let bullet = flat(&paragraph(SENTINEL_PAGE, &page, CARRY_BULLET_LEAD));
+    let lead = "The bundled `coder` carries";
+    let at = bullet
+        .find(lead)
+        .unwrap_or_else(|| panic!("the carry bullet does not say {lead:?}: {bullet}"));
+    let carried = &bullet[at + lead.len()..];
+    let end = carried
+        .find(" and renders")
+        .unwrap_or_else(|| panic!("the carry bullet goes on to what the coder renders: {bullet}"));
+    let documented: BTreeSet<String> = code_spans(&carried[..end]).into_iter().collect();
+    assert_eq!(
+        documented, carry,
+        "the carry bullet's coder keys differ from the coder graph's carry: list"
+    );
+    let turns = flat(&section(SENTINEL_PAGE, &page, PREVIOUS_TURNS_HEADING));
+    for literal in &reserved {
+        assert!(
+            turns.contains(&format!("`{literal}`")),
+            "the previous_turns subsection does not quote `{literal}`"
+        );
+    }
+    for needle in [
+        "24 KiB",
+        "`[N earlier turn(s) omitted]`",
+        "compressed session renders only its kept tail",
+    ] {
+        assert!(
+            turns.contains(needle),
+            "the previous_turns subsection does not say {needle:?}"
+        );
+    }
+    let scripts = flat(&section(SENTINEL_PAGE, &page, "### Environment"));
+    assert!(
+        scripts.contains("`previous_turns`") && scripts.contains("24 KiB"),
+        "the script Environment section does not warn that previous_turns pushes state into GRAPH_STATE_FILE"
+    );
+}
+
+/// The `agent__spawn` row quotes the parameter description's `null`
+/// sentence verbatim, and the resume subsection names the other results
+/// that carry `session_id`, the refusals in the code's words, the
+/// unknown-id hint's length from `recent_child_ids_hint`, and the one
+/// policy sentence the bundled prompts repeat.
+#[test]
+fn agents_page_quotes_the_spawn_session_id_contract() {
+    let agents = src(&["function", "agents.rs"]);
+    let declarations = fn_body(&agents, "pub fn agent_function_declarations()");
+    let description = string_literals(&declarations)
+        .into_iter()
+        .find(|literal| {
+            literal.starts_with("Resume a child session returned by an earlier spawn/collect")
+        })
+        .expect("agents.rs describes the session_id parameter of agent__spawn");
+    let lead = "`null` on a spawn result";
+    let at = description
+        .find(lead)
+        .expect("the session_id description explains a null result");
+    let end = description[at..]
+        .find('.')
+        .expect("the null sentence ends with a period");
+    let sentence = &description[at..=at + end];
+    assert_eq!(
+        sentence,
+        "`null` on a spawn result means that child cannot be resumed (child sessions are off)."
+    );
+    let refusals: Vec<String> = string_literals(&fn_body(&agents, "fn resume_child_session("))
+        .into_iter()
+        .filter(|literal| literal.starts_with('\''))
+        .collect();
+    let fragments = [
+        "expected sess_<agent>_<12 hex>",
+        "collect or cancel it first",
+        "child compression is not available yet - spawn fresh",
+    ];
+    for fragment in fragments {
+        assert!(
+            refusals.iter().any(|literal| literal.contains(fragment)),
+            "resume_child_session no longer refuses with {fragment:?}: {refusals:?}"
+        );
+    }
+    let recent = format!(
+        "up to {} recent ids",
+        number_after(
+            &fn_body(&agents, "fn recent_child_ids_hint("),
+            "root.recent_child_ids(",
+            ')',
+        )
+    );
+    let policy = resume_policy_sentence();
+    assert_eq!(
+        policy,
+        "A fix or follow-up to a child's work resumes that child's `session_id`; a fresh spawn is for new work."
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Agents.md"));
+    let row = table_row("Agents.md", &page, "`agent__spawn`").join(" ");
+    assert!(
+        row.contains("`session_id`"),
+        "the `agent__spawn` row does not name `session_id`: {row}"
+    );
+    assert!(
+        row.contains(sentence),
+        "the `agent__spawn` row does not quote {sentence:?}: {row}"
+    );
+    let resume = flat(&section("Agents.md", &page, RESUME_HEADING));
+    let mut needles = vec![
+        "`agent__check`",
+        "`agent__collect`",
+        "`agent__cancel`",
+        "`agent__list_running`",
+        "`auto_dispatched`",
+        "belongs to another agent",
+        &recent,
+        &policy,
+    ];
+    needles.extend(fragments);
+    for needle in needles {
+        assert!(
+            resume.contains(needle),
+            "the Resuming a child subsection does not say {needle:?}"
+        );
+    }
+}
+
+/// The `## Sweep at startup` bullets are held to the sweep's own arms: one
+/// bullet per reason string `remove_unless_adopted` / the `_proc` sweep log
+/// (four arms, in the code's order), the identity grace quoted as "an hour"
+/// from `ORPHAN_IDENTITY_GRACE`, the exemption file by its literal name, and
+/// the re-read before a removal plus the logging promise, all spelled on the
+/// page. The sweep runs only from the REPL arm of `main.rs`, which the
+/// section says in as many words.
+#[test]
+fn usage_probe_sessions_sweep_bullets_match_the_sweep_arms() {
+    let child_sessions = src(&["config", "child_sessions.rs"]);
+    // The uid arms live in `orphan_reason`, the `_proc` arm in the
+    // process-root sweep; the file's test module is left out of the scan.
+    let mut arms: Vec<String> = Vec::new();
+    for head in ["fn orphan_reason(", "fn sweep_dead_process_roots("] {
+        arms.extend(
+            string_literals(&fn_body(&child_sessions, head))
+                .into_iter()
+                .filter(|literal| literal.starts_with("orphan sweep arm ")),
+        );
+    }
+    assert_eq!(
+        arms.len(),
+        4,
+        "the sweep has four removal arms (0..=3): {arms:?}"
+    );
+    for n in 0..4 {
+        assert!(
+            arms.iter()
+                .any(|arm| arm.starts_with(&format!("orphan sweep arm {n}:"))),
+            "arm {n} is missing from {arms:?}"
+        );
+    }
+    assert!(
+        child_sessions.contains(
+            "const ORPHAN_IDENTITY_GRACE: std::time::Duration = std::time::Duration::from_secs(60 * 60);"
+        ),
+        "ORPHAN_IDENTITY_GRACE changed; update the `an hour` wording on Sessions.md and this pin"
+    );
+    assert!(
+        child_sessions.contains(".join(\"recovery.yaml\").exists()"),
+        "the sweep's exemption file is no longer recovery.yaml"
+    );
+    let main = src(&["main.rs"]);
+    assert_eq!(
+        main.matches("child_sessions::sweep_orphans()").count(),
+        1,
+        "sweep_orphans has one production caller, the REPL arm of main.rs"
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let sessions = read(wiki.join("Sessions.md"));
+    let sweep = section("Sessions.md", &sessions, "## Sweep at startup");
+    let bullets: Vec<String> = sweep
+        .lines()
+        .filter(|line| line.starts_with("- "))
+        .map(flat)
+        .collect();
+    assert_eq!(bullets.len(), 4, "one bullet per sweep arm: {bullets:?}");
+    // The page lists the arms in the code's order: 0, 1, 2, 3.
+    for (bullet, needle) in bullets.iter().zip([
+        "without a usable `root.yaml` goes an hour after its last change",
+        "whose recorded parent files are all gone goes",
+        "with no parent recorded goes once the process that wrote it is dead, unless `recovery.yaml`",
+        "`_proc/<pid>-<start>/` directories go when their process is dead",
+    ]) {
+        assert!(
+            bullet.contains(needle),
+            "sweep bullet does not say {needle:?}: {bullet}"
+        );
+    }
+    let text = flat(&sweep);
+    for needle in [
+        "The REPL sweeps `<cache dir>/sessions/` once at start",
+        "the sweep never fails the start",
+        "a parent directory that itself does not exist counts as unreachable",
+        "`root.yaml` is re-read and a root a live process adopted in the meantime is kept",
+        "Every removal is logged",
+    ] {
+        assert!(
+            text.contains(needle),
+            "the sweep section does not say {needle:?}"
+        );
+    }
 }

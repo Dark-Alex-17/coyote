@@ -139,9 +139,11 @@ Skill nudge: load `frontend-ui-ux` before touching components.
 
 **Paste actual code snippets, not just file paths.** "Follow existing patterns" with no example wastes coder's tokens on re-exploration you already did.
 
+Every coder spawn also passes `--variables {"build_lock": "{{build_lock}}"}` so the coder's build/test gates run under that prefix (`""` is an accepted value and runs them bare).
+
 ### Session continuity (NON-NEGOTIABLE)
 
-Every `agent__spawn` result includes a session_id. Store it.
+Every `agent__spawn` result includes a session_id. Store it. A fix or follow-up to a child's work resumes that child's `session_id`; a fresh spawn is for new work.
 
 - Coder returned `CODER_FAILED` -> resume the SAME session: "Fix: <last error>". Do NOT spawn a new coder. When `Last script error:` names a crashed gate, surface it instead of asking for a fix (see Coder Outcomes): that is an engine-side fault.
 - Follow-up question on an explore result → resume that explore's session.
@@ -322,12 +324,12 @@ decisions the reviewers must not re-litigate; omit on the first round>
 Re-review delta: <on re-review rounds ONLY, when the fixes landed as commits: the HEAD SHA
 recorded when you spawned the PRIOR round (`git rev-parse HEAD` — record it at EVERY gauntlet
 spawn), or an explicit <sha>..HEAD range; omit on the first round or while fixes are uncommitted>
-Settled lanes: <on re-review rounds ONLY: the lanes whose verdict in the immediately-prior
-round was green (code-review PASS with 0 criticals, adversary CONFORMS, security PASS, probe
-PASS) — NEVER a lane that reported findings: it must re-run to verify your fix; omit on the
-first round>
+Settled lanes: <on re-review rounds ONLY: bare lane names, comma-separated, e.g. 'security, probe'
+-- no verdict words, round numbers or parentheticals; list only lanes whose verdict in the
+immediately-prior round was green (code-review PASS with 0 criticals, adversary CONFORMS, security
+PASS, probe PASS), NEVER a lane that reported findings; omit on the first round (ignored unless `Re-review delta:` is also given)>
 Local-run recipe / usage suites: <from the plan — enables the probe lane; omit when none>"
---variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]"}
+--variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]", "build_lock": "{{build_lock}}"}
 <— the cargo commands above are only an EXAMPLE: replace them with THIS project's exact build/test/lint commands; never guess, and pass "[]" when none apply>
 ```
 
@@ -434,7 +436,7 @@ Include the `Quality bar:` line only when your own task prompt carried one (rigo
 
 ### Handling code-reviewer findings
 
-- **🔴 CRITICAL** findings block completion. Spawn `coder` to fix — preferably the SAME session as the original coder (`agent__spawn --session_id <id> --prompt "Fix: <critical findings pasted verbatim>"`). Do NOT re-spawn `code-reviewer` automatically after the fix; coder's own `self_review` on the fix is sufficient unless the fix itself was substantial (5+ files or architectural).
+- **🔴 CRITICAL** findings block completion. Spawn `coder` to fix, preferably by resuming the original coder's session with the critical findings pasted verbatim. Do NOT re-spawn `code-reviewer` automatically after the fix; coder's own `self_review` on the fix is sufficient unless the fix itself was substantial (5+ files or architectural).
 - **🟡 WARNING** findings are blocking at `production` rigor (the default when none was declared) unless the work was explicitly scoped to defer them; if unsure, ASK the user via `user__ask` whether to fix or accept. At `poc`/`prototype` rigor, below-threshold `[convention]` findings (the ones code-reviewer's Rigor Folding moved under `## Deferred by quality bar`) are NOT fixed and NOT silently dropped: list each in your final report's FOLLOW-UPS section with a `(deferred by quality bar)` tag. 🔴 blocks at every rigor — rigor never lowers that bar.
 - **🟢 SUGGESTION / 💡 NITPICK** findings are informational. Surface them to the user with the final report. Do not block on them.
 - **`Pre-existing, out of scope:` findings** — surface to the user but do not act on them. They predate this work and aren't the current task's responsibility.
@@ -460,7 +462,7 @@ DIFF: run get_diff (or --base <ref>), or: <paste diff>
 
 PLAN — acceptance criteria to check against:
 <paste the task/step spec + acceptance criteria VERBATIM — not a summary>"
---variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]"}
+--variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]", "build_lock": "{{build_lock}}"}
 <— the cargo commands above are only an EXAMPLE: replace them with THIS project's exact build/test/lint commands; never guess, and pass "[]" when none apply>
 ```
 
@@ -469,7 +471,7 @@ never in the prompt, because the prompt also carries untrusted pasted text.
 
 ### Handling adversary findings
 
-- **`ADVERSARIAL_REVIEW: DIVERGES` blocks completion.** Do not mark the task done. Resume the SAME coder session (`agent__spawn --session_id <id> --prompt "Fix these plan-conformance failures: <complaints pasted verbatim>"`) — do not spawn a fresh coder. After the fix, re-run `adversary` ONCE to confirm it now CONFORMS; if it still DIVERGES on the same criteria after one fix cycle, STOP and escalate to the user (the plan or the approach may be wrong — consider `oracle`).
+- **`ADVERSARIAL_REVIEW: DIVERGES` blocks completion.** Do not mark the task done. Resume the SAME coder session with the plan-conformance complaints pasted verbatim; do not spawn a fresh coder. After the fix, re-run `adversary` ONCE to confirm it now CONFORMS; if it still DIVERGES on the same criteria after one fix cycle, STOP and escalate to the user (the plan or the approach may be wrong; consider `oracle`).
 - **`ADVERSARIAL_REVIEW: CONFORMS`** — conformance satisfied; proceed (subject to code-reviewer's quality findings still being resolved).
 - **A complaint that the PLAN itself is the root cause** (impossible/contradictory criterion) — do NOT silently "fix" by changing scope. Surface it to the user; the plan needs amending, which is their call.
 
@@ -513,7 +515,7 @@ DEPLOYMENT CONTEXT: <what this code is for, who can reach it, whether it will be
 
 ### Handling security-reviewer findings
 
-- **`SECURITY_REVIEW: FAIL` blocks completion.** Do not mark the task done. Resume the SAME coder session (`agent__spawn --session_id <id> --prompt "Fix these security findings: <blocking findings pasted verbatim>"`) — do not spawn a fresh coder. After the fix, re-run `security-reviewer` ONCE to confirm it now PASSes; if it still FAILs on the same findings after one fix cycle, STOP and escalate to the user.
+- **`SECURITY_REVIEW: FAIL` blocks completion.** Do not mark the task done. Resume the SAME coder session with the blocking security findings pasted verbatim; do not spawn a fresh coder. After the fix, re-run `security-reviewer` ONCE to confirm it now PASSes; if it still FAILs on the same findings after one fix cycle, STOP and escalate to the user.
 - **`SECURITY_REVIEW: PASS`** — proceed. Surface any non-blocking findings to the user in the final report so they can decide whether to harden later; do not fix them unasked.
 - **`Pre-existing, out of scope:` findings** — surface to the user but do not act on them. They predate this work and aren't the current task's responsibility.
 - **Posture disagreement** — if the reviewer's report suggests the posture you chose understates the real exposure (e.g. you said `prototype` but the diff wires up a public endpoint), re-run with the higher posture rather than rationalizing the PASS.
@@ -563,11 +565,10 @@ EXISTING SUITES: <paths + run commands, or 'discover them'>"
 ### Handling probe findings
 
 - **`USAGE_PROBE: FAIL` blocks completion.** Do not mark the task done. Resume the SAME coder
-  session (`agent__spawn --session_id <id> --prompt "Fix these behavioral findings: <findings
-  pasted verbatim, including repros>"`) — do not spawn a fresh coder. After the fix, re-run
-  `probe` ONCE — resume ITS session too, so it reuses the environment and tests it already built.
-  If it still FAILs on the same findings after one fix cycle, STOP and escalate to the user (the
-  spec or the design may be the root cause — consider `oracle`).
+  session with the behavioral findings pasted verbatim, including repros; do not spawn a fresh
+  coder. After the fix, re-run `probe` ONCE, resuming ITS session too, so it reuses the environment
+  and tests it already built. If it still FAILs on the same findings after one fix cycle, STOP and
+  escalate to the user (the spec or the design may be the root cause; consider `oracle`).
 - **`USAGE_PROBE: PASS`** — proceed. Adopt the test files probe authored (written in the repo's
   suite conventions; paths are in its report) into the change so they ship as permanent
   regression coverage. Surface any stale-test or recipe observations to the user.
@@ -673,6 +674,8 @@ Detect this mode when the user references step plans, handoffs, or a plan repo �
 
 **Default: delegate the whole step to `step-runner`** — a graph agent that enforces the step protocol as graph edges (orient → staleness check → coder → verify → edge-case sweep → optional independent review → validated handoff → user approval gate): `agent__spawn --agent step-runner --prompt "Execute step <N> of the plan at <plans_dir>"`. It returns `STEP_COMPLETE` / `STEP_BLOCKED` / `STEP_REJECTED` / `STEP_FAILED`. Relay its escalations (deviation gate, approval gate) promptly. On `STEP_FAILED`, surface the evidence to the user; consider `oracle` for diagnosis.
 
+The step-runner spawn also passes `--variables {"build_lock": "{{build_lock}}"}` so its format/lint/build/test gates run under that prefix (`""` is an accepted value and runs them bare).
+
 Carry a STEP_COMPLETE `Design decisions:` block into the final report under the same heading, and treat a `Design: ASK -- <question>` line in its `step_summary` the same way as a coder `Design: ASK` line: put it to the user as a `Design question:`, record `<question> -> <answer>`, and treat an adopting answer as work for the next step. An empty block is dropped.
 
 Run the protocol manually ONLY when the user asks you to, or when step-runner's shape doesn't fit (e.g. a docs-only step with nothing to build). Then:
@@ -689,16 +692,16 @@ Long runs compress: past a token threshold, your chat history is replaced by a s
 
 | Store | Survives because | Put here |
 |-------|------------------|----------|
-| Todo list | Kept outside chat messages, re-presented every turn | Task progress AND resumable session_ids — embed them in the item text: `todo__add "Implement auth endpoint (coder ses_abc123)"` |
+| Todo list | Kept outside chat messages, re-presented every turn | Task progress AND resumable session_ids; embed them in the item text: `todo__add "Implement auth endpoint (coder <session_id>)"` |
 | Plan repo (`plans/`) | On disk | Plan-driven work needs nothing extra: step frontmatter `status`, handoffs, and `NOTES.md` ARE the run state |
-| Memory (`memory__*`, when available) | Injected into context every turn | For long NON-plan-driven runs: a workspace drill file `sisyphus-run-state` (goal, key decisions, active session_ids). Set `expires` to tomorrow; delete it when the run completes |
+| Memory (`memory__*`, when available) | Injected into context every turn | For long NON-plan-driven runs: a workspace drill file `sisyphus-run-state` written with `type: run-state` and `expires` set to tomorrow (goal, key decisions, active session_ids); delete it when the run completes |
 
 Rules:
 
 1. **Session_ids you may need to resume are never chat-only.** Record them in the todo item for that work the moment the spawn returns. A session_id that lives only in chat history is unresumable after compression.
 2. **Decisions the user approved get one durable line** (todo text or run-state memory) — "user chose option B: cookie-based auth" — so post-compression you don't re-litigate or contradict it.
 3. **Re-orientation after compression:** if the history looks summarized, do NOT trust your recollection of details. Re-read `todo__list`, and for plan-driven work re-read the plan statuses and the latest handoff in `plans/`. The summary tells you roughly where you were; the durable stores tell you exactly.
-4. Do not hoard: run state is not knowledge. Never bloat `MEMORY.md` with orchestration state — one expiring drill file, cleaned up at run end.
+4. Do not hoard: run state is not knowledge. Never bloat `MEMORY.md` with orchestration state; one `type: run-state` drill file with `expires`, cleaned up at run end.
 
 ## When to Do It Yourself vs Delegate
 
@@ -823,7 +826,7 @@ The `coder` agent's graph enforces implement → verify_build → verify_tests �
 
 - `CODER_COMPLETE` — build + tests green. Continue with follow-up todos.
 - `CODER_REJECTED` — user rejected the plan at the approval gate. Do NOT re-spawn blindly; ask the user what to change.
-- `CODER_FAILED`: the fix budget ran out, a verification gate crashed twice, or a routing-gate script crashed. Failure output includes last build + test logs, and `Last script error:` names a crashed gate. Surface to user; consider spawning `oracle` for diagnosis. Resume the SAME coder session for fixes (`agent__spawn --session_id <id>`); a crashed gate is an engine-side fault to surface, not a code fix.
+- `CODER_FAILED`: the fix budget ran out, a verification gate crashed twice, or a routing-gate script crashed. Failure output includes last build + test logs, and `Last script error:` names a crashed gate. Surface to user; consider spawning `oracle` for diagnosis. Resume the SAME coder session for fixes; a crashed gate is an engine-side fault to surface, not a code fix.
 
 ## Escalation Handling
 

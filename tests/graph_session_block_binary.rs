@@ -1166,3 +1166,268 @@ fn usage_probe_info_runs_the_delegate_pass_like_an_engage() {
         "--info names the inspected graph agent:\n{combined}"
     );
 }
+
+/// The top-level `carry:` list from a cold start: a key declared through
+/// `initial_state` loads and the graph still echoes; every documented
+/// mistake fails at graph load with its sentence; a mistyped `cary:` is a
+/// plain unknown field and is ignored; `carry` nested under `session:` is
+/// an unknown field whose hint names both the session block and the carry
+/// list, the session sentence byte-for-byte as before.
+#[test]
+fn usage_probe_carry_list_rules_hold_from_a_cold_start() {
+    const SESSION_HINT: &str = "Optional top-level block: `session` (keys: expose, route, chat).";
+    const CARRY_HINT: &str =
+        "Optional top-level list: `carry` (state keys remembered into the next run of a session).";
+
+    for (label, block) in [
+        ("declared key", "carry: [said]\n"),
+        (
+            "declared key with a session block",
+            "carry: [said]\nsession:\n  expose: [said]\n  chat:\n    instructions: Answer.\n",
+        ),
+        ("empty list", "carry: []\n"),
+        ("mistyped top-level name is ignored", "cary: [nope]\n"),
+        (
+            "a variable and a carried key may coexist under different names",
+            "variables:\n  - name: tone\n    description: a knob\n    default: terse\ncarry: [said]\n",
+        ),
+    ] {
+        let dir = fresh_config_dir("carry-ok");
+        let _guard = TempDirGuard(dir.clone());
+        write_fixture(&dir, block);
+
+        assert_echoes_hello(label, &run_echo(&dir));
+    }
+
+    let cases: &[(&str, &str, &[&str])] = &[
+        (
+            "undeclared carry key",
+            "carry: [nope]\n",
+            &[
+                "carry key 'nope' is not declared anywhere (add it to initial_state, or have a node write it via state_updates / output_schema)",
+            ],
+        ),
+        (
+            "reserved initial_prompt",
+            "carry: [initial_prompt]\n",
+            &["carry key 'initial_prompt' is reserved"],
+        ),
+        (
+            "reserved previous_turns",
+            "carry: [previous_turns]\n",
+            &["carry key 'previous_turns' is reserved"],
+        ),
+        (
+            "duplicate carry key",
+            "carry: [said, said]\n",
+            &["carry key 'said' is listed more than once"],
+        ),
+        (
+            "blank carry key",
+            "carry: [\" \"]\n",
+            &["carry key ' ' must be non-empty"],
+        ),
+        (
+            "carry key that is also a variable",
+            "variables:\n  - name: said\n    description: a knob\n    default: x\ncarry: [said]\n",
+            &["carry key 'said' is also a variable; carried values would out-rank --variables"],
+        ),
+        (
+            "carry is a scalar",
+            "carry: said\n",
+            &["carry: invalid type"],
+        ),
+        (
+            "carry nested under session",
+            "session:\n  carry: [said]\n  chat:\n    instructions: Answer.\n",
+            &["unknown field `carry`", SESSION_HINT, CARRY_HINT],
+        ),
+    ];
+    for (label, block, expected) in cases {
+        let dir = fresh_config_dir("carry-err");
+        let _guard = TempDirGuard(dir.clone());
+        write_fixture(&dir, block);
+
+        let output = run_echo(&dir);
+        assert_fails_at_graph_load(label, &output, expected);
+        if *label == "carry nested under session" {
+            // The added carry sentence rides on its own line after the
+            // session sentence, so the pinned sentence stays byte-intact.
+            let stderr = stderr_of(&output);
+            let session_at = stderr.find(SESSION_HINT).unwrap();
+            let carry_at = stderr.find(CARRY_HINT).unwrap();
+            // (anyhow indents the cause chain, so only the line break counts.)
+            let between = &stderr[session_at + SESSION_HINT.len()..carry_at];
+            assert!(
+                between.trim().is_empty() && between.matches('\n').count() == 1,
+                "the carry sentence follows the session sentence on the next line:\n{stderr}"
+            );
+        }
+    }
+}
+
+/// `graph.example.yaml` enables the `ddg-search` MCP server, which the
+/// bundled `mcp.json` launches through `uvx`. That launcher is not on every
+/// host (the CI runners lack it), and a cold start of the example tries to
+/// spawn it before `--info` prints anything. The carry test is about the
+/// `carry:` block, so the copy it boots drops every MCP reference: the
+/// graph-level `mcp_servers:` and `mcp_tools:` blocks, the node-level
+/// `mcp_tools:` block, and each `- mcp:<server>` tool entry. A block is its
+/// key line plus every following non-blank line indented deeper than it.
+fn without_mcp_references(yaml: &str) -> String {
+    let mut kept = String::new();
+    let mut block_indent: Option<usize> = None;
+    for line in yaml.lines() {
+        let body = line.trim_start();
+        let indent = line.len() - body.len();
+        if let Some(opened_at) = block_indent {
+            if !body.is_empty() && indent > opened_at {
+                continue;
+            }
+            block_indent = None;
+        }
+        if body.starts_with("mcp_servers:") || body.starts_with("mcp_tools:") {
+            block_indent = Some(indent);
+            continue;
+        }
+        if body.starts_with("- mcp:") {
+            continue;
+        }
+        kept.push_str(line);
+        kept.push('\n');
+    }
+    kept
+}
+
+/// Fold CRLF to LF so a checkout with either line ending reads the same
+/// example text. `.gitattributes` pins no `eol` for `graph.example.yaml`,
+/// so a Windows checkout hands the test CRLF bytes and every LF needle
+/// below would miss without this.
+fn lf_text(text: &str) -> String {
+    text.replace("\r\n", "\n")
+}
+
+/// The commented `carry:` block as the shipped example spells it, and the
+/// two uncommented lines a consumer ends up with.
+const COMMENTED_CARRY: &str = "\n# carry:\n#   - final_report\n";
+const UNCOMMENTED_CARRY: &str = "\ncarry:\n  - final_report\n";
+
+/// Read the shipped `graph.example.yaml` as LF text.
+fn example_graph_text() -> String {
+    lf_text(
+        &fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("graph.example.yaml"))
+            .unwrap(),
+    )
+}
+
+/// The copy of the example the carry test boots: the commented `carry:`
+/// block uncommented, the example's own model knobs swapped for the dry-run
+/// model, and its MCP wiring dropped, so the only thing under test is the
+/// uncommented list and no MCP launcher has to exist on the host. `None`
+/// when the example no longer carries the commented block. Folds CRLF first
+/// so a CRLF copy of the example takes the same path as the LF copy.
+fn example_carry_fixture(example: &str) -> Option<String> {
+    let example = lf_text(example);
+    if !example.contains(COMMENTED_CARRY) {
+        return None;
+    }
+    Some(
+        without_mcp_references(&example.replace(COMMENTED_CARRY, UNCOMMENTED_CARRY))
+            .replace("claude:claude-sonnet-4-6", "dryrun:dry-model")
+            .replace("claude:claude-haiku-4-5", "dryrun:dry-model"),
+    )
+}
+
+/// A CRLF copy of the example misses every LF needle the carry test uses
+/// until it is folded; folded, the LF and CRLF copies derive byte-identical
+/// fixtures. This is the Windows-checkout shape the real binary test sees.
+#[test]
+fn usage_probe_example_carry_fixture_is_line_ending_independent() {
+    let lf = example_graph_text();
+    assert!(
+        !lf.contains('\r'),
+        "LF fixture must carry no carriage returns"
+    );
+    let crlf = lf.replace('\n', "\r\n");
+    assert!(
+        crlf.contains("\r\n# carry:\r\n#   - final_report\r\n"),
+        "CRLF fixture must present the carry block with CRLF bytes"
+    );
+    assert!(
+        !crlf.contains(COMMENTED_CARRY),
+        "the unfolded CRLF copy must miss the LF needle, or this pin proves nothing"
+    );
+
+    assert_eq!(lf_text(&crlf), lf);
+    assert_eq!(lf_text(&lf), lf);
+
+    let from_lf = example_carry_fixture(&lf).expect("LF example carries the commented block");
+    let from_crlf = example_carry_fixture(&crlf).expect("CRLF example carries the commented block");
+    assert_eq!(from_crlf, from_lf);
+    assert!(from_crlf.contains(UNCOMMENTED_CARRY));
+    assert!(!from_crlf.contains('\r'));
+}
+
+/// The shipped `graph.example.yaml` documents `carry:` as a commented block
+/// ending in a ready-to-use `carry: [final_report]`. A consumer who
+/// uncomments exactly those two lines gets a graph the real binary still
+/// loads from a cold start (`final_report` is written by a node, is not a
+/// variable, and is not reserved), inspected end to end with `--info`. The
+/// same block naming an undeclared key is refused at graph load with the
+/// carry sentence, so the positive leg really did parse the list.
+#[test]
+fn usage_probe_uncommenting_the_example_carry_block_loads_from_a_cold_start() {
+    let example = example_graph_text();
+    let uncommented = example_carry_fixture(&example)
+        .expect("graph.example.yaml no longer carries the commented `carry:` block");
+    assert!(
+        !uncommented.to_ascii_lowercase().contains("mcp") && !uncommented.contains("ddg-search"),
+        "the booted copy still references an MCP server:\n{uncommented}"
+    );
+    assert!(
+        uncommented.contains(UNCOMMENTED_CARRY),
+        "the MCP strip must leave the uncommented carry block in place"
+    );
+
+    for (label, graph, expect_ok) in [
+        ("as documented", uncommented.clone(), true),
+        (
+            "undeclared key in the same block",
+            uncommented.replace(UNCOMMENTED_CARRY, "\ncarry:\n  - nope\n"),
+            false,
+        ),
+    ] {
+        let dir = fresh_config_dir("carry-example");
+        let _guard = TempDirGuard(dir.clone());
+        write_fixture(&dir, "");
+        let agent_dir = dir.join("agents").join(AGENT);
+        fs::write(agent_dir.join("graph.yaml"), &graph).unwrap();
+        // The example's synthesize script only has to exist for the parser.
+        fs::create_dir_all(agent_dir.join("scripts")).unwrap();
+        fs::write(agent_dir.join("scripts").join("synthesize.py"), "").unwrap();
+
+        let output = run_with(&dir, &["-a", AGENT, "--info"]);
+        let combined = format!("{}\n{}", stderr_of(&output), stdout_of(&output));
+        if expect_ok {
+            assert!(
+                output.status.success() && !combined.contains("panicked"),
+                "{label}: expected `--info` to inspect the example, got exit {:?}\n{combined}",
+                output.status
+            );
+            assert!(
+                !combined.contains("Failed to load graph.yaml"),
+                "{label}: the uncommented carry block failed to load:\n{combined}"
+            );
+            assert!(
+                stdout_of(&output).contains("config_file:"),
+                "{label}: `--info` did not reach the agent summary:\n{combined}"
+            );
+        } else {
+            assert_fails_at_graph_load(
+                label,
+                &output,
+                &["carry key 'nope' is not declared anywhere"],
+            );
+        }
+    }
+}

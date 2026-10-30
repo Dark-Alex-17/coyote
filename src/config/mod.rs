@@ -3,6 +3,7 @@ mod app_config;
 mod app_state;
 pub(crate) mod builtin_manifest;
 mod bundles;
+pub(crate) mod child_sessions;
 mod command_prefix;
 pub(crate) mod conflict;
 pub(crate) mod envoy;
@@ -16,6 +17,7 @@ mod macros;
 mod mcp_factory;
 mod mcp_tool_policy;
 pub(crate) mod memory;
+pub(crate) mod memory_migrate;
 pub(crate) mod mesh_config;
 pub(crate) mod mesh_digest;
 pub(crate) mod mesh_envoy;
@@ -27,6 +29,7 @@ mod rag_cache;
 mod request_context;
 pub(crate) mod reserved_agents;
 mod role;
+mod round_chains;
 mod session;
 mod skill;
 mod skill_policy;
@@ -74,8 +77,9 @@ pub use self::mesh_snapshot::{publish_mesh_snapshot, refresh_mesh_snapshot};
 pub(crate) use self::request_context::asset_table;
 #[allow(unused_imports)]
 pub use self::request_context::{
-    ForkedSession, PendingFork, RenderMode, RequestContext, effective_max_concurrent_jobs,
-    jobs_enabled, mesh_tools_available, should_inject_skill_instructions,
+    ForkedSession, PendingFork, RenderMode, RequestContext, child_sessions_enabled,
+    effective_max_concurrent_jobs, jobs_enabled, mesh_tools_available,
+    should_inject_skill_instructions,
 };
 pub use self::reserved_agents::{
     BuiltinAgentSource, BuiltinAgentUnavailable, RESERVED_AGENT_NAMES, UnavailableReason,
@@ -86,6 +90,7 @@ pub use self::reserved_agents::{
 pub use self::role::{
     CODE_ROLE, CREATE_TITLE_ROLE, EXPLAIN_SHELL_ROLE, INPUT_PLACEHOLDER, Role, RoleLike, SHELL_ROLE,
 };
+pub use self::round_chains::RoundChains;
 pub use self::session::{
     ForkRekey, Session, SessionScope, TURN_INTERRUPTED_TEXT, labeled_session_names,
     session_scope_dirs,
@@ -326,10 +331,16 @@ pub struct Config {
     pub max_tool_result_chars: Option<usize>,
     pub max_concurrent_jobs: Option<usize>,
     pub tool_timeout: Option<u64>,
+    pub child_sessions: Option<bool>,
+    pub prompt_cache_ttl: Option<String>,
 
     pub memory: Option<bool>,
-    pub memory_cap_with_tools: Option<usize>,
-    pub memory_cap_without_tools: Option<usize>,
+    #[serde(alias = "memory_cap_with_tools")]
+    pub memory_facts_cap: Option<usize>,
+    #[serde(alias = "memory_cap_without_tools")]
+    pub memory_drill_cap: Option<usize>,
+    pub memory_run_state_ttl_days: Option<u32>,
+    pub memory_round_chains: RoundChains,
 
     pub workspace_instructions: Option<bool>,
     pub workspace_instructions_files: Option<Vec<String>>,
@@ -420,10 +431,14 @@ impl Default for Config {
             max_tool_result_chars: None,
             max_concurrent_jobs: None,
             tool_timeout: None,
+            child_sessions: None,
+            prompt_cache_ttl: None,
 
             memory: None,
-            memory_cap_with_tools: None,
-            memory_cap_without_tools: None,
+            memory_facts_cap: None,
+            memory_drill_cap: None,
+            memory_run_state_ttl_days: None,
+            memory_round_chains: RoundChains::default(),
 
             workspace_instructions: None,
             workspace_instructions_files: None,
@@ -514,6 +529,13 @@ impl AssetCategory {
 pub enum MemoryScope {
     Global,
     Workspace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum MigrateScope {
+    Global,
+    Workspace,
+    All,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -1534,17 +1556,139 @@ clients:
     }
 
     #[test]
+    fn config_template_documents_prompt_cache_ttl() {
+        assert!(CONFIG_TEMPLATE.contains("\nprompt_cache_ttl: null"));
+        assert!(CONFIG_TEMPLATE.contains("long-lived root session turns"));
+        assert!(CONFIG_TEMPLATE.contains("Spawned children and graph nodes always use 5m"));
+        let example = include_str!("../../config.example.yaml");
+        assert!(example.contains("\nprompt_cache_ttl: null"));
+        assert!(example.contains("Spawned children and graph nodes always use 5m"));
+        let cfg = Config::load_from_str(example).unwrap();
+        assert_eq!(cfg.prompt_cache_ttl, None);
+    }
+
+    #[test]
+    fn config_template_documents_memory_cap_as_enforced() {
+        let facts_default = format!("null = {}", memory::DEFAULT_MEMORY_FACTS_CAP);
+        let drill_default = format!("null = {}", memory::DEFAULT_MEMORY_DRILL_CAP);
+        assert!(CONFIG_TEMPLATE.contains("\nmemory_facts_cap: null"));
+        assert!(CONFIG_TEMPLATE.contains("\nmemory_drill_cap: null"));
+        assert!(CONFIG_TEMPLATE.contains(&facts_default));
+        assert!(CONFIG_TEMPLATE.contains(&drill_default));
+        assert!(CONFIG_TEMPLATE.contains("facts first, then the drill-file catalogue"));
+        assert!(CONFIG_TEMPLATE.contains("Old key memory_cap_with_tools still loads"));
+        assert!(CONFIG_TEMPLATE.contains("the facts section counts against it"));
+        assert!(CONFIG_TEMPLATE.contains("Old key memory_cap_without_tools still loads"));
+        assert!(!CONFIG_TEMPLATE.contains("\nmemory_cap_with_tools:"));
+        assert!(!CONFIG_TEMPLATE.contains("\nmemory_cap_without_tools:"));
+        let example = include_str!("../../config.example.yaml");
+        assert!(example.contains("\nmemory_facts_cap: null"));
+        assert!(example.contains("\nmemory_drill_cap: null"));
+        assert!(example.contains(&facts_default));
+        assert!(example.contains(&drill_default));
+        assert!(example.contains("facts first, then the drill-file catalogue"));
+        assert!(example.contains("Old key memory_cap_with_tools still loads"));
+        assert!(example.contains("the facts section counts against it"));
+        assert!(example.contains("Old key memory_cap_without_tools still loads"));
+        assert!(!example.contains("\nmemory_cap_with_tools:"));
+        assert!(!example.contains("\nmemory_cap_without_tools:"));
+    }
+
+    #[test]
+    fn memory_cap_keys_load_under_their_old_and_new_names() {
+        let old = "memory_cap_with_tools: 123\nmemory_cap_without_tools: 456\n";
+        let cfg = Config::load_from_str(old).unwrap();
+        assert_eq!(cfg.memory_facts_cap, Some(123));
+        assert_eq!(cfg.memory_drill_cap, Some(456));
+        let new = "memory_facts_cap: 123\nmemory_drill_cap: 456\n";
+        let cfg = Config::load_from_str(new).unwrap();
+        assert_eq!(cfg.memory_facts_cap, Some(123));
+        assert_eq!(cfg.memory_drill_cap, Some(456));
+    }
+
+    #[test]
     fn config_template_documents_command_prefix() {
         assert!(CONFIG_TEMPLATE.contains("command_prefix: dot"));
         assert!(CONFIG_TEMPLATE.contains("Set at runtime with .set command_prefix"));
     }
 
     #[test]
+    fn config_template_documents_child_sessions() {
+        assert!(CONFIG_TEMPLATE.contains("\nchild_sessions: null"));
+        assert!(CONFIG_TEMPLATE.contains("# ---- Child Sessions ----"));
+        assert!(CONFIG_TEMPLATE.contains("an agent can never re-enable"));
+        // The per-agent knob is read from the SPAWNED agent's own config.
+        assert!(CONFIG_TEMPLATE.contains("when spawned as a child it gets no session"));
+        assert!(!CONFIG_TEMPLATE.contains("own children out"));
+        assert!(CONFIG_TEMPLATE.contains("not settable with .set"));
+        assert!(!CONFIG_TEMPLATE.contains(".set child_sessions"));
+    }
+
+    #[test]
+    fn config_template_documents_memory_run_state_ttl() {
+        assert!(CONFIG_TEMPLATE.contains("\nmemory_run_state_ttl_days: null"));
+        assert!(CONFIG_TEMPLATE.contains("null = 14"));
+    }
+
+    #[test]
+    fn config_template_documents_memory_round_chains() {
+        assert!(CONFIG_TEMPLATE.contains("\nmemory_round_chains: supersede"));
+        assert!(CONFIG_TEMPLATE.contains("keep leaves them alone"));
+        assert!(CONFIG_TEMPLATE.contains(
+            "# Either way, a round written below an existing one keeps superseded_by pointing at the round above."
+        ));
+    }
+
+    #[test]
     fn config_example_parses_with_dot_command_prefix() {
         let example = include_str!("../../config.example.yaml");
         assert!(example.contains("command_prefix: dot"));
+        assert!(example.contains("\nmemory_round_chains: supersede"));
         let cfg = Config::load_from_str(example).unwrap();
         assert_eq!(cfg.command_prefix, CommandPrefix::Dot);
+        assert_eq!(cfg.memory_round_chains, RoundChains::Supersede);
+    }
+
+    #[test]
+    fn config_example_documents_child_sessions_and_still_parses() {
+        let example = include_str!("../../config.example.yaml");
+        assert!(example.contains("\nchild_sessions:"));
+        assert!(example.contains("when spawned as a child it gets no session"));
+        assert!(!example.contains("own children out"));
+        let cfg = Config::load_from_str(example).unwrap();
+        assert_eq!(cfg.child_sessions, None);
+    }
+
+    #[test]
+    fn config_agent_example_documents_child_sessions() {
+        let example = include_str!("../../config.agent.example.yaml");
+        assert!(example.contains("\nchild_sessions:"));
+        assert!(example.contains("THIS agent, when spawned as a child"));
+        assert!(!example.contains("THIS agent spawns"));
+        let cfg: AgentConfig = serde_yaml::from_str(example).unwrap();
+        assert_eq!(cfg.child_sessions, None);
+    }
+
+    #[test]
+    fn bundled_explore_agent_runs_without_memory() {
+        let config = include_str!("../../assets/agents/explore/config.yaml");
+        let cfg: AgentConfig = serde_yaml::from_str(config).unwrap();
+        assert_eq!(cfg.memory, Some(false));
+    }
+
+    #[test]
+    fn config_loads_child_sessions_knob() {
+        assert_eq!(Config::default().child_sessions, None);
+        let cfg = Config::load_from_str("child_sessions: false").unwrap();
+        assert_eq!(cfg.child_sessions, Some(false));
+        let cfg = Config::load_from_str("child_sessions: true").unwrap();
+        assert_eq!(cfg.child_sessions, Some(true));
+        assert_eq!(
+            Config::load_from_str("model: openai:gpt-4o")
+                .unwrap()
+                .child_sessions,
+            None
+        );
     }
 
     #[test]

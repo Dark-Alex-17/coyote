@@ -15,6 +15,7 @@ pub mod staging;
 pub mod state;
 pub mod state_updates;
 pub mod structured;
+pub mod transcript;
 pub mod types;
 pub mod user_interaction;
 pub mod validator;
@@ -105,6 +106,9 @@ pub(crate) fn is_context_overflow_error(err: &Error) -> bool {
 }
 
 pub const MAX_STATE_SIZE_BYTES: usize = 32 * 1024;
+/// State keys the dispatcher overwrites on every run; agent-node `inputs`
+/// may not pass them.
+pub(crate) const RESERVED_STATE_KEYS: [&str; 2] = ["initial_prompt", "previous_turns"];
 /// Environment variable carrying the serialized state to a script node when
 /// it fits; otherwise `GRAPH_STATE_FILE_ENV` names a temp file holding it.
 pub(super) const GRAPH_STATE_ENV: &str = "GRAPH_STATE";

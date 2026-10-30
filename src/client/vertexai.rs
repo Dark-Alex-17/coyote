@@ -348,6 +348,7 @@ pub fn gemini_build_chat_completions_body(
         reasoning_effort,
         functions,
         stream: _,
+        prompt_cache_ttl: _,
     } = data;
 
     let system_message = extract_system_message(&mut messages);
@@ -611,6 +612,7 @@ mod tests {
             reasoning_effort: None,
             functions: None,
             stream: false,
+            prompt_cache_ttl: None,
         };
 
         let body = gemini_build_chat_completions_body(data, &Model::new("vertexai", "gemini-test"))

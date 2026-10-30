@@ -386,6 +386,9 @@ pub struct ChatCompletionsData {
     pub reasoning_effort: Option<String>,
     pub functions: Option<Vec<FunctionDeclaration>>,
     pub stream: bool,
+    /// Cache TTL for the system prompt and tool declarations (`"1h"`), or
+    /// None for the provider default. Only the Anthropic clients read it.
+    pub prompt_cache_ttl: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]

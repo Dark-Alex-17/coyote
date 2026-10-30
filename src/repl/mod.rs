@@ -74,6 +74,10 @@ const MENU_NAME: &str = "completion_menu";
 /// tears down. Never used mid-session.
 pub(crate) const EXIT_HOOK_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Ceiling on how long an exiting session waits for its cancelled background
+/// agents to finish writing their status before the session itself settles.
+const EXIT_CANCEL_WAIT: Duration = Duration::from_secs(5);
+
 const CANCELLED_TASKS_HINT: &str =
     "Cancelled the background task(s) left running by the interrupted turn.";
 
@@ -821,7 +825,13 @@ impl Repl {
         // against a session on its way out.
         mesh.clear_hook_sink();
 
-        self.ctx.read().cancel_background_tasks();
+        {
+            // Holding the context guard across the wait follows the turn loop,
+            // which holds the write guard across run_repl_command; the
+            // supervisor guard itself is released inside the callee.
+            let ctx = self.ctx.read();
+            ctx.cancel_background_tasks_and_wait(EXIT_CANCEL_WAIT).await;
+        }
 
         let exit_result = self.ctx.write().exit_session();
         self.ctx
@@ -1864,6 +1874,11 @@ pub async fn run_repl_command_with_prefix(
                     // session goes even when the node refuses to stop, and that refusal
                     // is reported once the exit is done.
                     let left = mesh::before_session_left(ctx).await;
+                    // With nothing to settle this is a no-op, not a sweep of
+                    // every job and agent the user left running.
+                    if ctx.session.is_some() || ctx.child_session_root.is_some() {
+                        ctx.cancel_background_tasks_and_wait(EXIT_CANCEL_WAIT).await;
+                    }
                     if ctx.agent.is_some() {
                         ctx.exit_agent_session()?;
                     } else {
@@ -2200,17 +2215,10 @@ async fn ask_loop(
                 GraphTurn::Run { output, last_run } => {
                     app.print_markdown(&output)?;
                     input.clear_continue_output();
-                    ctx.record_chat_completion(app.as_ref(), &input, &output, &[])?;
-                    if !app.dry_run
-                        && let Some(session) = input.session_mut(&mut ctx.session)
-                    {
-                        // `None` (a run on a graph without a session block)
-                        // clears any stale record from an earlier run.
-                        session.set_last_run(last_run);
-                    }
-                    if input.session(&ctx.session).is_some() {
-                        ctx.checkpoint_session_to_disk(app.dry_run);
-                    }
+                    // `None` (a run the graph does not record: no session
+                    // block and nothing to carry) clears any stale record
+                    // from an earlier run.
+                    ctx.record_graph_run(app.as_ref(), &input, &output, last_run.map(|run| *run))?;
                     settle_turn(ctx, app.as_ref()).await;
                     print_turn_divider();
                     return Ok(());
@@ -3934,6 +3942,69 @@ local_hello() {\n\
         });
     }
 
+    /// A graph agent with no session block but a `carry:` list, whose
+    /// script node folds the prompt onto the carried `said` value, so the
+    /// second run's output shows what the first run left behind.
+    #[cfg(unix)]
+    fn write_blockless_carry_agent(name: &str) {
+        let agent_dir = paths::agent_data_dir(name);
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("remember.sh"), "#!/bin/bash\necho '{}'\n").unwrap();
+        std::fs::write(
+            agent_dir.join("graph.yaml"),
+            format!(
+                "name: {name}\ncarry: [said]\ninitial_state:\n  said: \"\"\n  initial_prompt: \"\"\nstart: remember\nnodes:\n  remember:\n    type: script\n    script: remember.sh\n    state_updates:\n      said: \"{{{{said}}}}|{{{{initial_prompt}}}}\"\n    next: done\n  done:\n    type: end\n    output: \"{{{{said}}}}\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Under a session, a block-less graph that carries state records its
+    /// run like a block graph does, so the next `.run` starts from the
+    /// carried value. No branch is classified or recorded on the way.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn run_command_on_a_blockless_carry_graph_reseeds_the_next_run_from_its_record() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let name = unique("repl_run_cmd_carry");
+        write_blockless_carry_agent(&name);
+        run_async(async {
+            let mut ctx = engage_graph_agent(repl_ctx(), &name).await;
+
+            repl_command(&mut ctx, ".run first").await.unwrap();
+
+            assert_eq!(ctx.last_graph_branch, None);
+            let session = ctx.session.as_ref().unwrap();
+            let first = session.last_run().expect("the carry graph records its run");
+            assert_eq!(first.prompt, "first");
+            assert_eq!(first.output, "|first");
+            assert!(first.exposed.is_empty());
+            assert_eq!(first.carried.get("said"), Some(&json!("|first")));
+            let messages_after_first = session.messages().len();
+
+            repl_command(&mut ctx, ".run second").await.unwrap();
+
+            assert_eq!(ctx.last_graph_branch, None);
+            let session = ctx.session.as_ref().unwrap();
+            let messages = session.messages();
+            assert_eq!(messages.len(), messages_after_first + 2);
+            let [.., user, assistant] = messages else {
+                panic!("expected the run exchange, got {messages:?}");
+            };
+            assert_eq!(user.content.to_text(), "second");
+            assert_eq!(
+                assistant.content.to_text(),
+                "|first|second",
+                "the second run starts from the value the first run carried"
+            );
+            let second = session.last_run().unwrap();
+            assert_eq!(second.prompt, "second");
+            assert_eq!(second.carried.get("said"), Some(&json!("|first|second")));
+            assert_eq!(second.recorded_at_message_count, messages.len());
+        });
+    }
+
     /// `.run <prompt>` opens a fresh turn the way a plain prompt does: a
     /// paused auto-continue is resumed and the continuation count starts
     /// over, and the session copy of that state follows, so a later save
@@ -5352,7 +5423,11 @@ local_hello() {\n\
             assert_eq!(born_by_run, first_message(&chat_first));
             let prompt = born_by_run["content"].as_str().unwrap();
             assert!(prompt.starts_with("Be brief."), "{prompt}");
-            assert!(prompt.contains("<global_index>"), "{prompt}");
+            assert!(prompt.contains("<facts>"), "{prompt}");
+            assert!(
+                prompt.contains("The user prefers terse answers."),
+                "{prompt}"
+            );
             assert!(prompt.contains("## Memory\n"), "{prompt}");
             assert!(!prompt.contains("## Memory (read-only)"), "{prompt}");
             assert_graph_agent_restored(&run_first, &name, &chat_agent);
@@ -5741,6 +5816,7 @@ local_hello() {\n\
                 agent_name: "child".to_string(),
                 output: String::new(),
                 exit_status: AgentExitStatus::Completed,
+                session_id: None,
             })
         });
         ctx.supervisor
@@ -5755,6 +5831,7 @@ local_hello() {\n\
                 abort_signal: create_abort_signal(),
                 join_handle,
                 child_supervisor: None,
+                session_id: None,
             })
             .unwrap();
     }
@@ -9684,6 +9761,7 @@ local_hello() {\n\
                 agent_name: "test".into(),
                 output: "result".into(),
                 exit_status: AgentExitStatus::Completed,
+                session_id: None,
             })
         });
         let child_signal = create_abort_signal();
@@ -9696,6 +9774,7 @@ local_hello() {\n\
             abort_signal: child_signal.clone(),
             join_handle,
             child_supervisor: None,
+            session_id: None,
         })
         .unwrap();
         let supervisor = RwLock::new(sup);
@@ -9864,6 +9943,7 @@ local_hello() {\n\
                 agent_name: "explore".to_string(),
                 output: String::new(),
                 exit_status: AgentExitStatus::Completed,
+                session_id: None,
             })
         });
         if for_secs == 0 {
@@ -9883,6 +9963,7 @@ local_hello() {\n\
                 abort_signal: abort.clone(),
                 join_handle,
                 child_supervisor: None,
+                session_id: None,
             })
             .unwrap();
         abort
@@ -10157,6 +10238,7 @@ local_hello() {\n\
                     agent_name: "worker".to_string(),
                     output: String::new(),
                     exit_status: AgentExitStatus::Completed,
+                    session_id: None,
                 })
             });
             let mut child_sup = Supervisor::new(4, 3);
@@ -10169,6 +10251,7 @@ local_hello() {\n\
                     abort_signal: create_abort_signal(),
                     join_handle: grandchild,
                     child_supervisor: None,
+                    session_id: None,
                 })
                 .unwrap();
             // The parent's own task is already finished, so the only live
@@ -10179,6 +10262,7 @@ local_hello() {\n\
                     agent_name: "explore".to_string(),
                     output: String::new(),
                     exit_status: AgentExitStatus::Completed,
+                    session_id: None,
                 })
             });
             while !parent_task.is_finished() {
@@ -10196,6 +10280,7 @@ local_hello() {\n\
                     abort_signal: create_abort_signal(),
                     join_handle: parent_task,
                     child_supervisor: Some(Arc::new(RwLock::new(child_sup))),
+                    session_id: None,
                 })
                 .unwrap();
             assert_eq!(
@@ -10462,5 +10547,156 @@ local_hello() {\n\
         });
         assert_eq!(hook_count(marker, "turn.interrupted"), 1);
         assert_eq!(hook_count(marker, "agent.interrupted"), 0);
+    }
+
+    /// A supervisor holding one agent that runs until its abort signal is
+    /// set; the signal is returned so a test can tell whether a cancel
+    /// reached it.
+    fn supervisor_with_cancellable_agent() -> (Arc<RwLock<Supervisor>>, AbortSignal) {
+        use crate::supervisor::mailbox::Inbox;
+        use crate::supervisor::{AgentExitStatus, AgentHandle, AgentResult};
+
+        let child_signal = create_abort_signal();
+        let signal = child_signal.clone();
+        let join_handle = tokio::spawn(async move {
+            crate::utils::wait_abort_signal(&signal).await;
+            Ok(AgentResult {
+                id: "a1".into(),
+                agent_name: "explore".into(),
+                output: String::new(),
+                exit_status: AgentExitStatus::Completed,
+                session_id: None,
+            })
+        });
+        let mut sup = Supervisor::new(4, 3);
+        sup.register(AgentHandle {
+            id: "a1".to_string(),
+            agent_name: "explore".to_string(),
+            depth: 1,
+            inbox: Arc::new(Inbox::new()),
+            abort_signal: child_signal.clone(),
+            join_handle,
+            child_supervisor: None,
+            session_id: None,
+        })
+        .unwrap();
+        (Arc::new(RwLock::new(sup)), child_signal)
+    }
+
+    #[test]
+    fn exit_session_with_nothing_attached_leaves_background_work_alone() {
+        run_async(async {
+            let mut ctx = repl_ctx();
+            assert!(ctx.session.is_none());
+            assert!(ctx.child_session_root.is_none());
+            let (supervisor, child_signal) = supervisor_with_cancellable_agent();
+            ctx.supervisor = Some(Arc::clone(&supervisor));
+
+            repl_command(&mut ctx, ".exit session").await.unwrap();
+
+            assert!(
+                !child_signal.aborted_ctrlc(),
+                "with no session to settle the exit cancels nothing"
+            );
+            assert_eq!(supervisor.read().is_finished("a1"), Some(false));
+        });
+    }
+
+    #[test]
+    fn exit_session_with_a_session_attached_cancels_background_work() {
+        run_async(async {
+            let mut ctx = repl_ctx();
+            let mut session = Session::default();
+            session.set_save_session(Some(false));
+            ctx.session = Some(session);
+            let (supervisor, child_signal) = supervisor_with_cancellable_agent();
+            ctx.supervisor = Some(Arc::clone(&supervisor));
+
+            repl_command(&mut ctx, ".exit session").await.unwrap();
+
+            assert!(ctx.session.is_none());
+            assert!(
+                child_signal.aborted_ctrlc(),
+                "the attached session's exit cancels"
+            );
+            assert_eq!(supervisor.read().is_finished("a1"), Some(true));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn exit_session_with_only_a_process_root_cancels_background_work_and_drops_the_root() {
+        use crate::config::child_sessions::{ChildSessionRoot, RootFile};
+        use crate::utils::process::ProcessStamp;
+
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        run_async(async {
+            let mut ctx = repl_ctx();
+            assert!(ctx.session.is_none());
+            let root = ChildSessionRoot::from_stamp(ProcessStamp::current());
+            root.ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
+                .unwrap();
+            ctx.child_session_root = Some(Arc::new(root.clone()));
+            let (supervisor, child_signal) = supervisor_with_cancellable_agent();
+            ctx.supervisor = Some(Arc::clone(&supervisor));
+
+            repl_command(&mut ctx, ".exit session").await.unwrap();
+
+            assert!(
+                child_signal.aborted_ctrlc(),
+                "a sessionless process root still has children to settle"
+            );
+            assert_eq!(supervisor.read().is_finished("a1"), Some(true));
+            assert!(!root.dir().exists());
+            assert!(ctx.child_session_root.is_none());
+        });
+    }
+
+    /// Both session exits run behind a live editor loop, so the ordering is
+    /// pinned by source scrape: the cancel-and-wait must precede the exit
+    /// that settles the session's child directory.
+    #[test]
+    fn session_exits_cancel_and_wait_before_settling_the_session() {
+        let source = include_str!("mod.rs").replace("\r\n", "\n");
+        let production = &source[..source.find("\n#[cfg(test)]\nmod tests {").unwrap()];
+        let call = "cancel_background_tasks_and_wait(EXIT_CANCEL_WAIT).await";
+        assert_eq!(EXIT_CANCEL_WAIT, Duration::from_secs(5));
+        assert!(production.contains("const EXIT_CANCEL_WAIT: Duration = Duration::from_secs(5);"));
+
+        let finished = production.find("top_level_agent_finished(").unwrap();
+        let before_finished = &production[..finished];
+        let wait_at = before_finished.rfind(call).unwrap();
+        let exit_at = before_finished.rfind("exit_session()").unwrap();
+        assert!(wait_at < exit_at, "the REPL exit waits before it exits");
+        assert!(
+            !before_finished[wait_at..].contains(" fn "),
+            "the wait and the exit sit in the same fn"
+        );
+        let signal_only = format!("cancel_background_tasks{}", "();");
+        assert!(
+            !production.contains(&signal_only),
+            "the signal-only cancel has no place at an exit seam"
+        );
+
+        let exit_match = production.find("\".exit\" => match args {").unwrap();
+        let arm_start = exit_match
+            + production[exit_match..]
+                .find("Some(\"session\") => {")
+                .unwrap();
+        let arm_len = production[arm_start..].find("Some(\"rag\") =>").unwrap();
+        let arm = &production[arm_start..arm_start + arm_len];
+        let guard = "if ctx.session.is_some() || ctx.child_session_root.is_some() {";
+        let arm_guard = arm.find(guard).unwrap();
+        let arm_wait = arm_guard + arm[arm_guard..].find(&format!("{call};")).unwrap();
+        assert_eq!(
+            arm[arm_guard + guard.len()..arm_wait].trim(),
+            "ctx.",
+            "the guard wraps the wait"
+        );
+        assert!(
+            arm_wait < arm.find("exit_agent_session()").unwrap(),
+            "{arm}"
+        );
+        assert!(arm_wait < arm.find("exit_session()").unwrap(), "{arm}");
     }
 }

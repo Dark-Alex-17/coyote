@@ -29,6 +29,23 @@ variables:
       directory you invoked `coyote` from. Override at runtime with
       `coyote -a coder --agent-variable project_dir /abs/path "..."`.
     default: '.'
+  - name: build_lock
+    description: |
+      Command prefix for every gate (build and tests), e.g. `flock /path/to/lock`
+      so parallel agents sharing one target directory serialise their gate
+      runs (the coder's own ad-hoc cargo calls are not covered). The whole
+      gate command runs under the prefix as one unit. Waiting on the lock
+      counts toward the gate node's timeout (300 s build, 600 s tests), so
+      prefer `flock -w <secs>` or raise those timeouts when runs are long.
+      A gate killed by its timeout while still waiting leaves the lock
+      request queued; `-w` below the node timeout makes it give up instead
+      of running later unobserved.
+      The prefix is a shell fragment and is re-parsed: quote paths containing
+      spaces (`flock '/tmp/my lock'`); `$VAR` inside it expands when the gate runs.
+      `flock` is util-linux (not shipped on macOS); any wrapper that
+      serialises its argument command works. Empty (the default) runs the
+      gate command bare.
+    default: ''
 
 settings:
   max_loop_iterations: 20
@@ -58,6 +75,11 @@ initial_state:
   review_notes: ''
   design_notes: ''
   design_trail: ''
+
+carry:
+  - plan_summary
+  - files_to_modify
+  - files_to_create
 
 start: resolve_paths
 
@@ -102,7 +124,24 @@ nodes:
       orchestrator see. Omit it when the approach only follows precedent.
 
       Project directory: {{project_dir}}
-    prompt: '{{initial_prompt}}'
+    prompt: |
+      ## Earlier turns with this agent (empty on a first run)
+      {{previous_turns}}
+
+      ## Plan carried from the earlier run (empty on a first run)
+      {{plan_summary}}
+
+      - Modified so far: {{files_to_modify}}
+      - Created so far: {{files_to_create}}
+
+      When earlier turns exist, the carried plan is the earlier run's plan,
+      which may not have been applied (a rejected or failed run carries it
+      too): check the tree before building on it, then plan only the change
+      the new request asks for on top of what actually landed; keep the
+      file lists cumulative.
+
+      ## New request from the orchestrator
+      {{initial_prompt}}
     tools: []
     timeout: 300
     output_schema:
@@ -352,6 +391,9 @@ nodes:
       ## Files involved
       - Modify: {{files_to_modify}}
       - Create: {{files_to_create}}
+
+      ## Earlier turns with this agent (empty on a first run)
+      {{previous_turns}}
 
       ## Original request from the orchestrator
       {{initial_prompt}}

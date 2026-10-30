@@ -1,5 +1,6 @@
 use super::llm::CompletionRunner;
 use super::structured;
+use super::transcript::truncate_from_front;
 use super::types::{Graph, SessionBlock};
 use crate::client::{Message, MessageContent, Model, ModelType};
 use crate::config::{Input, RequestContext, Role, RoleLike};
@@ -22,8 +23,6 @@ pub const ROUTE_SCHEMA: &str = r#"{"type":"object","properties":{"decision":{"ty
 pub const ROUTE_ROLE_NAME: &str = "__graph_route__";
 
 const ROUTE_QUESTION: &str = "Is the user instructing the agent to perform its task (run) or asking about / discussing previous work (chat)? Answer with JSON matching the schema.";
-
-const TRUNCATION_MARK: &str = "...";
 
 pub async fn classify(
     ctx: &mut RequestContext,
@@ -131,18 +130,6 @@ fn recent_messages(messages: &[Message]) -> String {
     truncate_from_front(&lines[start..].join("\n"), ROUTE_CONTEXT_BYTES)
 }
 
-fn truncate_from_front(text: &str, max_bytes: usize) -> String {
-    if text.len() <= max_bytes {
-        return text.to_string();
-    }
-    let keep = max_bytes.saturating_sub(TRUNCATION_MARK.len());
-    let mut cut = text.len() - keep;
-    while !text.is_char_boundary(cut) {
-        cut += 1;
-    }
-    format!("{TRUNCATION_MARK}{}", &text[cut..])
-}
-
 pub fn routing_line(branch: Branch) -> String {
     let text = match branch {
         Branch::Run => "routing: run",
@@ -158,6 +145,7 @@ mod tests {
     use crate::config::{AppState, LastMessage, Session, WorkingMode, paths};
     use crate::function::ToolResult;
     use crate::graph::llm::test_support::{boxed_completion, completion_runner};
+    use crate::graph::transcript::TRUNCATION_MARK;
     use crate::graph::types::{ChatBlock, RouteBlock};
     use crate::graph::{GraphRunResult, LastRun};
     use crate::testing::TestConfigDirGuard;
@@ -511,7 +499,7 @@ mod tests {
         ctx.session
             .as_mut()
             .unwrap()
-            .set_last_run(Some(LastRun::capture(&result, "ship 1.1", &[])));
+            .set_last_run(Some(LastRun::capture(&result, "ship 1.1", &[], &[])));
 
         let (_, seen) = classify_with_reply(
             &mut ctx,

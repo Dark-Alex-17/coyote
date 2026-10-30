@@ -1814,6 +1814,7 @@ dependencies = [
  "subtle",
  "syntect",
  "sys-locale",
+ "sysinfo",
  "terminal-colorsaurus",
  "textwrap",
  "time",
@@ -7660,6 +7661,7 @@ checksum = "2ef6dac1e96601b4fb3acccccff2139741fcb757cb9a36089bf5be91cfb285ce"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 

@@ -3,12 +3,14 @@ mod clipboard;
 mod command;
 mod crypto;
 mod cursor_sync;
+pub(crate) mod fs;
 mod html_to_md;
 mod input;
 mod loader;
 mod logs;
 pub mod native;
 mod path;
+pub(crate) mod process;
 mod render_prompt;
 mod request;
 mod spinner;
@@ -45,7 +47,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::sync::atomic::AtomicBool;
 use std::sync::{LazyLock, Mutex, OnceLock};
-use std::{cmp, env, path::PathBuf, process};
+use std::{cmp, env, path::PathBuf};
 use syntect::highlighting::{Highlighter, Theme};
 use syntect::parsing::Scope;
 
@@ -351,7 +353,7 @@ pub fn temp_file(prefix: &str, suffix: &str) -> PathBuf {
     env::temp_dir().join(format!(
         "{}-{}{prefix}{}{suffix}",
         env!("CARGO_CRATE_NAME").to_lowercase(),
-        process::id(),
+        std::process::id(),
         uuid::Uuid::new_v4()
     ))
 }

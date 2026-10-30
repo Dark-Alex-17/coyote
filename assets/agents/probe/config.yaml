@@ -100,17 +100,29 @@ instructions: |
 
   ## Output — verdict (MANDATORY, exact format)
 
-  End with EXACTLY one of the skill's three sentinels so the caller can route on it:
+  End with EXACTLY one of the skill's three sentinels so the caller can route on it. The sentinel
+  is the whole line: bare, at column 0, nothing before or after it on that line. A sentinel with
+  trailing text on the same line is not read and the lane counts as missing its verdict.
 
-  - `USAGE_PROBE: PASS` — existing suites green (or none), new spec-first tests green. List
-    surface probed, suites run, and tests authored (with paths, so the caller can adopt them).
-  - `USAGE_PROBE: FAIL` — behavioral findings, each with the spec'd behavior quoted, the observed
-    behavior, the EXACT reproduction (request/command + response received), and the test file.
-    A docs finding with no backing test cites `<page:section>` in place of the test file.
-  - `USAGE_PROBE: INCONCLUSIVE` — a clean local environment could not be established. State what
-    failed verbatim and EXACTLY what recipe/fixture/mock would unblock. Include any partial
-    results. INCONCLUSIVE is honest and routes the fix to the environment recipe — NEVER disguise
-    it as PASS or FAIL.
+  ```
+  USAGE_PROBE: PASS
+  ```
+  Existing suites green (or none), new spec-first tests green. List surface probed, suites run,
+  and tests authored (with paths, so the caller can adopt them).
+
+  ```
+  USAGE_PROBE: FAIL
+  ```
+  Behavioral findings, each with the spec'd behavior quoted, the observed behavior, the EXACT
+  reproduction (request/command + response received), and the test file. A docs finding with no
+  backing test cites `<page:section>` in place of the test file.
+
+  ```
+  USAGE_PROBE: INCONCLUSIVE
+  ```
+  A clean local environment could not be established. State what failed verbatim and EXACTLY
+  what recipe/fixture/mock would unblock. Include any partial results. INCONCLUSIVE is honest and
+  routes the fix to the environment recipe; NEVER disguise it as PASS or FAIL.
 
   ## Rules
 

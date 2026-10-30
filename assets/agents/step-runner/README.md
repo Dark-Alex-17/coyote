@@ -161,6 +161,9 @@ coyote -a step-runner --agent-variable step 3 "Execute step 3"
 
 # Plan repo somewhere else
 coyote -a step-runner --agent-variable plans_dir docs/plans "Execute the next step"
+
+# Serialise the gates with other agents sharing the target directory
+coyote -a step-runner --agent-variable build_lock 'flock -w 240 /tmp/coyote-cargo.lock' "Execute the next step"
 ```
 
 **Invoke from the project root.** The coder sub-agent resolves its own
@@ -176,11 +179,32 @@ does not propagate to the spawned coder.
 - `max_review_attempts` (default `1`) — bounded 🔴-finding fix loops after
   independent review.
 
+`graph.yaml` `variables` also exposes:
+
+- `build_lock` (default empty): command prefix applied to every gate
+  (format, lint, build and tests), e.g. `flock /tmp/coyote-cargo.lock` so
+  parallel agents sharing one target directory serialise their gate runs
+  (the spawned coder's own gates inherit the prefix: parent agent variables
+  are cloned into the child; its ad-hoc cargo calls are not covered). The
+  whole gate
+  command runs under the prefix as one unit. Waiting on the lock counts
+  toward the gate node's timeout (300 s format/lint, 600 s build, 1200 s
+  tests), so prefer `flock -w <secs>` or raise those timeouts when runs are
+  long. A gate killed by its timeout while still waiting leaves the lock
+  request queued; `-w` below the node timeout makes it give up instead of
+  running later unobserved. The prefix is a shell fragment and is re-parsed:
+  quote paths containing spaces (`flock '/tmp/my lock'`); `$VAR` inside it
+  expands when the gate runs.
+  `flock` is util-linux (not shipped on macOS); any wrapper that
+  serialises its argument command works.
+
 Environment overrides honored by the script nodes:
 
 - `FORMAT_CMD` / `LINT_CMD` — formatting and linting (otherwise a per-type
   heuristic formats, and linting defers to the build/check command).
 - `BUILD_CMD` / `TEST_CMD` — skip project-type detection (same as coder).
+  Under a `build_lock` prefix the inner shell sees only exported variables;
+  a gate command must not depend on the gate script's own locals.
 - `COYOTE_GATE_OUTPUT_MAX_BYTES` — cap on each gate transcript kept in state
   (default 64 KiB; keeps the head ¼ and tail ¾, trimming the middle).
 - `STEP_AUTOAPPROVE=1` — bypass the deviation gate (non-interactive runs).

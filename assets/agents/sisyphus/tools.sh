@@ -55,11 +55,11 @@ run_build() {
     return 0
   fi
 
-  info "Running: ${build_cmd}" >> "$LLM_OUTPUT"
+  info "Running: $(gate_ran "${build_cmd}")" >> "$LLM_OUTPUT"
   echo "" >> "$LLM_OUTPUT"
 
   local output
-  if output=$(cd "${project_dir}" && eval "${build_cmd}" 2>&1); then
+  if output=$(cd "${project_dir}" && run_gate "${build_cmd}" 2>&1); then
     green "BUILD SUCCESS" >> "$LLM_OUTPUT"
     echo "${output}" >> "$LLM_OUTPUT"
     return 0
@@ -85,11 +85,11 @@ run_tests() {
     return 0
   fi
 
-  info "Running: ${test_cmd}" >> "$LLM_OUTPUT"
+  info "Running: $(gate_ran "${test_cmd}")" >> "$LLM_OUTPUT"
   echo "" >> "$LLM_OUTPUT"
 
   local output
-  if output=$(cd "${project_dir}" && eval "${test_cmd}" 2>&1); then
+  if output=$(cd "${project_dir}" && run_gate "${test_cmd}" 2>&1); then
     green "TESTS PASSED" >> "$LLM_OUTPUT"
     echo "${output}" >> "$LLM_OUTPUT"
     return 0

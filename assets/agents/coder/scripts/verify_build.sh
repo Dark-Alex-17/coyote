@@ -32,7 +32,8 @@ if [[ -z "$cmd" || "$cmd" == "null" ]]; then
 fi
 
 exit_code=0
-output=$(cd "$project_dir" && eval "$cmd" 2>&1) || exit_code=$?
+output=$(cd "$project_dir" && run_gate "$cmd" 2>&1) || exit_code=$?
+cmd=$(gate_ran "$cmd")
 
 # Transcript goes to jq on stdin, not as an argument — a single argv string is
 # capped at 128 KiB on Linux (MAX_ARG_STRLEN) and a verbose build exceeds it.

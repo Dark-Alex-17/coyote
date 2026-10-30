@@ -1,4 +1,5 @@
 use super::input::*;
+use super::memory::Truncated;
 use super::todo::TodoList;
 use super::*;
 
@@ -19,6 +20,7 @@ use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use uuid::Uuid;
 
 static RE_AUTONAME_PREFIX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d{8}T\d{6}-").unwrap());
 
@@ -94,9 +96,72 @@ pub struct CompressionInfo {
     pub kept_tail_messages: Option<usize>,
     pub kept_tail_tokens: Option<usize>,
     pub archived_messages: Option<usize>,
+    /// `None` inside a session that has not built a memory-injecting role
+    /// yet, so the split rows read `n/a` rather than zeros.
+    pub system_prompt: Option<SystemPromptSplit>,
+    pub max_input_tokens: Option<usize>,
+}
+
+/// Estimated tokens of the system prompt the last memory-injecting role
+/// build produced: the prompt before the memory block, the memory block
+/// itself and the memory instructions that follow it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SystemPromptSplit {
+    /// Measured before loaded skill bodies are appended, so it excludes
+    /// skill text.
+    pub role_tokens: usize,
+    pub memory_tokens: usize,
+    pub instructions_tokens: usize,
+    pub truncated: Option<Truncated>,
+}
+
+impl SystemPromptSplit {
+    /// Whole percent of `window` the system prompt fills; `None` without a
+    /// known, non-zero window.
+    pub fn share_percent(&self, window: Option<usize>) -> Option<usize> {
+        let total = self.role_tokens + self.memory_tokens + self.instructions_tokens;
+        window
+            .filter(|window| *window > 0)
+            .map(|window| total * 100 / window)
+    }
 }
 
 impl CompressionInfo {
+    fn system_prompt_rows(&self) -> [(&'static str, String); 4] {
+        let Some(split) = &self.system_prompt else {
+            return [
+                ("system_prompt_role_tokens", "n/a".to_string()),
+                ("system_prompt_memory_tokens", "n/a".to_string()),
+                ("system_prompt_share", "n/a".to_string()),
+                ("memory_facts_truncated", "n/a".to_string()),
+            ];
+        };
+        [
+            ("system_prompt_role_tokens", split.role_tokens.to_string()),
+            (
+                "system_prompt_memory_tokens",
+                split.memory_tokens.to_string(),
+            ),
+            (
+                "system_prompt_share",
+                match (
+                    split.share_percent(self.max_input_tokens),
+                    self.max_input_tokens,
+                ) {
+                    (Some(pct), Some(window)) => format!("{pct}% of {window}"),
+                    _ => "n/a".to_string(),
+                },
+            ),
+            (
+                "memory_facts_truncated",
+                match split.truncated {
+                    Some(cut) => format!("{} lines / {} chars", cut.lines, cut.chars),
+                    None => "none".to_string(),
+                },
+            ),
+        ]
+    }
+
     pub fn rows(&self) -> Vec<(&'static str, String)> {
         let mut rows = vec![
             ("compression_threshold", self.threshold.to_string()),
@@ -127,6 +192,7 @@ impl CompressionInfo {
                 format_option_value(&self.last_prompt_tokens),
             ),
         ];
+        rows.extend(self.system_prompt_rows());
         let live = [
             ("compression_reclaimable", self.reclaimable_tokens),
             ("compression_kept_tail_messages", self.kept_tail_messages),
@@ -155,6 +221,19 @@ impl CompressionInfo {
             "min_reclaim": self.min_reclaim,
             "last_prompt_tokens": self.last_prompt_tokens,
         });
+        let [role, memory, share, truncated] = self.system_prompt_rows();
+        match self.system_prompt {
+            Some(split) => {
+                data[role.0] = split.role_tokens.into();
+                data[memory.0] = split.memory_tokens.into();
+            }
+            None => {
+                data[role.0] = role.1.into();
+                data[memory.0] = memory.1.into();
+            }
+        }
+        data[share.0] = share.1.into();
+        data[truncated.0] = truncated.1.into();
         let live = [
             ("reclaimable", self.reclaimable_tokens),
             ("kept_tail_messages", self.kept_tail_messages),
@@ -327,6 +406,10 @@ pub struct Session {
     cost: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_run: Option<LastRun>,
+    /// Stable identity of the directory this session's child sessions live
+    /// under; minted the first time a graph runs under a persisted session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    uid: Option<Uuid>,
     /// The config agent that answers this session's chat turns in place of
     /// the graph agent, with the variables and rendered prompt it was seated
     /// with; reused as is when the session is resumed under the same agent.
@@ -347,6 +430,8 @@ pub struct Session {
     name: String,
     #[serde(skip)]
     path: Option<String>,
+    #[serde(skip)]
+    owner_only: bool,
     #[serde(skip)]
     scope: SessionScope,
     #[serde(skip)]
@@ -436,6 +521,49 @@ impl Session {
         Ok(session)
     }
 
+    /// Loads a session from an explicit file, named after the file's stem,
+    /// seating `model` instead of resolving the stored model id. A child
+    /// session is reloaded under whatever model its new spawner runs, so an
+    /// id that no longer resolves (a removed client, a renamed model) must
+    /// not fail the load. An agent session keeps the instructions it was
+    /// given in `agent_instructions`, while the prompt `build_messages`
+    /// seats is not serialised; it is rebuilt from them here so a child
+    /// reloaded without re-syncing its agent still speaks with the
+    /// instructions it was spawned with.
+    pub fn load_from_path(
+        path: &Path,
+        model: Model,
+        ctx: &RequestContext,
+        app: &AppConfig,
+    ) -> Result<Self> {
+        let content = read_to_string(path)
+            .with_context(|| format!("Failed to load session at {}", path.display()))?;
+        let mut session: Self = serde_yaml::from_str(&content)
+            .with_context(|| format!("Invalid session at {}", path.display()))?;
+
+        session.model_id = model.id();
+        session.model = model;
+        session.name = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        session.path = Some(path.display().to_string());
+
+        if let Some(role_name) = &session.role_name
+            && let Ok(role) = ctx.retrieve_role(app, role_name)
+        {
+            session.role_prompt = role.prompt().to_string();
+            session.role_hooks = role.hooks().cloned();
+        }
+        if session.role_name.is_none() && !session.agent_instructions.is_empty() {
+            session.role_prompt = session.agent_instructions.clone();
+        }
+
+        session.update_tokens();
+
+        Ok(session)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.messages.is_empty() && self.compressed_messages.is_empty()
     }
@@ -482,6 +610,13 @@ impl Session {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The file `flush` writes: where the session was loaded from, last
+    /// saved to, or pointed at by `set_path`. `None` for a session that
+    /// has no file yet.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref().map(Path::new)
     }
 
     pub fn set_name(&mut self, name: String) {
@@ -994,6 +1129,28 @@ impl Session {
         }
     }
 
+    pub fn uid(&self) -> Option<Uuid> {
+        self.uid
+    }
+
+    pub fn set_uid(&mut self, value: Option<Uuid>) {
+        if self.uid != value {
+            self.uid = value;
+            self.dirty = true;
+        }
+    }
+
+    /// Writes the session file readable by its owner alone; set for sessions
+    /// that hold a spawned agent's transcript.
+    pub fn set_owner_only(&mut self, value: bool) {
+        self.owner_only = value;
+    }
+
+    /// Points the session at the file `flush` writes, without saving.
+    pub fn set_path(&mut self, path: PathBuf) {
+        self.path = Some(path.display().to_string());
+    }
+
     pub fn set_save_session_this_time(&mut self) {
         self.save_session_this_time = true;
     }
@@ -1353,11 +1510,18 @@ impl Session {
                 session_path.display()
             )
         };
+        let owner_only = self.owner_only;
         let open_tmp = || {
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp_path)
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            if owner_only {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            #[cfg(not(unix))]
+            let _ = owner_only;
+            options.open(&tmp_path)
         };
         let mut tmp_file = match open_tmp() {
             Ok(file) => file,
@@ -1379,6 +1543,14 @@ impl Session {
         if let Err(error) = rename(&tmp_path, session_path) {
             let _ = remove_file(&tmp_path);
             return Err(error).with_context(write_context);
+        }
+        if let Some(uid) = self.uid
+            && let Err(error) = child_sessions::note_parent_saved(uid, session_path)
+        {
+            log::warn!(
+                "Failed to record the save of session '{}' for its child sessions: {error:#}",
+                self.name
+            );
         }
 
         self.path = Some(session_path.display().to_string());
@@ -2255,6 +2427,7 @@ mod tests {
                 fell_back: false,
             }],
             recorded_at_message_count: 0,
+            carried: IndexMap::new(),
         }
     }
 
@@ -2467,6 +2640,18 @@ last_run:
             kept_tail_messages: Some(3),
             kept_tail_tokens: Some(5_000),
             archived_messages: Some(12),
+            system_prompt: Some(SystemPromptSplit {
+                role_tokens: 1_000,
+                memory_tokens: 39_000,
+                instructions_tokens: 0,
+                truncated: Some(Truncated {
+                    lines: 7,
+                    chars: 420,
+                    global_lines: 2,
+                    workspace_lines: 5,
+                }),
+            }),
+            max_input_tokens: Some(200_000),
         }
     }
 
@@ -2489,6 +2674,10 @@ last_run:
         assert!(exported.contains("  kept_tail_messages: 3\n"));
         assert!(exported.contains("  kept_tail_tokens: 5000\n"));
         assert!(exported.contains("  archived_messages: 12\n"));
+        assert!(exported.contains("  system_prompt_role_tokens: 1000\n"));
+        assert!(exported.contains("  system_prompt_memory_tokens: 39000\n"));
+        assert!(exported.contains("  system_prompt_share: 20% of 200000\n"));
+        assert!(exported.contains("  memory_facts_truncated: 7 lines / 420 chars\n"));
 
         assert!(
             !Session::default()
@@ -2514,6 +2703,8 @@ last_run:
             kept_tail_messages: None,
             kept_tail_tokens: None,
             archived_messages: None,
+            system_prompt: Some(SystemPromptSplit::default()),
+            max_input_tokens: None,
         };
 
         let rows = info.rows();
@@ -2530,7 +2721,11 @@ last_run:
         assert_eq!(row("compression_keep_tokens"), "unlimited");
         assert_eq!(row("compression_min_reclaim"), "null");
         assert_eq!(row("compression_last_prompt_tokens"), "null");
-        assert_eq!(rows.len(), 9, "live rows are absent without a session");
+        assert_eq!(row("system_prompt_role_tokens"), "0");
+        assert_eq!(row("system_prompt_memory_tokens"), "0");
+        assert_eq!(row("system_prompt_share"), "n/a");
+        assert_eq!(row("memory_facts_truncated"), "none");
+        assert_eq!(rows.len(), 13, "live rows are absent without a session");
 
         let json = info.to_json();
         assert_eq!(json["model"], serde_json::Value::Null);
@@ -2540,6 +2735,23 @@ last_run:
         assert_eq!(json["last_prompt_tokens"], serde_json::Value::Null);
         assert!(json.get("reclaimable").is_none());
         assert!(json.get("archived_messages").is_none());
+
+        let unbuilt = CompressionInfo {
+            system_prompt: None,
+            ..info
+        };
+        let rows = unbuilt.rows();
+        for key in [
+            "system_prompt_role_tokens",
+            "system_prompt_memory_tokens",
+            "system_prompt_share",
+            "memory_facts_truncated",
+        ] {
+            assert!(rows.contains(&(key, "n/a".to_string())), "{key}: {rows:?}");
+        }
+        let json = unbuilt.to_json();
+        assert_eq!(json["system_prompt_role_tokens"], json!("n/a"));
+        assert_eq!(json["system_prompt_memory_tokens"], json!("n/a"));
     }
 
     #[test]
@@ -2561,6 +2773,10 @@ last_run:
                 "compression_checkpoint_tokens",
                 "compression_min_reclaim",
                 "compression_last_prompt_tokens",
+                "system_prompt_role_tokens",
+                "system_prompt_memory_tokens",
+                "system_prompt_share",
+                "memory_facts_truncated",
                 "compression_reclaimable",
                 "compression_kept_tail_messages",
                 "compression_kept_tail_tokens",
@@ -2754,6 +2970,150 @@ last_run:
     }
 
     #[test]
+    fn session_uid_is_absent_until_set_and_round_trips_through_yaml() {
+        let session: Session = serde_yaml::from_str("model: ''\nmessages: []\n").unwrap();
+        assert_eq!(session.uid(), None);
+        assert!(
+            !serde_yaml::to_string(&Session::default())
+                .unwrap()
+                .contains("uid:")
+        );
+
+        let uid = Uuid::new_v4();
+        let mut session = Session::default();
+        assert!(!session.dirty());
+        session.set_uid(Some(uid));
+        assert!(session.dirty());
+
+        let yaml = serde_yaml::to_string(&session).unwrap();
+        assert!(yaml.contains("uid:"), "{yaml}");
+        let mut reloaded: Session = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(reloaded.uid(), Some(uid));
+
+        assert!(!reloaded.dirty());
+        reloaded.set_uid(Some(uid));
+        assert!(!reloaded.dirty(), "setting the same uid must not dirty");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn session_save_owner_only_writes_a_0600_file_and_a_default_save_keeps_the_open_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("coyote-session-save-mode-{unique}"));
+        let sessions_dir = dir.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let probe = sessions_dir.join("probe.txt");
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+            .unwrap();
+        let open_mode = probe.metadata().unwrap().permissions().mode() & 0o777;
+
+        let shared = sessions_dir.join("shared.yaml");
+        Session::default().save("shared", &shared, false).unwrap();
+        assert_eq!(
+            shared.metadata().unwrap().permissions().mode() & 0o777,
+            open_mode
+        );
+
+        let private = sessions_dir.join("private.yaml");
+        let mut session = Session::default();
+        session.set_owner_only(true);
+        session.save("private", &private, false).unwrap();
+        assert_eq!(
+            private.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn session_set_path_names_the_file_flush_writes() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("coyote-session-set-path-{unique}"));
+        let sessions_dir = dir.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let destination = sessions_dir.join("notes.yaml");
+
+        let mut session = Session::default();
+        session.set_path(destination.clone());
+        session.flush().unwrap();
+        assert!(
+            !destination.exists(),
+            "flush on a clean session must write nothing"
+        );
+
+        session.set_uid(Some(Uuid::new_v4()));
+        assert!(session.dirty());
+        session.flush().unwrap();
+        assert!(read_to_string(&destination).unwrap().contains("model:"));
+        assert!(!session.dirty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn load_from_path_seats_the_given_model_without_resolving_the_stored_id() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("coyote-session-load-from-path-{unique}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sess_coder_0123456789ab.yaml");
+        std::fs::write(
+            &path,
+            "model: no-such-client:ghost\n\
+             agent_variables:\n\
+             \x20 tone: loud\n\
+             agent_instructions: Say loud\n\
+             messages:\n\
+             \x20 - role: user\n\
+             \x20   content: hi\n\
+             \x20 - role: assistant\n\
+             \x20   content: hello\n",
+        )
+        .unwrap();
+        let ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        let app = AppConfig::default();
+        let model = Model::new("test-seeded", "other");
+
+        let session = Session::load_from_path(&path, model.clone(), &ctx, &app).unwrap();
+
+        assert_eq!(session.model().id(), model.id());
+        assert_eq!(session.model_id, model.id());
+        assert_eq!(session.name(), "sess_coder_0123456789ab");
+        assert_eq!(session.path(), Some(path.as_path()));
+        assert_eq!(session.messages().len(), 2);
+        assert_eq!(session.agent_variables().get("tone").unwrap(), "loud");
+        assert_eq!(session.agent_instructions(), "Say loud");
+        assert_eq!(session.to_role().prompt(), "Say loud");
+        assert!(session.tokens() > 0);
+        assert!(!session.dirty());
+
+        let missing = dir.join("missing.yaml");
+        let error = Session::load_from_path(&missing, model, &ctx, &app).unwrap_err();
+        assert!(
+            format!("{error:#}")
+                .contains(&format!("Failed to load session at {}", missing.display())),
+            "{error:#}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     #[serial]
     fn exit_on_a_clean_autosaving_named_session_writes_nothing() {
         let unique = std::time::SystemTime::now()
@@ -2786,6 +3146,91 @@ last_run:
         entries.sort();
         assert_eq!(entries, vec![std::ffi::OsString::from("notes.yaml")]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn save_records_the_parent_path_and_time_in_the_child_session_root() {
+        use crate::config::child_sessions::{ChildSessionRoot, RootFile};
+        use crate::utils::process::ProcessStamp;
+        use chrono::TimeZone;
+
+        let cache = crate::testing::CacheDirGuard::new("session-save-note-parent");
+        let sessions_dir = cache.root.join("sessions-dir");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let uid = Uuid::new_v4();
+        let root = ChildSessionRoot::Uid(uid);
+        let seeded_at = chrono::Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
+        root.ensure_dir(&RootFile::seed_at(seeded_at, ProcessStamp::current(), None))
+            .unwrap();
+        let a_path = sessions_dir.join("a.yaml");
+        let other_path = sessions_dir.join("other.yaml");
+        let mut session = Session::default();
+        session.set_uid(Some(uid));
+
+        let before_save = chrono::Utc::now();
+        session.save("a", &a_path, false).unwrap();
+        let record = RootFile::load(&root.root_file()).unwrap();
+        assert_eq!(
+            record.parent_paths,
+            vec![std::fs::canonicalize(&a_path).unwrap()]
+        );
+        let first_saved_at = record.last_saved_at.unwrap();
+        assert!(first_saved_at >= before_save);
+        assert_eq!(record.created_at, seeded_at);
+
+        session.mark_dirty();
+        session.save("a", &a_path, false).unwrap();
+        let record = RootFile::load(&root.root_file()).unwrap();
+        assert_eq!(
+            record.parent_paths,
+            vec![std::fs::canonicalize(&a_path).unwrap()]
+        );
+        assert!(record.last_saved_at.unwrap() >= first_saved_at);
+
+        session.save("other", &other_path, false).unwrap();
+        let record = RootFile::load(&root.root_file()).unwrap();
+        assert_eq!(
+            record.parent_paths,
+            vec![
+                std::fs::canonicalize(&a_path).unwrap(),
+                std::fs::canonicalize(&other_path).unwrap()
+            ]
+        );
+        assert!(!session.dirty());
+    }
+
+    #[test]
+    #[serial]
+    fn save_without_a_child_session_root_dir_creates_nothing_under_the_cache() {
+        let cache = crate::testing::CacheDirGuard::new("session-save-no-root");
+        let sessions_dir = cache.root.join("sessions-dir");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let path = sessions_dir.join("a.yaml");
+        let mut session = Session::default();
+        session.set_uid(Some(Uuid::new_v4()));
+
+        session.save("a", &path, false).unwrap();
+
+        assert!(path.is_file());
+        let mut entries: Vec<_> = std::fs::read_dir(&cache.root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        entries.sort();
+        assert_eq!(entries, vec![std::ffi::OsString::from("sessions-dir")]);
+
+        let mut unidentified = Session::default();
+        assert_eq!(unidentified.uid(), None);
+        unidentified
+            .save("b", &sessions_dir.join("b.yaml"), false)
+            .unwrap();
+        let mut entries: Vec<_> = std::fs::read_dir(&cache.root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        entries.sort();
+        assert_eq!(entries, vec![std::ffi::OsString::from("sessions-dir")]);
     }
 
     #[test]

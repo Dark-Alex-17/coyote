@@ -5,7 +5,7 @@ use crate::cli::completer::{
     model_completer, rag_completer, role_completer, secrets_completer, session_completer,
 };
 use crate::config::paths;
-use crate::config::{AssetCategory, InstallFilter, MemoryScope};
+use crate::config::{AssetCategory, InstallFilter, MemoryScope, MigrateScope};
 use anyhow::{Context, Result};
 use clap::{ArgGroup, ValueHint};
 use clap::{Parser, crate_authors, crate_description, crate_version};
@@ -51,7 +51,7 @@ pub enum McpScopeArg {
 			.conflicts_with_all([
 				"model", "temp_role", "role", "session", "agent", "rag", "rebuild_rag",
 				"macro_name", "execute", "code", "file", "no_stream", "no_memory",
-				"init_memory", "dry_run", "info", "build_tools", "install",
+				"init_memory", "memory_migrate", "apply", "dry_run", "info", "build_tools", "install",
 				"install_builtins", "sync_models", "list_models", "list_roles",
 				"list_sessions", "list_agents", "list_rags", "list_macros",
 				"list_skills", "list_bundles", "skill", "tail_logs", "completions",
@@ -130,6 +130,39 @@ pub struct Cli {
         help_heading = "Session & Memory"
     )]
     pub init_memory: Option<MemoryScope>,
+    /// Report what migrating the memory store to front-matter descriptions
+    /// would change; add --apply to back it up and rewrite it
+    #[arg(
+        long,
+        value_name = "SCOPE",
+        value_enum,
+        help_heading = "Session & Memory",
+        conflicts_with_all = [
+            "agent", "session", "role", "temp_role", "model", "empty_session", "save_session",
+            "init_memory", "text", "file", "execute", "code", "dry_run",
+            "completions", "tail_logs", "generate_models", "update", "list_bundles", "headless",
+            "info", "list_models", "list_roles", "list_sessions", "list_agents", "list_rags",
+            "list_macros", "list_skills", "list_secrets", "sync_models", "install",
+            "install_builtins", "update_bundle", "uninstall", "mcp_add", "mcp_remove", "mcp_list",
+            "mcp_get", "rag", "rebuild_rag", "macro_name", "skill", "build_tools",
+            "init_instructions", "acp_server",
+            "no_memory", "no_stream", "raw_markdown", "no_workspace_mcp", "no_workspace_macros",
+            "no_workspace_instructions", "workspace_instructions_file",
+            "dangerously_skip_permissions", "agent_variable", "git_host", "filter",
+            "install_force", "yes", "force", "transport", "url", "scope", "env", "header", "cwd",
+            "client_id", "client_secret", "callback_port", "redirect_host", "mcp_force",
+            "disable_log_colors", "mcp_command",
+        ]
+    )]
+    pub memory_migrate: Option<MigrateScope>,
+    /// With --memory-migrate, back up each memory dir and write the changes
+    #[arg(
+        long,
+        requires = "memory_migrate",
+        conflicts_with = "dry_run",
+        help_heading = "Session & Memory"
+    )]
+    pub apply: bool,
     /// Scaffold a COYOTE.md workspace instructions file in the current directory
     #[arg(long, help_heading = "Session & Memory")]
     pub init_instructions: bool,
@@ -665,6 +698,109 @@ mod tests {
             Cli::try_parse_from(["coyote", "--install-builtins", "agents", "--install", "x"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn parse_memory_migrate_takes_a_scope_and_an_optional_apply() {
+        let cli = parse(&["--memory-migrate", "all"]);
+        assert_eq!(cli.memory_migrate, Some(MigrateScope::All));
+        assert!(!cli.apply);
+        assert_eq!(
+            parse(&["--memory-migrate", "global", "--apply"]).memory_migrate,
+            Some(MigrateScope::Global)
+        );
+        assert!(parse(&["--memory-migrate", "workspace", "--apply"]).apply);
+        assert!(parse(&[]).memory_migrate.is_none());
+        assert!(Cli::try_parse_from(["coyote", "--apply"]).is_err());
+        assert!(Cli::try_parse_from(["coyote", "--memory-migrate"]).is_err());
+        assert!(Cli::try_parse_from(["coyote", "--memory-migrate", "both"]).is_err());
+        assert!(Cli::try_parse_from(["coyote", "--init-memory", "all"]).is_err());
+        assert!(Cli::try_parse_from(["coyote", "--sandbox", "--memory-migrate", "all"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "coyote",
+                "--init-memory",
+                "global",
+                "--memory-migrate",
+                "all"
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["coyote", "--apply", "--dry-run"]).is_err());
+        assert!(
+            Cli::try_parse_from(["coyote", "--memory-migrate", "all", "--apply", "--dry-run"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["coyote", "--memory-migrate", "all", "some", "prompt"]).is_err()
+        );
+        assert_eq!(
+            Cli::try_parse_from(["coyote", "--memory-migrate", "all", "--", "x"])
+                .err()
+                .map(|err| err.kind()),
+            Some(clap::error::ErrorKind::ArgumentConflict)
+        );
+    }
+
+    #[test]
+    fn memory_migrate_conflicts_with_every_other_flag() {
+        use clap::CommandFactory;
+
+        const ALLOWED_WITH_MIGRATE: &[&str] = &[
+            // The migration's own write switch.
+            "apply",
+        ];
+
+        let command = Cli::command();
+        let mut accepted = Vec::new();
+        for arg in command.get_arguments() {
+            let id = arg.get_id().as_str();
+            if arg.is_positional() || id == "memory_migrate" || ALLOWED_WITH_MIGRATE.contains(&id) {
+                continue;
+            }
+            let flag = match (arg.get_long(), arg.get_short()) {
+                (Some(long), _) => format!("--{long}"),
+                (None, Some(short)) => format!("-{short}"),
+                (None, None) => panic!("{id} is neither positional nor named"),
+            };
+            let mut args = vec![
+                "coyote".to_string(),
+                "--memory-migrate".into(),
+                "all".into(),
+                flag,
+            ];
+            if arg.get_action().takes_values() {
+                let value = arg
+                    .get_possible_values()
+                    .first()
+                    .map(|v| v.get_name().to_string())
+                    .unwrap_or_else(|| "1".into());
+                let count = arg
+                    .get_num_args()
+                    .map_or(1, |range| range.min_values().max(1));
+                args.extend(std::iter::repeat_n(value, count));
+            }
+            match Cli::try_parse_from(&args) {
+                Err(err) if err.kind() == clap::error::ErrorKind::ArgumentConflict => {}
+                Err(err) => accepted.push(format!("{id}: failed with ErrorKind::{:?}", err.kind())),
+                Ok(_) => accepted.push(format!("{id}: parsed without an error")),
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "expected ErrorKind::ArgumentConflict next to --memory-migrate: {accepted:#?}"
+        );
+    }
+
+    #[test]
+    fn migrate_scope_value_names_are_pinned() {
+        use clap::ValueEnum;
+
+        let names: Vec<String> = MigrateScope::value_variants()
+            .iter()
+            .map(|v| v.to_possible_value().unwrap().get_name().to_string())
+            .collect();
+        assert_eq!(names, ["global", "workspace", "all"]);
     }
 
     #[test]

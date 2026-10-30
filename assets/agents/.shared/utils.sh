@@ -363,6 +363,44 @@ resolve_gate_dir() {
   echo "${dir}"
 }
 
+# gate_prefix prints the command prefix a verification gate must run under,
+# taken from the `build_lock` graph variable (exported to script nodes as
+# LLM_AGENT_VAR_BUILD_LOCK). Prints nothing when unset or empty.
+# Gate scripts go through run_gate and gate_ran rather than reading this.
+gate_prefix() {
+  printf '%s' "${LLM_AGENT_VAR_BUILD_LOCK:-}"
+}
+
+# gate_ran prints the command run_gate effectively ran for `cmd`: the prefix
+# and the command, or just the command when no prefix is set. Gate scripts
+# use it for their `Ran:` lines.
+gate_ran() {
+  local ran
+  ran="$(gate_prefix) $1"
+  printf '%s' "${ran# }"
+}
+
+# run_gate evals a gate command string, under gate_prefix when one is set.
+# The whole command runs as ONE unit beneath the prefix (one lock for a
+# compound `a && b`, and `FOO=bar cmd` keeps its leading assignment), so the
+# prefix must accept a command to wrap, like `flock <path>` does. The command
+# travels in GATE_CMD rather than being spliced into the eval'd string, so
+# its quoting is never re-parsed. The inner shell re-applies the `-u` and
+# `pipefail` options the gate scripts run under, so a piped or unbound-variable
+# gate command fails the same way with or without a prefix. The inner shell
+# sees only exported variables; a gate command must not depend on the gate
+# script's own locals.
+# Usage: output=$(cd "$dir" && run_gate "$cmd" 2>&1) || rc=$?
+run_gate() {
+  local cmd=$1 prefix
+  prefix=$(gate_prefix)
+  if [[ -n "$prefix" ]]; then
+    GATE_CMD=$cmd eval "$prefix bash -c 'set -uo pipefail; eval \"\$GATE_CMD\"'"
+  else
+    eval "$cmd"
+  fi
+}
+
 # trim_output bounds a command transcript before it is embedded in graph
 # state (and from there into LLM prompts). Keeps the head and the tail —
 # test runners put failures and `test result:` summaries at the end — and

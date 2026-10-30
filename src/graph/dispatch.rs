@@ -1,5 +1,6 @@
 use super::llm::CompletionRunner;
 use super::route::{self, Branch};
+use super::transcript::{PREVIOUS_TURNS_BYTES, render_turns};
 use super::{
     Graph, GraphExecutor, GraphParser, GraphRunResult, LastRun, agent_has_graph, session_turn,
 };
@@ -7,6 +8,7 @@ use crate::config::paths;
 use crate::config::{Input, RequestContext, Session, TEMP_SESSION_NAME};
 use crate::utils::AbortSignal;
 use anyhow::{Context, Result, anyhow, bail};
+use indexmap::IndexMap;
 use log::info;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -17,23 +19,32 @@ pub fn active_agent_graph_name(ctx: &RequestContext) -> Option<String> {
     agent_has_graph(&name).then_some(name)
 }
 
+/// What a child graph run hands back: the run itself and the record it
+/// would leave on a session. The caller decides whether to store the
+/// record; the dispatcher never touches the session.
+pub struct ChildGraphRun {
+    pub result: GraphRunResult,
+    pub last_run: Option<LastRun>,
+}
+
 pub async fn run_active_agent_graph(
     ctx: &mut RequestContext,
     prompt: &str,
     abort_signal: AbortSignal,
-) -> Result<String> {
+) -> Result<ChildGraphRun> {
     run_active_agent_graph_with_inputs(ctx, prompt, abort_signal, None).await
 }
 
 /// Runs the active agent's graph with `inputs` overlaid on its
 /// `initial_state` before the executor starts. `None` seeds exactly what
-/// `run_active_agent_graph` does: the prompt under `initial_prompt`.
+/// `run_active_agent_graph` does: the prompt under `initial_prompt` and the
+/// session transcript under `previous_turns`.
 pub async fn run_active_agent_graph_with_inputs(
     ctx: &mut RequestContext,
     prompt: &str,
     abort_signal: AbortSignal,
     inputs: Option<HashMap<String, Value>>,
-) -> Result<String> {
+) -> Result<ChildGraphRun> {
     let agent_name =
         active_agent_graph_name(ctx).ok_or_else(|| anyhow!("Active agent has no graph.yaml"))?;
 
@@ -47,25 +58,53 @@ pub async fn run_active_agent_graph_with_inputs(
         .load_from_file(&graph_path)
         .with_context(|| format!("Failed to load graph.yaml for agent '{agent_name}'"))?;
 
-    seed_initial_state(&mut graph.initial_state, prompt, inputs);
+    let previous_turns = previous_turns_for(ctx);
+    let carried = carried_for(ctx, &graph.carry);
+    seed_initial_state(
+        &mut graph.initial_state,
+        prompt,
+        inputs,
+        &previous_turns,
+        &carried,
+    );
 
-    let executor = GraphExecutor::new(graph, agent_dir);
-    let output = executor
-        .execute(ctx, abort_signal)
-        .await
-        .with_context(|| format!("Graph execution failed for agent '{agent_name}'"))?;
+    let expose = graph.session.as_ref().map(|block| block.expose.clone());
+    let carry = graph.carry.clone();
+    let result = execute_graph(ctx, &agent_name, &agent_dir, graph, abort_signal).await?;
+    let last_run = last_run_for(
+        expose.as_deref(),
+        &carry,
+        &result,
+        prompt,
+        true,
+        ctx.session.is_some(),
+    );
+    Ok(ChildGraphRun { result, last_run })
+}
 
-    if let Some(supervisor) = ctx.supervisor.clone() {
-        supervisor.read().cancel_all();
-    }
-
-    Ok(output)
+/// The record a finished run leaves behind, or `None` when there is
+/// nothing to store it on. A child always records: its caller seats it on
+/// its own session. A REPL turn records only when a session is engaged and
+/// the graph gives the record a home: a `session:` block (`expose` is
+/// `Some`, possibly empty) or a non-empty `carry:` list whose values the
+/// next run reads back.
+pub fn last_run_for(
+    expose: Option<&[String]>,
+    carry: &[String],
+    result: &GraphRunResult,
+    prompt: &str,
+    child: bool,
+    has_session: bool,
+) -> Option<LastRun> {
+    (child || (has_session && (expose.is_some() || !carry.is_empty())))
+        .then(|| LastRun::capture(result, prompt, expose.unwrap_or(&[]), carry))
 }
 
 pub enum GraphTurn {
+    /// The record is boxed so the variant stays close in size to `Chat`.
     Run {
         output: String,
-        last_run: Option<LastRun>,
+        last_run: Option<Box<LastRun>>,
     },
     /// The input for the chat branch. When the block names `chat.agent`,
     /// the delegate is swapped into `ctx.agent` (and the tool scope and RAG)
@@ -105,13 +144,29 @@ pub async fn run_graph_turn(
                 };
                 bail!("Cannot force the chat branch for agent '{agent_name}': {why}");
             }
-            seed_initial_state(&mut graph.initial_state, &input.text(), None);
-            let output = execute_graph(ctx, &agent_name, &agent_dir, graph, abort)
-                .await?
-                .output;
+            let previous_turns = previous_turns_for(ctx);
+            let carried = carried_for(ctx, &graph.carry);
+            seed_initial_state(
+                &mut graph.initial_state,
+                &input.text(),
+                None,
+                &previous_turns,
+                &carried,
+            );
+            let expose = graph.session.as_ref().map(|block| block.expose.clone());
+            let carry = graph.carry.clone();
+            let result = execute_graph(ctx, &agent_name, &agent_dir, graph, abort).await?;
+            let last_run = last_run_for(
+                expose.as_deref(),
+                &carry,
+                &result,
+                input.bare_text(),
+                false,
+                ctx.session.is_some(),
+            );
             return Ok(GraphTurn::Run {
-                output,
-                last_run: None,
+                output: result.output,
+                last_run: last_run.map(Box::new),
             });
         }
     };
@@ -123,12 +178,28 @@ pub async fn run_graph_turn(
     println!("{}", route::routing_line(branch));
     match branch {
         Branch::Run => {
-            seed_initial_state(&mut graph.initial_state, &input.text(), None);
+            let previous_turns = previous_turns_for(ctx);
+            let carried = carried_for(ctx, &graph.carry);
+            seed_initial_state(
+                &mut graph.initial_state,
+                &input.text(),
+                None,
+                &previous_turns,
+                &carried,
+            );
+            let carry = graph.carry.clone();
             let result = execute_graph(ctx, &agent_name, &agent_dir, graph, abort).await?;
-            let last_run = LastRun::capture(&result, input.bare_text(), &block.expose);
+            let last_run = last_run_for(
+                Some(&block.expose),
+                &carry,
+                &result,
+                input.bare_text(),
+                false,
+                ctx.session.is_some(),
+            );
             Ok(GraphTurn::Run {
                 output: result.output,
-                last_run: Some(last_run),
+                last_run: last_run.map(Box::new),
             })
         }
         Branch::Chat => {
@@ -206,8 +277,9 @@ fn delegated_chat_input(
 }
 
 /// Runs a seeded graph and cancels whatever jobs it left in the supervisor,
-/// the same way `run_active_agent_graph_with_inputs` finishes. Boxed for
-/// the same stack reason as `GraphExecutor::execute`.
+/// the same way `run_active_agent_graph_with_inputs` finishes. Boxed so the
+/// executor's large future is not reserved on this frame too; see the
+/// comment on `GraphExecutor::execute`.
 async fn execute_graph(
     ctx: &mut RequestContext,
     agent_name: &str,
@@ -225,17 +297,58 @@ async fn execute_graph(
 }
 
 /// Seeds a child graph's `initial_state`, later writers winning: the graph's
-/// own YAML defaults, then the caller's `inputs`, then `initial_prompt`,
-/// which the dispatcher always owns.
+/// own YAML defaults, then the values `carried` over from the session's last
+/// run that the graph still lists in `carry:`, then the caller's `inputs`,
+/// then `initial_prompt` and `previous_turns`, which the dispatcher always
+/// owns. Declared `variables` come after all of these and only fill keys
+/// still absent (the executor's `seed_variables` runs `or_insert` on the
+/// seeded map).
 pub fn seed_initial_state(
     initial_state: &mut HashMap<String, Value>,
     prompt: &str,
     inputs: Option<HashMap<String, Value>>,
+    previous_turns: &str,
+    carried: &IndexMap<String, Value>,
 ) {
+    for (key, value) in carried {
+        initial_state.insert(key.clone(), value.clone());
+    }
     if let Some(inputs) = inputs {
         initial_state.extend(inputs);
     }
     initial_state.insert("initial_prompt".into(), Value::String(prompt.to_string()));
+    initial_state.insert(
+        "previous_turns".into(),
+        Value::String(previous_turns.to_string()),
+    );
+}
+
+/// The engaged session's transcript for `previous_turns`. Renders whatever
+/// session the context holds, a child context carrying its own agent session
+/// included; empty when there is none.
+pub fn previous_turns_for(ctx: &RequestContext) -> String {
+    ctx.session
+        .as_ref()
+        .map(|session| render_turns(session.messages(), PREVIOUS_TURNS_BYTES))
+        .unwrap_or_default()
+}
+
+/// The values the engaged session's last run carried over that the graph
+/// still lists in `carry:`, in the stored order; a key the graph has since
+/// dropped from the list (or moved into `variables[]`) is left out. Empty
+/// when there is no session or it has no run yet.
+pub fn carried_for(ctx: &RequestContext, carry: &[String]) -> IndexMap<String, Value> {
+    ctx.session
+        .as_ref()
+        .and_then(|session| session.last_run())
+        .map(|run| {
+            run.carried
+                .iter()
+                .filter(|(key, _)| carry.contains(key))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -256,6 +369,9 @@ mod tests {
 
     const SESSION_BLOCK: &str = "session:\n  chat:\n    instructions: hi\n";
     const ECHO_GRAPH: &str = "initial_state:\n  initial_prompt: \"\"\nstart: done\nnodes:\n  done:\n    type: end\n    output: \"{{initial_prompt}}\"\n";
+    const TURNS_ECHO_GRAPH: &str = "initial_state:\n  initial_prompt: \"\"\nstart: done\nnodes:\n  done:\n    type: end\n    output: \"{{previous_turns}}\"\n";
+    /// A graph that carries `said` and echoes it.
+    const CARRY_ECHO_GRAPH: &str = "carry: [said]\ninitial_state:\n  said: \"\"\nstart: done\nnodes:\n  done:\n    type: end\n    output: \"{{said}}\"\n";
 
     fn yaml_defaults() -> HashMap<String, Value> {
         HashMap::from([
@@ -275,11 +391,21 @@ mod tests {
     /// A graph agent whose end node echoes `initial_prompt`, with or
     /// without a session block.
     fn write_graph_agent(name: &str, session_block: &str) {
+        write_agent(name, session_block, ECHO_GRAPH);
+    }
+
+    /// A graph agent whose end node echoes `previous_turns`, which the
+    /// graph itself may not declare.
+    fn write_turns_echo_agent(name: &str, session_block: &str) {
+        write_agent(name, session_block, TURNS_ECHO_GRAPH);
+    }
+
+    fn write_agent(name: &str, session_block: &str, graph: &str) {
         let agent_dir = paths::agent_data_dir(name);
         create_dir_all(&agent_dir).unwrap();
         write(
             agent_dir.join("graph.yaml"),
-            format!("name: {name}\n{session_block}{ECHO_GRAPH}"),
+            format!("name: {name}\n{session_block}{graph}"),
         )
         .unwrap();
     }
@@ -297,6 +423,26 @@ mod tests {
         let mut session = Session::default();
         session.set_model(Model::from_config("openai", &[ModelData::new("fc-model")]).remove(0));
         session
+    }
+
+    fn add_exchange(ctx: &mut RequestContext) -> Input {
+        let input = Input::from_str(ctx, "q1", None).unwrap();
+        ctx.session
+            .as_mut()
+            .unwrap()
+            .add_message(&input, "r1")
+            .unwrap();
+        input
+    }
+
+    fn assert_output_is_the_session_transcript(ctx: &RequestContext, output: &str) {
+        let session = ctx.session.as_ref().unwrap();
+        assert_eq!(
+            output,
+            render_turns(session.messages(), PREVIOUS_TURNS_BYTES)
+        );
+        assert!(!output.is_empty());
+        assert!(output.contains("user: q1\nassistant: r1"), "{output}");
     }
 
     /// An input whose request-only patch differs from the typed text, so
@@ -364,6 +510,60 @@ mod tests {
         assert!(last_run.is_none());
         assert!(roles.is_empty());
         assert_eq!(ctx.last_graph_branch, None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_graph_turn_without_a_session_block_seeds_previous_turns() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("no_block_turns");
+        write_turns_echo_agent(&name, "");
+        let mut ctx = ctx_with_agent(&name).await;
+        ctx.session = Some(chat_session());
+        let input = add_exchange(&mut ctx);
+
+        let (turn, _) = turn_with_reply(&mut ctx, &input, None, "unused").await;
+
+        let GraphTurn::Run { output, .. } = turn.unwrap() else {
+            panic!("expected a run");
+        };
+        assert_output_is_the_session_transcript(&ctx, &output);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_graph_turn_run_branch_seeds_previous_turns() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("run_branch_turns");
+        write_turns_echo_agent(&name, SESSION_BLOCK);
+        let mut ctx = ctx_with_agent(&name).await;
+        ctx.session = Some(chat_session());
+        let input = add_exchange(&mut ctx);
+
+        let (turn, roles) = turn_with_reply(&mut ctx, &input, Some(Branch::Run), "unused").await;
+
+        let GraphTurn::Run { output, .. } = turn.unwrap() else {
+            panic!("expected a run");
+        };
+        assert!(roles.is_empty());
+        assert_output_is_the_session_transcript(&ctx, &output);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_graph_turn_without_a_session_seeds_empty_previous_turns() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("no_session_turns");
+        write_turns_echo_agent(&name, SESSION_BLOCK);
+        let mut ctx = ctx_with_agent(&name).await;
+        let input = patched_input(&ctx);
+
+        let (turn, _) = turn_with_reply(&mut ctx, &input, None, "unused").await;
+
+        let GraphTurn::Run { output, .. } = turn.unwrap() else {
+            panic!("expected a run");
+        };
+        assert_eq!(output, "");
     }
 
     #[tokio::test]
@@ -634,7 +834,7 @@ mod tests {
             final_state: HashMap::new(),
             trace: vec![],
         };
-        session.set_last_run(Some(LastRun::capture(&earlier, "earlier prompt", &[])));
+        session.set_last_run(Some(LastRun::capture(&earlier, "earlier prompt", &[], &[])));
         ctx.session = Some(session);
         let input = patched_input(&ctx);
 
@@ -847,7 +1047,7 @@ mod tests {
             final_state: HashMap::new(),
             trace: vec![],
         };
-        session.set_last_run(Some(LastRun::capture(&earlier, "earlier prompt", &[])));
+        session.set_last_run(Some(LastRun::capture(&earlier, "earlier prompt", &[], &[])));
         ctx.session = Some(session);
         let input = patched_input(&ctx);
 
@@ -864,9 +1064,9 @@ mod tests {
     }
 
     /// A child agent context (as `use_agent` from a graph node builds it)
-    /// runs a block graph straight through the legacy entry point, with no
-    /// classification and no session bookkeeping, even with a session
-    /// engaged.
+    /// runs a block graph straight through the child entry point, with no
+    /// classification, even with a session engaged. The run's record comes
+    /// back to the caller; nothing is stored on the session here.
     #[tokio::test]
     #[serial]
     async fn run_active_agent_graph_with_inputs_bypasses_routing_for_a_child_context() {
@@ -888,7 +1088,7 @@ mod tests {
         ctx.current_depth = 1;
         ctx.session = Some(chat_session());
 
-        let output = run_active_agent_graph_with_inputs(
+        let run = run_active_agent_graph_with_inputs(
             &mut ctx,
             "from a node",
             create_abort_signal(),
@@ -897,10 +1097,102 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(output, "from a node");
+        assert_eq!(run.result.output, "from a node");
+        assert!(!run.result.trace.is_empty());
+        let last_run = run.last_run.as_ref().expect("a child run is recorded");
+        assert_eq!(last_run.prompt, "from a node");
+        assert_eq!(last_run.output, "from a node");
+        assert!(last_run.exposed.is_empty());
+        assert_eq!(last_run.trace, run.result.trace);
         assert_eq!(ctx.current_depth, 1);
         assert!(ctx.session.as_ref().unwrap().last_run().is_none());
         assert_eq!(ctx.last_graph_branch, None);
+    }
+
+    /// A child run on a `carry:` graph starts from the values the session's
+    /// last run left behind and carries the run's own values forward in the
+    /// record it hands back.
+    #[tokio::test]
+    #[serial]
+    async fn run_active_agent_graph_with_inputs_seeds_and_records_the_carried_values() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("child_carried");
+        write_agent(&name, "", CARRY_ECHO_GRAPH);
+        let parent = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        let mut ctx = RequestContext::new_for_child(
+            Arc::clone(&parent.app),
+            &parent,
+            1,
+            Arc::new(Inbox::new()),
+            format!("{name}_1"),
+        );
+        let app = ctx.app.config.clone();
+        ctx.use_agent(&app, &name, None, create_abort_signal())
+            .await
+            .unwrap();
+        ctx.current_depth = 1;
+        let mut session = chat_session();
+        session.set_last_run(Some(first_run_that_said("from the first run")));
+        ctx.session = Some(session);
+
+        let run = run_active_agent_graph_with_inputs(
+            &mut ctx,
+            "from a node",
+            create_abort_signal(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(run.result.output, "from the first run");
+        let last_run = run.last_run.expect("a child run is recorded");
+        assert!(last_run.exposed.is_empty());
+        assert_eq!(
+            last_run.carried.get("said"),
+            Some(&json!("from the first run"))
+        );
+        assert_eq!(
+            ctx.session.as_ref().unwrap().last_run().unwrap().prompt,
+            "earlier",
+            "the dispatcher leaves the session's record alone"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_active_agent_graph_with_inputs_seeds_empty_previous_turns_without_a_session() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("child_turns");
+        write_turns_echo_agent(&name, SESSION_BLOCK);
+        let parent = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        let mut ctx = RequestContext::new_for_child(
+            Arc::clone(&parent.app),
+            &parent,
+            1,
+            Arc::new(Inbox::new()),
+            format!("{name}_1"),
+        );
+        let app = ctx.app.config.clone();
+        ctx.use_agent(&app, &name, None, create_abort_signal())
+            .await
+            .unwrap();
+        ctx.current_depth = 1;
+        assert!(ctx.session.is_none());
+
+        let run = run_active_agent_graph_with_inputs(
+            &mut ctx,
+            "from a node",
+            create_abort_signal(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(run.result.output, "");
+        assert!(
+            run.last_run.is_some(),
+            "a child run is recorded even without a session"
+        );
     }
 
     /// Forcing `Chat` where the chat branch exists skips the classifier
@@ -920,7 +1212,7 @@ mod tests {
             final_state: HashMap::new(),
             trace: vec![],
         };
-        session.set_last_run(Some(LastRun::capture(&earlier, "earlier prompt", &[])));
+        session.set_last_run(Some(LastRun::capture(&earlier, "earlier prompt", &[], &[])));
         ctx.session = Some(session);
         let input = patched_input(&ctx);
 
@@ -1070,26 +1362,51 @@ mod tests {
     }
 
     #[test]
-    fn seed_initial_state_without_inputs_only_adds_initial_prompt() {
+    fn seed_initial_state_without_inputs_only_adds_the_reserved_keys() {
         let mut state = yaml_defaults();
 
-        seed_initial_state(&mut state, "hello", None);
+        seed_initial_state(&mut state, "hello", None, "", &IndexMap::new());
 
         let mut expected = yaml_defaults();
         expected.insert("initial_prompt".into(), json!("hello"));
+        expected.insert("previous_turns".into(), json!(""));
         assert_eq!(state, expected);
     }
 
     #[test]
-    fn seed_initial_state_without_inputs_on_empty_state_inserts_exactly_one_key() {
+    fn seed_initial_state_without_inputs_on_empty_state_inserts_only_the_reserved_keys() {
         let mut state = HashMap::new();
 
-        seed_initial_state(&mut state, "hello", None);
+        seed_initial_state(
+            &mut state,
+            "hello",
+            None,
+            "user: q1\nassistant: r1",
+            &IndexMap::new(),
+        );
 
         assert_eq!(
             state,
-            HashMap::from([("initial_prompt".to_string(), json!("hello"))])
+            HashMap::from([
+                ("initial_prompt".to_string(), json!("hello")),
+                (
+                    "previous_turns".to_string(),
+                    json!("user: q1\nassistant: r1")
+                ),
+            ])
         );
+    }
+
+    #[test]
+    fn seed_initial_state_without_inputs_seeds_every_reserved_key() {
+        let mut state = HashMap::new();
+
+        seed_initial_state(&mut state, "p", None, "t", &IndexMap::new());
+
+        for key in super::super::RESERVED_STATE_KEYS {
+            assert!(state.contains_key(key), "reserved key '{key}' not seeded");
+        }
+        assert_eq!(state.len(), super::super::RESERVED_STATE_KEYS.len());
     }
 
     #[test]
@@ -1100,13 +1417,14 @@ mod tests {
             ("extra".to_string(), json!(["a", "b"])),
         ]);
 
-        seed_initial_state(&mut state, "hello", Some(inputs));
+        seed_initial_state(&mut state, "hello", Some(inputs), "", &IndexMap::new());
 
         assert_eq!(state.get("width"), Some(&json!(2)));
         assert_eq!(state.get("mode"), Some(&json!("fast")));
         assert_eq!(state.get("extra"), Some(&json!(["a", "b"])));
         assert_eq!(state.get("initial_prompt"), Some(&json!("hello")));
-        assert_eq!(state.len(), 4);
+        assert_eq!(state.get("previous_turns"), Some(&json!("")));
+        assert_eq!(state.len(), 5);
     }
 
     #[test]
@@ -1114,10 +1432,33 @@ mod tests {
         let mut state = HashMap::from([("initial_prompt".to_string(), json!("from yaml"))]);
         let inputs = HashMap::from([("initial_prompt".to_string(), json!("from inputs"))]);
 
-        seed_initial_state(&mut state, "from dispatcher", Some(inputs));
+        seed_initial_state(
+            &mut state,
+            "from dispatcher",
+            Some(inputs),
+            "",
+            &IndexMap::new(),
+        );
 
         assert_eq!(state.get("initial_prompt"), Some(&json!("from dispatcher")));
-        assert_eq!(state.len(), 1);
+        assert_eq!(state.len(), 2);
+    }
+
+    #[test]
+    fn seed_initial_state_dispatcher_turns_beat_a_previous_turns_input() {
+        let mut state = HashMap::from([("previous_turns".to_string(), json!("from yaml"))]);
+        let inputs = HashMap::from([("previous_turns".to_string(), json!("from inputs"))]);
+
+        seed_initial_state(
+            &mut state,
+            "prompt",
+            Some(inputs),
+            "from dispatcher",
+            &IndexMap::new(),
+        );
+
+        assert_eq!(state.get("previous_turns"), Some(&json!("from dispatcher")));
+        assert_eq!(state.len(), 2);
     }
 
     #[test]
@@ -1125,8 +1466,352 @@ mod tests {
         let mut state = yaml_defaults();
         let inputs = HashMap::from([("width".to_string(), Value::Null)]);
 
-        seed_initial_state(&mut state, "hello", Some(inputs));
+        seed_initial_state(&mut state, "hello", Some(inputs), "", &IndexMap::new());
 
         assert_eq!(state.get("width"), Some(&Value::Null));
+    }
+
+    fn carried_said(value: &str) -> IndexMap<String, Value> {
+        IndexMap::from([("said".to_string(), json!(value))])
+    }
+
+    #[test]
+    fn seed_initial_state_inputs_beat_carried_values() {
+        let mut state = HashMap::from([("said".to_string(), json!("a"))]);
+        let inputs = HashMap::from([("said".to_string(), json!("c"))]);
+
+        seed_initial_state(&mut state, "p", Some(inputs), "", &carried_said("b"));
+
+        assert_eq!(state.get("said"), Some(&json!("c")));
+    }
+
+    #[test]
+    fn seed_initial_state_carried_values_beat_yaml_defaults() {
+        let mut state = HashMap::from([("said".to_string(), json!("a"))]);
+
+        seed_initial_state(&mut state, "p", None, "", &carried_said("b"));
+
+        assert_eq!(state.get("said"), Some(&json!("b")));
+        assert_eq!(state.len(), 3);
+    }
+
+    #[test]
+    fn seed_initial_state_carried_values_never_override_the_reserved_keys() {
+        let mut state = HashMap::new();
+        let carried = IndexMap::from([
+            ("initial_prompt".to_string(), json!("stale prompt")),
+            ("previous_turns".to_string(), json!("stale turns")),
+        ]);
+
+        seed_initial_state(&mut state, "fresh prompt", None, "fresh turns", &carried);
+
+        assert_eq!(state.get("initial_prompt"), Some(&json!("fresh prompt")));
+        assert_eq!(state.get("previous_turns"), Some(&json!("fresh turns")));
+    }
+
+    #[test]
+    fn carried_for_is_empty_without_a_session_or_a_last_run() {
+        let carry = ["said".to_string()];
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        assert!(carried_for(&ctx, &carry).is_empty());
+
+        ctx.session = Some(chat_session());
+        assert!(carried_for(&ctx, &carry).is_empty());
+
+        let mut session = chat_session();
+        session.set_last_run(Some(first_run_that_said("b")));
+        ctx.session = Some(session);
+        assert!(carried_for(&ctx, &[]).is_empty());
+    }
+
+    #[test]
+    fn carried_for_keeps_only_the_keys_the_graph_still_carries() {
+        let earlier = GraphRunResult {
+            output: String::new(),
+            final_state: HashMap::from([
+                ("said".to_string(), json!("b")),
+                ("gone".to_string(), json!("z")),
+            ]),
+            trace: vec![],
+        };
+        let mut session = chat_session();
+        session.set_last_run(Some(LastRun::capture(
+            &earlier,
+            "earlier",
+            &[],
+            &["said".to_string(), "gone".to_string()],
+        )));
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.session = Some(session);
+
+        let carried = carried_for(&ctx, &["said".to_string()]);
+
+        assert_eq!(carried, IndexMap::from([("said".to_string(), json!("b"))]));
+    }
+
+    fn first_run_that_said(value: &str) -> LastRun {
+        let earlier = GraphRunResult {
+            output: "earlier output".to_string(),
+            final_state: HashMap::from([("said".to_string(), json!(value))]),
+            trace: vec![],
+        };
+        LastRun::capture(&earlier, "earlier", &[], &["said".to_string()])
+    }
+
+    /// A graph that carries `said` and echoes it: the second run under a
+    /// session starts from the value the first run left behind, and the
+    /// run's own record carries the value forward again.
+    #[tokio::test]
+    #[serial]
+    async fn run_graph_turn_run_branch_seeds_the_carried_values_of_the_last_run() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("carried");
+        write_agent(
+            &name,
+            SESSION_BLOCK,
+            "carry: [said]\ninitial_state:\n  said: \"\"\nstart: done\nnodes:\n  done:\n    type: end\n    output: \"{{said}}\"\n",
+        );
+        let mut ctx = ctx_with_agent(&name).await;
+        let mut session = chat_session();
+        session.set_last_run(Some(first_run_that_said("from the first run")));
+        ctx.session = Some(session);
+        let input = patched_input(&ctx);
+
+        let (turn, roles) = turn_with_reply(&mut ctx, &input, Some(Branch::Run), "unused").await;
+
+        let GraphTurn::Run { output, last_run } = turn.unwrap() else {
+            panic!("expected a run");
+        };
+        assert!(roles.is_empty());
+        assert_eq!(output, "from the first run");
+        assert_eq!(
+            last_run.unwrap().carried.get("said"),
+            Some(&json!("from the first run"))
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_graph_turn_run_branch_without_a_last_run_keeps_the_yaml_default() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("carried_default");
+        write_agent(
+            &name,
+            SESSION_BLOCK,
+            "carry: [said]\ninitial_state:\n  said: \"yaml default\"\nstart: done\nnodes:\n  done:\n    type: end\n    output: \"{{said}}\"\n",
+        );
+        let mut ctx = ctx_with_agent(&name).await;
+        ctx.session = Some(chat_session());
+        let input = patched_input(&ctx);
+
+        let (turn, _) = turn_with_reply(&mut ctx, &input, Some(Branch::Run), "unused").await;
+
+        let GraphTurn::Run { output, last_run } = turn.unwrap() else {
+            panic!("expected a run");
+        };
+        assert_eq!(output, "yaml default");
+        assert_eq!(
+            last_run.unwrap().carried.get("said"),
+            Some(&json!("yaml default"))
+        );
+    }
+
+    /// A key the last run carried but the graph no longer lists must not
+    /// override that key's YAML default.
+    #[tokio::test]
+    #[serial]
+    async fn run_graph_turn_run_branch_ignores_carried_keys_the_graph_dropped() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("carried_stale");
+        write_agent(
+            &name,
+            SESSION_BLOCK,
+            "carry: [said]\ninitial_state:\n  said: \"\"\n  gone: \"default\"\nstart: done\nnodes:\n  done:\n    type: end\n    output: \"{{said}}|{{gone}}\"\n",
+        );
+        let earlier = GraphRunResult {
+            output: "earlier output".to_string(),
+            final_state: HashMap::from([
+                ("said".to_string(), json!("kept")),
+                ("gone".to_string(), json!("stale")),
+            ]),
+            trace: vec![],
+        };
+        let mut ctx = ctx_with_agent(&name).await;
+        let mut session = chat_session();
+        session.set_last_run(Some(LastRun::capture(
+            &earlier,
+            "earlier",
+            &[],
+            &["said".to_string(), "gone".to_string()],
+        )));
+        ctx.session = Some(session);
+        let input = patched_input(&ctx);
+
+        let (turn, _) = turn_with_reply(&mut ctx, &input, Some(Branch::Run), "unused").await;
+
+        let GraphTurn::Run { output, last_run } = turn.unwrap() else {
+            panic!("expected a run");
+        };
+        assert_eq!(output, "kept|default");
+        let carried = last_run.unwrap().carried;
+        assert_eq!(carried.get("said"), Some(&json!("kept")));
+        assert!(!carried.contains_key("gone"));
+    }
+
+    fn run_that_said(value: &str) -> GraphRunResult {
+        GraphRunResult {
+            output: "out".to_string(),
+            final_state: HashMap::from([("said".to_string(), json!(value))]),
+            trace: vec![],
+        }
+    }
+
+    #[test]
+    fn last_run_for_a_child_records_with_or_without_a_session() {
+        let result = run_that_said("x");
+        for has_session in [false, true] {
+            let run = last_run_for(None, &[], &result, "p", true, has_session)
+                .unwrap_or_else(|| panic!("has_session {has_session}"));
+            assert_eq!(run.prompt, "p");
+            assert_eq!(run.output, "out");
+            assert!(run.exposed.is_empty());
+            assert!(run.carried.is_empty());
+        }
+    }
+
+    #[test]
+    fn last_run_for_a_repl_turn_records_nothing_without_a_block_or_a_carry() {
+        let result = run_that_said("x");
+        assert!(last_run_for(None, &[], &result, "p", false, true).is_none());
+        assert!(last_run_for(None, &[], &result, "p", false, false).is_none());
+    }
+
+    #[test]
+    fn last_run_for_a_repl_turn_records_a_block_graph_only_under_a_session() {
+        let result = run_that_said("x");
+        let run = last_run_for(Some(&[]), &[], &result, "p", false, true).unwrap();
+        assert!(run.exposed.is_empty());
+        assert!(last_run_for(Some(&[]), &[], &result, "p", false, false).is_none());
+
+        let expose = ["said".to_string()];
+        let run = last_run_for(Some(&expose), &[], &result, "p", false, true).unwrap();
+        assert_eq!(run.exposed.get("said"), Some(&json!("x")));
+        assert!(last_run_for(Some(&expose), &[], &result, "p", false, false).is_none());
+    }
+
+    #[test]
+    fn last_run_for_a_repl_turn_records_a_blockless_carry_graph_only_under_a_session() {
+        let result = run_that_said("x");
+        let carry = ["said".to_string()];
+        let run = last_run_for(None, &carry, &result, "p", false, true).unwrap();
+        assert!(run.exposed.is_empty());
+        assert_eq!(run.carried.get("said"), Some(&json!("x")));
+        assert!(last_run_for(None, &carry, &result, "p", false, false).is_none());
+    }
+
+    /// A graph with no session block but a `carry:` list still records
+    /// under a session: the carried value needs the record to reach the
+    /// next run. No classifier runs and no branch is recorded.
+    #[tokio::test]
+    #[serial]
+    async fn run_graph_turn_without_a_session_block_records_a_carry_graph_under_a_session() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("no_block_carried");
+        write_agent(&name, "", CARRY_ECHO_GRAPH);
+        let mut ctx = ctx_with_agent(&name).await;
+        let mut session = chat_session();
+        session.set_last_run(Some(first_run_that_said("from the first run")));
+        ctx.session = Some(session);
+        let input = patched_input(&ctx);
+
+        let (turn, roles) = turn_with_reply(&mut ctx, &input, None, "unused").await;
+
+        let GraphTurn::Run { output, last_run } = turn.unwrap() else {
+            panic!("expected a run");
+        };
+        assert!(roles.is_empty());
+        assert_eq!(ctx.last_graph_branch, None);
+        assert_eq!(output, "from the first run");
+        let last_run = last_run.expect("a carry graph records under a session");
+        assert_eq!(last_run.prompt, "typed");
+        assert!(last_run.exposed.is_empty());
+        assert_eq!(
+            last_run.carried.get("said"),
+            Some(&json!("from the first run"))
+        );
+    }
+
+    /// The bundled coder carries its plan between runs and tells both model
+    /// nodes about the earlier turns in their prompts, not their standing
+    /// instructions.
+    #[test]
+    fn bundled_coder_carries_its_plan_and_reads_the_earlier_turns_in_its_prompts() {
+        let graph: Graph =
+            serde_yaml::from_str(include_str!("../../assets/agents/coder/graph.yaml")).unwrap();
+
+        assert_eq!(
+            graph.carry,
+            ["plan_summary", "files_to_modify", "files_to_create"]
+        );
+        // design_trail accumulates every implement pass's Design lines;
+        // carrying it across runs would re-raise questions already answered.
+        assert!(!graph.carry.iter().any(|key| key == "design_trail"));
+        for key in &graph.carry {
+            assert!(
+                graph.initial_state.contains_key(key),
+                "carry key '{key}' is not declared in initial_state"
+            );
+        }
+
+        let turns_heading = "## Earlier turns with this agent (empty on a first run)";
+        for node_id in ["analyze_request", "implement"] {
+            let node = graph.get_node(node_id).unwrap();
+            let super::super::types::NodeType::Llm(llm) = &node.node_type else {
+                panic!("{node_id} is not an llm node");
+            };
+            assert!(
+                llm.prompt.contains(turns_heading),
+                "{node_id}: {}",
+                llm.prompt
+            );
+            assert!(
+                llm.prompt.contains("{{previous_turns}}"),
+                "{node_id}: {}",
+                llm.prompt
+            );
+            let instructions = llm.instructions.as_deref().unwrap_or("");
+            assert!(!instructions.contains(turns_heading), "{node_id}");
+            assert!(!instructions.contains("{{previous_turns}}"), "{node_id}");
+            assert!(
+                !instructions.contains("Plan carried from the earlier run"),
+                "{node_id}"
+            );
+            assert!(!instructions.contains("{{plan_summary}}"), "{node_id}");
+        }
+
+        let super::super::types::NodeType::Llm(analyze) =
+            &graph.get_node("analyze_request").unwrap().node_type
+        else {
+            panic!("analyze_request is not an llm node");
+        };
+        assert!(
+            analyze
+                .prompt
+                .contains("## Plan carried from the earlier run (empty on a first run)"),
+            "{}",
+            analyze.prompt
+        );
+        assert!(
+            analyze.prompt.contains("may not have been applied"),
+            "{}",
+            analyze.prompt
+        );
+        // analyze_request overwrites these carried keys through its required
+        // output_schema fields, so the prompt must show the earlier values or
+        // the carry is lost on the second turn.
+        for key in ["plan_summary", "files_to_modify", "files_to_create"] {
+            let placeholder = format!("{{{{{key}}}}}");
+            assert!(analyze.prompt.contains(&placeholder), "{}", analyze.prompt);
+        }
     }
 }
