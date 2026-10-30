@@ -2531,7 +2531,9 @@ mod tests {
         for (file, source) in sources {
             // A test module may hand-append the mesh tools to exercise the
             // consumers; only the production code above it is an append site.
-            let production = source.split("\n#[cfg(test)]\n").next().unwrap();
+            // Keyed on the module, not the attribute alone, since a test-only
+            // item can sit among the production code.
+            let production = source.split("\n#[cfg(test)]\nmod ").next().unwrap();
             let lines: Vec<&str> = production.lines().collect();
             for (index, line) in lines.iter().enumerate() {
                 if !line.contains("append_mesh_functions(") {

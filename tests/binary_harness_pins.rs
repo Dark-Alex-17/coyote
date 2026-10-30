@@ -28,7 +28,9 @@ fn every_binary_spawn_in_the_harnesses_pins_the_config_dir_and_the_cache_dir() {
         let spawn_sites = source.matches(SPAWN_SITE).count();
         let config_sites = source.matches(CONFIG_ENV).count();
         let cache_sites = source.matches(CACHE_ENV).count();
-        if spawn_sites == 0 && config_sites == 0 && cache_sites == 0 {
+        // A file that never spawns the binary is not one of its harnesses: a script
+        // harness may hand the script under test its own config dir.
+        if spawn_sites == 0 {
             continue;
         }
         assert!(

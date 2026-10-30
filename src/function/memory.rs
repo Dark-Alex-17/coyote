@@ -17,7 +17,7 @@ use crate::config::memory::{
     create_workspace_memory, find_git_root, today_string,
 };
 use crate::config::paths;
-use crate::config::{Agent, RequestContext, RoundChains, WORKSPACE_COYOTE_DIR_NAME};
+use crate::config::{Agent, RequestContext, RoundChains};
 
 pub const MEMORY_FUNCTION_PREFIX: &str = "memory__";
 
@@ -1205,11 +1205,12 @@ fn workspace_write_dir(store: &MemoryStore, cwd: &Path) -> Result<PathBuf> {
     if let Some(git_root) = find_git_root(cwd) {
         return bootstrap_workspace_memory(&git_root);
     }
-    if cwd.join(WORKSPACE_COYOTE_DIR_NAME).is_dir() {
+    let home = paths::workspace_memory_home_name();
+    if cwd.join(home).is_dir() {
         return create_workspace_memory(cwd, false);
     }
     bail!(
-        "no workspace memory discoverable, not inside a git repository, and no .coyote directory here. \
+        "no workspace memory discoverable, not inside a git repository, and no {home} directory here. \
          If you want workspace memory, run `coyote --init-memory workspace`."
     )
 }

@@ -112,7 +112,7 @@ impl Probe {
             .env_remove("COYOTE_PROVIDER")
             .env_remove("COYOTE_PLATFORM")
             .env_remove("COYOTE_ENV_FILE")
-            .env_remove("COYOTE_CACHE_DIR")
+            .env("COYOTE_CACHE_DIR", self.temp_root.join("coyote"))
             .env_remove("COYOTE_LEFT_PROMPT")
             .env_remove("COYOTE_RIGHT_PROMPT")
             .env_remove("ENVOY_DATA_DIR")

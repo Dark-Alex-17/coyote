@@ -7490,7 +7490,7 @@ mod tests {
                 .map(String::as_str)
                 .collect();
             keys.sort_unstable();
-            assert_eq!(keys, ["agent", "id", "status"]);
+            assert_eq!(keys, ["agent", "id", "session_id", "status"]);
             let status = entry["status"].as_str().unwrap();
             assert!(
                 status == "running" || status == "finished",

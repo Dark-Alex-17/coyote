@@ -448,9 +448,15 @@ pub fn global_memory_index_file() -> PathBuf {
     global_memory_dir().join(MEMORY_INDEX_FILE_NAME)
 }
 
+/// The directory workspace memory lives under: always the literal default name, since
+/// memory ignores the workspace config dir override.
+pub fn workspace_memory_home_name() -> &'static str {
+    WORKSPACE_COYOTE_DIR_NAME
+}
+
 pub fn workspace_memory_dir_for(workspace_root: &Path) -> PathBuf {
     workspace_root
-        .join(WORKSPACE_COYOTE_DIR_NAME)
+        .join(workspace_memory_home_name())
         .join(MEMORY_DIR_NAME)
 }
 
