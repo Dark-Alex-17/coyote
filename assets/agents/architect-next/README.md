@@ -45,6 +45,12 @@ below. Later landings add their own rows.
 | `utils.sh` source | `scripts/smoke_test.py`, `scripts/mode_matrix.py` | both batteries copy the repo asset `.shared/utils.sh` into the scratch `LLM_ROOT_DIR` instead of the user-config copy, which never existed under the re-pointed `HOME`, so the stub branch always ran; the real `set -euo pipefail` is now live inside `architect/tools.sh` under both batteries, with no unset-variable fallout. A smoke check pins that the copy is the real file; the matrix has no stub branch left: it exits before the first combination if the asset is missing or lacks `set -euo pipefail`, and prints `utils.sh: real asset` otherwise, which the ignored wrapper test asserts |
 | marker map | `scripts/marker_map.json` | regenerated against the landed `architect/instructions.md`, which carries 62 marker regions (staging mapped 60): the two regions added since staging are the micro-mode `review_cadence: batch` line on the parallel wave spawn (mapped to the `## MODE` block `_delegation_text` builds for `compose_delegation` and `wave_claim`) and the multi-PR `--tasks <group members>` line for `assemble_pr_body` (mapped to `pr_body`, which passes the group members from `_group_members` in multi-PR mode only, so a group body covers just that group's tasks). The 60 known regions keep their mechanism and home; four recorded first-lines changed because upstream reworded or ASCII-normalised those lines; `first` keeps `\u2014` JSON escapes for 13 lines of the prose file |
 | dead `hygiene_pending_for_chain` guard | `scripts/gates.py` `stack_gate` | two lines deleted: the guard read `state.get("hygiene_pending_for_chain", {})`, a key no script, variable, `state_updates` target or output schema ever writes, so it was always falsy and the `continue` it guarded never ran; the repo's state-key walker (`bundled_graph_output_schemas_declare_every_key_relied_on`) rejects a consumed key with no declared writer, and deleting the read keeps behaviour identical rather than inventing a writer |
+| gauntlet grammar | `scripts/gates.py` `verify_gate` / `_code_tree_dirty` / `_gauntlet_header` / `_has_verdict` / `_lane_rows` / `_lane_cells` / `_probe_verdict` / `_parse_gauntlet` / `route_verdict` / `wave_route` / `_lane_table`, `scripts/smoke_test.py`, `scripts/mode_matrix.py` | the gauntlet's reply opens with `GAUNTLET: <verdict>` on line 1 and appends every lane's raw report under `## Full lane reports` inside `<details>` blocks, so `GAUNTLET:`, `GAUNTLET_REVIEW_INCOMPLETE:`, the lane table and the `## Blockers` section are read only from the header before the first column-0 `## Full lane reports` line (or before the first `<details>` when that heading is absent), as column-0 whole lines with `[ \t]*` gaps, first match winning: a prose-quoted, indented or trailing-text sentinel is ignored, so a missing whole-line verdict is BLOCKED, and a `GAUNTLET: PASS` or a GREEN row injected below the header cannot override it; `route_verdict` and `wave_route` pre-check the same header slice with the parser's own regex (`_has_verdict`). The lane table is read as `\| lane \| status \| detail \|` from the first contiguous run of column-0 `\|` lines, first row per lane, with the whole status cell kept (`GREEN`, `GREEN (attention)`, `BLOCKED`, `SKIPPED`); staging's `GREEN` tuple of detail words is gone. `USAGE_PROBE:` stays a whole-line last match; the probe verdict is the probe row's detail cell (`PASS`, `FAIL`, `INCONCLUSIVE (environment)`), and the last `USAGE_PROBE:` line of the header counts only when there is no probe row. `ADVERSARIAL_REVIEW:` stays unanchored for the micro-mode adversary lane. Settled lanes are the lanes whose whole status cell is exactly `GREEN`, minus the lanes with findings last round and never `debris`; `GREEN (attention)` never settles (a human must look, so the lane re-runs); `Settled lanes:` is written only when non-empty and `Re-review delta: <sha>..HEAD` stays bare. Neither line is written while the code repo has uncommitted changes outside the planning store: when `plans_root` resolves inside the code repo its paths are excluded from that `git status --porcelain`, because the in-repo planning store carries uncommitted task-status edits until the task closes. This diverges from the sisyphus-next twin, which has no planning store and checks the whole tree. The header boundary is the review-gauntlet producer's guarantee (its verdict gate folds every header value onto one line, so nothing it writes above the lane reports can start a column-0 `## Full lane reports` or `<details>` line), and the consumer defends it as well: nothing past the boundary is read |
+| E9: variables reach config children too | `graph.yaml` `delegate` / `wave_delegate`, `scripts/gates.py` `_delegation_text` / `compose_delegation` / `wave_claim` | staging's "agent nodes have no variables channel for config children" holds only for a variable the child does not declare: the engine copies the parent's agent variables to every agent-node child, config and graph alike, and the child seats them over its own declared defaults. Of the variables both this graph and `sisyphus` declare (`project_dir`, `auto_confirm`, `escalation_policy`, `build_lock`), only `build_lock` is a value the delegate should inherit (the `build_lock` variable row). `review_cadence` and `parallel` are `sisyphus` variables this graph does not declare (the cadence is derived from micro mode), and `project_dir` is deliberately overridden with the task worktree, so those three stay in the `## MODE` block with the `mode-degraded:` ledger line. Every other child - the graph agent librarian and the config agents explore, gatekeeper, oracle, engineer and whetstone - receives `build_lock` by the same inheritance; a child that declares no `build_lock` does not consume it (no file of theirs names `build_lock`, `gate_prefix` or `run_gate`). Not a schema change: no node, prompt, bound or timeout moved |
+| V1: session-resume replacement (artifact re-entry) - the contract | this README, `scripts/gates.py` `_delegation_text` | a fix round hands the `sisyphus` delegate the task's branch, commits and prior report verbatim, plus the `Sisyphus run id` that report carries, and a later session re-enters this graph's run by `Architect run id`; nothing is ever resumed by a child session id, so there is no resume plumbing and no session-id ledger |
+| engine facts | this README | agent-node resume: not available by decision (2026-10-28); E1 stays as the artifact contract; G6 escalation_timeout open |
+| battery env hygiene | `scripts/smoke_test.py`, `scripts/mode_matrix.py`, `tests/candidate_architect_next.rs` | both batteries drop every `LLM_AGENT_VAR_*` variable at start so they cannot inherit the agent variables of the process running them (`_lib.var` reads the mode variables through them), and drop `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY` and `GIT_COMMON_DIR` the same way, so a run from a git hook (which exports them) commits in the scratch repositories, not the caller's; the Rust wrapper strips the same list from every git, script and binary command it starts |
+| ledger rollup scope | `scripts/gates.py` `hygiene_create` / `_group_members` / `pr_body` / `_collect`, `scripts/smoke_test.py` | every `collect_ledger_lines` call passes `--plan`: the prose `architect/tools.sh` declares it required and hands it to `plan_tasks.py`, which exits `plan not found` without it, so staging's calls always fell back to `(collect_ledger_lines unavailable: ...)`. In multi-PR mode the group-scoped calls (`hygiene_create`'s starting ledger and `pr_body`'s `assemble_pr_body`) also pass `--tasks <group members>`, as the prose architect does; the run report (`_collect`) passes no `--tasks` and stays run-scoped, because it covers every PR group. The smoke battery records each call's arguments and runs the real `tools.sh` over a scratch plan and task log |
 
 Recorded census against the staging tree (files that differ; hunks per file as counted by
 `diff -u <staging file> <file> | grep -c '^@@'`):
@@ -52,10 +58,10 @@ Recorded census against the staging tree (files that differ; hunks per file as c
 ```
 graph.yaml                3 hunks   (description provenance; project_dir em dash; pr_strategy em dash + build_lock + task_granularity em dash)
 scripts/_lib.py           1 hunk    (new cache_dir; runs_root docstring; runs_root base path)
-scripts/smoke_test.py     3 hunks   (import _lib; utils.sh source + the real-copy pin; run dir resolution checks)
-scripts/mode_matrix.py    1 hunk    (utils.sh source; fails loud instead of stubbing; confirmation line)
+scripts/smoke_test.py     8 hunks   (LLM_AGENT_VAR_* and GIT_* repository-variable scrub + import _lib; utils.sh source + the real-copy pin; run dir resolution checks; gauntlet_reply / verdict_state fixtures in the real table shape, composer settled-lanes, attention, in-repo planning-store and dirty-tree rows, GPASS / GPROBE / GBLOCK; GINC / GDEB; the parser rows: prose-quoted, trailing-text, indented, first match, whole status cells, first table only, USAGE_PROBE last match, probe detail cell, injected header overrides, sentinel only in a lane report; the wave_route header rows; the rollup-scope rows and the real collect_ledger_lines rows)
+scripts/mode_matrix.py    3 hunks   (LLM_AGENT_VAR_* and GIT_* repository-variable scrub; canned gauntlet reply in the real table shape; utils.sh source, fails loud instead of stubbing, confirmation line)
 scripts/marker_map.json  25 hunks   (62 regions: two new, line numbers shifted, four first-lines reworded upstream)
-scripts/gates.py          1 hunk    (dead hygiene_pending_for_chain guard in stack_gate removed)
+scripts/gates.py         13 hunks   (GREEN tuple retired; verify_gate: dirty-tree guard + whole-cell GREEN settling; one hunk for _code_tree_dirty, _gauntlet_header, _GAUNTLET_VERDICT_RE / _has_verdict, _lane_rows, _lane_cells, _probe_verdict and the header-only _parse_gauntlet; route_verdict: header pre-check, probe verdict, lanes_with_findings; the probe adopt and INCONCLUSIVE checks, 2 hunks; _lane_table; dead hygiene_pending_for_chain guard in stack_gate removed; wave_route header pre-check; hygiene_create collect_ledger_lines --plan / --tasks; _group_members; pr_body --tasks; _collect --plan)
 README.md                 2 hunks   (design-record aside in the status paragraph; run-state bullet, this section and the Verify section)
 ```
 
@@ -119,8 +125,18 @@ The wrapper's live test groups:
   `run("<name>")`, names `<name>` in its docstring, the shims map one-to-one onto the
   `type: script` nodes of `graph.yaml`, and every `run()` name is a key of `GATES` in
   `gates.py`);
+- gauntlet grammar: a prior report rendered by the review gauntlet's own `verdict_gate.py`
+  and `done` template, read by `route_verdict`, composed into the next round by
+  `verify_gate` and narrowed through the gauntlet's real `signals.py` and `build_items.py`;
+  the no-settled-lanes round; the parser rows; the planning-store dirty-tree rows;
+- budgets and channels: graph, node, `initial_state` and `_lib.py` bounds against a literal
+  copy of the staging values, the `anomalies` property on every llm node, and no
+  `inputs: build_lock` anywhere; the real `tools.sh` `collect_ledger_lines` rollup; both
+  batteries drop the same variables as the wrapper;
 - README ground-truth pins: toolchain census, counts against the graph and the prose twin,
-  the `build_lock` row, the `assemble_pr_body` gap, and the dead-guard census row;
+  the `build_lock` and E9 rows, `pr_body` passing `--tasks`, the dead-guard census row, the
+  grammar, V1, engine-facts, env hygiene and ledger rows, and the battery figures against the
+  wrapper floors;
 - real-binary dry runs: four by name (from a seeded config dir; from an empty config dir that
   installs the candidate; re-entry by run id in the prompt; an unknown run id in the prompt
   starts a fresh run), the XDG-tier dry run (only `XDG_CACHE_HOME` set, the run lands under
@@ -135,7 +151,8 @@ The mode-matrix run is the one ignored test.
 
 The Rust wrapper runs the batteries with `HOME`, `LLM_ROOT_DIR`, `COYOTE_CACHE_DIR`,
 `TMPDIR` and `ARCHITECT_RUNS_ROOT` pointed at a scratch directory and
-`PYTHONDONTWRITEBYTECODE=1`, and drops any inherited `GRAPH_STATE*` / `LLM_AGENT_VAR_*`,
+`PYTHONDONTWRITEBYTECODE=1`, and drops any inherited `GRAPH_STATE*` / `LLM_AGENT_VAR_*`
+and git repository variables,
 so nothing under this directory or `~/.config/coyote` is touched and no agent session leaks
 in. `audit_graph.py`, `check_session_block.sh` and `mode_matrix.py` need the Go `yq`
 by mikefarah (`yq --version` names it); the wrapper's audit, session-check and poison tests,
@@ -143,7 +160,7 @@ and the ignored matrix, skip when a different `yq` (or none) is on `PATH`. The s
 keeps every bundled agent from naming this candidate lives in
 `tests/candidate_sisyphus_next.rs` and covers both candidate names.
 
-Measured 2026-10-28 after the adjustments above, from a fresh scratch dir: audit
-`PROBLEMS: none`; smoke `304/304 checks passed`; mode matrix `53/53 checks passed`
-(`62 live regions == 62 mapped`) in 3m53s wall clock; session check ok (mikefarah yq
+Measured 2026-10-30 after the adjustments above, from a fresh scratch dir: audit
+`PROBLEMS: none`; smoke `331/331 checks passed`; mode matrix `53/53 checks passed`
+(`62 live regions == 62 mapped`) in 4m27s wall clock; session check ok (mikefarah yq
 v4.53.3); no unset-variable failure from `architect/tools.sh` under the real `utils.sh`.
