@@ -1630,8 +1630,17 @@ clients:
 
     /// The spawn-source phrase every `child_sessions` note shares, so the
     /// three yaml twins cannot drift apart on how a child comes to exist.
-    const CHILD_SESSIONS_SPAWN_PHRASE: &str =
-        "`agent__spawn` (or a task-queue entry that names an `agent:`)";
+    const CHILD_SESSIONS_SPAWN_PHRASE: &str = "`agent__spawn` (or a task queued with \
+         `agent__task_create` that names an `agent:`, once it is dispatched)";
+
+    /// Wrapped yaml comment lines joined into one line of prose, so a
+    /// phrase reads the same however the note is wrapped.
+    fn comment_prose(text: &str) -> String {
+        text.lines()
+            .map(|line| line.trim_start_matches([' ', '#']).trim_end())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
 
     /// The `# ---- Child Sessions ----` heading through the `child_sessions:`
     /// line, read as LF text so a CRLF checkout compares the same bytes.
@@ -1662,11 +1671,8 @@ clients:
             child_sessions_block(&example_lf.replace('\n', "\r\n")),
             "a CRLF checkout of the example compares as the same block"
         );
-        assert!(block.contains(CHILD_SESSIONS_SPAWN_PHRASE), "{block}");
-        assert!(
-            !block.contains("agent__task_create"),
-            "the app-level note names the task queue by its agent: entry, not the tool:\n{block}"
-        );
+        let one_line = comment_prose(&block);
+        assert!(one_line.contains(CHILD_SESSIONS_SPAWN_PHRASE), "{one_line}");
     }
 
     #[test]
@@ -1679,16 +1685,8 @@ clients:
             .split("\n\n")
             .next()
             .unwrap();
-        let one_line = agent_block
-            .lines()
-            .map(|line| line.trim_start_matches([' ', '#']).trim_end())
-            .collect::<Vec<_>>()
-            .join(" ");
+        let one_line = comment_prose(agent_block);
         assert!(one_line.contains(CHILD_SESSIONS_SPAWN_PHRASE), "{one_line}");
-        assert!(
-            !agent_example.contains("agent__task_create"),
-            "the agent example names the task queue by its agent: entry, not the tool"
-        );
     }
 
     #[test]
