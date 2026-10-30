@@ -235,9 +235,9 @@ impl PeerTable {
         change
     }
 
-    /// Route facts from an announce this node asked for: everything `observe` would set
-    /// except `last_seen`, which only an announce the peer sent unprompted may move. A
-    /// destination without a row is not refreshed; its first announce files normally.
+    /// Route facts from an announce the peer sent as a path response: everything `observe`
+    /// would set except `last_seen`, which only a plain announce may move. A destination
+    /// without a row is not refreshed; its first announce files normally.
     pub(crate) fn refresh_route(&self, sighting: PeerSighting) -> bool {
         let mut peers = self.inner.lock();
         let Some(record) = peers.get_mut(&sighting.destination_hash) else {

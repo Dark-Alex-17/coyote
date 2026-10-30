@@ -23,6 +23,7 @@ use lxmf_core::stamp::{
 use rns_transport::PacketContext;
 use rns_transport::destination::link::{Link, LinkEvent, LinkEventData, LinkId, LinkStatus};
 use rns_transport::destination::{DestinationDesc, DestinationName, SingleOutputDestination};
+use rns_transport::error::RnsError;
 use rns_transport::hash::{AddressHash, Hash};
 use rns_transport::identity::Identity;
 use rns_transport::identity_bridge::{to_core_identity, to_transport_identity};
@@ -66,8 +67,9 @@ pub(crate) const PROPAGATION_TRANSFER_TIMEOUT: Duration = Duration::from_secs(60
 pub(crate) const PROPAGATION_REJECT_WINDOW: Duration = Duration::from_secs(2);
 
 /// Bounds the cancel sent for a resource a post gave up on before its outcome resolved;
-/// the transport is asked once and, past this, the out-link is reset instead. The reset
-/// is deliberately left unbounded, since it must finish before the post returns.
+/// the transport is asked once and, past this, the out-link is reset instead if it is
+/// still the one registered for the node. The reset is deliberately left unbounded, since
+/// it must finish before the post returns.
 const PROPAGATION_CANCEL_GRACE: Duration = Duration::from_secs(2);
 
 /// Aspect of the destination a propagation node serves clients on (`LXMRouter.py:173`) and
@@ -553,10 +555,20 @@ async fn send_on_link(
                 // advertisement before the call returns the hash.
                 started = Some(link_id);
                 // Compression on, as plain `send_resource` has it, so the wire is the same.
-                let (hash, outcome) = transport
+                let sent_resource = transport
                     .send_resource_with_outcome(&link_id, prepared.envelope.clone(), None, true)
-                    .await
-                    .map_err(|err| RequestError::Send(format!("propagation resource: {err}")))?;
+                    .await;
+                let (hash, outcome) = match sent_resource {
+                    Ok(sent_resource) => sent_resource,
+                    Err(err) => {
+                        // The transport concludes a resource whose send returned an error,
+                        // so only a call interrupted before returning leaves one behind.
+                        started = None;
+                        return Err(
+                            RequestError::Send(format!("propagation resource: {err}")).into()
+                        );
+                    }
+                };
                 sent = Some(hash);
                 let outcome = async {
                     let result = outcome.await;
@@ -594,7 +606,10 @@ async fn send_on_link(
                 Abandon::Cancel(link_id, hash) => {
                     abandon_transfer(transport, link_id, hash, destination).await;
                 }
-                Abandon::Reset => reset_after_abandon(transport, destination).await,
+                Abandon::Reset(link_id) => {
+                    reset_after_abandon(transport, link_id, destination, CancelResult::Unsettled)
+                        .await;
+                }
             }
             return Err(err);
         }
@@ -609,13 +624,13 @@ enum Abandon {
     Cancel(LinkId, Hash),
     /// The resource may be tracked on the link but its hash never came back, so there is
     /// nothing to name in a cancel.
-    Reset,
+    Reset(LinkId),
 }
 
-/// `started` is the link a resource send was begun on, `sent` its hash once the transport
-/// returned it, and `resolved` whether its outcome produced the verdict. An unresolved
-/// closed link can only be a close seen on that link, and the link's resource state goes
-/// with it.
+/// `started` is the link a resource send was begun on and not concluded by an error the
+/// send returned, `sent` its hash once the transport returned it, and `resolved` whether
+/// its outcome produced the verdict. An unresolved closed link can only be a close seen on
+/// that link, and the link's resource state goes with it.
 fn abandon_action(
     started: Option<LinkId>,
     sent: Option<Hash>,
@@ -630,7 +645,7 @@ fn abandon_action(
     }
     match sent {
         Some(hash) => Abandon::Cancel(link_id, hash),
-        None => Abandon::Reset,
+        None => Abandon::Reset(link_id),
     }
 }
 
@@ -646,37 +661,81 @@ fn still_active(status: LinkStatus) -> Result<(), RequestError> {
 
 /// Cancels a resource the post gave up on, so the node does not store a message the caller
 /// was told failed. When the cancel errs or outlasts `PROPAGATION_CANCEL_GRACE`, the
-/// out-link to `destination` is reset instead, so the next post opens a fresh link rather
-/// than reading this transfer's teardown as its own verdict. The reset itself is not
-/// bounded: it has to finish before the caller's posting slot is released.
+/// out-link to `destination` is reset instead if it is still `link_id`, so the next post
+/// opens a fresh link rather than reading this transfer's teardown as its own verdict. A
+/// cancel that finds no such link settles it: the link went, and its resource state with
+/// it. The reset itself is not bounded: it has to finish before the caller's posting slot
+/// is released.
 async fn abandon_transfer(
     transport: &Transport,
     link_id: LinkId,
     hash: Hash,
     destination: &AddressHash,
 ) {
-    let (outcome, settled) = match timeout(
+    let cancelled = timeout(
         PROPAGATION_CANCEL_GRACE,
         transport.cancel_resource(&link_id, hash),
     )
     .await
-    {
-        Ok(Ok(true)) => ("cancel sent".to_string(), true),
-        Ok(Ok(false)) => ("nothing left to cancel".to_string(), true),
-        Ok(Err(err)) => (format!("cancel failed: {err}"), false),
-        Err(_) => ("cancel timed out".to_string(), false),
-    };
+    .ok();
+    let (outcome, cancel) = cancel_outcome(cancelled);
     debug!(
         "Mesh propagation resource {} abandoned on link {}: {outcome}",
         short(&crate::mesh::hex_lower(hash.as_slice())),
         link_id.to_hex_string()
     );
-    if !settled {
-        reset_after_abandon(transport, destination).await;
+    reset_after_abandon(transport, link_id, destination, cancel).await;
+}
+
+/// How the cancel for an abandoned resource ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelResult {
+    /// The transport took the cancel, had nothing left to cancel, or no longer knew the
+    /// link.
+    Settled,
+    /// The cancel failed or outlasted its grace, or there was no hash to name in one.
+    Unsettled,
+}
+
+/// The log line and result for a cancel that answered with `cancelled`, or `None` when it
+/// outlasted `PROPAGATION_CANCEL_GRACE`. The transport answers `InvalidArgument` for a
+/// link it does not know.
+fn cancel_outcome(cancelled: Option<Result<bool, RnsError>>) -> (String, CancelResult) {
+    match cancelled {
+        Some(Ok(true)) => ("cancel sent".to_string(), CancelResult::Settled),
+        Some(Ok(false)) => ("nothing left to cancel".to_string(), CancelResult::Settled),
+        Some(Err(RnsError::InvalidArgument)) => {
+            ("link already gone".to_string(), CancelResult::Settled)
+        }
+        Some(Err(err)) => (format!("cancel failed: {err}"), CancelResult::Unsettled),
+        None => ("cancel timed out".to_string(), CancelResult::Unsettled),
     }
 }
 
-async fn reset_after_abandon(transport: &Transport, destination: &AddressHash) {
+/// Whether an abandoned resource's out-link is reset: only when its cancel did not settle
+/// and the `abandoned` link is still the one `registered` for the node. Any other link is
+/// one a later post may be using, and the abandoned link's teardown carries an id no watch
+/// on it reads.
+fn should_reset(registered: Option<LinkId>, abandoned: LinkId, cancel: CancelResult) -> bool {
+    cancel == CancelResult::Unsettled && registered == Some(abandoned)
+}
+
+async fn reset_after_abandon(
+    transport: &Transport,
+    abandoned: LinkId,
+    destination: &AddressHash,
+    cancel: CancelResult,
+) {
+    // The transport's only lookup by destination that opens nothing. A backchannel
+    // in-link it may return never has an out-link's id, and a closed out-link it skips
+    // is one no post reuses.
+    let registered = match transport.delivery_link(destination).await {
+        Some(link) => Some(*link.lock().await.id()),
+        None => None,
+    };
+    if !should_reset(registered, abandoned, cancel) {
+        return;
+    }
     transport.reset_out_link(destination).await;
     warn!(
         "Mesh propagation out-link to {} reset after an abandoned resource",
@@ -720,7 +779,8 @@ fn verdict_for_outcome(result: OutboundResult) -> Result<(), PropagationError> {
 /// Waits for a resource's outcome while reading `link_events`, so the receiver later handed
 /// to `watch_reject_window` has not fallen behind over a long transfer. On `link_id` a
 /// refusal sentinel rejects the message and a close is a closed link. Falling behind here
-/// loses nothing, since the outcome still carries the resource's verdict. The outcome is
+/// loses no transfer verdict, since the outcome still carries it; a sentinel skipped here
+/// only leaves the post to the outcome. The outcome is
 /// polled first so a close that follows the proof is left for the window to read as the
 /// node's rejection. Takes no transport so it can be driven from synthetic futures.
 async fn drain_during_transfer(
@@ -1979,6 +2039,18 @@ mod tests {
             );
         }
 
+        #[tokio::test]
+        async fn a_close_buffered_behind_the_proof_is_left_for_the_window() {
+            let mut watch = Watch::new();
+            watch.link(watch.link_id, LinkEvent::Closed);
+            let outcome = std::future::ready(OutboundResult::Complete);
+            assert_eq!(watch.transfer(outcome).await, Ok(()));
+            assert_eq!(
+                watch.run(FAR).await,
+                Err(PropagationError::ClosedAfterTransfer)
+            );
+        }
+
         #[test]
         fn a_resource_left_unresolved_is_cancelled_or_its_link_reset() {
             let link_id = AddressHash::new_from_rand(OsRng);
@@ -1991,7 +2063,6 @@ mod tests {
                 }),
                 PropagationError::RejectedByNode(RefusalCode::InvalidStamp),
                 PropagationError::Link(RequestError::Shutdown),
-                PropagationError::Link(RequestError::Send("propagation resource".to_string())),
             ];
             for err in &unresolved_exits {
                 assert_eq!(
@@ -2001,7 +2072,7 @@ mod tests {
                 );
                 assert_eq!(
                     abandon_action(Some(link_id), None, false, err),
-                    Abandon::Reset,
+                    Abandon::Reset(link_id),
                     "{err:?}"
                 );
                 assert_eq!(
@@ -2033,6 +2104,52 @@ mod tests {
                 ),
                 Abandon::Nothing
             );
+            // A resource send that returned an error has cleared its `started` marker.
+            assert_eq!(
+                abandon_action(
+                    None,
+                    None,
+                    false,
+                    &PropagationError::Link(RequestError::Send("propagation resource".to_string()))
+                ),
+                Abandon::Nothing
+            );
+        }
+
+        #[test]
+        fn only_a_cancel_that_did_not_land_is_unsettled() {
+            let settled = [
+                Some(Ok(true)),
+                Some(Ok(false)),
+                Some(Err(RnsError::InvalidArgument)),
+            ];
+            for cancelled in settled {
+                assert_eq!(cancel_outcome(cancelled).1, CancelResult::Settled);
+            }
+            for cancelled in [Some(Err(RnsError::ConnectionError)), None] {
+                assert_eq!(cancel_outcome(cancelled).1, CancelResult::Unsettled);
+            }
+        }
+
+        #[test]
+        fn only_the_abandoned_link_still_registered_is_reset() {
+            let abandoned = AddressHash::new_from_rand(OsRng);
+            let other = AddressHash::new_from_rand(OsRng);
+            assert!(should_reset(
+                Some(abandoned),
+                abandoned,
+                CancelResult::Unsettled
+            ));
+            for registered in [Some(other), None] {
+                assert!(!should_reset(
+                    registered,
+                    abandoned,
+                    CancelResult::Unsettled
+                ));
+            }
+            for registered in [Some(abandoned), Some(other), None] {
+                assert!(!should_reset(registered, abandoned, CancelResult::Settled));
+            }
         }
 
         #[test]
@@ -2651,10 +2768,12 @@ mod tests {
             post.stop().await;
         }
 
-        /// A cancel that cannot reach the transfer, here because no link has the id it
-        /// names, falls back to resetting the out-link to the node.
+        /// A failed cancel on a link the node is no longer reached by leaves the live
+        /// out-link alone, as does a reset for that link; a reset for the live link
+        /// closes it. A cancel that fails on the live link cannot be driven here, so the
+        /// reset is asked for directly.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn a_cancel_that_fails_resets_the_out_link() {
+        async fn an_abandon_resets_only_its_own_out_link() {
             let mut post = Post::start(1, DEFAULT_LIMIT_KB).await;
             post.propagate(&message(b"warm")).await.unwrap();
             assert!(matches!(
@@ -2683,6 +2802,29 @@ mod tests {
                 LinkId::new_from_rand(OsRng),
                 Hash::new_from_rand(OsRng),
                 &post.learned.destination.address_hash,
+            )
+            .await;
+            reset_after_abandon(
+                &post.client.transport,
+                LinkId::new_from_rand(OsRng),
+                &post.learned.destination.address_hash,
+                CancelResult::Unsettled,
+            )
+            .await;
+            assert!(
+                post.client
+                    .transport
+                    .find_out_link(&link_id)
+                    .await
+                    .is_some()
+            );
+            assert_eq!(link.lock().await.status(), LinkStatus::Active);
+
+            reset_after_abandon(
+                &post.client.transport,
+                link_id,
+                &post.learned.destination.address_hash,
+                CancelResult::Unsettled,
             )
             .await;
             assert!(
