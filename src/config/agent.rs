@@ -479,15 +479,9 @@ impl Agent {
         if app.function_calling_support
             && !matches!(agent_config.memory, Some(false))
             && !matches!(app.memory, Some(false))
+            && memory::memory_index_exists(env::current_dir().ok().as_deref())
         {
-            let memory_exists = paths::global_memory_index_file().exists()
-                || env::current_dir()
-                    .ok()
-                    .and_then(|cwd| memory::discover_workspace_memory(&cwd))
-                    .is_some();
-            if memory_exists {
-                functions.append_memory_functions();
-            }
+            functions.append_memory_functions();
         }
 
         if rag.is_some() && app.function_calling_support && graph_for_rag.is_none() {
