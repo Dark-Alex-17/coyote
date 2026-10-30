@@ -1020,6 +1020,7 @@ mod tests {
     use crate::config::{AppConfig, AppState, Role, WorkingMode};
     use crate::{testing, utils};
     use serial_test::serial;
+    use std::collections::BTreeMap;
     use std::env;
     use std::sync::Arc;
     use std::time::UNIX_EPOCH;
@@ -2193,22 +2194,37 @@ mod tests {
         let _guard = test_sink::install();
         let sink = crate::events::RecordingSink::install();
         for event in HookEvent::ALL {
-            let ctx = ctx_with_global_hooks(hooks_map(event.as_str(), &[("parity-probe", "true")]));
+            let mut ctx =
+                ctx_with_global_hooks(hooks_map(event.as_str(), &[("parity-probe", "true")]));
+            ctx.self_agent_id = Some("parity-child".to_string());
+            ctx.current_depth = 2;
             test_sink::drain();
             sink.drain();
 
             fire(
                 event,
                 &ctx,
-                &[("HOOK_EXTRA", "extra-value".to_string())],
+                &[("HOOK_EXTRA", "parity-probe-x7x".to_string())],
                 Some(format!("{{\"event\":\"{}\"}}", event.as_str())),
             );
 
-            let captures = test_sink::drain();
+            let captures: Vec<_> = test_sink::drain()
+                .into_iter()
+                .filter(|capture| capture.hook_name == "parity-probe")
+                .collect();
             assert_eq!(captures.len(), 1, "{event:?}: {captures:?}");
             let capture = &captures[0];
-            assert_eq!(capture.hook_name, "parity-probe", "{event:?}");
-            let published = sink.drain();
+            let published: Vec<_> = sink
+                .drain()
+                .into_iter()
+                .filter(|published| {
+                    matches!(
+                        published,
+                        Event::Hook { envs, .. }
+                            if envs.contains(&("HOOK_EXTRA".to_string(), "parity-probe-x7x".to_string()))
+                    )
+                })
+                .collect();
             assert_eq!(published.len(), 1, "{event:?}: {published:?}");
             let Event::Hook {
                 event: got,
@@ -2221,20 +2237,27 @@ mod tests {
             };
             assert_eq!(*got, event);
             assert_eq!(*payload, capture.payload, "{event:?}");
-            assert_eq!(*origin, Origin::detached(), "{event:?}");
-            let bus_keys: BTreeSet<String> = envs.iter().map(|(key, _)| key.clone()).collect();
             assert_eq!(
-                bus_keys.len(),
+                *origin,
+                Origin {
+                    agent_id: Some("parity-child".to_string()),
+                    depth: 2,
+                },
+                "{event:?}"
+            );
+            let bus_envs: BTreeMap<String, String> = envs.iter().cloned().collect();
+            assert_eq!(
+                bus_envs.len(),
                 envs.len(),
                 "{event:?}: duplicate key in {envs:?}"
             );
-            let hook_keys: BTreeSet<String> = capture
+            let hook_envs: BTreeMap<String, String> = capture
                 .envs
-                .keys()
-                .filter(|key| key.as_str() != "COYOTE_HOOK_NAME")
-                .cloned()
+                .iter()
+                .filter(|(key, _)| key.as_str() != "COYOTE_HOOK_NAME")
+                .map(|(key, value)| (key.clone(), value.clone()))
                 .collect();
-            assert_eq!(bus_keys, hook_keys, "{event:?}");
+            assert_eq!(bus_envs, hook_envs, "{event:?}");
         }
     }
 
@@ -2245,10 +2268,22 @@ mod tests {
         test_sink::drain();
         let sink = crate::events::RecordingSink::install();
         let ctx = ctx_with_global_hooks(IndexMap::new());
+        let probe = ("HOOK_EXTRA".to_string(), "no-hook-probe-k4v".to_string());
 
-        fire(HookEvent::TurnStarted, &ctx, &[], None);
+        fire(
+            HookEvent::TurnStarted,
+            &ctx,
+            &[("HOOK_EXTRA", "no-hook-probe-k4v".to_string())],
+            None,
+        );
 
-        let published = sink.drain();
+        let published: Vec<_> = sink
+            .drain()
+            .into_iter()
+            .filter(
+                |published| matches!(published, Event::Hook { envs, .. } if envs.contains(&probe)),
+            )
+            .collect();
         assert_eq!(published.len(), 1, "{published:?}");
         assert!(matches!(
             &published[0],
@@ -2258,7 +2293,12 @@ mod tests {
                 ..
             }
         ));
-        assert!(test_sink::drain().is_empty());
+        assert!(
+            test_sink::drain()
+                .iter()
+                .all(|capture| capture.envs.get("HOOK_EXTRA") != Some(&probe.1)),
+            "no shell hook is configured, so nothing may reach test_sink"
+        );
     }
 
     #[test]

@@ -174,7 +174,9 @@ mod recording {
     use std::sync::{Arc, Mutex};
 
     /// Records every event published on the global bus for the sink's
-    /// lifetime. The bus is process-global, so tests using it must serialize.
+    /// lifetime. The bus is process-global and its publishers are not
+    /// serialized, so tests must both serialize and filter the recorded
+    /// events on a fixture-unique value instead of asserting raw counts.
     pub(crate) struct RecordingSink {
         inner: Arc<Inner>,
         id: SubscriptionId,
@@ -297,8 +299,13 @@ mod tests {
             let sink = RecordingSink::install();
             assert_eq!(bus().sink_count(), 1);
             bus().publish(probe_event("recorded"));
-            assert_eq!(sink.drain(), vec![probe_event("recorded")]);
-            assert!(sink.drain().is_empty());
+            let recorded: Vec<Event> = sink
+                .drain()
+                .into_iter()
+                .filter(|event| *event == probe_event("recorded"))
+                .collect();
+            assert_eq!(recorded, vec![probe_event("recorded")]);
+            assert!(!sink.drain().contains(&probe_event("recorded")));
         }
         assert_eq!(bus().sink_count(), 0);
     }
