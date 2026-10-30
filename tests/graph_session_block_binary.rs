@@ -34,6 +34,10 @@ const COYOTE_BIN: &str = env!("CARGO_BIN_EXE_coyote");
 /// integration test cannot import from the binary crate.
 const TEST_WORKSPACE_MEMORY_ROOT_ENV: &str = "COYOTE_TEST_WORKSPACE_MEMORY_ROOT";
 
+/// The first line of every workspace index the memory probes plant; it
+/// rides under `<facts>` exactly when that workspace index does.
+const WORKSPACE_HEADER: &str = "# Workspace Memory Index";
+
 /// The `name:` the fixture graph declares; the run-time logger keys its
 /// `[graph:<name>]` prefix on `graph.name`, not on the agent directory.
 const GRAPH_NAME: &str = "echo-graph";
@@ -3135,7 +3139,6 @@ fn the_test_memory_root_env_name_matches_the_source_const() {
 fn usage_probe_the_shipped_binary_walks_up_from_its_cwd_for_workspace_memory_and_ignores_the_test_root_pin()
  {
     const GLOBAL_LINE: &str = "- global fact from the fixture";
-    const WORKSPACE_HEADER: &str = "# Workspace Memory Index";
     const WORKSPACE_LINE: &str = "- workspace fact planted by the probe";
     let dir = fresh_config_dir("workspace-memory");
     let _guard = TempDirGuard(dir.clone());
@@ -3254,7 +3257,7 @@ fn usage_probe_the_shipped_binary_does_not_load_workspace_memory_from_a_pinned_r
     fs::create_dir_all(&index_dir).unwrap();
     fs::write(
         index_dir.join("MEMORY.md"),
-        format!("# Workspace Memory Index\n{WORKSPACE_LINE}\n"),
+        format!("{WORKSPACE_HEADER}\n{WORKSPACE_LINE}\n"),
     )
     .unwrap();
     let cwd = dir.join("plain");
@@ -3282,7 +3285,7 @@ fn usage_probe_the_shipped_binary_does_not_load_workspace_memory_from_a_pinned_r
         "the pinned root's index leaked into a real run:\n{stdout}"
     );
     assert!(
-        !stdout.contains("# Workspace Memory Index"),
+        !stdout.contains(WORKSPACE_HEADER),
         "no workspace index header without one above the cwd:\n{stdout}"
     );
 }
