@@ -117,6 +117,19 @@ fn battery(program: &Path, scratch: &TempDirGuard) -> Command {
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .env_remove("GRAPH_STATE")
         .env_remove("GRAPH_STATE_FILE");
+    scrub_agent_vars(&mut cmd);
+    cmd
+}
+
+/// Drops every inherited `LLM_AGENT_VAR_*` variable from `cmd`, so a test run
+/// started inside an agent session does not hand that session's variables to
+/// the batteries, the gates or the binary.
+fn scrub_agent_vars(cmd: &mut Command) -> &mut Command {
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("LLM_AGENT_VAR_") {
+            cmd.env_remove(key);
+        }
+    }
     cmd
 }
 
@@ -535,6 +548,7 @@ fn runs_root_under(
         .env_remove("COYOTE_CACHE_DIR")
         .env_remove("XDG_CACHE_HOME")
         .env_remove("LOCALAPPDATA");
+    scrub_agent_vars(&mut cmd);
     for (key, value) in vars {
         cmd.env(key, value);
     }
@@ -621,6 +635,32 @@ fn runs_root_follows_the_cache_dir_precedence_from_a_fresh_process() {
             .join("runs"),
         "platform tier"
     );
+    assert_no_bytecode_under_candidate();
+}
+
+/// An empty `ARCHITECT_RUNS_ROOT` is no override: a consumer who clears it
+/// with `ARCHITECT_RUNS_ROOT=` gets the `COYOTE_CACHE_DIR` tier, not a run
+/// root at the current directory.
+#[test]
+fn empty_runs_root_override_falls_back_to_the_cache_dir_tier() {
+    let Some(python) = python3() else { return };
+    let scratch = scratch_dir("emptyoverride");
+    let cache = scratch.0.join("cache");
+    let (root, run) = runs_root_under(
+        &python,
+        &scratch,
+        &[
+            ("ARCHITECT_RUNS_ROOT", Path::new("")),
+            ("COYOTE_CACHE_DIR", cache.as_path()),
+        ],
+    );
+    let expected = cache.join(CANDIDATE).join("runs");
+    assert_eq!(
+        PathBuf::from(&root),
+        expected,
+        "an empty override falls back to the cache dir tier"
+    );
+    assert_eq!(PathBuf::from(&run), expected.join("r1"));
     assert_no_bytecode_under_candidate();
 }
 
@@ -988,6 +1028,7 @@ fn dry_run_until_ask_user_with_prompt(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    scrub_agent_vars(&mut cmd);
     for (key, value) in extra_env {
         cmd.env(key, value);
     }
@@ -1102,7 +1143,6 @@ fn single_run_under(root: &Path, label: &str) -> PathBuf {
 #[test]
 fn dry_run_by_name_walks_to_ask_user_and_pins_the_run_dir() {
     if python3().is_none() {
-        eprintln!("skipping: python3 not available");
         return;
     }
     let scratch = scratch_dir("dryrun");
@@ -1165,7 +1205,6 @@ fn dry_run_by_name_walks_to_ask_user_and_pins_the_run_dir() {
 #[test]
 fn dry_run_by_name_from_an_empty_config_dir_installs_the_candidate_and_walks_to_ask_user() {
     if python3().is_none() {
-        eprintln!("skipping: python3 not available");
         return;
     }
     let scratch = scratch_dir("coldstart");
@@ -1224,7 +1263,6 @@ fn dry_run_by_name_from_an_empty_config_dir_installs_the_candidate_and_walks_to_
 #[test]
 fn dry_run_with_only_xdg_cache_home_puts_the_run_under_the_engines_cache_dir() {
     if python3().is_none() {
-        eprintln!("skipping: python3 not available");
         return;
     }
     let scratch = scratch_dir("xdgtier");
@@ -1253,6 +1291,7 @@ fn dry_run_with_only_xdg_cache_home_puts_the_run_under_the_engines_cache_dir() {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    scrub_agent_vars(&mut cmd);
     let lines = run_until_ask_user(cmd, "xdg tier");
     let mut cursor = 0;
     for needle in EXPECTED_WALK {
@@ -1292,7 +1331,6 @@ fn dry_run_with_only_xdg_cache_home_puts_the_run_under_the_engines_cache_dir() {
 #[test]
 fn dry_run_with_the_run_id_in_the_prompt_re_enters_the_run_instead_of_starting_another() {
     if python3().is_none() {
-        eprintln!("skipping: python3 not available");
         return;
     }
     let scratch = scratch_dir("reenter");
@@ -1353,7 +1391,6 @@ fn dry_run_with_the_run_id_in_the_prompt_re_enters_the_run_instead_of_starting_a
 #[test]
 fn dry_run_with_an_unknown_run_id_in_the_prompt_starts_a_fresh_run() {
     if python3().is_none() {
-        eprintln!("skipping: python3 not available");
         return;
     }
     let scratch = scratch_dir("unknownid");
@@ -1440,7 +1477,6 @@ fn dry_run_with_an_unknown_run_id_in_the_prompt_starts_a_fresh_run() {
 #[test]
 fn dry_run_without_a_readable_design_doc_parks_on_need_design_doc_before_orienting() {
     if python3().is_none() {
-        eprintln!("skipping: python3 not available");
         return;
     }
     for (label, prompt) in [
@@ -1777,10 +1813,10 @@ fn readme_build_lock_row_names_shipped_nodes_agents_and_pins() {
     let doc: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
     let nodes = &doc["nodes"];
     let readme = readme();
-    assert!(
-        readme.contains("| `build_lock` variable |"),
-        "the README lost its build_lock row"
-    );
+    let row = readme
+        .lines()
+        .find(|l| l.starts_with("| `build_lock` variable |"))
+        .expect("the README lost its build_lock row");
     for (node, agent) in [
         ("delegate", "sisyphus"),
         ("wave_delegate", "sisyphus"),
@@ -1789,7 +1825,7 @@ fn readme_build_lock_row_names_shipped_nodes_agents_and_pins() {
         ("run_adversary", "adversary"),
     ] {
         assert!(
-            readme.contains(&format!("`{node}`")) && readme.contains(&format!("`{agent}`")),
+            row.contains(&format!("`{node}`")) && row.contains(&format!("`{agent}`")),
             "the README build_lock row no longer names {node} running {agent}"
         );
         assert_eq!(
@@ -1833,8 +1869,8 @@ fn readme_build_lock_row_names_shipped_nodes_agents_and_pins() {
         ("config/request_context.rs", "fn new_for_child"),
     ] {
         assert!(
-            readme.contains(needle.trim_start_matches("fn ")),
-            "the README no longer cites {needle} from `{file}`"
+            row.contains(needle.trim_start_matches("fn ")),
+            "the README build_lock row no longer cites {needle} from `{file}`"
         );
         let source = fs::read_to_string(src.join(file)).unwrap();
         assert!(

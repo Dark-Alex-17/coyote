@@ -110,7 +110,8 @@ The wrapper's live test groups:
   check still fails the run), session check, poison (the batteries never consult the user
   config dir), and the mode-matrix fail-loud test (`mode_matrix.py` exits before the walk
   when `.shared/utils.sh` is missing or a stub);
-- run dir: run-dir precedence from a fresh process;
+- run dir: run-dir precedence from a fresh process, and an empty `ARCHITECT_RUNS_ROOT`
+  falling back to the cache-dir tier;
 - graph and gates: `build_lock` position, the variable mirror (the candidate's variables
   match the prose `architect/config.yaml` name for name and default for default, without
   `yq`), the description pin (`description_names_no_file_outside_the_repo`), toolchain
