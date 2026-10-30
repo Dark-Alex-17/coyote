@@ -1175,7 +1175,11 @@ def _parse_gauntlet(text):
     start = next((i + 1 for i in range(start, len(header_lines)) if selection.fullmatch(header_lines[i])), start)
     section, start = _gauntlet_section(header_lines, start, "Blockers")
     blockers = [l[2:].strip() for l in section or [] if l.startswith(("- ", "* "))]
-    blockers += [l.rstrip() for l in header_lines if l.startswith("debris: Implementation debris")]
+    # The gauntlet writes debris hits only as items of its Blockers section,
+    # so an unbulleted debris line counts only inside that section; the same
+    # line anywhere else in the header, such as in the lane reasons, is not
+    # a blocker.
+    blockers += [l.rstrip() for l in section or [] if l.startswith("debris: Implementation debris")]
     section, _ = _gauntlet_section(header_lines, start, "Human attention required")
     attention = "\n".join(section or []).strip()
     return verdict, incomplete, lanes, details, blockers, attention
