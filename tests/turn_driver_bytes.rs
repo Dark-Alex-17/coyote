@@ -464,3 +464,171 @@ fn failing_tool_warns_on_stderr_and_the_turn_still_completes() {
         capture.stdout
     );
 }
+
+/// Without `COYOTE_SHOW_TOOL_CALLS` and with stdout detached from a tty the
+/// `Call <tool> <args>` narration stays off, while the root-depth tool's own
+/// stdout still echoes on fd 1 and the turn completes.
+#[cfg(unix)]
+#[test]
+fn tool_narration_stays_hidden_without_show_tool_calls() {
+    let dir = fresh_config_dir("tool_quiet");
+    let _guard = TempDirGuard(dir.clone());
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "fixture_echo".to_string(),
+            arguments: r#"{"text":"quiet"}"#.to_string(),
+        },
+        Reply::Text("fixture done quietly".to_string()),
+    ]);
+    write_tool_fixture(&dir, &fake);
+
+    let output = run_coyote(&dir, &["--macro", "tool"], &[]);
+    let capture = finish("tool_quiet", &output);
+
+    assert_eq!(
+        fake.served(),
+        2,
+        "tool_quiet: the tool result went back to the model:\n{}",
+        capture.stdout
+    );
+    assert!(
+        capture.stdout.contains("fixture stdout: quiet"),
+        "tool_quiet: the root-depth tool's stdout echoed on fd 1:\n{}",
+        capture.stdout
+    );
+    assert!(
+        !capture.stdout.contains("Call fixture_echo")
+            && !capture.stderr.contains("Call fixture_echo"),
+        "tool_quiet: narration leaked without COYOTE_SHOW_TOOL_CALLS:\nstdout:\n{}\nstderr:\n{}",
+        capture.stdout,
+        capture.stderr
+    );
+    assert!(
+        capture.stdout.contains("fixture done quietly"),
+        "tool_quiet: the follow-up answer was printed:\n{}",
+        capture.stdout
+    );
+}
+
+/// Lays out a dry-run config dir plus a `probe` agent whose instructions
+/// come from an `_instructions` tool; `script_body` is the body of that
+/// function in the agent's `tools.sh`.
+#[cfg(unix)]
+fn write_dynamic_agent_fixture(dir: &Path, script_body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    write_dry_run_fixture(dir, "stream: false\n");
+    let agent_dir = dir.join("agents").join("probe");
+    fs::create_dir_all(&agent_dir).unwrap();
+    fs::write(
+        agent_dir.join("config.yaml"),
+        "name: probe\n\
+         description: an agent with dynamic instructions\n\
+         version: 0.1.0\n\
+         dynamic_instructions: true\n\
+         instructions: |\n\
+         \x20 static fallback that must be replaced\n",
+    )
+    .unwrap();
+    let tools = agent_dir.join("tools.sh");
+    fs::write(
+        &tools,
+        format!(
+            "#!/usr/bin/env bash\n\
+             set -e\n\
+             \n\
+             # @env LLM_OUTPUT=/dev/stdout\n\
+             # @describe Probe agent tools for the harness.\n\
+             \n\
+             # @cmd Build the agent's instructions.\n\
+             _instructions() {{\n{script_body}\n}}\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&tools, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// An `_instructions` tool that exits non-zero fails the run instead of
+/// becoming the agent's prompt, and because that tool runs under the
+/// silent sink its own stdout/stderr never reach the terminal.
+#[cfg(unix)]
+#[test]
+fn failing_instructions_tool_fails_the_run_silently() {
+    let dir = fresh_config_dir("instr_fail");
+    let _guard = TempDirGuard(dir.clone());
+    write_dynamic_agent_fixture(
+        &dir,
+        "  echo \"instr stdout: boom\"\n  echo \"instr stderr: boom\" >&2\n  exit 3",
+    );
+
+    let output = run_coyote(&dir, &["--agent", "probe", "hello"], &[]);
+    let stdout = normalise(&output.stdout);
+    let stderr = normalise(&output.stderr);
+    let text = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    assert!(
+        !output.status.success(),
+        "instr_fail: a failed _instructions tool must fail the run, got {:?}\n{text}",
+        output.status
+    );
+    assert!(
+        stderr.contains("'_instructions' function failed"),
+        "instr_fail: the failure names the _instructions function:\n{text}"
+    );
+    assert!(
+        stderr.contains("exited with code 3"),
+        "instr_fail: the failure carries the tool's exit code:\n{text}"
+    );
+    assert!(
+        !stdout.contains("instr stdout: boom"),
+        "instr_fail: the silent sink swallowed the tool's stdout:\n{text}"
+    );
+    assert!(
+        stderr.contains("stderr:\ninstr stderr: boom"),
+        "instr_fail: the failure carries the tool's stderr:\n{text}"
+    );
+    assert_eq!(
+        stderr.matches("instr stderr: boom").count(),
+        1,
+        "instr_fail: the tool's stderr was not echoed live, only reported:\n{text}"
+    );
+    assert!(
+        !stdout.contains("static fallback"),
+        "instr_fail: the static instructions were not used after the bail:\n{text}"
+    );
+}
+
+/// A healthy `_instructions` tool runs under the silent sink: its answer
+/// becomes the agent's prompt, nothing it prints reaches fd 1 or fd 2, and
+/// the turn completes.
+#[cfg(unix)]
+#[test]
+fn instructions_tool_output_is_swallowed_by_the_silent_sink() {
+    let dir = fresh_config_dir("instr_ok");
+    let _guard = TempDirGuard(dir.clone());
+    write_dynamic_agent_fixture(
+        &dir,
+        "  echo \"instr stdout: chatter\"\n  echo \"instr stderr: chatter\" >&2\n  echo \"dynamic probe instructions\" >> \"$LLM_OUTPUT\"",
+    );
+
+    let output = run_coyote(&dir, &["--agent", "probe", "hello"], &[]);
+    let capture = finish("instr_ok", &output);
+    let text = format!("stdout:\n{}\nstderr:\n{}", capture.stdout, capture.stderr);
+
+    assert!(
+        !capture.stdout.contains("instr stdout: chatter"),
+        "instr_ok: the silent sink swallowed the tool's stdout:\n{text}"
+    );
+    assert!(
+        !capture.stderr.contains("instr stderr: chatter"),
+        "instr_ok: the silent sink swallowed the tool's stderr:\n{text}"
+    );
+    assert!(
+        !text.contains("'_instructions' function failed"),
+        "instr_ok: a clean _instructions run did not bail:\n{text}"
+    );
+    assert!(
+        capture.stdout.contains("hello"),
+        "instr_ok: the dry-run turn still answered:\n{text}"
+    );
+}

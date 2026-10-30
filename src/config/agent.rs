@@ -1553,21 +1553,31 @@ pub fn complete_agent_variables(agent_name: &str) -> Vec<(String, Option<String>
 
 /// Turns the `_instructions` function's output into the agent's instructions.
 /// A tool failure comes back as a `{"tool_call_error": ..}` payload rather
-/// than an error, and must not become the prompt the agent runs on.
+/// than an error, and must not become the prompt the agent runs on; the
+/// tool's stderr and partial output ride along so the failure can be read.
 fn instructions_from_tool_output(value: Option<String>) -> Result<String> {
     let Some(value) = value else {
         bail!("No return value from '_instructions' function");
     };
-    if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&value)
-        && let Some(error) = payload.get("tool_call_error")
-    {
-        let error = error
-            .as_str()
-            .map(str::to_string)
-            .unwrap_or_else(|| error.to_string());
-        bail!("'_instructions' function failed: {error}");
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(&value) else {
+        return Ok(value);
+    };
+    let Some(error) = payload.get("tool_call_error") else {
+        return Ok(value);
+    };
+    let error = error
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| error.to_string());
+    let mut message = format!("'_instructions' function failed: {error}");
+    for key in ["stderr", "output"] {
+        if let Some(detail) = payload.get(key).and_then(serde_json::Value::as_str)
+            && !detail.trim().is_empty()
+        {
+            message.push_str(&format!("\n{key}:\n{}", detail.trim_end()));
+        }
     }
-    Ok(value)
+    bail!("{message}")
 }
 
 #[cfg(test)]
@@ -1590,12 +1600,25 @@ mod tests {
         let failure = serde_json::json!({
             "tool_call_error": "Tool call 'probe' exited with code 3",
             "stderr": "boom",
+            "output": "partial\n",
         })
         .to_string();
         let err = instructions_from_tool_output(Some(failure)).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "'_instructions' function failed: Tool call 'probe' exited with code 3"
+            "'_instructions' function failed: Tool call 'probe' exited with code 3\n\
+             stderr:\n\
+             boom\n\
+             output:\n\
+             partial"
+        );
+
+        let bare = serde_json::json!({"tool_call_error": "Tool call 'probe' aborted"}).to_string();
+        assert_eq!(
+            instructions_from_tool_output(Some(bare))
+                .unwrap_err()
+                .to_string(),
+            "'_instructions' function failed: Tool call 'probe' aborted"
         );
 
         let err = instructions_from_tool_output(None).unwrap_err();
