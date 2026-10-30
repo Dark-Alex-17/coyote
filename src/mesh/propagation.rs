@@ -23,7 +23,7 @@ use lxmf_core::stamp::{
 use rns_transport::PacketContext;
 use rns_transport::destination::link::{Link, LinkEvent, LinkEventData, LinkId};
 use rns_transport::destination::{DestinationDesc, DestinationName, SingleOutputDestination};
-use rns_transport::hash::AddressHash;
+use rns_transport::hash::{AddressHash, Hash};
 use rns_transport::identity::Identity;
 use rns_transport::identity_bridge::{to_core_identity, to_transport_identity};
 use rns_transport::rand_core::OsRng;
@@ -64,6 +64,10 @@ pub(crate) const PROPAGATION_TRANSFER_TIMEOUT: Duration = Duration::from_secs(60
 /// (`link_sections/new.rs:323-324`), so only a rejection or the window passing decides.
 /// Fixed rather than RTT-scaled for the same reason as `PROPAGATION_TRANSFER_TIMEOUT`.
 pub(crate) const PROPAGATION_REJECT_WINDOW: Duration = Duration::from_secs(2);
+
+/// Bounds the cancel sent for a resource a post gave up on before its outcome resolved;
+/// the transport is asked once and, past this, the out-link is reset instead.
+const PROPAGATION_CANCEL_GRACE: Duration = Duration::from_secs(2);
 
 /// Aspect of the destination a propagation node serves clients on (`LXMRouter.py:173`) and
 /// a client posts to (`LXMRouter.py:2722`).
@@ -183,7 +187,8 @@ impl PropagationNode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PropagationError {
     /// The cancellation token fired while the stamp was being mined or the node awaited. A
-    /// resource still in flight at that point runs on in the transport.
+    /// resource still in flight at that point is cancelled on a best-effort basis, and the
+    /// out-link reset when the cancel cannot complete.
     Cancelled,
     /// The stamp search ran out of nonces, which no attainable cost does.
     StampExhausted,
@@ -198,7 +203,9 @@ pub(crate) enum PropagationError {
     /// The message could not be signed, encrypted or packed.
     Encode(String),
     /// The link machinery failed: establishment, a send the transport refused, a bounded
-    /// wait that expired, or a link that closed under the transfer.
+    /// wait that expired (a resource still in flight is then cancelled on a best-effort
+    /// basis, and the out-link reset when the cancel cannot complete), or a link that
+    /// closed under the transfer.
     Link(RequestError),
     /// The transport reported the resource failed, rejected or cancelled.
     TransferFailed,
@@ -472,8 +479,10 @@ pub(crate) async fn prepare_envelope(
 /// Calls for the same node must be serialised by the caller: the refusal sentinel and the
 /// teardown carry no message id and the out-link is shared, so two concurrent posts could
 /// not tell whose verdict arrived (the reference holds one `for_lxmessage` per link,
-/// `LXMRouter.py:2725`). `propagation_enabled` is deliberately not checked here; the node
-/// picker owns that decision.
+/// `LXMRouter.py:2725`). That serialisation is enough because a resource abandoned on a
+/// cancel or timeout is cancelled, or its out-link reset, before this returns, so no
+/// later post can read its teardown. `propagation_enabled` is deliberately not checked
+/// here; the node picker owns that decision.
 pub(crate) async fn propagate(
     transport: &Transport,
     sender: &PrivateIdentity,
@@ -505,6 +514,7 @@ pub(crate) async fn send_envelope(
         Deadline::after(options.link_timeout),
     )
     .await?;
+    let mut in_flight = None;
     let transfer = async {
         let (link_id, mdu) = {
             let link = link.lock().await;
@@ -527,6 +537,7 @@ pub(crate) async fn send_envelope(
                     .send_resource_with_outcome(&link_id, prepared.envelope.clone(), None, true)
                     .await
                     .map_err(|err| RequestError::Send(format!("propagation resource: {err}")))?;
+                in_flight = Some((link_id, hash));
                 drain_during_transfer(outcome, &mut link_events, link_id).await?;
                 debug!(
                     "Mesh propagation resource {} was received on link {}",
@@ -537,18 +548,68 @@ pub(crate) async fn send_envelope(
         }
         Ok::<_, PropagationError>((link_events, link_id))
     };
-    // Dropping an unfinished transfer cancels nothing: a resource runs on in the transport.
-    let (link_events, link_id) = tokio::select! {
+    let transferred = tokio::select! {
         biased;
-        () = cancel.cancelled() => return Err(PropagationError::Cancelled),
-        transfer = timeout(options.transfer_timeout, transfer) => transfer.map_err(|_| {
-            RequestError::Timeout {
+        () = cancel.cancelled() => Err(PropagationError::Cancelled),
+        transfer = timeout(options.transfer_timeout, transfer) => transfer.unwrap_or_else(|_| {
+            Err(RequestError::Timeout {
                 path: PROPAGATION_PATH_LABEL.to_string(),
                 after: options.transfer_timeout,
             }
-        })??,
+            .into())
+        }),
+    };
+    let (link_events, link_id) = match transferred {
+        Ok(sent) => sent,
+        Err(err) => {
+            // Only the cancel and the timeout drop the transfer before its outcome resolves;
+            // a resource left running there would hand its teardown to the next post.
+            if let (
+                PropagationError::Cancelled | PropagationError::Link(RequestError::Timeout { .. }),
+                Some((link_id, hash)),
+            ) = (&err, in_flight)
+            {
+                abandon_transfer(transport, link_id, hash, &node.destination.address_hash).await;
+            }
+            return Err(err);
+        }
     };
     watch_reject_window(link_events, link_id, options.reject_window, &cancel).await
+}
+
+/// Cancels a resource the post gave up on, so the node does not store a message the caller
+/// was told failed. When the cancel errs or outlasts `PROPAGATION_CANCEL_GRACE`, the
+/// out-link to `destination` is reset instead, so the next post opens a fresh link rather
+/// than reading this transfer's teardown as its own verdict.
+async fn abandon_transfer(
+    transport: &Transport,
+    link_id: LinkId,
+    hash: Hash,
+    destination: &AddressHash,
+) {
+    let (outcome, settled) = match timeout(
+        PROPAGATION_CANCEL_GRACE,
+        transport.cancel_resource(&link_id, hash),
+    )
+    .await
+    {
+        Ok(Ok(true)) => ("cancel sent".to_string(), true),
+        Ok(Ok(false)) => ("nothing left to cancel".to_string(), true),
+        Ok(Err(err)) => (format!("cancel failed: {err}"), false),
+        Err(_) => ("cancel timed out".to_string(), false),
+    };
+    debug!(
+        "Mesh propagation resource {} abandoned on link {}: {outcome}",
+        short(&crate::mesh::hex_lower(hash.as_slice())),
+        link_id.to_hex_string()
+    );
+    if !settled {
+        transport.reset_out_link(destination).await;
+        debug!(
+            "Mesh propagation out-link to {} reset after an abandoned resource",
+            short(&destination.to_hex_string())
+        );
+    }
 }
 
 async fn send_packet(
@@ -1912,8 +1973,9 @@ mod tests {
         use crate::mesh::node::SHUTDOWN_GRACE;
         use crate::mesh::propagation::test_support::{FakeNode, Received};
 
+        use rns_transport::destination::link::LinkStatus;
         use rns_transport::iface::tcp_client::TcpClient;
-        use rns_transport::resource::{LINK_PACKET_MDU, ResourceEventKind};
+        use rns_transport::resource::{LINK_PACKET_MDU, ResourceEvent, ResourceEventKind};
         use rns_transport::transport::{AnnounceEvent, TransportConfig};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::{TcpListener, TcpStream};
@@ -2348,12 +2410,20 @@ mod tests {
         /// node-bound byte, so the advertisement never reaches the node and the transfer
         /// cannot progress however fast the runner is; racing a short deadline against a
         /// large delivery instead loses on a fast runner, where the node completes before
-        /// the deadline. The only work still under the deadline is the transport
+        /// the cancel lands. The only work still under the deadline is the transport
         /// accepting the envelope, about 0.1 s for 100 KB on a slow debug build against a
         /// 1 s deadline; the deadline stays under the transport's 2 s advertisement retry
         /// so no retry can fail the transfer first.
+        ///
+        /// The cancel is the poster's own `cancel_resource`, which the transport reports
+        /// as `OutboundCancelled` (`ResourceManager::cancel_outgoing`); `OutboundRejected`
+        /// is the far end's RCL and cannot occur here, since the node has seen nothing.
+        /// Once the hold lifts the node reads the advertisement and, right behind it on
+        /// the same stream, the initiator's cancel, so it reports the transfer as
+        /// `remote_cancelled` rather than completing it: not one part was sent before the
+        /// poster dropped the resource.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn a_transfer_the_deadline_overtakes_is_a_timeout() {
+        async fn a_transfer_the_deadline_overtakes_is_cancelled_at_the_transport() {
             const TRANSFER_TIMEOUT: Duration = Duration::from_secs(1);
             let mut post = Post::start_relayed(1, 2000).await;
 
@@ -2366,7 +2436,8 @@ mod tests {
             ));
 
             post.options.transfer_timeout = TRANSFER_TIMEOUT;
-            let mut resources = post.client.transport.resource_events();
+            let mut client_events = post.client.transport.resource_events();
+            let mut node_events = post.node.transport.resource_events();
             let held = post.relay.as_ref().unwrap().hold().await;
 
             let outcome = post.propagate(&message(&[b'z'; 100_000])).await.err();
@@ -2377,21 +2448,99 @@ mod tests {
                     after: TRANSFER_TIMEOUT,
                 }))
             );
-            // The timeout leaves the resource to the transport; nothing cancels it.
-            let quiet_until = Instant::now() + Duration::from_secs(2);
-            loop {
-                match tokio::time::timeout_at(quiet_until, resources.recv()).await {
-                    Err(_) => break,
-                    Ok(Ok(event)) => assert!(
-                        !matches!(event.kind, ResourceEventKind::OutboundCancelled),
-                        "the timed-out resource {:?} was cancelled",
-                        event.hash
-                    ),
-                    Ok(Err(err)) => panic!("the resource events were not readable: {err}"),
-                }
-            }
+            let cancelled = cancelled_at_the_client(&mut client_events).await;
             post.node.nothing_else_received();
+
             drop(held);
+            assert_eq!(cancelled_at_the_node(&mut node_events).await, cancelled);
+            post.node.nothing_else_received();
+            post.stop().await;
+        }
+
+        /// The node would tear the link down over the first resource if it ever completed
+        /// it, so the second post sees `ClosedAfterTransfer` or a closed link unless the
+        /// abandoned resource was cancelled before the first post returned.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_abandoned_resource_cannot_hand_its_teardown_to_the_next_post() {
+            const TRANSFER_TIMEOUT: Duration = Duration::from_secs(1);
+            let mut post = Post::start_relayed(1, 2000).await;
+
+            post.propagate(&message(b"warm")).await.unwrap();
+            assert!(matches!(
+                post.node.next_received().await,
+                Received::Packet { .. }
+            ));
+
+            post.options.transfer_timeout = TRANSFER_TIMEOUT;
+            let mut node_events = post.node.transport.resource_events();
+            post.node.teardown.store(true, Ordering::SeqCst);
+            let held = post.relay.as_ref().unwrap().hold().await;
+            let outcome = post.propagate(&message(&[b'z'; 100_000])).await.err();
+            assert_eq!(
+                outcome,
+                Some(PropagationError::Link(RequestError::Timeout {
+                    path: PROPAGATION_PATH_LABEL.to_string(),
+                    after: TRANSFER_TIMEOUT,
+                }))
+            );
+
+            drop(held);
+            cancelled_at_the_node(&mut node_events).await;
+            post.node.teardown.store(false, Ordering::SeqCst);
+            let second = timeout(INTEROP_TIMEOUT, post.propagate(&message(b"second")))
+                .await
+                .expect("the second post must end inside the interop bound");
+            assert!(second.is_ok(), "{:?}", second.err());
+            assert!(matches!(
+                post.node.next_received().await,
+                Received::Packet { .. }
+            ));
+            post.node.nothing_else_received();
+            post.stop().await;
+        }
+
+        /// A cancel that cannot reach the transfer, here because no link has the id it
+        /// names, falls back to resetting the out-link to the node.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_cancel_that_fails_resets_the_out_link() {
+            let mut post = Post::start(1, DEFAULT_LIMIT_KB).await;
+            post.propagate(&message(b"warm")).await.unwrap();
+            assert!(matches!(
+                post.node.next_received().await,
+                Received::Packet { .. }
+            ));
+            let link = open_link(
+                &post.client.transport,
+                &post.learned.destination,
+                PROPAGATION_PATH_LABEL,
+                Deadline::after(post.options.link_timeout),
+            )
+            .await
+            .unwrap();
+            let link_id = *link.lock().await.id();
+            assert!(
+                post.client
+                    .transport
+                    .find_out_link(&link_id)
+                    .await
+                    .is_some()
+            );
+
+            abandon_transfer(
+                &post.client.transport,
+                LinkId::new_from_rand(OsRng),
+                Hash::new_from_rand(OsRng),
+                &post.learned.destination.address_hash,
+            )
+            .await;
+            assert!(
+                post.client
+                    .transport
+                    .find_out_link(&link_id)
+                    .await
+                    .is_none()
+            );
+            assert_eq!(link.lock().await.status(), LinkStatus::Closed);
             post.stop().await;
         }
 
@@ -2409,6 +2558,7 @@ mod tests {
                 Received::Packet { .. }
             ));
 
+            let mut client_events = post.client.transport.resource_events();
             let held = post.relay.as_ref().unwrap().hold().await;
             let cancel = post.cancel.clone();
             tokio::spawn(async move {
@@ -2423,9 +2573,68 @@ mod tests {
                 elapsed < PROMPT && PROMPT < post.options.transfer_timeout,
                 "{elapsed:?}"
             );
+            cancelled_at_the_client(&mut client_events).await;
             post.node.nothing_else_received();
             drop(held);
             post.stop().await;
+        }
+
+        /// Waits for the client transport to report a resource cancelled and returns its
+        /// hash; any other end to the transfer fails the test.
+        async fn cancelled_at_the_client(events: &mut broadcast::Receiver<ResourceEvent>) -> Hash {
+            timeout(Duration::from_secs(2), async {
+                loop {
+                    match events.recv().await {
+                        Ok(ResourceEvent {
+                            hash,
+                            kind: ResourceEventKind::OutboundCancelled,
+                            ..
+                        }) => break hash,
+                        Ok(ResourceEvent {
+                            kind:
+                                kind @ (ResourceEventKind::OutboundComplete
+                                | ResourceEventKind::OutboundFailed
+                                | ResourceEventKind::OutboundRejected { .. }),
+                            ..
+                        }) => panic!("the client transport ended the transfer with {kind:?}"),
+                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(broadcast::error::RecvError::Closed) => {
+                            panic!("the client transport went away")
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("the client transport must report the cancelled resource")
+        }
+
+        /// Waits for the node to report a transfer `remote_cancelled` and returns its hash;
+        /// a completed transfer fails the test.
+        async fn cancelled_at_the_node(events: &mut broadcast::Receiver<ResourceEvent>) -> Hash {
+            timeout(INTEROP_TIMEOUT, async {
+                loop {
+                    match events.recv().await {
+                        Ok(ResourceEvent {
+                            hash,
+                            kind: ResourceEventKind::InboundFailed(failure),
+                            ..
+                        }) => {
+                            assert_eq!(failure.reason, "remote_cancelled");
+                            break hash;
+                        }
+                        Ok(ResourceEvent {
+                            kind: ResourceEventKind::Complete(_),
+                            ..
+                        }) => panic!("the node completed a transfer the client had cancelled"),
+                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(broadcast::error::RecvError::Closed) => {
+                            panic!("the node transport went away")
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("the node must see the initiator's cancel")
         }
     }
 }
