@@ -37,6 +37,9 @@ for _k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
     # a caller's repository variables (a git hook exports them) would point
     # every scratch-repo git call at the caller's own repository
     os.environ.pop(_k, None)
+for _k in [k for k in os.environ if k == "ARCHITECT_CORE_TOOLS" or (k.startswith("ARCHITECT_GH_") and k.endswith("_CMD"))]:
+    # a caller's tool overrides would replace the scripts' own tools.sh and gh calls
+    os.environ.pop(_k)
 
 import gates  # noqa: E402
 import _lib  # noqa: E402
@@ -497,6 +500,20 @@ check("verify_gate: re-review round -> Prior review decisions + bare delta line 
 check("verify_gate: uncommitted edits inside the in-repo planning store alone keep the delta",
       all(l.split(maxsplit=1)[1].startswith("plans/") for l in git(CODE, "status", "--porcelain").splitlines()) and git(CODE, "status", "--porcelain") != ""
       and "Re-review delta: 0000000..HEAD" in gp)
+_relpath = os.path.relpath
+
+
+def _other_drive(*a):
+    raise ValueError("path is on mount 'D:', start on mount 'C:'")
+
+
+os.path.relpath = _other_drive
+try:
+    _dirty_other_drive = gates._code_tree_dirty(base_state(), CODE)
+finally:
+    os.path.relpath = _relpath
+check("_code_tree_dirty: a planning store relpath cannot reach (another drive) is outside the repo, so its dirt counts",
+      not gates._code_tree_dirty(base_state(), CODE) and _dirty_other_drive)
 GNOGREEN = gauntlet_reply("BLOCKED", [("code-review", "GREEN (attention)", "NEEDS-HUMAN, no critical"), ("adversary", "BLOCKED", "DIVERGES"),
                                       ("security", "SKIPPED", "not selected"), ("debris", "GREEN", "0 hits")], blockers=["adversary: criterion 2 not met"])
 rl_none = gates.route_verdict(verdict_state(GNOGREEN, head="0000000"))["round_log"]
@@ -589,6 +606,25 @@ GREPORTONLY = TABLE + "\n## Full lane reports\n\n<details>\nGAUNTLET: PASS\n</de
 u = gates.route_verdict(verdict_state(GREPORTONLY))
 check("route_verdict: a sentinel only inside a lane report -> pipeline incomplete", u["last_verdict"] == "BLOCKED" and u["round_log"][T1][0]["incomplete"] == ["pipeline"])
 check("_lane_table: the round comment shows only the header table", gates._lane_table(GINJECT).splitlines() == GINJECT.split("\n\n")[1].splitlines())
+DEBRIS = "debris: Implementation debris in api/h.go:3 (TODO marker)"
+_rows = [("code-review", "GREEN", "MERGE-READY"), ("debris", "GREEN", "0 hits")]
+check("_parse_gauntlet: a debris line under Full lane reports is no blocker",
+      gates._parse_gauntlet(gauntlet_reply("PASS", _rows, reports=[("debris", DEBRIS)]))[3] == [])
+check("_parse_gauntlet: an indented debris line in the header is no blocker",
+      gates._parse_gauntlet(gauntlet_reply("PASS", _rows).replace("(none recorded)", "(none recorded)\n  " + DEBRIS))[3] == [])
+check("_parse_gauntlet: a column-0 debris line in the header's Blockers section is a blocker",
+      gates._parse_gauntlet(gauntlet_reply("BLOCKED", _rows, blockers=["adversary: x"]).replace("- adversary: x", "- adversary: x\n" + DEBRIS))[3]
+      == ["adversary: x", DEBRIS])
+check("_parse_gauntlet: the direct adversary's own report keeps its debris lines",
+      DEBRIS in gates._parse_gauntlet("ADVERSARIAL_REVIEW: DIVERGES\n- criterion 1 fails\n" + DEBRIS + "\n")[3])
+GROOT = gauntlet_reply("PASS", [("code-review", "GREEN", "MERGE-READY"), ("adversary", "GREEN", "CONFORMS")],
+                       reports=[("code-review", "A reader might say the plan itself is the root cause here.")])
+u = gates.route_verdict(verdict_state(GROOT))
+check("route_verdict: a PASS whose code-review report quotes a plan-root phrase -> escalation plan_defect, never post_round",
+      u.get("escalation", {}).get("kind") == "plan_defect" and u.get("_next") != "post_round")
+u = gates.wave_route(base_state(wtask={"task": T1}, wave_gauntlet_result=GROOT, wave_report="done"))
+check("wave_route: a PASS whose lane report quotes a plan-root phrase -> plan_defect, never conforms",
+      u["wave_result"]["status"] == "needs_escalation" and u["wave_result"]["escalation"]["kind"] == "plan_defect")
 
 # ---------------------------------------------------------------- post_round / fix_done / harvest / design ask / debt / task_done_verify / stack / route
 os.environ["ARCHITECT_GH_COMMENT_CMD"] = "true"
@@ -999,13 +1035,17 @@ write(RECORDING_TOOLS, "record() { printf '%s tasks=%s plan=%s\\n' \"$1\" \"${ar
                        "collect_ledger_lines() { record collect_ledger_lines; echo '(none)'; }\n")
 
 
-def core_calls(run, name):
+def core_calls(run, name, tools=RECORDING_TOOLS):
     write(CORE_CALLS, "")
-    os.environ["ARCHITECT_CORE_TOOLS"] = RECORDING_TOOLS
+    prior = os.environ.get("ARCHITECT_CORE_TOOLS")
+    os.environ["ARCHITECT_CORE_TOOLS"] = tools
     try:
         run()
     finally:
-        os.environ.pop("ARCHITECT_CORE_TOOLS")
+        if prior is None:
+            os.environ.pop("ARCHITECT_CORE_TOOLS")
+        else:
+            os.environ["ARCHITECT_CORE_TOOLS"] = prior
     return [l.split(" ", 1)[1] for l in read_file(CORE_CALLS).splitlines() if l.startswith(name + " ")]
 
 
@@ -1017,12 +1057,23 @@ calls = core_calls(lambda: gates.pr_body(base_state(plan_path=PROMOTED, tasks=ts
 check("pr_body: PR-group mode -> assemble_pr_body --tasks <the closing group's task ids, comma-separated>", calls == [f"tasks={GROUP_TASKS} plan={PROMOTED}"], str(calls))
 calls = core_calls(lambda: gates.pr_body(base_state(plan_path=PROMOTED, tasks=ts_g, closeout_unit="g1", pr_summary_text="s", body_fix_rounds=RERUN_ONCE)), "assemble_pr_body")
 check("pr_body: single PR -> assemble_pr_body without --tasks", calls == [f"tasks=unset plan={PROMOTED}"], str(calls))
+FAILING_TOOLS = os.path.join(TMP, "failing-tools", "tools.sh")
+write(FAILING_TOOLS, "record() { printf '%s tasks=%s plan=%s\\n' \"$1\" \"${argc_tasks-unset}\" \"${argc_plan-unset}\" >> \"" + CORE_CALLS + "\"; }\n"
+                     "assemble_pr_body() { record assemble_pr_body; echo 'assemble failed' >&2; return 1; }\n")
+ts_fail = copy.deepcopy(ts_g)
+for t in ts_fail:
+    t["status"] = "complete"
+calls = core_calls(lambda: gates.pr_body(base_state(plan_path=PROMOTED, tasks=ts_fail, pr_strategy="multi", closeout_unit="g1", pr_summary_text="s",
+                                                    body_fix_rounds=RERUN_ONCE)), "assemble_pr_body", FAILING_TOOLS)
+_listed = [l.split(" ")[2] for l in read_file(os.path.join(base_state()["run_dir"], "pr-body.md")).splitlines() if l.startswith("- [x] ")]
+check("pr_body: assemble_pr_body fails in PR-group mode -> the fallback task list holds only the closing group's tasks",
+      calls == [f"tasks={GROUP_TASKS} plan={PROMOTED}"] and _listed == ([T1, T2] if MULTI_IS_GROUPS else [t["id"] for t in ts_fail]), f"{calls} {_listed}")
 calls = core_calls(lambda: gates.hygiene_create(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(ts_g), pr_strategy="multi", closeout_unit="g1", unit_base_sha=CODE_BASE,
                                                            run_branch="feat/PLAN-widgets", hygiene_units=[{"id": "g1", "members": [T1, T2]}])), "collect_ledger_lines")
 check("hygiene_create: PR-group mode -> collect_ledger_lines --plan <plan> --tasks <the group's members>", calls == [f"tasks={GROUP_TASKS} plan={PROMOTED}"], str(calls))
 calls = core_calls(lambda: gates.final_report(base_state(plan_path=PROMOTED, tasks=ts_g, pr_strategy="multi", closeout_unit="g2")), "collect_ledger_lines")
 check("final_report: every collect_ledger_lines call gets a non-empty --plan and no --tasks (the run report spans all groups)",
-      len(calls) >= 4 and all(c == f"tasks=unset plan={PROMOTED}" for c in calls), str(calls))
+      len(calls) == 4 and all(c == f"tasks=unset plan={PROMOTED}" for c in calls), str(calls))
 
 # The REAL tools.sh collect_ledger_lines over a scratch plan and task log: the lines arrive, not "(collect_ledger_lines unavailable: ...)".
 LEDGER = os.path.join(TMP, "ledger")

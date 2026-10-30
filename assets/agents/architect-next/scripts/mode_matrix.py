@@ -42,6 +42,9 @@ for _k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
     # a caller's repository variables (a git hook exports them) would point
     # every scratch-repo git call at the caller's own repository
     os.environ.pop(_k, None)
+for _k in [k for k in os.environ if k == "ARCHITECT_CORE_TOOLS" or (k.startswith("ARCHITECT_GH_") and k.endswith("_CMD"))]:
+    # a caller's tool overrides would replace the scripts' own tools.sh and gh calls
+    os.environ.pop(_k)
 from _fixture import Store  # noqa: E402
 
 MAP_PATH = os.path.join(HERE, "marker_map.json")

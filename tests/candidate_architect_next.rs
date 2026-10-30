@@ -35,7 +35,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "architect-next";
-const SMOKE_FLOOR: usize = 331;
+const SMOKE_FLOOR: usize = 339;
 const MATRIX_FLOOR: usize = 53;
 const _: () = assert!(MATRIX_FLOOR >= 53, "the matrix floor never drops below 53");
 
@@ -129,12 +129,17 @@ fn battery(program: &Path, scratch: &TempDirGuard) -> Command {
     cmd
 }
 
-/// Drops every inherited `LLM_AGENT_VAR_*` variable from `cmd`, so a test run
-/// started inside an agent session does not hand that session's variables to
-/// the batteries, the gates or the binary.
+/// Drops every inherited `LLM_AGENT_VAR_*` variable and the gates' tool
+/// overrides (`ARCHITECT_CORE_TOOLS`, `ARCHITECT_GH_*_CMD`) from `cmd`, so a
+/// test run started inside an agent session does not hand that session's
+/// variables or tools to the batteries, the gates or the binary.
 fn scrub_agent_vars(cmd: &mut Command) -> &mut Command {
     for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("LLM_AGENT_VAR_") {
+        let name = key.to_string_lossy();
+        if name.starts_with("LLM_AGENT_VAR_")
+            || name == "ARCHITECT_CORE_TOOLS"
+            || (name.starts_with("ARCHITECT_GH_") && name.ends_with("_CMD"))
+        {
             cmd.env_remove(key);
         }
     }
@@ -1772,10 +1777,10 @@ fn readme_toolchain_census_matches_the_live_grep() {
     );
     assert_eq!(
         gates_lines,
-        vec![41, 2568, 2577],
+        vec![41, 2594, 2603],
         "the gates.py toolchain hits moved; update the README census and its prose"
     );
-    for line in [2568, 2577] {
+    for line in [2594, 2603] {
         assert!(
             text.contains(&format!("`gates.py:{line}`")) || text.contains(&format!("`:{line}`")),
             "the README prose must cite gates.py:{line}"
@@ -2154,6 +2159,7 @@ fn gauntlet_script(
         .env("HOME", scratch.0.join("home"))
         .env("TMPDIR", scratch.0.join("tmp"))
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env_remove("GRAPH_STATE_FILE")
         .output()
         .unwrap_or_else(|e| panic!("failed to invoke python3 {script}: {e}"));
@@ -2174,6 +2180,7 @@ fn two_commit_repo(scratch: &TempDirGuard) -> (PathBuf, String, String) {
             .current_dir(&project)
             .env("HOME", scratch.0.join("home"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .output()
             .unwrap();
         assert!(out.status.success(), "git {args:?}\n{}", transcript(&out));
@@ -2615,6 +2622,154 @@ fn gauntlet_sentinels_are_column_zero_whole_lines_first_match_wins() {
         let parsed = parse_gauntlet_report(report, &scratch);
         assert_eq!(parsed["probe"], json!(expected), "{report:?} -> {parsed}");
     }
+}
+
+const DEBRIS_LINE: &str = "debris: Implementation debris in api/h.go:3 (TODO marker)";
+
+/// The gauntlet writes debris hits only into its header's `## Blockers`
+/// section, so an unbulleted debris line is a blocker only at column 0
+/// inside that section; the same line indented in the header or quoted in a
+/// lane report is not. The direct adversary's own report has no header,
+/// and its debris lines still count.
+#[test]
+fn debris_lines_count_only_inside_the_header_blockers_section() {
+    if python3().is_none() {
+        return;
+    }
+    let scratch = scratch_dir("debris-scope");
+    let header = "GAUNTLET: BLOCKED\n\n| lane | status | detail |\n|------|--------|--------|\n| adversary | BLOCKED | DIVERGES |\n| debris | GREEN | 0 hits |\n\n## Lane selection\n(none recorded)\n";
+    let rows = [
+        (
+            format!(
+                "{header}\n## Blockers\n- adversary: x\n\n## Full lane reports\n\n<details><summary>debris</summary>\n\n{DEBRIS_LINE}\n\n</details>\n"
+            ),
+            json!(["adversary: x"]),
+        ),
+        (
+            format!(
+                "{header}  {DEBRIS_LINE}\n\n## Blockers\n- adversary: x\n\n## Full lane reports\n"
+            ),
+            json!(["adversary: x"]),
+        ),
+        (
+            format!(
+                "{header}\n## Blockers\n- adversary: x\n{DEBRIS_LINE}\n\n## Full lane reports\n"
+            ),
+            json!(["adversary: x", DEBRIS_LINE]),
+        ),
+    ];
+    for (report, expected) in &rows {
+        let parsed = parse_gauntlet_report(report, &scratch);
+        assert_eq!(parsed["blockers"], *expected, "{report:?} -> {parsed}");
+    }
+    let parsed = parse_gauntlet_report(
+        &format!("ADVERSARIAL_REVIEW: DIVERGES\n- criterion 1 fails\n{DEBRIS_LINE}\n"),
+        &scratch,
+    );
+    assert!(
+        parsed["blockers"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(DEBRIS_LINE)),
+        "the adversary's own debris line: {parsed}"
+    );
+}
+
+/// The plan-root phrases are read from the whole reply, so a PASS header
+/// whose code-review report quotes one fails closed: `route_verdict` raises
+/// the plan-defect escalation instead of closing the round, and
+/// `wave_route` hands the wave a plan-defect escalation instead of
+/// `conforms`.
+#[test]
+fn a_plan_root_phrase_in_a_lane_report_fails_a_pass_closed() {
+    if python3().is_none() {
+        return;
+    }
+    let scratch = scratch_dir("plan-root");
+    let reply = "GAUNTLET: PASS\n\n| lane | status | detail |\n|------|--------|--------|\n| code-review | GREEN | MERGE-READY |\n| adversary | GREEN | CONFORMS |\n\n## Lane selection\n(none recorded)\n\n## Full lane reports\n\n<details><summary>code-review</summary>\n\nA reader might say the plan itself is the root cause here.\n\n</details>\n";
+    let mut state = verify_state(
+        &scratch.0,
+        "h",
+        json!({ TASK: [{"round": 1, "head": "h"}] }),
+        &scratch,
+    );
+    state["verify_unit"] = json!(TASK);
+    state["verify_lane"] = json!("gauntlet");
+    state["gauntlet_result"] = json!(reply);
+    let routed = gate_json("route_verdict", &state, &scratch);
+    assert_eq!(
+        routed["escalation"]["kind"],
+        json!("plan_defect"),
+        "{routed}"
+    );
+    assert_ne!(routed["_next"], json!("post_round"), "{routed}");
+
+    let wave = gate_json(
+        "wave_route",
+        &json!({"wtask": {"task": TASK}, "wave_gauntlet_result": reply, "wave_report": "done"}),
+        &scratch,
+    );
+    assert_eq!(
+        wave["wave_result"]["status"],
+        json!("needs_escalation"),
+        "{wave}"
+    );
+    assert_eq!(
+        wave["wave_result"]["escalation"]["kind"],
+        json!("plan_defect"),
+        "{wave}"
+    );
+}
+
+/// When `assemble_pr_body` fails in PR-group mode, the locally assembled
+/// fallback body lists only the closing group's tasks, the same scope the
+/// `--tasks` argument gave the failed call.
+#[test]
+fn pr_body_fallback_lists_only_the_closing_groups_tasks() {
+    let Some(python) = python3() else {
+        return;
+    };
+    let scratch = scratch_dir("pr-body-fallback");
+    let tools = scratch.0.join("failing-tools").join("tools.sh");
+    fs::create_dir_all(tools.parent().unwrap()).unwrap();
+    fs::write(
+        &tools,
+        "assemble_pr_body() { echo 'assemble failed' >&2; return 1; }\n",
+    )
+    .unwrap();
+    let run_dir = scratch.0.join("runs").join("x");
+    let state = json!({
+        "plan_path": "",
+        "tasks_root": scratch.0.join("tasks"),
+        "pr_strategy": "multi",
+        "closeout_unit": "g1",
+        "pr_summary_text": "summary",
+        "body_fix_rounds": 1,
+        "run_id": "x",
+        "run_dir": run_dir,
+        "decisions": [],
+        "tasks": [
+            {"id": "TASK-001", "title": "One", "unit": "g1", "status": "complete"},
+            {"id": "TASK-002", "title": "Two", "unit": "g1", "status": "complete"},
+            {"id": "TASK-003", "title": "Three", "unit": "g2", "status": "complete"}
+        ],
+    });
+    let mut cmd = battery(&python, &scratch);
+    let out = cmd
+        .arg(Path::new("scripts").join("pr_body.py"))
+        .env("GRAPH_STATE", state.to_string())
+        .env("ARCHITECT_CORE_TOOLS", &tools)
+        .output()
+        .unwrap();
+    assert_no_bytecode_under_candidate();
+    parse_json_stdout("pr_body", &out);
+    let body = fs::read_to_string(run_dir.join("pr-body.md")).unwrap();
+    let listed: Vec<&str> = body
+        .lines()
+        .filter_map(|l| l.strip_prefix("- [x] "))
+        .map(|l| l.split(' ').next().unwrap())
+        .collect();
+    assert_eq!(listed, ["TASK-001", "TASK-002"], "{body}");
 }
 
 /// The previous round left code-review whole-cell GREEN, security GREEN
@@ -3123,9 +3278,10 @@ fn every_llm_node_keeps_the_frozen_anomalies_channel() {
     );
 }
 
-/// Both batteries drop the agent variables and the wrapper's git repository
-/// variables themselves, before they import a gate, so a direct run from a
-/// git hook or an agent session is as isolated as a run through the wrapper.
+/// Both batteries drop the agent variables, the tool overrides and the
+/// wrapper's git repository variables themselves, before they import a gate,
+/// so a direct run from a git hook or an agent session is as isolated as a
+/// run through the wrapper.
 #[test]
 fn batteries_drop_the_same_variables_as_the_wrapper() {
     let quoted = fancy_regex::Regex::new(r#""([A-Z_]+)""#).unwrap();
@@ -3147,8 +3303,14 @@ fn batteries_drop_the_same_variables_as_the_wrapper() {
             "LLM_AGENT_VAR_ loop",
         );
         let git_at = find(&|l| l.starts_with("for _k in (\"GIT_DIR\""), "GIT_ loop");
+        let tools_at = find(
+            &|l| {
+                l == "for _k in [k for k in os.environ if k == \"ARCHITECT_CORE_TOOLS\" or (k.startswith(\"ARCHITECT_GH_\") and k.endswith(\"_CMD\"))]:"
+            },
+            "ARCHITECT_CORE_TOOLS / ARCHITECT_GH_*_CMD loop",
+        );
         assert!(
-            agent_at < import_at && git_at < import_at,
+            agent_at < import_at && git_at < import_at && tools_at < import_at,
             "{file} must drop the variables before it imports a gate"
         );
         let names: Vec<String> = quoted
@@ -3159,6 +3321,7 @@ fn batteries_drop_the_same_variables_as_the_wrapper() {
         for (at, pop) in [
             (agent_at, "    os.environ.pop(_k)"),
             (git_at, "    os.environ.pop(_k, None)"),
+            (tools_at, "    os.environ.pop(_k)"),
         ] {
             let body = lines[at + 1..]
                 .iter()
@@ -3312,12 +3475,22 @@ fn readme_grammar_row_records_the_producer_guarantee_and_the_planning_store_dive
         "This diverges from the sisyphus-next twin",
         "The header boundary is the review-gauntlet producer's guarantee",
         "the consumer defends it as well",
+        "the `## Blockers` section and the debris blocker lines (unbulleted `debris: Implementation debris` lines count only at column 0 inside that section) are read only from the header",
+        "Four reads take the full reply on purpose, and each can only block, escalate or add one capped adopt round, never turn a BLOCKED into a PASS",
+        "`ADVERSARIAL_REVIEW:` (the direct micro-mode adversary lane",
+        "`PIPELINE-FAULT` (consulted only when the header carries no verdict",
+        "a PASS that carries one escalates as a plan defect",
+        "the probe's test-file paths (read only when the probe verdict is PASS, adoption capped at one round)",
     ] {
         assert!(
             row.contains(clause),
             "the grammar row lost {clause:?}: {row}"
         );
     }
+    assert!(
+        !row.contains("nothing past the boundary is read"),
+        "the grammar row claims no full-reply read survives: {row}"
+    );
 }
 
 /// The battery env hygiene row names the exact variable list the wrapper
@@ -3327,6 +3500,8 @@ fn readme_grammar_row_records_the_producer_guarantee_and_the_planning_store_dive
 fn readme_env_hygiene_and_ledger_rows_match_the_code() {
     let row = adjustments_row("| battery env hygiene |");
     assert!(row.contains("`LLM_AGENT_VAR_*`"), "{row}");
+    assert!(row.contains("`ARCHITECT_CORE_TOOLS`"), "{row}");
+    assert!(row.contains("`ARCHITECT_GH_*_CMD`"), "{row}");
     for var in GIT_REPO_VARS {
         assert!(row.contains(&format!("`{var}`")), "{var} missing: {row}");
     }
