@@ -5470,8 +5470,50 @@ mod tests {
         assert_eq!(captures[0].payload.as_deref(), Some(r#"{"goal":"g"}"#));
         assert_eq!(captures[0].cwd, paths::config_dir());
         assert_eq!(captures[1].event, HookEvent::ToolCompleted);
+        assert_eq!(
+            captures[1]
+                .envs
+                .get("COYOTE_TOOL_CALL_ID")
+                .map(String::as_str),
+            Some("id1")
+        );
         assert!(captures[1].envs.contains_key("COYOTE_TOOL_DURATION_MS"));
         assert_eq!(captures[1].payload.as_deref(), Some(r#"{"goal":"g"}"#));
+    }
+
+    #[test]
+    #[serial]
+    fn eval_fires_tool_hooks_with_empty_call_id_when_the_call_has_no_id() {
+        use crate::hooks::HookEvent;
+        let marker = "tool-hooks-no-id-x7x";
+        let mut ctx = ctx_with_tool_hooks(marker, |config| {
+            config.function_calling_support = true;
+            config.auto_continue = true;
+        });
+        ctx.tool_scope.functions.append_todo_functions();
+        let _guard = hooks::test_sink::install();
+
+        let output = run_async(call("todo__init", None).eval(&mut ctx)).unwrap();
+
+        assert_eq!(output["status"], "ok");
+        let captures = tool_captures(marker);
+        assert_eq!(captures.len(), 2, "{captures:?}");
+        assert_eq!(captures[0].event, HookEvent::ToolStarted);
+        assert_eq!(
+            captures[0]
+                .envs
+                .get("COYOTE_TOOL_CALL_ID")
+                .map(String::as_str),
+            Some("")
+        );
+        assert_eq!(captures[1].event, HookEvent::ToolCompleted);
+        assert_eq!(
+            captures[1]
+                .envs
+                .get("COYOTE_TOOL_CALL_ID")
+                .map(String::as_str),
+            Some("")
+        );
     }
 
     #[test]

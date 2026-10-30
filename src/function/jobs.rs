@@ -3539,6 +3539,53 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn fire_terminal_publishes_bus_twin_without_resolved_hooks() {
+        let ctx = plain_ctx();
+        let job_id = "job-bus-probe-x7x";
+        let _guard = hooks::test_sink::install();
+        let sink = crate::events::RecordingSink::install();
+
+        JobHookSnapshot::resolve(&ctx, job_id, "echo").fire_terminal(true, None);
+        JobHookSnapshot::resolve(&ctx, job_id, "echo").fire_terminal(false, Some("boom".into()));
+
+        let published = sink.drain_hooks_with_env("COYOTE_JOB_ID", job_id);
+        assert_eq!(published.len(), 2, "{published:?}");
+        let expected = [
+            (HookEvent::JobCompleted, None),
+            (HookEvent::JobFailed, Some(("COYOTE_JOB_ERROR", "boom"))),
+        ];
+        for (published, (expected_event, expected_error)) in published.iter().zip(expected) {
+            let crate::events::Event::Hook {
+                event,
+                envs,
+                payload,
+                origin,
+            } = published
+            else {
+                panic!("expected Event::Hook, got {published:?}");
+            };
+            assert_eq!(*event, expected_event);
+            assert_eq!(*origin, Origin::detached());
+            assert_eq!(*payload, None);
+            assert!(envs.contains(&("COYOTE_TOOL_NAME".to_string(), "echo".to_string())));
+            let error = envs
+                .iter()
+                .find(|(key, _)| key == "COYOTE_JOB_ERROR")
+                .map(|(key, value)| (key.as_str(), value.as_str()));
+            assert_eq!(error, expected_error, "{expected_event:?}");
+        }
+        assert!(
+            hooks::test_sink::drain().iter().all(|capture| capture
+                .envs
+                .get("COYOTE_JOB_ID")
+                .map(String::as_str)
+                != Some(job_id)),
+            "no hook is resolved, so nothing may reach test_sink"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn job_hooks_fire_for_mcp_jobs() {
         run_async(async {
             let marker = "job-hooks-mcp-x7x";

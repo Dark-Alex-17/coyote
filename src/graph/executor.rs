@@ -2663,6 +2663,42 @@ nodes:
         );
     }
 
+    #[test]
+    #[serial]
+    fn completed_publishes_bus_twin_without_resolved_hooks() {
+        let ctx = ctx_with_global_hooks(Default::default());
+        let node_id = "node-bus-probe-x7x";
+        let _sink = hooks::test_sink::install();
+        let bus = crate::events::RecordingSink::install();
+
+        NodeHookEmitter::resolve(&ctx, node_id, "llm")
+            .completed(Duration::from_millis(5), Some("next"));
+
+        let published = bus.drain_hooks_with_env("COYOTE_NODE_ID", node_id);
+        assert_eq!(published.len(), 1, "{published:?}");
+        let crate::events::Event::Hook {
+            event,
+            envs,
+            payload,
+            origin,
+        } = &published[0]
+        else {
+            panic!("expected Event::Hook, got {:?}", published[0]);
+        };
+        assert_eq!(*event, HookEvent::GraphNodeCompleted);
+        assert_eq!(*origin, Origin::detached());
+        assert_eq!(*payload, None);
+        assert!(envs.contains(&("COYOTE_NODE_TYPE".to_string(), "llm".to_string())));
+        assert!(envs.contains(&("COYOTE_NODE_ROUTE".to_string(), "next".to_string())));
+        assert!(envs.contains(&("COYOTE_NODE_DURATION_MS".to_string(), "5".to_string())));
+        assert!(
+            hooks::test_sink::drain().iter().all(|capture| {
+                capture.envs.get("COYOTE_NODE_ID").map(String::as_str) != Some(node_id)
+            }),
+            "no hook is resolved, so nothing may reach test_sink"
+        );
+    }
+
     /// Declared variables are seeded into state at run start, so the agent
     /// node's strict prompt interpolation of `{{foo}}` succeeds instead of
     /// bailing with "not found in state". `ctx.agent` is None here, so each

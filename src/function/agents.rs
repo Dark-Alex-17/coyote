@@ -3126,6 +3126,42 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn fire_publishes_bus_twin_without_resolved_hooks() {
+        let ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        let agent_id = "agent-bus-probe-x7x";
+        let _sink = hooks::test_sink::install();
+        let bus = crate::events::RecordingSink::install();
+
+        SpawnResultHooks::resolve(&ctx, agent_id, "explore", None)
+            .fire(None, &create_abort_signal());
+
+        let published = bus.drain_hooks_with_env("COYOTE_AGENT_ID", agent_id);
+        assert_eq!(published.len(), 1, "{published:?}");
+        let crate::events::Event::Hook {
+            event,
+            envs,
+            payload,
+            origin,
+        } = &published[0]
+        else {
+            panic!("expected Event::Hook, got {:?}", published[0]);
+        };
+        assert_eq!(*event, HookEvent::AgentCompleted);
+        assert_eq!(*origin, Origin::detached());
+        assert_eq!(*payload, None);
+        assert!(envs.contains(&("COYOTE_AGENT_NAME".to_string(), "explore".to_string())));
+        assert!(envs.contains(&("COYOTE_EVENT".to_string(), "agent.completed".to_string())));
+        assert!(!envs.iter().any(|(key, _)| key == "COYOTE_AGENT_SESSION_ID"));
+        assert!(
+            hooks::test_sink::drain().iter().all(|capture| {
+                capture.envs.get("COYOTE_AGENT_ID").map(String::as_str) != Some(agent_id)
+            }),
+            "no hook is resolved, so nothing may reach test_sink"
+        );
+    }
+
+    #[test]
     fn agent_event_base_envs_carry_optional_names_only_when_present() {
         let envs = hooks::base_envs_parts(HookEvent::AgentCompleted, None, None);
         let keys: Vec<&str> = envs.iter().map(|(key, _)| key.as_str()).collect();

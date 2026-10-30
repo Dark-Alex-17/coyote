@@ -2302,6 +2302,74 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn rag_sync_fire_completed_publishes_bus_twin_without_resolved_hooks() {
+        let _guard = test_sink::install();
+        let sink = crate::events::RecordingSink::install();
+        let ctx = ctx_with_global_hooks(IndexMap::new());
+        let rag_name = "rag-bus-probe-x7x";
+
+        RagSyncHooks::resolve(&ctx).fire_completed(rag_name, "/tmp/rag", 3);
+
+        let published = sink.drain_hooks_with_env("COYOTE_RAG_NAME", rag_name);
+        assert_eq!(published.len(), 1, "{published:?}");
+        let Event::Hook {
+            event,
+            envs,
+            payload,
+            origin,
+        } = &published[0]
+        else {
+            panic!("expected Event::Hook, got {:?}", published[0]);
+        };
+        assert_eq!(*event, HookEvent::RagSyncCompleted);
+        assert_eq!(*origin, Origin::detached());
+        assert_eq!(*payload, None);
+        assert!(envs.contains(&("COYOTE_RAG_PATH".to_string(), "/tmp/rag".to_string())));
+        assert!(envs.contains(&("COYOTE_RAG_DOC_COUNT".to_string(), "3".to_string())));
+        assert!(
+            test_sink::drain().iter().all(|capture| {
+                capture.envs.get("COYOTE_RAG_NAME").map(String::as_str) != Some(rag_name)
+            }),
+            "no hook is resolved, so nothing may reach test_sink"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn mcp_server_fire_connected_publishes_bus_twin_without_resolved_hooks() {
+        let _guard = test_sink::install();
+        let sink = crate::events::RecordingSink::install();
+        let ctx = ctx_with_global_hooks(IndexMap::new());
+        let server = "mcp-bus-probe-x7x";
+
+        McpServerHooks::resolve(&ctx).fire_connected(server, "stdio", true);
+
+        let published = sink.drain_hooks_with_env("COYOTE_MCP_SERVER", server);
+        assert_eq!(published.len(), 1, "{published:?}");
+        let Event::Hook {
+            event,
+            envs,
+            payload,
+            origin,
+        } = &published[0]
+        else {
+            panic!("expected Event::Hook, got {:?}", published[0]);
+        };
+        assert_eq!(*event, HookEvent::McpServerConnected);
+        assert_eq!(*origin, Origin::detached());
+        assert_eq!(*payload, None);
+        assert!(envs.contains(&("COYOTE_MCP_TRANSPORT".to_string(), "stdio".to_string())));
+        assert!(envs.contains(&("COYOTE_MCP_RECONNECT".to_string(), "true".to_string())));
+        assert!(
+            test_sink::drain().iter().all(|capture| {
+                capture.envs.get("COYOTE_MCP_SERVER").map(String::as_str) != Some(server)
+            }),
+            "no hook is resolved, so nothing may reach test_sink"
+        );
+    }
+
+    #[test]
     fn sanitize_envs_strips_nul_and_bounds_length() {
         let oversized = "x".repeat(3000);
         let sanitized = sanitize_envs(vec![
