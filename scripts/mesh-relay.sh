@@ -483,9 +483,10 @@ interfaces_text() {
     type = AutoInterface
     enabled = Yes
 
-  # The TCP hop for other hosts that dial this one as their relay (--relay <this host>:4242)
-  # and for a session configured with type: private at 127.0.0.1:4242; sessions on this host
-  # attach over the shared instance instead.
+  # The TCP hop for a session configured with type: private at 127.0.0.1:4242. It listens on
+  # loopback only: for other hosts to dial this one as their relay, set listen_ip to an
+  # address they can reach and firewall the port. Sessions on this host attach over the
+  # shared instance instead.
   [[Coyote Sessions]]
     type = TCPServerInterface
     enabled = Yes
@@ -513,7 +514,7 @@ settings_text() {
   cat <<'EOF'
 [reticulum]
 
-# Relay announces and paths between the Coyote sessions that dial in. A transport
+# Relay announces and paths between the Coyote sessions attached to it. A transport
 # node also forwards traffic for any other Reticulum peer it hears on its interfaces.
 enable_transport = True
 
@@ -530,9 +531,9 @@ enable_transport = True
 # NomadNet. The three keys below are Reticulum's own defaults, written out so the contract
 # is visible. On Linux and Android the shared instance is the abstract AF_UNIX socket
 # rns/<instance_name>: instance_name is the key that matters there, and shared_instance_port
-# is inert unless shared_instance_type = tcp. On macOS and Windows the shared instance is
-# TCP 127.0.0.1:<shared_instance_port>. Any other local account on this host can attach to
-# this daemon too, over the shared instance and 127.0.0.1:4242; that is inherent to
+# is inert unless shared_instance_type = tcp. On macOS, BSD and Windows the shared instance
+# is TCP 127.0.0.1:<shared_instance_port>. Any other local account on this host can attach
+# to this daemon too, over the shared instance and 127.0.0.1:4242; that is inherent to
 # Reticulum's shared-instance model.
 share_instance = Yes
 shared_instance_port = 37428

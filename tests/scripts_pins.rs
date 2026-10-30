@@ -1054,7 +1054,6 @@ fn relay_scripts_are_config_twins_and_copy_the_propagation_node_comment() {
             "share_instance = Yes",
             "shared_instance_port = 37428",
             "instance_name = default",
-            "shared_instance_type = tcp",
             "[[Coyote Local]]",
             "type = AutoInterface",
             "[[Coyote Sessions]]",
@@ -1094,6 +1093,90 @@ fn relay_scripts_are_config_twins_and_copy_the_propagation_node_comment() {
                 .lines()
                 .any(|line| line.trim() == format!("{pattern} text eol=lf")),
             ".gitattributes must pin `{pattern} text eol=lf`: a CRLF checkout breaks bash and the LF pins above"
+        );
+    }
+}
+
+/// The relay scripts and the image template explain the shared-instance keys in a comment
+/// (`instance_name` is what Linux dials, the port is inert unless the type is tcp) and never
+/// set `shared_instance_type`, which would move Linux off the abstract socket. Comment runs
+/// are folded, so a sentence wrapped across lines is read whole.
+#[test]
+fn relay_configs_explain_the_shared_instance_keys_and_leave_the_type_unset() {
+    for (name, path) in [
+        ("mesh-relay.sh", scripts_dir().join("mesh-relay.sh")),
+        ("mesh-relay.ps1", scripts_dir().join("mesh-relay.ps1")),
+        (
+            "reticulum.config.tmpl",
+            scripts_dir().join("reticulum.config.tmpl"),
+        ),
+    ] {
+        let text = read(path);
+        let mut runs: Vec<String> = Vec::new();
+        let mut in_comment = false;
+        for line in text.lines() {
+            match line.trim_start().strip_prefix('#') {
+                Some(body) if in_comment => {
+                    let run = runs.last_mut().expect("a comment run is open");
+                    run.push(' ');
+                    run.push_str(body.trim());
+                }
+                Some(body) => {
+                    runs.push(body.trim().to_string());
+                    in_comment = true;
+                }
+                None => in_comment = false,
+            }
+        }
+        let explained = runs.iter().find(|run| {
+            run.contains("instance_name is the key that matters")
+                && run.contains("shared_instance_port is inert unless shared_instance_type = tcp")
+        });
+        assert!(
+            explained.is_some(),
+            "{name} must explain in one comment that instance_name is the key that matters on Linux and that shared_instance_port is inert unless shared_instance_type = tcp"
+        );
+        for line in text.lines().map(str::trim) {
+            assert!(
+                line.starts_with('#') || !line.starts_with("shared_instance_type"),
+                "{name} sets shared_instance_type, which moves Linux off the abstract socket: {line}"
+            );
+        }
+    }
+}
+
+/// The matching-config snippet both relay scripts print after the diagnostics line is the
+/// bare `type: local` entry, with no `type: private` pointing at the 4242 listener.
+#[test]
+fn relay_scripts_print_the_local_entry_as_the_matching_config() {
+    let body = |name: &str, open: &str| -> String {
+        let text = read(scripts_dir().join(name));
+        let at = text
+            .find(open)
+            .unwrap_or_else(|| panic!("{name} has no `{open}`"));
+        let rest = &text[at..];
+        let end = rest
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("{name}'s `{open}` does not close"));
+        rest[..end].to_string()
+    };
+    for (name, snippet) in [
+        (
+            "mesh-relay.sh",
+            body("mesh-relay.sh", "print_next_steps() {"),
+        ),
+        (
+            "mesh-relay.ps1",
+            body("mesh-relay.ps1", "function Write-NextStep {"),
+        ),
+    ] {
+        assert!(
+            snippet.contains("\nmesh:\n  interfaces:\n    - type: local\n"),
+            "{name}'s matching-config snippet is not the bare `- type: local` entry:\n{snippet}"
+        );
+        assert!(
+            !snippet.contains("type: private"),
+            "{name}'s matching-config snippet still carries `type: private`:\n{snippet}"
         );
     }
 }

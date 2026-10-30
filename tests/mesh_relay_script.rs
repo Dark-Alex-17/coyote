@@ -3369,8 +3369,11 @@ fn usage_probe_the_dry_run_plan_is_the_config_block_the_deployment_page_quotes_l
         "the 4242 listener for the remote rungs changed:\n{out}"
     );
     assert_eq!(
-        plain[sessions - 1],
-        "# attach over the shared instance instead.",
+        &plain[sessions - 2..sessions],
+        [
+            "# address they can reach and firewall the port. Sessions on this host attach over the",
+            "# shared instance instead.",
+        ],
         "the [[Coyote Sessions]] comment no longer says sessions on this host attach over the shared instance:\n{out}"
     );
     assert!(
@@ -3489,4 +3492,82 @@ fn usage_probe_the_dry_run_plan_is_the_config_block_the_deployment_page_quotes_l
         ["mesh:", "interfaces:", "- type: local"],
         "the script's matching-config snippet and the page's yaml block disagree on the interfaces entry"
     );
+}
+
+/// The planned config, split into `(section, key, value)` the way rnsd's ConfigObj reads
+/// it: `[x]` opens a section, `[[y]]` a subsection; comments and blanks are skipped.
+fn config_keys(plan: &str) -> Vec<(String, String, String)> {
+    let mut section = String::new();
+    let mut out = Vec::new();
+    for raw in plan.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with("[coyote-mesh]") {
+            continue;
+        }
+        if line.starts_with("[[") {
+            section = format!("{}/{}", section.split('/').next().unwrap(), line);
+        } else if line.starts_with('[') {
+            section = line.to_string();
+        } else if let Some((k, v)) = line.split_once(" = ") {
+            out.push((section.clone(), k.trim().to_string(), v.trim().to_string()));
+        }
+    }
+    out
+}
+
+/// The shared-instance keys Coyote's default `local` entry attaches through sit in the
+/// `[reticulum]` section, where rnsd reads them, with Reticulum's default values.
+#[test]
+fn the_shared_instance_keys_land_in_the_reticulum_section() {
+    let bash = bash_or_skip!();
+    let home = Home::new("shared-keys");
+    let (code, out, err) = run(&mut home.relay(&bash, &["--no-service", "--dry-run"]));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    let keys = config_keys(&out);
+    for (k, v) in [
+        ("share_instance", "Yes"),
+        ("shared_instance_port", "37428"),
+        ("instance_name", "default"),
+    ] {
+        let hits: Vec<_> = keys.iter().filter(|(_, key, _)| key == k).collect();
+        assert_eq!(hits.len(), 1, "{k} must appear exactly once:\n{out}");
+        assert_eq!(hits[0].0, "[reticulum]", "{k} outside [reticulum]:\n{out}");
+        assert_eq!(hits[0].2, v, "{k} has the wrong value:\n{out}");
+    }
+    assert!(
+        !keys.iter().any(|(_, k, _)| k == "shared_instance_type"),
+        "the comment says the port is inert on Linux unless shared_instance_type = tcp; the config must not set it:\n{out}"
+    );
+    assert_eq!(
+        home.entries(),
+        Vec::<String>::new(),
+        "the dry run created files"
+    );
+}
+
+/// A listener the written config advertises to other hosts ("--relay <this host>:4242")
+/// must be reachable from another host; a loopback-only `listen_ip` refuses every
+/// connection that does not originate on this machine.
+#[test]
+fn a_listener_advertised_to_other_hosts_is_not_bound_to_loopback_only() {
+    let bash = bash_or_skip!();
+    let home = Home::new("remote-listener");
+    let (code, out, err) = run(&mut home.relay(&bash, &["--no-service", "--dry-run"]));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    let advertises_remote = out.contains("other hosts that dial this one as their relay");
+    let listen_ip = config_keys(&out)
+        .into_iter()
+        .find(|(s, k, _)| s.ends_with("[[Coyote Sessions]]") && k == "listen_ip")
+        .map(|(_, _, v)| v)
+        .expect("[[Coyote Sessions]] has a listen_ip");
+    assert!(
+        !(advertises_remote && listen_ip.starts_with("127.")),
+        "the [[Coyote Sessions]] comment tells other hosts to dial this listener (--relay <this host>:4242) but it binds listen_ip = {listen_ip}, which only this machine can reach:\n{out}"
+    );
+    if listen_ip.starts_with("127.") {
+        assert!(
+            out.contains("# The TCP hop for a session configured with type: private at 127.0.0.1:4242. It listens on\n  # loopback only:"),
+            "the [[Coyote Sessions]] comment does not say the listener is loopback-only while listen_ip = {listen_ip}:\n{out}"
+        );
+    }
 }

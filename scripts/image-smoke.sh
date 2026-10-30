@@ -105,7 +105,7 @@ version="$(docker exec "$t" coyote --version)" || fail_with_logs "$t" "coyote --
 [[ -n "$version" ]] || fail_with_logs "$t" "coyote --version printed nothing"
 ok "coyote --version: $version"
 
-# 3. rnsd came up on the loopback hop every coyote session dials.
+# 3. rnsd came up; its 4242 TCPServerInterface answers.
 wait_exec "$t" 'exec 3<>/dev/tcp/127.0.0.1/4242' \
   || fail_with_logs "$t" "127.0.0.1:4242 did not answer within 30 s"
 ok "rnsd listens on 127.0.0.1:4242"
@@ -133,9 +133,11 @@ docker exec "$t" bash -c '"$(sed -n "1s/^#!//p" "$(command -v rnsd)")" -c "impor
   || fail_with_logs "$t" "rnsd's interpreter cannot import ssl and cryptography"
 ok "rnsd's python imports ssl and cryptography"
 
-# 6. The rendered config: logging section present, loopback listener only, no opt-in stanzas.
+# 6. The rendered config: logging section and shared instance present, loopback listener only,
+# no opt-in stanzas.
 config="$(docker exec "$t" cat /home/agent/.reticulum/config)"
-for needle in '[logging]' 'loglevel = 4' 'ingress_control = No' 'listen_ip = 127.0.0.1'; do
+for needle in '[logging]' 'loglevel = 4' 'ingress_control = No' 'listen_ip = 127.0.0.1' \
+  'share_instance = Yes' 'shared_instance_port = 37428' 'instance_name = default'; do
   grep -qF -- "$needle" <<<"$config" || fail "rendered config lacks \`$needle\`:"$'\n'"$config"
 done
 for absent in 'AutoInterface' 'Team Relay' 'share_instance = No'; do
