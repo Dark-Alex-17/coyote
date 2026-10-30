@@ -36,6 +36,21 @@ fn echo_chunk(out: &mut impl Write, chunk: &[u8]) {
     let _ = out.flush();
 }
 
+/// A spinner left running past its sink would keep painting over whatever
+/// the terminal shows next.
+impl Drop for StdoutSink {
+    fn drop(&mut self) {
+        if let Some(spinner) = self
+            .spinner
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            spinner.stop();
+        }
+    }
+}
+
 impl UiSink for StdoutSink {
     fn assistant_text(&self, app: &AppConfig, text: &str) -> Result<()> {
         app.print_markdown(text)
@@ -52,8 +67,14 @@ impl UiSink for StdoutSink {
 
     fn notice(&self, kind: NoticeKind, text: &str) {
         match kind {
+            NoticeKind::Routing => println!("{text}"),
             NoticeKind::ToolWarning => eprintln!("{}", muted_warning_text(text)),
-            _ => eprintln!("{text}"),
+            NoticeKind::Checkpoint
+            | NoticeKind::AutoContinue
+            | NoticeKind::Autoname
+            | NoticeKind::Interrupted
+            | NoticeKind::Compress
+            | NoticeKind::GraphNode => eprintln!("{text}"),
         }
     }
 
@@ -152,6 +173,11 @@ mod tests {
 
         // The harness reports from other threads on fd 1 too, so the capture
         // is checked for our marker and then passed through to the real fd 1.
+        // `notice` is not pinned this way: `println!`/`eprintln!` go through
+        // the test harness's own output capture and never reach fd 1 or fd 2
+        // here. Its stream split has one end-to-end pin, the tool warning on
+        // stderr in tests/turn_driver_bytes.rs; the other kinds, `Routing` on
+        // fd 1 included, have none.
         fn assert_marker_never_landed(sink: &dyn UiSink, depth: usize, marker: &str) {
             let (saved, mut reader) = capture_stdout();
             sink.tool_output(

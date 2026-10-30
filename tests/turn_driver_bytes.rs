@@ -1,16 +1,18 @@
 //! Captures what the REPL turn loop writes to stdout and stderr when the
-//! real binary runs a scripted turn, normalises the bytes, and under
-//! `UPDATE_GOLDENS=1` records them as golden files for later comparison.
+//! real binary runs a scripted turn, normalises the bytes and compares them
+//! with the committed golden files; `UPDATE_GOLDENS=1` recaptures them.
 
 mod common;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, fs, iter, process, thread};
 
 use common::fake_llm::{FakeLlm, Reply};
+use pretty_assertions::assert_eq;
 
 struct TempDirGuard(PathBuf);
 
@@ -50,6 +52,7 @@ const SCENARIOS: &[Scenario] = &[
 ];
 
 const RUN_DEADLINE: Duration = Duration::from_secs(120);
+const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
 
 fn fresh_config_dir(scenario: &str) -> PathBuf {
     let unique = SystemTime::now()
@@ -194,6 +197,7 @@ fn run_coyote(dir: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = common::pty::detached(&mut cmd).spawn().unwrap();
+    let pid = child.id();
     let stdout = drain(child.stdout.take().unwrap());
     let stderr = drain(child.stderr.take().unwrap());
     let deadline = Instant::now() + RUN_DEADLINE;
@@ -201,6 +205,7 @@ fn run_coyote(dir: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
         match child.try_wait().unwrap() {
             Some(status) => break Some(status),
             None if Instant::now() >= deadline => {
+                kill_session_group(pid);
                 let _ = child.kill();
                 let _ = child.wait();
                 break None;
@@ -208,15 +213,31 @@ fn run_coyote(dir: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
             None => thread::sleep(Duration::from_millis(50)),
         }
     };
-    let stdout = stdout.join().unwrap();
-    let stderr = stderr.join().unwrap();
+    let (stdout, stdout_drained) = collect(stdout);
+    let (stderr, stderr_drained) = collect(stderr);
     let Some(status) = status else {
         panic!(
-            "coyote {args:?} did not exit within {RUN_DEADLINE:?}\nstdout:\n{}\nstderr:\n{}",
+            "coyote {args:?} did not exit within {RUN_DEADLINE:?}\nstdout{}:\n{}\nstderr{}:\n{}",
+            drain_note(stdout_drained),
             String::from_utf8_lossy(&stdout),
+            drain_note(stderr_drained),
             String::from_utf8_lossy(&stderr)
         );
     };
+    // A pipe still open after the child exited belongs to something it
+    // spawned; take the group down before failing so it cannot outlive
+    // the test.
+    if !(stdout_drained && stderr_drained) {
+        kill_session_group(pid);
+    }
+    assert!(
+        stdout_drained && stderr_drained,
+        "coyote {args:?}: a pipe was still held open {DRAIN_DEADLINE:?} after exit\nstdout{}:\n{}\nstderr{}:\n{}",
+        drain_note(stdout_drained),
+        String::from_utf8_lossy(&stdout),
+        drain_note(stderr_drained),
+        String::from_utf8_lossy(&stderr)
+    );
     Output {
         status,
         stdout,
@@ -224,12 +245,51 @@ fn run_coyote(dir: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
     }
 }
 
-fn drain(mut stream: impl Read + Send + 'static) -> thread::JoinHandle<Vec<u8>> {
+/// The child runs in its own session (see `common::pty::detached`), so the
+/// whole group is the child and whatever it spawned; a grandchild that
+/// inherited the pipes would otherwise keep them open after the child dies.
+#[cfg(unix)]
+fn kill_session_group(pid: u32) {
+    // SAFETY: kill with a negative pid signals a process group and touches
+    // no memory; the group is the one `detached` created for this child, and
+    // its id stays reserved while any member is alive, so it cannot have
+    // been recycled for an unrelated process.
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_session_group(_pid: u32) {}
+
+/// Reads the stream to EOF on its own thread and hands the bytes back over
+/// a channel, so the caller can bound its wait.
+fn drain(mut stream: impl Read + Send + 'static) -> mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let mut bytes = Vec::new();
         stream.read_to_end(&mut bytes).unwrap();
-        bytes
-    })
+        let _ = tx.send(bytes);
+    });
+    rx
+}
+
+/// The drained bytes and whether EOF arrived in time; a stream still held
+/// open past the deadline yields nothing rather than hanging the test.
+fn collect(rx: mpsc::Receiver<Vec<u8>>) -> (Vec<u8>, bool) {
+    match rx.recv_timeout(DRAIN_DEADLINE) {
+        Ok(bytes) => (bytes, true),
+        Err(mpsc::RecvTimeoutError::Timeout) => (Vec::new(), false),
+        Err(mpsc::RecvTimeoutError::Disconnected) => panic!("drain thread died before EOF"),
+    }
+}
+
+fn drain_note(drained: bool) -> &'static str {
+    if drained {
+        ""
+    } else {
+        " (not drained: the pipe never reached EOF)"
+    }
 }
 
 /// Checks the run exited cleanly and returns both streams normalised.
@@ -375,13 +435,29 @@ fn capture_scenario(scenario: &Scenario) -> Capture {
 
 #[test]
 fn turn_loop_goldens() {
+    let golden_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/turn_driver");
     if env::var_os("UPDATE_GOLDENS").is_none() {
-        eprintln!(
-            "turn_loop_goldens: the compare arm is not wired yet; set UPDATE_GOLDENS=1 to capture the goldens"
-        );
+        for scenario in SCENARIOS {
+            let capture = capture_scenario(scenario);
+            // The goldens pass through `normalise` too, so a rule change
+            // reads both sides the same way. An empty `.stderr` golden is a
+            // real assertion: every scenario is expected to write nothing to
+            // stderr.
+            for (ext, text) in [("stdout", &capture.stdout), ("stderr", &capture.stderr)] {
+                let path = golden_dir.join(format!("{}.{ext}", scenario.name));
+                let golden = fs::read(&path)
+                    .unwrap_or_else(|e| panic!("read golden {}: {e}", path.display()));
+                assert_eq!(
+                    normalise(&golden),
+                    *text,
+                    "{}: {ext} differs from {} (left = golden, right = captured)",
+                    scenario.name,
+                    path.display()
+                );
+            }
+        }
         return;
     }
-    let golden_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/turn_driver");
     fs::create_dir_all(&golden_dir).unwrap();
     for scenario in SCENARIOS {
         let first = capture_scenario(scenario);
@@ -402,6 +478,17 @@ fn turn_loop_goldens() {
             println!("wrote {}", path.display());
         }
     }
+}
+
+#[test]
+fn normalise_folds_only_what_the_rules_name() {
+    assert_eq!(normalise(b"a\r\nb"), "a\nb");
+    assert_eq!(normalise(b"a\rb"), "a\rb");
+    assert_eq!(normalise(b"\x1b[2K\x1b[1;1H\x1b[Jx"), "<clear>x");
+    assert_eq!(normalise(b"\x1b[1mbold\x1b[0m"), "\x1b[1mbold\x1b[0m");
+    assert_eq!(normalise("─".as_bytes()), "─"); // debris-exempt
+    assert_eq!(normalise("──".as_bytes()), "<rule>"); // debris-exempt
+    assert_eq!(normalise("─────".as_bytes()), "<rule>"); // debris-exempt
 }
 
 /// A root-depth tool that fails is reported two ways: its stdout still

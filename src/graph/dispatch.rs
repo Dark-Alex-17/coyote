@@ -6,6 +6,8 @@ use super::{
 };
 use crate::config::paths;
 use crate::config::{Input, RequestContext, Session, TEMP_SESSION_NAME};
+use crate::events::NoticeKind;
+use crate::turn::emit_notice;
 use crate::utils::AbortSignal;
 use anyhow::{Context, Result, anyhow, bail};
 use indexmap::IndexMap;
@@ -175,7 +177,11 @@ pub async fn run_graph_turn(
         None => route::classify(ctx, &graph, &block, input.bare_text(), &abort, runner).await?,
     };
     ctx.set_last_graph_branch(branch, forced.is_some());
-    println!("{}", route::routing_line(branch));
+    emit_notice(
+        ctx.ui.as_ref(),
+        NoticeKind::Routing,
+        route::routing_line(branch),
+    );
     match branch {
         Branch::Run => {
             let previous_turns = previous_turns_for(ctx);

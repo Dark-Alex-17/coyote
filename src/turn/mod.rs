@@ -2,15 +2,17 @@
 //! (assistant text, notices, tool narration and output) so the same turn
 //! loop can drive a terminal, a silent run, or a later full-screen UI.
 
+pub(crate) mod driver;
 mod silent;
 mod stdout;
 
+pub use driver::{TurnDriver, TurnMode};
 pub use silent::SilentSink;
 pub use stdout::StdoutSink;
 
 use crate::client::SseEvent;
 use crate::config::AppConfig;
-use crate::events::{NoticeKind, OutputStream};
+use crate::events::{Event, NoticeKind, OutputStream};
 use crate::utils::AbortSignal;
 use anyhow::Result;
 use serde_json::Value;
@@ -20,10 +22,8 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 pub trait UiSink: Send + Sync {
     /// The final text of a round, rendered as markdown where the sink can.
-    #[allow(dead_code)] // TASK-307
     fn assistant_text(&self, app: &AppConfig, text: &str) -> Result<()>;
     /// Consumes a streaming response; the sink owns the receiver.
-    #[allow(dead_code)] // TASK-307
     fn stream<'a>(
         &'a self,
         app: &'a AppConfig,
@@ -38,11 +38,45 @@ pub trait UiSink: Send + Sync {
     /// A chunk a running tool wrote to its stdout or stderr.
     fn tool_output(&self, call_id: Option<&str>, stream: OutputStream, depth: usize, chunk: &[u8]);
     /// Shows (`Some(message)`) or clears (`None`) the busy indicator.
-    #[allow(dead_code)] // TASK-307
+    /// Clearing is synchronous: the indicator is gone from the terminal
+    /// when `busy(None)` returns, so the caller may print straight after.
     fn busy(&self, message: Option<&str>);
     /// The rule drawn between two turns.
-    #[allow(dead_code)] // TASK-307
     fn turn_divider(&self);
+}
+
+/// Keeps the sink's busy indicator up for as long as it lives, so a future
+/// cancelled mid-request clears the indicator on the way out.
+pub(crate) struct BusyGuard<'a>(&'a dyn UiSink);
+
+impl<'a> BusyGuard<'a> {
+    pub(crate) fn show(ui: &'a dyn UiSink, message: &str) -> Self {
+        ui.busy(Some(message));
+        Self(ui)
+    }
+}
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        self.0.busy(None);
+    }
+}
+
+/// Renders a notice on the sink and publishes it, so a sink stays a renderer
+/// and the bus stays the observer.
+pub(crate) fn emit_notice(ui: &dyn UiSink, kind: NoticeKind, text: String) {
+    ui.notice(kind, &text);
+    crate::events::bus().publish(Event::Notice { kind, text });
+}
+
+/// Renders a round's final text on the sink and publishes it as markdown.
+pub(crate) fn emit_assistant_text(ui: &dyn UiSink, app: &AppConfig, text: &str) -> Result<()> {
+    ui.assistant_text(app, text)?;
+    crate::events::bus().publish(Event::AssistantText {
+        text: text.to_string(),
+        markdown: true,
+    });
+    Ok(())
 }
 
 /// A sink that records every notice and ignores everything else, so a test

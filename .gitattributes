@@ -7,3 +7,4 @@ assets/functions/utils/*.sh text eol=lf
 scripts/*.sh text eol=lf
 assets/sbx-kit/** text eol=lf
 assets/functions/kits/** text eol=lf
+tests/fixtures/turn_driver/* text eol=lf

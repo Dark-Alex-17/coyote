@@ -2,7 +2,9 @@ use super::*;
 
 use super::access_token::{distrust_access_token, get_access_token};
 use crate::config::{RenderMode, paths};
+use crate::events::{Event, NoticeKind, bus};
 use crate::hooks::{self, HookEvent};
+use crate::turn::{BusyGuard, emit_assistant_text, emit_notice};
 use crate::{
     config::{AppConfig, Input, RequestContext},
     function::{FunctionDeclaration, ToolCall, ToolResult, eval_tool_calls},
@@ -20,9 +22,10 @@ use inquire::{
 use reqwest::{Client as ReqwestClient, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 pub const MODELS_YAML: &str = include_str!("../../models.yaml");
 
@@ -644,7 +647,6 @@ pub async fn call_chat_completions(
 ) -> Result<(String, Vec<ToolResult>)> {
     let is_child_agent = ctx.current_depth > 0;
     let suppress_spinner = is_child_agent || ctx.render_mode == RenderMode::Silent;
-    let spinner_message = if suppress_spinner { "" } else { "Generating" };
     hooks::fire(
         HookEvent::LlmRequestStarted,
         ctx,
@@ -652,17 +654,22 @@ pub async fn call_chat_completions(
         None,
     );
     let request_started_at = Instant::now();
+    let ui = Arc::clone(&ctx.ui);
+    let busy = (!suppress_spinner).then(|| BusyGuard::show(ui.as_ref(), "Generating"));
     // Spinner suppression and interrupt ownership are different questions:
     // an agent node running inline in a graph turn has depth > 0 (no spinner
     // of its own) yet still owns the turn's Ctrl-C, while a spawned child
     // does not, so the policy is not derived from `is_child_agent`.
+    // The empty message keeps this helper's own spinner dark (the sink owns
+    // the indicator); the call stays for its Ctrl-C and abort arms.
     let ret = abortable_run_with_spinner(
         client.chat_completions(input.clone()),
-        spinner_message,
+        "",
         abort_signal.clone(),
         ctx.interrupt_policy(),
     )
     .await;
+    drop(busy);
 
     match ret {
         Ok(ret) => {
@@ -683,7 +690,7 @@ pub async fn call_chat_completions(
                     text = extract_code_block(&strip_think_tag(&text)).to_string();
                 }
                 if print {
-                    ctx.app.config.print_markdown(&text)?;
+                    emit_assistant_text(ui.as_ref(), &ctx.app.config, &text)?;
                 }
             }
             ctx.record_token_usage(usage, client.model());
@@ -707,12 +714,50 @@ pub async fn call_chat_completions_streaming(
     ctx: &mut RequestContext,
     abort_signal: AbortSignal,
 ) -> Result<(String, Vec<ToolResult>)> {
+    call_chat_completions_streaming_to(StreamTarget::Terminal, input, client, ctx, abort_signal)
+        .await
+}
+
+/// Where a streaming reply's deltas go once the SSE handler has parsed them.
+pub enum StreamTarget {
+    /// The process terminal through `ctx.ui`.
+    Terminal,
+    /// Forward every `SseEvent` to a channel the caller consumes. Under
+    /// `RenderMode::Silent` the handler drops text, so the channel sees
+    /// only `Done`.
+    #[allow(dead_code)] // TASK-312
+    Channel(UnboundedSender<SseEvent>),
+}
+
+/// Republishes each text delta on the event bus and hands the event on to
+/// `out`. Stops on `Done`, when the handler drops its sender, or when the
+/// consumer behind `out` has gone away (a sink that aborted is not an error).
+async fn forward_deltas(mut rx: UnboundedReceiver<SseEvent>, out: UnboundedSender<SseEvent>) {
+    while let Some(ev) = rx.recv().await {
+        if let SseEvent::Text(t) = &ev {
+            bus().publish(Event::TextDelta(t.clone()));
+        }
+        let done = matches!(ev, SseEvent::Done);
+        if out.send(ev).is_err() || done {
+            break;
+        }
+    }
+}
+
+pub async fn call_chat_completions_streaming_to(
+    target: StreamTarget,
+    input: &Input,
+    client: &dyn Client,
+    ctx: &mut RequestContext,
+    abort_signal: AbortSignal,
+) -> Result<(String, Vec<ToolResult>)> {
     let (tx, rx) = unbounded_channel();
     let mut handler = SseHandler::new(tx, abort_signal.clone());
     let silent = ctx.render_mode == RenderMode::Silent;
     if silent {
         handler.set_silent(true);
     }
+    let ui = Arc::clone(&ctx.ui);
 
     hooks::fire(
         HookEvent::LlmRequestStarted,
@@ -721,10 +766,31 @@ pub async fn call_chat_completions_streaming(
         None,
     );
     let request_started_at = Instant::now();
-    let (send_ret, render_ret) = tokio::join!(
-        client.chat_completions_streaming(input, &mut handler),
-        render_stream(rx, client.app_config(), abort_signal.clone(), silent),
-    );
+    // A silent run keeps the plain drain even when `ctx.ui` would render:
+    // graph branches and the ACP server rely on nothing reaching the
+    // terminal from here.
+    let (send_ret, render_ret) = match target {
+        StreamTarget::Terminal if silent => tokio::join!(
+            client.chat_completions_streaming(input, &mut handler),
+            render_stream(rx, client.app_config(), abort_signal.clone(), true),
+        ),
+        StreamTarget::Terminal => {
+            let (sink_tx, sink_rx) = unbounded_channel();
+            let (send_ret, (), render_ret) = tokio::join!(
+                client.chat_completions_streaming(input, &mut handler),
+                forward_deltas(rx, sink_tx),
+                ui.stream(client.app_config(), sink_rx, abort_signal.clone()),
+            );
+            (send_ret, render_ret)
+        }
+        StreamTarget::Channel(out) => {
+            let (send_ret, ()) = tokio::join!(
+                client.chat_completions_streaming(input, &mut handler),
+                forward_deltas(rx, out),
+            );
+            (send_ret, Ok(()))
+        }
+    };
 
     let aborted_ctrlc = handler.abort().aborted_ctrlc();
     let aborted_ctrld = handler.abort().aborted_ctrld();
@@ -769,7 +835,11 @@ pub async fn call_chat_completions_streaming(
         if text.is_empty() {
             if !silent && *IS_STDOUT_TERMINAL {
                 println!();
-                eprintln!("{}", error_text("Response interrupted"));
+                emit_notice(
+                    ui.as_ref(),
+                    NoticeKind::Interrupted,
+                    error_text("Response interrupted"),
+                );
             }
 
             return Ok(("".to_string(), vec![]));
@@ -777,7 +847,11 @@ pub async fn call_chat_completions_streaming(
 
         if !silent && *IS_STDOUT_TERMINAL {
             println!();
-            eprintln!("{}", error_text("Response interrupted"));
+            emit_notice(
+                ui.as_ref(),
+                NoticeKind::Interrupted,
+                error_text("Response interrupted"),
+            );
         }
 
         return Ok((text, vec![]));
@@ -1176,11 +1250,82 @@ fn prompt_input_string(desc: &str, required: bool, help_message: Option<&str>) -
 }
 
 #[cfg(test)]
+pub(crate) mod test_fakes {
+    use super::*;
+
+    /// A provider that answers every request with one fixed text and no
+    /// tool calls, so a turn loop driven by it ends after a single round:
+    /// the plain path returns the text whole, the streaming path emits it
+    /// as a single delta.
+    pub(crate) struct FixedReplyClient {
+        config: AppConfig,
+        model: Model,
+        text: String,
+    }
+
+    impl FixedReplyClient {
+        pub(crate) fn new(text: &str) -> Self {
+            Self {
+                config: AppConfig::default(),
+                model: Model::default(),
+                text: text.to_string(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Client for FixedReplyClient {
+        fn app_config(&self) -> &AppConfig {
+            &self.config
+        }
+
+        fn extra_config(&self) -> Option<&ExtraConfig> {
+            None
+        }
+
+        fn patch_config(&self) -> Option<&RequestPatch> {
+            None
+        }
+
+        fn name(&self) -> &str {
+            "fixed-reply"
+        }
+
+        fn model(&self) -> &Model {
+            &self.model
+        }
+
+        async fn chat_completions_inner(
+            &self,
+            _client: &ReqwestClient,
+            _data: ChatCompletionsData,
+        ) -> Result<ChatCompletionsOutput> {
+            Ok(ChatCompletionsOutput {
+                text: self.text.clone(),
+                tool_calls: vec![],
+                thinking: vec![],
+                usage: None,
+            })
+        }
+
+        async fn chat_completions_streaming_inner(
+            &self,
+            _client: &ReqwestClient,
+            handler: &mut SseHandler,
+            _data: ChatCompletionsData,
+        ) -> Result<()> {
+            handler.text(&self.text)
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     use super::super::access_token::{is_rejected, set_access_token};
     use crate::config::{AppState, WorkingMode};
+    use crate::events::RecordingSink;
     use anyhow::Error;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1877,6 +2022,30 @@ mod tests {
         assert!(!captures[1].envs.contains_key("COYOTE_LLM_ERROR_KIND"));
     }
 
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn silent_streaming_transport_publishes_no_text_delta() {
+        let mut ctx = bus_probe_ctx();
+        ctx.render_mode = RenderMode::Silent;
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let client = paced_client(false);
+        let sink = RecordingSink::install();
+
+        call_chat_completions_streaming(&input, &client, &mut ctx, create_abort_signal())
+            .await
+            .unwrap();
+
+        let deltas: Vec<String> = sink
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::TextDelta(text) if text.starts_with("chunk") => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert!(deltas.is_empty(), "{deltas:?}");
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn plain_transport_fires_llm_request_failed_with_api_error_kind() {
@@ -2060,6 +2229,72 @@ mod tests {
         assert_eq!(
             failed.envs.get("COYOTE_LLM_STATUS").map(String::as_str),
             Some("500")
+        );
+    }
+
+    fn bus_probe_ctx() -> RequestContext {
+        let mut ctx = quiet_ctx();
+        ctx.ui = Arc::new(crate::turn::SilentSink);
+        ctx
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn streaming_transport_publishes_each_text_delta() {
+        let mut ctx = bus_probe_ctx();
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let client = paced_client(false);
+        let sink = RecordingSink::install();
+
+        call_chat_completions_streaming(&input, &client, &mut ctx, create_abort_signal())
+            .await
+            .unwrap();
+
+        let deltas: Vec<String> = sink
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::TextDelta(text) if text.starts_with("chunk") => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas.len(), PACED_DELTAS, "{deltas:?}");
+        assert_eq!(deltas.concat(), paced_text());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn plain_transport_publishes_the_printed_reply_as_assistant_text() {
+        let mut ctx = bus_probe_ctx();
+        let input = Input::from_str(&ctx, "hi", None).unwrap();
+        let mut client = paced_client(false);
+        client.nonstream_replies = true;
+        let sink = RecordingSink::install();
+
+        call_chat_completions(
+            &input,
+            true,
+            false,
+            &client,
+            &mut ctx,
+            create_abort_signal(),
+        )
+        .await
+        .unwrap();
+
+        let recorded: Vec<Event> = sink
+            .drain()
+            .into_iter()
+            .filter(
+                |event| matches!(event, Event::AssistantText { text, .. } if text == &paced_text()),
+            )
+            .collect();
+        assert_eq!(
+            recorded,
+            vec![Event::AssistantText {
+                text: paced_text(),
+                markdown: true,
+            }]
         );
     }
 

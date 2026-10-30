@@ -91,6 +91,7 @@ impl GraphExecutor {
             &self.graph.name,
             self.graph.settings.log_state_snapshots,
             is_nested,
+            Arc::clone(&ctx.ui),
         );
         let result = self.run(&mut logger, ctx, abort_signal).await;
         if let Err(e) = &result {
@@ -277,6 +278,7 @@ impl GraphExecutor {
                 );
                 let branch_state = state.fork_for_branch_state();
                 let mut branch_ctx = ctx.fork_for_branch();
+                let ui = Arc::clone(&branch_ctx.ui);
                 let mut peer_id: Option<String> = None;
                 if let Some(assignment) = peer_assignments.remove(node_id) {
                     peer_id = Some(assignment.0.clone());
@@ -316,6 +318,7 @@ impl GraphExecutor {
                         .expect("semaphore should not be closed");
                     if abort_clone.aborted() {
                         narrate_node_failed(
+                            ui.as_ref(),
                             silent,
                             &node,
                             Duration::default(),
@@ -351,6 +354,7 @@ impl GraphExecutor {
                                 Some(targets.join(", "))
                             };
                             narrate_node_complete(
+                                ui.as_ref(),
                                 silent,
                                 &node,
                                 elapsed,
@@ -362,6 +366,7 @@ impl GraphExecutor {
                         }
                         Ok(StepResult::FellBack(target)) => {
                             narrate_node_complete(
+                                ui.as_ref(),
                                 silent,
                                 &node,
                                 elapsed,
@@ -373,6 +378,7 @@ impl GraphExecutor {
                         }
                         Ok(StepResult::End(_)) => {
                             narrate_node_complete(
+                                ui.as_ref(),
                                 silent,
                                 &node,
                                 elapsed,
@@ -384,6 +390,7 @@ impl GraphExecutor {
                         }
                         Err(e) => {
                             narrate_node_failed(
+                                ui.as_ref(),
                                 silent,
                                 &node,
                                 elapsed,
