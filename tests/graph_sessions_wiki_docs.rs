@@ -30,8 +30,9 @@
 //! `carry:` list) and the resume policy sentence of
 //! `assets/skills/delegation-protocol/SKILL.md`; the resume refusal of a
 //! start-unknown stamp against `src/utils/process.rs`, the `--macro` arm
-//! against `src/main.rs`, and the child folds on Session-Compression.md
-//! against the child run loop in `src/function/agents.rs`.
+//! against `src/main.rs` and `src/config/macros.rs`, and the child folds on
+//! Session-Compression.md against the child run loop in
+//! `src/function/agents.rs`.
 
 use std::collections::BTreeSet;
 use std::env;
@@ -78,6 +79,9 @@ const STREAMED_ABORT_LEAD: &str = "When only a sub-agent's own children are stil
 /// The lead of the Sessions.md Error Recovery note on `.recover` after a
 /// Ctrl+C.
 const RECOVER_NOTE_LEAD: &str = "> **`.recover` after Ctrl+C.**";
+/// The lead of the Macros.md isolation bullet on what a headless
+/// `coyote --macro` run saves.
+const MACRO_SAVE_LEAD: &str = "* **`coyote --macro` saves nothing at exit.**";
 const SESSION_PATH: &str = "COYOTE_SESSION_PATH";
 /// The lead of the sentence that lists every denied `chat.tools` entry.
 const DENY_LEAD: &str = "Denied in `chat.tools`:";
@@ -594,6 +598,17 @@ fn fn_body(source: &str, head: &str) -> String {
         .find(&close)
         .unwrap_or_else(|| panic!("{head} closes with `}}` on its own line"));
     body[..end].to_string()
+}
+
+/// The text of a source file before its `mod tests` block, so a pin on
+/// production code never matches a copy of the same text that a unit test
+/// holds in a string literal. A file whose test module is not found that
+/// way fails rather than being read whole.
+fn before_test_module(source: &str) -> &str {
+    source
+        .split_once("\n#[cfg(test)]\nmod tests {")
+        .map(|(before, _)| before)
+        .expect("the source has a `#[cfg(test)] mod tests {` block")
 }
 
 /// The value of `const {name}: &str = "...";` in `source`, whatever its
@@ -1907,6 +1922,10 @@ fn edited_sections(wiki: &Path) -> Vec<(&'static str, String)> {
             paragraph("Sessions.md", &sessions, RECOVER_NOTE_LEAD),
         ),
         (
+            "Macros.md headless save bullet",
+            paragraph("Macros.md", &read(wiki.join("Macros.md")), MACRO_SAVE_LEAD),
+        ),
+        (
             "Session-Compression.md # Child sessions",
             section("Session-Compression.md", &compression, CHILD_FOLDS_HEADING),
         ),
@@ -2148,10 +2167,7 @@ fn sessions_child_section_names_the_layout_and_the_lifecycle_rules() {
     );
     // Every bounded drain in the REPL but the sessionless Ctrl-C helper is a
     // session command the subsection lists.
-    let repl_production = repl
-        .split("\n#[cfg(test)]\nmod tests {")
-        .next()
-        .expect("split yields the text before the test module");
+    let repl_production = before_test_module(&repl);
     let drains = repl_production
         .matches("cancel_background_tasks_and_wait(EXIT_CANCEL_WAIT).await;")
         .count();
@@ -2173,6 +2189,25 @@ fn sessions_child_section_names_the_layout_and_the_lifecycle_rules() {
             && !macro_arm.contains("exit_session"),
         "the --macro arm signals a cancel without waiting and never exits its session: {macro_arm}"
     );
+    // An isolated macro, the default, runs its steps on a new context that
+    // carries no session; only a non-isolated one runs on the caller's.
+    let macros = src(&["config", "macros.rs"]);
+    assert!(
+        macros.contains("#[serde(default = \"default_true\")]\n    pub isolated: bool,"),
+        "a macro is no longer isolated by default"
+    );
+    let execute = fn_body(&macros, "pub async fn macro_execute(");
+    let (live, isolated) = execute
+        .split_once("let role = ctx.extract_role(")
+        .expect("macro_execute builds the isolated context after the live path");
+    assert!(
+        live.contains("if !macro_value.isolated {") && live.contains("MacroModeGuard::new(ctx)"),
+        "a non-isolated macro no longer runs on the caller's context"
+    );
+    assert!(
+        isolated.contains("RequestContext::new(") && !isolated.contains(".session ="),
+        "an isolated macro's context no longer starts without a session"
+    );
 
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join("Sessions.md"));
@@ -2189,8 +2224,10 @@ fn sessions_child_section_names_the_layout_and_the_lifecycle_rules() {
         "not after every tool round",
         "keeps `running` in its sidecar and reads `crashed` afterwards",
         "`--macro` signals them to cancel as it ends, without waiting for them to record it",
-        "A `--macro` run does not exit its session when it ends, so the save at exit does not happen for it",
-        "saves them itself with a `.save session` step",
+        "A `--macro` run does not exit any session when it ends, so the save at exit does not happen for it",
+        "with [`isolated: false`](Macros#isolation) the steps run on the session given with `--session`",
+        "an isolated macro (the default) runs them on a fresh context that has no session until a step attaches one with `.session <name>`",
+        "a macro whose turns must be kept saves them itself with a `.save session` step",
         "copies as `running` and later reads `crashed` on the fork",
         "always runs its graph",
         "the run is recorded into the same child session file",
@@ -2217,6 +2254,22 @@ fn sessions_child_section_names_the_layout_and_the_lifecycle_rules() {
         assert!(
             commands.contains(needle),
             "the Session commands subsection does not say {needle:?}"
+        );
+    }
+    let macro_save = flat(&paragraph(
+        "Macros.md",
+        &read(wiki.join("Macros.md")),
+        MACRO_SAVE_LEAD,
+    ));
+    for needle in [
+        "A headless run does not exit the session its steps ran in, so the save at exit never happens",
+        "With `isolated: false` the steps run on the session given with `--session`",
+        "an isolated macro's context has no session until a step attaches one with `.session <name>`",
+        "end the macro with a `.save session` step to keep its exchanges",
+    ] {
+        assert!(
+            macro_save.contains(needle),
+            "the Macros.md headless save bullet does not say {needle:?}: {macro_save}"
         );
     }
     let written = flat(&section(
@@ -2404,7 +2457,7 @@ fn hook_pages_document_the_session_deleted_event() {
     );
     let fired = flat(&paragraph("Hooks.md", &hooks, SESSION_DELETED_LEAD));
     let replaced = format!(
-        "the previous `{temp}` session file that `.session` (with no name, or `{temp}`) replaces"
+        "the previous `{temp}` session file that `.session` or `--session` (with no name, or `{temp}`) replaces"
     );
     for needle in [
         "fires once per session file an operator command removed (or the child-session directory for `.empty`)",
@@ -2665,29 +2718,25 @@ fn agents_page_quotes_the_spawn_session_id_contract() {
 #[test]
 fn compression_page_names_where_a_child_folds() {
     let agents = src(&["function", "agents.rs"]);
-    let production = agents
-        .split("\n#[cfg(test)]\nmod tests {")
-        .next()
-        .expect("split yields the text before the test module");
+    let run_loop = before_test_module(&agents);
     assert_eq!(
-        production
+        run_loop
             .matches("maybe_compress_child_turn(&mut child_ctx")
             .count(),
         2,
         "the child run loop folds at a turn boundary and after a checkpoint"
     );
     assert!(
-        production.contains("if checkpoint.is_some() && maybe_compress_child_turn("),
+        run_loop.contains("if checkpoint.is_some() && maybe_compress_child_turn("),
         "the second fold no longer follows a checkpoint"
     );
-    let retry = fn_body(production, "async fn compress_child_for_error_retry(");
+    let retry = fn_body(run_loop, "async fn compress_child_for_error_retry(");
     assert!(
         retry.contains("if already_retried || abort_signal.aborted() {"),
         "the overflow retry is no longer once per run and skipped after a cancel"
     );
     assert!(
-        fn_body(production, "async fn load_and_gate(")
-            .contains("compress_child_session(child_ctx)"),
+        fn_body(run_loop, "async fn load_and_gate(").contains("compress_child_session(child_ctx)"),
         "a resume no longer compresses an over-window transcript"
     );
     assert_eq!(anchor_of(CHILD_FOLDS_HEADING), "child-sessions");
@@ -2842,10 +2891,7 @@ fn ctrl_c_wording_names_the_session_split() {
     // text, reaches the "still running" notice. Only that error branch
     // checkpoints the failed turn; the graph route call returns its error
     // with `?` before it, so it checkpoints nothing.
-    let repl_production = repl
-        .split("\n#[cfg(test)]\nmod tests {")
-        .next()
-        .expect("split yields the text before the test module");
+    let repl_production = before_test_module(&repl);
     assert!(
         repl_production.contains("if abort_signal.aborted_ctrlc() && ctx.session.is_none() {"),
         "the error branch of the ask loop no longer limits its notice to sessionless turns"
