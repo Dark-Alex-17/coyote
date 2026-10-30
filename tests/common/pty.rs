@@ -9,7 +9,9 @@ pub fn detached(cmd: &mut Command) -> &mut Command {
     // SAFETY: setsid is async-signal-safe and touches no memory of the parent.
     unsafe {
         cmd.pre_exec(|| {
-            libc::setsid();
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         })
     }

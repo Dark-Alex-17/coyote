@@ -304,9 +304,9 @@ fn is_outside_system32(path: &Path) -> bool {
         .any(|part| part.eq_ignore_ascii_case("system32"))
 }
 
-// Holds the stdout lock for the whole capture: the harness reports
-// from the main thread through `io::stdout()`, and a report caught
-// mid-`write(1)` while fd 1 is re-pointed fails with EPIPE and kills the run.
+/// Holds the stdout lock for the whole capture: the harness reports
+/// from the main thread through `io::stdout()`, and a report caught
+/// mid-`write(1)` while fd 1 is re-pointed fails with EPIPE and kills the run.
 #[cfg(unix)]
 pub(crate) struct SavedStdout {
     fd: OwnedFd,
@@ -324,13 +324,15 @@ impl Drop for SavedStdout {
     }
 }
 
-// Points fd 1 at a fresh pipe; the reader sees EOF once the guard
-// restores fd 1, because fd 1 is the pipe's only writer. The read end
-// is non-blocking so a writer inherited by a child of another test
-// fails `read_all` at its deadline instead of hanging the test.
-// Same-thread only: the guard holds the `io::stdout()` lock, so a write
-// through `io::stdout()` from any other thread blocks until the guard
-// drops. Raw `write(1)` calls are unaffected.
+/// Points fd 1 at a fresh pipe; the reader sees EOF once the guard
+/// restores fd 1, because fd 1 is the pipe's only writer. The read end
+/// is non-blocking so a writer inherited by a child of another test
+/// fails `read_all` at its deadline instead of hanging the test.
+/// Same-thread only: the guard holds the `io::stdout()` lock, so a write
+/// through `io::stdout()` from any other thread blocks until the guard
+/// drops. Raw `write(1)` calls are unaffected.
+/// Callers must be `#[serial]`: fd 1 is process-global, and two live
+/// captures would race each other's `dup2`.
 #[cfg(unix)]
 pub(crate) fn capture_stdout() -> (SavedStdout, File) {
     let mut lock = io::stdout().lock();
@@ -364,6 +366,8 @@ pub(crate) fn capture_stdout() -> (SavedStdout, File) {
     (saved, reader)
 }
 
+/// Writes straight to fd 1, bypassing the `io::stdout()` lock a live
+/// capture holds; used to pass captured harness output through.
 #[cfg(unix)]
 pub(crate) fn write_fd1(bytes: &[u8]) {
     // SAFETY: `bytes` is a valid buffer of the given length.
@@ -371,6 +375,8 @@ pub(crate) fn write_fd1(bytes: &[u8]) {
     assert_eq!(n, bytes.len() as isize);
 }
 
+/// Drains the capture pipe to EOF, giving up after two seconds if some
+/// inherited writer still holds it open.
 #[cfg(unix)]
 pub(crate) fn read_all(reader: &mut File) -> String {
     use std::io::Read;
