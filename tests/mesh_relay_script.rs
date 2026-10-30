@@ -454,6 +454,46 @@ fn assert_no_announce_rate_setting(text: &str, what: &str) {
     );
 }
 
+/// A reader whose host already has a hand-written Reticulum config is told to merge the
+/// script's settings by hand, so the printed advice must carry the shared-instance keys
+/// every `type: local` session attaches through, consecutive and in the written order,
+/// next to the 4242 listener the remote rungs keep; the file itself stays untouched.
+#[test]
+fn an_existing_config_is_told_to_carry_the_shared_instance_keys_and_the_4242_listener() {
+    let bash = bash_or_skip!();
+    let home = Home::new("existing-shared-keys");
+    home.seed_rnsd();
+    fs::create_dir_all(home.reticulum_config().parent().unwrap()).unwrap();
+    let hand_written = "[reticulum]\nenable_transport = True\n\n[interfaces]\n";
+    fs::write(home.reticulum_config(), hand_written).unwrap();
+
+    let (code, out, err) = run(&mut home.relay(&bash, &["--no-service", "--dry-run"]));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(out.contains("already exists, not touched"), "{out}");
+    let advice = &out[out.find("already exists, not touched").unwrap()..];
+    assert!(
+        advice.contains(
+            "share_instance = Yes\nshared_instance_port = 37428\ninstance_name = default\n"
+        ),
+        "the merge advice lacks the consecutive shared-instance keys:\n{advice}"
+    );
+    for needle in [
+        "type = TCPServerInterface",
+        "listen_ip = 127.0.0.1",
+        "listen_port = 4242",
+    ] {
+        assert!(
+            advice.contains(needle),
+            "the merge advice lacks {needle:?}:\n{advice}"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(home.reticulum_config()).unwrap(),
+        hand_written,
+        "an existing config was modified"
+    );
+}
+
 #[test]
 fn usage_errors_exit_1_on_stderr_and_touch_nothing_while_help_exits_0() {
     let bash = bash_or_skip!();
