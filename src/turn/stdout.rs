@@ -174,8 +174,10 @@ mod tests {
         // The harness reports from other threads on fd 1 too, so the capture
         // is checked for our marker and then passed through to the real fd 1.
         // `notice` is not pinned this way: `println!`/`eprintln!` go through
-        // the test harness's own output capture and never reach fd 1 or
-        // fd 2 here, so its stream split is checked by the binary goldens.
+        // the test harness's own output capture and never reach fd 1 or fd 2
+        // here. Its stream split has one end-to-end pin, the tool warning on
+        // stderr in tests/turn_driver_bytes.rs; the other kinds, `Routing` on
+        // fd 1 included, have none.
         fn assert_marker_never_landed(sink: &dyn UiSink, depth: usize, marker: &str) {
             let (saved, mut reader) = capture_stdout();
             sink.tool_output(
