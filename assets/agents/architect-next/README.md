@@ -68,22 +68,22 @@ from the brief, never from a hard-coded toolchain):
 ```
 $ grep -nE '\b(cargo|npm|pnpm|yarn|go (test|build)|pytest|mvn|gradle|make)\b' scripts/*.py
 scripts/_lib.py:546:    r"`[^`]+`|\b(go|cargo|npm|pnpm|yarn|make|pytest|python3?|bash|sh|grep|rg|curl|task|just|mvn|gradle|dotnet|bun)\b\s",
-scripts/gates.py:42:    r"yarn\.lock$|pnpm-lock\.yaml$|Cargo\.(toml|lock)$|requirements.*\.txt$|poetry\.lock$",
-scripts/gates.py:2511:        "file:line, at most 25 per run so iterate); identifiers that only make sense with the plan open; ...
-scripts/gates.py:2520:        "failing test to make it pass; you still do NOT edit the plan or task files -- report instead.\n\n"
-scripts/mode_matrix.py:158:`make run`
-scripts/mode_matrix.py:253:            ... "local_run_recipe": "`make run`",
-scripts/smoke_test.py:84:CODE_BASE = make_repo(CODE, {..., "CLAUDE.md": "Run `go test ./...` before committing.\n", ...
-scripts/smoke_test.py:143:`make run`
-scripts/smoke_test.py:457:u = gates.verify_gate(base_state(..., local_run_recipe="make run"))
-scripts/smoke_test.py:636:   ... "acceptance_criteria": ["`go test ./...`"], ...
-scripts/smoke_test.py:751:u = AA("probe_gap", "Supply the recipe: make run", ...)
+scripts/gates.py:41:    r"yarn\.lock$|pnpm-lock\.yaml$|Cargo\.(toml|lock)$|requirements.*\.txt$|poetry\.lock$",
+scripts/gates.py:2567:        "file:line, at most 25 per run so iterate); identifiers that only make sense with the plan open; ...
+scripts/gates.py:2576:        "failing test to make it pass; you still do NOT edit the plan or task files -- report instead.\n\n"
+scripts/mode_matrix.py:165:`make run`
+scripts/mode_matrix.py:260:            ... "local_run_recipe": "`make run`",
+scripts/smoke_test.py:88:CODE_BASE = make_repo(CODE, {..., "CLAUDE.md": "Run `go test ./...` before committing.\n", ...
+scripts/smoke_test.py:147:`make run`
+scripts/smoke_test.py:461:u = gates.verify_gate(base_state(..., local_run_recipe="make run"))
+scripts/smoke_test.py:726:   ... "acceptance_criteria": ["`go test ./...`"], ...
+scripts/smoke_test.py:841:u = AA("probe_gap", "Supply the recipe: make run", ...)
 ```
 
 None of these runs a toolchain: `_lib.py:546` is the alternation of the executable-criterion
 classifier (`EXECUTABLE_RE` recognises a command-shaped acceptance criterion; it hardcodes no
-command), `gates.py:42` is the dependency-manifest regex (the hits are `yarn`/`pnpm` inside
-lockfile names), `gates.py:2511` and `:2520` are the English verb `make` in prompt prose, and
+command), `gates.py:41` is the dependency-manifest regex (the hits are `yarn`/`pnpm` inside
+lockfile names), `gates.py:2567` and `:2576` are the English verb `make` in prompt prose, and
 the `mode_matrix.py` and `smoke_test.py` lines are battery fixtures. The wrapper test
 `no_gate_names_a_toolchain_command` keeps it that way with a `make`-less variant of the
 pattern: it matches `\b(cargo|rustc|npm|pnpm|yarn|pytest|mvn|gradle|just)\b|\bgo (test|build|run)\b`
