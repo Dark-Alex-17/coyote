@@ -1,5 +1,6 @@
 use crate::config::RequestContext;
 use crate::hooks::HookEvent;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, RwLock};
 
@@ -110,7 +111,8 @@ pub struct SubscriptionId(u64);
 
 /// Synchronous fan-out of [`Event`]s to subscribed sinks. Publishing never
 /// holds the subscriber lock while a sink runs, so a sink may subscribe or
-/// unsubscribe from inside `on_event`.
+/// unsubscribe from inside `on_event`. A sink that panics is unsubscribed
+/// so one broken observer cannot take the publisher down with it.
 #[derive(Default)]
 pub struct EventBus {
     sinks: RwLock<Vec<(SubscriptionId, Arc<dyn EventSink>)>>,
@@ -129,7 +131,6 @@ impl EventBus {
     }
 
     /// Removes the subscription; unknown ids are ignored.
-    #[allow(dead_code)] // TASK-307
     pub fn unsubscribe(&self, id: SubscriptionId) {
         self.sinks
             .write()
@@ -138,15 +139,16 @@ impl EventBus {
     }
 
     pub fn publish(&self, event: Event) {
-        let sinks: Vec<Arc<dyn EventSink>> = self
+        let sinks: Vec<(SubscriptionId, Arc<dyn EventSink>)> = self
             .sinks
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .map(|(_, sink)| Arc::clone(sink))
-            .collect();
-        for sink in sinks {
-            sink.on_event(&event);
+            .clone();
+        for (id, sink) in sinks {
+            if catch_unwind(AssertUnwindSafe(|| sink.on_event(&event))).is_err() {
+                warn!("Event sink panicked; dropping it");
+                self.unsubscribe(id);
+            }
         }
     }
 
@@ -214,6 +216,16 @@ mod recording {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()),
             )
+        }
+
+        /// Drains the recording and keeps only the [`Event::Hook`]s whose
+        /// envs carry the `(key, value)` pair.
+        pub(crate) fn drain_hooks_with_env(&self, key: &str, value: &str) -> Vec<Event> {
+            let probe = (key.to_string(), value.to_string());
+            self.drain()
+                .into_iter()
+                .filter(|event| matches!(event, Event::Hook { envs, .. } if envs.contains(&probe)))
+                .collect()
         }
     }
 
@@ -290,6 +302,34 @@ mod tests {
         bus.unsubscribe(id);
 
         assert_eq!(bus.sink_count(), 0);
+    }
+
+    #[test]
+    fn panicking_sink_is_dropped_and_other_sinks_keep_receiving() {
+        struct PanickingSink;
+
+        impl EventSink for PanickingSink {
+            fn on_event(&self, _: &Event) {
+                panic!("sink failure under test");
+            }
+        }
+
+        let bus = EventBus::default();
+        bus.subscribe(Arc::new(PanickingSink));
+        let sink = Arc::new(CollectingSink {
+            seen: Mutex::new(Vec::new()),
+        });
+        bus.subscribe(Arc::clone(&sink) as Arc<dyn EventSink>);
+
+        bus.publish(probe_event("first"));
+        assert_eq!(bus.sink_count(), 1);
+        assert_eq!(*sink.seen.lock().unwrap(), vec![probe_event("first")]);
+
+        bus.publish(probe_event("second"));
+        assert_eq!(
+            *sink.seen.lock().unwrap(),
+            vec![probe_event("first"), probe_event("second")]
+        );
     }
 
     #[test]
