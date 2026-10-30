@@ -309,7 +309,7 @@ mod tests {
         );
 
         handle_todo_tool(&mut ctx, "todo__list", &json!({})).unwrap();
-        assert!(todo_updates(&recording).is_empty());
+        assert!(bearing(&todo_updates(&recording), PROBE).is_empty());
 
         handle_todo_tool(&mut ctx, "todo__done", &json!({"id": 1})).unwrap();
         let updates = todo_updates(&recording);
@@ -320,7 +320,7 @@ mod tests {
 
         handle_todo_tool(&mut ctx, "todo__done", &json!({"id": 99})).unwrap();
         handle_todo_tool(&mut ctx, "todo__add", &json!({"task": ""})).unwrap();
-        assert!(todo_updates(&recording).is_empty());
+        assert!(bearing(&todo_updates(&recording), PROBE).is_empty());
 
         handle_todo_tool(&mut ctx, "todo__add", &json!({"task": "second"})).unwrap();
         handle_todo_tool(&mut ctx, "todo__clear", &json!({})).unwrap();

@@ -3407,9 +3407,10 @@ impl RequestContext {
         }
         self.last_token_usage = usage;
         self.last_cost = cost;
-        // Only the root context owns the footer; a child agent's usage would
-        // otherwise overwrite the user's.
-        if self.self_agent_id.is_none() {
+        // Only the session-owning root context feeds the footer. A child
+        // agent or a graph branch (which clones the session but never writes
+        // it back) would otherwise overwrite the user's totals with its own.
+        if self.self_agent_id.is_none() && self.persists_session {
             let right_prompt = self.render_prompt_right(&self.app.config);
             events::bus().publish(Event::UsageUpdated { right_prompt });
         }
@@ -8473,6 +8474,33 @@ mod tests {
         });
         assert!(!published);
         assert!(ctx.last_prompt_token_usage.is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn record_token_usage_publishes_nothing_for_a_graph_branch() {
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.right_prompt = Some("usage-probe-x7x".into()));
+        let mut branch = ctx.fork_for_branch();
+        assert!(!branch.persists_session);
+        let recording = crate::events::RecordingSink::install();
+
+        branch.record_token_usage(
+            Some(TokenUsage {
+                input_tokens: Some(1),
+                ..Default::default()
+            }),
+            &priced_model(),
+        );
+
+        let published = recording.drain().into_iter().any(|event| {
+            matches!(
+                event,
+                Event::UsageUpdated { right_prompt } if right_prompt.contains("usage-probe-x7x")
+            )
+        });
+        assert!(!published);
+        assert!(branch.last_prompt_token_usage.is_some());
     }
 
     fn todo_updates_bearing(

@@ -469,7 +469,9 @@ fn merge_system_channel(last: &mut ToolResult, escalations: Vec<Value>, notifica
         "Background tasks have finished; collect each result with its next_action command.";
     let user_message_instruction =
         "The user sent a message while you were working; read it before continuing.";
-    let has_tasks = notifications.iter().any(|n| n.get("id").is_some());
+    let has_tasks = notifications
+        .iter()
+        .any(|n| n.get("event").and_then(Value::as_str) != Some(USER_MESSAGE_EVENT));
     let has_user_message = notifications
         .iter()
         .any(|n| n.get("event").and_then(Value::as_str) == Some(USER_MESSAGE_EVENT));
