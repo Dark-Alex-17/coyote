@@ -115,16 +115,24 @@ fn keep_attached_option_values(build_script: &str) -> String {
     )
 }
 
-/// argc 1.24.0's generated `_argc_run` passes several arrays on with a bare
-/// `"${a[@]}"`, and those arrays are empty on ordinary calls: any call with
-/// no positionals, or a subcommand with no required option or env while a
-/// sibling declares one. Every agent tool runs under `set -u` (from
-/// `.shared/utils.sh`), and bash before 4.4, including the 3.2 that macOS
-/// ships, treats an empty `"${a[@]}"` as an unbound variable, so the call
-/// dies before the function runs. Rewrite each one to `${a[@]+"${a[@]}"}`,
-/// which expands to nothing for an empty array on every bash. Applied
-/// post-build so it survives every regeneration.
-const EMPTY_ARRAY_EXPANSIONS: [(&str, &str); 4] = [
+/// argc 1.24.0's generated code passes several arrays on with a bare
+/// `"${a[@]}"`, and those arrays are empty on ordinary calls: `_argc_run`
+/// with no positionals, or a subcommand with no required option, env or
+/// tool while a sibling declares one; `take_args.sh` when a delimited option
+/// value is empty (`--x=`); `split_positionals.sh` when a delimited
+/// positional is empty or has no positionals before or after it. Every agent
+/// tool runs under `set -u` (from `.shared/utils.sh`), and bash before 4.4,
+/// including the 3.2 that macOS ships, treats an empty `"${a[@]}"` as an
+/// unbound variable, so the call dies before the function runs. Rewrite each
+/// one to `${a[@]+"${a[@]}"}`, which expands to nothing for an empty array on
+/// every bash. The `{var_name}+=(...)` and `{var_name}=(...)` assignments are
+/// matched by their suffix because the variable name varies per parameter.
+/// Only the generated block is rewritten, so the generic template lines
+/// cannot match hand-written tool code. The `argc__positionals` slices in
+/// `split_positionals.sh` and the loop over `_argc_take_args_values` in
+/// `take_args.sh` stay bare because argc only reaches them with a non-empty
+/// array. Applied post-build so it survives every regeneration.
+const EMPTY_ARRAY_EXPANSIONS: [(&str, &str); 11] = [
     (
         r#"$argc__fn "${argc__positionals[@]}""#,
         r#"$argc__fn ${argc__positionals[@]+"${argc__positionals[@]}"}"#,
@@ -141,14 +149,49 @@ const EMPTY_ARRAY_EXPANSIONS: [(&str, &str); 4] = [
         r#"_argc_require_tools "${_argc_tools[@]}""#,
         r#"_argc_require_tools ${_argc_tools[@]+"${_argc_tools[@]}"}"#,
     ),
+    (
+        r#"arr+=("${values[@]}")"#,
+        r#"arr+=(${values[@]+"${values[@]}"})"#,
+    ),
+    (
+        r#"_argc_take_args_values=("${arr[@]}")"#,
+        r#"_argc_take_args_values=(${arr[@]+"${arr[@]}"})"#,
+    ),
+    (
+        r#"+=("${_argc_take_args_values[@]}")"#,
+        r#"+=(${_argc_take_args_values[@]+"${_argc_take_args_values[@]}"})"#,
+    ),
+    (
+        r#"for item in "${split_values[@]}"; do"#,
+        r#"for item in ${split_values[@]+"${split_values[@]}"}; do"#,
+    ),
+    (
+        r#"_argc_split_positionals_values+=("${values[@]}")"#,
+        r#"_argc_split_positionals_values+=(${values[@]+"${values[@]}"})"#,
+    ),
+    (
+        r#"argc__positionals=("${heads[@]}" "${_argc_split_positionals_values[@]}" "${tails[@]}")"#,
+        r#"argc__positionals=(${heads[@]+"${heads[@]}"} ${_argc_split_positionals_values[@]+"${_argc_split_positionals_values[@]}"} ${tails[@]+"${tails[@]}"})"#,
+    ),
+    (
+        r#"=("${_argc_split_positionals_values[@]}")"#,
+        r#"=(${_argc_split_positionals_values[@]+"${_argc_split_positionals_values[@]}"})"#,
+    ),
 ];
 
+const ARGC_BUILD_MARKER: &str = "# ARGC-BUILD {";
+
 fn tolerate_empty_arrays_under_nounset(build_script: &str) -> String {
-    EMPTY_ARRAY_EXPANSIONS
+    let Some(block) = build_script.find(ARGC_BUILD_MARKER) else {
+        return build_script.to_string();
+    };
+    let (hand_written, generated) = build_script.split_at(block);
+    let generated = EMPTY_ARRAY_EXPANSIONS
         .iter()
-        .fold(build_script.to_string(), |script, (needle, replacement)| {
+        .fold(generated.to_string(), |script, (needle, replacement)| {
             script.replace(needle, replacement)
-        })
+        });
+    format!("{hand_written}{generated}")
 }
 
 fn schema_ty(t: &str) -> JsonSchema {
@@ -263,16 +306,19 @@ mod tests {
     fn rewrites_argc_empty_array_expansions_to_nounset_safe_form_test() {
         // `forward` is hand-written code that expands the same arrays the
         // rewrite targets, without the generated call around them; a wider
-        // rewrite than the listed lines would reach it.
-        let forward =
-            "forward() { printf '%s' \"${_argc_tools[@]}\" \"${argc__positionals[@]}\"; }";
+        // rewrite than the listed lines would reach it. Its `arr+=` line is
+        // identical to a generated one, so only the block scoping keeps it.
+        let forward = "forward() { local arr=() values=(); arr+=(\"${values[@]}\"); printf '%s' \"${_argc_tools[@]}\" \"${argc__positionals[@]}\" \"${arr[@]}\"; }";
+        // `split` makes argc emit the delimiter and split-positionals
+        // templates.
         let src = format!(
-            "# @describe test tool\n# @meta require-tools ls\n# @env NEEDED! An env\n\n# @cmd run\n# @option --content! The content\nrun() {{ :; }}\n\n{forward}\n"
+            "# @describe test tool\n# @meta require-tools ls\n# @env NEEDED! An env\n\n# @cmd run\n# @option --content! The content\nrun() {{ :; }}\n\n# @cmd split\n# @option --x*, Delimited values\n# @arg items*, Delimited items\nsplit() {{ :; }}\n\n{forward}\n"
         );
         let built = argc::build(&src, "", None).expect("argc build failed");
+        let block = built.find(ARGC_BUILD_MARKER).expect("argc build block");
         for (needle, _) in EMPTY_ARRAY_EXPANSIONS {
             assert!(
-                built.contains(needle),
+                built[block..].contains(needle),
                 "argc changed its generated `{needle}`; update EMPTY_ARRAY_EXPANSIONS"
             );
         }
@@ -280,15 +326,18 @@ mod tests {
         let fixed = tolerate_empty_arrays_under_nounset(&built);
 
         for (needle, replacement) in EMPTY_ARRAY_EXPANSIONS {
-            assert!(!fixed.contains(needle), "still present: {needle}");
-            assert!(fixed.contains(replacement), "missing: {replacement}");
+            assert!(!fixed[block..].contains(needle), "still present: {needle}");
+            assert!(
+                fixed[block..].contains(replacement),
+                "missing: {replacement}"
+            );
         }
 
         // Nothing outside the listed generated expansions changes: the
         // hand-written part (everything before the generated block) is
-        // byte-identical, and inside the block exactly one line changes per
-        // listed expansion, each by that expansion's replacement alone.
-        let block = built.find("# ARGC-BUILD {").expect("argc build block");
+        // byte-identical, and inside the block one line changes per
+        // occurrence of a listed expansion, each by that expansion's
+        // replacement alone.
         assert!(
             built[..block].contains(forward),
             "fixture lost its hand-written line"
@@ -299,6 +348,10 @@ mod tests {
             "the rewrite touched hand-written code"
         );
         assert_eq!(fixed.lines().count(), built.lines().count());
+        let occurrences: usize = EMPTY_ARRAY_EXPANSIONS
+            .iter()
+            .map(|(needle, _)| built[block..].matches(needle).count())
+            .sum();
         let changed: Vec<(&str, &str)> = built
             .lines()
             .zip(fixed.lines())
@@ -306,7 +359,7 @@ mod tests {
             .collect();
         assert_eq!(
             changed.len(),
-            EMPTY_ARRAY_EXPANSIONS.len(),
+            occurrences,
             "the rewrite changed other lines: {changed:#?}"
         );
         for (before, after) in changed {
@@ -353,43 +406,70 @@ mod tests {
             return;
         }
 
-        // `strict` declares a required option and a required env, so the
-        // generated `_argc_require_params` calls exist and run, with empty
-        // arrays, on a `greet` call that passes no options.
-        let src = "#!/usr/bin/env bash\nset -euo pipefail\n# @describe t\n\n# @cmd greet\n# @option --name The name\ngreet() { printf 'hi %s' \"${argc_name:-nobody}\" >> \"$LLM_OUTPUT\"; }\n\n# @cmd strict\n# @option --x! A required option\n# @env NEEDED! A required env\nstrict() { :; }\n";
+        struct TempFiles(Vec<std::path::PathBuf>);
+        impl Drop for TempFiles {
+            fn drop(&mut self) {
+                for path in &self.0 {
+                    let _ = fs::remove_file(path);
+                }
+            }
+        }
+
+        // `strict` declares a required option, a required env and a required
+        // tool, so the generated `_argc_require_params` and
+        // `_argc_require_tools` calls exist and run, with empty arrays, on a
+        // `greet` call that passes no options. `split` takes the delimited
+        // option and positional paths, where an empty value or an empty item
+        // leaves the split arrays empty.
+        let src = "#!/usr/bin/env bash\nset -euo pipefail\n# @describe t\n\n# @cmd greet\n# @option --name The name\ngreet() { printf 'hi %s' \"${argc_name:-nobody}\" >> \"$LLM_OUTPUT\"; }\n\n# @cmd strict\n# @meta require-tools sh\n# @option --x! A required option\n# @env NEEDED! A required env\nstrict() { :; }\n\n# @cmd split\n# @option --x*, Delimited values\n# @arg items*, Delimited items\nsplit() { printf 'x=%s items=%s' \"${argc_x[*]:-}\" \"${argc_items[*]:-}\" >> \"$LLM_OUTPUT\"; }\n";
         let path = crate::utils::temp_file("bash-nounset", ".sh");
+        let mut temps = TempFiles(vec![path.clone()]);
         fs::write(&path, src).expect("failed to write temp script");
         generate_bash_declarations(File::open(&path).unwrap(), &path, "t").expect("build failed");
         let built = fs::read_to_string(&path).unwrap();
-        assert!(
-            built.contains("_argc_require_params"),
-            "the fixture no longer exercises _argc_require_params"
-        );
-
-        for bash in &shells {
-            let out = crate::utils::temp_file("bash-nounset-out", ".txt");
-            let output = Command::new(bash)
-                .arg(&path)
-                .arg("greet")
-                .env("LLM_OUTPUT", &out)
-                .env_remove("NEEDED")
-                .output()
-                .expect("failed to run built script");
+        for generated in [
+            "_argc_require_params",
+            "_argc_require_tools",
+            "_argc_split_positionals",
+        ] {
             assert!(
-                output.status.success(),
-                "built script failed with no positionals under {}: {}",
-                bash.display(),
-                String::from_utf8_lossy(&output.stderr)
+                built.contains(generated),
+                "the fixture no longer exercises {generated}"
             );
-            assert_eq!(
-                fs::read_to_string(&out).unwrap(),
-                "hi nobody",
-                "under {}",
-                bash.display()
-            );
-            fs::remove_file(&out).unwrap();
         }
-        fs::remove_file(&path).unwrap();
+
+        let cases: [(&[&str], &str); 5] = [
+            (&["greet"], "hi nobody"),
+            (&["split", "--x="], "x= items="),
+            (&["split", "--x=a,b", "c,d"], "x=a b items=c d"),
+            (&["split", "--x=a,,b", "c", "", "d"], "x=a  b items=c d"),
+            (&["split", ""], "x= items="),
+        ];
+        for bash in &shells {
+            for (args, expected) in cases {
+                let out = crate::utils::temp_file("bash-nounset-out", ".txt");
+                temps.0.push(out.clone());
+                let output = Command::new(bash)
+                    .arg(&path)
+                    .args(args)
+                    .env("LLM_OUTPUT", &out)
+                    .env_remove("NEEDED")
+                    .output()
+                    .expect("failed to run built script");
+                assert!(
+                    output.status.success(),
+                    "built script failed for {args:?} under {}: {}",
+                    bash.display(),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(
+                    fs::read_to_string(&out).unwrap(),
+                    expected,
+                    "{args:?} under {}",
+                    bash.display()
+                );
+            }
+        }
     }
 
     #[cfg(unix)]
