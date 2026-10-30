@@ -12,13 +12,19 @@
 //! Go `yq` by mikefarah and skip without it. Every run points `HOME`,
 //! `LLM_ROOT_DIR`, `COYOTE_CACHE_DIR`, `TMPDIR` and `ARCHITECT_RUNS_ROOT` at a
 //! scratch directory and sets `PYTHONDONTWRITEBYTECODE=1`, so nothing under
-//! `assets/` or `~/.config/coyote` is read or written.
+//! `assets/` or `~/.config/coyote` is read or written. Every git, script and
+//! binary command drops `LLM_AGENT_VAR_*` and the git repository variables
+//! (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`,
+//! `GIT_COMMON_DIR`), so a run from a git hook cannot reach the caller's
+//! repository.
 //!
 //! The reachability sweep that keeps both candidates out of every bundled
 //! agent lives in `candidate_sisyphus_next.rs` and already covers this name.
 
 #![cfg(unix)]
 
+use serde_json::json;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -29,8 +35,9 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "architect-next";
-const SMOKE_FLOOR: usize = 304;
+const SMOKE_FLOOR: usize = 331;
 const MATRIX_FLOOR: usize = 53;
+const _: () = assert!(MATRIX_FLOOR >= 53, "the matrix floor never drops below 53");
 
 fn agents_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents")
@@ -118,6 +125,7 @@ fn battery(program: &Path, scratch: &TempDirGuard) -> Command {
         .env_remove("GRAPH_STATE")
         .env_remove("GRAPH_STATE_FILE");
     scrub_agent_vars(&mut cmd);
+    without_git_repo_vars(&mut cmd);
     cmd
 }
 
@@ -129,6 +137,24 @@ fn scrub_agent_vars(cmd: &mut Command) -> &mut Command {
         if key.to_string_lossy().starts_with("LLM_AGENT_VAR_") {
             cmd.env_remove(key);
         }
+    }
+    cmd
+}
+
+/// The repository variables a git hook exports; inherited, they would point
+/// every scratch-repo git call (direct, or made by a gate script) at the
+/// caller's own repository. Both batteries drop the same list themselves.
+const GIT_REPO_VARS: [&str; 5] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_COMMON_DIR",
+];
+
+fn without_git_repo_vars(cmd: &mut Command) -> &mut Command {
+    for key in GIT_REPO_VARS {
+        cmd.env_remove(key);
     }
     cmd
 }
@@ -549,6 +575,7 @@ fn runs_root_under(
         .env_remove("XDG_CACHE_HOME")
         .env_remove("LOCALAPPDATA");
     scrub_agent_vars(&mut cmd);
+    without_git_repo_vars(&mut cmd);
     for (key, value) in vars {
         cmd.env(key, value);
     }
@@ -1029,6 +1056,7 @@ fn dry_run_until_ask_user_with_prompt(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     scrub_agent_vars(&mut cmd);
+    without_git_repo_vars(&mut cmd);
     for (key, value) in extra_env {
         cmd.env(key, value);
     }
@@ -1292,6 +1320,7 @@ fn dry_run_with_only_xdg_cache_home_puts_the_run_under_the_engines_cache_dir() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     scrub_agent_vars(&mut cmd);
+    without_git_repo_vars(&mut cmd);
     let lines = run_until_ask_user(cmd, "xdg tier");
     let mut cursor = 0;
     for needle in EXPECTED_WALK {
@@ -1582,9 +1611,8 @@ fn dry_run_without_a_readable_design_doc_parks_on_need_design_doc_before_orienti
 // ---------------------------------------------------------------------------
 // README ground truth. The candidate's README is user documentation: every
 // file:line it cites, every count it states and every node, agent and pin it
-// names must match the shipped files, and the one gap it documents must still
-// be open. These flip the moment a later landing moves a line or closes the
-// gap without updating the README.
+// names must match the shipped files. These flip the moment a later landing
+// moves a line or changes a recorded behaviour without updating the README.
 // ---------------------------------------------------------------------------
 
 fn readme() -> String {
@@ -1978,6 +2006,7 @@ fn info_by_name(scratch: &TempDirGuard, project: &Path, extra: &[&str], label: &
         .env_remove("GRAPH_STATE_FILE")
         .stdin(Stdio::null());
     scrub_agent_vars(&mut cmd);
+    without_git_repo_vars(&mut cmd);
     let output = cmd.output().unwrap();
     assert!(
         output.status.success(),
@@ -2075,5 +2104,1289 @@ fn info_by_name_lists_exactly_the_prose_twins_variables_in_order() {
         listed.len(),
         11,
         "--info must list eleven variables: {listed:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Gauntlet grammar end to end. The prior report comes from the review
+// gauntlet's own `verdict_gate.py` and `done` template, the candidate's real
+// gates parse it and compose the next round, and the gauntlet's own
+// `signals.py` and `build_items.py` read the composed prompt.
+// ---------------------------------------------------------------------------
+
+fn parse_json_stdout(label: &str, out: &Output) -> serde_json::Value {
+    assert!(out.status.success(), "{label}:\n{}", transcript(out));
+    serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("{label} stdout is not JSON ({e}):\n{}", transcript(out)))
+}
+
+/// Runs one candidate gate the way the engine does: the entry script under
+/// `scripts/`, the state in `GRAPH_STATE`, one JSON object on stdout.
+fn gate_json(gate: &str, state: &serde_json::Value, scratch: &TempDirGuard) -> serde_json::Value {
+    let python = python3().expect("callers skip without python3");
+    let mut cmd = battery(&python, scratch);
+    cmd.arg(Path::new("scripts").join(format!("{gate}.py")))
+        .env("GRAPH_STATE", state.to_string());
+    let out = cmd.output().unwrap();
+    assert_no_bytecode_under_candidate();
+    parse_json_stdout(gate, &out)
+}
+
+/// Runs one of the review gauntlet's own scripts on `state`, exactly as the
+/// engine invokes them (no path adjustments; bytecode writing is turned off
+/// so the shared module it imports leaves no cache under `assets/`, and
+/// `HOME`/`TMPDIR` point at the scratch dir), so the test reads the composed
+/// prompt with the real consumer.
+fn gauntlet_script(
+    script: &str,
+    state: &serde_json::Value,
+    scratch: &TempDirGuard,
+) -> serde_json::Value {
+    let python = python3().expect("callers skip without python3");
+    let path = agents_dir().join("review-gauntlet/scripts").join(script);
+    let mut cmd = Command::new(python);
+    scrub_agent_vars(&mut cmd);
+    without_git_repo_vars(&mut cmd);
+    let out = cmd
+        .arg(&path)
+        .env("GRAPH_STATE", state.to_string())
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env("HOME", scratch.0.join("home"))
+        .env("TMPDIR", scratch.0.join("tmp"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GRAPH_STATE_FILE")
+        .output()
+        .unwrap_or_else(|e| panic!("failed to invoke python3 {script}: {e}"));
+    parse_json_stdout(script, &out)
+}
+
+/// A clean repository with two commits, so a prior round can be pinned at
+/// the first sha while HEAD sits on the second.
+fn two_commit_repo(scratch: &TempDirGuard) -> (PathBuf, String, String) {
+    let git = which::which("git").expect("callers skip without git");
+    let project = scratch.0.join("project");
+    fs::create_dir_all(&project).unwrap();
+    let run = |args: &[&str]| -> String {
+        let mut cmd = Command::new(&git);
+        without_git_repo_vars(&mut cmd);
+        let out = cmd
+            .args(args)
+            .current_dir(&project)
+            .env("HOME", scratch.0.join("home"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}\n{}", transcript(&out));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let commit = |message: &str| -> String {
+        run(&[
+            "-c",
+            "user.name=probe",
+            "-c",
+            "user.email=probe@example.invalid",
+            "add",
+            ".",
+        ]);
+        run(&[
+            "-c",
+            "user.name=probe",
+            "-c",
+            "user.email=probe@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            message,
+        ]);
+        run(&["rev-parse", "HEAD"])
+    };
+    run(&["init", "-q"]);
+    fs::write(project.join("README.md"), "# demo\n").unwrap();
+    let first = commit("base");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(project.join("src/lib.txt"), "hello\n").unwrap();
+    let second = commit("feature");
+    assert_eq!(
+        run(&["status", "--porcelain"]),
+        "",
+        "the tree must be clean"
+    );
+    (project, first, second)
+}
+
+/// The reply the review-gauntlet graph hands back: the REAL `verdict_gate.py`
+/// output substituted into the REAL `done` node's `output:` template from the
+/// gauntlet's `graph.yaml`, so the sentinel line, the optional incomplete
+/// line and the report land exactly where the engine would put them.
+fn real_gauntlet_reply(verdict_state: &serde_json::Value, scratch: &TempDirGuard) -> String {
+    let gate = gauntlet_script("verdict_gate.py", verdict_state, scratch);
+    let graph: serde_yaml::Value = serde_yaml::from_str(
+        &fs::read_to_string(agents_dir().join("review-gauntlet/graph.yaml")).unwrap(),
+    )
+    .unwrap();
+    let template = graph["nodes"]["done"]["output"]
+        .as_str()
+        .expect("the gauntlet's done node renders a string output");
+    let mut reply = template.to_string();
+    for key in [
+        "gauntlet_verdict",
+        "gauntlet_incomplete_line",
+        "gauntlet_report",
+    ] {
+        let placeholder = format!("{{{{{key}}}}}");
+        assert!(
+            template.contains(&placeholder),
+            "{placeholder} missing from the done node output:\n{template}"
+        );
+        reply = reply.replace(&placeholder, gate[key].as_str().unwrap());
+    }
+    assert!(!reply.contains("{{"), "unrendered placeholder:\n{reply}");
+    let verdict = gate["gauntlet_verdict"].as_str().unwrap();
+    assert_eq!(
+        reply.lines().next(),
+        Some(format!("GAUNTLET: {verdict}").as_str()),
+        "the sentinel is line 1 of the reply:\n{reply}"
+    );
+    reply
+}
+
+const TASK: &str = "TASK-100";
+
+const MERGE_READY_REVIEW: &str = "# Code review\n\n**Verdict: MERGE-READY**\n\n\
+    *Reviewed 2 files, found 0 critical, 1 warnings, 0 suggestions, 0 nitpicks (0 deferred by quality bar)*\n";
+
+const DIVERGES_REPORT: &str =
+    "ADVERSARIAL_REVIEW: DIVERGES\nCriteria: 1 of 2 met\n- AC1: the endpoint returns 500\n";
+
+/// The state `verify_gate` and `route_verdict` read for one standard-mode
+/// task on the single run PR, whose diff starts at `base`, with `round_log`
+/// as the review history so far.
+fn verify_state(
+    repo: &Path,
+    base: &str,
+    round_log: serde_json::Value,
+    scratch: &TempDirGuard,
+) -> serde_json::Value {
+    json!({
+        "code_repo_path": repo,
+        "plan_path": "",
+        "pr_strategy": "single",
+        "task_granularity": "standard",
+        "tasks": [{"id": TASK, "title": "Widget endpoint", "base_sha": base}],
+        "current_task": TASK,
+        "verify_scope": "task",
+        "round_log": round_log,
+        "run_id": "x",
+        "run_dir": scratch.0.join("runs").join("x"),
+        "decisions": [],
+        "rejected_findings": [],
+        "quality_rigor": "production",
+        "verification_commands": "[\"true\"]",
+    })
+}
+
+/// The round log `route_verdict` leaves after reading `reply` as round 1,
+/// which `verify_gate` pinned at `head`.
+fn routed_round_log(
+    repo: &Path,
+    head: &str,
+    reply: &str,
+    scratch: &TempDirGuard,
+) -> serde_json::Value {
+    let mut state = verify_state(
+        repo,
+        head,
+        json!({ TASK: [{"round": 1, "head": head}] }),
+        scratch,
+    );
+    state["verify_unit"] = json!(TASK);
+    state["verify_lane"] = json!("gauntlet");
+    state["gauntlet_result"] = json!(reply);
+    let routed = gate_json("route_verdict", &state, scratch);
+    routed["round_log"].clone()
+}
+
+/// The state `build_items.py` sees after the real `signals.py` ran on a
+/// re-review prompt: every key that script emitted (`settled_lanes`,
+/// `rereview_spec`, the `delta_*` signals), with only the primary signals
+/// forced so that security and probe are selected in the first place. The
+/// delta over a text file carries no attack-surface or consumer signal, so
+/// settling both lanes is the only thing standing between them and a
+/// narrowed SKIP.
+fn gauntlet_narrowable_state(signals: &serde_json::Value) -> serde_json::Value {
+    for key in ["settled_lanes", "rereview_spec", "delta_summary"] {
+        assert!(
+            signals.get(key).is_some(),
+            "signals.py output must carry {key}: {signals}"
+        );
+    }
+    let mut state = signals.clone();
+    state["touches_auth"] = json!(true);
+    state["consumer_surface"] = json!(true);
+    state["probe_context"] = json!("make run && hurl tests/");
+    state
+}
+
+fn prompt_lines_starting_with<'a>(prompt: &'a str, prefix: &str) -> Vec<&'a str> {
+    prompt.lines().filter(|l| l.starts_with(prefix)).collect()
+}
+
+/// The acceptance chain with nothing pre-parsed: the gauntlet's own verdict
+/// gate renders a `| lane | status | detail |` report, `route_verdict` reads
+/// it into the round log, HEAD moves on, and the prompt `verify_gate`
+/// composes for round 2 narrows through the real `signals.py` and
+/// `build_items.py`: the whole-cell GREEN lanes settle, the lane that
+/// carried findings re-runs, and every settled name is a bare lane name.
+#[test]
+fn composed_re_review_prompt_narrows_through_the_real_gauntlet_scripts() {
+    if python3().is_none() || which::which("git").is_err() {
+        return;
+    }
+    let scratch = scratch_dir("rereview-narrow");
+    let (repo, first, _second) = two_commit_repo(&scratch);
+    let reply = real_gauntlet_reply(
+        &json!({
+            "code_review_results": [MERGE_READY_REVIEW],
+            "adversary_results": [DIVERGES_REPORT],
+            "security_results": ["No exploitable finding.\n\nSECURITY_REVIEW: PASS\n"],
+            "probe_results": ["Ran the local-run recipe.\n\nUSAGE_PROBE: PASS\n"],
+            "debris_findings": [],
+            "debris_summary": "clean (3 added lines)",
+            "lanes_summary": "code-review: always on\nadversary: spec present\nsecurity: touches auth\nprobe: consumer surface",
+        }),
+        &scratch,
+    );
+    for row in [
+        "| code-review | GREEN | MERGE-READY |",
+        "| adversary | BLOCKED | DIVERGES |",
+        "| security | GREEN | PASS |",
+        "| probe | GREEN | PASS |",
+        "| debris | GREEN | clean (3 added lines) |",
+    ] {
+        assert!(reply.lines().any(|l| l == row), "{row} missing:\n{reply}");
+    }
+
+    let round_log = routed_round_log(&repo, &first, &reply, &scratch);
+    assert_eq!(
+        round_log[TASK][0]["lanes_with_findings"],
+        json!(["adversary"]),
+        "{round_log}"
+    );
+    let composed = gate_json(
+        "verify_gate",
+        &verify_state(&repo, &first, round_log, &scratch),
+        &scratch,
+    );
+    let prompt = composed["gauntlet_prompt"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no gauntlet_prompt in {composed}"));
+    assert_eq!(
+        prompt_lines_starting_with(prompt, "Re-review delta:"),
+        vec![format!("Re-review delta: {first}..HEAD").as_str()],
+        "{prompt}"
+    );
+    assert_eq!(
+        prompt_lines_starting_with(prompt, "Settled lanes:"),
+        vec!["Settled lanes: code-review, security, probe"],
+        "{prompt}"
+    );
+
+    let signals = gauntlet_script(
+        "signals.py",
+        &json!({"project_dir": repo, "diff_spec": first, "initial_prompt": prompt}),
+        &scratch,
+    );
+    assert_eq!(
+        signals["rereview_spec"],
+        json!(format!("{first}..HEAD")),
+        "{signals}"
+    );
+    assert_eq!(
+        signals["settled_lanes"],
+        json!(["code-review", "security", "probe"]),
+        "{signals}"
+    );
+
+    let items = gauntlet_script(
+        "build_items.py",
+        &gauntlet_narrowable_state(&signals),
+        &scratch,
+    );
+    let summary = items["lanes_summary"].as_str().unwrap();
+    for expected in [
+        "security: SKIPPED (narrowed)",
+        "probe: SKIPPED (narrowed)",
+        "code-review: never narrowed",
+        "always-on floor",
+    ] {
+        assert!(summary.contains(expected), "{expected} missing:\n{summary}");
+    }
+    assert!(
+        !summary.contains("unrecognised token"),
+        "every settled name must be a bare lane name:\n{summary}"
+    );
+    assert_eq!(items["security_items"], json!([]), "{items}");
+    assert_eq!(items["probe_items"], json!([]), "{items}");
+}
+
+/// When the previous report left nothing whole-cell GREEN (an attention
+/// GREEN, SKIPPED lanes, a BLOCKED lane that carried findings; debris never
+/// settles) the composer writes no `Settled lanes:` line at all, the delta
+/// line stays bare, and `signals.py` sees an empty settled list.
+#[test]
+fn blocked_after_findings_prior_report_yields_no_settled_lanes_line() {
+    if python3().is_none() || which::which("git").is_err() {
+        return;
+    }
+    let scratch = scratch_dir("rereview-unsettled");
+    let (repo, first, _second) = two_commit_repo(&scratch);
+    let reply = real_gauntlet_reply(
+        &json!({
+            "code_review_results": ["# Code review\n\n**Verdict: NEEDS-HUMAN**\n\n\
+                *Reviewed 2 files, found 0 critical, 3 warnings, 0 suggestions, 0 nitpicks (0 deferred by quality bar)*\n"],
+            "adversary_results": [DIVERGES_REPORT],
+            "debris_findings": [],
+            "debris_summary": "clean (3 added lines)",
+            "lanes_summary": "code-review: always on\nadversary: spec present",
+        }),
+        &scratch,
+    );
+    for row in [
+        "| code-review | GREEN (attention) |",
+        "| adversary | BLOCKED | DIVERGES |",
+        "| security | SKIPPED | not selected |",
+        "| probe | SKIPPED | not selected |",
+        "| debris | GREEN | clean (3 added lines) |",
+    ] {
+        assert!(
+            reply.lines().any(|l| l.starts_with(row)),
+            "{row} missing:\n{reply}"
+        );
+    }
+
+    let round_log = routed_round_log(&repo, &first, &reply, &scratch);
+    let composed = gate_json(
+        "verify_gate",
+        &verify_state(&repo, &first, round_log, &scratch),
+        &scratch,
+    );
+    let prompt = composed["gauntlet_prompt"].as_str().unwrap();
+    assert_eq!(
+        prompt_lines_starting_with(prompt, "Re-review delta:"),
+        vec![format!("Re-review delta: {first}..HEAD").as_str()],
+        "{prompt}"
+    );
+    assert!(
+        prompt_lines_starting_with(prompt, "Settled lanes:").is_empty(),
+        "{prompt}"
+    );
+
+    let signals = gauntlet_script(
+        "signals.py",
+        &json!({"project_dir": repo, "diff_spec": first, "initial_prompt": prompt}),
+        &scratch,
+    );
+    assert_eq!(signals["settled_lanes"], json!([]), "{signals}");
+    assert_eq!(
+        signals["rereview_spec"],
+        json!(format!("{first}..HEAD")),
+        "{signals}"
+    );
+}
+
+/// Feeds `report` to `gates._parse_gauntlet` and `gates._probe_verdict` in a
+/// fresh interpreter and returns the verdict, incomplete list, lane
+/// statuses, blockers and probe verdict.
+fn parse_gauntlet_report(report: &str, scratch: &TempDirGuard) -> serde_json::Value {
+    use std::io::Write;
+    let python = python3().expect("callers skip without python3");
+    let mut cmd = battery(&python, scratch);
+    cmd.current_dir(candidate_dir().join("scripts"))
+        .arg("-c")
+        .arg(
+            "import json, sys\n\
+             import gates\n\
+             text = sys.stdin.read()\n\
+             v, inc, lanes, blockers, _root, _files = gates._parse_gauntlet(text)\n\
+             print(json.dumps({\"verdict\": v, \"incomplete\": inc, \"lanes\": lanes, \"blockers\": blockers, \"probe\": gates._probe_verdict(text)}))\n",
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(report.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_no_bytecode_under_candidate();
+    parse_json_stdout("_parse_gauntlet", &out)
+}
+
+/// The gauntlet's reply opens with `GAUNTLET: <verdict>` on line 1 and
+/// appends every lane's raw report under `## Full lane reports` inside
+/// `<details>` blocks, so the parser reads only the header before that
+/// heading (or before the first `<details>` when the heading is absent), as
+/// whole lines at column 0 with `[ \t]*` gaps, first match wins. A sentinel
+/// quoted inside a sentence, indented, or followed by a remark is not a
+/// verdict, no whole-line verdict means BLOCKED, and a lane report quoting
+/// `GAUNTLET: PASS` or a GREEN lane row cannot override the header.
+/// `USAGE_PROBE:` is the one last-match sentinel.
+#[test]
+fn gauntlet_sentinels_are_column_zero_whole_lines_first_match_wins() {
+    if python3().is_none() {
+        return;
+    }
+    let scratch = scratch_dir("sentinels");
+    let table = "| lane | status | detail |\n|------|--------|--------|\n| security | GREEN (attention) | PASS (attention items) |\n";
+    let after_heading = "GAUNTLET: BLOCKED\n\n| lane | status | detail |\n|------|--------|--------|\n| security | BLOCKED | FAIL (High) |\n| code-review | GREEN | MERGE-READY |\n\n## Full lane reports\n\n<details><summary>security</summary>\n\nGAUNTLET: PASS\nGAUNTLET_REVIEW_INCOMPLETE: security\n\n| security | GREEN | PASS |\n\n</details>\n";
+    let after_details = "GAUNTLET: BLOCKED\n\n| lane | status | detail |\n|------|--------|--------|\n| security | BLOCKED | FAIL (High) |\n\n<details><summary>security</summary>\n\nGAUNTLET: PASS\nGAUNTLET_REVIEW_INCOMPLETE: security\n\n| code-review | GREEN | MERGE-READY |\n\n</details>\n";
+    let verdict_rows = [
+        (
+            "The lane said \"GAUNTLET: PASS\" in prose but the table disagrees.\n\nGAUNTLET: BLOCKED\n".to_string(),
+            "BLOCKED",
+        ),
+        (
+            format!("The lane said \"GAUNTLET: PASS\" in prose.\n{table}"),
+            "BLOCKED",
+        ),
+        (format!("  GAUNTLET: PASS\n{table}"), "BLOCKED"),
+        (format!("GAUNTLET: PASS (tentative)\n{table}"), "BLOCKED"),
+        (format!("GAUNTLET:\tPASS \n{table}"), "PASS"),
+        (format!("GAUNTLET: BLOCKED\n{table}GAUNTLET: PASS\n"), "BLOCKED"),
+        (format!("GAUNTLET: PASS\n{table}GAUNTLET: BLOCKED\n"), "PASS"),
+        (after_heading.to_string(), "BLOCKED"),
+        (after_details.to_string(), "BLOCKED"),
+    ];
+    for (report, expected) in &verdict_rows {
+        let parsed = parse_gauntlet_report(report, &scratch);
+        assert_eq!(parsed["verdict"], json!(expected), "{report:?} -> {parsed}");
+    }
+
+    let incomplete_rows = [
+        (
+            "Earlier it printed \"GAUNTLET_REVIEW_INCOMPLETE: security\" by mistake.\n  GAUNTLET_REVIEW_INCOMPLETE: adversary\nGAUNTLET: BLOCKED\nGAUNTLET_REVIEW_INCOMPLETE: probe, pipeline\n",
+            json!(["probe", "pipeline"]),
+        ),
+        (
+            "GAUNTLET: BLOCKED\nGAUNTLET_REVIEW_INCOMPLETE: security\nGAUNTLET_REVIEW_INCOMPLETE: probe\n",
+            json!(["security"]),
+        ),
+        (after_heading, json!([])),
+        (after_details, json!([])),
+    ];
+    for (report, expected) in &incomplete_rows {
+        let parsed = parse_gauntlet_report(report, &scratch);
+        assert_eq!(parsed["incomplete"], *expected, "{report:?} -> {parsed}");
+    }
+
+    let parsed = parse_gauntlet_report(after_heading, &scratch);
+    assert_eq!(
+        parsed["lanes"],
+        json!({"security": "BLOCKED", "code-review": "GREEN"}),
+        "{parsed}"
+    );
+    let parsed = parse_gauntlet_report(after_details, &scratch);
+    assert_eq!(parsed["lanes"], json!({"security": "BLOCKED"}), "{parsed}");
+    let parsed = parse_gauntlet_report(&format!("GAUNTLET: PASS\n\n{table}"), &scratch);
+    assert_eq!(
+        parsed["lanes"],
+        json!({"security": "GREEN (attention)"}),
+        "the status cell is kept whole: {parsed}"
+    );
+
+    let probe_rows = [
+        (
+            "USAGE_PROBE: INCONCLUSIVE\nUSAGE_PROBE: PASS\n  USAGE_PROBE: FAIL\nUSAGE_PROBE: FAIL maybe\nThe probe once printed \"USAGE_PROBE: FAIL\" by mistake.\n".to_string(),
+            "PASS",
+        ),
+        (
+            "GAUNTLET: BLOCKED\n\n| lane | status | detail |\n|------|--------|--------|\n| probe | BLOCKED | INCONCLUSIVE (environment) |\n".to_string(),
+            "INCONCLUSIVE",
+        ),
+        (
+            "GAUNTLET: PASS\n\n| lane | status | detail |\n|------|--------|--------|\n| code-review | GREEN | MERGE-READY |\n\n## Full lane reports\n\n<details><summary>code-review</summary>\n\nUSAGE_PROBE: PASS\n\n</details>\n".to_string(),
+            "",
+        ),
+    ];
+    for (report, expected) in &probe_rows {
+        let parsed = parse_gauntlet_report(report, &scratch);
+        assert_eq!(parsed["probe"], json!(expected), "{report:?} -> {parsed}");
+    }
+}
+
+/// The previous round left code-review whole-cell GREEN, security GREEN
+/// with attention items, and adversary BLOCKED with findings. A clean tree
+/// composes both re-review lines with only code-review settled; uncommitted
+/// task-status edits inside an in-repo planning store keep them; any other
+/// uncommitted change, including planning files when no store is declared,
+/// drops both, because the delta would no longer describe what the gauntlet
+/// reviews.
+#[test]
+fn only_dirt_outside_the_in_repo_planning_store_suppresses_the_re_review_lines() {
+    if python3().is_none() || which::which("git").is_err() {
+        return;
+    }
+    let scratch = scratch_dir("dirty-tree");
+    let (repo, first, _second) = two_commit_repo(&scratch);
+    let round_log = json!({ TASK: [{
+        "round": 1,
+        "head": first,
+        "lanes": {
+            "code-review": "GREEN",
+            "adversary": "BLOCKED",
+            "security": "GREEN (attention)",
+            "debris": "GREEN"
+        },
+        "lanes_with_findings": ["adversary"]
+    }] });
+    let delta = format!("Re-review delta: {first}..HEAD");
+    let compose = |plans_root: Option<&Path>| -> (Vec<String>, Vec<String>) {
+        let mut state = verify_state(&repo, &first, round_log.clone(), &scratch);
+        if let Some(root) = plans_root {
+            state["plans_root"] = json!(root);
+        }
+        let composed = gate_json("verify_gate", &state, &scratch);
+        let prompt = composed["gauntlet_prompt"].as_str().unwrap();
+        let owned = |prefix: &str| {
+            prompt_lines_starting_with(prompt, prefix)
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        (owned("Re-review delta:"), owned("Settled lanes:"))
+    };
+    let plans = repo.join("plans");
+
+    let (lines, settled) = compose(Some(&plans));
+    assert_eq!(lines, [delta.as_str()], "clean tree");
+    assert_eq!(settled, ["Settled lanes: code-review"], "clean tree");
+
+    let task_dir = plans.join("tasks").join("TASK-100-widget");
+    fs::create_dir_all(&task_dir).unwrap();
+    fs::write(task_dir.join("index.md"), "---\nstatus: in-progress\n---\n").unwrap();
+    let (lines, settled) = compose(Some(&plans));
+    assert_eq!(lines, [delta.as_str()], "planning-store dirt only");
+    assert_eq!(
+        settled,
+        ["Settled lanes: code-review"],
+        "planning-store dirt only"
+    );
+
+    let (lines, settled) = compose(None);
+    assert!(
+        lines.is_empty() && settled.is_empty(),
+        "no planning store declared: {lines:?} {settled:?}"
+    );
+
+    fs::write(repo.join("src/scratch.txt"), "uncommitted\n").unwrap();
+    let (lines, settled) = compose(Some(&plans));
+    assert!(
+        lines.is_empty() && settled.is_empty(),
+        "code dirt beside planning-store dirt: {lines:?} {settled:?}"
+    );
+}
+
+/// The run report's rollups go through the prose architect's REAL
+/// `tools.sh`, which requires `--plan` and lists the plan's completed tasks
+/// with `plan_tasks.py`: a debris-exempt line and a `Follow-ups:` block
+/// written in a completed task's log come back, not the
+/// `(collect_ledger_lines unavailable ...)` fallback.
+#[test]
+fn the_real_collect_ledger_lines_returns_debris_exempt_and_follow_up_lines() {
+    let Some(python) = python3() else {
+        return;
+    };
+    let scratch = scratch_dir("ledger");
+    let agents = scratch.0.join("root").join("agents");
+    for name in [".shared", "architect"] {
+        copy_tree(&agents_dir().join(name), &agents.join(name));
+    }
+    let ledger = scratch.0.join("ledger");
+    let plan = ledger.join("PLAN-ledger.md");
+    let task = ledger.join("tasks").join("TASK-901-done");
+    fs::create_dir_all(&task).unwrap();
+    fs::write(
+        &plan,
+        "---\ntitle: Ledger\nrigor: production\n---\n\n# Ledger\n",
+    )
+    .unwrap();
+    fs::write(
+        task.join("index.md"),
+        "---\ntitle: Done\nstatus: complete\nplan: PLAN-ledger\n---\n",
+    )
+    .unwrap();
+    fs::write(
+        task.join("log.md"),
+        "# TASK-901 log\n\n## 2026-01-01 - completed\n\n\
+         debris-exempt: scripts/gen.py keeps its marker (generated upstream)\n\
+         Follow-ups:\n- rotate the widget key before merge\n",
+    )
+    .unwrap();
+    let state = json!({"plan_path": plan, "tasks_root": ledger.join("tasks")});
+
+    let mut cmd = battery(&python, &scratch);
+    let out = cmd
+        .current_dir(candidate_dir().join("scripts"))
+        .args([
+            "-c",
+            "import json, sys\n\
+             import gates, _lib\n\
+             state = json.loads(sys.argv[1])\n\
+             print(json.dumps({\"tools\": _lib.core_tools_path(), \"rows\": {t: gates._collect(state, t) for t in (\"debris-exempt\", \"Follow-ups:\")}}))\n",
+            &state.to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert_no_bytecode_under_candidate();
+    let collected = parse_json_stdout("_collect", &out);
+    assert_eq!(
+        collected["tools"],
+        json!(agents.join("architect/tools.sh")),
+        "the rollup must run the scratch copy of the real tools.sh"
+    );
+    assert_eq!(
+        collected["rows"]["debris-exempt"],
+        json!([
+            "TASK-901-done (log.md:5): debris-exempt: scripts/gen.py keeps its marker (generated upstream)"
+        ]),
+        "{collected}"
+    );
+    assert_eq!(
+        collected["rows"]["Follow-ups:"],
+        json!([
+            "TASK-901-done (log.md:6): Follow-ups:",
+            "  - rotate the widget key before merge"
+        ]),
+        "{collected}"
+    );
+}
+
+/// `build_lock` reaches every child by variable inheritance, so no node in
+/// the graph threads it through `inputs:`; the variable declaration is the
+/// one line of `graph.yaml` that names it.
+#[test]
+fn no_node_threads_build_lock_through_inputs() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let doc: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    for (id, node) in doc["nodes"].as_mapping().unwrap() {
+        assert!(
+            !node["inputs"]
+                .as_mapping()
+                .is_some_and(|m| m.contains_key(serde_yaml::Value::from("build_lock"))),
+            "{id:?} threads build_lock through inputs: {node:?}"
+        );
+    }
+    let mentions: Vec<&str> = text.lines().filter(|l| l.contains("build_lock")).collect();
+    assert_eq!(mentions, ["  - name: build_lock"], "graph.yaml");
+}
+
+/// The graph-level integer bounds as the staging baseline records them: the
+/// top-level agent limits and every integer under `settings`.
+const FROZEN_GRAPH_BOUNDS: &[(&str, i64)] = &[
+    ("max_agent_depth", 10),
+    ("max_concurrent_agents", 10),
+    ("settings.max_loop_iterations", 100),
+    ("settings.timeout", 0),
+];
+
+/// Every integer field of every node in the staging baseline (`timeout`,
+/// `max_attempts`, `max_iterations`, `max_concurrency`); a node absent here
+/// declares none.
+const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
+    ("amend_plan", "max_iterations", 20),
+    ("amend_plan", "timeout", 1800),
+    ("answer_leaks", "max_iterations", 45),
+    ("answer_leaks", "timeout", 3600),
+    ("apply_answer", "timeout", 120),
+    ("archivist_question", "max_attempts", 2),
+    ("archivist_question", "timeout", 1800),
+    ("ask_owner_poll", "timeout", 0),
+    ("author_plan", "max_iterations", 45),
+    ("author_plan", "timeout", 3600),
+    ("batch_close", "timeout", 300),
+    ("batch_fix_route", "timeout", 300),
+    ("batch_triage", "max_iterations", 10),
+    ("batch_triage", "timeout", 900),
+    ("branch_setup", "timeout", 300),
+    ("checklist_librarian", "max_attempts", 2),
+    ("checklist_librarian", "timeout", 3600),
+    ("ci_apply", "timeout", 120),
+    ("ci_diagnose", "timeout", 600),
+    ("ci_evidence", "timeout", 300),
+    ("ci_poll", "timeout", 120),
+    ("claim_task", "timeout", 600),
+    ("compose_delegation", "timeout", 60),
+    ("consult_navigator", "max_attempts", 1),
+    ("consult_navigator", "timeout", 1800),
+    ("debt_assign", "timeout", 300),
+    ("delegate", "max_attempts", 1),
+    ("delegate", "timeout", 0),
+    ("explore_slice_solo", "max_attempts", 2),
+    ("explore_slice_solo", "timeout", 1800),
+    ("explore_slice_team", "max_attempts", 2),
+    ("explore_slice_team", "timeout", 1800),
+    ("final_report", "timeout", 300),
+    ("finish_plan", "timeout", 600),
+    ("flip_ready", "timeout", 300),
+    ("gate1", "max_attempts", 2),
+    ("gate1", "timeout", 3600),
+    ("gate2", "max_attempts", 2),
+    ("gate2", "timeout", 3600),
+    ("hygiene_create", "timeout", 600),
+    ("intake", "timeout", 120),
+    ("integrate_findings", "max_iterations", 20),
+    ("integrate_findings", "timeout", 1800),
+    ("integration_check", "timeout", 3600),
+    ("integration_test", "timeout", 3600),
+    ("ladder_judge", "timeout", 300),
+    ("librarian_question", "max_attempts", 2),
+    ("librarian_question", "timeout", 1800),
+    ("open_pr", "timeout", 300),
+    ("oracle_diagnose", "max_attempts", 2),
+    ("oracle_diagnose", "timeout", 1800),
+    ("orient_read", "max_iterations", 20),
+    ("orient_read", "timeout", 900),
+    ("plan_research", "timeout", 600),
+    ("post_round", "timeout", 120),
+    ("pr_body", "timeout", 300),
+    ("pr_body_fix", "max_iterations", 10),
+    ("pr_body_fix", "timeout", 600),
+    ("pr_round_comments", "timeout", 300),
+    ("pr_summary", "max_iterations", 10),
+    ("pr_summary", "timeout", 600),
+    ("promote_tasks", "max_iterations", 45),
+    ("promote_tasks", "timeout", 3600),
+    ("promote_verify", "timeout", 600),
+    ("run_adversary", "max_attempts", 1),
+    ("run_adversary", "timeout", 7200),
+    ("run_gauntlet", "max_attempts", 1),
+    ("run_gauntlet", "timeout", 0),
+    ("run_whetstone", "max_attempts", 1),
+    ("run_whetstone", "timeout", 3600),
+    ("stack_gate", "timeout", 300),
+    ("stack_gate_final", "timeout", 600),
+    ("summarize_run", "timeout", 300),
+    ("task_done", "max_iterations", 20),
+    ("task_done", "timeout", 1800),
+    ("task_done_verify", "timeout", 600),
+    ("verify_gate", "timeout", 60),
+    ("wave_claim", "timeout", 600),
+    ("wave_cleanup", "timeout", 300),
+    ("wave_delegate", "max_attempts", 1),
+    ("wave_delegate", "timeout", 0),
+    ("wave_gauntlet", "max_attempts", 1),
+    ("wave_gauntlet", "timeout", 0),
+    ("wave_integrate", "timeout", 120),
+    ("wave_map", "max_concurrency", 3),
+    ("wave_verify_build", "timeout", 60),
+];
+
+/// The integer counters and indices `initial_state` seeds, all at zero; the
+/// round counters among them are what the `_lib.py` bounds are checked on.
+const FROZEN_COUNTER_SEEDS: &[&str] = &[
+    "amend_cycles",
+    "author_retries",
+    "body_fix_rounds",
+    "ci_poll_fails",
+    "ci_polls",
+    "ci_rounds",
+    "ci_started_at",
+    "design_rounds",
+    "final_integration_strikes",
+    "gate_fault_retries",
+    "group_index",
+    "oracle_rejects",
+    "owner_polls",
+    "promote_retries",
+    "reask_rounds",
+    "wave_fix_rounds",
+    "wave_index",
+];
+
+/// Every module-level integer constant of `scripts/_lib.py` in the baseline:
+/// name, annotation (none carries one), the expression as written, and the
+/// value the module computes from it.
+const FROZEN_SCRIPT_BOUNDS: &[(&str, &str, &str, i64)] = &[
+    ("AMEND_CYCLES_MAX", "", "3", 3),
+    ("CI_FLAKE_RERUNS", "", "2", 2),
+    ("CI_MAX_ROUNDS", "", "CI_WALL_SECS // CI_POLL_SLEEP", 240),
+    ("CI_POLL_FAILS", "", "3", 3),
+    ("CI_POLL_SLEEP", "", "60", 60),
+    ("CI_WALL_SECS", "", "14400", 14400),
+    ("CONFLICT_CYCLES_MAX", "", "2", 2),
+    ("DESIGN_ROUNDS_MAX", "", "STRIKE_LIMIT", 3),
+    ("OWNER_POLL_MAX", "", "2", 2),
+    ("OWNER_POLL_MINUTES", "", "25", 25),
+    ("OWNER_WAIT_MINUTES", "", "30", 30),
+    ("RERUN_ONCE", "", "1", 1),
+    ("STRIKE_LIMIT", "", "3", 3),
+    ("TAIL_CHARS", "", "6000", 6000),
+    ("VERIFY_CMD_SECS", "", "900", 900),
+    ("VERIFY_SET_SECS", "", "3300", 3300),
+    ("WAVE_CAP", "", "3", 3),
+];
+
+fn is_constant_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    chars.next().is_some_and(|c| c.is_ascii_uppercase())
+        && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+#[test]
+fn graph_and_gate_budgets_equal_the_frozen_baseline() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let shipped: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+
+    let mut graph_bounds = BTreeMap::new();
+    for (key, value) in shipped.as_mapping().unwrap() {
+        if let Some(n) = value.as_i64() {
+            graph_bounds.insert(key.as_str().unwrap().to_string(), n);
+        }
+    }
+    for (key, value) in shipped["settings"].as_mapping().unwrap() {
+        if let Some(n) = value.as_i64() {
+            graph_bounds.insert(format!("settings.{}", key.as_str().unwrap()), n);
+        }
+    }
+    let expected: BTreeMap<String, i64> = FROZEN_GRAPH_BOUNDS
+        .iter()
+        .map(|(k, n)| (k.to_string(), *n))
+        .collect();
+    assert_eq!(
+        graph_bounds, expected,
+        "graph-level bounds moved (left: shipped)"
+    );
+
+    let mut node_bounds = BTreeMap::new();
+    for (id, node) in shipped["nodes"].as_mapping().unwrap() {
+        for (key, value) in node.as_mapping().unwrap() {
+            if let Some(n) = value.as_i64() {
+                let id = id.as_str().unwrap().to_string();
+                node_bounds.insert((id, key.as_str().unwrap().to_string()), n);
+            }
+        }
+    }
+    let expected: BTreeMap<(String, String), i64> = FROZEN_NODE_BOUNDS
+        .iter()
+        .map(|(id, k, n)| ((id.to_string(), k.to_string()), *n))
+        .collect();
+    assert_eq!(node_bounds, expected, "node bounds moved (left: shipped)");
+
+    let mut seeds = BTreeMap::new();
+    for (key, value) in shipped["initial_state"].as_mapping().unwrap() {
+        if let Some(n) = value.as_i64() {
+            seeds.insert(key.as_str().unwrap().to_string(), n);
+        }
+    }
+    let expected: BTreeMap<String, i64> = FROZEN_COUNTER_SEEDS
+        .iter()
+        .map(|k| (k.to_string(), 0))
+        .collect();
+    assert_eq!(
+        seeds, expected,
+        "initial_state counter seeds moved (left: shipped)"
+    );
+
+    let Some(python) = python3() else {
+        return;
+    };
+    let scratch = scratch_dir("lib-bounds");
+    let mut cmd = battery(&python, &scratch);
+    let out = cmd
+        .current_dir(candidate_dir().join("scripts"))
+        .args([
+            "-c",
+            "import json, _lib\n\
+             print(json.dumps({k: v for k, v in vars(_lib).items() if k.isupper() and type(v) is int}))\n",
+        ])
+        .output()
+        .unwrap();
+    assert_no_bytecode_under_candidate();
+    let values = parse_json_stdout("_lib integer constants", &out);
+    let lib = fs::read_to_string(candidate_dir().join("scripts/_lib.py")).unwrap();
+    let mut written = BTreeMap::new();
+    for line in lib.lines() {
+        let Some((target, rest)) = line.split_once('=') else {
+            continue;
+        };
+        if rest.starts_with('=') {
+            continue;
+        }
+        let (name, annotation) = target
+            .split_once(':')
+            .map_or((target, ""), |(n, a)| (n, a.trim()));
+        let name = name.trim_end();
+        if !is_constant_name(name) {
+            continue;
+        }
+        let expression = rest.split('#').next().unwrap().trim();
+        let previous = written.insert(
+            name.to_string(),
+            (annotation.to_string(), expression.to_string()),
+        );
+        assert!(previous.is_none(), "{name} is assigned twice in _lib.py");
+    }
+    let mut script_bounds = BTreeMap::new();
+    for (name, value) in values.as_object().unwrap() {
+        let (annotation, expression) = written
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} has no column-0 assignment in _lib.py"))
+            .clone();
+        script_bounds.insert(
+            name.clone(),
+            (annotation, expression, value.as_i64().unwrap()),
+        );
+    }
+    let expected: BTreeMap<String, (String, String, i64)> = FROZEN_SCRIPT_BOUNDS
+        .iter()
+        .map(|(name, annotation, expression, value)| {
+            (
+                name.to_string(),
+                (annotation.to_string(), expression.to_string(), *value),
+            )
+        })
+        .collect();
+    assert_eq!(
+        script_bounds, expected,
+        "_lib.py bounds moved (left: shipped)"
+    );
+}
+
+/// How each llm node's output schema carries the `anomalies` channel in the
+/// staging baseline: `Plain` is the optional string-array property,
+/// `NoSchema` is a node with no `output_schema` at all.
+#[derive(Clone, Copy, Debug)]
+enum AnomaliesChannel {
+    Plain,
+    NoSchema,
+}
+
+const FROZEN_LLM_ANOMALIES: &[(&str, AnomaliesChannel)] = &[
+    ("amend_plan", AnomaliesChannel::Plain),
+    ("answer_leaks", AnomaliesChannel::Plain),
+    ("author_plan", AnomaliesChannel::Plain),
+    ("batch_triage", AnomaliesChannel::Plain),
+    ("ci_diagnose", AnomaliesChannel::Plain),
+    ("integrate_findings", AnomaliesChannel::Plain),
+    ("ladder_judge", AnomaliesChannel::Plain),
+    ("orient_read", AnomaliesChannel::Plain),
+    ("plan_research", AnomaliesChannel::Plain),
+    ("pr_body_fix", AnomaliesChannel::NoSchema),
+    ("pr_summary", AnomaliesChannel::Plain),
+    ("promote_tasks", AnomaliesChannel::NoSchema),
+    ("summarize_run", AnomaliesChannel::NoSchema),
+    ("task_done", AnomaliesChannel::NoSchema),
+];
+
+#[test]
+fn every_llm_node_keeps_the_frozen_anomalies_channel() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let shipped: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let expected: BTreeMap<&str, AnomaliesChannel> = FROZEN_LLM_ANOMALIES.iter().copied().collect();
+    let mut llm_ids = BTreeSet::new();
+    for (id, node) in shipped["nodes"].as_mapping().unwrap() {
+        if node["type"].as_str() != Some("llm") {
+            continue;
+        }
+        let id = id.as_str().unwrap();
+        llm_ids.insert(id);
+        let Some(channel) = expected.get(id) else {
+            continue;
+        };
+        let schema = node.get("output_schema");
+        if let AnomaliesChannel::NoSchema = channel {
+            assert!(schema.is_none(), "{id} gained an output_schema: {schema:?}");
+            continue;
+        }
+        let schema = schema.unwrap_or_else(|| panic!("{id} lost its output_schema"));
+        let actual = serde_json::to_value(&schema["properties"]["anomalies"]).unwrap();
+        assert_eq!(
+            actual,
+            json!({"type": "array", "items": {"type": "string"}}),
+            "{id}: the anomalies property changed shape"
+        );
+        let required = serde_json::to_value(&schema["required"]).unwrap();
+        assert!(
+            !required
+                .as_array()
+                .is_some_and(|r| r.iter().any(|v| v == "anomalies")),
+            "{id}: anomalies became required: {required}"
+        );
+    }
+    let expected_ids: BTreeSet<&str> = expected.keys().copied().collect();
+    assert_eq!(
+        llm_ids, expected_ids,
+        "the llm node set changed (left: shipped)"
+    );
+}
+
+/// Both batteries drop the agent variables and the wrapper's git repository
+/// variables themselves, before they import a gate, so a direct run from a
+/// git hook or an agent session is as isolated as a run through the wrapper.
+#[test]
+fn batteries_drop_the_same_variables_as_the_wrapper() {
+    let quoted = fancy_regex::Regex::new(r#""([A-Z_]+)""#).unwrap();
+    for (file, first_import) in [
+        ("smoke_test.py", "import gates"),
+        ("mode_matrix.py", "from _fixture import"),
+    ] {
+        let text = fs::read_to_string(candidate_dir().join("scripts").join(file)).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let find = |predicate: &dyn Fn(&str) -> bool, what: &str| -> usize {
+            lines
+                .iter()
+                .position(|l| predicate(l))
+                .unwrap_or_else(|| panic!("{file} has no {what}"))
+        };
+        let import_at = find(&|l| l.starts_with(first_import), first_import);
+        let agent_at = find(
+            &|l| l == "for _k in [k for k in os.environ if k.startswith(\"LLM_AGENT_VAR_\")]:",
+            "LLM_AGENT_VAR_ loop",
+        );
+        let git_at = find(&|l| l.starts_with("for _k in (\"GIT_DIR\""), "GIT_ loop");
+        assert!(
+            agent_at < import_at && git_at < import_at,
+            "{file} must drop the variables before it imports a gate"
+        );
+        let names: Vec<String> = quoted
+            .captures_iter(lines[git_at])
+            .map(|c| c.unwrap()[1].to_string())
+            .collect();
+        assert_eq!(names, GIT_REPO_VARS, "{file}: {}", lines[git_at]);
+        for (at, pop) in [
+            (agent_at, "    os.environ.pop(_k)"),
+            (git_at, "    os.environ.pop(_k, None)"),
+        ] {
+            let body = lines[at + 1..]
+                .iter()
+                .find(|l| !l.trim_start().starts_with('#'))
+                .unwrap();
+            assert_eq!(*body, pop, "{file}: the loop at line {} pops", at + 1);
+        }
+    }
+}
+
+/// The README's adjustments-table row starting with `prefix`.
+fn adjustments_row(prefix: &str) -> String {
+    readme()
+        .lines()
+        .find(|l| l.starts_with(prefix))
+        .unwrap_or_else(|| panic!("the README has no row starting with {prefix:?}"))
+        .to_string()
+}
+
+/// The README's adjustments table records the artifact re-entry contract
+/// and the engine facts it rests on; both rows stay word for word.
+#[test]
+fn readme_pins_the_artifact_re_entry_and_engine_fact_rows() {
+    let readme = readme();
+    let section = readme
+        .split("\n## ")
+        .find(|s| s.starts_with("Landed-upstream adjustments"))
+        .expect("README has a Landed-upstream adjustments section");
+    let contract_row = "| V1: session-resume replacement (artifact re-entry) - the contract |";
+    assert!(
+        section.lines().any(|l| l.starts_with(contract_row)),
+        "missing row starting with {contract_row:?}:\n{section}"
+    );
+    let facts_row = "| engine facts | this README | agent-node resume: not available by decision (2026-10-28); E1 stays as the artifact contract; G6 escalation_timeout open |";
+    assert!(
+        section.lines().any(|l| l == facts_row),
+        "missing row {facts_row:?}:\n{section}"
+    );
+}
+
+/// The `build_lock` variable row as it landed with the variable; the
+/// threading row beside it must not reword it.
+const BUILD_LOCK_ROW: &str = "| `build_lock` variable | `graph.yaml` `variables:` | declared after `pr_strategy` with default `''`, mirroring the prose `architect/config.yaml`; `scripts/check_session_block.sh` asserts the two variable lists match name-for-name, default-for-default. No `inputs: build_lock` is needed on any child node: the engine hands a parent's agent variables to every agent-node child, config and graph alike (`src/graph/agent.rs` runs the child through `run_agent_for_graph`, whose `RequestContext::new_for_child` copies the parent's agent variables, and `src/graph/executor.rs` `seed_variables` seats them over the child graph's declared defaults; pinned by `src/function/agents.rs` `run_agent_for_graph_child_seats_the_parents_build_lock_over_its_default`), so `delegate` and `wave_delegate` (`sisyphus`), `run_gauntlet` and `wave_gauntlet` (`review-gauntlet`) and `run_adversary` (`adversary`) all receive the value by inheritance; each of the three agents behind those five nodes declares `build_lock` itself |";
+
+/// Every agent the graph delegates to that declares no `build_lock` receives
+/// the inherited value without consuming it: none of its own files names
+/// the variable or the shared helpers that run a build under it, and the
+/// README's threading row says so for exactly those children, librarian
+/// among them as the one graph agent.
+#[test]
+fn children_without_a_build_lock_declaration_never_consume_it() {
+    let graph = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let target_re = fancy_regex::Regex::new(r"(?m)^\s+agent:\s+([\w-]+)\s*$").unwrap();
+    let targets: BTreeSet<String> = target_re
+        .captures_iter(&graph)
+        .map(|c| c.unwrap()[1].to_string())
+        .collect();
+    let declares = |agent: &str| {
+        ["graph.yaml", "config.yaml"].iter().any(|f| {
+            fs::read_to_string(agents_dir().join(agent).join(f))
+                .is_ok_and(|t| t.contains("- name: build_lock"))
+        })
+    };
+    let silent: BTreeSet<&str> = targets
+        .iter()
+        .map(String::as_str)
+        .filter(|a| !declares(a))
+        .collect();
+    let expected = [
+        "engineer",
+        "explore",
+        "gatekeeper",
+        "librarian",
+        "oracle",
+        "whetstone",
+    ];
+    assert_eq!(
+        silent,
+        BTreeSet::from(expected),
+        "the children that declare no build_lock changed; update the README E9 row"
+    );
+
+    for agent in expected {
+        let root = agents_dir().join(agent);
+        let is_graph = root.join("graph.yaml").is_file();
+        assert_eq!(
+            is_graph,
+            agent == "librarian",
+            "{agent}: the README names librarian as the only graph agent among them"
+        );
+        assert_eq!(
+            root.join("config.yaml").is_file(),
+            !is_graph,
+            "{agent}: a config agent ships config.yaml, a graph agent does not"
+        );
+        for rel in files_under(&root) {
+            if rel == "README.md" || rel.contains("__pycache__") {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(root.join(&rel)) else {
+                continue;
+            };
+            for needle in ["build_lock", "BUILD_LOCK", "gate_prefix", "run_gate"] {
+                assert!(
+                    !text.contains(needle),
+                    "{agent}/{rel} names {needle}: the child would consume build_lock"
+                );
+            }
+        }
+    }
+
+    let row = adjustments_row("| E9: ");
+    for clause in [
+        "a child that declares no `build_lock` does not consume it",
+        "the graph agent librarian and the config agents",
+        "`## MODE` block with the `mode-degraded:` ledger line",
+    ] {
+        assert!(row.contains(clause), "the E9 row lost {clause:?}: {row}");
+    }
+    for agent in expected {
+        assert!(row.contains(agent), "{agent} missing from: {row}");
+    }
+    assert!(
+        !row.contains("inputs"),
+        "the E9 row must not describe an inputs channel: {row}"
+    );
+    assert_eq!(
+        adjustments_row("| `build_lock` variable |"),
+        BUILD_LOCK_ROW,
+        "the build_lock variable row changed"
+    );
+}
+
+/// The README's gauntlet grammar row records the boundary contract both
+/// ways (the producer guarantees it, the consumer defends it) and the one
+/// place this candidate's composer departs from the sisyphus-next twin.
+#[test]
+fn readme_grammar_row_records_the_producer_guarantee_and_the_planning_store_divergence() {
+    let row = adjustments_row("| gauntlet grammar |");
+    for clause in [
+        "before the first column-0 `## Full lane reports` line (or before the first `<details>` when that heading is absent)",
+        "first match winning",
+        "`USAGE_PROBE:` stays a whole-line last match",
+        "the probe verdict is the probe row's detail cell",
+        "whole status cell is exactly `GREEN`",
+        "never `debris`",
+        "`GREEN (attention)` never settles",
+        "`Settled lanes:` is written only when non-empty",
+        "`Re-review delta: <sha>..HEAD` stays bare",
+        "when `plans_root` resolves inside the code repo its paths are excluded",
+        "This diverges from the sisyphus-next twin",
+        "The header boundary is the review-gauntlet producer's guarantee",
+        "the consumer defends it as well",
+    ] {
+        assert!(
+            row.contains(clause),
+            "the grammar row lost {clause:?}: {row}"
+        );
+    }
+}
+
+/// The battery env hygiene row names the exact variable list the wrapper
+/// and both batteries drop, and the ledger rollup row describes the
+/// arguments every `collect_ledger_lines` call in `gates.py` passes.
+#[test]
+fn readme_env_hygiene_and_ledger_rows_match_the_code() {
+    let row = adjustments_row("| battery env hygiene |");
+    assert!(row.contains("`LLM_AGENT_VAR_*`"), "{row}");
+    for var in GIT_REPO_VARS {
+        assert!(row.contains(&format!("`{var}`")), "{var} missing: {row}");
+    }
+
+    let row = adjustments_row("| ledger rollup scope |");
+    for clause in [
+        "every `collect_ledger_lines` call passes `--plan`",
+        "exits `plan not found` without it",
+        "In multi-PR mode the group-scoped calls",
+        "also pass `--tasks <group members>`",
+        "passes no `--tasks` and stays run-scoped",
+    ] {
+        assert!(
+            row.contains(clause),
+            "the ledger row lost {clause:?}: {row}"
+        );
+    }
+    let gates = fs::read_to_string(candidate_dir().join("scripts/gates.py")).unwrap();
+    let lines: Vec<&str> = gates.lines().collect();
+    let mut calls = Vec::new();
+    for (at, line) in lines.iter().enumerate() {
+        if !line.contains("core_tool(\"collect_ledger_lines\"") {
+            continue;
+        }
+        let mut call = String::new();
+        for line in &lines[at..] {
+            call.push_str(line);
+            call.push('\n');
+            if line.trim_end().ends_with(')') {
+                break;
+            }
+        }
+        calls.push(call);
+    }
+    assert_eq!(calls.len(), 2, "{calls:#?}");
+    for call in &calls {
+        assert!(
+            call.contains("plan=state.get(\"plan_path\", \"\")"),
+            "{call}"
+        );
+    }
+    assert_eq!(
+        calls.iter().filter(|c| c.contains("tasks=")).count(),
+        1,
+        "only the group-scoped hygiene call passes --tasks: {calls:#?}"
+    );
+}
+
+/// The README's recorded battery figures are runs of the current batteries,
+/// so they can never sit below the floors the wrapper enforces.
+#[test]
+fn readme_battery_figures_meet_the_wrapper_floors() {
+    let smoke = readme_number(r"smoke `(\d+)/\1 checks passed`");
+    let matrix = readme_number(r"mode matrix `(\d+)/\1 checks passed`");
+    assert!(
+        smoke >= SMOKE_FLOOR,
+        "README smoke figure {smoke} < {SMOKE_FLOOR}"
+    );
+    assert!(
+        matrix >= MATRIX_FLOOR,
+        "README matrix figure {matrix} < {MATRIX_FLOOR}"
     );
 }
