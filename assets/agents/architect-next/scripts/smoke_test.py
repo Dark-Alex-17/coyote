@@ -537,6 +537,11 @@ GNOGREEN = gauntlet_reply("BLOCKED", [("code-review", "GREEN (attention)", "NEED
 rl_none = gates.route_verdict(verdict_state(GNOGREEN, head="0000000"))["round_log"]
 gp = gates.verify_gate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", round_log=rl_none))["gauntlet_prompt"].splitlines()
 check("verify_gate: no Settled lanes line when no lane is whole-cell GREEN", "Re-review delta: 0000000..HEAD" in gp and not any("Settled lanes" in l for l in gp))
+rl_skip = {T1: [{"round": 1, "head": "0000000", "lanes": {"security": "GREEN"}, "lanes_with_findings": []},
+                {"round": 2, "head": "0000000", "lanes": {"security": "SKIPPED"}, "lanes_with_findings": []}]}
+gp = gates.verify_gate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", round_log=rl_skip))["gauntlet_prompt"].splitlines()
+check("verify_gate: a lane GREEN in round 1 but SKIPPED in round 2 is not settled in round 3 (prior round only)",
+      "Re-review delta: 0000000..HEAD" in gp and not any("Settled lanes" in l for l in gp), str([l for l in gp if "Settled" in l]))
 write(os.path.join(CODE, "dirty.txt"), "uncommitted\n")
 try:
     gp = gates.verify_gate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", round_log=copy.deepcopy(rl)))["gauntlet_prompt"]
@@ -578,6 +583,19 @@ GADVNUM = ("ADVERSARIAL_REVIEW: DIVERGES\nCriteria: 1/2 met.\nComplaints:\n1. Ac
 u = gates.route_verdict(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", verify_unit=T1, verify_lane="adversary", adversary_result=GADVNUM, round_log={T1: [{"round": 1, "head": "h"}]}))
 check("route_verdict: the adversary's numbered Complaints are the fix items",
       u["last_verdict"] == "BLOCKED" and u["fix_items"] == ["Acceptance criterion \"two\" -- Unmet -- api/h.go:10"])
+GADVDETAILS = ("ADVERSARIAL_REVIEW: DIVERGES\nCriteria: 1/2 met.\n\n<details><summary>verification</summary>\n\nGAUNTLET: PASS\n\n</details>\n\n"
+               "Complaints:\n1. Acceptance criterion \"two\" -- Unmet -- api/h.go:10\n")
+u = gates.route_verdict(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", verify_unit=T1, verify_lane="adversary", adversary_result=GADVDETAILS, round_log={T1: [{"round": 1, "head": "h"}]}))
+check("route_verdict: an adversary report with a <details> block above its Complaints still yields them as the fix items",
+      u["last_verdict"] == "BLOCKED" and u["fix_items"] == ["Acceptance criterion \"two\" -- Unmet -- api/h.go:10"], str(u.get("fix_items")))
+GADVLANE = "ADVERSARIAL_REVIEW: CONFORMS\nCriteria: 2/2 met.\n\nVerification runs:\n| security | GREEN | PASS |\n"
+check("_parse_gauntlet: an adversary report quoting a column-0 lane row reports no lanes",
+      gates._parse_gauntlet(GADVLANE, adversary_lane=True)[2] == {}, str(gates._parse_gauntlet(GADVLANE, adversary_lane=True)[2]))
+rl_adv = gates.route_verdict(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", verify_unit=T1, verify_lane="adversary",
+                                        adversary_result=GADVLANE, round_log={T1: [{"round": 1, "head": "0000000"}]}))["round_log"]
+gp = gates.verify_gate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", round_log=rl_adv))["gauntlet_prompt"].splitlines()
+check("verify_gate: a lane row quoted in an adversary report settles no lane on the next head",
+      "Re-review delta: 0000000..HEAD" in gp and not any(l.startswith("Settled lanes:") for l in gp), str([l for l in gp if "Settled" in l]))
 u = gates.route_verdict(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", verify_unit=T1, verify_lane="adversary",
                                    adversary_result="ADVERSARIAL_REVIEW: CONFORMS\nCriteria: 2/2 met (all with tests).\n\nVerification runs:\nGAUNTLET: BLOCKED\n", round_log={T1: [{"round": 1, "head": "h"}]}))
 check("route_verdict: on the adversary lane a CONFORMS report quoting GAUNTLET: BLOCKED -> post_round", u["last_verdict"] == "PASS" and u["_next"] == "post_round")
@@ -1122,6 +1140,43 @@ check("pr_body: assemble_pr_body fails in PR-group mode -> the fallback task lis
 calls = core_calls(lambda: gates.hygiene_create(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(ts_g), pr_strategy="multi", closeout_unit="g1", unit_base_sha=CODE_BASE,
                                                            run_branch="feat/PLAN-widgets", hygiene_units=[{"id": "g1", "members": [T1, T2]}])), "collect_ledger_lines")
 check("hygiene_create: PR-group mode -> collect_ledger_lines --plan <plan> --tasks <the group's members>", calls == [f"tasks={GROUP_TASKS} plan={PROMOTED}"], str(calls))
+if MULTI_IS_GROUPS:
+    ts_empty = copy.deepcopy(ts_g)
+    for t, s in zip(ts_empty, ("skipped", "failed", "complete")):
+        t["status"] = s
+    ts_empty.append({**copy.deepcopy(ts_g[0]), "id": "TASK-990", "status": "parked", "unit": "g1"})
+    _outs = []
+    core_calls(lambda: _outs.extend([
+        gates.group_closeout(base_state(plan_path=PROMOTED, tasks=ts_empty, pr_strategy="multi", closeout_unit="g1", closeout_scope="group")),
+        gates.group_closeout(base_state(plan_path=PROMOTED, tasks=ts_empty, pr_strategy="multi", closeout_unit="g1", closeout_scope="run")),
+        gates.pr_body(base_state(plan_path=PROMOTED, tasks=ts_empty, pr_strategy="multi", closeout_unit="g1", closeout_scope="group", pr_summary_text="s")),
+        gates.hygiene_create(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(ts_empty), pr_strategy="multi", closeout_unit="g1", unit_base_sha=CODE_BASE,
+                                        run_branch="feat/PLAN-widgets", hygiene_units=[{"id": "g1", "members": []}]))]), "assemble_pr_body")
+    calls = read_file(CORE_CALLS).splitlines()
+    _gc, _gc_run, _pb, _hy = _outs
+    check("group_closeout: a group with no complete task skips its PR (ledger + follow-up naming it) -> select_tasks, or finish_plan at run scope",
+          _gc["_next"] == "select_tasks" and _gc["closeout_done_for"] == "g1" and any("g1" in f for f in _gc["follow_ups"])
+          and any("g1 has no complete task" in d for d in _gc["decisions"]) and _gc_run["_next"] == "finish_plan", f"{_gc.get('_next')} {_gc_run.get('_next')}")
+    check("pr_body / hygiene_create: an empty group makes no core call, so none widens to the whole plan",
+          calls == [] and _pb["_next"] == "select_tasks" and _hy["_next"] == "hygiene_create" and _hy["hygiene_units"] == [], f"{calls} {_pb.get('_next')} {_hy.get('_next')}")
+DIR_TOOLS = os.path.join(TMP, "dir-tools", "tools.sh")
+write(DIR_TOOLS, "record() { printf '%s dir=%s\\n' \"$1\" \"${argc_dir-${argc_tasks_dir-unset}}\" >> \"" + CORE_CALLS + "\"; }\n"
+                 "assemble_pr_body() { record assemble_pr_body; echo body > \"$argc_out\"; }\n"
+                 "collect_ledger_lines() { record collect_ledger_lines; echo '(none)'; }\n")
+_taskstore = gates.TASKSTORE
+gates.TASKSTORE = "dirstate"
+try:
+    core_calls(lambda: (
+        gates.hygiene_create(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(ts_g), unit_base_sha=CODE_BASE, run_branch="feat/PLAN-widgets",
+                                        hygiene_units=[{"id": "run", "members": [T1, T2]}])),
+        gates.pr_body(base_state(plan_path=PROMOTED, tasks=ts_g, pr_summary_text="s", body_fix_rounds=RERUN_ONCE)),
+        gates._collect(base_state(plan_path=PROMOTED), "Follow-ups:")), "assemble_pr_body", DIR_TOOLS)
+finally:
+    gates.TASKSTORE = _taskstore
+calls = read_file(CORE_CALLS).splitlines()
+_completed = os.path.join(base_state()["tasks_root"], "completed")
+check("dirstate: hygiene_create, pr_body and the report rollup all read the completed tasks dir",
+      calls == [f"collect_ledger_lines dir={_completed}", f"assemble_pr_body dir={_completed}", f"collect_ledger_lines dir={_completed}"], str(calls))
 calls = core_calls(lambda: gates.final_report(base_state(plan_path=PROMOTED, tasks=ts_g, pr_strategy="multi", closeout_unit="g2")), "collect_ledger_lines")
 check("final_report: every collect_ledger_lines call gets a non-empty --plan and no --tasks (the run report spans all groups)",
       len(calls) == 4 and all(c == f"tasks=unset plan={PROMOTED}" for c in calls), str(calls))
