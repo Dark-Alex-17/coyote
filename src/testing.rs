@@ -346,6 +346,7 @@ mod tests {
     use super::{TestConfigDirGuard, is_outside_system32};
     use crate::utils;
     use serial_test::serial;
+    use std::collections::HashSet;
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -393,36 +394,415 @@ mod tests {
         );
     }
 
-    /// Workspace memory lookups outside src/config/memory.rs go through its
-    /// pinned entry point, and config dir isolation has one guard type, so no
-    /// test can reach the developer's real workspace memory through a raw
-    /// ancestor walk or a private guard copy that skips the pin. The needles
-    /// are split so this file's own source does not match them.
+    /// Workspace memory lookups go through the pinned entry point in
+    /// src/config/memory.rs, git-root walks outside it are bounded, and tests
+    /// pin the config dir only through the shared guard, so no test can reach
+    /// the developer's real workspace memory or config dir through a raw
+    /// ancestor walk or a private guard that skips the pins. Each line is
+    /// judged by the scope it sits in (a `#[cfg(test)]` item, a file declared
+    /// as a `#[cfg(test)]` module, the innermost `fn`), not by its file. The
+    /// needles are split so this file's own source does not match them.
     #[test]
     fn no_source_file_bypasses_the_workspace_memory_pin() {
         const RAW_WALK: &str = concat!("walk_workspace", "_memory");
+        const RAW_WALK_HOMES: [&str; 2] = [RAW_WALK, "find_workspace_memory"];
         const GUARD_DEFINITION: &str = concat!("struct TestConfig", "DirGuard");
+        const CONFIG_DIR_ENV: &str = concat!("env_name(\"config", "_dir\")");
+        const UNBOUNDED_GIT_ROOT: &str = concat!("find_git", "_root(");
+        // Tests that check config dir resolution itself and must point the raw
+        // env var at a dir the shared guard cannot provide, as (file, fn).
+        const CONFIG_DIR_PIN_EXEMPT: [(&str, &str); 1] = [
+            // The config dir has to sit under a home dir the test then renames.
+            (
+                "function/mod.rs",
+                "built_shims_resolve_paths_at_runtime_after_relocation",
+            ),
+        ];
+        let config_dir_literal = format!("\"{}\"", utils::get_env_name("config_dir"));
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let sources: Vec<(PathBuf, String)> = rust_sources(&src)
+            .into_iter()
+            .map(|path| {
+                let source = fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+                (path, source)
+            })
+            .collect();
+        let scanned: Vec<(&Path, ScopedSource)> = sources
+            .iter()
+            .map(|(path, source)| (path.as_path(), scope_lines(source)))
+            .collect();
+        let test_only_files: HashSet<PathBuf> = scanned
+            .iter()
+            .flat_map(|(path, scoped)| {
+                scoped
+                    .test_modules
+                    .iter()
+                    .flat_map(|name| module_files(path, name))
+            })
+            .collect();
         let mut offences = Vec::new();
-        for path in rust_sources(&src) {
+        for (path, scoped) in &scanned {
             let relative = path.strip_prefix(&src).unwrap();
-            let source = fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-            for (index, line) in source.lines().enumerate() {
-                let at = format!("src/{}:{}", relative.display(), index + 1);
-                if line.contains(RAW_WALK) && relative != Path::new("config/memory.rs") {
+            let is = |name: &str| relative == Path::new(name);
+            let test_only_file = test_only_files.contains(*path);
+            let opens_set_call = |text: &str| {
+                let text = text.trim_end();
+                text.ends_with("set_var(") || text.ends_with("EnvVarGuard::set(")
+            };
+            let mut previous_opens_set_call = false;
+            for line in &scoped.lines {
+                let in_test = test_only_file || line.in_test;
+                let enclosing_fn = line.enclosing_fn.as_deref().unwrap_or_default();
+                let text = line.text;
+                let at = format!("src/{}:{}", relative.display(), line.number);
+                if text.contains(RAW_WALK)
+                    && !(is("config/memory.rs")
+                        && (in_test || RAW_WALK_HOMES.contains(&enclosing_fn)))
+                {
                     offences.push(format!(
                         "{at}: raw workspace memory walk; call memory::find_workspace_memory"
                     ));
                 }
-                if line.contains(GUARD_DEFINITION) && relative != Path::new("testing.rs") {
+                if text.contains(GUARD_DEFINITION) && !is("testing.rs") {
                     offences.push(format!(
                         "{at}: private config dir guard; use crate::testing::TestConfigDirGuard"
+                    ));
+                }
+                let pins_config_dir = text.contains(CONFIG_DIR_ENV)
+                    || (text.contains(&config_dir_literal)
+                        && (previous_opens_set_call
+                            || text.contains("set_var(")
+                            || text.contains("EnvVarGuard::set(")));
+                previous_opens_set_call = opens_set_call(text);
+                let exempt_pin = CONFIG_DIR_PIN_EXEMPT
+                    .iter()
+                    .any(|&(file, test)| is(file) && enclosing_fn == test);
+                if in_test && pins_config_dir && !is("testing.rs") && !exempt_pin {
+                    offences.push(format!(
+                        "{at}: test pins the config dir env by hand; use crate::testing::TestConfigDirGuard"
+                    ));
+                }
+                if text.contains(UNBOUNDED_GIT_ROOT) && !in_test && !is("config/memory.rs") {
+                    offences.push(format!(
+                        "{at}: unbounded git root walk; bound it with memory::workspace_search_bounds"
                     ));
                 }
             }
         }
         assert!(offences.is_empty(), "{}", offences.join("\n"));
+    }
+
+    #[test]
+    fn scope_lines_tracks_test_items_and_the_enclosing_fn() {
+        let source = concat!(
+            "fn shipped() {\n",
+            "    let s = \"} fn fake() {\";\n",
+            "    let c = '{';\n",
+            "}\n",
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    fn probe() {\n",
+            "        let r = r#\"{\"#;\n",
+            "    }\n",
+            "}\n",
+            "#[cfg(test)]\n",
+            "mod live;\n",
+            "fn after<'a>(x: &'a str) {\n",
+            "}\n",
+            "struct Holder {\n",
+            "    #[cfg(test)]\n",
+            "    probe: Option<u8>,\n",
+            "}\n",
+            "impl Holder {\n",
+            "    fn shipped_too(a: u8, b: u8) {\n",
+            "        Self {\n",
+            "            #[cfg(test)]\n",
+            "            probe: None\n",
+            "        };\n",
+            "    }\n",
+            "}\n",
+            "#[cfg(test)]\n",
+            "#[derive(Clone, Copy)]\n",
+            "impl<A, B> Holder {\n",
+            "    fn probe_too<C, D>(c: C, d: D) {\n",
+            "    }\n",
+            "}\n",
+        );
+        let scoped = scope_lines(source);
+        let scopes: Vec<(bool, Option<&str>)> = scoped
+            .lines
+            .iter()
+            .map(|line| (line.in_test, line.enclosing_fn.as_deref()))
+            .collect();
+        assert_eq!(
+            scopes,
+            [
+                (false, Some("shipped")),
+                (false, Some("shipped")),
+                (false, Some("shipped")),
+                (false, None),
+                (false, None),
+                (true, None),
+                (true, Some("probe")),
+                (true, Some("probe")),
+                (true, None),
+                (false, None),
+                (false, None),
+                (false, None),
+                (false, Some("after")),
+                (false, None),
+                (false, None),
+                (false, None),
+                (false, None),
+                (false, None),
+                (false, None),
+                (false, Some("shipped_too")),
+                (false, Some("shipped_too")),
+                (false, Some("shipped_too")),
+                (false, Some("shipped_too")),
+                (false, Some("shipped_too")),
+                (false, None),
+                (false, None),
+                (false, None),
+                (false, None),
+                (true, None),
+                (true, Some("probe_too")),
+                (true, None),
+                (false, None),
+            ]
+        );
+        assert_eq!(scoped.test_modules, ["live"]);
+    }
+
+    /// One source line with the scope it sits in.
+    struct ScopedLine<'a> {
+        number: usize,
+        text: &'a str,
+        in_test: bool,
+        enclosing_fn: Option<String>,
+    }
+
+    struct ScopedSource<'a> {
+        lines: Vec<ScopedLine<'a>>,
+        /// Names from `#[cfg(test)] mod name;` declarations.
+        test_modules: Vec<String>,
+    }
+
+    #[derive(Clone, Default)]
+    struct Scope {
+        in_test: bool,
+        enclosing_fn: Option<String>,
+        /// Open `(` and `[` inside this brace scope.
+        nesting: usize,
+    }
+
+    /// Tracks brace depth over `source` with literals and comments blanked,
+    /// recording for each line the scope in force at its end. An attribute
+    /// or `fn` name applies to the next `{` and is dropped at a `;` or `}`.
+    /// Outside an item header, an attribute is also dropped at a top-level
+    /// `,`, which ends the struct field or literal field it annotated.
+    fn scope_lines(source: &str) -> ScopedSource<'_> {
+        const CFG_TEST: [&str; 7] = ["#", "[", "cfg", "(", "test", ")", "]"];
+        const ITEM_KEYWORDS: [&str; 7] = ["fn", "impl", "struct", "enum", "trait", "mod", "union"];
+        let code = code_only(source);
+        let mut scopes = vec![Scope::default()];
+        let mut pending_test = false;
+        let mut pending_item = false;
+        let mut pending_fn = None;
+        let mut pending_mod = None;
+        let mut test_modules = Vec::new();
+        let mut lines = Vec::new();
+        for (index, (text, code)) in source.lines().zip(code.lines()).enumerate() {
+            let tokens = tokens(code);
+            let mut k = 0;
+            while k < tokens.len() {
+                let next_ident = tokens.get(k + 1).filter(|t| is_ident(t));
+                if ITEM_KEYWORDS.contains(&tokens[k])
+                    && (next_ident.is_some() || tokens.get(k + 1) == Some(&"<"))
+                {
+                    pending_item = true;
+                }
+                match tokens[k] {
+                    _ if tokens[k..].starts_with(&CFG_TEST) => {
+                        pending_test = true;
+                        k += CFG_TEST.len() - 1;
+                    }
+                    "fn" if next_ident.is_some() => pending_fn = next_ident.map(|t| t.to_string()),
+                    "mod" if next_ident.is_some() => {
+                        pending_mod = next_ident.map(|t| t.to_string())
+                    }
+                    "{" => {
+                        let outer = scopes.last().unwrap();
+                        let scope = Scope {
+                            in_test: outer.in_test || pending_test,
+                            enclosing_fn: pending_fn.take().or_else(|| outer.enclosing_fn.clone()),
+                            nesting: 0,
+                        };
+                        scopes.push(scope);
+                        pending_test = false;
+                        pending_item = false;
+                        pending_mod = None;
+                    }
+                    "}" => {
+                        if scopes.len() > 1 {
+                            scopes.pop();
+                        }
+                        pending_test = false;
+                        pending_item = false;
+                        pending_fn = None;
+                        pending_mod = None;
+                    }
+                    ";" => {
+                        if let Some(name) = pending_mod.take().filter(|_| pending_test) {
+                            test_modules.push(name);
+                        }
+                        pending_test = false;
+                        pending_item = false;
+                        pending_fn = None;
+                        pending_mod = None;
+                    }
+                    "(" | "[" => scopes.last_mut().unwrap().nesting += 1,
+                    ")" | "]" => {
+                        let scope = scopes.last_mut().unwrap();
+                        scope.nesting = scope.nesting.saturating_sub(1);
+                    }
+                    "," if !pending_item && scopes.last().unwrap().nesting == 0 => {
+                        pending_test = false;
+                        pending_fn = None;
+                        pending_mod = None;
+                    }
+                    _ => {}
+                }
+                k += 1;
+            }
+            let scope = scopes.last().unwrap();
+            lines.push(ScopedLine {
+                number: index + 1,
+                text,
+                in_test: scope.in_test,
+                enclosing_fn: scope.enclosing_fn.clone(),
+            });
+        }
+        ScopedSource {
+            lines,
+            test_modules,
+        }
+    }
+
+    /// Identifiers as one token each; every other non-space char alone.
+    fn tokens(code: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut chars = code.char_indices().peekable();
+        while let Some((start, c)) = chars.next() {
+            if c.is_whitespace() {
+                continue;
+            }
+            let mut end = start + c.len_utf8();
+            if c.is_alphanumeric() || c == '_' {
+                while let Some(&(at, next)) = chars.peek() {
+                    if !(next.is_alphanumeric() || next == '_') {
+                        break;
+                    }
+                    end = at + next.len_utf8();
+                    chars.next();
+                }
+            }
+            out.push(&code[start..end]);
+        }
+        out
+    }
+
+    fn is_ident(token: &str) -> bool {
+        token
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphabetic() || c == '_')
+    }
+
+    /// `source` with string and char literals and comments turned into
+    /// spaces, newlines kept, so braces and keywords inside them are not
+    /// read as code.
+    fn code_only(source: &str) -> String {
+        let chars: Vec<char> = source.chars().collect();
+        let mut out = String::with_capacity(source.len());
+        let mut i = 0;
+        while i < chars.len() {
+            match literal_or_comment_end(&chars, i) {
+                Some(end) => {
+                    out.extend(
+                        chars[i..end]
+                            .iter()
+                            .map(|&c| if c == '\n' { c } else { ' ' }),
+                    );
+                    i = end;
+                }
+                None => {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// The index just past the literal or comment starting at `i`, if one
+    /// does. A `'` not closed two chars later is a lifetime.
+    fn literal_or_comment_end(chars: &[char], i: usize) -> Option<usize> {
+        let at = |j: usize| chars.get(j).copied();
+        let first_from = |from: usize, found: &dyn Fn(usize) -> bool| {
+            (from..chars.len())
+                .find(|&j| found(j))
+                .unwrap_or(chars.len())
+        };
+        let after_ident = i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_');
+        match chars[i] {
+            '/' if at(i + 1) == Some('/') => Some(first_from(i, &|j| chars[j] == '\n')),
+            '/' if at(i + 1) == Some('*') => Some(
+                (first_from(i + 2, &|j| chars[j] == '*' && at(j + 1) == Some('/')) + 2)
+                    .min(chars.len()),
+            ),
+            '"' => Some(quoted_end(chars, i + 1, None)),
+            'r' if !after_ident => {
+                let hashes = chars[i + 1..].iter().take_while(|&&c| c == '#').count();
+                (at(i + 1 + hashes) == Some('"'))
+                    .then(|| quoted_end(chars, i + 2 + hashes, Some(hashes)))
+            }
+            '\'' if at(i + 1) == Some('\\') => {
+                Some((first_from(i + 3, &|j| chars[j] == '\'') + 1).min(chars.len()))
+            }
+            '\'' if at(i + 2) == Some('\'') => Some(i + 3),
+            _ => None,
+        }
+    }
+
+    /// The index just past the closing quote of a string whose body starts
+    /// at `from`; `raw_hashes` is set for a raw string, which has no escapes.
+    fn quoted_end(chars: &[char], from: usize, raw_hashes: Option<usize>) -> usize {
+        let mut j = from;
+        while j < chars.len() {
+            match (chars[j], raw_hashes) {
+                ('\\', None) => j += 2,
+                ('"', None) => return j + 1,
+                ('"', Some(n)) if chars[j + 1..].iter().take_while(|&&c| c == '#').count() >= n => {
+                    return j + 1 + n;
+                }
+                _ => j += 1,
+            }
+        }
+        chars.len()
+    }
+
+    /// The files a `mod name;` in `parent` may load.
+    fn module_files(parent: &Path, name: &str) -> [PathBuf; 2] {
+        let dir = match parent.file_stem().and_then(|stem| stem.to_str()) {
+            Some("mod" | "main" | "lib") => parent.parent().unwrap().to_path_buf(),
+            _ => parent.with_extension(""),
+        };
+        [
+            dir.join(format!("{name}.rs")),
+            dir.join(name).join("mod.rs"),
+        ]
     }
 
     fn rust_sources(dir: &Path) -> Vec<PathBuf> {

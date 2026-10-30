@@ -1193,15 +1193,23 @@ fn find_file(store: &MemoryStore, name: &str) -> Result<Option<MemoryFile>> {
 }
 
 fn workspace_write_dir(store: &MemoryStore, cwd: &Path) -> Result<PathBuf> {
+    let (start, ceiling) = workspace_search_bounds(cwd);
+    workspace_write_dir_from(store, &start, ceiling.as_deref())
+}
+
+fn workspace_write_dir_from(
+    store: &MemoryStore,
+    start: &Path,
+    ceiling: Option<&Path>,
+) -> Result<PathBuf> {
     if let Some(ws) = &store.workspace {
         return Ok(ws.dir.clone());
     }
-    let (start, ceiling) = workspace_search_bounds(cwd);
-    if let Some(git_root) = find_git_root_within(&start, ceiling.as_deref()) {
+    if let Some(git_root) = find_git_root_within(start, ceiling) {
         return bootstrap_workspace_memory(&git_root);
     }
     if start.join(WORKSPACE_COYOTE_DIR_NAME).is_dir() {
-        return create_workspace_memory(&start, false);
+        return create_workspace_memory(start, false);
     }
     bail!(
         "no workspace memory discoverable, not inside a git repository, and no .coyote directory here. \
@@ -1343,7 +1351,6 @@ fn extract_wikilinks(body: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::memory::find_git_root;
     use serial_test::serial;
     use std::fs;
     use std::time;
@@ -1442,9 +1449,9 @@ mod tests {
         fs::create_dir_all(&structured).unwrap();
         fs::write(structured.join("MEMORY.md"), "idx").unwrap();
 
-        let store = MemoryStore::for_test(root.join("g"), &workspace);
+        let store = MemoryStore::for_test(root.join("g"), &workspace, &root);
 
-        let dir = workspace_write_dir(&store, &workspace).unwrap();
+        let dir = workspace_write_dir_from(&store, &workspace, Some(&root)).unwrap();
         assert_eq!(dir, structured);
 
         let _ = fs::remove_dir_all(&root);
@@ -1458,10 +1465,10 @@ mod tests {
         fs::create_dir_all(workspace.join(".git")).unwrap();
         fs::write(workspace.join("COYOTE.md"), "instructions, not memory").unwrap();
 
-        let store = MemoryStore::for_test(root.join("g"), &workspace);
+        let store = MemoryStore::for_test(root.join("g"), &workspace, &root);
         assert!(store.workspace.is_none(), "COYOTE.md must not be memory");
 
-        let dir = workspace_write_dir(&store, &workspace).unwrap();
+        let dir = workspace_write_dir_from(&store, &workspace, Some(&root)).unwrap();
         assert_eq!(dir, workspace.join(".coyote").join("memory"));
         assert!(
             dir.join("MEMORY.md").exists(),
@@ -1478,9 +1485,9 @@ mod tests {
         let bare = root.join("nowhere");
         fs::create_dir_all(&bare).unwrap();
 
-        let store = MemoryStore::for_test(root.join("g"), &bare);
+        let store = MemoryStore::for_test(root.join("g"), &bare, &root);
 
-        let err = workspace_write_dir(&store, &bare).unwrap_err();
+        let err = workspace_write_dir_from(&store, &bare, Some(&root)).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("no workspace memory discoverable"));
         assert!(msg.contains("no .coyote directory here"));
@@ -1498,9 +1505,9 @@ mod tests {
         let nested = repo.join("sub");
         fs::create_dir_all(nested.join(".coyote")).unwrap();
 
-        let store = MemoryStore::for_test(root.join("g"), &nested);
+        let store = MemoryStore::for_test(root.join("g"), &nested, &root);
 
-        let dir = workspace_write_dir(&store, &nested).unwrap();
+        let dir = workspace_write_dir_from(&store, &nested, Some(&root)).unwrap();
         assert_eq!(dir, repo.join(".coyote").join("memory"));
         assert!(!nested.join(".coyote").join("memory").exists());
 
@@ -1513,18 +1520,18 @@ mod tests {
         let root = temp_root("ws_coyote_no_git");
         let cwd = root.join("proj");
         fs::create_dir_all(cwd.join(".coyote")).unwrap();
-        assert!(find_git_root(&cwd).is_none());
+        assert!(find_git_root_within(&cwd, Some(&root)).is_none());
 
-        let store = MemoryStore::for_test(root.join("g"), &cwd);
+        let store = MemoryStore::for_test(root.join("g"), &cwd, &root);
         assert!(store.workspace.is_none());
 
-        let dir = workspace_write_dir(&store, &cwd).unwrap();
+        let dir = workspace_write_dir_from(&store, &cwd, Some(&root)).unwrap();
         assert_eq!(dir, cwd.join(".coyote").join("memory"));
         let index = fs::read_to_string(dir.join("MEMORY.md")).unwrap();
         assert_eq!(index, "# Workspace Memory Index\n\n");
         assert!(!cwd.join(".gitignore").exists());
 
-        let found = MemoryStore::for_test(root.join("g"), &cwd)
+        let found = MemoryStore::for_test(root.join("g"), &cwd, &root)
             .workspace
             .expect("created store is discoverable");
         assert_eq!(found.workspace_root, cwd);
@@ -1542,9 +1549,9 @@ mod tests {
         let cwd = parent.join("child");
         fs::create_dir_all(&cwd).unwrap();
 
-        let store = MemoryStore::for_test(root.join("g"), &cwd);
+        let store = MemoryStore::for_test(root.join("g"), &cwd, &root);
 
-        let err = workspace_write_dir(&store, &cwd).unwrap_err();
+        let err = workspace_write_dir_from(&store, &cwd, Some(&root)).unwrap_err();
         assert!(err.to_string().contains("no .coyote directory here"));
         assert!(!parent.join(".coyote").join("memory").exists());
         assert!(!cwd.join(".coyote").exists());
@@ -1561,10 +1568,10 @@ mod tests {
         let nested = repo.join("src").join("deep");
         fs::create_dir_all(&nested).unwrap();
 
-        let store = MemoryStore::for_test(root.join("g"), &nested);
+        let store = MemoryStore::for_test(root.join("g"), &nested, &root);
         assert!(store.workspace.is_none());
 
-        let dir = workspace_write_dir(&store, &nested).unwrap();
+        let dir = workspace_write_dir_from(&store, &nested, Some(&root)).unwrap();
         assert_eq!(dir, repo.join(".coyote").join("memory"));
         assert!(dir.join("MEMORY.md").exists());
         let gi = fs::read_to_string(repo.join(".gitignore")).unwrap();
@@ -1633,7 +1640,7 @@ mod tests {
         )
         .unwrap();
 
-        let store = MemoryStore::for_test(root.join("g"), &workspace);
+        let store = MemoryStore::for_test(root.join("g"), &workspace, &root);
 
         let hit = find_file(&store, "target").unwrap();
         assert!(hit.is_some());
@@ -1703,7 +1710,7 @@ mod tests {
         )
         .unwrap();
 
-        let store = MemoryStore::for_test(root.join("nonexistent_global"), &workspace);
+        let store = MemoryStore::for_test(root.join("nonexistent_global"), &workspace, &root);
 
         let report = lint_memory(&store).unwrap();
         assert_eq!(report["total_files"], 3);
@@ -1793,7 +1800,7 @@ mod tests {
         )
         .unwrap();
 
-        let store = MemoryStore::for_test(global, &workspace);
+        let store = MemoryStore::for_test(global, &workspace, &root);
 
         let report = lint_memory(&store).unwrap();
         assert!(
@@ -1831,7 +1838,7 @@ mod tests {
         )
         .unwrap();
 
-        let store = MemoryStore::for_test(root.join("nonexistent_global"), &workspace);
+        let store = MemoryStore::for_test(root.join("nonexistent_global"), &workspace, &root);
 
         let report = lint_memory(&store).unwrap();
         let stale = report["stale"].as_array().unwrap();
@@ -1873,7 +1880,7 @@ mod tests {
         )
         .unwrap();
 
-        let store = MemoryStore::for_test(root.join("g"), &workspace);
+        let store = MemoryStore::for_test(root.join("g"), &workspace, &root);
 
         let args = json!({"name": "doomed", "scope": "workspace"});
         let result = delete_memory(&store, &workspace, &args).unwrap();
@@ -1914,7 +1921,7 @@ mod tests {
         )
         .unwrap();
 
-        let store = MemoryStore::for_test(root.join("g"), &workspace);
+        let store = MemoryStore::for_test(root.join("g"), &workspace, &root);
 
         let args = json!({"name": "old-name", "new_name": "new-name", "scope": "workspace"});
         let result = rename_memory(&store, &workspace, &args).unwrap();
@@ -1971,7 +1978,7 @@ mod tests {
             "---\nname: uncatalogued\ndescription: never indexed\n---\nx\n",
         )
         .unwrap();
-        let store = MemoryStore::for_test(root.join("g"), &workspace);
+        let store = MemoryStore::for_test(root.join("g"), &workspace, &root);
 
         let args = json!({"name": "linker", "new_name": "new-linker", "scope": "workspace"});
         rename_memory(&store, &workspace, &args).unwrap();
@@ -2011,7 +2018,7 @@ mod tests {
         fs::write(structured.join("a.md"), "---\nname: a\n---\nx\n").unwrap();
         fs::write(structured.join("b.md"), "---\nname: b\n---\nx\n").unwrap();
 
-        let store = MemoryStore::for_test(root.join("g"), &workspace);
+        let store = MemoryStore::for_test(root.join("g"), &workspace, &root);
 
         let collision = json!({"name": "a", "new_name": "b", "scope": "workspace"});
         let err = rename_memory(&store, &workspace, &collision).unwrap_err();
@@ -2032,7 +2039,7 @@ mod tests {
         fs::create_dir_all(&structured).unwrap();
         fs::write(structured.join("MEMORY.md"), "# Memory Index\n").unwrap();
 
-        let store = MemoryStore::for_test(root.join("g"), &workspace);
+        let store = MemoryStore::for_test(root.join("g"), &workspace, &root);
 
         let first = json!({
             "name": "fact",
@@ -2100,7 +2107,7 @@ mod tests {
         let structured = workspace.join(".coyote").join("memory");
         fs::create_dir_all(&structured).unwrap();
         fs::write(structured.join("MEMORY.md"), "# Memory Index\n").unwrap();
-        let store = MemoryStore::for_test(root.join("g"), &workspace);
+        let store = MemoryStore::for_test(root.join("g"), &workspace, &root);
 
         let args = json!({
             "name": "fresh",
@@ -2144,7 +2151,7 @@ mod tests {
              superseded_by: x\nname: fact\ndescription: old\n---\n\nold body\n",
         )
         .unwrap();
-        let store = MemoryStore::for_test(root.join("g"), &workspace);
+        let store = MemoryStore::for_test(root.join("g"), &workspace, &root);
 
         let args = json!({
             "name": "fact",
@@ -2187,7 +2194,7 @@ mod tests {
         let structured = workspace.join(".coyote").join("memory");
         fs::create_dir_all(&structured).unwrap();
         fs::write(structured.join("MEMORY.md"), "# Memory Index\n").unwrap();
-        let store = MemoryStore::for_test(root.join("g"), &workspace);
+        let store = MemoryStore::for_test(root.join("g"), &workspace, &root);
 
         let missing_description = json!({
             "name": "fact",
@@ -2312,7 +2319,7 @@ mod tests {
         let structured = workspace.join(".coyote").join("memory");
         fs::create_dir_all(&structured).unwrap();
         fs::write(structured.join("MEMORY.md"), index).unwrap();
-        let store = MemoryStore::for_test(root.join("g"), &workspace);
+        let store = MemoryStore::for_test(root.join("g"), &workspace, root);
         (store, workspace, structured)
     }
 

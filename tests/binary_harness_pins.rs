@@ -16,6 +16,12 @@ const CACHE_ENV: &str = ".env(\"COYOTE_CACHE_DIR\"";
 const PATH_PIN: &str = ".env(\"PATH\", pinned_path(";
 const MEMORY_ROOT_SCRUB: &str = ".env_remove(TEST_WORKSPACE_MEMORY_ROOT_ENV)";
 const MEMORY_ROOT_MIRROR: &str = "const TEST_WORKSPACE_MEMORY_ROOT_ENV: &str = ";
+/// The spellings a harness uses to build a command around the binary.
+const BINARY_COMMANDS: [&str; 3] = [
+    "Command::new(binary)",
+    "Command::new(COYOTE_BIN)",
+    "Command::new(env!(",
+];
 
 /// The graph-session harnesses run fixture hooks and scripts through the
 /// binary, so on top of the dir pins every spawn there pins PATH and scrubs
@@ -73,12 +79,20 @@ fn every_graph_session_harness_spawn_pins_path_and_scrubs_the_memory_root_overri
         let source =
             fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         let spawn_sites = source.matches(SPAWN_SITE).count();
+        let command_sites: usize = BINARY_COMMANDS
+            .iter()
+            .map(|command| source.matches(command).count())
+            .sum();
         let path_sites = source.matches(PATH_PIN).count();
         let scrub_sites = source.matches(MEMORY_ROOT_SCRUB).count();
         assert!(
-            spawn_sites > 0 && spawn_sites == path_sites && path_sites == scrub_sites,
-            "{name}: {spawn_sites} binary spawn(s), {path_sites} PATH pin(s), \
-             {scrub_sites} memory-root scrub(s); every spawn must pin PATH and scrub the override"
+            spawn_sites > 0
+                && spawn_sites == command_sites
+                && command_sites == path_sites
+                && path_sites == scrub_sites,
+            "{name}: {spawn_sites} binary spawn(s), {command_sites} binary command(s), \
+             {path_sites} PATH pin(s), {scrub_sites} memory-root scrub(s); every spawn must pin \
+             PATH and scrub the override"
         );
         let mirror = format!("{MEMORY_ROOT_MIRROR}{source_name};");
         assert!(

@@ -3289,15 +3289,14 @@ mod tests {
     use crate::supervisor::{JobHandle, JobResult, JobState, JobStatus};
     use crate::testing::TestConfigDirGuard;
     use crate::utils::fs::ExclusiveLock;
-    use crate::utils::get_env_name;
     use parking_lot::Mutex;
     use serde_json::json;
     use serial_test::serial;
     use std::fs::{create_dir_all, read_to_string, remove_dir_all, write};
+    use std::mem;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
-    use std::{env, mem};
 
     fn default_app_state() -> Arc<AppState> {
         Arc::new(AppState::test_default())
@@ -12501,18 +12500,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_a_workspace_scoped_root_session_is_the_parent_path_not_its_global_namesake() {
-        let _guard = TestConfigDirGuard::new("agents-tests");
-        let workspace = env::temp_dir().join(format!(
-            "coyote-agents-tests-workspace-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        create_dir_all(&workspace).unwrap();
-        let _workspace_env =
-            crate::testing::EnvVarGuard::set(get_env_name("workspace_config_dir"), &workspace);
+        let guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_probe_workspace_parent");
         write_config_only_agent(&agent_name);
         let mut ctx = spawner_with_session("shared-name");
@@ -12524,7 +12512,7 @@ mod tests {
         let in_global = ctx.session_file_for("shared-name", SessionScope::Global);
         assert_ne!(in_workspace, in_global);
         assert!(
-            in_workspace.starts_with(&workspace),
+            in_workspace.starts_with(guard.workspace_root()),
             "{}",
             in_workspace.display()
         );
@@ -12547,7 +12535,6 @@ mod tests {
             root.child_session_file(spawn.session_id.as_ref().unwrap())
                 .is_file()
         );
-        let _ = remove_dir_all(&workspace);
     }
 
     /// When the `children/` directory an earlier process left behind cannot

@@ -82,7 +82,15 @@ pub fn workspace_search_bounds(cwd: &Path) -> (PathBuf, Option<PathBuf>) {
 #[cfg(test)]
 pub fn workspace_search_bounds(cwd: &Path) -> (PathBuf, Option<PathBuf>) {
     match std::env::var_os(WORKSPACE_MEMORY_ROOT_TEST_ENV) {
-        Some(root) => (PathBuf::from(&root), Some(PathBuf::from(root))),
+        Some(root) => {
+            let root = PathBuf::from(root);
+            assert!(
+                root.is_absolute(),
+                "{WORKSPACE_MEMORY_ROOT_TEST_ENV} must be absolute, got {}",
+                root.display()
+            );
+            (root.clone(), Some(root))
+        }
         None => (cwd.to_path_buf(), None),
     }
 }
@@ -470,12 +478,12 @@ impl MemoryStore {
     }
 
     /// A store over explicit test dirs: the workspace is found by walking up
-    /// from `start` with no override and no ceiling.
+    /// from `start`, ignoring the override and never above `ceiling`.
     #[cfg(test)]
-    pub(crate) fn for_test(global_dir: PathBuf, start: &Path) -> Self {
+    pub(crate) fn for_test(global_dir: PathBuf, start: &Path, ceiling: &Path) -> Self {
         Self {
             global_dir,
-            workspace: walk_workspace_memory(start, None),
+            workspace: walk_workspace_memory(start, Some(ceiling)),
         }
     }
 
@@ -1010,10 +1018,7 @@ mod tests {
         fs::create_dir_all(&global).unwrap();
         fs::write(global.join(MEMORY_INDEX_FILE_NAME), "global-content").unwrap();
 
-        let store = MemoryStore {
-            global_dir: global,
-            workspace: walk_workspace_memory(&workspace, None),
-        };
+        let store = MemoryStore::for_test(global, &workspace, &root);
 
         assert_eq!(
             store.load_global_index().unwrap().as_deref(),
@@ -1034,7 +1039,7 @@ mod tests {
         fs::create_dir_all(&workspace).unwrap();
         fs::write(workspace.join("COYOTE.md"), "instructions, not memory").unwrap();
 
-        assert!(walk_workspace_memory(&workspace, None).is_none());
+        assert!(walk_workspace_memory(&workspace, Some(&root)).is_none());
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1045,10 +1050,7 @@ mod tests {
         let workspace = root.join("ws");
         fs::create_dir_all(&workspace).unwrap();
 
-        let store = MemoryStore {
-            global_dir: root.join("global"),
-            workspace: walk_workspace_memory(&workspace, None),
-        };
+        let store = MemoryStore::for_test(root.join("global"), &workspace, &root);
 
         assert!(
             build_memory_section(&store, true, 4_000, 12_000)
@@ -1078,10 +1080,7 @@ mod tests {
         )
         .unwrap();
 
-        let store = MemoryStore {
-            global_dir: root.join("global"),
-            workspace: walk_workspace_memory(&workspace, None),
-        };
+        let store = MemoryStore::for_test(root.join("global"), &workspace, &root);
 
         let section = build_memory_section(&store, true, 4_000, 12_000)
             .unwrap()
@@ -1115,10 +1114,7 @@ mod tests {
         )
         .unwrap();
 
-        let store = MemoryStore {
-            global_dir: root.join("global"),
-            workspace: walk_workspace_memory(&workspace, None),
-        };
+        let store = MemoryStore::for_test(root.join("global"), &workspace, &root);
 
         let section = build_memory_section(&store, false, 4_000, 12_000)
             .unwrap()
@@ -1147,10 +1143,7 @@ mod tests {
         )
         .unwrap();
 
-        let store = MemoryStore {
-            global_dir: root.join("global"),
-            workspace: walk_workspace_memory(&workspace, None),
-        };
+        let store = MemoryStore::for_test(root.join("global"), &workspace, &root);
 
         let section = build_memory_section(&store, false, 4_000, 100)
             .unwrap()
@@ -1187,10 +1180,7 @@ mod tests {
         let global = root.join("global");
         fs::create_dir_all(&global).unwrap();
         fs::write(global.join(MEMORY_INDEX_FILE_NAME), global_index).unwrap();
-        let store = MemoryStore {
-            global_dir: global,
-            workspace: walk_workspace_memory(&workspace, None),
-        };
+        let store = MemoryStore::for_test(global, &workspace, &root);
         (root, store)
     }
 
@@ -1923,10 +1913,7 @@ mod tests {
         write_store_file(&structured, "scratch", "type: run-state\n");
         write_store_file(&structured, "bygone", "expires: 2000-01-01\n");
 
-        let store = MemoryStore {
-            global_dir: root.join("global"),
-            workspace: walk_workspace_memory(&workspace, None),
-        };
+        let store = MemoryStore::for_test(root.join("global"), &workspace, &root);
 
         let section = build_memory_section(&store, false, 4_000, 12_000)
             .unwrap()
@@ -1952,7 +1939,8 @@ mod tests {
         let nested = workspace.join("src").join("deep").join("path");
         fs::create_dir_all(&nested).unwrap();
 
-        let found = walk_workspace_memory(&nested, None).expect("workspace memory should be found");
+        let found =
+            walk_workspace_memory(&nested, Some(&root)).expect("workspace memory should be found");
         assert_eq!(found.dir, mem_dir);
 
         let _ = fs::remove_dir_all(&root);

@@ -57,12 +57,12 @@ impl Drop for TempDirGuard {
     }
 }
 
-const GRAPH_AGENT: &str = "echo-graph";
-
 /// The workspace-memory root override the unit-test guards set; it mirrors
 /// `WORKSPACE_MEMORY_ROOT_TEST_ENV` in `src/config/memory.rs`, which an
 /// integration test cannot import from the binary crate.
 const TEST_WORKSPACE_MEMORY_ROOT_ENV: &str = "COYOTE_TEST_WORKSPACE_MEMORY_ROOT";
+
+const GRAPH_AGENT: &str = "echo-graph";
 const CONFIG_AGENT: &str = "probe";
 const TURN_EVENTS: [&str; 2] = ["turn.started", "turn.completed"];
 

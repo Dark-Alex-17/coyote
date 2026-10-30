@@ -184,7 +184,8 @@ fn run_from(cwd: &Path, dir: &Path, args: &[&str], extra_env: &[(&str, &str)]) -
 /// A PATH holding only `bin_dir` (the built binary's own directory) and the
 /// system shell directories, so the fixture's `sh`/`bash` hooks and tool
 /// scripts resolve the same way on every host and nothing else on the
-/// developer's PATH can leak into a run.
+/// developer's PATH can leak into a run. Twin of `pinned_path` in
+/// tests/graph_session_repl_binary.rs; change both together.
 fn pinned_path(bin_dir: &Path) -> std::ffi::OsString {
     let system_dirs: Vec<PathBuf> = if cfg!(windows) {
         let system_root = env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
