@@ -33,7 +33,7 @@ use crate::config::{
     install_builtins, list_agents, load_env_file, macro_execute, maybe_spawn_models_refresh,
     sync_models,
 };
-use crate::config::{memory, paths};
+use crate::config::{memory, memory_migrate, paths};
 use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail};
 use crate::mcp::McpServersConfig;
 use crate::render::{prompt_theme, render_error};
@@ -110,7 +110,11 @@ async fn async_main() -> Result<()> {
         return Ok(());
     }
 
-    let text = if cli.acp_server { None } else { cli.text()? };
+    let text = if cli.acp_server || cli.memory_migrate.is_some() {
+        None
+    } else {
+        cli.text()?
+    };
     let working_mode = if !cli.acp_server && text.is_none() && cli.file.is_empty() {
         WorkingMode::Repl
     } else {
@@ -176,6 +180,15 @@ async fn async_main() -> Result<()> {
 
     if cli.list_bundles {
         return config::list_installed_bundles();
+    }
+
+    if let Some(scope) = cli.memory_migrate {
+        let round_chains = memory_migrate::configured_round_chains().context(
+            "memory_round_chains could not be read; fix the config and rerun --memory-migrate",
+        )?;
+        let report = memory_migrate::run(scope, cli.apply, round_chains)?;
+        print!("{report}");
+        return report.into_result();
     }
 
     let mcp_inspect =
@@ -538,8 +551,7 @@ async fn run(
                 "# Global Memory\n\n<!-- Universal facts about you go here. The LLM uses this as always-on context. -->\n<!-- Drill files (when created) are listed below. -->\n",
             ),
             MemoryScope::Workspace => {
-                let cwd = env::current_dir()?;
-                let root = memory::find_git_root(&cwd).unwrap_or(cwd);
+                let root = memory::init_workspace_root(&env::current_dir()?);
                 (
                     paths::workspace_memory_index_file_for(&root),
                     "# Workspace Memory Index\n\n<!-- Facts about this project go here. The LLM uses this as always-on context. -->\n<!-- Drill files (when created) are listed below. -->\n",
@@ -552,15 +564,14 @@ async fn run(
             return Ok(());
         }
 
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        fs::write(&path, content)?;
-        if scope == MemoryScope::Workspace
-            && let Some(git_root) = memory::find_git_root(&path)
-        {
-            memory::append_gitignore_entry(&git_root)?;
+        match scope {
+            MemoryScope::Global => {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&path, content)?;
+            }
+            MemoryScope::Workspace => memory::write_workspace_memory_index(&path, content)?,
         }
         println!("✓ Created memory marker at '{}'.", path.display());
         return Ok(());

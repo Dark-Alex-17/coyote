@@ -5632,6 +5632,31 @@ fn step_runner_route_coder_result_failed_label_is_cause_neutral_and_sisyphus_nam
     );
 }
 
+/// The memory prompt tells agents that run state kept as a memory must carry
+/// `type: run-state` with an `expires` date. The sisyphus run-state drill
+/// file is exactly that, so both places that describe it must say so or the
+/// orchestrator guidance contradicts the prompt it runs under.
+#[test]
+fn sisyphus_run_state_memory_is_typed_and_expiring() {
+    let sisyphus = fs::read_to_string(asset("sisyphus/instructions.md")).unwrap();
+    assert!(
+        sisyphus.contains("written with `type: run-state` and `expires` set to tomorrow"),
+        "sisyphus Memory row must type the run-state drill file and set expires"
+    );
+    assert!(
+        sisyphus.contains("one `type: run-state` drill file with `expires`"),
+        "sisyphus do-not-hoard rule must name the typed, expiring drill file"
+    );
+    let hoard = sisyphus
+        .lines()
+        .find(|l| l.starts_with("4. Do not hoard"))
+        .expect("sisyphus instructions have a `4. Do not hoard` rule");
+    assert!(
+        hoard.is_ascii(),
+        "the do-not-hoard rule must stay ASCII: {hoard}"
+    );
+}
+
 /// verify_format_lint.sh writes the format transcript to a spill file for
 /// `--rawfile`. When that write fails (a read-only spill directory stands
 /// in for a full or read-only TMPDIR) the gate must stop before any result

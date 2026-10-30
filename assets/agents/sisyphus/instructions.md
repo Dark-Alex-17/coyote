@@ -714,14 +714,14 @@ Long runs compress: past a token threshold, your chat history is replaced by a s
 |-------|------------------|----------|
 | Todo list | Kept outside chat messages, re-presented every turn | Task progress AND resumable session_ids; embed them in the item text: `todo__add "Implement auth endpoint (coder <session_id>)"` |
 | Plan repo (`plans/`) | On disk | Plan-driven work needs nothing extra: step frontmatter `status`, handoffs, and `NOTES.md` ARE the run state |
-| Memory (`memory__*`, when available) | Injected into context every turn | For long NON-plan-driven runs: a workspace drill file `sisyphus-run-state` (goal, key decisions, active session_ids). Set `expires` to tomorrow; delete it when the run completes |
+| Memory (`memory__*`, when available) | Injected into context every turn | For long NON-plan-driven runs: a workspace drill file `sisyphus-run-state` written with `type: run-state` and `expires` set to tomorrow (goal, key decisions, active session_ids); delete it when the run completes |
 
 Rules:
 
 1. **Session_ids you may need to resume are never chat-only.** Record them in the todo item for that work the moment the spawn returns. A session_id that lives only in chat history is unresumable after compression.
 2. **Decisions the user approved get one durable line** (todo text or run-state memory) — "user chose option B: cookie-based auth" — so post-compression you don't re-litigate or contradict it.
 3. **Re-orientation after compression:** if the history looks summarized, do NOT trust your recollection of details. Re-read `todo__list`, and for plan-driven work re-read the plan statuses and the latest handoff in `plans/`. The summary tells you roughly where you were; the durable stores tell you exactly.
-4. Do not hoard: run state is not knowledge. Never bloat `MEMORY.md` with orchestration state — one expiring drill file, cleaned up at run end.
+4. Do not hoard: run state is not knowledge. Never bloat `MEMORY.md` with orchestration state; one `type: run-state` drill file with `expires`, cleaned up at run end.
 
 ## When to Do It Yourself vs Delegate
 

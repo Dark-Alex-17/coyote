@@ -469,6 +469,7 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
         reasoning_effort,
         functions,
         stream,
+        prompt_cache_ttl: _,
     } = data;
 
     let messages_len = messages.len();
@@ -672,6 +673,7 @@ pub fn openai_build_responses_body(data: ChatCompletionsData, model: &Model) -> 
         reasoning_effort,
         functions,
         stream,
+        prompt_cache_ttl: _,
     } = data;
 
     let messages_len = messages.len();
@@ -1010,6 +1012,7 @@ mod tests {
             reasoning_effort: None,
             functions: None,
             stream: false,
+            prompt_cache_ttl: None,
         };
         openai_build_chat_completions_body(data, &Model::new("openai", "gpt-test"))
     }
@@ -1075,6 +1078,7 @@ mod tests {
             reasoning_effort: None,
             functions,
             stream: false,
+            prompt_cache_ttl: None,
         };
         openai_build_responses_body(data, &Model::new("openai", "gpt-test"))
     }
@@ -1541,6 +1545,7 @@ mod tests {
             reasoning_effort: None,
             functions: None,
             stream,
+            prompt_cache_ttl: None,
         };
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
