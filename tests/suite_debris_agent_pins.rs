@@ -792,6 +792,8 @@ fn agent_quoted_command(rel: &str, needle: &str) -> String {
 /// A caller running inside a git hook or a worktree can export repository
 /// variables that would point every scratch-repo git call (direct, or made by
 /// a scanned recipe or script) at the caller's own repository instead.
+/// A caller running inside a graph exports its state, which puts the debt
+/// scanner in graph mode, where it ignores `--dir` and `--base`.
 #[cfg(unix)]
 fn without_git_repo_vars(cmd: &mut Command) -> &mut Command {
     for key in [
@@ -800,6 +802,8 @@ fn without_git_repo_vars(cmd: &mut Command) -> &mut Command {
         "GIT_INDEX_FILE",
         "GIT_OBJECT_DIRECTORY",
         "GIT_COMMON_DIR",
+        "GRAPH_STATE",
+        "GRAPH_STATE_FILE",
     ] {
         cmd.env_remove(key);
     }
