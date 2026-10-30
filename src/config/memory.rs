@@ -119,7 +119,8 @@ pub fn find_workspace_git_root(cwd: &Path) -> Option<PathBuf> {
     find_git_root_within(&start, ceiling.as_deref())
 }
 
-/// The git root at or above `start`, never above `ceiling`; ignores the override.
+/// Test-only: the bounded walk with an explicit ceiling, for tests that must
+/// not read above their own temp root. Ignores the override.
 #[cfg(test)]
 pub(crate) fn find_git_root_under(start: &Path, ceiling: &Path) -> Option<PathBuf> {
     find_git_root_within(start, Some(ceiling))
@@ -2067,31 +2068,31 @@ mod tests {
     }
 
     #[test]
-    fn find_git_root_returns_dir_containing_git_dir() {
+    fn find_git_root_under_returns_dir_containing_git_dir() {
         let root = temp_root("git_root");
         let repo = root.join("repo");
         fs::create_dir_all(repo.join(GIT_DIR_NAME)).unwrap();
 
-        assert_eq!(find_git_root(&repo), Some(repo.clone()));
+        assert_eq!(find_git_root_under(&repo, &root), Some(repo.clone()));
 
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn find_git_root_walks_up_from_nested_dir() {
+    fn find_git_root_under_walks_up_from_nested_dir() {
         let root = temp_root("git_root_walk");
         let repo = root.join("repo");
         fs::create_dir_all(repo.join(GIT_DIR_NAME)).unwrap();
         let nested = repo.join("a").join("b").join("c");
         fs::create_dir_all(&nested).unwrap();
 
-        assert_eq!(find_git_root(&nested), Some(repo));
+        assert_eq!(find_git_root_under(&nested, &root), Some(repo));
 
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn find_git_root_within_stops_at_the_ceiling() {
+    fn find_git_root_under_stops_at_the_ceiling() {
         let root = temp_root("git_root_ceiling");
         let repo = root.join("repo");
         fs::create_dir_all(repo.join(GIT_DIR_NAME)).unwrap();
@@ -2099,14 +2100,14 @@ mod tests {
         let nested = ceiling.join("b");
         fs::create_dir_all(&nested).unwrap();
 
-        assert_eq!(find_git_root_within(&nested, Some(&ceiling)), None);
-        assert_eq!(find_git_root_within(&nested, Some(&repo)), Some(repo));
+        assert_eq!(find_git_root_under(&nested, &ceiling), None);
+        assert_eq!(find_git_root_under(&nested, &repo), Some(repo));
 
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn find_git_root_treats_git_file_as_repo_marker() {
+    fn find_git_root_under_treats_git_file_as_repo_marker() {
         let root = temp_root("git_root_worktree");
         let worktree = root.join("worktree");
         fs::create_dir_all(&worktree).unwrap();
@@ -2116,18 +2117,18 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(find_git_root(&worktree), Some(worktree));
+        assert_eq!(find_git_root_under(&worktree, &root), Some(worktree));
 
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn find_git_root_returns_none_when_no_git() {
+    fn find_git_root_under_returns_none_when_no_git() {
         let root = temp_root("git_root_missing");
         let bare = root.join("bare");
         fs::create_dir_all(&bare).unwrap();
 
-        assert_eq!(find_git_root(&bare), None);
+        assert_eq!(find_git_root_under(&bare, &root), None);
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -2252,7 +2253,7 @@ mod tests {
         let root = temp_root("init_no_git");
         let cwd = root.join("proj");
         fs::create_dir_all(&cwd).unwrap();
-        assert_eq!(find_git_root(&cwd), None);
+        assert_eq!(find_git_root_under(&cwd, &root), None);
 
         let index = paths::workspace_memory_index_file_for(&init_workspace_root(&cwd));
         assert_eq!(

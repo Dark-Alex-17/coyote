@@ -409,11 +409,16 @@ mod tests {
     /// Walker and `--init-memory` helper names are matched as identifier
     /// tokens on the line with literals and comments blanked, so a point-free
     /// use or an aliased import counts and a mention in a string or comment
-    /// does not. Outside memory.rs's own `#[cfg(test)]` code they are allowed
-    /// only in the fns of `RAW_WALK_HOMES` and `GIT_ROOT_ALLOW`, and the
-    /// helpers also in src/main.rs. The guard struct and config dir needles
-    /// match raw text and are split so this file's own source does not match
-    /// them.
+    /// does not. The git root walkers are allowed only in the fns of
+    /// `GIT_ROOT_ALLOW`: the walk's own definitions (`find_git_root`,
+    /// `find_git_root_within`, `find_workspace_git_root`,
+    /// `find_git_root_under`) plus the two `--init-memory` helpers. memory.rs
+    /// tests get no blanket exemption for them and use `find_git_root_under`
+    /// with their own temp root as the ceiling. The raw memory walk is allowed
+    /// in the fns of `RAW_WALK_HOMES` and memory.rs's `#[cfg(test)]` code, the
+    /// helpers in their own definitions, memory.rs's `#[cfg(test)]` code and
+    /// src/main.rs. The guard struct and config dir needles match raw text and
+    /// are split so this file's own source does not match them.
     #[test]
     fn no_source_file_bypasses_the_workspace_memory_pin() {
         const RAW_WALK: &str = "walk_workspace_memory";
@@ -509,10 +514,9 @@ mod tests {
                         "{at}: test pins the config dir env by hand; use crate::testing::TestConfigDirGuard"
                     ));
                 }
-                let allowed_git_root_walk = (is("config/memory.rs") && in_test)
-                    || GIT_ROOT_ALLOW
-                        .iter()
-                        .any(|&(file, allowed)| is(file) && enclosing_fn == allowed);
+                let allowed_git_root_walk = GIT_ROOT_ALLOW
+                    .iter()
+                    .any(|&(file, allowed)| is(file) && enclosing_fn == allowed);
                 if names_any(&line.code, &GIT_ROOT_WALKS) && !allowed_git_root_walk {
                     offences.push(format!(
                         "{at}: raw git root walk; call memory::find_workspace_git_root, or memory::find_git_root_under in tests"
