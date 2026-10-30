@@ -2,32 +2,68 @@ use fmt::{Debug, Formatter};
 use serde_json::{Value, json};
 use std::fmt;
 
-/// One background-task completion event, delivered to the context that
-/// started the task by merging a `system_notifications` entry onto the last
-/// tool result of a batch.
+pub(crate) const USER_MESSAGE_EVENT: &str = "user_message";
+
+/// One entry of the `system_notifications` channel, delivered to the context
+/// that owns the queue by merging onto the last tool result of a batch.
 #[derive(Clone)]
-pub struct SystemNotification {
-    pub event: &'static str,
-    pub id: String,
-    pub tool_or_agent: String,
-    pub status: &'static str,
-    pub next_action: String,
+pub enum SystemNotification {
+    /// A background task reached a terminal state.
+    Task {
+        event: &'static str,
+        id: String,
+        tool_or_agent: String,
+        status: &'static str,
+        next_action: String,
+    },
+    /// Text the user typed while a turn was running, handed to the model at
+    /// the next tool-round boundary.
+    #[allow(dead_code)] // TASK-315
+    UserMessage { text: String },
 }
 
 impl SystemNotification {
     pub fn to_value(&self) -> Value {
-        json!({
-            "event": self.event,
-            "id": self.id,
-            "tool_or_agent": self.tool_or_agent,
-            "status": self.status,
-            "next_action": self.next_action,
-        })
+        match self {
+            Self::Task {
+                event,
+                id,
+                tool_or_agent,
+                status,
+                next_action,
+            } => json!({
+                "event": event,
+                "id": id,
+                "tool_or_agent": tool_or_agent,
+                "status": status,
+                "next_action": next_action,
+            }),
+            Self::UserMessage { text } => json!({
+                "event": USER_MESSAGE_EVENT,
+                "text": text,
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn event(&self) -> &'static str {
+        match self {
+            Self::Task { event, .. } => event,
+            Self::UserMessage { .. } => USER_MESSAGE_EVENT,
+        }
+    }
+
+    /// The task id a notification points the model at; a user message has none.
+    pub fn id(&self) -> Option<&str> {
+        match self {
+            Self::Task { id, .. } => Some(id),
+            Self::UserMessage { .. } => None,
+        }
     }
 }
 
 pub fn job_notification(id: &str, tool: &str, success: bool) -> SystemNotification {
-    SystemNotification {
+    SystemNotification::Task {
         event: if success {
             "job_completed"
         } else {
@@ -41,7 +77,7 @@ pub fn job_notification(id: &str, tool: &str, success: bool) -> SystemNotificati
 }
 
 pub fn agent_notification(id: &str, agent_name: &str, success: bool) -> SystemNotification {
-    SystemNotification {
+    SystemNotification::Task {
         event: if success {
             "agent_completed"
         } else {
@@ -115,9 +151,12 @@ mod tests {
     #[test]
     fn job_notification_failure_shape() {
         let event = job_notification("job_a1b2", "execute_command", false);
-        assert_eq!(event.event, "job_failed");
-        assert_eq!(event.status, "failed");
-        assert_eq!(event.next_action, "job__collect --id job_a1b2 for output");
+        assert_eq!(event.event(), "job_failed");
+        assert_eq!(event.to_value()["status"], "failed");
+        assert_eq!(
+            event.to_value()["next_action"],
+            "job__collect --id job_a1b2 for output"
+        );
     }
 
     #[test]
@@ -138,11 +177,24 @@ mod tests {
     #[test]
     fn agent_notification_failure_shape() {
         let event = agent_notification("agent_explore_a1b2", "explore", false);
-        assert_eq!(event.event, "agent_failed");
-        assert_eq!(event.status, "failed");
+        assert_eq!(event.event(), "agent_failed");
+        assert_eq!(event.to_value()["status"], "failed");
         assert_eq!(
-            event.next_action,
+            event.to_value()["next_action"],
             "agent__collect --id agent_explore_a1b2 for output"
+        );
+    }
+
+    #[test]
+    fn user_message_shape() {
+        let event = SystemNotification::UserMessage {
+            text: "keep going".to_string(),
+        };
+        assert_eq!(event.event(), "user_message");
+        assert_eq!(event.id(), None);
+        assert_eq!(
+            serde_json::to_string(&event.to_value()).unwrap(),
+            r#"{"event":"user_message","text":"keep going"}"#
         );
     }
 
@@ -155,8 +207,8 @@ mod tests {
         let drained = queue.drain();
 
         assert_eq!(drained.len(), 2);
-        assert_eq!(drained[0].id, "job_1");
-        assert_eq!(drained[1].id, "job_2");
+        assert_eq!(drained[0].id(), Some("job_1"));
+        assert_eq!(drained[1].id(), Some("job_2"));
         assert!(queue.drain().is_empty());
     }
 

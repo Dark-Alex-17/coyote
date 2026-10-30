@@ -26,6 +26,7 @@ use crate::mcp::{
     McpServersConfig, is_mcp_meta_function, render,
 };
 use crate::parsers::{bash, python, typescript};
+use crate::supervisor::notification::USER_MESSAGE_EVENT;
 use crate::turn::UiSink;
 use agents::AGENT_FUNCTION_PREFIX;
 use anyhow::{Context, Result, anyhow, bail};
@@ -334,11 +335,12 @@ pub async fn eval_tool_calls(
     for (idx, call) in calls.into_iter().enumerate() {
         if let Some(msg) = ctx.tool_scope.tool_tracker.check_loop(&call.clone()) {
             let dup_msg = format!("{{\"tool_call_loop_alert\":{}}}", msg.trim());
-            println!(
-                "{}",
-                muted_warning_text(
-                    format!("{}: ⚠️ Tool-call loop detected! ⚠️", call.name).as_str()
-                )
+            let plain = format!("{}: ⚠️ Tool-call loop detected! ⚠️", call.name);
+            emit_tool_warning(
+                ctx.ui.as_ref(),
+                ctx.current_depth,
+                &sanitize_display_text(&plain),
+                &plain,
             );
             indexed_results.push((idx, ToolResult::new(call, json!(dup_msg))));
         } else {
@@ -426,32 +428,36 @@ fn normalize_tool_result(result: Value) -> Value {
     }
 }
 
-/// Drains this context's own notification queue and drops events whose
+/// Drains this context's own notification queue and drops task events whose
 /// handle is no longer registered with the supervisor (already collected or
-/// cancelled), so the model is never pointed at a dead id.
+/// cancelled), so the model is never pointed at a dead id. User messages
+/// name no task and always pass through.
 fn drain_live_notifications(ctx: &RequestContext) -> Vec<Value> {
     let events = ctx.notification_queue.drain();
     if events.is_empty() {
         return vec![];
     }
 
-    let Some(supervisor) = ctx.supervisor.as_ref() else {
-        return vec![];
+    let sup = ctx.supervisor.as_ref().map(|supervisor| supervisor.read());
+    let task_is_live = |id: &str| {
+        sup.as_ref()
+            .is_some_and(|sup| sup.has_job(id) || sup.has_agent(id))
     };
-    let sup = supervisor.read();
     events
         .into_iter()
-        .filter(|event| sup.has_job(&event.id) || sup.has_agent(&event.id))
+        .filter(|event| event.id().is_none_or(task_is_live))
         .map(|event| event.to_value())
         .collect()
 }
 
 /// Single-pass merge of both system channels onto the last tool result of a
 /// batch: pending escalations (children are blocked; listed first) and
-/// background-task completion notifications. A single pass is mandatory —
-/// two independent mergers would each apply the non-object wrap and nest the
-/// output twice. With both channels empty this is a no-op, and with only
-/// escalations it produces exactly the pre-notification output shape.
+/// system notifications (background-task completions and user messages typed
+/// mid-turn), whose instruction is derived from the kinds of entries present.
+/// A single pass is mandatory: two independent mergers would each apply the
+/// non-object wrap and nest the output twice. With both channels empty this
+/// is a no-op, and with only escalations it produces exactly the
+/// pre-notification output shape.
 fn merge_system_channel(last: &mut ToolResult, escalations: Vec<Value>, notifications: Vec<Value>) {
     if escalations.is_empty() && notifications.is_empty() {
         return;
@@ -459,8 +465,19 @@ fn merge_system_channel(last: &mut ToolResult, escalations: Vec<Value>, notifica
 
     let escalation_instruction = "Child agents are BLOCKED waiting for your reply. \
         Call agent__reply_escalation for each pending escalation to unblock them.";
-    let notification_instruction =
+    let task_instruction =
         "Background tasks have finished; collect each result with its next_action command.";
+    let user_message_instruction =
+        "The user sent a message while you were working; read it before continuing.";
+    let has_tasks = notifications.iter().any(|n| n.get("id").is_some());
+    let has_user_message = notifications
+        .iter()
+        .any(|n| n.get("event").and_then(Value::as_str) == Some(USER_MESSAGE_EVENT));
+    let notification_instruction = match (has_tasks, has_user_message) {
+        (false, true) => user_message_instruction.to_string(),
+        (true, true) => format!("{task_instruction} {user_message_instruction}"),
+        (true, false) | (false, false) => task_instruction.to_string(),
+    };
 
     let map = match &mut last.output {
         Value::Object(map) => map,
@@ -1489,6 +1506,7 @@ impl ToolCall {
     async fn eval_mcp(&self, ctx: &RequestContext) -> Result<Value> {
         let json_data = self.parse_arguments()?;
         let cmd_name = self.name.as_str();
+        let display_name = sanitize_display_text(cmd_name);
         let call_id = self.id.clone().unwrap_or_default();
         let cmd_args = [json_data.to_string()];
         if (*IS_STDOUT_TERMINAL || *SHOW_TOOL_CALLS)
@@ -1496,11 +1514,11 @@ impl ToolCall {
             && !HEADLESS.load(Ordering::SeqCst)
         {
             ctx.ui
-                .tool_narration(&call_id, cmd_name, &cmd_args, &json_data);
+                .tool_narration(&call_id, &display_name, &cmd_args, &json_data);
         }
         events::bus().publish(Event::ToolNarration {
             call_id,
-            line: plain_call_log(cmd_name, &cmd_args),
+            line: plain_call_log(&display_name, &cmd_args),
         });
         let result = if cmd_name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX) {
             Self::search_mcp_tools(ctx, cmd_name, &json_data)
@@ -2560,6 +2578,11 @@ pub fn run_llm_function(
             }
             let chunk = &buffer[0..n];
             buf.extend_from_slice(chunk);
+            events::bus().publish(Event::ToolOutputChunk {
+                call_id: stdout_io.call_id.clone().unwrap_or_default(),
+                stream: OutputStream::Stdout,
+                bytes: chunk.to_vec(),
+            });
             stdout_io.ui.tool_output(
                 stdout_io.call_id.as_deref(),
                 OutputStream::Stdout,
@@ -2580,6 +2603,11 @@ pub fn run_llm_function(
             }
             let chunk = &buffer[0..n];
             buf.extend_from_slice(chunk);
+            events::bus().publish(Event::ToolOutputChunk {
+                call_id: stderr_io.call_id.clone().unwrap_or_default(),
+                stream: OutputStream::Stderr,
+                bytes: chunk.to_vec(),
+            });
             stderr_io.ui.tool_output(
                 stderr_io.call_id.as_deref(),
                 OutputStream::Stderr,
@@ -2885,7 +2913,9 @@ mod tests {
     use crate::config::{Agent, AgentConfig, AppConfig, AppState, Session, WorkingMode};
     use crate::supervisor::escalation::{EscalationQueue, EscalationRequest};
     use crate::supervisor::mailbox::Inbox;
-    use crate::supervisor::notification::{agent_notification, job_notification};
+    use crate::supervisor::notification::{
+        SystemNotification, agent_notification, job_notification,
+    };
     use crate::supervisor::{
         AgentExitStatus, AgentHandle, AgentResult, JobHandle, JobResult, JobState, JobStatus,
         Supervisor,
@@ -3168,6 +3198,84 @@ mod tests {
         ctx.notification_queue
             .push(job_notification("job_x", "execute_command", true));
         assert!(drain_live_notifications(&ctx).is_empty());
+    }
+
+    #[test]
+    fn user_message_notification_merges_without_a_supervisor() {
+        let ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.notification_queue
+            .push(SystemNotification::UserMessage {
+                text: "user-msg-probe-x7x".into(),
+            });
+        let expected = json!({
+            "output": "DONE",
+            "system_notifications": [{"event": "user_message", "text": "user-msg-probe-x7x"}],
+            "notification_instruction": "The user sent a message while you were working; \
+                read it before continuing.",
+        });
+
+        let notifications = drain_live_notifications(&ctx);
+        let mut result = ToolResult::new(call("t", Some("id-1")), json!("DONE"));
+        merge_system_channel(&mut result, vec![], notifications);
+
+        assert_eq!(
+            serde_json::to_string(&result.output).unwrap(),
+            serde_json::to_string(&expected).unwrap()
+        );
+    }
+
+    #[test]
+    fn mixed_task_and_user_message_notifications_join_both_instructions() {
+        let ctx = ctx_with_registered_job("job_live");
+        ctx.notification_queue
+            .push(job_notification("job_live", "execute_command", true));
+        ctx.notification_queue
+            .push(SystemNotification::UserMessage {
+                text: "user-msg-probe-x7x".into(),
+            });
+        let expected = json!({
+            "output": "DONE",
+            "system_notifications": [
+                {
+                    "event": "job_completed",
+                    "id": "job_live",
+                    "tool_or_agent": "execute_command",
+                    "status": "success",
+                    "next_action": "job__collect --id job_live for output",
+                },
+                {"event": "user_message", "text": "user-msg-probe-x7x"},
+            ],
+            "notification_instruction": "Background tasks have finished; collect each result \
+                with its next_action command. The user sent a message while you were \
+                working; read it before continuing.",
+        });
+
+        let notifications = drain_live_notifications(&ctx);
+        let mut result = ToolResult::new(call("t", Some("id-1")), json!("DONE"));
+        merge_system_channel(&mut result, vec![], notifications);
+
+        assert_eq!(
+            serde_json::to_string(&result.output).unwrap(),
+            serde_json::to_string(&expected).unwrap()
+        );
+    }
+
+    #[test]
+    fn drain_live_notifications_keeps_user_messages_but_drops_dead_tasks() {
+        let ctx = ctx_with_registered_job("job_live");
+        ctx.notification_queue
+            .push(job_notification("job_gone", "execute_command", true));
+        ctx.notification_queue
+            .push(SystemNotification::UserMessage {
+                text: "user-msg-probe-x7x".into(),
+            });
+
+        let live = drain_live_notifications(&ctx);
+
+        assert_eq!(
+            live,
+            vec![json!({"event": "user_message", "text": "user-msg-probe-x7x"})]
+        );
     }
 
     fn ctx_with_registered_agent(id: &str) -> RequestContext {
@@ -4673,6 +4781,46 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn eval_mcp_publishes_tool_narration() {
+        let recording = crate::events::RecordingSink::install();
+        let fixture = FixtureServer {
+            tool_result: Some(CallToolResult::success(vec![ContentBlock::text("hi")])),
+            ..Default::default()
+        };
+
+        run_async(async {
+            let (runtime, _server) = fixture_runtime(fixture).await;
+            let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+            ctx.tool_scope.mcp_runtime = runtime;
+            call_with_args(
+                "mcp_invoke_fixture",
+                json!({"tool": "dup", "arguments": {"q": "mcp-narration-probe-x7x"}}),
+            )
+            .eval_mcp(&ctx)
+            .await
+        })
+        .unwrap();
+
+        let narrations: Vec<(String, String)> = recording
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::ToolNarration { call_id, line }
+                    if line.contains("mcp-narration-probe-x7x") =>
+                {
+                    Some((call_id, line))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(narrations.len(), 1, "{narrations:?}");
+        assert_eq!(narrations[0].0, "id1");
+        assert!(narrations[0].1.starts_with("Call mcp_invoke_fixture "));
+        assert!(!narrations[0].1.contains('\x1b'));
+    }
+
+    #[test]
     fn functions_supervisor_includes_task_queue_tools() {
         let mut f = Functions::default();
         f.append_supervisor_functions();
@@ -4845,6 +4993,45 @@ mod tests {
         assert_eq!(json["output"], "partial-output\n");
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn run_llm_function_publishes_output_chunks_per_stream() {
+        let recording = crate::events::RecordingSink::install();
+        run_llm_function(
+            "bash".into(),
+            vec![
+                "-c".into(),
+                "printf out-chunk-x7x; printf err-chunk-x7x >&2".into(),
+            ],
+            HashMap::new(),
+            None,
+            None,
+            ToolIo::new(Arc::new(SilentSink), Some("call-chunk-x7x".into()), 0),
+            None,
+        )
+        .unwrap();
+
+        let mut stdout_bytes = Vec::new();
+        let mut stderr_bytes = Vec::new();
+        for event in recording.drain() {
+            if let Event::ToolOutputChunk {
+                call_id,
+                stream,
+                bytes,
+            } = event
+                && call_id == "call-chunk-x7x"
+            {
+                match stream {
+                    OutputStream::Stdout => stdout_bytes.extend(bytes),
+                    OutputStream::Stderr => stderr_bytes.extend(bytes),
+                }
+            }
+        }
+        assert_eq!(String::from_utf8(stdout_bytes).unwrap(), "out-chunk-x7x");
+        assert_eq!(String::from_utf8(stderr_bytes).unwrap(), "err-chunk-x7x");
+    }
+
     #[test]
     fn emit_tool_warning_hands_the_sink_unpainted_text_at_depth_zero_only() {
         let probe = NoticeProbe::default();
@@ -4858,6 +5045,53 @@ mod tests {
             vec![(NoticeKind::ToolWarning, "⚠️ boom ⚠️".to_string())]
         );
         assert!(!notices[0].1.contains('\x1b'));
+    }
+
+    #[test]
+    fn eval_tool_calls_hands_the_loop_alert_to_the_sink_unpainted() {
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        let probe = Arc::new(NoticeProbe::default());
+        ctx.ui = Arc::clone(&probe) as Arc<dyn UiSink>;
+        let repeated = call_with_args("loop-probe-x7x", json!({"a": 1}));
+        ctx.tool_scope.tool_tracker.record_call(repeated.clone());
+        ctx.tool_scope.tool_tracker.record_call(repeated.clone());
+
+        let results = run_async(eval_tool_calls(&mut ctx, vec![repeated])).unwrap();
+
+        assert_eq!(
+            probe.notices(),
+            vec![(
+                NoticeKind::ToolWarning,
+                "loop-probe-x7x: ⚠️ Tool-call loop detected! ⚠️".to_string()
+            )]
+        );
+        assert!(
+            results[0]
+                .output
+                .as_str()
+                .is_some_and(|text| text.contains("tool_call_loop_alert"))
+        );
+    }
+
+    #[test]
+    fn eval_tool_calls_keeps_the_loop_alert_off_the_sink_at_depth_one() {
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.current_depth = 1;
+        let probe = Arc::new(NoticeProbe::default());
+        ctx.ui = Arc::clone(&probe) as Arc<dyn UiSink>;
+        let repeated = call_with_args("loop-depth1-probe-x7x", json!({"a": 1}));
+        ctx.tool_scope.tool_tracker.record_call(repeated.clone());
+        ctx.tool_scope.tool_tracker.record_call(repeated.clone());
+
+        let results = run_async(eval_tool_calls(&mut ctx, vec![repeated])).unwrap();
+
+        assert!(probe.notices().is_empty());
+        assert!(
+            results[0]
+                .output
+                .as_str()
+                .is_some_and(|text| text.contains("tool_call_loop_alert"))
+        );
     }
 
     // The capture lock is held on this thread, so a regression that echoes

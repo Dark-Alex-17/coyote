@@ -27,6 +27,7 @@ use super::{MessageContentToolCalls, prompts};
 use crate::client::{
     Message, MessageContent, MessageRole, Model, ModelType, ThinkingBlock, TokenUsage, list_models,
 };
+use crate::events::{self, Event};
 use crate::function::{
     FunctionDeclaration, Functions, ToolCall, ToolCallTracker, ToolResult,
     agents::AGENT_FUNCTION_PREFIX,
@@ -1055,17 +1056,22 @@ impl RequestContext {
         self.todo_list = TodoList::new(goal);
         self.auto_continue_paused = None;
         self.sync_todo_state_to_session();
+        self.publish_todo_update();
     }
 
     pub fn add_todo(&mut self, task: &str) -> usize {
         let id = self.todo_list.add(task);
         self.sync_todo_state_to_session();
+        self.publish_todo_update();
         id
     }
 
     pub fn mark_todo_done(&mut self, id: usize) -> bool {
         let marked = self.todo_list.mark_done(id);
         self.sync_todo_state_to_session();
+        if marked {
+            self.publish_todo_update();
+        }
         marked
     }
 
@@ -1074,6 +1080,12 @@ impl RequestContext {
         self.auto_continue_count = 0;
         self.auto_continue_paused = None;
         self.sync_todo_state_to_session();
+        self.publish_todo_update();
+    }
+
+    pub(crate) fn replace_todo_list(&mut self, list: TodoList) {
+        self.todo_list = list;
+        self.publish_todo_update();
     }
 
     pub fn increment_auto_continue_count(&mut self) {
@@ -1096,6 +1108,16 @@ impl RequestContext {
     fn sync_todo_state_to_session(&mut self) {
         if let Some(session) = self.session.as_mut() {
             session.sync_todo_state(&self.todo_list, self.auto_continue_paused.as_deref());
+        }
+    }
+
+    /// Only the root context drives the todo panel; a child agent's todo list
+    /// is its own and would otherwise overwrite the user's.
+    fn publish_todo_update(&self) {
+        if self.self_agent_id.is_none() {
+            events::bus().publish(Event::TodoUpdated {
+                items: self.todo_list.todos.clone(),
+            });
         }
     }
 
@@ -1619,7 +1641,7 @@ impl RequestContext {
             self.discontinuous_last_message();
             self.last_graph_branch = None;
             self.graph_chat_fc_warned = false;
-            self.todo_list = TodoList::default();
+            self.replace_todo_list(TodoList::default());
             self.auto_continue_paused = None;
             if let Some(delegate) = self.delegate_agent_mut() {
                 delegate.exit_session();
@@ -1881,14 +1903,21 @@ impl RequestContext {
         if dry_run || !self.persists_session {
             return;
         }
+        let is_child = self.self_agent_id.is_some();
         let Some(session) = self.session.as_mut() else {
             return;
         };
         if session.effective_save_session() != Some(true) {
             return;
         }
-        if let Err(err) = session.flush() {
-            warn!("Failed to checkpoint session '{}': {err:#}", session.name());
+        match session.flush() {
+            Ok(()) if is_child => events::bus().publish(Event::ChildTranscriptFlushed {
+                session_id: session.name().to_string(),
+            }),
+            Ok(()) => {}
+            Err(err) => {
+                warn!("Failed to checkpoint session '{}': {err:#}", session.name());
+            }
         }
     }
 
@@ -3378,6 +3407,12 @@ impl RequestContext {
         }
         self.last_token_usage = usage;
         self.last_cost = cost;
+        // Only the root context owns the footer; a child agent's usage would
+        // otherwise overwrite the user's.
+        if self.self_agent_id.is_none() {
+            let right_prompt = self.render_prompt_right(&self.app.config);
+            events::bus().publish(Event::UsageUpdated { right_prompt });
+        }
     }
 
     pub fn generate_prompt_context(&self, app: &AppConfig) -> HashMap<&str, String> {
@@ -6179,18 +6214,17 @@ impl RequestContext {
         self.graph_chat_fc_warned = false;
         // Adopt the session's todo state wholesale: a session without any todo
         // state resets ctx to defaults, so nothing leaks across a session switch.
-        match &self.session {
-            Some(session) => {
-                self.todo_list = session.todo_list().clone();
-                self.auto_continue_paused = session.auto_continue_paused().map(str::to_string);
-            }
-            None => {
-                // Structurally unreachable today (both arms above assign Some);
-                // kept so the no-leakage reset stays explicit.
-                self.todo_list = TodoList::default();
-                self.auto_continue_paused = None;
-            }
-        }
+        let (todo_list, auto_continue_paused) = match &self.session {
+            Some(session) => (
+                session.todo_list().clone(),
+                session.auto_continue_paused().map(str::to_string),
+            ),
+            // Structurally unreachable today (both arms above assign Some);
+            // kept so the no-leakage reset stays explicit.
+            None => (TodoList::default(), None),
+        };
+        self.replace_todo_list(todo_list);
+        self.auto_continue_paused = auto_continue_paused;
         self.refresh_mcp_tool_filters();
         self.init_agent_session_variables(new_session)?;
         if created_new_session {
@@ -6388,7 +6422,7 @@ impl RequestContext {
         self.parent_supervisor = None;
         self.current_depth = 0;
         self.auto_continue_count = 0;
-        self.todo_list = TodoList::default();
+        self.replace_todo_list(TodoList::default());
         self.auto_continue_paused = None;
         // Defensive: the already-in-a-session bail above guarantees no session
         // is attached here; this sync only matters if that bail is relaxed.
@@ -6605,7 +6639,7 @@ impl RequestContext {
             self.current_depth = 0;
             self.auto_continue_count = 0;
             self.pending_tasks_guardrail_count = 0;
-            self.todo_list = TodoList::default();
+            self.replace_todo_list(TodoList::default());
             self.auto_continue_paused = None;
             self.last_graph_branch = None;
             self.graph_chat_fc_warned = false;
@@ -8007,6 +8041,7 @@ mod tests {
         AgentExitStatus, AgentHandle, AgentResult, JobHandle, JobResult, JobState, JobStatus,
     };
     use crate::testing::{install_log_collector, warn_snapshot};
+    use crate::turn::SilentSink;
     use crate::utils;
     use crate::utils::get_env_name;
     use crate::vault::Vault;
@@ -8380,6 +8415,106 @@ mod tests {
         assert_eq!(vars.get("last_input_tokens").map(String::as_str), Some("1"));
         assert!(!vars.contains_key("last_cost"));
         assert!(!vars.contains_key("total_cost"));
+    }
+
+    #[test]
+    #[serial]
+    fn record_token_usage_publishes_the_rendered_right_prompt_on_every_call() {
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.right_prompt = Some("usage-probe-x7x".into()));
+        let recording = crate::events::RecordingSink::install();
+
+        ctx.record_token_usage(
+            Some(TokenUsage {
+                input_tokens: Some(1),
+                ..Default::default()
+            }),
+            &priced_model(),
+        );
+        ctx.record_token_usage(None, &priced_model());
+
+        let prompts: Vec<String> = recording
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::UsageUpdated { right_prompt }
+                    if right_prompt.contains("usage-probe-x7x") =>
+                {
+                    Some(right_prompt)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(prompts.len(), 2, "{prompts:?}");
+    }
+
+    #[test]
+    #[serial]
+    fn record_token_usage_publishes_nothing_for_a_child_context() {
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.right_prompt = Some("usage-probe-x7x".into()));
+        ctx.self_agent_id = Some("agent-usage-x7x".into());
+        let recording = crate::events::RecordingSink::install();
+
+        ctx.record_token_usage(
+            Some(TokenUsage {
+                input_tokens: Some(1),
+                ..Default::default()
+            }),
+            &priced_model(),
+        );
+        ctx.record_token_usage(None, &priced_model());
+
+        let published = recording.drain().into_iter().any(|event| {
+            matches!(
+                event,
+                Event::UsageUpdated { right_prompt } if right_prompt.contains("usage-probe-x7x")
+            )
+        });
+        assert!(!published);
+        assert!(ctx.last_prompt_token_usage.is_some());
+    }
+
+    fn todo_updates_bearing(
+        recording: &crate::events::RecordingSink,
+        desc: &str,
+    ) -> Vec<Vec<crate::config::todo::TodoItem>> {
+        recording
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::TodoUpdated { items } if items.iter().any(|item| item.desc == desc) => {
+                    Some(items)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    #[serial]
+    fn replace_todo_list_publishes_on_root_and_not_on_child() {
+        let mut root = create_test_ctx();
+        let mut replacement = TodoList::new("g");
+        replacement.add("replace-probe-x7x");
+        let recording = crate::events::RecordingSink::install();
+
+        root.replace_todo_list(replacement.clone());
+
+        let updates = todo_updates_bearing(&recording, "replace-probe-x7x");
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0], replacement.todos);
+        assert_eq!(root.todo_list, replacement);
+
+        let mut child = create_test_ctx();
+        child.self_agent_id = Some("agent-todo-x7x".into());
+        let mut replacement = TodoList::new("g");
+        replacement.add("replace-child-probe-x7x");
+
+        child.replace_todo_list(replacement.clone());
+
+        assert!(todo_updates_bearing(&recording, "replace-child-probe-x7x").is_empty());
+        assert_eq!(child.todo_list, replacement);
     }
 
     fn test_decl(name: &str) -> FunctionDeclaration {
@@ -11773,6 +11908,30 @@ mod tests {
     }
 
     #[test]
+    fn fork_for_branch_shares_the_ui_sink() {
+        let mut ctx = create_test_ctx();
+        let sink: Arc<dyn UiSink> = Arc::new(SilentSink);
+        ctx.ui = Arc::clone(&sink);
+        let branch = ctx.fork_for_branch();
+        assert!(Arc::ptr_eq(&ctx.ui, &branch.ui));
+    }
+
+    #[test]
+    fn new_for_child_shares_the_parent_ui_sink() {
+        let mut parent = create_test_ctx();
+        let sink: Arc<dyn UiSink> = Arc::new(SilentSink);
+        parent.ui = Arc::clone(&sink);
+        let child = RequestContext::new_for_child(
+            Arc::clone(&parent.app),
+            &parent,
+            1,
+            Arc::new(Inbox::new()),
+            "agent_test_1".to_string(),
+        );
+        assert!(Arc::ptr_eq(&parent.ui, &child.ui));
+    }
+
+    #[test]
     fn fork_for_branch_copies_in_graph_llm_node() {
         let mut ctx = create_test_ctx();
         ctx.in_graph_llm_node = true;
@@ -13721,6 +13880,50 @@ mod tests {
 
         assert!(read_to_string(&path).unwrap().contains("reply"));
         assert!(!ctx.session.as_ref().unwrap().dirty());
+    }
+
+    fn flushed_session_ids(recording: &crate::events::RecordingSink) -> Vec<String> {
+        recording
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::ChildTranscriptFlushed { session_id } if session_id == "flush-probe-x7x" => {
+                    Some(session_id)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    #[serial]
+    fn checkpoint_publishes_child_transcript_flushed_for_a_child_context() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, _path) = loaded_session_ctx("flush-probe-x7x");
+        ctx.session.as_mut().unwrap().set_save_session(Some(true));
+        ctx.self_agent_id = Some("agent-flush-x7x".into());
+        let recording = crate::events::RecordingSink::install();
+
+        complete_turn(&mut ctx, "hello", "reply");
+
+        assert_eq!(
+            flushed_session_ids(&recording),
+            vec!["flush-probe-x7x".to_string()]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn checkpoint_does_not_publish_child_transcript_flushed_for_the_root() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, _path) = loaded_session_ctx("flush-probe-x7x");
+        ctx.session.as_mut().unwrap().set_save_session(Some(true));
+        ctx.self_agent_id = None;
+        let recording = crate::events::RecordingSink::install();
+
+        complete_turn(&mut ctx, "hello", "reply");
+
+        assert!(flushed_session_ids(&recording).is_empty());
     }
 
     fn graph_run(prompt: &str, output: &str) -> LastRun {

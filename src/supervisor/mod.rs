@@ -104,6 +104,33 @@ pub enum TaskKind {
     Job,
 }
 
+/// Where a supervised task stands. `Finished` is a task whose future has
+/// returned but whose outcome is only known once it is collected: every
+/// agent ends this way, and a job does when its state was never updated.
+#[allow(dead_code)] // TASK-317
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskRowStatus {
+    Running,
+    Finished,
+    Completed,
+    Failed,
+}
+
+/// One row of a task listing, detached from the handle so callers can keep
+/// it past the supervisor lock.
+#[allow(dead_code)] // TASK-317
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRow {
+    pub id: String,
+    pub kind: TaskKind,
+    /// The agent name or the job's tool.
+    pub name: String,
+    /// Agents do not record a start time.
+    pub started_at: Option<Instant>,
+    pub status: TaskRowStatus,
+    pub session_id: Option<String>,
+}
+
 impl From<AgentHandle> for TaskHandle {
     fn from(handle: AgentHandle) -> Self {
         Self::Agent(handle)
@@ -322,6 +349,46 @@ impl Supervisor {
                 ),
             })
             .collect()
+    }
+
+    /// Every registered task as an owned row, sorted by id.
+    #[allow(dead_code)] // TASK-317
+    pub fn task_snapshot(&self) -> Vec<TaskRow> {
+        let mut rows: Vec<TaskRow> = self
+            .handles
+            .values()
+            .map(|handle| match handle {
+                TaskHandle::Agent(agent) => TaskRow {
+                    id: agent.id.clone(),
+                    kind: TaskKind::Agent,
+                    name: agent.agent_name.clone(),
+                    started_at: None,
+                    status: if agent.join_handle.is_finished() {
+                        TaskRowStatus::Finished
+                    } else {
+                        TaskRowStatus::Running
+                    },
+                    session_id: agent.session_id.clone(),
+                },
+                TaskHandle::Job(job) => TaskRow {
+                    id: job.id.clone(),
+                    kind: TaskKind::Job,
+                    name: job.tool.clone(),
+                    started_at: Some(job.started_at),
+                    status: match job.state.lock().status {
+                        JobStatus::Running if job.join_handle.is_finished() => {
+                            TaskRowStatus::Finished
+                        }
+                        JobStatus::Running => TaskRowStatus::Running,
+                        JobStatus::Completed => TaskRowStatus::Completed,
+                        JobStatus::Failed => TaskRowStatus::Failed,
+                    },
+                    session_id: None,
+                },
+            })
+            .collect();
+        rows.sort_by(|a, b| a.id.cmp(&b.id));
+        rows
     }
 
     pub fn cancel_all(&self) {
@@ -613,6 +680,86 @@ mod tests {
         assert_eq!(sup.session_id_for("a1").as_deref(), Some("sess_x"));
         assert_eq!(sup.session_id_for("a2"), None);
         assert_eq!(sup.session_id_for("missing"), None);
+    }
+
+    #[test]
+    fn task_snapshot_lists_agents_and_jobs_sorted_by_id() {
+        let mut sup = Supervisor::new(4, 3).with_max_concurrent_jobs(1);
+        let mut agent = make_handle("a_snap", "explore", 1);
+        agent.session_id = Some("sess_x7x".into());
+        sup.register(agent).unwrap();
+        sup.register(make_job("j_snap", create_abort_signal()))
+            .unwrap();
+
+        let rows = sup.task_snapshot();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, "a_snap");
+        assert_eq!(rows[0].kind, TaskKind::Agent);
+        assert_eq!(rows[0].name, "explore");
+        assert_eq!(rows[0].started_at, None);
+        assert_eq!(rows[0].session_id.as_deref(), Some("sess_x7x"));
+        // make_handle drops its runtime, so the agent task is already over.
+        assert_eq!(rows[0].status, TaskRowStatus::Finished);
+
+        assert_eq!(rows[1].id, "j_snap");
+        assert_eq!(rows[1].kind, TaskKind::Job);
+        assert_eq!(rows[1].name, "execute_command");
+        assert!(rows[1].started_at.is_some());
+        assert_eq!(rows[1].session_id, None);
+        assert_eq!(rows[1].status, TaskRowStatus::Running);
+    }
+
+    #[test]
+    fn task_snapshot_reports_each_job_state() {
+        let mut sup = Supervisor::new(4, 3).with_max_concurrent_jobs(4);
+        let completed = make_job("j_completed", create_abort_signal());
+        completed.state.lock().status = JobStatus::Completed;
+        sup.register(completed).unwrap();
+        let failed = make_job("j_failed", create_abort_signal());
+        failed.state.lock().status = JobStatus::Failed;
+        sup.register(failed).unwrap();
+        // Dropping the runtime ends the future before the job ever reported
+        // a state of its own.
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        let join_handle = rt.spawn(async {
+            Ok(JobResult {
+                output: Value::Null,
+                exit_code: Some(0),
+                output_bytes_captured: 0,
+            })
+        });
+        drop(rt);
+        sup.register(JobHandle {
+            id: "j_finished".to_string(),
+            tool: "execute_command".to_string(),
+            started_at: Instant::now(),
+            join_handle,
+            abort_signal: create_abort_signal(),
+            state: Arc::new(Mutex::new(JobState {
+                status: JobStatus::Running,
+                pgid: None,
+            })),
+            output_buf: Arc::new(Mutex::new(RingBuf::default())),
+            no_change_checks: 0,
+            last_check_state: None,
+        })
+        .unwrap();
+
+        let statuses: Vec<(String, TaskRowStatus)> = sup
+            .task_snapshot()
+            .into_iter()
+            .map(|row| (row.id, row.status))
+            .collect();
+
+        assert_eq!(
+            statuses,
+            vec![
+                ("j_completed".to_string(), TaskRowStatus::Completed),
+                ("j_failed".to_string(), TaskRowStatus::Failed),
+                ("j_finished".to_string(), TaskRowStatus::Finished),
+            ]
+        );
     }
 
     #[test]
