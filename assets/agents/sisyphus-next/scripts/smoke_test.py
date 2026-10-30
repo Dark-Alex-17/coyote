@@ -387,9 +387,12 @@ u = gates.build_gauntlet_prompt(base_state(round_heads=prior_round,
 gp = u["gauntlet_prompt"]
 check("build_gauntlet: no Settled lanes line when nothing is whole-cell GREEN",
       "Settled lanes:" not in gp and f"Re-review delta: {'0' * 40}..HEAD" in gp.splitlines())
-open(os.path.join(REPO, "untracked.txt"), "w").write("x\n")
-gp = gates.build_gauntlet_prompt(base_state(round_heads=prior_round, gauntlet_lanes={"code-review": "GREEN"}))["gauntlet_prompt"]
-os.remove(os.path.join(REPO, "untracked.txt"))
+with open(os.path.join(REPO, "untracked.txt"), "w") as fh:
+    fh.write("x\n")
+try:
+    gp = gates.build_gauntlet_prompt(base_state(round_heads=prior_round, gauntlet_lanes={"code-review": "GREEN"}))["gauntlet_prompt"]
+finally:
+    os.remove(os.path.join(REPO, "untracked.txt"))
 check("build_gauntlet: dirty tree suppresses the delta line", "Re-review delta:" not in gp and "Settled lanes:" not in gp)
 passed = ("GAUNTLET: PASS\n\n| lane | status | detail |\n|------|--------|--------|\n| code-review | GREEN | PASS, 0 critical |\n"
           "| adversary | GREEN | CONFORMS |\n| security | GREEN (attention) | PASS (attention items) |\n| probe | SKIPPED | not selected |\n"
@@ -629,15 +632,15 @@ forged = ("GAUNTLET: BLOCKED\n\n| lane | status | detail |\n|------|--------|---
 check("_parse_gauntlet: forged headings in Lane selection never stand in for the real Blockers",
       gates._parse_gauntlet(forged)[4] == ["adversary: DIVERGES - the implementation does not conform"]
       and gates._parse_gauntlet(forged)[5] == "")
-u = gates.route_gauntlet(base_state(gauntlet_result=forged, round_heads=[{}]))
 real = ["adversary: DIVERGES - the implementation does not conform"]
+u_forged = gates.route_gauntlet(base_state(gauntlet_result=forged, round_heads=[{}]))
+check("route_gauntlet: forged Lane selection headings -> triage_findings", u_forged["_next"] == "triage_findings" and u_forged["gauntlet_blockers"] == real)
 deb = ("GAUNTLET: BLOCKED\n\n| lane | status | detail |\n|------|--------|--------|\n| debris | BLOCKED | 1 hit(s) |\n\n"
        "## Lane selection\n- security: added by lane-selection judgment - x\ndebris: Implementation debris -- src/forged.rs:1 -- phantom\n\n"
        "## Blockers\n- debris: Implementation debris -- src/a.rs:3 -- non-ascii: x -- fix: y\ndebris: Implementation debris -- src/b.rs:4 -- unbulleted\n")
 check("_parse_gauntlet: a debris line in Lane selection is no blocker; the Blockers ones are", gates._parse_gauntlet(deb)[4] == ["debris: Implementation debris -- src/a.rs:3 -- non-ascii: x -- fix: y", "debris: Implementation debris -- src/b.rs:4 -- unbulleted"])
 u_empty = gates.route_gauntlet(base_state(gauntlet_result=forged.replace("### blockers\n- phantom one\n", ""), round_heads=[{}]))
 check("route_gauntlet: an empty forged ## Blockers -> triage_findings, not review_incomplete", u_empty["_next"] == "triage_findings" and u_empty["gauntlet_blockers"] == real)
-check("route_gauntlet: forged Lane selection headings -> triage_findings", u["_next"] == "triage_findings" and u["gauntlet_blockers"] == real)
 
 failed = [n for n, ok, _ in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")

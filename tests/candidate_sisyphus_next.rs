@@ -717,7 +717,7 @@ fn readme_toolchain_census_matches_the_live_grep() {
         .collect();
     paths.sort();
     let mut live = BTreeSet::new();
-    let mut gates_lines = Vec::new();
+    let mut gates_hits = Vec::new();
     for path in paths {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let text = fs::read_to_string(&path).unwrap();
@@ -725,7 +725,7 @@ fn readme_toolchain_census_matches_the_live_grep() {
             if re.is_match(line).unwrap() {
                 live.insert(format!("scripts/{name}:{}", idx + 1));
                 if name == "gates.py" {
-                    gates_lines.push(idx + 1);
+                    gates_hits.push(line.to_string());
                 }
             }
         }
@@ -743,9 +743,13 @@ fn readme_toolchain_census_matches_the_live_grep() {
         "the README census block no longer matches the live grep (left: live, right: README)"
     );
     assert_eq!(
-        gates_lines,
-        vec![904],
-        "the gates.py toolchain hit moved from line 904; update the README census block and this pin"
+        gates_hits.len(),
+        1,
+        "gates.py has exactly one toolchain hit: {gates_hits:?}"
+    );
+    assert!(
+        gates_hits[0].contains("Observability pass:"),
+        "the lone gates.py hit is the observability prose line: {gates_hits:?}"
     );
 }
 
@@ -2903,6 +2907,105 @@ fn build_lock_has_no_prompt_carry_and_re_entry_has_no_session_ledger() {
         "librarian listed among the config agents: {row}"
     );
     assert!(!row.contains("inputs:` on every"), "{row}");
+}
+
+/// Every agent `graph.yaml` delegates to that declares no `build_lock`
+/// receives the inherited value without consuming it: none of its own
+/// files names the variable or the shared helpers that run a build under
+/// it, and the README's threading row says so for exactly those children.
+#[test]
+fn children_without_a_build_lock_declaration_never_consume_it() {
+    let graph = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let target_re = fancy_regex::Regex::new(r"(?m)^\s+agent:\s+([\w-]+)\s*$").unwrap();
+    let targets: BTreeSet<String> = target_re
+        .captures_iter(&graph)
+        .map(|c| c.unwrap()[1].to_string())
+        .collect();
+    let declares = |agent: &str| {
+        ["graph.yaml", "config.yaml"].iter().any(|f| {
+            fs::read_to_string(agents_dir().join(agent).join(f))
+                .is_ok_and(|t| t.contains("- name: build_lock"))
+        })
+    };
+    let silent: BTreeSet<&str> = targets
+        .iter()
+        .map(String::as_str)
+        .filter(|a| !declares(a))
+        .collect();
+    let expected = [
+        "architecture-reviewer",
+        "engineer",
+        "explore",
+        "librarian",
+        "oracle",
+        "whetstone",
+    ];
+    assert_eq!(
+        silent,
+        BTreeSet::from(expected),
+        "the children that declare no build_lock changed; update the README threading row"
+    );
+
+    for agent in expected {
+        let root = agents_dir().join(agent);
+        for rel in files_under(&root) {
+            if rel == "README.md" || rel.contains("__pycache__") {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(root.join(&rel)) else {
+                continue;
+            };
+            for needle in ["build_lock", "BUILD_LOCK", "gate_prefix", "run_gate"] {
+                assert!(
+                    !text.contains(needle),
+                    "{agent}/{rel} names {needle}: the child would consume build_lock"
+                );
+            }
+        }
+    }
+
+    let readme = fs::read_to_string(candidate_dir().join("README.md")).unwrap();
+    let row = readme
+        .lines()
+        .find(|l| l.starts_with("| `build_lock` threading |"))
+        .expect("README has a build_lock threading row");
+    assert!(
+        row.contains(
+            "Those six declare no `build_lock` and do not consume it themselves: the inherited \
+             value reaches them, but nothing in them runs a build under it"
+        ),
+        "the threading row no longer says the undeclared children do not consume build_lock: {row}"
+    );
+    for agent in expected {
+        assert!(row.contains(agent), "{agent} missing from: {row}");
+    }
+}
+
+/// The README's gauntlet grammar row claims only what the parser
+/// guarantees: look-alike section headings and debris lines in the lane
+/// reasons are covered, while the header boundary itself is left to the
+/// producer writing every model-written item on one line.
+#[test]
+fn readme_grammar_row_scopes_the_look_alike_guarantee_to_the_parsed_sections() {
+    let readme = fs::read_to_string(candidate_dir().join("README.md")).unwrap();
+    let row = readme
+        .lines()
+        .find(|l| l.starts_with("| gauntlet grammar |"))
+        .expect("README has a gauntlet grammar row");
+    for clause in [
+        "so a look-alike `## Lane selection`, `## Blockers` or `## Human attention required` \
+         heading or debris line in the lane reasons adds no phantom blocker and cannot empty \
+         the real list",
+        "The parser guarantees that much and no more: a look-alike `## Full lane reports` or \
+         `<details>` line in the lane reasons would still end the header early, so the header \
+         boundary is guaranteed by the producer, which writes every model-written item on one line",
+    ] {
+        assert!(row.contains(clause), "missing {clause:?} in: {row}");
+    }
+    assert!(
+        !row.contains("so a look-alike in the lane reasons adds no phantom blocker"),
+        "the unscoped claim is back: {row}"
+    );
 }
 
 /// The state `route_gauntlet` reads a reply with: a fresh round with no
