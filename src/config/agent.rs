@@ -1554,7 +1554,7 @@ pub fn complete_agent_variables(agent_name: &str) -> Vec<(String, Option<String>
 /// Turns the `_instructions` function's output into the agent's instructions.
 /// A tool failure comes back as a `{"tool_call_error": ..}` payload rather
 /// than an error, and must not become the prompt the agent runs on; the
-/// tool's stderr and partial output ride along so the failure can be read.
+/// tool's stderr, stdout and partial output ride along so the failure can be read.
 fn instructions_from_tool_output(value: Option<String>) -> Result<String> {
     let Some(value) = value else {
         bail!("No return value from '_instructions' function");
@@ -1570,7 +1570,7 @@ fn instructions_from_tool_output(value: Option<String>) -> Result<String> {
         .map(str::to_string)
         .unwrap_or_else(|| error.to_string());
     let mut message = format!("'_instructions' function failed: {error}");
-    for key in ["stderr", "output"] {
+    for key in ["stderr", "stdout", "output"] {
         if let Some(detail) = payload.get(key).and_then(serde_json::Value::as_str)
             && !detail.trim().is_empty()
         {
@@ -1600,6 +1600,7 @@ mod tests {
         let failure = serde_json::json!({
             "tool_call_error": "Tool call 'probe' exited with code 3",
             "stderr": "boom",
+            "stdout": "chatter\n",
             "output": "partial\n",
         })
         .to_string();
@@ -1609,6 +1610,8 @@ mod tests {
             "'_instructions' function failed: Tool call 'probe' exited with code 3\n\
              stderr:\n\
              boom\n\
+             stdout:\n\
+             chatter\n\
              output:\n\
              partial"
         );

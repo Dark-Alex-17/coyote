@@ -108,13 +108,18 @@ fn write_dry_run_fixture(dir: &Path, config_extra: &str) {
 /// Lays out a config dir whose only model is served by `fake`, with one
 /// bash tool for the model to call.
 fn write_tool_fixture(dir: &Path, fake: &FakeLlm) {
+    write_tool_fixture_with_stream(dir, fake, true);
+}
+
+/// `write_tool_fixture` with the model's `stream` flag chosen by the caller.
+fn write_tool_fixture_with_stream(dir: &Path, fake: &FakeLlm, stream: bool) {
     let vault_pass = write_vault_pass(dir);
     fs::write(
         dir.join("config.yaml"),
         format!(
             "model: fake:fake-model\n\
              function_calling_support: true\n\
-             stream: true\n\
+             stream: {stream}\n\
              vault_password_file: '{vault_pass}'\n\
              clients:\n\
              \x20 - type: openai-compatible\n\
@@ -584,6 +589,10 @@ fn failing_instructions_tool_fails_the_run_silently() {
         "instr_fail: the silent sink swallowed the tool's stdout:\n{text}"
     );
     assert!(
+        stderr.contains("stdout:\ninstr stdout: boom"),
+        "instr_fail: the failure carries the tool's stdout:\n{text}"
+    );
+    assert!(
         stderr.contains("stderr:\ninstr stderr: boom"),
         "instr_fail: the failure carries the tool's stderr:\n{text}"
     );
@@ -628,7 +637,108 @@ fn instructions_tool_output_is_swallowed_by_the_silent_sink() {
         "instr_ok: a clean _instructions run did not bail:\n{text}"
     );
     assert!(
+        capture.stdout.contains("dynamic probe instructions"),
+        "instr_ok: the tool's answer became the agent's prompt:\n{text}"
+    );
+    assert!(
+        !capture.stdout.contains("static fallback"),
+        "instr_ok: the static instructions were replaced:\n{text}"
+    );
+    assert!(
         capture.stdout.contains("hello"),
         "instr_ok: the dry-run turn still answered:\n{text}"
+    );
+}
+
+/// The tool loop's terminal bytes do not depend on how the model's reply
+/// arrived: a tool call answered without streaming narrates the call,
+/// echoes the root-depth tool's stdout on fd 1 and prints the follow-up
+/// answer, just as the streaming `tool_call` scenario does.
+#[cfg(unix)]
+#[test]
+fn tool_call_without_streaming_narrates_and_echoes_like_the_streaming_scenario() {
+    let dir = fresh_config_dir("tool_nostream");
+    let _guard = TempDirGuard(dir.clone());
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "fixture_echo".to_string(),
+            arguments: r#"{"text":"hello"}"#.to_string(),
+        },
+        Reply::Text("fixture done".to_string()),
+    ]);
+    write_tool_fixture_with_stream(&dir, &fake, false);
+
+    let output = run_coyote(
+        &dir,
+        &["--macro", "tool"],
+        &[("COYOTE_SHOW_TOOL_CALLS", "1")],
+    );
+    let capture = finish("tool_nostream", &output);
+    let text = format!("stdout:\n{}\nstderr:\n{}", capture.stdout, capture.stderr);
+
+    assert_eq!(
+        fake.served(),
+        2,
+        "tool_nostream: the fake answered the tool call and the follow-up:\n{text}"
+    );
+    assert!(
+        capture
+            .stdout
+            .contains("Call fixture_echo {\"text\":\"hello\"}"),
+        "tool_nostream: the call was narrated on fd 1:\n{text}"
+    );
+    assert!(
+        capture.stdout.contains("fixture stdout: hello"),
+        "tool_nostream: the root-depth tool's stdout echoed on fd 1:\n{text}"
+    );
+    assert!(
+        capture.stdout.contains("fixture done"),
+        "tool_nostream: the follow-up answer was printed:\n{text}"
+    );
+    assert!(
+        capture.stderr.is_empty(),
+        "tool_nostream: a clean tool call wrote nothing to fd 2:\n{text}"
+    );
+}
+
+/// A model that asks for a tool the config does not define gets the
+/// refusal back as the tool result and the turn completes with the
+/// follow-up answer; nothing about the missing tool is painted on fd 1 and
+/// the binary never panics. (The refusal is not narrated on fd 2 either;
+/// that matches the pre-refactor binary and is not pinned here.)
+#[cfg(unix)]
+#[test]
+fn unknown_tool_request_goes_back_to_the_model_and_the_turn_still_completes() {
+    let dir = fresh_config_dir("tool_unknown");
+    let _guard = TempDirGuard(dir.clone());
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "no_such_tool".to_string(),
+            arguments: r#"{"text":"ghost"}"#.to_string(),
+        },
+        Reply::Text("fixture recovered".to_string()),
+    ]);
+    write_tool_fixture(&dir, &fake);
+
+    let output = run_coyote(&dir, &["--macro", "tool"], &[]);
+    let capture = finish("tool_unknown", &output);
+    let text = format!("stdout:\n{}\nstderr:\n{}", capture.stdout, capture.stderr);
+
+    assert_eq!(
+        fake.served(),
+        2,
+        "tool_unknown: the refusal went back to the model and it answered:\n{text}"
+    );
+    assert!(
+        capture.stdout.contains("fixture recovered"),
+        "tool_unknown: the follow-up answer was printed:\n{text}"
+    );
+    assert!(
+        !capture.stdout.contains("no_such_tool") && !capture.stdout.contains("ghost"),
+        "tool_unknown: the refusal did not leak onto fd 1:\n{text}"
+    );
+    assert_eq!(
+        capture.stdout, ">> Call the fixture tool with text hello\nfixture recovered\n<rule>\n\n",
+        "tool_unknown: fd 1 carries only the prompt echo, the answer and the divider:\n{text}"
     );
 }
