@@ -53,7 +53,6 @@ use rns_transport::destination::link::LinkId;
 use rns_transport::hash::AddressHash;
 use rns_transport::identity::PrivateIdentity;
 use rns_transport::rand_core::OsRng;
-use rns_transport::resource::MAX_EFFICIENT_SIZE;
 use sha2::{Digest, Sha256};
 use std::fmt::Debug;
 use std::fs;
@@ -2696,7 +2695,7 @@ fn the_serving_limit_is_the_configured_bytes() -> Result<(), String> {
 }
 
 fn a_file_one_past_max_bytes_is_too_large_and_one_at_it_is_ok() -> Result<(), String> {
-    let limit = MAX_EFFICIENT_SIZE + 512 * 1024;
+    let limit = crate::mesh::test_support::MULTI_SEGMENT_BYTES;
     let serve = Serve::new("fetch-max-bytes", limit as u64, &["**"]);
     serve.file("over.bin", &vec![b'x'; limit + 1]);
     serve.file("at.bin", &vec![b'x'; limit]);

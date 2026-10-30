@@ -472,9 +472,7 @@ pub(crate) mod network {
     use rns_transport::iface::tcp_client::TcpClient;
     use rns_transport::iface::tcp_server::TcpServer;
     use rns_transport::rand_core::{OsRng, RngCore};
-    use rns_transport::resource::{
-        LINK_PACKET_MDU, MAX_EFFICIENT_SIZE, ResourceEvent, ResourceEventKind,
-    };
+    use rns_transport::resource::{LINK_PACKET_MDU, ResourceEvent, ResourceEventKind};
     use rns_transport::transport::{AnnounceEvent, Transport};
     use sha2::{Digest as _, Sha256};
     use std::collections::VecDeque;
@@ -1852,9 +1850,9 @@ pub(crate) mod network {
     }
 
     /// The response cap is the library's, armed per path when the request is sent: a
-    /// `/status` response well over `MAX_REQUEST_PAYLOAD_BYTES` fails the request as
-    /// oversize at its advertisement, naming one over the cap rather than the advertised
-    /// size, which the library never reports for a response it refuses; a `/fetch`
+    /// `/status` response well over `MAX_REQUEST_PAYLOAD_BYTES` fails the request as an
+    /// oversize response at its advertisement, naming the cap only (the library never
+    /// reports the size of a response it refuses); a `/fetch`
     /// response one byte over that cap, under that path's own bound, is delivered.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_response_cap_is_armed_per_path_and_held_by_the_library() {
@@ -1887,8 +1885,7 @@ pub(crate) mod network {
         let result = timeout(INTEROP_TIMEOUT, in_flight).await.unwrap().unwrap();
         assert_eq!(
             result.unwrap_err(),
-            RequestError::Oversize {
-                len: MAX_REQUEST_PAYLOAD_BYTES + 1,
+            RequestError::ResponseOversize {
                 max: MAX_REQUEST_PAYLOAD_BYTES,
             }
         );
@@ -1978,10 +1975,9 @@ pub(crate) mod network {
         responder.stop().await;
     }
 
-    /// A `/fetch` response past that path's own bound fails as `Oversize` naming the fetch
-    /// cap, not the general one, with a length above it. The library records no size for an
-    /// advertisement it refuses, so the length is the requester's own floor rather than the
-    /// two bytes over the peer advertised; the test fixes the cap, not that floor.
+    /// A `/fetch` response past that path's own bound fails as `ResponseOversize` naming the
+    /// fetch cap, not the general one. The library records no size for an advertisement it
+    /// refuses, so only the cap is named.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_fetch_response_past_its_own_bound_is_oversize_naming_the_fetch_cap() {
         let recorder = Arc::new(Recorder::default());
@@ -2007,9 +2003,8 @@ pub(crate) mod network {
         answer_as_resource(&responder, &requester, &seen, bytes).await;
         let result = timeout(INTEROP_TIMEOUT, in_flight).await.unwrap().unwrap();
         match result.unwrap_err() {
-            RequestError::Oversize { len, max } => {
+            RequestError::ResponseOversize { max } => {
                 assert_eq!(max, MAX_FETCH_RESPONSE_BYTES, "the fetch cap is named");
-                assert!(len > MAX_FETCH_RESPONSE_BYTES, "{len} is over the cap");
             }
             other => panic!("expected an oversize response, got {other:?}"),
         }
@@ -2348,7 +2343,7 @@ pub(crate) mod network {
 
     /// The `/fetch` bound is inclusive on the requester's side: a response frame of
     /// exactly `MAX_FETCH_RESPONSE_BYTES` is delivered byte for byte, and one of a byte
-    /// more fails as `Oversize` naming that cap and one over it.
+    /// more fails as `ResponseOversize` naming that cap.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_fetch_response_at_its_bound_is_delivered_and_one_byte_over_is_oversize() {
         let recorder = Arc::new(Recorder::default());
@@ -2405,8 +2400,7 @@ pub(crate) mod network {
         let result = timeout(INTEROP_TIMEOUT, in_flight).await.unwrap().unwrap();
         assert_eq!(
             result.unwrap_err(),
-            RequestError::Oversize {
-                len: MAX_FETCH_RESPONSE_BYTES + 1,
+            RequestError::ResponseOversize {
                 max: MAX_FETCH_RESPONSE_BYTES,
             }
         );
@@ -8048,7 +8042,7 @@ pub(crate) mod network {
 
     /// Node B answers the access request with a response frame one byte over the path
     /// cap, sent as a Resource. The library refuses the advertisement, so the request
-    /// fails as `Oversize` naming the cap and one over it; the exchange reached the peer,
+    /// fails as `ResponseOversize` naming the cap; the exchange reached the peer,
     /// so it is a direct failure with nothing stored, and the propagation node known to A
     /// is never posted to.
     ///
@@ -8101,8 +8095,7 @@ pub(crate) mod network {
         );
         assert_eq!(
             err,
-            AccessError::Direct(RequestError::Oversize {
-                len: MAX_REQUEST_PAYLOAD_BYTES + 1,
+            AccessError::Direct(RequestError::ResponseOversize {
                 max: MAX_REQUEST_PAYLOAD_BYTES,
             })
         );
@@ -10267,7 +10260,7 @@ pub(crate) mod network {
 
     /// Node B answers the message with a response frame one byte over the path cap, sent
     /// as a Resource. The library refuses the advertisement, so the send fails as
-    /// `Oversize` naming the cap and one over it; the exchange reached the peer, so it is
+    /// `ResponseOversize` naming the cap; the exchange reached the peer, so it is
     /// a direct failure with nothing stored, and the propagation node known to A is never
     /// posted to.
     ///
@@ -10326,8 +10319,7 @@ pub(crate) mod network {
         );
         assert_eq!(
             err,
-            SendError::Direct(RequestError::Oversize {
-                len: MAX_REQUEST_PAYLOAD_BYTES + 1,
+            SendError::Direct(RequestError::ResponseOversize {
                 max: MAX_REQUEST_PAYLOAD_BYTES,
             })
         );
@@ -11411,7 +11403,7 @@ pub(crate) mod network {
         let pair = NodePair::start_with("request-fetch-big", |_| {}, trusting_b).await;
         let (slot, _idle) = installed_slot(&pair);
         let workspace = share_docs_from_a(&pair, &slot, "request-fetch-big-root");
-        let mut bytes = vec![0u8; MAX_EFFICIENT_SIZE + 512 * 1024];
+        let mut bytes = vec![0u8; crate::mesh::test_support::MULTI_SEGMENT_BYTES];
         RngCore::fill_bytes(&mut OsRng, &mut bytes);
         fs::write(workspace.path.join("docs").join("big.bin"), &bytes).unwrap();
 

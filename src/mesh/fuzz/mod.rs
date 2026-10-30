@@ -339,7 +339,8 @@ fn seed() -> u64 {
 }
 
 /// The dispatch tier has no frame bytes of its own to replay: the library decodes the
-/// frame, so the envelope corpus stands in as the request data on every known path.
+/// frame, so the envelope corpus stands in as the request data on every known path and on
+/// one unregistered path.
 #[test]
 fn fuzz_dispatch_authorizes_every_request_exactly_as_the_trust_model_predicts() {
     let seed = seed();
@@ -1244,6 +1245,24 @@ fn fuzz_corpus_files_belong_to_the_classes_their_names_claim() {
             "envelope/{name}: a version refusal with no representable `v`"
         );
     }
+
+    // A representable `v` outside the supported window names the version it refuses.
+    assert!(
+        matches!(
+            expect_envelope(&envelope("env-v-two.bin")),
+            Expect::Version(Some(2))
+        ),
+        "envelope/env-v-two.bin: a version refusal naming v = 2"
+    );
+
+    // A body nested well inside the budget is still a valid envelope.
+    assert!(
+        matches!(
+            expect_envelope(&envelope("env-deeply-nested-body-fields.bin")),
+            Expect::Ok { .. }
+        ),
+        "envelope/env-deeply-nested-body-fields.bin: a valid envelope with a deeply nested body"
+    );
 
     // Bytes `unpack_whole` refuses outright.
     for name in ["env-truncated-msgpack.bin", "env-nested-past-depth.bin"] {

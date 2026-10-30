@@ -2116,7 +2116,7 @@ mod tests {
     /// whole, in a response frame the transport splits.
     #[tokio::test]
     async fn a_file_above_max_bytes_is_too_large_with_that_limit() {
-        let limit = MAX_EFFICIENT_SIZE + 512 * 1024;
+        let limit = crate::mesh::test_support::MULTI_SEGMENT_BYTES;
         let fx = Fixture::new("fetch-max-bytes", limit as u64, &["docs/**"]);
         fx.file("docs/over.bin", &vec![0x5a; limit + 1]);
         let at_limit = vec![0xa5; limit];
@@ -2145,7 +2145,7 @@ mod tests {
     /// encodes and decodes back byte-exact.
     #[test]
     fn an_ok_reply_above_one_segment_encodes_and_decodes_byte_exact() {
-        let bytes = vec![0xffu8; MAX_EFFICIENT_SIZE + 512 * 1024];
+        let bytes = vec![0xffu8; crate::mesh::test_support::MULTI_SEGMENT_BYTES];
         let digest = sha256_of(&bytes);
         let frame = ResponseFrame::new(
             RequestId::from([0xeeu8; 16]),

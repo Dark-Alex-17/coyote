@@ -187,9 +187,8 @@ pub(crate) async fn request_on_link(
         }
         Err(LibraryRequestError::Oversize) => {
             // The library never reports the size of a response it refuses, whether at the
-            // advertisement or after assembly, so one over the cap stands for more than
-            // the cap.
-            return Err(RequestError::Oversize { len: max + 1, max });
+            // advertisement or after assembly, so only the cap is known.
+            return Err(RequestError::ResponseOversize { max });
         }
         Err(LibraryRequestError::Decode) => {
             return Err(RequestError::Decode("response frame".to_string()));

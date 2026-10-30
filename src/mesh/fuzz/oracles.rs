@@ -868,13 +868,18 @@ fn is_no_access(reply: &Reply) -> bool {
     matches!(reply, Reply::Code(code) if code.to_wire() == Value::from(0xf1u8))
 }
 
-/// One envelope corpus file as a request's data on every known path. Bytes the library's
-/// frame decoder would refuse never reach a dispatcher, so they are not checked here.
+/// A path no handler is registered for, so every corpus file also replays the
+/// unknown-path arm instead of leaving it to the random iterations.
+const UNREGISTERED_PATH: &str = "/fuzz-unregistered";
+
+/// One envelope corpus file as a request's data on every known path and on one path no
+/// handler serves. Bytes the library's frame decoder would refuse never reach a
+/// dispatcher, so they are not checked here.
 pub(super) fn check_dispatch_bytes(fx: &DispatchFixture, bytes: &[u8]) -> Result<(), String> {
     let Some(data) = unpack_whole(bytes) else {
         return Ok(());
     };
-    for path in KNOWN_PATHS {
+    for path in KNOWN_PATHS.iter().copied().chain([UNREGISTERED_PATH]) {
         check_dispatch_value(fx, PathHash::of(path), &data)
             .map_err(|what| format!("on {path}: {what}"))?;
     }

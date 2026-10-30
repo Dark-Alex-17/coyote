@@ -699,7 +699,7 @@ pub(crate) fn write_owner_only_file(
     #[cfg(not(any(unix, windows)))]
     {
         bail!(
-            "Owner-only file creation is not yet implemented on this platform, so the mesh identity cannot be stored safely and mesh cannot be enabled here yet. This is being tracked; no workaround is available."
+            "Mesh is not supported on this platform: the mesh identity must be stored in an owner-only file, and Coyote can create one only on Unix and Windows. Run the mesh from a Unix or Windows host."
         )
     }
 }

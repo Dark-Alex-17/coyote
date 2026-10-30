@@ -104,13 +104,17 @@ use tokio::time::{interval, sleep, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 
 /// Budget for each join and lock wait around the node's lifecycle: `stop` gives the node's
-/// tasks one window, and a second window, opened before the transport stops, is shared by
-/// the transport's own stop, the TCP client joins and the request handler drain, so a
-/// transport that uses up its own budget leaves the joins and the drain nothing but their
-/// warnings; `start` gives registering and first announcing the destination one, and
+/// tasks one window, and a second window, opened before the transport stops, bounds the
+/// transport's own stop, the TCP client joins and the request handler drain together,
+/// except that the joins and the drain always keep `POST_STOP_GRACE` after the stop
+/// returns (the library's stop has its own budget of the same length, so it can use the
+/// whole window); `start` gives registering and first announcing the destination one, and
 /// `abandon_start` and the `join_lan` failure cleanup bound their unwinding with it. The
 /// request-layer tests bound their own teardown with it too.
 pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+/// What the TCP client joins and the request handler drain keep after the transport's stop
+/// returns, however much of `SHUTDOWN_GRACE` the stop used.
+const POST_STOP_GRACE: Duration = Duration::from_secs(2);
 /// Budget for each step `rekey` and `announce_now` take under the `destination` lock:
 /// registering and releasing a destination, attaching announce data, announcing.
 pub(crate) const REKEY_GRACE: Duration = Duration::from_secs(5);
@@ -826,7 +830,9 @@ impl MeshRuntime {
             // `validate` refused an empty list above, so every plan failed and the first
             // failure is the first plan.
             let mut text = failures[0].clone();
-            if states.iter().all(InterfaceStatus::is_loopback) {
+            // A `local` refusal already names its one fix (start rnsd or fix
+            // mesh.interfaces); the relay hint would stack a second next step on it.
+            if states[0].kind != "local" && states.iter().all(InterfaceStatus::is_loopback) {
                 text.push_str(&loopback_hint(
                     states[0].endpoint.as_deref().unwrap_or_default(),
                 ));
@@ -1793,9 +1799,10 @@ impl MeshRuntime {
     /// slot, so the drain does not cover it; it only touches the settlement, whose store
     /// has its own lock, and the same holds for the blocking drop of an unsent settlement,
     /// which the slot leaves behind the same way. The task joins share one grace window;
-    /// a second one, opened before the transport stops, is shared by the transport's own
-    /// stop, the client joins and the handler drain, so when the transport's stop uses it
-    /// up the clients are aborted and the drain gives up at once, each with its warning.
+    /// a second one, opened before the transport stops, bounds the transport's own stop,
+    /// the client joins and the handler drain, which keep at least `POST_STOP_GRACE` after
+    /// the stop returns; past that the clients are aborted and the drain gives up, each
+    /// with its warning.
     async fn shutdown(&self) -> Result<()> {
         self.cancel.cancel();
         let tasks = std::mem::take(&mut *self.tasks.lock());
@@ -1816,7 +1823,7 @@ impl MeshRuntime {
             return Ok(());
         };
         let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
-        stop_transport(transport, interfaces, deadline).await;
+        let deadline = stop_transport(transport, interfaces, deadline).await;
         drain_request_handlers(&self.request_handler, deadline).await;
         state.lock = None;
         *self.identity_lock.lock() = None;
@@ -2016,7 +2023,7 @@ async fn abandon_start(
     request_handler: Option<&Arc<LibraryHandler>>,
 ) {
     let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
-    stop_transport(transport, joined, deadline).await;
+    let deadline = stop_transport(transport, joined, deadline).await;
     if let Some(handler) = request_handler {
         drain_request_handlers(handler, deadline).await;
         #[cfg(all(test, unix))]
@@ -2030,8 +2037,7 @@ async fn abandon_start(
 async fn drain_request_handlers(handler: &LibraryHandler, deadline: tokio::time::Instant) {
     if timeout_at(deadline, handler.drained()).await.is_err() {
         warn!(
-            "Mesh request handlers did not stop within {}s; the node releases its locks with them still running",
-            SHUTDOWN_GRACE.as_secs()
+            "Mesh request handlers did not stop within the shutdown window; the node releases its locks with them still running"
         );
     }
 }
@@ -2219,7 +2225,7 @@ async fn probe_local(endpoint: &LocalEndpoint, connect_timeout: Duration) -> Res
             LocalEndpoint::Tcp(addr) => tokio::net::TcpStream::connect(addr)
                 .await
                 .map(drop)
-                .map_err(|err| format!("tcp connect failed endpoint={addr} err={err}")),
+                .map_err(|err| format!("could not connect to {addr}: {err}")),
             #[cfg(unix)]
             LocalEndpoint::Abstract(value) => {
                 preflight_unix_connect(&LocalUnixEndpoint::from_config_value(value)).await
@@ -2350,13 +2356,14 @@ async fn detach_interface(
 /// also cancels the TCP client tasks Coyote spawned, and those are joined under
 /// `deadline` since the transport's own wait does not cover them. `deadline` is taken by
 /// the caller before the transport stops and bounds the transport's stop and the client
-/// joins together: a stop that runs past it leaves the joins nothing, and each client is
-/// then aborted with a warning.
+/// joins together, except that the joins keep at least `POST_STOP_GRACE` after the stop
+/// returns; a client still running past that is aborted with a warning. Returns the
+/// deadline the joins used, for whatever the caller still bounds after them.
 async fn stop_transport(
     transport: Arc<Transport>,
     interfaces: Vec<JoinedInterface>,
     deadline: tokio::time::Instant,
-) {
+) -> tokio::time::Instant {
     let mut left = Vec::with_capacity(interfaces.len());
     let mut clients = Vec::new();
     for iface in interfaces {
@@ -2371,20 +2378,19 @@ async fn stop_transport(
     }
     transport.stop().await;
     drop(transport);
+    let deadline = deadline.max(tokio::time::Instant::now() + POST_STOP_GRACE);
     for label in left {
         debug!("Left mesh interface {label}");
     }
     for (mut handle, label) in clients {
         if timeout_at(deadline, &mut handle).await.is_err() {
             handle.abort();
-            warn!(
-                "Mesh interface {label} did not stop within {}s; aborted it",
-                SHUTDOWN_GRACE.as_secs()
-            );
+            warn!("Mesh interface {label} did not stop within the shutdown window; aborted it");
             continue;
         }
         debug!("Left mesh interface {label}");
     }
+    deadline
 }
 
 /// What `record_announce` read off a Coyote announce and did with it.
@@ -2754,7 +2760,13 @@ async fn receive_announces(
         };
         let desc = event.destination.lock().await.desc;
         let now = SystemTime::now();
-        if propagation_nodes.observe_announce(&desc, event.app_data.as_slice(), event.hops, now) {
+        if propagation_nodes.observe_announce(
+            &desc,
+            event.app_data.as_slice(),
+            event.hops,
+            event.is_path_response,
+            now,
+        ) {
             continue;
         }
         let destination_hash = desc.address_hash.to_hex_string();
@@ -3004,6 +3016,8 @@ async fn watch_interfaces(
         return;
     };
     let mut ticks = interval(CONNECT_WATCH_TICK);
+    // A stalled runtime must not replay the missed ticks as a burst of probes.
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         let event = tokio::select! {
             () = cancel.cancelled() => return,
@@ -11562,6 +11576,46 @@ mod tests {
         assert!(message.starts_with("Failed to bind the mesh lan interface"));
     }
 
+    /// Once `start` has built the request handler, every `abandon_start` below it hands
+    /// the handler over, so an unwinding start drains it like `stop` does; only the
+    /// failure before the handler exists passes `None`.
+    #[test]
+    fn every_abandon_after_the_handler_exists_drains_it() {
+        let source = include_str!("node.rs");
+        // Assembled at run time so this test's own text is not a second match.
+        let handler = ["let request_handler = Arc::new(", "LibraryHandler::new("].concat();
+        let start = source.split(handler.as_str()).collect::<Vec<_>>();
+        assert_eq!(start.len(), 2, "one handler construction in start");
+        let before = start[0]
+            .rsplit("async fn start(")
+            .next()
+            .expect("start precedes the handler");
+        let after = start[1]
+            .split("\n    }\n")
+            .next()
+            .expect("start ends after the handler");
+        let call = "abandon_start(";
+        assert_eq!(
+            before
+                .matches(&format!("{call}transport, joined, None)"))
+                .count(),
+            1,
+            "exactly one abandon before the handler, passing None"
+        );
+        let calls: Vec<&str> = after
+            .match_indices(call)
+            .map(|(at, _)| &after[at..])
+            .collect();
+        assert!(!calls.is_empty(), "start unwinds after the handler exists");
+        for call in calls {
+            let args = call.split(')').next().unwrap_or_default();
+            assert!(
+                args.contains("Some(&request_handler"),
+                "an abandon after the handler exists must drain it: {args}"
+            );
+        }
+    }
+
     #[test]
     fn loopback_hint_names_the_endpoint() {
         assert_eq!(
@@ -12139,11 +12193,11 @@ mod tests {
         }
     }
 
-    /// A `local`-only config with no rnsd bails on the probe's reason, with the loopback
-    /// hint, and nothing stays attached.
+    /// A `local`-only config with no rnsd bails on the probe's reason with one next step
+    /// (its own), not the relay hint stacked on it, and nothing stays attached.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn start_fails_with_the_loopback_hint_when_the_local_rnsd_is_not_listening() {
+    async fn start_fails_with_one_next_step_when_the_local_rnsd_is_not_listening() {
         let (port, _held) = held_port().await;
         let endpoint = local_endpoint(port);
         let tmp = TempDir::new("node-local-absent");
@@ -12171,10 +12225,8 @@ mod tests {
             )),
             "{err}"
         );
-        assert!(
-            err.contains(&format!(" Nothing is listening on {endpoint}.")),
-            "{err}"
-        );
+        assert!(err.ends_with("start rnsd or fix mesh.interfaces."), "{err}");
+        assert!(!err.contains("Nothing is listening on"), "{err}");
         let metrics = tokio::runtime::Handle::current().metrics();
         wait_until("the transport's tasks to exit", || {
             metrics.num_alive_tasks() == 0
@@ -12533,8 +12585,8 @@ mod tests {
             "{err}"
         );
         assert!(
-            err.contains(&format!(" Nothing is listening on {endpoint}.")),
-            "{err}"
+            err.ends_with("start rnsd or fix mesh.interfaces."),
+            "one next step, not the relay hint stacked on it: {err}"
         );
         stub.await.unwrap();
         let metrics = tokio::runtime::Handle::current().metrics();

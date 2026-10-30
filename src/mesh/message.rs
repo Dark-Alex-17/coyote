@@ -1526,7 +1526,9 @@ pub(crate) fn propagation_remedy(err: &PropagationError) -> &'static str {
         PropagationError::Link(RequestError::Shutdown | RequestError::NotRunning) => {
             "The mesh node stopped before the message was stored; run `.mesh on`, then send it again"
         }
-        PropagationError::Cancelled => "Nothing was stored; send it again when ready",
+        PropagationError::Cancelled => {
+            "Cancelled before the node confirmed it, so it may have been stored anyway; send it again only if a second copy is acceptable"
+        }
         PropagationError::TransferFailed
         | PropagationError::VerdictLost { .. }
         | PropagationError::RejectedByNode(_)
@@ -2828,7 +2830,7 @@ mod tests {
         );
         assert_eq!(
             stored(PropagationError::Cancelled),
-            "Nothing was stored; send it again when ready"
+            "Cancelled before the node confirmed it, so it may have been stored anyway; send it again only if a second copy is acceptable"
         );
         assert_eq!(
             SendError::NotAcknowledged.to_string(),

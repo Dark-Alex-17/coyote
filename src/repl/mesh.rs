@@ -6045,9 +6045,8 @@ fn trust_refusal(
 fn audience(interface: &MeshInterface) -> &'static str {
     match interface {
         MeshInterface::Lan => "every node on this LAN",
-        MeshInterface::Private { .. } | MeshInterface::Local { .. } => {
-            "the nodes joined to that relay"
-        }
+        MeshInterface::Private { .. } => "the nodes joined to that relay",
+        MeshInterface::Local { .. } => "every node reachable through this host's rnsd",
         MeshInterface::Public { .. } => "anyone on the internet who reaches that relay",
     }
 }
@@ -6228,12 +6227,12 @@ fn interface_warnings(states: &[InterfaceStatus]) -> Vec<String> {
                 InterfaceState::Unreachable { reason, .. } => format!(
                     "WARNING: {label} is unreachable ({reason}); peers behind that relay are out of reach."
                 ),
-                InterfaceState::Connecting { reason } => {
-                    let reason = reason.as_deref().unwrap_or("not connected yet");
-                    format!(
-                        "WARNING: {label} is not reachable yet: {reason}; start the local rnsd"
-                    )
-                }
+                InterfaceState::Connecting { reason: Some(reason) } => format!(
+                    "WARNING: {label} is not reachable yet: {reason}; start the local rnsd"
+                ),
+                InterfaceState::Connecting { reason: None } => format!(
+                    "WARNING: {label} answered but has not finished connecting; mesh traffic through it waits until it does"
+                ),
                 InterfaceState::Disconnected { reason } => format!(
                     "WARNING: {label} dropped the connection: {reason}; it is being redialed"
                 ),
@@ -8276,8 +8275,9 @@ mod tests {
     }
 
     /// The `local` rows cover both producers of `Connecting`: the probe's reason while
-    /// nothing listens and the bare `not connected yet` once the transport is attached
-    /// and dialing; `Disconnected` carries the fixed reason the client's drop sets.
+    /// nothing listens, and no reason once rnsd answered and the attached client is still
+    /// dialing (which must not tell the user to start rnsd); `Disconnected` carries the
+    /// fixed reason the client's drop sets.
     #[test]
     fn interface_warnings_name_the_tail_for_lan_a_remote_relay_and_a_loopback_relay() {
         let states = [
@@ -8345,7 +8345,7 @@ mod tests {
                 "WARNING: private relay.example:4965 is unreachable (tcp connect failed endpoint=relay.example:4965); peers behind that relay are out of reach.".to_string(),
                 "WARNING: private 127.0.0.1:4242 is unreachable (tcp connect failed endpoint=127.0.0.1:4242); sessions on this machine cannot reach each other until a local Reticulum daemon (rnsd) is listening there.".to_string(),
                 "WARNING: local rnsd at 127.0.0.1:37428 is not reachable yet: tcp connect failed endpoint=127.0.0.1:37428; start the local rnsd".to_string(),
-                "WARNING: local rnsd at @rns/default is not reachable yet: not connected yet; start the local rnsd".to_string(),
+                "WARNING: local rnsd at @rns/default answered but has not finished connecting; mesh traffic through it waits until it does".to_string(),
                 "WARNING: local rnsd at @rns/default dropped the connection: rnsd closed the socket; it is being redialed".to_string(),
             ]
         );
@@ -17358,7 +17358,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     assert_eq!(
                         warnings_now,
                         vec![format!(
-                            "WARNING: {label} is not reachable yet: not connected yet; start the local rnsd"
+                            "WARNING: {label} answered but has not finished connecting; mesh traffic through it waits until it does"
                         )],
                         "{:?}",
                         stderr_lines()
@@ -17484,8 +17484,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         );
                         let out = &stdout_lines()[before..];
                         assert!(
-                            out.iter()
-                                .all(|line| !line.contains("the nodes joined to that relay")),
+                            out.iter().all(|line| line.as_str() != "To whom:"),
                             "no preview is printed before the refusal: {out:?}"
                         );
                         assert!(warnings().is_empty(), "{:?}", stderr_lines());
@@ -34972,8 +34971,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     run_async(async {
                         let mut fx = PeerFixture::new("repl-mesh-grant-under-max-bytes").await;
                         assert_eq!(fx.ctx.app.config.mesh.fetch.max_bytes, 4_194_304);
-                        let above_one_segment =
-                            rns_transport::resource::MAX_EFFICIENT_SIZE + 512 * 1024;
+                        let above_one_segment = crate::mesh::test_support::MULTI_SEGMENT_BYTES;
                         assert!(
                             (above_one_segment as u64) < fx.ctx.app.config.mesh.fetch.max_bytes,
                             "the file under test sits between one segment and max_bytes"
@@ -38728,8 +38726,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         let mut fx = PeerFixture::new("repl-mesh-attach-under-max-bytes").await;
                         let max_bytes = fx.ctx.app.config.mesh.fetch.max_bytes;
                         assert_eq!(max_bytes, 4_194_304);
-                        let above_one_segment =
-                            rns_transport::resource::MAX_EFFICIENT_SIZE + 512 * 1024;
+                        let above_one_segment = crate::mesh::test_support::MULTI_SEGMENT_BYTES;
                         write(&fx.root.path, "big.bin", &vec![0x5A; above_one_segment]);
                         write(
                             &fx.root.path,

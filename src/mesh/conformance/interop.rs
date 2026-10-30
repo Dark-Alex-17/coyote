@@ -26,7 +26,6 @@ use crate::repl::idle::testing::driver_on_a_fresh_state;
 use crate::supervisor::mailbox::EnvelopePayload;
 
 use rns_transport::rand_core::{OsRng, RngCore};
-use rns_transport::resource::MAX_EFFICIENT_SIZE;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
@@ -1718,7 +1717,7 @@ async fn a_reference_fetch_of_a_file_above_one_segment_arrives_whole() {
     std::fs::write(shares, "version: 1\nallow:\n- pattern: 'docs/**'\n").unwrap();
     let workspace = TempDir::new("interop-fetch-big-root");
     std::fs::create_dir_all(workspace.path.join("docs")).unwrap();
-    let mut bytes = vec![0u8; MAX_EFFICIENT_SIZE + 512 * 1024];
+    let mut bytes = vec![0u8; crate::mesh::test_support::MULTI_SEGMENT_BYTES];
     RngCore::fill_bytes(&mut OsRng, &mut bytes);
     std::fs::write(workspace.path.join("docs").join("big.bin"), &bytes).unwrap();
     let mut snapshot = snapshot_fixture();
@@ -2026,7 +2025,21 @@ async fn two_local_clients_of_one_rnsd_knock_through_it_and_follow_it_down_and_b
         .knock(&b_desc, &KnockIntro::new("hi again from A").unwrap())
         .await
         .unwrap();
-    assert_eq!(again.via, KnockVia::Direct);
+    assert_eq!(
+        again,
+        KnockOutcome {
+            via: KnockVia::Direct,
+            fallback: None,
+        }
+    );
+    wait_until("B to file A's second knock", || {
+        gate.cache()
+            .list(SystemTime::now())
+            .unwrap()
+            .iter()
+            .any(|knock| knock.intro.as_deref() == Some("hi again from A"))
+    })
+    .await;
 
     a.stop().await;
     b.stop().await;

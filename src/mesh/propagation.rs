@@ -736,6 +736,11 @@ async fn reset_after_abandon(
     if !should_reset(registered, abandoned, cancel) {
         return;
     }
+    // The reset has no time bound; this line shows where a wedged one stopped.
+    debug!(
+        "Resetting the mesh propagation out-link to {} after an abandoned resource",
+        short(&destination.to_hex_string())
+    );
     transport.reset_out_link(destination).await;
     warn!(
         "Mesh propagation out-link to {} reset after an abandoned resource",
@@ -780,9 +785,8 @@ fn verdict_for_outcome(result: OutboundResult) -> Result<(), PropagationError> {
 /// to `watch_reject_window` has not fallen behind over a long transfer. On `link_id` a
 /// refusal sentinel rejects the message and a close is a closed link. Falling behind here
 /// loses no transfer verdict, since the outcome still carries it; a sentinel skipped here
-/// only leaves the post to the outcome. The outcome is
-/// polled first so a close that follows the proof is left for the window to read as the
-/// node's rejection. Takes no transport so it can be driven from synthetic futures.
+/// only leaves the post to the outcome. The outcome is polled first so a close that
+/// follows the proof is left for the window to read as the node's rejection. Takes no transport so it can be driven from synthetic futures.
 async fn drain_during_transfer(
     outcome: impl Future<Output = OutboundResult>,
     link_events: &mut broadcast::Receiver<LinkEventData>,

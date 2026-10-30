@@ -133,6 +133,12 @@ docker exec "$t" bash -c '"$(sed -n "1s/^#!//p" "$(command -v rnsd)")" -c "impor
   || fail_with_logs "$t" "rnsd's interpreter cannot import ssl and cryptography"
 ok "rnsd's python imports ssl and cryptography"
 
+# 5b. The shared instance Coyote attaches to as `type: local` answers on its abstract
+# socket (Linux: @rns/default; the 37428 port is inert there).
+wait_exec "$t" '"$(sed -n "1s/^#!//p" "$(command -v rnsd)")" -c "import socket; s = socket.socket(socket.AF_UNIX); s.connect(\"\\0rns/default\")"' \
+  || fail_with_logs "$t" "the shared instance @rns/default did not answer within 30 s"
+ok "rnsd's shared instance answers on @rns/default"
+
 # 6. The rendered config: logging section and shared instance present, loopback listener only,
 # no opt-in stanzas.
 config="$(docker exec "$t" cat /home/agent/.reticulum/config)"
@@ -143,7 +149,7 @@ done
 for absent in 'AutoInterface' 'Team Relay' 'share_instance = No'; do
   ! grep -qF -- "$absent" <<<"$config" || fail "rendered config must not contain \`$absent\` by default:"$'\n'"$config"
 done
-ok "rendered config has the logging section and the loopback listener only"
+ok "rendered config has the logging section, the shared-instance keys and the loopback listener only"
 
 # 7. docker's default grace is 10 s before SIGKILL; TERM must reach the main child well inside it.
 start=$(date +%s)

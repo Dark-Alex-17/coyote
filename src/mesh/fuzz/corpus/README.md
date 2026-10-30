@@ -3,7 +3,7 @@
 Wire-byte inputs the fuzz targets in `src/mesh/fuzz/mod.rs` replay before their random
 iterations. One directory per target with wire bytes of its own: `envelope/`, `receipt/`,
 `codecs/`. The dispatch target has none: the library decodes the request frame, so it
-replays `envelope/` as the request data on every known path.
+replays `envelope/` as the request data on every known path and on one unregistered path.
 Every file is fed to the same oracle as a random iteration, so a file that no longer
 matches the spec predicate fails the test exactly as a random input would.
 

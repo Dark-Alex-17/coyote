@@ -3042,8 +3042,8 @@ fn the_commands_and_deployment_pages_quote_the_interface_warnings_and_states_as_
         .collect();
     assert_eq!(
         warnings.len(),
-        5,
-        "interface_warnings in src/repl/mesh.rs does not format exactly five WARNING lines: {warnings:?}"
+        6,
+        "interface_warnings in src/repl/mesh.rs does not format exactly six WARNING lines: {warnings:?}"
     );
     let failures: Vec<String> = string_literals(&fn_body("src/mesh/node.rs", "join_tcp"))
         .into_iter()
@@ -4504,24 +4504,28 @@ fn the_commands_page_states_the_blank_line_convention_and_its_progress_samples_f
 }
 
 /// The `.mesh on` section's samples follow the shipped default: the preview's `To whom:`
-/// line names the local rnsd's audience as `audience` words it (the relay text, which
-/// `local` shares with `private`), the summary's `interfaces:` row names the local rnsd,
-/// and the idle line a late relay prints is quoted.
+/// line names the local rnsd's audience as `audience` words it (its own text, not the
+/// relay one `private` gets), the summary's `interfaces:` row names the local rnsd, and
+/// the idle line a late relay prints is quoted.
 #[test]
 fn the_commands_page_on_samples_name_the_local_default_and_the_connect_idle_line() {
     let audiences = string_literals(&fn_body("src/repl/mesh.rs", "audience"));
-    let private = audiences
+    let local = audiences
         .iter()
-        .find(|literal| literal.contains("relay") && !literal.contains("internet"))
+        .find(|literal| literal.contains("rnsd"))
         .unwrap_or_else(|| {
-            panic!("audience in src/repl/mesh.rs has no private-relay literal: {audiences:?}")
+            panic!("audience in src/repl/mesh.rs has no local-rnsd literal: {audiences:?}")
         });
+    assert!(
+        !local.contains("relay"),
+        "the local rnsd's audience must not call it a relay: {local:?}"
+    );
 
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join("Mesh-Commands.md"));
     let on = section("Mesh-Commands.md", &page, "### `.mesh on`");
     for needle in [
-        format!("  local rnsd at 127.0.0.1:37428: {private}"),
+        format!("  local rnsd at 127.0.0.1:37428: {local}"),
         "  interfaces: local rnsd at 127.0.0.1:37428".to_string(),
         "`[mesh] <label> connected`".to_string(),
     ] {

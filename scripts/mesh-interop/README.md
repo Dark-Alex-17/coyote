@@ -30,7 +30,7 @@ Linux run of row 1 are covered by the `Mesh Interop` CI job), with the Rust side
 |---|---|
 | `COYOTE_MESH_INTEROP=1 cargo test --all mesh::conformance -- --include-ignored` (vectors + interop) | 76 passed, 0 ignored |
 | `cargo test --all mesh::fuzz` | 21 passed |
-| `cargo test --all --no-fail-fast` | 7145 passed, 0 failed, 15 ignored in the unit binary; 535 passed, 1 ignored across the integration binaries |
+| `cargo test --all --no-fail-fast` | 7616 passed, 0 failed, 16 ignored in the unit binary; 586 passed, 1 ignored across the integration binaries |
 
 Rows 2 and 3 also run on all three legs of the CI matrix, and row 1 runs only in the Linux
 `Mesh Interop` job; none of those runs is part of this record.
@@ -58,7 +58,7 @@ Independently of the interop setup, the wiki lint runs with
 else. The interop tests are `#[ignore]`d, so a plain `cargo test` never spawns Python; without
 `COYOTE_MESH_INTEROP=1` they print `skipping: ...` and pass. With it set, every missing
 prerequisite is a failure that names `setup.sh`. The script also byte-compiles both clones:
-the tests run five references in parallel with 15 s waits, and a reference compiling
+the tests run their references in parallel with 15 s waits, and a reference compiling
 Reticulum's interfaces and LXMF's router on first import starts late enough to miss them
 (`timed out waiting for the node to file the reference` on a cold clone is this).
 
@@ -84,7 +84,8 @@ creates a Coyote-shaped destination `scope.session.<instance_id>` serving `/stat
 in-process conformance vectors in `src/mesh/conformance/share_vectors.rs`,
 `access_vectors.rs` and `live_vectors.rs` (the last runs its node-pair rows over the
 loopback pair of `src/mesh/request/tests.rs` and its symlink rows on unix only), so the
-interop matrix exercises `/status` and `/message` against the reference's handlers, and
+interop matrix exercises `/status` and `/message` in both directions (the reference's
+requests against Coyote's handlers, and Coyote's requests decoded by the reference), and
 fetches one file above one Resource segment from the Coyote node over `/fetch` with the
 reference as the requester.
 

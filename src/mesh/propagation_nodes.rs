@@ -43,17 +43,26 @@ impl PropagationNodeTable {
     /// every announce that is not an `lxmf.propagation` one, so the caller can go on to
     /// read it as something else; a propagation announce that does not parse is dropped
     /// with a debug line and still counts as handled.
+    /// A path response (an announce answering this node's path request, or a shared
+    /// instance replaying what it knows) says where a node is, not that it is there: for a
+    /// node already in the table it refreshes the record and the hops but not `last_seen`,
+    /// so a node heard only that way still ages out. An unknown node files as heard.
     pub(crate) fn observe_announce(
         &self,
         destination: &DestinationDesc,
         app_data: &[u8],
         hops: u8,
+        is_path_response: bool,
         now: SystemTime,
     ) -> bool {
         let destination_hex = destination.address_hash.to_hex_string();
         match PropagationNode::from_announce(destination, app_data) {
             Ok(node) => {
-                let change = self.observe(node, hops, now);
+                let change = if is_path_response {
+                    self.refresh_route(node, hops, now)
+                } else {
+                    self.observe(node, hops, now)
+                };
                 debug!(
                     "{} propagation node {} ({hops} hops)",
                     match change {
@@ -74,6 +83,21 @@ impl PropagationNodeTable {
                 true
             }
         }
+    }
+
+    /// Files a path response: a known node keeps its `last_seen`, anything else is
+    /// observed as a first sighting.
+    fn refresh_route(&self, node: PropagationNode, hops: u8, now: SystemTime) -> PeerChange {
+        let key = node.destination.address_hash.to_hex_string();
+        {
+            let mut nodes = self.inner.lock();
+            if let Some(record) = nodes.get_mut(&key) {
+                record.node = node;
+                record.hops = hops;
+                return PeerChange::Refreshed;
+            }
+        }
+        self.observe(node, hops, now)
     }
 
     pub(crate) fn observe(&self, node: PropagationNode, hops: u8, now: SystemTime) -> PeerChange {
@@ -309,6 +333,44 @@ mod tests {
         );
     }
 
+    /// A path response refreshes a known node's record and hops but not its `last_seen`,
+    /// so a node heard only through path responses still ages out; an unknown node it
+    /// names is filed as heard.
+    #[test]
+    fn a_path_response_refreshes_a_known_node_without_moving_last_seen() {
+        let table = PropagationNodeTable::new();
+        let pn = desc("propagation");
+        assert!(table.observe_announce(&pn, &pn_announce_app_data(true, 8, 256), 2, false, t(1)));
+
+        assert!(table.observe_announce(&pn, &pn_announce_app_data(true, 12, 256), 4, true, t(9)));
+        let record = table.snapshot().pop().unwrap();
+        assert_eq!(record.last_seen, t(1), "a path response is not a sighting");
+        assert_eq!(record.hops, 4, "the route it names is kept");
+        assert_eq!(record.node.stamp_cost, 12, "the record it carries is kept");
+
+        assert!(table.observe_announce(&pn, &pn_announce_app_data(true, 12, 256), 4, false, t(10)));
+        assert_eq!(
+            table.snapshot().pop().unwrap().last_seen,
+            t(10),
+            "an announce is"
+        );
+
+        let fresh = desc("propagation");
+        assert!(table.observe_announce(
+            &fresh,
+            &pn_announce_app_data(true, 8, 256),
+            1,
+            true,
+            t(11)
+        ));
+        let filed = table
+            .snapshot()
+            .into_iter()
+            .find(|record| hex(&record.node) == fresh.address_hash.to_hex_string())
+            .expect("an unknown node named by a path response is filed");
+        assert_eq!(filed.last_seen, t(11));
+    }
+
     #[test]
     fn observe_announce_files_a_propagation_announce_and_passes_others_through() {
         install_log_collector();
@@ -320,14 +382,20 @@ mod tests {
         )
         .desc;
 
-        assert!(table.observe_announce(&pn, &pn_announce_app_data(true, 8, 256), 2, t(1)));
-        assert!(!table.observe_announce(&coyote, b"not a pn", 1, t(1)));
+        assert!(table.observe_announce(&pn, &pn_announce_app_data(true, 8, 256), 2, false, t(1)));
+        assert!(!table.observe_announce(&coyote, b"not a pn", 1, false, t(1)));
         assert_eq!(table.snapshot().len(), 1);
         assert_eq!(table.select().unwrap().stamp_cost, 8);
 
         // A cost this node would never mine is still filed: it bounds posting, not fetching.
         let dear = desc("propagation");
-        assert!(table.observe_announce(&dear, &pn_announce_app_data(true, 30, 256), 3, t(1)));
+        assert!(table.observe_announce(
+            &dear,
+            &pn_announce_app_data(true, 30, 256),
+            3,
+            false,
+            t(1)
+        ));
         let filed = table
             .snapshot()
             .into_iter()
@@ -338,7 +406,7 @@ mod tests {
 
         // A propagation announce that does not parse is handled (dropped), not passed on.
         let broken = desc("propagation");
-        assert!(table.observe_announce(&broken, b"\x90", 1, t(2)));
+        assert!(table.observe_announce(&broken, b"\x90", 1, false, t(2)));
         assert_eq!(table.snapshot().len(), 2);
         let ignored = format!(
             "Ignored propagation node announce from {} (1 hops)",

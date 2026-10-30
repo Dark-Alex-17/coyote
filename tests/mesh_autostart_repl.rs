@@ -4457,7 +4457,8 @@ fn a_local_only_node_is_refused_until_rnsd_listens_then_joins_through_it() {
     assert_eq!(table.value("reach"), reach, "{info}");
     assert!(!info.contains("private "), "{info}");
 
-    // Nothing answers at the endpoint: `.mesh on` is refused with the reason and the hint.
+    // Nothing answers at the endpoint: `.mesh on` is refused with the reason and the one
+    // next step the `local` refusal names, not the relay hint stacked on it.
     let refused = command_text(
         &mut session,
         ".mesh on --yes",
@@ -4471,14 +4472,10 @@ fn a_local_only_node_is_refused_until_rnsd_listens_then_joins_through_it() {
         "{refused:?}"
     );
     assert!(
-        refused.contains(&format!(" Nothing is listening on {endpoint}.")),
+        refused.contains("start rnsd or fix mesh.interfaces."),
         "{refused:?}"
     );
-    assert!(
-        refused
-            .contains("The default configuration expects a local Reticulum daemon (rnsd) there."),
-        "{refused:?}"
-    );
+    assert!(!refused.contains("Nothing is listening on"), "{refused:?}");
     assert!(
         !refused.contains(MESH_ON_SUMMARY) && !refused.contains("WARNING"),
         "a local-only node that cannot reach rnsd is refused, not started with a warning: {refused:?}"

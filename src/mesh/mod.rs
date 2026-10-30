@@ -358,6 +358,11 @@ fn without_verbatim_disk(path: PathBuf) -> PathBuf {
 
 #[cfg(test)]
 pub(crate) mod test_support {
+    /// A file size that needs a multi-segment Resource: half a MiB past the size the
+    /// library sends as one segment.
+    pub(crate) const MULTI_SEGMENT_BYTES: usize =
+        rns_transport::resource::MAX_EFFICIENT_SIZE + 512 * 1024;
+
     #[cfg(unix)]
     use super::announce::AnnounceAppData;
     #[cfg(unix)]

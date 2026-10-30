@@ -41,8 +41,9 @@ loglevel = 4
     enabled = Yes
 
 #@end
-  # The TCP hop for a session configured with type: private at 127.0.0.1:4242; sessions
-  # in this container attach over the shared instance instead.
+  # The TCP hop for a session configured with type: private at 127.0.0.1:4242. It listens on
+  # loopback only, inside this container; sessions in this container attach over the shared
+  # instance instead.
   [[Coyote Sessions]]
     type = TCPServerInterface
     enabled = Yes

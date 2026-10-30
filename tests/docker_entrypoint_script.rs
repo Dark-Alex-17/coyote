@@ -336,8 +336,38 @@ fn a_first_start_renders_the_default_config_and_passes_the_exit_code_through() {
             "rendered config lacks `{needle}`:\n{config}"
         );
     }
+    let reticulum: Vec<&str> = config
+        .lines()
+        .map(str::trim)
+        .skip_while(|line| *line != "[reticulum]")
+        .skip(1)
+        .take_while(|line| !line.starts_with('['))
+        .collect();
+    assert!(
+        !config
+            .lines()
+            .map(str::trim)
+            .any(|line| !line.starts_with('#') && line.starts_with("shared_instance_type")),
+        "the comment says the port is inert on Linux unless shared_instance_type = tcp; the config must not set it:\n{config}"
+    );
+    for key in [
+        "share_instance = Yes",
+        "shared_instance_port = 37428",
+        "instance_name = default",
+    ] {
+        assert_eq!(
+            config.lines().filter(|line| line.trim() == key).count(),
+            1,
+            "`{key}` must appear exactly once:\n{config}"
+        );
+        assert!(
+            reticulum.contains(&key),
+            "`{key}` is outside the [reticulum] section:\n{config}"
+        );
+    }
     for absent in [
         "#@",
+        "share_instance = No",
         "@RELAY_HOST@",
         "@RELAY_PORT@",
         "AutoInterface",

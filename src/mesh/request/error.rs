@@ -23,6 +23,9 @@ pub(crate) enum RequestError {
     /// refused it, at its advertisement or after assembly. The transport never reports
     /// the refused size, so `len` for a response is one over `max`.
     Oversize { len: usize, max: usize },
+    /// The peer's answer was refused because it would exceed `max`; the library does not
+    /// report how large the refused answer was.
+    ResponseOversize { max: usize },
     /// Bytes that are not a well-formed request or response frame.
     Decode(String),
     /// The transport refused to build or hand over the packet or resource.
@@ -69,6 +72,10 @@ impl fmt::Display for RequestError {
             Self::Oversize { len, max } => write!(
                 f,
                 "The mesh request payload is {len} bytes, above the {max}-byte limit"
+            ),
+            Self::ResponseOversize { max } => write!(
+                f,
+                "The peer's answer is larger than the {max}-byte limit for this request"
             ),
             Self::Decode(reason) => write!(f, "Malformed mesh request frame: {reason}"),
             Self::Send(reason) => write!(f, "The mesh transport could not send: {reason}"),
@@ -153,6 +160,9 @@ pub(crate) fn request_remedy(err: &RequestError) -> &'static str {
         }
         RequestError::Oversize { .. } => {
             "Shorten the message or send fewer parts so the frame fits the limit, then send it again"
+        }
+        RequestError::ResponseOversize { .. } => {
+            "The peer sent more than this request allows; if it repeats, the peer may run a different Coyote"
         }
         RequestError::Decode(_) => {
             "The peer answered in a form this Coyote could not read; it may run a different Coyote"
