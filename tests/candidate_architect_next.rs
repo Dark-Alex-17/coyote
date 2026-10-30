@@ -1777,10 +1777,10 @@ fn readme_toolchain_census_matches_the_live_grep() {
     );
     assert_eq!(
         gates_lines,
-        vec![41, 2594, 2603],
+        vec![41, 2596, 2605],
         "the gates.py toolchain hits moved; update the README census and its prose"
     );
-    for line in [2594, 2603] {
+    for line in [2596, 2605] {
         assert!(
             text.contains(&format!("`gates.py:{line}`")) || text.contains(&format!("`:{line}`")),
             "the README prose must cite gates.py:{line}"
@@ -2677,7 +2677,8 @@ fn debris_lines_count_only_inside_the_header_blockers_section() {
 
 /// The plan-root phrases are read from the whole reply, so a PASS header
 /// whose code-review report quotes one fails closed: `route_verdict` raises
-/// the plan-defect escalation instead of closing the round, and
+/// the plan-defect escalation instead of closing the round, in batch scope
+/// too rather than handing the phrase to batch triage as a finding, and
 /// `wave_route` hands the wave a plan-defect escalation instead of
 /// `conforms`.
 #[test]
@@ -2703,6 +2704,11 @@ fn a_plan_root_phrase_in_a_lane_report_fails_a_pass_closed() {
         "{routed}"
     );
     assert_ne!(routed["_next"], json!("post_round"), "{routed}");
+
+    state["verify_scope"] = json!("batch");
+    let batch = gate_json("route_verdict", &state, &scratch);
+    assert_eq!(batch["escalation"]["kind"], json!("plan_defect"), "{batch}");
+    assert_ne!(batch["_next"], json!("batch_triage"), "{batch}");
 
     let wave = gate_json(
         "wave_route",
@@ -3479,7 +3485,7 @@ fn readme_grammar_row_records_the_producer_guarantee_and_the_planning_store_dive
         "Four reads take the full reply on purpose, and each can only block, escalate or add one capped adopt round, never turn a BLOCKED into a PASS",
         "`ADVERSARIAL_REVIEW:` (the direct micro-mode adversary lane",
         "`PIPELINE-FAULT` (consulted only when the header carries no verdict",
-        "a PASS that carries one escalates as a plan defect",
+        "a PASS that carries one escalates as a plan defect in every scope, batch included, while a BLOCKED round keeps its own route",
         "the probe's test-file paths (read only when the probe verdict is PASS, adoption capped at one round)",
     ] {
         assert!(
