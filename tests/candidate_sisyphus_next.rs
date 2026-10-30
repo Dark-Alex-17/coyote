@@ -20,6 +20,15 @@
 //! variable, so neither the caller's agent variables nor its repository or
 //! injected git config leak into a fixture.
 //!
+//! Every real-binary run starts from a scratch config dir whose `mcp.json`
+//! defines no server (`{"mcpServers": {}}`), checked before each spawn, so no
+//! MCP server or `uvx` launcher starts, and inherited `COYOTE_*` variables are
+//! removed before the run sets its own config and cache dirs.
+//!
+//! With `SISYPHUS_NEXT_STAGING_DIR` pointing at the upstream staging tree, the
+//! README census of files that differ from staging, and the hunks per file, is
+//! checked against a live `diff -u`; without it that one test is skipped.
+//!
 //! The sweep is key-based over every bundled agent: no `spawnable_agents`
 //! entry, no `session.chat.agent` value and no `agent:` node value names a
 //! candidate, and no instructions or config prose mentions one. Both
@@ -29,7 +38,7 @@
 
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -119,6 +128,72 @@ fn without_agent_vars(cmd: &mut Command) {
         if key.to_string_lossy().starts_with("LLM_AGENT_VAR_") {
             cmd.env_remove(key);
         }
+    }
+}
+
+/// Inherited overrides such as `COYOTE_WORKSPACE_CONFIG_DIR`, `COYOTE_PROVIDER`
+/// or `COYOTE_PLATFORM` would steer a real-binary run away from its scratch
+/// config. Call it before the builder sets its own `COYOTE_*` values: a later
+/// `env_remove` of the same key cancels an earlier `env`.
+fn scrub_coyote_env(cmd: &mut Command) {
+    scrub_coyote_env_from(cmd, std::env::vars_os().map(|(key, _)| key));
+}
+
+fn scrub_coyote_env_from(cmd: &mut Command, names: impl IntoIterator<Item = OsString>) {
+    for name in names {
+        if name.to_string_lossy().starts_with("COYOTE_") {
+            cmd.env_remove(name);
+        }
+    }
+}
+
+#[test]
+fn coyote_scrub_removes_every_coyote_name_and_keeps_later_sets() {
+    let fakes = [
+        "COYOTE_PROVIDER",
+        "COYOTE_WORKSPACE_CONFIG_DIR",
+        "COYOTE_PLATFORM",
+        "COYOTE_X_FAKE",
+    ];
+    let names = fakes
+        .iter()
+        .chain(&["COYOTE_CONFIG_DIR", "SISYPHUS_FAKE_KEEP"])
+        .map(OsString::from);
+    let mut cmd = Command::new("true");
+    scrub_coyote_env_from(&mut cmd, names);
+    cmd.env("COYOTE_CONFIG_DIR", "/scratch/config");
+    let envs: BTreeMap<OsString, Option<OsString>> = cmd
+        .get_envs()
+        .map(|(k, v)| (k.to_os_string(), v.map(OsStr::to_os_string)))
+        .collect();
+    for fake in fakes {
+        assert_eq!(envs.get(OsStr::new(fake)), Some(&None), "{fake}: {envs:?}");
+    }
+    assert!(
+        !envs.contains_key(OsStr::new("SISYPHUS_FAKE_KEEP")),
+        "{envs:?}"
+    );
+    assert_eq!(
+        envs.get(OsStr::new("COYOTE_CONFIG_DIR")),
+        Some(&Some(OsString::from("/scratch/config"))),
+        "{envs:?}"
+    );
+}
+
+#[test]
+fn every_binary_run_scrubs_coyote_env_first() {
+    let source = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(file!())).unwrap();
+    let spawn = "Command::new(env!(\"CARGO_BIN_EXE_coyote\"))";
+    let sites: Vec<usize> = source.match_indices(spawn).map(|(at, _)| at).collect();
+    assert!(!sites.is_empty(), "no binary runner found in this file");
+    for at in sites {
+        let rest = &source[at + spawn.len()..];
+        let next = rest.strip_prefix(';').unwrap_or(rest).trim_start();
+        assert!(
+            rest.starts_with(';') && next.starts_with("scrub_coyote_env(&mut cmd);"),
+            "a binary runner sets its environment before scrub_coyote_env: {}",
+            &next[..next.len().min(120)]
+        );
     }
 }
 
@@ -328,6 +403,122 @@ fn readme_hygiene_row_lists_the_scrubbed_git_variables() {
         );
     }
     assert!(row.contains("`GIT_CONFIG_NOSYSTEM` is kept"), "{row}");
+}
+
+#[test]
+fn readme_hygiene_row_states_the_wrapper_run_isolation() {
+    let readme = fs::read_to_string(candidate_dir().join("README.md")).unwrap();
+    let row = readme
+        .lines()
+        .find(|l| l.starts_with("| battery env hygiene |"))
+        .expect("README has a battery env hygiene row");
+    let sentence = "Every real-binary run of the Rust wrapper starts from a scratch config dir \
+                    whose `mcp.json` defines no server (`{\"mcpServers\": {}}`), checked before \
+                    each spawn, so no MCP server or `uvx` launcher starts, and inherited \
+                    `COYOTE_*` variables are removed before the run sets its own config and \
+                    cache dirs";
+    assert!(row.contains(sentence), "missing {sentence:?} in: {row}");
+    assert!(row.contains("`tests/candidate_sisyphus_next.rs`"), "{row}");
+}
+
+/// Hunks in `diff -u old new`, or `None` when the files are identical. A file
+/// missing on one side is diffed against `/dev/null`, so it still differs.
+fn hunk_count(old: &Path, new: &Path) -> Option<usize> {
+    let side = |p: &Path| {
+        if p.is_file() {
+            p.to_path_buf()
+        } else {
+            PathBuf::from("/dev/null")
+        }
+    };
+    let output = Command::new("diff")
+        .arg("-u")
+        .arg(side(old))
+        .arg(side(new))
+        .output()
+        .unwrap();
+    match output.status.code() {
+        Some(0) => None,
+        Some(1) => Some(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter(|l| l.starts_with("@@"))
+                .count(),
+        ),
+        _ => panic!(
+            "diff -u {} {}: {}",
+            old.display(),
+            new.display(),
+            transcript(&output)
+        ),
+    }
+}
+
+/// The rows of the README's staging census block: file name to hunk count,
+/// `None` for a row that gives no count.
+fn readme_census_rows(readme: &str) -> BTreeMap<String, Option<usize>> {
+    let block: Vec<&str> = readme
+        .lines()
+        .skip_while(|l| !l.starts_with("Recorded census against the staging tree"))
+        .skip_while(|l| *l != "```")
+        .skip(1)
+        .take_while(|l| *l != "```")
+        .collect();
+    assert!(!block.is_empty(), "the README staging census block is gone");
+    block
+        .iter()
+        .map(|line| {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            let count = match words.get(2) {
+                Some(&"hunk" | &"hunks") => Some(words[1].parse().unwrap()),
+                _ => None,
+            };
+            (words[0].to_string(), count)
+        })
+        .collect()
+}
+
+#[test]
+fn readme_census_matches_a_live_diff_against_staging() {
+    // The staging tree lives outside this repository, so the check runs only
+    // on a host that has it.
+    let staging = std::env::var_os("SISYPHUS_NEXT_STAGING_DIR").map(PathBuf::from);
+    let Some(staging) = staging.filter(|p| p.is_dir()) else {
+        eprintln!(
+            "skipping the staging census: SISYPHUS_NEXT_STAGING_DIR is unset or not a directory"
+        );
+        return;
+    };
+    let ours = candidate_dir();
+    let tracked = |root: &Path| {
+        files_under(root)
+            .into_iter()
+            .filter(|f| {
+                !Path::new(f)
+                    .components()
+                    .any(|c| c.as_os_str() == "__pycache__")
+            })
+            .collect::<BTreeSet<String>>()
+    };
+    let names: BTreeSet<String> = tracked(&staging).union(&tracked(&ours)).cloned().collect();
+    let live: BTreeMap<String, Option<usize>> = names
+        .into_iter()
+        .filter_map(|name| {
+            let hunks = hunk_count(&staging.join(&name), &ours.join(&name))?;
+            let count = (name != "README.md").then_some(hunks);
+            Some((name, count))
+        })
+        .collect();
+    let recorded = readme_census_rows(&fs::read_to_string(ours.join("README.md")).unwrap());
+    assert_eq!(
+        recorded.get("README.md"),
+        Some(&None),
+        "README.md is listed as differing, with no count"
+    );
+    assert_eq!(
+        live, recorded,
+        "the README staging census no longer matches diff -u (left: live, right: README)"
+    );
 }
 
 #[test]
@@ -1061,9 +1252,24 @@ fn write_dry_run_config(dir: &Path) {
     fs::write(dir.join("mcp.json"), "{\"mcpServers\": {}}\n").unwrap();
 }
 
-/// Every binary run in this file starts from a config dir that
-/// `write_dry_run_config` wrote, the only `config.yaml` writer here, so none
-/// of them can reach the `uvx` launcher a CI host lacks.
+/// Panics unless `dir/mcp.json` exists and defines no server, so a
+/// real-binary run from `dir` cannot reach the `uvx` launcher a CI host lacks.
+fn assert_no_mcp_server(dir: &Path) {
+    let path = dir.join("mcp.json");
+    let text = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{}: no readable mcp.json ({e})", path.display()));
+    let mcp: serde_json::Value = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("{}: not JSON ({e})", path.display()));
+    assert_eq!(
+        mcp,
+        json!({"mcpServers": {}}),
+        "{} defines an MCP server",
+        path.display()
+    );
+}
+
+/// The config dir `write_dry_run_config` builds passes the guard
+/// `run_lifted_graph` applies before every spawn.
 #[test]
 fn every_scratch_config_dir_defines_no_mcp_server() {
     let scratch = scratch_dir("mcpconfig");
@@ -1071,16 +1277,45 @@ fn every_scratch_config_dir_defines_no_mcp_server() {
     let mcp: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(scratch.0.join("mcp.json")).unwrap()).unwrap();
     assert_eq!(mcp, json!({"mcpServers": {}}));
-    let source = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(file!())).unwrap();
-    let lines: Vec<&str> = source.lines().collect();
-    let writers = lines
-        .windows(2)
-        .filter(|w| w[0].trim() == "fs::write(" && w[1].trim().ends_with(".join(\"config.yaml\"),"))
-        .count();
-    assert_eq!(
-        writers, 1,
-        "a second config.yaml writer must also write mcp.json"
-    );
+    assert_no_mcp_server(&scratch.0);
+}
+
+#[test]
+fn the_mcp_guard_rejects_a_missing_or_populated_mcp_json() {
+    let scratch = scratch_dir("mcpguard");
+    let missing = scratch.0.join("missing");
+    let populated = scratch.0.join("populated");
+    for dir in [&missing, &populated] {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("config.yaml"), "model: dryrun:dry-model\n").unwrap();
+    }
+    fs::write(
+        populated.join("mcp.json"),
+        "{\"mcpServers\": {\"git\": {\"command\": \"uvx\", \"args\": [\"mcp-server-git\"]}}}\n",
+    )
+    .unwrap();
+    for dir in [&missing, &populated] {
+        assert!(
+            std::panic::catch_unwind(|| assert_no_mcp_server(dir)).is_err(),
+            "the guard accepted {}",
+            dir.display()
+        );
+    }
+}
+
+#[test]
+fn a_lifted_graph_run_refuses_a_config_dir_without_mcp_json() {
+    let scratch = scratch_dir("mcpspawn");
+    fs::write(scratch.0.join("config.yaml"), "model: dryrun:dry-model\n").unwrap();
+    let dump = scratch.0.join("dump.json");
+    let payload =
+        std::panic::catch_unwind(|| run_lifted_graph(&scratch.0, "probe-mcp", &dump, "mcpspawn"))
+            .expect_err("run_lifted_graph spawned without an mcp.json");
+    let message = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_default();
+    assert!(message.contains("no readable mcp.json"), "{message}");
 }
 
 /// Runs the real binary on a lifted graph under `dir/agents/<agent>/` and
@@ -1092,6 +1327,7 @@ fn run_lifted_graph(
     label: &str,
 ) -> (serde_json::Value, Output) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_coyote"));
+    scrub_coyote_env(&mut cmd);
     cmd.args(["--agent", agent, "probe"])
         .current_dir(dir)
         .env("HOME", dir.join("home"))
@@ -1099,13 +1335,13 @@ fn run_lifted_graph(
         .env("COYOTE_CACHE_DIR", dir.join("cache"))
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .env("NO_COLOR", "1")
-        .env_remove("COYOTE_LOG_PATH")
         .env_remove("IS_SANDBOX")
         .env_remove("GRAPH_STATE")
         .env_remove("GRAPH_STATE_FILE")
         .stdin(std::process::Stdio::null());
     without_agent_vars(&mut cmd);
     without_git_repo_vars(&mut cmd);
+    assert_no_mcp_server(dir);
     let output = cmd.output().unwrap();
     let report = transcript(&output);
     assert!(output.status.success(), "{label}: {report}");
