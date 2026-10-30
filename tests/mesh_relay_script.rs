@@ -3363,7 +3363,7 @@ fn wiki_section(page: &str, heading: &str) -> String {
 /// `--relay HOST:PORT` the only added lines are the page's second fenced block. The
 /// script-side checks run on every run; the page comparison needs `COYOTE_WIKI_DIR`.
 #[test]
-fn usage_probe_the_dry_run_plan_is_the_config_block_the_deployment_page_quotes_line_for_line() {
+fn the_dry_run_plan_is_the_config_block_the_deployment_page_quotes_line_for_line() {
     let bash = bash_or_skip!();
     let home = Home::new("plan-vs-wiki");
 

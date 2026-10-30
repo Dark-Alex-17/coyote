@@ -332,7 +332,7 @@ fn every_verb_row_in_the_wiki_table_matches_the_repl_verbs_table() {
 /// is not a verb and is not judged; fenced blocks are transcripts, not instructions, and
 /// are skipped.
 #[test]
-fn usage_probe_every_mesh_verb_a_page_spells_is_one_the_repl_dispatches() {
+fn every_mesh_verb_a_page_spells_is_one_the_repl_dispatches() {
     let Some(wiki) = wiki_dir() else { return };
     let verbs: Vec<String> = repl_verbs().into_iter().map(|(name, _, _)| name).collect();
     assert!(verbs.iter().any(|verb| verb == "info"), "{verbs:?}");
@@ -389,7 +389,7 @@ fn usage_probe_every_mesh_verb_a_page_spells_is_one_the_repl_dispatches() {
 /// of them is something the node does: the start announce, a reconnect, the heartbeat.
 /// It must not name a `.mesh` verb that does not exist as one of them.
 #[test]
-fn usage_probe_the_last_announce_prose_names_only_announces_the_node_sends() {
+fn the_last_announce_prose_names_only_announces_the_node_sends() {
     let Some(wiki) = wiki_dir() else { return };
     let label = "Mesh-Commands.md";
     let info = section(label, &read(wiki.join(label)), "### `.mesh info`");
@@ -2789,7 +2789,7 @@ fn the_interfaces_block_is_byte_identical_across_the_template_the_example_and_th
 /// a one-segment cap, a transport workaround or the number such a cap used to be. The
 /// template/example/README half runs on every run; the pages only with `COYOTE_WIKI_DIR`.
 #[test]
-fn usage_probe_the_max_bytes_twins_name_the_setting_as_the_only_bound_on_a_served_file() {
+fn the_max_bytes_twins_name_the_setting_as_the_only_bound_on_a_served_file() {
     // The retired per-file ceiling was one Resource segment less the reply framing; spelled
     // from its parts so the number itself never reappears in this tree as a literal.
     let retired_ceiling = (1024 * 1024 - 1 - 128).to_string();
@@ -6827,7 +6827,7 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
 /// Commands page's `.mesh pending` prose must describe that fallback, not a word the
 /// renderer cannot print for an unheard peer.
 #[test]
-fn usage_probe_the_pending_prose_names_the_short_destination_fallback_for_an_unheard_peer() {
+fn the_pending_prose_names_the_short_destination_fallback_for_an_unheard_peer() {
     // The fallback is the renderer's contract: `peer_name_at` never hands back an empty
     // name, so `question_header` prints the name slot as given.
     let name_at = method_body("src/mesh/node.rs", "peer_name_at");
@@ -7211,7 +7211,7 @@ fn the_mesh_forget_section_quotes_the_headline_the_refusal_and_the_claims_row_as
 /// remembered claim the verb sweeps - attachment references, grants and access requests -
 /// in the nouns the claims row counts them by, so the prose and the row agree.
 #[test]
-fn usage_probe_the_forget_entry_prose_names_every_remembered_claim_class_the_row_counts() {
+fn the_forget_entry_prose_names_every_remembered_claim_class_the_row_counts() {
     let claims_many = string_literals(&fn_body("src/repl/mesh.rs", "forget"))
         .into_iter()
         .find(|literal| literal.starts_with("remembered attachments, "))
@@ -8328,7 +8328,7 @@ fn no_user_facing_mesh_string_spells_the_banned_vocabulary_of_the_message_standa
 /// older `where the abstract socket is (not) used` wording. The template/example half
 /// runs on every run; the Configuration page only with `COYOTE_WIKI_DIR`.
 #[test]
-fn usage_probe_the_interfaces_twins_say_which_local_key_is_inert_where() {
+fn the_interfaces_twins_say_which_local_key_is_inert_where() {
     fn check(label: &str, text: &str) {
         let block = interfaces_block(label, text);
         let entry = |key: &str| {
@@ -8415,7 +8415,7 @@ fn usage_probe_the_interfaces_twins_say_which_local_key_is_inert_where() {
 /// `local rnsd at 127.0.0.1:37428` on the `interfaces:` row, and the prose after it
 /// gives the `@rns/default` form. The source-side checks run on every run.
 #[test]
-fn usage_probe_the_deployment_page_rung_one_and_the_two_laptop_walk_run_through_type_local() {
+fn the_deployment_page_rung_one_and_the_two_laptop_walk_run_through_type_local() {
     let summary = string_literals(&fn_body("src/repl/mesh.rs", "render_on_summary"))
         .into_iter()
         .find(|literal| literal.starts_with("Mesh is on for this session"))

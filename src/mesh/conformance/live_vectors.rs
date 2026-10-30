@@ -8,8 +8,6 @@
 
 use super::{Kind, Listed};
 
-// Read only by the unix executor below; the table itself is declared everywhere so its rows are listed on every platform.
-#[cfg_attr(not(unix), allow(dead_code))]
 struct Vector {
     name: &'static str,
     kind: Kind,

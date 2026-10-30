@@ -1905,7 +1905,7 @@ mod tests {
     /// `expired_at` with `grant_expired`, nothing more with `unknown`) and the
     /// `next_action` the model is told to use instead of free text.
     #[test]
-    fn usage_probe_the_fetch_description_names_every_not_shared_reason_word_and_its_keys() {
+    fn the_fetch_description_names_every_not_shared_reason_word_and_its_keys() {
         let fetch = mesh_function_declarations()
             .into_iter()
             .find(|declaration| declaration.name == format!("{MESH_FUNCTION_PREFIX}fetch"))
@@ -7352,8 +7352,7 @@ mod tests {
         /// line inside its quotes.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]
-        async fn usage_probe_every_tool_asking_a_peer_that_has_not_trusted_this_instance_names_both_sides()
-         {
+        async fn every_tool_asking_a_peer_that_has_not_trusted_this_instance_names_both_sides() {
             let mut live = trusted_stub("mesh-tool-not-trusted-by-peer").await;
             let runtime = live.started.runtime.clone();
             let own = runtime.current_destination_hash();
@@ -7476,7 +7475,7 @@ mod tests {
         /// bare wire code or a `refused:`-prefixed copy of the sentence.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]
-        async fn usage_probe_a_broadcast_reports_the_peer_that_has_not_trusted_this_instance_once_with_its_remedy()
+        async fn a_broadcast_reports_the_peer_that_has_not_trusted_this_instance_once_with_its_remedy()
          {
             use crate::config::mesh_config::MeshInterface;
             use crate::mesh::test_support::started_runtime_on_with;
@@ -7722,8 +7721,7 @@ mod tests {
         /// under it. The peer's answer is the same bare `not_shared` every time.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]
-        async fn usage_probe_a_not_shared_fetch_reads_what_the_tools_own_calls_left_in_the_claims()
-        {
+        async fn a_not_shared_fetch_reads_what_the_tools_own_calls_left_in_the_claims() {
             let mut live = trusted_stub("mesh-tool-fetch-claims").await;
             let runtime = live.started.runtime.clone();
             let to = live.to.clone();
@@ -7979,7 +7977,7 @@ mod tests {
         /// peer's answer is the same bare `not_shared` whether the copy is there or not.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]
-        async fn usage_probe_the_tool_says_when_the_already_fetched_copy_has_gone_from_this_node() {
+        async fn the_tool_says_when_the_already_fetched_copy_has_gone_from_this_node() {
             let mut live = trusted_stub("mesh-tool-fetch-gone-copy").await;
             let runtime = live.started.runtime.clone();
             let to = live.to.clone();
@@ -8077,8 +8075,7 @@ mod tests {
         /// An end far off but still on the calendar is a grant like any other.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]
-        async fn usage_probe_a_grant_whose_end_this_node_cannot_read_is_no_grant_and_renders_nowhere()
-         {
+        async fn a_grant_whose_end_this_node_cannot_read_is_no_grant_and_renders_nowhere() {
             let mut live = trusted_stub("mesh-tool-grant-unreadable-end").await;
             let to = live.to.clone();
             let d8 = short(&to).to_string();
@@ -8191,7 +8188,7 @@ mod tests {
         /// on the one-off grant spends its row while the standing row stays.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]
-        async fn usage_probe_a_decision_the_peers_human_makes_later_reaches_the_tools_as_a_grant() {
+        async fn a_decision_the_peers_human_makes_later_reaches_the_tools_as_a_grant() {
             use crate::mesh::access::decision_reply;
             use crate::mesh::events::AccessDecision;
             use crate::mesh::message::{PartLimits, from_request_body};
@@ -8385,7 +8382,7 @@ mod tests {
         /// second escalated reply after the decision answers nothing.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]
-        async fn usage_probe_an_escalated_interim_reply_through_the_tools_leaves_the_request_pending_until_the_decision()
+        async fn an_escalated_interim_reply_through_the_tools_leaves_the_request_pending_until_the_decision()
          {
             use crate::mesh::access::decision_reply;
             use crate::mesh::events::AccessDecision;

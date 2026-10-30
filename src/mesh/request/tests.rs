@@ -1924,7 +1924,7 @@ pub(crate) mod network {
     /// responder never sees it, the library never has to refuse it, nothing is logged as
     /// sent, and the link goes on serving.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_an_over_cap_request_never_touches_the_wire_and_the_link_goes_on_serving() {
+    async fn an_over_cap_request_never_touches_the_wire_and_the_link_goes_on_serving() {
         install_log_collector();
         let recorder = Arc::new(Recorder::default());
         let (responder, requester, desc) = pair(recorder.clone()).await;
@@ -1983,7 +1983,7 @@ pub(crate) mod network {
     /// advertisement it refuses, so the length is the requester's own floor rather than the
     /// two bytes over the peer advertised; the test fixes the cap, not that floor.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_fetch_response_past_its_own_bound_is_oversize_naming_the_fetch_cap() {
+    async fn a_fetch_response_past_its_own_bound_is_oversize_naming_the_fetch_cap() {
         let recorder = Arc::new(Recorder::default());
         let responder = Responder::listen(recorder.clone(), TcpServer::DEFAULT_CLIENT_MTU).await;
         let mut requester = Requester::connect(responder.port, TcpClient::DEFAULT_MTU).await;
@@ -2027,8 +2027,7 @@ pub(crate) mod network {
     /// were sent in, each resolve with their own answer: correlation is by request id,
     /// never by arrival order or by link.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_two_requests_in_flight_on_one_link_each_get_their_own_answer_whatever_the_order()
-     {
+    async fn two_requests_in_flight_on_one_link_each_get_their_own_answer_whatever_the_order() {
         let recorder = Arc::new(Recorder::default());
         let (responder, requester, desc) = pair(recorder.clone()).await;
         let link = open_link(&requester.transport, &desc, "/slow", link_deadline())
@@ -2094,7 +2093,7 @@ pub(crate) mod network {
     /// answers the dropped request its answer reaches nobody, least of all a request that
     /// is still waiting.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_request_dropped_mid_flight_leaves_its_link_serving_and_its_late_answer_reaches_nobody()
+    async fn a_request_dropped_mid_flight_leaves_its_link_serving_and_its_late_answer_reaches_nobody()
      {
         let recorder = Arc::new(Recorder::default());
         let (responder, requester, desc) = pair(recorder.clone()).await;
@@ -2302,7 +2301,7 @@ pub(crate) mod network {
     /// and nothing else: the requester's next request to the same peer reuses the same
     /// link and is answered, and the responder saw both requests over that link.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_failed_reply_resource_leaves_its_link_serving_the_next_request() {
+    async fn a_failed_reply_resource_leaves_its_link_serving_the_next_request() {
         let recorder = Arc::new(Recorder::default());
         let (responder, requester, desc) = pair(recorder.clone()).await;
         let (in_flight, seen) = hanging_request_on(
@@ -5944,8 +5943,7 @@ pub(crate) mod network {
     /// known identity granting nothing, the destination record stays, and B's status
     /// request is served on the destination tier instead of the identity tier.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_untrust_identity_withdraws_the_grant_and_serves_the_instance_on_its_own_record()
-     {
+    async fn untrust_identity_withdraws_the_grant_and_serves_the_instance_on_its_own_record() {
         install_log_collector();
         let pair = NodePair::start_with(
             "request-untrust-identity-own-record",
@@ -6003,8 +6001,7 @@ pub(crate) mod network {
     /// stranger afterwards: its next status request is dropped before decode (B times
     /// out), nothing is filed and nothing surfaces.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_untrust_identity_with_nothing_bound_leaves_a_stranger_whose_request_is_silence()
-     {
+    async fn untrust_identity_with_nothing_bound_leaves_a_stranger_whose_request_is_silence() {
         install_log_collector();
         let pair = NodePair::start_with(
             "request-untrust-identity-nothing-bound",
@@ -8120,7 +8117,7 @@ pub(crate) mod network {
     /// classes: the request fails directly as `Decode` naming the response frame, and the
     /// propagation node known to A is never posted to.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_an_undecodable_access_reply_is_a_direct_failure_and_never_stored() {
+    async fn an_undecodable_access_reply_is_a_direct_failure_and_never_stored() {
         let (pair, mut node) =
             pair_with_propagation_node("request-access-undecodable-no-fallback").await;
         pair.introduce_b_to_a().await;
@@ -10384,8 +10381,8 @@ pub(crate) mod network {
     /// sender hears `StoreAndForward`, and it hears it when the transfer fails rather
     /// than when the direct budget runs out.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_reply_resource_that_fails_mid_transfer_stores_the_message_with_the_propagation_node()
-     {
+    async fn a_reply_resource_that_fails_mid_transfer_stores_the_message_with_the_propagation_node()
+    {
         let (pair, mut node) =
             pair_with_propagation_node_trusting("request-peer-reply-failed-fallback", trusting_b)
                 .await;
@@ -10469,7 +10466,7 @@ pub(crate) mod network {
     /// the send fails directly as `Decode` naming the response frame, and the
     /// propagation node known to A is never posted to.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_an_undecodable_peer_message_reply_is_a_direct_failure_and_never_stored() {
+    async fn an_undecodable_peer_message_reply_is_a_direct_failure_and_never_stored() {
         let (pair, mut node) =
             pair_with_propagation_node_trusting("request-peer-undecodable-no-fallback", trusting_b)
                 .await;
@@ -11443,8 +11440,7 @@ pub(crate) mod network {
     /// `/fetch` response bound still admits), and one byte more is refused `too_large` with
     /// `limit` equal to the setting, not to any lower number.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_fetch_at_the_default_max_bytes_arrives_whole_and_one_past_it_is_too_large()
-     {
+    async fn a_fetch_at_the_default_max_bytes_arrives_whole_and_one_past_it_is_too_large() {
         install_log_collector();
         let pair = NodePair::start_with("request-fetch-default-max", |_| {}, trusting_b).await;
         assert_eq!(

@@ -1292,7 +1292,7 @@ fn an_interface_that_connects_later_prints_its_idle_line_and_leaves_the_prompt_i
 /// the reset lands right after the closing bracket and the body is plain; under
 /// `NO_COLOR` the same row reaches the editor as today's bare bytes.
 #[test]
-fn usage_probe_the_idle_line_prefix_is_theme_painted_at_a_tty_and_bare_under_no_color() {
+fn the_idle_line_prefix_is_theme_painted_at_a_tty_and_bare_under_no_color() {
     let sink = SilentRelay::start();
     let mut held = HeldPort::hold();
     let probe = Probe::new("connect-later-paint", true, &[sink.port, held.port]);
@@ -1721,8 +1721,7 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
 /// line, sends nothing, and its one access expiry line follows. `.mesh pending` then
 /// lists the fresh question alone and announces nothing more.
 #[test]
-fn usage_probe_dismiss_and_refuse_of_an_expired_unswept_row_announce_it_once_then_refuse_at_a_cold_prompt()
- {
+fn dismiss_and_refuse_of_an_expired_unswept_row_announce_it_once_then_refuse_at_a_cold_prompt() {
     let relay = SilentRelay::start();
     let probe = Probe::new("dismiss-expired-cold", true, &[relay.port]);
     let mut command = probe.command();
@@ -2087,7 +2086,7 @@ fn answer_at_a_cold_prompt_prints_the_question_block_and_prompts_for_the_text() 
 /// Ctrl-C each print the `Nothing was sent:` line, keep the REPL alive at its prompt,
 /// send nothing, and leave the question filed for the next `.mesh pending`.
 #[test]
-fn usage_probe_question_blocks_are_bare_under_no_color_and_enter_or_ctrl_c_sends_nothing() {
+fn question_blocks_are_bare_under_no_color_and_enter_or_ctrl_c_sends_nothing() {
     let relay = SilentRelay::start();
     let probe = Probe::new("answer-prompt-plain", true, &[relay.port]);
     let mut command = probe.command();
@@ -2567,7 +2566,7 @@ fn info_mesh_rows(info: &str) -> Vec<(String, String)> {
 /// sync` prints its progress line, then an empty line, then its result (here the no-node
 /// refusal). Every table is narrower than the terminal.
 #[test]
-fn usage_probe_mesh_listings_at_a_cold_prompt_are_one_bordered_table_each_and_a_progress_line_is_followed_by_an_empty_line()
+fn mesh_listings_at_a_cold_prompt_are_one_bordered_table_each_and_a_progress_line_is_followed_by_an_empty_line()
  {
     let relay = SilentRelay::start();
     let probe = Probe::new("tables", true, &[relay.port]);
@@ -2826,8 +2825,7 @@ fn spawn_repl_with_columns(command: Command, columns: u16) -> Target {
 /// and names `.mesh on` precedes the table, which keeps the configured `interfaces[0]`
 /// settings row and has no `node` row.
 #[test]
-fn usage_probe_a_narrow_terminal_wraps_the_mesh_info_table_within_its_width_while_the_node_is_off()
-{
+fn a_narrow_terminal_wraps_the_mesh_info_table_within_its_width_while_the_node_is_off() {
     const NARROW: u16 = 60;
     let relay = SilentRelay::start();
     let probe = Probe::new("narrow", false, &[relay.port]);
@@ -3390,7 +3388,7 @@ fn untrust_of_the_last_instance_leaves_a_binding_only_entry_that_untrust_identit
 /// `.mesh peers`, under the trust legend that names the five standings, and the next
 /// write keeps the header in place.
 #[test]
-fn usage_probe_the_trust_file_header_survives_a_cold_restart_and_the_block_is_read_back() {
+fn the_trust_file_header_survives_a_cold_restart_and_the_block_is_read_back() {
     let relay = SilentRelay::start();
     let probe = Probe::new("trust-header-restart", true, &[relay.port]);
     let dest = "cd".repeat(16);
@@ -3610,7 +3608,7 @@ fn seconds_of(text: &str) -> Option<u64> {
 /// before a table that keeps the configured `interfaces[0]` row, ends on `reach` keyed on the
 /// config (the loopback relay reads as the local rnsd), and holds no node fact.
 #[test]
-fn usage_probe_an_announcing_node_reads_its_start_announce_with_the_first_tick_a_period_away_and_off_keeps_only_the_settings()
+fn an_announcing_node_reads_its_start_announce_with_the_first_tick_a_period_away_and_off_keeps_only_the_settings()
  {
     let relay = SilentRelay::start();
     let probe = Probe::new("announcing", true, &[relay.port]).with_announce();
@@ -3750,8 +3748,7 @@ fn usage_probe_an_announcing_node_reads_its_start_announce_with_the_first_tick_a
 /// leaves the access request; with the node off every form is refused by the `.mesh on`
 /// teaching line before any block or list.
 #[test]
-fn usage_probe_dismiss_at_a_cold_prompt_refuses_tells_or_stays_silent_and_pending_sweeps_the_expired()
- {
+fn dismiss_at_a_cold_prompt_refuses_tells_or_stays_silent_and_pending_sweeps_the_expired() {
     const DRY_RUN_LINE: &str = "This was a dry run; nothing changed.";
     let relay = SilentRelay::start();
     let probe = Probe::new("dismiss-cold", true, &[relay.port]);
@@ -4199,7 +4196,7 @@ fn usage_probe_dismiss_at_a_cold_prompt_refuses_tells_or_stays_silent_and_pendin
 /// named. No node starts for any of it. Then `.session work` + `.mesh on --yes` previews
 /// the status card and the brief on two rows of their own.
 #[test]
-fn usage_probe_brief_modes_and_the_bare_brief_before_a_turn_answer_at_a_cold_prompt() {
+fn brief_modes_and_the_bare_brief_before_a_turn_answer_at_a_cold_prompt() {
     const AUTO: &str = "Brief mode is auto for this session: your envoy answers peers from the status card, the session digest, your note and the todo list (the digest is model-written, so it spends tokens). config.yaml is not changed; the change applies at the next turn boundary. Run .mesh brief to see the sections.";
     const MANUAL: &str = "Brief mode is manual for this session: your envoy answers peers from the status card, your note and the todo list; no model spend. config.yaml is not changed; the change applies at the next turn boundary. Run .mesh brief to see the sections.";
     const OFF: &str = "Brief mode is off for this session: no brief is assembled, so your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. config.yaml is not changed; the change applies at the next turn boundary. .mesh brief auto or .mesh brief manual turns the brief back on.";
@@ -4321,7 +4318,7 @@ fn usage_probe_brief_modes_and_the_bare_brief_before_a_turn_answer_at_a_cold_pro
 /// off-mode bare brief and the retired-spelling refusal all read `/mesh brief ...` and none
 /// of them keeps a `.mesh` the user cannot type.
 #[test]
-fn usage_probe_brief_confirmations_under_slash_name_their_next_command_with_the_slash_sigil() {
+fn brief_confirmations_under_slash_name_their_next_command_with_the_slash_sigil() {
     const NOTE_SET: &str = "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Run `/mesh brief` to see what your envoy answers from.";
     const OFF: &str = "Brief mode is off for this session: no brief is assembled, so your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. config.yaml is not changed; the change applies at the next turn boundary. /mesh brief auto or /mesh brief manual turns the brief back on.";
     const OFF_BARE: &str = "No brief is assembled in off mode: your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. /mesh brief auto or /mesh brief manual turns it back on.";
@@ -4432,7 +4429,7 @@ impl LocalRnsd {
 /// `local rnsd at <endpoint>  connected`, `reach` keeps the endpoint, no WARNING is
 /// printed, and `.exit` stops the node once.
 #[test]
-fn usage_probe_a_local_only_node_is_refused_until_rnsd_listens_then_joins_through_it() {
+fn a_local_only_node_is_refused_until_rnsd_listens_then_joins_through_it() {
     let mut rnsd = LocalRnsd::absent();
     let endpoint = rnsd.endpoint();
     let label = format!("local rnsd at {endpoint}");

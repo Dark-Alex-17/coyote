@@ -2607,7 +2607,7 @@ mod tests {
     /// punctuation keeps that punctuation before the marker, and the blanks before the
     /// word that did not fit (spaces, a tab) all go, so the kept text never ends on one.
     #[test]
-    fn usage_probe_summary_line_keeps_a_title_only_line_whole_and_cuts_content_after_punctuation() {
+    fn summary_line_keeps_a_title_only_line_whole_and_cuts_content_after_punctuation() {
         let long_title = (0..60)
             .map(|i| format!("t{i:03}"))
             .collect::<Vec<_>>()

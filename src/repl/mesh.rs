@@ -11488,7 +11488,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         /// interface and nothing else.
         #[test]
         #[serial]
-        fn usage_probe_info_while_off_keys_reach_on_the_configured_interfaces() {
+        fn info_while_off_keys_reach_on_the_configured_interfaces() {
             let _capture = capture::install();
             let mut ctx = ctx_with(
                 MeshConfig {
@@ -12951,7 +12951,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         /// declined preview changes nothing.
         #[test]
         #[serial]
-        fn usage_probe_the_on_preview_brief_row_follows_the_mode_set_in_this_session() {
+        fn the_on_preview_brief_row_follows_the_mode_set_in_this_session() {
             let _guard = TestConfigDirGuard::new("repl-mesh-probe-preview-brief-mode");
             let _capture = capture::install();
             let _script = prompt_script::install(&[false, false, false]);
@@ -15081,7 +15081,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             /// slot, never hidden as if nothing had been retired.
             #[test]
             #[serial]
-            fn usage_probe_info_places_each_history_row_after_its_anchor_when_both_appear() {
+            fn info_places_each_history_row_after_its_anchor_when_both_appear() {
                 let _guard = TestConfigDirGuard::new("repl-mesh-info-history-order");
                 run_async(async {
                     let started = started_runtime("repl-mesh-info-history-order").await;
@@ -15168,7 +15168,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             /// clock that puts the join or the announce in the future reads as `0s ago`,
             /// never as a panic or a negative span.
             #[test]
-            fn usage_probe_liveness_rows_hold_at_the_period_boundaries_and_under_clock_skew() {
+            fn liveness_rows_hold_at_the_period_boundaries_and_under_clock_skew() {
                 let now = SystemTime::now();
                 let period = Duration::from_secs(HEARTBEAT_PERIOD_SECS);
                 let at = |secs_ago: u64| now - Duration::from_secs(secs_ago);
@@ -15217,7 +15217,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             /// `reach` between the settings and `identity`.
             #[test]
             #[serial]
-            fn usage_probe_info_table_order_through_the_repl_is_the_fixed_one() {
+            fn info_table_order_through_the_repl_is_the_fixed_one() {
                 let _guard = TestConfigDirGuard::new("repl-mesh-info-order");
                 let _capture = capture::install();
                 run_async(async {
@@ -17145,7 +17145,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             #[cfg(unix)]
             #[test]
             #[serial]
-            fn usage_probe_info_follows_a_local_rnsd_through_connecting_connected_lost_and_back() {
+            fn info_follows_a_local_rnsd_through_connecting_connected_lost_and_back() {
                 let guard = TestConfigDirGuard::new("repl-mesh-info-local-round-trip");
                 let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
                 let _script = prompt_script::install(&[true]);
@@ -18128,8 +18128,8 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             /// bare-form usage error. An empty reply is never sent either way.
             #[test]
             #[serial]
-            fn usage_probe_an_empty_quoted_answer_on_the_line_opens_the_prompt_and_never_sends_an_empty_reply()
-             {
+            fn an_empty_quoted_answer_on_the_line_opens_the_prompt_and_never_sends_an_empty_reply()
+            {
                 use crate::mesh::pending::{
                     INBOUND_RECORD_VERSION, InboundKind, PENDING_RECORD_VERSION,
                 };
@@ -21447,8 +21447,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             /// forget's ledger.
             #[test]
             #[serial]
-            fn usage_probe_forget_identity_known_only_by_its_attachments_and_grants_lists_and_sweeps_them()
-             {
+            fn forget_identity_known_only_by_its_attachments_and_grants_lists_and_sweeps_them() {
                 let _guard = TestConfigDirGuard::new("repl-mesh-forget-claims-only");
                 let _capture = capture::install();
                 let _script = prompt_script::install(&[]);
@@ -21541,8 +21540,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             /// <TAB>` offers nothing for that instance.
             #[test]
             #[serial]
-            fn usage_probe_forget_identity_sweeps_an_open_access_request_so_a_late_grant_files_nothing()
-             {
+            fn forget_identity_sweeps_an_open_access_request_so_a_late_grant_files_nothing() {
                 use crate::mesh::access::decision_reply;
                 use crate::mesh::events::AccessDecision;
                 use crate::mesh::message::{
@@ -25625,8 +25623,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             /// the peer; neither the wire code nor the retired knock hint shows.
             #[test]
             #[serial]
-            fn usage_probe_message_and_fetch_to_a_peer_that_has_not_trusted_this_instance_name_both_sides()
-             {
+            fn message_and_fetch_to_a_peer_that_has_not_trusted_this_instance_name_both_sides() {
                 let _guard = TestConfigDirGuard::new("repl-mesh-not-trusted-by-peer");
                 let _script = prompt_script::install(&[]);
                 let _capture = capture::install();
@@ -25777,8 +25774,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             /// `refused: <reason>` copy of it, and the total counts her refused.
             #[test]
             #[serial]
-            fn usage_probe_broadcast_lists_the_peer_that_has_not_trusted_this_instance_once_in_its_own_words()
-             {
+            fn broadcast_lists_the_peer_that_has_not_trusted_this_instance_once_in_its_own_words() {
                 use crate::config::mesh_config::MeshInterface;
 
                 let _guard = TestConfigDirGuard::new("repl-mesh-broadcast-not-trusted-by-peer");
@@ -25864,7 +25860,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             /// each of their sites: message, status and fetch, each with its own tail.
             #[test]
             #[serial]
-            fn usage_probe_a_known_instance_is_refused_with_the_known_word_at_every_contact_verb() {
+            fn a_known_instance_is_refused_with_the_known_word_at_every_contact_verb() {
                 use crate::mesh::session_destination_name;
                 use rns_transport::destination::SingleInputDestination;
                 use rns_transport::identity::PrivateIdentity;
@@ -25936,7 +25932,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             /// after, cache and counters alike.
             #[test]
             #[serial]
-            fn usage_probe_forget_identity_removes_the_dropped_knock_line_with_the_knocks() {
+            fn forget_identity_removes_the_dropped_knock_line_with_the_knocks() {
                 use crate::mesh::knock::{InboundKnock, KnockVia};
                 use std::time::Instant;
 
@@ -28683,8 +28679,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 /// named with both kinds. Nothing is removed by a refused call.
                 #[test]
                 #[serial]
-                fn usage_probe_unshare_flag_refusal_names_the_holder_kind_and_command_in_both_directions()
-                 {
+                fn unshare_flag_refusal_names_the_holder_kind_and_command_in_both_directions() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-probe-unshare-flag-both-ways");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -29176,7 +29171,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 /// as a line that follows the table and never as a cell or a heading.
                 #[test]
                 #[serial]
-                fn usage_probe_shares_effective_past_the_page_cap_keeps_the_table_to_a_page_and_says_so_under_it()
+                fn shares_effective_past_the_page_cap_keeps_the_table_to_a_page_and_says_so_under_it()
                  {
                     let _guard = TestConfigDirGuard::new("repl-mesh-shares-effective-cap");
                     let _capture = capture::install();
@@ -34970,7 +34965,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 /// request cleared; no segment-sized bound sits in front of the setting.
                 #[test]
                 #[serial]
-                fn usage_probe_grant_serves_a_file_above_one_segment_under_the_default_max_bytes() {
+                fn grant_serves_a_file_above_one_segment_under_the_default_max_bytes() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-grant-under-max-bytes");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -36307,8 +36302,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 /// beside it is still decidable afterwards with no further idle line.
                 #[test]
                 #[serial]
-                fn usage_probe_an_expired_unswept_row_is_announced_once_then_refused_by_every_deciding_verb()
-                 {
+                fn an_expired_unswept_row_is_announced_once_then_refused_by_every_deciding_verb() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-expired-unswept");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -36459,7 +36453,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 /// drained.
                 #[test]
                 #[serial]
-                fn usage_probe_the_nodes_own_copy_of_a_dismissal_reads_refused_in_the_inbox_and_as_one_idle_line()
+                fn the_nodes_own_copy_of_a_dismissal_reads_refused_in_the_inbox_and_as_one_idle_line()
                  {
                     let _guard = TestConfigDirGuard::new("repl-mesh-dismiss-own-copy");
                     let _capture = capture::install();
@@ -36571,7 +36565,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 /// the empty line, then the race sentence, with the asker told nothing.
                 #[test]
                 #[serial]
-                fn usage_probe_dismiss_all_speaks_in_the_singular_for_one_question_and_a_question_another_process_closes_meanwhile_is_reported()
+                fn dismiss_all_speaks_in_the_singular_for_one_question_and_a_question_another_process_closes_meanwhile_is_reported()
                  {
                     use crate::mesh::limits::PeerRefusal;
                     use crate::mesh::pending::InboundStore;
@@ -36795,7 +36789,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 /// own pin; the wall clock here only ever reads at or past it).
                 #[test]
                 #[serial]
-                fn usage_probe_a_peer_re_asking_with_an_expired_id_is_filed_fresh_at_the_head_and_the_expiry_boundary_is_shared()
+                fn a_peer_re_asking_with_an_expired_id_is_filed_fresh_at_the_head_and_the_expiry_boundary_is_shared()
                  {
                     let _guard = TestConfigDirGuard::new("repl-mesh-expired-id-reused");
                     let _capture = capture::install();
@@ -36938,7 +36932,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 /// counted as stayed, and the other asker is still told.
                 #[test]
                 #[serial]
-                fn usage_probe_a_question_closed_before_the_nodes_lookup_is_the_race_sentence_from_every_repl_arm()
+                fn a_question_closed_before_the_nodes_lookup_is_the_race_sentence_from_every_repl_arm()
                  {
                     use crate::mesh::limits::PeerRefusal;
                     use crate::mesh::pending::InboundStore;
@@ -37153,8 +37147,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 /// user the directory mode does not bind (root) leaves after planting.
                 #[test]
                 #[serial]
-                fn usage_probe_grant_and_refuse_still_refuse_an_expired_request_the_sweep_could_not_take_out()
-                 {
+                fn grant_and_refuse_still_refuse_an_expired_request_the_sweep_could_not_take_out() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-expired-unsweepable");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -37241,7 +37234,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 /// `this node ->`.
                 #[test]
                 #[serial]
-                fn usage_probe_a_peers_refused_reply_keeps_the_peer_side_clause_beside_this_nodes_own_dismissal()
+                fn a_peers_refused_reply_keeps_the_peer_side_clause_beside_this_nodes_own_dismissal()
                  {
                     use crate::mesh::message::RawPeerMessage;
                     use crate::mesh::pending::{
@@ -37368,8 +37361,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 /// line is ASCII with one full stop. Ids go in as given, so the 8-char
                 /// short form the loop pushes is what the reader sees.
                 #[test]
-                fn usage_probe_dismiss_all_summary_chains_held_then_silent_untold_and_stays_ascii()
-                {
+                fn dismiss_all_summary_chains_held_then_silent_untold_and_stays_ascii() {
                     let ids = |ids: &[&str]| -> Vec<String> {
                         ids.iter().map(|id| id.to_string()).collect()
                     };
@@ -37428,7 +37420,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 /// the row up.
                 #[test]
                 #[serial]
-                fn usage_probe_dismiss_all_names_a_stayed_question_by_its_full_id_in_the_rows_and_the_summary_which_the_single_form_takes()
+                fn dismiss_all_names_a_stayed_question_by_its_full_id_in_the_rows_and_the_summary_which_the_single_form_takes()
                  {
                     let _guard = TestConfigDirGuard::new("repl-mesh-dismiss-all-stayed-full-id");
                     let _capture = capture::install();
@@ -37584,7 +37576,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 /// remembers as the turn after the peer's question.
                 #[test]
                 #[serial]
-                fn usage_probe_a_failed_dismissal_names_a_heard_asker_by_name_and_only_a_sent_refusal_is_remembered()
+                fn a_failed_dismissal_names_a_heard_asker_by_name_and_only_a_sent_refusal_is_remembered()
                  {
                     use crate::mesh::envoy_sessions::{EnvoyRole, EnvoyTurn};
                     let _guard = TestConfigDirGuard::new("repl-mesh-dismiss-named-stays");
@@ -38538,8 +38530,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 /// `Answered <id>.`.
                 #[test]
                 #[serial]
-                fn usage_probe_answer_prompt_text_reaches_the_peer_with_the_attachment_judged_first()
-                 {
+                fn answer_prompt_text_reaches_the_peer_with_the_attachment_judged_first() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-answer-prompt-attach");
                     let _capture = capture::install();
                     run_async(async {
@@ -38729,8 +38720,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 /// number, nothing in between.
                 #[test]
                 #[serial]
-                fn usage_probe_an_attached_reference_above_one_segment_is_lent_under_the_default_max_bytes()
-                 {
+                fn an_attached_reference_above_one_segment_is_lent_under_the_default_max_bytes() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-attach-under-max-bytes");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -40203,7 +40193,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 /// grant pre-flight on this node's own setting says nothing about one either.
                 #[test]
                 #[serial]
-                fn usage_probe_a_too_large_limit_under_one_segment_gets_the_plain_sentence() {
+                fn a_too_large_limit_under_one_segment_gets_the_plain_sentence() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-fetch-old-ceiling");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -40374,7 +40364,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 /// said anything about completes to the flag alone.
                 #[test]
                 #[serial]
-                fn usage_probe_fetch_tab_and_the_not_shared_refusal_follow_the_verbs_own_fetch() {
+                fn fetch_tab_and_the_not_shared_refusal_follow_the_verbs_own_fetch() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-fetch-claims-follow");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -40475,7 +40465,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 /// nothing this node remembers explains it.
                 #[test]
                 #[serial]
-                fn usage_probe_a_hash_match_spends_the_one_off_grant_row_and_keeps_the_standing_one_and_the_reference()
+                fn a_hash_match_spends_the_one_off_grant_row_and_keeps_the_standing_one_and_the_reference()
                  {
                     let _guard = TestConfigDirGuard::new("repl-mesh-fetch-hash-match-claims");
                     let _capture = capture::install();
@@ -40602,8 +40592,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 /// destination's last listing, which is no claim.
                 #[test]
                 #[serial]
-                fn usage_probe_a_rotated_identity_at_the_destination_takes_the_old_claims_off_every_surface()
-                 {
+                fn a_rotated_identity_at_the_destination_takes_the_old_claims_off_every_surface() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-fetch-rotated-claims");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
@@ -40799,8 +40788,8 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 /// prompt and the fetch goes through.
                 #[test]
                 #[serial]
-                fn usage_probe_claims_outlive_a_swept_peer_row_and_completion_offers_only_what_the_verb_takes()
-                 {
+                fn claims_outlive_a_swept_peer_row_and_completion_offers_only_what_the_verb_takes()
+                {
                     let _guard = TestConfigDirGuard::new("repl-mesh-fetch-swept-row-claims");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);

@@ -1612,7 +1612,7 @@ mod tests {
     /// stays in the file through `adopt_from`, hidden from the listing, and is handed
     /// back by `prune_expired` alone, so the sweep can still say it went.
     #[test]
-    fn usage_probe_adopt_from_keeps_the_targets_expired_row_for_the_sweep() {
+    fn adopt_from_keeps_the_targets_expired_row_for_the_sweep() {
         let tmp = TempDir::new("inbound-adopt-keeps-expired");
         let base = 1_000_000;
         let now = t(base);
@@ -1691,8 +1691,7 @@ mod tests {
     /// the sweep, and repeating the merge (as the re-key does) adopts nothing more and
     /// changes nothing.
     #[test]
-    fn usage_probe_adopt_from_frees_an_expired_twins_id_for_any_peer_keeps_live_twins_and_repeats_as_a_no_op()
-     {
+    fn adopt_from_frees_an_expired_twins_id_for_any_peer_keeps_live_twins_and_repeats_as_a_no_op() {
         let tmp = TempDir::new("inbound-adopt-expired-twin-any-peer");
         let now = t(1_000_000);
         let hour = Duration::from_secs(3_600);

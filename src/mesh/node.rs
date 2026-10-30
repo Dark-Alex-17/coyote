@@ -8566,7 +8566,7 @@ mod tests {
     /// peer and the class, never the refusal text.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_dismiss_fires_the_answer_paths_hooks_and_the_silent_form_fires_none() {
+    async fn dismiss_fires_the_answer_paths_hooks_and_the_silent_form_fires_none() {
         use crate::mesh::trust::TrustOptions;
         let stub = PeerStub::listen("node-dismiss-hooks-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
         let started = started_runtime_on("node-dismiss-hooks", stub.port()).await;
@@ -12303,7 +12303,7 @@ mod tests {
     /// tell the connect a second time, and `stop` detaches the shared-instance client.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_local_only_node_with_rnsd_listening_is_connected_at_start() {
+    async fn a_local_only_node_with_rnsd_listening_is_connected_at_start() {
         use crate::testing::info_snapshot;
 
         install_log_collector();
@@ -13479,7 +13479,7 @@ mod tests {
     /// nor restarts the join clock: the fork's announce is just the newest announce.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_announce_now_moves_the_mirror_and_a_rekey_keeps_it_and_the_join_clock() {
+    async fn announce_now_moves_the_mirror_and_a_rekey_keeps_it_and_the_join_clock() {
         let started = started_runtime("node-mirror-announce-now-rekey").await;
         let runtime = &started.runtime;
         let joined_at = runtime.joined_at();
@@ -14137,8 +14137,7 @@ mod tests {
     /// connect.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_stop_with_one_relay_down_and_one_never_reached_is_prompt_and_restartable()
-    {
+    async fn stop_with_one_relay_down_and_one_never_reached_is_prompt_and_restartable() {
         install_log_collector();
         let late_port = closed_port().await;
         let relay = TransportRelay::start().await;

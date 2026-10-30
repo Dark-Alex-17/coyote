@@ -547,7 +547,7 @@ mod tests {
     /// a word within the budget and whose tail (`is in the inbox` and the pointer) sits
     /// whole after them.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_cut_peer_ask_reaches_the_editor_painted_with_its_tail_whole() {
+    async fn a_cut_peer_ask_reaches_the_editor_painted_with_its_tail_whole() {
         use crate::config::{AppState, RequestContext, WorkingMode};
         use crate::mesh::message::{PeerKind, PeerMessage, PeerVia};
         use crate::repl::idle::IdleDriver;
@@ -642,7 +642,7 @@ mod tests {
     /// The same path with colour settled off: the editor gets the same composed line
     /// in plain bytes, no escape anywhere in the payload.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_cut_peer_ask_reaches_the_editor_plain_when_colour_is_off() {
+    async fn a_cut_peer_ask_reaches_the_editor_plain_when_colour_is_off() {
         use crate::config::{AppState, RequestContext, WorkingMode};
         use crate::mesh::message::{PeerKind, PeerMessage, PeerVia};
         use crate::repl::idle::IdleDriver;

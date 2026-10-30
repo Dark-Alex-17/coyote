@@ -39464,7 +39464,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn usage_probe_repl_complete_mesh_fetch_keeps_a_clean_twin_of_an_omitted_hostile_path() {
+    async fn repl_complete_mesh_fetch_keeps_a_clean_twin_of_an_omitted_hostile_path() {
         use crate::mesh::fetch::ListedFile;
 
         let _guard = TestConfigDirGuard::new();
