@@ -1508,6 +1508,7 @@ def ci_poll(state):
     cmd = os.environ.get("SISYPHUS_GH_CHECKS_CMD")
     try:
         if cmd:
+            # Operator-environment test seam run through the shell; it carries the same trust as the process environment.
             p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=90)
         else:
             p = subprocess.run(["gh", "pr", "checks", pr, "--json", "name,state,bucket,link"], cwd=root,

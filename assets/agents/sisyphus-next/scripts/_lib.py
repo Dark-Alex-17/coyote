@@ -116,10 +116,14 @@ def now_iso():
 
 # ---------------------------------------------------------------- run dir (A2)
 def cache_dir():
-    """Coyote's cache directory, resolved the way the engine resolves it:
-    `COYOTE_CACHE_DIR`, else `$XDG_CACHE_HOME/coyote`, else the platform cache
-    directory joined with `coyote` (`~/Library/Caches` on macOS, `~/.cache` on
-    Linux, `%LOCALAPPDATA%` on Windows)."""
+    """Coyote's cache directory: `COYOTE_CACHE_DIR`, else `$XDG_CACHE_HOME/coyote`,
+    the same precedence as the engine for the two environment tiers. The last tier
+    approximates the engine's platform tier: the platform cache directory joined
+    with `coyote` (`~/Library/Caches` on macOS, `~/.cache` on Linux,
+    `%LOCALAPPDATA%` on Windows). Two differences remain: the engine treats a
+    set-but-empty variable as set where this treats it as unset, and the engine
+    takes the platform directory from the `dirs` crate (the Known Folder API on
+    Windows) and falls back to the temp dir."""
     explicit = os.environ.get("COYOTE_CACHE_DIR")
     if explicit:
         return explicit
@@ -157,23 +161,34 @@ def run_dir_for(run_id):
 
 def ensure_run_dir(run_id):
     d = run_dir_for(run_id)
-    os.makedirs(d, exist_ok=True)
+    os.makedirs(d, mode=0o700, exist_ok=True)
     return d
+
+
+def _open_private(path, flags):
+    """Open `path` for writing as an owner-only (0600) file, tightening one that
+    already exists, since os.open applies the mode only on creation."""
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return os.fdopen(fd, "a" if flags & os.O_APPEND else "w", encoding="utf-8")
 
 
 def write_artifact(run_dir, name, text):
     if not run_dir:
         return
-    os.makedirs(run_dir, exist_ok=True)
-    with open(os.path.join(run_dir, name), "w", encoding="utf-8") as f:
+    os.makedirs(run_dir, mode=0o700, exist_ok=True)
+    with _open_private(os.path.join(run_dir, name), os.O_CREAT | os.O_WRONLY | os.O_TRUNC) as f:
         f.write(text if text.endswith("\n") else text + "\n")
 
 
 def append_artifact(run_dir, name, line):
     if not run_dir:
         return
-    os.makedirs(run_dir, exist_ok=True)
-    with open(os.path.join(run_dir, name), "a", encoding="utf-8") as f:
+    os.makedirs(run_dir, mode=0o700, exist_ok=True)
+    with _open_private(os.path.join(run_dir, name), os.O_CREAT | os.O_WRONLY | os.O_APPEND) as f:
         f.write(line.rstrip("\n") + "\n")
 
 

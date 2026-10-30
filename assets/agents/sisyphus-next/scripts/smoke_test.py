@@ -97,6 +97,32 @@ for _k, _v in _saved_env.items():
         os.environ[_k] = _v
 check("runs_root: battery env restored", _lib.runs_root() == os.environ["SISYPHUS_RUNS_ROOT"])
 
+# ---------------------------------------------------------------- run dir permissions
+_old_umask = os.umask(0o022)
+try:
+    _perm_dir = _lib.ensure_run_dir("perm-check")
+    _lib.write_artifact(_perm_dir, "fresh-write.md", "x")
+    _lib.append_artifact(_perm_dir, "fresh-append.md", "x")
+    _existing = os.path.join(_perm_dir, "existing.md")
+    with open(_existing, "w") as _f:
+        _f.write("old\n")
+    os.chmod(_existing, 0o644)
+    _lib.write_artifact(_perm_dir, "existing.md", "new")
+finally:
+    os.umask(_old_umask)
+
+
+def _mode(path):
+    return os.stat(path).st_mode & 0o777
+
+
+for _name in ("fresh-write.md", "fresh-append.md", "existing.md"):
+    _p = os.path.join(_perm_dir, _name)
+    check(f"run dir permissions: {_name} is 0600 under umask 022", os.name == "nt" or _mode(_p) == 0o600, oct(_mode(_p)))
+check("run dir permissions: a fresh run dir is 0700 under umask 022", os.name == "nt" or _mode(_perm_dir) == 0o700,
+      oct(_mode(_perm_dir)))
+check("run dir permissions: the rewritten artifact holds the new text", _lib.read_artifact(_perm_dir, "existing.md") == "new\n")
+
 
 # ---------------------------------------------------------------- intake / re-entry (A2)
 st = gates.intake({"initial_prompt": "Implement TASK-007 (hello) in the project. ## SOURCE OF TRUTH plans/x.md\nQuality bar: rigor=prototype, surfaces=http",

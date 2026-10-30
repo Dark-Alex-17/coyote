@@ -5,10 +5,12 @@ Checks: every declared edge (next / fallback / branch / approval routes /
 on_other) and every script-emitted `_next` resolves to a real node; map branch
 subgraphs stay disjoint from the main flow; every cycle (static + dynamic)
 passes through a node that owns a named bound (section 5); the engine backstop
-is set. Script `_next` targets are harvested per gate function from gates.py
-by AST (string constants assigned to `u["_next"]` and the shared
-`raise_escalation` / `_terminal_prompt` helpers), so the dynamic edges are
-attributed to the node that emits them, not smeared over every script node.
+is set; every entry script's `run("<gate>")` names a key of gates.py's `GATES`
+dict that equals the script's file stem. Script `_next` targets are harvested
+per gate function from gates.py by AST (string constants assigned to
+`u["_next"]` and the shared `raise_escalation` / `_terminal_prompt` helpers),
+so the dynamic edges are attributed to the node that emits them, not smeared
+over every script node.
 
 Usage: audit_graph.py [agent dir]   (exit 1 on any problem)
 """
@@ -56,6 +58,15 @@ def gate_for_script(path):
     src = open(path, encoding="utf-8").read()
     m = re.search(r'run\("([a-z_]+)"\)', src)
     return m.group(1) if m else None
+
+
+def gate_names(gates_src):
+    """The keys of the module-level `GATES` dict, the names `run()` dispatches on."""
+    for node in ast.parse(gates_src).body:
+        if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Dict)
+                and any(isinstance(t, ast.Name) and t.id == "GATES" for t in node.targets)):
+            return {k.value for k in node.value.keys if isinstance(k, ast.Constant)}
+    return set()
 
 
 def harvest_gate_targets(gates_src):
@@ -119,6 +130,7 @@ def main():
     problems, edges = [], []
     gates_src = open(os.path.join(AGENT_DIR, "scripts", "gates.py"), encoding="utf-8").read()
     gate_targets = harvest_gate_targets(gates_src)
+    known_gates = gate_names(gates_src)
     dyn = defaultdict(set)
 
     for nid, n in nodes.items():
@@ -140,6 +152,12 @@ def main():
             gate = gate_for_script(sp)
             if gate is None and nid != "debt_scan":
                 problems.append(f"{nid}: entry script names no gate")
+            elif gate is not None:
+                stem = os.path.splitext(os.path.basename(sp))[0]
+                if gate not in known_gates:
+                    problems.append(f"{nid}: entry script names unknown gate {gate}")
+                if gate != stem:
+                    problems.append(f"{nid}: entry script names gate {gate}, not {stem}")
             for t in gate_targets.get(gate, set()):
                 dyn[nid].add(t)
                 edges.append((nid, t, "_next"))

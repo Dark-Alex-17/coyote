@@ -35,7 +35,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "sisyphus-next";
 const CANDIDATE_NAMES: [&str; 2] = ["sisyphus-next", "architect-next"];
-const SMOKE_FLOOR: usize = 243;
+const SMOKE_FLOOR: usize = 248;
 
 fn agents_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents")
@@ -2848,6 +2848,155 @@ fn readme_ci_budget_row_separates_per_watch_from_per_run_counters() {
     ] {
         assert!(row.contains(sentence), "missing {sentence:?} in {row}");
     }
+}
+
+/// Every entry shim dispatches `run("<its own stem>")`, that name is a key of
+/// the `GATES` dict in gates.py, and every `GATES` key has its shim.
+#[test]
+fn entry_shims_and_the_gates_dict_name_each_other() {
+    let scripts = candidate_dir().join("scripts");
+    let gates = fs::read_to_string(scripts.join("gates.py")).unwrap();
+    let open = "\nGATES = {";
+    let start = gates.find(open).expect("gates.py defines GATES") + open.len();
+    let end = gates[start..].find("\n}").expect("the GATES dict closes") + start;
+    let key_re = fancy_regex::Regex::new(r#""([a-z_]+)":"#).unwrap();
+    let keys: BTreeSet<String> = key_re
+        .captures_iter(&gates[start..end])
+        .map(|c| c.unwrap()[1].to_string())
+        .collect();
+    assert!(keys.len() > 40, "GATES holds only {} keys", keys.len());
+
+    let run_re = fancy_regex::Regex::new(r#"\brun\("([^"]*)"\)"#).unwrap();
+    let mut shims = BTreeSet::new();
+    for entry in fs::read_dir(&scripts).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|e| e != "py") {
+            continue;
+        }
+        let text = fs::read_to_string(&path).unwrap();
+        if !text.contains("from gates import run") {
+            continue;
+        }
+        let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+        let literals: Vec<String> = run_re
+            .captures_iter(&text)
+            .map(|c| c.unwrap()[1].to_string())
+            .collect();
+        assert_eq!(literals, std::slice::from_ref(&stem), "{}", path.display());
+        assert!(keys.contains(&stem), "{stem} is not a GATES key");
+        shims.insert(stem);
+    }
+    assert_eq!(
+        keys, shims,
+        "GATES keys and entry shims differ (left: GATES, right: shims)"
+    );
+}
+
+/// `audit_graph.py` reports a shim whose `run()` literal is not a `GATES` key
+/// or is not the shim's own stem, instead of treating it as a gate with no
+/// `_next` edges.
+#[test]
+fn audit_graph_reports_a_shim_naming_a_wrong_gate() {
+    let Some(python) = python3() else { return };
+    let Some(yq) = mikefarah_yq() else { return };
+    let scratch = scratch_dir("audit-shim");
+    let copy = scratch_candidate_copy(&scratch);
+    let shim = copy.join("scripts").join("assess_fault.py");
+    let original = fs::read_to_string(&shim).unwrap();
+    assert!(original.contains("run(\"assess_fault\")"), "{original}");
+    let cases = [
+        (
+            "missing_gate",
+            vec![
+                "assess_fault: entry script names unknown gate missing_gate",
+                "assess_fault: entry script names gate missing_gate, not assess_fault",
+            ],
+        ),
+        (
+            "intake",
+            vec!["assess_fault: entry script names gate intake, not assess_fault"],
+        ),
+    ];
+    for (literal, expected) in cases {
+        fs::write(
+            &shim,
+            original.replace("run(\"assess_fault\")", &format!("run(\"{literal}\")")),
+        )
+        .unwrap();
+        let output = battery(&python, &scratch)
+            .current_dir(&copy)
+            .env("PATH", path_with(yq.parent().unwrap()))
+            .args(["scripts/audit_graph.py", "."])
+            .output()
+            .unwrap();
+        let report = transcript(&output);
+        assert!(!output.status.success(), "{report}");
+        let problems = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find(|l| l.starts_with("PROBLEMS: "))
+            .unwrap_or_else(|| panic!("no PROBLEMS line\n{report}"))
+            .to_string();
+        for line in &expected {
+            assert!(problems.contains(line), "missing {line:?}\n{report}");
+        }
+        if expected.len() == 1 {
+            assert!(!problems.contains("unknown gate"), "{report}");
+        }
+    }
+}
+
+#[test]
+fn cache_dir_docstring_claims_only_the_shared_precedence() {
+    let lib = fs::read_to_string(candidate_dir().join("scripts").join("_lib.py")).unwrap();
+    let open = "def cache_dir():\n    \"\"\"";
+    let start = lib.find(open).expect("_lib.py defines cache_dir") + open.len();
+    let end = lib[start..].find("\"\"\"").expect("the docstring closes") + start;
+    let doc = lib[start..end]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(!doc.contains("the way the engine resolves it"), "{doc}");
+    for phrase in [
+        "the same precedence as the engine for the two environment tiers",
+        "approximates the engine's platform tier",
+        "the engine treats a set-but-empty variable as set",
+        "from the `dirs` crate",
+        "falls back to the temp dir",
+    ] {
+        assert!(doc.contains(phrase), "missing {phrase:?} in {doc}");
+    }
+}
+
+#[test]
+fn readme_pins_the_run_dir_modes_and_the_checks_seam_trust() {
+    let readme = fs::read_to_string(candidate_dir().join("README.md")).unwrap();
+    let section = readme
+        .split("\n## ")
+        .find(|s| s.starts_with("Landed-upstream adjustments"))
+        .expect("README has a Landed-upstream adjustments section");
+    let row = section
+        .lines()
+        .find(|l| l.starts_with("| run-dir permissions and the checks seam |"))
+        .unwrap_or_else(|| panic!("missing run-dir permissions row:\n{section}"));
+    for sentence in [
+        "Run dirs are created 0700 and every artifact written into them is 0600, whatever the umask;",
+        "it is an operator-environment test seam that `ci_poll` runs through the shell in place of `gh pr checks`, so it carries the same trust as the process environment that sets it.",
+    ] {
+        assert!(row.contains(sentence), "missing {sentence:?} in {row}");
+    }
+    let gates = fs::read_to_string(candidate_dir().join("scripts").join("gates.py")).unwrap();
+    let lines: Vec<&str> = gates.lines().collect();
+    let seam = lines
+        .iter()
+        .position(|l| l.contains("subprocess.run(cmd, shell=True"))
+        .expect("ci_poll runs the checks seam through the shell");
+    assert!(
+        lines[seam - 1]
+            .trim_start()
+            .starts_with("# Operator-environment test seam run through the shell"),
+        "the shell=True line carries its trust-model comment: {}",
+        lines[seam - 1]
+    );
 }
 
 /// A clean one-commit repository plus the cold round-1 state a gauntlet

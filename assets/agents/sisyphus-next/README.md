@@ -44,6 +44,7 @@ below. Later landings add their own rows.
 | battery env hygiene | `scripts/smoke_test.py` | every `LLM_AGENT_VAR_*` variable is dropped from the environment at start so the battery cannot inherit the agent variables of the process running it (the standalone-brief intake check reads `LLM_AGENT_VAR_PARALLEL` through `_lib.var`); `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY` and `GIT_COMMON_DIR` are dropped the same way, so a run from a git hook (which exports them) commits and stashes in the scratch repository, not the caller's |
 | CI budget nesting | `scripts/gates.py` `ci_apply` | Per-watch budgets are `ci_polls`, `ci_poll_fails` and `ci_started_at`: they reset every time a watch starts (`ci_gate`, the owner's re-run answer, a flake re-run). Per-run budgets are `ci_reruns` (per check, `CI_FLAKE_RERUNS`) and `ci_fix_strikes` (`STRIKE_LIMIT`). The flake re-run path now also resets `ci_started_at`, so the `CI_WALL_SECS` wall clock no longer carries over from the previous watch; the smoke battery pins the reset |
 | re-review dirty check | `scripts/gates.py` `_code_tree_dirty` / `build_gauntlet_prompt` | the check that suppresses `Re-review delta:` runs `git status --porcelain --untracked-files=normal` with an `:(exclude,literal)` pathspec for `<project_dir>/plans` when that directory sits strictly inside the repository root (the in-repo planning store, which intake already excludes from the debris scan), so uncommitted handoff and status edits there no longer drop the delta; any other uncommitted or untracked file still does. `strikeout` keeps its plain `status --porcelain`, since it stashes the whole tree, plans included; the smoke battery pins both sides |
+| run-dir permissions and the checks seam | `scripts/_lib.py` `ensure_run_dir` / `write_artifact` / `append_artifact`, `scripts/gates.py` `ci_poll`, `scripts/smoke_test.py` | Run dirs are created 0700 and every artifact written into them is 0600, whatever the umask; an artifact that already exists is tightened to 0600 when it is rewritten or appended to. `SISYPHUS_GH_CHECKS_CMD` stays: it is an operator-environment test seam that `ci_poll` runs through the shell in place of `gh pr checks`, so it carries the same trust as the process environment that sets it. The smoke battery pins the modes under umask 022 |
 
 Recorded census against the staging tree (files that differ; hunks per file as counted by
 `diff -u <staging file> <file> | grep -c '^@@'`):
@@ -67,8 +68,8 @@ from the brief, never from a hard-coded toolchain):
 ```
 $ grep -nE '\b(cargo|npm|pnpm|yarn|go (test|build)|pytest|mvn|gradle|make)\b' scripts/*.py
 scripts/gates.py:904:        lines += ["Observability pass: make these alert-as-code / instrumentation changes following the repo's existing "
-scripts/smoke_test.py:636:u = gates.ci_gate({"git_report": "ok\nANOMALY: commits I did not make\n", "git_task": {"return_to": "final_report"}, "run_dir": TMP, "anomalies_log": []})
-scripts/smoke_test.py:637:check("ci_gate: ANOMALY: lines harvested from git_report", any("commits I did not make" in e for e in u.get("anomalies_log", [])))
+scripts/smoke_test.py:662:u = gates.ci_gate({"git_report": "ok\nANOMALY: commits I did not make\n", "git_task": {"return_to": "final_report"}, "run_dir": TMP, "anomalies_log": []})
+scripts/smoke_test.py:663:check("ci_gate: ANOMALY: lines harvested from git_report", any("commits I did not make" in e for e in u.get("anomalies_log", [])))
 ```
 
 All three hits are the English verb `make` (one prompt sentence, two battery fixtures);
@@ -105,5 +106,5 @@ key naming `sisyphus-next` or `architect-next`, and every `instructions.md` and
 `config.yaml` for prose containing either name, pinning the candidate status above.
 
 Measured 2026-10-29 after the adjustments above, from a fresh scratch dir: audit
-`PROBLEMS: none`; smoke `243/243 checks passed`; session check ok (mikefarah yq
+`PROBLEMS: none`; smoke `248/248 checks passed`; session check ok (mikefarah yq
 v4.53.3).
