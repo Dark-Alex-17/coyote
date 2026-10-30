@@ -42,12 +42,18 @@ for _k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
     # a caller's repository variables (a git hook exports them) would point
     # every scratch-repo git call at the caller's own repository
     os.environ.pop(_k, None)
-for _k in [k for k in os.environ if k == "ARCHITECT_CORE_TOOLS" or (k.startswith("ARCHITECT_GH_") and k.endswith("_CMD"))]:
+for _k in [k for k in os.environ if k in ("ARCHITECT_CORE_TOOLS", "ARCHITECT_ASK_OWNER_BIN", "ARCHITECT_SLACK_PING_BIN") or (k.startswith("ARCHITECT_GH_") and k.endswith("_CMD"))]:
     # a caller's tool overrides would replace the scripts' own tools.sh and gh calls
     os.environ.pop(_k)
-# HOME becomes a scratch dir, so git has no user identity and on Linux refuses
-# to guess one; every gate that commits inherits this fixed identity instead
+for _k in [k for k in os.environ if k in ("GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT") or k.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))]:
+    # a caller's command-line git config would reach every scratch-repo git call
+    os.environ.pop(_k)
+# HOME becomes a scratch dir with no git identity. git refuses to guess one when
+# user.useConfigOnly is set or when the host name has no dot (it cannot build an
+# email), so the walk sets useConfigOnly on every host and every gate that
+# commits inherits this fixed identity instead
 os.environ.update({"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+os.environ.update({"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "user.useConfigOnly", "GIT_CONFIG_VALUE_0": "true"})
 from _fixture import Store  # noqa: E402
 
 MAP_PATH = os.path.join(HERE, "marker_map.json")
@@ -110,11 +116,8 @@ def check_marker_map(instr_path, regen):
 
 
 # ---------------------------------------------------------------- 2. combination walk
-GIT_ENV = None
-
-
 def git(repo, *a, check_=True):
-    p = subprocess.run(["git", "-C", repo, *a], capture_output=True, text=True, env=GIT_ENV)
+    p = subprocess.run(["git", "-C", repo, *a], capture_output=True, text=True)
     if check_ and p.returncode != 0:
         raise RuntimeError(p.stderr)
     return p.stdout.strip()
@@ -414,7 +417,6 @@ def _walk_loop(nodes, state, cur, visited, asserts, log, gates, canned, run_chai
 
 
 def main():
-    global GIT_ENV
     regen = "--regen" in sys.argv
     instr = None
     if "--instructions" in sys.argv:
@@ -438,7 +440,6 @@ def main():
     os.environ["ARCHITECT_GH_READY_CMD"] = "true"
     os.environ["ARCHITECT_GH_CHECKS_CMD"] = "echo '[{\"name\":\"build\",\"bucket\":\"pass\",\"link\":\"\"}]'"
     os.environ["ARCHITECT_SLACK_PING_BIN"] = os.path.join(tmp_home, "nope")
-    GIT_ENV = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
     # The REAL tools.sh through a scratch LLM_ROOT_DIR (copies only).
     root = os.path.join(tmp_home, "coyote")
     core = CORE_TOOLS_REL

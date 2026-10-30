@@ -16,10 +16,18 @@
 //! `PYTHONDONTWRITEBYTECODE=1`, so nothing under `assets/` or
 //! `~/.config/coyote` is read or written, and every command that runs git
 //! or a gate ignores the system and user git config. Every git, script and
-//! binary command drops `LLM_AGENT_VAR_*` and the git repository variables
-//! (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`,
+//! binary command drops the git repository variables (`GIT_DIR`,
+//! `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`,
 //! `GIT_COMMON_DIR`), so a run from a git hook cannot reach the caller's
-//! repository.
+//! repository. Every script and binary command also drops `LLM_AGENT_VAR_*`
+//! and the gates' tool overrides (`ARCHITECT_CORE_TOOLS`,
+//! `ARCHITECT_ASK_OWNER_BIN`, `ARCHITECT_SLACK_PING_BIN`,
+//! `ARCHITECT_GH_*_CMD`). Every battery run drops `GIT_CONFIG_PARAMETERS` and
+//! every inherited `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_*` /
+//! `GIT_CONFIG_VALUE_*`, then sets `user.useConfigOnly=true` through
+//! `GIT_CONFIG_COUNT=1`, so git uses only the fixed identity the batteries
+//! set. Every binary run drops every inherited `COYOTE_*` variable before it
+//! sets its own `COYOTE_CONFIG_DIR` / `COYOTE_CACHE_DIR`.
 //!
 //! The reachability sweep that keeps both candidates out of every bundled
 //! agent lives in `candidate_sisyphus_next.rs` and already covers this name.
@@ -115,9 +123,12 @@ fn path_with(yq_dir: &Path) -> OsString {
 }
 
 /// A command that runs inside the candidate dir with every path-bearing
-/// variable pointed at the scratch dir and no system or user git config.
+/// variable pointed at the scratch dir and no system, user or inherited
+/// command-line git config; it sets `user.useConfigOnly` the same way both
+/// batteries do.
 fn battery(program: &Path, scratch: &TempDirGuard) -> Command {
     let mut cmd = Command::new(program);
+    without_git_config_vars(&mut cmd);
     cmd.current_dir(candidate_dir())
         .env("HOME", scratch.0.join("home"))
         .env("LLM_ROOT_DIR", scratch.0.join("root"))
@@ -127,6 +138,9 @@ fn battery(program: &Path, scratch: &TempDirGuard) -> Command {
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "user.useConfigOnly")
+        .env("GIT_CONFIG_VALUE_0", "true")
         .env_remove("GRAPH_STATE")
         .env_remove("GRAPH_STATE_FILE");
     scrub_agent_vars(&mut cmd);
@@ -135,16 +149,60 @@ fn battery(program: &Path, scratch: &TempDirGuard) -> Command {
 }
 
 /// Drops every inherited `LLM_AGENT_VAR_*` variable and the gates' tool
-/// overrides (`ARCHITECT_CORE_TOOLS`, `ARCHITECT_GH_*_CMD`) from `cmd`, so a
-/// test run started inside an agent session does not hand that session's
-/// variables or tools to the batteries, the gates or the binary.
+/// overrides (`ARCHITECT_CORE_TOOLS`, `ARCHITECT_ASK_OWNER_BIN`,
+/// `ARCHITECT_SLACK_PING_BIN`, `ARCHITECT_GH_*_CMD`) from `cmd`, so a test run
+/// started inside an agent session does not hand that session's variables or
+/// tools to the batteries, the gates or the binary.
 fn scrub_agent_vars(cmd: &mut Command) -> &mut Command {
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();
         if name.starts_with("LLM_AGENT_VAR_")
-            || name == "ARCHITECT_CORE_TOOLS"
+            || matches!(
+                name.as_ref(),
+                "ARCHITECT_CORE_TOOLS" | "ARCHITECT_ASK_OWNER_BIN" | "ARCHITECT_SLACK_PING_BIN"
+            )
             || (name.starts_with("ARCHITECT_GH_") && name.ends_with("_CMD"))
         {
+            cmd.env_remove(key);
+        }
+    }
+    cmd
+}
+
+/// Drops `GIT_CONFIG_PARAMETERS` and every inherited `GIT_CONFIG_COUNT`,
+/// `GIT_CONFIG_KEY_*` and `GIT_CONFIG_VALUE_*` from `cmd`. It must run before
+/// the builder sets its own `GIT_CONFIG_COUNT` triple: an `env_remove` after
+/// an `env` for the same key removes it.
+fn without_git_config_vars(cmd: &mut Command) -> &mut Command {
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if name == "GIT_CONFIG_PARAMETERS"
+            || name == "GIT_CONFIG_COUNT"
+            || name.starts_with("GIT_CONFIG_KEY_")
+            || name.starts_with("GIT_CONFIG_VALUE_")
+        {
+            cmd.env_remove(key);
+        }
+    }
+    cmd
+}
+
+/// Drops every inherited `COYOTE_*` variable from a binary runner
+/// (`COYOTE_PROVIDER`, `COYOTE_PLATFORM`, `COYOTE_WORKSPACE_CONFIG_DIR`,
+/// `COYOTE_CONFIG_FILE` and the rest), so the caller's overrides cannot pick
+/// the binary's provider, platform or config. Every runner calls it before
+/// its first `.env`, so the `COYOTE_CONFIG_DIR` / `COYOTE_CACHE_DIR` it sets
+/// afterwards survive.
+fn scrub_coyote_env(cmd: &mut Command) -> &mut Command {
+    scrub_coyote_env_from(cmd, std::env::vars_os().map(|(key, _)| key))
+}
+
+fn scrub_coyote_env_from(
+    cmd: &mut Command,
+    names: impl IntoIterator<Item = OsString>,
+) -> &mut Command {
+    for key in names {
+        if key.to_string_lossy().starts_with("COYOTE_") {
             cmd.env_remove(key);
         }
     }
@@ -1079,6 +1137,7 @@ fn dry_run_until_ask_user_with_prompt(
 ) -> Vec<String> {
     let dir = &scratch.0;
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_coyote"));
+    scrub_coyote_env(&mut cmd);
     cmd.args(["--agent", CANDIDATE, "--dry-run", prompt])
         .current_dir(project)
         .env("HOME", dir.join("home"))
@@ -1345,6 +1404,7 @@ fn dry_run_with_only_xdg_cache_home_puts_the_run_under_the_engines_cache_dir() {
     // `dry_run_until_ask_user` pins `COYOTE_CACHE_DIR` to the scratch dir;
     // this tier needs it absent, so drive the same command line by hand.
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_coyote"));
+    scrub_coyote_env(&mut cmd);
     cmd.args(["--agent", CANDIDATE, "--dry-run", DRY_RUN_PROMPT])
         .current_dir(&project)
         .env("HOME", dir.join("home"))
@@ -2036,6 +2096,7 @@ fn readme_census_row_dead_hygiene_guard_matches_the_shipped_gates() {
 fn info_by_name(scratch: &TempDirGuard, project: &Path, extra: &[&str], label: &str) -> String {
     let dir = &scratch.0;
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_coyote"));
+    scrub_coyote_env(&mut cmd);
     cmd.args(["--agent", CANDIDATE])
         .args(extra)
         .arg("--info")
@@ -3757,10 +3818,11 @@ fn every_llm_node_keeps_the_frozen_anomalies_channel() {
 /// Both batteries drop the agent variables, the tool overrides and the
 /// wrapper's git repository variables themselves, before they import a gate,
 /// so a direct run from a git hook or an agent session is as isolated as a
-/// run through the wrapper. After those drops, and still before the import,
-/// each sets a fixed git author and committer: its scratch `HOME` holds no
-/// identity and git on Linux will not guess one, so every gate commit would
-/// fail on a bare host.
+/// run through the wrapper. They also drop any inherited command-line git
+/// config before they set `user.useConfigOnly`. After those drops, and still
+/// before the import, each sets a fixed git author and committer: its scratch
+/// `HOME` holds no identity, and git refuses to guess one when
+/// `user.useConfigOnly` is set or the host name has no dot.
 #[test]
 fn batteries_drop_the_same_variables_as_the_wrapper() {
     let quoted = fancy_regex::Regex::new(r#""([A-Z_]+)""#).unwrap();
@@ -3784,12 +3846,21 @@ fn batteries_drop_the_same_variables_as_the_wrapper() {
         let git_at = find(&|l| l.starts_with("for _k in (\"GIT_DIR\""), "GIT_ loop");
         let tools_at = find(
             &|l| {
-                l == "for _k in [k for k in os.environ if k == \"ARCHITECT_CORE_TOOLS\" or (k.startswith(\"ARCHITECT_GH_\") and k.endswith(\"_CMD\"))]:"
+                l == "for _k in [k for k in os.environ if k in (\"ARCHITECT_CORE_TOOLS\", \"ARCHITECT_ASK_OWNER_BIN\", \"ARCHITECT_SLACK_PING_BIN\") or (k.startswith(\"ARCHITECT_GH_\") and k.endswith(\"_CMD\"))]:"
             },
-            "ARCHITECT_CORE_TOOLS / ARCHITECT_GH_*_CMD loop",
+            "ARCHITECT_CORE_TOOLS / ARCHITECT_*_BIN / ARCHITECT_GH_*_CMD loop",
+        );
+        let git_config_at = find(
+            &|l| {
+                l == "for _k in [k for k in os.environ if k in (\"GIT_CONFIG_PARAMETERS\", \"GIT_CONFIG_COUNT\") or k.startswith((\"GIT_CONFIG_KEY_\", \"GIT_CONFIG_VALUE_\"))]:"
+            },
+            "GIT_CONFIG_* loop",
         );
         assert!(
-            agent_at < import_at && git_at < import_at && tools_at < import_at,
+            agent_at < import_at
+                && git_at < import_at
+                && tools_at < import_at
+                && git_config_at < import_at,
             "{file} must drop the variables before it imports a gate"
         );
         let identity_at = find(
@@ -3799,6 +3870,16 @@ fn batteries_drop_the_same_variables_as_the_wrapper() {
         assert!(
             agent_at.max(git_at).max(tools_at) < identity_at && identity_at < import_at,
             "{file} must set the git identity after the drops and before it imports a gate"
+        );
+        let use_config_only_at = find(
+            &|l| {
+                l == "os.environ.update({\"GIT_CONFIG_COUNT\": \"1\", \"GIT_CONFIG_KEY_0\": \"user.useConfigOnly\", \"GIT_CONFIG_VALUE_0\": \"true\"})"
+            },
+            "user.useConfigOnly line",
+        );
+        assert!(
+            git_config_at < use_config_only_at && use_config_only_at < import_at,
+            "{file} must drop the inherited GIT_CONFIG_* before it sets its own, and both before it imports a gate"
         );
         let identity: Vec<String> = quoted
             .captures_iter(lines[identity_at])
@@ -3824,6 +3905,7 @@ fn batteries_drop_the_same_variables_as_the_wrapper() {
             (agent_at, "    os.environ.pop(_k)"),
             (git_at, "    os.environ.pop(_k, None)"),
             (tools_at, "    os.environ.pop(_k)"),
+            (git_config_at, "    os.environ.pop(_k)"),
         ] {
             let body = lines[at + 1..]
                 .iter()
@@ -3832,6 +3914,95 @@ fn batteries_drop_the_same_variables_as_the_wrapper() {
             assert_eq!(*body, pop, "{file}: the loop at line {} pops", at + 1);
         }
     }
+}
+
+/// The variables `cmd` sets (`Some`) or removes (`None`) on top of the
+/// inherited environment.
+fn env_overrides(cmd: &Command) -> BTreeMap<String, Option<String>> {
+    cmd.get_envs()
+        .map(|(k, v)| {
+            (
+                k.to_string_lossy().into_owned(),
+                v.map(|v| v.to_string_lossy().into_owned()),
+            )
+        })
+        .collect()
+}
+
+/// The scrub removes every `COYOTE_*` name it is handed and nothing else, and
+/// a variable the builder sets after it survives. The names are passed in, so
+/// the test never touches the parent environment.
+#[test]
+fn scrub_coyote_env_removes_inherited_coyote_vars_but_keeps_later_sets() {
+    let mut cmd = Command::new("true");
+    scrub_coyote_env_from(
+        &mut cmd,
+        [
+            "COYOTE_PROVIDER",
+            "COYOTE_WORKSPACE_CONFIG_DIR",
+            "COYOTE_X_FAKE",
+            "NOT_COYOTE_X_FAKE",
+        ]
+        .map(OsString::from),
+    );
+    cmd.env("COYOTE_CONFIG_DIR", "/scratch");
+    let expected: BTreeMap<String, Option<String>> = [
+        ("COYOTE_CONFIG_DIR", Some("/scratch")),
+        ("COYOTE_PROVIDER", None),
+        ("COYOTE_WORKSPACE_CONFIG_DIR", None),
+        ("COYOTE_X_FAKE", None),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.map(str::to_string)))
+    .collect();
+    assert_eq!(env_overrides(&cmd), expected);
+}
+
+/// Every binary runner scrubs the inherited `COYOTE_*` variables before its
+/// first `.env`; a scrub placed after it would remove the runner's own
+/// `COYOTE_CONFIG_DIR` / `COYOTE_CACHE_DIR`.
+#[test]
+fn every_binary_runner_scrubs_coyote_env_before_its_first_env() {
+    let source = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(file!())).unwrap();
+    let needle = concat!("Command::new(env!(\"CARGO_BIN_EXE_", "coyote\"))");
+    let runners: Vec<usize> = source.match_indices(needle).map(|(at, _)| at).collect();
+    assert!(runners.len() >= 3, "found {} binary runners", runners.len());
+    for at in runners {
+        let rest = &source[at..];
+        let first_env = rest.find(".env(").expect("a binary runner sets no env");
+        let line = source[..at].lines().count() + 1;
+        assert!(
+            rest[..first_env].contains("scrub_coyote_env(&mut cmd);"),
+            "the binary runner at line {line} does not scrub COYOTE_* before its first .env"
+        );
+    }
+}
+
+/// `battery()` drops the inherited command-line git config before it sets its
+/// own `user.useConfigOnly` triple, the order both batteries use.
+#[test]
+fn battery_drops_inherited_git_config_before_it_sets_use_config_only() {
+    let scratch = scratch_dir("gitconfig");
+    let cmd = battery(Path::new("true"), &scratch);
+    let envs = env_overrides(&cmd);
+    for (key, value) in [
+        ("GIT_CONFIG_COUNT", "1"),
+        ("GIT_CONFIG_KEY_0", "user.useConfigOnly"),
+        ("GIT_CONFIG_VALUE_0", "true"),
+    ] {
+        assert_eq!(envs.get(key), Some(&Some(value.to_string())), "{key}");
+    }
+    let source = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(file!())).unwrap();
+    let body = &source[source.find("fn battery(").unwrap()..];
+    let body = &body[..body.find("\n}\n").unwrap()];
+    let drop_at = body
+        .find("without_git_config_vars(&mut cmd);")
+        .expect("battery() does not drop the inherited GIT_CONFIG_*");
+    let inject_at = body.find(".env(\"GIT_CONFIG_COUNT\", \"1\")").unwrap();
+    assert!(
+        drop_at < inject_at,
+        "battery() must drop the inherited GIT_CONFIG_* before it sets its own"
+    );
 }
 
 /// The README's adjustments-table row starting with `prefix`.
@@ -4018,13 +4189,17 @@ fn readme_env_hygiene_and_ledger_rows_match_the_code() {
     let row = adjustments_row("| battery env hygiene |");
     assert!(row.contains("`LLM_AGENT_VAR_*`"), "{row}");
     assert!(row.contains("`ARCHITECT_CORE_TOOLS`"), "{row}");
+    assert!(row.contains("`ARCHITECT_ASK_OWNER_BIN`"), "{row}");
+    assert!(row.contains("`ARCHITECT_SLACK_PING_BIN`"), "{row}");
     assert!(row.contains("`ARCHITECT_GH_*_CMD`"), "{row}");
     for var in GIT_REPO_VARS {
         assert!(row.contains(&format!("`{var}`")), "{var} missing: {row}");
     }
     for clause in [
         "both set a fixed `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME` and `GIT_COMMITTER_EMAIL`",
-        "Neither drops `GIT_CONFIG_COUNT`",
+        "drop `GIT_CONFIG_PARAMETERS` and every inherited `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_*` and `GIT_CONFIG_VALUE_*`",
+        "then set `GIT_CONFIG_COUNT=1`, `GIT_CONFIG_KEY_0=user.useConfigOnly` and `GIT_CONFIG_VALUE_0=true`",
+        "drops every inherited `COYOTE_*` variable",
         "holds an `mcp.json` that defines no server",
     ] {
         assert!(
@@ -4032,6 +4207,10 @@ fn readme_env_hygiene_and_ledger_rows_match_the_code() {
             "the env hygiene row lost {clause:?}: {row}"
         );
     }
+    assert!(
+        !row.contains("Neither drops `GIT_CONFIG_COUNT`"),
+        "the env hygiene row still says the batteries keep GIT_CONFIG_COUNT: {row}"
+    );
 
     let row = adjustments_row("| ledger rollup scope |");
     for clause in [
@@ -4071,8 +4250,12 @@ fn readme_env_hygiene_and_ledger_rows_match_the_code() {
             "{call}"
         );
     }
+    let passes_tasks = fancy_regex::Regex::new(r"\btasks=").unwrap();
     assert_eq!(
-        calls.iter().filter(|c| c.contains("tasks=")).count(),
+        calls
+            .iter()
+            .filter(|c| passes_tasks.is_match(c).unwrap())
+            .count(),
         1,
         "only the group-scoped hygiene call passes --tasks: {calls:#?}"
     );

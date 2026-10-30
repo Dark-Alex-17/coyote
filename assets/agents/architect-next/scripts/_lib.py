@@ -441,7 +441,8 @@ def core_tool(name, timeout=600, **argc):
     path = core_tools_path()
     if not path:
         return False, f"{name}: architect tools.sh not found (LLM_ROOT_DIR unset and no sibling {CORE_TOOLS_REL}/)"
-    env = dict(os.environ)
+    # an inherited argc_* (a stale argc_tasks) would act as an option this call never passed
+    env = {k: v for k, v in os.environ.items() if not k.startswith("argc_")}
     env["LLM_OUTPUT"] = "/dev/stdout"
     env.setdefault("LLM_ROOT_DIR", os.path.abspath(os.path.join(os.path.dirname(path), "..", "..")))
     env["LLM_AGENT_ROOT_DIR"] = os.path.dirname(path)

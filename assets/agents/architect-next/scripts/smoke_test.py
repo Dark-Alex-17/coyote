@@ -37,12 +37,18 @@ for _k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
     # a caller's repository variables (a git hook exports them) would point
     # every scratch-repo git call at the caller's own repository
     os.environ.pop(_k, None)
-for _k in [k for k in os.environ if k == "ARCHITECT_CORE_TOOLS" or (k.startswith("ARCHITECT_GH_") and k.endswith("_CMD"))]:
+for _k in [k for k in os.environ if k in ("ARCHITECT_CORE_TOOLS", "ARCHITECT_ASK_OWNER_BIN", "ARCHITECT_SLACK_PING_BIN") or (k.startswith("ARCHITECT_GH_") and k.endswith("_CMD"))]:
     # a caller's tool overrides would replace the scripts' own tools.sh and gh calls
     os.environ.pop(_k)
-# HOME is a scratch dir, so git has no user identity and on Linux refuses to
-# guess one; every gate that commits inherits this fixed identity instead
+for _k in [k for k in os.environ if k in ("GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT") or k.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))]:
+    # a caller's command-line git config would reach every scratch-repo git call
+    os.environ.pop(_k)
+# HOME is a scratch dir with no git identity. git refuses to guess one when
+# user.useConfigOnly is set or when the host name has no dot (it cannot build an
+# email), so the battery sets useConfigOnly on every host and every gate that
+# commits inherits this fixed identity instead
 os.environ.update({"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+os.environ.update({"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "user.useConfigOnly", "GIT_CONFIG_VALUE_0": "true"})
 
 import gates  # noqa: E402
 import _lib  # noqa: E402
@@ -57,11 +63,8 @@ def check(name, cond, detail=""):
     print(("ok   " if cond else "FAIL ") + name + (f"  ({detail})" if detail and not cond else ""))
 
 
-GIT_ENV = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
-
-
 def git(repo, *a, check_=True):
-    p = subprocess.run(["git", "-C", repo, *a], capture_output=True, text=True, env=GIT_ENV)
+    p = subprocess.run(["git", "-C", repo, *a], capture_output=True, text=True)
     if check_ and p.returncode != 0:
         raise RuntimeError(p.stderr)
     return p.stdout.strip()
@@ -1119,6 +1122,18 @@ calls = core_calls(lambda: gates.pr_body(base_state(plan_path=PROMOTED, tasks=ts
 check("pr_body: PR-group mode -> assemble_pr_body --tasks <the closing group's task ids, comma-separated>", calls == [f"tasks={GROUP_TASKS} plan={PROMOTED}"], str(calls))
 calls = core_calls(lambda: gates.pr_body(base_state(plan_path=PROMOTED, tasks=ts_g, closeout_unit="g1", pr_summary_text="s", body_fix_rounds=RERUN_ONCE)), "assemble_pr_body")
 check("pr_body: single PR -> assemble_pr_body without --tasks", calls == [f"tasks=unset plan={PROMOTED}"], str(calls))
+_argc_prior = {k: os.environ.get(k) for k in ("argc_tasks", "argc_dir")}
+os.environ.update({"argc_tasks": "BOGUS-1,BOGUS-2", "argc_dir": "/nonexistent-argc-dir"})
+try:
+    calls = core_calls(lambda: _lib.core_tool("collect_ledger_lines", plan=PROMOTED), "collect_ledger_lines")
+finally:
+    for _k, _v in _argc_prior.items():
+        if _v is None:
+            os.environ.pop(_k)
+        else:
+            os.environ[_k] = _v
+check("core_tool: an inherited argc_* never reaches tools.sh (a stale argc_tasks would act as --tasks)",
+      calls == [f"tasks=unset plan={PROMOTED}"], str(calls))
 ts_skip = copy.deepcopy(ts_g)
 for t in ts_skip:
     t["status"] = "skipped" if t["id"] == T2 else "complete"
