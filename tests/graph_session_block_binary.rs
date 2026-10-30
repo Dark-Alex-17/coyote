@@ -121,10 +121,22 @@ fn run_echo(dir: &Path) -> Output {
     run_with(dir, &["-a", AGENT, "-e", "hello"])
 }
 
+/// Removes every inherited `COYOTE_*` variable, so a developer's own
+/// override (`COYOTE_CONFIG_FILE` beats the scratch config dir) never
+/// reaches the child; the harness then sets the ones it needs.
+fn scrub_coyote_env(cmd: &mut Command) -> &mut Command {
+    for (key, _) in std::env::vars_os() {
+        if key.to_str().is_some_and(|k| k.starts_with("COYOTE_")) {
+            cmd.env_remove(key);
+        }
+    }
+    cmd
+}
+
 /// The real binary over `dir` with `args`, from a scrubbed env and no TTY.
 fn run_with(dir: &Path, args: &[&str]) -> Output {
     let home = dir.join("home");
-    Command::new(env!("CARGO_BIN_EXE_coyote"))
+    scrub_coyote_env(&mut Command::new(env!("CARGO_BIN_EXE_coyote")))
         .args(args)
         .current_dir(dir)
         .env("COYOTE_CONFIG_DIR", dir)
