@@ -41,7 +41,12 @@ never kills the graph.
 
 import json
 import os
+import sys
 import time
+
+sys.dont_write_bytecode = True
+
+from report_text import one_line
 
 # Keep in sync with default_lanes.ALIASES — a caller-forced lane must
 # canonicalize the same way on the degraded path as it does here.
@@ -295,7 +300,9 @@ def main():
                 "adversary_items": [{"lane": "adversary"}] if "adversary" in lanes else [],
                 "security_items": [{"lane": "security"}] if "security" in lanes else [],
                 "probe_items": [{"lane": "probe"}] if "probe" in lanes else [],
-                "lanes_summary": "\n".join(f"- {r}" for r in reasons),
+                # Each reason is folded before the join: the gate reads one
+                # bullet per line, and a reason may carry model-written text.
+                "lanes_summary": "\n".join(f"- {one_line(r)}" for r in reasons),
                 **stamp,
             }
         )

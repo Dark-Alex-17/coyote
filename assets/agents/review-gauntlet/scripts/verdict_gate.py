@@ -66,6 +66,8 @@ import sys
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".shared"))
 
+from report_text import one_line, table_cell
+
 # Duplicated verbatim in the sibling gate script — the two copies must stay identical.
 ADVERSARY_DEGRADED_HEADER = re.compile(
     r"Criteria: .*("
@@ -93,6 +95,20 @@ def adversary_degraded(report):
             nxt = lines[i + 1] if i + 1 < len(lines) else ""
             return bool(ADVERSARY_DEGRADED_HEADER.match(nxt))
     return False
+
+
+def selection_lines(summary):
+    # build_items writes one `- ` bullet per reason; a continuation line from
+    # any other writer joins the item above it instead of starting a line.
+    items = []
+    for line in summary.splitlines():
+        if line.startswith("- "):
+            items.append(["- ", line[2:]])
+        elif line.strip() and items:
+            items[-1][1] += " " + line
+        elif line.strip():
+            items.append(["", line])
+    return [prefix + one_line(text) for prefix, text in items]
 
 
 def main():
@@ -404,40 +420,51 @@ def main():
     for name in sorted(incomplete):
         if name == "pipeline":
             incomplete_lines.append(
-                f"- pipeline: {signals_error}"
+                f"pipeline: {signals_error}"
                 if pipeline_fault
-                else "- pipeline: review incomplete (no fault text recorded)"
+                else "pipeline: review incomplete (no fault text recorded)"
             )
         elif name == "debris" and debris_incomplete is not None:
-            incomplete_lines.append(f"- debris: {debris_incomplete}")
+            incomplete_lines.append(f"debris: {debris_incomplete}")
         elif n := attempt_count(name):
-            incomplete_lines.append(f"- {name}: no completed review after {n} attempt(s)")
+            incomplete_lines.append(f"{name}: no completed review after {n} attempt(s)")
         else:
-            incomplete_lines.append(f"- {name}: no completed review")
+            incomplete_lines.append(f"{name}: no completed review")
     incomplete_line = (
-        "\nGAUNTLET_REVIEW_INCOMPLETE: " + ", ".join(sorted(incomplete))
+        "\nGAUNTLET_REVIEW_INCOMPLETE: " + ", ".join(one_line(n) for n in sorted(incomplete))
         if incomplete
         else ""
     )
 
+    # Above `## Full lane reports` every interpolated value goes through
+    # report_text, so no state-sourced text can start a header line of its own.
     md = "\n".join(
         ["| lane | status | detail |", "|------|--------|--------|"]
-        + [f"| {lane} | {status} | {detail} |" for lane, (status, detail) in rows.items()]
+        + [
+            f"| {table_cell(lane)} | {status} | {table_cell(detail)} |"
+            for lane, (status, detail) in rows.items()
+        ]
     )
-    md += "\n\n## Lane selection\n" + (state.get("lanes_summary") or "(none recorded)")
+    md += "\n\n## Lane selection\n" + (
+        "\n".join(selection_lines(state.get("lanes_summary") or "")) or "(none recorded)"
+    )
     _notes = state.get("retry_notes")
     if isinstance(_notes, list):
         _shown = [n for n in _notes if isinstance(n, str)][:8]
         if _shown:
-            md += "\n\n## Pipeline notes\n" + "\n".join(f"- {n}" for n in _shown)
+            md += "\n\n## Pipeline notes\n" + "\n".join(f"- {one_line(n)}" for n in _shown)
     if blockers:
-        md += "\n\n## Blockers\n" + "\n".join(f"- {b}" for b in blockers)
+        md += "\n\n## Blockers\n" + "\n".join(f"- {one_line(b)}" for b in blockers)
     if attention:
-        md += "\n\n## Human attention required\n" + "\n".join(f"- {a}" for a in attention)
+        md += "\n\n## Human attention required\n" + "\n".join(
+            f"- {one_line(a)}" for a in attention
+        )
     if state.get("signals_error"):
-        md += f"\n\n> {state['signals_error']}"
+        md += f"\n\n> {one_line(state['signals_error'])}"
     if incomplete_lines:
-        md += "\n\n## Review incomplete\n" + "\n".join(incomplete_lines)
+        md += "\n\n## Review incomplete\n" + "\n".join(
+            f"- {one_line(x)}" for x in incomplete_lines
+        )
     md += "\n\n## Full lane reports\n"
     for lane, rep in reports:
         md += f"\n<details><summary>{lane}</summary>\n\n{rep}\n\n</details>\n"

@@ -35452,12 +35452,17 @@ print(json.dumps({
         let dir = utils::temp_file("-debris-orphan-gate-", "");
         create_dir_all(&dir).unwrap();
         let script = dir.join("verdict_gate.py");
-        std::fs::copy(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("assets/agents/review-gauntlet/scripts/verdict_gate.py"),
-            &script,
-        )
-        .unwrap();
+        // Every install ships report_text.py beside the gate, so only the
+        // `.shared` module is missing from this copy.
+        for name in ["verdict_gate.py", "report_text.py"] {
+            std::fs::copy(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("assets/agents/review-gauntlet/scripts")
+                    .join(name),
+                dir.join(name),
+            )
+            .unwrap();
+        }
         let run = |state: serde_json::Value| -> serde_json::Value {
             let out = Command::new("python3")
                 .arg(&script)
