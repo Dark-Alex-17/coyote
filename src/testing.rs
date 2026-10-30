@@ -217,6 +217,11 @@ impl TestConfigDirGuard {
     /// files above the pinned workspace root without touching the shared
     /// system temp dir.
     pub(crate) fn new_under(label: &str, base: &Path) -> Self {
+        assert!(
+            base.is_absolute(),
+            "the guard's base dir must be absolute, got {}",
+            base.display()
+        );
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -400,18 +405,26 @@ mod tests {
     /// the developer's real workspace memory or config dir through a raw
     /// ancestor walk or a private guard that skips the pins. Each line is
     /// judged by the scope it sits in (a `#[cfg(test)]` item, a file declared
-    /// as a `#[cfg(test)]` module, the innermost `fn`), not by its file. The
-    /// needles are split so this file's own source does not match them.
+    /// as a `#[cfg(test)]` module, the innermost `fn`), not by its file.
+    /// Walker and `--init-memory` helper names are matched as identifier
+    /// tokens on the line with literals and comments blanked, so a point-free
+    /// use or an aliased import counts and a mention in a string or comment
+    /// does not. Outside memory.rs's own `#[cfg(test)]` code they are allowed
+    /// only in the fns of `RAW_WALK_HOMES` and `GIT_ROOT_ALLOW`, and the
+    /// helpers also in src/main.rs. The guard struct and config dir needles
+    /// match raw text and are split so this file's own source does not match
+    /// them.
     #[test]
     fn no_source_file_bypasses_the_workspace_memory_pin() {
-        const RAW_WALK: &str = concat!("walk_workspace", "_memory");
+        const RAW_WALK: &str = "walk_workspace_memory";
         const RAW_WALK_HOMES: [&str; 2] = [RAW_WALK, "find_workspace_memory"];
         const GUARD_DEFINITION: &str = concat!("struct TestConfig", "DirGuard");
         const CONFIG_DIR_ENV: &str = concat!("env_name(\"config", "_dir\")");
-        const GIT_ROOT_WALKS: [&str; 2] = [
-            concat!("find_git", "_root("),
-            concat!("find_git", "_root_within("),
-        ];
+        const GIT_ROOT_WALKS: [&str; 2] = ["find_git_root", "find_git_root_within"];
+        // Unbounded on purpose: they serve the explicit `--init-memory`
+        // command in src/main.rs.
+        const INIT_MEMORY_HELPERS: [&str; 2] =
+            ["init_workspace_root", "write_workspace_memory_index"];
         // The walker's own definitions and the explicit `--init-memory`
         // command, which roots the store at the real git root on purpose.
         const GIT_ROOT_ALLOW: [(&str, &str); 6] = [
@@ -469,7 +482,7 @@ mod tests {
                 let enclosing_fn = line.enclosing_fn.as_deref().unwrap_or_default();
                 let text = line.text;
                 let at = format!("src/{}:{}", relative.display(), line.number);
-                if text.contains(RAW_WALK)
+                if names_any(&line.code, &[RAW_WALK])
                     && !(is("config/memory.rs")
                         && (in_test || RAW_WALK_HOMES.contains(&enclosing_fn)))
                 {
@@ -500,14 +513,41 @@ mod tests {
                     || GIT_ROOT_ALLOW
                         .iter()
                         .any(|&(file, allowed)| is(file) && enclosing_fn == allowed);
-                if GIT_ROOT_WALKS.iter().any(|walk| text.contains(walk)) && !allowed_git_root_walk {
+                if names_any(&line.code, &GIT_ROOT_WALKS) && !allowed_git_root_walk {
                     offences.push(format!(
                         "{at}: raw git root walk; call memory::find_workspace_git_root, or memory::find_git_root_under in tests"
+                    ));
+                }
+                let allowed_init_memory_call = is("main.rs")
+                    || (is("config/memory.rs")
+                        && (in_test || INIT_MEMORY_HELPERS.contains(&enclosing_fn)));
+                if names_any(&line.code, &INIT_MEMORY_HELPERS) && !allowed_init_memory_call {
+                    offences.push(format!(
+                        "{at}: unbounded --init-memory helper outside the explicit command in src/main.rs"
                     ));
                 }
             }
         }
         assert!(offences.is_empty(), "{}", offences.join("\n"));
+    }
+
+    #[test]
+    fn names_any_matches_identifier_tokens_outside_literals_and_comments() {
+        const WALKS: [&str; 2] = ["find_git_root", "find_git_root_within"];
+        for line in [
+            "let root = cwd.and_then(memory::find_git_root);",
+            "use crate::config::memory::find_git_root as root;",
+            "let r = find_git_root_within(a, None);",
+        ] {
+            assert!(names_any(&code_only(line), &WALKS), "{line}");
+        }
+        for line in [
+            "let s = \"find_git_root\";",
+            "// find_git_root here",
+            "find_git_root_under(a, b)",
+        ] {
+            assert!(!names_any(&code_only(line), &WALKS), "{line}");
+        }
     }
 
     #[test]
@@ -662,6 +702,8 @@ mod tests {
     struct ScopedLine<'a> {
         number: usize,
         text: &'a str,
+        /// `text` with literals and comments blanked.
+        code: String,
         in_test: bool,
         enclosing_fn: Option<String>,
     }
@@ -769,6 +811,7 @@ mod tests {
             lines.push(ScopedLine {
                 number: index + 1,
                 text,
+                code: code.to_string(),
                 in_test: scope.in_test,
                 enclosing_fn: scope.enclosing_fn.clone(),
             });
@@ -875,6 +918,11 @@ mod tests {
             out.push(&code[start..end]);
         }
         out
+    }
+
+    /// Whether `code` holds any of `names` as a whole identifier token.
+    fn names_any(code: &str, names: &[&str]) -> bool {
+        tokens(code).iter().any(|token| names.contains(token))
     }
 
     fn is_ident(token: &str) -> bool {

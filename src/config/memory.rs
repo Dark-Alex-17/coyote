@@ -108,7 +108,7 @@ fn walk_workspace_memory(start: &Path, ceiling: Option<&Path>) -> Option<Workspa
     None
 }
 
-pub fn find_git_root(start: &Path) -> Option<PathBuf> {
+fn find_git_root(start: &Path) -> Option<PathBuf> {
     find_git_root_within(start, None)
 }
 
