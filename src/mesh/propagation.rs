@@ -21,7 +21,7 @@ use lxmf_core::stamp::{
     PROPAGATION_STAMP_SIZE, generate_propagation_stamp_with_value_until_cancelled,
 };
 use rns_transport::PacketContext;
-use rns_transport::destination::link::{Link, LinkEvent, LinkEventData, LinkId};
+use rns_transport::destination::link::{Link, LinkEvent, LinkEventData, LinkId, LinkStatus};
 use rns_transport::destination::{DestinationDesc, DestinationName, SingleOutputDestination};
 use rns_transport::hash::{AddressHash, Hash};
 use rns_transport::identity::Identity;
@@ -66,7 +66,8 @@ pub(crate) const PROPAGATION_TRANSFER_TIMEOUT: Duration = Duration::from_secs(60
 pub(crate) const PROPAGATION_REJECT_WINDOW: Duration = Duration::from_secs(2);
 
 /// Bounds the cancel sent for a resource a post gave up on before its outcome resolved;
-/// the transport is asked once and, past this, the out-link is reset instead.
+/// the transport is asked once and, past this, the out-link is reset instead. The reset
+/// is deliberately left unbounded, since it must finish before the post returns.
 const PROPAGATION_CANCEL_GRACE: Duration = Duration::from_secs(2);
 
 /// Aspect of the destination a propagation node serves clients on (`LXMRouter.py:173`) and
@@ -479,8 +480,8 @@ pub(crate) async fn prepare_envelope(
 /// Calls for the same node must be serialised by the caller: the refusal sentinel and the
 /// teardown carry no message id and the out-link is shared, so two concurrent posts could
 /// not tell whose verdict arrived (the reference holds one `for_lxmessage` per link,
-/// `LXMRouter.py:2725`). That serialisation is enough because a resource abandoned on a
-/// cancel or timeout is cancelled, or its out-link reset, before this returns, so no
+/// `LXMRouter.py:2725`). That serialisation is enough because a resource the post leaves
+/// unresolved, on any exit, is cancelled or its out-link reset before this returns, so no
 /// later post can read its teardown. `propagation_enabled` is deliberately not checked
 /// here; the node picker owns that decision.
 pub(crate) async fn propagate(
@@ -514,7 +515,22 @@ pub(crate) async fn send_envelope(
         Deadline::after(options.link_timeout),
     )
     .await?;
-    let mut in_flight = None;
+    send_on_link(transport, node, &link, prepared, cancel, options).await
+}
+
+/// `send_envelope` once the link is open. Split out so a test can close the link in the
+/// gap between opening it and watching it.
+async fn send_on_link(
+    transport: &Transport,
+    node: &PropagationNode,
+    link: &Arc<tokio::sync::Mutex<Link>>,
+    prepared: &PreparedEnvelope,
+    cancel: CancellationToken,
+    options: &PropagationOptions,
+) -> Result<(), PropagationError> {
+    let mut started = None;
+    let mut sent = None;
+    let mut resolved = false;
     let transfer = async {
         let (link_id, mdu) = {
             let link = link.lock().await;
@@ -529,15 +545,24 @@ pub(crate) async fn send_envelope(
             short(&node_hex)
         );
         let mut link_events = transport.out_link_events();
+        still_active(link.lock().await.status())?;
         match representation {
-            SizeBranch::Packet => send_packet(transport, &link, &prepared.envelope).await?,
+            SizeBranch::Packet => send_packet(transport, link, &prepared.envelope).await?,
             SizeBranch::Resource => {
+                // Marked before the call: the transport tracks the resource and sends its
+                // advertisement before the call returns the hash.
+                started = Some(link_id);
                 // Compression on, as plain `send_resource` has it, so the wire is the same.
                 let (hash, outcome) = transport
                     .send_resource_with_outcome(&link_id, prepared.envelope.clone(), None, true)
                     .await
                     .map_err(|err| RequestError::Send(format!("propagation resource: {err}")))?;
-                in_flight = Some((link_id, hash));
+                sent = Some(hash);
+                let outcome = async {
+                    let result = outcome.await;
+                    resolved = true;
+                    result
+                };
                 drain_during_transfer(outcome, &mut link_events, link_id).await?;
                 debug!(
                     "Mesh propagation resource {} was received on link {}",
@@ -562,14 +587,14 @@ pub(crate) async fn send_envelope(
     let (link_events, link_id) = match transferred {
         Ok(sent) => sent,
         Err(err) => {
-            // Only the cancel and the timeout drop the transfer before its outcome resolves;
-            // a resource left running there would hand its teardown to the next post.
-            if let (
-                PropagationError::Cancelled | PropagationError::Link(RequestError::Timeout { .. }),
-                Some((link_id, hash)),
-            ) = (&err, in_flight)
-            {
-                abandon_transfer(transport, link_id, hash, &node.destination.address_hash).await;
+            // A resource left running here would hand its teardown to the next post.
+            let destination = &node.destination.address_hash;
+            match abandon_action(started, sent, resolved, &err) {
+                Abandon::Nothing => {}
+                Abandon::Cancel(link_id, hash) => {
+                    abandon_transfer(transport, link_id, hash, destination).await;
+                }
+                Abandon::Reset => reset_after_abandon(transport, destination).await,
             }
             return Err(err);
         }
@@ -577,10 +602,53 @@ pub(crate) async fn send_envelope(
     watch_reject_window(link_events, link_id, options.reject_window, &cancel).await
 }
 
+/// What a failed post owes a resource it may have left running on the link.
+#[derive(Debug, PartialEq, Eq)]
+enum Abandon {
+    Nothing,
+    Cancel(LinkId, Hash),
+    /// The resource may be tracked on the link but its hash never came back, so there is
+    /// nothing to name in a cancel.
+    Reset,
+}
+
+/// `started` is the link a resource send was begun on, `sent` its hash once the transport
+/// returned it, and `resolved` whether its outcome produced the verdict. An unresolved
+/// closed link can only be a close seen on that link, and the link's resource state goes
+/// with it.
+fn abandon_action(
+    started: Option<LinkId>,
+    sent: Option<Hash>,
+    resolved: bool,
+    err: &PropagationError,
+) -> Abandon {
+    let Some(link_id) = started else {
+        return Abandon::Nothing;
+    };
+    if resolved || *err == PropagationError::Link(RequestError::LinkClosed) {
+        return Abandon::Nothing;
+    }
+    match sent {
+        Some(hash) => Abandon::Cancel(link_id, hash),
+        None => Abandon::Reset,
+    }
+}
+
+/// A link that closed before its events were subscribed left no event for the watch to
+/// read, so its status is the only sign of it; a close after the subscribe is buffered.
+fn still_active(status: LinkStatus) -> Result<(), RequestError> {
+    if status == LinkStatus::Active {
+        Ok(())
+    } else {
+        Err(RequestError::LinkClosed)
+    }
+}
+
 /// Cancels a resource the post gave up on, so the node does not store a message the caller
 /// was told failed. When the cancel errs or outlasts `PROPAGATION_CANCEL_GRACE`, the
 /// out-link to `destination` is reset instead, so the next post opens a fresh link rather
-/// than reading this transfer's teardown as its own verdict.
+/// than reading this transfer's teardown as its own verdict. The reset itself is not
+/// bounded: it has to finish before the caller's posting slot is released.
 async fn abandon_transfer(
     transport: &Transport,
     link_id: LinkId,
@@ -604,12 +672,16 @@ async fn abandon_transfer(
         link_id.to_hex_string()
     );
     if !settled {
-        transport.reset_out_link(destination).await;
-        debug!(
-            "Mesh propagation out-link to {} reset after an abandoned resource",
-            short(&destination.to_hex_string())
-        );
+        reset_after_abandon(transport, destination).await;
     }
+}
+
+async fn reset_after_abandon(transport: &Transport, destination: &AddressHash) {
+    transport.reset_out_link(destination).await;
+    warn!(
+        "Mesh propagation out-link to {} reset after an abandoned resource",
+        short(&destination.to_hex_string())
+    );
 }
 
 async fn send_packet(
@@ -1908,6 +1980,79 @@ mod tests {
         }
 
         #[test]
+        fn a_resource_left_unresolved_is_cancelled_or_its_link_reset() {
+            let link_id = AddressHash::new_from_rand(OsRng);
+            let hash = Hash::new_from_rand(OsRng);
+            let unresolved_exits = [
+                PropagationError::Cancelled,
+                PropagationError::Link(RequestError::Timeout {
+                    path: PROPAGATION_PATH_LABEL.to_string(),
+                    after: Duration::from_secs(1),
+                }),
+                PropagationError::RejectedByNode(RefusalCode::InvalidStamp),
+                PropagationError::Link(RequestError::Shutdown),
+                PropagationError::Link(RequestError::Send("propagation resource".to_string())),
+            ];
+            for err in &unresolved_exits {
+                assert_eq!(
+                    abandon_action(Some(link_id), Some(hash), false, err),
+                    Abandon::Cancel(link_id, hash),
+                    "{err:?}"
+                );
+                assert_eq!(
+                    abandon_action(Some(link_id), None, false, err),
+                    Abandon::Reset,
+                    "{err:?}"
+                );
+                assert_eq!(
+                    abandon_action(Some(link_id), Some(hash), true, err),
+                    Abandon::Nothing,
+                    "{err:?}"
+                );
+                assert_eq!(
+                    abandon_action(None, None, false, err),
+                    Abandon::Nothing,
+                    "{err:?}"
+                );
+            }
+            assert_eq!(
+                abandon_action(
+                    Some(link_id),
+                    Some(hash),
+                    false,
+                    &PropagationError::Link(RequestError::LinkClosed)
+                ),
+                Abandon::Nothing
+            );
+            assert_eq!(
+                abandon_action(
+                    Some(link_id),
+                    Some(hash),
+                    true,
+                    &PropagationError::TransferFailed
+                ),
+                Abandon::Nothing
+            );
+        }
+
+        #[test]
+        fn only_an_active_link_is_still_open() {
+            assert_eq!(still_active(LinkStatus::Active), Ok(()));
+            for status in [
+                LinkStatus::Pending,
+                LinkStatus::Handshake,
+                LinkStatus::Stale,
+                LinkStatus::Closed,
+            ] {
+                assert_eq!(
+                    still_active(status),
+                    Err(RequestError::LinkClosed),
+                    "{status:?}"
+                );
+            }
+        }
+
+        #[test]
         fn every_error_reads_as_its_sentence() {
             let cases = [
                 (
@@ -2057,6 +2202,8 @@ mod tests {
         struct Relay {
             port: u16,
             node_bound: Arc<tokio::sync::Mutex<()>>,
+            /// Node-bound chunks read from the poster, held or not.
+            chunks: Arc<AtomicUsize>,
             accept: JoinHandle<()>,
         }
 
@@ -2065,17 +2212,20 @@ mod tests {
                 let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let port = listener.local_addr().unwrap().port();
                 let node_bound = Arc::new(tokio::sync::Mutex::new(()));
+                let chunks = Arc::new(AtomicUsize::new(0));
                 let gate = node_bound.clone();
+                let counter = chunks.clone();
                 let accept = tokio::spawn(async move {
                     loop {
                         let (poster, _) = listener.accept().await.unwrap();
                         let node = TcpStream::connect(("127.0.0.1", node_port)).await.unwrap();
-                        tokio::spawn(Self::forward(poster, node, gate.clone()));
+                        tokio::spawn(Self::forward(poster, node, gate.clone(), counter.clone()));
                     }
                 });
                 Self {
                     port,
                     node_bound,
+                    chunks,
                     accept,
                 }
             }
@@ -2086,6 +2236,7 @@ mod tests {
                 poster: TcpStream,
                 node: TcpStream,
                 gate: Arc<tokio::sync::Mutex<()>>,
+                chunks: Arc<AtomicUsize>,
             ) {
                 let (mut from_poster, mut to_poster) = poster.into_split();
                 let (mut from_node, mut to_node) = node.into_split();
@@ -2096,6 +2247,7 @@ mod tests {
                         if n == 0 {
                             break Ok::<(), std::io::Error>(());
                         }
+                        chunks.fetch_add(1, Ordering::SeqCst);
                         let _open = gate.lock().await;
                         to_node.write_all(&buf[..n]).await?;
                     }
@@ -2541,6 +2693,125 @@ mod tests {
                     .is_none()
             );
             assert_eq!(link.lock().await.status(), LinkStatus::Closed);
+            post.stop().await;
+        }
+
+        /// The relay holds the advertisement back, so the resource is still unresolved
+        /// when the node's refusal reaches the poster; the refusal must not leave it
+        /// running on the link.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_sentinel_during_a_resource_cancels_the_resource() {
+            let mut post = Post::start_relayed(1, 2000).await;
+            post.propagate(&message(b"warm")).await.unwrap();
+            assert!(matches!(
+                post.node.next_received().await,
+                Received::Packet { .. }
+            ));
+            let link_id = *open_link(
+                &post.client.transport,
+                &post.learned.destination,
+                PROPAGATION_PATH_LABEL,
+                Deadline::after(post.options.link_timeout),
+            )
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .id();
+
+            let mut client_events = post.client.transport.resource_events();
+            let mut node_events = post.node.transport.resource_events();
+            let relay = post.relay.as_ref().unwrap();
+            let held = relay.hold().await;
+            let before = relay.chunks.load(Ordering::SeqCst);
+            let chunks = relay.chunks.clone();
+            let node_transport = post.node.transport.clone();
+            // The advertisement leaves the poster after its link events are subscribed,
+            // so a refusal sent once it is seen is buffered for the transfer watch.
+            let refuse = tokio::spawn(async move {
+                wait_until("the advertisement to reach the relay", || {
+                    chunks.load(Ordering::SeqCst) > before
+                })
+                .await;
+                let mut signal = Vec::new();
+                rmpv::encode::write_value(
+                    &mut signal,
+                    &rmpv::Value::Array(vec![RefusalCode::InvalidStamp.to_wire()]),
+                )
+                .unwrap();
+                let link = node_transport
+                    .find_in_link(&link_id)
+                    .await
+                    .expect("the node still has the in-link");
+                let packet = link.lock().await.data_packet(&signal).unwrap();
+                node_transport
+                    .send_link_packet_on_bound_iface(&link, packet)
+                    .await;
+            });
+
+            let outcome = timeout(INTEROP_TIMEOUT, post.propagate(&message(&[b'z'; 100_000])))
+                .await
+                .expect("the refused post must end inside the interop bound")
+                .err();
+            assert_eq!(
+                outcome,
+                Some(PropagationError::RejectedByNode(RefusalCode::InvalidStamp))
+            );
+            refuse.await.unwrap();
+            let cancelled = cancelled_at_the_client(&mut client_events).await;
+
+            drop(held);
+            assert_eq!(cancelled_at_the_node(&mut node_events).await, cancelled);
+            post.node.nothing_else_received();
+            post.stop().await;
+        }
+
+        /// A link that closes after it is opened but before its events are subscribed
+        /// leaves no `Closed` event for the post to read, and the transport still sends a
+        /// packet onto it, so only its status keeps the post from reading as delivered.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_link_closed_before_the_watch_is_a_closed_link() {
+            let mut post = Post::start(1, DEFAULT_LIMIT_KB).await;
+            post.propagate(&message(b"warm")).await.unwrap();
+            assert!(matches!(
+                post.node.next_received().await,
+                Received::Packet { .. }
+            ));
+            let link = open_link(
+                &post.client.transport,
+                &post.learned.destination,
+                PROPAGATION_PATH_LABEL,
+                Deadline::after(post.options.link_timeout),
+            )
+            .await
+            .unwrap();
+            post.client
+                .transport
+                .reset_out_link(&post.learned.destination.address_hash)
+                .await;
+
+            let prepared = prepare_envelope(
+                &post.sender,
+                &recipient_of(&post.recipient),
+                &post.learned,
+                &message(b"late"),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let outcome = send_on_link(
+                &post.client.transport,
+                &post.learned,
+                &link,
+                &prepared,
+                post.cancel.clone(),
+                &post.options,
+            )
+            .await;
+            assert_eq!(
+                outcome,
+                Err(PropagationError::Link(RequestError::LinkClosed))
+            );
             post.stop().await;
         }
 
