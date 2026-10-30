@@ -789,9 +789,26 @@ fn agent_quoted_command(rel: &str, needle: &str) -> String {
     command
 }
 
+/// A caller running inside a git hook or a worktree can export repository
+/// variables that would point every scratch-repo git call (direct, or made by
+/// a scanned recipe or script) at the caller's own repository instead.
+#[cfg(unix)]
+fn without_git_repo_vars(cmd: &mut Command) -> &mut Command {
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_COMMON_DIR",
+    ] {
+        cmd.env_remove(key);
+    }
+    cmd
+}
+
 #[cfg(unix)]
 fn sh(cwd: &Path, command: &str) -> std::process::Output {
-    Command::new("sh")
+    without_git_repo_vars(&mut Command::new("sh"))
         .arg("-c")
         .arg(command)
         .current_dir(cwd)
@@ -803,7 +820,7 @@ fn sh(cwd: &Path, command: &str) -> std::process::Output {
 
 #[cfg(unix)]
 fn git(repo: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
+    let out = without_git_repo_vars(&mut Command::new("git"))
         .arg("-C")
         .arg(repo)
         .args([
@@ -834,7 +851,7 @@ fn debt_scan_full(
 ) -> (Option<i32>, String, String) {
     let scanner =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared/debt_scan.py");
-    let out = Command::new("python3")
+    let out = without_git_repo_vars(&mut Command::new("python3"))
         .arg(&scanner)
         .arg("--dir")
         .arg(repo)
