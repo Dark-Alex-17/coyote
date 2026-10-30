@@ -1653,12 +1653,13 @@ clients:
     #[test]
     fn config_template_and_example_child_sessions_blocks_are_byte_identical() {
         let example = include_str!("../../config.example.yaml");
+        let example_lf = example.replace("\r\n", "\n");
         let block = child_sessions_block(CONFIG_TEMPLATE);
         assert!(block.ends_with("not settable with .set)\n"), "{block}");
         assert_eq!(block, child_sessions_block(example));
         assert_eq!(
             block,
-            child_sessions_block(&example.replace('\n', "\r\n")),
+            child_sessions_block(&example_lf.replace('\n', "\r\n")),
             "a CRLF checkout of the example compares as the same block"
         );
         assert!(block.contains(CHILD_SESSIONS_SPAWN_PHRASE), "{block}");
