@@ -135,6 +135,8 @@ ok "rnsd's python imports ssl and cryptography"
 
 # 5b. The shared instance Coyote attaches to as `type: local` answers on its abstract
 # socket (Linux: @rns/default; the 37428 port is inert there).
+# The probe is expanded by `bash -c` inside the container, as in step 5.
+# shellcheck disable=SC2016
 wait_exec "$t" '"$(sed -n "1s/^#!//p" "$(command -v rnsd)")" -c "import socket; s = socket.socket(socket.AF_UNIX); s.connect(\"\\0rns/default\")"' \
   || fail_with_logs "$t" "the shared instance @rns/default did not answer within 30 s"
 ok "rnsd's shared instance answers on @rns/default"
