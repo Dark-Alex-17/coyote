@@ -16721,6 +16721,32 @@ mod tests {
 
     #[test]
     #[serial]
+    fn abandon_fork_removes_the_copied_children_and_leaves_the_original_alone() {
+        let _config = TestConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("abandon-children");
+        let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
+        let old_uid = root_uid(&root);
+        let sid = "sess_coder_0123456789ab";
+        write_child(&root, sid, retention_time());
+        let before = child_bytes(&root, sid);
+
+        let pending = ctx.prepare_fork(Some("abandon-children-fork")).unwrap();
+        let fork_path = ctx.session_file_for("abandon-children-fork", SessionScope::Workspace);
+        let on_disk: Session = serde_yaml::from_str(&read_to_string(&fork_path).unwrap()).unwrap();
+        let new_root = ChildSessionRoot::Uid(on_disk.uid().expect("the fork carries a new uid"));
+        assert!(new_root.dir().is_dir());
+
+        ctx.abandon_fork(pending);
+
+        assert!(!fork_path.exists());
+        assert!(!new_root.dir().exists());
+        assert_eq!(child_bytes(&root, sid), before);
+        assert_eq!(session_uid(&ctx), Some(old_uid));
+        assert!(ctx.child_session_root.is_some());
+    }
+
+    #[test]
+    #[serial]
     fn fork_session_of_a_session_without_children_drops_the_uid_and_creates_no_dir() {
         let _config = TestConfigDirGuard::new();
         let (mut ctx, path) = loaded_session_ctx("fork-childless");
