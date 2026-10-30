@@ -1550,7 +1550,7 @@ fn with_test_hook<T>(
 
 /// `with_test_hook` at `before_seat_flush`, so a test can make the
 /// session write fail.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn with_hook_before_seat_flush<T>(hook: impl FnOnce() + 'static, f: impl FnOnce() -> T) -> T {
     with_test_hook(&BEFORE_SEAT_FLUSH, hook, f)
 }
@@ -5974,6 +5974,7 @@ mod tests {
 
     /// A spawner whose one client, `openai`, is the one its model names, so
     /// a child seated from it has a client to echo through.
+    #[cfg(unix)]
     fn echoing_spawner() -> RequestContext {
         let mut client_config = crate::client::ClientConfig::default();
         if let crate::client::ClientConfig::OpenAIConfig(config) = &mut client_config {
@@ -5996,6 +5997,7 @@ mod tests {
     /// provider: built while `ctx` is briefly dry-run, which the client
     /// reads off the input. The context itself keeps dry-run off, so the
     /// turn still records the exchange and flushes the session.
+    #[cfg(unix)]
     fn echoing_input(ctx: &mut RequestContext, prompt: &str) -> Input {
         let live = Arc::clone(&ctx.app);
         ctx.app = Arc::new(AppState {
