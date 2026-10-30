@@ -129,7 +129,9 @@ fn transcript(total: usize) -> String {
 }
 
 fn bash() -> Command {
-    Command::new(bash_program().expect("bash resolved by tools_missing"))
+    let mut cmd = Command::new(bash_program().expect("bash resolved by tools_missing"));
+    cmd.env("PYTHONDONTWRITEBYTECODE", "1");
+    cmd
 }
 
 fn run(output: Output) -> (i32, String, String) {
@@ -1139,6 +1141,7 @@ fn adversary_run_checks_runs_declared_commands_under_build_lock() {
             .env("GRAPH_STATE_FILE", &state_file)
             .env("ADVERSARY_STACK_LOCK_PATH", dir.0.join("stack.lock"))
             .env_remove("GRAPH_STATE")
+            .env("PYTHONDONTWRITEBYTECODE", "1")
             .env("LLM_AGENT_VAR_BUILD_LOCK", "env GATE_SEEN=leaked")
             .output()
             .expect("spawn python3");
@@ -1187,6 +1190,7 @@ fn adversary_run_checks_runs_declared_commands_under_build_lock() {
         .env("GRAPH_STATE_FILE", &state_file)
         .env("ADVERSARY_STACK_LOCK_PATH", dir.0.join("stack.lock"))
         .env_remove("GRAPH_STATE")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
         .output()
         .expect("spawn python3");
     let (code, stdout, stderr) = run(out);
@@ -1234,6 +1238,7 @@ fn adversary_verdict_names_the_prefix_a_verification_run_was_under() {
         .env("GRAPH_STATE_FILE", &state_file)
         .env("ADVERSARY_STACK_LOCK_PATH", dir.0.join("stack.lock"))
         .env_remove("GRAPH_STATE")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
         .output()
         .expect("spawn python3");
     let (code, stdout, stderr) = run(out);
@@ -1335,6 +1340,7 @@ fn assemble_pr_body_with(
         .arg(dir.join("summary.md"))
         .arg("--followups")
         .args(extra_args)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
         .envs(envs.iter().copied())
         .output()
         .expect("spawn python3"))

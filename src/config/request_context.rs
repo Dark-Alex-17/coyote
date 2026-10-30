@@ -8213,6 +8213,7 @@ mod tests {
             let out = Command::new("python3")
                 .arg(agents.join(wrapper))
                 .env("GRAPH_STATE", state.to_string())
+                .env("PYTHONDONTWRITEBYTECODE", "1")
                 .env_remove("GRAPH_STATE_FILE")
                 .output()
                 .unwrap();
@@ -23172,6 +23173,7 @@ mod tests {
         cmd.arg(&path)
             .env("GRAPH_STATE", state.to_string())
             .env("ADVERSARY_STACK_LOCK_PATH", &lock_path)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
             .env_remove("GRAPH_STATE_FILE");
         cmd
     }
@@ -25439,6 +25441,7 @@ mod tests {
         let mut cmd = Command::new("python3");
         cmd.arg(&path)
             .env("GRAPH_STATE", state.to_string())
+            .env("PYTHONDONTWRITEBYTECODE", "1")
             .env_remove("GRAPH_STATE_FILE")
             .envs(envs.iter().copied());
         let out = cmd
@@ -28187,6 +28190,7 @@ print(json.dumps({
         let out = Command::new("python3")
             .arg("-c")
             .arg(HARNESS)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
             .env(
                 "GRAPH_STATE",
                 json!({"project_dir": dir.to_string_lossy(), "diff_spec": "worktree"}).to_string(),
@@ -28432,6 +28436,7 @@ print(json.dumps({
         let out = Command::new("python3")
             .arg(&path)
             .env("GRAPH_STATE", state.to_string())
+            .env("PYTHONDONTWRITEBYTECODE", "1")
             .env_remove("GRAPH_STATE_FILE")
             .output()
             .expect("failed to invoke python3 build_items.py");
@@ -28958,6 +28963,7 @@ print(json.dumps({
         let out = Command::new("python3")
             .arg(&path)
             .env("GRAPH_STATE", raw_state)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
             .env_remove("GRAPH_STATE_FILE")
             .envs(envs.iter().copied())
             .output()
@@ -30139,6 +30145,7 @@ print(json.dumps({
         let out = Command::new("python3")
             .arg(&path)
             .env("GRAPH_STATE", raw_state)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
             .env_remove("GRAPH_STATE_FILE")
             .output()
             .unwrap_or_else(|e| panic!("failed to invoke python3 {script}: {e}"));
@@ -31257,6 +31264,7 @@ print(json.dumps({
         let out = Command::new("python3")
             .arg(&path)
             .env("GRAPH_STATE", raw_state)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
             .env_remove("GRAPH_STATE_FILE")
             .output()
             .unwrap_or_else(|e| panic!("failed to invoke python3 {script}: {e}"));
@@ -34809,6 +34817,7 @@ print(json.dumps({
         Command::new("python3")
             .arg(&cli)
             .args(args)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
             .output()
             .unwrap()
     }

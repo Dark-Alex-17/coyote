@@ -823,8 +823,10 @@ fn git(repo: &Path, args: &[&str]) -> String {
 
 /// Runs the shared debt scanner the way both sweep twins do (`--dir <repo>
 /// --base <base>`), from `cwd`, with git's global/system config disabled so
-/// only the scratch repo's own config shapes the diff. Returns (exit code,
-/// stdout, stderr).
+/// only the scratch repo's own config shapes the diff, and with any inherited
+/// `GRAPH_STATE` / `GRAPH_STATE_FILE` dropped so a run inside a graph node
+/// does not flip the scanner into graph mode. Returns (exit code, stdout,
+/// stderr).
 #[cfg(unix)]
 fn debt_scan_full(
     cwd: &Path,
@@ -843,6 +845,9 @@ fn debt_scan_full(
         .current_dir(cwd)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env_remove("GRAPH_STATE")
+        .env_remove("GRAPH_STATE_FILE")
         .envs(envs.iter().copied())
         .output()
         .unwrap();
