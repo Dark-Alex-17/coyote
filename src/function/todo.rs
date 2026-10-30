@@ -236,7 +236,10 @@ pub fn handle_todo_tool(ctx: &mut RequestContext, cmd_name: &str, args: &Value) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::todo::TodoItem;
     use crate::config::{AppConfig, AppState, WorkingMode};
+    use crate::events::Event;
+    use serial_test::serial;
     use std::sync::Arc;
 
     #[test]
@@ -254,6 +257,99 @@ mod tests {
         let error = result["error"].as_str().unwrap();
         assert!(error.contains("requires an active session"));
         assert!(ctx.auto_continue_paused.is_none());
+    }
+
+    fn auto_continue_ctx() -> RequestContext {
+        let mut app_state = AppState::test_default();
+        app_state.config = Arc::new(AppConfig {
+            auto_continue: true,
+            ..AppConfig::default()
+        });
+        RequestContext::new(Arc::new(app_state), WorkingMode::Cmd)
+    }
+
+    fn todo_updates(recording: &crate::events::RecordingSink) -> Vec<Vec<TodoItem>> {
+        recording
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::TodoUpdated { items } => Some(items),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn bearing<'a>(updates: &'a [Vec<TodoItem>], desc: &str) -> Vec<&'a Vec<TodoItem>> {
+        updates
+            .iter()
+            .filter(|items| items.iter().any(|item| item.desc == desc))
+            .collect()
+    }
+
+    #[test]
+    #[serial]
+    fn mutating_actions_publish_todo_updated_and_list_does_not() {
+        const PROBE: &str = "todo-probe-x7x";
+        let mut ctx = auto_continue_ctx();
+        let recording = crate::events::RecordingSink::install();
+
+        handle_todo_tool(&mut ctx, "todo__init", &json!({"goal": "g"})).unwrap();
+        handle_todo_tool(&mut ctx, "todo__add", &json!({"task": PROBE})).unwrap();
+
+        let updates = todo_updates(&recording);
+        let probe = bearing(&updates, PROBE);
+        let last = probe.last().expect("todo__add publishes the new list");
+        assert_eq!(
+            **last,
+            vec![TodoItem {
+                id: 1,
+                desc: PROBE.to_string(),
+                done: false,
+            }]
+        );
+
+        handle_todo_tool(&mut ctx, "todo__list", &json!({})).unwrap();
+        assert!(bearing(&todo_updates(&recording), PROBE).is_empty());
+
+        handle_todo_tool(&mut ctx, "todo__done", &json!({"id": 1})).unwrap();
+        let updates = todo_updates(&recording);
+        let probe = bearing(&updates, PROBE);
+        let last = probe.last().expect("todo__done publishes the marked list");
+        assert_eq!(last.len(), 1);
+        assert!(last[0].done);
+
+        handle_todo_tool(&mut ctx, "todo__done", &json!({"id": 99})).unwrap();
+        handle_todo_tool(&mut ctx, "todo__add", &json!({"task": ""})).unwrap();
+        assert!(bearing(&todo_updates(&recording), PROBE).is_empty());
+
+        handle_todo_tool(&mut ctx, "todo__add", &json!({"task": "second"})).unwrap();
+        handle_todo_tool(&mut ctx, "todo__clear", &json!({})).unwrap();
+        let updates = todo_updates(&recording);
+        let first_probe = updates
+            .iter()
+            .position(|items| items.iter().any(|item| item.desc == PROBE))
+            .expect("the second add republishes the probe item");
+        assert!(
+            updates[first_probe + 1..]
+                .iter()
+                .any(|items| items.is_empty()),
+            "todo__clear publishes an empty list after the probe-bearing one"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn child_context_todo_mutations_publish_nothing() {
+        const PROBE: &str = "todo-child-probe-x7x";
+        let mut ctx = auto_continue_ctx();
+        ctx.self_agent_id = Some("agent-todo-x7x".to_string());
+        let recording = crate::events::RecordingSink::install();
+
+        handle_todo_tool(&mut ctx, "todo__add", &json!({"task": PROBE})).unwrap();
+
+        let updates = todo_updates(&recording);
+        assert!(bearing(&updates, PROBE).is_empty());
+        assert_eq!(ctx.todo_list.todos.len(), 1);
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use crate::config::RequestContext;
+use crate::config::todo::TodoItem;
 use crate::hooks::HookEvent;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,7 +34,6 @@ impl From<&RequestContext> for Origin {
 
 /// Which process stream a tool output chunk was read from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // TASK-308
 pub enum OutputStream {
     Stdout,
     Stderr,
@@ -85,23 +85,22 @@ pub enum Event {
         kind: NoticeKind,
         text: String,
     },
-    #[allow(dead_code)] // TASK-308
     ToolOutputChunk {
         call_id: String,
         stream: OutputStream,
         bytes: Vec<u8>,
     },
-    #[allow(dead_code)] // TASK-308
     UsageUpdated {
         right_prompt: String,
     },
-    #[allow(dead_code)] // TASK-308
     ChildTranscriptFlushed {
         session_id: String,
     },
-    #[allow(dead_code)] // TASK-308
     JobCancelled {
         job_id: String,
+    },
+    TodoUpdated {
+        items: Vec<TodoItem>,
     },
     #[allow(dead_code)] // TASK-309
     PromptRequested {

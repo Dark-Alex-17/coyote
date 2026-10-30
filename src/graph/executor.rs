@@ -3730,8 +3730,8 @@ nodes:
         );
         let events = ctx.notification_queue.drain();
         assert_eq!(events.len(), 1, "queued notification must survive the run");
-        assert_eq!(events[0].id, "job_bg");
-        assert_eq!(events[0].event, "job_completed");
+        assert_eq!(events[0].id(), Some("job_bg"));
+        assert_eq!(events[0].event(), "job_completed");
     }
 
     use crate::testing::TestConfigDirGuard;

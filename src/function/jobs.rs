@@ -8,7 +8,7 @@ use super::{FunctionDeclaration, JsonSchema, PATH_SEP, mcp_error_display, render
 use crate::config::{
     McpRuntime, RequestContext, effective_max_concurrent_jobs, jobs_enabled, paths,
 };
-use crate::events::Origin;
+use crate::events::{self, Event, Origin};
 use crate::graph;
 use crate::hooks::{self, HookEvent, ResolvedHook};
 use crate::mcp::{
@@ -883,6 +883,9 @@ async fn handle_cancel(ctx: &RequestContext, args: &Value) -> Result<Value> {
 
     handle.abort_signal.set_ctrlc();
     kill_job_with_grace(&mut handle).await;
+    events::bus().publish(Event::JobCancelled {
+        job_id: id.to_string(),
+    });
 
     let tool = handle.tool.clone();
     let (tail, total_written) = {
@@ -947,6 +950,7 @@ pub async fn reap_jobs(
         if let Some(mut handle) = handle {
             handle.abort_signal.set_ctrlc();
             kill_job_with_grace(&mut handle).await;
+            events::bus().publish(Event::JobCancelled { job_id: id.clone() });
             warn!(
                 "Reaped background job '{id}' ({}): left unreclaimed at graph node exit",
                 handle.tool
@@ -1825,6 +1829,68 @@ mod tests {
         });
     }
 
+    fn cancelled_job_ids(recording: &crate::events::RecordingSink, marker: &str) -> Vec<String> {
+        recording
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::JobCancelled { job_id } if job_id.contains(marker) => Some(job_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn handle_cancel_publishes_job_cancelled() {
+        run_async(async {
+            let ctx = ctx_with_job_supervisor(4);
+            ctx.supervisor
+                .as_ref()
+                .unwrap()
+                .write()
+                .register(make_running_job("job-cancel-x7x"))
+                .unwrap();
+            let recording = crate::events::RecordingSink::install();
+
+            let result = handle_cancel(&ctx, &json!({"id": "job-cancel-x7x"}))
+                .await
+                .unwrap();
+
+            assert_eq!(result["status"], "cancelled");
+            assert_eq!(
+                cancelled_job_ids(&recording, "x7x"),
+                vec!["job-cancel-x7x".to_string()]
+            );
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reap_jobs_publishes_job_cancelled_for_reaped_ids_only() {
+        run_async(async {
+            let ctx = ctx_with_job_supervisor(4);
+            ctx.supervisor
+                .as_ref()
+                .unwrap()
+                .write()
+                .register(make_running_job("job-reap-x7x"))
+                .unwrap();
+            let recording = crate::events::RecordingSink::install();
+
+            reap_jobs(
+                ctx.supervisor.as_ref(),
+                &["job-reap-x7x".to_string(), "missing-x7x".to_string()],
+            )
+            .await;
+
+            assert_eq!(
+                cancelled_job_ids(&recording, "x7x"),
+                vec!["job-reap-x7x".to_string()]
+            );
+        });
+    }
+
     #[test]
     fn job_runtime_carries_the_servers_tool_filter() {
         run_async(async {
@@ -1958,12 +2024,13 @@ mod tests {
 
             let events = ctx.notification_queue.drain();
             assert_eq!(events.len(), 1);
-            assert_eq!(events[0].event, "job_completed");
-            assert_eq!(events[0].id, job_id);
-            assert_eq!(events[0].tool_or_agent, "echo");
-            assert_eq!(events[0].status, "success");
+            assert_eq!(events[0].event(), "job_completed");
+            assert_eq!(events[0].id(), Some(job_id.as_str()));
+            let value = events[0].to_value();
+            assert_eq!(value["tool_or_agent"], "echo");
+            assert_eq!(value["status"], "success");
             assert_eq!(
-                events[0].next_action,
+                value["next_action"],
                 format!("job__collect --id {job_id} for output")
             );
         });
@@ -1996,8 +2063,8 @@ mod tests {
 
             let events = ctx.notification_queue.drain();
             assert_eq!(events.len(), 1);
-            assert_eq!(events[0].event, "job_failed");
-            assert_eq!(events[0].status, "failed");
+            assert_eq!(events[0].event(), "job_failed");
+            assert_eq!(events[0].to_value()["status"], "failed");
         });
     }
 
