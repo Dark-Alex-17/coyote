@@ -1528,7 +1528,6 @@ pub(crate) fn propagation_remedy(err: &PropagationError) -> &'static str {
         }
         PropagationError::Cancelled => "Nothing was stored; send it again when ready",
         PropagationError::TransferFailed
-        | PropagationError::VerdictLost { .. }
         | PropagationError::RejectedByNode(_)
         | PropagationError::Link(_) => RETRY,
     }
@@ -2770,7 +2769,6 @@ mod tests {
         };
         let retry = "Try again in a minute; `.mesh peers` shows when the peer was last heard";
         assert_eq!(stored(PropagationError::TransferFailed), retry);
-        assert_eq!(stored(PropagationError::VerdictLost { skipped: 3 }), retry);
         assert_eq!(
             stored(PropagationError::Link(RequestError::LinkClosed)),
             retry

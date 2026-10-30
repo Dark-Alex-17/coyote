@@ -23,11 +23,11 @@ use lxmf_core::stamp::{
 use rns_transport::PacketContext;
 use rns_transport::destination::link::{Link, LinkEvent, LinkEventData, LinkId};
 use rns_transport::destination::{DestinationDesc, DestinationName, SingleOutputDestination};
-use rns_transport::hash::{AddressHash, Hash};
+use rns_transport::hash::AddressHash;
 use rns_transport::identity::Identity;
 use rns_transport::identity_bridge::{to_core_identity, to_transport_identity};
 use rns_transport::rand_core::OsRng;
-use rns_transport::resource::{ResourceEvent, ResourceEventKind};
+use rns_transport::resource::{OutboundFailure, OutboundResult};
 use rns_transport::transport::{SendPacketOutcome, Transport};
 use std::fmt;
 use std::io::Cursor;
@@ -59,13 +59,11 @@ pub(crate) const PROPAGATION_TRANSFER_TIMEOUT: Duration = Duration::from_secs(60
 /// How long after a completed send the link is watched for the node's rejection signal
 /// before the transfer is reported as accepted. The reference answers an invalid stamp on a
 /// packet with `[ERROR_INVALID_STAMP]` and a teardown (`LXMRouter.py:2134-2136`), and a
-/// stamp it accepts with a packet proof only, which upstream surfaces as no event at all.
+/// stamp it accepts with a packet proof only. The proof is not read as acceptance: a node
+/// on the Rust transport proves every link packet before its application sees it
+/// (`link_sections/new.rs:323-324`), so only a rejection or the window passing decides.
 /// Fixed rather than RTT-scaled for the same reason as `PROPAGATION_TRANSFER_TIMEOUT`.
 pub(crate) const PROPAGATION_REJECT_WINDOW: Duration = Duration::from_secs(2);
-
-/// Bounds the cancel sent for a resource the verdict watch gave up on; the transport is
-/// asked once and not waited for beyond this.
-const PROPAGATION_CANCEL_GRACE: Duration = Duration::from_secs(2);
 
 /// Aspect of the destination a propagation node serves clients on (`LXMRouter.py:173`) and
 /// a client posts to (`LXMRouter.py:2722`).
@@ -76,7 +74,7 @@ const DELIVERY_ASPECT: &str = "delivery";
 /// The reference's kilobyte, used wherever it compares a transfer against an announced
 /// limit (`LXMRouter.py:1866, 2103`).
 const LIMIT_KB_BYTES: u64 = 1000;
-/// Names the exchange in the timeouts `Deadline` reports.
+/// Names the exchange in the timeouts a post reports.
 const PROPAGATION_PATH_LABEL: &str = "lxmf.propagation";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,7 +183,7 @@ impl PropagationNode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PropagationError {
     /// The cancellation token fired while the stamp was being mined or the node awaited. A
-    /// resource still in flight at that point is cancelled on a best-effort basis.
+    /// resource still in flight at that point runs on in the transport.
     Cancelled,
     /// The stamp search ran out of nonces, which no attainable cost does.
     StampExhausted,
@@ -200,8 +198,7 @@ pub(crate) enum PropagationError {
     /// The message could not be signed, encrypted or packed.
     Encode(String),
     /// The link machinery failed: establishment, a send the transport refused, a bounded
-    /// wait that expired (a resource still in flight is then cancelled on a best-effort
-    /// basis), or a link that closed under the transfer.
+    /// wait that expired, or a link that closed under the transfer.
     Link(RequestError),
     /// The transport reported the resource failed, rejected or cancelled.
     TransferFailed,
@@ -209,9 +206,6 @@ pub(crate) enum PropagationError {
     /// resource whose stamp it rejects (`LXMRouter.py:2277-2278`), so retrying with the
     /// same stamp is pointless.
     ClosedAfterTransfer,
-    /// The verdict watch fell `skipped` link events behind and the node's answer may have
-    /// been among them; the message may or may not have been stored.
-    VerdictLost { skipped: u64 },
     /// The node answered the transfer with one of its refusal sentinels
     /// (`LXMPeer.ERROR_*`, `LXMPeer.py:24-31`).
     RejectedByNode(RefusalCode),
@@ -243,10 +237,6 @@ impl fmt::Display for PropagationError {
             Self::ClosedAfterTransfer => write!(
                 f,
                 "The propagation node closed the link after receiving the message"
-            ),
-            Self::VerdictLost { skipped } => write!(
-                f,
-                "The propagation node's answer was lost among {skipped} skipped link events"
             ),
             Self::RejectedByNode(code) => {
                 write!(f, "The propagation node rejected the message: {code}")
@@ -465,11 +455,12 @@ pub(crate) async fn prepare_envelope(
 /// reused) without identifying on it, as the reference client does when posting
 /// (`LXMRouter.py:2714-2725`; identify is for fetching, `:495`), and left up afterwards:
 /// the transport reuses it for the next message, as the reference does under
-/// `P_LINK_MAX_INACTIVITY`. Acceptance is inferred, not proven: the reference answers an
-/// accepted packet with a per-packet proof, which upstream turns into no event on an active
-/// link (`link_sections/handle_proof_packet.rs:4-16`), so a packet that drew no rejection
-/// inside the watch window counts as delivered. A resource is at least confirmed received,
-/// by its `OutboundComplete` event.
+/// `P_LINK_MAX_INACTIVITY`. A packet's acceptance is inferred, not proven: one that drew
+/// no rejection inside the watch window counts as delivered (see
+/// `PROPAGATION_REJECT_WINDOW` for why its proof is not read). A resource is confirmed
+/// received by the transport's outcome for it, and then watched for the same window, since
+/// the reference tears the link down after proving a resource whose stamp it rejects
+/// (`LXMRouter.py:2277-2278`).
 ///
 /// Calls for the same node must be serialised by the caller: the refusal sentinel and the
 /// teardown carry no message id and the out-link is shared, so two concurrent posts could
@@ -489,10 +480,10 @@ pub(crate) async fn propagate(
     send_envelope(transport, node, &prepared, cancel, options).await
 }
 
-/// Puts a prepared envelope in front of `node` and waits for its verdict. Both event
-/// streams are subscribed before the link is touched so no verdict can slip past. The
-/// envelope is borrowed so a retry can resend the same transient id and stamp, as the
-/// reference does by caching its encrypted form across attempts (`LXMessage.py:426-428`).
+/// Puts a prepared envelope in front of `node` and waits for its verdict. The link events
+/// are subscribed right before the send so no answer to it can slip past. The envelope is
+/// borrowed so a retry can resend the same transient id and stamp, as the reference does
+/// by caching its encrypted form across attempts (`LXMessage.py:426-428`).
 pub(crate) async fn send_envelope(
     transport: &Transport,
     node: &PropagationNode,
@@ -500,8 +491,6 @@ pub(crate) async fn send_envelope(
     cancel: CancellationToken,
     options: &PropagationOptions,
 ) -> Result<(), PropagationError> {
-    let link_events = transport.out_link_events();
-    let resource_events = transport.resource_events();
     let link = open_link(
         transport,
         &node.destination,
@@ -509,68 +498,65 @@ pub(crate) async fn send_envelope(
         Deadline::after(options.link_timeout),
     )
     .await?;
-    let deadline = Deadline::after(options.transfer_timeout);
-    let (link_id, mdu) = deadline
-        .bound(PROPAGATION_PATH_LABEL, async {
+    let transfer = async {
+        let (link_id, mdu) = {
             let link = link.lock().await;
             (*link.id(), link.link_mdu())
-        })
-        .await?;
-    let envelope_len = prepared.envelope.len();
-    let representation = representation_for(envelope_len, mdu);
-    let node_hex = node.destination.address_hash.to_hex_string();
-    debug!(
-        "Sending mesh transient {} to propagation node {} as a {representation:?} ({envelope_len} bytes, link MDU {mdu})",
-        short(&crate::mesh::hex_lower(&prepared.transient_id)),
-        short(&node_hex)
-    );
-    let pending = match representation {
-        SizeBranch::Packet => {
-            send_packet(transport, &link, &prepared.envelope, deadline).await?;
-            None
+        };
+        let envelope_len = prepared.envelope.len();
+        let representation = representation_for(envelope_len, mdu);
+        let node_hex = node.destination.address_hash.to_hex_string();
+        debug!(
+            "Sending mesh transient {} to propagation node {} as a {representation:?} ({envelope_len} bytes, link MDU {mdu})",
+            short(&crate::mesh::hex_lower(&prepared.transient_id)),
+            short(&node_hex)
+        );
+        let link_events = transport.out_link_events();
+        match representation {
+            SizeBranch::Packet => send_packet(transport, &link, &prepared.envelope).await?,
+            SizeBranch::Resource => {
+                // Compression on, as plain `send_resource` has it, so the wire is the same.
+                let (hash, outcome) = transport
+                    .send_resource_with_outcome(&link_id, prepared.envelope.clone(), None, true)
+                    .await
+                    .map_err(|err| RequestError::Send(format!("propagation resource: {err}")))?;
+                verdict_for_outcome(outcome.await)?;
+                debug!(
+                    "Mesh propagation resource {} was received on link {}",
+                    short(&crate::mesh::hex_lower(hash.as_slice())),
+                    link_id.to_hex_string()
+                );
+            }
         }
-        SizeBranch::Resource => Some(
-            deadline
-                .bound(
-                    PROPAGATION_PATH_LABEL,
-                    transport.send_resource(&link_id, prepared.envelope.clone(), None),
-                )
-                .await?
-                .map_err(|err| RequestError::Send(format!("propagation resource: {err}")))?,
-        ),
+        Ok::<_, PropagationError>((link_events, link_id))
     };
-    await_verdict(
-        transport,
-        VerdictStreams {
-            link_events,
-            resource_events,
-        },
-        link_id,
-        pending,
-        deadline,
-        options.reject_window,
-        cancel,
-    )
-    .await
+    // Dropping an unfinished transfer cancels nothing: a resource runs on in the transport.
+    let (link_events, link_id) = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return Err(PropagationError::Cancelled),
+        transfer = timeout(options.transfer_timeout, transfer) => transfer.map_err(|_| {
+            RequestError::Timeout {
+                path: PROPAGATION_PATH_LABEL.to_string(),
+                after: options.transfer_timeout,
+            }
+        })??,
+    };
+    watch_reject_window(link_events, link_id, options.reject_window, &cancel).await
 }
 
 async fn send_packet(
     transport: &Transport,
     link: &Arc<tokio::sync::Mutex<Link>>,
     envelope: &[u8],
-    deadline: Deadline,
 ) -> Result<(), PropagationError> {
-    let packet = deadline
-        .bound(PROPAGATION_PATH_LABEL, link.lock())
-        .await?
+    let packet = link
+        .lock()
+        .await
         .data_packet(envelope)
         .map_err(|err| RequestError::Send(format!("propagation packet: {err}")))?;
-    match deadline
-        .bound(
-            PROPAGATION_PATH_LABEL,
-            transport.send_link_packet_on_bound_iface(link, packet),
-        )
-        .await?
+    match transport
+        .send_link_packet_on_bound_iface(link, packet)
+        .await
     {
         SendPacketOutcome::SentDirect => Ok(()),
         outcome => Err(RequestError::LinkFailed(format!(
@@ -580,110 +566,35 @@ async fn send_packet(
     }
 }
 
-struct VerdictStreams {
-    link_events: broadcast::Receiver<LinkEventData>,
-    resource_events: broadcast::Receiver<ResourceEvent>,
-}
-
-/// Watches the link after a send and, when the watch gives up on a resource still in
-/// flight, asks the transport to cancel it so the node cannot go on to store a message the
-/// caller was told failed. The cancel is best-effort: bounded by
-/// `PROPAGATION_CANCEL_GRACE`, its outcome only logged.
-async fn await_verdict(
-    transport: &Transport,
-    mut streams: VerdictStreams,
-    link_id: LinkId,
-    mut pending: Option<Hash>,
-    deadline: Deadline,
-    reject_window: Duration,
-    cancel: CancellationToken,
-) -> Result<(), PropagationError> {
-    let verdict = watch_verdict(
-        &mut streams.link_events,
-        &mut streams.resource_events,
-        link_id,
-        &mut pending,
-        deadline,
-        reject_window,
-        &cancel,
-    )
-    .await;
-    if let (
-        Err(PropagationError::Cancelled | PropagationError::Link(RequestError::Timeout { .. })),
-        Some(hash),
-    ) = (&verdict, pending)
-    {
-        let outcome = match timeout(
-            PROPAGATION_CANCEL_GRACE,
-            transport.cancel_resource(&link_id, hash),
-        )
-        .await
-        {
-            Ok(Ok(true)) => "cancel sent".to_string(),
-            Ok(Ok(false)) => "nothing left to cancel".to_string(),
-            Ok(Err(err)) => format!("cancel failed: {err}"),
-            Err(_) => "cancel timed out".to_string(),
-        };
-        debug!(
-            "Mesh propagation resource {} abandoned on link {}: {outcome}",
-            short(&crate::mesh::hex_lower(hash.as_slice())),
-            link_id.to_hex_string()
-        );
+/// The transport's verdict on a resource as this module reports it. A link that went away
+/// under the transfer is a closed link, as it is for any other exchange; every other way a
+/// resource stops short of its proof is a failed transfer.
+fn verdict_for_outcome(result: OutboundResult) -> Result<(), PropagationError> {
+    match result {
+        OutboundResult::Complete => Ok(()),
+        OutboundResult::Failed(OutboundFailure::LinkClosed) => Err(RequestError::LinkClosed.into()),
+        _ => Err(PropagationError::TransferFailed),
     }
-    verdict
 }
 
-/// While `pending` names a resource in flight the wait is bounded by `deadline`; once the
-/// transport reports `OutboundComplete`, `pending` is cleared and the rejection watch of
-/// `reject_window` begins, in which a refusal sentinel on the link rejects the message, the
-/// link closing is `ClosedAfterTransfer`, and silence accepts. The reference tears the link
-/// down after a rejected resource without sending a sentinel (`LXMRouter.py:2277-2278`), so
-/// the close is the verdict there. Takes no transport so it can be driven from synthetic
-/// channels.
-async fn watch_verdict(
-    link_events: &mut broadcast::Receiver<LinkEventData>,
-    resource_events: &mut broadcast::Receiver<ResourceEvent>,
+/// Watches `link_id` for `window` after a completed send: a refusal sentinel rejects the
+/// message, the link closing is `ClosedAfterTransfer`, and silence accepts it when the
+/// window passes. A packet proof is not a verdict (see `PROPAGATION_REJECT_WINDOW`). The
+/// reference tears the link down after a rejected resource without sending a sentinel
+/// (`LXMRouter.py:2277-2278`), so the close is the verdict there. Takes no transport so it
+/// can be driven from synthetic channels.
+async fn watch_reject_window(
+    mut link_events: broadcast::Receiver<LinkEventData>,
     link_id: LinkId,
-    pending: &mut Option<Hash>,
-    deadline: Deadline,
-    reject_window: Duration,
+    window: Duration,
     cancel: &CancellationToken,
 ) -> Result<(), PropagationError> {
-    let mut until = if pending.is_some() {
-        Instant::now() + deadline.remaining()
-    } else {
-        Instant::now() + reject_window
-    };
+    let until = Instant::now() + window;
     loop {
         tokio::select! {
-            // A buffered verdict must beat the window expiring, and a buffered
-            // `OutboundComplete` must be seen before the close that may follow it.
+            // A buffered verdict must beat the window expiring.
             biased;
             () = cancel.cancelled() => return Err(PropagationError::Cancelled),
-            event = resource_events.recv(), if pending.is_some() => match event {
-                Ok(event) if Some(event.hash) == *pending => match event.kind {
-                    ResourceEventKind::OutboundComplete => {
-                        debug!(
-                            "Mesh propagation resource {} was received on link {}",
-                            short(&crate::mesh::hex_lower(event.hash.as_slice())),
-                            link_id.to_hex_string()
-                        );
-                        *pending = None;
-                        until = Instant::now() + reject_window;
-                    }
-                    ResourceEventKind::OutboundFailed
-                    | ResourceEventKind::OutboundRejected { .. }
-                    | ResourceEventKind::OutboundCancelled => {
-                        return Err(PropagationError::TransferFailed);
-                    }
-                    _ => {}
-                },
-                Ok(_) => {}
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    debug!("Mesh propagation watch fell behind and skipped {skipped} resource events");
-                }
-                Err(broadcast::error::RecvError::Closed) => return Err(RequestError::Shutdown.into()),
-            },
             event = link_events.recv() => match event {
                 Ok(event) if event.id == link_id => match event.event {
                     LinkEvent::Data(payload) if payload.context() == PacketContext::None => {
@@ -695,30 +606,16 @@ async fn watch_verdict(
                             return Err(PropagationError::RejectedByNode(code));
                         }
                     }
-                    LinkEvent::Closed if pending.is_none() => {
-                        return Err(PropagationError::ClosedAfterTransfer);
-                    }
-                    LinkEvent::Closed => return Err(RequestError::LinkClosed.into()),
+                    LinkEvent::Closed => return Err(PropagationError::ClosedAfterTransfer),
                     _ => {}
                 },
                 Ok(_) => {}
-                // While a resource is in flight its outcome is re-derivable from later
-                // events; inside the rejection watch a skipped refusal is gone for good.
-                Err(broadcast::error::RecvError::Lagged(skipped)) if pending.is_some() => {
-                    debug!("Mesh propagation watch fell behind and skipped {skipped} link events");
-                }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    return Err(PropagationError::VerdictLost { skipped });
+                    debug!("Mesh propagation watch fell behind and skipped {skipped} link events");
                 }
                 Err(broadcast::error::RecvError::Closed) => return Err(RequestError::Shutdown.into()),
             },
-            () = sleep_until(until) => {
-                return if pending.is_some() {
-                    Err(deadline.expired(PROPAGATION_PATH_LABEL).into())
-                } else {
-                    Ok(())
-                };
-            }
+            () = sleep_until(until) => return Ok(()),
         }
     }
 }
@@ -786,7 +683,7 @@ pub(crate) mod test_support {
     #[cfg(unix)]
     use rns_transport::iface::tcp_server::TcpServer;
     #[cfg(unix)]
-    use rns_transport::resource::ResourceComplete;
+    use rns_transport::resource::{ResourceComplete, ResourceEvent, ResourceEventKind};
     #[cfg(unix)]
     use rns_transport::transport::TransportConfig;
     #[cfg(unix)]
@@ -1618,25 +1515,24 @@ mod tests {
         WireMessage::unpack_paper(lxmf_data, recipient).unwrap()
     }
 
-    /// `watch_verdict` driven from hand-built event streams, with no transport behind them.
+    /// `watch_reject_window` driven from a hand-built event stream with no transport behind
+    /// it, and `verdict_for_outcome` over the transport's resource verdicts.
     mod verdict {
         use super::*;
         use rns_transport::destination::link::LinkPayload;
+        use rns_transport::hash::Hash;
         use rns_transport::resource::RejectReason;
 
         const WINDOW: Duration = Duration::from_millis(100);
-        /// A bound no test is meant to reach.
+        /// A window no test is meant to reach.
         const FAR: Duration = Duration::from_secs(10);
         /// Generous room over `WINDOW`, but far short of `FAR`.
         const PROMPT: Duration = Duration::from_secs(2);
 
         struct Watch {
             link_tx: broadcast::Sender<LinkEventData>,
-            resource_tx: broadcast::Sender<ResourceEvent>,
             link_rx: broadcast::Receiver<LinkEventData>,
-            resource_rx: broadcast::Receiver<ResourceEvent>,
             link_id: LinkId,
-            resource: Hash,
             cancel: CancellationToken,
         }
 
@@ -1647,59 +1543,35 @@ mod tests {
 
             fn with_capacity(capacity: usize) -> Self {
                 let (link_tx, link_rx) = broadcast::channel(capacity);
-                let (resource_tx, resource_rx) = broadcast::channel(capacity);
                 Self {
                     link_tx,
-                    resource_tx,
                     link_rx,
-                    resource_rx,
                     link_id: AddressHash::new_from_rand(OsRng),
-                    resource: Hash::new_from_rand(OsRng),
                     cancel: CancellationToken::new(),
                 }
             }
 
             fn link(&self, id: LinkId, event: LinkEvent) {
-                let sent = self
-                    .link_tx
-                    .send(LinkEventData {
-                        id,
-                        address_hash: AddressHash::new_from_rand(OsRng),
-                        event,
-                        close_reason: None,
-                    })
-                    .is_ok();
-                assert!(sent, "the watch's link receiver is gone");
+                send_link_event(&self.link_tx, id, event);
             }
 
-            fn resource(&self, hash: Hash, kind: ResourceEventKind) {
-                self.resource_tx
-                    .send(ResourceEvent {
-                        hash,
-                        link_id: self.link_id,
-                        kind,
-                    })
-                    .unwrap();
+            /// The sender stays alive for the whole watch, so silence is silence and not a
+            /// closed channel.
+            async fn run(self, window: Duration) -> Result<(), PropagationError> {
+                watch_reject_window(self.link_rx, self.link_id, window, &self.cancel).await
             }
+        }
 
-            async fn run(
-                mut self,
-                in_flight: bool,
-                deadline: Duration,
-                window: Duration,
-            ) -> Result<(), PropagationError> {
-                let mut pending = in_flight.then_some(self.resource);
-                watch_verdict(
-                    &mut self.link_rx,
-                    &mut self.resource_rx,
-                    self.link_id,
-                    &mut pending,
-                    Deadline::after(deadline),
-                    window,
-                    &self.cancel,
-                )
-                .await
-            }
+        fn send_link_event(tx: &broadcast::Sender<LinkEventData>, id: LinkId, event: LinkEvent) {
+            let sent = tx
+                .send(LinkEventData {
+                    id,
+                    address_hash: AddressHash::new_from_rand(OsRng),
+                    event,
+                    close_reason: None,
+                })
+                .is_ok();
+            assert!(sent, "the watch's link receiver is gone");
         }
 
         fn data(bytes: &[u8], context: PacketContext) -> LinkEvent {
@@ -1719,29 +1591,28 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn a_completed_transfer_is_accepted_one_window_later_not_at_the_deadline() {
+        async fn a_completed_transfer_is_accepted_after_one_silent_window() {
+            assert_eq!(verdict_for_outcome(OutboundResult::Complete), Ok(()));
             let watch = Watch::new();
-            watch.resource(watch.resource, ResourceEventKind::OutboundComplete);
             let started = StdInstant::now();
-            assert_eq!(watch.run(true, FAR, WINDOW).await, Ok(()));
+            assert_eq!(watch.run(WINDOW).await, Ok(()));
             let elapsed = started.elapsed();
             assert!(elapsed >= WINDOW && elapsed < PROMPT, "{elapsed:?}");
         }
 
-        #[tokio::test]
-        async fn a_failed_rejected_or_cancelled_transfer_fails() {
-            for kind in [
-                ResourceEventKind::OutboundFailed,
-                ResourceEventKind::OutboundRejected {
-                    reason: RejectReason::PeerCancelled,
-                },
-                ResourceEventKind::OutboundCancelled,
+        #[test]
+        fn a_failed_rejected_or_cancelled_transfer_fails() {
+            for result in [
+                OutboundResult::Failed(OutboundFailure::NotSent),
+                OutboundResult::Failed(OutboundFailure::RetriesExhausted),
+                OutboundResult::Failed(OutboundFailure::Segmenting),
+                OutboundResult::Rejected(RejectReason::PeerCancelled),
+                OutboundResult::Cancelled,
             ] {
-                let watch = Watch::new();
-                watch.resource(watch.resource, kind);
                 assert_eq!(
-                    watch.run(true, FAR, FAR).await,
-                    Err(PropagationError::TransferFailed)
+                    verdict_for_outcome(result.clone()),
+                    Err(PropagationError::TransferFailed),
+                    "{result:?}"
                 );
             }
         }
@@ -1749,33 +1620,18 @@ mod tests {
         #[tokio::test]
         async fn a_close_after_the_transfer_is_the_nodes_rejection() {
             let watch = Watch::new();
-            watch.resource(watch.resource, ResourceEventKind::OutboundComplete);
             watch.link(watch.link_id, LinkEvent::Closed);
             assert_eq!(
-                watch.run(true, FAR, FAR).await,
+                watch.run(FAR).await,
                 Err(PropagationError::ClosedAfterTransfer)
             );
         }
 
-        #[tokio::test]
-        async fn a_close_during_the_transfer_is_a_closed_link() {
-            let watch = Watch::new();
-            watch.link(watch.link_id, LinkEvent::Closed);
+        #[test]
+        fn a_close_during_the_transfer_is_a_closed_link() {
             assert_eq!(
-                watch.run(true, FAR, FAR).await,
+                verdict_for_outcome(OutboundResult::Failed(OutboundFailure::LinkClosed)),
                 Err(PropagationError::Link(RequestError::LinkClosed))
-            );
-        }
-
-        #[tokio::test]
-        async fn the_deadline_expiring_during_the_transfer_is_a_timeout() {
-            let watch = Watch::new();
-            assert_eq!(
-                watch.run(true, WINDOW, FAR).await,
-                Err(PropagationError::Link(RequestError::Timeout {
-                    path: PROPAGATION_PATH_LABEL.to_string(),
-                    after: WINDOW,
-                }))
             );
         }
 
@@ -1784,7 +1640,25 @@ mod tests {
             let watch = Watch::new();
             watch.link(watch.link_id, data(&refusal(), PacketContext::None));
             assert_eq!(
-                watch.run(false, FAR, FAR).await,
+                watch.run(FAR).await,
+                Err(PropagationError::RejectedByNode(RefusalCode::InvalidStamp))
+            );
+        }
+
+        /// A node on the Rust transport proves the packet before its application reads it,
+        /// so the refusal that follows the proof must still be seen.
+        #[tokio::test]
+        async fn a_packet_proof_does_not_end_the_window() {
+            let watch = Watch::new();
+            watch.link(
+                watch.link_id,
+                LinkEvent::PacketProven {
+                    packet_hash: Hash::new_from_rand(OsRng),
+                },
+            );
+            watch.link(watch.link_id, data(&refusal(), PacketContext::None));
+            assert_eq!(
+                watch.run(FAR).await,
                 Err(PropagationError::RejectedByNode(RefusalCode::InvalidStamp))
             );
         }
@@ -1803,11 +1677,9 @@ mod tests {
                     packet_hash: Hash::new_from_rand(OsRng),
                 },
             );
-            watch.resource(
-                Hash::new_from_rand(OsRng),
-                ResourceEventKind::OutboundFailed,
-            );
-            assert_eq!(watch.run(false, FAR, WINDOW).await, Ok(()));
+            let started = StdInstant::now();
+            assert_eq!(watch.run(WINDOW).await, Ok(()));
+            assert!(started.elapsed() >= WINDOW);
         }
 
         #[tokio::test]
@@ -1819,42 +1691,26 @@ mod tests {
                 cancel.cancel();
             });
             let started = StdInstant::now();
-            assert_eq!(
-                watch.run(false, FAR, FAR).await,
-                Err(PropagationError::Cancelled)
-            );
+            assert_eq!(watch.run(FAR).await, Err(PropagationError::Cancelled));
             assert!(started.elapsed() < PROMPT);
         }
 
         #[tokio::test]
-        async fn lagging_inside_the_window_loses_the_verdict() {
+        async fn a_lagged_window_keeps_watching_and_a_later_sentinel_still_rejects() {
             let watch = Watch::with_capacity(1);
             for _ in 0..3 {
                 watch.link(watch.link_id, LinkEvent::Activated);
             }
-            assert_eq!(
-                watch.run(false, FAR, FAR).await,
-                Err(PropagationError::VerdictLost { skipped: 2 })
-            );
-        }
-
-        #[tokio::test]
-        async fn lagging_during_the_transfer_is_tolerated() {
-            let watch = Watch::with_capacity(1);
-            for _ in 0..3 {
-                watch.link(watch.link_id, LinkEvent::Activated);
-            }
-            let resource_tx = watch.resource_tx.clone();
-            let event = ResourceEvent {
-                hash: watch.resource,
-                link_id: watch.link_id,
-                kind: ResourceEventKind::OutboundComplete,
-            };
+            let link_tx = watch.link_tx.clone();
+            let link_id = watch.link_id;
             tokio::spawn(async move {
                 sleep(Duration::from_millis(50)).await;
-                resource_tx.send(event).unwrap();
+                send_link_event(&link_tx, link_id, data(&refusal(), PacketContext::None));
             });
-            assert_eq!(watch.run(true, FAR, WINDOW).await, Ok(()));
+            assert_eq!(
+                watch.run(FAR).await,
+                Err(PropagationError::RejectedByNode(RefusalCode::InvalidStamp))
+            );
         }
     }
 
@@ -2297,20 +2153,12 @@ mod tests {
         /// node-bound byte, so the advertisement never reaches the node and the transfer
         /// cannot progress however fast the runner is; racing a short deadline against a
         /// large delivery instead loses on a fast runner, where the node completes before
-        /// the cancel lands. The only work still under the deadline is the transport
+        /// the deadline. The only work still under the deadline is the transport
         /// accepting the envelope, about 0.1 s for 100 KB on a slow debug build against a
         /// 1 s deadline; the deadline stays under the transport's 2 s advertisement retry
         /// so no retry can fail the transfer first.
-        ///
-        /// The cancel is the poster's own `cancel_resource`, which the transport reports
-        /// as `OutboundCancelled` (`ResourceManager::cancel_outgoing`); `OutboundRejected`
-        /// is the far end's RCL and cannot occur here, since the node has seen nothing.
-        /// Once the hold lifts the node reads the advertisement and, right behind it on
-        /// the same stream, the initiator's cancel, so it reports the transfer as
-        /// `remote_cancelled` rather than completing it: not one part was sent before the
-        /// poster dropped the resource.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn a_transfer_the_deadline_overtakes_is_cancelled_at_the_transport() {
+        async fn a_transfer_the_deadline_overtakes_is_a_timeout() {
             const TRANSFER_TIMEOUT: Duration = Duration::from_secs(1);
             let mut post = Post::start_relayed(1, 2000).await;
 
@@ -2323,8 +2171,6 @@ mod tests {
             ));
 
             post.options.transfer_timeout = TRANSFER_TIMEOUT;
-            let mut resource_events = post.client.transport.resource_events();
-            let mut node_events = post.node.transport.resource_events();
             let held = post.relay.as_ref().unwrap().hold().await;
 
             let outcome = post.propagate(&message(&[b'z'; 100_000])).await.err();
@@ -2335,59 +2181,8 @@ mod tests {
                     after: TRANSFER_TIMEOUT,
                 }))
             );
-            let cancelled = timeout(Duration::from_secs(2), async {
-                loop {
-                    match resource_events.recv().await {
-                        Ok(ResourceEvent {
-                            hash,
-                            kind: ResourceEventKind::OutboundCancelled,
-                            ..
-                        }) => break hash,
-                        Ok(ResourceEvent {
-                            kind:
-                                kind @ (ResourceEventKind::OutboundComplete
-                                | ResourceEventKind::OutboundFailed
-                                | ResourceEventKind::OutboundRejected { .. }),
-                            ..
-                        }) => panic!("the client transport ended the transfer with {kind:?}"),
-                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                        Err(broadcast::error::RecvError::Closed) => {
-                            panic!("the client transport went away")
-                        }
-                    }
-                }
-            })
-            .await
-            .expect("the client transport must report the cancelled resource");
             post.node.nothing_else_received();
-
             drop(held);
-            let failed = timeout(INTEROP_TIMEOUT, async {
-                loop {
-                    match node_events.recv().await {
-                        Ok(ResourceEvent {
-                            hash,
-                            kind: ResourceEventKind::InboundFailed(failure),
-                            ..
-                        }) => {
-                            assert_eq!(failure.reason, "remote_cancelled");
-                            break hash;
-                        }
-                        Ok(ResourceEvent {
-                            kind: ResourceEventKind::Complete(_),
-                            ..
-                        }) => panic!("the node completed a transfer the client had cancelled"),
-                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                        Err(broadcast::error::RecvError::Closed) => {
-                            panic!("the node transport went away")
-                        }
-                    }
-                }
-            })
-            .await
-            .expect("the node must see the initiator's cancel");
-            assert_eq!(failed, cancelled);
-            post.node.nothing_else_received();
             post.stop().await;
         }
     }
