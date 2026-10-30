@@ -295,10 +295,12 @@ jobs:
         "$BIN_DIR/rnsd" --version
         test -f "$cfg"
         grep -q '^loglevel = 4' "$cfg"
-        if grep -q share_instance "$cfg"; then
-          echo "::error::the written config sets share_instance"
-          exit 1
-        fi
+        for key in 'share_instance = Yes' 'shared_instance_port = 37428' 'instance_name = default'; do
+          if ! grep -qx "$key" "$cfg"; then
+            echo "::error::the written config lacks '$key'"
+            exit 1
+          fi
+        done
         before=$(shasum -a 256 "$cfg")
         echo "::endgroup::"
 
@@ -418,7 +420,9 @@ jobs:
         if (-not (Test-Path $cfg)) { throw "no config at $cfg" }
         $text = Get-Content -Raw $cfg
         if ($text -notmatch '(?m)^loglevel = 4') { throw 'config lacks loglevel = 4' }
-        if ($text -match 'share_instance') { throw 'the written config sets share_instance' }
+        foreach ($key in @('share_instance = Yes', 'shared_instance_port = 37428', 'instance_name = default')) {
+          if ($text -notmatch "(?m)^$([regex]::Escape($key))\r?$") { throw "the written config lacks '$key'" }
+        }
         $before = (Get-FileHash -Algorithm SHA256 $cfg).Hash
         Write-Output '::endgroup::'
 

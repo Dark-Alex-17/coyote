@@ -7,6 +7,7 @@ use rmpv::Value;
 use rns_transport::destination::request::RequestFrame;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
 fn sixteen(byte: u8) -> Value {
     Value::Binary(vec![byte; 16])
 }
@@ -17,6 +18,7 @@ fn packed(value: Value) -> Vec<u8> {
     bytes
 }
 
+#[cfg(unix)]
 fn nested_arrays(depth: usize, leaf: Value) -> Value {
     (0..depth).fold(leaf, |inner, _| Value::Array(vec![inner]))
 }

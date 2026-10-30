@@ -5379,6 +5379,7 @@ mod tests {
     use crate::config::mesh_config::{EnvoyMemoryConfig, MAX_TIMEOUT_SECS, MeshBrief};
     use crate::hooks::HookEvent;
     use crate::mesh::access::{AccessOptions, access_message, validate_access};
+    #[cfg(unix)]
     use crate::mesh::announce::PATH_REQUEST_TIMEOUT;
     use crate::mesh::destination_address;
     use crate::mesh::envoy_sessions::{EnvoyMemoryError, session_key};
@@ -12088,7 +12089,7 @@ mod tests {
     /// together, so every later dial to the port is refused, which is the attached
     /// client dialing into a refusal. Awaiting the task proves the port is free for
     /// `restart_local_stub`.
-    #[cfg(unix)]
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
     fn accept_once_then_close(listener: tokio::net::TcpListener) -> JoinHandle<()> {
         tokio::spawn(async move {
             let (_probe, _) = listener.accept().await.unwrap();
