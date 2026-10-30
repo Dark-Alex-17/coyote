@@ -1090,7 +1090,7 @@ def build_gauntlet_prompt(state):
         if last.get("head") and last["head"] != head and not dirty:
             lines += [f"Re-review delta: {last['head']}..HEAD"]
             green = [l for l, v in as_dict(state.get("gauntlet_lanes")).items()
-                     if l != "debris" and v in ("PASS", "CONFORMS", "MERGE-READY") and l not in as_list(last.get("lanes_with_findings"))]
+                     if l != "debris" and str(v).strip() == "GREEN" and l not in as_list(last.get("lanes_with_findings"))]
             if green:
                 lines += [f"Settled lanes: {', '.join(green)}"]
     recipe = (state.get("local_run_recipe") or "").strip()
@@ -1108,41 +1108,95 @@ def build_gauntlet_prompt(state):
     return u
 
 
+def _gauntlet_header(text):
+    if m := re.search(r"^## Full lane reports[ \t]*$", text, re.M):
+        return text[:m.start()]
+    if (i := text.find("<details>")) >= 0:
+        return text[:i]
+    return text
+
+
+_GAUNTLET_VERDICT_RE = re.compile(r"^GAUNTLET:[ \t]*(PASS|BLOCKED)[ \t]*$", re.M)
+
+
+def _has_verdict(header):
+    return bool(_GAUNTLET_VERDICT_RE.search(header))
+
+
+# The gauntlet writes its sections after the lane table in a fixed order:
+# `## Lane selection` (lane reasons, model-written and free to carry a
+# column-0 heading of its own), then the optional `## Pipeline notes`,
+# `## Blockers` and `## Human attention required`. A section is read only
+# below the first `## Lane selection` heading after the table, from the
+# LAST exact level-2 heading of its title, up to the next column-0 `## `
+# heading, so a look-alike inside the lane reasons always sits above the
+# real one and never stands in for it. The attention section is read below
+# the Blockers heading when there is one, because it is written after it; a
+# BLOCKED reply always carries `## Blockers`, so the look-alike can only be
+# read when the gauntlet wrote neither section.
+def _gauntlet_section(header_lines, start, title):
+    heading = re.compile(rf"##[ \t]+{re.escape(title)}[ \t]*")
+    heads = [i for i in range(start, len(header_lines)) if heading.fullmatch(header_lines[i])]
+    if not heads:
+        return None, start
+    body = []
+    for line in header_lines[heads[-1] + 1:]:
+        if re.match(r"##[ \t]", line):
+            break
+        body.append(line)
+    return body, heads[-1] + 1
+
+
 def _parse_gauntlet(text):
+    header = _gauntlet_header(text)
     verdict = "BLOCKED"
-    if m := re.search(r"GAUNTLET:\s*(PASS|BLOCKED)", text):
+    if m := _GAUNTLET_VERDICT_RE.search(header):
         verdict = m.group(1)
     incomplete = []
-    if m := re.search(r"GAUNTLET_REVIEW_INCOMPLETE:\s*([^\n]+)", text):
+    if m := re.search(r"^GAUNTLET_REVIEW_INCOMPLETE:[ \t]*([^\n]+?)[ \t]*$", header, re.M):
         incomplete = [x.strip() for x in m.group(1).split(",") if x.strip()]
     lanes = {}
-    for line in text.splitlines():
-        cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        if len(cells) >= 2 and cells[0].lower() in GAUNTLET_LANES:
-            lanes[cells[0].lower()] = cells[1].split()[0] if cells[1] else ""
-    blockers = []
-    sec = re.search(r"(?ims)^#+\s*Blockers?\s*\n(.*?)(?=^#+\s|\Z)", text)
-    if sec:
-        blockers = [l.strip()[1:].strip() for l in sec.group(1).splitlines() if l.strip().startswith(("-", "*"))]
-    blockers += [l.strip() for l in text.splitlines() if l.strip().startswith("debris: Implementation debris")]
-    attention = ""
-    if m := re.search(r"(?ims)^#+\s*Human attention required\s*\n(.*?)(?=^#+\s|\Z)", text):
-        attention = m.group(1).strip()
-    return verdict, incomplete, lanes, blockers, attention
+    details = {}
+    header_lines = header.splitlines()
+    first_row = next((i for i, l in enumerate(header_lines) if l.startswith("|")), len(header_lines))
+    table_end = first_row
+    for line in header_lines[first_row:]:
+        if not line.startswith("|"):
+            break
+        table_end += 1
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        lane = cells[0].lower()
+        if len(cells) >= 2 and lane in GAUNTLET_LANES and lane not in lanes:
+            lanes[lane] = cells[1]
+            if len(cells) >= 3 and cells[2]:
+                details[lane] = cells[2]
+    start = table_end if table_end > first_row else 0
+    selection = re.compile(r"##[ \t]+Lane selection[ \t]*")
+    start = next((i + 1 for i in range(start, len(header_lines)) if selection.fullmatch(header_lines[i])), start)
+    section, start = _gauntlet_section(header_lines, start, "Blockers")
+    blockers = [l[2:].strip() for l in section or [] if l.startswith(("- ", "* "))]
+    # The gauntlet writes debris hits only as items of its Blockers section,
+    # so an unbulleted debris line counts only inside that section; the same
+    # line anywhere else in the header, such as in the lane reasons, is not
+    # a blocker.
+    blockers += [l.rstrip() for l in section or [] if l.startswith("debris: Implementation debris")]
+    section, _ = _gauntlet_section(header_lines, start, "Human attention required")
+    attention = "\n".join(section or []).strip()
+    return verdict, incomplete, lanes, details, blockers, attention
 
 
 def route_gauntlet(state):
     u = {}
     note_script_error(state, u, "run_gauntlet")
     text = state.get("gauntlet_result") or ""
-    if not text or text.startswith("Agent node failed") or "GAUNTLET:" not in text:
-        verdict, incomplete, lanes, blockers, attention = "BLOCKED", ["pipeline"], {}, [], ""
+    if not text or text.startswith("Agent node failed") or not _has_verdict(_gauntlet_header(text)):
+        verdict, incomplete, lanes, details, blockers, attention = "BLOCKED", ["pipeline"], {}, {}, [], ""
     else:
-        verdict, incomplete, lanes, blockers, attention = _parse_gauntlet(text)
+        verdict, incomplete, lanes, details, blockers, attention = _parse_gauntlet(text)
     rounds = as_list(state.get("round_heads"))
     if rounds and isinstance(rounds[-1], dict):
-        rounds[-1].update({"verdict": verdict, "lanes": lanes, "incomplete": incomplete,
-                           "lanes_with_findings": [l for l, v in lanes.items() if v not in ("PASS", "CONFORMS", "MERGE-READY", "SKIPPED", "")]})
+        rounds[-1].update({"verdict": verdict, "lanes": lanes, "lane_details": details, "incomplete": incomplete,
+                           "lanes_with_findings": [l for l, v in lanes.items() if v not in ("GREEN", "GREEN (attention)", "SKIPPED", "")]})
     merged_lanes = dict(as_dict(state.get("gauntlet_lanes")))
     merged_lanes.update(lanes)
     u.update({"gauntlet_verdict": verdict, "gauntlet_incomplete": incomplete, "gauntlet_lanes": merged_lanes,
@@ -1584,7 +1638,9 @@ def _assemble_report(state, u, pre_publish=False):
                      + (f"; lanes: " + ", ".join(f"{k}={v}" for k, v in lanes.items()) if lanes else ""))
         for r in as_list(g("round_heads", [])):
             if isinstance(r, dict):
-                lines.append(f"  - round {r.get('round')} @ {r.get('head')}: {r.get('verdict', '(running)')}")
+                details = as_dict(r.get("lane_details"))
+                lines.append(f"  - round {r.get('round')} @ {r.get('head')}: {r.get('verdict', '(running)')}"
+                             + (" [" + "; ".join(f"{k}: {v}" for k, v in details.items()) + "]" if details else ""))
     if g("ci_status"):
         lines.append(f"- CI: {g('ci_status')}" + (" (flipped to ready)" if truthy(g("flip_ready", False)) else ""))
     lines.append("")
