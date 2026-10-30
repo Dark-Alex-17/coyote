@@ -930,7 +930,8 @@ fn a_debt_scan_crash_falls_forward_to_bookkeeping_scan_with_the_default_report()
     );
 }
 
-/// Writes the dry-run `config.yaml` every lifted-graph run below shares.
+/// Writes the dry-run `config.yaml` every lifted-graph run below shares, and
+/// an `mcp.json` that defines no server.
 fn write_dry_run_config(dir: &Path) {
     let vault_pass = dir.join("vault-pass");
     fs::write(&vault_pass, "test-password\n").unwrap();
@@ -942,6 +943,32 @@ fn write_dry_run_config(dir: &Path) {
         ),
     )
     .unwrap();
+    // The bundled `mcp.json` launches servers through `uvx`, which CI hosts
+    // lack. The engine never installs over an existing `mcp.json` and only
+    // spawns servers the file defines, so a run here starts none.
+    fs::write(dir.join("mcp.json"), "{\"mcpServers\": {}}\n").unwrap();
+}
+
+/// Every binary run in this file starts from a config dir that
+/// `write_dry_run_config` wrote, the only `config.yaml` writer here, so none
+/// of them can reach the `uvx` launcher a CI host lacks.
+#[test]
+fn every_scratch_config_dir_defines_no_mcp_server() {
+    let scratch = scratch_dir("mcpconfig");
+    write_dry_run_config(&scratch.0);
+    let mcp: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(scratch.0.join("mcp.json")).unwrap()).unwrap();
+    assert_eq!(mcp, json!({"mcpServers": {}}));
+    let source = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(file!())).unwrap();
+    let lines: Vec<&str> = source.lines().collect();
+    let writers = lines
+        .windows(2)
+        .filter(|w| w[0].trim() == "fs::write(" && w[1].trim().ends_with(".join(\"config.yaml\"),"))
+        .count();
+    assert_eq!(
+        writers, 1,
+        "a second config.yaml writer must also write mcp.json"
+    );
 }
 
 /// Runs the real binary on a lifted graph under `dir/agents/<agent>/` and
