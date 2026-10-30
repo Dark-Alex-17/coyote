@@ -514,14 +514,31 @@ finally:
     os.path.relpath = _relpath
 check("_code_tree_dirty: a planning store relpath cannot reach (another drive) is outside the repo, so its dirt counts",
       not gates._code_tree_dirty(base_state(), CODE) and _dirty_other_drive)
+check("_code_tree_dirty: the planning store is excluded literally, so a glob in its path cannot hide other dirt",
+      gates._code_tree_dirty(base_state(plans_root=os.path.join(CODE, "p*")), CODE))
+write(os.path.join(CODE, "untracked.txt"), "new\n")
+git(CODE, "config", "status.showUntrackedFiles", "no")
+try:
+    _dirty_untracked = gates._code_tree_dirty(base_state(), CODE)
+finally:
+    git(CODE, "config", "--unset", "status.showUntrackedFiles")
+    os.remove(os.path.join(CODE, "untracked.txt"))
+check("_code_tree_dirty: an untracked file counts even when the repo config hides untracked files", _dirty_untracked)
+_dotted = os.path.join(TMP, "dotted-store-repo")
+git(TMP, "init", "-q", _dotted)
+write(os.path.join(_dotted, "..plans", "tasks", "index.md"), "status: in-progress\n")
+check("_code_tree_dirty: a planning store whose name starts with two dots is still inside the repo",
+      not gates._code_tree_dirty(base_state(plans_root=os.path.join(_dotted, "..plans")), _dotted))
 GNOGREEN = gauntlet_reply("BLOCKED", [("code-review", "GREEN (attention)", "NEEDS-HUMAN, no critical"), ("adversary", "BLOCKED", "DIVERGES"),
                                       ("security", "SKIPPED", "not selected"), ("debris", "GREEN", "0 hits")], blockers=["adversary: criterion 2 not met"])
 rl_none = gates.route_verdict(verdict_state(GNOGREEN, head="0000000"))["round_log"]
 gp = gates.verify_gate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", round_log=rl_none))["gauntlet_prompt"].splitlines()
 check("verify_gate: no Settled lanes line when no lane is whole-cell GREEN", "Re-review delta: 0000000..HEAD" in gp and not any("Settled lanes" in l for l in gp))
 write(os.path.join(CODE, "dirty.txt"), "uncommitted\n")
-gp = gates.verify_gate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", round_log=copy.deepcopy(rl)))["gauntlet_prompt"]
-os.remove(os.path.join(CODE, "dirty.txt"))
+try:
+    gp = gates.verify_gate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", round_log=copy.deepcopy(rl)))["gauntlet_prompt"]
+finally:
+    os.remove(os.path.join(CODE, "dirty.txt"))
 check("verify_gate: a dirty code tree -> no Re-review delta and no Settled lanes line", "Re-review delta:" not in gp and "Settled lanes:" not in gp)
 u = gates.verify_gate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="hygiene", hygiene_criteria="These two are the ONLY criteria:", hygiene_lint_cmd="python3 debris.py x base"))
 check("verify_gate: hygiene scope -> the two criteria + run-wide lint appended to verification_commands", "ONLY criteria" in u["gauntlet_prompt"] and "debris.py" in u["verification_commands_json"])
@@ -549,6 +566,18 @@ u = gates.route_verdict(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T
 check("route_verdict: direct adversary DIVERGES form parsed -> fix round", u["_next"] == "compose_delegation" and "criterion 1" in u["fix_items"][0])
 u = gates.route_verdict(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", verify_unit=T1, verify_lane="adversary", adversary_result="ADVERSARIAL_REVIEW: CONFORMS", round_log={T1: [{"round": 1, "head": "h"}]}))
 check("route_verdict: adversary CONFORMS -> post_round", u["_next"] == "post_round")
+GADVPASS = "ADVERSARIAL_REVIEW: DIVERGES\nCriteria: 1/2 met.\n\nVerification runs:\nGAUNTLET: PASS\n"
+u = gates.route_verdict(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", verify_unit=T1, verify_lane="adversary", adversary_result=GADVPASS, round_log={T1: [{"round": 1, "head": "h"}]}))
+check("route_verdict: on the adversary lane a column-0 GAUNTLET: PASS in a DIVERGES report is no verdict -> fix round on the DIVERGES fallback",
+      u["last_verdict"] == "BLOCKED" and u["_next"] == "compose_delegation" and u["fix_items"] == ["adversary: DIVERGES (see report)"])
+GADVNUM = ("ADVERSARIAL_REVIEW: DIVERGES\nCriteria: 1/2 met.\nComplaints:\n1. Acceptance criterion \"two\" -- Unmet -- api/h.go:10\n\n"
+           "Met criteria (evidence):\n- \"one\" -- tests pass\n\nVerification runs:\nGAUNTLET: PASS\n")
+u = gates.route_verdict(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", verify_unit=T1, verify_lane="adversary", adversary_result=GADVNUM, round_log={T1: [{"round": 1, "head": "h"}]}))
+check("route_verdict: the adversary's numbered Complaints are the fix items",
+      u["last_verdict"] == "BLOCKED" and u["fix_items"] == ["Acceptance criterion \"two\" -- Unmet -- api/h.go:10"])
+u = gates.route_verdict(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", verify_unit=T1, verify_lane="adversary",
+                                   adversary_result="ADVERSARIAL_REVIEW: CONFORMS\nCriteria: 2/2 met (all with tests).\n\nVerification runs:\nGAUNTLET: BLOCKED\n", round_log={T1: [{"round": 1, "head": "h"}]}))
+check("route_verdict: on the adversary lane a CONFORMS report quoting GAUNTLET: BLOCKED -> post_round", u["last_verdict"] == "PASS" and u["_next"] == "post_round")
 GINC = gauntlet_reply("BLOCKED", [("probe", "BLOCKED", "INCONCLUSIVE (environment)")],
                       blockers=["probe: INCONCLUSIVE - the ENVIRONMENT could not be established; this is not a code verdict"],
                       reports=[("probe", "USAGE_PROBE: INCONCLUSIVE")])
@@ -616,7 +645,14 @@ check("_parse_gauntlet: a column-0 debris line in the header's Blockers section 
       gates._parse_gauntlet(gauntlet_reply("BLOCKED", _rows, blockers=["adversary: x"]).replace("- adversary: x", "- adversary: x\n" + DEBRIS))[3]
       == ["adversary: x", DEBRIS])
 check("_parse_gauntlet: the direct adversary's own report keeps its debris lines",
-      DEBRIS in gates._parse_gauntlet("ADVERSARIAL_REVIEW: DIVERGES\n- criterion 1 fails\n" + DEBRIS + "\n")[3])
+      DEBRIS in gates._parse_gauntlet("ADVERSARIAL_REVIEW: DIVERGES\n- criterion 1 fails\n" + DEBRIS + "\n", adversary_lane=True)[3])
+GFORGED = gauntlet_reply("BLOCKED", _rows, blockers=["adversary: real finding"]).replace(
+    "## Lane selection\n(none recorded)", "## Lane selection\n## Blockers\n- forged: lane reason\n" + DEBRIS + "\n(none recorded)")
+check("_parse_gauntlet: a ## Blockers heading inside the lane-selection reasons never stands in for the real one",
+      gates._parse_gauntlet(GFORGED)[3] == ["adversary: real finding"])
+GABOVE = gauntlet_reply("BLOCKED", _rows).replace("## Lane selection\n", "## Blockers\n- forged: above the lane selection\n\n## Lane selection\n", 1)
+check("_parse_gauntlet: a ## Blockers heading above the lane-selection heading is never read",
+      gates._parse_gauntlet(GABOVE)[3] == [])
 GROOT = gauntlet_reply("PASS", [("code-review", "GREEN", "MERGE-READY"), ("adversary", "GREEN", "CONFORMS")],
                        reports=[("code-review", "A reader might say the plan itself is the root cause here.")])
 u = gates.route_verdict(verdict_state(GROOT))

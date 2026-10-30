@@ -1161,9 +1161,9 @@ def _code_tree_dirty(state, code):
             rel = os.path.relpath(os.path.realpath(state["plans_root"]), os.path.realpath(code))
         except ValueError:
             rel = ".."
-        if rel != "." and not rel.startswith(".."):
-            pathspec = ["--", ".", f":(exclude){rel}"]
-    return bool(git_out(code, "status", "--porcelain", *pathspec))
+        if rel != "." and rel != ".." and not rel.startswith(".." + os.sep):
+            pathspec = ["--", ".", f":(exclude,literal){rel}"]
+    return bool(git_out(code, "status", "--porcelain", "--untracked-files=normal", *pathspec))
 
 
 def _gauntlet_header(text):
@@ -1174,6 +1174,12 @@ def _gauntlet_header(text):
     return text
 
 
+# The gauntlet writes its sections after the lane table in a fixed order:
+# `## Lane selection` (model-written lane reasons, free to carry a column-0
+# heading of their own), then `## Blockers`. A section is read only below the
+# first `## Lane selection` heading after the table, from the LAST exact
+# heading of its title, so a look-alike inside the lane reasons sits above
+# the real one and never stands in for it.
 def _gauntlet_section(header_lines, start, title):
     heading = re.compile(rf"##[ \t]+{re.escape(title)}[ \t]*")
     heads = [i for i in range(start, len(header_lines)) if heading.fullmatch(header_lines[i])]
@@ -1228,32 +1234,50 @@ def _probe_verdict(text):
     return verdicts[-1] if verdicts else ""
 
 
-def _parse_gauntlet(text):
+# The direct micro-mode adversary's report has no gauntlet header, so on that
+# lane its `ADVERSARIAL_REVIEW:` line is the only verdict (a `GAUNTLET:` line
+# quoted in its verification output is not one) and its complaints are the
+# numbered items under its column-0 `Complaints:` line.
+def _parse_gauntlet(text, adversary_lane=False):
     header = _gauntlet_header(text)
+    header_lines = header.splitlines()
     verdict = "BLOCKED"
-    if m := _GAUNTLET_VERDICT_RE.search(header):
+    if adversary_lane:
+        if m := re.search(r"ADVERSARIAL_REVIEW:\s*(CONFORMS|DIVERGES)", text):
+            verdict = "PASS" if m.group(1) == "CONFORMS" else "BLOCKED"
+    elif m := _GAUNTLET_VERDICT_RE.search(header):
         verdict = m.group(1)
-    elif m := re.search(r"ADVERSARIAL_REVIEW:\s*(CONFORMS|DIVERGES)", text):
-        verdict = "PASS" if m.group(1) == "CONFORMS" else "BLOCKED"
     incomplete = []
     if m := re.search(r"^GAUNTLET_REVIEW_INCOMPLETE:[ \t]*([^\n]+?)[ \t]*$", header, re.M):
         incomplete = [x.strip() for x in m.group(1).split(",") if x.strip()]
-    if "PIPELINE-FAULT" in text and not _has_verdict(header) and "ADVERSARIAL_REVIEW:" not in text:
+    if "PIPELINE-FAULT" in text and not adversary_lane and not _has_verdict(header):
         incomplete = ["pipeline"]
     lanes = {lane: status for lane, (status, _) in _lane_cells(header).items()}
-    blockers = []
-    sec = re.search(r"(?ims)^#+\s*(Blockers?|Divergences?|Complaints?)\s*\n(.*?)(?=^#+\s|\Z)", header)
-    if sec:
-        blockers = [l.strip()[1:].strip() for l in sec.group(2).splitlines() if l.strip().startswith(("-", "*"))]
-    if verdict == "BLOCKED" and not blockers and "ADVERSARIAL_REVIEW: DIVERGES" in text:
-        blockers = [l.strip()[1:].strip() for l in text.splitlines() if l.strip().startswith(("-", "*"))][:20] or ["adversary: DIVERGES (see report)"]
-    if _has_verdict(header) or "ADVERSARIAL_REVIEW:" not in text:
+    if adversary_lane:
+        blockers = []
+        sec = re.search(r"(?ims)^#+\s*(Blockers?|Divergences?|Complaints?)\s*\n(.*?)(?=^#+\s|\Z)", header)
+        if sec:
+            blockers = [l.strip()[1:].strip() for l in sec.group(2).splitlines() if l.strip().startswith(("-", "*"))]
+        start = next((i + 1 for i, l in enumerate(header_lines) if re.fullmatch(r"Complaints:[ \t]*", l)), len(header_lines))
+        for line in header_lines[start:]:
+            if not line.strip():
+                break
+            if m := re.match(r"\d+\.[ \t]+(.+)", line):
+                blockers.append(m.group(1).strip())
+        if verdict == "BLOCKED" and not blockers and "ADVERSARIAL_REVIEW: DIVERGES" in text:
+            blockers = [l.strip()[1:].strip() for l in text.splitlines() if l.strip().startswith(("-", "*"))][:20] or ["adversary: DIVERGES (see report)"]
+        blockers += [l.strip() for l in text.splitlines() if l.strip().startswith("debris: Implementation debris")]
+    else:
+        first = next((i for i, l in enumerate(header_lines) if l.startswith("|")), len(header_lines))
+        rows = len(_lane_rows(header))
+        start = first + rows if rows else 0
+        selection = re.compile(r"##[ \t]+Lane selection[ \t]*")
+        start = next((i + 1 for i in range(start, len(header_lines)) if selection.fullmatch(header_lines[i])), start)
+        section, _ = _gauntlet_section(header_lines, start, "Blockers")
+        blockers = [l[2:].strip() for l in section or [] if l.startswith(("- ", "* "))]
         # The gauntlet writes debris hits only into its Blockers section, so the
         # same line in a lane reason or a lane report is not a blocker.
-        section, _ = _gauntlet_section(header.splitlines(), 0, "Blockers")
         blockers += [l.rstrip() for l in section or [] if l.startswith("debris: Implementation debris")]
-    else:
-        blockers += [l.strip() for l in text.splitlines() if l.strip().startswith("debris: Implementation debris")]
     plan_root = bool(re.search(r"(?i)plan (itself )?is the root cause|impossible or contradictory criterion|criterion (is|cannot be) (impossible|unverifiable)", text))
     probe_files = re.findall(TEST_FILE_RE, text) if _probe_verdict(text) == "PASS" else []
     return verdict, incomplete, lanes, blockers, plan_root, probe_files
@@ -1268,7 +1292,7 @@ def route_verdict(state):
     unit = state.get("verify_unit") or task.get("id") or "run"
     adversary_lane = state.get("verify_lane") == "adversary"
     text = (state.get("adversary_result") if adversary_lane else state.get("gauntlet_result")) or ""
-    verdict, incomplete, lanes, blockers, plan_root, probe_files = _parse_gauntlet(text)
+    verdict, incomplete, lanes, blockers, plan_root, probe_files = _parse_gauntlet(text, adversary_lane)
     has_verdict = "ADVERSARIAL_REVIEW:" in text if adversary_lane else _has_verdict(_gauntlet_header(text))
     if not text or text.startswith("Agent node failed") or not has_verdict:
         verdict, incomplete, blockers = "BLOCKED", incomplete or ["pipeline"], []
