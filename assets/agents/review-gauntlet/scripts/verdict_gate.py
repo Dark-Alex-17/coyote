@@ -66,7 +66,14 @@ import sys
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".shared"))
 
-from report_text import one_line, table_cell
+# A missing helper module or name must still end in the BLOCKED stub below,
+# so the import error is kept here and raised inside the crash guard by main().
+try:
+    from report_text import one_line, table_cell
+
+    helper_import_error = None
+except ImportError as e:
+    helper_import_error = e
 
 # Duplicated verbatim in the sibling gate script — the two copies must stay identical.
 ADVERSARY_DEGRADED_HEADER = re.compile(
@@ -99,19 +106,22 @@ def adversary_degraded(report):
 
 def selection_lines(summary):
     # build_items writes one `- ` bullet per reason; a continuation line from
-    # any other writer joins the item above it instead of starting a line.
+    # any other writer joins the item above it instead of starting a line,
+    # and a leading non-bullet line gets the bullet so no line starts bare.
     items = []
     for line in summary.splitlines():
         if line.startswith("- "):
-            items.append(["- ", line[2:]])
+            items.append(line[2:])
         elif line.strip() and items:
-            items[-1][1] += " " + line
+            items[-1] += " " + line
         elif line.strip():
-            items.append(["", line])
-    return [prefix + one_line(text) for prefix, text in items]
+            items.append(line)
+    return ["- " + one_line(text) for text in items]
 
 
 def main():
+    if helper_import_error:
+        raise helper_import_error
     state = load_state()
     blockers, attention, reports = [], [], []
     rows = {}
@@ -483,11 +493,14 @@ def main():
 try:
     main()
 except Exception as e:  # noqa: BLE001 — the gate must never crash into a silent pass
+    # Without the helper the error is its own ImportError, whose message is
+    # one line; any other error may carry state text and is folded.
+    error = e if helper_import_error else one_line(e)
     print(
         json.dumps(
             {
                 "gauntlet_verdict": "BLOCKED",
-                "gauntlet_report": f"verdict gate error: {e} — treat as a failed gate, not a pass.",
+                "gauntlet_report": f"verdict gate error: {error} \u2014 treat as a failed gate, not a pass.",
                 "gauntlet_incomplete_line": "\nGAUNTLET_REVIEW_INCOMPLETE: pipeline",
             }
         )

@@ -46,7 +46,14 @@ import time
 
 sys.dont_write_bytecode = True
 
-from report_text import one_line
+# A missing helper module or name must still end in the crash stub below, so
+# the import error is kept here and raised inside the crash guard by main().
+try:
+    from report_text import one_line
+
+    helper_import_error = None
+except ImportError as e:
+    helper_import_error = e
 
 # Keep in sync with default_lanes.ALIASES — a caller-forced lane must
 # canonicalize the same way on the degraded path as it does here.
@@ -99,6 +106,8 @@ def main():
         return v.strip() if isinstance(v, str) else ""
 
     crash_context["lanes_summary"] = text("lanes_summary")
+    if helper_import_error:
+        raise helper_import_error
     retry_lanes = [lane for lane in (state.get("retry_lanes") or []) if lane in LANE_KEYS]
     if retry_lanes:
         attempts = state.get("lane_attempts") or {}

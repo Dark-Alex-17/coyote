@@ -35452,8 +35452,9 @@ print(json.dumps({
         let dir = utils::temp_file("-debris-orphan-gate-", "");
         create_dir_all(&dir).unwrap();
         let script = dir.join("verdict_gate.py");
-        // Every install ships report_text.py beside the gate, so only the
-        // `.shared` module is missing from this copy.
+        // This test is about the unresolvable `.shared` module, so the
+        // gate's sibling helper is copied along; a missing sibling is
+        // pinned on its own by the crash-stub test below.
         for name in ["verdict_gate.py", "report_text.py"] {
             std::fs::copy(
                 Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -35520,6 +35521,78 @@ print(json.dumps({
             "no findings means the shared module is never imported: {out}"
         );
         let _ = remove_dir_all(&dir);
+    }
+
+    /// Each script copied alone, without report_text.py beside it, still
+    /// ends in its own crash stub: the gate blocks with the pipeline marked
+    /// incomplete, and the builder runs no lanes, keeps the prior
+    /// lanes_summary and records the fault.
+    #[test]
+    fn gauntlet_scripts_without_the_report_text_helper_end_in_their_crash_stubs() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let run_alone = |name: &str, state: serde_json::Value| -> serde_json::Value {
+            let dir = utils::temp_file("-gauntlet-no-helper-", "");
+            create_dir_all(&dir).unwrap();
+            std::fs::copy(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("assets/agents/review-gauntlet/scripts")
+                    .join(name),
+                dir.join(name),
+            )
+            .unwrap();
+            let out = Command::new("python3")
+                .arg(dir.join(name))
+                .env("GRAPH_STATE", state.to_string())
+                .env_remove("GRAPH_STATE_FILE")
+                .output()
+                .unwrap();
+            let _ = remove_dir_all(&dir);
+            assert!(
+                out.status.success(),
+                "{name}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            serde_json::from_slice(&out.stdout).unwrap()
+        };
+
+        let gate = run_alone("verdict_gate.py", gauntlet_happy_state());
+        assert_eq!(gate["gauntlet_verdict"], "BLOCKED", "{gate}");
+        assert_eq!(
+            gate["gauntlet_incomplete_line"], "\nGAUNTLET_REVIEW_INCOMPLETE: pipeline",
+            "{gate}"
+        );
+        let report = gate["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.starts_with("verdict gate error: ") && report.contains("report_text"),
+            "{gate}"
+        );
+
+        let prior = "- code-review: always on";
+        let items = run_alone(
+            "build_items.py",
+            json!({
+                "add_security": true,
+                "lanes_summary": prior,
+                "gauntlet_started_at": 1.0,
+            }),
+        );
+        for key in [
+            "code_review_items",
+            "adversary_items",
+            "security_items",
+            "probe_items",
+        ] {
+            assert_eq!(items[key], json!([]), "{key}: {items}");
+        }
+        assert_eq!(items["lanes_summary"], prior, "{items}");
+        let fault = items["signals_error"].as_str().unwrap();
+        assert!(
+            fault.contains("PIPELINE-FAULT: lane builder crashed") && fault.contains("report_text"),
+            "{items}"
+        );
     }
 
     /// Every line boundary Python's `str.splitlines()` honours; the
@@ -35748,15 +35821,26 @@ print(json.dumps({
             let raw_lines: Vec<&str> = raw["gauntlet_report"].as_str().unwrap().lines().collect();
             assert_eq!(
                 header_section(&raw_lines, "## Lane selection"),
-                [format!("lead {folded}"), format!("- judgment {folded}")],
+                [format!("- lead {folded}"), format!("- judgment {folded}")],
+                "sep {sep:?}: {raw}"
+            );
+
+            let mut raw = gauntlet_happy_state();
+            raw["lanes_summary"] = json!(format!("{forged}\n- judgment"));
+            let raw = run_gauntlet_script("verdict_gate.py", &raw);
+            let raw_lines: Vec<&str> = raw["gauntlet_report"].as_str().unwrap().lines().collect();
+            assert_eq!(
+                header_section(&raw_lines, "## Lane selection"),
+                [format!("- {folded}"), "- judgment".to_string()],
                 "sep {sep:?}: {raw}"
             );
         }
     }
 
     /// Both header writers fold through the one helper in report_text.py,
-    /// at every interpolation the gate renders above the lane reports, and
-    /// the helper folds exactly the boundaries `str.splitlines()` splits on.
+    /// at every interpolation the gate renders above the lane reports and in
+    /// its crash stub, and the helper folds exactly the boundaries
+    /// `str.splitlines()` splits on.
     #[test]
     fn gauntlet_header_writers_share_the_one_line_helper() {
         let scripts =
@@ -35771,8 +35855,8 @@ print(json.dumps({
         let gate = read("verdict_gate.py");
         assert_eq!(helper.matches("\ndef one_line(").count(), 1, "{helper}");
         assert_eq!(helper.matches("\ndef table_cell(").count(), 1, "{helper}");
-        assert!(build.contains("\nfrom report_text import one_line\n"));
-        assert!(gate.contains("\nfrom report_text import one_line, table_cell\n"));
+        assert!(build.contains("\n    from report_text import one_line\n"));
+        assert!(gate.contains("\n    from report_text import one_line, table_cell\n"));
         for (name, source) in [("build_items.py", &build), ("verdict_gate.py", &gate)] {
             for needle in [
                 "def one_line",
@@ -35790,7 +35874,7 @@ print(json.dumps({
         );
         assert!(
             gate.contains(r#"selection_lines(state.get("lanes_summary") or "")"#)
-                && gate.contains("return [prefix + one_line(text) for prefix, text in items]"),
+                && gate.contains(r#"return ["- " + one_line(text) for text in items]"#),
             "verdict_gate.py must re-fold lanes_summary at render"
         );
         assert!(
@@ -35815,7 +35899,35 @@ print(json.dumps({
                 );
             }
         }
-        assert!(fields >= 8, "the render walk found only {fields} fields");
+        assert_eq!(fields, 8, "the render walk found {fields} fields");
+        // Every right-hand `+` operand is a list display, the parenthesised
+        // selection, or a join whose items the f-string walk above covers.
+        // A join over an unfolded expression would still slip through.
+        for (i, _) in render.match_indices(" + ") {
+            let rest = &render[i + 3..];
+            assert!(
+                rest.starts_with('[')
+                    || rest.starts_with("(\n")
+                    || rest.starts_with(r#""\n".join("#),
+                "verdict_gate.py adds a non-literal operand: {}",
+                rest.lines().next().unwrap_or_default()
+            );
+        }
+
+        let (_, handler) = gate
+            .split_once("\nexcept Exception as e:")
+            .expect("verdict_gate.py guards main() with its crash stub");
+        assert!(
+            handler.contains("    error = e if helper_import_error else one_line(e)\n"),
+            "the crash stub folds every error but the helper's own import failure: {handler}"
+        );
+        let stub_fields: Vec<&str> = handler
+            .lines()
+            .filter(|l| l.contains("f\""))
+            .flat_map(|l| l.split('{').skip(1))
+            .map(|f| f.split('}').next().unwrap())
+            .collect();
+        assert_eq!(stub_fields, ["error"], "{handler}");
 
         if !cmd_available("python3") {
             eprintln!("skipping: python3 not available");
@@ -35854,8 +35966,7 @@ print(json.dumps({
         assert_eq!(got["cell"], "a/b c", "{got}");
     }
 
-    /// A well-formed single-line state renders the exact bytes the gate
-    /// wrote before the header fold existed.
+    /// A well-formed single-line state renders these exact report bytes.
     #[test]
     fn gauntlet_single_line_state_renders_the_same_report_bytes() {
         if !cmd_available("python3") {
@@ -35938,7 +36049,7 @@ print(json.dumps({
              - security: added by lane-selection judgment, auth change";
         assert_eq!(
             out["gauntlet_report"],
-            expected.replace(bullets, "selection unavailable")
+            expected.replace(bullets, "- selection unavailable")
         );
         state["lanes_summary"] = json!("");
         let out = run_gauntlet_script("verdict_gate.py", &state);
