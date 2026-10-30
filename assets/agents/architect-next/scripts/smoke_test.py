@@ -1098,6 +1098,13 @@ calls = core_calls(lambda: gates.pr_body(base_state(plan_path=PROMOTED, tasks=ts
 check("pr_body: PR-group mode -> assemble_pr_body --tasks <the closing group's task ids, comma-separated>", calls == [f"tasks={GROUP_TASKS} plan={PROMOTED}"], str(calls))
 calls = core_calls(lambda: gates.pr_body(base_state(plan_path=PROMOTED, tasks=ts_g, closeout_unit="g1", pr_summary_text="s", body_fix_rounds=RERUN_ONCE)), "assemble_pr_body")
 check("pr_body: single PR -> assemble_pr_body without --tasks", calls == [f"tasks=unset plan={PROMOTED}"], str(calls))
+ts_skip = copy.deepcopy(ts_g)
+for t in ts_skip:
+    t["status"] = "skipped" if t["id"] == T2 else "complete"
+calls = core_calls(lambda: gates.pr_body(base_state(plan_path=PROMOTED, tasks=ts_skip, pr_strategy="multi", closeout_unit="g1", pr_summary_text="s", body_fix_rounds=RERUN_ONCE)),
+                   "assemble_pr_body")
+check("pr_body: PR-group mode with a skipped member -> assemble_pr_body --tasks lists only the group's complete tasks",
+      calls == [f"tasks={T1 if MULTI_IS_GROUPS else 'unset'} plan={PROMOTED}"], str(calls))
 FAILING_TOOLS = os.path.join(TMP, "failing-tools", "tools.sh")
 write(FAILING_TOOLS, "record() { printf '%s tasks=%s plan=%s\\n' \"$1\" \"${argc_tasks-unset}\" \"${argc_plan-unset}\" >> \"" + CORE_CALLS + "\"; }\n"
                      "assemble_pr_body() { record assemble_pr_body; echo 'assemble failed' >&2; return 1; }\n")

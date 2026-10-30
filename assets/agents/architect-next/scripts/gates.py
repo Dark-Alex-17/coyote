@@ -2696,11 +2696,11 @@ def stack_gate_final(state):
 
 
 def _group_members(state):
-    """The closing PR group's task ids, comma-separated as tools.sh `--tasks` takes them; None outside group mode."""
+    """The closing PR group's complete task ids, comma-separated as tools.sh `--tasks` takes them; None outside group mode."""
     unit = state.get("closeout_unit")
     if is_single(state) or not MULTI_IS_GROUPS or not unit:
         return None
-    return ",".join(t["id"] for t in as_list(state.get("tasks")) if t.get("unit") == unit) or None
+    return ",".join(t["id"] for t in as_list(state.get("tasks")) if t.get("unit") == unit and t.get("status") == "complete") or None
 
 
 def pr_body(state):
