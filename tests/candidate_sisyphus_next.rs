@@ -11,7 +11,12 @@
 //! Every run points `HOME`, `LLM_ROOT_DIR`, `COYOTE_CACHE_DIR`, `TMPDIR` and
 //! `SISYPHUS_RUNS_ROOT` at a scratch directory and sets
 //! `PYTHONDONTWRITEBYTECODE=1`, so nothing under `assets/` or `~/.config/coyote`
-//! is read or written.
+//! is read or written. The batteries and the lifted-graph runs drop every
+//! `LLM_AGENT_VAR_*` variable, and every process that can reach git (the
+//! wrapper's own git calls, the batteries, the gauntlet scripts and the
+//! lifted-graph runs) drops `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`,
+//! `GIT_OBJECT_DIRECTORY` and `GIT_COMMON_DIR`, so neither the caller's agent
+//! variables nor its repository leak into a fixture.
 //!
 //! The sweep is key-based over every bundled agent: no `spawnable_agents`
 //! entry, no `session.chat.agent` value and no `agent:` node value names a
@@ -2005,7 +2010,24 @@ const FROZEN_SCRIPT_BOUNDS: &[(&str, &str)] = &[
 ];
 
 fn is_constant_name(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_ascii_uppercase() || c == '_')
+    let mut chars = s.chars();
+    chars.next().is_some_and(|c| c.is_ascii_uppercase())
+        && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// A right-hand side built only from integer literals, constant names and
+/// arithmetic, so `3`, `STRIKE_LIMIT` and `STRIKE_LIMIT + 1` all count while a
+/// string, a bool or a call does not.
+fn is_bound_expression(value: &str) -> bool {
+    value.chars().any(|c| c.is_ascii_alphanumeric())
+        && value
+            .split(|c: char| " +-*/%()".contains(c))
+            .filter(|t| !t.is_empty())
+            .all(|t| {
+                is_constant_name(t)
+                    || (t.starts_with(|c: char| c.is_ascii_digit())
+                        && t.replace('_', "").parse::<i64>().is_ok())
+            })
 }
 
 #[test]
@@ -2066,11 +2088,15 @@ fn graph_and_gate_budgets_equal_the_frozen_baseline() {
     let lib = fs::read_to_string(candidate_dir().join("scripts/_lib.py")).unwrap();
     let mut script_bounds = BTreeMap::new();
     for line in lib.lines() {
-        let Some((name, rest)) = line.split_once(" = ") else {
+        let Some((target, rest)) = line.split_once('=') else {
             continue;
         };
+        if rest.starts_with('=') {
+            continue;
+        }
+        let name = target.split_once(':').map_or(target, |(n, _)| n).trim_end();
         let value = rest.split('#').next().unwrap().trim();
-        if is_constant_name(name) && (value.parse::<i64>().is_ok() || is_constant_name(value)) {
+        if is_constant_name(name) && is_bound_expression(value) {
             let previous = script_bounds.insert(name.to_string(), value.to_string());
             assert!(previous.is_none(), "{name} is assigned twice in _lib.py");
         }
