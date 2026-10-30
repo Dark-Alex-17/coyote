@@ -795,7 +795,7 @@ fn agent_quoted_command(rel: &str, needle: &str) -> String {
 /// A caller running inside a graph exports its state, which puts the debt
 /// scanner in graph mode, where it ignores `--dir` and `--base`.
 #[cfg(unix)]
-fn without_git_repo_vars(cmd: &mut Command) -> &mut Command {
+fn without_caller_repo_and_graph_vars(cmd: &mut Command) -> &mut Command {
     for key in [
         "GIT_DIR",
         "GIT_WORK_TREE",
@@ -812,7 +812,7 @@ fn without_git_repo_vars(cmd: &mut Command) -> &mut Command {
 
 #[cfg(unix)]
 fn sh(cwd: &Path, command: &str) -> std::process::Output {
-    without_git_repo_vars(&mut Command::new("sh"))
+    without_caller_repo_and_graph_vars(&mut Command::new("sh"))
         .arg("-c")
         .arg(command)
         .current_dir(cwd)
@@ -824,7 +824,7 @@ fn sh(cwd: &Path, command: &str) -> std::process::Output {
 
 #[cfg(unix)]
 fn git(repo: &Path, args: &[&str]) -> String {
-    let out = without_git_repo_vars(&mut Command::new("git"))
+    let out = without_caller_repo_and_graph_vars(&mut Command::new("git"))
         .arg("-C")
         .arg(repo)
         .args([
@@ -855,7 +855,7 @@ fn debt_scan_full(
 ) -> (Option<i32>, String, String) {
     let scanner =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared/debt_scan.py");
-    let out = without_git_repo_vars(&mut Command::new("python3"))
+    let out = without_caller_repo_and_graph_vars(&mut Command::new("python3"))
         .arg(&scanner)
         .arg("--dir")
         .arg(repo)
