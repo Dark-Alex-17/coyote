@@ -1157,7 +1157,10 @@ def verify_gate(state):
 def _code_tree_dirty(state, code):
     pathspec = []
     if state.get("plans_root") and code:
-        rel = os.path.relpath(os.path.realpath(state["plans_root"]), os.path.realpath(code))
+        try:
+            rel = os.path.relpath(os.path.realpath(state["plans_root"]), os.path.realpath(code))
+        except ValueError:
+            rel = ".."
         if rel != "." and not rel.startswith(".."):
             pathspec = ["--", ".", f":(exclude){rel}"]
     return bool(git_out(code, "status", "--porcelain", *pathspec))
@@ -1169,6 +1172,19 @@ def _gauntlet_header(text):
     if (i := text.find("<details>")) >= 0:
         return text[:i]
     return text
+
+
+def _gauntlet_section(header_lines, start, title):
+    heading = re.compile(rf"##[ \t]+{re.escape(title)}[ \t]*")
+    heads = [i for i in range(start, len(header_lines)) if heading.fullmatch(header_lines[i])]
+    if not heads:
+        return None, start
+    body = []
+    for line in header_lines[heads[-1] + 1:]:
+        if re.match(r"##[ \t]", line):
+            break
+        body.append(line)
+    return body, heads[-1] + 1
 
 
 _GAUNTLET_VERDICT_RE = re.compile(r"^GAUNTLET:[ \t]*(PASS|BLOCKED)[ \t]*$", re.M)
@@ -1231,7 +1247,13 @@ def _parse_gauntlet(text):
         blockers = [l.strip()[1:].strip() for l in sec.group(2).splitlines() if l.strip().startswith(("-", "*"))]
     if verdict == "BLOCKED" and not blockers and "ADVERSARIAL_REVIEW: DIVERGES" in text:
         blockers = [l.strip()[1:].strip() for l in text.splitlines() if l.strip().startswith(("-", "*"))][:20] or ["adversary: DIVERGES (see report)"]
-    blockers += [l.strip() for l in text.splitlines() if l.strip().startswith("debris: Implementation debris")]
+    if _has_verdict(header) or "ADVERSARIAL_REVIEW:" not in text:
+        # The gauntlet writes debris hits only into its Blockers section, so the
+        # same line in a lane reason or a lane report is not a blocker.
+        section, _ = _gauntlet_section(header.splitlines(), 0, "Blockers")
+        blockers += [l.rstrip() for l in section or [] if l.startswith("debris: Implementation debris")]
+    else:
+        blockers += [l.strip() for l in text.splitlines() if l.strip().startswith("debris: Implementation debris")]
     plan_root = bool(re.search(r"(?i)plan (itself )?is the root cause|impossible or contradictory criterion|criterion (is|cannot be) (impossible|unverifiable)", text))
     probe_files = re.findall(TEST_FILE_RE, text) if _probe_verdict(text) == "PASS" else []
     return verdict, incomplete, lanes, blockers, plan_root, probe_files
@@ -1264,6 +1286,10 @@ def route_verdict(state):
     u["task_rounds"] = rounds
     ledger(state, u, f"verdict: {unit} round {len(rl)} -> {verdict} lanes={lanes} incomplete={incomplete}")
     real = [b for b in blockers if "PIPELINE-FAULT" not in b and "review incomplete" not in b.lower()]
+    # The plan-root phrases are read from the whole reply, lane reports included,
+    # so a PASS that carries one fails closed instead of closing the task.
+    if plan_root and not real:
+        real = ["the review names the plan itself as the root cause (see the round report)"]
     if verdict == "PASS" and not real:
         if probe == "PASS" and probe_files and as_int(tr.get("adopt_rounds")) < RERUN_ONCE and scope == "task":
             tr["adopt_rounds"] = as_int(tr.get("adopt_rounds")) + 1
@@ -1706,7 +1732,7 @@ def wave_route(state):
     if _report_failed(report):
         result.update({"status": "failed", "escalation": {"kind": "task_failed", "evidence": tail(report, 2000)}})
         return {"wave_result": result}
-    if verdict == "PASS" and not real:
+    if verdict == "PASS" and not real and not plan_root:
         result["status"] = "conforms"
         return {"wave_result": result}
     if real and not plan_root and as_int(state.get("wave_fix_rounds")) < RERUN_ONCE:
@@ -2681,7 +2707,9 @@ def pr_body(state):
     notes = [l for l in (out or "").splitlines() if "NOTE" in l]
     if not ok:
         ledger(state, u, f"pr: assemble_pr_body failed ({tail(out, 200)}); body = summary + task checklist assembled locally")
-        tasks = [t for t in as_list(state.get("tasks")) if t.get("status") == "complete"]
+        members = _group_members(state)
+        tasks = [t for t in as_list(state.get("tasks")) if t.get("status") == "complete"
+                 and (members is None or t["id"] in members.split(","))]
         body = summary + "\n\n## Tasks\n" + "\n".join(f"- [x] {t['id']} - {t.get('title', '')} ({t.get('head_sha') or 'see log'})" for t in tasks)
         body += "\n\n## Hygiene pass\n" + ("\n".join(f"- {h}" for h in hyg) if hyg else "clean") + "\n"
         write_artifact(run_dir, "pr-body.md", body)
