@@ -1123,6 +1123,30 @@ def _has_verdict(header):
     return bool(_GAUNTLET_VERDICT_RE.search(header))
 
 
+# The gauntlet writes its sections after the lane table in a fixed order:
+# `## Lane selection` (lane reasons, model-written and free to carry a
+# column-0 heading of its own), then the optional `## Pipeline notes`,
+# `## Blockers` and `## Human attention required`. A section is read only
+# below the first `## Lane selection` heading after the table, from the
+# LAST exact level-2 heading of its title, up to the next column-0 `## `
+# heading, so a look-alike inside the lane reasons always sits above the
+# real one and never stands in for it. The attention section is read below
+# the Blockers heading when there is one, because it is written after it; a
+# BLOCKED reply always carries `## Blockers`, so the look-alike can only be
+# read when the gauntlet wrote neither section.
+def _gauntlet_section(header_lines, start, title):
+    heading = re.compile(rf"##[ \t]+{re.escape(title)}[ \t]*")
+    heads = [i for i in range(start, len(header_lines)) if heading.fullmatch(header_lines[i])]
+    if not heads:
+        return None, start
+    body = []
+    for line in header_lines[heads[-1] + 1:]:
+        if re.match(r"##[ \t]", line):
+            break
+        body.append(line)
+    return body, heads[-1] + 1
+
+
 def _parse_gauntlet(text):
     header = _gauntlet_header(text)
     verdict = "BLOCKED"
@@ -1135,22 +1159,25 @@ def _parse_gauntlet(text):
     details = {}
     header_lines = header.splitlines()
     first_row = next((i for i, l in enumerate(header_lines) if l.startswith("|")), len(header_lines))
+    table_end = first_row
     for line in header_lines[first_row:]:
         if not line.startswith("|"):
             break
+        table_end += 1
         cells = [c.strip() for c in line.strip("|").split("|")]
         lane = cells[0].lower()
         if len(cells) >= 2 and lane in GAUNTLET_LANES and lane not in lanes:
             lanes[lane] = cells[1]
             if len(cells) >= 3 and cells[2]:
                 details[lane] = cells[2]
-    blockers = []
-    if sec := re.search(r"(?ims)^#+[ \t]*Blockers?[ \t]*$\n?(.*?)(?=^#+\s|\Z)", header):
-        blockers = [l[2:].strip() for l in sec.group(1).splitlines() if l.startswith(("- ", "* "))]
+    start = table_end if table_end > first_row else 0
+    selection = re.compile(r"##[ \t]+Lane selection[ \t]*")
+    start = next((i + 1 for i in range(start, len(header_lines)) if selection.fullmatch(header_lines[i])), start)
+    section, start = _gauntlet_section(header_lines, start, "Blockers")
+    blockers = [l[2:].strip() for l in section or [] if l.startswith(("- ", "* "))]
     blockers += [l.rstrip() for l in header_lines if l.startswith("debris: Implementation debris")]
-    attention = ""
-    if m := re.search(r"(?ims)^#+[ \t]*Human attention required[ \t]*\n(.*?)(?=^#+\s|\Z)", header):
-        attention = m.group(1).strip()
+    section, _ = _gauntlet_section(header_lines, start, "Human attention required")
+    attention = "\n".join(section or []).strip()
     return verdict, incomplete, lanes, details, blockers, attention
 
 
