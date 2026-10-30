@@ -3287,6 +3287,7 @@ mod tests {
     use crate::mcp::{McpServer, McpServersConfig, McpTransportType};
     use crate::supervisor::escalation::{EscalationQueue, EscalationRequest};
     use crate::supervisor::{JobHandle, JobResult, JobState, JobStatus};
+    use crate::testing::TestConfigDirGuard;
     use crate::utils::fs::ExclusiveLock;
     use crate::utils::get_env_name;
     use parking_lot::Mutex;
@@ -3300,79 +3301,6 @@ mod tests {
 
     fn default_app_state() -> Arc<AppState> {
         Arc::new(AppState::test_default())
-    }
-
-    /// Pins the config dir and the cache dir to fresh temp dirs so a spawn
-    /// in a test never reads or writes the developer's real ones; both are
-    /// restored on drop.
-    struct TestConfigDirGuard {
-        keys: [(String, Option<std::ffi::OsString>); 2],
-        path: PathBuf,
-        cache_root: PathBuf,
-    }
-
-    impl TestConfigDirGuard {
-        fn new() -> Self {
-            let unique = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let path = env::temp_dir().join(format!("coyote-agents-tests-{unique}"));
-            create_dir_all(&path).unwrap();
-            let cache_root = env::temp_dir().join(format!("coyote-agents-tests-cache-{unique}"));
-            create_dir_all(&cache_root).unwrap();
-            let keys = [
-                (get_env_name("config_dir"), path.as_os_str()),
-                (get_env_name("cache_dir"), cache_root.as_os_str()),
-            ]
-            .map(|(key, value)| {
-                let previous = env::var_os(&key);
-                unsafe {
-                    env::set_var(&key, value);
-                }
-                (key, previous)
-            });
-            Self {
-                keys,
-                path,
-                cache_root,
-            }
-        }
-    }
-
-    impl Drop for TestConfigDirGuard {
-        fn drop(&mut self) {
-            for (key, previous) in &self.keys {
-                if let Some(previous) = previous {
-                    unsafe {
-                        env::set_var(key, previous);
-                    }
-                } else {
-                    unsafe {
-                        env::remove_var(key);
-                    }
-                }
-            }
-            let _ = remove_dir_all(&self.path);
-            let _ = remove_dir_all(&self.cache_root);
-        }
-    }
-
-    #[test]
-    #[serial]
-    fn test_config_dir_guard_pins_the_cache_dir_and_restores_it_on_drop() {
-        let key = get_env_name("cache_dir");
-        let before = env::var_os(&key);
-        let cache_root = {
-            let guard = TestConfigDirGuard::new();
-            let pinned = env::var_os(&key).expect("cache dir pinned while the guard lives");
-            assert_eq!(PathBuf::from(&pinned), guard.cache_root);
-            assert!(guard.cache_root.is_dir());
-            assert_ne!(guard.cache_root, guard.path);
-            guard.cache_root.clone()
-        };
-        assert_eq!(env::var_os(&key), before);
-        assert!(!cache_root.exists());
     }
 
     fn ctx_with_supervisor(max_concurrent: usize, max_depth: usize) -> RequestContext {
@@ -3416,7 +3344,7 @@ mod tests {
     #[test]
     #[serial]
     fn effective_max_agent_depth_uses_agent_limit_without_supervisor() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = format!(
             "test_depth_agent_{}",
             SystemTime::now()
@@ -3621,7 +3549,7 @@ mod tests {
     #[test]
     #[serial]
     fn spawned_agent_success_fires_started_and_completed_with_matching_id() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let _sink = hooks::test_sink::install();
         let agent_name = unique_agent_name("test_hook_spawn_ok");
         write_graph_agent_with_hooks(&agent_name, "t037_spawn_ok", false);
@@ -3652,7 +3580,7 @@ mod tests {
     #[test]
     #[serial]
     fn spawned_agent_failure_fires_started_and_failed_with_matching_id() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let _sink = hooks::test_sink::install();
         let agent_name = unique_agent_name("test_hook_spawn_fail");
         write_graph_agent_with_hooks(&agent_name, "t037_spawn_fail", true);
@@ -3714,7 +3642,7 @@ mod tests {
     #[test]
     #[serial]
     fn cancelled_spawned_agent_fires_interrupted_not_failed() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let _sink = hooks::test_sink::install();
         let agent_name = unique_agent_name("test_hook_spawn_cancel");
         write_graph_agent_with_hooks(&agent_name, "t049_spawn_cancel", true);
@@ -3750,7 +3678,7 @@ mod tests {
     #[test]
     #[serial]
     fn unseated_spawn_hooks_carry_no_session_keys() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let _sink = hooks::test_sink::install();
         let agent_name = unique_agent_name("test_hook_spawn_unseated");
         write_graph_agent_with_hooks(&agent_name, "sidecar_spawn_unseated", false);
@@ -3819,7 +3747,7 @@ mod tests {
     #[test]
     #[serial]
     fn run_agent_for_graph_rejects_inputs_for_config_only_agent() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_inputs_plain_agent");
         write_config_only_agent(&agent_name);
 
@@ -3836,7 +3764,7 @@ mod tests {
     #[test]
     #[serial]
     fn run_agent_for_graph_rejects_initial_prompt_input_on_graph_agent() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_inputs_graph_agent");
         write_graph_agent(&agent_name);
         let inputs = HashMap::from([("initial_prompt".to_string(), json!("x"))]);
@@ -3854,7 +3782,7 @@ mod tests {
     #[test]
     #[serial]
     fn run_agent_for_graph_rejects_previous_turns_input_on_graph_agent() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_inputs_graph_agent_turns");
         write_graph_agent(&agent_name);
         let inputs = HashMap::from([("previous_turns".to_string(), json!("x"))]);
@@ -3876,7 +3804,7 @@ mod tests {
     #[test]
     #[serial]
     fn run_agent_for_graph_child_inherits_session_abort() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_session_abort_graph_agent");
         write_graph_agent(&agent_name);
         let session = create_abort_signal();
@@ -3942,7 +3870,7 @@ mod tests {
     #[test]
     #[serial]
     fn run_agent_for_graph_child_seats_the_parents_build_lock_over_its_default() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_graph_child_build_lock");
         write_graph_agent_that_reports_build_lock(&agent_name);
         let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
@@ -3960,7 +3888,7 @@ mod tests {
     #[test]
     #[serial]
     fn run_agent_for_graph_child_without_a_parent_value_seats_its_declared_default() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_graph_child_build_lock_default");
         write_graph_agent_that_reports_build_lock(&agent_name);
         let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
@@ -4070,7 +3998,7 @@ mod tests {
     #[test]
     #[serial]
     fn build_child_spawn_seats_the_child_on_an_owner_only_session_under_the_spawner_root() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_seat_child");
         write_config_agent_with_variables(&agent_name);
         let prompt = "describe the seating ".repeat(20);
@@ -4100,7 +4028,7 @@ mod tests {
             .expect("the child carries the spawner's root");
         assert!(
             root.dir()
-                .starts_with(_guard.cache_root.join("sessions").join("_proc")),
+                .starts_with(_guard.cache_root().join("sessions").join("_proc")),
             "{}",
             root.dir().display()
         );
@@ -4146,7 +4074,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_spawn_refuses_to_seat_an_agent_whose_name_does_not_fit_a_session_id() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test bad+name");
         assert!(!child_sessions::agent_name_fits_session_id(&agent_name));
         write_config_only_agent(&agent_name);
@@ -4170,7 +4098,7 @@ mod tests {
     #[test]
     #[serial]
     fn an_agent_whose_name_does_not_fit_a_session_id_still_spawns_unseated() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test bad+name unseated");
         write_config_agent_with_setting(&agent_name, "child_sessions: false");
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -4184,7 +4112,7 @@ mod tests {
     #[test]
     #[serial]
     fn build_child_spawn_records_the_root_spawner_saved_session_as_the_root_parent() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_seat_parent_path");
         write_config_only_agent(&agent_name);
         let mut ctx = spawner_with_session("root-saved");
@@ -4206,7 +4134,7 @@ mod tests {
         assert_eq!(
             root.dir(),
             _guard
-                .cache_root
+                .cache_root()
                 .join("sessions")
                 .join(uid.simple().to_string())
         );
@@ -4223,7 +4151,7 @@ mod tests {
     #[test]
     #[serial]
     fn build_child_spawn_records_the_root_session_file_rather_than_a_rederived_path() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_seat_parent_file");
         write_config_only_agent(&agent_name);
         let mut ctx = spawner_with_session("root-saved");
@@ -4251,7 +4179,7 @@ mod tests {
     #[test]
     #[serial]
     fn build_child_spawn_keys_an_unsaved_root_session_on_its_uid_without_a_parent_path() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_seat_unsaved_parent");
         write_config_only_agent(&agent_name);
         let mut ctx = spawner_with_session("root-unsaved");
@@ -4268,7 +4196,7 @@ mod tests {
     #[test]
     #[serial]
     fn build_child_spawn_from_a_child_shares_the_root_and_names_the_child_as_spawner() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let child_agent = unique_agent_name("test_seat_child_spawner");
         let grandchild_agent = unique_agent_name("test_seat_grandchild");
         write_config_only_agent(&child_agent);
@@ -4300,7 +4228,7 @@ mod tests {
     #[test]
     #[serial]
     fn handle_spawn_with_the_agent_knob_off_mints_the_root_but_seats_no_session() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_seat_agent_knob_off");
         write_config_agent_with_setting(&agent_name, "child_sessions: false");
         let mut ctx = spawner_with_session("knob-spawner");
@@ -4313,13 +4241,13 @@ mod tests {
             "the agent knob decides seating, not whether the spawner has a root"
         );
         assert!(ctx.session.as_ref().unwrap().uid().is_some());
-        assert!(!_guard.cache_root.join("sessions").exists());
+        assert!(!_guard.cache_root().join("sessions").exists());
     }
 
     #[test]
     #[serial]
     fn build_child_spawn_with_the_app_knob_off_mints_nothing() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_seat_app_knob_off");
         write_config_only_agent(&agent_name);
         let app = AppState {
@@ -4341,13 +4269,13 @@ mod tests {
         assert!(spawn.child_ctx.session.is_none());
         assert!(ctx.child_session_root.is_none());
         assert!(ctx.session.as_ref().unwrap().uid().is_none());
-        assert!(!_guard.cache_root.join("sessions").exists());
+        assert!(!_guard.cache_root().join("sessions").exists());
     }
 
     #[test]
     #[serial]
     fn build_child_spawn_ignores_the_agent_session_setting_of_a_spawned_agent() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_seat_agent_session");
         write_config_agent_with_setting(&agent_name, "agent_session: shared");
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -4358,13 +4286,13 @@ mod tests {
         assert_eq!(Some(session.name()), spawn.session_id.as_deref());
         assert!(session.name().starts_with("sess_"), "{}", session.name());
         assert!(files_named(&_guard.path, "shared.yaml").is_empty());
-        assert!(files_named(&_guard.cache_root, "shared.yaml").is_empty());
+        assert!(files_named(_guard.cache_root(), "shared.yaml").is_empty());
     }
 
     #[test]
     #[serial]
     fn a_seated_child_turn_lands_in_its_session_file_and_a_tool_round_does_not() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_seat_turn");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -4473,7 +4401,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_child_compresses_at_a_turn_boundary_not_mid_tool_loop() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_child_turn_compress");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -4587,7 +4515,7 @@ mod tests {
         use crate::testing::{install_log_collector, warn_snapshot};
 
         install_log_collector();
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_child_turn_compress_fails");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -4649,7 +4577,7 @@ mod tests {
         use crate::testing::{install_log_collector, warn_snapshot};
 
         install_log_collector();
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_child_compress_warn_names");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -4795,7 +4723,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_child_folds_committed_rounds_after_a_tool_loop_checkpoint() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_child_checkpoint_compress");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -4920,7 +4848,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_child_folds_after_a_safety_valve_checkpoint() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_child_valve_checkpoint_compress");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -5067,7 +4995,7 @@ mod tests {
         use crate::testing::{install_log_collector, warn_snapshot};
 
         install_log_collector();
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_child_overflow_retry");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -5340,7 +5268,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_the_request_after_a_checkpoint_fold_carries_the_compressed_transcript() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_child_fold_refresh");
         write_config_only_agent(&agent_name);
         // A 6_000-char argument blob rides both the call and the refusal
@@ -5420,7 +5348,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_a_child_retries_an_overflow_once_and_surfaces_the_second() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_child_overflow_once");
         write_config_only_agent(&agent_name);
         let server = ScriptedModelServer::serving(vec![
@@ -5488,7 +5416,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_a_second_overflow_with_a_foldable_transcript_is_surfaced_not_compressed() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_child_overflow_once_foldable");
         write_config_only_agent(&agent_name);
         // A 6_000-char argument blob rides both the call and the refusal
@@ -5576,7 +5504,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_the_safety_valve_compresses_a_child_under_its_threshold() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_child_valve_compress");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -5651,7 +5579,7 @@ mod tests {
     #[serial]
     fn usage_probe_a_child_compression_fires_no_session_compressed_hook() {
         let _sink = hooks::test_sink::install();
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let marker = "usage_probe_child_compressed_hook";
         let agent_name = unique_agent_name("test_child_compress_no_hook");
         write_config_agent_with_setting(
@@ -5718,7 +5646,7 @@ mod tests {
     #[serial]
     fn usage_probe_a_resumed_child_keeps_its_stored_compression_knobs_when_the_agent_config_changes()
      {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_keeps_compression_knobs");
         write_config_agent_with_setting(
             &agent_name,
@@ -5769,7 +5697,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         crate::testing::install_log_collector();
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_child_compress_write_back_fails");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -5852,7 +5780,7 @@ mod tests {
     #[serial]
     fn handle_spawn_reports_the_child_session_id_and_a_completed_child_ends_its_sidecar_completed()
     {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_seat_graph_child");
         write_graph_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -5894,7 +5822,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_seated_graph_child_records_its_run_into_its_session_file() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_graph_child_records");
         write_graph_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -5952,7 +5880,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_failing_child_ends_its_sidecar_failed_with_its_error() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let _sink = hooks::test_sink::install();
         let agent_name = unique_agent_name("test_sidecar_failed");
         write_graph_agent_with_hooks(&agent_name, "sidecar_run_failed", true);
@@ -6061,7 +5989,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_ctrlc_after_an_ok_run_lands_the_sidecar_cancelled_and_fires_interrupted() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let _sink = hooks::test_sink::install();
         let agent_name = unique_agent_name("test_ctrlc_after_ok_run");
         write_graph_agent_with_hooks(&agent_name, "ctrlc_after_ok", false);
@@ -6101,7 +6029,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_ctrlc_verdict_fires_interrupted_even_when_the_run_returned_ok() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let _sink = hooks::test_sink::install();
         let agent_name = unique_agent_name("test_ctrlc_ok_verdict");
         write_config_agent_with_result_hooks(&agent_name, "ctrlc_ok_verdict");
@@ -6188,7 +6116,7 @@ mod tests {
     #[serial]
     fn a_child_whose_final_session_flush_fails_ends_failed_with_that_error() {
         crate::testing::install_log_collector();
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let _sink = hooks::test_sink::install();
         let agent_name = unique_agent_name("test_child_flush_failed");
         write_config_agent_with_result_hooks(&agent_name, "child_flush_failed");
@@ -6240,7 +6168,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_graph_child_whose_final_session_flush_fails_ends_failed_with_that_error() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let _sink = hooks::test_sink::install();
         let agent_name = unique_agent_name("test_graph_child_flush_failed");
         write_graph_agent_with_hooks(&agent_name, "graph_flush_failed", false);
@@ -6348,7 +6276,7 @@ mod tests {
     #[test]
     #[serial]
     fn resume_of_a_completed_graph_child_keeps_the_session_id_under_a_fresh_agent_id() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_graph");
         write_graph_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -6409,7 +6337,7 @@ mod tests {
     #[test]
     #[serial]
     fn resume_of_a_graph_child_seeds_the_transcript_and_the_carried_values_of_its_first_run() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_graph_remembers");
         write_graph_agent_that_remembers(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -6475,7 +6403,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_resume_of_a_plain_graph_child_seeds_the_transcript_of_its_first_run() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_plain_graph_turns");
         write_graph_agent_that_echoes_the_turns(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -6554,7 +6482,7 @@ mod tests {
     #[test]
     #[serial]
     fn resume_marks_the_sidecar_running_under_the_new_agent_id_while_the_child_runs() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_graph_running");
         let (started, release) = write_graph_agent_gated_by_markers(&agent_name);
         write(&release, "").unwrap();
@@ -6613,7 +6541,7 @@ mod tests {
     fn resume_marks_the_sidecar_failed_when_the_runtime_cannot_be_prepared() {
         use crate::config::StubSpawnsGuard;
 
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_runtime_fails");
         write_config_agent_with_setting(&agent_name, "mcp_servers:\n  - fixture");
         let mut ctx = RequestContext::new(app_state_with_fixture_mcp_config(), WorkingMode::Cmd);
@@ -6713,7 +6641,7 @@ mod tests {
     #[test]
     #[serial]
     fn resumed_config_child_carries_the_stored_transcript_instructions_and_variables() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_config");
         write_config_agent_with_variables(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -6800,7 +6728,7 @@ mod tests {
     #[test]
     #[serial]
     fn resumed_session_runs_on_the_agents_resolved_model_not_the_stored_one() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_model");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -6835,7 +6763,7 @@ mod tests {
     #[test]
     #[serial]
     fn resumed_session_keeps_the_agents_pinned_model_over_the_spawners() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_pinned_model");
         write_config_agent_with_setting(&agent_name, "model: test-seeded:pinned");
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -6876,7 +6804,7 @@ mod tests {
     #[test]
     #[serial]
     fn resume_of_an_unknown_id_lists_the_ten_newest_ids_and_marks_crashed_ones() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_unknown");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -6954,7 +6882,7 @@ mod tests {
     #[test]
     #[serial]
     fn resume_of_an_unknown_id_under_an_empty_root_says_so() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_unknown_empty");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -7044,7 +6972,7 @@ mod tests {
     #[test]
     #[serial]
     fn list_sessions_pages_newest_first_and_the_cursor_visits_every_child_once() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let (mut ctx, seeded) = ctx_with_completed_children(45);
 
         let first = list_sessions(&mut ctx, json!({})).unwrap();
@@ -7114,7 +7042,7 @@ mod tests {
     #[test]
     #[serial]
     fn list_sessions_breaks_created_at_ties_by_session_id() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let mut ctx = ctx_with_supervisor(4, 3);
         let root = ctx.ensure_child_session_root().unwrap();
         root.ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
@@ -7138,7 +7066,7 @@ mod tests {
     #[test]
     #[serial]
     fn list_sessions_caps_page_size_and_refuses_zero_or_an_unknown_cursor() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let (mut ctx, _) = ctx_with_completed_children(120);
 
         let capped = list_sessions(&mut ctx, json!({"page_size": 1000})).unwrap();
@@ -7170,7 +7098,7 @@ mod tests {
     #[test]
     #[serial]
     fn list_sessions_after_a_restart_derives_the_root_from_the_session_uid_without_minting() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let mut ctx = spawner_with_session("root");
         let root = ctx.ensure_child_session_root().unwrap();
         let ChildSessionRoot::Uid(uid) = *root else {
@@ -7205,7 +7133,7 @@ mod tests {
     #[test]
     #[serial]
     fn list_sessions_reports_a_dead_running_sidecar_as_crashed() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let mut ctx = ctx_with_supervisor(4, 3);
         let root = ctx.ensure_child_session_root().unwrap();
         root.ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
@@ -7242,7 +7170,7 @@ mod tests {
     #[test]
     #[serial]
     fn list_sessions_returns_the_empty_shape_with_a_note_when_child_sessions_are_off() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let mut ctx = ctx_with_child_sessions_off();
 
         let page = list_sessions(&mut ctx, json!({})).unwrap();
@@ -7262,7 +7190,7 @@ mod tests {
     #[test]
     #[serial]
     fn list_sessions_returns_the_empty_shape_with_a_note_without_a_root() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let mut ctx = ctx_with_supervisor(4, 3);
         let sessions_dir = child_sessions::sessions_root();
         let before = paths_under(&sessions_dir);
@@ -7292,7 +7220,7 @@ mod tests {
     #[test]
     #[serial]
     fn recent_child_ids_hint_spends_one_lookup_and_agrees_with_the_lister() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let mut ctx = ctx_with_supervisor(4, 3);
         let root = ctx.ensure_child_session_root().unwrap();
         root.ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
@@ -7345,7 +7273,7 @@ mod tests {
     #[test]
     #[serial]
     fn list_sessions_does_not_follow_a_symlinked_root() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let mut ctx = spawner_with_session("root");
         let root = ctx.ensure_child_session_root().unwrap();
         root.ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
@@ -7393,7 +7321,7 @@ mod tests {
     #[test]
     #[serial]
     fn list_sessions_under_dry_run_says_dry_run_records_nothing() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let app = AppState {
             config: Arc::new(AppConfig {
                 dry_run: true,
@@ -7421,7 +7349,7 @@ mod tests {
     #[test]
     #[serial]
     fn list_sessions_under_dry_run_with_child_sessions_off_says_dry_run_records_nothing() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let app = AppState {
             config: Arc::new(AppConfig {
                 dry_run: true,
@@ -7451,7 +7379,7 @@ mod tests {
     #[serial]
     #[cfg(unix)]
     fn usage_probe_list_sessions_refuses_a_dangling_symlinked_root_and_creates_nothing() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let mut ctx = spawner_with_session("dangling");
         let root = ctx.ensure_child_session_root().unwrap();
         let gone = root.dir().parent().unwrap().join("nowhere-at-all");
@@ -7481,7 +7409,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_list_sessions_under_dry_run_with_an_existing_root_lists_nothing() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let (mut ctx, _ids) = ctx_with_completed_children(2);
         assert_eq!(
             list_sessions(&mut ctx, json!({})).unwrap()["total"],
@@ -7510,7 +7438,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_recent_child_ids_hint_with_no_running_child_labels_nothing() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let (mut ctx, _ids) = ctx_with_completed_children(3);
         let root = ctx.ensure_child_session_root().unwrap();
 
@@ -7571,7 +7499,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_list_sessions_counts_every_real_resume_as_a_run() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_run_ring");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -7651,7 +7579,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_list_sessions_skips_unreadable_sidecars_and_counts_old_ones_as_zero_runs() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let mut ctx = ctx_with_supervisor(4, 3);
         let root = ctx.ensure_child_session_root().unwrap();
         root.ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
@@ -7704,7 +7632,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_list_sessions_mints_nothing_for_an_unsaved_or_childless_saved_session() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let sessions_dir = child_sessions::sessions_root();
         let before = paths_under(&sessions_dir);
 
@@ -7740,7 +7668,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_list_sessions_cursor_crosses_a_tie_and_refuses_malformed_arguments() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let mut ctx = ctx_with_supervisor(4, 3);
         let root = ctx.ensure_child_session_root().unwrap();
         root.ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
@@ -7799,7 +7727,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_list_sessions_cursor_after_the_last_child_is_an_empty_last_page() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let (mut ctx, _) = ctx_with_completed_children(3);
         let first = list_sessions(&mut ctx, json!({})).unwrap();
         let ids = session_ids_of(&first);
@@ -7825,7 +7753,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_list_sessions_cursor_survives_a_child_spawned_between_pages() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let (mut ctx, seeded) = ctx_with_completed_children(4);
         let first = list_sessions(&mut ctx, json!({"page_size": 2})).unwrap();
         let page_one = session_ids_of(&first);
@@ -7872,7 +7800,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_list_sessions_counts_the_first_resume_of_an_old_sidecar_as_one_run() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_old_sidecar");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -8008,7 +7936,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_list_sessions_decides_liveness_against_the_requested_page_only() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let mut ctx = ctx_with_supervisor(4, 3);
         let root = ctx.ensure_child_session_root().unwrap();
         root.ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
@@ -8110,7 +8038,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_list_sessions_runs_saturates_at_the_number_the_description_promises() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let decl = agent_function_declarations()
             .into_iter()
             .find(|d| d.name == "agent__list_sessions")
@@ -8180,7 +8108,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_list_sessions_orders_by_created_at_not_by_the_latest_resume() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let (mut ctx, seeded) = ctx_with_completed_children(5);
         let root = Arc::clone(ctx.child_session_root.as_ref().unwrap());
         let dead = ProcessStamp {
@@ -8232,7 +8160,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_list_sessions_reads_the_root_without_touching_a_file() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let (mut ctx, _) = ctx_with_completed_children(3);
         let root = Arc::clone(ctx.child_session_root.as_ref().unwrap());
         assert!(root.root_file().is_file());
@@ -8287,7 +8215,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_list_sessions_crashed_row_with_an_unknown_start_is_refused_on_resume_with_why() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let current = ProcessStamp::current();
         if current.start == 0 {
             eprintln!(
@@ -8349,7 +8277,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_list_sessions_skips_a_sidecar_whose_run_ring_is_malformed_and_keeps_the_rest() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         crate::testing::install_log_collector();
         let (mut ctx, ids) = ctx_with_completed_children(5);
         let root = Arc::clone(ctx.child_session_root.as_ref().unwrap());
@@ -8410,12 +8338,12 @@ mod tests {
     #[test]
     #[serial]
     fn resume_refuses_malformed_ids_before_building_any_path() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_malformed");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
         seed_completed_config_child(&mut ctx, &agent_name, json!({}));
-        let before = paths_under(&_guard.cache_root);
+        let before = paths_under(_guard.cache_root());
         assert!(!before.is_empty());
 
         for bad in [
@@ -8436,13 +8364,13 @@ mod tests {
             );
         }
 
-        assert_eq!(paths_under(&_guard.cache_root), before);
+        assert_eq!(paths_under(_guard.cache_root()), before);
     }
 
     #[test]
     #[serial]
     fn resume_refuses_a_session_that_belongs_to_another_agent() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_owner");
         let other_agent = unique_agent_name("test_resume_other");
         write_config_only_agent(&agent_name);
@@ -8466,7 +8394,7 @@ mod tests {
     #[test]
     #[serial]
     fn resume_refuses_a_running_child_and_accepts_a_crashed_one() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_running");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -8516,7 +8444,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_resume_over_a_crashed_open_run_closes_it_and_lists_two_runs() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_open_run");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -8582,7 +8510,7 @@ mod tests {
     #[test]
     #[serial]
     fn resume_refuses_differing_variables_and_accepts_equal_or_omitted_ones() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_variables");
         write_config_agent_with_variables(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -8647,7 +8575,7 @@ mod tests {
     #[test]
     #[serial]
     fn resume_with_variables_omitted_satisfies_a_required_variable_from_the_stored_ones() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_required_variable");
         let agent_dir = paths::agent_data_dir(&agent_name);
         create_dir_all(&agent_dir).unwrap();
@@ -8688,7 +8616,7 @@ mod tests {
     #[test]
     #[serial]
     fn resume_of_a_child_that_crashed_before_its_first_turn_speaks_with_the_stored_instructions() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_before_first_turn");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -8756,7 +8684,7 @@ mod tests {
     #[test]
     #[serial]
     fn knob_source_names_the_app_file_then_the_agent_file_then_dry_run() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_off = Agent::test_new(AgentConfig {
             name: "knob_probe".into(),
             child_sessions: Some(false),
@@ -8808,7 +8736,7 @@ mod tests {
     #[test]
     #[serial]
     fn resume_with_the_app_knob_off_names_the_config_file() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_app_knob");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_child_sessions_off();
@@ -8826,13 +8754,13 @@ mod tests {
             )),
             "{error}"
         );
-        assert!(!_guard.cache_root.join("sessions").exists());
+        assert!(!_guard.cache_root().join("sessions").exists());
     }
 
     #[test]
     #[serial]
     fn resume_with_the_agent_knob_off_names_the_agent_config_file() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_agent_knob");
         write_config_agent_with_setting(&agent_name, "child_sessions: false");
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -8857,7 +8785,7 @@ mod tests {
     #[test]
     #[serial]
     fn resume_under_dry_run_names_the_flag_before_missing_the_root() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_dry_run");
         write_config_only_agent(&agent_name);
         let app = AppState {
@@ -8889,7 +8817,7 @@ mod tests {
     #[test]
     #[serial]
     fn resume_from_a_spawner_without_a_root_is_refused() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_no_root");
         write_config_only_agent(&agent_name);
         let parent = ctx_with_supervisor(4, 3);
@@ -8920,7 +8848,7 @@ mod tests {
     #[test]
     #[serial]
     fn resume_refuses_a_transcript_over_the_model_window() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_window");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -8951,7 +8879,7 @@ mod tests {
     #[test]
     #[serial]
     fn resume_refuses_a_transcript_that_cannot_be_compressed() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_window_uncompressible");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -8984,7 +8912,7 @@ mod tests {
     #[test]
     #[serial]
     fn resume_compresses_a_transcript_over_the_model_window_once_and_admits() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_window_compress");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -9059,7 +8987,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         crate::testing::install_log_collector();
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_write_back_fails");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -9151,7 +9079,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         crate::testing::install_log_collector();
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_write_back_next_turn");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -9253,7 +9181,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_a_resume_dropped_after_the_re_stamp_is_refused_until_this_process_exits() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_dropped");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -9324,7 +9252,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_resume_compressing_its_transcript_does_not_hold_the_uid_lock_against_a_sibling_finish() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_compress_unlocked");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -9385,7 +9313,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_a_refused_resume_compresses_once_and_leaves_the_stored_transcript_untouched() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_compress_once");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -9477,7 +9405,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_a_resume_with_differing_variables_over_the_window_bails_before_compressing() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_variables_before_window");
         write_config_agent_with_variables(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -9523,7 +9451,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_a_resumed_child_compresses_at_its_next_boundary_on_the_stored_threshold() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_stored_threshold_fires");
         write_config_agent_with_setting(&agent_name, "compression_threshold: 1");
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -9683,7 +9611,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_a_running_child_stamped_with_start_zero_reads_crashed_but_resume_refuses() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_start_zero");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -9734,7 +9662,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_child_stamped_with_start_zero_under_a_dead_pid_reads_crashed_and_resumes() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_start_zero_dead");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -9781,7 +9709,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_running_child_stamped_with_pid_zero_resumes() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_pid_zero");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -9814,7 +9742,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_a_resumed_child_resumes_again_carrying_its_own_additions() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_chain");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -9876,7 +9804,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_resume_degrades_to_an_error_on_a_corrupt_sidecar_or_session_file() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_corrupt");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -9932,7 +9860,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_a_child_of_another_root_is_unknown_under_this_one() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_sibling_root");
         write_config_only_agent(&agent_name);
         let mut owner = spawner_with_session("owner-root");
@@ -9965,7 +9893,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_a_null_session_id_spawns_fresh_like_an_omitted_one() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_null_id");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -9993,7 +9921,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_a_resumed_child_answers_under_the_stored_prompt_and_the_spawner_model() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_role");
         write_config_agent_with_variables(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -10058,7 +9986,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_a_transcript_exactly_at_the_model_window_resumes() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_window_edge");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -10114,7 +10042,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_a_second_resume_of_a_live_child_is_refused_and_the_cancelled_hop_resumes() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_double_submit");
         let (started, release) = write_graph_agent_gated_by_markers(&agent_name);
         write(&release, "").unwrap();
@@ -10204,7 +10132,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_resume_refusals_report_the_earliest_failing_step() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_order");
         let other_agent = unique_agent_name("test_resume_order_other");
         write_config_agent_with_variables(&agent_name);
@@ -10315,7 +10243,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_the_recent_ids_hint_orders_by_creation_and_caps_at_ten() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_recent_cap");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -10395,7 +10323,7 @@ mod tests {
     #[test]
     #[serial]
     fn handle_cancel_marks_the_sidecar_cancelled_and_reports_the_child_ids() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let _sink = hooks::test_sink::install();
         let agent_name = unique_agent_name("test_sidecar_cancel");
         write_graph_agent_with_hooks(&agent_name, "sidecar_cancel", true);
@@ -10428,7 +10356,7 @@ mod tests {
     #[test]
     #[serial]
     fn handle_cancel_of_a_finished_child_keeps_its_own_terminal_status() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_sidecar_cancel_finished");
         write_graph_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -10464,7 +10392,7 @@ mod tests {
     #[test]
     #[serial]
     fn handle_cancel_records_cancelled_on_the_root_captured_at_spawn() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_sidecar_cancel_root");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -10521,7 +10449,7 @@ mod tests {
     #[test]
     #[serial]
     fn handle_cancel_of_a_panicked_task_marks_the_sidecar_failed() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_sidecar_cancel_panic");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -10561,7 +10489,7 @@ mod tests {
     #[test]
     #[serial]
     fn handle_cancel_of_a_running_task_that_then_panics_marks_the_sidecar_failed() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_sidecar_cancel_then_panic");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -10679,7 +10607,7 @@ mod tests {
     #[test]
     #[serial]
     fn handle_collect_of_a_panicked_task_marks_the_sidecar_failed() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_sidecar_panic");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -10747,7 +10675,7 @@ mod tests {
     #[test]
     #[serial]
     fn interrupted_collect_carries_the_child_session_id() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_collect_interrupted_sid");
         write_graph_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -10764,7 +10692,7 @@ mod tests {
     #[test]
     #[serial]
     fn interrupted_collect_of_an_unseated_child_carries_a_null_session_id_key() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_collect_interrupted_null_sid");
         write_graph_agent(&agent_name);
         let mut ctx = ctx_with_child_sessions_off();
@@ -10782,7 +10710,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_ctrl_c_aborted_child_ends_its_sidecar_cancelled() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let _sink = hooks::test_sink::install();
         let agent_name = unique_agent_name("test_sidecar_ctrlc");
         write_graph_agent_with_hooks(&agent_name, "sidecar_ctrlc", true);
@@ -10798,7 +10726,7 @@ mod tests {
     #[test]
     #[serial]
     fn check_collect_and_list_running_carry_the_child_session_id() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_payload_sid");
         write_graph_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -10848,7 +10776,7 @@ mod tests {
     #[test]
     #[serial]
     fn unseated_spawn_payloads_all_carry_a_null_session_id_key() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_payload_null_sid");
         write_graph_agent(&agent_name);
         let mut ctx = ctx_with_child_sessions_off();
@@ -10883,7 +10811,7 @@ mod tests {
             assert_eq!(cancelled["id"], second["id"]);
             assert_null_session_id(&cancelled);
         });
-        assert!(!_guard.cache_root.join("sessions").exists());
+        assert!(!_guard.cache_root().join("sessions").exists());
     }
 
     /// Under a read-only `children/` the child's final session flush fails,
@@ -10896,7 +10824,7 @@ mod tests {
     fn a_failed_final_flush_turns_the_collect_result_failed() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_sidecar_unwritable");
         write_graph_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -10942,7 +10870,7 @@ mod tests {
     #[serial]
     fn a_failed_terminal_sidecar_write_alone_leaves_the_collect_result_completed() {
         crate::testing::install_log_collector();
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_sidecar_alone_unwritable");
         write_graph_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -10986,7 +10914,7 @@ mod tests {
     #[test]
     #[serial]
     fn auto_dispatched_children_carry_the_queue_task_id_into_the_sidecar() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_dispatch_task_id");
         write_graph_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -11044,7 +10972,7 @@ mod tests {
     #[test]
     #[serial]
     fn launch_child_spawn_marks_the_sidecar_failed_when_registration_fails() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let _sink = hooks::test_sink::install();
         let agent_name = unique_agent_name("test_register_fails");
         write_graph_agent_with_hooks(&agent_name, "sidecar_register_fails", false);
@@ -11103,7 +11031,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_spawn_error_reaches_the_tool_result_as_its_whole_message() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_spawn_error_tool_result");
         write_graph_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -11130,7 +11058,7 @@ mod tests {
     #[test]
     #[serial]
     fn finish_child_meta_turns_a_running_sidecar_failed_and_keeps_the_error() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let mut ctx = ctx_with_supervisor(4, 3);
         let root = ctx.ensure_child_session_root().unwrap();
         let sid = child_sessions::new_session_id("test_finish_direct");
@@ -11201,7 +11129,7 @@ mod tests {
     #[test]
     #[serial]
     fn concurrent_locked_read_modify_writes_of_one_sidecar_lose_no_update() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let mut ctx = ctx_with_supervisor(4, 3);
         let root = ctx.ensure_child_session_root().unwrap();
         let meta = running_sidecar_for(&root, "test_locked_rmw");
@@ -11250,7 +11178,7 @@ mod tests {
     #[test]
     #[serial]
     fn finish_child_meta_from_two_threads_leaves_one_whole_sidecar() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let mut ctx = ctx_with_supervisor(4, 3);
         let root = ctx.ensure_child_session_root().unwrap();
         let meta = running_sidecar_for(&root, "test_finish_two_threads");
@@ -11291,7 +11219,7 @@ mod tests {
     #[test]
     #[serial]
     fn finish_child_meta_waits_for_the_root_lock_before_writing() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let mut ctx = ctx_with_supervisor(4, 3);
         let root = ctx.ensure_child_session_root().unwrap();
         let meta = running_sidecar_for(&root, "test_finish_waits");
@@ -11327,7 +11255,7 @@ mod tests {
     #[test]
     #[serial]
     fn finish_child_meta_does_not_recreate_a_removed_root_for_its_lock() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let mut ctx = ctx_with_supervisor(4, 3);
         let root = ctx.ensure_child_session_root().unwrap();
         let meta = running_sidecar_for(&root, "test_finish_gone");
@@ -11351,7 +11279,7 @@ mod tests {
     #[serial]
     fn finish_child_meta_does_not_follow_a_symlinked_root() {
         crate::testing::install_log_collector();
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let mut ctx = ctx_with_supervisor(4, 3);
         let root = ctx.ensure_child_session_root().unwrap();
         let meta = running_sidecar_for(&root, "test_finish_symlink");
@@ -11389,7 +11317,7 @@ mod tests {
     #[test]
     #[serial]
     fn resume_is_refused_with_the_holder_message_while_another_holder_keeps_the_root_lock() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_locked");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -11437,7 +11365,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_resume_refused_after_the_re_stamp_restores_the_sidecar() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_restore");
         write_config_agent_with_variables(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -11470,7 +11398,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_refused_resume_restores_a_hand_written_sidecar_byte_for_byte() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_verbatim");
         write_config_agent_with_variables(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -11510,7 +11438,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_refused_resume_that_cannot_restore_the_sidecar_names_the_remedy() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_norestore");
         write_config_agent_with_variables(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -11569,7 +11497,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_refused_resume_whose_root_vanished_meanwhile_says_nothing_remains() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_rootgone");
         write_config_agent_with_variables(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -11607,7 +11535,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_refused_resume_whose_root_became_a_symlink_meanwhile_does_not_follow_it() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_rootlink");
         write_config_agent_with_variables(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -11771,7 +11699,7 @@ mod tests {
         prefix: &str,
         damage: impl FnOnce(&Path),
     ) -> (Value, Value) {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name(prefix);
         write_graph_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -11891,7 +11819,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_seat_whose_session_flush_fails_marks_the_sidecar_failed() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_seat_flush_failed");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -11944,7 +11872,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         crate::testing::install_log_collector();
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_seat_children_readonly");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -12005,7 +11933,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_unseated_spawn_payload_still_carries_a_null_session_id_key() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_probe_null_key");
         write_config_agent_with_setting(&agent_name, "child_sessions: false");
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -12015,7 +11943,7 @@ mod tests {
         let fields = payload.as_object().expect("payload is an object");
         assert!(fields.contains_key("session_id"), "{payload}");
         assert!(fields["session_id"].is_null(), "{payload}");
-        assert!(!_guard.cache_root.join("sessions").exists());
+        assert!(!_guard.cache_root().join("sessions").exists());
     }
 
     /// A dry run persists nothing: no uid is minted on the spawner's
@@ -12024,7 +11952,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_dry_run_spawner_mints_no_root_and_seats_no_session() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_probe_dry_run");
         write_config_only_agent(&agent_name);
         let app = AppState {
@@ -12047,7 +11975,7 @@ mod tests {
         assert!(spawn.child_ctx.child_session_root.is_none());
         assert!(ctx.child_session_root.is_none());
         assert!(ctx.session.as_ref().unwrap().uid().is_none());
-        assert!(!_guard.cache_root.join("sessions").exists());
+        assert!(!_guard.cache_root().join("sessions").exists());
     }
 
     /// The seated session carries the model the agent's own config pins,
@@ -12057,7 +11985,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_seated_child_session_keeps_the_agent_pinned_model() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_probe_model");
         write_config_agent_with_setting(&agent_name, "model: test-seeded:agent-own");
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -12084,7 +12012,7 @@ mod tests {
     #[test]
     #[serial]
     fn seated_child_session_without_a_pinned_model_runs_on_the_spawner_current_model() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_seat_fallback_model");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -12111,7 +12039,7 @@ mod tests {
     #[test]
     #[serial]
     fn seating_writes_the_session_file_when_the_app_config_already_saves_sessions() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_seat_app_saves");
         write_config_only_agent(&agent_name);
         let app = AppState {
@@ -12140,7 +12068,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_child_spawner_on_a_non_child_session_records_no_spawner_session_id() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let child_agent = unique_agent_name("test_seat_swapped_spawner");
         let grandchild_agent = unique_agent_name("test_seat_swapped_grandchild");
         write_config_only_agent(&child_agent);
@@ -12175,7 +12103,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_two_children_of_one_root_share_the_dir_and_keep_the_parent_path() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_probe_two_children");
         write_config_only_agent(&agent_name);
         let mut ctx = spawner_with_session("root-twice");
@@ -12251,7 +12179,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_unseated_child_still_hands_the_root_to_its_grandchild() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let child_agent = unique_agent_name("test_probe_unseated_child");
         let grandchild_agent = unique_agent_name("test_probe_seated_grandchild");
         write_config_agent_with_setting(&child_agent, "child_sessions: false");
@@ -12300,7 +12228,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_a_file_in_the_way_of_the_children_dir_is_an_error_not_a_panic() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_probe_children_blocked");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -12327,9 +12255,9 @@ mod tests {
         assert!(blocker.is_file(), "the blocker is left as found");
         assert!(expected_root.root_file().is_file());
         assert!(
-            files_named(&_guard.cache_root, "root.yaml").len() == 1,
+            files_named(_guard.cache_root(), "root.yaml").len() == 1,
             "{:?}",
-            files_named(&_guard.cache_root, "root.yaml")
+            files_named(_guard.cache_root(), "root.yaml")
         );
         // The spawner still answers once the way is clear.
         std::fs::remove_file(&blocker).unwrap();
@@ -12349,7 +12277,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_a_root_spawner_named_like_a_child_session_records_no_spawner_session_id() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_probe_root_lookalike");
         write_config_only_agent(&agent_name);
         let lookalike = child_sessions::new_session_id("rooter");
@@ -12373,7 +12301,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_seating_saves_the_child_even_when_the_app_config_turns_saving_off() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_probe_app_saves_off");
         write_config_only_agent(&agent_name);
         let app = AppState {
@@ -12431,7 +12359,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_a_root_spawner_on_the_temp_session_records_no_parent_path() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_probe_temp_root");
         write_config_only_agent(&agent_name);
         let mut ctx = spawner_with_session(TEMP_SESSION_NAME);
@@ -12457,7 +12385,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_a_malformed_root_file_is_replaced_and_a_directory_there_is_an_error() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_probe_root_file_garbage");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -12510,7 +12438,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_agent_hooks_of_a_seated_child_carry_its_session_id_and_none_when_off() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let _sink = hooks::test_sink::install();
         let seated_agent = unique_agent_name("test_probe_hook_sid_on");
         write_graph_agent_with_hooks(&seated_agent, "seated_hook_sid_on", false);
@@ -12573,7 +12501,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_a_workspace_scoped_root_session_is_the_parent_path_not_its_global_namesake() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let workspace = env::temp_dir().join(format!(
             "coyote-agents-tests-workspace-{}-{}",
             std::process::id(),
@@ -12633,7 +12561,7 @@ mod tests {
     fn usage_probe_an_unwritable_children_dir_refuses_the_spawn_without_a_trace() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let _sink = hooks::test_sink::install();
         let agent_name = unique_agent_name("test_probe_children_readonly");
         write_graph_agent_with_hooks(&agent_name, "children_ro_hook", false);
@@ -12681,7 +12609,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_the_seat_time_session_file_loads_as_the_child_session() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_probe_seat_file_loads");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -13698,7 +13626,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_graph_teammate_records_the_bare_spawn_prompt() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_teammate_graph_prompt");
         let agent_dir = paths::agent_data_dir(&agent_name);
         create_dir_all(&agent_dir).unwrap();
@@ -13771,7 +13699,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_config_teammate_is_sent_the_roster_in_its_system_prompt() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_teammate_config_roster");
         write_config_agent_with_setting(&agent_name, "agent_session: teammate");
         let mut ctx = parent_seating_a_teammate(echoing_app_state("openai"));
@@ -13800,7 +13728,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_dynamic_instructions_teammate_is_sent_the_roster_too() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_teammate_dynamic_roster");
         write_config_agent_with_setting(
             &agent_name,
@@ -13888,7 +13816,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_resumed_agent_session_teammate_gets_a_fresh_roster() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_teammate_resumed_roster");
         write_agent_with_a_stale_roster_session(&agent_name);
         let mut ctx = parent_seating_a_teammate(echoing_app_state("test-seeded"));
@@ -13912,7 +13840,7 @@ mod tests {
     #[test]
     #[serial]
     fn an_unseated_resume_drops_the_previous_runs_roster() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_teammate_unseated_resume");
         write_agent_with_a_stale_roster_session(&agent_name);
         let mut ctx = RequestContext::new(echoing_app_state("test-seeded"), WorkingMode::Cmd);
@@ -13933,7 +13861,7 @@ mod tests {
     #[test]
     #[serial]
     fn an_unseated_resume_keeps_a_stored_prompt_that_only_mentions_the_roster() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_teammate_roster_mention");
         write_agent_with_a_stale_roster_session(&agent_name);
         let stored = format!("Keep the {TEAMMATE_ROSTER_HEADING} short.");
@@ -13965,7 +13893,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_teammate_without_a_registry_is_sent_no_roster() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_teammate_no_roster");
         write_config_agent_with_setting(&agent_name, "agent_session: teammate");
         let mut ctx = RequestContext::new(echoing_app_state("openai"), WorkingMode::Cmd);
@@ -15561,7 +15489,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_both_reclaim_paths_record_one_panic_wording_on_the_spawn_root() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_probe_panic_wording");
         write_config_only_agent(&agent_name);
         let mut ctx = ctx_with_supervisor(4, 3);
@@ -15648,7 +15576,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_a_dotted_agent_name_is_refused_before_any_root_is_minted() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("probe..dots");
         assert!(
             agent_name
@@ -15668,7 +15596,7 @@ mod tests {
             )
         );
         assert!(ctx.child_session_root.is_none());
-        let sessions = _guard.cache_root.join("sessions");
+        let sessions = _guard.cache_root().join("sessions");
         assert!(
             !sessions.exists(),
             "a refused spawn mints no root: {}",
@@ -15712,7 +15640,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_a_ctrlc_child_lands_cancelled_and_interrupted_through_the_launch_path() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("agents-tests");
         let _sink = hooks::test_sink::install();
         let agent_name = unique_agent_name("test_probe_ctrlc_launch");
         write_config_agent_with_result_hooks(&agent_name, "probe_ctrlc_launch");

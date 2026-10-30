@@ -58,6 +58,11 @@ impl Drop for TempDirGuard {
 }
 
 const GRAPH_AGENT: &str = "echo-graph";
+
+/// The workspace-memory root override the unit-test guards set; it mirrors
+/// `WORKSPACE_MEMORY_ROOT_TEST_ENV` in `src/config/memory.rs`, which an
+/// integration test cannot import from the binary crate.
+const TEST_WORKSPACE_MEMORY_ROOT_ENV: &str = "COYOTE_TEST_WORKSPACE_MEMORY_ROOT";
 const CONFIG_AGENT: &str = "probe";
 const TURN_EVENTS: [&str; 2] = ["turn.started", "turn.completed"];
 
@@ -182,7 +187,8 @@ fn write_fixture(dir: &Path, session_block: &str) {
 
 fn run_coyote(dir: &Path, args: &[&str]) -> Output {
     let home = dir.join("home");
-    Command::new(env!("CARGO_BIN_EXE_coyote"))
+    let binary = Path::new(env!("CARGO_BIN_EXE_coyote"));
+    Command::new(binary)
         .args(args)
         .current_dir(dir)
         .env("COYOTE_CONFIG_DIR", dir)
@@ -190,14 +196,33 @@ fn run_coyote(dir: &Path, args: &[&str]) -> Output {
         .env("HOME", &home)
         .env("USERPROFILE", &home)
         .env("NO_COLOR", "1")
+        .env("PATH", pinned_path(binary.parent().unwrap()))
         .env_remove("COYOTE_LOG_PATH")
         .env_remove("COYOTE_WORKSPACE_CONFIG_DIR")
         .env_remove("IS_SANDBOX")
         .env_remove("COYOTE_PROVIDER")
         .env_remove("COYOTE_PLATFORM")
+        // The unit-test guard's workspace-memory pin; a shipped binary
+        // ignores it, and a run here starts without it.
+        .env_remove(TEST_WORKSPACE_MEMORY_ROOT_ENV)
         .stdin(Stdio::null())
         .output()
         .unwrap()
+}
+
+/// A PATH holding only `bin_dir` (the built binary's own directory) and the
+/// system shell directories, so the fixture's `sh` hooks and bash scripts
+/// resolve the same way on every host and nothing else on the developer's
+/// PATH can leak into a run. Twin of `pinned_path` in
+/// tests/graph_session_block_binary.rs; change both together.
+fn pinned_path(bin_dir: &Path) -> std::ffi::OsString {
+    let system_dirs: Vec<PathBuf> = if cfg!(windows) {
+        let system_root = env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+        vec![Path::new(&system_root).join("System32")]
+    } else {
+        vec![PathBuf::from("/usr/bin"), PathBuf::from("/bin")]
+    };
+    env::join_paths(std::iter::once(bin_dir.to_path_buf()).chain(system_dirs)).unwrap()
 }
 
 fn stdout_of(output: &Output) -> String {

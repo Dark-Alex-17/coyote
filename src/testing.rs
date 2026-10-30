@@ -193,8 +193,8 @@ impl Drop for EnvVarGuard {
 /// the cache dir is pinned to a fresh temp dir so nothing a test spawns can
 /// write into the developer's real cache.
 /// Workspace memory discovery starts at the temp workspace root (which has
-/// no `memory/MEMORY.md`), so the repo's own memory index never reaches a
-/// test prompt.
+/// no `memory/MEMORY.md`) and never walks above it, so the repo's own memory
+/// index never reaches a test prompt.
 /// Tests using it must serialize (`#[serial]`) — the env vars are
 /// process-global.
 pub(crate) struct TestConfigDirGuard {
@@ -203,28 +203,31 @@ pub(crate) struct TestConfigDirGuard {
     _sessions_env: EnvVarGuard,
     _workspace_memory_root_env: EnvVarGuard,
     pub(crate) path: PathBuf,
-    workspace_path: PathBuf,
+    workspace_root: PathBuf,
     cache_root: PathBuf,
     _cache_env: EnvVarGuard,
 }
 
 impl TestConfigDirGuard {
     pub(crate) fn new(label: &str) -> Self {
+        Self::new_under(label, &std::env::temp_dir())
+    }
+
+    /// `new` with the temp dirs created inside `base`, so a test can plant
+    /// files above the pinned workspace root without touching the shared
+    /// system temp dir.
+    pub(crate) fn new_under(label: &str, base: &Path) -> Self {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("coyote-{label}-{unique}"));
+        let path = base.join(format!("coyote-{label}-{unique}"));
         std::fs::create_dir_all(&path).unwrap();
-        let workspace_path = std::env::temp_dir()
-            .join(format!("coyote-{label}-ws-{unique}"))
-            .join(WORKSPACE_COYOTE_DIR_NAME);
+        let workspace_root = base.join(format!("coyote-{label}-ws-{unique}"));
+        let workspace_path = workspace_root.join(WORKSPACE_COYOTE_DIR_NAME);
         std::fs::create_dir_all(&workspace_path).unwrap();
-        let cache_root = std::env::temp_dir().join(format!("coyote-{label}-cache-{unique}"));
+        let cache_root = base.join(format!("coyote-{label}-cache-{unique}"));
         std::fs::create_dir_all(&cache_root).unwrap();
-        let workspace_root = workspace_path
-            .parent()
-            .expect("workspace config dir sits inside its workspace root");
         Self {
             _env: EnvVarGuard::set(utils::get_env_name("config_dir"), &path),
             _workspace_env: EnvVarGuard::set(
@@ -234,13 +237,19 @@ impl TestConfigDirGuard {
             _sessions_env: EnvVarGuard::unset(utils::get_env_name("sessions_dir")),
             _workspace_memory_root_env: EnvVarGuard::set(
                 memory::WORKSPACE_MEMORY_ROOT_TEST_ENV,
-                workspace_root,
+                &workspace_root,
             ),
             path,
-            workspace_path,
+            workspace_root,
             _cache_env: EnvVarGuard::set(utils::get_env_name("cache_dir"), &cache_root),
             cache_root,
         }
+    }
+
+    /// The parent of the pinned workspace config dir, and the root workspace
+    /// memory discovery is pinned to.
+    pub(crate) fn workspace_root(&self) -> &Path {
+        &self.workspace_root
     }
 
     /// The temp dir `COYOTE_CACHE_DIR` points at for the guard's lifetime.
@@ -252,9 +261,7 @@ impl TestConfigDirGuard {
 impl Drop for TestConfigDirGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
-        if let Some(root) = self.workspace_path.parent() {
-            let _ = std::fs::remove_dir_all(root);
-        }
+        let _ = std::fs::remove_dir_all(&self.workspace_root);
         let _ = std::fs::remove_dir_all(&self.cache_root);
     }
 }
@@ -339,7 +346,8 @@ mod tests {
     use super::{TestConfigDirGuard, is_outside_system32};
     use crate::utils;
     use serial_test::serial;
-    use std::path::Path;
+    use std::fs;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn is_outside_system32_reads_windows_and_unix_paths() {
@@ -371,6 +379,11 @@ mod tests {
                 guard.path,
                 "the cache dir is not the config dir"
             );
+            assert_ne!(
+                guard.cache_root(),
+                guard.workspace_root(),
+                "the cache dir is not the workspace root"
+            );
             guard.cache_root().to_path_buf()
         };
         assert_eq!(std::env::var_os(&key), before);
@@ -378,5 +391,50 @@ mod tests {
             !cache_root.exists(),
             "the temp cache dir is removed on drop"
         );
+    }
+
+    /// Workspace memory lookups outside src/config/memory.rs go through its
+    /// pinned entry point, and config dir isolation has one guard type, so no
+    /// test can reach the developer's real workspace memory through a raw
+    /// ancestor walk or a private guard copy that skips the pin. The needles
+    /// are split so this file's own source does not match them.
+    #[test]
+    fn no_source_file_bypasses_the_workspace_memory_pin() {
+        const RAW_WALK: &str = concat!("walk_workspace", "_memory");
+        const GUARD_DEFINITION: &str = concat!("struct TestConfig", "DirGuard");
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offences = Vec::new();
+        for path in rust_sources(&src) {
+            let relative = path.strip_prefix(&src).unwrap();
+            let source = fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            for (index, line) in source.lines().enumerate() {
+                let at = format!("src/{}:{}", relative.display(), index + 1);
+                if line.contains(RAW_WALK) && relative != Path::new("config/memory.rs") {
+                    offences.push(format!(
+                        "{at}: raw workspace memory walk; call memory::find_workspace_memory"
+                    ));
+                }
+                if line.contains(GUARD_DEFINITION) && relative != Path::new("testing.rs") {
+                    offences.push(format!(
+                        "{at}: private config dir guard; use crate::testing::TestConfigDirGuard"
+                    ));
+                }
+            }
+        }
+        assert!(offences.is_empty(), "{}", offences.join("\n"));
+    }
+
+    fn rust_sources(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for entry in fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display())) {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                out.extend(rust_sources(&path));
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+        out
     }
 }

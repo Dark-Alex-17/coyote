@@ -1642,14 +1642,13 @@ mod tests {
     use super::*;
     use crate::client::ModelData;
     use crate::config::AgentConfig;
-    use crate::utils::get_env_name;
+    use crate::testing::TestConfigDirGuard;
     use indexmap::IndexMap;
     use serial_test::serial;
     use std::collections::HashMap;
     use std::env;
     use std::fs;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn graph_with(nodes: Vec<(&str, Node)>, start: &str) -> Graph {
         let mut map: IndexMap<String, Node> = IndexMap::new();
@@ -2291,7 +2290,7 @@ mod tests {
     #[test]
     #[serial]
     fn session_chat_agent_refuses_a_graph_agent_before_checking_config() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("graph-validator-tests");
         materialize_graph_agent("helper");
         materialize_config_agent_with("helper", "name: helper\n");
         let graph = session_graph(delegating_session_block("helper", &[]));
@@ -2311,7 +2310,7 @@ mod tests {
     #[test]
     #[serial]
     fn session_chat_agent_refuses_an_agent_without_config() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("graph-validator-tests");
         let graph = session_graph(delegating_session_block("helper", &[]));
 
         let result = validator().validate(&graph);
@@ -2329,7 +2328,7 @@ mod tests {
     #[test]
     #[serial]
     fn session_chat_variables_must_be_declared_by_the_agent() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("graph-validator-tests");
         materialize_config_agent_with(
             "helper",
             "name: helper\nvariables:\n  - name: tone\n    description: t\n  - name: depth\n    description: d\n",
@@ -2354,7 +2353,7 @@ mod tests {
     #[test]
     #[serial]
     fn session_chat_variables_error_says_when_the_agent_declares_none() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("graph-validator-tests");
         materialize_config_agent_with("helper", "name: helper\nvariables: []\n");
         let graph = session_graph(delegating_session_block("helper", &[("tone", "x")]));
 
@@ -2372,7 +2371,7 @@ mod tests {
     #[test]
     #[serial]
     fn session_chat_agent_pass_accepts_declared_variables() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("graph-validator-tests");
         materialize_config_agent_with(
             "helper",
             "name: helper\nvariables:\n  - name: tone\n    description: t\n",
@@ -2387,7 +2386,7 @@ mod tests {
     #[test]
     #[serial]
     fn session_chat_agent_pass_adds_nothing_without_chat_agent() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("graph-validator-tests");
         let graph = session_graph(session_block(Some("test-seeded:plain"), None, &[], true));
         let v = validator().with_agent_context(agent_ctx_with(&[], &[], &[], true));
 
@@ -2411,7 +2410,7 @@ mod tests {
     #[test]
     #[serial]
     fn session_chat_agent_pass_runs_without_agent_ctx() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("graph-validator-tests");
         let graph = session_graph(delegating_session_block("helper", &[]));
         let v = validator();
         assert!(v.agent_ctx.is_none());
@@ -2425,7 +2424,7 @@ mod tests {
     #[test]
     #[serial]
     fn validate_session_block_for_agent_runs_the_chat_agent_pass() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("graph-validator-tests");
         let agent = Agent::test_new(AgentConfig {
             name: "graph-agent".into(),
             ..AgentConfig::default()
@@ -2506,7 +2505,7 @@ mod tests {
     #[test]
     #[serial]
     fn the_engage_pass_reports_carry_without_a_session_block() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("graph-validator-tests");
         let agent = Agent::test_new(AgentConfig::default());
         let mut graph = graph_with(vec![("end", end_node("end"))], "end");
         graph.carry = vec!["said".into()];
@@ -2521,7 +2520,7 @@ mod tests {
     #[test]
     #[serial]
     fn session_block_errors_precede_chat_agent_errors() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("graph-validator-tests");
         // The parser refuses `agent` beside `model`; only a hand-built
         // graph reaches both passes with something to report.
         let mut block = session_block(Some("nope:x"), None, &[], false);
@@ -5214,48 +5213,6 @@ mod tests {
         );
     }
 
-    struct TestConfigDirGuard {
-        key: String,
-        previous: Option<std::ffi::OsString>,
-        path: PathBuf,
-    }
-
-    impl TestConfigDirGuard {
-        fn new() -> Self {
-            let key = get_env_name("config_dir");
-            let previous = env::var_os(&key);
-            let unique = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let path = env::temp_dir().join(format!("coyote-graph-validator-tests-{unique}"));
-            fs::create_dir_all(&path).unwrap();
-            unsafe {
-                env::set_var(&key, &path);
-            }
-            Self {
-                key,
-                previous,
-                path,
-            }
-        }
-    }
-
-    impl Drop for TestConfigDirGuard {
-        fn drop(&mut self) {
-            if let Some(previous) = &self.previous {
-                unsafe {
-                    env::set_var(&self.key, previous);
-                }
-            } else {
-                unsafe {
-                    env::remove_var(&self.key);
-                }
-            }
-            let _ = fs::remove_dir_all(&self.path);
-        }
-    }
-
     fn materialize_config_only_agent(name: &str) {
         materialize_config_agent_with(name, "");
     }
@@ -5290,7 +5247,7 @@ mod tests {
     #[test]
     #[serial]
     fn agent_inputs_on_config_only_agent_errors() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("graph-validator-tests");
         materialize_config_only_agent("plain-agent");
         let node = agent_node_with_inputs("a", "plain-agent", &[("x", "{{k}}")]);
         let graph = graph_with(vec![("a", node), ("end", end_node("end"))], "a");
@@ -5311,7 +5268,7 @@ mod tests {
     #[test]
     #[serial]
     fn agent_empty_inputs_on_config_only_agent_still_errors() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("graph-validator-tests");
         materialize_config_only_agent("plain-agent");
         let node = agent_node_with_inputs("a", "plain-agent", &[]);
         let graph = graph_with(vec![("a", node), ("end", end_node("end"))], "a");
@@ -5328,7 +5285,7 @@ mod tests {
     #[test]
     #[serial]
     fn agent_inputs_on_graph_agent_passes() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("graph-validator-tests");
         materialize_graph_agent("graph-agent");
         let node = agent_node_with_inputs("a", "graph-agent", &[("x", "{{k}}")]);
         let graph = graph_with(vec![("a", node), ("end", end_node("end"))], "a");
@@ -5342,7 +5299,7 @@ mod tests {
     #[test]
     #[serial]
     fn agent_with_both_config_and_graph_errors() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("graph-validator-tests");
         materialize_config_only_agent("mixed-agent");
         materialize_graph_agent("mixed-agent");
         let node = agent_node_with_inputs("a", "mixed-agent", &[("x", "{{k}}")]);
@@ -5363,7 +5320,7 @@ mod tests {
     #[test]
     #[serial]
     fn agent_inputs_missing_agent_dir_gets_only_the_not_found_error() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("graph-validator-tests");
         let node = agent_node_with_inputs("a", "ghost-agent", &[("x", "{{k}}")]);
         let graph = graph_with(vec![("a", node), ("end", end_node("end"))], "a");
 
@@ -5383,7 +5340,7 @@ mod tests {
     #[test]
     #[serial]
     fn agent_inputs_initial_prompt_is_reserved() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("graph-validator-tests");
         materialize_graph_agent("graph-agent");
         let node = agent_node_with_inputs(
             "a",
@@ -5409,7 +5366,7 @@ mod tests {
     #[test]
     #[serial]
     fn agent_inputs_previous_turns_is_reserved() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("graph-validator-tests");
         materialize_graph_agent("graph-agent");
         let node = agent_node_with_inputs(
             "a",
@@ -5435,7 +5392,7 @@ mod tests {
     #[test]
     #[serial]
     fn agent_inputs_both_reserved_keys_are_each_reported() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = TestConfigDirGuard::new("graph-validator-tests");
         materialize_graph_agent("graph-agent");
         let node = agent_node_with_inputs(
             "a",

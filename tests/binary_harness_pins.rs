@@ -13,6 +13,17 @@ use std::path::Path;
 const SPAWN_SITE: &str = concat!("CARGO_BIN_EXE_", "coyote");
 const CONFIG_ENV: &str = ".env(\"COYOTE_CONFIG_DIR\"";
 const CACHE_ENV: &str = ".env(\"COYOTE_CACHE_DIR\"";
+const PATH_PIN: &str = ".env(\"PATH\", pinned_path(";
+const MEMORY_ROOT_SCRUB: &str = ".env_remove(TEST_WORKSPACE_MEMORY_ROOT_ENV)";
+const MEMORY_ROOT_MIRROR: &str = "const TEST_WORKSPACE_MEMORY_ROOT_ENV: &str = ";
+
+/// The graph-session harnesses run fixture hooks and scripts through the
+/// binary, so on top of the dir pins every spawn there pins PATH and scrubs
+/// the unit-test workspace-memory override.
+const GRAPH_SESSION_HARNESSES: [&str; 2] = [
+    "graph_session_block_binary.rs",
+    "graph_session_repl_binary.rs",
+];
 
 #[test]
 fn every_binary_spawn_in_the_harnesses_pins_the_config_dir_and_the_cache_dir() {
@@ -43,4 +54,36 @@ fn every_binary_spawn_in_the_harnesses_pins_the_config_dir_and_the_cache_dir() {
         pinned.len() >= 9,
         "expected the known binary harnesses to be scanned, found {pinned:?}"
     );
+}
+
+#[test]
+fn every_graph_session_harness_spawn_pins_path_and_scrubs_the_memory_root_override() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let memory_source = fs::read_to_string(root.join("src/config/memory.rs"))
+        .expect("src/config/memory.rs is readable");
+    let source_name = memory_source
+        .lines()
+        .find_map(|line| {
+            line.split_once("WORKSPACE_MEMORY_ROOT_TEST_ENV: &str = ")
+                .map(|(_, value)| value.trim_end_matches(';'))
+        })
+        .expect("src/config/memory.rs declares the workspace-memory root override");
+    for name in GRAPH_SESSION_HARNESSES {
+        let path = root.join("tests").join(name);
+        let source =
+            fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let spawn_sites = source.matches(SPAWN_SITE).count();
+        let path_sites = source.matches(PATH_PIN).count();
+        let scrub_sites = source.matches(MEMORY_ROOT_SCRUB).count();
+        assert!(
+            spawn_sites > 0 && spawn_sites == path_sites && path_sites == scrub_sites,
+            "{name}: {spawn_sites} binary spawn(s), {path_sites} PATH pin(s), \
+             {scrub_sites} memory-root scrub(s); every spawn must pin PATH and scrub the override"
+        );
+        let mirror = format!("{MEMORY_ROOT_MIRROR}{source_name};");
+        assert!(
+            source.contains(&mirror),
+            "{name} must declare `{mirror}` to mirror src/config/memory.rs"
+        );
+    }
 }
