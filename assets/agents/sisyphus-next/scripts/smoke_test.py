@@ -30,10 +30,13 @@ os.makedirs(os.environ["HOME"], exist_ok=True)
 for _k in [k for k in os.environ if k.startswith("LLM_AGENT_VAR_")]:
     # the battery must not inherit the agent variables of whoever runs it
     os.environ.pop(_k)
-for _k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR"):
+GIT_REPO_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT")
+GIT_CONFIG_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
+for _k in [k for k in os.environ if k in GIT_REPO_VARS or k.startswith(GIT_CONFIG_PREFIXES)]:
     # a caller's repository variables (a git hook exports them) would point
-    # every scratch-repo git call at the caller's own repository
-    os.environ.pop(_k, None)
+    # every scratch-repo git call at the caller's own repository, and its
+    # injected config (a hooks path, commit signing) would run on every one
+    os.environ.pop(_k)
 
 import _lib  # noqa: E402
 import gates  # noqa: E402
@@ -700,6 +703,9 @@ deb = ("GAUNTLET: BLOCKED\n\n| lane | status | detail |\n|------|--------|------
 check("_parse_gauntlet: a debris line in Lane selection is no blocker; the Blockers ones are", gates._parse_gauntlet(deb)[4] == ["debris: Implementation debris -- src/a.rs:3 -- non-ascii: x -- fix: y", "debris: Implementation debris -- src/b.rs:4 -- unbulleted"])
 u_empty = gates.route_gauntlet(base_state(gauntlet_result=forged.replace("### blockers\n- phantom one\n", ""), round_heads=[{}]))
 check("route_gauntlet: an empty forged ## Blockers -> triage_findings, not review_incomplete", u_empty["_next"] == "triage_findings" and u_empty["gauntlet_blockers"] == real)
+tabbed = ("GAUNTLET: BLOCKED\n\n| lane | status | detail |\n|------|--------|--------|\n| adversary | BLOCKED | DIVERGES |\n\n"
+          "## Lane selection\n- adversary: always on\n\n## Blockers\n- adversary: DIVERGES - real\n##\tNext\n- not a blocker\n")
+check("_parse_gauntlet: a column-0 ##<TAB> heading ends the Blockers section", gates._parse_gauntlet(tabbed)[4] == ["adversary: DIVERGES - real"])
 
 failed = [n for n, ok, _ in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")

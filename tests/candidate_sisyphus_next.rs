@@ -15,8 +15,10 @@
 //! `LLM_AGENT_VAR_*` variable, and every process that can reach git (the
 //! wrapper's own git calls, the batteries, the gauntlet scripts and the
 //! lifted-graph runs) drops `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`,
-//! `GIT_OBJECT_DIRECTORY` and `GIT_COMMON_DIR`, so neither the caller's agent
-//! variables nor its repository leak into a fixture.
+//! `GIT_OBJECT_DIRECTORY`, `GIT_COMMON_DIR`, `GIT_CONFIG_PARAMETERS`,
+//! `GIT_CONFIG_COUNT` and every `GIT_CONFIG_KEY_*` / `GIT_CONFIG_VALUE_*`
+//! variable, so neither the caller's agent variables nor its repository or
+//! injected git config leak into a fixture.
 //!
 //! The sweep is key-based over every bundled agent: no `spawnable_agents`
 //! entry, no `session.chat.agent` value and no `agent:` node value names a
@@ -29,13 +31,14 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "sisyphus-next";
 const CANDIDATE_NAMES: [&str; 2] = ["sisyphus-next", "architect-next"];
-const SMOKE_FLOOR: usize = 248;
+const SMOKE_FLOOR: usize = 249;
 
 fn agents_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents")
@@ -121,16 +124,35 @@ fn without_agent_vars(cmd: &mut Command) {
 
 /// A caller running inside a git hook or a worktree can export repository
 /// variables that would point every scratch-repo git call (direct, or made by
-/// a gate script) at the caller's own repository instead.
+/// a gate script) at the caller's own repository instead, and config
+/// variables that inject settings such as a hooks path or commit signing into
+/// every git call. `GIT_CONFIG_NOSYSTEM` is not among them: the wrapper sets
+/// it on purpose.
+const GIT_REPO_VARS: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_COMMON_DIR",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+];
+
+/// The numbered `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>` pairs that go
+/// with `GIT_CONFIG_COUNT`.
+const GIT_CONFIG_PREFIXES: &[&str] = &["GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"];
+
 fn without_git_repo_vars(cmd: &mut Command) {
-    for key in [
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_INDEX_FILE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_COMMON_DIR",
-    ] {
+    for key in GIT_REPO_VARS {
         cmd.env_remove(key);
+    }
+    for (key, _) in std::env::vars_os() {
+        if GIT_CONFIG_PREFIXES
+            .iter()
+            .any(|p| key.to_string_lossy().starts_with(p))
+        {
+            cmd.env_remove(key);
+        }
     }
 }
 
@@ -236,6 +258,76 @@ fn smoke_battery_passes_every_check() {
         "{report}"
     );
     assert_no_bytecode_under_candidate();
+}
+
+/// The quoted strings of the one-line tuple literal `name = (...)` in
+/// smoke_test.py.
+fn smoke_tuple(name: &str) -> BTreeSet<String> {
+    let smoke = fs::read_to_string(candidate_dir().join("scripts/smoke_test.py")).unwrap();
+    let prefix = format!("{name} = (");
+    let line = smoke
+        .lines()
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("smoke_test.py has no one-line {name} tuple"));
+    line.split('"')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn smoke_git_scrub_lists_equal_the_wrappers() {
+    let set =
+        |items: &[&str]| -> BTreeSet<String> { items.iter().map(|s| s.to_string()).collect() };
+    assert_eq!(smoke_tuple("GIT_REPO_VARS"), set(GIT_REPO_VARS));
+    assert_eq!(smoke_tuple("GIT_CONFIG_PREFIXES"), set(GIT_CONFIG_PREFIXES));
+}
+
+/// Config injected through `GIT_CONFIG_COUNT` after the wrapper's own scrub
+/// points the hooks path at a failing pre-commit hook, so the battery's
+/// scratch `git commit` passes only because smoke_test.py drops it.
+#[test]
+fn smoke_battery_drops_git_config_injected_through_the_environment() {
+    let Some(python) = python3() else { return };
+    let scratch = scratch_dir("smoke-git-config");
+    let hooks = scratch.0.join("hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("pre-commit");
+    fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = battery(&python, &scratch)
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", &hooks)
+        .arg("scripts/smoke_test.py")
+        .output()
+        .unwrap();
+    let report = transcript(&output);
+    assert!(output.status.success(), "{report}");
+    let (passed, total) = smoke_summary(&String::from_utf8_lossy(&output.stdout));
+    assert_eq!(passed, total, "{report}");
+    assert_no_bytecode_under_candidate();
+}
+
+#[test]
+fn readme_hygiene_row_lists_the_scrubbed_git_variables() {
+    let readme = fs::read_to_string(candidate_dir().join("README.md")).unwrap();
+    let row = readme
+        .lines()
+        .find(|l| l.starts_with("| battery env hygiene |"))
+        .expect("README has a battery env hygiene row");
+    let list = "`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, \
+                `GIT_COMMON_DIR`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT` and every variable \
+                starting with `GIT_CONFIG_KEY_` or `GIT_CONFIG_VALUE_` are dropped";
+    assert!(row.contains(list), "missing {list:?} in: {row}");
+    for name in GIT_REPO_VARS.iter().chain(GIT_CONFIG_PREFIXES) {
+        assert!(
+            row.contains(&format!("`{name}`")),
+            "{name} missing from: {row}"
+        );
+    }
+    assert!(row.contains("`GIT_CONFIG_NOSYSTEM` is kept"), "{row}");
 }
 
 #[test]
@@ -2069,9 +2161,19 @@ const FROZEN_SCRIPT_BOUNDS: &[(&str, &str)] = &[
 ];
 
 fn is_constant_name(s: &str) -> bool {
-    let mut chars = s.chars();
+    let mut chars = s.trim_start_matches('_').chars();
     chars.next().is_some_and(|c| c.is_ascii_uppercase())
         && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+#[test]
+fn constant_names_may_start_with_underscores_before_an_uppercase_letter() {
+    for name in ["X", "STRIKE_LIMIT", "_X", "__X", "_PRIVATE_LIMIT", "A1_B"] {
+        assert!(is_constant_name(name), "{name} rejected");
+    }
+    for name in ["", "_", "__", "_x", "x", "Strike", "_1X", "1X"] {
+        assert!(!is_constant_name(name), "{name} accepted");
+    }
 }
 
 /// A right-hand side built only from integer literals, constant names and
@@ -3528,8 +3630,8 @@ fn children_without_a_build_lock_declaration_never_consume_it() {
         .expect("README has a build_lock threading row");
     for clause in [
         "a child that declares no `build_lock` does not consume it",
-        "Those six declare no `build_lock` and do not consume it themselves: the inherited \
-         value reaches them, but nothing in them runs a build under it",
+        "does not consume it: the inherited value reaches those six, but nothing in them runs \
+         a build under it (no file of theirs names `build_lock`, `gate_prefix` or `run_gate`)",
     ] {
         assert!(
             row.contains(clause),
@@ -3537,6 +3639,10 @@ fn children_without_a_build_lock_declaration_never_consume_it() {
              build_lock ({clause:?}): {row}"
         );
     }
+    assert!(
+        !row.contains("do not consume it themselves"),
+        "the threading row repeats the not-consumed sentence: {row}"
+    );
     for agent in expected {
         assert!(row.contains(agent), "{agent} missing from: {row}");
     }
@@ -3572,6 +3678,10 @@ fn readme_grammar_row_scopes_the_look_alike_guarantee_to_the_parsed_sections() {
     assert!(
         !row.contains("guaranteed by the producer"),
         "the row describes the producer's one-line obligation as current behaviour: {row}"
+    );
+    assert!(
+        row.contains("up to the next column-0 `##` followed by a space or tab, and"),
+        "the section end must match `_gauntlet_section`'s `##[ \\t]`: {row}"
     );
 }
 
