@@ -3482,7 +3482,7 @@ fn readme_grammar_row_records_the_producer_guarantee_and_the_planning_store_dive
         "`PIPELINE-FAULT` (consulted only when the header carries no verdict",
         "consulted only on a round that already has real blockers, where they pick the plan-defect escalation over a fix round",
         "the probe's test-file paths (read only when the probe verdict is PASS, adoption capped at one round)",
-        "None of them can turn a BLOCKED into a PASS, or a PASS into anything but that one capped adopt round",
+        "When the reply carries a gauntlet header verdict, none of them can turn a BLOCKED into a PASS, or a PASS into anything but that one capped adopt round; the direct adversary lane has no header, so its `ADVERSARIAL_REVIEW:` line is the verdict there",
     ] {
         assert!(
             row.contains(clause),
@@ -3493,6 +3493,7 @@ fn readme_grammar_row_records_the_producer_guarantee_and_the_planning_store_dive
         "nothing past the boundary is read",
         "a PASS that carries one escalates as a plan defect",
         "in every scope",
+        "None of them can turn",
     ] {
         assert!(
             !row.contains(stale),
