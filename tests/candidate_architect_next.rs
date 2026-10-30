@@ -1777,10 +1777,10 @@ fn readme_toolchain_census_matches_the_live_grep() {
     );
     assert_eq!(
         gates_lines,
-        vec![41, 2596, 2605],
+        vec![41, 2590, 2599],
         "the gates.py toolchain hits moved; update the README census and its prose"
     );
-    for line in [2596, 2605] {
+    for line in [2590, 2599] {
         assert!(
             text.contains(&format!("`gates.py:{line}`")) || text.contains(&format!("`:{line}`")),
             "the README prose must cite gates.py:{line}"
@@ -2675,19 +2675,21 @@ fn debris_lines_count_only_inside_the_header_blockers_section() {
     );
 }
 
-/// The plan-root phrases are read from the whole reply, so a PASS header
-/// whose code-review report quotes one fails closed: `route_verdict` raises
-/// the plan-defect escalation instead of closing the round, in batch scope
-/// too rather than handing the phrase to batch triage as a finding, and
-/// `wave_route` hands the wave a plan-defect escalation instead of
-/// `conforms`.
+/// The plan-root phrases are read from the whole reply but consulted only
+/// on a round that already has real blockers, so a PASS header whose
+/// code-review report quotes one still closes the round (`post_round`) and
+/// the wave (`conforms`), while the same quote on a BLOCKED round with a
+/// real blocker picks the plan-defect escalation over a fix round.
 #[test]
-fn a_plan_root_phrase_in_a_lane_report_fails_a_pass_closed() {
+fn a_plan_root_phrase_in_a_lane_report_never_changes_a_pass() {
     if python3().is_none() {
         return;
     }
     let scratch = scratch_dir("plan-root");
-    let reply = "GAUNTLET: PASS\n\n| lane | status | detail |\n|------|--------|--------|\n| code-review | GREEN | MERGE-READY |\n| adversary | GREEN | CONFORMS |\n\n## Lane selection\n(none recorded)\n\n## Full lane reports\n\n<details><summary>code-review</summary>\n\nA reader might say the plan itself is the root cause here.\n\n</details>\n";
+    let report = "## Full lane reports\n\n<details><summary>code-review</summary>\n\nA reader might say the plan itself is the root cause here.\n\n</details>\n";
+    let reply = format!(
+        "GAUNTLET: PASS\n\n| lane | status | detail |\n|------|--------|--------|\n| code-review | GREEN | MERGE-READY |\n| adversary | GREEN | CONFORMS |\n\n## Lane selection\n(none recorded)\n\n{report}"
+    );
     let mut state = verify_state(
         &scratch.0,
         "h",
@@ -2698,32 +2700,25 @@ fn a_plan_root_phrase_in_a_lane_report_fails_a_pass_closed() {
     state["verify_lane"] = json!("gauntlet");
     state["gauntlet_result"] = json!(reply);
     let routed = gate_json("route_verdict", &state, &scratch);
-    assert_eq!(
-        routed["escalation"]["kind"],
-        json!("plan_defect"),
-        "{routed}"
-    );
-    assert_ne!(routed["_next"], json!("post_round"), "{routed}");
-
-    state["verify_scope"] = json!("batch");
-    let batch = gate_json("route_verdict", &state, &scratch);
-    assert_eq!(batch["escalation"]["kind"], json!("plan_defect"), "{batch}");
-    assert_ne!(batch["_next"], json!("batch_triage"), "{batch}");
+    assert_eq!(routed["_next"], json!("post_round"), "{routed}");
+    assert_eq!(routed["last_verdict"], json!("PASS"), "{routed}");
+    assert!(routed.get("escalation").is_none(), "{routed}");
 
     let wave = gate_json(
         "wave_route",
         &json!({"wtask": {"task": TASK}, "wave_gauntlet_result": reply, "wave_report": "done"}),
         &scratch,
     );
+    assert_eq!(wave["wave_result"]["status"], json!("conforms"), "{wave}");
+
+    state["gauntlet_result"] = json!(format!(
+        "GAUNTLET: BLOCKED\n\n| lane | status | detail |\n|------|--------|--------|\n| code-review | GREEN | MERGE-READY |\n| adversary | BLOCKED | DIVERGES |\n\n## Blockers\n- adversary: criterion 2 fails\n\n{report}"
+    ));
+    let blocked = gate_json("route_verdict", &state, &scratch);
     assert_eq!(
-        wave["wave_result"]["status"],
-        json!("needs_escalation"),
-        "{wave}"
-    );
-    assert_eq!(
-        wave["wave_result"]["escalation"]["kind"],
+        blocked["escalation"]["kind"],
         json!("plan_defect"),
-        "{wave}"
+        "{blocked}"
     );
 }
 
@@ -3482,21 +3477,28 @@ fn readme_grammar_row_records_the_producer_guarantee_and_the_planning_store_dive
         "The header boundary is the review-gauntlet producer's guarantee",
         "the consumer defends it as well",
         "the `## Blockers` section and the debris blocker lines (unbulleted `debris: Implementation debris` lines count only at column 0 inside that section) are read only from the header",
-        "Four reads take the full reply on purpose, and each can only block, escalate or add one capped adopt round, never turn a BLOCKED into a PASS",
+        "Four reads take the full reply on purpose:",
         "`ADVERSARIAL_REVIEW:` (the direct micro-mode adversary lane",
         "`PIPELINE-FAULT` (consulted only when the header carries no verdict",
-        "a PASS that carries one escalates as a plan defect in every scope, batch included, while a BLOCKED round keeps its own route",
+        "consulted only on a round that already has real blockers, where they pick the plan-defect escalation over a fix round",
         "the probe's test-file paths (read only when the probe verdict is PASS, adoption capped at one round)",
+        "None of them can turn a BLOCKED into a PASS, or a PASS into anything but that one capped adopt round",
     ] {
         assert!(
             row.contains(clause),
             "the grammar row lost {clause:?}: {row}"
         );
     }
-    assert!(
-        !row.contains("nothing past the boundary is read"),
-        "the grammar row claims no full-reply read survives: {row}"
-    );
+    for stale in [
+        "nothing past the boundary is read",
+        "a PASS that carries one escalates as a plan defect",
+        "in every scope",
+    ] {
+        assert!(
+            !row.contains(stale),
+            "the grammar row still carries {stale:?}: {row}"
+        );
+    }
 }
 
 /// The battery env hygiene row names the exact variable list the wrapper

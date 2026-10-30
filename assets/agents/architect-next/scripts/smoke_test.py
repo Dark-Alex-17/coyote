@@ -620,20 +620,16 @@ check("_parse_gauntlet: the direct adversary's own report keeps its debris lines
 GROOT = gauntlet_reply("PASS", [("code-review", "GREEN", "MERGE-READY"), ("adversary", "GREEN", "CONFORMS")],
                        reports=[("code-review", "A reader might say the plan itself is the root cause here.")])
 u = gates.route_verdict(verdict_state(GROOT))
-check("route_verdict: a PASS whose code-review report quotes a plan-root phrase -> escalation plan_defect, never post_round",
-      u.get("escalation", {}).get("kind") == "plan_defect" and u.get("_next") != "post_round")
-u = gates.route_verdict(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="batch", verify_unit="batch-1", verify_lane="gauntlet",
-                                   gauntlet_result=GROOT, round_log={"batch-1": [{"round": 1, "head": "h"}]}))
-check("route_verdict: batch scope, a PASS quoting a plan-root phrase -> escalation plan_defect, never batch_triage",
-      u.get("escalation", {}).get("kind") == "plan_defect" and u.get("_next") != "batch_triage" and "gauntlet_blockers" not in u)
+check("route_verdict: a PASS whose code-review report quotes a plan-root phrase still -> post_round, no escalation",
+      u.get("_next") == "post_round" and u.get("last_verdict") == "PASS" and "escalation" not in u)
 GROOTINC = gauntlet_reply("BLOCKED", [("debris", "BLOCKED", "review incomplete")], incomplete="debris",
                           reports=[("code-review", "A reader might say the plan itself is the root cause here.")])
 u = gates.route_verdict(verdict_state(GROOTINC))
 check("route_verdict: an incomplete-only BLOCKED quoting a plan-root phrase keeps the debris re-run, no plan_defect",
       u.get("_next") == "verify_gate" and "escalation" not in u)
 u = gates.wave_route(base_state(wtask={"task": T1}, wave_gauntlet_result=GROOT, wave_report="done"))
-check("wave_route: a PASS whose lane report quotes a plan-root phrase -> plan_defect, never conforms",
-      u["wave_result"]["status"] == "needs_escalation" and u["wave_result"]["escalation"]["kind"] == "plan_defect")
+check("wave_route: a PASS whose lane report quotes a plan-root phrase still -> conforms",
+      u["wave_result"]["status"] == "conforms" and "escalation" not in u["wave_result"])
 
 # ---------------------------------------------------------------- post_round / fix_done / harvest / design ask / debt / task_done_verify / stack / route
 os.environ["ARCHITECT_GH_COMMENT_CMD"] = "true"
