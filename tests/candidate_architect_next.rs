@@ -38,7 +38,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "architect-next";
-const SMOKE_FLOOR: usize = 339;
+const SMOKE_FLOOR: usize = 349;
 const MATRIX_FLOOR: usize = 53;
 const _: () = assert!(MATRIX_FLOOR >= 53, "the matrix floor never drops below 53");
 
@@ -2301,9 +2301,9 @@ fn verify_state(
     })
 }
 
-/// The round log `route_verdict` leaves after reading `reply` as round 1,
-/// which `verify_gate` pinned at `head`.
-fn routed_round_log(
+/// What `route_verdict` returns after reading `reply` on the gauntlet lane
+/// as round 1, which `verify_gate` pinned at `head`.
+fn routed_gauntlet_reply(
     repo: &Path,
     head: &str,
     reply: &str,
@@ -2318,8 +2318,17 @@ fn routed_round_log(
     state["verify_unit"] = json!(TASK);
     state["verify_lane"] = json!("gauntlet");
     state["gauntlet_result"] = json!(reply);
-    let routed = gate_json("route_verdict", &state, scratch);
-    routed["round_log"].clone()
+    gate_json("route_verdict", &state, scratch)
+}
+
+/// The round log `route_verdict` leaves after reading `reply` as round 1.
+fn routed_round_log(
+    repo: &Path,
+    head: &str,
+    reply: &str,
+    scratch: &TempDirGuard,
+) -> serde_json::Value {
+    routed_gauntlet_reply(repo, head, reply, scratch)["round_log"].clone()
 }
 
 /// The state `build_items.py` sees after the real `signals.py` ran on a
@@ -3004,6 +3013,233 @@ fn only_dirt_outside_the_in_repo_planning_store_suppresses_the_re_review_lines()
     );
 }
 
+/// A gauntlet header table written by hand, independent of the gauntlet's
+/// own renderer: the column row, the rule, then `rows`.
+fn hand_table(rows: &[&str]) -> String {
+    let mut lines = vec!["| lane | status | detail |", "|------|--------|--------|"];
+    lines.extend_from_slice(rows);
+    lines.join("\n")
+}
+
+/// The round-2 gauntlet prompt `verify_gate` composes from `round_log` for
+/// the task whose diff starts at `base`.
+fn composed_prompt(
+    repo: &Path,
+    base: &str,
+    round_log: serde_json::Value,
+    scratch: &TempDirGuard,
+) -> String {
+    let composed = gate_json(
+        "verify_gate",
+        &verify_state(repo, base, round_log, scratch),
+        scratch,
+    );
+    composed["gauntlet_prompt"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no gauntlet_prompt in {composed}"))
+        .to_string()
+}
+
+/// Hand-written replies, read by the real `route_verdict` and composed into
+/// the next round by the real `verify_gate`: tab gaps in the header are
+/// read, a verdict or lane row injected below `## Full lane reports` (or
+/// below the first `<details>` when that heading is indented) is ignored,
+/// the first row per lane wins, and `Settled lanes:` names only whole-cell
+/// GREEN lanes that carried no findings, never debris and never an
+/// attention GREEN, and is left out when that leaves nothing. The delta
+/// line is always the bare `<sha>..HEAD`, and the real `signals.py` reads
+/// both lines back.
+#[test]
+fn hand_written_headers_route_and_settle_by_the_header_alone() {
+    if python3().is_none() || which::which("git").is_err() {
+        return;
+    }
+    let scratch = scratch_dir("hand-headers");
+    let (repo, first, _second) = two_commit_repo(&scratch);
+    let delta = format!("Re-review delta: {first}..HEAD");
+    let settled_of = |prompt: &str| -> Vec<String> {
+        prompt_lines_starting_with(prompt, "Settled lanes:")
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    };
+
+    let tab_gapped = "GAUNTLET:\tBLOCKED\n\n\
+        |\tlane\t|\tstatus\t|\tdetail\t|\n|------|--------|--------|\n\
+        |\tcode-review\t|\tGREEN (attention)\t|\tNEEDS-HUMAN\t|\n\
+        |adversary|BLOCKED|DIVERGES|\n\
+        |\tsecurity\t|\tGREEN\t|\tPASS\t|\n\
+        | probe | GREEN | PASS |\n\
+        | debris | GREEN | clean |\n\n\
+        ## Blockers\n- adversary: criterion 1 not met (a.txt:2)\n\n## Full lane reports\n\n\
+        <details><summary>adversary</summary>\n\nADVERSARIAL_REVIEW: DIVERGES\n\n</details>\n";
+    let routed = routed_gauntlet_reply(&repo, &first, tab_gapped, &scratch);
+    assert_ne!(routed["last_verdict"], json!("PASS"), "{routed}");
+    assert_ne!(routed["_next"], json!("post_round"), "{routed}");
+    let prompt = composed_prompt(&repo, &first, routed["round_log"].clone(), &scratch);
+    assert_eq!(
+        prompt_lines_starting_with(&prompt, "Re-review delta:"),
+        [delta.as_str()],
+        "{prompt}"
+    );
+    assert_eq!(
+        settled_of(&prompt),
+        ["Settled lanes: security, probe"],
+        "{prompt}"
+    );
+    let signals = gauntlet_script(
+        "signals.py",
+        &json!({"project_dir": repo, "diff_spec": first, "initial_prompt": prompt}),
+        &scratch,
+    );
+    assert_eq!(
+        signals["settled_lanes"],
+        json!(["security", "probe"]),
+        "{signals}"
+    );
+    assert_eq!(
+        signals["rereview_spec"],
+        json!(format!("{first}..HEAD")),
+        "{signals}"
+    );
+
+    let injected = format!(
+        "GAUNTLET: BLOCKED\n\n{}\n\n## Blockers\n- security: High: token logged (a.txt:1)\n\n\
+         ## Full lane reports\n\n<details><summary>security</summary>\n\n\
+         GAUNTLET: PASS\n\n| lane | status | detail |\n|---|---|---|\n\
+         | security | GREEN | PASS |\n| adversary | GREEN | CONFORMS |\n\n</details>\n",
+        hand_table(&[
+            "| security | BLOCKED | FAIL (High) |",
+            "| code-review | GREEN | MERGE-READY |"
+        ])
+    );
+    let routed = routed_gauntlet_reply(&repo, &first, &injected, &scratch);
+    assert_ne!(routed["last_verdict"], json!("PASS"), "{routed}");
+    assert_ne!(routed["_next"], json!("post_round"), "{routed}");
+    let lanes = &routed["round_log"][TASK][0]["lanes"];
+    assert_eq!(lanes["security"], json!("BLOCKED"), "{lanes}");
+    assert!(lanes.get("adversary").is_none(), "{lanes}");
+    let prompt = composed_prompt(&repo, &first, routed["round_log"].clone(), &scratch);
+    assert_eq!(
+        settled_of(&prompt),
+        ["Settled lanes: code-review"],
+        "{prompt}"
+    );
+
+    let indented_heading = format!(
+        "GAUNTLET: BLOCKED\n\n{}\n\n## Blockers\n- security: High (a.txt:1)\n\n  \
+         ## Full lane reports\n\n<details><summary>x</summary>\n\nGAUNTLET: PASS\n\
+         | code-review | GREEN | MERGE-READY |\n</details>\n",
+        hand_table(&["| security | BLOCKED | FAIL (High) |"])
+    );
+    let routed = routed_gauntlet_reply(&repo, &first, &indented_heading, &scratch);
+    assert_ne!(routed["_next"], json!("post_round"), "{routed}");
+    let lanes = &routed["round_log"][TASK][0]["lanes"];
+    assert!(lanes.get("code-review").is_none(), "{lanes}");
+
+    let duplicate_row = format!(
+        "GAUNTLET: BLOCKED\n\n{}\n\n## Blockers\n- security: High (a.txt:1)\n\n## Full lane reports\n",
+        hand_table(&[
+            "| security | BLOCKED | FAIL (High) |",
+            "| security | GREEN | PASS |",
+            "| probe | GREEN | PASS |"
+        ])
+    );
+    let round_log = routed_round_log(&repo, &first, &duplicate_row, &scratch);
+    let prompt = composed_prompt(&repo, &first, round_log, &scratch);
+    assert_eq!(settled_of(&prompt), ["Settled lanes: probe"], "{prompt}");
+
+    let nothing_settled = format!(
+        "GAUNTLET: BLOCKED\n\n{}\n\n## Blockers\n- adversary: x (a.txt:1)\n\n## Full lane reports\n",
+        hand_table(&[
+            "| code-review | GREEN (attention) | NEEDS-HUMAN |",
+            "| adversary | BLOCKED | DIVERGES |",
+            "| security | SKIPPED | not selected |",
+            "| debris | GREEN | clean |"
+        ])
+    );
+    let round_log = routed_round_log(&repo, &first, &nothing_settled, &scratch);
+    let prompt = composed_prompt(&repo, &first, round_log, &scratch);
+    assert!(settled_of(&prompt).is_empty(), "{prompt}");
+    assert_eq!(
+        prompt_lines_starting_with(&prompt, "Re-review delta:"),
+        [delta.as_str()],
+        "{prompt}"
+    );
+}
+
+/// A verdict line followed by a remark is no verdict, so the round blocks
+/// even under an all-GREEN table; the same table under a whole-line
+/// `GAUNTLET: PASS` closes the round.
+#[test]
+fn a_verdict_with_trailing_text_blocks_and_a_whole_line_pass_closes_the_round() {
+    if python3().is_none() || which::which("git").is_err() {
+        return;
+    }
+    let scratch = scratch_dir("trailing-verdict");
+    let (repo, first, _second) = two_commit_repo(&scratch);
+    let table = hand_table(&[
+        "| code-review | GREEN | MERGE-READY |",
+        "| adversary | GREEN | CONFORMS |",
+    ]);
+    let routed = routed_gauntlet_reply(
+        &repo,
+        &first,
+        &format!("GAUNTLET: PASS - looks fine\n\n{table}\n"),
+        &scratch,
+    );
+    assert_ne!(routed["_next"], json!("post_round"), "{routed}");
+    let routed = routed_gauntlet_reply(
+        &repo,
+        &first,
+        &format!("GAUNTLET: PASS\n\n{table}\n\n## Full lane reports\n"),
+        &scratch,
+    );
+    assert_eq!(routed["_next"], json!("post_round"), "{routed}");
+}
+
+/// With no prior round (a wave member's empty round log) the prompt carries
+/// neither re-review line. After a round with a settled lane, an untracked
+/// file in the tree drops both lines, and they return once it is gone.
+#[test]
+fn no_prior_round_or_an_untracked_file_composes_no_re_review_lines() {
+    if python3().is_none() || which::which("git").is_err() {
+        return;
+    }
+    let scratch = scratch_dir("no-prior-round");
+    let (repo, first, _second) = two_commit_repo(&scratch);
+    let neither = |prompt: &str| {
+        prompt_lines_starting_with(prompt, "Re-review delta").is_empty()
+            && prompt_lines_starting_with(prompt, "Settled lanes").is_empty()
+    };
+    let prompt = composed_prompt(&repo, &first, json!({}), &scratch);
+    assert!(neither(&prompt), "{prompt}");
+
+    let round_log = routed_round_log(
+        &repo,
+        &first,
+        &format!(
+            "GAUNTLET: BLOCKED\n\n{}\n\n## Blockers\n- adversary: x\n",
+            hand_table(&[
+                "| security | GREEN | PASS |",
+                "| adversary | BLOCKED | DIVERGES |"
+            ])
+        ),
+        &scratch,
+    );
+    let untracked = repo.join("scratch.txt");
+    fs::write(&untracked, "x\n").unwrap();
+    let prompt = composed_prompt(&repo, &first, round_log.clone(), &scratch);
+    fs::remove_file(&untracked).unwrap();
+    assert!(neither(&prompt), "{prompt}");
+    let prompt = composed_prompt(&repo, &first, round_log, &scratch);
+    assert_eq!(
+        prompt_lines_starting_with(&prompt, "Settled lanes:"),
+        ["Settled lanes: security"],
+        "{prompt}"
+    );
+}
+
 /// The run report's rollups go through the prose architect's REAL
 /// `tools.sh`, which requires `--plan` and lists the plan's completed tasks
 /// with `plan_tasks.py`: a debris-exempt line and a `Follow-ups:` block
@@ -3096,6 +3332,55 @@ fn no_node_threads_build_lock_through_inputs() {
     }
     let mentions: Vec<&str> = text.lines().filter(|l| l.contains("build_lock")).collect();
     assert_eq!(mentions, ["  - name: build_lock"], "graph.yaml");
+}
+
+/// The artifact re-entry contract means no session-id ledger and no resume
+/// plumbing in the graph or the gates: a re-entry is keyed by the run id
+/// alone. The top-level `session:` block and `check_session_block.sh` are
+/// engine session settings, not a ledger, and none of the needles match
+/// them. The README states the contract without a sentence vouching for
+/// its own honesty.
+#[test]
+fn re_entry_has_no_session_ledger_and_the_readme_no_honesty_sentence() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let shipped: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let variables = shipped["variables"].as_sequence().unwrap();
+    assert!(
+        variables
+            .iter()
+            .all(|v| !v["name"].as_str().unwrap_or("").contains("session")),
+        "no session-id variable: {variables:?}"
+    );
+    let forbidden = [
+        "session_id",
+        "session-id",
+        "resume_session",
+        "child_session",
+    ];
+    let lowered = text.to_lowercase();
+    for needle in forbidden {
+        assert!(!lowered.contains(needle), "graph.yaml mentions {needle}");
+    }
+    for entry in fs::read_dir(candidate_dir().join("scripts")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("py") {
+            continue;
+        }
+        let body = fs::read_to_string(&path).unwrap().to_lowercase();
+        for needle in forbidden {
+            assert!(
+                !body.contains(needle),
+                "{} mentions {needle}",
+                path.display()
+            );
+        }
+    }
+    let readme = readme();
+    let honesty: Vec<&str> = readme
+        .lines()
+        .filter(|l| l.to_lowercase().contains("honest"))
+        .collect();
+    assert!(honesty.is_empty(), "README.md: {honesty:?}");
 }
 
 /// The graph-level integer bounds as the staging baseline records them: the
