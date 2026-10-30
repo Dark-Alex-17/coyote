@@ -4,8 +4,16 @@ use crate::config::WORKSPACE_COYOTE_DIR_NAME;
 use crate::utils;
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use std::ffi::{OsStr, OsString};
+#[cfg(unix)]
+use std::fs::File;
+#[cfg(unix)]
+use std::io::{self, Write};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, Once, OnceLock};
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 struct TestLogCollector;
 
@@ -294,6 +302,91 @@ fn is_outside_system32(path: &Path) -> bool {
         .to_string_lossy()
         .split(['/', '\\'])
         .any(|part| part.eq_ignore_ascii_case("system32"))
+}
+
+// Holds the stdout lock for the whole capture: the harness reports
+// from the main thread through `io::stdout()`, and a report caught
+// mid-`write(1)` while fd 1 is re-pointed fails with EPIPE and kills the run.
+#[cfg(unix)]
+pub(crate) struct SavedStdout {
+    fd: OwnedFd,
+    _lock: io::StdoutLock<'static>,
+}
+
+#[cfg(unix)]
+impl Drop for SavedStdout {
+    fn drop(&mut self) {
+        // SAFETY: both descriptors are open; dup2 takes no pointers.
+        assert_ne!(
+            unsafe { libc::dup2(self.fd.as_raw_fd(), libc::STDOUT_FILENO) },
+            -1
+        );
+    }
+}
+
+// Points fd 1 at a fresh pipe; the reader sees EOF once the guard
+// restores fd 1, because fd 1 is the pipe's only writer. The read end
+// is non-blocking so a writer inherited by a child of another test
+// fails `read_all` at its deadline instead of hanging the test.
+#[cfg(unix)]
+pub(crate) fn capture_stdout() -> (SavedStdout, File) {
+    let mut lock = io::stdout().lock();
+    lock.flush().unwrap();
+    // SAFETY: fcntl with F_DUPFD_CLOEXEC takes no pointers; the result is checked.
+    let saved = unsafe { libc::fcntl(libc::STDOUT_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
+    assert_ne!(saved, -1);
+    // SAFETY: `saved` was just created by fcntl and nothing else owns it.
+    let saved = SavedStdout {
+        fd: unsafe { OwnedFd::from_raw_fd(saved) },
+        _lock: lock,
+    };
+
+    let mut fds = [0; 2];
+    // SAFETY: `fds` is a valid two-element array for pipe to fill.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    // SAFETY: fcntl with F_GETFL/F_SETFL takes no pointers; results are checked.
+    let flags = unsafe { libc::fcntl(fds[0], libc::F_GETFL) };
+    assert_ne!(flags, -1);
+    // SAFETY: as above.
+    let rc = unsafe { libc::fcntl(fds[0], libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    assert_ne!(rc, -1);
+    // SAFETY: both ends were just created by pipe and nothing else owns them.
+    let (reader, writer) = unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
+    // SAFETY: both descriptors are open; dup2 takes no pointers.
+    assert_ne!(
+        unsafe { libc::dup2(writer.as_raw_fd(), libc::STDOUT_FILENO) },
+        -1
+    );
+    drop(writer);
+    (saved, reader)
+}
+
+#[cfg(unix)]
+pub(crate) fn write_fd1(bytes: &[u8]) {
+    // SAFETY: `bytes` is a valid buffer of the given length.
+    let n = unsafe { libc::write(libc::STDOUT_FILENO, bytes.as_ptr().cast(), bytes.len()) };
+    assert_eq!(n, bytes.len() as isize);
+}
+
+#[cfg(unix)]
+pub(crate) fn read_all(reader: &mut File) -> String {
+    use std::io::Read;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut out = Vec::new();
+    let mut buf = [0; 4096];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "pipe still open: {out:?}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) => panic!("{err}"),
+        }
+    }
+    String::from_utf8(out).unwrap()
 }
 
 mod tests {

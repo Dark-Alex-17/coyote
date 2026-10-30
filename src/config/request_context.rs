@@ -48,6 +48,7 @@ use crate::supervisor::Supervisor;
 use crate::supervisor::escalation::EscalationQueue;
 use crate::supervisor::mailbox::{Inbox, PeerRegistry};
 use crate::supervisor::notification::NotificationQueue;
+use crate::turn::{StdoutSink, UiSink};
 use crate::utils::process::ProcessStamp;
 use crate::utils::{
     AbortSignal, UserInterrupt, abortable_run_with_spinner, create_abort_signal, edit_file,
@@ -639,6 +640,9 @@ pub struct RequestContext {
     pub top_level_agent_id: Option<String>,
 
     pub render_mode: RenderMode,
+
+    /// Where this context's turn output is drawn.
+    pub ui: Arc<dyn UiSink>,
 }
 
 impl RequestContext {
@@ -695,6 +699,7 @@ impl RequestContext {
             task_abort: None,
             top_level_agent_id: None,
             render_mode: RenderMode::default(),
+            ui: Arc::new(StdoutSink::default()),
         }
     }
 
@@ -782,6 +787,7 @@ impl RequestContext {
             task_abort: None,
             top_level_agent_id: None,
             render_mode: RenderMode::default(),
+            ui: Arc::new(StdoutSink::default()),
         };
         ctx.refresh_mcp_tool_filters();
         Ok(ctx)
@@ -906,6 +912,7 @@ impl RequestContext {
             // root flow that opened it may fire its terminal event.
             top_level_agent_id: None,
             render_mode: self.render_mode,
+            ui: Arc::clone(&self.ui),
         }
     }
 
@@ -974,6 +981,7 @@ impl RequestContext {
             task_abort: None,
             top_level_agent_id: None,
             render_mode: parent.render_mode,
+            ui: Arc::clone(&parent.ui),
         }
     }
 

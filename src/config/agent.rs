@@ -5,7 +5,7 @@ use crate::{
     client::Model,
     config::memory,
     function::{
-        FunctionDeclaration, Functions,
+        FunctionDeclaration, Functions, ToolIo,
         jobs::{DEFAULT_MAX_CONCURRENT_JOBS, JOB_FUNCTION_PREFIX},
         run_llm_function,
     },
@@ -26,6 +26,7 @@ use crate::graph::types::{RagNode, SessionBlock};
 use crate::graph::{Graph, GraphParser, NodeType};
 use crate::mcp::McpServerFeatures;
 use crate::rag::RagInitConfig;
+use crate::turn::SilentSink;
 use crate::vault::SECRET_RE;
 use anyhow::{Context, Result};
 use fancy_regex::Captures;
@@ -886,7 +887,7 @@ impl Agent {
             self.variable_envs(),
             Some(self.name().to_string()),
             tool_timeout,
-            false,
+            ToolIo::new(Arc::new(SilentSink), None, 0),
             None,
         )?;
         match value {

@@ -50,6 +50,7 @@ pub enum NoticeKind {
     Compress,
     Routing,
     GraphNode,
+    ToolWarning,
 }
 
 /// Something that happened inside the engine, published on the [`EventBus`]
@@ -68,8 +69,10 @@ pub enum Event {
         payload: Option<String>,
         origin: Origin,
     },
-    #[allow(dead_code)] // TASK-306
-    ToolNarration { call_id: String, line: String },
+    ToolNarration {
+        call_id: String,
+        line: String,
+    },
     #[allow(dead_code)] // TASK-307
     TextDelta(String),
     #[allow(dead_code)] // TASK-307
@@ -77,9 +80,15 @@ pub enum Event {
     #[allow(dead_code)] // TASK-307
     ThinkingStopped,
     #[allow(dead_code)] // TASK-307
-    AssistantText { text: String, markdown: bool },
+    AssistantText {
+        text: String,
+        markdown: bool,
+    },
     #[allow(dead_code)] // TASK-307
-    Notice { kind: NoticeKind, text: String },
+    Notice {
+        kind: NoticeKind,
+        text: String,
+    },
     #[allow(dead_code)] // TASK-308
     ToolOutputChunk {
         call_id: String,
@@ -87,17 +96,30 @@ pub enum Event {
         bytes: Vec<u8>,
     },
     #[allow(dead_code)] // TASK-308
-    UsageUpdated { right_prompt: String },
+    UsageUpdated {
+        right_prompt: String,
+    },
     #[allow(dead_code)] // TASK-308
-    ChildTranscriptFlushed { session_id: String },
+    ChildTranscriptFlushed {
+        session_id: String,
+    },
     #[allow(dead_code)] // TASK-308
-    JobCancelled { job_id: String },
+    JobCancelled {
+        job_id: String,
+    },
     #[allow(dead_code)] // TASK-309
-    PromptRequested { id: String },
+    PromptRequested {
+        id: String,
+    },
     #[allow(dead_code)] // TASK-309
-    PromptAnswered { id: String, answer: String },
+    PromptAnswered {
+        id: String,
+        answer: String,
+    },
     #[allow(dead_code)] // TASK-315
-    QueuedInput { text: String },
+    QueuedInput {
+        text: String,
+    },
 }
 
 /// Observes events published on an [`EventBus`]. Called synchronously on the

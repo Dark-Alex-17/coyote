@@ -71,6 +71,7 @@ pub async fn macro_execute(
     macro_ctx.inbox = ctx.inbox.clone();
     macro_ctx.parent_inbox = ctx.parent_inbox.clone();
     macro_ctx.escalation_queue = ctx.escalation_queue.clone();
+    macro_ctx.ui = ctx.ui.clone();
     macro_ctx.current_depth = ctx.current_depth;
     macro_ctx.auto_continue_count = ctx.auto_continue_count;
     macro_ctx.todo_list = ctx.todo_list.clone();
