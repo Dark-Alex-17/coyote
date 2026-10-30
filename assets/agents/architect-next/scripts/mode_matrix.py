@@ -45,6 +45,9 @@ for _k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
 for _k in [k for k in os.environ if k == "ARCHITECT_CORE_TOOLS" or (k.startswith("ARCHITECT_GH_") and k.endswith("_CMD"))]:
     # a caller's tool overrides would replace the scripts' own tools.sh and gh calls
     os.environ.pop(_k)
+# HOME becomes a scratch dir, so git has no user identity and on Linux refuses
+# to guess one; every gate that commits inherits this fixed identity instead
+os.environ.update({"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
 from _fixture import Store  # noqa: E402
 
 MAP_PATH = os.path.join(HERE, "marker_map.json")

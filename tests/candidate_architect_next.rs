@@ -985,15 +985,17 @@ const EXPECTED_WALK: [&str; 7] = [
 
 /// A scratch `COYOTE_CONFIG_DIR` holding the three agent dirs the candidate
 /// reaches at run time (`.shared`, the prose `architect` whose `tools.sh` the
-/// gates call, and the candidate itself), a dry-run `config.yaml`, and a
-/// project dir with one readable design doc. Returns the project dir.
+/// gates call, and the candidate itself), a dry-run `config.yaml`, an
+/// `mcp.json` that defines no server, and a project dir with one readable
+/// design doc. Returns the project dir.
 fn dry_run_config_dir(scratch: &TempDirGuard) -> PathBuf {
     dry_run_config_dir_with(scratch, true)
 }
 
 /// `dry_run_config_dir` with the agent copies optional: a consumer's first
-/// run starts from a config dir that holds nothing but `config.yaml`, and the
-/// engine installs the bundled agents (the candidate included) on that run.
+/// run starts from a config dir that holds nothing but `config.yaml` and
+/// `mcp.json`, and the engine installs the bundled agents (the candidate
+/// included) on that run.
 fn dry_run_config_dir_with(scratch: &TempDirGuard, copy_agents: bool) -> PathBuf {
     let dir = &scratch.0;
     if copy_agents {
@@ -1012,6 +1014,11 @@ fn dry_run_config_dir_with(scratch: &TempDirGuard, copy_agents: bool) -> PathBuf
         ),
     )
     .unwrap();
+    // The graph's chat agent `engineer` declares the `ddg-search` MCP server,
+    // which the bundled `mcp.json` launches through `uvx`, and CI hosts lack
+    // that launcher. The engine never installs over an existing `mcp.json`
+    // and only spawns servers the file defines, so this one starts none.
+    fs::write(dir.join("mcp.json"), "{\"mcpServers\": {}}\n").unwrap();
     let project = dir.join("project");
     fs::create_dir_all(project.join("plans")).unwrap();
     fs::write(
@@ -1024,6 +1031,30 @@ fn dry_run_config_dir_with(scratch: &TempDirGuard, copy_agents: bool) -> PathBuf
 
 /// The brief every dry run below starts from unless it re-enters a run.
 const DRY_RUN_PROMPT: &str = "Implement the plan at plans/PLAN-x.md";
+
+/// Every binary run in this file starts from a config dir that
+/// `dry_run_config_dir_with` wrote, the only `config.yaml` writer here, so
+/// none of them can reach the `uvx` launcher a CI host lacks.
+#[test]
+fn every_scratch_config_dir_defines_no_mcp_server() {
+    for copy_agents in [true, false] {
+        let scratch = scratch_dir("mcpconfig");
+        dry_run_config_dir_with(&scratch, copy_agents);
+        let mcp: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(scratch.0.join("mcp.json")).unwrap()).unwrap();
+        assert_eq!(mcp, json!({"mcpServers": {}}), "copy_agents={copy_agents}");
+    }
+    let source = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(file!())).unwrap();
+    let lines: Vec<&str> = source.lines().collect();
+    let writers = lines
+        .windows(2)
+        .filter(|w| w[0].trim() == "fs::write(" && w[1].trim().ends_with(".join(\"config.yaml\"),"))
+        .count();
+    assert_eq!(
+        writers, 1,
+        "a second config.yaml writer must also write mcp.json"
+    );
+}
 
 /// Dry-runs the candidate by name through the real binary until the trace
 /// reaches `ask_user` (an input node that waits on a terminal, so the child
@@ -1238,10 +1269,10 @@ fn dry_run_by_name_walks_to_ask_user_and_pins_the_run_dir() {
 }
 
 /// A consumer's first run: a config dir holding nothing but `config.yaml`
-/// (no agent copied in), `coyote -a architect-next --dry-run ...`. The
-/// engine installs the bundled agents on that run (the candidate among
-/// them), walks the same `intake -> ... -> ask_user` path and puts the run
-/// dir under `$COYOTE_CACHE_DIR/architect-next/runs/`.
+/// and `mcp.json` (no agent copied in), `coyote -a architect-next --dry-run
+/// ...`. The engine installs the bundled agents on that run (the candidate
+/// among them), walks the same `intake -> ... -> ask_user` path and puts the
+/// run dir under `$COYOTE_CACHE_DIR/architect-next/runs/`.
 #[test]
 fn dry_run_by_name_from_an_empty_config_dir_installs_the_candidate_and_walks_to_ask_user() {
     if python3().is_none() {
@@ -3726,7 +3757,10 @@ fn every_llm_node_keeps_the_frozen_anomalies_channel() {
 /// Both batteries drop the agent variables, the tool overrides and the
 /// wrapper's git repository variables themselves, before they import a gate,
 /// so a direct run from a git hook or an agent session is as isolated as a
-/// run through the wrapper.
+/// run through the wrapper. After those drops, and still before the import,
+/// each sets a fixed git author and committer: its scratch `HOME` holds no
+/// identity and git on Linux will not guess one, so every gate commit would
+/// fail on a bare host.
 #[test]
 fn batteries_drop_the_same_variables_as_the_wrapper() {
     let quoted = fancy_regex::Regex::new(r#""([A-Z_]+)""#).unwrap();
@@ -3757,6 +3791,29 @@ fn batteries_drop_the_same_variables_as_the_wrapper() {
         assert!(
             agent_at < import_at && git_at < import_at && tools_at < import_at,
             "{file} must drop the variables before it imports a gate"
+        );
+        let identity_at = find(
+            &|l| l.starts_with("os.environ.update({\"GIT_AUTHOR_NAME\""),
+            "git identity line",
+        );
+        assert!(
+            agent_at.max(git_at).max(tools_at) < identity_at && identity_at < import_at,
+            "{file} must set the git identity after the drops and before it imports a gate"
+        );
+        let identity: Vec<String> = quoted
+            .captures_iter(lines[identity_at])
+            .map(|c| c.unwrap()[1].to_string())
+            .collect();
+        assert_eq!(
+            identity,
+            [
+                "GIT_AUTHOR_NAME",
+                "GIT_AUTHOR_EMAIL",
+                "GIT_COMMITTER_NAME",
+                "GIT_COMMITTER_EMAIL"
+            ],
+            "{file}: {}",
+            lines[identity_at]
         );
         let names: Vec<String> = quoted
             .captures_iter(lines[git_at])
@@ -3964,6 +4021,16 @@ fn readme_env_hygiene_and_ledger_rows_match_the_code() {
     assert!(row.contains("`ARCHITECT_GH_*_CMD`"), "{row}");
     for var in GIT_REPO_VARS {
         assert!(row.contains(&format!("`{var}`")), "{var} missing: {row}");
+    }
+    for clause in [
+        "both set a fixed `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME` and `GIT_COMMITTER_EMAIL`",
+        "Neither drops `GIT_CONFIG_COUNT`",
+        "holds an `mcp.json` that defines no server",
+    ] {
+        assert!(
+            row.contains(clause),
+            "the env hygiene row lost {clause:?}: {row}"
+        );
     }
 
     let row = adjustments_row("| ledger rollup scope |");
