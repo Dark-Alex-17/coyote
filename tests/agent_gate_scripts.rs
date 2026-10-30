@@ -1917,9 +1917,68 @@ fn collect_ledger_lines_reads_only_the_plans_complete_tasks() {
     );
 }
 
-/// Through the built argc tool, `--plan` is required: a call without it is
-/// a usage error (non-zero, no `(none)`, the option named), and a call with
-/// it plus `--tasks` reaches the same scoped read the sourced function gave.
+#[cfg(unix)]
+fn copy_tree(src: &Path, dst: &Path) {
+    fs::create_dir_all(dst).unwrap();
+    for entry in fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let target = dst.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+/// `agent`'s tools.sh as the engine builds it: a copy of the agent under a
+/// scratch config dir, rebuilt in place by `coyote --agent <agent>
+/// --build-tools`. A raw `argc::build` would skip the engine's post-build
+/// rewrites, which the tool needs to run under the bash 3.2 macOS ships.
+#[cfg(unix)]
+fn engine_built_tool(dir: &Path, agent: &str) -> PathBuf {
+    let config = dir.join("config");
+    for name in [".shared", agent] {
+        copy_tree(&asset(name), &config.join("agents").join(name));
+    }
+    let vault_pass = dir.join("vault-pass");
+    fs::write(&vault_pass, "test-password\n").unwrap();
+    fs::write(
+        config.join("config.yaml"),
+        format!(
+            "model: dryrun:dry-model\ndry_run: true\nvault_password_file: '{}'\nclients:\n  - type: openai\n    name: dryrun\n    auth: none\n    api_key: 'unused'\n    models:\n      - name: dry-model\n        max_input_tokens: 100000\n        supports_function_calling: true\nsave: false\nmemory: false\nstream: false\n",
+            vault_pass.display()
+        ),
+    )
+    .unwrap();
+    // CI hosts lack the `uvx` launcher the bundled `mcp.json` names, and the
+    // engine never installs over an existing one.
+    fs::write(config.join("mcp.json"), "{\"mcpServers\": {}}\n").unwrap();
+    let home = dir.join("home");
+    fs::create_dir_all(&home).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_coyote"))
+        .args(["--agent", agent, "--build-tools"])
+        .current_dir(dir)
+        .env("COYOTE_CONFIG_DIR", &config)
+        .env("COYOTE_CACHE_DIR", dir.join("cache"))
+        .env("HOME", &home)
+        .env("NO_COLOR", "1")
+        .env_remove("COYOTE_LOG_PATH")
+        .env_remove("COYOTE_WORKSPACE_CONFIG_DIR")
+        .env_remove("COYOTE_PROVIDER")
+        .env_remove("COYOTE_PLATFORM")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("spawn coyote --build-tools");
+    let (code, stdout, stderr) = run(output);
+    assert_eq!(code, 0, "--build-tools failed: {stdout}\n{stderr}");
+    config.join("agents").join(agent).join("tools.sh")
+}
+
+/// Through the engine-built argc tool, `--plan` is required: a call without
+/// it is a usage error (non-zero, no `(none)`, the option named), and a call
+/// with it plus `--tasks` reaches the same scoped read the sourced function
+/// gave.
 #[cfg(unix)]
 #[test]
 fn collect_ledger_lines_refuses_a_call_without_a_plan() {
@@ -1931,10 +1990,7 @@ fn collect_ledger_lines_refuses_a_call_without_a_plan() {
         return;
     }
     let dir = shared_tasks_fixture("collect-ledger-argc");
-    let source = fs::read_to_string(asset("architect/tools.sh")).unwrap();
-    let built = argc::build(&source, "", None).expect("argc build");
-    let tool = dir.0.join("tools.built.sh");
-    fs::write(&tool, built).unwrap();
+    let tool = engine_built_tool(&dir.0, "architect");
     let run_tool = |args: &[&str]| {
         run(bash()
             .arg(&tool)

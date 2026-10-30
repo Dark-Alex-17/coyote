@@ -36,6 +36,7 @@ pub fn build_bash_tool(src: &str, file_name: &str) -> Result<(String, Vec<Functi
     )?;
     let build_script = allow_empty_required_values(&build_script);
     let build_script = keep_attached_option_values(&build_script);
+    let build_script = tolerate_empty_arrays_under_nounset(&build_script);
 
     let command_value = argc::export(&build_script, file_name)
         .with_context(|| format!("Failed to parse script '{file_name}'"))?;
@@ -112,6 +113,42 @@ fn keep_attached_option_values(build_script: &str) -> String {
         r#"_argc_take_args_values=("${_argc_item##*=}")"#,
         r#"_argc_take_args_values=("${_argc_item#*=}")"#,
     )
+}
+
+/// argc 1.24.0's generated `_argc_run` passes several arrays on with a bare
+/// `"${a[@]}"`, and those arrays are empty on ordinary calls: any call with
+/// no positionals, or a subcommand with no required option or env while a
+/// sibling declares one. Every agent tool runs under `set -u` (from
+/// `.shared/utils.sh`), and bash before 4.4, including the 3.2 that macOS
+/// ships, treats an empty `"${a[@]}"` as an unbound variable, so the call
+/// dies before the function runs. Rewrite each one to `${a[@]+"${a[@]}"}`,
+/// which expands to nothing for an empty array on every bash. Applied
+/// post-build so it survives every regeneration.
+const EMPTY_ARRAY_EXPANSIONS: [(&str, &str); 4] = [
+    (
+        r#"$argc__fn "${argc__positionals[@]}""#,
+        r#"$argc__fn ${argc__positionals[@]+"${argc__positionals[@]}"}"#,
+    ),
+    (
+        r#"_argc_require_params "error: the following required arguments were not provided:" "${_argc_required_flag_options[@]}""#,
+        r#"_argc_require_params "error: the following required arguments were not provided:" ${_argc_required_flag_options[@]+"${_argc_required_flag_options[@]}"}"#,
+    ),
+    (
+        r#"_argc_require_params "error: the following required environments were not provided:" "${_argc_required_envs[@]}""#,
+        r#"_argc_require_params "error: the following required environments were not provided:" ${_argc_required_envs[@]+"${_argc_required_envs[@]}"}"#,
+    ),
+    (
+        r#"_argc_require_tools "${_argc_tools[@]}""#,
+        r#"_argc_require_tools ${_argc_tools[@]+"${_argc_tools[@]}"}"#,
+    ),
+];
+
+fn tolerate_empty_arrays_under_nounset(build_script: &str) -> String {
+    EMPTY_ARRAY_EXPANSIONS
+        .iter()
+        .fold(build_script.to_string(), |script, (needle, replacement)| {
+            script.replace(needle, replacement)
+        })
 }
 
 fn schema_ty(t: &str) -> JsonSchema {
@@ -220,6 +257,60 @@ mod tests {
 
         assert!(fixed.contains(r#"_argc_take_args_values=("${_argc_item#*=}")"#));
         assert!(!fixed.contains(r#"_argc_take_args_values=("${_argc_item##*=}")"#));
+    }
+
+    #[test]
+    fn rewrites_argc_empty_array_expansions_to_nounset_safe_form_test() {
+        let src = "# @describe test tool\n# @meta require-tools ls\n# @env NEEDED! An env\n\n# @cmd run\n# @option --content! The content\nrun() { :; }\n";
+        let built = argc::build(src, "", None).expect("argc build failed");
+        for (needle, _) in EMPTY_ARRAY_EXPANSIONS {
+            assert!(
+                built.contains(needle),
+                "argc changed its generated `{needle}`; update EMPTY_ARRAY_EXPANSIONS"
+            );
+        }
+
+        let fixed = tolerate_empty_arrays_under_nounset(&built);
+
+        for (needle, replacement) in EMPTY_ARRAY_EXPANSIONS {
+            assert!(!fixed.contains(needle), "still present: {needle}");
+            assert!(fixed.contains(replacement), "missing: {replacement}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn built_tool_runs_a_command_without_positionals_under_nounset_test() {
+        use std::fs;
+        use std::process::Command;
+
+        let Some(bash) = crate::testing::bash_program() else {
+            eprintln!("skipping: bash not available");
+            return;
+        };
+
+        let src = "#!/usr/bin/env bash\nset -euo pipefail\n# @describe t\n\n# @cmd greet\n# @option --name The name\ngreet() { printf 'hi %s' \"${argc_name:-nobody}\" >> \"$LLM_OUTPUT\"; }\n";
+        let path = crate::utils::temp_file("bash-nounset", ".sh");
+        fs::write(&path, src).expect("failed to write temp script");
+        generate_bash_declarations(File::open(&path).unwrap(), &path, "t").expect("build failed");
+
+        let out = crate::utils::temp_file("bash-nounset-out", ".txt");
+        let output = Command::new(&bash)
+            .arg(&path)
+            .arg("greet")
+            .env("LLM_OUTPUT", &out)
+            .output()
+            .expect("failed to run built script");
+        assert!(
+            output.status.success(),
+            "built script failed with no positionals under {}: {}",
+            bash.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(fs::read_to_string(&out).unwrap(), "hi nobody");
+
+        fs::remove_file(&out).unwrap();
+        fs::remove_file(&path).unwrap();
     }
 
     #[cfg(unix)]
