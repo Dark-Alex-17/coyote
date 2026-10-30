@@ -3585,28 +3585,87 @@ fn the_shared_instance_keys_land_in_the_reticulum_section() {
     );
 }
 
-/// A listener the written config advertises to other hosts ("--relay <this host>:4242")
-/// must be reachable from another host; a loopback-only `listen_ip` refuses every
+/// The comment block directly above the `[[Coyote Sessions]]` header of a planned
+/// config, its `#` lines trimmed and joined with spaces.
+fn sessions_comment(plan: &str) -> String {
+    let lines: Vec<&str> = plan.lines().map(str::trim).collect();
+    let header = lines
+        .iter()
+        .position(|line| *line == "[[Coyote Sessions]]")
+        .unwrap_or_else(|| panic!("the plan has no [[Coyote Sessions]] stanza:\n{plan}"));
+    let mut comment: Vec<&str> = lines[..header]
+        .iter()
+        .rev()
+        .take_while(|line| line.starts_with('#'))
+        .map(|line| line.trim_start_matches('#').trim())
+        .collect();
+    comment.reverse();
+    comment.join(" ")
+}
+
+/// True when `comment` invites other hosts to dial a listener bound to `listen_ip`
+/// that only this machine can reach, without saying it listens on loopback only.
+fn misadvertises_the_listener(comment: &str, listen_ip: &str) -> bool {
+    let comment = comment.to_lowercase();
+    let invites_other_hosts = comment.contains("other hosts") || comment.contains("--relay");
+    invites_other_hosts && listen_ip.starts_with("127.") && !comment.contains("loopback only")
+}
+
+/// A listener the written config offers to other hosts must say it listens on loopback
+/// only while `listen_ip` is a loopback address, since such a listener refuses every
 /// connection that does not originate on this machine.
 #[test]
 fn a_listener_advertised_to_other_hosts_is_not_bound_to_loopback_only() {
+    for (comment, listen_ip, expected) in [
+        (
+            "The TCP hop for other hosts that dial this one as their relay (--relay <this host>:4242)",
+            "127.0.0.1",
+            true,
+        ),
+        (
+            "Other hosts can use this one as their relay.",
+            "127.0.0.1",
+            true,
+        ),
+        ("Point --relay at this host.", "127.0.0.1", true),
+        (
+            "It listens on loopback only: for other hosts to dial this one, set listen_ip.",
+            "127.0.0.1",
+            false,
+        ),
+        ("For other hosts that dial this one.", "0.0.0.0", false),
+        (
+            "The TCP hop for a session on this host.",
+            "127.0.0.1",
+            false,
+        ),
+    ] {
+        assert_eq!(
+            misadvertises_the_listener(comment, listen_ip),
+            expected,
+            "the predicate misjudges {comment:?} at listen_ip = {listen_ip}"
+        );
+    }
+
     let bash = bash_or_skip!();
     let home = Home::new("remote-listener");
     let (code, out, err) = run(&mut home.relay(&bash, &["--no-service", "--dry-run"]));
     assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
-    let advertises_remote = out.contains("other hosts that dial this one as their relay");
     let listen_ip = config_keys(&out)
         .into_iter()
         .find(|(s, k, _)| s.ends_with("[[Coyote Sessions]]") && k == "listen_ip")
         .map(|(_, _, v)| v)
         .expect("[[Coyote Sessions]] has a listen_ip");
+    let comment = sessions_comment(&out);
     assert!(
-        !(advertises_remote && listen_ip.starts_with("127.")),
-        "the [[Coyote Sessions]] comment tells other hosts to dial this listener (--relay <this host>:4242) but it binds listen_ip = {listen_ip}, which only this machine can reach:\n{out}"
+        !misadvertises_the_listener(&comment, &listen_ip),
+        "the [[Coyote Sessions]] comment offers the listener to other hosts but it binds listen_ip = {listen_ip}, which only this machine can reach, and the comment does not say so: {comment:?}"
     );
     if listen_ip.starts_with("127.") {
         assert!(
-            out.contains("# The TCP hop for a session configured with type: private at 127.0.0.1:4242. It listens on\n  # loopback only:"),
+            comment.starts_with(
+                "The TCP hop for a session configured with type: private at 127.0.0.1:4242. It listens on loopback only:"
+            ),
             "the [[Coyote Sessions]] comment does not say the listener is loopback-only while listen_ip = {listen_ip}:\n{out}"
         );
     }
