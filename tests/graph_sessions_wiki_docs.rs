@@ -28,7 +28,10 @@
 //! `src/function/agents.rs`, the `previous_turns` budget in
 //! `src/graph/transcript.rs`, the bundled coder graph (which declares no
 //! `carry:` list) and the resume policy sentence of
-//! `assets/skills/delegation-protocol/SKILL.md`.
+//! `assets/skills/delegation-protocol/SKILL.md`; the resume refusal of a
+//! start-unknown stamp against `src/utils/process.rs`, the `--macro` arm
+//! against `src/main.rs`, and the child folds on Session-Compression.md
+//! against the child run loop in `src/function/agents.rs`.
 
 use std::collections::BTreeSet;
 use std::env;
@@ -58,6 +61,17 @@ const SESSION_EVENTS: &[&str] = &["session.deleted"];
 /// What the Hooks.md `session.deleted` row says fires it.
 const SESSION_DELETED_DEFINITION: &str =
     "an operator command removed a session file or a session's child-session directory";
+/// The lead of the Hooks.md paragraph that says what fires `session.deleted`
+/// and which removals fire nothing.
+const SESSION_DELETED_LEAD: &str = "`session.deleted` fires once per session file";
+/// The Sessions.md subsection that lists what the session commands do to
+/// running children and to the child files.
+const SESSION_COMMANDS_HEADING: &str = "## Session commands";
+/// The Session-Compression.md section that lists where a child's session
+/// folds.
+const CHILD_FOLDS_HEADING: &str = "# Child sessions";
+/// The Sessions.md subsection on Ctrl+C with background work.
+const INTERRUPT_HEADING: &str = "## Interrupting a turn with background work";
 const SESSION_PATH: &str = "COYOTE_SESSION_PATH";
 /// The lead of the sentence that lists every denied `chat.tools` entry.
 const DENY_LEAD: &str = "Denied in `chat.tools`:";
@@ -1810,6 +1824,7 @@ fn edited_sections(wiki: &Path) -> Vec<(&'static str, String)> {
     let sessions = read(wiki.join("Sessions.md"));
     let hooks = read(wiki.join("Hooks.md"));
     let agents = read(wiki.join("Agents.md"));
+    let compression = read(wiki.join("Session-Compression.md"));
     let run_heading = format!("## `.run` - {}", run_command_description());
     vec![
         (
@@ -1872,6 +1887,14 @@ fn edited_sections(wiki: &Path) -> Vec<(&'static str, String)> {
         (
             "Agents.md resuming a child",
             section("Agents.md", &agents, RESUME_HEADING),
+        ),
+        (
+            "Hooks.md session.deleted paragraph",
+            paragraph("Hooks.md", &hooks, SESSION_DELETED_LEAD),
+        ),
+        (
+            "Session-Compression.md # Child sessions",
+            section("Session-Compression.md", &compression, CHILD_FOLDS_HEADING),
         ),
     ]
 }
@@ -2098,10 +2121,43 @@ fn sessions_child_section_names_the_layout_and_the_lifecycle_rules() {
             "child_sessions.rs joins {literal}; the layout names on Sessions.md are read from it"
         );
     }
+    let run_history = number_after(
+        &child_sessions,
+        "pub(crate) const CHILD_RUN_HISTORY: usize = ",
+        ';',
+    );
+    let repl = src(&["repl", "mod.rs"]);
     let exit_wait = number_after(
-        &src(&["repl", "mod.rs"]),
+        &repl,
         "const EXIT_CANCEL_WAIT: Duration = Duration::from_secs(",
         ')',
+    );
+    // Every bounded drain in the REPL but the sessionless Ctrl-C helper is a
+    // session command the subsection lists.
+    let repl_production = repl
+        .split("\n#[cfg(test)]\nmod tests {")
+        .next()
+        .expect("split yields the text before the test module");
+    let drains = repl_production
+        .matches("cancel_background_tasks_and_wait(EXIT_CANCEL_WAIT).await;")
+        .count();
+    let sessionless = fn_body(repl_production, "async fn cancel_sessionless_turn_tasks(")
+        .matches("cancel_background_tasks_and_wait(EXIT_CANCEL_WAIT).await;")
+        .count();
+    assert_eq!(sessionless, 1, "the sessionless Ctrl-C helper drains once");
+    let command_drains = match drains - sessionless {
+        5 => "Five",
+        n => panic!(
+            "the REPL drains at {n} session-command sites; update the Session commands list and this pin"
+        ),
+    };
+    let main = src(&["main.rs"]);
+    let macro_arm = fn_body(&main, "if let Some(name) = &cli.macro_name {");
+    assert!(
+        macro_arm.contains("ctx.cancel_background_tasks();")
+            && !macro_arm.contains("cancel_background_tasks_and_wait")
+            && !macro_arm.contains("exit_session"),
+        "the --macro arm signals a cancel without waiting and never exits its session: {macro_arm}"
     );
 
     let Some(wiki) = wiki_dir() else { return };
@@ -2114,19 +2170,39 @@ fn sessions_child_section_names_the_layout_and_the_lifecycle_rules() {
         "`sessions/_proc/<pid>-<start>/`",
         &format!("`{prefix}<agent>_<12 hex>`"),
         &format!("first {prompt_head} characters"),
+        "`runs` (one entry per spawn or resume",
+        &format!("only the most recent {run_history} are kept"),
         "not after every tool round",
         "keeps `running` in its sidecar and reads `crashed` afterwards",
+        "`--macro` signals them to cancel as it ends, without waiting for them to record it",
+        "A `--macro` run never exits its session, so the save at exit does not happen for it",
+        "saves them itself with a `.save session` step",
         "copies as `running` and later reads `crashed` on the fork",
-        "**`.exit session`**",
-        &format!("wait up to {exit_wait} s for them to record `cancelled`"),
-        "**`.empty`** clears the transcript and removes the child directory",
-        "**`.delete session`** refuses the attached session",
         "always runs its graph",
         "the run is recorded into the same child session file",
     ] {
         assert!(
             text.contains(needle),
             "the Child Sessions section does not say {needle:?}"
+        );
+    }
+    let commands = flat(&section("Sessions.md", &page, SESSION_COMMANDS_HEADING));
+    let drain_lead = format!(
+        "{command_drains} commands cancel running children the way Ctrl-C does and wait up to {exit_wait} s for them to record `cancelled`"
+    );
+    for needle in [
+        drain_lead.as_str(),
+        "**`.exit session`** and **`.exit agent`**, when a session is attached",
+        "**Leaving the REPL**, always.",
+        "**`.empty`** (`.empty session`), when a session is attached.",
+        "**`.session`**, when no session is attached",
+        "**`.empty`** clears the transcript and removes the child directory",
+        "**`.delete session`** refuses the attached session",
+        "`session.deleted`",
+    ] {
+        assert!(
+            commands.contains(needle),
+            "the Session commands subsection does not say {needle:?}"
         );
     }
     let written = flat(&section(
@@ -2275,7 +2351,8 @@ fn hook_pages_carry_the_child_session_variable() {
 }
 
 /// `session.deleted` is a real event name, and the hook pages define it,
-/// list the path variable it carries, and the Sessions page names it.
+/// list the path variable it carries, say it fires per session file and
+/// which removals stay silent, and the Session commands subsection names it.
 #[test]
 fn hook_pages_document_the_session_deleted_event() {
     let names = string_literals(&fn_body(&src(&["hooks.rs"]), "pub fn as_str("));
@@ -2285,6 +2362,20 @@ fn hook_pages_document_the_session_deleted_event() {
             "HookEvent::as_str does not name {event}: {names:?}"
         );
     }
+    // `.session` with no name, or the temp name, unlinks the previous temp
+    // session file without firing the event.
+    let temp = const_str(&src(&["config", "mod.rs"]), "TEMP_SESSION_NAME");
+    assert_eq!(temp, "temp");
+    let rebuild = fn_body(
+        &src(&["config", "request_context.rs"]),
+        "async fn use_session_recording_rebuild(",
+    );
+    assert!(
+        rebuild.contains("None | Some(TEMP_SESSION_NAME) =>")
+            && rebuild.contains("child_sessions::unlink_parent_yaml(&session_file)")
+            && !rebuild.contains("SessionDeleted"),
+        "use_session_recording_rebuild no longer replaces the temp session file silently"
+    );
 
     let Some(wiki) = wiki_dir() else { return };
     let hooks = read(wiki.join("Hooks.md"));
@@ -2297,6 +2388,24 @@ fn hook_pages_document_the_session_deleted_event() {
         row.contains(&format!("`{SESSION_PATH}`")),
         "the Hooks.md `session.deleted` row does not list `{SESSION_PATH}`: {row}"
     );
+    let fired = flat(&paragraph("Hooks.md", &hooks, SESSION_DELETED_LEAD));
+    let replaced = format!(
+        "the previous `{temp}` session file that `.session` (with no name, or `{temp}`) replaces"
+    );
+    for needle in [
+        "fires once per session file an operator command removed (or the child-session directory for `.empty`)",
+        "Removals Coyote makes on its own fire nothing",
+        replaced.as_str(),
+    ] {
+        assert!(
+            fired.contains(needle),
+            "the Hooks.md `session.deleted` paragraph does not say {needle:?}: {fired}"
+        );
+    }
+    assert!(
+        !fired.contains("every path"),
+        "the Hooks.md `session.deleted` paragraph still says it fires for every path: {fired}"
+    );
     let env = read(wiki.join("Environment-Variables.md"));
     let env_row = table_row(
         "Environment-Variables.md",
@@ -2304,13 +2413,16 @@ fn hook_pages_document_the_session_deleted_event() {
         &format!("`{SESSION_PATH}`"),
     );
     assert!(
-        env_row[1].contains("`session.deleted`"),
+        env_row
+            .get(1)
+            .is_some_and(|cell| cell.contains("`session.deleted`")),
         "the Environment-Variables.md `{SESSION_PATH}` row does not name `session.deleted`: {env_row:?}"
     );
     let sessions = read(wiki.join("Sessions.md"));
+    let commands = section("Sessions.md", &sessions, SESSION_COMMANDS_HEADING);
     assert!(
-        sessions.contains("`session.deleted`"),
-        "Sessions.md does not mention `session.deleted`"
+        commands.contains("`session.deleted`"),
+        "the Sessions.md Session commands subsection does not mention `session.deleted`"
     );
 }
 
@@ -2423,6 +2535,7 @@ fn agents_page_quotes_the_spawn_session_id_contract() {
     let fragments = [
         "expected sess_<agent>_<12 hex>",
         "collect or cancel it first",
+        "may still be running (its process start time is unknown); collect or cancel it first",
         "even after compression - spawn fresh",
         "could not be compressed",
     ];
@@ -2452,6 +2565,25 @@ fn agents_page_quotes_the_spawn_session_id_contract() {
     assert_eq!(
         policy,
         "A fix or follow-up to a child's work resumes that child's `session_id`; a fresh spawn is for new work."
+    );
+    let run_history = number_after(
+        &src(&["config", "child_sessions.rs"]),
+        "pub(crate) const CHILD_RUN_HISTORY: usize = ",
+        ';',
+    );
+    assert!(
+        fn_body(&agents, "fn handle_list_sessions(").contains("\"runs\": meta.runs.len(),"),
+        "agent__list_sessions no longer reports the sidecar's run count as `runs`"
+    );
+    let runs_cap = format!("the sidecar keeps only the most recent {run_history}");
+    let process = src(&["utils", "process.rs"]);
+    assert!(
+        fn_body(&process, "pub(crate) fn is_alive_or_start_unknown(").contains("self.pid != 0 &&"),
+        "is_alive_or_start_unknown no longer refuses pid 0 up front"
+    );
+    assert!(
+        fn_body(&agents, "fn resume_child_session(").contains(".is_alive_or_start_unknown()"),
+        "resume_child_session no longer refuses a start-unknown stamp under a live pid"
     );
 
     let Some(wiki) = wiki_dir() else { return };
@@ -2489,12 +2621,82 @@ fn agents_page_quotes_the_spawn_session_id_contract() {
         "belongs to another agent",
         &recent,
         &policy,
+        "To find the id of an earlier child, call `agent__list_sessions`",
+        &runs_cap,
+        "`pid_start` 0",
+        "pid 0 never counts as a live process",
+        "a chat child folds its older turns into a summary",
+        "at a turn boundary or right after a tool-loop checkpoint",
+        "once per run before retrying a request the model rejected as too long",
+        "any child is compressed once at resume",
+        "[Session Compression](Session-Compression#child-sessions)",
     ];
     needles.extend(fragments);
     for needle in needles {
         assert!(
             resume.contains(needle),
             "the Resuming a child subsection does not say {needle:?}"
+        );
+    }
+}
+
+/// The Session-Compression.md `# Child sessions` section names the four
+/// points a child's session folds at, each read against the code that
+/// folds there: the turn-boundary and post-checkpoint calls of
+/// `maybe_compress_child_turn` in the child's run loop, the once-per-run
+/// retry of `compress_child_for_error_retry`, and the resume gate in
+/// `load_and_gate`. The Agents.md link to the section resolves.
+#[test]
+fn compression_page_names_where_a_child_folds() {
+    let agents = src(&["function", "agents.rs"]);
+    let production = agents
+        .split("\n#[cfg(test)]\nmod tests {")
+        .next()
+        .expect("split yields the text before the test module");
+    assert_eq!(
+        production
+            .matches("maybe_compress_child_turn(&mut child_ctx")
+            .count(),
+        2,
+        "the child run loop folds at a turn boundary and after a checkpoint"
+    );
+    assert!(
+        production.contains("if checkpoint.is_some() && maybe_compress_child_turn("),
+        "the second fold no longer follows a checkpoint"
+    );
+    let retry = fn_body(production, "async fn compress_child_for_error_retry(");
+    assert!(
+        retry.contains("if already_retried || abort_signal.aborted() {"),
+        "the overflow retry is no longer once per run and skipped after a cancel"
+    );
+    assert!(
+        fn_body(production, "async fn load_and_gate(")
+            .contains("compress_child_session(child_ctx)"),
+        "a resume no longer compresses an over-window transcript"
+    );
+    assert_eq!(anchor_of(CHILD_FOLDS_HEADING), "child-sessions");
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Session-Compression.md"));
+    let text = flat(&section(
+        "Session-Compression.md",
+        &page,
+        CHILD_FOLDS_HEADING,
+    ));
+    for needle in [
+        "A child has no pre-request check of its own",
+        "**At a turn boundary.**",
+        "**After a checkpoint.**",
+        "**Before an overflow retry.**",
+        "This happens once per child run, not once per input",
+        "**At resume.**",
+        "is written back to the child session file at once",
+        "no `session.compressed` hook fires for them",
+        "A graph agent spawned as a child folds only at resume",
+    ] {
+        assert!(
+            text.contains(needle),
+            "the Session-Compression.md Child sessions section does not say {needle:?}"
         );
     }
 }
@@ -2619,14 +2821,17 @@ fn ctrl_c_wording_names_the_session_split() {
             "the REPL no longer prints {notice:?}"
         );
     }
+    // A request aborted as an error prints a notice only without a session,
+    // so in a session only the streamed abort, which returns its partial
+    // text, reaches the "still running" notice.
+    assert!(
+        repl.contains("if abort_signal.aborted_ctrlc() && ctx.session.is_none() {"),
+        "the error branch of the ask loop no longer limits its notice to sessionless turns"
+    );
 
     let Some(wiki) = wiki_dir() else { return };
     let sessions = read(wiki.join("Sessions.md"));
-    let section = flat(&section(
-        "Sessions.md",
-        &sessions,
-        "## Interrupting a turn with background work",
-    ));
+    let section = flat(&section("Sessions.md", &sessions, INTERRUPT_HEADING));
     for needle in [
         "In a session, Ctrl+C works in two stages",
         "the second press, at the idle prompt, cancels whatever the turn left running",
@@ -2635,6 +2840,8 @@ fn ctrl_c_wording_names_the_session_split() {
         "waits up to 5 s for the agents to finish; jobs are signalled, not waited on",
         "`Turn interrupted; cancelled N background task(s).`, with N the number of tasks still running at the press",
         "`Turn interrupted; cancelled the background work.` when only a sub-agent's own children were alive",
+        "That holds only for a streamed request: when streaming is off",
+        "and no \"still running\" notice prints, although the background tasks keep running",
     ] {
         assert!(
             section.contains(needle),
