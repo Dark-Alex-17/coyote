@@ -328,6 +328,9 @@ impl Drop for SavedStdout {
 // restores fd 1, because fd 1 is the pipe's only writer. The read end
 // is non-blocking so a writer inherited by a child of another test
 // fails `read_all` at its deadline instead of hanging the test.
+// Same-thread only: the guard holds the `io::stdout()` lock, so a write
+// through `io::stdout()` from any other thread blocks until the guard
+// drops. Raw `write(1)` calls are unaffected.
 #[cfg(unix)]
 pub(crate) fn capture_stdout() -> (SavedStdout, File) {
     let mut lock = io::stdout().lock();

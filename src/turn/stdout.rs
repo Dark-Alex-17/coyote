@@ -2,7 +2,9 @@ use super::UiSink;
 use crate::client::SseEvent;
 use crate::config::AppConfig;
 use crate::events::{NoticeKind, OutputStream};
-use crate::utils::{AbortSignal, IS_STDOUT_TERMINAL, Spinner, dimmed_text, spawn_spinner};
+use crate::utils::{
+    AbortSignal, IS_STDOUT_TERMINAL, Spinner, dimmed_text, muted_warning_text, spawn_spinner,
+};
 use anyhow::Result;
 use std::future::Future;
 use std::io::{self, Write};
@@ -46,8 +48,11 @@ impl UiSink for StdoutSink {
         Box::pin(crate::render::render_stream(rx, app, abort, false))
     }
 
-    fn notice(&self, _kind: NoticeKind, text: &str) {
-        eprintln!("{text}");
+    fn notice(&self, kind: NoticeKind, text: &str) {
+        match kind {
+            NoticeKind::ToolWarning => eprintln!("{}", muted_warning_text(text)),
+            _ => eprintln!("{text}"),
+        }
     }
 
     fn tool_narration(&self, _call_id: &str, line: &str) {

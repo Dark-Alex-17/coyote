@@ -2302,7 +2302,7 @@ fn emit_tool_warning(sink: &dyn UiSink, depth: usize, display: &str, plain: &str
     if depth > 0 {
         debug!("{plain}");
     } else {
-        sink.notice(NoticeKind::ToolWarning, &muted_warning_text(display));
+        sink.notice(NoticeKind::ToolWarning, display);
     }
 }
 
@@ -2876,7 +2876,7 @@ mod tests {
         AgentExitStatus, AgentHandle, AgentResult, JobHandle, JobResult, JobState, JobStatus,
         Supervisor,
     };
-    use crate::turn::StdoutSink;
+    use crate::turn::{NoticeProbe, StdoutSink};
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
     use jobs::RingBuf;
@@ -2884,6 +2884,7 @@ mod tests {
     use serde_json::json;
     use serial_test::serial;
     use std::sync::Arc;
+    use std::sync::mpsc;
     use std::{mem, process};
 
     #[test]
@@ -4830,30 +4831,63 @@ mod tests {
         assert_eq!(json["output"], "partial-output\n");
     }
 
+    #[test]
+    fn emit_tool_warning_hands_the_sink_unpainted_text_at_depth_zero_only() {
+        let probe = NoticeProbe::default();
+        emit_tool_warning(&probe, 1, "⚠️ boom ⚠️", "boom");
+        assert!(probe.notices().is_empty());
+
+        emit_tool_warning(&probe, 0, "⚠️ boom ⚠️", "boom");
+        let notices = probe.notices();
+        assert_eq!(
+            notices,
+            vec![(NoticeKind::ToolWarning, "⚠️ boom ⚠️".to_string())]
+        );
+        assert!(!notices[0].1.contains('\x1b'));
+    }
+
+    // The capture lock is held on this thread, so a regression that echoes
+    // depth-1 output would block the pump thread on `io::stdout()` and
+    // `run_llm_function` would never return from joining it. Running it on
+    // a helper thread turns that deadlock into a timeout we can report.
     #[cfg(unix)]
     #[test]
     #[serial]
     fn run_llm_function_at_depth_one_keeps_tool_output_off_the_terminal() {
         let (saved, mut reader) = crate::testing::capture_stdout();
-        let result = run_llm_function(
-            "bash".into(),
-            vec![
-                "-c".into(),
-                "echo depth-one-marker-x7x; echo partial-output >> \"$LLM_OUTPUT\"; echo err-text >&2; exit 3".into(),
-            ],
-            HashMap::new(),
-            None,
-            None,
-            ToolIo::new(Arc::new(StdoutSink::default()), Some("call-1".into()), 1),
-            None,
-        )
-        .unwrap()
-        .expect("nonzero exit must return an error payload");
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = run_llm_function(
+                "bash".into(),
+                vec![
+                    "-c".into(),
+                    "echo depth-one-marker-x7x; echo partial-output >> \"$LLM_OUTPUT\"; echo err-text >&2; exit 3".into(),
+                ],
+                HashMap::new(),
+                None,
+                None,
+                ToolIo::new(Arc::new(StdoutSink::default()), Some("call-1".into()), 1),
+                None,
+            );
+            let _ = tx.send(result);
+        });
+        let result = match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(result) => result,
+            Err(_) => {
+                drop(saved);
+                panic!(
+                    "depth-1 tool output reached io::stdout(): the pump thread blocked on the capture lock"
+                );
+            }
+        };
         drop(saved);
         let out = crate::testing::read_all(&mut reader);
         assert!(!out.contains("depth-one-marker-x7x"), "{out:?}");
         crate::testing::write_fd1(out.as_bytes());
 
+        let result = result
+            .unwrap()
+            .expect("nonzero exit must return an error payload");
         let json: Value = serde_json::from_str(&result).unwrap();
         assert!(
             json["tool_call_error"]

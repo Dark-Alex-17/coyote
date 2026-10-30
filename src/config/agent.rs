@@ -890,10 +890,7 @@ impl Agent {
             ToolIo::new(Arc::new(SilentSink), None, 0),
             None,
         )?;
-        match value {
-            Some(v) => Ok(v),
-            _ => bail!("No return value from '_instructions' function"),
-        }
+        instructions_from_tool_output(value)
     }
 
     #[cfg(test)]
@@ -1554,6 +1551,25 @@ pub fn complete_agent_variables(agent_name: &str) -> Vec<(String, Option<String>
         .collect()
 }
 
+/// Turns the `_instructions` function's output into the agent's instructions.
+/// A tool failure comes back as a `{"tool_call_error": ..}` payload rather
+/// than an error, and must not become the prompt the agent runs on.
+fn instructions_from_tool_output(value: Option<String>) -> Result<String> {
+    let Some(value) = value else {
+        bail!("No return value from '_instructions' function");
+    };
+    if let Ok(payload) = serde_json::from_str::<serde_json::Value>(&value)
+        && let Some(error) = payload.get("tool_call_error")
+    {
+        let error = error
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| error.to_string());
+        bail!("'_instructions' function failed: {error}");
+    }
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1567,6 +1583,36 @@ mod tests {
         assert_eq!(parse_direct_hook_path("x/hooks/"), None);
         assert_eq!(parse_direct_hook_path("x/config.yaml"), None);
         assert_eq!(parse_direct_hook_path("config.yaml"), None);
+    }
+
+    #[test]
+    fn instructions_from_tool_output_rejects_a_tool_failure_payload() {
+        let failure = serde_json::json!({
+            "tool_call_error": "Tool call 'probe' exited with code 3",
+            "stderr": "boom",
+        })
+        .to_string();
+        let err = instructions_from_tool_output(Some(failure)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "'_instructions' function failed: Tool call 'probe' exited with code 3"
+        );
+
+        let err = instructions_from_tool_output(None).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "No return value from '_instructions' function"
+        );
+
+        let text = "You are a probe agent.\n{\"not\": \"an error\"}".to_string();
+        assert_eq!(
+            instructions_from_tool_output(Some(text.clone())).unwrap(),
+            text
+        );
+        assert_eq!(
+            instructions_from_tool_output(Some("{\"output\": \"fine\"}".to_string())).unwrap(),
+            "{\"output\": \"fine\"}"
+        );
     }
 
     #[test]

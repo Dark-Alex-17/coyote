@@ -97,6 +97,7 @@ fn write_dry_run_fixture(dir: &Path, config_extra: &str) {
              \x20       max_input_tokens: 100000\n\
              \x20       supports_function_calling: true\n\
              save: false\n\
+             workspace_instructions: false\n\
              memory: false\n",
             vault_pass = vault_pass.display(),
         ),
@@ -125,6 +126,7 @@ fn write_tool_fixture(dir: &Path, fake: &FakeLlm) {
              \x20       max_input_tokens: 100000\n\
              \x20       supports_function_calling: true\n\
              save: false\n\
+             workspace_instructions: false\n\
              memory: false\n",
             vault_pass = vault_pass.display(),
             api_base = fake.api_base(),
@@ -164,6 +166,11 @@ fn run_coyote(dir: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
     )
     .unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_coyote"));
+    for (key, _) in env::vars_os() {
+        if key.to_string_lossy().starts_with("COYOTE_") {
+            cmd.env_remove(&key);
+        }
+    }
     cmd.args(args)
         .current_dir(dir)
         .env("COYOTE_CONFIG_DIR", dir)
@@ -176,13 +183,7 @@ fn run_coyote(dir: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
         .env("PATH", path)
         .env_remove("NO_COLOR")
         .env_remove("COLORTERM")
-        .env_remove("COYOTE_LOG_PATH")
-        .env_remove("COYOTE_WORKSPACE_CONFIG_DIR")
-        .env_remove("COYOTE_SAVE_SESSION")
-        .env_remove("COYOTE_PROVIDER")
-        .env_remove("COYOTE_PLATFORM")
         .env_remove("IS_SANDBOX")
-        .env_remove("COYOTE_SHOW_TOOL_CALLS")
         .envs(extra_env.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -354,7 +355,7 @@ fn undo_redraw(dir: &Path) -> Capture {
     let output = run_coyote(dir, &["--session", "notes", "--macro", "undo-redraw"], &[]);
     let capture = finish("undo_redraw", &output);
     assert!(
-        capture.stdout.contains("<rule> ↑ redrawn ↑ <rule>"),
+        capture.stdout.contains("<rule> ↑ redrawn ↑ <rule>"), // debris-exempt
         "undo_redraw: the redraw footer was printed:\n{}",
         capture.stdout
     );
@@ -396,4 +397,70 @@ fn turn_loop_goldens() {
             println!("wrote {}", path.display());
         }
     }
+}
+
+/// A root-depth tool that fails is reported two ways: its stdout still
+/// echoes on fd 1 and the exit-code warning lands on stderr, while the
+/// error payload goes back to the model and the turn finishes cleanly.
+#[cfg(unix)]
+#[test]
+fn failing_tool_warns_on_stderr_and_the_turn_still_completes() {
+    let dir = fresh_config_dir("tool_fail");
+    let _guard = TempDirGuard(dir.clone());
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "fixture_fail".to_string(),
+            arguments: r#"{"text":"boom"}"#.to_string(),
+        },
+        Reply::Text("fixture recovered".to_string()),
+    ]);
+    write_tool_fixture(&dir, &fake);
+    fs::write(
+        dir.join("functions/tools/fixture_fail.sh"),
+        "#!/usr/bin/env bash\n\
+         set -e\n\
+         \n\
+         # @describe Print a line, then exit non-zero for the harness.\n\
+         # @option --text! The text to echo\n\
+         \n\
+         # @env LLM_OUTPUT=/dev/stdout The output path\n\
+         \n\
+         main() {\n\
+         \x20   echo \"fixture stdout: $argc_text\"\n\
+         \x20   echo \"fixture stderr: $argc_text\" >&2\n\
+         \x20   exit 3\n\
+         }\n",
+    )
+    .unwrap();
+
+    let output = run_coyote(&dir, &["--macro", "tool"], &[]);
+    let capture = finish("tool_fail", &output);
+
+    assert_eq!(
+        fake.served(),
+        2,
+        "tool_fail: the error payload went back to the model and it answered:\n{}",
+        capture.stdout
+    );
+    assert!(
+        capture.stdout.contains("fixture stdout: boom"),
+        "tool_fail: the root-depth tool's stdout echoed on fd 1:\n{}",
+        capture.stdout
+    );
+    assert!(
+        capture.stderr.contains("fixture stderr: boom"),
+        "tool_fail: the root-depth tool's stderr echoed on fd 2:\n{}",
+        capture.stderr
+    );
+    assert!(
+        capture.stderr.contains("exited with code 3"),
+        "tool_fail: the exit-code warning landed on stderr:\nstderr:\n{}\nstdout:\n{}",
+        capture.stderr,
+        capture.stdout
+    );
+    assert!(
+        !capture.stdout.contains("exited with code 3"),
+        "tool_fail: the warning did not leak onto stdout:\n{}",
+        capture.stdout
+    );
 }
