@@ -13,26 +13,27 @@ use crate::client::{
 };
 use crate::config::{
     AgentVariables, AppConfig, AssertState, CommandPrefix, Input, LastMessage, MacroState,
-    RequestContext, Session, SessionScope, StateFlags, TURN_INTERRUPTED_TEXT,
-    flatten_prompt_messages, macro_execute, resolve_prompt_args, sanitize_display_text,
+    RequestContext, SessionScope, StateFlags, flatten_prompt_messages, macro_execute,
+    resolve_prompt_args, sanitize_display_text,
 };
 use crate::config::{AssetCategory, paths};
-use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail, pending_tasks};
-use crate::graph::dispatch::{GraphTurn, run_graph_turn};
 use crate::graph::llm::{CompletionFuture, CompletionRunner};
 use crate::graph::route::Branch;
 use crate::hooks::{self, HookEvent};
 use crate::render::render_error;
-use crate::supervisor::{Supervisor, TaskKind};
+use crate::supervisor::Supervisor;
+use crate::turn::driver::{
+    PreflightError, autoname_with_notice, emit_pause_banner, reset_continuation,
+};
+use crate::turn::{TurnDriver, TurnMode};
 use crate::utils::{
-    AbortSignal, SHELL, TaskCancelGuard, UserInterrupt, abortable_run_with_spinner,
-    create_abort_signal, dimmed_text, drain_stale_tty_input, resync_cursor_queries, run_command,
-    set_text, temp_file, wait_user_interrupt,
+    AbortSignal, SHELL, UserInterrupt, abortable_run_with_spinner, create_abort_signal,
+    dimmed_text, drain_stale_tty_input, resync_cursor_queries, run_command, set_text, temp_file,
 };
 
 use crate::sandbox::SANDBOX_ENV_FLAG;
 use crate::{config, graph, mcp, resolve_oauth_client};
-use anyhow::{Context, Error, Result, bail};
+use anyhow::{Context, Result, bail};
 use crossterm::cursor::SetCursorStyle;
 use fancy_regex::Regex;
 use indoc::indoc;
@@ -538,7 +539,7 @@ impl Repl {
         // OSC 11 / DA1 responses) so they don't get injected into the prompt.
         drain_stale_tty_input();
 
-        print_pause_banner(&self.ctx.read());
+        emit_pause_banner(&self.ctx.read());
 
         loop {
             if self.abort_signal.aborted_ctrld() {
@@ -1070,25 +1071,12 @@ pub async fn run_repl_command_with_prefix(
                 let app = Arc::clone(&ctx.app.config);
                 ctx.use_session(app.as_ref(), args, abort_signal.clone())
                     .await?;
-                if ctx.maybe_autoname_session() {
-                    eprintln!(
-                        "\n📢 {}",
-                        dim_notice_color(app.as_ref())
-                            .italic()
-                            .paint("Autonaming the session."),
-                    );
-                    if let Err(err) = ctx.autoname_session(app.as_ref()).await {
-                        warn!("Failed to autonaming the session: {err}");
-                    }
-                    if let Some(session) = ctx.session.as_mut() {
-                        session.set_autonaming(false);
-                    }
-                }
+                autoname_with_notice(ctx, app.as_ref()).await;
                 if let Some(session) = &ctx.session {
                     let (compressed, active) = replay::snapshot(session);
                     replay::render(app.as_ref(), &compressed, &active)?;
                 }
-                print_pause_banner(ctx);
+                emit_pause_banner(ctx);
             }
             ".install" => match parse_repl_install(args) {
                 ReplInstallDispatch::Builtins(category) => config::install_assets(category)?,
@@ -1151,7 +1139,7 @@ pub async fn run_repl_command_with_prefix(
                     if let Some(session) = &ctx.session {
                         let (compressed, active) = replay::snapshot(session);
                         replay::render(app.as_ref(), &compressed, &active)?;
-                        print_pause_banner(ctx);
+                        emit_pause_banner(ctx);
                     }
                 }
                 None => {
@@ -1588,7 +1576,7 @@ pub async fn run_repl_command_with_prefix(
                     println!("{}", dimmed_text("─── ↑ redrawn ↑ ───"));
                     println!();
                     io::stdout().flush()?;
-                    print_pause_banner(ctx);
+                    emit_pause_banner(ctx);
                 }
                 Some("session") => {
                     let Some(session) = &ctx.session else {
@@ -1607,7 +1595,7 @@ pub async fn run_repl_command_with_prefix(
                         replay::clear_viewport()?;
                         replay::render(app.as_ref(), &compressed, &active)?;
                         io::stdout().flush()?;
-                        print_pause_banner(ctx);
+                        emit_pause_banner(ctx);
                     }
                 }
                 _ => unknown_command(ctx)?,
@@ -1766,23 +1754,6 @@ fn select_transport(input: &Input) -> Transport {
     }
 }
 
-/// Marks an error raised before any request went out, so the completion
-/// step can return it bare instead of treating it as a failed request.
-#[derive(Debug)]
-struct PreflightError(anyhow::Error);
-
-impl std::fmt::Display for PreflightError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.0, f)
-    }
-}
-
-impl std::error::Error for PreflightError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.0.source()
-    }
-}
-
 /// One model call as the REPL makes it: build the client, run the
 /// before-hook, then the transport `select_transport` picks. The same
 /// runner serves the route classifier and the turn's own completion, so a
@@ -1852,13 +1823,17 @@ async fn ask_with_branch_with_runner(
 ) -> Result<()> {
     restore_graph_agent_if_left_swapped_in(ctx);
     let bracket = TurnBracket::enter(ctx);
+    let mut driver = TurnDriver {
+        runner,
+        mode: TurnMode::Repl,
+    };
     let result = ask_inner(
         ctx,
         abort_signal.clone(),
         input,
         with_embeddings,
         forced,
-        runner,
+        &mut driver,
     )
     .await;
     bracket.finish(ctx, &abort_signal, result)
@@ -1897,383 +1872,16 @@ async fn ask_inner(
     input: Input,
     with_embeddings: bool,
     forced: Option<Branch>,
-    runner: &mut CompletionRunner<'_>,
+    driver: &mut TurnDriver<'_>,
 ) -> Result<()> {
-    let result = ask_loop(ctx, abort_signal, input, with_embeddings, forced, runner).await;
+    let result = driver
+        .run_turn(ctx, abort_signal, input, with_embeddings, forced)
+        .await
+        // The outcome is not needed here: the REPL derives interrupt state
+        // from `abort_signal` via `TurnBracket::finish`.
+        .map(|_| ());
     ctx.leave_delegate_turn();
     result
-}
-
-async fn ask_loop(
-    ctx: &mut RequestContext,
-    abort_signal: AbortSignal,
-    input: Input,
-    with_embeddings: bool,
-    forced: Option<Branch>,
-    runner: &mut CompletionRunner<'_>,
-) -> Result<()> {
-    let mut input = input;
-    let mut with_embeddings = with_embeddings;
-    // One compress-and-retry per fresh input; tool-loop iterations share it.
-    let mut retried_after_compress = false;
-    // The graph gate runs once per user turn: tool rounds, the compress
-    // retry, the guardrail inject and auto-continue all re-enter the loop
-    // with `routed` set, so a chat turn's tool rounds are never
-    // re-classified and the graph never runs mid tool-loop.
-    let mut routed = false;
-    ctx.last_graph_branch = None;
-    let _sigint_bridge = spawn_turn_interrupt_bridge(&abort_signal);
-    loop {
-        if input.is_empty() {
-            return Ok(());
-        }
-        ctx.session_abort = Some(abort_signal.clone());
-        if with_embeddings {
-            input.use_embeddings(abort_signal.clone()).await?;
-            with_embeddings = false;
-        }
-        while ctx.is_compressing_session() {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-
-        let app = Arc::clone(&ctx.app.config);
-
-        if maybe_auto_compress(ctx, app.as_ref()).await.succeeded {
-            input.refresh_session(ctx);
-        }
-
-        if !routed && input.tool_calls().is_none() && graph::active_agent_graph_name(ctx).is_some()
-        {
-            routed = true;
-            ctx.before_chat_completion(&input)?;
-            match run_graph_turn(ctx, &input, abort_signal.clone(), forced, runner).await? {
-                GraphTurn::Run { output, last_run } => {
-                    app.print_markdown(&output)?;
-                    input.clear_continue_output();
-                    // `None` (a run the graph does not record: no session
-                    // block and nothing to carry) clears any stale record
-                    // from an earlier run.
-                    ctx.record_graph_run(app.as_ref(), &input, &output, last_run.map(|run| *run))?;
-                    settle_turn(ctx, app.as_ref()).await;
-                    print_turn_divider();
-                    return Ok(());
-                }
-                GraphTurn::Chat(attached) => {
-                    input = *attached;
-                }
-            }
-        }
-
-        let (output, tool_results) = {
-            let result = runner(&input, ctx, abort_signal.clone()).await;
-            match result {
-                Ok(v) => v,
-                Err(err) => {
-                    let err = match err.downcast::<PreflightError>() {
-                        Ok(preflight) => return Err(preflight.0),
-                        Err(err) => err,
-                    };
-                    if compress_for_error_retry(
-                        ctx,
-                        app.as_ref(),
-                        retried_after_compress,
-                        &abort_signal,
-                        &err,
-                    )
-                    .await
-                    {
-                        input.refresh_session(ctx);
-                        retried_after_compress = true;
-                        continue;
-                    }
-                    ctx.on_chat_completion_error(app.as_ref(), &input);
-                    return Err(err);
-                }
-            }
-        };
-        ctx.after_chat_completion(app.as_ref(), &input, &output, &tool_results)?;
-        let interrupted = abort_signal.aborted_ctrlc();
-        if !tool_results.is_empty() {
-            if interrupted {
-                debug!(
-                    "turn interrupted: {} tool results committed, unfinished tasks {:?}",
-                    tool_results.len(),
-                    pending_tasks(ctx)
-                        .into_iter()
-                        .filter(|task| !task.finished)
-                        .map(|task| task.id)
-                        .collect::<Vec<_>>()
-                );
-                let merged = input.merge_tool_results(output.clone(), tool_results);
-                ctx.after_chat_completion(app.as_ref(), &merged, TURN_INTERRUPTED_TEXT, &[])?;
-                // The marker is bookkeeping, not model text: `.continue` and
-                // `%%` must not replay it. `continuous` stays set so
-                // `.recover` and `.regenerate` work as after any tool turn.
-                if let Some(last) = ctx.last_message.as_mut() {
-                    last.output.clear();
-                }
-            } else {
-                input = input.merge_tool_results(output, tool_results);
-                let (next, checkpoint) = ctx.maybe_checkpoint_tool_loop(input)?;
-                input = next;
-                if let Some(checkpoint) = checkpoint {
-                    eprintln!(
-                        "\n📎 {}",
-                        dim_notice_color(app.as_ref()).italic().paint(format!(
-                            "Checkpointed {} tool results (~{} tokens) to the session; the tool loop continues.",
-                            checkpoint.committed_results, checkpoint.committed_tokens
-                        ))
-                    );
-                    retried_after_compress = false;
-                }
-                continue;
-            }
-        }
-
-        // The guardrail must not run on an interrupted turn: its reminders
-        // would be saved as phantom exchanges and its force-terminate would
-        // cancel the background tasks the user chose to leave running.
-        if interrupted {
-            print_interrupted_turn_notice(ctx);
-        } else {
-            match check_pending_tasks_guardrail(ctx) {
-                GuardrailAction::Inject(prompt) => {
-                    input = Input::from_str(ctx, &prompt, None)?;
-                    retried_after_compress = false;
-                    continue;
-                }
-                GuardrailAction::ForceTerminate(ids) => {
-                    warn!(
-                        "Pending-agent guardrail force-cancelled {} agent(s) after max reminders: {:?}",
-                        ids.len(),
-                        ids
-                    );
-                }
-                GuardrailAction::NoAction => {}
-            }
-        }
-        let do_continue = should_continue(ctx) && !abort_signal.aborted_ctrlc();
-
-        if do_continue {
-            let full_prompt = {
-                let config = ctx.auto_continue_config();
-                let todo_state = ctx.todo_list.render_for_model();
-                let remaining = ctx.todo_list.incomplete_count();
-                ctx.set_last_continuation_response(output.clone());
-                ctx.increment_auto_continue_count();
-                let count = ctx.auto_continue_count;
-                let max = config.max_continues;
-
-                let prompt = config
-                    .continuation_prompt
-                    .as_deref()
-                    .unwrap_or(DEFAULT_CONTINUATION_PROMPT);
-
-                eprintln!(
-                    "\n📋 {}",
-                    dim_notice_color(app.as_ref()).italic().paint(format!(
-                        "Auto-continuing ({count}/{max}): {remaining} incomplete todo(s) remain"
-                    ))
-                );
-
-                format!("{prompt}\n\n{todo_state}")
-            };
-            input = Input::from_str(ctx, &full_prompt, None)?;
-            retried_after_compress = false;
-            continue;
-        }
-
-        settle_turn(ctx, app.as_ref()).await;
-
-        let agent_can_continue_after_compress =
-            should_continue(ctx) && !abort_signal.aborted_ctrlc();
-
-        // Auto-continue keys off the compression CONDITION, not the outcome:
-        // a transiently failed compression retries at the next turn end, and
-        // gating on success would stall an unattended agent at the pause
-        // banner with incomplete todos.
-        let compression = maybe_auto_compress(ctx, app.as_ref()).await;
-        if compression.fired && agent_can_continue_after_compress {
-            let full_prompt = {
-                let config = ctx.auto_continue_config();
-                let todo_state = ctx.todo_list.render_for_model();
-                let remaining = ctx.todo_list.incomplete_count();
-                ctx.increment_auto_continue_count();
-                let count = ctx.auto_continue_count;
-                let max = config.max_continues;
-
-                let prompt = config
-                    .continuation_prompt
-                    .as_deref()
-                    .unwrap_or(DEFAULT_CONTINUATION_PROMPT);
-
-                eprintln!(
-                    "\n📋 {}",
-                    dim_notice_color(app.as_ref()).italic().paint(format!(
-                        "Auto-continuing after compression ({count}/{max}): {remaining} incomplete todo(s) remain"
-                    ))
-                );
-
-                format!("{prompt}\n\n{todo_state}")
-            };
-            input = Input::from_str(ctx, &full_prompt, None)?;
-            retried_after_compress = false;
-            continue;
-        }
-
-        print_turn_divider();
-        return Ok(());
-    }
-}
-
-/// The end-of-turn bookkeeping every completed turn shares, graph run or
-/// chat: the continuation counter resets, the pause banner prints and a
-/// temp session gets its autoname.
-async fn settle_turn(ctx: &mut RequestContext, app: &AppConfig) {
-    reset_continuation(ctx);
-    print_pause_banner(ctx);
-    if ctx.maybe_autoname_session() {
-        eprintln!(
-            "\n📢 {}",
-            dim_notice_color(app)
-                .italic()
-                .paint("Autonaming the session."),
-        );
-        if let Err(err) = ctx.autoname_session(app).await {
-            warn!("Failed to autonaming the session: {err}");
-        }
-        if let Some(session) = ctx.session.as_mut() {
-            session.set_autonaming(false);
-        }
-    }
-}
-
-fn print_turn_divider() {
-    let width = crossterm::terminal::size()
-        .map(|(columns, _)| columns as usize)
-        .unwrap_or(33);
-    println!("{}", dimmed_text(&"─".repeat(width)));
-    println!();
-}
-
-struct AutoCompressOutcome {
-    fired: bool,
-    succeeded: bool,
-}
-
-async fn maybe_auto_compress(ctx: &mut RequestContext, app: &AppConfig) -> AutoCompressOutcome {
-    let keep = ctx.compression_keep_policy(None);
-    let should_compress = ctx.session.as_ref().is_some_and(|session| {
-        session.needs_compression(app.compression_threshold, keep)
-            || session.safety_valve_triggered(
-                app.compression_safety_valve,
-                keep,
-                ctx.last_prompt_token_usage,
-            )
-    });
-    if !should_compress {
-        return AutoCompressOutcome {
-            fired: false,
-            succeeded: false,
-        };
-    }
-    AutoCompressOutcome {
-        fired: true,
-        succeeded: run_auto_compress(ctx, app).await,
-    }
-}
-
-async fn run_auto_compress(ctx: &mut RequestContext, app: &AppConfig) -> bool {
-    if let Some(session) = ctx.session.as_mut() {
-        session.set_compressing(true);
-    }
-
-    eprintln!(
-        "\n📢 {}",
-        dim_notice_color(app)
-            .italic()
-            .paint("Compressing the session."),
-    );
-
-    let compressed = auto_compress_session(ctx, app).await;
-    if let Some(session) = ctx.session.as_mut() {
-        session.set_compressing(false);
-    }
-    compressed
-}
-
-/// A context-overflow rejection is proof the prompt is too big even when the
-/// model declares no window for the valve to measure against, so it earns
-/// the same compress-and-retry as a tripped valve, provided there is a
-/// session with something to fold.
-async fn compress_for_error_retry(
-    ctx: &mut RequestContext,
-    app: &AppConfig,
-    already_retried: bool,
-    abort_signal: &AbortSignal,
-    err: &Error,
-) -> bool {
-    if already_retried || abort_signal.aborted() {
-        return false;
-    }
-    let keep = ctx.compression_keep_policy(None);
-    let valve_triggered = ctx.session.as_ref().is_some_and(|session| {
-        session.safety_valve_triggered(
-            app.compression_safety_valve,
-            keep,
-            ctx.last_prompt_token_usage,
-        )
-    });
-    let compressible = ctx.session.as_ref().is_some_and(Session::has_user_messages);
-    (valve_triggered || (compressible && graph::is_context_overflow_error(err)))
-        && run_auto_compress(ctx, app).await
-}
-
-async fn auto_compress_session(ctx: &mut RequestContext, app: &AppConfig) -> bool {
-    match ctx.compress_session().await {
-        Ok(()) => {
-            hooks::fire(
-                HookEvent::SessionCompressed,
-                ctx,
-                &hooks::role_extras(ctx),
-                None,
-            );
-            true
-        }
-        Err(err) => {
-            warn!("Failed to compress the session: {err:#}");
-            eprintln!("\n{}", compression_failure_notice(app, &err));
-            false
-        }
-    }
-}
-
-fn compression_failure_notice(app: &AppConfig, err: &Error) -> String {
-    dim_notice_color(app)
-        .italic()
-        .paint(format!("⚠️ Compression failed: {err:#}"))
-        .to_string()
-}
-
-fn dim_notice_color(app: &AppConfig) -> nu_ansi_term::Color {
-    if app.light_theme() {
-        nu_ansi_term::Color::LightGray
-    } else {
-        nu_ansi_term::Color::DarkGray
-    }
-}
-
-fn should_continue(ctx: &RequestContext) -> bool {
-    let config = ctx.auto_continue_config();
-    ctx.app.config.function_calling_support
-        && config.enabled
-        && ctx.auto_continue_count < config.max_continues
-        && ctx.todo_list.has_incomplete()
-        && ctx.auto_continue_paused.is_none()
-}
-
-fn reset_continuation(ctx: &mut RequestContext) {
-    ctx.reset_continuation_count();
 }
 
 /// Returns whether any background task was still running and got cancelled.
@@ -2288,72 +1896,6 @@ pub(crate) fn latch_prompt_interrupt(
     }
     supervisor.cancel_recursive();
     had_active_tasks
-}
-
-fn spawn_turn_interrupt_bridge(abort_signal: &AbortSignal) -> TaskCancelGuard {
-    let signal = abort_signal.clone();
-    TaskCancelGuard::spawn_one(async move { wait_user_interrupt(Some(&signal)).await })
-}
-
-fn pause_banner_text(ctx: &RequestContext) -> Option<String> {
-    let reason = ctx.auto_continue_paused.as_deref()?;
-    if !ctx.todo_list.has_incomplete() {
-        return None;
-    }
-    let remaining = ctx.todo_list.incomplete_count();
-    Some(format!(
-        "Auto-continue paused, awaiting user ({remaining} incomplete todo(s) preserved): {reason}"
-    ))
-}
-
-fn print_pause_banner(ctx: &RequestContext) {
-    if let Some(text) = pause_banner_text(ctx) {
-        eprintln!(
-            "\n⏸ {}",
-            dim_notice_color(&ctx.app.config).italic().paint(text)
-        );
-    }
-}
-
-fn interrupted_turn_notice(ctx: &RequestContext) -> Option<String> {
-    let running: Vec<String> = pending_tasks(ctx)
-        .into_iter()
-        .filter(|task| !task.finished)
-        .map(|task| {
-            let kind = match task.kind {
-                TaskKind::Agent => "agent",
-                TaskKind::Job => "job",
-            };
-            format!("{} ({kind})", task.id)
-        })
-        .collect();
-    if running.is_empty() {
-        // Grandchild-only activity has no top-level id to list, but it is
-        // what the second Ctrl-C would cancel, so the notice must still
-        // agree with `latch_prompt_interrupt`.
-        let has_active_tasks = ctx
-            .supervisor
-            .as_ref()
-            .is_some_and(|supervisor| supervisor.read().has_active_tasks());
-        if has_active_tasks {
-            return Some("Turn interrupted; background work is still running. Press Ctrl-C again to cancel it, or type to continue.".into());
-        }
-        return None;
-    }
-    Some(format!(
-        "Turn interrupted; {} background task(s) still running: {}. Press Ctrl-C again to cancel them, or type to continue.",
-        running.len(),
-        running.join(", ")
-    ))
-}
-
-fn print_interrupted_turn_notice(ctx: &RequestContext) {
-    if let Some(text) = interrupted_turn_notice(ctx) {
-        eprintln!(
-            "\n⏸ {}",
-            dim_notice_color(&ctx.app.config).italic().paint(text)
-        );
-    }
 }
 
 fn unknown_command(ctx: &RequestContext) -> Result<()> {
@@ -2693,14 +2235,22 @@ pub fn split_args_text(line: &str, is_win: bool) -> (Vec<String>, &str) {
 mod tests {
     use super::*;
     use crate::client::{ClientConfig, MessageContent, Model, ModelData, ToolCall};
-    use crate::config::{AppState, Role, RoleLike, TEMP_ROLE_NAME, WorkingMode};
+    use crate::config::{
+        AppState, Role, RoleLike, Session, TEMP_ROLE_NAME, TURN_INTERRUPTED_TEXT, WorkingMode,
+    };
     use crate::function::ToolResult;
     use crate::function::agents::AGENT_FUNCTION_PREFIX;
+    use crate::function::agents::pending_tasks;
     use crate::function::memory::MEMORY_FUNCTION_PREFIX;
     use crate::function::user_interaction::USER_FUNCTION_PREFIX;
     use crate::graph::llm::test_support::{boxed_completion, completion_runner};
     use crate::graph::route::ROUTE_ROLE_NAME;
     use crate::hooks::{HookDef, HooksMap, test_sink};
+    use crate::turn::driver::{
+        auto_compress_session, compress_for_error_retry, compression_failure_notice,
+        dim_notice_color, interrupted_turn_notice, maybe_auto_compress, pause_banner_text,
+        spawn_turn_interrupt_bridge,
+    };
     use anyhow::anyhow;
     use serde_json::json;
     use serial_test::serial;

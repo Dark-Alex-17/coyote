@@ -41,7 +41,6 @@ pub enum OutputStream {
 
 /// What kind of engine notice a [`Event::Notice`] carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // TASK-307
 pub enum NoticeKind {
     Checkpoint,
     AutoContinue,
@@ -73,18 +72,15 @@ pub enum Event {
         call_id: String,
         line: String,
     },
-    #[allow(dead_code)] // TASK-307
     TextDelta(String),
-    #[allow(dead_code)] // TASK-307
+    #[allow(dead_code)] // TASK-312
     ThinkingStarted,
-    #[allow(dead_code)] // TASK-307
+    #[allow(dead_code)] // TASK-312
     ThinkingStopped,
-    #[allow(dead_code)] // TASK-307
     AssistantText {
         text: String,
         markdown: bool,
     },
-    #[allow(dead_code)] // TASK-307
     Notice {
         kind: NoticeKind,
         text: String,
@@ -142,7 +138,7 @@ pub struct EventBus {
 }
 
 impl EventBus {
-    #[allow(dead_code)] // TASK-307
+    #[allow(dead_code)] // TASK-312
     pub fn subscribe(&self, sink: Arc<dyn EventSink>) -> SubscriptionId {
         let id = SubscriptionId(self.next_id.fetch_add(1, Ordering::SeqCst));
         self.sinks

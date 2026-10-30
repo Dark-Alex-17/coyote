@@ -36,10 +36,11 @@ use crate::config::{
     sync_models,
 };
 use crate::config::{memory, memory_migrate, paths};
-use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail};
+use crate::graph::llm::CompletionFuture;
 use crate::mcp::McpServersConfig;
 use crate::render::{prompt_theme, render_error};
 use crate::repl::{EXIT_HOOK_DRAIN_TIMEOUT, Repl, TurnBracket};
+use crate::turn::{SilentSink, TurnDriver, TurnMode};
 use crate::utils::*;
 use crate::vault::{Vault, interpolate_secrets};
 use anyhow::{Context, Result, anyhow, bail};
@@ -47,7 +48,7 @@ use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
 use client::ClientConfig;
 use inquire::{Select, Text, set_global_render_config};
-use log::{LevelFilter, warn};
+use log::LevelFilter;
 use log4rs::append::console::{ConsoleAppender, Target};
 use log4rs::append::rolling_file::RollingFileAppender;
 use log4rs::append::rolling_file::policy::compound::CompoundPolicy;
@@ -645,6 +646,7 @@ async fn run(
 
     if cli.acp_server {
         ctx.render_mode = RenderMode::Silent;
+        ctx.ui = Arc::new(SilentSink);
         return acp::run_acp_server(ctx, abort_signal).await;
     }
 
@@ -694,69 +696,38 @@ async fn start_directive_inner(
     code_mode: bool,
     abort_signal: AbortSignal,
 ) -> Result<()> {
-    let app: Arc<AppConfig> = Arc::clone(&ctx.app.config);
     ctx.session_abort = Some(abort_signal.clone());
-
-    if graph::active_agent_graph_name(ctx).is_some() {
-        ctx.before_chat_completion(&input)?;
-        let output = graph::run_active_agent_graph(ctx, &input.text(), abort_signal.clone())
-            .await?
-            .result
-            .output;
-        app.print_markdown(&output)?;
-        ctx.after_chat_completion(app.as_ref(), &input, &output, &[])?;
-        ctx.exit_session()?;
-        return Ok(());
-    }
-
     let extract_code = !*IS_STDOUT_TERMINAL && code_mode;
-    let mut input = input;
-    loop {
-        let client = input.create_client()?;
-        ctx.before_chat_completion(&input)?;
-        let (output, tool_results) = if !input.stream() || extract_code {
-            call_chat_completions(
-                &input,
-                true,
-                extract_code,
-                client.as_ref(),
-                ctx,
-                abort_signal.clone(),
-            )
-            .await?
-        } else {
-            call_chat_completions_streaming(&input, client.as_ref(), ctx, abort_signal.clone())
-                .await?
-        };
-        ctx.after_chat_completion(app.as_ref(), &input, &output, &tool_results)?;
-
-        if !tool_results.is_empty() {
-            input = input.merge_tool_results(output, tool_results);
-            let (next, _) = ctx.maybe_checkpoint_tool_loop(input)?;
-            input = next;
-            continue;
-        }
-
-        match check_pending_tasks_guardrail(ctx) {
-            GuardrailAction::Inject(prompt) => {
-                input = Input::from_str(ctx, &prompt, None)?;
-                continue;
-            }
-            GuardrailAction::ForceTerminate(ids) => {
-                warn!(
-                    "Pending-agent guardrail force-cancelled {} agent(s) after max reminders: {:?}",
-                    ids.len(),
-                    ids
-                );
-            }
-            GuardrailAction::NoAction => {}
-        }
-
-        break;
-    }
-
+    let mut runner = headless_completion_runner(extract_code);
+    let mut driver = TurnDriver {
+        runner: &mut runner,
+        mode: TurnMode::Headless,
+    };
+    driver
+        .run_turn(ctx, abort_signal, input, false, None)
+        .await?;
     ctx.exit_session()?;
     Ok(())
+}
+
+/// One model call as a headless directive makes it: build the client, run
+/// the before-hook, then stream unless the input or code extraction (which
+/// needs the whole reply) says otherwise.
+fn headless_completion_runner(
+    extract_code: bool,
+) -> impl for<'a> FnMut(&'a Input, &'a mut RequestContext, AbortSignal) -> CompletionFuture<'a> + Send
+{
+    move |input, ctx, abort| {
+        Box::pin(async move {
+            let client = input.create_client()?;
+            ctx.before_chat_completion(input)?;
+            if !input.stream() || extract_code {
+                call_chat_completions(input, true, extract_code, client.as_ref(), ctx, abort).await
+            } else {
+                call_chat_completions_streaming(input, client.as_ref(), ctx, abort).await
+            }
+        })
+    }
 }
 
 async fn start_interactive(ctx: RequestContext) -> Result<()> {

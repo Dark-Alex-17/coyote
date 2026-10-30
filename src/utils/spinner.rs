@@ -3,22 +3,20 @@ use super::{AbortSignal, IS_STDOUT_TERMINAL, poll_abort_signal, wait_abort_signa
 use anyhow::{Result, anyhow};
 use crossterm::{cursor, queue, style, terminal};
 #[cfg(test)]
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     future::Future,
     io::{Write, stdout},
+    sync::{Arc, Mutex, mpsc as std_mpsc},
     time::Duration,
 };
-use tokio::{
-    sync::{
-        mpsc::{self, UnboundedReceiver},
-        oneshot,
-    },
-    time::interval,
+use tokio::sync::{
+    mpsc::{self, UnboundedReceiver},
+    oneshot,
 };
+
+const FRAME_INTERVAL: Duration = Duration::from_millis(50);
+const STOP_ACK_DEADLINE: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Default)]
 pub struct SpinnerInner {
@@ -101,25 +99,56 @@ impl Drop for SpinnerInner {
 }
 
 #[derive(Clone)]
-pub struct Spinner(mpsc::UnboundedSender<SpinnerEvent>);
+enum SpinnerTx {
+    Std(std_mpsc::Sender<SpinnerEvent>),
+    Tokio(mpsc::UnboundedSender<SpinnerEvent>),
+}
+
+impl SpinnerTx {
+    fn send(&self, event: SpinnerEvent) -> Result<()> {
+        match self {
+            Self::Std(tx) => tx.send(event)?,
+            Self::Tokio(tx) => tx.send(event)?,
+        }
+        Ok(())
+    }
+}
+
+/// Handle to a running spinner. A `spawn_spinner` one lives on its own
+/// thread and acknowledges `stop` once the terminal is clear; a `create`
+/// one is stepped by whichever `abortable_run_with_spinner*` call consumes
+/// its receiver, so its stop needs no ack.
+#[derive(Clone)]
+pub struct Spinner {
+    tx: SpinnerTx,
+    cleared: Option<Arc<Mutex<std_mpsc::Receiver<()>>>>,
+}
 
 impl Spinner {
     pub fn create(message: &str) -> (Self, UnboundedReceiver<SpinnerEvent>) {
         let (tx, spinner_rx) = mpsc::unbounded_channel();
-        let spinner = Spinner(tx);
+        let spinner = Spinner {
+            tx: SpinnerTx::Tokio(tx),
+            cleared: None,
+        };
         let _ = spinner.set_message(message.to_string());
         (spinner, spinner_rx)
     }
 
     pub fn set_message(&self, message: String) -> Result<()> {
-        self.0.send(SpinnerEvent::SetMessage(message))?;
-        std::thread::sleep(Duration::from_millis(10));
-        Ok(())
+        self.tx.send(SpinnerEvent::SetMessage(message))
     }
 
+    /// Returns once the spinner's line is gone, or after `STOP_ACK_DEADLINE`
+    /// if the thread never answers; the caller may print straight after.
     pub fn stop(&self) {
-        let _ = self.0.send(SpinnerEvent::Stop);
-        std::thread::sleep(Duration::from_millis(10));
+        let _ = self.tx.send(SpinnerEvent::Stop);
+        if let Some(cleared) = &self.cleared {
+            let _ = cleared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .recv_timeout(STOP_ACK_DEADLINE);
+        }
     }
 }
 
@@ -128,34 +157,48 @@ pub enum SpinnerEvent {
     Stop,
 }
 
+/// Runs the spinner on its own thread, off the tokio runtime, so a frame
+/// lands every `FRAME_INTERVAL` whatever the async workers are doing and
+/// `stop` can block on the clear without a runtime in scope.
 pub fn spawn_spinner(message: &str) -> Spinner {
-    let (spinner, mut spinner_rx) = Spinner::create(message);
-    tokio::spawn(async move {
-        let mut spinner = SpinnerInner::default();
-        let mut interval = interval(Duration::from_millis(50));
-        loop {
-            tokio::select! {
-                evt = spinner_rx.recv() => {
-                    if let Some(evt) = evt {
-                        match evt {
-                            SpinnerEvent::SetMessage(message) => {
-                                spinner.set_message(message)?;
-                            }
-                            SpinnerEvent::Stop => {
-                                spinner.clear_message()?;
-                                break;
-                            }
-                        }
+    spawn_spinner_with(SpinnerInner::default(), message)
+}
 
+/// Returns a dark handle when the thread cannot be spawned: sends fail
+/// harmlessly and `stop` has no ack to wait for.
+fn spawn_spinner_with(mut inner: SpinnerInner, message: &str) -> Spinner {
+    let (tx, spinner_rx) = std_mpsc::channel();
+    let (cleared_tx, cleared_rx) = std_mpsc::channel();
+    let mut spinner = Spinner {
+        tx: SpinnerTx::Std(tx),
+        cleared: Some(Arc::new(Mutex::new(cleared_rx))),
+    };
+    let _ = spinner.set_message(message.to_string());
+    let spawned = std::thread::Builder::new()
+        .name("spinner".into())
+        .spawn(move || {
+            loop {
+                match spinner_rx.recv_timeout(FRAME_INTERVAL) {
+                    Ok(SpinnerEvent::SetMessage(message)) => {
+                        if inner.set_message(message).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(SpinnerEvent::Stop) | Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                        break;
+                    }
+                    Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                        let _ = inner.step();
                     }
                 }
-                _ = interval.tick() => {
-                    let _ = spinner.step();
-                }
             }
-        }
-        Ok::<(), anyhow::Error>(())
-    });
+            let _ = inner.clear_message();
+            let _ = cleared_tx.send(());
+        });
+    if let Err(err) = spawned {
+        debug!("Failed to spawn the spinner thread: {err}");
+        spinner.cleared = None;
+    }
     spinner
 }
 
@@ -303,6 +346,7 @@ async fn run_abortable_spinner(
 mod tests {
     use super::*;
     use crate::utils::create_abort_signal;
+    use serial_test::serial;
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
 
@@ -314,6 +358,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn drop_with_active_message_clears_once() {
         let (spinner, cleared) = observed("Thinking");
         assert_eq!(cleared.load(Ordering::SeqCst), 0);
@@ -322,6 +367,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn explicit_clear_then_drop_clears_exactly_once() {
         let (mut spinner, cleared) = observed("Thinking");
         spinner.clear_message().unwrap();
@@ -340,6 +386,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn set_message_replaces_and_clears_previous_once() {
         let (mut spinner, cleared) = observed("Thinking");
         spinner.set_message("Fetching".to_string()).unwrap();
@@ -349,6 +396,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn cancelled_task_restores_terminal_on_drop() {
         let (spinner, cleared) = observed("Thinking");
         let task = tokio::spawn(async move {
@@ -360,6 +408,29 @@ mod tests {
 
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(cleared.load(Ordering::SeqCst), 1);
+    }
+
+    /// No runtime here on purpose: the thread-backed spinner must stop from
+    /// plain sync code. The counter, not the clock, proves the clear ran
+    /// before `stop` returned; the timing bound only shows it was the ack
+    /// that released the call rather than the deadline.
+    #[test]
+    #[serial]
+    fn spawned_spinner_stop_returns_after_the_clear() {
+        let cleared = Arc::new(AtomicUsize::new(0));
+        let spinner = spawn_spinner_with(SpinnerInner::observed(cleared.clone()), "Thinking");
+        std::thread::sleep(FRAME_INTERVAL * 2);
+        assert_eq!(cleared.load(Ordering::SeqCst), 0);
+
+        let started = std::time::Instant::now();
+        spinner.stop();
+        let elapsed = started.elapsed();
+
+        assert_eq!(cleared.load(Ordering::SeqCst), 1);
+        assert!(elapsed < STOP_ACK_DEADLINE / 2, "stop took {elapsed:?}");
+
+        spinner.stop();
         assert_eq!(cleared.load(Ordering::SeqCst), 1);
     }
 
