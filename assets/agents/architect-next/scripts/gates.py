@@ -1286,12 +1286,6 @@ def route_verdict(state):
     u["task_rounds"] = rounds
     ledger(state, u, f"verdict: {unit} round {len(rl)} -> {verdict} lanes={lanes} incomplete={incomplete}")
     real = [b for b in blockers if "PIPELINE-FAULT" not in b and "review incomplete" not in b.lower()]
-    # The plan-root phrases are read from the whole reply, lane reports included,
-    # so a PASS that carries one escalates as a plan defect in every scope
-    # instead of closing the task or reaching batch triage as a finding.
-    plan_root_pass = verdict == "PASS" and plan_root and not real
-    if plan_root_pass:
-        real = ["the review names the plan itself as the root cause (see the round report)"]
     if verdict == "PASS" and not real:
         if probe == "PASS" and probe_files and as_int(tr.get("adopt_rounds")) < RERUN_ONCE and scope == "task":
             tr["adopt_rounds"] = as_int(tr.get("adopt_rounds")) + 1
@@ -1315,7 +1309,7 @@ def route_verdict(state):
                              "verdict). Supply/fix the recipe (the plan is amended and re-sealed, then the probe re-runs once), or surface the gap?",
                 [option("Supply the recipe (type it); amend the plan and re-run the probe once"),
                  option("Surface the gap as a follow-up and proceed", recommended=True)], evidence=tail(text, 2000)))
-        if scope == "batch" and not plan_root_pass:
+        if scope == "batch":
             u["gauntlet_blockers"] = real
             u["_next"] = "batch_triage"
             return u
@@ -1734,7 +1728,7 @@ def wave_route(state):
     if _report_failed(report):
         result.update({"status": "failed", "escalation": {"kind": "task_failed", "evidence": tail(report, 2000)}})
         return {"wave_result": result}
-    if verdict == "PASS" and not real and not plan_root:
+    if verdict == "PASS" and not real:
         result["status"] = "conforms"
         return {"wave_result": result}
     if real and not plan_root and as_int(state.get("wave_fix_rounds")) < RERUN_ONCE:
