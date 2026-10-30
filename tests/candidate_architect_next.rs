@@ -1880,11 +1880,10 @@ fn readme_build_lock_row_names_shipped_nodes_agents_and_pins() {
     }
 }
 
-/// The README records one gap: `pr_body` still calls `assemble_pr_body`
-/// without `--tasks`. While that is true the row must stay; once the call
-/// site passes the task list this test flips and the row must go.
+/// `pr_body` hands the group members to `assemble_pr_body` as `tasks=`, and
+/// the README no longer records a missing `--tasks` gap for that call.
 #[test]
-fn readme_documented_gap_assemble_pr_body_runs_without_tasks() {
+fn pr_body_passes_tasks_and_the_readme_records_no_gap() {
     let gates = fs::read_to_string(candidate_dir().join("scripts/gates.py")).unwrap();
     let lines: Vec<&str> = gates.lines().collect();
     let start = lines
@@ -1905,7 +1904,7 @@ fn readme_documented_gap_assemble_pr_body_runs_without_tasks() {
         .unwrap();
     let readme_owns_gap = readme().contains("without `--tasks`");
     assert!(
-        !passes_tasks && readme_owns_gap,
+        passes_tasks && !readme_owns_gap,
         "README gap row and gates.py disagree: call passes tasks = {passes_tasks}, \
          README documents the gap = {readme_owns_gap}\n{call}"
     );
