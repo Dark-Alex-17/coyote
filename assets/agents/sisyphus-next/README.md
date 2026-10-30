@@ -41,7 +41,7 @@ below. Later landings add their own rows.
 | `build_lock` threading | `graph.yaml` `run_coder`, `run_gauntlet`, `run_step` | `inputs: build_lock: '{{build_lock}}'` on the three children that declare the variable (coder, review-gauntlet and step-runner; the gauntlet forwards it to the adversary the same way). Every other child - the graph agent librarian and the config agents explore, oracle, architecture-reviewer, whetstone and engineer - receives it by variable inheritance and must not carry `inputs:`; a child that declares no `build_lock` does not consume it. Those six declare no `build_lock` and do not consume it themselves: the inherited value reaches them, but nothing in them runs a build under it (no file of theirs names `build_lock`, `gate_prefix` or `run_gate`). The three `inputs:` lines are belt-and-braces: the engine copies the parent's variables to every agent-node child, graph-agent children included (pinned by the `src/function/agents.rs` test `run_agent_for_graph_child_seats_the_parents_build_lock_over_its_default`), so inheritance alone would reach them. Not a schema change: no node, prompt, bound or timeout moved |
 | V1: session-resume replacement (artifact re-entry) - the contract | this README | fix rounds and later re-entries hand the delegate the run's artifact paste (brief, state, context pack, decisions) by `Sisyphus run id`; nothing is ever resumed by a child session id, so there is no resume plumbing and no session-id ledger |
 | engine facts | this README | agent-node resume: not available by decision (2026-10-28); E1 stays as the artifact contract; G6 escalation_timeout open |
-| battery env hygiene | `scripts/smoke_test.py` | every `LLM_AGENT_VAR_*` variable is dropped from the environment at start so the battery cannot inherit the agent variables of the process running it (the standalone-brief intake check reads `LLM_AGENT_VAR_PARALLEL` through `_lib.var`) |
+| battery env hygiene | `scripts/smoke_test.py` | every `LLM_AGENT_VAR_*` variable is dropped from the environment at start so the battery cannot inherit the agent variables of the process running it (the standalone-brief intake check reads `LLM_AGENT_VAR_PARALLEL` through `_lib.var`); `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY` and `GIT_COMMON_DIR` are dropped the same way, so a run from a git hook (which exports them) commits and stashes in the scratch repository, not the caller's |
 
 Recorded census against the staging tree (files that differ; hunks per file as counted by
 `diff -u <staging file> <file> | grep -c '^@@'`):
@@ -49,7 +49,7 @@ Recorded census against the staging tree (files that differ; hunks per file as c
 ```
 graph.yaml              9 hunks  (variables: build_lock; initial_state debt_hits comment; initial_state debris_exemptions_new; debt_scan fallback; triage_findings schema property rename; git_ops instructions em dashes, 2 lines; build_lock inputs on run_coder, run_gauntlet and run_step, 3 hunks)
 scripts/_lib.py         1 hunk   (new cache_dir; runs_root docstring; runs_root base path - three edits close enough to share one hunk)
-scripts/smoke_test.py   7 hunks  (LLM_AGENT_VAR_* scrub + import _lib, one hunk; run dir resolution checks; bookkeeping_scan crash rows; gauntlet grammar fixtures: composer settled-lanes rows, dirty-tree row, table-shaped parser rows, the sentinel matrix, the indented-sentinel, indented-row, duplicate-row, post-table-row and indented-Blockers rows, and the sentinel-only-in-a-lane-report route_gauntlet row; triage reset rows + three-round exemptions ledger pin; the failure tally moved below the last check, 2 hunks; the pre-check/_has_verdict rows, the round-line lane-details row, the forged-Lane-selection-heading rows and the forged-debris-line row sit in the tally hunk)
+scripts/smoke_test.py   7 hunks  (LLM_AGENT_VAR_* and GIT_* repository-variable scrub + import _lib, one hunk; run dir resolution checks; bookkeeping_scan crash rows; gauntlet grammar fixtures: composer settled-lanes rows, dirty-tree row, table-shaped parser rows, the sentinel matrix, the indented-sentinel, indented-row, duplicate-row, post-table-row and indented-Blockers rows, and the sentinel-only-in-a-lane-report route_gauntlet row; triage reset rows + three-round exemptions ledger pin; the failure tally moved below the last check, 2 hunks; the pre-check/_has_verdict rows, the round-line lane-details row, the forged-Lane-selection-heading rows and the forged-debris-line row sit in the tally hunk)
 scripts/gates.py        6 hunks  (the DEBT_HITS_STALE constant; bookkeeping_scan: debt_hits untrusted after a crash; build_gauntlet_prompt: whole-cell GREEN settling; one hunk for _gauntlet_header (the header slice shared by the parser and the router's pre-check), _has_verdict (the parser's verdict regex, shared with the router's pre-check), _gauntlet_section (exact level-2 section read below Lane selection, last heading wins), _parse_gauntlet (header-only, column-0 first-match sentinels, lane rows from the first contiguous column-0 table with the first row per lane winning, whole status cell + detail cell, Blockers and attention sections through _gauntlet_section with column-0 items, unbulleted debris lines read only inside the Blockers section) and route_gauntlet (six-tuple, lane_details, the GREEN-based lanes_with_findings and the header-sliced, regex-twinned pre-check); triage_route: the debris_exemptions_new + triage resets in the update dict, the merge line itself byte-equal to staging; _assemble_report: lane details on the round lines)
 scripts/debt_scan.py    1 hunk   (docstring: the crash-forward sentence names the fallback edge and what bookkeeping_scan does with debt_hits)
 README.md               this section, the run-state bullet above, the Verify section
@@ -65,8 +65,8 @@ from the brief, never from a hard-coded toolchain):
 ```
 $ grep -nE '\b(cargo|npm|pnpm|yarn|go (test|build)|pytest|mvn|gradle|make)\b' scripts/*.py
 scripts/gates.py:904:        lines += ["Observability pass: make these alert-as-code / instrumentation changes following the repo's existing "
-scripts/smoke_test.py:603:u = gates.ci_gate({"git_report": "ok\nANOMALY: commits I did not make\n", "git_task": {"return_to": "final_report"}, "run_dir": TMP, "anomalies_log": []})
-scripts/smoke_test.py:604:check("ci_gate: ANOMALY: lines harvested from git_report", any("commits I did not make" in e for e in u.get("anomalies_log", [])))
+scripts/smoke_test.py:607:u = gates.ci_gate({"git_report": "ok\nANOMALY: commits I did not make\n", "git_task": {"return_to": "final_report"}, "run_dir": TMP, "anomalies_log": []})
+scripts/smoke_test.py:608:check("ci_gate: ANOMALY: lines harvested from git_report", any("commits I did not make" in e for e in u.get("anomalies_log", [])))
 ```
 
 All three hits are the English verb `make` (one prompt sentence, two battery fixtures);
@@ -90,7 +90,12 @@ composer writes and what the gauntlet reads fails here rather than in a live run
 The Rust wrapper runs the batteries with `HOME`, `LLM_ROOT_DIR`, `COYOTE_CACHE_DIR`,
 `TMPDIR` and `SISYPHUS_RUNS_ROOT` pointed at a scratch directory and
 `PYTHONDONTWRITEBYTECODE=1`, so nothing under this directory or `~/.config/coyote` is
-touched. `audit_graph.py` and `check_session_block.sh` need the Go `yq` by mikefarah
+touched. It also strips the `LLM_AGENT_VAR_*` variables from the batteries and the
+lifted-graph runs, and the `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`,
+`GIT_OBJECT_DIRECTORY` and `GIT_COMMON_DIR` repository variables from every process that
+can reach git (its own git calls, the batteries, the gauntlet scripts and the lifted-graph
+runs), so neither the caller's agent variables nor its repository leak into a fixture.
+`audit_graph.py` and `check_session_block.sh` need the Go `yq` by mikefarah
 (`yq --version` names it); the wrapper skips both of those tests when a different `yq`
 (or none) is on `PATH`. The wrapper also sweeps every bundled agent's `graph.yaml` and
 `config.yaml` for a `spawnable_agents` entry, a `session.chat.agent` value or an `agent:`

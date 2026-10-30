@@ -29,6 +29,10 @@ os.makedirs(os.environ["HOME"], exist_ok=True)
 for _k in [k for k in os.environ if k.startswith("LLM_AGENT_VAR_")]:
     # the battery must not inherit the agent variables of whoever runs it
     os.environ.pop(_k)
+for _k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR"):
+    # a caller's repository variables (a git hook exports them) would point
+    # every scratch-repo git call at the caller's own repository
+    os.environ.pop(_k, None)
 
 import _lib  # noqa: E402
 import gates  # noqa: E402
