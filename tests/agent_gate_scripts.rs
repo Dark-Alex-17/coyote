@@ -1967,6 +1967,9 @@ fn engine_built_tool(dir: &Path, agent: &str) -> PathBuf {
         .env_remove("COYOTE_WORKSPACE_CONFIG_DIR")
         .env_remove("COYOTE_PROVIDER")
         .env_remove("COYOTE_PLATFORM")
+        .env_remove("IS_SANDBOX")
+        .env_remove("GRAPH_STATE")
+        .env_remove("GRAPH_STATE_FILE")
         .stdin(std::process::Stdio::null())
         .output()
         .expect("spawn coyote --build-tools");

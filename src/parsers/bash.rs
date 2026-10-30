@@ -261,8 +261,15 @@ mod tests {
 
     #[test]
     fn rewrites_argc_empty_array_expansions_to_nounset_safe_form_test() {
-        let src = "# @describe test tool\n# @meta require-tools ls\n# @env NEEDED! An env\n\n# @cmd run\n# @option --content! The content\nrun() { :; }\n";
-        let built = argc::build(src, "", None).expect("argc build failed");
+        // `forward` is hand-written code that expands the same arrays the
+        // rewrite targets, without the generated call around them; a wider
+        // rewrite than the listed lines would reach it.
+        let forward =
+            "forward() { printf '%s' \"${_argc_tools[@]}\" \"${argc__positionals[@]}\"; }";
+        let src = format!(
+            "# @describe test tool\n# @meta require-tools ls\n# @env NEEDED! An env\n\n# @cmd run\n# @option --content! The content\nrun() {{ :; }}\n\n{forward}\n"
+        );
+        let built = argc::build(&src, "", None).expect("argc build failed");
         for (needle, _) in EMPTY_ARRAY_EXPANSIONS {
             assert!(
                 built.contains(needle),
@@ -276,6 +283,50 @@ mod tests {
             assert!(!fixed.contains(needle), "still present: {needle}");
             assert!(fixed.contains(replacement), "missing: {replacement}");
         }
+
+        // Nothing outside the listed generated expansions changes: the
+        // hand-written part (everything before the generated block) is
+        // byte-identical, and inside the block exactly one line changes per
+        // listed expansion, each by that expansion's replacement alone.
+        let block = built.find("# ARGC-BUILD {").expect("argc build block");
+        assert!(
+            built[..block].contains(forward),
+            "fixture lost its hand-written line"
+        );
+        assert_eq!(
+            fixed[..block],
+            built[..block],
+            "the rewrite touched hand-written code"
+        );
+        assert_eq!(fixed.lines().count(), built.lines().count());
+        let changed: Vec<(&str, &str)> = built
+            .lines()
+            .zip(fixed.lines())
+            .filter(|(before, after)| before != after)
+            .collect();
+        assert_eq!(
+            changed.len(),
+            EMPTY_ARRAY_EXPANSIONS.len(),
+            "the rewrite changed other lines: {changed:#?}"
+        );
+        for (before, after) in changed {
+            let hits: Vec<_> = EMPTY_ARRAY_EXPANSIONS
+                .iter()
+                .filter(|(needle, _)| before.contains(needle))
+                .collect();
+            assert_eq!(
+                hits.len(),
+                1,
+                "a changed line matched {} needles: {before}",
+                hits.len()
+            );
+            let (needle, replacement) = hits[0];
+            assert_eq!(
+                after,
+                before.replace(needle, replacement),
+                "a changed line differs by more than its listed expansion"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -284,32 +335,60 @@ mod tests {
         use std::fs;
         use std::process::Command;
 
-        let Some(bash) = crate::testing::bash_program() else {
+        // The first bash on PATH, plus the system /bin/bash (3.2 on macOS)
+        // when it is a different program, so a host whose PATH leads with a
+        // newer bash still runs the old one.
+        let mut shells: Vec<std::path::PathBuf> =
+            crate::testing::bash_program().into_iter().collect();
+        let system = Path::new("/bin/bash");
+        if system.is_file()
+            && !shells
+                .iter()
+                .any(|s| fs::canonicalize(s).ok() == fs::canonicalize(system).ok())
+        {
+            shells.push(system.to_path_buf());
+        }
+        if shells.is_empty() {
             eprintln!("skipping: bash not available");
             return;
-        };
+        }
 
-        let src = "#!/usr/bin/env bash\nset -euo pipefail\n# @describe t\n\n# @cmd greet\n# @option --name The name\ngreet() { printf 'hi %s' \"${argc_name:-nobody}\" >> \"$LLM_OUTPUT\"; }\n";
+        // `strict` declares a required option and a required env, so the
+        // generated `_argc_require_params` calls exist and run, with empty
+        // arrays, on a `greet` call that passes no options.
+        let src = "#!/usr/bin/env bash\nset -euo pipefail\n# @describe t\n\n# @cmd greet\n# @option --name The name\ngreet() { printf 'hi %s' \"${argc_name:-nobody}\" >> \"$LLM_OUTPUT\"; }\n\n# @cmd strict\n# @option --x! A required option\n# @env NEEDED! A required env\nstrict() { :; }\n";
         let path = crate::utils::temp_file("bash-nounset", ".sh");
         fs::write(&path, src).expect("failed to write temp script");
         generate_bash_declarations(File::open(&path).unwrap(), &path, "t").expect("build failed");
-
-        let out = crate::utils::temp_file("bash-nounset-out", ".txt");
-        let output = Command::new(&bash)
-            .arg(&path)
-            .arg("greet")
-            .env("LLM_OUTPUT", &out)
-            .output()
-            .expect("failed to run built script");
+        let built = fs::read_to_string(&path).unwrap();
         assert!(
-            output.status.success(),
-            "built script failed with no positionals under {}: {}",
-            bash.display(),
-            String::from_utf8_lossy(&output.stderr)
+            built.contains("_argc_require_params"),
+            "the fixture no longer exercises _argc_require_params"
         );
-        assert_eq!(fs::read_to_string(&out).unwrap(), "hi nobody");
 
-        fs::remove_file(&out).unwrap();
+        for bash in &shells {
+            let out = crate::utils::temp_file("bash-nounset-out", ".txt");
+            let output = Command::new(bash)
+                .arg(&path)
+                .arg("greet")
+                .env("LLM_OUTPUT", &out)
+                .env_remove("NEEDED")
+                .output()
+                .expect("failed to run built script");
+            assert!(
+                output.status.success(),
+                "built script failed with no positionals under {}: {}",
+                bash.display(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                fs::read_to_string(&out).unwrap(),
+                "hi nobody",
+                "under {}",
+                bash.display()
+            );
+            fs::remove_file(&out).unwrap();
+        }
         fs::remove_file(&path).unwrap();
     }
 
