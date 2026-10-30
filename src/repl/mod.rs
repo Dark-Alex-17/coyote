@@ -825,7 +825,7 @@ pub async fn run_repl_command_with_prefix(
                 }
                 let clients = ctx.app.config.clients.clone();
                 let (client_name, provider) = resolve_oauth_client(Some(client.name()), &clients)?;
-                oauth::run_oauth_flow(&*provider, &client_name).await?;
+                oauth::run_oauth_flow(&*provider, &client_name, ctx.prompter.as_ref()).await?;
             }
             ".mcp" => match args {
                 Some(args) => {
@@ -874,6 +874,7 @@ pub async fn run_repl_command_with_prefix(
                                             client_id,
                                             callback_port,
                                             redirect_host,
+                                            ctx.prompter.as_ref(),
                                         )
                                         .await?;
                                         println!("Authentication saved.");

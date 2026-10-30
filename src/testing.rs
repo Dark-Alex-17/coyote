@@ -11,6 +11,7 @@ use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, Once, OnceLock};
 #[cfg(unix)]
 use std::time::{Duration, Instant};
@@ -189,6 +190,27 @@ impl Drop for EnvVarGuard {
                 None => std::env::remove_var(&self.key),
             }
         }
+    }
+}
+
+/// Holds a process-global flag such as `utils::HEADLESS` at a value for the
+/// guard's lifetime and puts the old value back on drop, including on panic.
+/// Tests using it must serialize (`#[serial]`).
+pub(crate) struct AtomicFlagGuard {
+    flag: &'static AtomicBool,
+    previous: bool,
+}
+
+impl AtomicFlagGuard {
+    pub(crate) fn set(flag: &'static AtomicBool, value: bool) -> Self {
+        let previous = flag.swap(value, Ordering::SeqCst);
+        Self { flag, previous }
+    }
+}
+
+impl Drop for AtomicFlagGuard {
+    fn drop(&mut self) {
+        self.flag.store(self.previous, Ordering::SeqCst);
     }
 }
 

@@ -1,6 +1,7 @@
 use crate::config::RequestContext;
 use crate::config::todo::TodoItem;
 use crate::hooks::HookEvent;
+use crate::prompt::PromptAction;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, RwLock};
@@ -102,14 +103,21 @@ pub enum Event {
     TodoUpdated {
         items: Vec<TodoItem>,
     },
-    #[allow(dead_code)] // TASK-309
     PromptRequested {
         id: String,
+        action: PromptAction,
+        question: String,
+        options: Vec<String>,
+        default: Option<serde_json::Value>,
+        tool: Option<String>,
+        call_id: Option<String>,
+        job_id: Option<String>,
+        origin: Origin,
     },
-    #[allow(dead_code)] // TASK-309
     PromptAnswered {
         id: String,
         answer: String,
+        auto: bool,
     },
     #[allow(dead_code)] // TASK-315
     QueuedInput {

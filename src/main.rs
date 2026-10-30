@@ -13,6 +13,7 @@ mod repl;
 mod utils;
 mod mcp;
 mod parsers;
+mod prompt;
 mod sandbox;
 mod supervisor;
 #[cfg(test)]
@@ -38,6 +39,7 @@ use crate::config::{
 use crate::config::{memory, memory_migrate, paths};
 use crate::graph::llm::CompletionFuture;
 use crate::mcp::McpServersConfig;
+use crate::prompt::InquirePrompter;
 use crate::render::{prompt_theme, render_error};
 use crate::repl::{EXIT_HOOK_DRAIN_TIMEOUT, Repl, TurnBracket};
 use crate::turn::{SilentSink, TurnDriver, TurnMode};
@@ -234,7 +236,8 @@ async fn async_main() -> Result<()> {
         let app_config = AppConfig::from_config(cfg)?;
         let (client_name, provider) =
             resolve_oauth_client(client_arg.as_deref(), &app_config.clients)?;
-        oauth::run_oauth_flow(&*provider, &client_name).await?;
+        let prompter = InquirePrompter::default();
+        oauth::run_oauth_flow(&*provider, &client_name, &prompter).await?;
         return Ok(());
     }
 
@@ -275,12 +278,14 @@ async fn async_main() -> Result<()> {
         }
 
         let url = spec.url.as_deref().expect("validated: remote spec has url");
+        let prompter = InquirePrompter::default();
         mcp::oauth::run_mcp_oauth_flow(
             server_name,
             url,
             spec.oauth.as_ref().and_then(|o| o.client_id.as_deref()),
             spec.oauth.as_ref().and_then(|o| o.callback_port),
             spec.oauth.as_ref().and_then(|o| o.redirect_host.as_deref()),
+            &prompter,
         )
         .await?;
         println!("Authentication saved. '{server_name}' is now available for use.");

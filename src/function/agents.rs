@@ -2315,7 +2315,17 @@ fn handle_reply_escalation(ctx: &mut RequestContext, args: &Value) -> Result<Val
         .get("reply")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("'reply' is required"))?;
+    reply_escalation(ctx, escalation_id, reply)
+}
 
+/// Answers a pending escalation from the parent's side; the reply reaches
+/// the waiting child and `escalation.answered` fires from the replying
+/// context, carrying the request's agent and question in its envs.
+pub(crate) fn reply_escalation(
+    ctx: &mut RequestContext,
+    escalation_id: &str,
+    reply: &str,
+) -> Result<Value> {
     let queue = ctx
         .escalation_queue
         .clone()
@@ -8000,6 +8010,22 @@ mod tests {
         let result =
             handle_reply_escalation(&mut ctx, &json!({"escalation_id": "x", "reply": "y"}));
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn reply_escalation_matches_the_tool_wrapper_for_an_unknown_id() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+        ctx.escalation_queue = Some(Arc::new(EscalationQueue::new()));
+        let via_tool = handle_agent_tool(
+            &mut ctx,
+            "agent__reply_escalation",
+            &json!({ "escalation_id": "esc_missing_7h", "reply": "ok" }),
+        )
+        .await
+        .unwrap();
+        let lifted = reply_escalation(&mut ctx, "esc_missing_7h", "ok").unwrap();
+        assert_eq!(via_tool["status"], "error");
+        assert_eq!(via_tool, lifted);
     }
 
     /// `escalation.answered` belongs to the successful take -> reply arm

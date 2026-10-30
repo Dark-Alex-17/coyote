@@ -5,12 +5,13 @@ use super::openai_compatible_oauth::OpenAICompatibleOAuthProvider;
 use super::openai_oauth::OpenAIOAuthProvider;
 use super::{ClientConfig, ProviderModels};
 use crate::config::paths;
+use crate::events::Origin;
+use crate::prompt::{PromptAction, PromptAnswer, PromptRequest, Prompter, ask, human_present};
 use anyhow::{Context, Error, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::Utc;
 use indexmap::IndexMap;
-use inquire::Text;
 use reqwest::{Client as ReqwestClient, RequestBuilder, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -235,9 +236,13 @@ pub struct OAuthTokens {
 
 const TOKEN_ENDPOINT_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub async fn run_oauth_flow(provider: &dyn OAuthProvider, client_name: &str) -> Result<()> {
+pub async fn run_oauth_flow(
+    provider: &dyn OAuthProvider,
+    client_name: &str,
+    prompter: &dyn Prompter,
+) -> Result<()> {
     match provider.flow() {
-        OAuthFlow::Pkce => run_pkce_flow(provider, client_name).await,
+        OAuthFlow::Pkce => run_pkce_flow(provider, client_name, prompter).await,
         OAuthFlow::ClientCredentials => {
             run_client_credentials_flow(provider, client_name).await?;
             println!(
@@ -286,7 +291,11 @@ fn build_authorize_url(
     authorize_url
 }
 
-async fn run_pkce_flow(provider: &dyn OAuthProvider, client_name: &str) -> Result<()> {
+async fn run_pkce_flow(
+    provider: &dyn OAuthProvider,
+    client_name: &str,
+    prompter: &dyn Prompter,
+) -> Result<()> {
     let random_bytes: [u8; 32] = rand::random::<[u8; 32]>();
     let code_verifier = URL_SAFE_NO_PAD.encode(random_bytes);
 
@@ -323,8 +332,7 @@ async fn run_pkce_flow(provider: &dyn OAuthProvider, client_name: &str) -> Resul
         let (code, state) = listen_for_oauth_callback(&redirect_uri)?;
         (code, Some(state))
     } else {
-        let input = Text::new("Paste the authorization code or callback URL:").prompt()?;
-        parse_paste_input(input.trim())?
+        ask_paste_input(prompter)?
     };
 
     if let Some(returned) = returned_state.as_deref() {
@@ -959,6 +967,19 @@ fn build_token_request(
     request
 }
 
+fn ask_paste_input(prompter: &dyn Prompter) -> Result<(String, Option<String>)> {
+    if !human_present() {
+        bail!("OAuth sign-in needs an interactive terminal; run it without --headless");
+    }
+    let req = PromptRequest::new(
+        PromptAction::Input,
+        "Paste the authorization code or callback URL:",
+        Origin::detached(),
+    );
+    let input = ask(prompter, req).and_then(PromptAnswer::into_text)?;
+    parse_paste_input(input.trim())
+}
+
 fn parse_paste_input(input: &str) -> Result<(String, Option<String>)> {
     if input.is_empty() {
         bail!("Empty input; paste the code, code#state, or callback URL from your browser.");
@@ -1241,7 +1262,9 @@ mod tests {
     use crate::client::openai::OpenAIConfig;
     use crate::client::openai_compatible::OpenAICompatibleConfig;
     use crate::client::{ModelData, ProviderModels};
-    use crate::utils::get_env_name;
+    use crate::prompt::ScriptedPrompter;
+    use crate::testing::AtomicFlagGuard;
+    use crate::utils::{HEADLESS, get_env_name};
     use serial_test::serial;
     use std::{env, time::SystemTime};
 
@@ -1992,6 +2015,65 @@ echo_pkce_in_token_exchange: true
         let err =
             parse_paste_input("https://provider.example/oauth/callback?state=xyz").unwrap_err();
         assert!(err.to_string().contains("code"), "unexpected error: {err}");
+    }
+
+    #[test]
+    #[serial]
+    fn ask_paste_input_round_trips_a_url_and_a_code_state_paste() {
+        let _headless = AtomicFlagGuard::set(&HEADLESS, false);
+        let prompter = ScriptedPrompter::new(vec![
+            PromptAnswer::Text(
+                " https://provider.example/oauth/callback?code=abc123&state=xyz ".to_string(),
+            ),
+            PromptAnswer::Text("def456#uvw".to_string()),
+        ]);
+
+        let (code, state) = ask_paste_input(&prompter).unwrap();
+        assert_eq!(code, "abc123");
+        assert_eq!(state.as_deref(), Some("xyz"));
+        let (code, state) = ask_paste_input(&prompter).unwrap();
+        assert_eq!(code, "def456");
+        assert_eq!(state.as_deref(), Some("uvw"));
+
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 2);
+        for req in &requests {
+            assert_eq!(req.action, PromptAction::Input);
+            assert_eq!(
+                req.question,
+                "Paste the authorization code or callback URL:"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn ask_paste_input_reports_a_cancel() {
+        let _headless = AtomicFlagGuard::set(&HEADLESS, false);
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Cancelled]);
+
+        let err = ask_paste_input(&prompter).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Operation was canceled by the user"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn ask_paste_input_bails_without_a_human_before_asking() {
+        let _headless = AtomicFlagGuard::set(&HEADLESS, true);
+        let prompter = ScriptedPrompter::refusing();
+
+        let err = ask_paste_input(&prompter).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "OAuth sign-in needs an interactive terminal; run it without --headless"
+        );
+        assert!(prompter.requests().is_empty());
     }
 
     #[test]

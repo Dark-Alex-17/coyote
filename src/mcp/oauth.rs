@@ -3,9 +3,10 @@ use crate::client::oauth::{
     run_oauth_flow, token_response_keys,
 };
 use crate::config::paths;
-use anyhow::{Context, Result, anyhow};
+use crate::events::Origin;
+use crate::prompt::{PromptAction, PromptAnswer, PromptRequest, Prompter, ask, human_present};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
-use inquire::Text;
 use log::{debug, warn};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -117,7 +118,13 @@ pub async fn run_mcp_oauth_flow(
     configured_client_id: Option<&str>,
     callback_port: Option<u16>,
     redirect_host: Option<&str>,
+    prompter: &dyn Prompter,
 ) -> Result<()> {
+    // Checked before discovery so a headless run never reaches the point
+    // where a prompter's placeholder answer could be persisted as a client_id.
+    if !human_present() {
+        bail!("OAuth sign-in needs an interactive terminal; run it without --headless");
+    }
     let discovered = discover_oauth_metadata(server_url).await?;
     let metadata = discovered.metadata;
     let resource = resolve_resource(discovered.resource, server_url)?;
@@ -166,15 +173,11 @@ pub async fn run_mcp_oauth_flow(
                 Ok(id) => id,
                 Err(e) => {
                     warn!("Dynamic client registration failed: {e}. Falling back to manual entry.");
-                    Text::new("Enter the OAuth client ID for this MCP server:")
-                        .prompt()
-                        .context("Failed to read client ID")?
+                    ask_client_id(prompter)?
                 }
             }
         } else {
-            Text::new("Enter the OAuth client ID for this MCP server:")
-                .prompt()
-                .context("Failed to read client ID")?
+            ask_client_id(prompter)?
         };
         // Persist regardless of how the client_id was obtained (DCR, config,
         // or manual entry) so refresh_mcp_token can run the refresh_token
@@ -200,7 +203,18 @@ pub async fn run_mcp_oauth_flow(
         resource,
     };
 
-    run_oauth_flow(&provider, &mcp_token_key(server_name)).await
+    run_oauth_flow(&provider, &mcp_token_key(server_name), prompter).await
+}
+
+fn ask_client_id(prompter: &dyn Prompter) -> Result<String> {
+    let req = PromptRequest::new(
+        PromptAction::Input,
+        "Enter the OAuth client ID for this MCP server:",
+        Origin::detached(),
+    );
+    ask(prompter, req)
+        .and_then(PromptAnswer::into_text)
+        .context("Failed to read client ID")
 }
 
 #[derive(PartialEq, Eq)]
@@ -673,6 +687,9 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::with_temp_cache;
     use super::*;
+    use crate::prompt::ScriptedPrompter;
+    use crate::testing::AtomicFlagGuard;
+    use crate::utils::HEADLESS;
     use serial_test::serial;
     use std::fs;
 
@@ -681,6 +698,63 @@ mod tests {
         let result = extract_base_url("https://mcp.notion.com/mcp?foo=bar").unwrap();
 
         assert_eq!(result, "https://mcp.notion.com");
+    }
+
+    #[test]
+    #[serial]
+    fn ask_client_id_round_trips_an_input_prompt() {
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Text("cid-7q".to_string())]);
+
+        let client_id = ask_client_id(&prompter).unwrap();
+
+        assert_eq!(client_id, "cid-7q");
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].action, PromptAction::Input);
+        assert_eq!(
+            requests[0].question,
+            "Enter the OAuth client ID for this MCP server:"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn ask_client_id_wraps_a_cancel_in_its_context() {
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Cancelled]);
+
+        let err = ask_client_id(&prompter).unwrap_err();
+
+        assert_eq!(err.to_string(), "Failed to read client ID");
+        assert_eq!(
+            err.root_cause().to_string(),
+            "Operation was canceled by the user"
+        );
+    }
+
+    /// The bogus server URL would surface as a connection error if the
+    /// gate ran after discovery.
+    #[tokio::test]
+    #[serial]
+    async fn run_mcp_oauth_flow_bails_without_a_human_before_discovery_or_the_prompter() {
+        let _headless = AtomicFlagGuard::set(&HEADLESS, true);
+        let prompter = ScriptedPrompter::refusing();
+
+        let err = run_mcp_oauth_flow(
+            "srv-hl-4k",
+            "http://127.0.0.1:9",
+            None,
+            None,
+            None,
+            &prompter,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "OAuth sign-in needs an interactive terminal; run it without --headless"
+        );
+        assert!(prompter.requests().is_empty());
     }
 
     #[test]

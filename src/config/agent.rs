@@ -20,17 +20,18 @@ use crate::config::prompts::{
     DEFAULT_JOB_INSTRUCTIONS, DEFAULT_SPAWN_INSTRUCTIONS, DEFAULT_TEAMMATE_INSTRUCTIONS,
     DEFAULT_TODO_INSTRUCTIONS, DEFAULT_USER_INTERACTION_INSTRUCTIONS,
 };
+use crate::events::Origin;
 use crate::function::write_file_atomic;
 use crate::graph::session_turn::chat_tool_pool;
 use crate::graph::types::{RagNode, SessionBlock};
 use crate::graph::{Graph, GraphParser, NodeType};
 use crate::mcp::McpServerFeatures;
+use crate::prompt::{PromptAction, PromptRequest, Prompter, ask, human_present};
 use crate::rag::RagInitConfig;
 use crate::turn::SilentSink;
 use crate::vault::SECRET_RE;
 use anyhow::{Context, Result};
 use fancy_regex::Captures;
-use inquire::{Text, validator::Validation};
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -516,6 +517,7 @@ impl Agent {
         pre_set_variables: Option<&AgentVariables>,
         no_interaction: bool,
         interactive: bool,
+        prompter: &dyn Prompter,
     ) -> Result<AgentVariables> {
         let mut output = IndexMap::new();
         if agent_variables.is_empty() {
@@ -536,23 +538,16 @@ impl Agent {
             if no_interaction {
                 continue;
             }
-            if interactive && *IS_STDOUT_TERMINAL {
+            if may_ask_human(interactive, *IS_STDOUT_TERMINAL) {
                 if !printed {
                     println!("⚙ Init agent variables...");
                     printed = true;
                 }
-                let value = Text::new(&format!(
-                    "{} ({}):",
-                    agent_variable.name, agent_variable.description
-                ))
-                .with_validator(|input: &str| {
-                    if input.trim().is_empty() {
-                        Ok(Validation::Invalid("This field is required".into()))
-                    } else {
-                        Ok(Validation::Valid)
-                    }
-                })
-                .prompt()?;
+                let value = ask_required_variable(
+                    prompter,
+                    &agent_variable.name,
+                    &agent_variable.description,
+                )?;
                 output.insert(key, value);
             } else {
                 unset_variables.push(agent_variable)
@@ -1580,10 +1575,132 @@ fn instructions_from_tool_output(value: Option<String>) -> Result<String> {
     bail!("{message}")
 }
 
+/// Asks for an agent variable until the answer is not blank.
+fn ask_required_variable(prompter: &dyn Prompter, name: &str, description: &str) -> Result<String> {
+    loop {
+        let req = PromptRequest::new(
+            PromptAction::Input,
+            format!("{name} ({description}):"),
+            Origin::detached(),
+        );
+        let value = ask(prompter, req)?.into_text()?;
+        if value.trim().is_empty() {
+            eprintln!("This field is required");
+        } else {
+            return Ok(value);
+        }
+    }
+}
+
+/// Whether a required agent variable may be asked for rather than
+/// reported as missing.
+fn may_ask_human(interactive: bool, tty: bool) -> bool {
+    interactive && tty && human_present()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing;
+    use crate::prompt::{PromptAnswer, ScriptedPrompter};
+    use crate::testing::{self, AtomicFlagGuard};
+    use crate::utils::HEADLESS;
+    use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn ask_required_variable_re_asks_until_the_answer_is_not_blank() {
+        let prompter = ScriptedPrompter::new(vec![
+            PromptAnswer::Text("  ".to_string()),
+            PromptAnswer::Text("value-7p".to_string()),
+        ]);
+
+        let value = ask_required_variable(&prompter, "region", "Deployment region").unwrap();
+
+        assert_eq!(value, "value-7p");
+        let questions: Vec<String> = prompter
+            .requests()
+            .into_iter()
+            .map(|req| req.question)
+            .collect();
+        assert_eq!(
+            questions,
+            vec!["region (Deployment region):", "region (Deployment region):"]
+        );
+        assert!(
+            prompter
+                .requests()
+                .iter()
+                .all(|req| req.action == PromptAction::Input)
+        );
+    }
+
+    #[test]
+    fn init_agent_variables_does_not_prompt_for_a_preset_variable() {
+        let variables = vec![AgentVariable {
+            name: "region".to_string(),
+            description: "Deployment region".to_string(),
+            default: None,
+            value: String::new(),
+        }];
+        let preset = IndexMap::from([("region".to_string(), "preset-3k".to_string())]);
+
+        let seeded = Agent::init_agent_variables(
+            &variables,
+            Some(&preset),
+            false,
+            true,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
+
+        assert_eq!(seeded.get("region").map(String::as_str), Some("preset-3k"));
+    }
+
+    /// A headless run has nobody to ask, so a required variable fails closed
+    /// instead of storing whatever the prompter hands back.
+    #[test]
+    #[serial]
+    fn init_agent_variables_fails_closed_without_a_human() {
+        let _headless = AtomicFlagGuard::set(&HEADLESS, true);
+        let variables = vec![AgentVariable {
+            name: "region".to_string(),
+            description: "Deployment region".to_string(),
+            default: None,
+            value: String::new(),
+        }];
+
+        let err = Agent::init_agent_variables(
+            &variables,
+            None,
+            false,
+            true,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("The following agent variables are required"),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains("region: Deployment region"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn may_ask_human_needs_an_interactive_tty_and_a_human() {
+        let headless = AtomicFlagGuard::set(&HEADLESS, true);
+        assert!(!may_ask_human(true, true));
+        drop(headless);
+
+        let _headless = AtomicFlagGuard::set(&HEADLESS, false);
+        assert!(may_ask_human(true, true));
+        assert!(!may_ask_human(false, true));
+        assert!(!may_ask_human(true, false));
+    }
 
     #[test]
     fn parse_direct_hook_path_accepts_only_direct_hook_children() {

@@ -27,7 +27,7 @@ use super::{MessageContentToolCalls, prompts};
 use crate::client::{
     Message, MessageContent, MessageRole, Model, ModelType, ThinkingBlock, TokenUsage, list_models,
 };
-use crate::events::{self, Event};
+use crate::events::{self, Event, Origin};
 use crate::function::{
     FunctionDeclaration, Functions, ToolCall, ToolCallTracker, ToolResult,
     agents::AGENT_FUNCTION_PREFIX,
@@ -43,6 +43,10 @@ use crate::mcp::{
     CatalogItem, MCP_SEARCH_META_FUNCTION_NAME_PREFIX, McpAuthReason, McpAuthRequired,
     McpServerFeatures, McpServersConfig, McpTransportType, is_auth_required_error,
     is_mcp_meta_function, mcp_meta_function_names,
+};
+use crate::prompt::{
+    HeadlessPrompter, InquirePrompter, PromptAction, PromptAnswer, PromptMemory, PromptRequest,
+    Prompter, human_present,
 };
 use crate::rag::Rag;
 use crate::supervisor::Supervisor;
@@ -73,7 +77,7 @@ use gman::providers::SupportedProvider;
 use hooks::{McpServerHooks, RagSyncHooks};
 use indexmap::IndexMap;
 use indoc::formatdoc;
-use inquire::{Confirm, MultiSelect, Text, list_option::ListOption, validator::Validation};
+use inquire::{Confirm, Text, validator::Validation};
 use log::warn;
 use parking_lot::RwLock;
 use prompts::DEFAULT_SKILL_INSTRUCTIONS;
@@ -305,6 +309,7 @@ fn seed_delegate_shared_variables(
     chat_variables: Option<&AgentVariables>,
     info_flag: bool,
     interactive: bool,
+    prompter: &dyn Prompter,
 ) -> Result<()> {
     if agent.defined_variables().is_empty() || !agent.shared_variables().is_empty() {
         return Ok(());
@@ -314,9 +319,20 @@ fn seed_delegate_shared_variables(
         chat_variables,
         info_flag,
         interactive,
+        prompter,
     )?;
     agent.set_shared_variables(variables);
     Ok(())
+}
+
+/// A run with no human -- headless or the ACP server -- answers for itself;
+/// every other run draws prompts on the terminal.
+fn default_prompter(memory: &Arc<PromptMemory>) -> Arc<dyn Prompter> {
+    if human_present() {
+        Arc::new(InquirePrompter::new(Arc::clone(memory)))
+    } else {
+        Arc::new(HeadlessPrompter)
+    }
 }
 
 fn ensure_reasoning_effort_supported(agent: &Agent) -> Result<()> {
@@ -644,10 +660,19 @@ pub struct RequestContext {
 
     /// Where this context's turn output is drawn.
     pub ui: Arc<dyn UiSink>,
+
+    /// Who answers this context's questions to the human.
+    pub prompter: Arc<dyn Prompter>,
+
+    /// Confirms already waved through for the session; shared with the
+    /// prompter that records them and with forks and children.
+    pub prompt_memory: Arc<PromptMemory>,
 }
 
 impl RequestContext {
     pub fn new(app: Arc<AppState>, working_mode: WorkingMode) -> Self {
+        let prompt_memory = Arc::new(PromptMemory::default());
+        let prompter = default_prompter(&prompt_memory);
         Self {
             app,
             macro_flag: false,
@@ -701,6 +726,8 @@ impl RequestContext {
             top_level_agent_id: None,
             render_mode: RenderMode::default(),
             ui: Arc::new(StdoutSink::default()),
+            prompter,
+            prompt_memory,
         }
     }
 
@@ -732,6 +759,8 @@ impl RequestContext {
             mcp_runtime.sync_from_registry(registry);
         }
 
+        let prompt_memory = Arc::new(PromptMemory::default());
+        let prompter = default_prompter(&prompt_memory);
         let mut ctx = Self {
             app,
             macro_flag: false,
@@ -789,6 +818,8 @@ impl RequestContext {
             top_level_agent_id: None,
             render_mode: RenderMode::default(),
             ui: Arc::new(StdoutSink::default()),
+            prompter,
+            prompt_memory,
         };
         ctx.refresh_mcp_tool_filters();
         Ok(ctx)
@@ -914,6 +945,8 @@ impl RequestContext {
             top_level_agent_id: None,
             render_mode: self.render_mode,
             ui: Arc::clone(&self.ui),
+            prompter: Arc::clone(&self.prompter),
+            prompt_memory: Arc::clone(&self.prompt_memory),
         }
     }
 
@@ -983,6 +1016,40 @@ impl RequestContext {
             top_level_agent_id: None,
             render_mode: parent.render_mode,
             ui: Arc::clone(&parent.ui),
+            prompter: Arc::clone(&parent.prompter),
+            prompt_memory: Arc::clone(&parent.prompt_memory),
+        }
+    }
+
+    /// Asks the human through this context's prompter, unless an earlier
+    /// "Yes for this session" already answered the same tool confirm; that
+    /// answer is replayed and published as automatic.
+    pub(crate) fn prompt(&self, req: PromptRequest) -> Result<PromptAnswer> {
+        if self.prompt_memory.auto_answer(&req) == Some(true) {
+            let answer = PromptAnswer::Confirmed(true);
+            events::bus().publish(req.requested_event());
+            events::bus().publish(Event::PromptAnswered {
+                id: req.id,
+                answer: answer.summary(PromptAction::Confirm),
+                auto: true,
+            });
+            return Ok(answer);
+        }
+        crate::prompt::ask(self.prompter.as_ref(), req)
+    }
+
+    /// A request from this context: fresh id, no tool or job, this origin.
+    pub(crate) fn prompt_request(
+        &self,
+        action: PromptAction,
+        question: impl Into<String>,
+        options: Vec<String>,
+        default: Option<serde_json::Value>,
+    ) -> PromptRequest {
+        PromptRequest {
+            options,
+            default,
+            ..PromptRequest::new(action, question, Origin::from(self))
         }
     }
 
@@ -1630,9 +1697,17 @@ impl RequestContext {
         let mut taken = self.session.take();
         let exited = taken.as_mut().map(|session| {
             let sessions_dir = self.sessions_dir_for(session.scope());
-            session.exit(&sessions_dir, self.working_mode.is_repl())
+            session.exit(
+                &sessions_dir,
+                self.working_mode.is_repl(),
+                self.prompter.as_ref(),
+            )
         });
         if taken.is_some() {
+            // A "Yes for this session" answer lasts as long as the session.
+            // The memory is shared with forks and children, so a sessionless
+            // exit on a branch must leave the root's answers alone.
+            self.prompt_memory.clear();
             // The session is gone from ctx whether or not the save succeeds,
             // so the message that belonged to it stops being continuous
             // either way, and the turn state it scoped goes with it: a todo
@@ -1856,6 +1931,7 @@ impl RequestContext {
                 chat_variables,
                 self.info_flag,
                 delegate.interactive,
+                self.prompter.as_ref(),
             )
             .with_context(|| chat_agent_engage_failure(&delegate.name, graph_agent_name))?;
             if !self.info_flag {
@@ -2062,6 +2138,7 @@ impl RequestContext {
                 self.agent_variables.as_ref(),
                 self.info_flag,
                 self.self_agent_id.is_none(),
+                self.prompter.as_ref(),
             )?;
             agent.set_shared_variables(new_variables);
         }
@@ -2087,6 +2164,7 @@ impl RequestContext {
                         self.agent_variables.as_ref(),
                         self.info_flag,
                         self.self_agent_id.is_none(),
+                        self.prompter.as_ref(),
                     )?;
                     agent.set_shared_variables(new_variables.clone());
                     new_variables
@@ -2140,9 +2218,16 @@ impl RequestContext {
         let graph_agent_name = graph_agent.map(Agent::name).unwrap_or_default();
         let engage_failure = || chat_agent_engage_failure(&delegate.name, graph_agent_name);
         let interactive = delegate.interactive;
+        let prompter = self.prompter.as_ref();
         if new_session {
-            seed_delegate_shared_variables(agent, chat_variables, self.info_flag, interactive)
-                .with_context(engage_failure)?;
+            seed_delegate_shared_variables(
+                agent,
+                chat_variables,
+                self.info_flag,
+                interactive,
+                prompter,
+            )
+            .with_context(engage_failure)?;
             agent.set_session_variables(agent.shared_variables().clone());
             if !self.info_flag {
                 agent.update_session_dynamic_instructions(None, tool_timeout)?;
@@ -2156,8 +2241,14 @@ impl RequestContext {
             )?;
         } else {
             let previous = session.chat_agent().map(str::to_string);
-            seed_delegate_shared_variables(agent, chat_variables, self.info_flag, interactive)
-                .with_context(engage_failure)?;
+            seed_delegate_shared_variables(
+                agent,
+                chat_variables,
+                self.info_flag,
+                interactive,
+                prompter,
+            )
+            .with_context(engage_failure)?;
             agent.set_session_variables(agent.shared_variables().clone());
             if !self.info_flag {
                 agent.update_session_dynamic_instructions(None, tool_timeout)?;
@@ -4546,17 +4637,24 @@ impl RequestContext {
             bail!("No {kind} to delete")
         }
 
-        let select_names = MultiSelect::new(&format!("Select {kind} to delete:"), names)
-            .with_validator(|list: &[ListOption<&String>]| {
-                if list.is_empty() {
-                    Ok(Validation::Invalid(
-                        "At least one item must be selected".into(),
-                    ))
-                } else {
-                    Ok(Validation::Valid)
-                }
-            })
-            .prompt()?;
+        let select_names = loop {
+            let picked = self
+                .prompt(self.prompt_request(
+                    PromptAction::Checkbox,
+                    format!("Select {kind} to delete:"),
+                    names.clone(),
+                    None,
+                ))?
+                .into_checked()?;
+            if picked.is_empty() {
+                eprintln!("At least one item must be selected");
+                continue;
+            }
+            break picked;
+        };
+        if let Some(name) = select_names.iter().find(|name| !names.contains(name)) {
+            bail!("Unknown {kind} '{name}'");
+        }
 
         if kind == "agent-data" {
             self.delete_agent_data_selection(&dir, &select_names)?;
@@ -4718,20 +4816,27 @@ impl RequestContext {
             .map(|(name, scope)| session_delete_label(name, *scope))
             .collect();
 
-        let selected = MultiSelect::new("Select session to delete:", labels)
-            .with_validator(|list: &[ListOption<&String>]| {
-                if list.is_empty() {
-                    Ok(Validation::Invalid(
-                        "At least one item must be selected".into(),
-                    ))
-                } else {
-                    Ok(Validation::Valid)
-                }
-            })
-            .raw_prompt()?;
+        let selected = loop {
+            let picked = self
+                .prompt(self.prompt_request(
+                    PromptAction::Checkbox,
+                    "Select session to delete:",
+                    labels.clone(),
+                    None,
+                ))?
+                .into_checked()?;
+            if picked.is_empty() {
+                eprintln!("At least one item must be selected");
+                continue;
+            }
+            break picked;
+        };
 
-        for option in selected {
-            let (name, scope) = &entries[option.index];
+        for label in selected {
+            let Some(index) = labels.iter().position(|candidate| *candidate == label) else {
+                bail!("Unknown session '{label}'");
+            };
+            let (name, scope) = &entries[index];
             self.delete_session_at(name, *scope)?;
         }
         println!("✓ Successfully deleted session.");
@@ -6543,6 +6648,7 @@ impl RequestContext {
                 Some(chat_variables),
                 self.info_flag,
                 interactive,
+                self.prompter.as_ref(),
             )?;
             if !self.info_flag {
                 agent.update_shared_dynamic_instructions(false, self.app.config.tool_timeout)?;
@@ -8038,10 +8144,11 @@ mod tests {
     use crate::mcp::{
         ConnectedServer, McpServer, McpServerFeatures, McpServersConfig, McpTransportType,
     };
+    use crate::prompt::ScriptedPrompter;
     use crate::supervisor::{
         AgentExitStatus, AgentHandle, AgentResult, JobHandle, JobResult, JobState, JobStatus,
     };
-    use crate::testing::{install_log_collector, warn_snapshot};
+    use crate::testing::{AtomicFlagGuard, install_log_collector, warn_snapshot};
     use crate::turn::SilentSink;
     use crate::utils;
     use crate::utils::get_env_name;
@@ -11957,6 +12064,283 @@ mod tests {
             "agent_test_1".to_string(),
         );
         assert!(Arc::ptr_eq(&parent.ui, &child.ui));
+    }
+
+    #[test]
+    fn fork_for_branch_shares_the_prompter() {
+        let mut ctx = create_test_ctx();
+        let prompter: Arc<dyn Prompter> = Arc::new(ScriptedPrompter::refusing());
+        ctx.prompter = Arc::clone(&prompter);
+        let branch = ctx.fork_for_branch();
+        assert!(Arc::ptr_eq(&ctx.prompter, &branch.prompter));
+        assert!(Arc::ptr_eq(&ctx.prompt_memory, &branch.prompt_memory));
+    }
+
+    #[test]
+    fn new_for_child_shares_the_parent_prompter() {
+        let mut parent = create_test_ctx();
+        let prompter: Arc<dyn Prompter> = Arc::new(ScriptedPrompter::refusing());
+        parent.prompter = Arc::clone(&prompter);
+        let child = RequestContext::new_for_child(
+            Arc::clone(&parent.app),
+            &parent,
+            1,
+            Arc::new(Inbox::new()),
+            "agent_test_1".to_string(),
+        );
+        assert!(Arc::ptr_eq(&parent.prompter, &child.prompter));
+        assert!(Arc::ptr_eq(&parent.prompt_memory, &child.prompt_memory));
+    }
+
+    #[test]
+    #[serial]
+    fn headless_run_seats_the_headless_prompter() {
+        let _headless = AtomicFlagGuard::set(&utils::HEADLESS, true);
+        let ctx = create_test_ctx();
+        let seat = format!("{:?}", ctx.prompter);
+        assert!(seat.starts_with("HeadlessPrompter"), "{seat}");
+        let req = ctx.prompt_request(PromptAction::Confirm, "go? hl-ctx-5r", Vec::new(), None);
+        let answer = ctx.prompt(req).unwrap();
+        let PromptAnswer::Text(json) = answer else {
+            panic!("{answer:?}");
+        };
+        let reply: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(reply["needs_human"], true);
+        assert_eq!(reply["question"], "go? hl-ctx-5r");
+    }
+
+    /// The seat is inspected rather than exercised: drawing an inquire
+    /// widget here would block on `/dev/tty` wherever a controlling
+    /// terminal exists.
+    #[test]
+    #[serial]
+    fn interactive_run_seats_the_inquire_prompter_in_every_working_mode() {
+        let _headless = AtomicFlagGuard::set(&utils::HEADLESS, false);
+        let _acp = AtomicFlagGuard::set(&utils::ACP_SERVER, false);
+        for mode in [WorkingMode::Cmd, WorkingMode::Repl] {
+            let ctx = RequestContext::new(default_app_state(), mode);
+            let seat = format!("{:?}", ctx.prompter);
+            assert!(seat.starts_with("InquirePrompter"), "{mode:?}: {seat}");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn acp_server_run_seats_the_headless_prompter() {
+        let _acp = AtomicFlagGuard::set(&utils::ACP_SERVER, true);
+        let ctx = RequestContext::new(default_app_state(), WorkingMode::Repl);
+        let seat = format!("{:?}", ctx.prompter);
+        assert!(seat.starts_with("HeadlessPrompter"), "{seat}");
+    }
+
+    #[test]
+    #[serial]
+    fn delete_role_asks_a_checkbox_and_removes_the_pick() {
+        let _guard = TestConfigDirGuard::new();
+        let roles_dir = paths::roles_dir();
+        create_dir_all(&roles_dir).unwrap();
+        let role_path = roles_dir.join("doomed-role-6w.md");
+        fs::write(&role_path, "---\n---\nPrompt").unwrap();
+
+        let mut ctx = create_test_ctx();
+        let prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Checked(vec![
+            "doomed-role-6w".to_string(),
+        ])]));
+        ctx.prompter = prompter.clone();
+
+        ctx.delete("role").unwrap();
+
+        assert!(!role_path.exists());
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].action, PromptAction::Checkbox);
+        assert_eq!(requests[0].question, "Select role to delete:");
+        assert_eq!(requests[0].options, vec!["doomed-role-6w".to_string()]);
+    }
+
+    #[test]
+    #[serial]
+    fn delete_re_asks_after_an_empty_selection() {
+        let _guard = TestConfigDirGuard::new();
+        let roles_dir = paths::roles_dir();
+        create_dir_all(&roles_dir).unwrap();
+        let role_path = roles_dir.join("kept-role-2j.md");
+        fs::write(&role_path, "---\n---\nPrompt").unwrap();
+
+        let mut ctx = create_test_ctx();
+        let prompter = Arc::new(ScriptedPrompter::new(vec![
+            PromptAnswer::Checked(vec![]),
+            PromptAnswer::Checked(vec!["kept-role-2j".to_string()]),
+        ]));
+        ctx.prompter = prompter.clone();
+
+        ctx.delete("role").unwrap();
+
+        assert_eq!(prompter.requests().len(), 2);
+        assert!(!role_path.exists());
+    }
+
+    #[test]
+    #[serial]
+    fn delete_refuses_a_name_it_did_not_offer() {
+        let _guard = TestConfigDirGuard::new();
+        let roles_dir = paths::roles_dir();
+        create_dir_all(&roles_dir).unwrap();
+        let role_path = roles_dir.join("offered-role-4n.md");
+        fs::write(&role_path, "---\n---\nPrompt").unwrap();
+
+        let mut ctx = create_test_ctx();
+        ctx.prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Checked(vec![
+            "../escaped-role".to_string(),
+        ])]));
+
+        let err = ctx.delete("role").unwrap_err();
+
+        assert_eq!(err.to_string(), "Unknown role '../escaped-role'");
+        assert!(role_path.exists());
+    }
+
+    #[test]
+    #[serial]
+    fn delete_sessions_removes_only_the_picked_session() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        write_session_file(
+            &ctx,
+            "first-sess-8d",
+            SessionScope::Workspace,
+            "messages: []\n",
+        );
+        write_session_file(
+            &ctx,
+            "second-sess-8d",
+            SessionScope::Workspace,
+            "messages: []\n",
+        );
+        let first = ctx.session_file_for("first-sess-8d", SessionScope::Workspace);
+        let second = ctx.session_file_for("second-sess-8d", SessionScope::Workspace);
+        let second_label = session_delete_label("second-sess-8d", SessionScope::Workspace);
+        let prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Checked(vec![
+            second_label.clone(),
+        ])]));
+        ctx.prompter = prompter.clone();
+
+        ctx.delete("session").unwrap();
+
+        assert!(first.exists());
+        assert!(!second.exists());
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].action, PromptAction::Checkbox);
+        assert_eq!(requests[0].question, "Select session to delete:");
+        assert!(requests[0].options.contains(&second_label));
+    }
+
+    #[test]
+    #[serial]
+    fn delete_sessions_re_asks_after_an_empty_selection() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        write_session_file(
+            &ctx,
+            "lone-sess-3f",
+            SessionScope::Workspace,
+            "messages: []\n",
+        );
+        let path = ctx.session_file_for("lone-sess-3f", SessionScope::Workspace);
+        let prompter = Arc::new(ScriptedPrompter::new(vec![
+            PromptAnswer::Checked(vec![]),
+            PromptAnswer::Checked(vec![session_delete_label(
+                "lone-sess-3f",
+                SessionScope::Workspace,
+            )]),
+        ]));
+        ctx.prompter = prompter.clone();
+
+        ctx.delete("session").unwrap();
+
+        assert_eq!(prompter.requests().len(), 2);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn exit_session_clears_prompt_memory() {
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        ctx.prompt_memory.remember("fake_tool", "again? mem-9c");
+        let req = PromptRequest {
+            tool: Some("fake_tool".to_string()),
+            ..ctx.prompt_request(PromptAction::Confirm, "again? mem-9c", Vec::new(), None)
+        };
+        assert_eq!(ctx.prompt_memory.auto_answer(&req), Some(true));
+
+        ctx.exit_session().unwrap();
+
+        assert_eq!(ctx.prompt_memory.auto_answer(&req), None);
+    }
+
+    #[test]
+    fn exit_session_without_a_session_keeps_prompt_memory() {
+        let mut ctx = create_test_ctx();
+        ctx.prompt_memory.remember("fake_tool", "again? mem-2v");
+        let req = PromptRequest {
+            tool: Some("fake_tool".to_string()),
+            ..ctx.prompt_request(PromptAction::Confirm, "again? mem-2v", Vec::new(), None)
+        };
+
+        ctx.exit_session().unwrap();
+
+        assert_eq!(ctx.prompt_memory.auto_answer(&req), Some(true));
+    }
+
+    fn remembered_request(ctx: &RequestContext) -> PromptRequest {
+        PromptRequest {
+            tool: Some("fake_tool".to_string()),
+            ..ctx.prompt_request(PromptAction::Confirm, "run it? ysf-3m1", Vec::new(), None)
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn yes_for_session_answers_without_the_prompter_until_the_session_exits() {
+        let sink = crate::events::RecordingSink::install();
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        ctx.prompter = Arc::new(ScriptedPrompter::refusing());
+        ctx.prompt_memory.remember("fake_tool", "run it? ysf-3m1");
+
+        let answer = ctx.prompt(remembered_request(&ctx)).unwrap();
+        assert_eq!(answer, PromptAnswer::Confirmed(true));
+        let events = sink.drain();
+        let requested: Vec<&Event> = events
+            .iter()
+            .filter(|event| {
+                matches!(event, Event::PromptRequested { question, .. } if question == "run it? ysf-3m1")
+            })
+            .collect();
+        let [Event::PromptRequested { id, tool, .. }] = requested.as_slice() else {
+            panic!("{requested:?}");
+        };
+        assert_eq!(tool.as_deref(), Some("fake_tool"));
+        let answered: Vec<&Event> = events
+            .iter()
+            .filter(|event| matches!(event, Event::PromptAnswered { id: a, .. } if a == id))
+            .collect();
+        assert_eq!(
+            answered,
+            vec![&Event::PromptAnswered {
+                id: id.clone(),
+                answer: "yes".to_string(),
+                auto: true,
+            }]
+        );
+
+        ctx.exit_session().unwrap();
+        let prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]));
+        ctx.prompter = prompter.clone();
+        let answer = ctx.prompt(remembered_request(&ctx)).unwrap();
+        assert_eq!(answer, PromptAnswer::Confirmed(false));
+        assert_eq!(prompter.requests().len(), 1);
     }
 
     #[test]

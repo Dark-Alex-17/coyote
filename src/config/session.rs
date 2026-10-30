@@ -4,13 +4,14 @@ use super::todo::TodoList;
 use super::*;
 
 use crate::client::{Message, MessageContent, MessageRole, TokenUsage};
+use crate::events::Origin;
 use crate::graph::LastRun;
 use crate::hooks::HooksMap;
+use crate::prompt::{PromptAction, PromptRequest, Prompter, ask};
 use crate::render::MarkdownRender;
 
 use anyhow::{Context, Result, bail};
 use fancy_regex::Regex;
-use inquire::{Confirm, Text, validator::Validation};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -1335,7 +1336,12 @@ impl Session {
         self.autoname = Some(AutoName::new(name));
     }
 
-    pub fn exit(&mut self, session_dir: &Path, is_repl: bool) -> Result<()> {
+    pub fn exit(
+        &mut self,
+        session_dir: &Path,
+        is_repl: bool,
+        prompter: &dyn Prompter,
+    ) -> Result<()> {
         let save_session = self.effective_save_session();
         if self.dirty && save_session != Some(false) {
             let mut session_dir = session_dir.to_path_buf();
@@ -1344,23 +1350,16 @@ impl Session {
                 if !is_repl {
                     return Ok(());
                 }
-                let ans = Confirm::new("Save session?").with_default(false).prompt()?;
+                let save = PromptRequest {
+                    default: Some(json!(false)),
+                    ..PromptRequest::new(PromptAction::Confirm, "Save session?", Origin::detached())
+                };
+                let ans = ask(prompter, save)?.into_confirmed()?;
                 if !ans {
                     return Ok(());
                 }
                 if session_name == TEMP_SESSION_NAME {
-                    session_name = Text::new("Session name:")
-                        .with_validator(|input: &str| {
-                            let input = input.trim();
-                            if input.is_empty() {
-                                Ok(Validation::Invalid("This name is required".into()))
-                            } else if input == TEMP_SESSION_NAME {
-                                Ok(Validation::Invalid("This name is reserved".into()))
-                            } else {
-                                Ok(Validation::Valid)
-                            }
-                        })
-                        .prompt()?;
+                    session_name = ask_session_name(prompter)?;
                 }
             } else if save_session == Some(true) && session_name == TEMP_SESSION_NAME {
                 session_dir = session_dir.join("_");
@@ -1754,6 +1753,22 @@ fn print_saved_to(session_path: &Path) {
     println!("✓ Saved the session to '{}'.", session_path.display());
 }
 
+/// Asks until the name is neither blank nor the temp session's.
+fn ask_session_name(prompter: &dyn Prompter) -> Result<String> {
+    loop {
+        let req = PromptRequest::new(PromptAction::Input, "Session name:", Origin::detached());
+        let name = ask(prompter, req)?.into_text()?;
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            eprintln!("This name is required");
+        } else if trimmed == TEMP_SESSION_NAME {
+            eprintln!("This name is reserved");
+        } else {
+            return Ok(name);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1763,6 +1778,7 @@ mod tests {
     };
     use crate::config::{AppConfig, AppState, RequestContext, WorkingMode};
     use crate::function::{Functions, ToolCall, ToolResult};
+    use crate::prompt::{PromptAnswer, ScriptedPrompter};
     use serial_test::serial;
     use std::sync::Arc;
 
@@ -2903,7 +2919,9 @@ last_run:
         let before = read_to_string(&destination).unwrap();
         let modified_before = destination.metadata().unwrap().modified().unwrap();
 
-        session.exit(&sessions_dir, true).unwrap();
+        session
+            .exit(&sessions_dir, true, &ScriptedPrompter::refusing())
+            .unwrap();
 
         assert_eq!(read_to_string(&destination).unwrap(), before);
         assert_eq!(
@@ -2917,6 +2935,108 @@ last_run:
             .collect();
         entries.sort();
         assert_eq!(entries, vec![std::ffi::OsString::from("notes.yaml")]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn unique_sessions_dir(label: &str) -> (PathBuf, PathBuf) {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("coyote-session-{label}-{unique}"));
+        let sessions_dir = dir.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        (dir, sessions_dir)
+    }
+
+    fn dirty_unsaved_session() -> Session {
+        let mut session = Session::default();
+        session.set_name(TEMP_SESSION_NAME.to_string());
+        session.set_save_session(None);
+        session.mark_dirty();
+        assert!(session.dirty());
+        assert_eq!(session.effective_save_session(), None);
+        session
+    }
+
+    #[test]
+    #[serial]
+    fn exit_outside_the_repl_never_prompts() {
+        let (dir, sessions_dir) = unique_sessions_dir("exit-headless");
+        let mut session = dirty_unsaved_session();
+
+        session
+            .exit(&sessions_dir, false, &ScriptedPrompter::refusing())
+            .unwrap();
+
+        assert!(std::fs::read_dir(&sessions_dir).unwrap().next().is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn exit_declined_saves_nothing() {
+        let (dir, sessions_dir) = unique_sessions_dir("exit-declined");
+        let mut session = dirty_unsaved_session();
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]);
+
+        session.exit(&sessions_dir, true, &prompter).unwrap();
+
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].action, PromptAction::Confirm);
+        assert_eq!(requests[0].question, "Save session?");
+        assert_eq!(requests[0].default, Some(json!(false)));
+        assert!(std::fs::read_dir(&sessions_dir).unwrap().next().is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn exit_accepted_asks_for_a_name_until_it_is_usable() {
+        let (dir, sessions_dir) = unique_sessions_dir("exit-accepted");
+        let mut session = dirty_unsaved_session();
+        assert_eq!(session.name(), TEMP_SESSION_NAME);
+        let prompter = ScriptedPrompter::new(vec![
+            PromptAnswer::Confirmed(true),
+            PromptAnswer::Text("   ".to_string()),
+            PromptAnswer::Text(TEMP_SESSION_NAME.to_string()),
+            PromptAnswer::Text("my-sess-9z".to_string()),
+        ]);
+
+        session.exit(&sessions_dir, true, &prompter).unwrap();
+
+        let questions: Vec<String> = prompter
+            .requests()
+            .into_iter()
+            .map(|req| req.question)
+            .collect();
+        assert_eq!(
+            questions,
+            vec![
+                "Save session?",
+                "Session name:",
+                "Session name:",
+                "Session name:"
+            ]
+        );
+        assert!(sessions_dir.join("my-sess-9z.yaml").is_file());
+        assert_eq!(session.name(), "my-sess-9z");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn exit_cancelled_at_the_name_is_an_error() {
+        let (dir, sessions_dir) = unique_sessions_dir("exit-cancelled");
+        let mut session = dirty_unsaved_session();
+        let prompter =
+            ScriptedPrompter::new(vec![PromptAnswer::Confirmed(true), PromptAnswer::Cancelled]);
+
+        let err = session.exit(&sessions_dir, true, &prompter).unwrap_err();
+
+        assert_eq!(err.to_string(), "Operation was canceled by the user");
+        assert!(std::fs::read_dir(&sessions_dir).unwrap().next().is_none());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
