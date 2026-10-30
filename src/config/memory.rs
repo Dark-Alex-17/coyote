@@ -112,7 +112,20 @@ pub fn find_git_root(start: &Path) -> Option<PathBuf> {
     find_git_root_within(start, None)
 }
 
-pub fn find_git_root_within(start: &Path, ceiling: Option<&Path>) -> Option<PathBuf> {
+/// The git root a process running in `cwd` sees, bounded like
+/// `find_workspace_memory` so the test override applies.
+pub fn find_workspace_git_root(cwd: &Path) -> Option<PathBuf> {
+    let (start, ceiling) = workspace_search_bounds(cwd);
+    find_git_root_within(&start, ceiling.as_deref())
+}
+
+/// The git root at or above `start`, never above `ceiling`; ignores the override.
+#[cfg(test)]
+pub(crate) fn find_git_root_under(start: &Path, ceiling: &Path) -> Option<PathBuf> {
+    find_git_root_within(start, Some(ceiling))
+}
+
+fn find_git_root_within(start: &Path, ceiling: Option<&Path>) -> Option<PathBuf> {
     for dir in ancestors_within(start, ceiling) {
         if dir.join(GIT_DIR_NAME).exists() {
             return Some(dir.to_path_buf());

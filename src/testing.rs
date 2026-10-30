@@ -408,7 +408,20 @@ mod tests {
         const RAW_WALK_HOMES: [&str; 2] = [RAW_WALK, "find_workspace_memory"];
         const GUARD_DEFINITION: &str = concat!("struct TestConfig", "DirGuard");
         const CONFIG_DIR_ENV: &str = concat!("env_name(\"config", "_dir\")");
-        const UNBOUNDED_GIT_ROOT: &str = concat!("find_git", "_root(");
+        const GIT_ROOT_WALKS: [&str; 2] = [
+            concat!("find_git", "_root("),
+            concat!("find_git", "_root_within("),
+        ];
+        // The walker's own definitions and the explicit `--init-memory`
+        // command, which roots the store at the real git root on purpose.
+        const GIT_ROOT_ALLOW: [(&str, &str); 6] = [
+            ("config/memory.rs", "find_git_root"),
+            ("config/memory.rs", "find_git_root_within"),
+            ("config/memory.rs", "find_workspace_git_root"),
+            ("config/memory.rs", "find_git_root_under"),
+            ("config/memory.rs", "init_workspace_root"),
+            ("config/memory.rs", "write_workspace_memory_index"),
+        ];
         // Tests that check config dir resolution itself and must point the raw
         // env var at a dir the shared guard cannot provide, as (file, fn).
         const CONFIG_DIR_PIN_EXEMPT: [(&str, &str); 1] = [
@@ -483,9 +496,13 @@ mod tests {
                         "{at}: test pins the config dir env by hand; use crate::testing::TestConfigDirGuard"
                     ));
                 }
-                if text.contains(UNBOUNDED_GIT_ROOT) && !in_test && !is("config/memory.rs") {
+                let allowed_git_root_walk = (is("config/memory.rs") && in_test)
+                    || GIT_ROOT_ALLOW
+                        .iter()
+                        .any(|&(file, allowed)| is(file) && enclosing_fn == allowed);
+                if GIT_ROOT_WALKS.iter().any(|walk| text.contains(walk)) && !allowed_git_root_walk {
                     offences.push(format!(
-                        "{at}: unbounded git root walk; bound it with memory::workspace_search_bounds"
+                        "{at}: raw git root walk; call memory::find_workspace_git_root, or memory::find_git_root_under in tests"
                     ));
                 }
             }
@@ -527,6 +544,25 @@ mod tests {
             "impl<A, B> Holder {\n",
             "    fn probe_too<C, D>(c: C, d: D) {\n",
             "    }\n",
+            "}\n",
+            "#[cfg(all(test, unix))]\n",
+            "mod m {\n",
+            "    fn a() {}\n",
+            "}\n",
+            "#[cfg(all(test, not(target_env = \"musl\")))]\n",
+            "mod n {\n",
+            "}\n",
+            "#[cfg(any(test, unix))]\n",
+            "fn b() {\n",
+            "}\n",
+            "#[cfg(any(test, all(test, unix)))]\n",
+            "fn c() {\n",
+            "}\n",
+            "#[cfg(not(test))]\n",
+            "fn d() {\n",
+            "}\n",
+            "#[cfg(test)]\n",
+            "fn helper(buf: [u8; 4]) {\n",
             "}\n",
         );
         let scoped = scope_lines(source);
@@ -570,9 +606,56 @@ mod tests {
                 (true, Some("probe_too")),
                 (true, None),
                 (false, None),
+                (false, None),
+                (true, None),
+                (true, None),
+                (false, None),
+                (false, None),
+                (true, None),
+                (false, None),
+                (false, None),
+                (false, Some("b")),
+                (false, None),
+                (false, None),
+                (true, Some("c")),
+                (false, None),
+                (false, None),
+                (false, Some("d")),
+                (false, None),
+                (false, None),
+                (true, Some("helper")),
+                (false, None),
             ]
         );
         assert_eq!(scoped.test_modules, ["live"]);
+    }
+
+    #[test]
+    fn cfg_implies_test_only_for_predicates_no_shipped_build_satisfies() {
+        for predicate in [
+            "test",
+            " test ",
+            "all(test, unix)",
+            "all(unix, all(feature = \"a,b\", test))",
+            "all(test, not(target_env = \"musl\"))",
+            "any(test, all(test, unix))",
+            "any(test,)",
+        ] {
+            assert!(cfg_implies_test(predicate), "{predicate}");
+        }
+        for predicate in [
+            "unix",
+            "tests",
+            "feature = \"test\"",
+            "not(test)",
+            "any(test, unix)",
+            "any()",
+            "all()",
+            "all(unix, not(test))",
+            "any(test, feature = \"x,test\")",
+        ] {
+            assert!(!cfg_implies_test(predicate), "{predicate}");
+        }
     }
 
     /// One source line with the scope it sits in.
@@ -598,12 +681,13 @@ mod tests {
     }
 
     /// Tracks brace depth over `source` with literals and comments blanked,
-    /// recording for each line the scope in force at its end. An attribute
-    /// or `fn` name applies to the next `{` and is dropped at a `;` or `}`.
-    /// Outside an item header, an attribute is also dropped at a top-level
-    /// `,`, which ends the struct field or literal field it annotated.
+    /// recording for each line the scope in force at its end. A `#[cfg(..)]`
+    /// whose predicate implies `test`, or a `fn` name, applies to the next
+    /// `{` and is dropped at a `}` or a `;` outside brackets. Outside an
+    /// item header, an attribute is also dropped at a top-level `,`, which
+    /// ends the struct field or literal field it annotated.
     fn scope_lines(source: &str) -> ScopedSource<'_> {
-        const CFG_TEST: [&str; 7] = ["#", "[", "cfg", "(", "test", ")", "]"];
+        const CFG_OPEN: [&str; 4] = ["#", "[", "cfg", "("];
         const ITEM_KEYWORDS: [&str; 7] = ["fn", "impl", "struct", "enum", "trait", "mod", "union"];
         let code = code_only(source);
         let mut scopes = vec![Scope::default()];
@@ -617,6 +701,15 @@ mod tests {
             let tokens = tokens(code);
             let mut k = 0;
             while k < tokens.len() {
+                if tokens[k..].starts_with(&CFG_OPEN)
+                    && let Some(close) = closing_paren(&tokens, k + CFG_OPEN.len() - 1)
+                    && tokens.get(close + 1) == Some(&"]")
+                {
+                    let predicate = tokens[k + CFG_OPEN.len()..close].join(" ");
+                    pending_test |= cfg_implies_test(&predicate);
+                    k = close + 2;
+                    continue;
+                }
                 let next_ident = tokens.get(k + 1).filter(|t| is_ident(t));
                 if ITEM_KEYWORDS.contains(&tokens[k])
                     && (next_ident.is_some() || tokens.get(k + 1) == Some(&"<"))
@@ -624,10 +717,6 @@ mod tests {
                     pending_item = true;
                 }
                 match tokens[k] {
-                    _ if tokens[k..].starts_with(&CFG_TEST) => {
-                        pending_test = true;
-                        k += CFG_TEST.len() - 1;
-                    }
                     "fn" if next_ident.is_some() => pending_fn = next_ident.map(|t| t.to_string()),
                     "mod" if next_ident.is_some() => {
                         pending_mod = next_ident.map(|t| t.to_string())
@@ -653,7 +742,7 @@ mod tests {
                         pending_fn = None;
                         pending_mod = None;
                     }
-                    ";" => {
+                    ";" if scopes.last().unwrap().nesting == 0 => {
                         if let Some(name) = pending_mod.take().filter(|_| pending_test) {
                             test_modules.push(name);
                         }
@@ -688,6 +777,81 @@ mod tests {
             lines,
             test_modules,
         }
+    }
+
+    /// The index of the `)` matching the `(` at `open`.
+    fn closing_paren(tokens: &[&str], open: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        for (i, token) in tokens.iter().enumerate().skip(open) {
+            match *token {
+                "(" => depth += 1,
+                ")" => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Whether code under `#[cfg(predicate)]` is compiled only for tests:
+    /// `test` itself, an `all` with an argument that implies it, or an `any`
+    /// whose every argument does. `not(..)` and every other predicate can
+    /// hold in a shipped build.
+    fn cfg_implies_test(predicate: &str) -> bool {
+        let predicate = predicate.trim();
+        if predicate == "test" {
+            return true;
+        }
+        let Some((operator, rest)) = predicate.split_once('(') else {
+            return false;
+        };
+        let Some(arguments) = rest.trim_end().strip_suffix(')') else {
+            return false;
+        };
+        let arguments = cfg_arguments(arguments);
+        match operator.trim() {
+            "all" => arguments.into_iter().any(cfg_implies_test),
+            "any" => !arguments.is_empty() && arguments.into_iter().all(cfg_implies_test),
+            _ => false,
+        }
+    }
+
+    /// The comma-separated arguments of a cfg operator, split only at commas
+    /// outside nested parentheses and string literals.
+    fn cfg_arguments(arguments: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut depth = 0usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        let mut start = 0;
+        for (i, c) in arguments.char_indices() {
+            if in_string {
+                match c {
+                    _ if escaped => escaped = false,
+                    '\\' => escaped = true,
+                    '"' => in_string = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match c {
+                '"' => in_string = true,
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    out.push(&arguments[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        out.push(&arguments[start..]);
+        out.retain(|argument| !argument.trim().is_empty());
+        out
     }
 
     /// Identifiers as one token each; every other non-space char alone.

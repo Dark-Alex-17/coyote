@@ -14,7 +14,7 @@ use crate::config::memory::{
     CatalogueEntry, DEFAULT_MEMORY_RUN_STATE_TTL_DAYS, Filter, KindField, MEMORY_DESCRIPTION_CAP,
     MEMORY_FILE_HARD_CAP, MemoryFile, MemoryFrontmatter, MemoryKind, MemoryStore, Retention, Scope,
     WorkspaceMemory, bootstrap_workspace_memory, catalogue_entry, catalogue_slug,
-    create_workspace_memory, find_git_root_within, today_string, workspace_search_bounds,
+    create_workspace_memory, find_workspace_git_root, today_string, workspace_search_bounds,
 };
 use crate::config::paths;
 use crate::config::{RequestContext, RoundChains, WORKSPACE_COYOTE_DIR_NAME};
@@ -1193,19 +1193,19 @@ fn find_file(store: &MemoryStore, name: &str) -> Result<Option<MemoryFile>> {
 }
 
 fn workspace_write_dir(store: &MemoryStore, cwd: &Path) -> Result<PathBuf> {
-    let (start, ceiling) = workspace_search_bounds(cwd);
-    workspace_write_dir_from(store, &start, ceiling.as_deref())
+    let (start, _) = workspace_search_bounds(cwd);
+    workspace_write_dir_from(store, &start, || find_workspace_git_root(cwd))
 }
 
 fn workspace_write_dir_from(
     store: &MemoryStore,
     start: &Path,
-    ceiling: Option<&Path>,
+    git_root: impl FnOnce() -> Option<PathBuf>,
 ) -> Result<PathBuf> {
     if let Some(ws) = &store.workspace {
         return Ok(ws.dir.clone());
     }
-    if let Some(git_root) = find_git_root_within(start, ceiling) {
+    if let Some(git_root) = git_root() {
         return bootstrap_workspace_memory(&git_root);
     }
     if start.join(WORKSPACE_COYOTE_DIR_NAME).is_dir() {
@@ -1351,6 +1351,7 @@ fn extract_wikilinks(body: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::memory::find_git_root_under;
     use serial_test::serial;
     use std::fs;
     use std::time;
@@ -1451,7 +1452,10 @@ mod tests {
 
         let store = MemoryStore::for_test(root.join("g"), &workspace, &root);
 
-        let dir = workspace_write_dir_from(&store, &workspace, Some(&root)).unwrap();
+        let dir = workspace_write_dir_from(&store, &workspace, || {
+            find_git_root_under(&workspace, &root)
+        })
+        .unwrap();
         assert_eq!(dir, structured);
 
         let _ = fs::remove_dir_all(&root);
@@ -1468,7 +1472,10 @@ mod tests {
         let store = MemoryStore::for_test(root.join("g"), &workspace, &root);
         assert!(store.workspace.is_none(), "COYOTE.md must not be memory");
 
-        let dir = workspace_write_dir_from(&store, &workspace, Some(&root)).unwrap();
+        let dir = workspace_write_dir_from(&store, &workspace, || {
+            find_git_root_under(&workspace, &root)
+        })
+        .unwrap();
         assert_eq!(dir, workspace.join(".coyote").join("memory"));
         assert!(
             dir.join("MEMORY.md").exists(),
@@ -1487,7 +1494,8 @@ mod tests {
 
         let store = MemoryStore::for_test(root.join("g"), &bare, &root);
 
-        let err = workspace_write_dir_from(&store, &bare, Some(&root)).unwrap_err();
+        let err = workspace_write_dir_from(&store, &bare, || find_git_root_under(&bare, &root))
+            .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("no workspace memory discoverable"));
         assert!(msg.contains("no .coyote directory here"));
@@ -1507,7 +1515,8 @@ mod tests {
 
         let store = MemoryStore::for_test(root.join("g"), &nested, &root);
 
-        let dir = workspace_write_dir_from(&store, &nested, Some(&root)).unwrap();
+        let dir = workspace_write_dir_from(&store, &nested, || find_git_root_under(&nested, &root))
+            .unwrap();
         assert_eq!(dir, repo.join(".coyote").join("memory"));
         assert!(!nested.join(".coyote").join("memory").exists());
 
@@ -1520,12 +1529,13 @@ mod tests {
         let root = temp_root("ws_coyote_no_git");
         let cwd = root.join("proj");
         fs::create_dir_all(cwd.join(".coyote")).unwrap();
-        assert!(find_git_root_within(&cwd, Some(&root)).is_none());
+        assert!(find_git_root_under(&cwd, &root).is_none());
 
         let store = MemoryStore::for_test(root.join("g"), &cwd, &root);
         assert!(store.workspace.is_none());
 
-        let dir = workspace_write_dir_from(&store, &cwd, Some(&root)).unwrap();
+        let dir =
+            workspace_write_dir_from(&store, &cwd, || find_git_root_under(&cwd, &root)).unwrap();
         assert_eq!(dir, cwd.join(".coyote").join("memory"));
         let index = fs::read_to_string(dir.join("MEMORY.md")).unwrap();
         assert_eq!(index, "# Workspace Memory Index\n\n");
@@ -1551,7 +1561,8 @@ mod tests {
 
         let store = MemoryStore::for_test(root.join("g"), &cwd, &root);
 
-        let err = workspace_write_dir_from(&store, &cwd, Some(&root)).unwrap_err();
+        let err = workspace_write_dir_from(&store, &cwd, || find_git_root_under(&cwd, &root))
+            .unwrap_err();
         assert!(err.to_string().contains("no .coyote directory here"));
         assert!(!parent.join(".coyote").join("memory").exists());
         assert!(!cwd.join(".coyote").exists());
@@ -1571,7 +1582,8 @@ mod tests {
         let store = MemoryStore::for_test(root.join("g"), &nested, &root);
         assert!(store.workspace.is_none());
 
-        let dir = workspace_write_dir_from(&store, &nested, Some(&root)).unwrap();
+        let dir = workspace_write_dir_from(&store, &nested, || find_git_root_under(&nested, &root))
+            .unwrap();
         assert_eq!(dir, repo.join(".coyote").join("memory"));
         assert!(dir.join("MEMORY.md").exists());
         let gi = fs::read_to_string(repo.join(".gitignore")).unwrap();
