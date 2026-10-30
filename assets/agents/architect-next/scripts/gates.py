@@ -2604,7 +2604,9 @@ def hygiene_create(state):
             "hygiene_base_missing", f"The {scope_word} base (merge-base of origin/{base_branch} and {top}) is empty - the lint would fall back to the "
                                     "worktree and report a vacuous clean. Skip the hygiene pass (recorded), or stop?",
             [option("Stop and report", recommended=True), option("Skip the hygiene pass (recorded as a follow-up)")], hard_trigger=True))
-    ok, ledger_out = core_tool("collect_ledger_lines", tag="debris-exempt", dir=state.get("tasks_root", ""))
+    group_tasks = ",".join(unit.get("members", [])) if MULTI_IS_GROUPS and not is_single(state) else None
+    ok, ledger_out = core_tool("collect_ledger_lines", tag="debris-exempt", dir=state.get("tasks_root", ""),
+                               plan=state.get("plan_path", ""), tasks=group_tasks or None)
     ledger_lines = ledger_out.strip() if ok else "(collect_ledger_lines unavailable: " + tail(ledger_out, 120) + ")"
     agents_dir = os.path.join(os.environ.get("LLM_ROOT_DIR", os.path.expanduser("~/.config/coyote")), "agents")
     lint_cmd = f"python3 {agents_dir}/.shared/debris.py {code} {base}"
@@ -2647,6 +2649,14 @@ def stack_gate_final(state):
     return u
 
 
+def _group_members(state):
+    """The closing PR group's task ids, comma-separated as tools.sh `--tasks` takes them; None outside group mode."""
+    unit = state.get("closeout_unit")
+    if is_single(state) or not MULTI_IS_GROUPS or not unit:
+        return None
+    return ",".join(t["id"] for t in as_list(state.get("tasks")) if t.get("unit") == unit) or None
+
+
 def pr_body(state):
     u = {}
     harvest_anomalies(state, u, "pr_summary")
@@ -2664,6 +2674,7 @@ def pr_body(state):
         write_artifact(run_dir, "pr-hygiene.md", "\n".join(f"- {h}" for h in hyg))
     tasks_dir = os.path.join(state.get("tasks_root", ""), "completed") if TASKSTORE == "dirstate" else state.get("tasks_root", "")
     ok, out = core_tool("assemble_pr_body", plan=state.get("plan_path", ""), tasks_dir=tasks_dir,
+                        tasks=_group_members(state),
                         summary_file=os.path.join(run_dir, "pr-summary.md"), out=os.path.join(run_dir, "pr-body.md"),
                         hygiene_file=os.path.join(run_dir, "pr-hygiene.md") if hyg else None,
                         quality_note=state.get("quality_note") or None, followups=(TASKSTORE != "dirstate"))
@@ -2973,7 +2984,8 @@ def finish_plan(state):
 
 def _collect(state, tag):
     tasks_dir = os.path.join(state.get("tasks_root", ""), "completed") if TASKSTORE == "dirstate" else state.get("tasks_root", "")
-    ok, out = core_tool("collect_ledger_lines", tag=tag, dir=tasks_dir)
+    # No --tasks: the run report covers every PR group, not only the last one closed.
+    ok, out = core_tool("collect_ledger_lines", tag=tag, dir=tasks_dir, plan=state.get("plan_path", ""))
     if not ok:
         return [f"(collect_ledger_lines unavailable for {tag}: {tail(out, 100)})"]
     return [l for l in out.splitlines() if l.strip() and l.strip() != "(none)"]

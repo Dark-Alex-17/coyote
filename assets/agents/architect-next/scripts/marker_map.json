@@ -372,8 +372,8 @@
   "line": 914,
   "condition": "pr_strategy=multi",
   "first": "Pass `--tasks <this group's member task ids, comma-separated",
-  "mechanism": "R",
-  "home": "`pr_body` (gap: `assemble_pr_body` is called without `--tasks`, so a group body still covers every complete task of the plan)"
+  "mechanism": "I",
+  "home": "`pr_body` (`assemble_pr_body --tasks` from `_group_members`) and `hygiene_create` (`collect_ledger_lines --tasks` from the `_hygiene_units` group unit)"
  },
  {
   "ordinal": 48,

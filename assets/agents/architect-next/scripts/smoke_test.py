@@ -990,6 +990,57 @@ check("whetstone_gate: feedback -> run_whetstone", gates.whetstone_gate(base_sta
 check("whetstone_gate: none -> summarize_run (noted)", gates.whetstone_gate(base_state())["_next"] == "summarize_run")
 check("group_closeout -> phase_f_gate", gates.group_closeout(base_state(closeout_unit="g1"))["_next"] == "phase_f_gate")
 
+# ---------------------------------------------------------------- rollup scope: --plan always, --tasks for a PR group only
+# A recording tools.sh (ARCHITECT_CORE_TOOLS) logs the --tasks / --plan each core call receives.
+CORE_CALLS = os.path.join(TMP, "core-calls.txt")
+RECORDING_TOOLS = os.path.join(TMP, "recording-tools", "tools.sh")
+write(RECORDING_TOOLS, "record() { printf '%s tasks=%s plan=%s\\n' \"$1\" \"${argc_tasks-unset}\" \"${argc_plan-unset}\" >> \"" + CORE_CALLS + "\"; }\n"
+                       "assemble_pr_body() { record assemble_pr_body; echo body > \"$argc_out\"; }\n"
+                       "collect_ledger_lines() { record collect_ledger_lines; echo '(none)'; }\n")
+
+
+def core_calls(run, name):
+    write(CORE_CALLS, "")
+    os.environ["ARCHITECT_CORE_TOOLS"] = RECORDING_TOOLS
+    try:
+        run()
+    finally:
+        os.environ.pop("ARCHITECT_CORE_TOOLS")
+    return [l.split(" ", 1)[1] for l in read_file(CORE_CALLS).splitlines() if l.startswith(name + " ")]
+
+
+ts_g = copy.deepcopy(ts_f)
+for t, g in zip(ts_g, ("g1", "g1", "g2")):
+    t["unit"] = g
+GROUP_TASKS = f"{T1},{T2}" if MULTI_IS_GROUPS else "unset"
+calls = core_calls(lambda: gates.pr_body(base_state(plan_path=PROMOTED, tasks=ts_g, pr_strategy="multi", closeout_unit="g1", pr_summary_text="s", body_fix_rounds=RERUN_ONCE)), "assemble_pr_body")
+check("pr_body: PR-group mode -> assemble_pr_body --tasks <the closing group's task ids, comma-separated>", calls == [f"tasks={GROUP_TASKS} plan={PROMOTED}"], str(calls))
+calls = core_calls(lambda: gates.pr_body(base_state(plan_path=PROMOTED, tasks=ts_g, closeout_unit="g1", pr_summary_text="s", body_fix_rounds=RERUN_ONCE)), "assemble_pr_body")
+check("pr_body: single PR -> assemble_pr_body without --tasks", calls == [f"tasks=unset plan={PROMOTED}"], str(calls))
+calls = core_calls(lambda: gates.hygiene_create(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(ts_g), pr_strategy="multi", closeout_unit="g1", unit_base_sha=CODE_BASE,
+                                                           run_branch="feat/PLAN-widgets", hygiene_units=[{"id": "g1", "members": [T1, T2]}])), "collect_ledger_lines")
+check("hygiene_create: PR-group mode -> collect_ledger_lines --plan <plan> --tasks <the group's members>", calls == [f"tasks={GROUP_TASKS} plan={PROMOTED}"], str(calls))
+calls = core_calls(lambda: gates.final_report(base_state(plan_path=PROMOTED, tasks=ts_g, pr_strategy="multi", closeout_unit="g2")), "collect_ledger_lines")
+check("final_report: every collect_ledger_lines call gets a non-empty --plan and no --tasks (the run report spans all groups)",
+      len(calls) >= 4 and all(c == f"tasks=unset plan={PROMOTED}" for c in calls), str(calls))
+
+# The REAL tools.sh collect_ledger_lines over a scratch plan and task log: the lines arrive, not "(collect_ledger_lines unavailable: ...)".
+LEDGER = os.path.join(TMP, "ledger")
+LEDGER_PLAN = os.path.join(LEDGER, "PLAN-ledger.md")
+LEDGER_TASKS = os.path.join(LEDGER, "tasks")
+write(LEDGER_PLAN, "---\ntitle: Ledger\nrigor: production\n---\n\n# Ledger\n")
+ledger_task = os.path.join(LEDGER_TASKS, "completed" if gates.TASKSTORE == "dirstate" else "", "TASK-901-done")
+write(os.path.join(ledger_task, "index.md"), "---\ntitle: Done\nstatus: complete\nplan: PLAN-ledger\n---\n")
+write(os.path.join(ledger_task, "log.md"), "# TASK-901 log\n\n## 2026-01-01 - completed\n\n"
+                                           "debris-exempt: scripts/gen.py keeps its marker (generated upstream)\nFollow-ups:\n- rotate the widget key before merge\n")
+u = gates.hygiene_create(base_state(plan_path=LEDGER_PLAN, tasks_root=LEDGER_TASKS, tasks=[], unit_base_sha=CODE_BASE, run_branch="feat/PLAN-widgets",
+                                    hygiene_units=[{"id": "run", "members": ["TASK-901"]}]))
+check("hygiene_create: the real collect_ledger_lines collects the plan's debris-exempt line into the starting ledger",
+      "TASK-901-done (log.md:5): debris-exempt: scripts/gen.py keeps its marker" in u.get("hygiene_brief", "") and "unavailable" not in u.get("hygiene_brief", ""), u.get("hygiene_brief", "")[-400:])
+rows = gates._collect(base_state(plan_path=LEDGER_PLAN, tasks_root=LEDGER_TASKS), "Follow-ups:")
+check("final_report rollup: the real collect_ledger_lines collects a Follow-ups: line with its bullet",
+      rows == ["TASK-901-done (log.md:6): Follow-ups:", "  - rotate the widget key before merge"], str(rows))
+
 # ---------------------------------------------------------------- entry scripts through GRAPH_STATE / GRAPH_STATE_FILE
 env = {**os.environ, "GRAPH_STATE": json.dumps(base_state(escalation=E, escalation_policy="interactive"))}
 p = subprocess.run([sys.executable, os.path.join(HERE, "escalate_gate.py")], capture_output=True, text=True, env=env)
