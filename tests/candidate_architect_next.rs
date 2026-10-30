@@ -1958,3 +1958,123 @@ fn readme_census_row_dead_hygiene_guard_matches_the_shipped_gates() {
         "the README lost its dead-guard census row while gates.py still carries the deletion"
     );
 }
+
+/// Runs `coyote --agent architect-next [extra..] --info` from a scratch
+/// config dir and returns its stdout, asserting a clean, error-free exit.
+fn info_by_name(scratch: &TempDirGuard, project: &Path, extra: &[&str], label: &str) -> String {
+    let dir = &scratch.0;
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_coyote"));
+    cmd.args(["--agent", CANDIDATE])
+        .args(extra)
+        .arg("--info")
+        .current_dir(project)
+        .env("HOME", dir.join("home"))
+        .env("COYOTE_CONFIG_DIR", dir)
+        .env("COYOTE_CACHE_DIR", dir.join("cache"))
+        .env("TMPDIR", dir.join("tmp"))
+        .env("NO_COLOR", "1")
+        .env_remove("ARCHITECT_RUNS_ROOT")
+        .env_remove("XDG_CACHE_HOME")
+        .env_remove("GRAPH_STATE")
+        .env_remove("GRAPH_STATE_FILE")
+        .stdin(Stdio::null());
+    scrub_agent_vars(&mut cmd);
+    let output = cmd.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{label}: --info failed\n{}",
+        transcript(&output)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    assert!(
+        !stderr.contains("error"),
+        "{label}: --info reported an error\n{}",
+        transcript(&output)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// The `name: value` lines of the `variables:` block `--info` prints.
+fn info_variables(stdout: &str) -> Vec<&str> {
+    stdout
+        .lines()
+        .skip_while(|l| *l != "variables:")
+        .skip(1)
+        .take_while(|l| l.starts_with("  "))
+        .map(str::trim)
+        .collect()
+}
+
+/// `coyote -a architect-next --info` lists the graph with zero errors, the
+/// variables block carries `build_lock` with its empty default between
+/// `pr_strategy` and `task_granularity`, and a consumer's
+/// `--agent-variable build_lock <cmd>` is seated over that default (the value
+/// every agent-node child then inherits).
+#[test]
+fn info_by_name_lists_the_graph_and_seats_a_build_lock_override() {
+    let scratch = scratch_dir("info");
+    let project = dry_run_config_dir(&scratch);
+
+    let stdout = info_by_name(&scratch, &project, &[], "default");
+    assert!(
+        stdout.contains("name: architect-next"),
+        "default: no graph name:\n{stdout}"
+    );
+    let vars = info_variables(&stdout);
+    let at = |p: &str| vars.iter().position(|l| l.starts_with(p));
+    let lock = at("build_lock:").unwrap_or_else(|| panic!("no build_lock in {vars:?}"));
+    assert_eq!(
+        vars[lock], "build_lock: ''",
+        "default: build_lock default must be empty"
+    );
+    assert_eq!(
+        at("pr_strategy:"),
+        Some(lock - 1),
+        "build_lock must follow pr_strategy: {vars:?}"
+    );
+    assert_eq!(
+        at("task_granularity:"),
+        Some(lock + 1),
+        "build_lock must precede task_granularity: {vars:?}"
+    );
+
+    let lock_cmd = "flock -w 240 /tmp/probe.lock";
+    let stdout = info_by_name(
+        &scratch,
+        &project,
+        &["--agent-variable", "build_lock", lock_cmd],
+        "override",
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.trim() == format!("build_lock: {lock_cmd}")),
+        "override: build_lock not seated over the default:\n{stdout}"
+    );
+}
+
+/// The variables block the binary renders for `coyote -a architect-next
+/// --info` is exactly the prose twin's variable list, name for name and in
+/// order (eleven entries, `build_lock` included), so a consumer sees no
+/// variable the twin lacks and misses none it has.
+#[test]
+fn info_by_name_lists_exactly_the_prose_twins_variables_in_order() {
+    let scratch = scratch_dir("info-vars");
+    let project = dry_run_config_dir(&scratch);
+    let stdout = info_by_name(&scratch, &project, &[], "variables");
+    let listed: Vec<&str> = info_variables(&stdout)
+        .into_iter()
+        .map(|l| l.split_once(':').map_or(l, |(name, _)| name))
+        .collect();
+    let prose = variable_list(&agents_dir().join("architect/config.yaml"));
+    let twin = names_of(&prose);
+    assert_eq!(
+        listed, twin,
+        "--info variables must be the prose twin's list in order:\n{stdout}"
+    );
+    assert_eq!(
+        listed.len(),
+        11,
+        "--info must list eleven variables: {listed:?}"
+    );
+}

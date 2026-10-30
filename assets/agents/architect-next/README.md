@@ -126,13 +126,18 @@ The wrapper's live test groups:
   starts a fresh run), the XDG-tier dry run (only `XDG_CACHE_HOME` set, the run lands under
   the engine's cache dir), and the no-design-doc dry run (without a readable design doc the
   run parks on the `need_design_doc` escalation before orienting).
+- real-binary `--info`: by name it lists the graph with no error, renders `build_lock` with
+  its empty default between `pr_strategy` and `task_granularity`, seats an
+  `--agent-variable build_lock` override over that default, and renders exactly the prose
+  twin's variable list in order.
 
 The mode-matrix run is the one ignored test.
 
 The Rust wrapper runs the batteries with `HOME`, `LLM_ROOT_DIR`, `COYOTE_CACHE_DIR`,
 `TMPDIR` and `ARCHITECT_RUNS_ROOT` pointed at a scratch directory and
-`PYTHONDONTWRITEBYTECODE=1`, so nothing under this directory or `~/.config/coyote` is
-touched. `audit_graph.py`, `check_session_block.sh` and `mode_matrix.py` need the Go `yq`
+`PYTHONDONTWRITEBYTECODE=1`, and drops any inherited `GRAPH_STATE*` / `LLM_AGENT_VAR_*`,
+so nothing under this directory or `~/.config/coyote` is touched and no agent session leaks
+in. `audit_graph.py`, `check_session_block.sh` and `mode_matrix.py` need the Go `yq`
 by mikefarah (`yq --version` names it); the wrapper's audit, session-check and poison tests,
 and the ignored matrix, skip when a different `yq` (or none) is on `PATH`. The sweep that
 keeps every bundled agent from naming this candidate lives in
