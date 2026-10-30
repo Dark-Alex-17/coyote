@@ -72,6 +72,12 @@ const SESSION_COMMANDS_HEADING: &str = "## Session commands";
 const CHILD_FOLDS_HEADING: &str = "# Child sessions";
 /// The Sessions.md subsection on Ctrl+C with background work.
 const INTERRUPT_HEADING: &str = "## Interrupting a turn with background work";
+/// The lead of the Sessions.md paragraph that says which aborted requests
+/// reach the "still running" notice.
+const STREAMED_ABORT_LEAD: &str = "When only a sub-agent's own children are still alive";
+/// The lead of the Sessions.md Error Recovery note on `.recover` after a
+/// Ctrl+C.
+const RECOVER_NOTE_LEAD: &str = "> **`.recover` after Ctrl+C.**";
 const SESSION_PATH: &str = "COYOTE_SESSION_PATH";
 /// The lead of the sentence that lists every denied `chat.tools` entry.
 const DENY_LEAD: &str = "Denied in `chat.tools`:";
@@ -1893,6 +1899,14 @@ fn edited_sections(wiki: &Path) -> Vec<(&'static str, String)> {
             paragraph("Hooks.md", &hooks, SESSION_DELETED_LEAD),
         ),
         (
+            "Sessions.md streamed abort paragraph",
+            paragraph("Sessions.md", &sessions, STREAMED_ABORT_LEAD),
+        ),
+        (
+            "Sessions.md .recover after Ctrl+C note",
+            paragraph("Sessions.md", &sessions, RECOVER_NOTE_LEAD),
+        ),
+        (
             "Session-Compression.md # Child sessions",
             section("Session-Compression.md", &compression, CHILD_FOLDS_HEADING),
         ),
@@ -2175,7 +2189,7 @@ fn sessions_child_section_names_the_layout_and_the_lifecycle_rules() {
         "not after every tool round",
         "keeps `running` in its sidecar and reads `crashed` afterwards",
         "`--macro` signals them to cancel as it ends, without waiting for them to record it",
-        "A `--macro` run never exits its session, so the save at exit does not happen for it",
+        "A `--macro` run does not exit its session when it ends, so the save at exit does not happen for it",
         "saves them itself with a `.save session` step",
         "copies as `running` and later reads `crashed` on the fork",
         "always runs its graph",
@@ -2575,7 +2589,9 @@ fn agents_page_quotes_the_spawn_session_id_contract() {
         fn_body(&agents, "fn handle_list_sessions(").contains("\"runs\": meta.runs.len(),"),
         "agent__list_sessions no longer reports the sidecar's run count as `runs`"
     );
-    let runs_cap = format!("the sidecar keeps only the most recent {run_history}");
+    let runs_cap = format!(
+        "the sidecar keeps only the most recent {run_history}, so `runs` stops at {run_history}"
+    );
     let process = src(&["utils", "process.rs"]);
     assert!(
         fn_body(&process, "pub(crate) fn is_alive_or_start_unknown(").contains("self.pid != 0 &&"),
@@ -2627,7 +2643,7 @@ fn agents_page_quotes_the_spawn_session_id_contract() {
         "pid 0 never counts as a live process",
         "a chat child folds its older turns into a summary",
         "at a turn boundary or right after a tool-loop checkpoint",
-        "once per run before retrying a request the model rejected as too long",
+        "once per run before retrying a failed request (the model rejected it as too long, or the safety valve had tripped)",
         "any child is compressed once at resume",
         "[Session Compression](Session-Compression#child-sessions)",
     ];
@@ -2823,10 +2839,29 @@ fn ctrl_c_wording_names_the_session_split() {
     }
     // A request aborted as an error prints a notice only without a session,
     // so in a session only the streamed abort, which returns its partial
-    // text, reaches the "still running" notice.
+    // text, reaches the "still running" notice. Only that error branch
+    // checkpoints the failed turn; the graph route call returns its error
+    // with `?` before it, so it checkpoints nothing.
+    let repl_production = repl
+        .split("\n#[cfg(test)]\nmod tests {")
+        .next()
+        .expect("split yields the text before the test module");
     assert!(
-        repl.contains("if abort_signal.aborted_ctrlc() && ctx.session.is_none() {"),
+        repl_production.contains("if abort_signal.aborted_ctrlc() && ctx.session.is_none() {"),
         "the error branch of the ask loop no longer limits its notice to sessionless turns"
+    );
+    assert_eq!(
+        repl_production
+            .matches("ctx.on_chat_completion_error(app.as_ref(), &input);")
+            .count(),
+        1,
+        "the ask loop checkpoints a failed request at one site"
+    );
+    assert!(
+        repl_production.contains(
+            "match run_graph_turn(ctx, &input, abort_signal.clone(), forced, runner).await? {"
+        ),
+        "the graph route call no longer returns its error before the checkpointing branch"
     );
 
     let Some(wiki) = wiki_dir() else { return };
@@ -2841,13 +2876,20 @@ fn ctrl_c_wording_names_the_session_split() {
         "`Turn interrupted; cancelled N background task(s).`, with N the number of tasks still running at the press",
         "`Turn interrupted; cancelled the background work.` when only a sub-agent's own children were alive",
         "That holds only for a streamed request: when streaming is off",
-        "and no \"still running\" notice prints, although the background tasks keep running",
+        "the turn is checkpointed with the `[Response interrupted due to error]` marker",
+        "during the route call a graph agent makes before the turn, the Ctrl+C ends the turn with the error and nothing is checkpointed",
+        "In both cases no \"still running\" notice prints, although the background tasks keep running",
     ] {
         assert!(
             section.contains(needle),
             "the Sessions.md Ctrl+C section does not say {needle:?}"
         );
     }
+    let recover = flat_unquoted(&paragraph("Sessions.md", &sessions, RECOVER_NOTE_LEAD));
+    assert!(
+        recover.contains("Interrupting a streamed turn with Ctrl+C does not write the `[Response interrupted due to error]` checkpoint"),
+        "the Sessions.md `.recover` after Ctrl+C note does not limit itself to streamed turns: {recover}"
+    );
     let repl_page = read(wiki.join("REPL.md"));
     let bullet = flat(&paragraph("REPL.md", &repl_page, "* **Two-stage Ctrl-C:**"));
     for needle in [
