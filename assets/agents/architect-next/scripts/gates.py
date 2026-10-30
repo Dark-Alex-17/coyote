@@ -1203,11 +1203,12 @@ def _lane_cells(header):
 # ("INCONCLUSIVE (environment)" included); a report without that row is the
 # probe's own output, whose last USAGE_PROBE line is its verdict.
 def _probe_verdict(text):
-    row = _lane_cells(_gauntlet_header(text)).get("probe")
+    header = _gauntlet_header(text)
+    row = _lane_cells(header).get("probe")
     if row:
         m = re.match(r"(PASS|FAIL|INCONCLUSIVE)\b", row[1])
         return m.group(1) if m else ""
-    verdicts = re.findall(r"^USAGE_PROBE:[ \t]*(PASS|FAIL|INCONCLUSIVE)[ \t]*$", text, re.M)
+    verdicts = re.findall(r"^USAGE_PROBE:[ \t]*(PASS|FAIL|INCONCLUSIVE)[ \t]*$", header, re.M)
     return verdicts[-1] if verdicts else ""
 
 

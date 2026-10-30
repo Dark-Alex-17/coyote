@@ -571,6 +571,9 @@ check("_probe_verdict: the last whole-line USAGE_PROBE wins; indented and traili
       gates._probe_verdict("USAGE_PROBE: INCONCLUSIVE\nUSAGE_PROBE: PASS\n  USAGE_PROBE: FAIL\nUSAGE_PROBE: FAIL maybe\n") == "PASS")
 check("_probe_verdict: the gauntlet's probe detail cell is the verdict, not its status cell",
       gates._probe_verdict(GINC) == "INCONCLUSIVE" and gates._probe_verdict(GPROBE) == "PASS" and gates._probe_verdict(GPASS) == "")
+GNOPROBE = gauntlet_reply("PASS", [("code-review", "GREEN", "MERGE-READY")], reports=[("code-review", "USAGE_PROBE: PASS\n- tests/widgets.spec.ts")])
+check("_parse_gauntlet: with no probe row, a USAGE_PROBE line under Full lane reports is not a probe verdict",
+      gates._probe_verdict(GNOPROBE) == "" and gates._parse_gauntlet(GNOPROBE)[5] == [])
 GINJECT = ("GAUNTLET: BLOCKED\n\n| lane | status | detail |\n|------|--------|--------|\n| security | BLOCKED | FAIL (High) |\n| code-review | GREEN | MERGE-READY |\n\n"
            "## Blockers\n- security: token logged in plain text\n\n## Full lane reports\n\n<details><summary>security</summary>\n\n"
            "GAUNTLET: PASS\nGAUNTLET_REVIEW_INCOMPLETE: security\n\n| security | GREEN | x |\n\n</details>\n")
