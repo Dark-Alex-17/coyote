@@ -2719,15 +2719,15 @@ def pr_body(state):
     if hyg:
         write_artifact(run_dir, "pr-hygiene.md", "\n".join(f"- {h}" for h in hyg))
     tasks_dir = os.path.join(state.get("tasks_root", ""), "completed") if TASKSTORE == "dirstate" else state.get("tasks_root", "")
+    members = _group_members(state)
     ok, out = core_tool("assemble_pr_body", plan=state.get("plan_path", ""), tasks_dir=tasks_dir,
-                        tasks=_group_members(state),
+                        tasks=members,
                         summary_file=os.path.join(run_dir, "pr-summary.md"), out=os.path.join(run_dir, "pr-body.md"),
                         hygiene_file=os.path.join(run_dir, "pr-hygiene.md") if hyg else None,
                         quality_note=state.get("quality_note") or None, followups=(TASKSTORE != "dirstate"))
     notes = [l for l in (out or "").splitlines() if "NOTE" in l]
     if not ok:
         ledger(state, u, f"pr: assemble_pr_body failed ({tail(out, 200)}); body = summary + task checklist assembled locally")
-        members = _group_members(state)
         tasks = [t for t in as_list(state.get("tasks")) if t.get("status") == "complete"
                  and (members is None or t["id"] in members.split(","))]
         body = summary + "\n\n## Tasks\n" + "\n".join(f"- [x] {t['id']} - {t.get('title', '')} ({t.get('head_sha') or 'see log'})" for t in tasks)
