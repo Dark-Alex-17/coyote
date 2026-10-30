@@ -3359,7 +3359,7 @@ fn dangling_section_links(label: &str, text: &str, anchors: &[(&str, Vec<String>
 }
 
 /// The block from the line starting `**Which setup?**` through the first following line
-/// ending `the loopback hop.`, inclusive.
+/// ending `reached through the local rnsd.`, inclusive.
 fn decision_tree(label: &str, page: &str) -> String {
     let lines: Vec<&str> = page.lines().collect();
     let start = lines
@@ -3368,9 +3368,11 @@ fn decision_tree(label: &str, page: &str) -> String {
         .unwrap_or_else(|| panic!("{label} has no `**Which setup?**` line"));
     let end = lines[start..]
         .iter()
-        .position(|line| line.ends_with("the loopback hop."))
+        .position(|line| line.ends_with("reached through the local rnsd."))
         .map(|offset| start + offset)
-        .unwrap_or_else(|| panic!("{label}'s decision tree does not end with `the loopback hop.`"));
+        .unwrap_or_else(|| {
+            panic!("{label}'s decision tree does not end with `reached through the local rnsd.`")
+        });
     lines[start..=end].join("\n")
 }
 
@@ -3643,16 +3645,16 @@ fn the_relay_restart_idle_lines_are_the_nodes_own_wording_and_the_floor_is_five_
     }
 }
 
-/// The decision tree, from `**Which setup?**` through `the loopback hop.`, is one text on
-/// the Mesh and Deployment pages.
+/// The decision tree, from `**Which setup?**` through `reached through the local rnsd.`,
+/// is one text on the Mesh and Deployment pages.
 #[test]
 fn the_decision_tree_is_byte_identical_on_the_mesh_and_deployment_pages() {
     let Some(wiki) = wiki_dir() else { return };
-    let fixture = "intro\n**Which setup?** lead\n1. one\n\nreached through\nthe loopback hop.\nAll of it is elsewhere.\n";
+    let fixture = "intro\n**Which setup?** lead\n1. one\n\nconfigured in rnsd and\nreached through the local rnsd.\nAll of it is elsewhere.\n";
     assert_eq!(
         decision_tree("fixture", fixture),
-        "**Which setup?** lead\n1. one\n\nreached through\nthe loopback hop.",
-        "decision_tree does not stop at the first `the loopback hop.` line"
+        "**Which setup?** lead\n1. one\n\nconfigured in rnsd and\nreached through the local rnsd.",
+        "decision_tree does not stop at the first `reached through the local rnsd.` line"
     );
     let mesh = decision_tree("Mesh.md", &read(wiki.join("Mesh.md")));
     let deployment = decision_tree("Mesh-Deployment.md", &read(wiki.join("Mesh-Deployment.md")));
@@ -8330,15 +8332,20 @@ fn usage_probe_the_interfaces_twins_say_which_local_key_is_inert_where() {
     fn check(label: &str, text: &str) {
         let block = interfaces_block(label, text);
         let entry = |key: &str| {
-            comment_text(&commented_entry(
-                label,
-                &block,
-                &format!("`#   {key}` line"),
-                |line| line.trim_start().starts_with(&format!("#   {key}")),
-            ))
+            block
+                .lines()
+                .find(|line| line.trim_start().starts_with(&format!("#   {key}")))
+                .unwrap_or_else(|| panic!("{label}'s `interfaces:` block has no `#   {key}` line"))
+                .trim()
+                .to_string()
         };
         let port = entry("port: 37428");
         let instance = entry("instance: default");
+        assert!(
+            !port.contains("ignored elsewhere")
+                && !instance.contains("ignored on Linux and Android"),
+            "{label}'s `port:` and `instance:` comments name the wrong inert platform: {port} / {instance}"
+        );
         assert!(
             port.contains("ignored on Linux and Android"),
             "{label}'s `port:` comment does not say the key is ignored on Linux and Android: {port}"
@@ -8381,21 +8388,32 @@ fn usage_probe_the_interfaces_twins_say_which_local_key_is_inert_where() {
     );
 
     let Some(wiki) = wiki_dir() else { return };
-    check(
-        "Mesh-Configuration.md",
-        &read(wiki.join("Mesh-Configuration.md")),
+    let configuration = read(wiki.join("Mesh-Configuration.md"));
+    check("Mesh-Configuration.md", &configuration);
+    let row = configuration
+        .lines()
+        .find(|line| line.starts_with("| `interfaces` "))
+        .expect("Mesh-Configuration.md's key table has an `interfaces` row");
+    let cells: Vec<&str> = row.split(" | ").map(str::trim).collect();
+    assert!(
+        cells
+            .get(3)
+            .is_some_and(|shapes| shapes.starts_with("`{type: local, port?, instance?}`")),
+        "Mesh-Configuration.md's `interfaces` row does not name `{{type: local, port?, instance?}}` first in its shapes cell: {row}"
     );
 }
 
 /// A first-time reader of `Mesh-Deployment.md` climbs rung 1 and the two-laptop walk
 /// as a client of the host rnsd: the rung is headed `Coyote is a client of your rnsd`,
-/// its `reach` row is the one `reach_line` prints for a local rnsd, it keeps the daemon's
-/// 4242 listener for other hosts and says sessions on this host do not use it; the
-/// two-laptop walk says it is stage 1 of the mesh test plan and now runs through
-/// `type: local` with no `private` entry at 4242, its yaml block is the `local` entry
-/// under `enabled: true`, and its `Mesh is on for this session.` block is
-/// `render_on_summary`'s shape with `local rnsd at 127.0.0.1:37428` on the
-/// `interfaces:` row. The source-side checks run on every run.
+/// its label and `reach` row are the ones `reach_line` prints for a local rnsd, with the
+/// `@rns/default` form Linux and Android show, and it says the 4242 listener is on
+/// loopback, that sessions on this host do not need it, and that other hosts need a
+/// reachable `listen_ip`; the two-laptop walk says it is stage 1 of the mesh test plan,
+/// that both sessions attach over the shared instance with no `private` entry at 4242,
+/// its yaml block is the `local` entry under `enabled: true`, its
+/// `Mesh is on for this session.` block is `render_on_summary`'s shape with
+/// `local rnsd at 127.0.0.1:37428` on the `interfaces:` row, and the prose after it
+/// gives the `@rns/default` form. The source-side checks run on every run.
 #[test]
 fn usage_probe_the_deployment_page_rung_one_and_the_two_laptop_walk_run_through_type_local() {
     let summary = string_literals(&fn_body("src/repl/mesh.rs", "render_on_summary"))
@@ -8425,8 +8443,11 @@ fn usage_probe_the_deployment_page_rung_one_and_the_two_laptop_walk_run_through_
     let rung = flat(&section("Mesh-Deployment.md", &page, rung_heading));
     for needle in [
         "`local` makes Coyote a shared-instance client of the host's own `rnsd`",
+        "the shipped `local rnsd at 127.0.0.1:37428` (on Linux and Android the abstract socket, `local rnsd at @rns/default`) is that daemon.",
         &format!("the `reach` row of `.mesh info` reads `{reach}`"),
-        "The daemon's own 4242 listener stays for other hosts that dial this one as their relay; sessions on this host do not use it.",
+        &format!("reads `{reach}` (`@rns/default` in place of the address on Linux and Android)."),
+        "The daemon keeps its 4242 listener on loopback for a `type: private` session on this host; sessions on this host do not need it.",
+        "For other hosts to use this one as their relay, set its `listen_ip` to an address they can reach and firewall the port (see [Mesh Platform Support](Mesh-Platform-Support)).",
     ] {
         assert!(
             rung.contains(needle),
@@ -8437,14 +8458,18 @@ fn usage_probe_the_deployment_page_rung_one_and_the_two_laptop_walk_run_through_
         !rung.contains("127.0.0.1:4242"),
         "Mesh-Deployment.md's rung 1 points sessions on this host at the 4242 listener again:\n{rung}"
     );
+    assert!(
+        !rung.contains("other hosts that dial this one as their relay"),
+        "Mesh-Deployment.md's rung 1 says other hosts can dial the loopback-only 4242 listener:\n{rung}"
+    );
 
     let walk = section("Mesh-Deployment.md", &page, "## Two laptops on one network");
     let prose = flat(&walk);
     for needle in [
-        "This walkthrough is stage 1 of the mesh test plan and now runs through `type: local`",
-        "both sessions attach to their host's rnsd over its shared instance",
-        "no `private` entry pointing at the daemon's 4242 listener is needed",
+        "This walkthrough is stage 1 of the mesh test plan; re-run it after changing `mesh.interfaces`.",
+        "Both sessions attach to their host's rnsd over its shared instance, so no `private` entry pointing at the daemon's 4242 listener is needed.",
         &format!("printing `{autostart}` and then:"),
+        "On Linux and Android the `interfaces:` row reads `local rnsd at @rns/default`, the abstract socket, in place of the address.",
         "`Local rnsd at 127.0.0.1:37428 (type: local) is not reachable`",
     ] {
         assert!(
