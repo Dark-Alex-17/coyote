@@ -156,10 +156,10 @@ variables, the `ARCHITECT_CORE_TOOLS` / `ARCHITECT_GH_*_CMD` tool overrides and 
 repository variables,
 so nothing under this directory or `~/.config/coyote` is touched and no agent session leaks
 in. `audit_graph.py`, `check_session_block.sh` and `mode_matrix.py` need the Go `yq`
-by mikefarah (`yq --version` names it); the wrapper's audit, session-check and poison tests,
-skip when a different `yq` (or none) is on `PATH`. The sweep that
-keeps every bundled agent from naming this candidate lives in
-`tests/candidate_sisyphus_next.rs` and covers both candidate names.
+by mikefarah (`yq --version` names it); the wrapper's audit, session-check and poison tests
+skip when a different `yq` (or none) is on `PATH`. The sweep that keeps every bundled agent
+from naming this candidate lives in `tests/candidate_sisyphus_next.rs` and covers both
+candidate names.
 
 Measured 2026-10-30 after the adjustments above, from a fresh scratch dir: audit
 `PROBLEMS: none`; smoke `349/349 checks passed`; mode matrix `53/53 checks passed`
