@@ -114,6 +114,21 @@ fn without_agent_vars(cmd: &mut Command) {
     }
 }
 
+/// A caller running inside a git hook or a worktree can export repository
+/// variables that would point every scratch-repo git call (direct, or made by
+/// a gate script) at the caller's own repository instead.
+fn without_git_repo_vars(cmd: &mut Command) {
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_COMMON_DIR",
+    ] {
+        cmd.env_remove(key);
+    }
+}
+
 /// A command that runs inside the candidate dir with every path-bearing
 /// variable pointed at the scratch dir and no agent variables inherited.
 fn battery(program: &Path, scratch: &TempDirGuard) -> Command {
@@ -128,6 +143,7 @@ fn battery(program: &Path, scratch: &TempDirGuard) -> Command {
         .env_remove("GRAPH_STATE")
         .env_remove("GRAPH_STATE_FILE");
     without_agent_vars(&mut cmd);
+    without_git_repo_vars(&mut cmd);
     cmd
 }
 
@@ -945,6 +961,7 @@ fn run_lifted_graph(
         .env_remove("GRAPH_STATE_FILE")
         .stdin(std::process::Stdio::null());
     without_agent_vars(&mut cmd);
+    without_git_repo_vars(&mut cmd);
     let output = cmd.output().unwrap();
     let report = transcript(&output);
     assert!(output.status.success(), "{label}: {report}");
@@ -1006,7 +1023,9 @@ fn debt_scan_leg(
             "base",
         ],
     ] {
-        let status = Command::new(&git)
+        let mut cmd = Command::new(&git);
+        without_git_repo_vars(&mut cmd);
+        let status = cmd
             .args(&args)
             .current_dir(&project)
             .env("HOME", dir.join("home"))
@@ -1493,7 +1512,9 @@ fn gauntlet_script(
 ) -> serde_json::Value {
     let python = python3().expect("callers skip without python3");
     let path = agents_dir().join("review-gauntlet/scripts").join(script);
-    let out = Command::new(python)
+    let mut cmd = Command::new(python);
+    without_git_repo_vars(&mut cmd);
+    let out = cmd
         .arg(&path)
         .env("GRAPH_STATE", state.to_string())
         .env("PYTHONDONTWRITEBYTECODE", "1")
@@ -1513,7 +1534,9 @@ fn two_commit_repo(scratch: &TempDirGuard) -> (PathBuf, String, String) {
     let project = scratch.0.join("project");
     fs::create_dir_all(&project).unwrap();
     let run = |args: &[&str]| -> String {
-        let out = Command::new(&git)
+        let mut cmd = Command::new(&git);
+        without_git_repo_vars(&mut cmd);
+        let out = cmd
             .args(args)
             .current_dir(&project)
             .env("HOME", scratch.0.join("home"))
@@ -1870,6 +1893,281 @@ fn build_lock_inputs_census_is_exactly_the_three_recorded_nodes() {
     }
 }
 
+/// The graph-level integer bounds as the staging baseline records them: the
+/// top-level agent limits and every integer under `settings`.
+const FROZEN_GRAPH_BOUNDS: &[(&str, i64)] = &[
+    ("max_agent_depth", 5),
+    ("max_concurrent_agents", 40),
+    ("settings.max_loop_iterations", 100),
+    ("settings.timeout", 0),
+];
+
+/// Every integer field of every node in the staging baseline (`timeout`,
+/// `max_attempts`, `max_iterations`); a node absent here declares none.
+const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
+    ("architecture_review", "max_attempts", 1),
+    ("architecture_review", "timeout", 3600),
+    ("ask_owner_poll", "timeout", 0),
+    ("assess", "max_iterations", 20),
+    ("assess", "timeout", 900),
+    ("bookkeeping_judge", "timeout", 300),
+    ("bookkeeping_scan", "timeout", 60),
+    ("build_gauntlet_prompt", "timeout", 60),
+    ("check_inbox_final", "timeout", 300),
+    ("check_inbox_pre", "timeout", 300),
+    ("ci_apply", "timeout", 120),
+    ("ci_diagnose", "timeout", 600),
+    ("ci_poll", "timeout", 120),
+    ("compose_brief", "timeout", 600),
+    ("consult_navigator", "max_attempts", 1),
+    ("consult_navigator", "timeout", 1800),
+    ("consult_oracle", "max_attempts", 2),
+    ("consult_oracle", "timeout", 1800),
+    ("debt_scan", "timeout", 120),
+    ("diagnose_failure", "max_iterations", 20),
+    ("diagnose_failure", "timeout", 1800),
+    ("explore_slice_solo", "max_attempts", 2),
+    ("explore_slice_solo", "timeout", 1800),
+    ("explore_slice_team", "max_attempts", 2),
+    ("explore_slice_team", "timeout", 1800),
+    ("final_report", "timeout", 60),
+    ("git_ops", "max_iterations", 20),
+    ("git_ops", "timeout", 1800),
+    ("intake", "timeout", 60),
+    ("ladder_judge", "timeout", 300),
+    ("librarian_question", "max_attempts", 2),
+    ("librarian_question", "timeout", 1800),
+    ("observability_gate", "timeout", 60),
+    ("observability_pass", "max_iterations", 20),
+    ("observability_pass", "timeout", 1200),
+    ("oracle_strikeout", "max_attempts", 2),
+    ("oracle_strikeout", "timeout", 1800),
+    ("plan_research", "timeout", 300),
+    ("plan_subtasks", "timeout", 600),
+    ("research_answer", "max_iterations", 45),
+    ("research_answer", "timeout", 3600),
+    ("run_coder", "max_attempts", 1),
+    ("run_coder", "timeout", 0),
+    ("run_gauntlet", "max_attempts", 1),
+    ("run_gauntlet", "timeout", 0),
+    ("run_step", "max_attempts", 1),
+    ("run_step", "timeout", 0),
+    ("run_whetstone", "max_attempts", 1),
+    ("run_whetstone", "timeout", 3600),
+    ("send_breach_notice", "timeout", 300),
+    ("strikeout", "timeout", 60),
+    ("summarize_run", "timeout", 300),
+    ("synthesize_context", "max_iterations", 20),
+    ("synthesize_context", "timeout", 900),
+    ("triage_findings", "max_iterations", 10),
+    ("triage_findings", "timeout", 900),
+];
+
+/// The integer counters and indices `initial_state` seeds, all at zero; the
+/// round counters among them are what the `_lib.py` bounds are checked on.
+const FROZEN_COUNTER_SEEDS: &[&str] = &[
+    "ci_fix_strikes",
+    "ci_poll_fails",
+    "ci_polls",
+    "ci_started_at",
+    "clarify_rounds",
+    "debris_reruns",
+    "debt_rounds",
+    "design_ask_rounds",
+    "fix_round",
+    "fix_strikes",
+    "obs_rounds",
+    "owner_polls",
+    "reask_rounds",
+    "rejected_rounds",
+    "review_rounds",
+    "strikeout_rounds",
+    "subtask_index",
+    "task_number",
+];
+
+/// The bound constants in `scripts/_lib.py` the gates route on (the
+/// re-run-once family covers `debris_reruns`), as written in the baseline.
+const FROZEN_SCRIPT_BOUNDS: &[(&str, &str)] = &[
+    ("CI_FLAKE_RERUNS", "2"),
+    ("CI_POLL_FAILS", "3"),
+    ("CI_POLL_SLEEP", "60"),
+    ("CI_WALL_SECS", "14400"),
+    ("CLARIFY_MAX", "STRIKE_LIMIT"),
+    ("OWNER_POLL_MAX", "2"),
+    ("OWNER_POLL_MINUTES", "25"),
+    ("OWNER_WAIT_MINUTES", "30"),
+    ("REASK_MAX", "STRIKE_LIMIT"),
+    ("RERUN_ONCE", "1"),
+    ("STRIKE_LIMIT", "3"),
+    ("SUBTASK_MAX", "3"),
+    ("TAIL_CHARS", "6000"),
+];
+
+fn is_constant_name(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_uppercase() || c == '_')
+}
+
+#[test]
+fn graph_and_gate_budgets_equal_the_frozen_baseline() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let shipped: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+
+    let mut graph_bounds = BTreeMap::new();
+    for (key, value) in shipped.as_mapping().unwrap() {
+        if let Some(n) = value.as_i64() {
+            graph_bounds.insert(key.as_str().unwrap().to_string(), n);
+        }
+    }
+    for (key, value) in shipped["settings"].as_mapping().unwrap() {
+        if let Some(n) = value.as_i64() {
+            graph_bounds.insert(format!("settings.{}", key.as_str().unwrap()), n);
+        }
+    }
+    let expected: BTreeMap<String, i64> = FROZEN_GRAPH_BOUNDS
+        .iter()
+        .map(|(k, n)| (k.to_string(), *n))
+        .collect();
+    assert_eq!(
+        graph_bounds, expected,
+        "graph-level bounds moved (left: shipped)"
+    );
+
+    let mut node_bounds = BTreeMap::new();
+    for (id, node) in shipped["nodes"].as_mapping().unwrap() {
+        for (key, value) in node.as_mapping().unwrap() {
+            if let Some(n) = value.as_i64() {
+                let id = id.as_str().unwrap().to_string();
+                node_bounds.insert((id, key.as_str().unwrap().to_string()), n);
+            }
+        }
+    }
+    let expected: BTreeMap<(String, String), i64> = FROZEN_NODE_BOUNDS
+        .iter()
+        .map(|(id, k, n)| ((id.to_string(), k.to_string()), *n))
+        .collect();
+    assert_eq!(node_bounds, expected, "node bounds moved (left: shipped)");
+
+    let mut seeds = BTreeMap::new();
+    for (key, value) in shipped["initial_state"].as_mapping().unwrap() {
+        if let Some(n) = value.as_i64() {
+            seeds.insert(key.as_str().unwrap().to_string(), n);
+        }
+    }
+    let expected: BTreeMap<String, i64> = FROZEN_COUNTER_SEEDS
+        .iter()
+        .map(|k| (k.to_string(), 0))
+        .collect();
+    assert_eq!(
+        seeds, expected,
+        "initial_state counter seeds moved (left: shipped)"
+    );
+
+    let lib = fs::read_to_string(candidate_dir().join("scripts/_lib.py")).unwrap();
+    let mut script_bounds = BTreeMap::new();
+    for line in lib.lines() {
+        let Some((name, rest)) = line.split_once(" = ") else {
+            continue;
+        };
+        let value = rest.split('#').next().unwrap().trim();
+        if is_constant_name(name) && (value.parse::<i64>().is_ok() || is_constant_name(value)) {
+            let previous = script_bounds.insert(name.to_string(), value.to_string());
+            assert!(previous.is_none(), "{name} is assigned twice in _lib.py");
+        }
+    }
+    let expected: BTreeMap<String, String> = FROZEN_SCRIPT_BOUNDS
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    assert_eq!(
+        script_bounds, expected,
+        "_lib.py bounds moved (left: shipped)"
+    );
+}
+
+/// How each llm node's output schema carries the `anomalies` channel in the
+/// staging baseline: `Plain` and `Described` are the two property shapes,
+/// `NoSchema` is a node with no `output_schema` at all.
+#[derive(Clone, Copy, Debug)]
+enum AnomaliesChannel {
+    Plain,
+    Described,
+    NoSchema,
+}
+
+const FROZEN_LLM_ANOMALIES: &[(&str, AnomaliesChannel)] = &[
+    ("assess", AnomaliesChannel::Plain),
+    ("bookkeeping_judge", AnomaliesChannel::Plain),
+    ("check_inbox_final", AnomaliesChannel::Described),
+    ("check_inbox_pre", AnomaliesChannel::Described),
+    ("ci_diagnose", AnomaliesChannel::Plain),
+    ("compose_brief", AnomaliesChannel::Plain),
+    ("diagnose_failure", AnomaliesChannel::Plain),
+    ("git_ops", AnomaliesChannel::NoSchema),
+    ("ladder_judge", AnomaliesChannel::Plain),
+    ("observability_pass", AnomaliesChannel::Plain),
+    ("plan_research", AnomaliesChannel::Plain),
+    ("plan_subtasks", AnomaliesChannel::Plain),
+    ("research_answer", AnomaliesChannel::NoSchema),
+    ("send_breach_notice", AnomaliesChannel::NoSchema),
+    ("summarize_run", AnomaliesChannel::NoSchema),
+    ("synthesize_context", AnomaliesChannel::Plain),
+    ("triage_findings", AnomaliesChannel::Plain),
+];
+
+#[test]
+fn every_llm_node_keeps_the_frozen_anomalies_channel() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let shipped: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let expected: BTreeMap<&str, AnomaliesChannel> = FROZEN_LLM_ANOMALIES.iter().copied().collect();
+    let mut llm_ids = BTreeSet::new();
+    for (id, node) in shipped["nodes"].as_mapping().unwrap() {
+        if node["type"].as_str() != Some("llm") {
+            continue;
+        }
+        let id = id.as_str().unwrap();
+        llm_ids.insert(id);
+        let Some(channel) = expected.get(id) else {
+            continue;
+        };
+        let schema = node.get("output_schema");
+        let want = match channel {
+            AnomaliesChannel::NoSchema => {
+                assert!(schema.is_none(), "{id} gained an output_schema: {schema:?}");
+                continue;
+            }
+            AnomaliesChannel::Plain => json!({"type": "array", "items": {"type": "string"}}),
+            AnomaliesChannel::Described => json!({
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional (A10): observations outside this node's scope; empty is the normal case.",
+            }),
+        };
+        let schema = schema.unwrap_or_else(|| panic!("{id} lost its output_schema"));
+        let actual = serde_json::to_value(&schema["properties"]["anomalies"]).unwrap();
+        assert_eq!(actual, want, "{id}: the anomalies property changed shape");
+        let required = serde_json::to_value(&schema["required"]).unwrap();
+        assert!(
+            !required
+                .as_array()
+                .is_some_and(|r| r.iter().any(|v| v == "anomalies")),
+            "{id}: anomalies became required: {required}"
+        );
+    }
+    let expected_ids: BTreeSet<&str> = expected.keys().copied().collect();
+    assert_eq!(
+        llm_ids, expected_ids,
+        "the llm node set changed (left: shipped)"
+    );
+    assert!(
+        shipped["nodes"]["git_ops"]["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("add a line starting exactly \"ANOMALY: \" to your\nreport"),
+        "git_ops lost the ANOMALY: line protocol ci_gate harvests"
+    );
+}
+
 /// Applies a gate's update dict to the state the way the engine does: every
 /// key is merged, the `_next` routing key is dropped.
 fn merge_updates(state: &mut serde_json::Value, updates: &serde_json::Value) {
@@ -1884,7 +2182,9 @@ fn merge_updates(state: &mut serde_json::Value, updates: &serde_json::Value) {
 fn git_commit_all(project: &Path, home: &Path, message: &str) -> String {
     let git = which::which("git").expect("callers skip without git");
     let run = |args: &[&str]| -> String {
-        let out = Command::new(&git)
+        let mut cmd = Command::new(&git);
+        without_git_repo_vars(&mut cmd);
+        let out = cmd
             .args([
                 "-c",
                 "user.name=probe",
@@ -1961,7 +2261,9 @@ fn a_real_gauntlet_reply_round_trips_from_parser_to_narrowed_re_review() {
     let project = scratch.0.join("project");
     fs::create_dir_all(project.join("src")).unwrap();
     let git = which::which("git").unwrap();
-    let init = Command::new(&git)
+    let mut cmd = Command::new(&git);
+    without_git_repo_vars(&mut cmd);
+    let init = cmd
         .args(["init", "-q"])
         .current_dir(&project)
         .env("HOME", &home)
@@ -2452,7 +2754,9 @@ fn cold_round_one(scratch: &TempDirGuard) -> (PathBuf, PathBuf, String, serde_js
     let project = scratch.0.join("project");
     fs::create_dir_all(project.join("src")).unwrap();
     let git = which::which("git").unwrap();
-    let init = Command::new(&git)
+    let mut cmd = Command::new(&git);
+    without_git_repo_vars(&mut cmd);
+    let init = cmd
         .args(["init", "-q"])
         .current_dir(&project)
         .env("HOME", &home)
@@ -2969,13 +3273,17 @@ fn children_without_a_build_lock_declaration_never_consume_it() {
         .lines()
         .find(|l| l.starts_with("| `build_lock` threading |"))
         .expect("README has a build_lock threading row");
-    assert!(
-        row.contains(
-            "Those six declare no `build_lock` and do not consume it themselves: the inherited \
-             value reaches them, but nothing in them runs a build under it"
-        ),
-        "the threading row no longer says the undeclared children do not consume build_lock: {row}"
-    );
+    for clause in [
+        "a child that declares no `build_lock` does not consume it",
+        "Those six declare no `build_lock` and do not consume it themselves: the inherited \
+         value reaches them, but nothing in them runs a build under it",
+    ] {
+        assert!(
+            row.contains(clause),
+            "the threading row no longer says the undeclared children do not consume \
+             build_lock ({clause:?}): {row}"
+        );
+    }
     for agent in expected {
         assert!(row.contains(agent), "{agent} missing from: {row}");
     }
@@ -2984,7 +3292,8 @@ fn children_without_a_build_lock_declaration_never_consume_it() {
 /// The README's gauntlet grammar row claims only what the parser
 /// guarantees: look-alike section headings and debris lines in the lane
 /// reasons are covered, while the header boundary itself is left to the
-/// producer writing every model-written item on one line.
+/// producer, whose obligation is to write every model-written item on one
+/// line.
 #[test]
 fn readme_grammar_row_scopes_the_look_alike_guarantee_to_the_parsed_sections() {
     let readme = fs::read_to_string(candidate_dir().join("README.md")).unwrap();
@@ -2998,13 +3307,18 @@ fn readme_grammar_row_scopes_the_look_alike_guarantee_to_the_parsed_sections() {
          the real list",
         "The parser guarantees that much and no more: a look-alike `## Full lane reports` or \
          `<details>` line in the lane reasons would still end the header early, so the header \
-         boundary is guaranteed by the producer, which writes every model-written item on one line",
+         boundary is the producer's responsibility: every model-written item must be written on \
+         one line",
     ] {
         assert!(row.contains(clause), "missing {clause:?} in: {row}");
     }
     assert!(
         !row.contains("so a look-alike in the lane reasons adds no phantom blocker"),
         "the unscoped claim is back: {row}"
+    );
+    assert!(
+        !row.contains("guaranteed by the producer"),
+        "the row describes the producer's one-line obligation as current behaviour: {row}"
     );
 }
 
