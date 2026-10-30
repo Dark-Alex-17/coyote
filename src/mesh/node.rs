@@ -2561,8 +2561,8 @@ impl DiscoveredThrottle {
 
 /// Where a heard announce goes: the peer table, the trust list's sightings, and
 /// `mesh.peer.discovered`, trusted or not, compatible or not, as far as the throttle
-/// lets it through. An announce that answers this node's own path request goes to the
-/// peer table's route facts only.
+/// lets it through. An announce the peer sent as a path response goes to the peer table's
+/// route facts only.
 struct AnnounceFiler<'a> {
     peers: &'a PeerTable,
     trust: &'a TrustStore,
@@ -2571,7 +2571,12 @@ struct AnnounceFiler<'a> {
 }
 
 impl AnnounceFiler<'_> {
-    fn file(
+    /// Files an announce the peer sent as a path response. Keyed on the announced
+    /// destination, never on the identity: a path response says where the peer is, not
+    /// that it is there, so for a known row it moves no sighting time and fires no
+    /// discovery. A rotated key is still a rotated key. A destination without a row files
+    /// as a first sighting through `file`.
+    fn file_path_response(
         &mut self,
         destination_hash: String,
         identity_hash: String,
@@ -2580,12 +2585,7 @@ impl AnnounceFiler<'_> {
         hops: u8,
         now: SystemTime,
     ) -> Option<PeerChange> {
-        // Keyed on the destination this node asked about, never on the identity: a path
-        // response says where the peer is, not that it is there, so it moves no sighting
-        // time and fires no discovery. A rotated key is still a rotated key.
-        if self.peers.get(&destination_hash).is_some()
-            && self.peers.take_path_request(&destination_hash, now)
-        {
+        if self.peers.get(&destination_hash).is_some() {
             let decoded = decode_announce(&destination_hash, app_data, hops)?;
             let refreshed = self.peers.refresh_route(PeerSighting {
                 destination_hash: destination_hash.clone(),
@@ -2606,6 +2606,25 @@ impl AnnounceFiler<'_> {
                 return Some(PeerChange::Refreshed);
             }
         }
+        self.file(
+            destination_hash,
+            identity_hash,
+            name_hash,
+            app_data,
+            hops,
+            now,
+        )
+    }
+
+    fn file(
+        &mut self,
+        destination_hash: String,
+        identity_hash: String,
+        name_hash: String,
+        app_data: &[u8],
+        hops: u8,
+        now: SystemTime,
+    ) -> Option<PeerChange> {
         let filed = record_announce(
             self.peers,
             destination_hash.clone(),
@@ -2738,14 +2757,29 @@ async fn receive_announces(
         if propagation_nodes.observe_announce(&desc, event.app_data.as_slice(), event.hops, now) {
             continue;
         }
-        filer.file(
-            desc.address_hash.to_hex_string(),
-            desc.identity.address_hash.to_hex_string(),
-            hex_lower(&event.name_hash),
-            event.app_data.as_slice(),
-            event.hops,
-            now,
-        );
+        let destination_hash = desc.address_hash.to_hex_string();
+        let identity_hash = desc.identity.address_hash.to_hex_string();
+        let name_hash = hex_lower(&event.name_hash);
+        let app_data = event.app_data.as_slice();
+        if event.is_path_response {
+            filer.file_path_response(
+                destination_hash,
+                identity_hash,
+                name_hash,
+                app_data,
+                event.hops,
+                now,
+            );
+        } else {
+            filer.file(
+                destination_hash,
+                identity_hash,
+                name_hash,
+                app_data,
+                event.hops,
+                now,
+            );
+        }
     }
 }
 
@@ -10366,12 +10400,11 @@ mod tests {
         );
     }
 
-    /// An announce that answers this node's own path request says where a known peer is,
-    /// not that it is alive: the row's route facts follow it, its `last_seen` and the
-    /// trust list's sighting do not, and no discovery fires. The mark is spent by one
-    /// announce and ignored once the request has timed out, a destination without a row
-    /// files as a first sighting whatever marks exist, and a rotated key seen in a path
-    /// response is still noted.
+    /// An announce the peer sent as a path response says where a known peer is, not that
+    /// it is alive: the row's route facts follow it, its `last_seen` and the trust list's
+    /// sighting do not, and no discovery fires. A plain announce after it is a sighting
+    /// again, a destination without a row files as a first sighting even from a path
+    /// response, and a rotated key seen in a path response is still noted.
     #[test]
     fn a_path_response_for_a_known_row_refreshes_its_route_but_not_its_liveness() {
         // Past the trust list's own `last_seen_at`, so the sighting overlay is what is read.
@@ -10431,15 +10464,14 @@ mod tests {
         one_fire(&sink, HookEvent::MeshPeerDiscovered);
         assert_eq!(trust_seen(&a_destination), heard_at);
 
-        let asked_at = at(2_100);
-        peers.note_path_request(&a_destination, asked_at);
-        let change = filer.file(
+        let responded_at = at(2_100);
+        let change = filer.file_path_response(
             a_destination.clone(),
             a_hex.clone(),
             name_hex.clone(),
             &app_data("Ada"),
             4,
-            asked_at + Duration::from_secs(1),
+            responded_at,
         );
         assert_eq!(change, Some(PeerChange::Refreshed));
         let row = peers.get(&a_destination).unwrap();
@@ -10465,7 +10497,7 @@ mod tests {
         assert_eq!(
             peers.get(&a_destination).unwrap().last_seen,
             announced_at,
-            "the mark was spent; the peer's own announce is a sighting again"
+            "the peer's own announce is a sighting again"
         );
         assert_eq!(trust_seen(&a_destination), announced_at);
         let envs = one_fire(&sink, HookEvent::MeshPeerDiscovered);
@@ -10473,23 +10505,6 @@ mod tests {
             env_value(&envs, "COYOTE_MESH_HOPS"),
             Some("4"),
             "the hop count the path response brought is first announced by the peer itself"
-        );
-
-        let stale_request_at = at(2_300);
-        let after_timeout = stale_request_at + PATH_REQUEST_TIMEOUT + Duration::from_secs(2);
-        peers.note_path_request(&a_destination, stale_request_at);
-        filer.file(
-            a_destination.clone(),
-            a_hex.clone(),
-            name_hex.clone(),
-            &app_data("Ada"),
-            4,
-            after_timeout,
-        );
-        assert_eq!(
-            peers.get(&a_destination).unwrap().last_seen,
-            after_timeout,
-            "a mark older than the request timeout no longer claims the announce"
         );
 
         // The same instance under another key, in a row the trust list was never told
@@ -10506,8 +10521,7 @@ mod tests {
             heard_at,
         );
         let rotated_at = at(2_400);
-        peers.note_path_request(&b_destination, rotated_at);
-        let change = filer.file(
+        let change = filer.file_path_response(
             b_destination.clone(),
             b_hex.clone(),
             name_hex.clone(),
@@ -10530,8 +10544,7 @@ mod tests {
             })
         );
 
-        peers.note_path_request(&c_destination, rotated_at);
-        let change = filer.file(
+        let change = filer.file_path_response(
             c_destination.clone(),
             c_hex,
             name_hex,
@@ -10542,7 +10555,7 @@ mod tests {
         assert_eq!(
             change,
             Some(PeerChange::Added),
-            "a destination without a row is a first sighting, marked or not"
+            "a destination without a row is a first sighting, path response or not"
         );
         let envs = one_fire(&sink, HookEvent::MeshPeerDiscovered);
         assert_eq!(
@@ -11109,9 +11122,8 @@ mod tests {
     /// route to A. Resolving A asks the network once: the relay answers from its path
     /// table well inside `PATH_REQUEST_TIMEOUT`, the description comes back, and the
     /// answer is filed as a route, not a sighting: A's row keeps its `last_seen`, the
-    /// trust list keeps its sighting time, no `mesh.peer.discovered` fires on B, and the
-    /// mark is spent. A second resolve, with the identity now held, neither waits nor
-    /// marks.
+    /// trust list keeps its sighting time, and no `mesh.peer.discovered` fires on B. A
+    /// second resolve, with the identity now held, does not wait.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resolving_a_peer_known_only_from_the_persisted_table_asks_for_a_path_and_files_the_answer_as_a_route()
@@ -11210,12 +11222,8 @@ mod tests {
             !fired.contains(&HookEvent::MeshPeerDiscovered),
             "no discovery fires for the answer to this node's own request: {fired:?}"
         );
-        assert!(
-            !peers_b.take_path_request(&to_a, SystemTime::now()),
-            "the mark was spent by the answer"
-        );
 
-        // With the identity held, resolving again is immediate and leaves no mark behind.
+        // With the identity held, resolving again is immediate.
         let again = Instant::now();
         assert!(b.runtime.resolve_destination(&to_a).await.is_some());
         assert!(
@@ -11223,7 +11231,6 @@ mod tests {
             "a held identity is not asked for: {:?}",
             again.elapsed()
         );
-        assert!(!peers_b.take_path_request(&to_a, SystemTime::now()));
 
         // The route works: a message goes over a link without A ever re-announcing.
         let message =
@@ -11243,9 +11250,8 @@ mod tests {
     }
 
     /// The peer table is no gate on resolving: a destination the transport does not hold
-    /// is asked for once, row or no row, and the mark is set before asking. The cached
-    /// twin a listing uses returns `None` at once for either, without a mark, so a sweep
-    /// over silent peers never pays the path-request wait.
+    /// is asked for once, row or no row. The cached twin a listing uses returns `None` at
+    /// once for either, so a sweep over silent peers never pays the path-request wait.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_destination_the_transport_lacks_is_asked_for_once_and_the_cached_resolve_never_asks()
@@ -11270,20 +11276,12 @@ mod tests {
             "the cached resolve of a destination without a row does not wait: {:?}",
             asked.elapsed()
         );
-        assert!(
-            !peers.take_path_request(&stranger, SystemTime::now()),
-            "the cached resolve sets no mark for a destination without a row"
-        );
         let asked = Instant::now();
         assert!(runtime.resolve_destination(&stranger).await.is_none());
         assert!(
             asked.elapsed() >= PATH_REQUEST_TIMEOUT,
             "a destination without a row is still asked for: {:?}",
             asked.elapsed()
-        );
-        assert!(
-            peers.take_path_request(&stranger, SystemTime::now()),
-            "the waiting resolve marked the destination without a row before asking"
         );
 
         let silent = derived_sighting("node-resolve-no-ask-silent", Some("Sol"));
@@ -11301,13 +11299,8 @@ mod tests {
             "the cached resolve does not wait: {:?}",
             asked.elapsed()
         );
-        assert!(
-            !peers.take_path_request(&silent_destination, SystemTime::now()),
-            "the cached resolve sets no mark"
-        );
 
-        // The waiting resolve on the same row does mark, and the mark survives its
-        // unanswered request for one timeout more, so a late answer is still not a sighting.
+        // The waiting resolve on the same row does ask.
         let asked = Instant::now();
         assert!(
             runtime
@@ -11316,10 +11309,6 @@ mod tests {
                 .is_none()
         );
         assert!(asked.elapsed() >= PATH_REQUEST_TIMEOUT);
-        assert!(
-            peers.take_path_request(&silent_destination, SystemTime::now()),
-            "the waiting resolve marked the destination before asking"
-        );
 
         let slot = Arc::new(MeshSlot::default());
         slot.install(runtime.clone()).unwrap();
@@ -11328,8 +11317,8 @@ mod tests {
     }
 
     /// The description is the transport's, not the peer table's: a peer whose row the
-    /// sweep has aged out still resolves, at once and without a mark, for as long as the
-    /// transport holds what its announce taught.
+    /// sweep has aged out still resolves, at once, for as long as the transport holds what
+    /// its announce taught.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_peer_whose_row_was_swept_still_resolves_through_the_transport() {
@@ -11360,7 +11349,6 @@ mod tests {
             again.name.as_name_hash_slice(),
             desc.name.as_name_hash_slice()
         );
-        assert!(!peers.take_path_request(&to, SystemTime::now()));
 
         let slot = Arc::new(MeshSlot::default());
         slot.install(runtime.clone()).unwrap();
@@ -12891,7 +12879,6 @@ mod tests {
             desc.name.as_name_hash_slice()
         );
         assert_eq!(upper.address_hash, desc.address_hash);
-        assert!(!peers.take_path_request(&to, SystemTime::now()));
 
         let slot = Arc::new(MeshSlot::default());
         slot.install(runtime.clone()).unwrap();

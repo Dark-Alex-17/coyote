@@ -1920,9 +1920,7 @@ impl MeshRuntime {
     /// filled from the peer's announce or a restored path table, with `name` the announce's
     /// truncated name hash. The peer table is not consulted. A destination the transport
     /// does not hold is asked for once over the network, and the answer is waited for up
-    /// to `PATH_REQUEST_TIMEOUT`; the mark set first lets the announce filer tell that
-    /// answer from the peer announcing on its own. `None` when the transport still holds
-    /// nothing after that.
+    /// to `PATH_REQUEST_TIMEOUT`. `None` when the transport still holds nothing after that.
     pub(crate) async fn resolve_destination(
         &self,
         destination_hex: &str,
@@ -1937,8 +1935,6 @@ impl MeshRuntime {
             "Mesh has no route to {}; asking the network for one",
             short(&destination)
         );
-        self.peers()
-            .note_path_request(&destination, SystemTime::now());
         transport
             .await_path(&address_hash, PATH_REQUEST_TIMEOUT, None)
             .await;

@@ -1,6 +1,4 @@
-use crate::mesh::announce::{
-    HEARTBEAT_PERIOD_SECS, PATH_REQUEST_TIMEOUT, PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT,
-};
+use crate::mesh::announce::{HEARTBEAT_PERIOD_SECS, PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT};
 use crate::mesh::protocol::Compatibility;
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_cause, version_refusal};
 use crate::mesh::trust::{InstancePresence, PresenceRow};
@@ -10,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use log::warn;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,11 +28,6 @@ pub(crate) const PEER_TTL: Duration =
 pub(crate) const PEER_STALE_AFTER: Duration = Duration::from_secs(2 * HEARTBEAT_PERIOD_SECS);
 
 pub(crate) const PEER_TABLE_VERSION: u64 = 2;
-
-/// A path-request mark older than this no longer claims the next announce: the request
-/// has timed out and been reported, so what arrives after is the peer speaking for itself.
-pub(crate) const PATH_REQUEST_MARK_TTL: Duration =
-    Duration::from_secs(PATH_REQUEST_TIMEOUT.as_secs() + 1);
 
 /// `peers.json` whole: the version first, then the peers. Rejects unknown fields, as does
 /// each `PeerRecord`, so any change to the layout bumps `PEER_TABLE_VERSION`.
@@ -154,11 +147,6 @@ pub(crate) struct PeerTable {
     inner: Mutex<BTreeMap<String, PeerRecord>>,
     /// Set by every change since the last write, so a burst of announces costs one write.
     dirty: AtomicBool,
-    /// Destinations this node has asked the network for a route to, and when. An announce
-    /// for a marked destination is the answer to that request, not the peer announcing on
-    /// its own, so it must not pass for liveness. Never persisted: a request outlives
-    /// nothing but its own timeout.
-    path_requests: Mutex<HashMap<String, SystemTime>>,
 }
 
 impl PeerTable {
@@ -206,7 +194,6 @@ impl PeerTable {
             path,
             inner: Mutex::new(inner),
             dirty: AtomicBool::new(false),
-            path_requests: Mutex::new(HashMap::new()),
         })
     }
 
@@ -259,38 +246,6 @@ impl PeerTable {
         record.follow(sighting);
         self.dirty.store(true, Ordering::Release);
         true
-    }
-
-    /// Records that a path request for `destination` went out at `now`. The map is capped
-    /// like the table itself, oldest mark out first, so resolving many silent peers cannot
-    /// grow it without bound.
-    pub(crate) fn note_path_request(&self, destination: &str, now: SystemTime) {
-        let mut requests = self.path_requests.lock();
-        if !requests.contains_key(destination) {
-            if let Some(expired_before) = now.checked_sub(PATH_REQUEST_MARK_TTL) {
-                requests.retain(|_, at| *at > expired_before);
-            }
-            if requests.len() >= PEER_TABLE_MAX_ENTRIES {
-                let oldest = requests
-                    .iter()
-                    .min_by_key(|(_, at)| **at)
-                    .map(|(hash, _)| hash.clone());
-                if let Some(oldest) = oldest {
-                    requests.remove(&oldest);
-                }
-            }
-        }
-        requests.insert(destination.to_string(), now);
-    }
-
-    /// Whether an announce for `destination` arriving at `now` answers a path request this
-    /// node sent. The mark is consumed either way; one request claims one announce. A mark
-    /// in the future (clock stepped back) reads as just made.
-    pub(crate) fn take_path_request(&self, destination: &str, now: SystemTime) -> bool {
-        let Some(at) = self.path_requests.lock().remove(destination) else {
-            return false;
-        };
-        now.duration_since(at).unwrap_or_default() <= PATH_REQUEST_MARK_TTL
     }
 
     /// A peer the table does not know is left unknown; nothing about it is worth
@@ -664,55 +619,6 @@ mod tests {
         assert!(hashes.contains(&"0000".to_string()));
         assert!(hashes.contains(&"newcomer".to_string()));
         assert!(!hashes.contains(&"0001".to_string()));
-    }
-
-    /// One mark claims one announce, a mark older than its TTL claims none, and the map
-    /// is capped like the table, oldest mark out first, with expired marks dropped before
-    /// the cap is weighed.
-    #[test]
-    fn a_path_request_mark_is_spent_once_expires_and_is_capped() {
-        let (table, _tmp) = table("peers-path-request-marks");
-        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
-
-        table.note_path_request("a", t0);
-        assert!(table.take_path_request("a", t0 + PATH_REQUEST_MARK_TTL));
-        assert!(!table.take_path_request("a", t0), "the mark was spent");
-        table.note_path_request("a", t0);
-        assert!(
-            !table.take_path_request("a", t0 + PATH_REQUEST_MARK_TTL + Duration::from_secs(1)),
-            "a mark past its TTL claims nothing"
-        );
-        assert!(
-            !table.take_path_request("a", t0),
-            "an expired mark is still removed"
-        );
-        table.note_path_request("a", t0);
-        assert!(
-            table.take_path_request("a", t0 - Duration::from_secs(60)),
-            "a mark from a clock stepped forward reads as just made"
-        );
-
-        // All within one TTL, so only the cap can evict; the one older mark is the one to go.
-        table.note_path_request("0000", t0 - Duration::from_secs(1));
-        for i in 1..PEER_TABLE_MAX_ENTRIES {
-            table.note_path_request(&format!("{i:04}"), t0);
-        }
-        table.note_path_request("newcomer", t0);
-        assert!(table.take_path_request("newcomer", t0));
-        assert!(
-            !table.take_path_request("0000", t0),
-            "the oldest mark went to make room"
-        );
-        assert!(table.take_path_request("0001", t0));
-
-        let later = t0 + PATH_REQUEST_MARK_TTL + Duration::from_secs(1);
-        table.note_path_request("fresh", later);
-        assert!(
-            !table.take_path_request("0002", later),
-            "every mark past its TTL was dropped when a new one was made"
-        );
-        assert_eq!(table.path_requests.lock().len(), 1);
-        assert!(table.take_path_request("fresh", later));
     }
 
     #[test]
