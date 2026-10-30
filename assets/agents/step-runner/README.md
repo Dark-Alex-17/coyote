@@ -203,6 +203,7 @@ Environment overrides honored by the script nodes:
 - `FORMAT_CMD` / `LINT_CMD` — formatting and linting (otherwise a per-type
   heuristic formats, and linting defers to the build/check command).
 - `BUILD_CMD` / `TEST_CMD` — skip project-type detection (same as coder).
+- The `test_command` graph variable — the test gate runs this instead of the detected command (`TEST_CMD` still wins). Use it for a project whose full suite does not fit the gate's timeout: hand the gate a targeted command and leave the full suite to the review.
   Under a `build_lock` prefix the inner shell sees only exported variables;
   a gate command must not depend on the gate script's own locals.
 - `COYOTE_GATE_OUTPUT_MAX_BYTES` — cap on each gate transcript kept in state
