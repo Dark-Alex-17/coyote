@@ -5,9 +5,8 @@ use super::mcp_tool_policy::{McpToolPolicy, SkillMcpLayer, ToolFilter, expand_mc
 use super::rag_cache::{RagCache, RagKey};
 use super::session::{
     AUTONAME_LABEL_PREFIX, AUTONAME_PLACEHOLDER, CompressionInfo, INTERRUPTED_RESPONSE_TEXT,
-    KeepPolicy, Session, SessionScope, SystemPromptSplit, keep_token_budget,
-    labeled_session_names, merged_session_names, min_reclaim_tokens, session_scope_dirs,
-    valve_limit,
+    KeepPolicy, Session, SessionScope, SystemPromptSplit, keep_token_budget, labeled_session_names,
+    merged_session_names, min_reclaim_tokens, session_scope_dirs, valve_limit,
 };
 use super::skill::{SKILL_SCAFFOLD, Skill};
 use super::skill_policy::SkillPolicy;
@@ -598,10 +597,6 @@ pub struct RequestContext {
     /// under. Resolved once per graph run by `ensure_child_session_root`;
     /// forks and children copy the parent's handle.
     pub(crate) child_session_root: Option<Arc<ChildSessionRoot>>,
-    /// Test seam: where `memory_config` starts workspace memory discovery
-    /// instead of the process cwd.
-    #[cfg(test)]
-    workspace_memory_root: Option<PathBuf>,
 
     pub supervisor: Option<Arc<RwLock<Supervisor>>>,
     pub parent_supervisor: Option<Arc<RwLock<Supervisor>>>,
@@ -684,8 +679,6 @@ impl RequestContext {
             last_graph_branch: None,
             delegate: None,
             child_session_root: None,
-            #[cfg(test)]
-            workspace_memory_root: None,
             supervisor: None,
             parent_supervisor: None,
             self_agent_id: None,
@@ -773,8 +766,6 @@ impl RequestContext {
             last_graph_branch: None,
             delegate: None,
             child_session_root: None,
-            #[cfg(test)]
-            workspace_memory_root: None,
             supervisor: None,
             parent_supervisor: None,
             self_agent_id: None,
@@ -897,8 +888,6 @@ impl RequestContext {
             last_graph_branch: self.last_graph_branch,
             delegate,
             child_session_root: self.child_session_root.clone(),
-            #[cfg(test)]
-            workspace_memory_root: self.workspace_memory_root.clone(),
             supervisor: self.supervisor.clone(),
             parent_supervisor: self.parent_supervisor.clone(),
             self_agent_id: self.self_agent_id.clone(),
@@ -969,8 +958,6 @@ impl RequestContext {
             last_graph_branch: None,
             delegate: None,
             child_session_root: parent.child_session_root.clone(),
-            #[cfg(test)]
-            workspace_memory_root: parent.workspace_memory_root.clone(),
             supervisor: None,
             parent_supervisor: parent.supervisor.clone(),
             self_agent_id: Some(self_agent_id),
@@ -2466,8 +2453,7 @@ impl RequestContext {
             return MemoryConfig::disabled();
         }
 
-        let root = self.workspace_memory_root_or_cwd();
-        let store = root.as_deref().map(MemoryStore::new);
+        let store = env::current_dir().ok().map(|cwd| MemoryStore::new(&cwd));
         let workspace = store.as_ref().and_then(|s| s.workspace.clone());
 
         let global_exists = paths::global_memory_index_file().exists();
@@ -2481,18 +2467,6 @@ impl RequestContext {
             enabled: true,
             workspace,
         }
-    }
-
-    #[cfg(not(test))]
-    fn workspace_memory_root_or_cwd(&self) -> Option<PathBuf> {
-        env::current_dir().ok()
-    }
-
-    #[cfg(test)]
-    fn workspace_memory_root_or_cwd(&self) -> Option<PathBuf> {
-        self.workspace_memory_root
-            .clone()
-            .or_else(|| env::current_dir().ok())
     }
 
     pub fn should_inject_memory(&self) -> bool {
@@ -3251,14 +3225,14 @@ impl RequestContext {
                 super::format_option_value(&app.memory_drill_cap),
             ),
             (
-                "child_sessions",
-                super::format_option_value(&app.child_sessions),
-            ),
-            (
                 "memory_run_state_ttl_days",
                 super::format_option_value(&app.memory_run_state_ttl_days),
             ),
             ("memory_round_chains", app.memory_round_chains.to_string()),
+            (
+                "child_sessions",
+                super::format_option_value(&app.child_sessions),
+            ),
             (
                 "workspace_instructions",
                 super::format_option_value(&app.workspace_instructions),
@@ -8348,9 +8322,9 @@ mod tests {
     /// ancestors may carry a live `.coyote/memory/MEMORY.md`; with the guard
     /// up the walk starts at the guard's own workspace root instead, so no
     /// workspace memory is discovered and the rendered prompt carries no
-    /// `<workspace_index>`. An index planted under that root is what the
-    /// walk then finds (the pin steers discovery rather than switching it
-    /// off), and dropping the guard puts the variable back.
+    /// workspace index lines under `<facts>`. An index planted under that
+    /// root is what the walk then finds (the pin steers discovery rather
+    /// than switching it off), and dropping the guard puts the variable back.
     #[test]
     #[serial]
     fn usage_probe_the_guard_pins_the_workspace_memory_root_and_restores_it_on_drop() {
@@ -8383,8 +8357,10 @@ mod tests {
             );
             let role = ctx.extract_role(&app).unwrap();
             let prompt = role.prompt();
-            assert!(prompt.contains("<global_index>"), "{prompt}");
-            assert!(!prompt.contains("<workspace_index>"), "{prompt}");
+            assert!(
+                prompt.contains("<facts>\n# Memory\n</facts>\n"),
+                "only the global index rides in: {prompt}"
+            );
 
             let index = paths::workspace_memory_dir_for(&guard.workspace_root)
                 .join(crate::config::MEMORY_INDEX_FILE_NAME);
@@ -8403,7 +8379,7 @@ mod tests {
             let role = ctx.extract_role(&app).unwrap();
             let prompt = role.prompt();
             assert!(
-                prompt.contains("<workspace_index>")
+                prompt.contains("# Workspace Memory Index")
                     && prompt.contains("planted under the pinned root"),
                 "{prompt}"
             );
@@ -8760,17 +8736,25 @@ mod tests {
                 .position(|line| line.starts_with("memory "))
                 .unwrap();
             assert!(
-                lines[save_session + 1..memory]
-                    .iter()
-                    .all(|line| line.starts_with("compression_")),
-                "compression rows sit between save_session and memory:\n{info}"
+                lines[save_session + 1..memory].iter().all(|line| [
+                    "compression_",
+                    "system_prompt_",
+                    "memory_facts_truncated"
+                ]
+                .iter()
+                .any(|prefix| line.starts_with(prefix))),
+                "compression and system prompt rows sit between save_session and memory:\n{info}"
             );
             let row = lines
                 .iter()
                 .position(|line| line.trim_start().starts_with("child_sessions"))
                 .unwrap_or_else(|| panic!("child_sessions row missing from:\n{info}"));
+            let round_chains = lines
+                .iter()
+                .position(|line| line.starts_with("memory_round_chains"))
+                .unwrap();
             assert!(
-                row > memory,
+                row > round_chains,
                 "child_sessions sits after the memory rows:\n{info}"
             );
             lines[row].to_string()
@@ -14600,7 +14584,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn forks_and_children_keep_the_workspace_memory_root() {
+    fn forks_and_children_resolve_the_pinned_workspace_memory() {
         let guard = TestConfigDirGuard::new();
         let workspace_index = paths::workspace_memory_index_file_for(&guard.workspace_root);
         create_dir_all(workspace_index.parent().unwrap()).unwrap();
@@ -14610,8 +14594,7 @@ mod tests {
             .map(|w| w.dir);
         assert!(expected_dir.is_some());
 
-        let mut ctx = create_test_ctx();
-        ctx.workspace_memory_root = Some(guard.workspace_root.clone());
+        let ctx = create_test_ctx();
         let fork = ctx.fork_for_branch();
         let child = RequestContext::new_for_child(
             Arc::clone(&ctx.app),
@@ -14622,10 +14605,6 @@ mod tests {
         );
 
         for copy in [&ctx, &fork, &child] {
-            assert_eq!(
-                copy.workspace_memory_root,
-                Some(guard.workspace_root.clone())
-            );
             let config = copy.memory_config();
             assert!(config.enabled);
             assert_eq!(config.workspace.map(|w| w.dir), expected_dir);
@@ -14634,16 +14613,16 @@ mod tests {
 
     #[test]
     #[serial]
-    fn without_a_workspace_memory_root_memory_resolves_from_the_current_dir() {
+    fn without_the_test_pin_memory_resolves_from_the_current_dir() {
         let _guard = TestConfigDirGuard::new();
         write_global_memory_store();
+        let _unpinned = crate::testing::EnvVarGuard::unset(memory::WORKSPACE_MEMORY_ROOT_TEST_ENV);
         let ctx = create_test_ctx();
-        assert_eq!(ctx.workspace_memory_root, None);
 
         let config = ctx.memory_config();
 
         assert!(config.enabled);
-        let expected = MemoryStore::new(&env::current_dir().unwrap()).workspace;
+        let expected = memory::discover_workspace_memory(&env::current_dir().unwrap());
         assert_eq!(config.workspace.map(|w| w.dir), expected.map(|w| w.dir));
     }
 
@@ -19787,7 +19766,6 @@ mod tests {
         let workspace_index = paths::workspace_memory_index_file_for(&guard.workspace_root);
         create_dir_all(workspace_index.parent().unwrap()).unwrap();
         write(workspace_index, "# Workspace Memory\n").unwrap();
-        let workspace_root = Some(guard.workspace_root.clone());
         let deterministic_prompt = |app: &mut AppConfig| {
             app.workspace_instructions = Some(false);
             app.skills_enabled = false;
@@ -19814,7 +19792,6 @@ mod tests {
         let expected_workspace_dir = store.workspace.as_ref().map(|w| w.dir.clone());
 
         let mut ctx = create_test_ctx();
-        ctx.workspace_memory_root = workspace_root.clone();
         ctx.update_app_config(deterministic_prompt);
         let app = ctx.app.config.clone();
         assert!(ctx.agent.is_none());
@@ -19825,7 +19802,6 @@ mod tests {
         assert_eq!(ctx.extract_role(&app).unwrap().prompt(), memory_tail);
 
         let mut ctx = create_test_ctx();
-        ctx.workspace_memory_root = workspace_root.clone();
         ctx.update_app_config(deterministic_prompt);
         let app = ctx.app.config.clone();
         ctx.agent = Some(Agent::test_new(AgentConfig {
@@ -19852,7 +19828,6 @@ mod tests {
             let agent_name = unique_name("test_block_graph_agent");
             write_graph_agent(&agent_name, extra);
             let mut ctx = create_test_ctx();
-            ctx.workspace_memory_root = workspace_root.clone();
             ctx.update_app_config(deterministic_prompt);
             ctx.model = fc_model("agent-model");
             let app = ctx.app.config.clone();
