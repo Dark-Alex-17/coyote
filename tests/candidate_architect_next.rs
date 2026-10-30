@@ -3687,6 +3687,7 @@ fn readme_env_hygiene_and_ledger_rows_match_the_code() {
         "exits `plan not found` without it",
         "In multi-PR mode the group-scoped calls",
         "also pass `--tasks <group members>`",
+        "the members are the closing group's complete tasks",
         "passes no `--tasks` and stays run-scoped",
     ] {
         assert!(
@@ -3726,7 +3727,8 @@ fn readme_env_hygiene_and_ledger_rows_match_the_code() {
 }
 
 /// The README's recorded battery figures are runs of the current batteries,
-/// so they can never sit below the floors the wrapper enforces.
+/// so they can never sit below the floors the wrapper enforces, and the
+/// session check figure is its script's literal closing line.
 #[test]
 fn readme_battery_figures_meet_the_wrapper_floors() {
     let smoke = readme_number(r"smoke `(\d+)/\1 checks passed`");
@@ -3738,5 +3740,15 @@ fn readme_battery_figures_meet_the_wrapper_floors() {
     assert!(
         matrix >= MATRIX_FLOOR,
         "README matrix figure {matrix} < {MATRIX_FLOOR}"
+    );
+    let script =
+        fs::read_to_string(candidate_dir().join("scripts/check_session_block.sh")).unwrap();
+    assert!(
+        script.contains("say ok \"node ids / script paths consistent\""),
+        "check_session_block.sh no longer ends on the line the README records"
+    );
+    assert!(
+        readme().contains("session check last line\n`ok node ids / script paths consistent`"),
+        "README lost the session check's literal last line"
     );
 }
