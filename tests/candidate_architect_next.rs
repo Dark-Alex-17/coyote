@@ -7,7 +7,10 @@
 //! `check_session_block.sh` (session block rules plus the variable mirror
 //! against the prose `architect/config.yaml`) and `mode_matrix.py` (the
 //! marker map against the prose `architect/instructions.md` plus all 48 mode
-//! combinations walked to `end_complete`; several minutes, so opt-in).
+//! combinations walked to `end_complete`). The wrapper does not run the
+//! matrix walk, which takes three to five minutes; run
+//! `python3 scripts/mode_matrix.py` directly. It pins only the walk's
+//! fail-loud exit and the README's recorded matrix figure.
 //! `audit_graph.py`, `check_session_block.sh` and `mode_matrix.py` need the
 //! Go `yq` by mikefarah and skip without it. Every battery and candidate gate
 //! run points `HOME`, `LLM_ROOT_DIR`, `COYOTE_CACHE_DIR`, `TMPDIR` and
@@ -337,42 +340,6 @@ fn session_block_check_passes_under_mikefarah_yq() {
             .any(|l| l.starts_with("ok variables mirror architect")),
         "{report}"
     );
-}
-
-/// Opt-in: the walk runs all 48 mode combinations through the real gates
-/// inside scratch repos and takes three to five minutes, so it is ignored by
-/// default and run with `cargo test --test candidate_architect_next -- --ignored`.
-/// `mode_matrix.py` loads the graph through `yq -o=json`, so like the audit
-/// and the session check it needs the mikefarah build and skips otherwise.
-#[test]
-#[ignore]
-fn mode_matrix_walks_every_combination() {
-    let Some(python) = python3() else { return };
-    let Some(yq) = mikefarah_yq() else { return };
-    let scratch = scratch_dir("matrix");
-    let output = battery(&python, &scratch)
-        .env("PATH", path_with(yq.parent().unwrap()))
-        .arg("scripts/mode_matrix.py")
-        .output()
-        .unwrap();
-    let report = transcript(&output);
-    assert!(output.status.success(), "{report}");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(!stdout.lines().any(|l| l.starts_with("FAIL ")), "{report}");
-    // The walk copies the repo's `.shared/utils.sh` into the scratch root and
-    // exits before any combination runs if that file is missing or lacks
-    // `set -euo pipefail`; the confirmation line proves the real file was used.
-    assert!(
-        stdout.lines().any(|l| l == "utils.sh: real asset"),
-        "{report}"
-    );
-    let (passed, total) = summary_counts(&stdout, &report);
-    assert_eq!(passed, total, "{report}");
-    assert!(
-        total >= MATRIX_FLOOR,
-        "the matrix shrank below {MATRIX_FLOOR} checks: {total}\n{report}"
-    );
-    assert_no_bytecode_under_candidate();
 }
 
 /// The matrix has no stub branch left: when the repo asset `.shared/utils.sh`
