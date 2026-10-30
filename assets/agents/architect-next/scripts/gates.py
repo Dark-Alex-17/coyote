@@ -1287,8 +1287,10 @@ def route_verdict(state):
     ledger(state, u, f"verdict: {unit} round {len(rl)} -> {verdict} lanes={lanes} incomplete={incomplete}")
     real = [b for b in blockers if "PIPELINE-FAULT" not in b and "review incomplete" not in b.lower()]
     # The plan-root phrases are read from the whole reply, lane reports included,
-    # so a PASS that carries one fails closed instead of closing the task.
-    if plan_root and not real:
+    # so a PASS that carries one escalates as a plan defect in every scope
+    # instead of closing the task or reaching batch triage as a finding.
+    plan_root_pass = verdict == "PASS" and plan_root and not real
+    if plan_root_pass:
         real = ["the review names the plan itself as the root cause (see the round report)"]
     if verdict == "PASS" and not real:
         if probe == "PASS" and probe_files and as_int(tr.get("adopt_rounds")) < RERUN_ONCE and scope == "task":
@@ -1313,7 +1315,7 @@ def route_verdict(state):
                              "verdict). Supply/fix the recipe (the plan is amended and re-sealed, then the probe re-runs once), or surface the gap?",
                 [option("Supply the recipe (type it); amend the plan and re-run the probe once"),
                  option("Surface the gap as a follow-up and proceed", recommended=True)], evidence=tail(text, 2000)))
-        if scope == "batch":
+        if scope == "batch" and not plan_root_pass:
             u["gauntlet_blockers"] = real
             u["_next"] = "batch_triage"
             return u
