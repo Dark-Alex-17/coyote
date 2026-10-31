@@ -25,15 +25,18 @@ flowchart TD
     verify_build{"verify_build<br/>script"}
     verify_build -->|pass| verify_tests
     verify_build -->|fail| fix_loop_gate
+    verify_build -->|"timed out"| end_failure
     verify_build -. "script crashed" .-> fix_loop_gate
     verify_tests{"verify_tests<br/>script"}
     verify_tests -->|pass| self_review
     verify_tests -->|fail| fix_loop_gate
+    verify_tests -->|"timed out"| end_failure
     verify_tests -. "script crashed" .-> fix_loop_gate
     fix_loop_gate{"fix_loop_gate<br/>script"}
     fix_loop_gate -->|"budget left"| implement
     fix_loop_gate -->|"budget spent"| end_failure
     fix_loop_gate -->|"gate crashed, 1st time"| verify_build
+    fix_loop_gate -->|"gate hit its node timeout"| end_failure
     self_review["self_review<br/>llm + skills"] --> route_review_result
     self_review -. "review died" .-> self_review_fault
     self_review_fault{"self_review_fault<br/>script"} --> end_success
@@ -69,6 +72,11 @@ End nodes emit one of three sentinel outcomes for the caller:
   the run does not end as `CODER_COMPLETE` on its behalf. The one gate that
   falls toward a human instead is `route_complexity`: a crash there asks for
   plan approval rather than skipping it.
+  A verify gate that ran out of time is not a red run: its
+  `Verification gate error:` starts with `verify_build TIMED OUT` /
+  `verify_tests TIMED OUT` (killed at `build_timeout` / `test_timeout`) or
+  with `TIMED OUT` (killed by the engine at the node timeout), and the run
+  ends at once instead of spending fix attempts on code nothing showed broken.
 
 ## Tuning
 
@@ -84,20 +92,36 @@ coyote -a coder "Add a foo() function..."
 coyote -a coder --agent-variable project_dir /path/to/your/project "Add..."
 ```
 
+A spawned coder whose caller left `project_dir` unset inherits the engine's
+working directory, which may be a different checkout from the one it edits.
+In that case the verify gates run at the root of the git work tree holding
+every absolute file in the plan, provided that tree does not contain the
+working directory; each gate's transcript names the directory on its
+`Ran in:` line. Passing `project_dir` explicitly is still the reliable form.
+
 `graph.yaml` `initial_state` exposes:
 
 - `max_fix_attempts` (default `5`) — fix-loop budget before `end_failure`.
 
 `graph.yaml` `variables` also exposes:
 
+- `test_command` (default empty): the command `verify_tests` runs instead
+  of the detected one, e.g. a targeted `cargo test --test my_suite` when the
+  full suite does not fit the deadline. It takes precedence over `TEST_CMD`.
+- `build_timeout` (default `900`) and `test_timeout` (default `1800`): whole
+  seconds each gate may run before it kills the command's whole process
+  group and ends the run with a `TIMED OUT` gate error rather than a red
+  verdict. `0` disables the deadline. Keep them below the nodes' own
+  timeouts (1800 s build, 3600 s tests); a gate the engine kills there is
+  also reported as `TIMED OUT`, but its children are not reaped.
 - `build_lock` (default empty): command prefix applied to every gate (build
   and tests), e.g. `flock /tmp/coyote-cargo.lock` so parallel agents sharing
   one target directory serialise their gate runs (the coder's own ad-hoc
   cargo calls are not covered). The whole gate command runs under the prefix
-  as one unit. Waiting on the lock counts toward the gate node's timeout
-  (300 s build, 600 s tests), so prefer `flock -w <secs>` or raise those
-  timeouts when runs are long. A gate killed by its timeout while still
-  waiting leaves the lock request queued; `-w` below the node timeout makes
+  as one unit. Waiting on the lock counts toward the gate's deadline
+  (`build_timeout` / `test_timeout`), so prefer `flock -w <secs>` or raise
+  those deadlines when runs are long. A gate killed while still waiting can
+  leave the lock request queued; `-w` below the deadline makes
   it give up instead of running later unobserved. The prefix is a shell
   fragment and is re-parsed: quote paths containing spaces
   (`flock '/tmp/my lock'`); `$VAR` inside it expands when the gate runs.
@@ -113,7 +137,7 @@ Environment overrides honored by the script nodes:
 - `BUILD_CMD` — skip project-type detection for the build/check command.
   Under a `build_lock` prefix the inner shell sees only exported variables;
   a gate command must not depend on the gate script's own locals.
-- `TEST_CMD` — skip detection for tests.
+- `TEST_CMD`: skip detection for tests (the `test_command` variable wins).
 - `COYOTE_GATE_OUTPUT_MAX_BYTES` — cap on each gate transcript kept in state
   (default 64 KiB; keeps the head ¼ and tail ¾, trimming the middle).
 - `CODER_AUTOAPPROVE=1` — bypass the approval gate (for non-interactive runs
