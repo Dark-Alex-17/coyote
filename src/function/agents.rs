@@ -1294,7 +1294,9 @@ fn spawned_agent_hook_extras(
 /// result it already has. The read-modify-write runs under the root lock,
 /// so two writers of one sidecar leave a whole record, not a torn one. A
 /// root whose directory is already gone has no sidecar left to record on,
-/// and one replaced by a symlink is not followed for the lock.
+/// and one replaced by a symlink is not followed for the lock. A child
+/// session directory replaced by a symlink is not followed either; that is
+/// checked under the lock, so the check and the write see the same entry.
 fn finish_child_meta(
     root: Option<&ChildSessionRoot>,
     session_id: Option<&str>,
@@ -1319,15 +1321,25 @@ fn finish_child_meta(
     } else if !dir.is_dir() {
         Err(no_sidecar())
     } else {
-        root.lock()
-            .and_then(|_lock| match root.load_child_meta(session_id) {
+        root.lock().and_then(|_lock| {
+            let children = root.children_dir();
+            if child_sessions::inspect_dir(&children, "child session finished")
+                != DirInspection::NotALink
+            {
+                bail!(
+                    "the child session directory {} is a symlink or could not be inspected",
+                    children.display()
+                );
+            }
+            match root.load_child_meta(session_id) {
                 Ok(Some(mut meta)) => {
                     meta.finish(status, error);
                     root.save_child_meta(&meta)
                 }
                 Ok(None) => Err(no_sidecar()),
                 Err(error) => Err(error),
-            })
+            }
+        })
     };
     if let Err(error) = saved {
         warn!("Failed to record child session {session_id} as {status:?}: {error:#}");
@@ -1885,6 +1897,13 @@ async fn resume_child_session(
     let sidecar = root.child_meta_file(id);
     let saved_bytes = {
         let _lock = root.lock()?;
+        if child_sessions::inspect_dir(&root.children_dir(), "child session resumed")
+            != DirInspection::NotALink
+        {
+            bail!(
+                "no child session '{id}' under this session; its child session directory is a symlink or could not be inspected"
+            );
+        }
         let mut meta = root
             .load_child_meta(id)
             .with_context(|| format!("Failed to read the sidecar of child session '{id}'"))?
@@ -12018,6 +12037,42 @@ mod tests {
         assert!(!warns[0].contains("no sidecar"), "{warns:?}");
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn finish_child_meta_does_not_follow_a_symlinked_children_dir() {
+        crate::testing::install_log_collector();
+        let _guard = TestConfigDirGuard::new("agents-tests");
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let root = ctx.ensure_child_session_root().unwrap();
+        let meta = running_sidecar_for(&root, "test_finish_symlinked_children");
+        let behind_the_link = symlink_the_children_dir(&root, &meta.session_id);
+        let before = read_to_string(&behind_the_link).unwrap();
+
+        finish_child_meta(
+            Some(&root),
+            Some(&meta.session_id),
+            ChildStatus::Failed,
+            Some("boom".to_string()),
+        );
+
+        assert_eq!(read_to_string(&behind_the_link).unwrap(), before);
+        let marker = format!(
+            "Failed to record child session {} as Failed",
+            meta.session_id
+        );
+        let warns: Vec<String> = crate::testing::warn_snapshot()
+            .into_iter()
+            .filter(|m| m.contains(&marker))
+            .collect();
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(
+            warns[0].contains("child session directory")
+                && warns[0].contains("is a symlink or could not be inspected"),
+            "{warns:?}"
+        );
+    }
+
     #[test]
     #[serial]
     fn resume_is_refused_with_the_holder_message_while_another_holder_keeps_the_root_lock() {
@@ -12340,6 +12395,11 @@ mod tests {
         let session_load_at = resume.find("load_and_gate(").unwrap();
         assert!(resume.find("refuse_symlinked_dir(&dir").unwrap() < dir_check_at);
         assert!(dir_check_at < lock_at && lock_at < load_at);
+        let locked_children_check_at = lock_at
+            + resume[lock_at..]
+                .find("child_sessions::inspect_dir(&root.children_dir(),")
+                .unwrap();
+        assert!(locked_children_check_at < load_at);
         assert!(load_at < gate_at && gate_at < bytes_at && bytes_at < restamp_at);
         assert!(restamp_at < save_at && save_at < seam_at && seam_at < session_load_at);
         let armed_at = resume.find("ResumeSidecarGuard {").unwrap();
@@ -12402,7 +12462,11 @@ mod tests {
         let lock_at = finish.find("root.lock()").unwrap();
         assert!(finish.find("refuse_symlinked_dir(&dir").unwrap() < lock_at);
         assert!(finish.find("} else if !dir.is_dir()").unwrap() < lock_at);
-        assert!(lock_at < finish.find("load_child_meta(session_id)").unwrap());
+        let children_check_at = finish
+            .find("child_sessions::inspect_dir(&children,")
+            .unwrap();
+        assert!(lock_at < children_check_at);
+        assert!(children_check_at < finish.find("load_child_meta(session_id)").unwrap());
         assert!(lock_at < finish.find("save_child_meta(&meta)").unwrap());
         assert_eq!(finish.matches("root.lock()").count(), 1);
     }
