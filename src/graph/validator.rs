@@ -2307,8 +2307,8 @@ mod tests {
     }
 
     #[test]
-    fn validate_runs_exactly_twenty_seven_passes() {
-        assert_eq!(validate_pass_count(include_str!("validator.rs")), Some(27));
+    fn validate_runs_exactly_twenty_eight_passes() {
+        assert_eq!(validate_pass_count(include_str!("validator.rs")), Some(28));
     }
 
     #[test]
@@ -2324,8 +2324,8 @@ mod tests {
             "CRLF fixture must present the pin's end needle with CRLF bytes"
         );
 
-        assert_eq!(validate_pass_count(&lf), Some(27));
-        assert_eq!(validate_pass_count(&crlf), Some(27));
+        assert_eq!(validate_pass_count(&lf), Some(28));
+        assert_eq!(validate_pass_count(&crlf), Some(28));
         assert_eq!(validate_pass_count(&crlf), validate_pass_count(&lf));
     }
 

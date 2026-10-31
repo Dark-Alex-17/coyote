@@ -45,8 +45,8 @@ pub fn catalogue_entry(line: &str) -> Option<(&str, &str)> {
 
 /// Test-only override of where workspace memory discovery starts, and the
 /// directory it never walks above. Without it, a test running from the repo
-/// root discovers the developer's real `.coyote/memory/MEMORY.md` and
-/// injects it into prompts.
+/// root discovers the developer's real workspace memory index and injects it
+/// into prompts.
 #[cfg(test)]
 pub(crate) const WORKSPACE_MEMORY_ROOT_TEST_ENV: &str = "COYOTE_TEST_WORKSPACE_MEMORY_ROOT";
 
