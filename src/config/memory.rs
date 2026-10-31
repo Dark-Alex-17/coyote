@@ -75,12 +75,12 @@ pub fn memory_index_exists(cwd: Option<&Path>) -> bool {
 /// Where a workspace lookup from `cwd` starts and the directory it must not
 /// walk above: `cwd` and no ceiling, or the test override for both.
 #[cfg(not(test))]
-pub fn workspace_search_bounds(cwd: &Path) -> (PathBuf, Option<PathBuf>) {
+pub(crate) fn workspace_search_bounds(cwd: &Path) -> (PathBuf, Option<PathBuf>) {
     (cwd.to_path_buf(), None)
 }
 
 #[cfg(test)]
-pub fn workspace_search_bounds(cwd: &Path) -> (PathBuf, Option<PathBuf>) {
+pub(crate) fn workspace_search_bounds(cwd: &Path) -> (PathBuf, Option<PathBuf>) {
     match std::env::var_os(WORKSPACE_MEMORY_ROOT_TEST_ENV) {
         Some(root) => {
             let root = PathBuf::from(root);

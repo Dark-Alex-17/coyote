@@ -1634,6 +1634,36 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    /// The positive side of the lookup above: an index at the guard's pinned
+    /// workspace root is what the memory-tools check and `memory migrate`
+    /// find, with no global index to answer for them.
+    #[test]
+    #[serial]
+    fn workspace_lookups_find_memory_at_the_guard_workspace_root() {
+        let guard = crate::testing::TestConfigDirGuard::new("memory-at-root");
+        let pinned = guard.workspace_root().join(".coyote").join("memory");
+        fs::create_dir_all(&pinned).unwrap();
+        fs::write(pinned.join("MEMORY.md"), "# pinned index\n").unwrap();
+        let cwd = guard.workspace_root().join("checkout");
+        fs::create_dir_all(&cwd).unwrap();
+        assert!(!paths::global_memory_index_file().exists());
+
+        assert!(crate::config::memory::memory_index_exists(Some(&cwd)));
+        let report = crate::config::memory_migrate::run_from(
+            &cwd,
+            crate::config::MigrateScope::Workspace,
+            false,
+            RoundChains::default(),
+        )
+        .unwrap()
+        .to_string();
+        assert!(!report.contains("skipped"), "{report}");
+        assert!(
+            report.contains(&format!("workspace: {}", pinned.display())),
+            "{report}"
+        );
+    }
+
     #[test]
     fn find_file_returns_matching_file() {
         let root = temp_root("find_file");
