@@ -271,6 +271,15 @@ impl Input {
         &self.text
     }
 
+    /// The text the model is sent: the request preamble, when one is set,
+    /// ahead of `text()`.
+    pub fn text_with_preamble(&self) -> String {
+        match &self.request_preamble {
+            Some(preamble) => format!("{}\n\n{}", preamble.trim_end(), self.text()),
+            None => self.text(),
+        }
+    }
+
     pub fn clear_patch(&mut self) {
         self.patched_text = None;
         self.request_preamble = None;
@@ -573,10 +582,7 @@ impl Input {
     }
 
     pub fn message_content(&self) -> MessageContent {
-        let text = match &self.request_preamble {
-            Some(preamble) => format!("{}\n\n{}", preamble.trim_end(), self.text()),
-            None => self.text(),
-        };
+        let text = self.text_with_preamble();
         if self.medias.is_empty() {
             MessageContent::Text(text)
         } else {
@@ -1582,6 +1588,37 @@ mod tests {
         assert!(matches!(
             &parts[0],
             MessageContentPart::Text { text } if text.starts_with("Last graph run")
+        ));
+    }
+
+    #[test]
+    fn text_with_preamble_is_the_text_part_of_the_request() {
+        let ctx = create_test_ctx();
+        let mut input = Input::from_str(&ctx, "hi", None).unwrap();
+        input.set_patched_text("hi (with retrieved context)");
+        assert_eq!(
+            input.text_with_preamble(),
+            input.message_content().to_text()
+        );
+        assert_eq!(input.text_with_preamble(), "hi (with retrieved context)");
+
+        input.set_request_preamble("Last graph run\n");
+        assert_eq!(
+            input.text_with_preamble(),
+            input.message_content().to_text()
+        );
+        assert_eq!(
+            input.text_with_preamble(),
+            "Last graph run\n\nhi (with retrieved context)"
+        );
+
+        input.medias.push("data:image/png;base64,abc".into());
+        let MessageContent::Array(parts) = input.message_content() else {
+            panic!("multimodal input must build an array");
+        };
+        assert!(matches!(
+            &parts[0],
+            MessageContentPart::Text { text } if *text == input.text_with_preamble()
         ));
     }
 

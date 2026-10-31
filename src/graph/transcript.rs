@@ -1,4 +1,4 @@
-use crate::client::{Message, MessageContent};
+use crate::client::{Message, MessageContent, MessageContentPart};
 
 /// Byte budget for the `previous_turns` state key. It has to leave room in
 /// the state size cap for everything else a graph carries.
@@ -24,19 +24,48 @@ pub(crate) const TRUNCATION_MARK: &str = "...";
 /// that same row, so a compressed session renders only its kept tail and the
 /// summary never reaches the graph. Tool rows and tool-call payloads are
 /// skipped as well.
+///
+/// Exchanges are walked newest-first and measured, not built; only the ones
+/// that survive the cut are rendered, so a long session costs the budget's
+/// worth of string building, not the session's.
 pub(crate) fn render_turns(messages: &[Message], max_bytes: usize) -> String {
-    let exchanges = exchanges(messages);
-    if exchanges.is_empty() {
+    let mut exchanges = Exchanges::newest_first(messages);
+    let Some(newest) = exchanges.next() else {
         return String::new();
-    }
+    };
+    // Newest first, each with its measured length; the oldest kept exchange
+    // is always the last entry.
+    let mut body_len = newest.len();
+    let mut kept = vec![(newest, body_len)];
     let mut dropped = 0;
-    let mut body_len = exchanges.iter().map(String::len).sum::<usize>() + exchanges.len() - 1;
-    while dropped + 1 < exchanges.len() && omitted_prefix(dropped).len() + body_len > max_bytes {
-        body_len -= exchanges[dropped].len() + 1;
+    for exchange in exchanges.by_ref() {
+        let len = exchange.len();
+        if body_len + len + 1 > max_bytes {
+            dropped += 1;
+            break;
+        }
+        body_len += len + 1;
+        kept.push((exchange, len));
+    }
+    dropped += exchanges.count();
+    // The omitted line widens with its count, so one more drop can leave the
+    // sum still over budget when the oldest kept exchange is shorter than it.
+    // Only measured handles are popped here, so nothing rendered is thrown
+    // away.
+    while let [_, .., (_, oldest_len)] = kept.as_slice()
+        && omitted_prefix(dropped).len() + body_len > max_bytes
+    {
+        body_len -= oldest_len + 1;
+        kept.pop();
         dropped += 1;
     }
     let prefix = omitted_prefix(dropped);
-    let body = exchanges[dropped..].join("\n");
+    let body = kept
+        .iter()
+        .rev()
+        .map(|(exchange, _)| exchange.render())
+        .collect::<Vec<_>>()
+        .join("\n");
     if prefix.len() + body.len() <= max_bytes {
         return format!("{prefix}{body}");
     }
@@ -57,24 +86,89 @@ fn omitted_prefix(dropped: usize) -> String {
     }
 }
 
-fn exchanges(messages: &[Message]) -> Vec<String> {
-    let mut exchanges: Vec<String> = Vec::new();
-    for message in messages {
-        let Some(line) = render_line(message) else {
-            continue;
-        };
-        match exchanges.last_mut() {
-            Some(current) if !message.role.is_user() => {
-                current.push('\n');
-                current.push_str(&line);
-            }
-            _ => exchanges.push(line),
-        }
-    }
-    exchanges
+#[cfg(test)]
+thread_local! {
+    /// Counts `Exchange::render` calls so a test can prove that only the
+    /// exchanges in the output are ever built.
+    static RENDERED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-fn render_line(message: &Message) -> Option<String> {
+/// One exchange as a slice of the session: it runs from a renderable User
+/// message (or the first message, for replies that precede any user turn)
+/// up to the next renderable User message. Rows the transcript skips stay in
+/// the slice and are filtered when it is rendered or measured.
+struct Exchange<'a> {
+    messages: &'a [Message],
+}
+
+impl Exchange<'_> {
+    fn render(&self) -> String {
+        #[cfg(test)]
+        RENDERED.with(|count| count.set(count.get() + 1));
+        self.messages
+            .iter()
+            .filter_map(render_line)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Byte length of `render()` without building it.
+    fn len(&self) -> usize {
+        let mut len = 0;
+        let mut lines = 0usize;
+        for message in self.messages {
+            let Some(speaker) = speaker(message) else {
+                continue;
+            };
+            len += speaker.len() + ": ".len() + text_len(&message.content);
+            lines += 1;
+        }
+        len + lines.saturating_sub(1)
+    }
+}
+
+struct Exchanges<'a> {
+    messages: &'a [Message],
+    /// Exclusive end of the oldest exchange not yet yielded.
+    end: usize,
+}
+
+impl<'a> Exchanges<'a> {
+    fn newest_first(messages: &'a [Message]) -> Self {
+        Self {
+            messages,
+            end: messages.len(),
+        }
+    }
+}
+
+impl<'a> Iterator for Exchanges<'a> {
+    type Item = Exchange<'a>;
+
+    fn next(&mut self) -> Option<Exchange<'a>> {
+        let end = self.end;
+        let mut saw_reply = false;
+        for start in (0..end).rev() {
+            let message = &self.messages[start];
+            if speaker(message).is_none() {
+                continue;
+            }
+            if message.role.is_user() {
+                self.end = start;
+                return Some(Exchange {
+                    messages: &self.messages[start..end],
+                });
+            }
+            saw_reply = true;
+        }
+        self.end = 0;
+        saw_reply.then(|| Exchange {
+            messages: &self.messages[..end],
+        })
+    }
+}
+
+fn speaker(message: &Message) -> Option<&'static str> {
     let speaker = if message.role.is_user() {
         "user"
     } else if message.role.is_assistant() {
@@ -84,7 +178,32 @@ fn render_line(message: &Message) -> Option<String> {
     };
     match &message.content {
         MessageContent::ToolCalls(_) => None,
-        content => Some(format!("{speaker}: {}", content.to_text())),
+        _ => Some(speaker),
+    }
+}
+
+fn render_line(message: &Message) -> Option<String> {
+    speaker(message).map(|speaker| format!("{speaker}: {}", message.content.to_text()))
+}
+
+/// Mirrors `MessageContent::to_text`, which joins the text parts of an array
+/// with a blank line.
+fn text_len(content: &MessageContent) -> usize {
+    match content {
+        MessageContent::Text(text) => text.len(),
+        MessageContent::Array(list) => {
+            let mut len = 0;
+            let mut parts = 0usize;
+            for item in list {
+                if let MessageContentPart::Text { text } = item {
+                    len += text.len();
+                    parts += 1;
+                }
+            }
+            len + "\n\n".len() * parts.saturating_sub(1)
+        }
+        // Unreachable from `Exchange::len`: `speaker` filters tool calls.
+        MessageContent::ToolCalls(_) => 0,
     }
 }
 
@@ -103,7 +222,7 @@ pub(crate) fn truncate_from_front(text: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::{MessageContentToolCalls, MessageRole, Model, ModelData};
+    use crate::client::{ImageUrl, MessageContentToolCalls, MessageRole, Model, ModelData};
     use crate::config::{AppState, Input, RequestContext, RoleLike, Session, WorkingMode};
     use crate::function::{ToolCall, ToolResult};
     use serde_json::json;
@@ -125,6 +244,67 @@ mod tests {
 
     const LAST_EXCHANGE: &str = "user: q2\nassistant: r2";
     const WHOLE: &str = "user: q1\nassistant: r1\nuser: q2\nassistant: r2";
+
+    /// The forward algorithm this module replaced: every exchange is built
+    /// oldest-first, then the oldest are dropped until the rest fit. Kept as
+    /// the oracle for the newest-first walk. Returns the rendering and the
+    /// number of exchanges kept.
+    fn forward_render_turns(messages: &[Message], max_bytes: usize) -> (String, usize) {
+        let mut exchanges: Vec<String> = Vec::new();
+        for message in messages {
+            let Some(line) = render_line(message) else {
+                continue;
+            };
+            match exchanges.last_mut() {
+                Some(current) if !message.role.is_user() => {
+                    current.push('\n');
+                    current.push_str(&line);
+                }
+                _ => exchanges.push(line),
+            }
+        }
+        if exchanges.is_empty() {
+            return (String::new(), 0);
+        }
+        let mut dropped = 0;
+        let mut body_len = exchanges.iter().map(String::len).sum::<usize>() + exchanges.len() - 1;
+        while dropped + 1 < exchanges.len() && omitted_prefix(dropped).len() + body_len > max_bytes
+        {
+            body_len -= exchanges[dropped].len() + 1;
+            dropped += 1;
+        }
+        let kept = exchanges.len() - dropped;
+        let prefix = omitted_prefix(dropped);
+        let body = exchanges[dropped..].join("\n");
+        if prefix.len() + body.len() <= max_bytes {
+            return (format!("{prefix}{body}"), kept);
+        }
+        if prefix.len() >= max_bytes {
+            return (truncate_from_front(&body, max_bytes), kept);
+        }
+        let rendered = format!(
+            "{prefix}{}",
+            truncate_from_front(&body, max_bytes - prefix.len())
+        );
+        (rendered, kept)
+    }
+
+    fn parts(texts: &[&str], with_image: bool) -> Message {
+        let mut list: Vec<MessageContentPart> = texts
+            .iter()
+            .map(|text| MessageContentPart::Text {
+                text: text.to_string(),
+            })
+            .collect();
+        if with_image {
+            list.push(MessageContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "data:image/png;base64,AA==".into(),
+                },
+            });
+        }
+        Message::new(MessageRole::User, MessageContent::Array(list))
+    }
 
     #[test]
     fn renders_user_and_assistant_lines_and_skips_system() {
@@ -313,5 +493,134 @@ mod tests {
         assert!(!rendered.contains("SUMMARY-TEXT"), "{rendered}");
         assert!(!rendered.contains("q1"), "{rendered}");
         assert_eq!(rendered, "user: q3\nassistant: r3");
+    }
+
+    #[test]
+    fn an_exchange_measures_exactly_what_it_renders() {
+        let messages = vec![
+            text(MessageRole::System, "s"),
+            parts(&["see", "this"], true),
+            text(MessageRole::Tool, "tool text"),
+            text(MessageRole::Assistant, "\u{4e2d}\u{4e2d}"),
+            parts(&[], true),
+            text(MessageRole::Assistant, "r"),
+        ];
+        let exchanges: Vec<Exchange> = Exchanges::newest_first(&messages).collect();
+
+        assert_eq!(exchanges.len(), 2);
+        for exchange in &exchanges {
+            assert_eq!(exchange.len(), exchange.render().len());
+        }
+        assert_eq!(
+            exchanges[1].render(),
+            "user: see\n\nthis\nassistant: \u{4e2d}\u{4e2d}"
+        );
+        assert_eq!(exchanges[0].render(), "user: \nassistant: r");
+    }
+
+    #[test]
+    fn replies_before_any_user_turn_form_the_oldest_exchange() {
+        let messages = vec![
+            text(MessageRole::System, "s"),
+            text(MessageRole::Assistant, "hello"),
+            text(MessageRole::Assistant, "again"),
+            text(MessageRole::User, "q1"),
+            text(MessageRole::Assistant, "r1"),
+        ];
+
+        let rendered: Vec<String> = Exchanges::newest_first(&messages)
+            .map(|exchange| exchange.render())
+            .collect();
+
+        assert_eq!(
+            rendered,
+            [
+                "user: q1\nassistant: r1",
+                "assistant: hello\nassistant: again"
+            ]
+        );
+        assert_eq!(
+            render_turns(&messages, 1000),
+            forward_render_turns(&messages, 1000).0
+        );
+    }
+
+    fn ten_thousand_varied_exchanges() -> Vec<Message> {
+        let mut messages = vec![text(MessageRole::System, "s")];
+        for i in 0..10_000 {
+            let filler = "x".repeat((i * 13) % 97);
+            messages.push(text(MessageRole::User, &format!("q{i} {filler}")));
+            if i % 7 == 0 {
+                messages.push(text(MessageRole::Tool, "tool text"));
+                messages.push(parts(&[&format!("part {i}"), "more"], true));
+            }
+            messages.push(text(MessageRole::Assistant, &format!("r{i} {filler}")));
+            if i % 3 == 0 {
+                messages.push(text(MessageRole::Assistant, "follow-up"));
+            }
+        }
+        messages
+    }
+
+    fn ten_thousand_equal_width_exchanges() -> Vec<Message> {
+        let mut messages = vec![text(MessageRole::System, "s")];
+        let filler = "x".repeat(40);
+        for i in 0..10_000 {
+            messages.push(text(MessageRole::User, &format!("q{i:04} {filler}")));
+            messages.push(text(MessageRole::Tool, "tool text"));
+            messages.push(text(MessageRole::Assistant, &format!("r{i:04}")));
+        }
+        messages
+    }
+
+    #[test]
+    fn ten_thousand_exchanges_render_like_the_forward_walk() {
+        let messages = ten_thousand_varied_exchanges();
+
+        for max_bytes in [PREVIOUS_TURNS_BYTES, 4096, 300, 64, 31, 10] {
+            let (expected, kept) = forward_render_turns(&messages, max_bytes);
+            RENDERED.with(|count| count.set(0));
+
+            assert_eq!(render_turns(&messages, max_bytes), expected, "{max_bytes}");
+            assert_eq!(RENDERED.with(|count| count.get()), kept, "{max_bytes}");
+        }
+    }
+
+    #[test]
+    fn only_the_kept_exchanges_are_rendered() {
+        // A budget whose slack over fifty whole exchanges covers the omitted
+        // line, so the walk stops exactly where the forward algorithm does and
+        // nothing it rendered is dropped again.
+        let messages = ten_thousand_equal_width_exchanges();
+        let width = Exchanges::newest_first(&messages).next().unwrap().len();
+        let max_bytes = 50 * (width + 1) - 1 + 40;
+        let (expected, kept) = forward_render_turns(&messages, max_bytes);
+        RENDERED.with(|count| count.set(0));
+
+        let rendered = render_turns(&messages, max_bytes);
+
+        assert_eq!(rendered, expected);
+        assert_eq!(kept, 50);
+        assert!(rendered.starts_with("[9950 earlier turn(s) omitted]\n"));
+        assert_eq!(RENDERED.with(|count| count.get()), kept);
+    }
+
+    #[test]
+    fn an_exchange_given_back_for_the_omitted_line_is_never_rendered() {
+        // Fifty whole exchanges fill the budget to the byte, so the walk
+        // keeps all fifty before the omitted line is counted and has to give
+        // the oldest one back.
+        let messages = ten_thousand_equal_width_exchanges();
+        let width = Exchanges::newest_first(&messages).next().unwrap().len();
+        let max_bytes = 50 * (width + 1) - 1;
+        let (expected, kept) = forward_render_turns(&messages, max_bytes);
+        RENDERED.with(|count| count.set(0));
+
+        let rendered = render_turns(&messages, max_bytes);
+
+        assert_eq!(rendered, expected);
+        assert_eq!(kept, 49);
+        assert!(rendered.starts_with("[9951 earlier turn(s) omitted]\n"));
+        assert_eq!(RENDERED.with(|count| count.get()), kept);
     }
 }

@@ -72,7 +72,7 @@ const CANCELLED_TASKS_HINT: &str =
 
 const WELCOME_INTERRUPT_HINT: &str = "\
 Tip: Press Ctrl-C as the model works to interrupt the turn and send another prompt.
-Press it again at the idle prompt to cancel background work it left running.";
+In a session, press it again at the idle prompt to cancel background work.";
 
 /// Brackets one user-visible turn at an outer boundary (`ask`,
 /// `start_directive`, `shell_execute`): `enter` fires `turn.started`, and
@@ -1068,6 +1068,14 @@ pub async fn run_repl_command_with_prefix(
                     bail!("{}", graph::no_session_block_text(&name));
                 }
                 let app = Arc::clone(&ctx.app.config);
+                // A root resolved while sessionless is settled when the
+                // session attaches; children still running under it
+                // would be writing into the directory that removes. With
+                // a session attached the attach is refused, so a cached
+                // uid root is left alone.
+                if ctx.session.is_none() && ctx.child_session_root.is_some() {
+                    ctx.cancel_background_tasks_and_wait(EXIT_CANCEL_WAIT).await;
+                }
                 ctx.use_session(app.as_ref(), args, abort_signal.clone())
                     .await?;
                 if ctx.maybe_autoname_session() {
@@ -1310,6 +1318,11 @@ pub async fn run_repl_command_with_prefix(
             }
             ".empty" => match args {
                 Some("session") => {
+                    // The empty removes the session's uid directory;
+                    // children still running would be writing under it.
+                    if ctx.session.is_some() {
+                        ctx.cancel_background_tasks_and_wait(EXIT_CANCEL_WAIT).await;
+                    }
                     ctx.empty_session()?;
                 }
                 _ => {
@@ -1638,6 +1651,11 @@ pub async fn run_repl_command_with_prefix(
                     ctx.exit_rag()?;
                 }
                 Some("agent") => {
+                    // `exit_agent` settles the session's child directory
+                    // before it tears the agent's children down.
+                    if ctx.session.is_some() || ctx.child_session_root.is_some() {
+                        ctx.cancel_background_tasks_and_wait(EXIT_CANCEL_WAIT).await;
+                    }
                     let app = Arc::clone(&ctx.app.config);
                     ctx.exit_agent(app.as_ref())?;
                     ctx.bootstrap_tools(app.as_ref(), true, abort_signal.clone())
@@ -1929,7 +1947,8 @@ async fn ask_loop(
         }
         ctx.session_abort = Some(abort_signal.clone());
         if with_embeddings {
-            input.use_embeddings(abort_signal.clone()).await?;
+            let embeddings = input.use_embeddings(abort_signal.clone());
+            interruptible_step(ctx, &abort_signal, embeddings).await?;
             with_embeddings = false;
         }
         while ctx.is_compressing_session() {
@@ -1946,7 +1965,17 @@ async fn ask_loop(
         {
             routed = true;
             ctx.before_chat_completion(&input)?;
-            match run_graph_turn(ctx, &input, abort_signal.clone(), forced, runner).await? {
+            let turn = match run_graph_turn(ctx, &input, abort_signal.clone(), forced, runner).await
+            {
+                Ok(turn) => turn,
+                Err(err) => {
+                    if abort_signal.aborted_ctrlc() {
+                        print_turn_notice(ctx, turn_interrupt_notice(ctx, &abort_signal).await);
+                    }
+                    return Err(err);
+                }
+            };
+            match turn {
                 GraphTurn::Run { output, last_run } => {
                     app.print_markdown(&output)?;
                     input.clear_continue_output();
@@ -1985,6 +2014,12 @@ async fn ask_loop(
                         input.refresh_session(ctx);
                         retried_after_compress = true;
                         continue;
+                    }
+                    // A request aborted by Ctrl-C without streamed text ends
+                    // here rather than in the interrupted arm below, and gets
+                    // the same notice.
+                    if abort_signal.aborted_ctrlc() {
+                        print_turn_notice(ctx, turn_interrupt_notice(ctx, &abort_signal).await);
                     }
                     ctx.on_chat_completion_error(app.as_ref(), &input);
                     return Err(err);
@@ -2031,10 +2066,11 @@ async fn ask_loop(
         }
 
         // The guardrail must not run on an interrupted turn: its reminders
-        // would be saved as phantom exchanges and its force-terminate would
-        // cancel the background tasks the user chose to leave running.
+        // would be saved as phantom exchanges and, in a session, its
+        // force-terminate would cancel the background tasks the user chose to
+        // leave running; without one, the arm cancels them itself.
         if interrupted {
-            print_interrupted_turn_notice(ctx);
+            print_turn_notice(ctx, turn_interrupt_notice(ctx, &abort_signal).await);
         } else {
             match check_pending_tasks_guardrail(ctx) {
                 GuardrailAction::Inject(prompt) => {
@@ -2347,12 +2383,131 @@ fn interrupted_turn_notice(ctx: &RequestContext) -> Option<String> {
     ))
 }
 
-fn print_interrupted_turn_notice(ctx: &RequestContext) {
-    if let Some(text) = interrupted_turn_notice(ctx) {
+/// The notice for a Ctrl-C that ended the turn, whichever way the turn ended.
+/// Without a session the press also cancels the turn's background work; in a
+/// session it leaves that work for a second press.
+async fn turn_interrupt_notice(ctx: &RequestContext, abort_signal: &AbortSignal) -> Option<String> {
+    if ctx.session.is_none() {
+        cancel_sessionless_turn_tasks(ctx, abort_signal).await
+    } else {
+        interrupted_turn_notice(ctx)
+    }
+}
+
+/// Awaits a step that runs before the turn's request, such as the RAG
+/// lookup, so a Ctrl-C that fails it prints the same notice (and, without a
+/// session, cancels the same background work) as an aborted request.
+async fn interruptible_step<T>(
+    ctx: &RequestContext,
+    abort_signal: &AbortSignal,
+    step: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    let result = step.await;
+    if result.is_err() && abort_signal.aborted_ctrlc() {
+        print_turn_notice(ctx, turn_interrupt_notice(ctx, abort_signal).await);
+    }
+    result
+}
+
+/// The notice for a sessionless turn whose interrupt is cancelling
+/// `unfinished` top-level tasks; zero means only a sub-agent's own children
+/// were live, which have no top-level id to count.
+fn sessionless_cancelling_notice(unfinished: usize) -> String {
+    if unfinished == 0 {
+        return "Turn interrupted; cancelling the background work.".into();
+    }
+    format!("Turn interrupted; cancelling {unfinished} background task(s).")
+}
+
+/// The notice for agents that had not stopped when the cancel wait of
+/// `wait` gave up.
+fn sessionless_still_running_notice(names: &[String], wait: Duration) -> String {
+    format!(
+        "{} background agent(s) still running after {}s: {}. Press Ctrl-C again at the idle prompt to cancel them.",
+        names.len(),
+        wait.as_secs(),
+        names.join(", ")
+    )
+}
+
+/// Without a session the next prompt carries no history of what this turn
+/// started, so the interrupt that ended the turn also cancels that work and
+/// waits for the agents to finish. The cancel is announced before the wait,
+/// which can take seconds; returns the notice naming the agents still
+/// running when the wait gave up, or `None` when nothing was running or
+/// everything stopped in time.
+async fn cancel_sessionless_turn_tasks(
+    ctx: &RequestContext,
+    abort_signal: &AbortSignal,
+) -> Option<String> {
+    let supervisor = ctx.supervisor.clone()?;
+    let has_active_tasks = supervisor.read().has_active_tasks();
+    if !has_active_tasks {
+        return None;
+    }
+    let unfinished = pending_tasks(ctx)
+        .into_iter()
+        .filter(|task| !task.finished)
+        .count();
+    latch_prompt_interrupt(abort_signal, &supervisor);
+    print_turn_notice(
+        ctx,
+        Some(
+            ctx.render_hints(&sessionless_cancelling_notice(unfinished))
+                .into_owned(),
+        ),
+    );
+    ctx.cancel_background_tasks_and_wait(EXIT_CANCEL_WAIT).await;
+    let mut still_running: Vec<String> = {
+        let supervisor = supervisor.read();
+        supervisor
+            .list_agents()
+            .into_iter()
+            .filter(|(id, _)| supervisor.is_finished(id) == Some(false))
+            .map(|(id, _)| id.to_string())
+            .collect()
+    };
+    if still_running.is_empty() {
+        return None;
+    }
+    still_running.sort();
+    Some(
+        ctx.render_hints(&sessionless_still_running_notice(
+            &still_running,
+            EXIT_CANCEL_WAIT,
+        ))
+        .into_owned(),
+    )
+}
+
+fn print_turn_notice(ctx: &RequestContext, notice: Option<String>) {
+    if let Some(text) = notice {
+        #[cfg(test)]
+        turn_notice_sink::record(&text);
         eprintln!(
             "\n⏸ {}",
             dim_notice_color(&ctx.app.config).italic().paint(text)
         );
+    }
+}
+
+/// Records every notice `print_turn_notice` prints on the current thread, so
+/// a test running the turn on its own runtime thread reads only its own.
+#[cfg(test)]
+mod turn_notice_sink {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static NOTICES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn record(text: &str) {
+        NOTICES.with(|notices| notices.borrow_mut().push(text.to_string()));
+    }
+
+    /// Removes and returns everything this thread recorded so far.
+    pub(super) fn drain() -> Vec<String> {
+        NOTICES.with(|notices| notices.take())
     }
 }
 
@@ -2542,7 +2697,7 @@ List them with ".list macros"; toggle them with ".macro enable|disable <name>".
 Type ::: to start multi-line editing, type ::: to finish it.
 Press Ctrl+O to open an editor for editing the input buffer.
 Press Ctrl+L to clear the screen; type ".redraw" to clear it and bring the last conversation turn back.
-Press Ctrl+C while the model is working to interrupt the turn; press it again at the idle prompt to cancel background work it left running. Press Ctrl+D to exit the REPL."###,
+Press Ctrl+C while the model is working to interrupt the turn; in a session, press it again at the idle prompt to cancel background work it left running (without a session, the first press cancels it). Press Ctrl+D to exit the REPL."###,
         "!<command>",
     );
     prefix.render_hints(&text).into_owned()
@@ -5100,6 +5255,13 @@ local_hello() {\n\
                 prompt.contains("The user prefers terse answers."),
                 "{prompt}"
             );
+            let memory_start = prompt.find("<memory>").expect("a memory section");
+            let memory_end = prompt.find("</memory>").expect("a closed memory section");
+            assert_eq!(
+                &prompt[memory_start..memory_end],
+                "<memory>\n<facts>\n# Memory\n- The user prefers terse answers.\n</facts>\n<catalogue>\n</catalogue>\n",
+                "only the global index rides in, no workspace one"
+            );
             assert!(prompt.contains("## Memory\n"), "{prompt}");
             assert!(!prompt.contains("## Memory (read-only)"), "{prompt}");
             assert_graph_agent_restored(&run_first, &name, &chat_agent);
@@ -5504,6 +5666,7 @@ local_hello() {\n\
                 join_handle,
                 child_supervisor: None,
                 session_id: None,
+                child_session_root: None,
             })
             .unwrap();
     }
@@ -9065,6 +9228,7 @@ local_hello() {\n\
             join_handle,
             child_supervisor: None,
             session_id: None,
+            child_session_root: None,
         })
         .unwrap();
         let supervisor = RwLock::new(sup);
@@ -9164,6 +9328,7 @@ local_hello() {\n\
                 join_handle,
                 child_supervisor: None,
                 session_id: None,
+                child_session_root: None,
             })
             .unwrap();
         abort
@@ -9366,6 +9531,642 @@ local_hello() {\n\
         assert_eq!(hook_count(marker, "turn.interrupted"), 1);
     }
 
+    /// An agent handle whose task runs until `abort` reads ctrl-c, yielding
+    /// between checks so it finishes on the first poll after the cancel.
+    fn abort_aware_agent_handle(
+        id: &str,
+        depth: usize,
+        abort: &AbortSignal,
+    ) -> crate::supervisor::AgentHandle {
+        use crate::supervisor::mailbox::Inbox;
+        use crate::supervisor::{AgentExitStatus, AgentHandle, AgentResult};
+
+        let signal = abort.clone();
+        let id_owned = id.to_string();
+        let join_handle = tokio::spawn(async move {
+            while !signal.aborted_ctrlc() {
+                tokio::task::yield_now().await;
+            }
+            Ok(AgentResult {
+                id: id_owned,
+                agent_name: "explore".to_string(),
+                output: String::new(),
+                exit_status: AgentExitStatus::Completed,
+                session_id: None,
+            })
+        });
+        AgentHandle {
+            id: id.to_string(),
+            agent_name: "explore".to_string(),
+            depth,
+            inbox: Arc::new(Inbox::new()),
+            abort_signal: abort.clone(),
+            join_handle,
+            child_supervisor: None,
+            session_id: None,
+            child_session_root: None,
+        }
+    }
+
+    /// Registers an agent that runs until it is cancelled; returns its
+    /// abort signal.
+    fn register_abort_aware_agent(ctx: &mut RequestContext, id: &str) -> AbortSignal {
+        let abort = create_abort_signal();
+        ctx.supervisor
+            .as_ref()
+            .unwrap()
+            .write()
+            .register(abort_aware_agent_handle(id, 1, &abort))
+            .unwrap();
+        abort
+    }
+
+    /// Registers a job that runs until it is cancelled; returns its abort
+    /// signal.
+    fn register_abort_aware_job(ctx: &mut RequestContext, id: &str) -> AbortSignal {
+        use crate::function::jobs::RingBuf;
+        use crate::supervisor::{JobHandle, JobResult, JobState, JobStatus};
+
+        let abort = create_abort_signal();
+        let signal = abort.clone();
+        let join_handle = tokio::spawn(async move {
+            while !signal.aborted_ctrlc() {
+                tokio::task::yield_now().await;
+            }
+            Ok(JobResult {
+                output: json!(null),
+                exit_code: None,
+                output_bytes_captured: 0,
+            })
+        });
+        ctx.supervisor
+            .as_ref()
+            .unwrap()
+            .write()
+            .register(JobHandle {
+                id: id.to_string(),
+                tool: "execute_command".to_string(),
+                started_at: std::time::Instant::now(),
+                join_handle,
+                abort_signal: abort.clone(),
+                state: Arc::new(parking_lot::Mutex::new(JobState {
+                    status: JobStatus::Running,
+                    pgid: None,
+                })),
+                output_buf: Arc::new(parking_lot::Mutex::new(RingBuf::default())),
+                no_change_checks: 0,
+                last_check_state: None,
+            })
+            .unwrap();
+        abort
+    }
+
+    fn sessionless_interruptible_ctx(marker: &str) -> RequestContext {
+        let mut ctx = interruptible_ctx(marker);
+        ctx.session = None;
+        ctx
+    }
+
+    /// Yields until the supervisor reports no active task, failing after a
+    /// bounded number of polls rather than a wall-clock budget.
+    async fn yield_until_no_active_tasks(ctx: &RequestContext) {
+        let supervisor = ctx.supervisor.clone().unwrap();
+        for _ in 0..10_000 {
+            if !supervisor.read().has_active_tasks() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("the cancelled tasks never finished");
+    }
+
+    /// Drives one tool round that Ctrl-C interrupts, with an abort-aware
+    /// agent `a1` and job `j1` registered on `ctx`; returns their signals.
+    async fn interrupt_a_tool_round_over_agent_and_job(
+        ctx: &mut RequestContext,
+    ) -> (AbortSignal, AbortSignal) {
+        let agent_abort = register_abort_aware_agent(ctx, "a1");
+        let job_abort = register_abort_aware_job(ctx, "j1");
+        let round = vec![ToolResult::new(
+            ToolCall::new(
+                "agent__collect".into(),
+                json!({"id": "a1"}),
+                Some("id-1".into()),
+            ),
+            json!({"status": "interrupted", "id": "a1"}),
+        )];
+        let seen: SeenInputs = Default::default();
+        let mut runner = ctrl_c_on_first_call_runner(("", round), Arc::clone(&seen));
+        let input = Input::from_str(ctx, "collect a1", None).unwrap();
+
+        ask_with_branch_with_runner(ctx, create_abort_signal(), input, false, None, &mut runner)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            seen.lock().len(),
+            1,
+            "the tool loop must stop after the interrupted round"
+        );
+        assert!(
+            ctx.last_message
+                .as_ref()
+                .is_some_and(|v| v.continuous && v.output.is_empty()),
+            "the interrupted round closes with the bookkeeping marker"
+        );
+        (agent_abort, job_abort)
+    }
+
+    #[test]
+    #[serial]
+    fn sessionless_ctrl_c_in_a_tool_round_cancels_background_tasks_at_once() {
+        let _sink = test_sink::install();
+        let marker = "sessionless-ctrlc-tool-round-v3n";
+        run_async(async {
+            let mut ctx = sessionless_interruptible_ctx(marker);
+
+            let (agent_abort, job_abort) =
+                interrupt_a_tool_round_over_agent_and_job(&mut ctx).await;
+
+            assert!(agent_abort.aborted_ctrlc(), "the agent must be cancelled");
+            assert!(job_abort.aborted_ctrlc(), "the job must be cancelled");
+            assert_eq!(
+                ctx.supervisor.as_ref().unwrap().read().is_finished("a1"),
+                Some(true),
+                "the turn waits for the cancelled agent before it returns"
+            );
+            yield_until_no_active_tasks(&ctx).await;
+            let sup = ctx.supervisor.as_ref().unwrap().read();
+            assert!(sup.has_agent("a1"), "a finished agent stays collectable");
+            assert!(sup.has_job("j1"), "a finished job stays collectable");
+        });
+        assert_eq!(hook_count(marker, "turn.interrupted"), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn session_ctrl_c_in_a_tool_round_leaves_abort_aware_tasks_alive() {
+        let _sink = test_sink::install();
+        let marker = "session-ctrlc-tool-round-w8d";
+        run_async(async {
+            let mut ctx = interruptible_ctx(marker);
+
+            let (agent_abort, job_abort) =
+                interrupt_a_tool_round_over_agent_and_job(&mut ctx).await;
+
+            assert!(!agent_abort.aborted(), "the agent must be left running");
+            assert!(!job_abort.aborted(), "the job must be left running");
+            let roles: Vec<MessageRole> = exchange(&ctx).iter().map(|(role, _)| *role).collect();
+            assert_eq!(
+                roles,
+                [MessageRole::User, MessageRole::Tool, MessageRole::Assistant]
+            );
+            let sup = ctx.supervisor.as_ref().unwrap().read();
+            assert_eq!(sup.is_finished("a1"), Some(false));
+            assert!(sup.has_active_tasks());
+            drop(sup);
+            assert_eq!(
+                interrupted_turn_notice(&ctx).as_deref(),
+                Some(
+                    "Turn interrupted; 2 background task(s) still running: a1 (agent), j1 (job). Press Ctrl-C again to cancel them, or type to continue."
+                )
+            );
+        });
+        assert_eq!(hook_count(marker, "turn.interrupted"), 1);
+    }
+
+    #[test]
+    fn sessionless_cancel_counts_the_tasks_it_cancelled() {
+        run_async(async {
+            let mut ctx = sessionless_interruptible_ctx("sessionless-notice-count");
+            let agent_abort = register_abort_aware_agent(&mut ctx, "a1");
+            let job_abort = register_abort_aware_job(&mut ctx, "j2");
+            // Already finished before the interrupt, so it is not counted.
+            register_agent(&mut ctx, "a0", 0).await;
+            let abort_signal = create_abort_signal();
+
+            let notice = cancel_sessionless_turn_tasks(&ctx, &abort_signal).await;
+
+            assert_eq!(
+                turn_notice_sink::drain(),
+                ["Turn interrupted; cancelling 2 background task(s)."]
+            );
+            assert_eq!(notice, None, "every agent stopped in time");
+            assert!(abort_signal.aborted_ctrlc());
+            assert!(agent_abort.aborted_ctrlc() && job_abort.aborted_ctrlc());
+            yield_until_no_active_tasks(&ctx).await;
+        });
+    }
+
+    /// An agent that ignores its cancel outlives the wait, so the notice
+    /// after it names that agent and the budget it outlived.
+    #[tokio::test(start_paused = true)]
+    async fn sessionless_cancel_names_the_agents_still_running_when_the_wait_gives_up() {
+        use crate::supervisor::{AgentExitStatus, AgentResult};
+
+        let mut ctx = sessionless_interruptible_ctx("sessionless-notice-timeout");
+        let agent_abort = register_abort_aware_agent(&mut ctx, "a1");
+        let mut stuck = abort_aware_agent_handle("a2", 1, &create_abort_signal());
+        stuck.join_handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            Ok(AgentResult {
+                id: "a2".to_string(),
+                agent_name: "explore".to_string(),
+                output: String::new(),
+                exit_status: AgentExitStatus::Completed,
+                session_id: None,
+            })
+        });
+        ctx.supervisor
+            .as_ref()
+            .unwrap()
+            .write()
+            .register(stuck)
+            .unwrap();
+        let abort_signal = create_abort_signal();
+        let start = tokio::time::Instant::now();
+
+        let notice = cancel_sessionless_turn_tasks(&ctx, &abort_signal).await;
+
+        assert!(start.elapsed() >= EXIT_CANCEL_WAIT);
+        assert_eq!(
+            turn_notice_sink::drain(),
+            ["Turn interrupted; cancelling 2 background task(s)."]
+        );
+        assert_eq!(
+            notice.as_deref(),
+            Some(
+                "1 background agent(s) still running after 5s: a2. Press Ctrl-C again at the idle prompt to cancel them."
+            )
+        );
+        assert!(agent_abort.aborted_ctrlc());
+        let sup = ctx.supervisor.as_ref().unwrap().read();
+        assert_eq!(sup.is_finished("a1"), Some(true));
+        assert_eq!(sup.is_finished("a2"), Some(false));
+    }
+
+    #[test]
+    fn sessionless_still_running_notice_spells_the_wait_in_seconds() {
+        let names = ["a1".to_string(), "a2".to_string()];
+        assert_eq!(
+            sessionless_still_running_notice(&names, Duration::from_secs(7)),
+            "2 background agent(s) still running after 7s: a1, a2. Press Ctrl-C again at the idle prompt to cancel them."
+        );
+    }
+
+    /// Latches Ctrl-C during the first completion and fails it the way the
+    /// client does when a request is aborted mid-stream or before the first
+    /// token.
+    fn ctrl_c_aborts_the_request_runner(
+        seen: SeenInputs,
+    ) -> impl for<'a> FnMut(&'a Input, &'a mut RequestContext, AbortSignal) -> CompletionFuture<'a> + Send
+    {
+        completion_runner(move |input, _ctx, abort| {
+            seen.lock().push(input.clone());
+            abort.set_ctrlc();
+            boxed_completion(async move { Err(anyhow!("Aborted.")) })
+        })
+    }
+
+    /// Drives one request that Ctrl-C aborts, with an abort-aware agent `a1`
+    /// and job `j1` registered on `ctx`; returns their signals.
+    async fn abort_a_request_over_agent_and_job(
+        ctx: &mut RequestContext,
+    ) -> (AbortSignal, AbortSignal) {
+        let agent_abort = register_abort_aware_agent(ctx, "a1");
+        let job_abort = register_abort_aware_job(ctx, "j1");
+        let seen: SeenInputs = Default::default();
+        let mut runner = ctrl_c_aborts_the_request_runner(Arc::clone(&seen));
+        let input = Input::from_str(ctx, "tell me", None).unwrap();
+
+        let err = ask_with_branch_with_runner(
+            ctx,
+            create_abort_signal(),
+            input,
+            false,
+            None,
+            &mut runner,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.to_string(), "Aborted.");
+        assert_eq!(seen.lock().len(), 1, "an aborted request is not retried");
+        (agent_abort, job_abort)
+    }
+
+    #[test]
+    #[serial]
+    fn sessionless_ctrl_c_that_aborts_the_request_cancels_background_tasks() {
+        let _sink = test_sink::install();
+        let marker = "sessionless-ctrlc-request-k7p";
+        run_async(async {
+            let mut ctx = sessionless_interruptible_ctx(marker);
+
+            let (agent_abort, job_abort) = abort_a_request_over_agent_and_job(&mut ctx).await;
+
+            assert!(agent_abort.aborted_ctrlc(), "the agent must be cancelled");
+            assert!(job_abort.aborted_ctrlc(), "the job must be cancelled");
+            assert_eq!(
+                ctx.supervisor.as_ref().unwrap().read().is_finished("a1"),
+                Some(true),
+                "the turn waits for the cancelled agent before it returns"
+            );
+            yield_until_no_active_tasks(&ctx).await;
+            assert_eq!(
+                turn_notice_sink::drain(),
+                ["Turn interrupted; cancelling 2 background task(s)."]
+            );
+        });
+        assert_eq!(hook_count(marker, "turn.interrupted"), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn session_ctrl_c_that_aborts_the_request_leaves_background_tasks_alive() {
+        let _sink = test_sink::install();
+        let marker = "session-ctrlc-request-b2x";
+        run_async(async {
+            let mut ctx = interruptible_ctx(marker);
+
+            let (agent_abort, job_abort) = abort_a_request_over_agent_and_job(&mut ctx).await;
+
+            assert!(!agent_abort.aborted(), "the agent must be left running");
+            assert!(!job_abort.aborted(), "the job must be left running");
+            assert!(ctx.supervisor.as_ref().unwrap().read().has_active_tasks());
+            assert_eq!(
+                turn_notice_sink::drain(),
+                [
+                    "Turn interrupted; 2 background task(s) still running: a1 (agent), j1 (job). Press Ctrl-C again to cancel them, or type to continue."
+                ]
+            );
+        });
+        assert_eq!(hook_count(marker, "turn.interrupted"), 1);
+    }
+
+    /// The graph's route call goes through the quiet transport, so a Ctrl-C
+    /// there ends the turn as an error before the chat branch runs; it still
+    /// prints the two-stage notice and checkpoints nothing.
+    #[test]
+    #[serial]
+    fn session_ctrl_c_that_aborts_the_route_call_prints_the_two_stage_notice() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let _sink = test_sink::install();
+        let name = unique("repl_route_abort");
+        write_graph_agent(&name, SESSION_BLOCK);
+        run_async(async {
+            let mut ctx = engage_graph_agent(repl_ctx(), &name).await;
+            ctx.supervisor = Some(Arc::new(RwLock::new(
+                Supervisor::new(4, 3).with_max_concurrent_jobs(4),
+            )));
+            let agent_abort = register_abort_aware_agent(&mut ctx, "a1");
+            let job_abort = register_abort_aware_job(&mut ctx, "j1");
+            let seen: SeenInputs = Default::default();
+            let mut runner = ctrl_c_aborts_the_request_runner(Arc::clone(&seen));
+
+            let err = turn(&mut ctx, "what happened?", None, &mut runner)
+                .await
+                .unwrap_err();
+
+            assert!(format!("{err:#}").contains("Aborted."), "{err:#}");
+            assert_eq!(route_calls(&seen.lock()), 1);
+            assert_eq!(seen.lock().len(), 1, "the chat branch never ran");
+            assert!(!agent_abort.aborted(), "the agent must be left running");
+            assert!(!job_abort.aborted(), "the job must be left running");
+            assert_eq!(
+                turn_notice_sink::drain(),
+                [
+                    "Turn interrupted; 2 background task(s) still running: a1 (agent), j1 (job). Press Ctrl-C again to cancel them, or type to continue."
+                ]
+            );
+            assert!(
+                ctx.session.as_ref().unwrap().messages().is_empty(),
+                "the aborted route call checkpoints nothing"
+            );
+        });
+    }
+
+    #[test]
+    fn sessionless_cancel_is_silent_with_nothing_running() {
+        let ctx = banner_ctx();
+        let abort_signal = create_abort_signal();
+        assert_eq!(
+            run_async(cancel_sessionless_turn_tasks(&ctx, &abort_signal)),
+            None
+        );
+
+        run_async(async {
+            let mut ctx = sessionless_interruptible_ctx("sessionless-notice-none");
+            register_agent(&mut ctx, "a1", 0).await;
+            let abort_signal = create_abort_signal();
+
+            assert_eq!(
+                cancel_sessionless_turn_tasks(&ctx, &abort_signal).await,
+                None
+            );
+            assert!(
+                !abort_signal.aborted_ctrlc(),
+                "nothing was running, so nothing latches"
+            );
+            assert!(turn_notice_sink::drain().is_empty());
+        });
+    }
+
+    /// Live work one supervisor level down has no top-level id to count, so
+    /// the notice names it as background work, the way the two-stage notice
+    /// does.
+    #[test]
+    fn sessionless_cancel_names_grandchild_only_activity_as_background_work() {
+        use crate::supervisor::{AgentExitStatus, AgentResult};
+
+        run_async(async {
+            let ctx = sessionless_interruptible_ctx("sessionless-notice-grandchild");
+            let grandchild_abort = create_abort_signal();
+            let mut child_sup = Supervisor::new(4, 3);
+            child_sup
+                .register(abort_aware_agent_handle("g1", 2, &grandchild_abort))
+                .unwrap();
+            let mut parent = abort_aware_agent_handle("a1", 1, &create_abort_signal());
+            parent.join_handle = tokio::spawn(async {
+                Ok(AgentResult {
+                    id: "a1".to_string(),
+                    agent_name: "explore".to_string(),
+                    output: String::new(),
+                    exit_status: AgentExitStatus::Completed,
+                    session_id: None,
+                })
+            });
+            while !parent.join_handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            parent.child_supervisor = Some(Arc::new(RwLock::new(child_sup)));
+            ctx.supervisor
+                .as_ref()
+                .unwrap()
+                .write()
+                .register(parent)
+                .unwrap();
+            let abort_signal = create_abort_signal();
+
+            let notice = cancel_sessionless_turn_tasks(&ctx, &abort_signal).await;
+
+            assert_eq!(
+                turn_notice_sink::drain(),
+                ["Turn interrupted; cancelling the background work."]
+            );
+            assert_eq!(notice, None, "the top-level agent had already stopped");
+            assert!(grandchild_abort.aborted_ctrlc());
+            yield_until_no_active_tasks(&ctx).await;
+        });
+    }
+
+    /// A step that latches Ctrl-C and then fails, the way the RAG lookup's
+    /// abortable search fails on a press.
+    async fn ctrl_c_fails_the_step(abort_signal: AbortSignal) -> Result<()> {
+        abort_signal.set_ctrlc();
+        Err(anyhow!("Aborted."))
+    }
+
+    #[test]
+    fn sessionless_ctrl_c_that_fails_the_rag_lookup_cancels_background_tasks() {
+        run_async(async {
+            let mut ctx = sessionless_interruptible_ctx("sessionless-rag-abort");
+            let agent_abort = register_abort_aware_agent(&mut ctx, "a1");
+            let job_abort = register_abort_aware_job(&mut ctx, "j1");
+            let abort_signal = create_abort_signal();
+
+            let err = interruptible_step(
+                &ctx,
+                &abort_signal,
+                ctrl_c_fails_the_step(abort_signal.clone()),
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(err.to_string(), "Aborted.");
+            assert!(agent_abort.aborted_ctrlc(), "the agent must be cancelled");
+            assert!(job_abort.aborted_ctrlc(), "the job must be cancelled");
+            assert_eq!(
+                turn_notice_sink::drain(),
+                ["Turn interrupted; cancelling 2 background task(s)."]
+            );
+            yield_until_no_active_tasks(&ctx).await;
+        });
+    }
+
+    #[test]
+    fn session_ctrl_c_that_fails_the_rag_lookup_prints_the_two_stage_notice() {
+        run_async(async {
+            let mut ctx = interruptible_ctx("session-rag-abort");
+            let agent_abort = register_abort_aware_agent(&mut ctx, "a1");
+            let job_abort = register_abort_aware_job(&mut ctx, "j1");
+            let abort_signal = create_abort_signal();
+
+            let err = interruptible_step(
+                &ctx,
+                &abort_signal,
+                ctrl_c_fails_the_step(abort_signal.clone()),
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(err.to_string(), "Aborted.");
+            assert!(!agent_abort.aborted(), "the agent must be left running");
+            assert!(!job_abort.aborted(), "the job must be left running");
+            assert_eq!(
+                turn_notice_sink::drain(),
+                [
+                    "Turn interrupted; 2 background task(s) still running: a1 (agent), j1 (job). Press Ctrl-C again to cancel them, or type to continue."
+                ]
+            );
+        });
+    }
+
+    /// A step that fails without a press, or succeeds after one, is not an
+    /// interrupt of the turn and prints nothing.
+    #[test]
+    fn interruptible_step_is_silent_unless_ctrl_c_failed_it() {
+        run_async(async {
+            let mut ctx = interruptible_ctx("rag-step-silent");
+            let agent_abort = register_abort_aware_agent(&mut ctx, "a1");
+            let abort_signal = create_abort_signal();
+
+            let failed: Result<()> = Err(anyhow!("search failed"));
+            let err = interruptible_step(&ctx, &abort_signal, async { failed })
+                .await
+                .unwrap_err();
+            assert_eq!(err.to_string(), "search failed");
+
+            let latched = abort_signal.clone();
+            let ok = interruptible_step(&ctx, &abort_signal, async move {
+                latched.set_ctrlc();
+                Ok(7)
+            })
+            .await
+            .unwrap();
+            assert_eq!(ok, 7);
+
+            assert!(turn_notice_sink::drain().is_empty());
+            assert!(!agent_abort.aborted(), "nothing was cancelled");
+        });
+    }
+
+    /// Every way a Ctrl-C ends the turn (the interrupted arm, an aborted
+    /// request, an aborted graph turn, an aborted RAG lookup) prints through
+    /// the one notice helper that branches on the session, so the sessionless
+    /// notices reach the same stderr channel as the two-stage one, and the
+    /// idle-prompt second press keeps its hint.
+    #[test]
+    fn every_interrupt_path_prints_through_one_notice_channel() {
+        let source = include_str!("mod.rs").replace("\r\n", "\n");
+        let production = &source[..source.find("\n#[cfg(test)]\nmod tests {").unwrap()];
+        let notice = "print_turn_notice(ctx, turn_interrupt_notice(ctx, &abort_signal).await);";
+        let arm = format!("        if interrupted {{\n            {notice}\n        }} else {{\n");
+        assert_eq!(production.matches(&arm).count(), 1);
+        let rag = "            let embeddings = input.use_embeddings(abort_signal.clone());\n            interruptible_step(ctx, &abort_signal, embeddings).await?;\n";
+        assert_eq!(production.matches(rag).count(), 1);
+        assert_eq!(production.matches(".use_embeddings(").count(), 1);
+        let step = &production[production.find("async fn interruptible_step<").unwrap()..];
+        let step = &step[..step.find("\n}\n").unwrap()];
+        assert!(
+            step.contains(
+                "print_turn_notice(ctx, turn_interrupt_notice(ctx, abort_signal).await);"
+            ),
+            "{step}"
+        );
+        let graph = format!(
+            "                Err(err) => {{\n                    if abort_signal.aborted_ctrlc() {{\n                        {notice}\n                    }}\n                    return Err(err);\n                }}\n            }};\n            match turn {{\n"
+        );
+        assert_eq!(production.matches(&graph).count(), 1);
+        let aborted = format!(
+            "                    if abort_signal.aborted_ctrlc() {{\n                        {notice}\n                    }}\n                    ctx.on_chat_completion_error(app.as_ref(), &input);\n                    return Err(err);\n"
+        );
+        assert_eq!(production.matches(&aborted).count(), 1);
+        assert_eq!(production.matches(notice).count(), 3);
+        assert_eq!(production.matches("print_turn_notice(").count(), 6);
+        let helper = &production[production.find("async fn turn_interrupt_notice(").unwrap()..];
+        let helper = &helper[..helper.find("\n}\n").unwrap()];
+        assert!(
+            helper.contains(
+                "    if ctx.session.is_none() {\n        cancel_sessionless_turn_tasks(ctx, abort_signal).await\n    } else {\n        interrupted_turn_notice(ctx)\n    }"
+            ),
+            "{helper}"
+        );
+        assert_eq!(
+            production
+                .matches("cancel_sessionless_turn_tasks(ctx,")
+                .count(),
+            1
+        );
+        let printer = &production[production.find("fn print_turn_notice(").unwrap()..];
+        let printer = &printer[..printer.find("\n}\n").unwrap()];
+        assert!(printer.contains("eprintln!("), "{printer}");
+        assert_eq!(
+            CANCELLED_TASKS_HINT,
+            "Cancelled the background task(s) left running by the interrupted turn."
+        );
+    }
+
     /// The welcome banner names both stages of Ctrl-C in the spelling the
     /// interrupt notices use, so the hint and the notices read as one rule.
     #[test]
@@ -9382,6 +10183,7 @@ local_hello() {\n\
         assert!(first.contains("another prompt"));
         assert!(second.contains("again at the idle prompt") && second.contains("cancel"));
         assert!(second.contains("background work"));
+        assert!(second.starts_with("In a session, "));
     }
 
     #[test]
@@ -9452,6 +10254,7 @@ local_hello() {\n\
                     join_handle: grandchild,
                     child_supervisor: None,
                     session_id: None,
+                    child_session_root: None,
                 })
                 .unwrap();
             // The parent's own task is already finished, so the only live
@@ -9481,6 +10284,7 @@ local_hello() {\n\
                     join_handle: parent_task,
                     child_supervisor: Some(Arc::new(RwLock::new(child_sup))),
                     session_id: None,
+                    child_session_root: None,
                 })
                 .unwrap();
             assert_eq!(
@@ -9778,13 +10582,16 @@ local_hello() {\n\
             join_handle,
             child_supervisor: None,
             session_id: None,
+            child_session_root: None,
         })
         .unwrap();
         (Arc::new(RwLock::new(sup)), child_signal)
     }
 
     #[test]
+    #[serial]
     fn exit_session_with_nothing_attached_leaves_background_work_alone() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
         run_async(async {
             let mut ctx = repl_ctx();
             assert!(ctx.session.is_none());
@@ -9803,7 +10610,9 @@ local_hello() {\n\
     }
 
     #[test]
+    #[serial]
     fn exit_session_with_a_session_attached_cancels_background_work() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
         run_async(async {
             let mut ctx = repl_ctx();
             let mut session = Session::default();
@@ -9852,9 +10661,264 @@ local_hello() {\n\
         });
     }
 
-    /// Both session exits run behind a live editor loop, so the ordering is
-    /// pinned by source scrape: the cancel-and-wait must precede the exit
-    /// that settles the session's child directory.
+    #[test]
+    #[serial]
+    fn exit_agent_with_a_session_attached_cancels_background_work() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        run_async(async {
+            let mut ctx = repl_ctx();
+            let mut session = Session::default();
+            session.set_save_session(Some(false));
+            ctx.session = Some(session);
+            let (supervisor, child_signal) = supervisor_with_cancellable_agent();
+            ctx.supervisor = Some(Arc::clone(&supervisor));
+
+            repl_command(&mut ctx, ".exit agent").await.unwrap();
+
+            assert!(ctx.session.is_none());
+            assert!(
+                child_signal.aborted_ctrlc(),
+                "leaving the agent settles the session, so it cancels first"
+            );
+            assert_eq!(supervisor.read().is_finished("a1"), Some(true));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn exit_agent_with_nothing_attached_leaves_background_work_alone() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        run_async(async {
+            let mut ctx = repl_ctx();
+            assert!(ctx.session.is_none());
+            assert!(ctx.child_session_root.is_none());
+            let (supervisor, child_signal) = supervisor_with_cancellable_agent();
+            ctx.supervisor = Some(Arc::clone(&supervisor));
+
+            repl_command(&mut ctx, ".exit agent").await.unwrap();
+
+            assert!(!child_signal.aborted_ctrlc());
+            assert_eq!(supervisor.read().is_finished("a1"), Some(false));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn empty_session_with_a_session_attached_cancels_background_work() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        run_async(async {
+            let mut ctx = repl_ctx();
+            let mut session = Session::default();
+            session.set_save_session(Some(false));
+            ctx.session = Some(session);
+            let (supervisor, child_signal) = supervisor_with_cancellable_agent();
+            ctx.supervisor = Some(Arc::clone(&supervisor));
+
+            repl_command(&mut ctx, ".empty session").await.unwrap();
+
+            assert!(
+                ctx.session
+                    .as_ref()
+                    .is_some_and(|session| session.messages().is_empty()),
+                "the session stays attached, emptied"
+            );
+            assert!(
+                child_signal.aborted_ctrlc(),
+                "children would write under the directory the empty removes"
+            );
+            assert_eq!(supervisor.read().is_finished("a1"), Some(true));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn empty_session_with_nothing_attached_leaves_background_work_alone() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        run_async(async {
+            let mut ctx = repl_ctx();
+            assert!(ctx.session.is_none());
+            assert!(ctx.child_session_root.is_none());
+            let (supervisor, child_signal) = supervisor_with_cancellable_agent();
+            ctx.supervisor = Some(Arc::clone(&supervisor));
+
+            let err = repl_command(&mut ctx, ".empty session").await.unwrap_err();
+
+            assert_eq!(err.to_string(), "No session");
+            assert!(!child_signal.aborted_ctrlc());
+            assert_eq!(supervisor.read().is_finished("a1"), Some(false));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn empty_session_with_only_a_process_root_leaves_background_work_alone() {
+        use crate::config::child_sessions::{ChildSessionRoot, RootFile};
+        use crate::utils::process::ProcessStamp;
+
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        run_async(async {
+            let mut ctx = repl_ctx();
+            assert!(ctx.session.is_none());
+            let root = ChildSessionRoot::from_stamp(ProcessStamp::current());
+            root.ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
+                .unwrap();
+            ctx.child_session_root = Some(Arc::new(root.clone()));
+            let (supervisor, child_signal) = supervisor_with_cancellable_agent();
+            ctx.supervisor = Some(Arc::clone(&supervisor));
+
+            let err = repl_command(&mut ctx, ".empty session").await.unwrap_err();
+
+            assert_eq!(err.to_string(), "No session");
+            assert!(
+                !child_signal.aborted_ctrlc(),
+                "an empty that bails removes nothing, so it cancels nothing"
+            );
+            assert_eq!(supervisor.read().is_finished("a1"), Some(false));
+            assert!(root.dir().exists());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn session_attach_with_a_process_root_cancels_background_work_and_settles_the_root() {
+        use crate::config::child_sessions::{ChildSessionRoot, RootFile};
+        use crate::utils::process::ProcessStamp;
+
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        run_async(async {
+            let mut ctx = repl_ctx();
+            assert!(ctx.session.is_none());
+            let root = ChildSessionRoot::from_stamp(ProcessStamp::current());
+            root.ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
+                .unwrap();
+            ctx.child_session_root = Some(Arc::new(root.clone()));
+            let (supervisor, child_signal) = supervisor_with_cancellable_agent();
+            ctx.supervisor = Some(Arc::clone(&supervisor));
+
+            repl_command(&mut ctx, ".session attach-test")
+                .await
+                .unwrap();
+
+            assert!(
+                child_signal.aborted_ctrlc(),
+                "the attach settles the process root the children run under"
+            );
+            assert_eq!(supervisor.read().is_finished("a1"), Some(true));
+            assert!(!root.dir().exists());
+            assert!(ctx.child_session_root.is_none());
+            assert!(ctx.session.is_some());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn session_attach_with_no_root_leaves_background_work_alone() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        run_async(async {
+            let mut ctx = repl_ctx();
+            assert!(ctx.session.is_none());
+            assert!(ctx.child_session_root.is_none());
+            let (supervisor, child_signal) = supervisor_with_cancellable_agent();
+            ctx.supervisor = Some(Arc::clone(&supervisor));
+
+            repl_command(&mut ctx, ".session attach-test-2")
+                .await
+                .unwrap();
+
+            assert!(
+                !child_signal.aborted_ctrlc(),
+                "with no root to settle the attach cancels nothing"
+            );
+            assert_eq!(supervisor.read().is_finished("a1"), Some(false));
+            assert!(ctx.session.is_some());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn session_attach_while_attached_with_a_uid_root_leaves_background_work_alone() {
+        use crate::config::child_sessions::ChildSessionRoot;
+
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        run_async(async {
+            let mut ctx = repl_ctx();
+            let mut session = Session::default();
+            session.set_save_session(Some(false));
+            ctx.session = Some(session);
+            let root = ChildSessionRoot::Uid(uuid::Uuid::new_v4());
+            ctx.child_session_root = Some(Arc::new(root));
+            let (supervisor, child_signal) = supervisor_with_cancellable_agent();
+            ctx.supervisor = Some(Arc::clone(&supervisor));
+
+            let err = repl_command(&mut ctx, ".session attach-test-3")
+                .await
+                .unwrap_err();
+
+            assert!(err.to_string().starts_with("Already in a session"), "{err}");
+            assert!(
+                !child_signal.aborted_ctrlc(),
+                "a refused attach settles nothing, so it cancels nothing"
+            );
+            assert_eq!(supervisor.read().is_finished("a1"), Some(false));
+            assert!(ctx.session.is_some());
+            assert!(ctx.child_session_root.is_some());
+        });
+    }
+
+    /// `.fork` is not an exit: the session stays attached and its children
+    /// keep running, so nothing is cancelled and nothing waits on them. The
+    /// cached process root an attached session never has is still settled
+    /// as a defensive mirror of the attach, without a drain.
+    #[test]
+    #[serial]
+    fn usage_probe_fork_leaves_background_work_alone_while_settling_a_process_root() {
+        use crate::config::child_sessions::{ChildSessionRoot, RootFile};
+        use crate::utils::process::ProcessStamp;
+
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        run_async(async {
+            let mut ctx = repl_ctx();
+            let app = ctx.app.config.clone();
+            let mut session = Session::new_from_ctx(&ctx, &app, "fork-src").unwrap();
+            session.set_save_session(Some(true));
+            ctx.session = Some(session);
+            let path = ctx.session_file_for("fork-src", SessionScope::Global);
+            let root = ChildSessionRoot::from_stamp(ProcessStamp::current());
+            root.ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
+                .unwrap();
+            ctx.child_session_root = Some(Arc::new(root.clone()));
+            let (supervisor, child_signal) = supervisor_with_cancellable_agent();
+            ctx.supervisor = Some(Arc::clone(&supervisor));
+
+            repl_command(&mut ctx, ".fork fork-dst").await.unwrap();
+
+            assert!(
+                !child_signal.aborted_ctrlc(),
+                "a fork keeps the session and its children; nothing is cancelled"
+            );
+            assert_eq!(supervisor.read().is_finished("a1"), Some(false));
+            assert_eq!(ctx.session.as_ref().map(Session::name), Some("fork-dst"));
+            assert!(
+                ctx.session_file_for("fork-dst", SessionScope::Global)
+                    .is_file()
+            );
+            assert!(
+                path.is_file(),
+                "the source session's file is saved and stays"
+            );
+            assert!(
+                !root.dir().exists(),
+                "the inherited process root is settled"
+            );
+            assert!(ctx.child_session_root.is_none());
+
+            child_signal.set_ctrlc();
+        });
+    }
+
+    /// Every session exit runs behind a live editor loop, so the ordering
+    /// is pinned by source scrape: the cancel-and-wait must precede the
+    /// exit, or the empty, that settles the session's child directory.
     #[test]
     fn session_exits_cancel_and_wait_before_settling_the_session() {
         let source = include_str!("mod.rs").replace("\r\n", "\n");
@@ -9862,6 +10926,7 @@ local_hello() {\n\
         let call = "cancel_background_tasks_and_wait(EXIT_CANCEL_WAIT).await";
         assert_eq!(EXIT_CANCEL_WAIT, Duration::from_secs(5));
         assert!(production.contains("const EXIT_CANCEL_WAIT: Duration = Duration::from_secs(5);"));
+        assert_eq!(production.matches(&format!("{call};")).count(), 6);
 
         let finished = production.find("top_level_agent_finished(").unwrap();
         let before_finished = &production[..finished];
@@ -9878,6 +10943,19 @@ local_hello() {\n\
             "the signal-only cancel has no place at an exit seam"
         );
 
+        let either_guard = "if ctx.session.is_some() || ctx.child_session_root.is_some() {";
+        let session_guard = "if ctx.session.is_some() {";
+        let guarded_wait_before = |arm: &str, guard: &str, settles: &str| {
+            let arm_guard = arm.find(guard).unwrap();
+            let arm_wait = arm_guard + arm[arm_guard..].find(&format!("{call};")).unwrap();
+            assert_eq!(
+                arm[arm_guard + guard.len()..arm_wait].trim(),
+                "ctx.",
+                "the guard wraps the wait"
+            );
+            assert!(arm_wait < arm.find(settles).unwrap(), "{arm}");
+        };
+
         let exit_match = production.find("\".exit\" => match args {").unwrap();
         let arm_start = exit_match
             + production[exit_match..]
@@ -9885,18 +10963,36 @@ local_hello() {\n\
                 .unwrap();
         let arm_len = production[arm_start..].find("Some(\"rag\") =>").unwrap();
         let arm = &production[arm_start..arm_start + arm_len];
-        let guard = "if ctx.session.is_some() || ctx.child_session_root.is_some() {";
-        let arm_guard = arm.find(guard).unwrap();
-        let arm_wait = arm_guard + arm[arm_guard..].find(&format!("{call};")).unwrap();
-        assert_eq!(
-            arm[arm_guard + guard.len()..arm_wait].trim(),
-            "ctx.",
-            "the guard wraps the wait"
+        guarded_wait_before(arm, either_guard, "exit_agent_session()");
+        guarded_wait_before(arm, either_guard, "exit_session()");
+
+        let agent_start = exit_match
+            + production[exit_match..]
+                .find("Some(\"agent\") => {")
+                .unwrap();
+        let agent_len = production[agent_start..]
+            .find("Some(_) => unknown_command")
+            .unwrap();
+        guarded_wait_before(
+            &production[agent_start..agent_start + agent_len],
+            either_guard,
+            "exit_agent(",
         );
-        assert!(
-            arm_wait < arm.find("exit_agent_session()").unwrap(),
-            "{arm}"
+
+        let empty_start = production.find("\".empty\" => match args {").unwrap();
+        let empty_len = production[empty_start..].find("_ =>").unwrap();
+        guarded_wait_before(
+            &production[empty_start..empty_start + empty_len],
+            session_guard,
+            "empty_session()",
         );
-        assert!(arm_wait < arm.find("exit_session()").unwrap(), "{arm}");
+
+        let session_start = production.find("\".session\" => {").unwrap();
+        let session_len = production[session_start..].find("\".install\" =>").unwrap();
+        guarded_wait_before(
+            &production[session_start..session_start + session_len],
+            "if ctx.session.is_none() && ctx.child_session_root.is_some() {",
+            "use_session(",
+        );
     }
 }

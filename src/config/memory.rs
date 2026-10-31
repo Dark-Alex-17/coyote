@@ -46,14 +46,57 @@ pub fn catalogue_entry(line: &str) -> Option<(&str, &str)> {
     ))
 }
 
+/// Test-only override of where workspace memory discovery starts, and the
+/// directory it never walks above. Without it, a test running from the repo
+/// root discovers the developer's real `.coyote/memory/MEMORY.md` and
+/// injects it into prompts.
+#[cfg(test)]
+pub(crate) const WORKSPACE_MEMORY_ROOT_TEST_ENV: &str = "COYOTE_TEST_WORKSPACE_MEMORY_ROOT";
+
 #[derive(Debug, Clone)]
 pub struct WorkspaceMemory {
     pub workspace_root: PathBuf,
     pub dir: PathBuf,
 }
 
-pub fn discover_workspace_memory(start: &Path) -> Option<WorkspaceMemory> {
-    for dir in start.ancestors() {
+/// The workspace memory a process running in `cwd` sees. Every lookup
+/// outside this module goes through here so the test override applies.
+pub fn find_workspace_memory(cwd: &Path) -> Option<WorkspaceMemory> {
+    let (start, ceiling) = workspace_search_bounds(cwd);
+    walk_workspace_memory(&start, ceiling.as_deref())
+}
+
+/// Whether a global index, or a workspace index visible from `cwd`, exists;
+/// an agent is offered the memory tools only when one does.
+pub fn memory_index_exists(cwd: Option<&Path>) -> bool {
+    paths::global_memory_index_file().exists() || cwd.and_then(find_workspace_memory).is_some()
+}
+
+/// Where a workspace lookup from `cwd` starts and the directory it must not
+/// walk above: `cwd` and no ceiling, or the test override for both.
+#[cfg(not(test))]
+pub(crate) fn workspace_search_bounds(cwd: &Path) -> (PathBuf, Option<PathBuf>) {
+    (cwd.to_path_buf(), None)
+}
+
+#[cfg(test)]
+pub(crate) fn workspace_search_bounds(cwd: &Path) -> (PathBuf, Option<PathBuf>) {
+    match std::env::var_os(WORKSPACE_MEMORY_ROOT_TEST_ENV) {
+        Some(root) => {
+            let root = PathBuf::from(root);
+            assert!(
+                root.is_absolute(),
+                "{WORKSPACE_MEMORY_ROOT_TEST_ENV} must be absolute, got {}",
+                root.display()
+            );
+            (root.clone(), Some(root))
+        }
+        None => (cwd.to_path_buf(), None),
+    }
+}
+
+fn walk_workspace_memory(start: &Path, ceiling: Option<&Path>) -> Option<WorkspaceMemory> {
+    for dir in ancestors_within(start, ceiling) {
         let structured = dir.join(WORKSPACE_COYOTE_DIR_NAME).join(MEMORY_DIR_NAME);
         if structured.join(MEMORY_INDEX_FILE_NAME).exists() {
             return Some(WorkspaceMemory {
@@ -65,14 +108,41 @@ pub fn discover_workspace_memory(start: &Path) -> Option<WorkspaceMemory> {
     None
 }
 
-pub fn find_git_root(start: &Path) -> Option<PathBuf> {
-    for dir in start.ancestors() {
+fn find_git_root(start: &Path) -> Option<PathBuf> {
+    find_git_root_within(start, None)
+}
+
+/// The git root a process running in `cwd` sees, bounded like
+/// `find_workspace_memory` so the test override applies.
+pub fn find_workspace_git_root(cwd: &Path) -> Option<PathBuf> {
+    let (start, ceiling) = workspace_search_bounds(cwd);
+    find_git_root_within(&start, ceiling.as_deref())
+}
+
+/// Test-only: the bounded walk with an explicit ceiling, for tests that must
+/// not read above their own temp root. Ignores the override.
+#[cfg(test)]
+pub(crate) fn find_git_root_under(start: &Path, ceiling: &Path) -> Option<PathBuf> {
+    find_git_root_within(start, Some(ceiling))
+}
+
+fn find_git_root_within(start: &Path, ceiling: Option<&Path>) -> Option<PathBuf> {
+    for dir in ancestors_within(start, ceiling) {
         if dir.join(GIT_DIR_NAME).exists() {
             return Some(dir.to_path_buf());
         }
     }
 
     None
+}
+
+fn ancestors_within<'a>(
+    start: &'a Path,
+    ceiling: Option<&'a Path>,
+) -> impl Iterator<Item = &'a Path> {
+    start
+        .ancestors()
+        .take_while(move |dir| ceiling.is_none_or(|ceiling| dir.starts_with(ceiling)))
 }
 
 pub fn bootstrap_workspace_memory(git_root: &Path) -> Result<PathBuf> {
@@ -417,7 +487,17 @@ impl MemoryStore {
     pub fn new(cwd: &Path) -> Self {
         Self {
             global_dir: paths::global_memory_dir(),
-            workspace: discover_workspace_memory(cwd),
+            workspace: find_workspace_memory(cwd),
+        }
+    }
+
+    /// A store over explicit test dirs: the workspace is found by walking up
+    /// from `start`, ignoring the override and never above `ceiling`.
+    #[cfg(test)]
+    pub(crate) fn for_test(global_dir: PathBuf, start: &Path, ceiling: &Path) -> Self {
+        Self {
+            global_dir,
+            workspace: walk_workspace_memory(start, Some(ceiling)),
         }
     }
 
@@ -919,6 +999,8 @@ fn is_drill_file(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::EnvVarGuard;
+    use serial_test::serial;
     use std::{env, time};
     use time::SystemTime;
 
@@ -950,10 +1032,7 @@ mod tests {
         fs::create_dir_all(&global).unwrap();
         fs::write(global.join(MEMORY_INDEX_FILE_NAME), "global-content").unwrap();
 
-        let store = MemoryStore {
-            global_dir: global,
-            workspace: discover_workspace_memory(&workspace),
-        };
+        let store = MemoryStore::for_test(global, &workspace, &root);
 
         assert_eq!(
             store.load_global_index().unwrap().as_deref(),
@@ -974,7 +1053,7 @@ mod tests {
         fs::create_dir_all(&workspace).unwrap();
         fs::write(workspace.join("COYOTE.md"), "instructions, not memory").unwrap();
 
-        assert!(discover_workspace_memory(&workspace).is_none());
+        assert!(walk_workspace_memory(&workspace, Some(&root)).is_none());
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -985,10 +1064,7 @@ mod tests {
         let workspace = root.join("ws");
         fs::create_dir_all(&workspace).unwrap();
 
-        let store = MemoryStore {
-            global_dir: root.join("global"),
-            workspace: discover_workspace_memory(&workspace),
-        };
+        let store = MemoryStore::for_test(root.join("global"), &workspace, &root);
 
         assert!(
             build_memory_section(&store, true, 4_000, 12_000)
@@ -1018,10 +1094,7 @@ mod tests {
         )
         .unwrap();
 
-        let store = MemoryStore {
-            global_dir: root.join("global"),
-            workspace: discover_workspace_memory(&workspace),
-        };
+        let store = MemoryStore::for_test(root.join("global"), &workspace, &root);
 
         let section = build_memory_section(&store, true, 4_000, 12_000)
             .unwrap()
@@ -1055,10 +1128,7 @@ mod tests {
         )
         .unwrap();
 
-        let store = MemoryStore {
-            global_dir: root.join("global"),
-            workspace: discover_workspace_memory(&workspace),
-        };
+        let store = MemoryStore::for_test(root.join("global"), &workspace, &root);
 
         let section = build_memory_section(&store, false, 4_000, 12_000)
             .unwrap()
@@ -1087,10 +1157,7 @@ mod tests {
         )
         .unwrap();
 
-        let store = MemoryStore {
-            global_dir: root.join("global"),
-            workspace: discover_workspace_memory(&workspace),
-        };
+        let store = MemoryStore::for_test(root.join("global"), &workspace, &root);
 
         let section = build_memory_section(&store, false, 4_000, 100)
             .unwrap()
@@ -1127,10 +1194,7 @@ mod tests {
         let global = root.join("global");
         fs::create_dir_all(&global).unwrap();
         fs::write(global.join(MEMORY_INDEX_FILE_NAME), global_index).unwrap();
-        let store = MemoryStore {
-            global_dir: global,
-            workspace: discover_workspace_memory(&workspace),
-        };
+        let store = MemoryStore::for_test(global, &workspace, &root);
         (root, store)
     }
 
@@ -1863,10 +1927,7 @@ mod tests {
         write_store_file(&structured, "scratch", "type: run-state\n");
         write_store_file(&structured, "bygone", "expires: 2000-01-01\n");
 
-        let store = MemoryStore {
-            global_dir: root.join("global"),
-            workspace: discover_workspace_memory(&workspace),
-        };
+        let store = MemoryStore::for_test(root.join("global"), &workspace, &root);
 
         let section = build_memory_section(&store, false, 4_000, 12_000)
             .unwrap()
@@ -1892,38 +1953,161 @@ mod tests {
         let nested = workspace.join("src").join("deep").join("path");
         fs::create_dir_all(&nested).unwrap();
 
-        let found = discover_workspace_memory(&nested).expect("workspace memory should be found");
+        let found =
+            walk_workspace_memory(&nested, Some(&root)).expect("workspace memory should be found");
         assert_eq!(found.dir, mem_dir);
 
         let _ = fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn find_git_root_returns_dir_containing_git_dir() {
-        let root = temp_root("git_root");
-        let repo = root.join("repo");
-        fs::create_dir_all(repo.join(GIT_DIR_NAME)).unwrap();
+    fn workspace_with_index(root: &Path, name: &str) -> PathBuf {
+        let workspace = root.join(name);
+        let mem_dir = workspace
+            .join(WORKSPACE_COYOTE_DIR_NAME)
+            .join(MEMORY_DIR_NAME);
+        fs::create_dir_all(&mem_dir).unwrap();
+        fs::write(mem_dir.join(MEMORY_INDEX_FILE_NAME), name).unwrap();
+        workspace
+    }
 
-        assert_eq!(find_git_root(&repo), Some(repo.clone()));
+    #[test]
+    #[serial]
+    fn store_new_discovers_from_cwd_without_the_test_root_override() {
+        let _unset = EnvVarGuard::unset(WORKSPACE_MEMORY_ROOT_TEST_ENV);
+        let root = temp_root("new_from_cwd");
+        let workspace = workspace_with_index(&root, "ws");
+
+        let store = MemoryStore::new(&workspace);
+        let found = store.workspace.expect("workspace memory should be found");
+        assert_eq!(found.workspace_root, workspace);
 
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn find_git_root_walks_up_from_nested_dir() {
+    #[serial]
+    fn store_new_starts_the_walk_at_the_test_root_override() {
+        let root = temp_root("new_override");
+        let cwd_workspace = workspace_with_index(&root, "cwd");
+        let override_workspace = workspace_with_index(&root, "override");
+        let _env = EnvVarGuard::set(WORKSPACE_MEMORY_ROOT_TEST_ENV, &override_workspace);
+
+        let store = MemoryStore::new(&cwd_workspace);
+        let found = store.workspace.expect("workspace memory should be found");
+        assert_eq!(found.workspace_root, override_workspace);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[serial]
+    fn store_new_never_walks_above_the_test_root_override() {
+        let root = temp_root("override_ceiling");
+        let indexed = workspace_with_index(&root, "indexed");
+        let pinned = indexed.join("nested");
+        fs::create_dir_all(&pinned).unwrap();
+        let _env = EnvVarGuard::set(WORKSPACE_MEMORY_ROOT_TEST_ENV, &pinned);
+
+        assert!(
+            MemoryStore::new(&pinned).workspace.is_none(),
+            "the index above the override is out of reach"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The shared test guard points the override at its own temp workspace
+    /// root (the parent of the directory it hands out as the workspace
+    /// config dir), which holds no memory index, so a store built from any
+    /// cwd under the guard carries no workspace memory even when that cwd
+    /// sits inside a workspace that has one. Dropping the guard puts the cwd
+    /// walk back.
+    #[test]
+    #[serial]
+    fn usage_probe_the_test_config_dir_guard_pins_the_workspace_memory_root_to_its_own_workspace() {
+        let _unset = EnvVarGuard::unset(WORKSPACE_MEMORY_ROOT_TEST_ENV);
+        let root = temp_root("guard_pins_memory_root");
+        let indexed = workspace_with_index(&root, "indexed");
+        let cwd = indexed.join("src").join("deep");
+        fs::create_dir_all(&cwd).unwrap();
+
+        let guard = crate::testing::TestConfigDirGuard::new("memory-root-pin");
+        let pinned = PathBuf::from(
+            env::var_os(WORKSPACE_MEMORY_ROOT_TEST_ENV).expect("the guard sets the override"),
+        );
+        let workspace_config_dir = PathBuf::from(
+            env::var_os(crate::utils::get_env_name("workspace_config_dir"))
+                .expect("the guard sets the workspace config dir"),
+        );
+        assert_eq!(
+            pinned.join(WORKSPACE_COYOTE_DIR_NAME),
+            workspace_config_dir,
+            "the override is the guard's workspace root"
+        );
+        assert!(
+            !pinned
+                .join(WORKSPACE_COYOTE_DIR_NAME)
+                .join(MEMORY_DIR_NAME)
+                .join(MEMORY_INDEX_FILE_NAME)
+                .exists(),
+            "the guard's workspace carries no memory index"
+        );
+        assert!(
+            MemoryStore::new(&cwd).workspace.is_none(),
+            "under the guard the indexed workspace around the cwd is never discovered"
+        );
+
+        drop(guard);
+        assert!(env::var_os(WORKSPACE_MEMORY_ROOT_TEST_ENV).is_none());
+        let found = MemoryStore::new(&cwd)
+            .workspace
+            .expect("without the guard the cwd walk finds the index again");
+        assert_eq!(found.workspace_root, indexed);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn find_git_root_under_returns_dir_containing_git_dir() {
+        let root = temp_root("git_root");
+        let repo = root.join("repo");
+        fs::create_dir_all(repo.join(GIT_DIR_NAME)).unwrap();
+
+        assert_eq!(find_git_root_under(&repo, &root), Some(repo.clone()));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn find_git_root_under_walks_up_from_nested_dir() {
         let root = temp_root("git_root_walk");
         let repo = root.join("repo");
         fs::create_dir_all(repo.join(GIT_DIR_NAME)).unwrap();
         let nested = repo.join("a").join("b").join("c");
         fs::create_dir_all(&nested).unwrap();
 
-        assert_eq!(find_git_root(&nested), Some(repo));
+        assert_eq!(find_git_root_under(&nested, &root), Some(repo));
 
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn find_git_root_treats_git_file_as_repo_marker() {
+    fn find_git_root_under_stops_at_the_ceiling() {
+        let root = temp_root("git_root_ceiling");
+        let repo = root.join("repo");
+        fs::create_dir_all(repo.join(GIT_DIR_NAME)).unwrap();
+        let ceiling = repo.join("a");
+        let nested = ceiling.join("b");
+        fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(find_git_root_under(&nested, &ceiling), None);
+        assert_eq!(find_git_root_under(&nested, &repo), Some(repo));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn find_git_root_under_treats_git_file_as_repo_marker() {
         let root = temp_root("git_root_worktree");
         let worktree = root.join("worktree");
         fs::create_dir_all(&worktree).unwrap();
@@ -1933,18 +2117,18 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(find_git_root(&worktree), Some(worktree));
+        assert_eq!(find_git_root_under(&worktree, &root), Some(worktree));
 
         let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn find_git_root_returns_none_when_no_git() {
+    fn find_git_root_under_returns_none_when_no_git() {
         let root = temp_root("git_root_missing");
         let bare = root.join("bare");
         fs::create_dir_all(&bare).unwrap();
 
-        assert_eq!(find_git_root(&bare), None);
+        assert_eq!(find_git_root_under(&bare, &root), None);
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -2069,7 +2253,7 @@ mod tests {
         let root = temp_root("init_no_git");
         let cwd = root.join("proj");
         fs::create_dir_all(&cwd).unwrap();
-        assert_eq!(find_git_root(&cwd), None);
+        assert_eq!(find_git_root_under(&cwd, &root), None);
 
         let index = paths::workspace_memory_index_file_for(&init_workspace_root(&cwd));
         assert_eq!(
