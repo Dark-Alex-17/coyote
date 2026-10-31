@@ -79,7 +79,7 @@ debt_scan() {
   if ! command -v python3 >/dev/null 2>&1; then
     printf 'DEBT_SCAN_FAILED: python3 is not on PATH\nManual fallback (run it yourself, <base> = %s):\n' "${argc_base}" >> "$LLM_OUTPUT"
     cat <<'EOF' >> "$LLM_OUTPUT"
-  git ls-files --others --exclude-standard -z | xargs -0 -r git add -N -- && git diff --no-color --no-ext-diff <base> | grep -nE '^\+.*(#!?\[(allow|expect)\(|cfg_attr\(|todo!|unimplemented!|#\[ignore)'
+  git ls-files --others --exclude-standard -z | xargs -0 -r git add -N -- && git diff --no-color --no-ext-diff --no-textconv --no-relative <base> -- | grep -nE '^\+.*(#!?\[(allow|expect)\(|cfg_attr\(|todo!|unimplemented!|#\[ignore)'
 grep exiting 1 with no lines is the no-debt result; -n numbers the DIFF output, so resolve each hit to its real <file:line> with the fs_grep tool: the hit text after the + is its pattern (regex metacharacters escaped) -- never paste diff text into a shell string -- and keep only matches in files the diff touched; a bare cfg_attr( without allow|expect is not debt.
 EOF
     return 0

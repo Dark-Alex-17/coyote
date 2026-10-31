@@ -6,7 +6,7 @@ decisions after a coder returns") and step-runner (edge_case_sweep step 5)
 previously asked the MODEL to execute and post-process:
 
     git ls-files --others --exclude-standard -z | xargs -0 -r git add -N -- \
-      && git diff --no-color --no-ext-diff <base> \
+      && git diff --no-color --no-ext-diff --no-textconv --no-relative <base> -- \
       | grep -nE '^\\+.*(#!?\\[(allow|expect)\\(|cfg_attr\\(|todo!|unimplemented!|#\\[ignore)'
 
 Improvements over the LLM procedure, with identical match semantics:
@@ -48,7 +48,7 @@ import sys
 MARKER_RE = re.compile(r"(#!?\[(allow|expect)\(|cfg_attr\(|todo!|unimplemented!|#\[ignore)")
 MANUAL_PIPELINE = (
     "git ls-files --others --exclude-standard -z | xargs -0 -r git add -N -- "
-    "&& git diff --no-color --no-ext-diff <base> | grep -nE "
+    "&& git diff --no-color --no-ext-diff --no-textconv --no-relative <base> -- | grep -nE "
     "'^\\+.*(#!?\\[(allow|expect)\\(|cfg_attr\\(|todo!|unimplemented!|#\\[ignore)'"
 )
 # Per git call; three calls run back to back, so the sum stays inside the
@@ -74,6 +74,7 @@ COMBINED_MARKERS = ("diff --cc ", "diff --combined ", "@@@")
 # cannot import debris.py); a test keeps the two copies identical.
 C_ESCAPE_RE = re.compile(r'\\([0-3][0-7]{2}|[abtnvfr"\\])')
 C_ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
+CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f-\x9f\u2028\u2029]")
 
 
 def unquote_c(name):
@@ -87,6 +88,12 @@ def unquote_c(name):
         pos = m.end()
     out += name[pos:].encode("utf-8")
     return out.decode("utf-8", errors="replace")
+
+
+def display_path(path):
+    """The path with control characters removed, so a name carrying a newline
+    or an escape sequence never splits or colours a report row."""
+    return CONTROL_CHAR_RE.sub("", path)
 
 
 def run_git(args, cwd):
@@ -141,7 +148,7 @@ def parse_diff(diff_text):
                 target = line[4:].strip()
                 if target.startswith('"') and target.endswith('"'):
                     target = unquote_c(target[1:-1])
-                path = None if target == "/dev/null" else re.sub(r"^b/", "", target)
+                path = None if target == "/dev/null" else display_path(re.sub(r"^b/", "", target))
             continue
         if line.startswith("+"):
             text = line[1:]

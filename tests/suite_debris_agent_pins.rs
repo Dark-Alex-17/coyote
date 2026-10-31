@@ -521,7 +521,9 @@ fn debt_grep_regex_has_one_home_in_debt_scan_and_its_fallbacks_match_the_debris_
     );
     assert!(
         pipeline.contains("ls-files --others --exclude-standard -z | xargs -0 -r git add -N -- ")
-            && pipeline.contains("git diff --no-color --no-ext-diff <base> | "),
+            && pipeline.contains(
+                "git diff --no-color --no-ext-diff --no-textconv --no-relative <base> -- | "
+            ),
         "the quoted manual pipeline lost its add -N feed or diff flags: {pipeline}"
     );
     // The python3-less fallback in the Sisyphus tool is a quoted heredoc, so
@@ -533,13 +535,20 @@ fn debt_grep_regex_has_one_home_in_debt_scan_and_its_fallbacks_match_the_debris_
         "the sisyphus debt_scan python3-less fallback must quote MANUAL_PIPELINE exactly once: {tool}"
     );
 
-    // The graph default is a YAML single-quoted scalar: `''` in source is `'`.
-    let graph = agent_file("step-runner/graph.yaml").replace("''", "'");
-    assert_eq!(
-        graph.matches(GREP_TAIL).count(),
-        1,
-        "step-runner graph must carry the fallback grep exactly once (the initial-state default)"
-    );
+    // The graph defaults are YAML single-quoted scalars: `''` in source is `'`.
+    for rel in ["step-runner/graph.yaml", "sisyphus-next/graph.yaml"] {
+        let graph = agent_file(rel).replace("''", "'");
+        assert_eq!(
+            graph.matches(GREP_TAIL).count(),
+            1,
+            "{rel} must carry the fallback grep exactly once (the initial-state default)"
+        );
+        assert_eq!(
+            graph.matches(pipeline.as_str()).count(),
+            1,
+            "{rel}: the debt_hits default must quote MANUAL_PIPELINE exactly once"
+        );
+    }
     assert!(
         !agent_file("sisyphus/instructions.md").contains("grep -nE"),
         "sisyphus prose must not keep its own copy of the debt grep - the tool owns it"
@@ -1043,6 +1052,58 @@ fn debt_scan_reports_a_marker_that_follows_a_bare_cfg_attr_on_the_same_line() {
     );
 }
 
+/// textconv output is not the file content: a filter that rewrites `todo!`
+/// must not hide the added marker from the scan.
+#[cfg(unix)]
+#[test]
+fn debt_scan_reads_the_real_lines_under_a_textconv_filter() {
+    if python3_missing() {
+        return;
+    }
+    let (guard, repo, _) = debt_scan_scratch_repo("textconv");
+    fs::write(repo.join(".gitattributes"), "*.rs diff=upper\n").unwrap();
+    git(
+        &repo,
+        &["config", "diff.upper.textconv", "sed 's/todo!/DONE/'"],
+    );
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "textconv"]);
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+    fs::write(repo.join("src/lib.rs"), "fn tracked() {}\ntodo!()\n").unwrap();
+    assert!(
+        git(&repo, &["diff", &base]).contains("+DONE()"),
+        "the fixture's textconv filter is not in effect"
+    );
+
+    let (code, text) = debt_scan(&guard.0, &repo, &base);
+    assert_eq!(code, Some(0), "{text}");
+    assert!(
+        text.lines().any(|l| l == "src/lib.rs:2 -- todo!()"),
+        "the scan must diff the real content, not the textconv output: {text}"
+    );
+}
+
+/// Runs debt_scan.py's `parse_diff` on `diff` and prints its hits one per
+/// line, or `RuntimeError: <message>` when it refuses the diff.
+#[cfg(unix)]
+fn debt_scan_parse_diff(diff: &str) -> String {
+    let scanner = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared/debt_scan.py");
+    let harness = "import runpy, sys\n\
+                   m = runpy.run_path(sys.argv[1])\n\
+                   try:\n    print('\\n'.join(m['parse_diff'](sys.argv[2])))\n\
+                   except RuntimeError as exc:\n    print(f'RuntimeError: {exc}')\n";
+    let out = Command::new("python3")
+        .arg("-c")
+        .arg(harness)
+        .arg(&scanner)
+        .arg(diff)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "harness: {out:?}");
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
 /// `git diff <rev>` compares against one tree even mid-merge, so only a bare
 /// `git diff` prints a combined diff and the scanner always passes a base.
 /// The refusal is therefore pinned on the parser directly, together with a
@@ -1053,26 +1114,8 @@ fn debt_scan_parse_diff_refuses_combined_diffs_and_headerless_hunks() {
     if python3_missing() {
         return;
     }
-    let scanner = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared/debt_scan.py");
-    let harness = "import runpy, sys\n\
-                   m = runpy.run_path(sys.argv[1])\n\
-                   try:\n    print('\\n'.join(m['parse_diff'](sys.argv[2])))\n\
-                   except RuntimeError as exc:\n    print(f'RuntimeError: {exc}')\n";
-    let parse = |diff: &str| -> String {
-        let out = Command::new("python3")
-            .arg("-c")
-            .arg(harness)
-            .arg(&scanner)
-            .arg(diff)
-            .env("PYTHONDONTWRITEBYTECODE", "1")
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "harness: {out:?}");
-        String::from_utf8_lossy(&out.stdout).to_string()
-    };
-
     let two_way = "diff --git a/f.rs b/f.rs\n--- a/f.rs\n+++ b/f.rs\n@@ -1 +1,2 @@\n a\n+todo!()\n";
-    assert_eq!(parse(two_way), "f.rs:2 -- todo!()\n");
+    assert_eq!(debt_scan_parse_diff(two_way), "f.rs:2 -- todo!()\n");
 
     let cc = "diff --cc f.rs\nindex 3d9e428,2299c37..0000000\n--- a/f.rs\n+++ b/f.rs\n\
               @@@ -1,1 -1,1 +1,5 @@@\n++<<<<<<< HEAD\n +main todo!()\n++=======\n+ side\n\
@@ -1080,19 +1123,46 @@ fn debt_scan_parse_diff_refuses_combined_diffs_and_headerless_hunks() {
     let combined =
         "diff --combined f.rs\n--- a/f.rs\n+++ b/f.rs\n@@@ -1,1 -1,1 +1,2 @@@\n++todo!()\n";
     let headerless = "diff --git a/f.rs b/f.rs\n@@ -0,0 +1 @@\n+todo!()\n";
+    // Opened by `diff --git`, so only the `@@@` hunk marker shows it is combined.
+    let triple_at_only =
+        "diff --git a/f.rs b/f.rs\n--- a/f.rs\n+++ b/f.rs\n@@@ -1,1 -1,1 +1,2 @@@\n++todo!()\n";
     for (label, diff, needle) in [
         ("diff --cc", cc, "combined (merge) diff"),
         ("diff --combined", combined, "combined (merge) diff"),
+        ("@@@ hunk only", triple_at_only, "combined (merge) diff"),
         (
             "headerless hunk",
             headerless,
             "arrived before any `+++ b/<path>` header",
         ),
     ] {
-        let out = parse(diff);
+        let out = debt_scan_parse_diff(diff);
         assert!(
             out.starts_with("RuntimeError: ") && out.contains(needle),
             "{label} must raise rather than number lines: {out}"
+        );
+    }
+}
+
+/// git C-quotes control characters even under core.quotePath=false, so a
+/// raw ESC or CR in a target path is pinned on the parser directly; quoted
+/// or not, the reported path drops them as debris.py's `display_path` does.
+#[cfg(unix)]
+#[test]
+fn debt_scan_parse_diff_strips_control_characters_from_target_paths() {
+    if python3_missing() {
+        return;
+    }
+    for (label, target) in [
+        ("unquoted", "b/src/a\u{1b}[31mb\rc.rs"),
+        ("quoted", "\"b/src/a\\033[31mb\\rc.rs\""),
+    ] {
+        let diff =
+            format!("diff --git a/x b/x\n--- /dev/null\n+++ {target}\n@@ -0,0 +1 @@\n+todo!()\n");
+        assert_eq!(
+            debt_scan_parse_diff(&diff),
+            "src/a[31mbc.rs:1 -- todo!()\n",
+            "{label}"
         );
     }
 }
@@ -1196,27 +1266,35 @@ fn debt_scan_unquotes_c_quoted_untracked_names() {
 }
 
 /// debt_scan.py runs via runpy from shims and cannot import debris.py, so it
-/// carries a copy of the C-unquoting helpers that must not drift.
+/// carries a copy of the diff-parsing helpers and git flags that must not
+/// drift.
 #[test]
 fn debt_scan_unquote_c_is_a_verbatim_twin_of_the_debris_lint() {
     let scanner = agent_file(".shared/debt_scan.py");
     let debris = agent_file(".shared/debris.py");
-    let function = |src: &str, file: &str| -> String {
-        let start = src
-            .find("def unquote_c(")
-            .unwrap_or_else(|| panic!("{file} defines unquote_c"));
-        let rest = &src[start..];
-        let end = rest
-            .find("\n\n\ndef ")
-            .unwrap_or_else(|| panic!("{file}: unquote_c is followed by another def"));
-        rest[..end].to_string()
-    };
-    assert_eq!(
-        function(&scanner, "debt_scan.py"),
-        function(&debris, "debris.py"),
-        "unquote_c drifted"
-    );
-    for prefix in ["C_ESCAPE_RE = ", "C_ESCAPES = "] {
+    for name in ["unquote_c", "display_path"] {
+        let function = |src: &str, file: &str| -> String {
+            let start = src
+                .find(&format!("def {name}("))
+                .unwrap_or_else(|| panic!("{file} defines {name}"));
+            let rest = &src[start..];
+            let end = rest
+                .find("\n\n\ndef ")
+                .unwrap_or_else(|| panic!("{file}: {name} is followed by another def"));
+            rest[..end].to_string()
+        };
+        assert_eq!(
+            function(&scanner, "debt_scan.py"),
+            function(&debris, "debris.py"),
+            "{name} drifted"
+        );
+    }
+    for prefix in [
+        "C_ESCAPE_RE = ",
+        "C_ESCAPES = ",
+        "CONTROL_CHAR_RE = ",
+        "HUNK_HEADER_RE = ",
+    ] {
         let line = |src: &str, file: &str| -> String {
             src.lines()
                 .find(|l| l.starts_with(prefix))
@@ -1229,6 +1307,33 @@ fn debt_scan_unquote_c_is_a_verbatim_twin_of_the_debris_lint() {
             "{prefix:?} drifted"
         );
     }
+    // debris.py spells DIFF_FLAGS as a tuple and debt_scan.py as a list, so
+    // the quoted members are compared, not the brackets.
+    let diff_flags = |src: &str, file: &str| -> Vec<String> {
+        let body = src
+            .split_once("\nDIFF_FLAGS = ")
+            .and_then(|(_, rest)| {
+                let close = match rest.as_bytes().first() {
+                    Some(b'(') => "\n)",
+                    Some(b'[') => "\n]",
+                    _ => return None,
+                };
+                rest.find(close).map(|end| &rest[..end])
+            })
+            .unwrap_or_else(|| panic!("{file} defines a bracketed DIFF_FLAGS"));
+        body.split('"')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect()
+    };
+    let flags = diff_flags(&scanner, "debt_scan.py");
+    assert!(flags.iter().any(|f| f == "--no-textconv"), "{flags:?}");
+    assert_eq!(
+        flags,
+        diff_flags(&debris, "debris.py"),
+        "DIFF_FLAGS drifted"
+    );
 }
 
 /// An option-shaped base never reaches git as an option, and a flag the
