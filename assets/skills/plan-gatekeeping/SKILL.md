@@ -112,7 +112,10 @@ BLOCKING question in the verdict:
    signature, types and target path in the plan. "Add a helper that..." with no signature is a
    leak. Every task has a **Context pack** (the snippets it needs, inline - a pointer is
    acceptable only for a target longer than a screen, and only if verified) and a `Batch`
-   value; a missing pack or batch is a leak.
+   value; a missing pack or batch is a leak. A task on a money path, auth/authz, secrets or
+   a migration must have its `Protected` column set (and `protected: true` in its
+   frontmatter); an unmarked one is a leak, because nothing else routes it to the full
+   review panel.
 
 Everything else in this skill applies unchanged. Do not demand smaller tasks than
 compile-atomicity allows, and do not re-review batch grouping or dependency order - that is

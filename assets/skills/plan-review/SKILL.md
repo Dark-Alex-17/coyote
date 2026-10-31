@@ -81,6 +81,23 @@ Every complaint must be actionable and point at a specific location. "The plan c
 - Do not rewrite the plan yourself. Complaints, not patches — the author owns the fix.
 - Three strong complaints beat fifteen weak ones. If you have fifteen, the plan needs a rewrite, not a list: say so.
 
+## Micro-grain addendum (applies ONLY when the spawner names it)
+
+Inert unless the spawn prompt says the plan is micro-grain (the architect's `task_granularity:
+micro`). Everything above still applies, with these changes:
+
+- **Sizing.** Section 5's "~1-5 files" is replaced by the `plan-authoring` micro sizing rule:
+  one file or one tight seam, hard cap 3 files including tests, and compile-atomicity as the
+  floor. A task over the cap is fine only when it states its compile-atomicity reason; a task
+  split below the floor (the tree would not build after it) is a complaint.
+- **Batch grouping.** Each batch maps to one plan section. Dependency order must hold INSIDE a
+  batch and ACROSS batches: a task's `blocked_by` never names a task in a later batch, or a
+  later task of its own batch. A violation is a complaint naming both tasks.
+- **Protected tasks.** A protected task closes its batch early for the full review panel, so
+  a later task of the same batch that depends on reviewed output of the protected task is
+  fine, but one the protected task depends on must not sit after it in the batch order.
+  Whether a task SHOULD be protected is the gatekeeper's leak check; do not repeat it.
+
 ## Anti-patterns
 
 - Approving without running a single ground-truth check — a syntax review, not a plan review
