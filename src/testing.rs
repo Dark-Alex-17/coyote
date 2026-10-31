@@ -476,15 +476,23 @@ mod tests {
             .iter()
             .map(|&(path, source)| (path, scope_lines(source)))
             .collect();
-        let test_only_files: HashSet<PathBuf> = scanned
-            .iter()
-            .flat_map(|(path, scoped)| {
-                scoped
-                    .test_modules
-                    .iter()
-                    .flat_map(|name| module_files(path, name))
-            })
-            .collect();
+        // A module declared in test-only code is test-only, and so is every
+        // module a test-only file declares, down the tree.
+        let mut test_only_files: HashSet<PathBuf> = HashSet::new();
+        loop {
+            let known = test_only_files.len();
+            for (path, scoped) in &scanned {
+                let file_is_test = test_only_files.contains(*path);
+                for (module, in_test) in &scoped.modules {
+                    if *in_test || file_is_test {
+                        test_only_files.extend(module_files(path, module));
+                    }
+                }
+            }
+            if test_only_files.len() == known {
+                break;
+            }
+        }
         let mut offences = Vec::new();
         for (relative, scoped) in &scanned {
             let relative: &Path = relative;
@@ -710,6 +718,87 @@ mod tests {
                 vec![("hooks.rs", "#[cfg(test)]\n#[path = \"other.rs\"]\nmod tests;\n".into())],
                 1,
             ),
+            (
+                "a #[path] module behind cfg_attr",
+                vec![(
+                    "hooks.rs",
+                    "#[cfg_attr(test, path = \"other.rs\")]\nmod tests;\n".into(),
+                )],
+                1,
+            ),
+            (
+                "a config dir pin in a module declared inside a test module",
+                vec![
+                    ("hooks.rs", in_test("").replace("fn probe", "mod live;\n    fn probe")),
+                    ("hooks/tests/live.rs", format!("fn probe() {{\n    {pin_config_dir}\n}}\n")),
+                ],
+                1,
+            ),
+            (
+                "a config dir pin in a module a #![cfg(test)] file declares",
+                vec![
+                    ("hooks.rs", "#![cfg(test)]\nmod live;\n".into()),
+                    ("hooks/live.rs", format!("fn probe() {{\n    {pin_config_dir}\n}}\n")),
+                ],
+                1,
+            ),
+            (
+                "a config dir pin two module levels below a test module",
+                vec![
+                    ("hooks.rs", "#[cfg(test)]\nmod live;\n".into()),
+                    ("hooks/live.rs", "mod deeper;\n".into()),
+                    ("hooks/live/deeper.rs", format!("fn probe() {{\n    {pin_config_dir}\n}}\n")),
+                ],
+                1,
+            ),
+            (
+                "a config dir pin split over two lines",
+                vec![(
+                    "hooks.rs",
+                    in_test(&format!(
+                        "std::env::set_var(\n            \"{}\",\n            &dir,\n        );",
+                        utils::get_env_name("config_dir")
+                    )),
+                )],
+                1,
+            ),
+            (
+                "a config dir pin through the env name helper",
+                vec![(
+                    "hooks.rs",
+                    in_test(concat!("let _ = std::env::set_var(utils::get_env_name(\"config", "_dir\"), &dir);")),
+                )],
+                1,
+            ),
+            (
+                "a config dir pin through EnvVarGuard",
+                vec![(
+                    "hooks.rs",
+                    in_test(&format!(
+                        "let _g = EnvVarGuard::set(\"{}\", &dir);",
+                        utils::get_env_name("config_dir")
+                    )),
+                )],
+                1,
+            ),
+            (
+                "the shared guard's own config dir pin",
+                vec![("testing.rs", in_test(&pin_config_dir))],
+                0,
+            ),
+            (
+                "the shared guard's own definition",
+                vec![("testing.rs", concat!("struct TestConfig", "DirGuard {}\n").into())],
+                0,
+            ),
+            (
+                "the walk's own definition",
+                vec![(
+                    "config/memory.rs",
+                    "fn walk_workspace_memory(start: &Path, ceiling: Option<&Path>) {\n    walk_workspace_memory(start, None);\n}\n".into(),
+                )],
+                0,
+            ),
         ];
         let mismatches: Vec<String> = cases
             .into_iter()
@@ -727,7 +816,8 @@ mod tests {
     }
 
     /// Whether every call of `walk` in `code` closes on the line and passes
-    /// `Some(..)` as its second argument, the ceiling.
+    /// `Some(..)` as its second argument, the ceiling. Only the syntax is
+    /// checked, not what the ceiling bounds.
     fn walk_names_a_ceiling(code: &str, walk: &str) -> bool {
         let tokens = tokens(code);
         let calls: Vec<usize> = (0..tokens.len()).filter(|&i| tokens[i] == walk).collect();
@@ -889,7 +979,7 @@ mod tests {
                 (false, None),
             ]
         );
-        assert_eq!(scoped.test_modules, ["live"]);
+        assert_eq!(scoped.modules, [("live".to_string(), true)]);
     }
 
     #[test]
@@ -932,10 +1022,12 @@ mod tests {
 
     struct ScopedSource<'a> {
         lines: Vec<ScopedLine<'a>>,
-        /// Names from `#[cfg(test)] mod name;` declarations.
-        test_modules: Vec<String>,
-        /// Line numbers of `#[path = ..]` attributes, whose module file the
-        /// scan does not resolve.
+        /// Each `mod name;` declaration as its path below the file's own
+        /// module (`name`, or `outer/name` inside an inline `mod outer`),
+        /// and whether it sits in test-only code.
+        modules: Vec<(String, bool)>,
+        /// Line numbers of `#[path = ..]` attributes, plain or inside a
+        /// `cfg_attr`, whose module file the scan does not resolve.
         path_attributes: Vec<usize>,
     }
 
@@ -945,6 +1037,8 @@ mod tests {
         enclosing_fn: Option<String>,
         /// Open `(` and `[` inside this brace scope.
         nesting: usize,
+        /// The inline `mod` blocks this scope sits in, outermost first.
+        module_path: Vec<String>,
     }
 
     /// Tracks brace depth over `source` with literals and comments blanked,
@@ -959,6 +1053,7 @@ mod tests {
         const CFG_OPEN: [&str; 4] = ["#", "[", "cfg", "("];
         const INNER_CFG_OPEN: [&str; 5] = ["#", "!", "[", "cfg", "("];
         const PATH_OPEN: [&str; 4] = ["#", "[", "path", "="];
+        const CFG_ATTR_OPEN: [&str; 4] = ["#", "[", "cfg_attr", "("];
         const ITEM_KEYWORDS: [&str; 7] = ["fn", "impl", "struct", "enum", "trait", "mod", "union"];
         let code = code_only(source);
         let code_lines: Vec<&str> = code.lines().collect();
@@ -972,7 +1067,7 @@ mod tests {
         let mut pending_item = false;
         let mut pending_fn = None;
         let mut pending_mod = None;
-        let mut test_modules = Vec::new();
+        let mut modules = Vec::new();
         let mut path_attributes = Vec::new();
         let mut lines = Vec::new();
         let mut texts = source.lines().zip(&code_lines).enumerate();
@@ -1018,6 +1113,14 @@ mod tests {
             if tokens[k..].starts_with(&PATH_OPEN) {
                 path_attributes.push(token_lines[k] + 1);
             }
+            if tokens[k..].starts_with(&CFG_ATTR_OPEN)
+                && let Some(close) = closing_paren(&tokens, k + CFG_ATTR_OPEN.len() - 1)
+                && tokens[k..close]
+                    .windows(2)
+                    .any(|pair| pair == ["path", "="])
+            {
+                path_attributes.push(token_lines[k] + 1);
+            }
             let next_ident = tokens.get(k + 1).filter(|t| is_ident(t));
             if ITEM_KEYWORDS.contains(&tokens[k])
                 && (next_ident.is_some() || tokens.get(k + 1) == Some(&"<"))
@@ -1029,15 +1132,17 @@ mod tests {
                 "mod" if next_ident.is_some() => pending_mod = next_ident.map(|t| t.to_string()),
                 "{" => {
                     let outer = scopes.last().unwrap();
+                    let mut module_path = outer.module_path.clone();
+                    module_path.extend(pending_mod.take());
                     let scope = Scope {
                         in_test: outer.in_test || pending_test,
                         enclosing_fn: pending_fn.take().or_else(|| outer.enclosing_fn.clone()),
                         nesting: 0,
+                        module_path,
                     };
                     scopes.push(scope);
                     pending_test = false;
                     pending_item = false;
-                    pending_mod = None;
                 }
                 "}" => {
                     if scopes.len() > 1 {
@@ -1049,8 +1154,11 @@ mod tests {
                     pending_mod = None;
                 }
                 ";" if scopes.last().unwrap().nesting == 0 => {
-                    if let Some(name) = pending_mod.take().filter(|_| pending_test) {
-                        test_modules.push(name);
+                    if let Some(name) = pending_mod.take() {
+                        let scope = scopes.last().unwrap();
+                        let mut path = scope.module_path.clone();
+                        path.push(name);
+                        modules.push((path.join("/"), pending_test || scope.in_test));
                     }
                     pending_test = false;
                     pending_item = false;
@@ -1074,7 +1182,7 @@ mod tests {
         record_until(usize::MAX, scopes.last().unwrap());
         ScopedSource {
             lines,
-            test_modules,
+            modules,
             path_attributes,
         }
     }
@@ -1262,12 +1370,15 @@ mod tests {
         chars.len()
     }
 
-    /// The files a `mod name;` in `parent` may load.
-    fn module_files(parent: &Path, name: &str) -> [PathBuf; 2] {
-        let dir = match parent.file_stem().and_then(|stem| stem.to_str()) {
+    /// The files a `mod name;` in `parent` may load; `module` is the
+    /// declaration's `/`-joined path from `ScopedSource::modules`.
+    fn module_files(parent: &Path, module: &str) -> [PathBuf; 2] {
+        let mut dir = match parent.file_stem().and_then(|stem| stem.to_str()) {
             Some("mod" | "main" | "lib") => parent.parent().unwrap().to_path_buf(),
             _ => parent.with_extension(""),
         };
+        let (inline, name) = module.rsplit_once('/').unwrap_or(("", module));
+        dir.extend(inline.split('/').filter(|segment| !segment.is_empty()));
         [
             dir.join(format!("{name}.rs")),
             dir.join(name).join("mod.rs"),
