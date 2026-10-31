@@ -2572,5 +2572,104 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             );
             fs::remove_dir_all(&dir).ok();
         }
+
+        #[test]
+        fn no_channel_or_the_reserved_fd_keeps_the_helpers_on_the_terminal_path() {
+            require_tools();
+            let dir = scratch_dir("no-channel");
+            // Without COYOTE_PROMPT_REPLY, or with it naming the fd the helper
+            // reserves for its own request stream, the helpers must behave as
+            // before the protocol existed: no request line, the terminal path
+            // (which, with no tty, settles on the confirm default) and no hang.
+            // The outer shell keeps the real channel so a request that does
+            // escape is answered rather than deadlocking the harness.
+            let inner =
+                "source \"$PROMPT_UTILS\"; v=\"$(confirm \"Go?\")\"; echo \"{tag} v=[$v] rc=$?\"";
+            let body = format!(
+                "env -u {reply} -u {out} timeout 10 bash -c '{unset}' 2>/dev/null; echo \"unset outer=$?\"; \
+                 {reply}=/dev/fd/9 env -u {out} timeout 10 bash -c '{fd9}' 2>/dev/null; echo \"fd9 outer=$?\"",
+                reply = REPLY_ENV,
+                out = OUT_FD_ENV,
+                unset = inner.replace("{tag}", "unset"),
+                fd9 = inner.replace("{tag}", "fd9"),
+            );
+            let run = run_helper(&dir, Some(&[json!(true), json!(true)]), &body, true);
+            assert!(
+                run.request_lines().is_empty(),
+                "no channel means no protocol request: {}",
+                run.stdout
+            );
+            let printed = run.other_lines();
+            assert_eq!(
+                printed,
+                vec![
+                    "unset v=[0] rc=0",
+                    "unset outer=0",
+                    "fd9 v=[0] rc=0",
+                    "fd9 outer=0"
+                ],
+                "{}\n{}",
+                run.stdout,
+                run.stderr
+            );
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn replies_of_the_wrong_shape_are_unusable_for_every_helper() {
+            require_tools();
+            let dir = scratch_dir("wrong-shape");
+            // The reply must fit the action it answers: a string is not a
+            // confirm, an index is not a select, a bare string is not a
+            // checkbox and a number or boolean is not text. Each helper prints
+            // nothing, returns 1 and says why on stderr, so callers fail closed
+            // exactly as they do for null.
+            let cases: Vec<(&str, Value)> = vec![
+                ("confirm \"Go?\"", json!("yes")),
+                ("confirm \"Go?\"", json!(1)),
+                ("list \"Pick\" a b", json!(0)),
+                ("list \"Pick\" a b", json!(["a"])),
+                ("checkbox \"Pick\" a b", json!("a")),
+                ("checkbox \"Pick\" a b", json!(true)),
+                ("input \"Name?\"", json!(42)),
+                ("input \"Name?\"", json!(["x"])),
+                ("password \"Secret?\"", json!(true)),
+                ("password \"Secret?\"", json!({"text": "x"})),
+            ];
+            for (call, answer) in &cases {
+                let run = run_helper(
+                    &dir,
+                    Some(std::slice::from_ref(answer)),
+                    &capture(call),
+                    false,
+                );
+                assert_eq!(
+                    run.request_lines().len(),
+                    1,
+                    "{call} <- {answer}: {}",
+                    run.stdout
+                );
+                assert_eq!(
+                    run.other_lines(),
+                    vec!["v=[] rc=1"],
+                    "{call} <- {answer}: {}\n{}",
+                    run.stdout,
+                    run.stderr
+                );
+                assert!(
+                    run.stderr.contains("prompt reply unusable"),
+                    "{call} <- {answer}: {}",
+                    run.stderr
+                );
+                if call.starts_with("password") {
+                    assert!(
+                        !run.stderr.contains("\"x\"") && !run.stderr.contains("true"),
+                        "{call}: a rejected password reply must not be echoed: {}",
+                        run.stderr
+                    );
+                }
+            }
+            fs::remove_dir_all(&dir).ok();
+        }
     }
 }
