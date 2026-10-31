@@ -2,6 +2,32 @@
 # Helpers for the coder's verify_build and verify_tests gates. Sourced after
 # .shared/utils.sh, never run on its own.
 
+# gate_posix_path prints `path` in the form bash's own file tests and dirname
+# read. A Windows drive path (C:\x or C:/x), which is what a Git Bash script
+# is handed, goes through cygpath when present, else has its separators
+# flipped; any other path is printed unchanged.
+gate_posix_path() {
+  local path=$1 drive_re='^[A-Za-z]:[\\/]'
+  if [[ "$path" =~ $drive_re ]]; then
+    if command -v cygpath >/dev/null 2>&1 && cygpath -u "$path"; then
+      return 0
+    fi
+    path=${path//\\//}
+  fi
+  printf '%s\n' "$path"
+}
+
+# gate_tree_root prints the root of the git work tree holding directory
+# `dir`, resolved through `pwd -P`, or fails when there is none. Both sides
+# of every comparison in gate_workdir come from here or from `pwd -P`, so
+# they share one spelling (separators, drive form, short names) whatever
+# form the input path had.
+gate_tree_root() {
+  local top
+  top=$(git -C "$1" rev-parse --show-toplevel 2>/dev/null) || return 1
+  (cd "$top" && pwd -P)
+}
+
 # gate_workdir prints the directory a verify gate runs in, given the graph
 # state. It is project_dir, except when resolve_paths recorded that the
 # project_dir variable was left unset: script nodes inherit the engine's
@@ -12,19 +38,22 @@
 # tree's root. Anything else (relative paths, no git, several trees) keeps
 # project_dir. resolve_gate_dir is applied last either way.
 gate_workdir() {
-  local state=$1 dir defaulted path parent top resolved_dir
+  local state=$1 dir defaulted path parent next top resolved_dir dir_top
   local -a tops=()
   dir=$(printf '%s' "$state" | jq -r '.project_dir // "" | if . == "" then "." else . end')
   defaulted=$(printf '%s' "$state" | jq -r '.project_dir_defaulted // false')
   if [[ "$defaulted" == "true" ]] && command -v git >/dev/null 2>&1; then
     while IFS= read -r path; do
-      [[ "$path" == /* ]] || continue
+      path=$(gate_posix_path "$path")
+      [[ "$path" == /* || "$path" =~ ^[A-Za-z]:/ ]] || continue
       parent=$path
-      while [[ ! -d "$parent" && "$parent" != "/" ]]; do
-        parent=$(dirname "$parent")
+      while [[ ! -d "$parent" ]]; do
+        next=$(dirname "$parent")
+        [[ "$next" != "$parent" ]] || break
+        parent=$next
       done
-      top=$(git -C "$parent" rev-parse --show-toplevel 2>/dev/null) || continue
-      top=$(cd "$top" && pwd -P) || continue
+      [[ -d "$parent" && "$parent" != "." ]] || continue
+      top=$(gate_tree_root "$parent") || continue
       if [[ ${#tops[@]} -eq 0 ]]; then
         tops=("$top")
       elif [[ "${tops[0]}" != "$top" ]]; then
@@ -35,8 +64,9 @@ gate_workdir() {
       | map(if type == "array" then .[] else empty end)
       | .[] | strings')
     if [[ ${#tops[@]} -eq 1 ]]; then
+      dir_top=$(gate_tree_root "$dir") || dir_top=''
       resolved_dir=$(cd "$dir" 2>/dev/null && pwd -P) || resolved_dir=$dir
-      if [[ "$resolved_dir" != "${tops[0]}" && "$resolved_dir" != "${tops[0]}"/* ]]; then
+      if [[ "$dir_top" != "${tops[0]}" && "$resolved_dir" != "${tops[0]}" && "$resolved_dir" != "${tops[0]}"/* ]]; then
         dir=${tops[0]}
       fi
     fi

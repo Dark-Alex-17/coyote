@@ -252,6 +252,84 @@ fn verify_gates_run_in_the_planned_work_tree_when_project_dir_defaulted() {
     }
 }
 
+/// Planned paths and project_dir are compared only after resolution, never
+/// as strings. A Windows drive path (`X:\...`, which is what the engine hands
+/// a Git Bash script) must still find its tree: on unix a `cygpath` shim
+/// maps `X:\` to `/`, on Windows the native path and the real cygpath are
+/// used. Paths with `.` and `..` segments, on either side, name the same
+/// directories as their plain spelling.
+#[test]
+fn verify_gates_resolve_planned_paths_and_project_dir_before_comparing() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("workdir-forms");
+    let orch = root.0.join("orchestrator");
+    let tree = root.0.join("worktree");
+    project(&orch, "in-orchestrator");
+    project(&tree, "in-worktree");
+    project(&tree.join("crates/inner"), "in-subdir");
+    git_init(&tree);
+
+    let bin = root.0.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let path_env = format!("{}:{}", bin.display(), env::var("PATH").unwrap_or_default());
+    let planned_file = tree.join("src").join("new.rs");
+    let drive_form = if cfg!(windows) {
+        planned_file.to_string_lossy().into_owned()
+    } else {
+        let shim = bin.join("cygpath");
+        fs::write(
+            &shim,
+            "#!/bin/sh\n[ \"$1\" = -u ] || exit 1\nprintf '%s\\n' \"$2\" | sed -e 's/^X://' -e 's/\\\\/\\//g'\n",
+        )
+        .unwrap();
+        let status = Command::new("chmod").arg("+x").arg(&shim).status().unwrap();
+        assert!(status.success(), "chmod the cygpath shim");
+        format!("X:{}", planned_file.to_string_lossy().replace('/', "\\"))
+    };
+    // Neither spelling starts with the tree's own path, so only resolving
+    // them shows they lie inside it.
+    let dotted_planned = format!(
+        "{}/orchestrator/../worktree/./src/new.rs",
+        root.0.to_string_lossy()
+    );
+    let dotted_sub = format!(
+        "{}/orchestrator/../worktree/./crates/inner",
+        root.0.to_string_lossy()
+    );
+    let orch_dir = orch.to_string_lossy().into_owned();
+
+    let legs: [(&str, &str, &str); 4] = [
+        (orch_dir.as_str(), drive_form.as_str(), "in-worktree"),
+        (orch_dir.as_str(), dotted_planned.as_str(), "in-worktree"),
+        (dotted_sub.as_str(), dotted_planned.as_str(), "in-subdir"),
+        (dotted_sub.as_str(), drive_form.as_str(), "in-subdir"),
+    ];
+    for (project_dir, planned, expected) in legs {
+        let state = serde_json::json!({
+            "project_dir": project_dir,
+            "project_dir_defaulted": true,
+            "files_to_modify": [planned],
+            "files_to_create": [],
+        });
+        for gate in &GATES {
+            let mut envs = vec![(gate.cmd_env, "cat where.txt")];
+            if !cfg!(windows) {
+                envs.push(("PATH", path_env.as_str()));
+            }
+            let out = run_script(gate.rel, &root.0, &state, &envs);
+            assert_eq!(out[gate.ok_key], Value::Bool(true), "{}: {out}", gate.rel);
+            let output = str_field(&out, gate.output_key);
+            assert!(
+                output.ends_with(expected),
+                "{} with project_dir {project_dir} and planned {planned} must run {expected}: {output}",
+                gate.rel
+            );
+        }
+    }
+}
+
 /// The test_command variable is the command verify_tests runs, ahead of
 /// TEST_CMD and detection.
 #[test]
