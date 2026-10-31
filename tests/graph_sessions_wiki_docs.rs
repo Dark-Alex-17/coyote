@@ -2855,7 +2855,7 @@ fn usage_probe_sessions_sweep_bullets_match_the_sweep_arms() {
 /// session the press that interrupts a turn leaves its background work
 /// running for a second press at the idle prompt, and without one that
 /// first press cancels it. The repo half pins the welcome hint, the `.help`
-/// footer and both sessionless notices; the wiki half pins the Sessions.md
+/// footer and the sessionless notices; the wiki half pins the Sessions.md
 /// section, the REPL.md bullet and the Agents.md sentence.
 #[test]
 fn ctrl_c_wording_names_the_session_split() {
@@ -2876,25 +2876,35 @@ fn ctrl_c_wording_names_the_session_split() {
         ),
         "the .help footer lost its session qualifier"
     );
-    let literals = string_literals(&fn_body(&repl, "fn sessionless_cancel_notice("));
+    let mut literals = string_literals(&fn_body(&repl, "fn sessionless_cancelling_notice("));
+    literals.extend(string_literals(&fn_body(
+        &repl,
+        "fn sessionless_still_running_notice(",
+    )));
     for notice in [
-        "Turn interrupted; cancelled {unfinished} background task(s).",
-        "Turn interrupted; cancelled the background work.",
+        "Turn interrupted; cancelling {unfinished} background task(s).",
+        "Turn interrupted; cancelling the background work.",
+        "{} background agent(s) still running after {}s: {}. Press Ctrl-C again at the idle prompt to cancel them.",
     ] {
         assert!(
             literals.iter().any(|literal| literal == notice),
             "the REPL no longer prints {notice:?}"
         );
     }
-    // A request aborted as an error prints a notice only without a session,
-    // so in a session only the streamed abort, which returns its partial
-    // text, reaches the "still running" notice. Only that error branch
-    // checkpoints the failed turn; the graph route call returns its error
-    // with `?` before it, so it checkpoints nothing.
+    // A request aborted as an error prints the same notice as a streamed
+    // abort, in a session or not. Only that error branch checkpoints the
+    // failed turn; the graph turn prints the notice and returns its error
+    // before it, so it checkpoints nothing.
     let repl_production = before_test_module(&repl);
     assert!(
-        repl_production.contains("if abort_signal.aborted_ctrlc() && ctx.session.is_none() {"),
-        "the error branch of the ask loop no longer limits its notice to sessionless turns"
+        repl_production.contains(
+            "                    if abort_signal.aborted_ctrlc() {\n                        print_turn_notice(ctx, turn_interrupt_notice(ctx, &abort_signal).await);\n                    }\n                    ctx.on_chat_completion_error(app.as_ref(), &input);\n"
+        ),
+        "the error branch of the ask loop no longer prints the interrupt notice in every turn"
+    );
+    assert!(
+        !repl_production.contains("aborted_ctrlc() && ctx.session.is_none()"),
+        "an interrupt notice is limited to sessionless turns again"
     );
     assert_eq!(
         repl_production
@@ -2905,9 +2915,9 @@ fn ctrl_c_wording_names_the_session_split() {
     );
     assert!(
         repl_production.contains(
-            "match run_graph_turn(ctx, &input, abort_signal.clone(), forced, runner).await? {"
+            "                Err(err) => {\n                    if abort_signal.aborted_ctrlc() {\n                        print_turn_notice(ctx, turn_interrupt_notice(ctx, &abort_signal).await);\n                    }\n                    return Err(err);\n                }\n            };\n            match turn {\n"
         ),
-        "the graph route call no longer returns its error before the checkpointing branch"
+        "the graph turn no longer returns its error before the checkpointing branch"
     );
 
     let Some(wiki) = wiki_dir() else { return };
@@ -2919,18 +2929,29 @@ fn ctrl_c_wording_names_the_session_split() {
         "**Without a session, the first press cancels.**",
         "the press that interrupts the turn, during a tool round or while the model is still answering, also cancels every background agent",
         "waits up to 5 s for the agents to finish; jobs are signalled, not waited on",
-        "`Turn interrupted; cancelled N background task(s).`, with N the number of tasks still running at the press",
-        "`Turn interrupted; cancelled the background work.` when only a sub-agent's own children were alive",
-        "That holds only for a streamed request: when streaming is off",
+        "A press while the turn is still loading [RAG](RAG) embeddings cancels the same way",
+        "Coyote prints, before the wait, `Turn interrupted; cancelling N background task(s).`, with N the number of tasks still running at the press",
+        "`Turn interrupted; cancelling the background work.` when only a sub-agent's own children were alive",
+        "Nothing more prints when every agent stops in time; when the wait gives up first, a second line names the agents still running",
+        "`1 background agent(s) still running after 5s: a2. Press Ctrl-C again at the idle prompt to cancel them.`",
+        "When streaming is off (or the model does not stream), the Ctrl+C ends the request as an error",
         "the turn is checkpointed with the `[Response interrupted due to error]` marker",
         "during the route call a graph agent makes before the turn, the Ctrl+C ends the turn with the error and nothing is checkpointed",
-        "In both cases no \"still running\" notice prints, although the background tasks keep running",
+        "Both print the same \"still running\" notice when tasks are running, as does a press while the turn is still loading [RAG](RAG) embeddings",
     ] {
         assert!(
             section.contains(needle),
             "the Sessions.md Ctrl+C section does not say {needle:?}"
         );
     }
+    assert!(
+        !section.contains("no \"still running\" notice"),
+        "the Sessions.md Ctrl+C section still says a non-streamed abort prints no notice"
+    );
+    assert!(
+        !section.contains("`Turn interrupted; cancelled "),
+        "the Sessions.md Ctrl+C section still quotes the old after-the-wait notice"
+    );
     let recover = flat_unquoted(&paragraph("Sessions.md", &sessions, RECOVER_NOTE_LEAD));
     assert!(
         recover.contains("Interrupting a streamed turn with Ctrl+C does not write the `[Response interrupted due to error]` checkpoint"),
