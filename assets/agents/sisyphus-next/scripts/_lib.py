@@ -167,13 +167,19 @@ def ensure_run_dir(run_id):
 
 def _open_private(path, flags):
     """Open `path` for writing as an owner-only (0600) file, tightening one that
-    already exists, since os.open applies the mode only on creation."""
-    fd = os.open(path, flags, 0o600)
+    already exists, since os.open applies the mode only on creation. The
+    descriptor is binary and the file object writes bare newlines, so no layer
+    translates line endings on Windows."""
+    fd = os.open(path, flags | getattr(os, "O_BINARY", 0), 0o600)
     try:
         os.chmod(path, 0o600)
     except OSError:
         pass
-    return os.fdopen(fd, "a" if flags & os.O_APPEND else "w", encoding="utf-8")
+    try:
+        return os.fdopen(fd, "a" if flags & os.O_APPEND else "w", encoding="utf-8", newline="\n")
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def write_artifact(run_dir, name, text):

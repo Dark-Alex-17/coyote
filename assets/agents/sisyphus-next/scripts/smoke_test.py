@@ -30,13 +30,16 @@ os.makedirs(os.environ["HOME"], exist_ok=True)
 for _k in [k for k in os.environ if k.startswith("LLM_AGENT_VAR_")]:
     # the battery must not inherit the agent variables of whoever runs it
     os.environ.pop(_k)
-GIT_REPO_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT")
+GIT_REPO_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM")
 GIT_CONFIG_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
 for _k in [k for k in os.environ if k in GIT_REPO_VARS or k.startswith(GIT_CONFIG_PREFIXES)]:
     # a caller's repository variables (a git hook exports them) would point
     # every scratch-repo git call at the caller's own repository, and its
     # injected config (a hooks path, commit signing) would run on every one
     os.environ.pop(_k)
+# no system or user git config (signing, hooks) applies to a scratch git call
+os.environ["GIT_CONFIG_NOSYSTEM"] = "1"
+os.environ["GIT_CONFIG_GLOBAL"] = os.devnull
 
 import _lib  # noqa: E402
 import gates  # noqa: E402
@@ -125,6 +128,12 @@ for _name in ("fresh-write.md", "fresh-append.md", "existing.md"):
 check("run dir permissions: a fresh run dir is 0700 under umask 022", os.name == "nt" or _mode(_perm_dir) == 0o700,
       oct(_mode(_perm_dir)))
 check("run dir permissions: the rewritten artifact holds the new text", _lib.read_artifact(_perm_dir, "existing.md") == "new\n")
+_lib.write_artifact(_perm_dir, "endings.md", "one\ntwo")
+_lib.append_artifact(_perm_dir, "endings.md", "three")
+with open(os.path.join(_perm_dir, "endings.md"), "rb") as _f:
+    _endings = _f.read()
+check("run dir artifacts: written and appended lines end in a bare \\n on every platform", _endings == b"one\ntwo\nthree\n",
+      repr(_endings))
 
 
 # ---------------------------------------------------------------- intake / re-entry (A2)
@@ -431,6 +440,16 @@ try:
 finally:
     os.remove(os.path.join(REPO, "untracked.txt"))
 check("build_gauntlet: dirty tree suppresses the delta line", "Re-review delta:" not in gp and "Settled lanes:" not in gp)
+with open(os.path.join(REPO, "untracked.txt"), "w") as fh:
+    fh.write("x\n")
+git("config", "status.showUntrackedFiles", "no")
+try:
+    gp = gates.build_gauntlet_prompt(base_state(round_heads=prior_round, gauntlet_lanes={"code-review": "GREEN"}))["gauntlet_prompt"]
+finally:
+    git("config", "--unset", "status.showUntrackedFiles")
+    os.remove(os.path.join(REPO, "untracked.txt"))
+check("build_gauntlet: an untracked file suppresses the delta even when the repo config hides untracked files",
+      "Re-review delta:" not in gp)
 os.makedirs(os.path.join(REPO, "plans"))
 with open(os.path.join(REPO, "plans", "handoff.md"), "w") as fh:
     fh.write("x\n")

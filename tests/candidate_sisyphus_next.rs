@@ -16,9 +16,11 @@
 //! wrapper's own git calls, the batteries, the gauntlet scripts and the
 //! lifted-graph runs) drops `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`,
 //! `GIT_OBJECT_DIRECTORY`, `GIT_COMMON_DIR`, `GIT_CONFIG_PARAMETERS`,
-//! `GIT_CONFIG_COUNT` and every `GIT_CONFIG_KEY_*` / `GIT_CONFIG_VALUE_*`
-//! variable, so neither the caller's agent variables nor its repository or
-//! injected git config leak into a fixture.
+//! `GIT_CONFIG_COUNT`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM` and every
+//! `GIT_CONFIG_KEY_*` / `GIT_CONFIG_VALUE_*` variable. The batteries then run
+//! with `GIT_CONFIG_NOSYSTEM=1` and `GIT_CONFIG_GLOBAL` set to the null device,
+//! so neither the caller's agent variables nor its repository, its injected
+//! git config or any system or user git config reach a fixture.
 //!
 //! Every real-binary run starts from a scratch config dir whose `mcp.json`
 //! defines no server (`{"mcpServers": {}}`), checked before each spawn, so no
@@ -47,7 +49,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "sisyphus-next";
 const CANDIDATE_NAMES: [&str; 2] = ["sisyphus-next", "architect-next"];
-const SMOKE_FLOOR: usize = 249;
+const SMOKE_FLOOR: usize = 251;
 
 fn agents_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents")
@@ -201,8 +203,8 @@ fn every_binary_run_scrubs_coyote_env_first() {
 /// variables that would point every scratch-repo git call (direct, or made by
 /// a gate script) at the caller's own repository instead, and config
 /// variables that inject settings such as a hooks path or commit signing into
-/// every git call. `GIT_CONFIG_NOSYSTEM` is not among them: the wrapper sets
-/// it on purpose.
+/// every git call, or swap in another user or system config file.
+/// `GIT_CONFIG_NOSYSTEM` is not among them: the wrapper sets it on purpose.
 const GIT_REPO_VARS: &[&str] = &[
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -211,6 +213,8 @@ const GIT_REPO_VARS: &[&str] = &[
     "GIT_COMMON_DIR",
     "GIT_CONFIG_PARAMETERS",
     "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
 ];
 
 /// The numbered `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>` pairs that go
@@ -246,6 +250,8 @@ fn battery(program: &Path, scratch: &TempDirGuard) -> Command {
         .env_remove("GRAPH_STATE_FILE");
     without_agent_vars(&mut cmd);
     without_git_repo_vars(&mut cmd);
+    cmd.env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null");
     cmd
 }
 
@@ -385,6 +391,37 @@ fn smoke_battery_drops_git_config_injected_through_the_environment() {
     assert_no_bytecode_under_candidate();
 }
 
+/// A user config file swapped in through `GIT_CONFIG_GLOBAL` after the
+/// wrapper's own settings points the hooks path at a failing pre-commit hook,
+/// so the battery's scratch `git commit` passes only because smoke_test.py
+/// replaces it with the null device.
+#[test]
+fn smoke_battery_ignores_a_user_config_swapped_in_through_the_environment() {
+    let Some(python) = python3() else { return };
+    let scratch = scratch_dir("smoke-git-global");
+    let hooks = scratch.0.join("hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("pre-commit");
+    fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    let global = scratch.0.join("gitconfig");
+    fs::write(
+        &global,
+        format!("[core]\n\thooksPath = {}\n", hooks.display()),
+    )
+    .unwrap();
+    let output = battery(&python, &scratch)
+        .env("GIT_CONFIG_GLOBAL", &global)
+        .arg("scripts/smoke_test.py")
+        .output()
+        .unwrap();
+    let report = transcript(&output);
+    assert!(output.status.success(), "{report}");
+    let (passed, total) = smoke_summary(&String::from_utf8_lossy(&output.stdout));
+    assert_eq!(passed, total, "{report}");
+    assert_no_bytecode_under_candidate();
+}
+
 #[test]
 fn readme_hygiene_row_lists_the_scrubbed_git_variables() {
     let readme = fs::read_to_string(candidate_dir().join("README.md")).unwrap();
@@ -393,8 +430,9 @@ fn readme_hygiene_row_lists_the_scrubbed_git_variables() {
         .find(|l| l.starts_with("| battery env hygiene |"))
         .expect("README has a battery env hygiene row");
     let list = "`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, \
-                `GIT_COMMON_DIR`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT` and every variable \
-                starting with `GIT_CONFIG_KEY_` or `GIT_CONFIG_VALUE_` are dropped";
+                `GIT_COMMON_DIR`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_GLOBAL`, \
+                `GIT_CONFIG_SYSTEM` and every variable starting with `GIT_CONFIG_KEY_` or \
+                `GIT_CONFIG_VALUE_` are dropped";
     assert!(row.contains(list), "missing {list:?} in: {row}");
     for name in GIT_REPO_VARS.iter().chain(GIT_CONFIG_PREFIXES) {
         assert!(
@@ -402,7 +440,13 @@ fn readme_hygiene_row_lists_the_scrubbed_git_variables() {
             "{name} missing from: {row}"
         );
     }
-    assert!(row.contains("`GIT_CONFIG_NOSYSTEM` is kept"), "{row}");
+    let neutral = "then the battery sets `GIT_CONFIG_NOSYSTEM=1` and `GIT_CONFIG_GLOBAL` to the \
+                   null device, so no system or user git config applies to a scratch git call";
+    assert!(row.contains(neutral), "missing {neutral:?} in: {row}");
+    assert!(
+        !row.contains("never reaches a scratch git call"),
+        "the row overclaims again: {row}"
+    );
 }
 
 #[test]
