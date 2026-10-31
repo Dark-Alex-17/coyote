@@ -30406,9 +30406,8 @@ print(json.dumps({
 
     #[test]
     fn finding_verifier_parse_script_declares_fallback_to_llm_parse() {
-        let graph = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("assets/agents/finding-verifier/graph.yaml"),
+        let graph = read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/finding-verifier/graph.yaml"),
         )
         .unwrap();
         assert!(
@@ -30994,13 +30993,16 @@ print(json.dumps({
     // A routing gate whose script crashes has decided nothing. Its fallback
     // edge must land on end_failure, where the engine-recorded
     // `last_script_error` is rendered for the caller, rather than on the
-    // branch the gate would have picked on success. The one exception falls
-    // toward a human: route_complexity asks for plan approval instead of
-    // skipping it. Every other script node that does not fail closed must be
-    // named in the allow-list below with the reason its fallback is open.
+    // branch the gate would have picked on success. The allow-list below
+    // names every script node that falls open instead, and admits three
+    // kinds: a verify gate that retries deliberately through the fix budget,
+    // a gate that falls toward a human (route_complexity asks for plan
+    // approval rather than skipping it), and a fail-open scan whose
+    // downstream node still runs on the failure default (step-runner's
+    // debt_scan into edge_case_sweep).
     #[test]
     fn routing_gate_script_crashes_fail_closed() {
-        use crate::graph::{GraphParser, NodeType};
+        use crate::graph::{GraphParser, NodeType, SCRIPT_FALLBACK_ERROR_KEY};
         let allowed_open_fallbacks: &[(&str, &str, &str, &str)] = &[
             (
                 "coder",
@@ -31108,11 +31110,12 @@ print(json.dumps({
                 panic!("{agent}/end_failure must be an end node")
             };
             assert!(
-                end.output.contains("{{last_script_error}}"),
+                end.output
+                    .contains(&format!("{{{{{SCRIPT_FALLBACK_ERROR_KEY}}}}}")),
                 "{agent}/end_failure must render the engine's script error"
             );
             assert!(
-                graph.initial_state.contains_key("last_script_error"),
+                graph.initial_state.contains_key(SCRIPT_FALLBACK_ERROR_KEY),
                 "{agent} must seed last_script_error so end_failure never hits a missing key"
             );
         }
@@ -31129,9 +31132,8 @@ print(json.dumps({
     /// standing instruction.
     #[test]
     fn step_runner_sweep_renders_the_debt_scan_status_beside_a_stale_report() {
-        use crate::graph::{GraphParser, NodeType, state::StateManager};
-        let dir =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/step-runner");
+        use crate::graph::{GraphParser, NodeType, SCRIPT_FALLBACK_ERROR_KEY, state::StateManager};
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/step-runner");
         let graph = GraphParser::new(&dir)
             .load_from_file(dir.join("graph.yaml"))
             .unwrap();
@@ -31147,7 +31149,7 @@ print(json.dumps({
             "the sweep instructions must name the stale-report rule: {instructions}"
         );
         assert_eq!(
-            graph.initial_state.get("last_script_error"),
+            graph.initial_state.get(SCRIPT_FALLBACK_ERROR_KEY),
             Some(&serde_json::Value::String(String::new())),
             "a clean run must render an empty status, so the key is seeded empty"
         );
@@ -31162,7 +31164,7 @@ print(json.dumps({
         let stale_error = "script 'debt_scan' failed: exit status 1";
         for (last_script_error, expect_status) in [("", false), (stale_error, true)] {
             state.insert(
-                "last_script_error".into(),
+                SCRIPT_FALLBACK_ERROR_KEY.into(),
                 serde_json::json!(last_script_error),
             );
             let prompt = StateManager::new(state.clone())
@@ -33217,6 +33219,7 @@ print(json.dumps({
     fn debris_python(snippet: &str, stdin: &str, args: &[&str]) -> std::process::Output {
         let shared = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared");
         let mut child = Command::new("python3")
+            .env("PYTHONDONTWRITEBYTECODE", "1")
             .arg("-c")
             .arg(format!(
                 "import json, sys; sys.dont_write_bytecode = True; \
@@ -35538,6 +35541,7 @@ print(json.dumps({
             let out = Command::new("python3")
                 .arg(&script)
                 .env("GRAPH_STATE", state.to_string())
+                .env("PYTHONDONTWRITEBYTECODE", "1")
                 .env_remove("GRAPH_STATE_FILE")
                 .output()
                 .unwrap();
@@ -35624,13 +35628,14 @@ print(json.dumps({
 
     #[test]
     fn gauntlet_debris_fault_marks_a_killed_lint_as_incomplete() {
+        use crate::graph::SCRIPT_FALLBACK_ERROR_KEY;
         if !cmd_available("python3") {
             eprintln!("skipping: python3 not available");
             return;
         }
         let marker = run_gauntlet_script(
             "debris_fault.py",
-            &json!({"last_script_error": "script 'debris_lint' failed: timed out\nafter 120s"}),
+            &json!({(SCRIPT_FALLBACK_ERROR_KEY): "script 'debris_lint' failed: timed out\nafter 120s"}),
         );
         assert_eq!(marker["debris_findings"], json!([]), "{marker}");
         assert_eq!(marker["debris_summary"], "", "{marker}");
@@ -35640,7 +35645,7 @@ print(json.dumps({
             "{marker}"
         );
         assert_eq!(
-            marker["last_script_error"], "",
+            marker[SCRIPT_FALLBACK_ERROR_KEY], "",
             "the engine detail is consumed, never left for a later node: {marker}"
         );
 
@@ -35673,7 +35678,7 @@ print(json.dumps({
         );
         let long = run_gauntlet_script(
             "debris_fault.py",
-            &json!({"last_script_error": "x".repeat(900)}),
+            &json!({(SCRIPT_FALLBACK_ERROR_KEY): "x".repeat(900)}),
         );
         let detail = long["debris_error"].as_str().unwrap();
         assert!(
@@ -35891,6 +35896,7 @@ print(json.dumps({
             .env("PYTHONIOENCODING", "ascii")
             .env("PYTHONUTF8", "0")
             .env("LC_ALL", "C")
+            .env("PYTHONDONTWRITEBYTECODE", "1")
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -35946,6 +35952,7 @@ print(json.dumps({
             .arg(&repo_str)
             .arg("staged")
             .envs(HOSTILE)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
             .output()
             .unwrap();
         assert_eq!(out.status.code(), Some(1), "{out:?}");
@@ -35963,6 +35970,7 @@ print(json.dumps({
         let usage = Command::new("python3")
             .arg(&cli)
             .envs(HOSTILE)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
             .output()
             .unwrap();
         assert_eq!(usage.status.code(), Some(2), "{usage:?}");
@@ -36102,6 +36110,7 @@ print(json.dumps({
             .env("GIT_CONFIG_VALUE_0", &fake_tool)
             .env("GIT_CONFIG_KEY_1", "diff.noprefix")
             .env("GIT_CONFIG_VALUE_1", "true")
+            .env("PYTHONDONTWRITEBYTECODE", "1")
             .output()
             .unwrap();
         assert_eq!(out.status.code(), Some(1), "{out:?}");
@@ -36174,6 +36183,7 @@ print(json.dumps({
             let out = Command::new("python3")
                 .arg(&script)
                 .env("GRAPH_STATE", state.to_string())
+                .env("PYTHONDONTWRITEBYTECODE", "1")
                 .env_remove("GRAPH_STATE_FILE")
                 .output()
                 .unwrap();
@@ -36252,6 +36262,7 @@ print(json.dumps({
             let out = Command::new("python3")
                 .arg(dir.join(name))
                 .env("GRAPH_STATE", state.to_string())
+                .env("PYTHONDONTWRITEBYTECODE", "1")
                 .env_remove("GRAPH_STATE_FILE")
                 .output()
                 .unwrap();
@@ -37006,6 +37017,7 @@ print(json.dumps({
     /// over the presence heuristics, which only apply without it.
     #[test]
     fn adversary_pipeline_fault_reads_the_engine_script_error_before_guessing() {
+        use crate::graph::SCRIPT_FALLBACK_ERROR_KEY;
         if !cmd_available("python3") {
             eprintln!("skipping: python3 not available");
             return;
@@ -37016,7 +37028,7 @@ print(json.dumps({
         )
         .unwrap();
         assert!(
-            script.contains("last_script_error") && !script.contains("writes NOTHING"),
+            script.contains(SCRIPT_FALLBACK_ERROR_KEY) && !script.contains("writes NOTHING"),
             "the docstring must describe the engine's last_script_error write"
         );
 
@@ -37024,7 +37036,7 @@ print(json.dumps({
         let out = run_adversary_script(
             "pipeline_fault.py",
             &json!({
-                "last_script_error": "script 'run_checks' failed: timed out\nafter 10s",
+                (SCRIPT_FALLBACK_ERROR_KEY): "script 'run_checks' failed: timed out\nafter 10s",
                 "diff_text": "diff --git a/x b/x",
                 "exec_results": [{"cmd": "true", "exit": 0, "duration_s": 0.1, "tail": ""}]
             }),
@@ -37042,7 +37054,7 @@ print(json.dumps({
         let out = run_adversary_script(
             "pipeline_fault.py",
             &json!({
-                "last_script_error": "script 'debris_lint' failed: boom",
+                (SCRIPT_FALLBACK_ERROR_KEY): "script 'debris_lint' failed: boom",
                 "diff_text": "",
                 "exec_results": "",
                 "pipeline_faults": ["PIPELINE-FAULT: earlier"]
@@ -37061,7 +37073,7 @@ print(json.dumps({
 
         let out = run_adversary_script(
             "pipeline_fault.py",
-            &json!({"last_script_error": "script 'facts' failed: git: not found"}),
+            &json!({(SCRIPT_FALLBACK_ERROR_KEY): "script 'facts' failed: git: not found"}),
         );
         assert!(
             out["pipeline_faults"][0]
@@ -37073,7 +37085,7 @@ print(json.dumps({
 
         let out = run_adversary_script(
             "pipeline_fault.py",
-            &json!({"last_script_error": "script 'later_stage' failed: x"}),
+            &json!({(SCRIPT_FALLBACK_ERROR_KEY): "script 'later_stage' failed: x"}),
         );
         assert_eq!(
             out["pipeline_faults"][0],
@@ -37083,7 +37095,7 @@ print(json.dumps({
 
         let long = run_adversary_script(
             "pipeline_fault.py",
-            &json!({"last_script_error": format!("script 'facts' failed: {}", "y".repeat(900))}),
+            &json!({(SCRIPT_FALLBACK_ERROR_KEY): format!("script 'facts' failed: {}", "y".repeat(900))}),
         );
         let detail = long["pipeline_faults"][0].as_str().unwrap();
         assert!(
@@ -37097,12 +37109,12 @@ print(json.dumps({
         for state in [
             json!({"diff_text": "d", "exec_results": [{"cmd": "true", "exit": 0}]}),
             json!({
-                "last_script_error": "",
+                (SCRIPT_FALLBACK_ERROR_KEY): "",
                 "diff_text": "d",
                 "exec_results": [{"cmd": "true", "exit": 0}]
             }),
             json!({
-                "last_script_error": "something else entirely",
+                (SCRIPT_FALLBACK_ERROR_KEY): "something else entirely",
                 "diff_text": "d",
                 "exec_results": [{"cmd": "true", "exit": 0}]
             }),
@@ -38759,6 +38771,7 @@ print(json.dumps({
             .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared/debris.py"))
             .args(["--exclude", "plans", &repo_str, "worktree"])
             .env("GIT_TRACE", &trace_path)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
             .status()
             .unwrap();
         assert_eq!(status.code(), Some(1));
@@ -38796,8 +38809,41 @@ print(json.dumps({
             .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared/debris.py"))
             .args(args)
             .env("GIT_TRACE", trace_path)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
             .output()
             .unwrap()
+    }
+
+    /// Every python3 the tests spawn runs with bytecode writes off, so no
+    /// test leaves `__pycache__` under assets/. A builder bound by
+    /// `let mut cmd = ...;` is followed into the next statement, where its
+    /// args and envs are set.
+    #[test]
+    fn python3_test_spawns_never_write_bytecode() {
+        let source = read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/config/request_context.rs"),
+        )
+        .unwrap()
+        .replace("\r\n", "\n");
+        let tests = &source[source.find("\n#[cfg(test)]\nmod tests {").unwrap()..];
+        let needle = concat!("Command::new(", "\"python3\")");
+        let mut chains = 0;
+        for (at, _) in tests.match_indices(needle) {
+            let rest = &tests[at + needle.len()..];
+            let rest = rest.strip_prefix(';').unwrap_or(rest);
+            let end = [".output()", ".spawn()", ".status()", ";"]
+                .iter()
+                .filter_map(|stop| rest.find(stop))
+                .min()
+                .unwrap();
+            let chain = &rest[..end];
+            assert!(
+                chain.contains("PYTHONDONTWRITEBYTECODE") || chain.contains("\"-B\""),
+                "set PYTHONDONTWRITEBYTECODE or pass -B on this python3 spawn:\n{needle}{chain}"
+            );
+            chains += 1;
+        }
+        assert!(chains >= 10, "the scan found only {chains} python3 spawns");
     }
 
     #[test]
