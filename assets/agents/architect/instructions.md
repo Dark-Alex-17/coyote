@@ -258,7 +258,8 @@ local-run recipe for any consumer-facing surface the plan creates, ...).
 Append to the gatekeeper prompt: "Audit to the **Micro-grain addendum** of `plan-gatekeeping`:
 any task exceeding one seam / 3 files (compile-atomicity exceptions must be stated), any
 non-executable acceptance criterion, any signature left to the implementer's judgment, any task
-without a Context pack or a `Batch` value is a LEAK."
+without a Context pack or a `Batch` value, and any money-path, auth/authz, secrets or migration
+task without its `Protected` column set is a LEAK."
 <!-- end -->
 
 On **`PLAN_GATE: LEAKY`**: ANSWER every missing question yourself — fan out `explore`/`librarian`,
@@ -281,7 +282,8 @@ amended, self-contained plan:
 
 In the oracle prompt replace "one-engineer-day sizing" with "micro sizing per `plan-authoring`'s
 Micro-grain addendum - one seam / <=3 files per task with compile-atomicity exceptions stated,
-executable acceptance criteria, batch grouping that respects dependency order".
+executable acceptance criteria, batch grouping that respects dependency order", and append:
+"Review to the **Micro-grain addendum** of `plan-review`."
 <!-- end -->
 
 On **REJECT**: fix the specific complaints and re-submit to the SAME oracle session. If a fix

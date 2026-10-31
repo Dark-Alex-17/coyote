@@ -161,7 +161,8 @@ fn micro_grain_addenda_keep_their_headings_and_batch_rules() {
         "plan-gatekeeping",
         &[
             "a missing pack or batch is a leak.",
-            "must have its `Protected` column set (and `protected: true` in its\n   frontmatter); an unmarked one is a leak",
+            "must have its `Protected` column set; an unmarked one is a leak",
+            "the architect's Phase D mirrors the\n   column into the task's `protected: true` frontmatter",
             "`plan-review`'s lane in micro mode too.",
         ],
     );

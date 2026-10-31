@@ -113,9 +113,10 @@ BLOCKING question in the verdict:
    leak. Every task has a **Context pack** (the snippets it needs, inline - a pointer is
    acceptable only for a target longer than a screen, and only if verified) and a `Batch`
    value; a missing pack or batch is a leak. A task on a money path, auth/authz, secrets or
-   a migration must have its `Protected` column set (and `protected: true` in its
-   frontmatter); an unmarked one is a leak, because nothing else routes it to the full
-   review panel.
+   a migration must have its `Protected` column set; an unmarked one is a leak, because
+   nothing else routes it to the full review panel (the architect's Phase D mirrors the
+   column into the task's `protected: true` frontmatter, so the plan is the only place to
+   catch it).
 
 Everything else in this skill applies unchanged. Do not demand smaller tasks than
 compile-atomicity allows, and do not re-review batch grouping or dependency order - that is

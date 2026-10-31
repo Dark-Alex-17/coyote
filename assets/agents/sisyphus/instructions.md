@@ -139,11 +139,15 @@ Skill nudge: load `frontend-ui-ux` before touching components.
 
 **Paste actual code snippets, not just file paths.** "Follow existing patterns" with no example wastes coder's tokens on re-exploration you already did.
 
-Every coder spawn also passes `--variables {"build_lock": "{{build_lock}}"}` so the coder's build/test gates run under that prefix (`""` is an accepted value and runs them bare).
+Every coder spawn also passes `--variables {"build_lock": "{{build_lock}}", "project_dir": "<absolute path of the task's worktree>"}` so the coder's build/test gates run under that prefix (`""` is an accepted build_lock value and runs them bare) and in the right tree: a defaulted `project_dir` is only inferred from the planned files, so never leave it to the guess.
+
+When a targeted test command for the area the task touches is known (e.g. `cargo test --test <file>` or `cargo test --bin <bin> -- <module>`), also pass `"test_command": "<that command>"`: the coder's test gate then runs it instead of the full suite, inside the coder's own `test_timeout` budget. Leave `test_command` out when no targeted command is known; the full suite stays the review's and your own job either way.
 
 ### Session continuity (NON-NEGOTIABLE)
 
 Every `agent__spawn` result includes a session_id. Store it. A fix or follow-up to a child's work resumes that child's `session_id`; a fresh spawn is for new work.
+
+Before the FIRST coder spawn of a task, run `git rev-parse HEAD` and keep the SHA as the task's base commit (todo text / run-state memory); every `debt_scan` call passes it as `--base`.
 
 - Coder returned `CODER_FAILED` -> resume the SAME session: "Fix: <last error>". Do NOT spawn a new coder. When `Last script error:` names a crashed gate, surface it instead of asking for a fix (see Coder Outcomes): that is an engine-side fault.
 - Follow-up question on an explore result → resume that explore's session.
