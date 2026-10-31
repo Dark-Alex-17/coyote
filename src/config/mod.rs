@@ -27,6 +27,7 @@ mod skill_policy;
 mod skill_registry;
 pub(crate) mod todo;
 mod tool_scope;
+pub(crate) mod ui_kind;
 mod update;
 
 #[cfg(test)]
@@ -82,6 +83,7 @@ pub use self::tool_scope::{
     McpPromptCompletion, McpRuntime, flatten_prompt_messages, resolve_prompt_args,
     sanitize_display_text,
 };
+pub(crate) use self::ui_kind::UiKind;
 pub use self::update::run_self_update;
 use crate::client::{
     self, ClientConfig, MODELS_YAML, MessageContentToolCalls, Model, ModelType,

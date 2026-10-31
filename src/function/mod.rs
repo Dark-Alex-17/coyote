@@ -1,6 +1,7 @@
 pub(crate) mod agents;
 pub(crate) mod jobs;
 pub(crate) mod memory;
+pub(crate) mod prompt_channel;
 pub(crate) mod rag_query;
 pub(crate) mod skill;
 pub(crate) mod todo;
@@ -17,7 +18,7 @@ use crate::{
 
 use crate::config::ensure_parent_exists;
 use crate::config::paths;
-use crate::events::{self, Event, NoticeKind, OutputStream};
+use crate::events::{self, Event, NoticeKind, Origin, OutputStream};
 use crate::hooks::{self, HookEvent};
 use crate::mcp::{
     MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX, MCP_INVOKE_META_FUNCTION_NAME_PREFIX,
@@ -26,6 +27,7 @@ use crate::mcp::{
     McpServersConfig, is_mcp_meta_function, render,
 };
 use crate::parsers::{bash, python, typescript};
+use crate::prompt::{PromptMemory, Prompter};
 use crate::supervisor::notification::USER_MESSAGE_EVENT;
 use crate::turn::UiSink;
 use agents::AGENT_FUNCTION_PREFIX;
@@ -1624,6 +1626,8 @@ impl ToolCall {
 
         envs.entry("COYOTE_CURRENT_MODEL".to_string())
             .or_insert_with(|| ctx.current_model().id());
+        envs.entry("COYOTE_UI".to_string())
+            .or_insert_with(|| ctx.ui_kind().as_str().to_string());
 
         let json_data = if self.arguments.is_object() {
             self.arguments.clone()
@@ -1838,7 +1842,11 @@ impl ToolCall {
                 envs,
                 agent_name,
                 ctx.app.config.tool_timeout,
-                ToolIo::new(Arc::clone(&ctx.ui), self.id.clone(), current_depth),
+                ToolIo::new(Arc::clone(&ctx.ui), self.id.clone(), current_depth).with_prompter(
+                    Arc::clone(&ctx.prompter),
+                    Arc::clone(&ctx.prompt_memory),
+                    Origin::from(&*ctx),
+                ),
                 ctx.session_abort.clone(),
             ) {
                 Ok(Some(contents)) => serde_json::from_str(&contents)
@@ -2492,11 +2500,28 @@ pub(crate) struct ToolIo {
     ui: Arc<dyn UiSink>,
     call_id: Option<String>,
     depth: usize,
+    prompter: Option<prompt_channel::ToolPrompter>,
 }
 
 impl ToolIo {
     pub(crate) fn new(ui: Arc<dyn UiSink>, call_id: Option<String>, depth: usize) -> Self {
-        Self { ui, call_id, depth }
+        Self {
+            ui,
+            call_id,
+            depth,
+            prompter: None,
+        }
+    }
+
+    /// Lets the tool ask the human; without it no reply channel is offered.
+    pub(crate) fn with_prompter(
+        mut self,
+        prompter: Arc<dyn Prompter>,
+        memory: Arc<PromptMemory>,
+        origin: Origin,
+    ) -> Self {
+        self.prompter = Some(prompt_channel::ToolPrompter::new(prompter, memory, origin));
+        self
     }
 }
 
@@ -2554,14 +2579,33 @@ pub fn run_llm_function(
     envs.insert("CLICOLOR_FORCE".into(), "1".into());
     envs.insert("FORCE_COLOR".into(), "1".into());
 
-    let mut child = Command::new(&cmd_name)
+    let mut reply = match io.prompter.as_ref().map(|_| prompt_channel::Server::open()) {
+        Some(Ok(server)) => {
+            envs.insert(prompt_channel::REPLY_ENV.into(), server.env_value());
+            Some(server)
+        }
+        Some(Err(err)) => {
+            warn!("Prompt reply channel unavailable for '{command_name}': {err}");
+            None
+        }
+        None => None,
+    };
+
+    let mut command = Command::new(&cmd_name);
+    command
         .args(&cmd_args)
         .envs(envs)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| anyhow!("Unable to run {command_name}, {err}"))?;
+        .stderr(Stdio::piped());
+    if let Some(server) = reply.as_ref() {
+        server.configure(&mut command);
+    }
+    let spawned_child = command.spawn();
+    if let Some(server) = reply.as_mut() {
+        server.spawned();
+    }
+    let mut child = spawned_child.map_err(|err| anyhow!("Unable to run {command_name}, {err}"))?;
     debug!("Spawned tool process '{command_name}' pid {}", child.id());
     let spawned = Instant::now();
 
@@ -2570,15 +2614,14 @@ pub fn run_llm_function(
 
     let stdout_io = io.clone();
     let stderr_io = io.clone();
+    let stdout_tool = command_name.clone();
     let stdout_thread = thread::spawn(move || {
         let mut buffer = [0; 1024];
         let mut reader = stdout;
         let mut buf = Vec::new();
-        while let Ok(n) = reader.read(&mut buffer) {
-            if n == 0 {
-                break;
-            }
-            let chunk = &buffer[0..n];
+        let mut lines = prompt_channel::LineAssembler::default();
+        let served = stdout_io.prompter.as_ref().zip(reply.as_ref());
+        let emit = |chunk: &[u8], buf: &mut Vec<u8>| {
             buf.extend_from_slice(chunk);
             events::bus().publish(Event::ToolOutputChunk {
                 call_id: stdout_io.call_id.clone().unwrap_or_default(),
@@ -2591,6 +2634,32 @@ pub fn run_llm_function(
                 stdout_io.depth,
                 chunk,
             );
+        };
+        while let Ok(n) = reader.read(&mut buffer) {
+            if n == 0 {
+                break;
+            }
+            for classified in lines.feed(&buffer[0..n]) {
+                match classified {
+                    prompt_channel::Classified::Output(bytes) => emit(&bytes, &mut buf),
+                    prompt_channel::Classified::Prompt(line) => {
+                        let request = served.and_then(|(prompter, server)| {
+                            prompter
+                                .parse_line(&line, &stdout_tool, stdout_io.call_id.clone(), None)
+                                .map(|req| (prompter, server, req))
+                        });
+                        match request {
+                            Some((prompter, server, req)) => {
+                                prompt_channel::handle_prompt_line(prompter, server, req);
+                            }
+                            None => emit(&line, &mut buf),
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(tail) = lines.finish() {
+            emit(&tail, &mut buf);
         }
         buf
     });

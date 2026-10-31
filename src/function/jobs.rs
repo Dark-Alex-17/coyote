@@ -1,5 +1,6 @@
 use super::agents::AGENT_FUNCTION_PREFIX;
 use super::memory::MEMORY_FUNCTION_PREFIX;
+use super::prompt_channel::{self, Classified, LineAssembler, Server, ToolPrompter};
 use super::rag_query::RAG_FUNCTION_PREFIX;
 use super::skill::SKILL_FUNCTION_PREFIX;
 use super::todo::TODO_FUNCTION_PREFIX;
@@ -197,6 +198,18 @@ pub struct JobEnvSnapshot {
     envs: HashMap<String, String>,
     output_file: PathBuf,
     timeout_secs: u64,
+    prompter: Option<ToolPrompter>,
+    prompt_reply: Option<Server>,
+    job_id: String,
+}
+
+/// What the stdout pump of a process job needs to answer a request line.
+struct JobPrompt {
+    job_id: String,
+    tool: String,
+    prompter: ToolPrompter,
+    /// Shared with the blocking task that writes the reply.
+    reply: Arc<Server>,
 }
 
 /// The complete context an MCP job task owns. The runtime holds ONLY the
@@ -559,7 +572,8 @@ async fn handle_start(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
             result
         })
     } else {
-        let snapshot = build_env_snapshot(ctx, &tool, &arguments)?;
+        let mut snapshot = build_env_snapshot(ctx, &tool, &arguments)?;
+        snapshot.job_id = job_id.clone();
         let task_state = Arc::clone(&state);
         let task_buf = Arc::clone(&output_buf);
         let task_notifications = Arc::clone(&ctx.notification_queue);
@@ -1039,6 +1053,18 @@ fn build_env_snapshot(
     envs.insert("FORCE_COLOR".into(), "1".into());
     envs.entry("COYOTE_CURRENT_MODEL".to_string())
         .or_insert_with(|| ctx.current_model().id());
+    envs.entry("COYOTE_UI".to_string())
+        .or_insert_with(|| ctx.ui_kind().as_str().to_string());
+    let prompt_reply = match Server::open() {
+        Ok(server) => {
+            envs.insert(prompt_channel::REPLY_ENV.into(), server.env_value());
+            Some(server)
+        }
+        Err(err) => {
+            warn!("Prompt reply channel unavailable for '{tool}': {err}");
+            None
+        }
+    };
 
     cmd_args.push(arguments.to_string());
 
@@ -1068,16 +1094,73 @@ fn build_env_snapshot(
         envs,
         output_file,
         timeout_secs,
+        prompter: Some(ToolPrompter::new(
+            Arc::clone(&ctx.prompter),
+            Arc::clone(&ctx.prompt_memory),
+            Origin::from(ctx),
+        )),
+        prompt_reply,
+        job_id: String::new(),
     })
 }
 
-async fn pump_into_ring(mut reader: impl AsyncReadExt + Unpin, output_buf: Arc<Mutex<RingBuf>>) {
+/// With `prompt`, request lines are answered instead of buffered; the
+/// prompter may block on a human, so it runs off the async worker.
+async fn pump_into_ring(
+    mut reader: impl AsyncReadExt + Unpin,
+    output_buf: Arc<Mutex<RingBuf>>,
+    prompt: Option<JobPrompt>,
+) {
     let mut chunk = [0u8; 1024];
+    let Some(prompt) = prompt else {
+        loop {
+            match reader.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => output_buf.lock().push(&chunk[..n]),
+            }
+        }
+        return;
+    };
+    let mut lines = LineAssembler::default();
     loop {
         match reader.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
-            Ok(n) => output_buf.lock().push(&chunk[..n]),
+            Ok(n) => {
+                for classified in lines.feed(&chunk[..n]) {
+                    match classified {
+                        Classified::Output(bytes) => output_buf.lock().push(&bytes),
+                        Classified::Prompt(line) => {
+                            let Some(req) = prompt.prompter.parse_line(
+                                &line,
+                                &prompt.tool,
+                                None,
+                                Some(prompt.job_id.clone()),
+                            ) else {
+                                output_buf.lock().push(&line);
+                                continue;
+                            };
+                            let id = req.id.clone();
+                            let prompter = prompt.prompter.clone();
+                            let reply = Arc::clone(&prompt.reply);
+                            let served = tokio::task::spawn_blocking(move || {
+                                prompt_channel::handle_prompt_line(&prompter, &reply, req)
+                            })
+                            .await;
+                            if let Err(err) = served {
+                                warn!(
+                                    "Prompt from job '{}' was not answered: {err}",
+                                    prompt.job_id
+                                );
+                                prompt.reply.reply(&id, &Value::Null);
+                            }
+                        }
+                    }
+                }
+            }
         }
+    }
+    if let Some(tail) = lines.finish() {
+        output_buf.lock().push(&tail);
     }
 }
 
@@ -1133,7 +1216,7 @@ async fn drain_pump(mut pump: tokio::task::JoinHandle<()>) {
 }
 
 async fn run_process_job(
-    snapshot: JobEnvSnapshot,
+    mut snapshot: JobEnvSnapshot,
     state: Arc<Mutex<JobState>>,
     output_buf: Arc<Mutex<RingBuf>>,
 ) -> Result<JobResult> {
@@ -1153,10 +1236,16 @@ async fn run_process_job(
         .kill_on_drop(true);
     #[cfg(unix)]
     command.process_group(0);
-
-    let mut child = command
-        .spawn()
-        .map_err(|err| anyhow!("Unable to run {}, {err}", snapshot.display_name))?;
+    let mut prompt_reply = snapshot.prompt_reply.take();
+    if let Some(server) = prompt_reply.as_ref() {
+        server.configure(command.as_std_mut());
+    }
+    let spawned_child = command.spawn();
+    if let Some(server) = prompt_reply.as_mut() {
+        server.spawned();
+    }
+    let mut child =
+        spawned_child.map_err(|err| anyhow!("Unable to run {}, {err}", snapshot.display_name))?;
     debug!(
         "Spawned job process '{}' pid {:?}",
         snapshot.display_name,
@@ -1177,8 +1266,18 @@ async fn run_process_job(
         .stderr
         .take()
         .ok_or_else(|| anyhow!("Failed to capture stderr"))?;
-    let stdout_pump = tokio::spawn(pump_into_ring(stdout, Arc::clone(&output_buf)));
-    let stderr_pump = tokio::spawn(pump_into_ring(stderr, Arc::clone(&output_buf)));
+    let job_prompt = snapshot
+        .prompter
+        .clone()
+        .zip(prompt_reply)
+        .map(|(prompter, reply)| JobPrompt {
+            job_id: snapshot.job_id.clone(),
+            tool: snapshot.display_name.clone(),
+            prompter,
+            reply: Arc::new(reply),
+        });
+    let stdout_pump = tokio::spawn(pump_into_ring(stdout, Arc::clone(&output_buf), job_prompt));
+    let stderr_pump = tokio::spawn(pump_into_ring(stderr, Arc::clone(&output_buf), None));
     let file_offset = Arc::new(Mutex::new(0u64));
     let file_tailer = AbortOnDrop(tokio::spawn({
         let path = snapshot.output_file.clone();
@@ -1476,6 +1575,9 @@ mod tests {
             envs,
             output_file,
             timeout_secs,
+            prompter: None,
+            prompt_reply: None,
+            job_id: String::new(),
         }
     }
 

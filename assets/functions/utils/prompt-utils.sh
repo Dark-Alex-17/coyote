@@ -103,6 +103,69 @@ white() {
   echo -e "${white}$1${default}"
 }
 
+# When Coyote offers a reply channel, prompts go to its prompter instead of
+# the terminal: the helper writes one request line to the tool's real stdout
+# and reads the answer line back from COYOTE_PROMPT_REPLY. Callers wrap the
+# helpers in $(...), which points fd 1 at the capture, so the real stdout is
+# saved on fd 9 once at source time.
+if [[ -n "${COYOTE_PROMPT_REPLY:-}" && -z "${_COYOTE_PROMPT_OUT:-}" ]]; then
+  exec 9>&1
+  _COYOTE_PROMPT_OUT=9
+fi
+
+_coyote_prompt_send() {
+  declare id="$1"
+  declare action="$2"
+  declare question="$3"
+  declare line
+  line="$(jq -cn --arg id "$id" --arg action "$action" --arg question "$question" \
+    '{coyote_prompt:{id:$id,action:$action,question:$question,options:$ARGS.positional}}' \
+    --args "${@:4}")" || return 1
+  printf '%s\n' "$line" >&"${_COYOTE_PROMPT_OUT:-1}"
+}
+
+# _coyote_prompt <action> <question> [options...]
+# Prints the answer in the same shape the terminal helpers print: confirm 1/0,
+# select the option index, checkbox the checked indices, input/password the
+# text. Returns 1 and prints nothing when the prompt was cancelled or the
+# reply is not usable, so callers fail closed.
+_coyote_prompt() {
+  declare action="$1"
+  declare question="$2"
+  declare id="p$$-$RANDOM"
+  declare reply
+
+  _coyote_prompt_send "$id" "$action" "$question" "${@:3}" || return 1
+  IFS= read -r reply <"$COYOTE_PROMPT_REPLY" || return 1
+
+  declare answer
+  case "$action" in
+    confirm)
+      answer="$(printf '%s' "$reply" | jq -er \
+        'if .answer == true then 1 elif .answer == false then 0 else empty end')" || return 1
+      ;;
+    select)
+      answer="$(printf '%s' "$reply" | jq -er --args \
+        'if (.answer | type) == "string" then (.answer as $a | $ARGS.positional | index($a)) else empty end' \
+        "${@:3}")" || return 1
+      ;;
+    checkbox)
+      answer="$(printf '%s' "$reply" | jq -er --args \
+        'if (.answer | type) == "array" then (.answer as $a | [$ARGS.positional | to_entries[] | select(.value | IN($a[])) | .key] | map(tostring) | join(" ")) else empty end' \
+        "${@:3}")" || return 1
+      ;;
+    input | password)
+      answer="$(printf '%s' "$reply" | jq -er \
+        'if (.answer | type) == "string" then .answer else empty end')" || return 1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+
+  printf '%s' "$answer"
+}
+
 _read_stdin() {
   read -r "$@" </dev/tty
 }
@@ -179,6 +242,10 @@ _increment_selected() {
 
 # shellcheck disable=SC2154
 input() {
+  if [[ -n "${COYOTE_PROMPT_REPLY:-}" ]]; then
+    _coyote_prompt input "$1"
+    return $?
+  fi
   _prompt_text "$1"
   echo -en "\033[36m\c" >&2
   _read_stdin -r text
@@ -186,6 +253,10 @@ input() {
 }
 
 confirm() {
+  if [[ -n "${COYOTE_PROMPT_REPLY:-}" ]]; then
+    _coyote_prompt confirm "$1"
+    return $?
+  fi
   # stty targets stdin, which is /dev/null when the host spawns tool scripts;
   # point it at the real terminal and stay quiet when there isn't one.
   trap "stty echo </dev/tty 2>/dev/null; exit" EXIT
@@ -220,6 +291,10 @@ confirm() {
 }
 
 list() {
+  if [[ -n "${COYOTE_PROMPT_REPLY:-}" ]]; then
+    _coyote_prompt select "$1" "${@:2}"
+    return $?
+  fi
   _prompt_text "$1 "
   declare opts=("${@:2}")
   declare opts_count=$(($# - 1))
@@ -264,6 +339,10 @@ list() {
 }
 
 checkbox() {
+  if [[ -n "${COYOTE_PROMPT_REPLY:-}" ]]; then
+    _coyote_prompt checkbox "$1" "${@:2}"
+    return $?
+  fi
   _prompt_text "$1"
   declare opts
   opts=("${@:2}")
@@ -333,6 +412,10 @@ checkbox() {
 }
 
 password() {
+  if [[ -n "${COYOTE_PROMPT_REPLY:-}" ]]; then
+    _coyote_prompt password "$1"
+    return $?
+  fi
   _prompt_text "$1"
   echo -en "\033[36m" >&2
   declare password=''
@@ -509,11 +592,15 @@ open_link() {
 
 guard_operation() {
 	if [[ -z "$AUTO_CONFIRM" && -z "$LLM_AGENT_VAR_AUTO_CONFIRM" ]]; then
-		# 2>/dev/tty: keep the prompt off the host-captured stderr pipe so it
-		# can't leak into tool_call_error JSON when the wrapped command fails.
-		ans="$(confirm "${1:-Are you sure you want to continue?}" 2>/dev/tty)"
+		if [[ -n "${COYOTE_PROMPT_REPLY:-}" ]]; then
+			ans="$(confirm "${1:-Are you sure you want to continue?}")"
+		else
+			# 2>/dev/tty: keep the prompt off the host-captured stderr pipe so it
+			# can't leak into tool_call_error JSON when the wrapped command fails.
+			ans="$(confirm "${1:-Are you sure you want to continue?}" 2>/dev/tty)"
+		fi
 
-		if [[ "$ans" == 0 ]]; then
+		if [[ "$ans" != 1 ]]; then
 			error "Operation aborted!" 2>&1
 			exit 1
 		fi
@@ -770,10 +857,14 @@ guard_path() {
 	confirmation_prompt="$2"
 
 	if [[ ! "$path" == "$(pwd)"* && -z "$AUTO_CONFIRM" && -z "$LLM_AGENT_VAR_AUTO_CONFIRM" ]]; then
-		# 2>/dev/tty: see guard_operation — prevents prompt text leaking via captured stderr.
-		ans="$(confirm "$confirmation_prompt" 2>/dev/tty)"
+		if [[ -n "${COYOTE_PROMPT_REPLY:-}" ]]; then
+			ans="$(confirm "$confirmation_prompt")"
+		else
+			# 2>/dev/tty: see guard_operation; prevents prompt text leaking via captured stderr.
+			ans="$(confirm "$confirmation_prompt" 2>/dev/tty)"
+		fi
 
-		if [[ "$ans" == 0 ]]; then
+		if [[ "$ans" != 1 ]]; then
 			error "Operation aborted!" >&2
 			exit 1
 		fi

@@ -20,8 +20,8 @@ use super::{
     CommandPrefix, Input, InstallFilter, LEFT_PROMPT, LastMessage, MESSAGES_FILE_NAME,
     MacroAllowlistLevel, MacroPolicy, MacroSource, MacroState, RESERVED_MACRO_NAMES, RIGHT_PROMPT,
     ResolvedMacro, Role, RoleLike, SESSIONS_DIR_NAME, SUMMARIZATION_PROMPT, SUMMARY_CONTEXT_PROMPT,
-    StateFlags, TEMP_ROLE_NAME, TEMP_SESSION_NAME, WORKSPACE_COYOTE_DIR_NAME, WorkingMode, bundles,
-    ensure_parent_exists, list_agents_with_descriptions, memory, paths,
+    StateFlags, TEMP_ROLE_NAME, TEMP_SESSION_NAME, UiKind, WORKSPACE_COYOTE_DIR_NAME, WorkingMode,
+    bundles, ensure_parent_exists, list_agents_with_descriptions, memory, paths,
 };
 use super::{MessageContentToolCalls, prompts};
 use crate::client::{
@@ -1064,6 +1064,15 @@ impl RequestContext {
 
     pub fn command_prefix(&self) -> CommandPrefix {
         self.app.config.command_prefix
+    }
+
+    /// What kind of surface answers this run's prompts, exported to tools as `COYOTE_UI`.
+    pub(crate) fn ui_kind(&self) -> UiKind {
+        if human_present() {
+            UiKind::Repl
+        } else {
+            UiKind::Headless
+        }
     }
 
     pub fn render_hints<'a>(&self, text: &'a str) -> Cow<'a, str> {
