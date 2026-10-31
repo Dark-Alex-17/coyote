@@ -821,12 +821,27 @@ fn git(repo: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+/// The shared debt scanner run from `cwd` with git's global/system config
+/// disabled, so only the scratch repo's own config shapes the diff. The
+/// caller adds the arguments and decides what happens to an inherited
+/// `GRAPH_STATE` / `GRAPH_STATE_FILE`.
+#[cfg(unix)]
+fn debt_scan_command(cwd: &Path) -> Command {
+    let scanner =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared/debt_scan.py");
+    let mut cmd = Command::new("python3");
+    cmd.arg(&scanner)
+        .current_dir(cwd)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("PYTHONDONTWRITEBYTECODE", "1");
+    cmd
+}
+
 /// Runs the shared debt scanner the way both sweep twins do (`--dir <repo>
-/// --base <base>`), from `cwd`, with git's global/system config disabled so
-/// only the scratch repo's own config shapes the diff, and with any inherited
-/// `GRAPH_STATE` / `GRAPH_STATE_FILE` dropped so a run inside a graph node
-/// does not flip the scanner into graph mode. Returns (exit code, stdout,
-/// stderr).
+/// --base <base>`), from `cwd`, with any inherited `GRAPH_STATE` /
+/// `GRAPH_STATE_FILE` dropped so the test does not depend on the graph node
+/// it may run inside. Returns (exit code, stdout, stderr).
 #[cfg(unix)]
 fn debt_scan_full(
     cwd: &Path,
@@ -834,18 +849,11 @@ fn debt_scan_full(
     base: &str,
     envs: &[(&str, &str)],
 ) -> (Option<i32>, String, String) {
-    let scanner =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared/debt_scan.py");
-    let out = Command::new("python3")
-        .arg(&scanner)
+    let out = debt_scan_command(cwd)
         .arg("--dir")
         .arg(repo)
         .arg("--base")
         .arg(base)
-        .current_dir(cwd)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("PYTHONDONTWRITEBYTECODE", "1")
         .env_remove("GRAPH_STATE")
         .env_remove("GRAPH_STATE_FILE")
         .envs(envs.iter().copied())
@@ -905,6 +913,235 @@ fn usage_probe_debt_scan_round_trips_a_non_ascii_untracked_path_under_a_c_locale
         text.contains(&hit),
         "the hit names the literal path {path:?}\nstdout: {text}\nstderr: {err}"
     );
+}
+
+/// A scratch repo under a unique temp root (removed when the guard drops)
+/// with `src/lib.rs` = `fn tracked() {}` committed. Returns (guard, repo,
+/// base commit).
+#[cfg(unix)]
+fn debt_scan_scratch_repo(label: &str) -> (ScratchDir, std::path::PathBuf, String) {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("coyote-debris-debt-scan-{label}-{unique}"));
+    let guard = ScratchDir(root.clone());
+    let repo = root.join("repo");
+    fs::create_dir_all(repo.join("src")).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    fs::write(repo.join("src/lib.rs"), "fn tracked() {}\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "base"]);
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+    (guard, repo, base)
+}
+
+/// A bare `cfg_attr(` is not debt on its own, but it must not hide a later
+/// marker on the same line.
+#[cfg(unix)]
+#[test]
+fn debt_scan_reports_a_marker_that_follows_a_bare_cfg_attr_on_the_same_line() {
+    let (guard, repo, base) = debt_scan_scratch_repo("cfg-attr-first");
+    fs::write(
+        repo.join("src/lib.rs"),
+        "fn tracked() {}\n#[cfg_attr(test, derive(Debug))] fn x() { todo!() }\n",
+    )
+    .unwrap();
+    let (code, text) = debt_scan(&guard.0, &repo, &base);
+    assert_eq!(code, Some(0), "{text}");
+    assert!(
+        text.contains("src/lib.rs:2 -- #[cfg_attr(test, derive(Debug))] fn x() { todo!() }"),
+        "the todo! after a bare cfg_attr is debt: {text}"
+    );
+}
+
+/// `git diff <rev>` compares against one tree even mid-merge, so only a bare
+/// `git diff` prints a combined diff and the scanner always passes a base.
+/// The refusal is therefore pinned on the parser directly, together with a
+/// hunk that arrives before any `+++ ` header.
+#[cfg(unix)]
+#[test]
+fn debt_scan_parse_diff_refuses_combined_diffs_and_headerless_hunks() {
+    let scanner = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared/debt_scan.py");
+    let harness = "import runpy, sys\n\
+                   m = runpy.run_path(sys.argv[1])\n\
+                   try:\n    print('\\n'.join(m['parse_diff'](sys.argv[2])))\n\
+                   except RuntimeError as exc:\n    print(f'RuntimeError: {exc}')\n";
+    let parse = |diff: &str| -> String {
+        let out = Command::new("python3")
+            .arg("-c")
+            .arg(harness)
+            .arg(&scanner)
+            .arg(diff)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "harness: {out:?}");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+
+    let two_way = "diff --git a/f.rs b/f.rs\n--- a/f.rs\n+++ b/f.rs\n@@ -1 +1,2 @@\n a\n+todo!()\n";
+    assert_eq!(parse(two_way), "f.rs:2 -- todo!()\n");
+
+    let cc = "diff --cc f.rs\nindex 3d9e428,2299c37..0000000\n--- a/f.rs\n+++ b/f.rs\n\
+              @@@ -1,1 -1,1 +1,5 @@@\n++<<<<<<< HEAD\n +main todo!()\n++=======\n+ side\n\
+              ++>>>>>>> side\n";
+    let combined =
+        "diff --combined f.rs\n--- a/f.rs\n+++ b/f.rs\n@@@ -1,1 -1,1 +1,2 @@@\n++todo!()\n";
+    let headerless = "diff --git a/f.rs b/f.rs\n@@ -0,0 +1 @@\n+todo!()\n";
+    for (label, diff, needle) in [
+        ("diff --cc", cc, "combined (merge) diff"),
+        ("diff --combined", combined, "combined (merge) diff"),
+        (
+            "headerless hunk",
+            headerless,
+            "arrived before any `+++ b/<path>` header",
+        ),
+    ] {
+        let out = parse(diff);
+        assert!(
+            out.starts_with("RuntimeError: ") && out.contains(needle),
+            "{label} must raise rather than number lines: {out}"
+        );
+    }
+}
+
+/// Command-line arguments mean CLI mode even when a graph node's state is
+/// inherited: the flags are honoured and the report is plain text.
+#[cfg(unix)]
+#[test]
+fn debt_scan_cli_flags_win_over_an_inherited_graph_state() {
+    let (guard, repo, base) = debt_scan_scratch_repo("graph-state-cli");
+    fs::write(repo.join("src/new.rs"), "todo!()\n").unwrap();
+    let out = debt_scan_command(&guard.0)
+        .arg("--dir")
+        .arg(&repo)
+        .arg("--base")
+        .arg(&base)
+        .env("GRAPH_STATE", r#"{"project_dir":"/nonexistent"}"#)
+        .env_remove("GRAPH_STATE_FILE")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(
+        text.starts_with(&format!("Debt scan (diff base: {base}): 1 hit(s)\n"))
+            && text.contains("src/new.rs:1 -- todo!()"),
+        "plain-text report for the flagged repo, not a JSON envelope: {text}"
+    );
+}
+
+/// git C-quotes a name holding a tab or a double quote even with
+/// core.quotePath=false; the hit names the file as it is on disk.
+#[cfg(unix)]
+#[test]
+fn debt_scan_unquotes_c_quoted_untracked_names() {
+    let (guard, repo, base) = debt_scan_scratch_repo("c-quoted");
+    let names = ["src/tab\there.rs", "src/quote\"here.rs"];
+    for name in names {
+        fs::write(repo.join(name), "todo!()\n").unwrap();
+    }
+    let (code, text) = debt_scan(&guard.0, &repo, &base);
+    assert_eq!(code, Some(0), "{text}");
+    for name in names {
+        let hit = format!("{name}:1 -- todo!()");
+        assert!(
+            text.lines().any(|l| l == hit),
+            "expected {hit:?} in: {text}"
+        );
+    }
+}
+
+/// debt_scan.py runs via runpy from shims and cannot import debris.py, so it
+/// carries a copy of the C-unquoting helpers that must not drift.
+#[test]
+fn debt_scan_unquote_c_is_a_verbatim_twin_of_the_debris_lint() {
+    let scanner = agent_file(".shared/debt_scan.py");
+    let debris = agent_file(".shared/debris.py");
+    let function = |src: &str, file: &str| -> String {
+        let start = src
+            .find("def unquote_c(")
+            .unwrap_or_else(|| panic!("{file} defines unquote_c"));
+        let rest = &src[start..];
+        let end = rest
+            .find("\n\n\ndef ")
+            .unwrap_or_else(|| panic!("{file}: unquote_c is followed by another def"));
+        rest[..end].to_string()
+    };
+    assert_eq!(
+        function(&scanner, "debt_scan.py"),
+        function(&debris, "debris.py"),
+        "unquote_c drifted"
+    );
+    for prefix in ["C_ESCAPE_RE = ", "C_ESCAPES = "] {
+        let line = |src: &str, file: &str| -> String {
+            src.lines()
+                .find(|l| l.starts_with(prefix))
+                .unwrap_or_else(|| panic!("{file} defines {prefix:?}"))
+                .to_string()
+        };
+        assert_eq!(
+            line(&scanner, "debt_scan.py"),
+            line(&debris, "debris.py"),
+            "{prefix:?} drifted"
+        );
+    }
+}
+
+/// An option-shaped base never reaches git as an option, and a flag the
+/// scanner does not know, or one missing its value, is a failure rather than
+/// a silent scan of the current directory.
+#[cfg(unix)]
+#[test]
+fn debt_scan_refuses_an_option_shaped_base_and_unknown_or_valueless_flags() {
+    let (guard, repo, _) = debt_scan_scratch_repo("arg-shape");
+    fs::write(repo.join("src/new.rs"), "todo!()\n").unwrap();
+    let written = guard.0.join("x");
+    let (code, text) = debt_scan(&guard.0, &repo, &format!("--output={}", written.display()));
+    assert_eq!(code, Some(0), "{text}");
+    assert!(
+        text.starts_with("DEBT_SCAN_FAILED:") && text.contains("option-shaped"),
+        "{text}"
+    );
+    assert!(!written.exists(), "git must not have written {written:?}");
+
+    for args in [&["--bogus"][..], &["--base"], &["--", "extra"]] {
+        let out = debt_scan_command(&repo)
+            .args(args)
+            .env_remove("GRAPH_STATE")
+            .env_remove("GRAPH_STATE_FILE")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {out:?}");
+        assert!(
+            text.starts_with("DEBT_SCAN_FAILED:"),
+            "{args:?} must fail open, not scan the cwd: {text}"
+        );
+    }
+}
+
+/// diff.mnemonicPrefix and diff.noprefix in the repo's own config do not
+/// change the reported paths: a `b/` directory stays `b/` and `src/` is never
+/// prefixed.
+#[cfg(unix)]
+#[test]
+fn debt_scan_paths_hold_under_mnemonic_prefix_and_noprefix() {
+    for (key, value) in [("diff.mnemonicPrefix", "true"), ("diff.noprefix", "true")] {
+        let (guard, repo, base) = debt_scan_scratch_repo("prefix");
+        git(&repo, &["config", key, value]);
+        fs::write(repo.join("src/lib.rs"), "fn tracked() {}\ntodo!()\n").unwrap();
+        fs::create_dir_all(repo.join("b")).unwrap();
+        fs::write(repo.join("b/lib.rs"), "todo!()\n").unwrap();
+        let (code, text) = debt_scan(&guard.0, &repo, &base);
+        assert_eq!(code, Some(0), "{key}: {text}");
+        for hit in ["src/lib.rs:2 -- todo!()", "b/lib.rs:1 -- todo!()"] {
+            assert!(
+                text.lines().any(|l| l == hit),
+                "{key}: expected {hit:?} in: {text}"
+            );
+        }
+    }
 }
 
 /// The architect's Phase F recipes are pinned as text above; this runs them.
@@ -1468,11 +1705,9 @@ fn usage_probe_step_runner_debt_scan_edges_new_dirs_odd_names_no_new_files_and_i
     );
     assert!(text.contains("// predicate allow"), "{text}");
 
-    // Added lines that start with `++` or removed lines that start with `--`
-    // render as `+++x` / `---y` inside a hunk; neither is a file header. The
-    // path must survive the first and the numbering the second: the marker
-    // on line 6 is reported at src/lib.rs:6, not under a phantom path or at
-    // a shifted line.
+    // An added line `++ x` renders as `+++ x` inside a hunk, which only the
+    // in-hunk gate keeps from being read as a new target path: the marker on
+    // line 6 is still reported at src/lib.rs:6.
     let (repo, _) = make_repo("hunk-headers");
     fs::write(repo.join("src/lib.rs"), "fn tracked() {}\n--y\n++x\n").unwrap();
     git(&repo, &["add", "-A"]);
