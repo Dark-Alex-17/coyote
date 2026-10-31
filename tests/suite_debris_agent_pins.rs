@@ -524,6 +524,14 @@ fn debt_grep_regex_has_one_home_in_debt_scan_and_its_fallbacks_match_the_debris_
             && pipeline.contains("git diff --no-color --no-ext-diff <base> | "),
         "the quoted manual pipeline lost its add -N feed or diff flags: {pipeline}"
     );
+    // The python3-less fallback in the Sisyphus tool is a quoted heredoc, so
+    // it carries the pipeline byte for byte.
+    let tool = sisyphus_debt_scan_tool();
+    assert_eq!(
+        tool.matches(pipeline.as_str()).count(),
+        1,
+        "the sisyphus debt_scan python3-less fallback must quote MANUAL_PIPELINE exactly once: {tool}"
+    );
 
     // The graph default is a YAML single-quoted scalar: `''` in source is `'`.
     let graph = agent_file("step-runner/graph.yaml").replace("''", "'");
@@ -556,6 +564,71 @@ fn debt_grep_regex_has_one_home_in_debt_scan_and_its_fallbacks_match_the_debris_
         assert!(
             markers.contains(&format!("\"{marker}\"")),
             "DEBT_MARKERS lost {marker:?}: {markers}"
+        );
+    }
+}
+
+/// The Sisyphus `debt_scan` tool from its `# @cmd` annotation through the
+/// function's closing brace.
+fn sisyphus_debt_scan_tool() -> String {
+    let tools = agent_file("sisyphus/tools.sh");
+    let start = tools
+        .find("\ndebt_scan() {\n")
+        .expect("sisyphus tools.sh defines debt_scan");
+    let cmd = tools[..start]
+        .rfind("# @cmd ")
+        .expect("debt_scan carries an @cmd annotation");
+    let end = start
+        + tools[start..]
+            .find("\n}\n")
+            .expect("debt_scan has a closing brace");
+    tools[cmd..end].to_string()
+}
+
+/// The tool demands the task's base, keeps an inherited graph state and
+/// bytecode away from the scanner, and reports through `$LLM_OUTPUT` when
+/// python3 is missing instead of dying with exit 127.
+#[test]
+fn sisyphus_debt_scan_tool_requires_a_base_strips_graph_state_and_guards_python3() {
+    let tool = sisyphus_debt_scan_tool();
+    for needle in [
+        "# @option --base! ",
+        "--base \"${argc_base}\"",
+        "if ! command -v python3 ",
+        "DEBT_SCAN_FAILED: python3 is not on PATH",
+        "env -u GRAPH_STATE -u GRAPH_STATE_FILE python3 -B ",
+    ] {
+        assert!(tool.contains(needle), "debt_scan lost {needle:?}: {tool}");
+    }
+    assert!(
+        !tool.contains("argc_base:-"),
+        "a defaulted base would silently diff against HEAD: {tool}"
+    );
+    let guard = tool.find("command -v python3").unwrap();
+    let run = tool.find("env -u GRAPH_STATE").unwrap();
+    assert!(guard < run, "the python3 guard must run first: {tool}");
+}
+
+/// The scanner runs three git calls back to back (ls-files, add -N, diff),
+/// each bounded by `GIT_TIMEOUT`; their sum must fit inside every graph
+/// node that runs it, or the node times out before the scanner fails open.
+#[test]
+fn debt_scan_git_timeouts_fit_inside_the_graph_node_budgets() {
+    let git_timeout: u64 = agent_file(".shared/debt_scan.py")
+        .lines()
+        .find_map(|l| l.strip_prefix("GIT_TIMEOUT = "))
+        .expect("debt_scan.py defines GIT_TIMEOUT")
+        .trim()
+        .parse()
+        .expect("GIT_TIMEOUT is an integer");
+    for rel in ["step-runner/graph.yaml", "sisyphus-next/graph.yaml"] {
+        let doc: serde_yaml::Value = serde_yaml::from_str(&agent_file(rel)).unwrap();
+        let timeout = doc["nodes"]["debt_scan"]["timeout"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{rel}: nodes.debt_scan.timeout is an integer"));
+        assert!(
+            3 * git_timeout < timeout,
+            "{rel}: 3 * GIT_TIMEOUT ({git_timeout}) must stay under the debt_scan node timeout ({timeout})"
         );
     }
 }
@@ -838,6 +911,15 @@ fn debt_scan_command(cwd: &Path) -> Command {
     cmd
 }
 
+#[cfg(unix)]
+fn python3_missing() -> bool {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return true;
+    }
+    false
+}
+
 /// Runs the shared debt scanner the way both sweep twins do (`--dir <repo>
 /// --base <base>`), from `cwd`, with any inherited `GRAPH_STATE` /
 /// `GRAPH_STATE_FILE` dropped so the test does not depend on the graph node
@@ -879,6 +961,9 @@ fn debt_scan(cwd: &Path, repo: &Path, base: &str) -> (Option<i32>, String) {
 #[cfg(unix)]
 #[test]
 fn usage_probe_debt_scan_round_trips_a_non_ascii_untracked_path_under_a_c_locale() {
+    if python3_missing() {
+        return;
+    }
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -941,6 +1026,9 @@ fn debt_scan_scratch_repo(label: &str) -> (ScratchDir, std::path::PathBuf, Strin
 #[cfg(unix)]
 #[test]
 fn debt_scan_reports_a_marker_that_follows_a_bare_cfg_attr_on_the_same_line() {
+    if python3_missing() {
+        return;
+    }
     let (guard, repo, base) = debt_scan_scratch_repo("cfg-attr-first");
     fs::write(
         repo.join("src/lib.rs"),
@@ -962,6 +1050,9 @@ fn debt_scan_reports_a_marker_that_follows_a_bare_cfg_attr_on_the_same_line() {
 #[cfg(unix)]
 #[test]
 fn debt_scan_parse_diff_refuses_combined_diffs_and_headerless_hunks() {
+    if python3_missing() {
+        return;
+    }
     let scanner = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared/debt_scan.py");
     let harness = "import runpy, sys\n\
                    m = runpy.run_path(sys.argv[1])\n\
@@ -1011,6 +1102,9 @@ fn debt_scan_parse_diff_refuses_combined_diffs_and_headerless_hunks() {
 #[cfg(unix)]
 #[test]
 fn debt_scan_cli_flags_win_over_an_inherited_graph_state() {
+    if python3_missing() {
+        return;
+    }
     let (guard, repo, base) = debt_scan_scratch_repo("graph-state-cli");
     fs::write(repo.join("src/new.rs"), "todo!()\n").unwrap();
     let out = debt_scan_command(&guard.0)
@@ -1031,11 +1125,60 @@ fn debt_scan_cli_flags_win_over_an_inherited_graph_state() {
     );
 }
 
+/// The step-runner shim run with no arguments, as its graph node runs it,
+/// reads `project_dir` from `GRAPH_STATE` or from `GRAPH_STATE_FILE` and
+/// answers with the `debt_hits` JSON envelope.
+#[cfg(unix)]
+#[test]
+fn debt_scan_step_runner_shim_reads_graph_state_and_its_file() {
+    if python3_missing() {
+        return;
+    }
+    let (guard, repo, _) = debt_scan_scratch_repo("graph-mode-shim");
+    fs::write(repo.join("src/x.rs"), "#[allow(dead_code)] fn x() {}\n").unwrap();
+    let shim = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets/agents/step-runner/scripts/debt_scan.py");
+    let state = serde_json::json!({ "project_dir": repo }).to_string();
+    let state_file = guard.0.join("state.json");
+    fs::write(&state_file, &state).unwrap();
+
+    for (var, value) in [
+        ("GRAPH_STATE", state.as_str()),
+        ("GRAPH_STATE_FILE", state_file.to_str().unwrap()),
+    ] {
+        let out = Command::new("python3")
+            .arg(&shim)
+            .current_dir(&guard.0)
+            .env_remove("GRAPH_STATE")
+            .env_remove("GRAPH_STATE_FILE")
+            .env(var, value)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{var}: {out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let envelope: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("{var}: stdout is not JSON ({e}): {stdout}"));
+        let hits = envelope["debt_hits"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{var}: no debt_hits string: {stdout}"));
+        assert!(
+            hits.contains("src/x.rs:1 -- #[allow(dead_code)] fn x() {}"),
+            "{var}: {hits}"
+        );
+    }
+}
+
 /// git C-quotes a name holding a tab or a double quote even with
 /// core.quotePath=false; the hit names the file as it is on disk.
 #[cfg(unix)]
 #[test]
 fn debt_scan_unquotes_c_quoted_untracked_names() {
+    if python3_missing() {
+        return;
+    }
     let (guard, repo, base) = debt_scan_scratch_repo("c-quoted");
     let names = ["src/tab\there.rs", "src/quote\"here.rs"];
     for name in names {
@@ -1094,6 +1237,9 @@ fn debt_scan_unquote_c_is_a_verbatim_twin_of_the_debris_lint() {
 #[cfg(unix)]
 #[test]
 fn debt_scan_refuses_an_option_shaped_base_and_unknown_or_valueless_flags() {
+    if python3_missing() {
+        return;
+    }
     let (guard, repo, _) = debt_scan_scratch_repo("arg-shape");
     fs::write(repo.join("src/new.rs"), "todo!()\n").unwrap();
     let written = guard.0.join("x");
@@ -1127,6 +1273,9 @@ fn debt_scan_refuses_an_option_shaped_base_and_unknown_or_valueless_flags() {
 #[cfg(unix)]
 #[test]
 fn debt_scan_paths_hold_under_mnemonic_prefix_and_noprefix() {
+    if python3_missing() {
+        return;
+    }
     for (key, value) in [("diff.mnemonicPrefix", "true"), ("diff.noprefix", "true")] {
         let (guard, repo, base) = debt_scan_scratch_repo("prefix");
         git(&repo, &["config", key, value]);
@@ -1367,6 +1516,9 @@ fn usage_probe_architect_plans_rel_recipe_and_anchored_sweeps_hold_on_a_scratch_
 #[cfg(unix)]
 #[test]
 fn usage_probe_step_runner_debt_scan_reads_the_coders_new_files_on_a_scratch_repo() {
+    if python3_missing() {
+        return;
+    }
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -1567,6 +1719,9 @@ fn usage_probe_step_runner_debt_scan_reads_the_coders_new_files_on_a_scratch_rep
 #[cfg(unix)]
 #[test]
 fn usage_probe_step_runner_debt_scan_edges_new_dirs_odd_names_no_new_files_and_ignore_sources() {
+    if python3_missing() {
+        return;
+    }
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -1726,10 +1881,16 @@ fn usage_probe_step_runner_debt_scan_edges_new_dirs_odd_names_no_new_files_and_i
     );
 
     // A repo that is not a git checkout fails OPEN: the report starts with the
-    // sentinel and quotes the manual pipeline for the model to run itself.
+    // sentinel and quotes the manual pipeline for the model to run itself. The
+    // ceiling stops git from finding a checkout that encloses the temp dir.
     let plain = root.join("not-a-repo");
     fs::create_dir_all(&plain).unwrap();
-    let (code, text, _) = sweep(&plain, "HEAD");
+    let (code, text, _) = debt_scan_full(
+        &root,
+        &plain,
+        "HEAD",
+        &[("GIT_CEILING_DIRECTORIES", root.to_str().unwrap())],
+    );
     assert_eq!(
         code,
         Some(0),
@@ -1819,6 +1980,9 @@ fn verdict_gate_debris_fault_arms_share_one_never_a_pass_blocker_shape() {
 #[cfg(unix)]
 #[test]
 fn usage_probe_debt_scan_and_architect_token_grep_hold_under_colour_and_an_external_differ() {
+    if python3_missing() {
+        return;
+    }
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
