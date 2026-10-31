@@ -2250,9 +2250,9 @@ fn collect_ledger_lines_names_an_unreadable_index_and_skips_the_task() {
 }
 
 /// A task dir whose NAME holds a newline followed by `..` stays one path:
-/// its own log.md hit is listed under that name, and the `..` tail is never
-/// read as a second search root, so a log.md in the caller's parent dir
-/// never reaches the output.
+/// its own log.md hit is listed under that name escaped to one line, and the
+/// `..` tail is never read as a second search root, so a log.md in the
+/// caller's parent dir never reaches the output.
 #[cfg(unix)]
 #[test]
 fn collect_ledger_lines_keeps_a_newline_named_task_dir_as_one_path() {
@@ -2292,13 +2292,273 @@ fn collect_ledger_lines_keeps_a_newline_named_task_dir_as_one_path() {
         "a dir name must never widen the search past the tasks tree: {stdout}"
     );
     assert!(
-        stdout.contains("TASK-9-z\n.. (log.md:1): debris-exempt: src/h.rs:9 -- hostile"),
+        stdout.contains("TASK-9-z\\n.. (log.md:1): debris-exempt: src/h.rs:9 -- hostile"),
         "the odd-named task is read under its own name: {stdout}"
     );
     assert!(
         stdout.contains("TASK-1-a (log.md:3): debris-exempt: src/a.rs:1 -- TASK-1-a"),
         "{stdout}"
     );
+}
+
+/// A carriage return or an ESC in a task dir name is escaped in the hit
+/// label, so a hit line can neither overwrite itself on a terminal nor
+/// carry a raw control sequence.
+#[cfg(unix)]
+#[test]
+fn collect_ledger_lines_escapes_control_characters_in_a_task_label() {
+    if tools_missing() {
+        return;
+    }
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = shared_tasks_fixture("collect-ledger-control-label");
+    for (name, file) in [
+        ("TASK-7-r\rx", "src/r.rs:7"),
+        ("TASK-8-e\u{1b}y", "src/e.rs:8"),
+    ] {
+        let task = dir.0.join("tasks").join(name);
+        fs::create_dir_all(&task).unwrap();
+        fs::write(
+            task.join("index.md"),
+            "---\nplan: PLAN-x.md\nstatus: complete\n---\n",
+        )
+        .unwrap();
+        fs::write(
+            task.join("log.md"),
+            format!("debris-exempt: {file} -- odd\n"),
+        )
+        .unwrap();
+    }
+    let (code, stdout, stderr) = collect_ledger_lines_with(&dir.0, "debris-exempt", &[]);
+    assert_eq!(code, 0, "stdout: {stdout:?}\nstderr: {stderr}");
+    for line in [
+        "TASK-7-r\\rx (log.md:1): debris-exempt: src/r.rs:7 -- odd",
+        "TASK-8-e\\x1by (log.md:1): debris-exempt: src/e.rs:8 -- odd",
+    ] {
+        assert!(stdout.contains(line), "missing {line:?} in {stdout:?}");
+    }
+    assert!(
+        !stdout.contains('\r') && !stdout.contains('\u{1b}'),
+        "{stdout:?}"
+    );
+}
+
+/// Each listed task's own log.md is the one read: a pending task nested
+/// under a complete one stays unread (its dir is a task of its own, not part
+/// of its parent's), and a log.md that is a symlink is read the way
+/// assemble_pr_body reads it.
+#[cfg(unix)]
+#[test]
+fn collect_ledger_lines_reads_only_each_listed_tasks_own_log() {
+    if tools_missing() {
+        return;
+    }
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = shared_tasks_fixture("collect-ledger-own-log");
+    let nested = dir.0.join("tasks/TASK-1-a/TASK-4-n");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(
+        nested.join("index.md"),
+        "---\nplan: PLAN-x.md\nstatus: pending\n---\n",
+    )
+    .unwrap();
+    fs::write(
+        nested.join("log.md"),
+        "debris-exempt: NESTED-PENDING-SENTINEL\n",
+    )
+    .unwrap();
+    let linked = dir.0.join("tasks/TASK-6-s");
+    fs::create_dir_all(&linked).unwrap();
+    fs::write(
+        linked.join("index.md"),
+        "---\nplan: PLAN-x.md\nstatus: complete\n---\n",
+    )
+    .unwrap();
+    let target = dir.0.join("linked-log.md");
+    fs::write(&target, "debris-exempt: src/s.rs:6 -- linked\n").unwrap();
+    std::os::unix::fs::symlink(&target, linked.join("log.md")).unwrap();
+
+    let (code, stdout, stderr) = collect_ledger_lines_with(&dir.0, "debris-exempt", &[]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        stdout,
+        [
+            "TASK-1-a (log.md:3): debris-exempt: src/a.rs:1 -- TASK-1-a",
+            "TASK-3-c (log.md:3): debris-exempt: src/c.rs:3 -- TASK-3-c",
+            "TASK-6-s (log.md:1): debris-exempt: src/s.rs:6 -- linked",
+            "",
+        ]
+        .join("\n"),
+        "the nested pending task must stay out and the symlinked log must be read"
+    );
+}
+
+/// A relative `--dir` shaped like an awk assignment (`a=b`) still reads each
+/// task's log: every hit prints with the block under it.
+#[cfg(unix)]
+#[test]
+fn collect_ledger_lines_reads_logs_under_an_assignment_shaped_dir() {
+    if tools_missing() {
+        return;
+    }
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = fixture_dir("collect-ledger-assignment-dir");
+    fs::write(dir.0.join("PLAN-x.md"), "# Plan\n").unwrap();
+    for (name, item) in [("TASK-1-a", "one"), ("TASK-2-b", "two")] {
+        let task = dir.0.join("a=b").join(name);
+        fs::create_dir_all(&task).unwrap();
+        fs::write(
+            task.join("index.md"),
+            "---\nplan: PLAN-x.md\nstatus: complete\n---\n",
+        )
+        .unwrap();
+        fs::write(task.join("log.md"), format!("Follow-ups:\n- item {item}\n")).unwrap();
+    }
+    let (code, stdout, stderr) =
+        collect_ledger_lines_in(&dir.0, "Follow-ups:", &[("argc_dir", "a=b")], &dir.0);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        stdout,
+        [
+            "TASK-1-a (log.md:1): Follow-ups:",
+            "  - item one",
+            "TASK-2-b (log.md:1): Follow-ups:",
+            "  - item two",
+            "",
+        ]
+        .join("\n")
+    );
+}
+
+/// A failed mktemp is named in the tool output with the temp dir in play,
+/// and nothing is read; a run that succeeds leaves no temp file behind.
+#[cfg(unix)]
+#[test]
+fn collect_ledger_lines_names_a_failed_mktemp_and_leaves_no_temp_file() {
+    use std::os::unix::fs::PermissionsExt;
+    if tools_missing() {
+        return;
+    }
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = shared_tasks_fixture("collect-ledger-mktemp");
+    let tmp = dir.0.join("private-tmp");
+    fs::create_dir_all(&tmp).unwrap();
+    let tmp = tmp.to_str().unwrap();
+
+    let (code, stdout, stderr) =
+        collect_ledger_lines_with(&dir.0, "debris-exempt", &[("TMPDIR", tmp)]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("TASK-1-a (log.md:3)"), "{stdout}");
+    assert_eq!(
+        entries_in(Path::new(tmp)),
+        Vec::<String>::new(),
+        "the listing must be removed when the tool exits"
+    );
+
+    let bin = dir.0.join("mktemp-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let shim = bin.join("mktemp");
+    fs::write(
+        &shim,
+        "#!/bin/sh\necho 'mktemp: no temp files today' >&2\nexit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), env::var("PATH").unwrap_or_default());
+    let (code, stdout, stderr) = collect_ledger_lines_with(
+        &dir.0,
+        "debris-exempt",
+        &[("PATH", path.as_str()), ("TMPDIR", tmp)],
+    );
+    assert_eq!(code, 1, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        stdout,
+        format!("collect_ledger_lines: could not create a temp file under {tmp}\n"),
+        "stderr: {stderr}"
+    );
+}
+
+/// The built tool's python calls write no `__pycache__` into the installed
+/// agent dir, even with PYTHONDONTWRITEBYTECODE unset: assemble_pr_body.py
+/// imports plan_tasks, which would otherwise be compiled there.
+#[cfg(unix)]
+#[test]
+fn architect_tools_write_no_bytecode_into_the_agent_dir() {
+    if tools_missing() {
+        return;
+    }
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = pr_body_fixture("architect-no-bytecode", "Follow-ups:\n- first item\n");
+    let tool = engine_built_tool(&dir.0, "architect");
+    let agent = tool.parent().unwrap().to_path_buf();
+    let pycache = agent.join("__pycache__");
+    let _ = fs::remove_dir_all(&pycache);
+    let plan = dir.0.join("PLAN-x.md");
+    let plan = plan.to_str().unwrap();
+    let tasks = dir.0.join("tasks");
+    let tasks = tasks.to_str().unwrap();
+    let summary = dir.0.join("summary.md");
+    let summary = summary.to_str().unwrap();
+    for (args, expected) in [
+        (
+            [
+                "assemble_pr_body",
+                "--plan",
+                plan,
+                "--tasks-dir",
+                tasks,
+                "--summary-file",
+                summary,
+            ],
+            "## Tasks",
+        ),
+        (
+            [
+                "collect_ledger_lines",
+                "--tag",
+                "Follow-ups:",
+                "--plan",
+                plan,
+                "--dir",
+                tasks,
+            ],
+            "TASK-1-a (log.md:4): Follow-ups:",
+        ),
+    ] {
+        let (code, stdout, stderr) = run(bash()
+            .arg(&tool)
+            .args(args)
+            .env("LLM_ROOT_DIR", dir.0.join("config"))
+            .env("LLM_AGENT_ROOT_DIR", &agent)
+            .env("LLM_OUTPUT", "/dev/stdout")
+            .env_remove("PYTHONDONTWRITEBYTECODE")
+            .env_remove("PYTHONPYCACHEPREFIX")
+            .output()
+            .expect("spawn bash"));
+        assert_eq!(code, 0, "{}: stdout: {stdout}\nstderr: {stderr}", args[0]);
+        assert!(stdout.contains(expected), "{}: {stdout}", args[0]);
+        assert!(
+            !pycache.exists(),
+            "{} left {} behind",
+            args[0],
+            pycache.display()
+        );
+    }
 }
 
 /// plan_tasks.py run directly over `dir/tasks` for the plan `dir/PLAN-x.md`.

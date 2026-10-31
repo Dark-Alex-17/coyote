@@ -17,6 +17,8 @@ one qualifying dir per NUL-terminated record (a dir name may hold a newline),
 as `<tasks-dir>/<rel>` with the dir spelled as given; NOTE lines go to stderr,
 one per line. A missing plan file or tasks dir is an error, never an empty listing.
 A `--tasks` value that names no id (blank or commas only) is a usage error.
+With `--labels` each dir record is followed by a second one, `<rel>` escaped to
+one printable line, for a caller that prints the dir next to its findings.
 """
 import argparse
 import os
@@ -164,6 +166,7 @@ def main(argv):
     ap.add_argument("--plan", required=True, help="PLAN-<slug>.md; its name, `.md` stripped, selects the tasks")
     ap.add_argument("--tasks-dir", required=True, help="tree searched recursively for TASK-NNN-*/index.md")
     ap.add_argument("--tasks", help="comma-separated task ids; keep only those")
+    ap.add_argument("--labels", action="store_true", help="follow each dir with its escaped path under --tasks-dir")
     args = ap.parse_args(argv)
     only = task_filter(ap, args.tasks)
     if not os.path.isdir(args.tasks_dir):
@@ -180,6 +183,8 @@ def main(argv):
             print(f"plan_tasks: NOTE {fieldless_note(label(root), absent)}", file=sys.stderr)
         if is_complete(fm):
             print(root, end="\0")
+            if args.labels:
+                print(escape(os.path.relpath(root, args.tasks_dir)), end="\0")
         elif only is not None:
             print(f"plan_tasks: NOTE {not_complete_note(label(root), fm['status'])}", file=sys.stderr)
     if missing:
