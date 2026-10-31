@@ -38,9 +38,10 @@ mod tests {
         assert_eq!(ctx.ui_kind().as_str(), "repl");
         drop(headless_off);
 
-        let _headless_on = AtomicFlagGuard::set(&HEADLESS, true);
+        let headless_on = AtomicFlagGuard::set(&HEADLESS, true);
         assert_eq!(ctx.ui_kind(), UiKind::Headless);
         assert_eq!(ctx.ui_kind().as_str(), "headless");
+        drop(headless_on);
 
         let _acp_on = AtomicFlagGuard::set(&ACP_SERVER, true);
         assert_eq!(ctx.ui_kind(), UiKind::Headless);

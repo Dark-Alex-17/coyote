@@ -47,7 +47,7 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::io::Read;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::{collections::VecDeque, thread};
 use std::{
     collections::{HashMap, HashSet},
@@ -69,6 +69,11 @@ struct FunctionAssets;
 const PATH_SEP: &str = ";";
 #[cfg(not(windows))]
 const PATH_SEP: &str = ":";
+
+/// How long a finished tool's output pumps may wait for pipe EOF. A
+/// descendant the tool left behind can hold the pipe open indefinitely, so
+/// the pump is detached once this passes.
+const TOOL_PUMP_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(AsRefStr)]
 enum BinaryType<'a> {
@@ -2619,14 +2624,24 @@ pub fn run_llm_function(
     let stdout_io = io.clone();
     let stderr_io = io.clone();
     let stdout_tool = command_name.clone();
+    let stdout_buf = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let stderr_buf = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let (stdout_done, stdout_done_rx) = std::sync::mpsc::channel();
+    let (stderr_done, stderr_done_rx) = std::sync::mpsc::channel();
+    let stdout_sink = Arc::clone(&stdout_buf);
+    let stderr_sink = Arc::clone(&stderr_buf);
+    // A pump detached after the tool exited may still read request lines
+    // from a surviving descendant; those are answered null rather than
+    // raised to the user as prompts for a tool already reported finished.
+    let tool_exited = Arc::new(AtomicBool::new(false));
+    let stdout_tool_exited = Arc::clone(&tool_exited);
     let stdout_thread = thread::spawn(move || {
         let mut buffer = [0; 1024];
         let mut reader = stdout;
-        let mut buf = Vec::new();
         let mut lines = prompt_channel::LineAssembler::default();
         let served = stdout_io.prompter.as_ref().zip(reply.as_ref());
-        let emit = |chunk: &[u8], buf: &mut Vec<u8>| {
-            buf.extend_from_slice(chunk);
+        let emit = |chunk: &[u8]| {
+            stdout_sink.lock().extend_from_slice(chunk);
             events::bus().publish(Event::ToolOutputChunk {
                 call_id: stdout_io.call_id.clone().unwrap_or_default(),
                 stream: OutputStream::Stdout,
@@ -2645,9 +2660,14 @@ pub fn run_llm_function(
             }
             for classified in lines.feed(&buffer[0..n]) {
                 match classified {
-                    prompt_channel::Classified::Output(bytes) => emit(&bytes, &mut buf),
+                    prompt_channel::Classified::Output(bytes) => emit(&bytes),
                     prompt_channel::Classified::Prompt(line) => {
-                        let request = served.and_then(|(prompter, server)| {
+                        let live = if stdout_tool_exited.load(Ordering::Acquire) {
+                            None
+                        } else {
+                            served
+                        };
+                        let request = live.and_then(|(prompter, server)| {
                             prompter
                                 .parse_line(&line, &stdout_tool, stdout_io.call_id.clone(), None)
                                 .map(|req| (prompter, server, req))
@@ -2656,28 +2676,32 @@ pub fn run_llm_function(
                             Some((prompter, server, req)) => {
                                 prompt_channel::handle_prompt_line(prompter, server, req);
                             }
-                            None => emit(&line, &mut buf),
+                            None => {
+                                emit(&line);
+                                if let Some((_, server)) = served {
+                                    prompt_channel::reject_line(server, &stdout_tool, &line);
+                                }
+                            }
                         }
                     }
                 }
             }
         }
         if let Some(tail) = lines.finish() {
-            emit(&tail, &mut buf);
+            emit(&tail);
         }
-        buf
+        let _ = stdout_done.send(());
     });
 
     let stderr_thread = thread::spawn(move || {
         let mut buffer = [0; 1024];
         let mut reader = stderr;
-        let mut buf = Vec::new();
         while let Ok(n) = reader.read(&mut buffer) {
             if n == 0 {
                 break;
             }
             let chunk = &buffer[0..n];
-            buf.extend_from_slice(chunk);
+            stderr_sink.lock().extend_from_slice(chunk);
             events::bus().publish(Event::ToolOutputChunk {
                 call_id: stderr_io.call_id.clone().unwrap_or_default(),
                 stream: OutputStream::Stderr,
@@ -2690,7 +2714,7 @@ pub fn run_llm_function(
                 chunk,
             );
         }
-        buf
+        let _ = stderr_done.send(());
     });
 
     let timeout_secs = tool_timeout_secs(tool_timeout);
@@ -2755,8 +2779,23 @@ pub fn run_llm_function(
         }
         thread::sleep(Duration::from_millis(100));
     };
-    let stdout_bytes = stdout_thread.join().unwrap_or_default();
-    let stderr_bytes = stderr_thread.join().unwrap_or_default();
+    tool_exited.store(true, Ordering::Release);
+    let drain = |pump: thread::JoinHandle<()>,
+                 done: std::sync::mpsc::Receiver<()>,
+                 stream: OutputStream| {
+        match done.recv_timeout(TOOL_PUMP_DRAIN_GRACE) {
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = pump.join();
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => debug!(
+                "Tool '{command_name}' exited but a descendant still holds its {stream:?} pipe; detaching the pump"
+            ),
+        }
+    };
+    drain(stdout_thread, stdout_done_rx, OutputStream::Stdout);
+    drain(stderr_thread, stderr_done_rx, OutputStream::Stderr);
+    let stdout_bytes = std::mem::take(&mut *stdout_buf.lock());
+    let stderr_bytes = std::mem::take(&mut *stderr_buf.lock());
 
     let exit_code = status.code().unwrap_or_default();
     if exit_code != 0 {

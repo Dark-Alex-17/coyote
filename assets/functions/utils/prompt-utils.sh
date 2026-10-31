@@ -20,6 +20,11 @@
 # See https://github.com/timo-reymann/bash-tui-toolkit/blob/main/test.sh
 # for examples on how to use these commands
 #
+# When Coyote offers a prompt channel (COYOTE_PROMPT_REPLY is set), confirm,
+# list, checkbox, input and password are answered through it; range and
+# editor always use the terminal. File descriptor 9 is reserved for the
+# channel's request stream while the helper is sourced.
+#
 # - guard_operation   Prompt for permission to run an operation
 # - guard_path        Prompt for permission to perform path operations
 # - patch_file        Patch a file
@@ -111,7 +116,7 @@ white() {
 # would be clobbered by that save, so it is treated as absent.
 if [[ -n "${COYOTE_PROMPT_REPLY:-}" && "$COYOTE_PROMPT_REPLY" != /dev/fd/9 && -z "${_COYOTE_PROMPT_OUT:-}" ]]; then
   exec 9>&1
-  _COYOTE_PROMPT_OUT=9
+  export _COYOTE_PROMPT_OUT=9
 fi
 
 _coyote_prompt_enabled() {
@@ -170,7 +175,7 @@ _coyote_prompt() {
   declare question="$2"
   declare options='[]'
   if [[ $# -gt 2 ]]; then
-    options="$(printf '%s\n' "${@:3}" | jq -cRs 'split("\n") | .[:-1]')" || return 1
+    options="$(printf '%s\0' "${@:3}" | jq -cRs 'split("\u0000") | .[:-1]')" || return 1
   fi
 
   # $RANDOM is not reseeded in $(...) subshells on bash < 5.1, so sibling
@@ -632,12 +637,13 @@ open_link() {
 
 guard_operation() {
 	if [[ -z "$AUTO_CONFIRM" && -z "$LLM_AGENT_VAR_AUTO_CONFIRM" ]]; then
+		# `|| ans=""`: a cancelled prompt returns 1, which errexit would turn into a silent exit here.
 		if _coyote_prompt_enabled; then
-			ans="$(confirm "${1:-Are you sure you want to continue?}")"
+			ans="$(confirm "${1:-Are you sure you want to continue?}")" || ans=""
 		else
 			# 2>/dev/tty: keep the prompt off the host-captured stderr pipe so it
 			# can't leak into tool_call_error JSON when the wrapped command fails.
-			ans="$(confirm "${1:-Are you sure you want to continue?}" 2>/dev/tty)"
+			ans="$(confirm "${1:-Are you sure you want to continue?}" 2>/dev/tty)" || ans=""
 		fi
 
 		if [[ "$ans" != 1 ]]; then
@@ -898,10 +904,10 @@ guard_path() {
 
 	if [[ ! "$path" == "$(pwd)"* && -z "$AUTO_CONFIRM" && -z "$LLM_AGENT_VAR_AUTO_CONFIRM" ]]; then
 		if _coyote_prompt_enabled; then
-			ans="$(confirm "$confirmation_prompt")"
+			ans="$(confirm "$confirmation_prompt")" || ans=""
 		else
 			# 2>/dev/tty: see guard_operation; prevents prompt text leaking via captured stderr.
-			ans="$(confirm "$confirmation_prompt" 2>/dev/tty)"
+			ans="$(confirm "$confirmation_prompt" 2>/dev/tty)" || ans=""
 		fi
 
 		if [[ "$ans" != 1 ]]; then

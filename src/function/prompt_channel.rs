@@ -4,6 +4,7 @@
 //! `COYOTE_PROMPT_REPLY`. Lines that are not requests flow through as
 //! ordinary output.
 
+use crate::config::sanitize_display_text;
 use crate::events::{self, Event, Origin};
 use crate::prompt::{PromptAction, PromptAnswer, PromptMemory, PromptRequest, Prompter};
 use anyhow::{Result, anyhow};
@@ -109,7 +110,7 @@ pub(crate) enum Server {}
 #[cfg(not(unix))]
 impl Server {
     pub(crate) fn open() -> Result<Self> {
-        anyhow::bail!("prompt reply channel is not implemented on this platform") // TASK-316
+        anyhow::bail!("Prompt reply channel is not implemented on this platform") // TASK-316
     }
 
     pub(crate) fn env_value(&self) -> String {
@@ -163,7 +164,7 @@ impl ToolPrompter {
         match parse_request(line, tool, call_id, job_id, self.origin.clone()) {
             Ok(req) => Some(req),
             Err(err) => {
-                warn!("Ignoring malformed prompt line from tool '{tool}': {err}");
+                warn!("Malformed prompt line from tool '{tool}': {err}");
                 None
             }
         }
@@ -228,9 +229,36 @@ pub(crate) fn handle_prompt_line(prompter: &ToolPrompter, reply: &Server, req: P
             );
             Value::Null
         }
+        Ok(PromptAnswer::Checked(choices))
+            if action == PromptAction::Checkbox
+                && !options.is_empty()
+                && choices.iter().any(|choice| !options.contains(choice)) =>
+        {
+            warn!(
+                "Tool '{tool}' prompt '{id}': answer {choices:?} includes a choice outside the offered options; answering null"
+            );
+            Value::Null
+        }
         Ok(_) => answer_value(&answer),
     };
     reply.reply(&id, &value);
+}
+
+/// Replies `null` to a marker line that names a request id but does not
+/// parse as a request, so the tool fails closed instead of blocking on the
+/// reply pipe. Lines without a readable id get nothing: the tool never
+/// asked under a name it could wait for. The parse failure itself is
+/// already logged by `parse_line`.
+pub(crate) fn reject_line(reply: &Server, tool: &str, line: &[u8]) {
+    if let Some(id) = wire_id(line) {
+        debug!("Tool '{tool}' prompt '{id}' answered null");
+        reply.reply(&id, &Value::Null);
+    }
+}
+
+pub(crate) fn wire_id(line: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(line).ok()?;
+    value["coyote_prompt"]["id"].as_str().map(str::to_string)
 }
 
 fn fits(action: PromptAction, answer: &PromptAnswer) -> bool {
@@ -267,11 +295,13 @@ struct WireRequest {
     action: String,
     question: String,
     #[serde(default)]
-    options: Vec<String>,
+    options: Option<Vec<String>>,
     #[serde(default)]
     default: Option<Value>,
 }
 
+/// Question and option text come from the tool, so terminal escapes are
+/// stripped before the prompter paints them.
 pub(crate) fn parse_request(
     line: &[u8],
     tool: &str,
@@ -294,8 +324,13 @@ pub(crate) fn parse_request(
     Ok(PromptRequest {
         id: wire.id,
         action,
-        question: wire.question,
-        options: wire.options,
+        question: sanitize_display_text(&wire.question),
+        options: wire
+            .options
+            .unwrap_or_default()
+            .iter()
+            .map(|option| sanitize_display_text(option))
+            .collect(),
         default: wire.default,
         tool: Some(tool.to_string()),
         call_id,
@@ -510,9 +545,9 @@ mod tests {
         assert_eq!(server.env_value(), format!("/dev/fd/{}", server.child_fd));
     }
 
-    #[test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    fn fixture_tool_round_trips_every_action() {
+    async fn fixture_tool_round_trips_every_action() {
         require_tools();
         let _guard = TestConfigDirGuard::new("prompt-proto");
         install_tool(
@@ -719,6 +754,39 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
     }
 
     #[test]
+    fn parse_request_tolerates_null_options() {
+        let line = r#"{"coyote_prompt": {"id": "p1", "action": "select", "question": "q", "options": null}}"#;
+
+        let req = parse_request(line.as_bytes(), "t", None, None, Origin::detached()).unwrap();
+
+        assert!(req.options.is_empty());
+    }
+
+    #[test]
+    fn parse_request_strips_terminal_escapes_from_tool_text() {
+        let line = json!({"coyote_prompt": {
+            "id": "p1", "action": "select", "question": "\u{1b}[2Jwhich?",
+            "options": ["\u{1b}[31ma", "b"]
+        }})
+        .to_string();
+
+        let req = parse_request(line.as_bytes(), "t", None, None, Origin::detached()).unwrap();
+
+        assert_eq!(req.question, "which?");
+        assert_eq!(req.options, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn wire_id_reads_the_id_off_an_unparseable_request() {
+        assert_eq!(
+            wire_id(br#"{"coyote_prompt": {"id": "p-bad", "action": "dance"}}"#),
+            Some("p-bad".to_string())
+        );
+        assert_eq!(wire_id(br#"{"coyote_prompt": {"id": 7}}"#), None);
+        assert_eq!(wire_id(br#"{"coyote_prompt": not-json}"#), None);
+    }
+
+    #[test]
     fn answer_value_serialises_every_answer_shape() {
         assert_eq!(
             answer_value(&Ok(PromptAnswer::Confirmed(true))),
@@ -778,6 +846,7 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
     }
 
     #[test]
+    #[serial]
     fn select_answer_outside_the_options_is_answered_null() {
         let mut req = PromptRequest::new(PromptAction::Select, "Pick? opt-x7x", Origin::detached());
         req.options = vec!["a".to_string(), "b".to_string()];
@@ -792,12 +861,35 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
     }
 
     #[test]
+    #[serial]
     fn mismatched_answer_shape_is_answered_null() {
         let req = PromptRequest::new(PromptAction::Confirm, "Sure? shape-x7x", Origin::detached());
         let id = req.id.clone();
 
         let reply = reply_for(
             ScriptedPrompter::new(vec![PromptAnswer::Text("x".to_string())]),
+            req,
+        );
+
+        assert_eq!(reply, json!({"id": id, "answer": null}));
+    }
+
+    #[test]
+    #[serial]
+    fn checkbox_answer_outside_the_options_is_answered_null() {
+        let mut req = PromptRequest::new(
+            PromptAction::Checkbox,
+            "Pick many? cb-x7x",
+            Origin::detached(),
+        );
+        req.options = vec!["a".to_string(), "b".to_string()];
+        let id = req.id.clone();
+
+        let reply = reply_for(
+            ScriptedPrompter::new(vec![PromptAnswer::Checked(vec![
+                "a".to_string(),
+                "zzz".to_string(),
+            ])]),
             req,
         );
 
@@ -921,6 +1013,61 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
 
     #[test]
     #[serial]
+    fn unparseable_request_with_an_id_is_answered_null_and_echoed() {
+        require_tools();
+        let _guard = TestConfigDirGuard::new("prompt-bad-action");
+        install_tool(
+            "bad-x7x",
+            "echo '{\"coyote_prompt\":{\"id\":\"p-bad-x7x\",\"action\":\"dance\",\"question\":\"q\"}}' >&9\nIFS= read -r r <\"$COYOTE_PROMPT_REPLY\"; echo \"$r\" >> \"$LLM_OUTPUT\"",
+        );
+        let sink = RecordingSink::install();
+        let prompter = Arc::new(ScriptedPrompter::refusing());
+
+        let output = run_tool(
+            "bad-x7x",
+            tool_envs(),
+            io_with(&prompter, Arc::new(PromptMemory::default())),
+        );
+
+        assert_eq!(
+            output["output"],
+            format!("{}\n", json!({"id": "p-bad-x7x", "answer": null}))
+        );
+        assert!(prompter.requests().is_empty());
+        let chunks = stdout_chunks(&sink.drain(), "call-x7x");
+        assert!(chunks.contains("dance"), "{chunks}");
+    }
+
+    /// The helper keeps a second handle on the tool's stdout pipe which a
+    /// background descendant inherits, so EOF never arrives while it runs.
+    #[test]
+    #[serial]
+    fn tool_returns_once_it_exits_even_if_a_descendant_holds_its_pipes() {
+        require_tools();
+        let _guard = TestConfigDirGuard::new("prompt-detached");
+        install_tool(
+            "bg-x7x",
+            "sleep 30 >/dev/null 2>&1 &\necho done >> \"$LLM_OUTPUT\"",
+        );
+        let prompter = Arc::new(ScriptedPrompter::refusing());
+        let started = std::time::Instant::now();
+
+        let output = run_tool(
+            "bg-x7x",
+            tool_envs(),
+            io_with(&prompter, Arc::new(PromptMemory::default())),
+        );
+
+        assert_eq!(output["output"], "done\n");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    #[serial]
     fn cancel_fails_the_guarded_tool_closed() {
         require_tools();
         let _guard = TestConfigDirGuard::new("prompt-cancel");
@@ -1018,6 +1165,43 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
                 answer: "yes".to_string(),
                 auto: true,
             }]
+        );
+    }
+
+    /// Usage-probe pin: a tool that drew a progress line without a newline
+    /// and then prompts (the spec's "request may follow unterminated
+    /// output") must get its answer, keep the partial output, and never
+    /// leak the request line to the display.
+    #[test]
+    #[serial]
+    fn prompt_after_unterminated_output_round_trips_end_to_end() {
+        require_tools();
+        let _guard = TestConfigDirGuard::new("prompt-progress");
+        install_tool(
+            "bar-x7x",
+            r#"printf 'Working... '
+ans="$(confirm "Go? bar-x7x")"
+echo "done=$ans"
+echo "$ans" >> "$LLM_OUTPUT""#,
+        );
+        let prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Confirmed(true)]));
+        let sink = RecordingSink::install();
+
+        let output = run_tool(
+            "bar-x7x",
+            tool_envs(),
+            io_with(&prompter, Arc::new(PromptMemory::default())),
+        );
+
+        assert_eq!(output["output"], "1\n", "{output}");
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert_eq!(requests[0].question, "Go? bar-x7x");
+        let chunks = stdout_chunks(&sink.drain(), "call-x7x");
+        assert!(!chunks.contains("coyote_prompt"), "{chunks}");
+        assert!(
+            chunks.starts_with("Working... ") && chunks.contains("done=1"),
+            "the partial line must survive and precede the echo: {chunks:?}"
         );
     }
 
@@ -1181,6 +1365,18 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
         /// channel before the first read). `detach` puts the shell in its
         /// own session so `/dev/tty` cannot be opened.
         fn run_helper(dir: &Path, answers: Option<&[Value]>, body: &str, detach: bool) -> Run {
+            run_helper_opts(dir, answers, body, detach, false)
+        }
+
+        /// `run_helper` with `stray`: every real reply is preceded by a reply
+        /// line carrying an id no request asked for.
+        fn run_helper_opts(
+            dir: &Path,
+            answers: Option<&[Value]>,
+            body: &str,
+            detach: bool,
+            stray: bool,
+        ) -> Run {
             let mut server = Server::open().unwrap();
             let mut cmd = Command::new(bash_program().unwrap());
             cmd.arg("-c")
@@ -1223,6 +1419,9 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
                 {
                     let req: Value = serde_json::from_str(&line).unwrap();
                     let id = req["coyote_prompt"]["id"].as_str().unwrap();
+                    if stray {
+                        server.reply("not-this-request", &json!(false));
+                    }
                     server.reply(id, answers.next().unwrap_or(&Value::Null));
                 }
                 stdout.push_str(&line);
@@ -1626,6 +1825,175 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
             ids.dedup();
             assert_eq!(ids.len(), 3, "request ids must be distinct: {}", run.stdout);
             assert_eq!(run.other_lines(), vec!["a=[1] b=[2] c=[Bob]"]);
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        // Usage-probe pins (spec-first, black-box). The spec: "reply read
+        // with `read -r line` until the id matches"; "cancel -> helper exits
+        // 1 and the tool's stderr carries its usual message"; the shipped
+        // tools (`execute_command.sh`, `fs_rm.sh`, ...) and the `run-tool.sh`
+        // shim all run under `set -e`.
+
+        #[test]
+        fn reply_lines_for_other_ids_are_skipped_until_ours_arrives() {
+            require_tools();
+            let dir = scratch_dir("stray-id");
+            let run = run_helper_opts(
+                &dir,
+                Some(&[json!(true), json!("b")]),
+                "a=\"$(confirm \"One?\")\"; b=\"$(list \"Two?\" a b c)\"; echo \"a=[$a] b=[$b]\"",
+                false,
+                true,
+            );
+            assert_eq!(run.code, 0, "{}\n{}", run.stdout, run.stderr);
+            assert_eq!(run.request_lines().len(), 2, "{}", run.stdout);
+            // The stray `false` for a foreign id must not be taken as ours.
+            assert_eq!(run.other_lines(), vec!["a=[1] b=[1]"]);
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn guards_under_set_e_abort_with_their_message_on_cancel() {
+            require_tools();
+            let dir = scratch_dir("set-e");
+            let outside = scratch_dir("set-e-outside").join("victim.txt");
+            fs::write(&outside, "x").unwrap();
+            let bodies = [
+                "set -e; guard_operation \"Really?\"; echo continued".to_string(),
+                format!(
+                    "set -e; guard_path \"{}\" \"Touch?\"; echo continued",
+                    outside.display()
+                ),
+            ];
+            for body in &bodies {
+                // A plain `false` keeps its message under set -e...
+                let run = run_helper(&dir, Some(&[json!(false)]), body, false);
+                assert_eq!(run.code, 1, "{body}\n{}\n{}", run.stdout, run.stderr);
+                assert!(
+                    run.stderr.contains("Operation aborted!"),
+                    "{body}: stderr={}",
+                    run.stderr
+                );
+                assert!(!run.stdout.contains("continued"), "{body}: {}", run.stdout);
+
+                // ...and so must a cancel (`null`): the tool exits 1 AND says why.
+                let run = run_helper(&dir, Some(&[Value::Null]), body, false);
+                assert_eq!(run.code, 1, "{body}\n{}\n{}", run.stdout, run.stderr);
+                assert!(!run.stdout.contains("continued"), "{body}: {}", run.stdout);
+                assert!(
+                    run.stderr.contains("Operation aborted!"),
+                    "{body}: a cancelled prompt under set -e must still report \
+                     'Operation aborted!' on stderr; got stderr={:?}",
+                    run.stderr
+                );
+            }
+            fs::remove_dir_all(&dir).ok();
+            fs::remove_dir_all(outside.parent().unwrap()).ok();
+        }
+
+        const TOOLS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/functions/tools");
+
+        /// Sources a shipped tool the way the `run-tool.sh` shim does (env
+        /// prepared, `main` invoked) so the probe runs the real consumers.
+        fn shipped(tool: &str, pre: &str) -> String {
+            format!(
+                "export LLM_PROMPT_UTILS_FILE=\"$PROMPT_UTILS\" LLM_OUTPUT=/dev/stdout; \
+                 {pre}; source \"{TOOLS}/{tool}\"; main"
+            )
+        }
+
+        #[test]
+        fn shipped_execute_command_honours_every_answer() {
+            require_tools();
+            let dir = scratch_dir("shipped-exec");
+            let pre = "export LLM_TOOL_RAW_JSON='{\"command\":\"echo ran-x7x\"}'";
+            let body = shipped("execute_command.sh", pre);
+
+            let run = run_helper(&dir, Some(&[json!(true)]), &body, false);
+            assert_eq!(run.code, 0, "{}\n{}", run.stdout, run.stderr);
+            let requests = run.request_lines();
+            assert_eq!(requests.len(), 1, "{}", run.stdout);
+            assert_eq!(
+                requests[0]["coyote_prompt"]["question"],
+                "Are you sure you want to continue?"
+            );
+            assert_eq!(run.other_lines(), vec!["ran-x7x"]);
+
+            for answer in [json!(false), Value::Null] {
+                let run = run_helper(&dir, Some(std::slice::from_ref(&answer)), &body, false);
+                assert_eq!(run.code, 1, "{answer}: {}\n{}", run.stdout, run.stderr);
+                assert!(!run.stdout.contains("ran-x7x"), "{answer}: {}", run.stdout);
+                assert!(
+                    run.stderr.contains("Operation aborted!"),
+                    "{answer}: execute_command must say why it stopped; stderr={:?}",
+                    run.stderr
+                );
+            }
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn shipped_fs_rm_outside_the_working_directory_asks_and_fails_closed() {
+            require_tools();
+            let dir = scratch_dir("shipped-rm");
+            let victim_dir = scratch_dir("shipped-rm-victim");
+            let victim = victim_dir.join("victim.txt");
+            let body = shipped("fs_rm.sh", &format!("argc_path=\"{}\"", victim.display()));
+
+            for answer in [json!(false), Value::Null] {
+                fs::write(&victim, "x").unwrap();
+                let run = run_helper(&dir, Some(std::slice::from_ref(&answer)), &body, false);
+                assert_eq!(run.code, 1, "{answer}: {}\n{}", run.stdout, run.stderr);
+                let requests = run.request_lines();
+                assert_eq!(requests.len(), 1, "{answer}: {}", run.stdout);
+                assert_eq!(
+                    requests[0]["coyote_prompt"]["question"],
+                    format!("Remove '{}'?", victim.display())
+                );
+                assert!(victim.exists(), "{answer}: the refused path must survive");
+                assert!(
+                    !run.stdout.contains("Path removed"),
+                    "{answer}: {}",
+                    run.stdout
+                );
+                assert!(
+                    run.stderr.contains("Operation aborted!"),
+                    "{answer}: fs_rm must say why it stopped; stderr={:?}",
+                    run.stderr
+                );
+            }
+
+            fs::write(&victim, "x").unwrap();
+            let run = run_helper(&dir, Some(&[json!(true)]), &body, false);
+            assert_eq!(run.code, 0, "{}\n{}", run.stdout, run.stderr);
+            assert_eq!(run.request_lines().len(), 1, "{}", run.stdout);
+            assert!(!victim.exists(), "an approved removal must remove the path");
+            assert_eq!(
+                run.other_lines(),
+                vec![format!("Path removed: {}", victim.display())]
+            );
+            fs::remove_dir_all(&dir).ok();
+            fs::remove_dir_all(&victim_dir).ok();
+        }
+
+        #[test]
+        fn checkbox_and_input_accept_empty_answers() {
+            require_tools();
+            let dir = scratch_dir("empty");
+            let run = run_helper(
+                &dir,
+                Some(&[json!([]), json!("")]),
+                &format!(
+                    "{}; {}",
+                    capture("checkbox \"Pick\" a b c"),
+                    capture("input \"Name?\"")
+                ),
+                false,
+            );
+            assert_eq!(run.code, 0, "{}\n{}", run.stdout, run.stderr);
+            assert_eq!(run.request_lines().len(), 2, "{}", run.stdout);
+            // Nothing picked / nothing typed is a valid answer, not a cancel.
+            assert_eq!(run.other_lines(), vec!["v=[] rc=0", "v=[] rc=0"]);
             fs::remove_dir_all(&dir).ok();
         }
     }

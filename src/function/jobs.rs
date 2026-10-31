@@ -1137,6 +1137,7 @@ async fn pump_into_ring(
                                 Some(prompt.job_id.clone()),
                             ) else {
                                 output_buf.lock().push(&line);
+                                prompt_channel::reject_line(&prompt.reply, &prompt.tool, &line);
                                 continue;
                             };
                             let id = req.id.clone();
