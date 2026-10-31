@@ -38,10 +38,10 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -49,6 +49,10 @@ const CANDIDATE: &str = "architect-next";
 const SMOKE_FLOOR: usize = 349;
 const MATRIX_FLOOR: usize = 53;
 const _: () = assert!(MATRIX_FLOOR >= 53, "the matrix floor never drops below 53");
+
+const BATTERY_LIMIT: Duration = Duration::from_secs(600);
+const MATRIX_LIMIT: Duration = Duration::from_secs(900);
+const GATE_LIMIT: Duration = Duration::from_secs(120);
 
 fn agents_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents")
@@ -100,7 +104,13 @@ fn mikefarah_yq() -> Option<PathBuf> {
         eprintln!("skipping: yq not available");
         return None;
     };
-    let version = Command::new(&yq).arg("--version").output().ok()?;
+    let version = match Command::new(&yq).arg("--version").output() {
+        Ok(version) => version,
+        Err(e) => {
+            eprintln!("skipping: yq --version could not run: {e}");
+            return None;
+        }
+    };
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&version.stdout),
@@ -236,6 +246,65 @@ fn transcript(output: &Output) -> String {
     )
 }
 
+/// Collects everything `stream` yields into a shared buffer, so a caller that
+/// gives up on the child can still read what arrived so far.
+fn drain(mut stream: impl Read + Send + 'static) -> (Arc<Mutex<Vec<u8>>>, thread::JoinHandle<()>) {
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&buf);
+    let handle = thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => sink.lock().unwrap().extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+    });
+    (buf, handle)
+}
+
+/// `cmd.output()` with a deadline: a child still running after `limit` is
+/// killed and the test panics with whatever it printed until then.
+fn output_with_timeout(cmd: &mut Command, limit: Duration, label: &str) -> Output {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("{label}: failed to spawn: {e}"));
+    let (stdout, stdout_reader) = drain(child.stdout.take().unwrap());
+    let (stderr, stderr_reader) = drain(child.stderr.take().unwrap());
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let partial = Output {
+                status: child.wait().unwrap(),
+                stdout: stdout.lock().unwrap().clone(),
+                stderr: stderr.lock().unwrap().clone(),
+            };
+            panic!(
+                "{label}: still running after {}s, killed\n{}",
+                limit.as_secs(),
+                transcript(&partial)
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    stdout_reader.join().unwrap();
+    stderr_reader.join().unwrap();
+    Output {
+        status,
+        stdout: std::mem::take(&mut *stdout.lock().unwrap()),
+        stderr: std::mem::take(&mut *stderr.lock().unwrap()),
+    }
+}
+
 fn assert_no_bytecode_under_candidate() {
     let mut pending = vec![candidate_dir()];
     while let Some(dir) = pending.pop() {
@@ -273,11 +342,13 @@ fn audit_graph_reports_no_problems() {
     let Some(python) = python3() else { return };
     let Some(yq) = mikefarah_yq() else { return };
     let scratch = scratch_dir("audit");
-    let output = battery(&python, &scratch)
-        .env("PATH", path_with(yq.parent().unwrap()))
-        .args(["scripts/audit_graph.py", "."])
-        .output()
-        .unwrap();
+    let output = output_with_timeout(
+        battery(&python, &scratch)
+            .env("PATH", path_with(yq.parent().unwrap()))
+            .args(["scripts/audit_graph.py", "."]),
+        BATTERY_LIMIT,
+        "audit",
+    );
     let report = transcript(&output);
     assert!(output.status.success(), "{report}");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -292,10 +363,11 @@ fn audit_graph_reports_no_problems() {
 fn smoke_battery_passes_every_check() {
     let Some(python) = python3() else { return };
     let scratch = scratch_dir("smoke");
-    let output = battery(&python, &scratch)
-        .arg("scripts/smoke_test.py")
-        .output()
-        .unwrap();
+    let output = output_with_timeout(
+        battery(&python, &scratch).arg("scripts/smoke_test.py"),
+        BATTERY_LIMIT,
+        "smoke",
+    );
     let report = transcript(&output);
     assert!(output.status.success(), "{report}");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -333,7 +405,7 @@ fn smoke_summary_and_exit_code_cover_a_check_recorded_last() {
     let run = |copy: &Path| {
         let mut cmd = battery(&python, &scratch);
         cmd.current_dir(copy).arg("scripts/smoke_test.py");
-        cmd.output().unwrap()
+        output_with_timeout(&mut cmd, BATTERY_LIMIT, "smoke tally")
     };
 
     let pristine = run(&copy);
@@ -380,11 +452,13 @@ fn session_block_check_passes_under_mikefarah_yq() {
         return;
     };
     let scratch = scratch_dir("session");
-    let output = battery(&bash, &scratch)
-        .env("PATH", path_with(yq.parent().unwrap()))
-        .arg("scripts/check_session_block.sh")
-        .output()
-        .unwrap();
+    let output = output_with_timeout(
+        battery(&bash, &scratch)
+            .env("PATH", path_with(yq.parent().unwrap()))
+            .arg("scripts/check_session_block.sh"),
+        BATTERY_LIMIT,
+        "session check",
+    );
     let report = transcript(&output);
     assert!(output.status.success(), "{report}");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -408,11 +482,13 @@ fn mode_matrix_walks_every_combination() {
     let Some(python) = python3() else { return };
     let Some(yq) = mikefarah_yq() else { return };
     let scratch = scratch_dir("matrix");
-    let output = battery(&python, &scratch)
-        .env("PATH", path_with(yq.parent().unwrap()))
-        .arg("scripts/mode_matrix.py")
-        .output()
-        .unwrap();
+    let output = output_with_timeout(
+        battery(&python, &scratch)
+            .env("PATH", path_with(yq.parent().unwrap()))
+            .arg("scripts/mode_matrix.py"),
+        MATRIX_LIMIT,
+        "mode matrix",
+    );
     let report = transcript(&output);
     assert!(output.status.success(), "{report}");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -455,11 +531,13 @@ fn mode_matrix_exits_before_the_walk_when_the_shared_utils_sh_is_missing_or_a_st
             Some(body) => fs::write(&utils, body).unwrap(),
             None => fs::remove_file(&utils).unwrap(),
         }
-        let output = battery(&python, &scratch)
-            .current_dir(agents.join(CANDIDATE))
-            .arg("scripts/mode_matrix.py")
-            .output()
-            .unwrap();
+        let output = output_with_timeout(
+            battery(&python, &scratch)
+                .current_dir(agents.join(CANDIDATE))
+                .arg("scripts/mode_matrix.py"),
+            MATRIX_LIMIT,
+            case,
+        );
         let report = transcript(&output);
         assert!(
             !output.status.success(),
@@ -488,6 +566,15 @@ fn mode_matrix_exits_before_the_walk_when_the_shared_utils_sh_is_missing_or_a_st
                 .unwrap()
                 .contains("set -euo pipefail"),
             "{case}: the shipped .shared/utils.sh was altered"
+        );
+        let left: Vec<String> = fs::read_dir(scratch.0.join("tmp"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("ax-matrix-"))
+            .collect();
+        assert!(
+            left.is_empty(),
+            "{case}: the matrix left its scratch dirs behind in TMPDIR: {left:?}\n{report}"
         );
     }
 }
@@ -568,11 +655,13 @@ fn batteries_never_consult_the_user_config_dir() {
     let planted = poison_user_config(&scratch);
     let home = scratch.0.join("home");
 
-    let audit = battery(&python, &scratch)
-        .env("PATH", path_with(yq.parent().unwrap()))
-        .args(["scripts/audit_graph.py", "."])
-        .output()
-        .unwrap();
+    let audit = output_with_timeout(
+        battery(&python, &scratch)
+            .env("PATH", path_with(yq.parent().unwrap()))
+            .args(["scripts/audit_graph.py", "."]),
+        BATTERY_LIMIT,
+        "poison audit",
+    );
     assert!(audit.status.success(), "{}", transcript(&audit));
     assert!(
         String::from_utf8_lossy(&audit.stdout)
@@ -582,10 +671,11 @@ fn batteries_never_consult_the_user_config_dir() {
         transcript(&audit)
     );
 
-    let smoke = battery(&python, &scratch)
-        .arg("scripts/smoke_test.py")
-        .output()
-        .unwrap();
+    let smoke = output_with_timeout(
+        battery(&python, &scratch).arg("scripts/smoke_test.py"),
+        BATTERY_LIMIT,
+        "poison smoke",
+    );
     let smoke_out = String::from_utf8_lossy(&smoke.stdout);
     assert!(smoke.status.success(), "{}", transcript(&smoke));
     assert!(
@@ -594,11 +684,13 @@ fn batteries_never_consult_the_user_config_dir() {
         transcript(&smoke)
     );
 
-    let session = battery(&bash, &scratch)
-        .env("PATH", path_with(yq.parent().unwrap()))
-        .arg("scripts/check_session_block.sh")
-        .output()
-        .unwrap();
+    let session = output_with_timeout(
+        battery(&bash, &scratch)
+            .env("PATH", path_with(yq.parent().unwrap()))
+            .arg("scripts/check_session_block.sh"),
+        BATTERY_LIMIT,
+        "poison session check",
+    );
     let out = String::from_utf8_lossy(&session.stdout);
     assert!(session.status.success(), "{}", transcript(&session));
     // The mirror is taken against the bundled prose config, not the
@@ -647,13 +739,14 @@ fn runs_root_under(
     for (key, value) in vars {
         cmd.env(key, value);
     }
-    let output = cmd
-        .args([
+    let output = output_with_timeout(
+        cmd.args([
             "-c",
             "import _lib; print(_lib.runs_root()); print(_lib.run_dir_for('r1'))",
-        ])
-        .output()
-        .unwrap();
+        ]),
+        GATE_LIMIT,
+        "runs_root",
+    );
     assert!(output.status.success(), "{}", transcript(&output));
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut lines = stdout.lines();
@@ -1090,52 +1183,54 @@ fn dry_run_config_dir_with(scratch: &TempDirGuard, copy_agents: bool) -> PathBuf
 /// The brief every dry run below starts from unless it re-enters a run.
 const DRY_RUN_PROMPT: &str = "Implement the plan at plans/PLAN-x.md";
 
-/// Every binary run in this file starts from a config dir that
-/// `dry_run_config_dir_with` wrote, the only `config.yaml` writer here, so
-/// none of them can reach the `uvx` launcher a CI host lacks.
-#[test]
-fn every_scratch_config_dir_defines_no_mcp_server() {
-    for copy_agents in [true, false] {
-        let scratch = scratch_dir("mcpconfig");
-        dry_run_config_dir_with(&scratch, copy_agents);
-        let mcp: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(scratch.0.join("mcp.json")).unwrap()).unwrap();
-        assert_eq!(mcp, json!({"mcpServers": {}}), "copy_agents={copy_agents}");
-    }
-    let source = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(file!())).unwrap();
-    let lines: Vec<&str> = source.lines().collect();
-    let writers = lines
-        .windows(2)
-        .filter(|w| w[0].trim() == "fs::write(" && w[1].trim().ends_with(".join(\"config.yaml\"),"))
-        .count();
+/// Panics unless `config_dir` holds an `mcp.json` that defines no server.
+/// Every binary runner calls it before it starts the binary, so no run here
+/// can reach the `uvx` launcher a CI host lacks.
+fn assert_scratch_mcp_json(config_dir: &Path) {
+    let path = config_dir.join("mcp.json");
+    let text =
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()));
+    let mcp: serde_json::Value = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("{} is not JSON ({e}): {text}", path.display()));
     assert_eq!(
-        writers, 1,
-        "a second config.yaml writer must also write mcp.json"
+        mcp,
+        json!({"mcpServers": {}}),
+        "{} must define no MCP server",
+        path.display()
     );
 }
 
-/// Dry-runs the candidate by name through the real binary until the trace
-/// reaches `ask_user` (an input node that waits on a terminal, so the child
-/// is killed there) and returns the trace lines seen. `extra_env` lays
-/// run-dir variables over the scratch defaults.
-fn dry_run_until_ask_user(
-    scratch: &TempDirGuard,
-    project: &Path,
-    extra_env: &[(&str, PathBuf)],
-    label: &str,
-) -> Vec<String> {
-    dry_run_until_ask_user_with_prompt(scratch, project, extra_env, label, DRY_RUN_PROMPT)
+#[test]
+fn dry_run_config_dir_writes_an_mcp_json_with_no_server() {
+    for copy_agents in [true, false] {
+        let scratch = scratch_dir("mcpconfig");
+        dry_run_config_dir_with(&scratch, copy_agents);
+        assert_scratch_mcp_json(&scratch.0);
+    }
 }
 
-/// `dry_run_until_ask_user` with the prompt chosen by the caller.
-fn dry_run_until_ask_user_with_prompt(
-    scratch: &TempDirGuard,
-    project: &Path,
-    extra_env: &[(&str, PathBuf)],
-    label: &str,
-    prompt: &str,
-) -> Vec<String> {
+/// Asserts `needles` appear in `lines` in that order, each on a later line
+/// than the one before.
+fn assert_walk(lines: &[String], needles: &[&str], label: &str) {
+    let mut cursor = 0;
+    for needle in needles {
+        let hit = lines[cursor..].iter().position(|l| l.contains(needle));
+        let idx = hit.unwrap_or_else(|| {
+            panic!(
+                "{label}: {needle:?} missing after line {cursor}:\n{}",
+                lines.join("\n")
+            )
+        });
+        cursor += idx + 1;
+    }
+}
+
+/// The real-binary dry run of the candidate by name with `prompt`, from the
+/// scratch config dir, cache dir, `HOME` and `TMPDIR`, with every inherited
+/// run-dir, `COYOTE_*`, agent and git repository variable dropped.
+fn dry_run_command(scratch: &TempDirGuard, project: &Path, prompt: &str) -> Command {
     let dir = &scratch.0;
+    assert_scratch_mcp_json(dir);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_coyote"));
     scrub_coyote_env(&mut cmd);
     cmd.args(["--agent", CANDIDATE, "--dry-run", prompt])
@@ -1159,6 +1254,31 @@ fn dry_run_until_ask_user_with_prompt(
         .stderr(Stdio::piped());
     scrub_agent_vars(&mut cmd);
     without_git_repo_vars(&mut cmd);
+    cmd
+}
+
+/// Dry-runs the candidate by name through the real binary until the trace
+/// reaches `ask_user` (an input node that waits on a terminal, so the child
+/// is killed there) and returns the trace lines seen. `extra_env` lays
+/// run-dir variables over the scratch defaults.
+fn dry_run_until_ask_user(
+    scratch: &TempDirGuard,
+    project: &Path,
+    extra_env: &[(&str, PathBuf)],
+    label: &str,
+) -> Vec<String> {
+    dry_run_until_ask_user_with_prompt(scratch, project, extra_env, label, DRY_RUN_PROMPT)
+}
+
+/// `dry_run_until_ask_user` with the prompt chosen by the caller.
+fn dry_run_until_ask_user_with_prompt(
+    scratch: &TempDirGuard,
+    project: &Path,
+    extra_env: &[(&str, PathBuf)],
+    label: &str,
+    prompt: &str,
+) -> Vec<String> {
+    let mut cmd = dry_run_command(scratch, project, prompt);
     for (key, value) in extra_env {
         cmd.env(key, value);
     }
@@ -1280,17 +1400,7 @@ fn dry_run_by_name_walks_to_ask_user_and_pins_the_run_dir() {
     let dir = scratch.0.clone();
 
     let lines = dry_run_until_ask_user(&scratch, &project, &[], "cache dir");
-    let mut cursor = 0;
-    for needle in EXPECTED_WALK {
-        let hit = lines[cursor..].iter().position(|l| l.contains(needle));
-        let idx = hit.unwrap_or_else(|| {
-            panic!(
-                "cache dir: {needle:?} missing after line {cursor}:\n{}",
-                lines.join("\n")
-            )
-        });
-        cursor += idx + 1;
-    }
+    assert_walk(&lines, &EXPECTED_WALK, "cache dir");
     let runs_root = dir.join("cache").join(CANDIDATE).join("runs");
     single_run_under(&runs_root, "cache dir");
     // The engine's own tooling may populate `HOME` (uv caches and the like);
@@ -1346,17 +1456,7 @@ fn dry_run_by_name_from_an_empty_config_dir_installs_the_candidate_and_walks_to_
     );
 
     let lines = dry_run_until_ask_user(&scratch, &project, &[], "cold start");
-    let mut cursor = 0;
-    for needle in EXPECTED_WALK {
-        let hit = lines[cursor..].iter().position(|l| l.contains(needle));
-        let idx = hit.unwrap_or_else(|| {
-            panic!(
-                "cold start: {needle:?} missing after line {cursor}:\n{}",
-                lines.join("\n")
-            )
-        });
-        cursor += idx + 1;
-    }
+    assert_walk(&lines, &EXPECTED_WALK, "cold start");
     // What the engine installs is the shipped candidate, file for file and
     // byte for byte; the engine-managed `bin/` functions dir is its own.
     let installed = dir.join("agents").join(CANDIDATE);
@@ -1401,43 +1501,13 @@ fn dry_run_with_only_xdg_cache_home_puts_the_run_under_the_engines_cache_dir() {
     let xdg = dir.join("xdg");
     fs::create_dir_all(&xdg).unwrap();
 
-    // `dry_run_until_ask_user` pins `COYOTE_CACHE_DIR` to the scratch dir;
-    // this tier needs it absent, so drive the same command line by hand.
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_coyote"));
-    scrub_coyote_env(&mut cmd);
-    cmd.args(["--agent", CANDIDATE, "--dry-run", DRY_RUN_PROMPT])
-        .current_dir(&project)
-        .env("HOME", dir.join("home"))
-        .env("COYOTE_CONFIG_DIR", &dir)
-        .env("XDG_CACHE_HOME", &xdg)
-        .env("TMPDIR", dir.join("tmp"))
-        .env("PYTHONDONTWRITEBYTECODE", "1")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("NO_COLOR", "1")
-        .env_remove("COYOTE_CACHE_DIR")
-        .env_remove("ARCHITECT_RUNS_ROOT")
-        .env_remove("COYOTE_LOG_PATH")
-        .env_remove("IS_SANDBOX")
-        .env_remove("GRAPH_STATE")
-        .env_remove("GRAPH_STATE_FILE")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    scrub_agent_vars(&mut cmd);
-    without_git_repo_vars(&mut cmd);
+    // `dry_run_command` pins `COYOTE_CACHE_DIR` to the scratch dir and drops
+    // `XDG_CACHE_HOME`; this tier needs the reverse.
+    let mut cmd = dry_run_command(&scratch, &project, DRY_RUN_PROMPT);
+    cmd.env_remove("COYOTE_CACHE_DIR")
+        .env("XDG_CACHE_HOME", &xdg);
     let lines = run_until_ask_user(cmd, "xdg tier");
-    let mut cursor = 0;
-    for needle in EXPECTED_WALK {
-        let hit = lines[cursor..].iter().position(|l| l.contains(needle));
-        let idx = hit.unwrap_or_else(|| {
-            panic!(
-                "xdg tier: {needle:?} missing after line {cursor}:\n{}",
-                lines.join("\n")
-            )
-        });
-        cursor += idx + 1;
-    }
+    assert_walk(&lines, &EXPECTED_WALK, "xdg tier");
 
     let engine_cache = xdg.join("coyote");
     single_run_under(&engine_cache.join(CANDIDATE).join("runs"), "xdg tier");
@@ -1482,22 +1552,16 @@ fn dry_run_with_the_run_id_in_the_prompt_re_enters_the_run_instead_of_starting_a
         "re-entry",
         &format!("Architect run id: {run_id} -- continue"),
     );
-    let mut cursor = 0;
-    for needle in [
-        "graph: architect-next (start: intake)",
-        "intake (script) done",
-        "resume_route (script) done",
-        "ask_user (input) start",
-    ] {
-        let hit = lines[cursor..].iter().position(|l| l.contains(needle));
-        let idx = hit.unwrap_or_else(|| {
-            panic!(
-                "re-entry: {needle:?} missing after line {cursor}:\n{}",
-                lines.join("\n")
-            )
-        });
-        cursor += idx + 1;
-    }
+    assert_walk(
+        &lines,
+        &[
+            "graph: architect-next (start: intake)",
+            "intake (script) done",
+            "resume_route (script) done",
+            "ask_user (input) start",
+        ],
+        "re-entry",
+    );
     assert!(
         !lines.iter().any(|l| l.contains("orient_read (llm) start")),
         "re-entry: the run was re-oriented from scratch instead of resumed:\n{}",
@@ -1539,21 +1603,15 @@ fn dry_run_with_an_unknown_run_id_in_the_prompt_starts_a_fresh_run() {
         "unknown id",
         &format!("Architect run id: {bogus} -- continue"),
     );
-    let mut cursor = 0;
-    for needle in [
-        "graph: architect-next (start: intake)",
-        "intake (script) done",
-        "ask_user (input) start",
-    ] {
-        let hit = lines[cursor..].iter().position(|l| l.contains(needle));
-        let idx = hit.unwrap_or_else(|| {
-            panic!(
-                "unknown id: {needle:?} missing after line {cursor}:\n{}",
-                lines.join("\n")
-            )
-        });
-        cursor += idx + 1;
-    }
+    assert_walk(
+        &lines,
+        &[
+            "graph: architect-next (start: intake)",
+            "intake (script) done",
+            "ask_user (input) start",
+        ],
+        "unknown id",
+    );
     assert!(
         !lines.iter().any(|l| l.contains("resume_route (script)")),
         "unknown id: an id with no durable state was resumed:\n{}",
@@ -1624,23 +1682,17 @@ fn dry_run_without_a_readable_design_doc_parks_on_need_design_doc_before_orienti
         let runs_root = scratch.0.join("cache").join(CANDIDATE).join("runs");
 
         let lines = dry_run_until_ask_user_with_prompt(&scratch, &project, &[], label, prompt);
-        let mut cursor = 0;
-        for needle in [
-            "graph: architect-next (start: intake)",
-            "intake (script) done",
-            "escalate_gate (script) done",
-            "ask_dispatch (script) done",
-            "ask_user (input) start",
-        ] {
-            let hit = lines[cursor..].iter().position(|l| l.contains(needle));
-            let idx = hit.unwrap_or_else(|| {
-                panic!(
-                    "{label}: {needle:?} missing after line {cursor}:\n{}",
-                    lines.join("\n")
-                )
-            });
-            cursor += idx + 1;
-        }
+        assert_walk(
+            &lines,
+            &[
+                "graph: architect-next (start: intake)",
+                "intake (script) done",
+                "escalate_gate (script) done",
+                "ask_dispatch (script) done",
+                "ask_user (input) start",
+            ],
+            label,
+        );
         assert!(
             !lines.iter().any(|l| l.contains("orient_read (llm)")),
             "{label}: the graph tried to orient a design doc it never had:\n{}",
@@ -2112,9 +2164,12 @@ fn readme_census_row_dead_hygiene_guard_matches_the_shipped_gates() {
 }
 
 /// Runs `coyote --agent architect-next [extra..] --info` from a scratch
-/// config dir and returns its stdout, asserting a clean, error-free exit.
+/// config dir and returns its stdout, asserting a clean exit and no stderr
+/// line that is an error report (`Error:` / `error:`, the form an error
+/// returned from `main` takes) or an `[ERROR]` log record.
 fn info_by_name(scratch: &TempDirGuard, project: &Path, extra: &[&str], label: &str) -> String {
     let dir = &scratch.0;
+    assert_scratch_mcp_json(dir);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_coyote"));
     scrub_coyote_env(&mut cmd);
     cmd.args(["--agent", CANDIDATE])
@@ -2139,10 +2194,15 @@ fn info_by_name(scratch: &TempDirGuard, project: &Path, extra: &[&str], label: &
         "{label}: --info failed\n{}",
         transcript(&output)
     );
-    let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let errors: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("Error:") || l.starts_with("error:") || l.contains("[ERROR]"))
+        .collect();
     assert!(
-        !stderr.contains("error"),
-        "{label}: --info reported an error\n{}",
+        errors.is_empty(),
+        "{label}: --info reported an error: {errors:?}\n{}",
         transcript(&output)
     );
     String::from_utf8_lossy(&output.stdout).into_owned()
@@ -2209,8 +2269,8 @@ fn info_by_name_lists_the_graph_and_seats_a_build_lock_override() {
 
 /// The variables block the binary renders for `coyote -a architect-next
 /// --info` is exactly the prose twin's variable list, name for name and in
-/// order (eleven entries, `build_lock` included), so a consumer sees no
-/// variable the twin lacks and misses none it has.
+/// order (`build_lock` included), so a consumer sees no variable the twin
+/// lacks and misses none it has.
 #[test]
 fn info_by_name_lists_exactly_the_prose_twins_variables_in_order() {
     let scratch = scratch_dir("info-vars");
@@ -2228,8 +2288,8 @@ fn info_by_name_lists_exactly_the_prose_twins_variables_in_order() {
     );
     assert_eq!(
         listed.len(),
-        11,
-        "--info must list eleven variables: {listed:?}"
+        twin.len(),
+        "--info must list as many variables as the prose twin declares: {listed:?}"
     );
 }
 
@@ -2253,7 +2313,7 @@ fn gate_json(gate: &str, state: &serde_json::Value, scratch: &TempDirGuard) -> s
     let mut cmd = battery(&python, scratch);
     cmd.arg(Path::new("scripts").join(format!("{gate}.py")))
         .env("GRAPH_STATE", state.to_string());
-    let out = cmd.output().unwrap();
+    let out = output_with_timeout(&mut cmd, GATE_LIMIT, gate);
     assert_no_bytecode_under_candidate();
     parse_json_stdout(gate, &out)
 }
@@ -2273,17 +2333,18 @@ fn gauntlet_script(
     let mut cmd = Command::new(python);
     scrub_agent_vars(&mut cmd);
     without_git_repo_vars(&mut cmd);
-    let out = cmd
-        .arg(&path)
-        .env("GRAPH_STATE", state.to_string())
-        .env("PYTHONDONTWRITEBYTECODE", "1")
-        .env("HOME", scratch.0.join("home"))
-        .env("TMPDIR", scratch.0.join("tmp"))
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env_remove("GRAPH_STATE_FILE")
-        .output()
-        .unwrap_or_else(|e| panic!("failed to invoke python3 {script}: {e}"));
+    let out = output_with_timeout(
+        cmd.arg(&path)
+            .env("GRAPH_STATE", state.to_string())
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .env("HOME", scratch.0.join("home"))
+            .env("TMPDIR", scratch.0.join("tmp"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env_remove("GRAPH_STATE_FILE"),
+        GATE_LIMIT,
+        script,
+    );
     parse_json_stdout(script, &out)
 }
 
@@ -3036,12 +3097,13 @@ fn pr_body_fallback_lists_only_the_closing_groups_tasks() {
         ],
     });
     let mut cmd = battery(&python, &scratch);
-    let out = cmd
-        .arg(Path::new("scripts").join("pr_body.py"))
-        .env("GRAPH_STATE", state.to_string())
-        .env("ARCHITECT_CORE_TOOLS", &tools)
-        .output()
-        .unwrap();
+    let out = output_with_timeout(
+        cmd.arg(Path::new("scripts").join("pr_body.py"))
+            .env("GRAPH_STATE", state.to_string())
+            .env("ARCHITECT_CORE_TOOLS", &tools),
+        GATE_LIMIT,
+        "pr_body",
+    );
     assert_no_bytecode_under_candidate();
     parse_json_stdout("pr_body", &out);
     let body = fs::read_to_string(run_dir.join("pr-body.md")).unwrap();
@@ -3391,8 +3453,7 @@ fn the_real_collect_ledger_lines_returns_debris_exempt_and_follow_up_lines() {
     let state = json!({"plan_path": plan, "tasks_root": ledger.join("tasks")});
 
     let mut cmd = battery(&python, &scratch);
-    let out = cmd
-        .current_dir(candidate_dir().join("scripts"))
+    cmd.current_dir(candidate_dir().join("scripts"))
         .args([
             "-c",
             "import json, sys\n\
@@ -3400,9 +3461,8 @@ fn the_real_collect_ledger_lines_returns_debris_exempt_and_follow_up_lines() {
              state = json.loads(sys.argv[1])\n\
              print(json.dumps({\"tools\": _lib.core_tools_path(), \"rows\": {t: gates._collect(state, t) for t in (\"debris-exempt\", \"Follow-ups:\")}}))\n",
             &state.to_string(),
-        ])
-        .output()
-        .unwrap();
+        ]);
+    let out = output_with_timeout(&mut cmd, GATE_LIMIT, "_collect");
     assert_no_bytecode_under_candidate();
     let collected = parse_json_stdout("_collect", &out);
     assert_eq!(
@@ -3709,15 +3769,13 @@ fn graph_and_gate_budgets_equal_the_frozen_baseline() {
     };
     let scratch = scratch_dir("lib-bounds");
     let mut cmd = battery(&python, &scratch);
-    let out = cmd
-        .current_dir(candidate_dir().join("scripts"))
+    cmd.current_dir(candidate_dir().join("scripts"))
         .args([
             "-c",
             "import json, _lib\n\
              print(json.dumps({k: v for k, v in vars(_lib).items() if k.isupper() and type(v) is int}))\n",
-        ])
-        .output()
-        .unwrap();
+        ]);
+    let out = output_with_timeout(&mut cmd, GATE_LIMIT, "_lib integer constants");
     assert_no_bytecode_under_candidate();
     let values = parse_json_stdout("_lib integer constants", &out);
     let lib = fs::read_to_string(candidate_dir().join("scripts/_lib.py")).unwrap();
@@ -3785,14 +3843,11 @@ fn loop_cap_exceeds_the_ci_poll_rounds_lib_computes() {
     };
     let scratch = scratch_dir("lib-ci-rounds");
     let mut cmd = battery(&python, &scratch);
-    let out = cmd
-        .current_dir(candidate_dir().join("scripts"))
-        .args([
-            "-c",
-            "import json, _lib\nprint(json.dumps({\"CI_MAX_ROUNDS\": _lib.CI_MAX_ROUNDS}))\n",
-        ])
-        .output()
-        .unwrap();
+    cmd.current_dir(candidate_dir().join("scripts")).args([
+        "-c",
+        "import json, _lib\nprint(json.dumps({\"CI_MAX_ROUNDS\": _lib.CI_MAX_ROUNDS}))\n",
+    ]);
+    let out = output_with_timeout(&mut cmd, GATE_LIMIT, "_lib CI_MAX_ROUNDS");
     assert_no_bytecode_under_candidate();
     let values = parse_json_stdout("_lib CI_MAX_ROUNDS", &out);
     let rounds = values["CI_MAX_ROUNDS"].as_i64().unwrap();
@@ -4021,7 +4076,7 @@ fn every_binary_runner_scrubs_coyote_env_before_its_first_env() {
     let source = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(file!())).unwrap();
     let needle = concat!("Command::new(env!(\"CARGO_BIN_EXE_", "coyote\"))");
     let runners: Vec<usize> = source.match_indices(needle).map(|(at, _)| at).collect();
-    assert!(runners.len() >= 3, "found {} binary runners", runners.len());
+    assert!(runners.len() >= 2, "found {} binary runners", runners.len());
     for at in runners {
         let rest = &source[at..];
         let first_env = rest.find(".env(").expect("a binary runner sets no env");

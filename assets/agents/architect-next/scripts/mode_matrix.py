@@ -424,7 +424,7 @@ def main():
     if "--instructions" in sys.argv:
         instr = sys.argv[sys.argv.index("--instructions") + 1]
     import gates  # noqa: WPS433
-    from _lib import CORE_TOOLS_REL, FORK, MULTI_IS_GROUPS, STACK_LINKING  # noqa: WPS433
+    from _lib import CORE_TOOLS_REL  # noqa: WPS433
     gates.gate_name = lambda script: re.search(r'run\("([a-z0-9_]+)"\)', open(os.path.join(HERE, os.path.basename(script))).read()).group(1)
     if instr is None:
         instr = os.path.join(HERE, "..", "..", CORE_TOOLS_REL, "instructions.md")
@@ -434,6 +434,18 @@ def main():
         check("marker map: instructions.md located", False, instr)
 
     tmp_home = tempfile.mkdtemp(prefix="ax-matrix-home-")
+    try:
+        walk_combinations(tmp_home)
+    finally:
+        shutil.rmtree(tmp_home, ignore_errors=True)
+    fails = [n for n, ok in RESULTS if not ok]
+    print(f"\n{len(RESULTS) - len(fails)}/{len(RESULTS)} checks passed")
+    sys.exit(1 if fails else 0)
+
+
+def walk_combinations(tmp_home):
+    import gates  # noqa: WPS433
+    from _lib import CORE_TOOLS_REL, FORK, MULTI_IS_GROUPS, STACK_LINKING  # noqa: WPS433
     os.environ["HOME"] = tmp_home
     os.environ["ARCHITECT_RUNS_ROOT"] = os.path.join(tmp_home, "runs")
     os.environ["ARCHITECT_CI_SLEEP"] = "0"
@@ -536,10 +548,6 @@ def main():
             problems.append("multi report lacks the stacks section")
         check(f"combo [{label}]", not problems, " | ".join(problems))
         shutil.rmtree(world.tmp, ignore_errors=True)
-    shutil.rmtree(tmp_home, ignore_errors=True)
-    fails = [n for n, ok in RESULTS if not ok]
-    print(f"\n{len(RESULTS) - len(fails)}/{len(RESULTS)} checks passed")
-    sys.exit(1 if fails else 0)
 
 
 if __name__ == "__main__":
