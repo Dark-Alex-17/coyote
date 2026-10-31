@@ -2747,6 +2747,7 @@ pub fn run_llm_function(
             Ok(None) => {}
             Err(err) => {
                 tool_exited.store(true, Ordering::Release);
+                pump_detached.store(true, Ordering::Release);
                 bail!("Unable to run {command_name}, {err}")
             }
         }

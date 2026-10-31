@@ -185,7 +185,10 @@ _coyote_prompt() {
     id="p$$-$RANDOM-$SECONDS"
   fi
 
-  _coyote_prompt_send "$id" "$action" "$question" "$options" || return 1
+  _coyote_prompt_send "$id" "$action" "$question" "$options" || {
+    show_error "prompt request channel unavailable"
+    return 1
+  }
 
   declare reply
   while :; do

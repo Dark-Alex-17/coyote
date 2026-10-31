@@ -2176,9 +2176,9 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             // `set -euo pipefail` plus a whitespace-free IFS is the common
             // "strict mode" prologue; an unset variable or a word-splitting
             // assumption on the protocol path would surface here.
-            // `set +u` before the guard: its AUTO_CONFIRM short-circuit is the
-            // pre-protocol code (`[[ -z "$AUTO_CONFIRM" ]]`) and has never
-            // tolerated nounset; that is outside the protocol contract.
+            // `set +u` before the guard: `guard_path` reaches `_to_real_path`,
+            // whose bare `$OS` read predates the protocol and is not nounset
+            // clean; that path is outside the protocol contract.
             let body = format!(
                 "set -euo pipefail; IFS=$'\\n\\t'; {}; {}; {}; {}; \
                  set +u; guard_operation \"Go on?\"; echo \"guard rc=$?\"",
@@ -2385,6 +2385,189 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             assert!(
                 run.stderr.is_empty(),
                 "re-sourcing must stay silent: {}",
+                run.stderr
+            );
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        // The request is ONE stdout line whatever the question text, answers
+        // are printed as text, secrets stay off
+        // stderr, the terminal-only helpers never touch the channel, and an
+        // unusable reply path fails closed instead of hanging the tool.
+
+        #[test]
+        fn question_with_a_newline_stays_one_request_line() {
+            require_tools();
+            let dir = scratch_dir("newline-question");
+            // A tool writes ONE stdout line: a raw newline in the question
+            // must be JSON-escaped, never split the request in two.
+            let run = run_helper(
+                &dir,
+                Some(&[json!(true)]),
+                &capture("confirm $'first line\\nsecond line'"),
+                false,
+            );
+            assert_eq!(run.code, 0, "{}\n{}", run.stdout, run.stderr);
+            let requests = run.request_lines();
+            assert_eq!(requests.len(), 1, "{}", run.stdout);
+            assert_eq!(
+                requests[0]["coyote_prompt"]["question"],
+                "first line\nsecond line"
+            );
+            assert_eq!(
+                run.other_lines(),
+                vec!["v=[1] rc=0"],
+                "a fragment of the request must not leak as plain output: {}",
+                run.stdout
+            );
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn multi_line_input_answer_is_printed_as_text() {
+            require_tools();
+            let dir = scratch_dir("newline-answer");
+            // input/password print the text: the reply is one JSON line, so a
+            // newline inside the answer arrives escaped and must be decoded.
+            let run = run_helper(
+                &dir,
+                Some(&[json!("line one\nline two")]),
+                &capture("input \"Notes?\""),
+                false,
+            );
+            assert_eq!(run.code, 0, "{}\n{}", run.stdout, run.stderr);
+            assert_eq!(run.request_lines().len(), 1, "{}", run.stdout);
+            assert_eq!(
+                run.other_lines(),
+                vec!["v=[line one", "line two] rc=0"],
+                "{}\n{}",
+                run.stdout,
+                run.stderr
+            );
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn password_answer_never_reaches_stderr() {
+            require_tools();
+            let dir = scratch_dir("password-stderr");
+            // The terminal path echoes asterisks and the prompt to stderr; on
+            // the protocol path nothing about the secret may surface there,
+            // and the request itself carries no default that could leak one.
+            let secret = "hunter2-x7x";
+            let run = run_helper(
+                &dir,
+                Some(&[json!(secret)]),
+                &capture("password \"Token?\""),
+                false,
+            );
+            assert_eq!(run.code, 0, "{}\n{}", run.stdout, run.stderr);
+            let requests = run.request_lines();
+            assert_eq!(requests.len(), 1, "{}", run.stdout);
+            assert_eq!(requests[0]["coyote_prompt"]["action"], "password");
+            assert!(
+                !requests[0].to_string().contains(secret),
+                "the request precedes the answer and cannot contain it: {}",
+                requests[0]
+            );
+            assert_eq!(run.other_lines(), vec![format!("v=[{secret}] rc=0")]);
+            assert!(
+                run.stderr.is_empty(),
+                "protocol password path must write nothing to stderr: {:?}",
+                run.stderr
+            );
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn editor_and_range_stay_terminal_only() {
+            require_tools();
+            let dir = scratch_dir("terminal-only");
+            // `editor` and `range` stay terminal-only. With a live
+            // channel and no tty they must still not emit a protocol request;
+            // `range` falls through to its current value on EOF and `editor`
+            // returns an empty buffer. `timeout` is only a hang guard.
+            let body = "export EDITOR=true; \
+                        r=\"$(timeout 10 bash -c 'source \"$PROMPT_UTILS\"; range \"How many?\" 1 3 5' 2>/dev/null)\"; echo \"range=[$r] rc=$?\"; \
+                        e=\"$(timeout 10 bash -c 'source \"$PROMPT_UTILS\"; editor \"Notes?\"' 2>/dev/null)\"; echo \"editor=[$e] rc=$?\"";
+            let run = run_helper(&dir, Some(&[json!(true)]), body, true);
+            assert!(
+                run.request_lines().is_empty(),
+                "editor/range must never use the prompt channel: {}",
+                run.stdout
+            );
+            let printed = run.other_lines();
+            assert_eq!(printed.len(), 2, "{}\n{}", run.stdout, run.stderr);
+            assert!(
+                printed[0].starts_with("range=[") && !printed[0].contains("rc=124"),
+                "range must terminate without a tty: {}\n{}",
+                run.stdout,
+                run.stderr
+            );
+            assert!(
+                printed[1].starts_with("editor=[") && !printed[1].contains("rc=124"),
+                "editor must terminate without a tty: {}\n{}",
+                run.stdout,
+                run.stderr
+            );
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn an_unopenable_reply_path_fails_closed_without_hanging() {
+            require_tools();
+            let dir = scratch_dir("bad-reply-path");
+            // A stale or broken COYOTE_PROMPT_REPLY (an fd the child did not
+            // inherit) is "fail closed for prompting": the helper returns 1
+            // and a guard aborts with its usual message, and nothing blocks.
+            // The outer shell keeps the real channel so a request that does
+            // escape is still answered rather than deadlocking the harness.
+            let body = format!(
+                "{}; \
+                 COYOTE_PROMPT_REPLY=/dev/fd/97 timeout 10 bash -c '{}'; echo \"outer rc=$?\"; \
+                 COYOTE_PROMPT_REPLY=/dev/fd/97 timeout 10 bash -c 'source \"$PROMPT_UTILS\"; guard_operation \"Really?\"; echo continued'; echo \"guard rc=$?\"",
+                capture("confirm \"Warm up?\""),
+                "source \"$PROMPT_UTILS\"; v=\"$(confirm \"Go?\")\"; rc=$?; echo \"v=[$v] rc=$rc\"; exit 0",
+            );
+            let started = std::time::Instant::now();
+            let run = run_helper(
+                &dir,
+                Some(&[json!(true), json!(true), json!(true)]),
+                &body,
+                false,
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(9),
+                "the helper must not block on an unopenable reply path: {:?}",
+                started.elapsed()
+            );
+            let printed = run.other_lines();
+            assert!(
+                printed.contains(&"v=[1] rc=0"),
+                "the warm-up on the real channel must work: {}\n{}",
+                run.stdout,
+                run.stderr
+            );
+            assert!(
+                printed.contains(&"v=[] rc=1"),
+                "confirm over a dead reply path must print nothing and return 1: {}\n{}",
+                run.stdout,
+                run.stderr
+            );
+            assert!(
+                printed.contains(&"outer rc=0") && printed.contains(&"guard rc=1"),
+                "{}\n{}",
+                run.stdout,
+                run.stderr
+            );
+            assert!(
+                !run.stdout.contains("continued"),
+                "the guarded body must not run: {}",
+                run.stdout
+            );
+            assert!(
+                run.stderr.contains("Operation aborted!"),
+                "the guard must say why it stopped: {:?}",
                 run.stderr
             );
             fs::remove_dir_all(&dir).ok();
