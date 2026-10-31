@@ -981,28 +981,15 @@ mod tests {
     #[serial_test::serial]
     fn loading_default_mesh_config_creates_no_mesh_directories() {
         use std::fs;
-        use std::time::{SystemTime, UNIX_EPOCH};
 
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let config_dir = env::temp_dir().join(format!("coyote-mesh-config-{unique}"));
-        let cache_dir = env::temp_dir().join(format!("coyote-mesh-cache-{unique}"));
-        fs::create_dir_all(&config_dir).unwrap();
-        fs::create_dir_all(&cache_dir).unwrap();
-        let config_path = config_dir.join("config.yaml");
+        let guard = crate::testing::TestConfigDirGuard::new("mesh-config");
+        let config_path = guard.path.join("config.yaml");
         fs::write(&config_path, "model: provider:test\nmesh: {}\n").unwrap();
-
-        let _config_env = crate::testing::EnvVarGuard::set(get_env_name("config_dir"), &config_dir);
-        let _cache_env = crate::testing::EnvVarGuard::set(get_env_name("cache_dir"), &cache_dir);
 
         let result = Config::load_from_file(&config_path)
             .and_then(|(cfg, _)| AppConfig::from_config_lenient(cfg));
-        let config_mesh_exists = config_dir.join("mesh").exists();
-        let cache_mesh_exists = cache_dir.join("mesh").exists();
-        fs::remove_dir_all(&config_dir).unwrap();
-        fs::remove_dir_all(&cache_dir).unwrap();
+        let config_mesh_exists = guard.path.join("mesh").exists();
+        let cache_mesh_exists = guard.cache_root().join("mesh").exists();
 
         let app = result.unwrap();
         assert_eq!(app.mesh, MeshConfig::default());

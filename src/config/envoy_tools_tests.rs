@@ -534,8 +534,18 @@ fn coyotes_config_and_cache_dirs_are_refused_wherever_the_root_is() {
     let Some(fx) = fixture("envoy-tools-deny-dirs") else {
         return;
     };
-    let config_dir = fx.root.join("cfg").join("coyote");
-    let cache_dir = fx.root.join("cache").join("coyote");
+    let guard = TestConfigDirGuard::new_under("deny-dirs", &fx.root.join("cfg"));
+    let config_dir = guard.path.clone();
+    let cache_dir = guard.cache_root().to_path_buf();
+    let under_root = |dir: &Path| {
+        dir.strip_prefix(&fx.root)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    };
+    let config_rel = under_root(&config_dir);
+    let cache_rel = under_root(&cache_dir);
     write(&config_dir.join("config.yaml"), "api_key: sk-secret\n");
     write(
         &config_dir.join("oauth_tokens").join("github.json"),
@@ -547,25 +557,17 @@ fn coyotes_config_and_cache_dirs_are_refused_wherever_the_root_is() {
     );
     write(&fx.root.join("cfg").join("readme.txt"), "public\n");
     symlink(&config_dir, fx.root.join("cfg_alias")).unwrap();
-    let _config = EnvVarGuard::set(get_env_name("config_dir"), &config_dir);
-    let _cache = EnvVarGuard::set(get_env_name("cache_dir"), &cache_dir);
     assert_eq!(paths::config_dir(), config_dir);
-    assert!(
-        fx.root
-            .join("cfg")
-            .join("coyote")
-            .join("config.yaml")
-            .is_file()
-    );
+    assert!(fx.root.join(&config_rel).join("config.yaml").is_file());
 
     for path in [
-        "cfg/coyote/config.yaml",
-        "cfg/coyote/oauth_tokens/github.json",
-        "cache/coyote/transcripts/t.md",
-        "cfg_alias/config.yaml",
-        "cfg/coyote",
+        format!("{config_rel}/config.yaml"),
+        format!("{config_rel}/oauth_tokens/github.json"),
+        format!("{cache_rel}/transcripts/t.md"),
+        "cfg_alias/config.yaml".to_string(),
+        config_rel.clone(),
     ] {
-        let result = read(&fx, path);
+        let result = read(&fx, &path);
         let error = refused(&result).to_string();
         assert!(result.get("content").is_none(), "{path}: {result}");
         assert!(
@@ -574,15 +576,12 @@ fn coyotes_config_and_cache_dirs_are_refused_wherever_the_root_is() {
         );
     }
     for (func, args) in [
-        ("fs_glob", json!({"pattern": "*", "path": "cfg/coyote"})),
+        ("fs_glob", json!({"pattern": "*", "path": config_rel})),
         ("fs_glob", json!({"pattern": "*", "path": "cfg_alias"})),
+        ("fs_grep", json!({"pattern": "api_key", "path": cache_rel})),
         (
             "fs_grep",
-            json!({"pattern": "api_key", "path": "cache/coyote"}),
-        ),
-        (
-            "fs_grep",
-            json!({"pattern": "api_key", "path": "cfg/coyote/config.yaml"}),
+            json!({"pattern": "api_key", "path": format!("{config_rel}/config.yaml")}),
         ),
     ] {
         let result = call(&fx, Some(&fx.root), func, args.clone());
@@ -599,7 +598,7 @@ fn coyotes_config_and_cache_dirs_are_refused_wherever_the_root_is() {
     assert!(
         paths
             .iter()
-            .all(|p| !p.starts_with("cfg/coyote") && !p.starts_with("cache/")),
+            .all(|p| !p.starts_with(&config_rel) && !p.starts_with(&cache_rel)),
         "{listing}"
     );
     let grep = call(

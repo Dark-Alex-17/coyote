@@ -291,6 +291,19 @@ impl TestConfigDirGuard {
     pub(crate) fn cache_root(&self) -> &Path {
         &self.cache_root
     }
+
+    /// The name of the config dir env var this guard pins, for tests that
+    /// check a rendered script never mentions it.
+    pub(crate) fn config_dir_env_name() -> String {
+        utils::get_env_name("config_dir")
+    }
+
+    /// Unsets the config dir env var until the returned guard drops, which
+    /// puts the pinned dir back, so a test can exercise the fallback for an
+    /// unset config dir while every other dir stays pinned.
+    pub(crate) fn unset_config_dir_env(&self) -> EnvVarGuard {
+        EnvVarGuard::unset(Self::config_dir_env_name())
+    }
 }
 
 impl Drop for TestConfigDirGuard {

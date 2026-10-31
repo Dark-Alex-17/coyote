@@ -5554,7 +5554,10 @@ mod tests {
             python.contains(r#"resolve_dir("ENVOY_DATA_DIR", os.path.join(self_dir, ".."))"#),
             "{python}"
         );
-        assert!(!python.contains(&get_env_name("config_dir")), "{python}");
+        assert!(
+            !python.contains(&crate::testing::TestConfigDirGuard::config_dir_env_name()),
+            "{python}"
+        );
         assert!(!python.contains(&get_env_name("functions_dir")), "{python}");
         assert!(!python.contains("{root_dir_env}"), "{python}");
         assert!(!python.contains("{agent_name}"), "{python}");
@@ -5801,7 +5804,8 @@ mod tests {
             );
         }
         {
-            let _unset = crate::testing::EnvVarGuard::unset(get_env_name("config_dir"));
+            let guard = crate::testing::TestConfigDirGuard::new("builtin-env-unset");
+            let _unset = guard.unset_config_dir_env();
             let env = builtin_agent_env(Some("envoy"));
             assert_eq!(env[..3], pinned);
             assert_eq!(env[3].0, "ENVOY_DENY_DIRS");
@@ -6037,7 +6041,7 @@ mod tests {
         };
 
         for config_dir_set in [true, false] {
-            let _unset = (!config_dir_set).then(|| EnvVarGuard::unset(get_env_name("config_dir")));
+            let _unset = (!config_dir_set).then(|| guard.unset_config_dir_env());
             let probe = run();
             let expected_dir = json!(dir.display().to_string());
             assert_eq!(
