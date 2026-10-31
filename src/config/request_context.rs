@@ -1792,12 +1792,11 @@ impl RequestContext {
                     match root.lock() {
                         Ok(lock) => {
                             drop(lock);
-                            child_sessions::remove_dir(&dir, "session emptied");
-                            // `remove_dir` only logs a failure, so the dir's
-                            // absence is what says it went.
-                            if fs::symlink_metadata(&dir)
-                                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-                            {
+                            before_emptied_dir_removal(&dir);
+                            // Another process may remove the dir once the
+                            // lock is let go; only this call's removal is
+                            // announced.
+                            if child_sessions::remove_dir(&dir, "session emptied") {
                                 removed_dir = Some(dir);
                             }
                         }
@@ -7265,10 +7264,18 @@ impl RequestContext {
     }
 
     /// A child agent has no terminal of its own, so its compression notices
-    /// go to the log rather than onto the parent's stderr.
+    /// go to the log rather than onto the parent's stderr, naming the child
+    /// session (or the agent id when none is named) so a reader of a log
+    /// shared by several children can tell whose notice it is.
     fn compression_notice(&self, text: String) {
-        if self.self_agent_id.is_some() {
-            warn!("{text}");
+        if let Some(agent_id) = self.self_agent_id.as_deref() {
+            let name = self
+                .session
+                .as_ref()
+                .map(Session::name)
+                .filter(|name| !name.is_empty())
+                .unwrap_or(agent_id);
+            warn!("{text} (child session '{name}')");
             return;
         }
         let line = format!("Warning: {text}");
@@ -7501,6 +7508,27 @@ impl RequestContext {
         self.rag = Some(Arc::new(rag));
         Ok(())
     }
+}
+
+/// The point in `empty_session` after the root lock is let go and before
+/// the directory is removed. A no-op outside tests.
+#[cfg(not(test))]
+fn before_emptied_dir_removal(_dir: &Path) {}
+
+#[cfg(test)]
+fn before_emptied_dir_removal(dir: &Path) {
+    if let Some(hook) = BEFORE_EMPTIED_DIR_REMOVAL.with(|slot| slot.take()) {
+        hook(dir);
+    }
+}
+
+#[cfg(test)]
+type EmptiedDirHook = Box<dyn FnOnce(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_EMPTIED_DIR_REMOVAL: std::cell::RefCell<Option<EmptiedDirHook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Seeds a fresh session with the exchange `last_message` holds, stored the
@@ -10223,6 +10251,35 @@ mod tests {
                 "{notice}: {warns:?}"
             );
         }
+    }
+
+    #[test]
+    #[serial]
+    fn child_compression_notices_name_the_child_session_or_else_the_agent_id() {
+        install_log_collector();
+        let mut ctx = ctx_with_text_exchanges(0, 0);
+        ctx.self_agent_id = Some("agent-n4p".to_string());
+        ctx.session
+            .as_mut()
+            .unwrap()
+            .set_name("child-sess-n4p".to_string());
+        ctx.compression_notice("named notice n4p".to_string());
+        ctx.session.as_mut().unwrap().set_name(String::new());
+        ctx.compression_notice("unnamed notice n4p".to_string());
+
+        let warns = warn_snapshot();
+        assert!(
+            warns
+                .iter()
+                .any(|line| line == "named notice n4p (child session 'child-sess-n4p')"),
+            "{warns:?}"
+        );
+        assert!(
+            warns
+                .iter()
+                .any(|line| line == "unnamed notice n4p (child session 'agent-n4p')"),
+            "{warns:?}"
+        );
     }
 
     #[test]
@@ -18418,6 +18475,29 @@ mod tests {
         assert!(root.dir().is_dir());
         assert!(marker_captures(marker).is_empty());
         drop(held);
+    }
+
+    /// A dir another process removes once the lock is let go is not this
+    /// empty's deletion to announce.
+    #[test]
+    #[serial]
+    fn empty_session_fires_nothing_when_another_process_removes_the_dir_first() {
+        let _config = HelperConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "sess-deleted-empty-raced-q7k";
+        let (mut ctx, path) = loaded_session_ctx("empty-raced-quiet");
+        let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
+        write_child(&root, "sess_coder_0123456789ab", retention_time());
+        ctx.update_app_config(|app| app.hooks = hooks_map_of(&["session.deleted"], marker));
+        BEFORE_EMPTIED_DIR_REMOVAL.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(|dir: &Path| fs::remove_dir_all(dir).unwrap()));
+        });
+
+        ctx.empty_session().unwrap();
+
+        assert!(BEFORE_EMPTIED_DIR_REMOVAL.with(|slot| slot.borrow().is_none()));
+        assert!(!root.dir().exists());
+        assert!(marker_captures(marker).is_empty());
     }
 
     #[test]
