@@ -285,16 +285,21 @@ fn sisyphus_prompt_pins_docs_trigger_and_debris_precedence() {
             "README install/usage",
             "the probe walks the page",
             "as a first-time consumer",
-            "`git ls-files --others --exclude-standard -z | xargs -0 -r git add -N -- && git diff --no-color --no-ext-diff <base> | grep -nE '^\\+.*(#!?\\[(allow|expect)\\(|cfg_attr\\(|todo!|unimplemented!|#\\[ignore)'`",
-            "ls-files --others --exclude-standard covers every file",
-            "the coder created, listed or not, while .gitignore keeps build artefacts out; grep exiting 1",
-            "with no lines is the no-debt result (the command runs under pipefail, so the tool reports a",
-            "non-zero exit; that is not an error); `-n` numbers the diff output, so resolve each hit to",
-            "its `<file:line>` with the `fs_grep` tool: the hit text after the `+`, regex metacharacters",
-            "escaped, is its pattern (never paste diff text into a shell string); keep only matches in",
-            "files the diff touched)",
-            "plus any env-gated or opt-in test it added. A `cfg_attr(` hit that carries neither `allow`",
-            "nor `expect` is not debt; drop it.",
+            "- The coder does not report debt; derive the list with the `debt_scan` tool (pass",
+            "`--base <the task's base commit>`, the commit you recorded before the first coder spawn;",
+            "Before the FIRST coder spawn of a task, run `git rev-parse HEAD` and keep the SHA as the task's base commit (todo text / run-state memory); every `debt_scan` call passes it as `--base`.",
+            "\"project_dir\": \"<absolute path of the task's worktree>\"",
+            "also pass `\"test_command\": \"<that command>\"`",
+            "the flag is required because a HEAD base silently misses every change the coder already",
+            "committed). It runs the sanctioned pipeline",
+            "deterministically - intent-to-add for the coder's new files (.gitignore keeps artefacts",
+            "out), diff vs base, ADDED-line marker grep - and prints one `<file>:<line> -- <line text>`",
+            "per hit with REAL positions already resolved; a bare `cfg_attr(` carrying neither `allow`",
+            "nor `expect` is already dropped (\"no hits (clean)\" = no debt; the predicate form",
+            "`#[cfg_attr(not(test), allow(dead_code))]` is kept). If the output starts with",
+            "`DEBT_SCAN_FAILED`, run the manual fallback it quotes and resolve hits to `<file:line>`",
+            "with the `fs_grep` tool as it describes. To the tool's list, add any env-gated or opt-in test the",
+            "coder added. Per the `task-tracking` skill, assign each marker to its",
             "for an env- or cfg-gated test, a gate the lint cannot recognise, the comment goes on the gate's code line",
             "(the one carve-out: a task id on the same line as a debt marker)",
             "killed, its module unresolvable, wrote a malformed verdict, or the diff spec itself unusable);",
@@ -469,21 +474,23 @@ fn step_runner_pins_mechanical_debt_sweep() {
     assert_anchors(
         "step-runner/graph.yaml",
         &[
-            "5. Debt sweep. The coder does not report debt",
-            "step's diff (the coder leaves its edits uncommitted):",
-            "`git -C {{project_dir}} ls-files --others --exclude-standard -z | xargs -0 -r git -C {{project_dir}} add -N -- && git -C {{project_dir}} diff --no-color --no-ext-diff <base, normally HEAD> | ",
-            "grep -nE '^\\+.*(#!?\\[(allow|expect)\\(|cfg_attr\\(|todo!|unimplemented!|#\\[ignore)'",
-            "(the `add -N` puts the coder's new files into the diff; ls-files",
-            "--others --exclude-standard covers every file the coder created,",
-            "listed or not, while .gitignore keeps build artefacts out; grep",
-            "exiting 1 with no lines is the no-debt result (the command runs",
-            "under pipefail, so the tool reports a non-zero exit; that is not",
-            "an error); `-n` numbers the diff output, so resolve each hit to its",
-            "`<file:line>` with the `fs_grep` tool: the hit text after the `+`,",
-            "regex metacharacters escaped, is its pattern (never paste diff text",
-            "into a shell string); keep only matches in files the diff touched)",
-            "plus any env-gated or opt-in test it added. A `cfg_attr(` hit that",
-            "carries neither `allow` nor `expect` is not debt; drop it.",
+            "5. Debt sweep. A deterministic scan already ran; its results are in",
+            "the \"## Debt scan\" section below - one `<file>:<line> -- <added",
+            "line text>` per hit, real positions already resolved, bare",
+            "`cfg_attr(` without allow|expect already dropped, \"no hits (clean)\"",
+            "= no debt. If the section starts with DEBT_SCAN_FAILED, run the",
+            "manual fallback it quotes (resolving each hit to its real `<file:line>`",
+            "with the `fs_grep` tool, as it describes) and use that result instead. If",
+            "the \"## Debt scan status\" line starts with `script 'debt_scan'`, the",
+            "scan did not run THIS pass and the section holds the PREVIOUS pass's",
+            "report: treat the section as DEBT_SCAN_FAILED and run the manual",
+            "fallback the initial-state default quotes (the same pipeline the scanner",
+            "prints when it fails), then use that result instead. To the",
+            "scan's list, add any env-gated or opt-in test the coder added",
+            "  debt_scan:\n    id: debt_scan\n    type: script",
+            "## Debt scan status\n      {{last_script_error}}\n\n      ## Debt scan\n      {{debt_hits}}",
+            "script: scripts/debt_scan.py\n    timeout: 120\n    next: edge_case_sweep\n    fallback: edge_case_sweep",
+            "debt_hits: 'DEBT_SCAN_FAILED: the debt_scan node did not run. Manual fallback (<base> normally HEAD):",
             "under a `Debt left behind:` heading",
             "A `Debt left behind:` list in \"Edge cases discovered\" below is copied",
         ],
@@ -491,12 +498,17 @@ fn step_runner_pins_mechanical_debt_sweep() {
     assert_anchors(
         "step-runner/README.md",
         &[
-            "derives the step's debt list mechanically",
-            "than trusting the coder's summary: after `git ls-files --others",
-            "--exclude-standard -z | xargs -0 -r git add -N --` (so every file the coder",
-            "created counts, listed or not, while `.gitignore` keeps build artefacts out)",
-            "`#![expect(`, `cfg_attr(`, `todo!`, `unimplemented!` and `#[ignore` (a",
-            "`cfg_attr(` hit carrying neither `allow` nor `expect` is dropped), plus any",
+            "The step's debt list is derived mechanically rather than trusted from the",
+            "coder's summary: a deterministic `debt_scan` script node (a thin shim over",
+            "the shared `agents/.shared/debt_scan.py`, the same scanner Sisyphus's",
+            "file the coder created counts, listed or not, while `.gitignore` keeps build",
+            "`#[expect(`, `#![expect(`, `cfg_attr(`, `todo!`, `unimplemented!` or",
+            "`cfg_attr(` hit carrying neither `allow` nor `expect` is dropped). The scan",
+            "fails open: on any error the sweep sees a `DEBT_SCAN_FAILED` report quoting",
+            "the manual pipeline to run by hand, and a crash of the shim itself falls",
+            "forward on the node's `fallback:` edge to that same sweep: on the FIRST pass",
+            "with the initial-state `DEBT_SCAN_FAILED` default still in `debt_hits`, and",
+            "`last_script_error` rendered as the prompt's `## Debt scan status` line,",
             "`Debt left behind:` in the handoff's Notes for next step",
         ],
     );
@@ -511,6 +523,19 @@ fn probe_readme_pins_docs_spawn_arm() {
             "rewrites consumer-facing docs for such a surface and a local-run recipe exists",
         ],
     );
+}
+
+/// True when `sess_` occurs in `text` at an identifier boundary: the character
+/// before it is not `[A-Za-z0-9_]`, or the match opens the text. A child
+/// session id (`sess_<agent>_<hex>`) trips it; an identifier that merely ends
+/// in those letters, such as a node named `assess_fault`, does not.
+fn names_a_child_session_id(text: &str) -> bool {
+    text.match_indices("sess_").any(|(idx, _)| {
+        text[..idx]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'))
+    })
 }
 
 /// The `session_id` parameter's description on `agent__spawn` is the one
@@ -553,11 +578,46 @@ fn bundled_prose_leaves_resume_mechanics_to_the_tool_description() {
             let bytes = fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
             let text = String::from_utf8_lossy(&bytes);
             for needle in needles {
-                if text.contains(needle) {
+                let tripped = match *needle {
+                    "sess_" => names_a_child_session_id(&text),
+                    _ => text.contains(needle),
+                };
+                if tripped {
                     hits.push(format!("{}: {needle}", path.display()));
                 }
             }
         }
     }
     assert!(hits.is_empty(), "{}", hits.join("\n"));
+}
+
+/// Positive control for the `sess_` needle above, on strings rather than on
+/// the asset tree: a session id trips it at the start of the text and after a
+/// non-identifier character, while identifiers whose tail happens to spell
+/// `sess_` stay clean.
+#[test]
+fn child_session_id_needle_is_identifier_bounded() {
+    for text in [
+        "sess_coder_0f3a9c2b7d14",
+        "x sess_y",
+        "resume (sess_abc) later",
+        "`sess_",
+    ] {
+        assert!(
+            names_a_child_session_id(text),
+            "{text:?} names a child session id"
+        );
+    }
+    for text in [
+        "assess_fault",
+        "assess_fault_sess_x",
+        "scripts/assess_fault.py",
+        "sess",
+        "",
+    ] {
+        assert!(
+            !names_a_child_session_id(text),
+            "{text:?} does not name a child session id"
+        );
+    }
 }

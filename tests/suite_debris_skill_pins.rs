@@ -141,6 +141,48 @@ fn plan_authoring_skill_pins_debris_rules() {
     );
 }
 
+/// The micro-grain addenda are named by heading in the architect's gate
+/// prompts, so a renamed heading silently drops the addendum from the gate.
+#[test]
+fn micro_grain_addenda_keep_their_headings_and_batch_rules() {
+    let heading = "## Micro-grain addendum (applies ONLY when the spawner names it)";
+    for name in ["plan-authoring", "plan-gatekeeping", "plan-review"] {
+        assert_anchors(name, &[heading]);
+    }
+    assert_anchors(
+        "plan-authoring",
+        &[
+            "Two extra columns: `Batch`",
+            "dependency order must hold INSIDE a batch and ACROSS batches",
+            "Task frontmatter mirrors\nthem: `batch: <slug>`, `protected: true`.",
+        ],
+    );
+    assert_anchors(
+        "plan-gatekeeping",
+        &[
+            "a missing pack or batch is a leak.",
+            "must have its `Protected` column set; an unmarked one is a leak",
+            "the architect's Phase D mirrors the\n   column into the task's `protected: true` frontmatter",
+            "`plan-review`'s lane in micro mode too.",
+        ],
+    );
+    assert_anchors(
+        "plan-review",
+        &[
+            "Section 5's \"~1-5 files\" is replaced by the `plan-authoring` micro sizing rule",
+            "Dependency order must hold INSIDE a\n  batch and ACROSS batches",
+            "Whether a task SHOULD be protected is the gatekeeper's leak check",
+        ],
+    );
+    assert_anchors(
+        "task-tracking",
+        &[
+            "batch: <slug>          # micro-grain plans only",
+            "protected: true        # micro-grain plans only",
+        ],
+    );
+}
+
 #[test]
 fn plan_review_skill_pins_debris_rules() {
     assert_anchors(

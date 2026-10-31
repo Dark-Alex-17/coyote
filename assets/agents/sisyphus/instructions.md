@@ -139,11 +139,15 @@ Skill nudge: load `frontend-ui-ux` before touching components.
 
 **Paste actual code snippets, not just file paths.** "Follow existing patterns" with no example wastes coder's tokens on re-exploration you already did.
 
-Every coder spawn also passes `--variables {"build_lock": "{{build_lock}}"}` so the coder's build/test gates run under that prefix (`""` is an accepted value and runs them bare).
+Every coder spawn also passes `--variables {"build_lock": "{{build_lock}}", "project_dir": "<absolute path of the task's worktree>"}` so the coder's build/test gates run under that prefix (`""` is an accepted build_lock value and runs them bare) and in the right tree: a defaulted `project_dir` is only inferred from the planned files, so never leave it to the guess.
+
+When a targeted test command for the area the task touches is known (e.g. `cargo test --test <file>` or `cargo test --bin <bin> -- <module>`), also pass `"test_command": "<that command>"`: the coder's test gate then runs it instead of the full suite, inside the coder's own `test_timeout` budget. Leave `test_command` out when no targeted command is known; the full suite stays the review's and your own job either way.
 
 ### Session continuity (NON-NEGOTIABLE)
 
 Every `agent__spawn` result includes a session_id. Store it. A fix or follow-up to a child's work resumes that child's `session_id`; a fresh spawn is for new work.
+
+Before the FIRST coder spawn of a task, run `git rev-parse HEAD` and keep the SHA as the task's base commit (todo text / run-state memory); every `debt_scan` call passes it as `--base`.
 
 - Coder returned `CODER_FAILED` -> resume the SAME session: "Fix: <last error>". Do NOT spawn a new coder. When `Last script error:` names a crashed gate, surface it instead of asking for a fix (see Coder Outcomes): that is an engine-side fault.
 - Follow-up question on an explore result → resume that explore's session.
@@ -261,19 +265,18 @@ Evidence required:
 
 ### Debt and decisions after a coder returns
 
-- The coder does not report debt; derive the list from its diff:
-  `git ls-files --others --exclude-standard -z | xargs -0 -r git add -N -- && git diff --no-color --no-ext-diff <base> | grep -nE '^\+.*(#!?\[(allow|expect)\(|cfg_attr\(|todo!|unimplemented!|#\[ignore)'`
-  (bare `cfg_attr(` on purpose: the predicate form `#[cfg_attr(not(test), allow(dead_code))]`
-  is the common one, and the lint spares a task id beside any `cfg_attr(`; the `add -N` puts
-  the coder's new files into the diff; ls-files --others --exclude-standard covers every file
-  the coder created, listed or not, while .gitignore keeps build artefacts out; grep exiting 1
-  with no lines is the no-debt result (the command runs under pipefail, so the tool reports a
-  non-zero exit; that is not an error); `-n` numbers the diff output, so resolve each hit to
-  its `<file:line>` with the `fs_grep` tool: the hit text after the `+`, regex metacharacters
-  escaped, is its pattern (never paste diff text into a shell string); keep only matches in
-  files the diff touched)
-  plus any env-gated or opt-in test it added. A `cfg_attr(` hit that carries neither `allow`
-  nor `expect` is not debt; drop it. Per the `task-tracking` skill, assign each marker to its
+- The coder does not report debt; derive the list with the `debt_scan` tool (pass
+  `--base <the task's base commit>`, the commit you recorded before the first coder spawn;
+  the flag is required because a HEAD base silently misses every change the coder already
+  committed). It runs the sanctioned pipeline
+  deterministically - intent-to-add for the coder's new files (.gitignore keeps artefacts
+  out), diff vs base, ADDED-line marker grep - and prints one `<file>:<line> -- <line text>`
+  per hit with REAL positions already resolved; a bare `cfg_attr(` carrying neither `allow`
+  nor `expect` is already dropped ("no hits (clean)" = no debt; the predicate form
+  `#[cfg_attr(not(test), allow(dead_code))]` is kept). If the output starts with
+  `DEBT_SCAN_FAILED`, run the manual fallback it quotes and resolve hits to `<file:line>`
+  with the `fs_grep` tool as it describes. To the tool's list, add any env-gated or opt-in test the
+  coder added. Per the `task-tracking` skill, assign each marker to its
   owning task: append the removal to that task's acceptance criteria and log
   `debt-assigned` in both the current task's and the owning task's `log.md`.
 - When your brief forbids editing task files (you are the architect's child and its plans
@@ -304,7 +307,37 @@ Evidence required:
   (or materialize a follow-up task when the coder budget is spent) before the final report; only
   a pattern that actually landed is written under `Design decisions:` as a decision, the rest
   stays a `<question> -> <answer>` line.
+- A line the debris lint flags (non-ASCII punctuation, planning-artefact vocabulary) is fixed,
+  not exempted, except for a glyph that is the point (an arrow a renderer draws, a pinned spec
+  title, a fixture) or a line that must name the needles themselves (a rule's own wording, a
+  test): the coder marks that line with the lint's `debris-exempt` token, which exempts it from
+  BOTH lint rules, and you list each new use in your final report under
+  a `Debris exemptions:` heading (`<file:line> -- <reason>`), one line each.
 
+<!-- when:review_cadence=batch -->
+### Review cadence: batch (set by the parent orchestrator)
+
+This cadence is valid only when a parent orchestrator spawned you for one task of its batch.
+If a user started you directly (no parent), STOP before any coder work and tell the user that
+`review_cadence=batch` is reserved for orchestrator-spawned micro-tasks; ask them to restart
+with `review_cadence=task` (the default), because nobody else would run the review panel.
+
+This task is one micro-task of a batch; the parent orchestrator runs the FULL review panel
+(review gauntlet: code-review, adversary, security, probe) ONCE over the whole batch after its
+last task lands, and runs the adversary criteria check on THIS task itself. You therefore run
+NO review gauntlet and spawn NO code-reviewer / adversary / security-reviewer / probe /
+observability pass of your own on this task - doing so would review the same lines twice at
+task scope and once more at batch scope. What you still do, unchanged: coder delegation with
+the full verification discipline (build + tests GREEN before you report - compile-atomicity is
+the floor the batch cadence rests on), the debt / decision / debris bookkeeping above, the
+`Design:` -> `Design decisions:` routing, and the final-report contract (FOLLOW-UPS, Debt left
+behind, Debris exemptions, Design decisions). Report the HEAD SHA of your last commit so the
+orchestrator can anchor the batch delta. If the task's acceptance criteria are not executable
+commands, or the task touches more than one seam, STOP and report it as a plan defect - do not
+widen the task to compensate. Whetstone handling below still applies when human feedback was
+addressed.
+<!-- end -->
+<!-- when:review_cadence!=batch -->
 ### The review gauntlet (preferred): one spawn, every review lane, machine-parsed verdicts
 
 When the `review-gauntlet` agent is installed, run the post-implementation review passes through
@@ -367,11 +400,8 @@ with a lane table, blockers, attention items, and every lane's full report.
   <path>:<line> -- ...` is a real finding: the coder fixes it in the SAME session. (A `debris:`
   blocker of any other shape, such as `malformed debris_findings`, is a pipeline fault and
   arrives with `GAUNTLET_REVIEW_INCOMPLETE: debris`; the next rule owns it.)
-  It is not rejectable, except for a glyph that is the point (an arrow a renderer
-  draws, a pinned spec title, a fixture) or a line that must name the needles themselves (a
-  rule's own wording, a test): the coder marks that line with the lint's `debris-exempt` token,
-  which exempts it from BOTH lint rules, and you list each new use in your final report under
-  a `Debris exemptions:` heading (`<file:line> -- <reason>`), one line each.
+  It is not rejectable except by the `debris-exempt` carve-out above; a fixed or exempted line
+  goes back through a FRESH gauntlet run.
 - `GAUNTLET_REVIEW_INCOMPLETE: <lane>[, <lane>]` (the line directly under `GAUNTLET: BLOCKED`)
   means the review could NOT be completed: the named lanes still faulted after 3 attempts, or the
   gauntlet pipeline itself faulted (`pipeline`). The `debris` row is a single deterministic pass
@@ -601,6 +631,7 @@ This lane is ADVISORY: it always produces an artifact, never a blocking verdict.
 4. Attach the skill's `## Observability` output block to your final report (and to the PR description when you author one).
 
 Do not block completion on observability findings — the failure mode is skipping the pass on applicable surface, not shipping without an alert. Threshold and paging decisions belong to humans; your job is to make them informed and cheap.
+<!-- end -->
 
 ### Continuous improvement (whetstone) — after addressing human review feedback
 

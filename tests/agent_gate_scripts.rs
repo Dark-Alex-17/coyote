@@ -129,7 +129,9 @@ fn transcript(total: usize) -> String {
 }
 
 fn bash() -> Command {
-    Command::new(bash_program().expect("bash resolved by tools_missing"))
+    let mut cmd = Command::new(bash_program().expect("bash resolved by tools_missing"));
+    cmd.env("PYTHONDONTWRITEBYTECODE", "1");
+    cmd
 }
 
 fn run(output: Output) -> (i32, String, String) {
@@ -177,6 +179,7 @@ fn run_script(
         .env_remove("TEST_CMD")
         .env_remove("FORMAT_CMD")
         .env_remove("LINT_CMD")
+        .env_remove("LLM_AGENT_VAR_TEST_COMMAND")
         .env_remove("LLM_AGENT_VAR_BUILD_LOCK");
     for (k, v) in envs {
         cmd.env(k, v);
@@ -354,7 +357,9 @@ const VERIFY_SCRIPTS: [VerifyScript; 4] = [
         cmd_env: "TEST_CMD",
         ok_key: "tests_ok",
         output_key: "tests_output",
-        success_next: "edge_case_sweep",
+        // A green test run routes through the deterministic debt_scan node, which
+        // then falls through to edge_case_sweep.
+        success_next: "debt_scan",
     },
 ];
 
@@ -428,6 +433,31 @@ fn verify_scripts_survive_300kb_failing_transcript() {
         assert!(output.contains("bytes trimmed"), "{}: {output}", script.rel);
         assert!(output.ends_with(LAST_LINE), "{}: tail lost", script.rel);
     }
+}
+
+/// step-runner: with no test command configured or detected, verify_tests
+/// still moves on to debt_scan, but says the gate did not run rather than
+/// reporting a green suite.
+#[test]
+fn step_runner_verify_tests_without_a_test_command_reports_gate_not_run() {
+    if tools_missing() {
+        return;
+    }
+    let dir = fixture_dir("verify-tests-no-cmd");
+    let out = run_script_json(
+        "step-runner/scripts/verify_tests.sh",
+        &dir.0,
+        &project_state(&dir.0),
+        &[],
+    );
+    assert_eq!(str_field(&out, "_next"), "debt_scan", "{out}");
+    let output = str_field(&out, "tests_output");
+    assert!(output.starts_with("(GATE NOT RUN"), "{output}");
+    assert!(
+        output.contains("This is NOT evidence that tests passed"),
+        "{output}"
+    );
+    assert!(!output.contains("Ran: "), "{output}");
 }
 
 /// The `build_lock` graph variable wraps every gate command as ONE unit. Each
@@ -621,6 +651,103 @@ fn build_lock_is_declared_with_empty_default_and_settled_lanes_are_bare() {
             .contains("omit on the first round (ignored unless `Re-review delta:` is also given)>"),
         "the Settled lanes placeholder must say the tokens are inert without a delta"
     );
+}
+
+fn declared_variables(rel: &str) -> Vec<serde_yaml::Value> {
+    let doc: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(asset(rel)).unwrap()).unwrap();
+    doc["variables"]
+        .as_sequence()
+        .unwrap_or_else(|| panic!("{rel}: variables"))
+        .clone()
+}
+
+fn declared<'a>(
+    variables: &'a [serde_yaml::Value],
+    rel: &str,
+    name: &str,
+) -> &'a serde_yaml::Value {
+    variables
+        .iter()
+        .find(|v| v["name"].as_str() == Some(name))
+        .unwrap_or_else(|| panic!("{rel}: no {name} variable"))
+}
+
+/// The architect's `task_granularity` and the Sisyphus `review_cadence` are a
+/// pair: micro granularity spawns Sisyphus with `review_cadence: batch`
+/// beside `build_lock`, so both configs declare both halves with their
+/// standalone defaults, and the architect's forward literal names a variable
+/// Sisyphus actually declares.
+#[test]
+fn micro_granularity_and_batch_cadence_are_declared_as_a_pair() {
+    let architect = declared_variables("architect/config.yaml");
+    assert_eq!(
+        declared(&architect, "architect/config.yaml", "task_granularity")["default"],
+        serde_yaml::Value::from("standard")
+    );
+    declared(&architect, "architect/config.yaml", "build_lock");
+
+    let sisyphus = declared_variables("sisyphus/config.yaml");
+    assert_eq!(
+        declared(&sisyphus, "sisyphus/config.yaml", "review_cadence")["default"],
+        serde_yaml::Value::from("task")
+    );
+    declared(&sisyphus, "sisyphus/config.yaml", "build_lock");
+
+    let forwarded = r#""review_cadence": "batch""#;
+    let instructions = fs::read_to_string(asset("architect/instructions.md")).unwrap();
+    assert!(
+        instructions.contains(forwarded),
+        "architect/instructions.md must forward {forwarded}"
+    );
+    let forwarded_name = forwarded.split('"').nth(1).unwrap();
+    declared(&sisyphus, "sisyphus/config.yaml", forwarded_name);
+}
+
+/// Rendering the Sisyphus instructions under `review_cadence=batch` drops the
+/// gauntlet section and keeps the batch section, with its refusal to run
+/// batch cadence without a parent; the `debris-exempt` rule the batch section
+/// leans on lives outside both blocks, so either cadence renders it.
+#[test]
+fn sisyphus_cadence_blocks_render_exclusively_and_share_the_debris_rule() {
+    if tools_missing() {
+        return;
+    }
+    let hoisted = "a `Debris exemptions:` heading (`<file:line> -- <reason>`)";
+    let standalone_stop = "If a user started you directly (no parent), STOP before any coder work and tell the user that";
+    let script = format!(
+        "source '{}'; render_instructions '{}'",
+        asset(".shared/utils.sh").display(),
+        asset("sisyphus/instructions.md").display()
+    );
+    for (cadence, present, absent) in [
+        (
+            "batch",
+            "### Review cadence: batch",
+            "### The review gauntlet",
+        ),
+        (
+            "task",
+            "### The review gauntlet",
+            "### Review cadence: batch",
+        ),
+    ] {
+        let (code, stdout, stderr) = run(bash()
+            .arg("-c")
+            .arg(&script)
+            .env("LLM_AGENT_VAR_REVIEW_CADENCE", cadence)
+            .output()
+            .expect("spawn bash"));
+        assert_eq!(code, 0, "render under {cadence}: {stderr}");
+        assert!(stdout.contains(present), "{cadence}: missing {present:?}");
+        assert!(!stdout.contains(absent), "{cadence}: leaked {absent:?}");
+        assert!(stdout.contains(hoisted), "{cadence}: missing {hoisted:?}");
+        assert_eq!(
+            stdout.contains(standalone_stop),
+            cadence == "batch",
+            "{cadence}: the standalone STOP sentence belongs to the batch block only"
+        );
+    }
 }
 
 /// The gauntlet hands `build_lock` to the adversary lane through `inputs:`
@@ -929,6 +1056,173 @@ fn build_lock_prose_twins_carry_the_same_warnings() {
     );
 }
 
+/// The engineer's three surfaces agree: the README usage block spawns it
+/// with `--agent-variable` (never the orchestrators' `--variables` hop), the
+/// config grants `fs_cat.sh`, and every fs tool the instructions call "your
+/// own" is a granted global tool.
+#[test]
+fn engineer_agent_surface_is_consistent() {
+    let readme = fs::read_to_string(asset("engineer/README.md")).unwrap();
+    let usage = readme
+        .split("## Usage")
+        .nth(1)
+        .and_then(|rest| rest.split("```").nth(1))
+        .expect("engineer/README.md: fenced block under ## Usage");
+    for needle in [
+        "--agent-variable project_dir",
+        "--agent-variable reference_root",
+    ] {
+        assert!(
+            usage.contains(needle),
+            "engineer/README.md usage: missing {needle:?}"
+        );
+    }
+    for stale in ["--variable ", "--variables"] {
+        assert!(
+            !readme.contains(stale),
+            "engineer/README.md: {stale:?} is the orchestrators' flag, not a config agent's"
+        );
+    }
+
+    let doc: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(asset("engineer/config.yaml")).unwrap()).unwrap();
+    let global_tools: Vec<String> = doc["global_tools"]
+        .as_sequence()
+        .expect("engineer/config.yaml: global_tools")
+        .iter()
+        .map(|t| {
+            t.as_str()
+                .expect("global_tools entry is a string")
+                .to_string()
+        })
+        .collect();
+    assert!(
+        global_tools.iter().any(|t| t == "fs_cat.sh"),
+        "engineer/config.yaml: global_tools must grant fs_cat.sh: {global_tools:?}"
+    );
+
+    let instructions = fs::read_to_string(asset("engineer/instructions.md")).unwrap();
+    // Indented lines continue the list item above them, so the tool list
+    // reads the same whichever name the line wrap lands on.
+    let mut unwrapped = String::with_capacity(instructions.len());
+    for line in instructions.lines() {
+        if line.starts_with(' ') {
+            unwrapped.push_str(line.trim_start());
+        } else {
+            unwrapped.push('\n');
+            unwrapped.push_str(line);
+        }
+    }
+    let lead = "own fs tools (";
+    let listed = unwrapped
+        .split_once(lead)
+        .and_then(|(_, rest)| rest.split_once(" - "))
+        .map(|(names, _)| names)
+        .unwrap_or_else(|| panic!("engineer/instructions.md: no `{lead}<a/b/c> - ...` sentence"));
+    let names: Vec<&str> = listed.split('/').collect();
+    assert!(
+        names.len() >= 2,
+        "engineer/instructions.md: own fs tools list {listed:?}"
+    );
+    for name in names {
+        let tool = format!("{name}.sh");
+        assert!(
+            global_tools.contains(&tool),
+            "engineer/instructions.md names {name} as an own fs tool but config.yaml does not grant {tool}: {global_tools:?}"
+        );
+    }
+}
+
+#[test]
+fn sisyphus_config_grants_fs_cat() {
+    let doc: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(asset("sisyphus/config.yaml")).unwrap()).unwrap();
+    let global_tools: Vec<&str> = doc["global_tools"]
+        .as_sequence()
+        .expect("sisyphus/config.yaml: global_tools")
+        .iter()
+        .map(|t| t.as_str().expect("global_tools entry is a string"))
+        .collect();
+    assert!(
+        global_tools.contains(&"fs_cat.sh"),
+        "sisyphus/config.yaml: global_tools must grant fs_cat.sh: {global_tools:?}"
+    );
+}
+
+/// engineer/instructions.md as a session sees it: the shell render resolves
+/// the `when:` blocks from LLM_AGENT_VAR_*, then the engine replaces each
+/// `{{name}}` with the variable's value. Returns both stages.
+fn render_engineer(vars: &[(&str, &str)]) -> (String, String) {
+    let script = format!(
+        "source '{}'; render_instructions '{}'",
+        asset(".shared/utils.sh").display(),
+        asset("engineer/instructions.md").display()
+    );
+    let mut cmd = bash();
+    cmd.arg("-c").arg(&script);
+    for name in ["project_dir", "reference_root", "chat_agent_for"] {
+        cmd.env_remove(format!("LLM_AGENT_VAR_{}", name.to_uppercase()));
+    }
+    for (name, value) in vars {
+        cmd.env(format!("LLM_AGENT_VAR_{}", name.to_uppercase()), value);
+    }
+    let (code, rendered, stderr) = run(cmd.output().expect("spawn bash"));
+    assert_eq!(code, 0, "render engineer/instructions.md: {stderr}");
+    let mut text = rendered.clone();
+    for (name, value) in vars {
+        text = text.replace(&format!("{{{{{name}}}}}"), value);
+    }
+    (rendered, text)
+}
+
+#[test]
+fn engineer_instructions_render_reference_root_project_dir_and_handoff_path() {
+    if tools_missing() {
+        return;
+    }
+    let bullet = "Cross-repo questions are first-class";
+
+    let (rendered, text) = render_engineer(&[
+        ("project_dir", "/work/repo"),
+        ("reference_root", ""),
+        ("chat_agent_for", ""),
+    ]);
+    assert!(
+        !rendered.lines().any(|l| l.contains(bullet)),
+        "an empty reference_root must drop the cross-repo bullet:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("{{reference_root}}"),
+        "an empty reference_root must leave no placeholder to substitute:\n{rendered}"
+    );
+    assert!(
+        text.contains("The primary repository for this conversation is /work/repo;"),
+        "project_dir not substituted:\n{text}"
+    );
+    assert!(
+        text.contains("plans/engineer-handoffs/<slug>.md"),
+        "standalone render must name the engineer handoff path:\n{text}"
+    );
+    assert!(
+        !text.contains("plans/handoffs/<slug>.md"),
+        "plans/handoffs/ holds phased-plan step handoffs, not engineer ones:\n{text}"
+    );
+
+    let (rendered, text) = render_engineer(&[
+        ("project_dir", "/work/repo"),
+        ("reference_root", "/srv/repos"),
+        ("chat_agent_for", ""),
+    ]);
+    assert!(
+        rendered.contains(bullet),
+        "a set reference_root must keep the cross-repo bullet:\n{rendered}"
+    );
+    assert!(
+        text.contains("sibling repos live under\n  /srv/repos"),
+        "reference_root not substituted into the bullet:\n{text}"
+    );
+}
+
 /// run_checks.py wraps each declared command in the `build_lock` prefix and
 /// records the prefix as `under`; without one (absent or empty) the record is
 /// unchanged. A failing command's exit status survives the wrapper. The
@@ -969,6 +1263,7 @@ fn adversary_run_checks_runs_declared_commands_under_build_lock() {
             .env("GRAPH_STATE_FILE", &state_file)
             .env("ADVERSARY_STACK_LOCK_PATH", dir.0.join("stack.lock"))
             .env_remove("GRAPH_STATE")
+            .env("PYTHONDONTWRITEBYTECODE", "1")
             .env("LLM_AGENT_VAR_BUILD_LOCK", "env GATE_SEEN=leaked")
             .output()
             .expect("spawn python3");
@@ -1017,6 +1312,7 @@ fn adversary_run_checks_runs_declared_commands_under_build_lock() {
         .env("GRAPH_STATE_FILE", &state_file)
         .env("ADVERSARY_STACK_LOCK_PATH", dir.0.join("stack.lock"))
         .env_remove("GRAPH_STATE")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
         .output()
         .expect("spawn python3");
     let (code, stdout, stderr) = run(out);
@@ -1064,6 +1360,7 @@ fn adversary_verdict_names_the_prefix_a_verification_run_was_under() {
         .env("GRAPH_STATE_FILE", &state_file)
         .env("ADVERSARY_STACK_LOCK_PATH", dir.0.join("stack.lock"))
         .env_remove("GRAPH_STATE")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
         .output()
         .expect("spawn python3");
     let (code, stdout, stderr) = run(out);
@@ -1085,6 +1382,1821 @@ fn adversary_verdict_names_the_prefix_a_verification_run_was_under() {
         run_line("cargo build").ends_with("0.5s"),
         "a bare record must not gain an `under` suffix: {report}"
     );
+}
+
+/// A plan with two complete tasks and one pending task; the first complete
+/// task's log holds `completed` SHAs and the ledger block `log` under its
+/// entry, the second names the plan without its `.md` (the spelling most task
+/// files in this repo use) and has no ledger lines.
+#[cfg(unix)]
+fn pr_body_fixture(label: &str, log: &str) -> TempDirGuard {
+    let dir = fixture_dir(label);
+    fs::write(
+        dir.0.join("PLAN-x.md"),
+        "---\nrigor: prototype\n---\n# Plan\n",
+    )
+    .unwrap();
+    fs::write(dir.0.join("summary.md"), "Summary prose.\n").unwrap();
+    let done = dir.0.join("tasks/TASK-1-a");
+    let pending = dir.0.join("tasks/TASK-2-b");
+    fs::create_dir_all(&done).unwrap();
+    fs::create_dir_all(&pending).unwrap();
+    fs::write(
+        done.join("index.md"),
+        "---\nplan: PLAN-x.md\nstatus: complete\ntitle: \"A\"\n---\n",
+    )
+    .unwrap();
+    fs::write(
+        done.join("log.md"),
+        format!("## 2026-10-27 - completed\nCommits abc1234, deadbee1 on feat/x.\n\n{log}"),
+    )
+    .unwrap();
+    fs::write(
+        pending.join("index.md"),
+        "---\nplan: PLAN-x.md\nstatus: pending\ntitle: \"B\"\n---\n",
+    )
+    .unwrap();
+    let bare = dir.0.join("tasks/TASK-3-c");
+    fs::create_dir_all(&bare).unwrap();
+    fs::write(
+        bare.join("index.md"),
+        "---\nplan: PLAN-x\nstatus: complete\ntitle: \"C\"\n---\n",
+    )
+    .unwrap();
+    fs::write(
+        bare.join("log.md"),
+        "## 2026-10-27 - completed\nCommit 0123abc on feat/x.\n",
+    )
+    .unwrap();
+    // A suffixed id (the split-task convention): keeps its letter in the
+    // checklist and as a `--tasks` key.
+    let suffixed = dir.0.join("tasks/TASK-4a-d");
+    fs::create_dir_all(&suffixed).unwrap();
+    fs::write(
+        suffixed.join("index.md"),
+        "---\nplan: PLAN-x.md\nstatus: complete\ntitle: \"D\"\n---\n",
+    )
+    .unwrap();
+    fs::write(
+        suffixed.join("log.md"),
+        "## 2026-10-27 - completed\nCommit 4567abc on feat/x.\n",
+    )
+    .unwrap();
+    dir
+}
+
+#[cfg(unix)]
+fn assemble_pr_body_with(
+    dir: &Path,
+    plan: &str,
+    extra_args: &[&str],
+    envs: &[(&str, &str)],
+) -> (i32, String, String) {
+    run(Command::new("python3")
+        .arg(asset("architect/assemble_pr_body.py"))
+        .arg("--plan")
+        .arg(dir.join(plan))
+        .arg("--tasks-dir")
+        .arg(dir.join("tasks"))
+        .arg("--summary-file")
+        .arg(dir.join("summary.md"))
+        .arg("--followups")
+        .args(extra_args)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .envs(envs.iter().copied())
+        .output()
+        .expect("spawn python3"))
+}
+
+#[cfg(unix)]
+fn assemble_pr_body_with_env(dir: &Path, envs: &[(&str, &str)]) -> (i32, String, String) {
+    assemble_pr_body_with(dir, "PLAN-x.md", &[], envs)
+}
+
+#[cfg(unix)]
+fn assemble_pr_body(dir: &Path) -> (i32, String, String) {
+    assemble_pr_body_with_env(dir, &[])
+}
+
+/// assemble_pr_body.py reads a tag line together with the block under it
+/// (bullets up to a blank line, heading, column-0 prose, or next entry tag),
+/// one entry per bullet with an indented wrap joined onto its bullet, and a
+/// `(deferred by quality bar)` qualifier never cuts an entry short; a wrapped
+/// prose paragraph after a mid-line tag is not a run of entries; a tag line
+/// with nothing on it or under it is a NOTE, not a silent `None.`. A task
+/// whose `plan:` omits the `.md` belongs to the plan all the same.
+#[cfg(unix)]
+#[test]
+fn assemble_pr_body_reads_ledger_blocks_whole() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = pr_body_fixture(
+        "assemble-pr-body",
+        "Follow-ups:\n\
+         - first item (deferred by quality bar)\n\
+         - second item (deferred by quality bar) and third item\n  \
+           (deferred by quality bar)\n\
+         rejected-finding: finding one - evidence src/x.rs:3\n\n\
+         Some narrative. rejected-finding: finding two - evidence src/y.rs:9\n\
+         which continues the narrative and is not a finding.\n\n",
+    );
+    let (code, stdout, stderr) = assemble_pr_body(&dir.0);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("**Quality bar:** prototype"), "{stdout}");
+    assert!(stdout.contains("## Tasks\n- [x] TASK-1 - A ("), "{stdout}");
+    assert!(
+        stdout.contains("`abc1234`") && stdout.contains("`deadbee1`"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("TASK-2"), "{stdout}");
+    assert!(
+        stdout.contains("\n- [x] TASK-3 - C (`0123abc`)"),
+        "a task whose `plan:` has no `.md` must still be listed: {stdout}"
+    );
+    assert!(!stderr.contains("checklist left empty"), "{stderr}");
+    let decisions: Vec<&str> = stdout
+        .lines()
+        .skip_while(|l| *l != "## Review decisions")
+        .skip(1)
+        .take_while(|l| !l.is_empty())
+        .collect();
+    assert_eq!(
+        decisions,
+        [
+            "- (TASK-1) finding one - evidence src/x.rs:3",
+            "- (TASK-1) finding two - evidence src/y.rs:9",
+        ],
+        "{stdout}"
+    );
+    assert!(!stdout.contains("continues the narrative"), "{stdout}");
+    let followups: Vec<&str> = stdout
+        .lines()
+        .filter(|l| l.starts_with("- [ ] (TASK-1) "))
+        .collect();
+    assert_eq!(
+        followups,
+        [
+            "- [ ] (TASK-1) first item (deferred by quality bar)",
+            "- [ ] (TASK-1) second item (deferred by quality bar) and third item (deferred by quality bar)",
+        ],
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains("NOTE") && stderr.contains("TASK-2-b (status: pending)"),
+        "{stderr}"
+    );
+
+    let dir = pr_body_fixture("assemble-pr-body-empty-tag", "Follow-ups:\n");
+    let (code, stdout, stderr) = assemble_pr_body(&dir.0);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("## Follow-up / manual actions\nNone.\n"),
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains("NOTE TASK-1: Follow-ups: tag with nothing under it"),
+        "{stderr}"
+    );
+}
+
+/// A complete task whose index.md has no `plan:` or no `status:` field is
+/// listed in the body and named in a NOTE with the missing field, the same
+/// sentence the ledger tool prints, so the leniency is visible on both
+/// consumers and neither can drift from the other.
+#[cfg(unix)]
+#[test]
+fn assemble_pr_body_lists_a_field_less_task_and_names_it() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = pr_body_fixture("assemble-pr-body-fieldless", "Follow-ups:\n- first item\n");
+    for (name, front) in [
+        ("TASK-6-f", "---\ntitle: \"F\"\n---\n"),
+        ("TASK-7-g", "---\nplan: PLAN-x.md\ntitle: \"G\"\n---\n"),
+        ("TASK-8-h", "---\nstatus: complete\ntitle: \"H\"\n---\n"),
+    ] {
+        let task = dir.0.join("tasks").join(name);
+        fs::create_dir_all(&task).unwrap();
+        fs::write(task.join("index.md"), front).unwrap();
+        fs::write(
+            task.join("log.md"),
+            "## 2026-10-27 - completed\nCommit 89abcde on feat/x.\n",
+        )
+        .unwrap();
+    }
+    let (code, stdout, stderr) = assemble_pr_body(&dir.0);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    for (name, id, title, fields) in [
+        ("TASK-6-f", "TASK-6", "F", "plan:/status:"),
+        ("TASK-7-g", "TASK-7", "G", "status:"),
+        ("TASK-8-h", "TASK-8", "H", "plan:"),
+    ] {
+        assert!(
+            stdout.contains(&format!("\n- [x] {id} - {title} (`89abcde`)")),
+            "{name}: a field-less complete task is listed: {stdout}"
+        );
+        assert!(
+            stderr.contains(&format!(
+                "assemble_pr_body: NOTE {name}: index.md has no {fields}; kept"
+            )),
+            "{name}: the missing field must be named: {stderr}"
+        );
+    }
+    assert!(
+        !stderr.contains("NOTE TASK-1-a: index.md has no"),
+        "{stderr}"
+    );
+}
+
+/// The body is UTF-8 whatever the host locale: a ledger line carrying a
+/// severity glyph reaches stdout intact under a C locale with a cp1252
+/// console codec (UTF-8 mode off) instead of raising on the write.
+#[cfg(unix)]
+#[test]
+fn assemble_pr_body_writes_utf8_whatever_the_locale() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = pr_body_fixture(
+        "assemble-pr-body-locale",
+        "rejected-finding: \u{1f7e1} finding one - evidence src/x.rs:3\n",
+    );
+    let (code, stdout, stderr) = assemble_pr_body_with_env(
+        &dir.0,
+        &[
+            ("LC_ALL", "C"),
+            ("LANG", "C"),
+            ("PYTHONIOENCODING", "cp1252"),
+            ("PYTHONUTF8", "0"),
+        ],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("- (TASK-1) \u{1f7e1} finding one - evidence src/x.rs:3"),
+        "the glyph must reach the body verbatim: {stdout}\nstderr: {stderr}"
+    );
+    assert!(!stderr.contains("Traceback"), "{stderr}");
+}
+
+/// `--tasks` scopes the body to a PR group's members: the checklist and the
+/// ledger rollups hold the listed ids alone, and a listed id that is not
+/// under the plan is a NOTE, never a silent drop.
+#[cfg(unix)]
+#[test]
+fn assemble_pr_body_tasks_filter_scopes_checklist_and_rollups_to_the_group() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = pr_body_fixture(
+        "assemble-pr-body-tasks",
+        "rejected-finding: finding one - evidence src/x.rs:3\n\
+         Follow-ups:\n\
+         - first item\n\n",
+    );
+    let (code, stdout, stderr) =
+        assemble_pr_body_with(&dir.0, "PLAN-x.md", &["--tasks", "TASK-3"], &[]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("\n- [x] TASK-3 - C (`0123abc`)"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("TASK-1") && !stdout.contains("TASK-2"),
+        "only the listed group member may appear: {stdout}"
+    );
+    assert!(
+        !stdout.contains("finding one") && !stdout.contains("first item"),
+        "an unlisted task's ledger lines must stay out of the rollups: {stdout}"
+    );
+    assert!(
+        stdout.contains("## Follow-up / manual actions\nNone.\n"),
+        "{stdout}"
+    );
+    assert!(!stderr.contains("checklist left empty"), "{stderr}");
+
+    let (code, stdout, stderr) = assemble_pr_body_with(
+        &dir.0,
+        "PLAN-x.md",
+        &["--tasks", "TASK-1,TASK-3,TASK-9"],
+        &[],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("\n- [x] TASK-1 - A ("), "{stdout}");
+    assert!(stdout.contains("\n- [x] TASK-3 - C ("), "{stdout}");
+    assert!(!stdout.contains("TASK-2"), "{stdout}");
+    assert!(
+        stdout.contains("- (TASK-1) finding one - evidence src/x.rs:3")
+            && stdout.contains("- [ ] (TASK-1) first item"),
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains("NOTE listed in --tasks but not found under the plan: TASK-9"),
+        "{stderr}"
+    );
+
+    let (code, _, stderr) = assemble_pr_body_with(&dir.0, "PLAN-x.md", &["--tasks", "TASK-2"], &[]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stderr.contains("TASK-2-b (status: pending)") && stderr.contains("checklist left empty"),
+        "a listed but incomplete member is a NOTE: {stderr}"
+    );
+
+    // The tools.sh wrapper is the model's only way in: it must forward the
+    // option, or the directive's `--tasks` never reaches the script.
+    if tools_missing() {
+        return;
+    }
+    let script = format!(
+        "source '{}'; assemble_pr_body",
+        asset("architect/tools.sh").display()
+    );
+    let (code, stdout, stderr) = run(bash()
+        .arg("-c")
+        .arg(&script)
+        .env(
+            "LLM_ROOT_DIR",
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("assets"),
+        )
+        .env("LLM_AGENT_ROOT_DIR", asset("architect"))
+        .env("LLM_OUTPUT", "/dev/stdout")
+        .env("argc_plan", dir.0.join("PLAN-x.md"))
+        .env("argc_tasks_dir", dir.0.join("tasks"))
+        .env("argc_summary_file", dir.0.join("summary.md"))
+        .env("argc_tasks", "TASK-3")
+        .output()
+        .expect("spawn bash"));
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("\n- [x] TASK-3 - C (") && !stdout.contains("TASK-1"),
+        "the wrapper must forward --tasks: {stdout}"
+    );
+}
+
+/// Plan identity strips only a trailing `.md`: a dotted slug keeps its dots,
+/// so the dotted plan owns the task whose `plan:` names it whole and not the
+/// task whose `plan:` names only the part before the dot.
+#[cfg(unix)]
+#[test]
+fn assemble_pr_body_keeps_the_dots_of_a_dotted_plan_slug() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = fixture_dir("assemble-pr-body-dotted");
+    fs::write(
+        dir.0.join("PLAN-a.b.md"),
+        "---\nrigor: production\n---\n# Plan\n",
+    )
+    .unwrap();
+    fs::write(dir.0.join("summary.md"), "Summary prose.\n").unwrap();
+    for (name, plan) in [("TASK-1-dotted", "PLAN-a.b"), ("TASK-2-prefix", "PLAN-a")] {
+        let task = dir.0.join("tasks").join(name);
+        fs::create_dir_all(&task).unwrap();
+        fs::write(
+            task.join("index.md"),
+            format!("---\nplan: {plan}\nstatus: complete\ntitle: \"{name}\"\n---\n"),
+        )
+        .unwrap();
+    }
+    let (code, stdout, stderr) = assemble_pr_body_with(&dir.0, "PLAN-a.b.md", &[], &[]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("\n- [x] TASK-1 - TASK-1-dotted ("),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("TASK-2"),
+        "a task of the prefix plan must not be mistaken for the dotted plan's: {stdout}"
+    );
+}
+
+/// A task id keeps its one-letter split suffix: it lists under that id in
+/// the checklist, sorts by number then suffix (after the bare id before it),
+/// and selects by that id through `--tasks`.
+#[cfg(unix)]
+#[test]
+fn assemble_pr_body_keeps_a_split_task_suffix() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = pr_body_fixture("assemble-pr-body-suffix", "Follow-ups:\n- first item\n");
+    let (code, stdout, stderr) = assemble_pr_body(&dir.0);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let suffixed = "\n- [x] TASK-4a - D (`4567abc`)";
+    assert!(
+        stdout.contains(suffixed),
+        "the suffixed id must list whole, with its SHA: {stdout}"
+    );
+    assert!(!stdout.contains("TASK-4 -"), "{stdout}");
+    let before = stdout.find("\n- [x] TASK-3 - C (").expect("bare id listed");
+    let after = stdout.find(suffixed).unwrap();
+    assert!(
+        before < after,
+        "the suffixed id sorts after the bare id before it: {stdout}"
+    );
+    assert!(
+        !stderr.contains("TASK-4a") && !stderr.contains("TASK-4-"),
+        "the suffixed task is complete and must not be a NOTE: {stderr}"
+    );
+
+    let (code, stdout, stderr) =
+        assemble_pr_body_with(&dir.0, "PLAN-x.md", &["--tasks", "TASK-4a"], &[]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains(suffixed), "{stdout}");
+    assert!(
+        !stdout.contains("TASK-1") && !stdout.contains("TASK-3"),
+        "`--tasks` must select by the whole suffixed id: {stdout}"
+    );
+    assert!(
+        !stdout.contains("first item"),
+        "an unlisted task's ledger lines must stay out: {stdout}"
+    );
+    assert!(
+        !stderr.contains("NOTE listed in --tasks but not found"),
+        "{stderr}"
+    );
+    let (code, _, stderr) = assemble_pr_body_with(&dir.0, "PLAN-x.md", &["--tasks", "TASK-4"], &[]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stderr.contains("NOTE listed in --tasks but not found under the plan: TASK-4"),
+        "the bare number is not the suffixed task: {stderr}"
+    );
+}
+
+/// An all-digit SHA counts when the log marks it as a commit (`@ `,
+/// `commit `, backticks), while a bare all-digit token such as a date is
+/// still not a SHA and leaves the task with the no-SHAs NOTE.
+#[cfg(unix)]
+#[test]
+fn assemble_pr_body_reads_an_all_digit_sha_only_where_marked() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = pr_body_fixture("assemble-pr-body-digit-sha", "Follow-ups:\n- first item\n");
+    for (name, title, log) in [
+        (
+            "TASK-5-e",
+            "E",
+            "## 2026-10-30 - completed\nLanded on 20261030 @ 1234567.\n",
+        ),
+        (
+            "TASK-6-f",
+            "F",
+            "## 2026-10-30 - completed\nCOMMIT 7654321 and `1111111`.\n",
+        ),
+        (
+            "TASK-7-g",
+            "G",
+            "## 2026-10-30 - completed\nLanded on 20261030.\n",
+        ),
+    ] {
+        let task = dir.0.join("tasks").join(name);
+        fs::create_dir_all(&task).unwrap();
+        fs::write(
+            task.join("index.md"),
+            format!("---\nplan: PLAN-x.md\nstatus: complete\ntitle: \"{title}\"\n---\n"),
+        )
+        .unwrap();
+        fs::write(task.join("log.md"), log).unwrap();
+    }
+    let (code, stdout, stderr) = assemble_pr_body(&dir.0);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("\n- [x] TASK-5 - E (`1234567`)\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("\n- [x] TASK-6 - F (`7654321`, `1111111`)\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("\n- [x] TASK-7 - G (commit SHAs: none recorded in log.md)\n"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("20261030"), "{stdout}");
+    assert!(
+        stderr.contains("NOTE TASK-7: no commit SHAs in the log.md `completed` entry"),
+        "{stderr}"
+    );
+}
+
+/// The architect's PR-body directive renders in both strategies; only the
+/// `multi` render adds the `--tasks` group filter, since a single-PR run
+/// wants every complete task of the plan.
+#[test]
+fn architect_pr_body_directive_names_the_tasks_filter_only_under_multi() {
+    if tools_missing() {
+        return;
+    }
+    let script = format!(
+        "source '{}'; render_instructions '{}'",
+        asset(".shared/utils.sh").display(),
+        asset("architect/instructions.md").display()
+    );
+    let directive = "Build the body with `assemble_pr_body --plan";
+    let filter = "Pass `--tasks <this group's member task ids, comma-separated>` as well";
+    for (strategy, filtered) in [("multi", true), ("single", false)] {
+        let (code, stdout, stderr) = run(bash()
+            .arg("-c")
+            .arg(&script)
+            .env("LLM_AGENT_VAR_PR_STRATEGY", strategy)
+            .output()
+            .expect("spawn bash"));
+        assert_eq!(code, 0, "render under {strategy}: {stderr}");
+        assert!(
+            stdout.contains(directive),
+            "{strategy}: missing {directive:?}"
+        );
+        assert_eq!(
+            stdout.contains(filter),
+            filtered,
+            "{strategy}: the `--tasks` sentence must render only under multi"
+        );
+        assert_eq!(stdout.contains("--tasks "), filtered, "{strategy}");
+    }
+}
+
+/// Runs `collect_ledger_lines` from the sourced tools.sh with the argc
+/// variables bound by `envs` (`argc_plan` points at the fixture's plan file
+/// unless an env overrides it).
+#[cfg(unix)]
+fn collect_ledger_lines_with(
+    dir: &Path,
+    tag: &str,
+    envs: &[(&str, &str)],
+) -> (i32, String, String) {
+    collect_ledger_lines_in(dir, tag, envs, dir)
+}
+
+/// `collect_ledger_lines_with` run from `cwd`, for the cases where a
+/// relative path the tool is handed would resolve against it.
+#[cfg(unix)]
+fn collect_ledger_lines_in(
+    dir: &Path,
+    tag: &str,
+    envs: &[(&str, &str)],
+    cwd: &Path,
+) -> (i32, String, String) {
+    let script = format!(
+        "source '{}'; collect_ledger_lines",
+        asset("architect/tools.sh").display()
+    );
+    run(bash()
+        .arg("-c")
+        .arg(&script)
+        .current_dir(cwd)
+        .env(
+            "LLM_ROOT_DIR",
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("assets"),
+        )
+        .env("LLM_AGENT_ROOT_DIR", asset("architect"))
+        .env("LLM_OUTPUT", "/dev/stdout")
+        .env("argc_dir", dir.join("tasks"))
+        .env("argc_tag", tag)
+        .env("argc_plan", dir.join("PLAN-x.md"))
+        .envs(envs.iter().copied())
+        .output()
+        .expect("spawn bash"))
+}
+
+/// collect_ledger_lines prints the block under each hit indented beneath
+/// the `<task> (log.md:NN): <line>` line, stopping at the next entry tag, so
+/// a bare `Follow-ups:` line arrives with its bullets and a wrapped bullet
+/// keeps its indented wrap line.
+#[cfg(unix)]
+#[test]
+fn collect_ledger_lines_prints_the_block_under_a_hit() {
+    if tools_missing() {
+        return;
+    }
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = pr_body_fixture(
+        "collect-ledger-lines",
+        "Follow-ups:\n\
+         - first item (deferred by quality bar)\n\
+         - second item\n  \
+           that wraps\n\
+         rejected-finding: finding one - evidence src/x.rs:3\n",
+    );
+    let (code, stdout, stderr) = collect_ledger_lines_with(&dir.0, "Follow-ups:", &[]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        stdout,
+        [
+            "TASK-1-a (log.md:4): Follow-ups:",
+            "  - first item (deferred by quality bar)",
+            "  - second item",
+            "    that wraps",
+            "",
+        ]
+        .join("\n")
+    );
+}
+
+/// A tasks tree shared by two plans: one plan owns a complete task, a
+/// pending task and a complete task whose `plan:` has no `.md`; the other
+/// plan owns a complete task. Every log carries the same tag line.
+#[cfg(unix)]
+fn shared_tasks_fixture(label: &str) -> TempDirGuard {
+    let dir = fixture_dir(label);
+    fs::write(
+        dir.0.join("PLAN-x.md"),
+        "---\nrigor: production\n---\n# Plan\n",
+    )
+    .unwrap();
+    for (name, plan, status, file) in [
+        ("TASK-1-a", "PLAN-x.md", "complete", "src/a.rs:1"),
+        ("TASK-2-b", "PLAN-x.md", "pending", "src/b.rs:2"),
+        ("TASK-3-c", "PLAN-x", "complete", "src/c.rs:3"),
+        ("TASK-5-e", "PLAN-y.md", "complete", "src/e.rs:5"),
+    ] {
+        let task = dir.0.join("tasks").join(name);
+        fs::create_dir_all(&task).unwrap();
+        fs::write(
+            task.join("index.md"),
+            format!("---\nplan: {plan}\nstatus: {status}\ntitle: \"{name}\"\n---\n"),
+        )
+        .unwrap();
+        fs::write(
+            task.join("log.md"),
+            format!("## 2026-10-27 - completed\nCommit 0123abc on feat/x.\ndebris-exempt: {file} -- {name}\n"),
+        )
+        .unwrap();
+    }
+    dir
+}
+
+/// `--plan` keeps the read to the named plan's `status: complete` tasks: the
+/// other plan's task and the pending task stay out, and a `plan:` written
+/// without `.md` still matches. `--tasks` narrows the read to the listed
+/// ids, and a listed id with no task under the plan is a NOTE in the tool
+/// output, never a silent drop.
+#[cfg(unix)]
+#[test]
+fn collect_ledger_lines_reads_only_the_plans_complete_tasks() {
+    if tools_missing() {
+        return;
+    }
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = shared_tasks_fixture("collect-ledger-plan");
+    let (code, stdout, stderr) = collect_ledger_lines_with(&dir.0, "debris-exempt", &[]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        stdout,
+        [
+            "TASK-1-a (log.md:3): debris-exempt: src/a.rs:1 -- TASK-1-a",
+            "TASK-3-c (log.md:3): debris-exempt: src/c.rs:3 -- TASK-3-c",
+            "",
+        ]
+        .join("\n"),
+        "only the named plan's complete tasks may be read"
+    );
+
+    let (code, stdout, stderr) =
+        collect_ledger_lines_with(&dir.0, "debris-exempt", &[("argc_tasks", "TASK-3")]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        stdout, "TASK-3-c (log.md:3): debris-exempt: src/c.rs:3 -- TASK-3-c\n",
+        "`--tasks` must keep the listed member alone"
+    );
+
+    let (code, stdout, stderr) =
+        collect_ledger_lines_with(&dir.0, "debris-exempt", &[("argc_tasks", "TASK-3,TASK-9")]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("plan_tasks: NOTE listed in --tasks but not found under the plan: TASK-9"),
+        "the unknown member must reach the tool output as a NOTE: {stdout}"
+    );
+    assert!(
+        stdout.contains("TASK-3-c (log.md:3): debris-exempt: src/c.rs:3 -- TASK-3-c")
+            && !stdout.contains("TASK-1-a")
+            && !stdout.contains("NOTE listed in --tasks but not found under the plan: TASK-9 ("),
+        "the NOTE is its own line, never read as a task dir: {stdout}"
+    );
+
+    let (code, stdout, stderr) =
+        collect_ledger_lines_with(&dir.0, "debris-exempt", &[("argc_tasks", "TASK-9")]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("NOTE listed in --tasks but not found under the plan: TASK-9")
+            && stdout.ends_with("(none)\n"),
+        "{stdout}"
+    );
+}
+
+#[cfg(unix)]
+fn copy_tree(src: &Path, dst: &Path) {
+    fs::create_dir_all(dst).unwrap();
+    for entry in fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let target = dst.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+/// `agent`'s tools.sh as the engine builds it: a copy of the agent under a
+/// scratch config dir, rebuilt in place by `coyote --agent <agent>
+/// --build-tools`. A raw `argc::build` would skip the engine's post-build
+/// rewrites, which the tool needs to run under the bash 3.2 macOS ships.
+#[cfg(unix)]
+fn engine_built_tool(dir: &Path, agent: &str) -> PathBuf {
+    let config = dir.join("config");
+    for name in [".shared", agent] {
+        copy_tree(&asset(name), &config.join("agents").join(name));
+    }
+    let vault_pass = dir.join("vault-pass");
+    fs::write(&vault_pass, "test-password\n").unwrap();
+    fs::write(
+        config.join("config.yaml"),
+        format!(
+            "model: dryrun:dry-model\ndry_run: true\nvault_password_file: '{}'\nclients:\n  - type: openai\n    name: dryrun\n    auth: none\n    api_key: 'unused'\n    models:\n      - name: dry-model\n        max_input_tokens: 100000\n        supports_function_calling: true\nsave: false\nmemory: false\nstream: false\n",
+            vault_pass.display()
+        ),
+    )
+    .unwrap();
+    // CI hosts lack the `uvx` launcher the bundled `mcp.json` names, and the
+    // engine never installs over an existing one.
+    fs::write(config.join("mcp.json"), "{\"mcpServers\": {}}\n").unwrap();
+    let home = dir.join("home");
+    fs::create_dir_all(&home).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_coyote"))
+        .args(["--agent", agent, "--build-tools"])
+        .current_dir(dir)
+        .env("COYOTE_CONFIG_DIR", &config)
+        .env("COYOTE_CACHE_DIR", dir.join("cache"))
+        .env("HOME", &home)
+        .env("NO_COLOR", "1")
+        .env_remove("COYOTE_LOG_PATH")
+        .env_remove("COYOTE_WORKSPACE_CONFIG_DIR")
+        .env_remove("COYOTE_PROVIDER")
+        .env_remove("COYOTE_PLATFORM")
+        .env_remove("IS_SANDBOX")
+        .env_remove("GRAPH_STATE")
+        .env_remove("GRAPH_STATE_FILE")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("spawn coyote --build-tools");
+    let (code, stdout, stderr) = run(output);
+    assert_eq!(code, 0, "--build-tools failed: {stdout}\n{stderr}");
+    config.join("agents").join(agent).join("tools.sh")
+}
+
+/// Through the engine-built argc tool, `--plan` is required: a call without
+/// it is a usage error (non-zero, no `(none)`, the option named), and a call
+/// with it plus `--tasks` reaches the same scoped read the sourced function
+/// gave.
+#[cfg(unix)]
+#[test]
+fn collect_ledger_lines_refuses_a_call_without_a_plan() {
+    if tools_missing() {
+        return;
+    }
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = shared_tasks_fixture("collect-ledger-argc");
+    let tool = engine_built_tool(&dir.0, "architect");
+    let run_tool = |args: &[&str]| {
+        run(bash()
+            .arg(&tool)
+            .arg("collect_ledger_lines")
+            .args(args)
+            .env(
+                "LLM_ROOT_DIR",
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("assets"),
+            )
+            .env("LLM_AGENT_ROOT_DIR", asset("architect"))
+            .env("LLM_OUTPUT", "/dev/stdout")
+            .output()
+            .expect("spawn bash"))
+    };
+    let tasks = dir.0.join("tasks");
+    let tasks = tasks.to_str().unwrap();
+    let plan = dir.0.join("PLAN-x.md");
+    let plan = plan.to_str().unwrap();
+
+    let (code, stdout, stderr) = run_tool(&["--tag", "debris-exempt", "--dir", tasks]);
+    assert_ne!(code, 0, "a call without --plan must fail: {stdout}");
+    assert!(
+        stderr.contains("--plan"),
+        "the usage error must name the missing option: {stderr}"
+    );
+    assert!(
+        !stdout.contains("(none)") && !stdout.contains("debris-exempt:"),
+        "nothing may be read without a plan: {stdout}"
+    );
+
+    let (code, stdout, stderr) = run_tool(&[
+        "--tag",
+        "debris-exempt",
+        "--plan",
+        plan,
+        "--dir",
+        tasks,
+        "--tasks",
+        "TASK-3",
+    ]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        stdout, "TASK-3-c (log.md:3): debris-exempt: src/c.rs:3 -- TASK-3-c\n",
+        "the argc options must reach the function"
+    );
+}
+
+/// A `--plan` that names no file is an error, not an empty read: the tool
+/// returns non-zero, prints no `(none)`, and the output names the path.
+#[cfg(unix)]
+#[test]
+fn collect_ledger_lines_refuses_a_missing_plan_file() {
+    if tools_missing() {
+        return;
+    }
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = shared_tasks_fixture("collect-ledger-no-plan-file");
+    let missing = dir.0.join("PLAN-missing.md");
+    let (code, stdout, stderr) = collect_ledger_lines_with(
+        &dir.0,
+        "debris-exempt",
+        &[("argc_plan", missing.to_str().unwrap())],
+    );
+    assert_ne!(code, 0, "a missing plan file must fail: {stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "plan_tasks: plan not found: {}",
+            missing.display()
+        )) && stdout.contains("could not list the plan's tasks"),
+        "the output must name the plan path: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("(none)") && !stdout.contains("debris-exempt:"),
+        "a false clean is the failure this guards: {stdout}"
+    );
+}
+
+/// A task whose index.md has no `plan:` or no `status:` field is still read
+/// (the field cannot exclude it), and the tool says so with a NOTE naming the
+/// dir and the missing field, so the leniency is never silent.
+#[cfg(unix)]
+#[test]
+fn collect_ledger_lines_names_a_task_without_plan_or_status_fields() {
+    if tools_missing() {
+        return;
+    }
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = shared_tasks_fixture("collect-ledger-fieldless");
+    for (name, front) in [
+        ("TASK-6-f", "---\ntitle: \"F\"\n---\n"),
+        ("TASK-7-g", "---\nplan: PLAN-x.md\ntitle: \"G\"\n---\n"),
+        ("TASK-8-h", "---\nstatus: complete\ntitle: \"H\"\n---\n"),
+    ] {
+        let task = dir.0.join("tasks").join(name);
+        fs::create_dir_all(&task).unwrap();
+        fs::write(task.join("index.md"), front).unwrap();
+        fs::write(
+            task.join("log.md"),
+            format!("debris-exempt: src/z.rs:1 -- {name}\n"),
+        )
+        .unwrap();
+    }
+    let (code, stdout, stderr) = collect_ledger_lines_with(&dir.0, "debris-exempt", &[]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    for (name, fields) in [
+        ("TASK-6-f", "plan:/status:"),
+        ("TASK-7-g", "status:"),
+        ("TASK-8-h", "plan:"),
+    ] {
+        assert!(
+            stdout.contains(&format!(
+                "plan_tasks: NOTE {name}: index.md has no {fields}; kept"
+            )),
+            "{name}: the missing field must be named: {stdout}"
+        );
+        assert!(
+            stdout.contains(&format!(
+                "{name} (log.md:1): debris-exempt: src/z.rs:1 -- {name}"
+            )),
+            "{name}: a field-less task is kept and read: {stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("NOTE TASK-1-a") && !stdout.contains("NOTE TASK-3-c"),
+        "a task with both fields earns no NOTE: {stdout}"
+    );
+}
+
+/// A task whose index.md exists but cannot be read is skipped with a NOTE
+/// naming the dir, its log.md stays unread, and the other tasks still list.
+/// Its plan is unknown, so a `--tasks` listing of its id also reports the id
+/// as not found under the plan. Skipped where mode bits do not bind (root,
+/// or a filesystem that ignores them), since the unreadable state cannot be
+/// produced there.
+#[cfg(unix)]
+#[test]
+fn collect_ledger_lines_names_an_unreadable_index_and_skips_the_task() {
+    use std::os::unix::fs::PermissionsExt;
+    if tools_missing() {
+        return;
+    }
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = shared_tasks_fixture("collect-ledger-unreadable-index");
+    let task = dir.0.join("tasks/TASK-6-u");
+    fs::create_dir_all(&task).unwrap();
+    let index = task.join("index.md");
+    fs::write(&index, "---\nplan: PLAN-x.md\nstatus: complete\n---\n").unwrap();
+    fs::write(
+        task.join("log.md"),
+        "debris-exempt: src/u.rs:6 -- UNREAD-SENTINEL\n",
+    )
+    .unwrap();
+    fs::set_permissions(&index, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&index).is_ok() {
+        eprintln!("skipping: mode bits do not bind here (root or a permissive filesystem)");
+        fs::set_permissions(&index, fs::Permissions::from_mode(0o644)).unwrap();
+        return;
+    }
+    let (code, stdout, stderr) = collect_ledger_lines_with(&dir.0, "debris-exempt", &[]);
+    let (listed_code, _, listed_stderr) = plan_tasks(&dir.0, &["--tasks", "TASK-6"]);
+    fs::set_permissions(&index, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("plan_tasks: NOTE TASK-6-u: index.md unreadable (plan unknown); skipped"),
+        "the unreadable task must be named: {stdout}"
+    );
+    assert_eq!(listed_code, 0, "{listed_stderr}");
+    assert!(
+        listed_stderr.contains("NOTE listed in --tasks but not found under the plan: TASK-6"),
+        "an unreadable index.md must not count as found under the plan: {listed_stderr}"
+    );
+    assert!(
+        !stdout.contains("UNREAD-SENTINEL"),
+        "a task whose index.md cannot be read must not be read at all: {stdout}"
+    );
+    assert_eq!(
+        stdout
+            .lines()
+            .filter(|l| l.contains("(log.md:"))
+            .collect::<Vec<_>>(),
+        [
+            "TASK-1-a (log.md:3): debris-exempt: src/a.rs:1 -- TASK-1-a",
+            "TASK-3-c (log.md:3): debris-exempt: src/c.rs:3 -- TASK-3-c",
+        ],
+        "the readable tasks still list: {stdout}"
+    );
+}
+
+/// A task dir whose NAME holds a newline followed by `..` stays one path:
+/// its own log.md hit is listed under that name escaped to one line, and the
+/// `..` tail is never read as a second search root, so a log.md in the
+/// caller's parent dir never reaches the output.
+#[cfg(unix)]
+#[test]
+fn collect_ledger_lines_keeps_a_newline_named_task_dir_as_one_path() {
+    if tools_missing() {
+        return;
+    }
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = shared_tasks_fixture("collect-ledger-newline-dir");
+    let hostile = dir.0.join("tasks").join("TASK-9-z\n..");
+    fs::create_dir_all(&hostile).unwrap();
+    fs::write(
+        hostile.join("index.md"),
+        "---\nplan: PLAN-x.md\nstatus: complete\ntitle: \"Z\"\n---\n",
+    )
+    .unwrap();
+    fs::write(
+        hostile.join("log.md"),
+        "debris-exempt: src/h.rs:9 -- hostile\n",
+    )
+    .unwrap();
+    // The caller's cwd is a child of the fixture, so a stray `..` search root
+    // would be the fixture dir itself, where this sentinel waits.
+    let cwd = dir.0.join("cwd");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::write(
+        dir.0.join("log.md"),
+        "debris-exempt: SENTINEL-OUTSIDE-THE-TASKS-TREE\n",
+    )
+    .unwrap();
+    let (code, stdout, stderr) = collect_ledger_lines_in(&dir.0, "debris-exempt", &[], &cwd);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        !stdout.contains("SENTINEL-OUTSIDE-THE-TASKS-TREE"),
+        "a dir name must never widen the search past the tasks tree: {stdout}"
+    );
+    assert!(
+        stdout.contains("TASK-9-z\\n.. (log.md:1): debris-exempt: src/h.rs:9 -- hostile"),
+        "the odd-named task is read under its own name: {stdout}"
+    );
+    assert!(
+        stdout.contains("TASK-1-a (log.md:3): debris-exempt: src/a.rs:1 -- TASK-1-a"),
+        "{stdout}"
+    );
+}
+
+/// A carriage return or an ESC in a task dir name is escaped in the hit
+/// label, so a hit line can neither overwrite itself on a terminal nor
+/// carry a raw control sequence.
+#[cfg(unix)]
+#[test]
+fn collect_ledger_lines_escapes_control_characters_in_a_task_label() {
+    if tools_missing() {
+        return;
+    }
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = shared_tasks_fixture("collect-ledger-control-label");
+    for (name, file) in [
+        ("TASK-7-r\rx", "src/r.rs:7"),
+        ("TASK-8-e\u{1b}y", "src/e.rs:8"),
+    ] {
+        let task = dir.0.join("tasks").join(name);
+        fs::create_dir_all(&task).unwrap();
+        fs::write(
+            task.join("index.md"),
+            "---\nplan: PLAN-x.md\nstatus: complete\n---\n",
+        )
+        .unwrap();
+        fs::write(
+            task.join("log.md"),
+            format!("debris-exempt: {file} -- odd\n"),
+        )
+        .unwrap();
+    }
+    let (code, stdout, stderr) = collect_ledger_lines_with(&dir.0, "debris-exempt", &[]);
+    assert_eq!(code, 0, "stdout: {stdout:?}\nstderr: {stderr}");
+    for line in [
+        "TASK-7-r\\rx (log.md:1): debris-exempt: src/r.rs:7 -- odd",
+        "TASK-8-e\\x1by (log.md:1): debris-exempt: src/e.rs:8 -- odd",
+    ] {
+        assert!(stdout.contains(line), "missing {line:?} in {stdout:?}");
+    }
+    assert!(
+        !stdout.contains('\r') && !stdout.contains('\u{1b}'),
+        "{stdout:?}"
+    );
+}
+
+/// Each listed task's own log.md is the one read: a pending task nested
+/// under a complete one stays unread (its dir is a task of its own, not part
+/// of its parent's), and a log.md that is a symlink is read the way
+/// assemble_pr_body reads it.
+#[cfg(unix)]
+#[test]
+fn collect_ledger_lines_reads_only_each_listed_tasks_own_log() {
+    if tools_missing() {
+        return;
+    }
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = shared_tasks_fixture("collect-ledger-own-log");
+    let nested = dir.0.join("tasks/TASK-1-a/TASK-4-n");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(
+        nested.join("index.md"),
+        "---\nplan: PLAN-x.md\nstatus: pending\n---\n",
+    )
+    .unwrap();
+    fs::write(
+        nested.join("log.md"),
+        "debris-exempt: NESTED-PENDING-SENTINEL\n",
+    )
+    .unwrap();
+    let linked = dir.0.join("tasks/TASK-6-s");
+    fs::create_dir_all(&linked).unwrap();
+    fs::write(
+        linked.join("index.md"),
+        "---\nplan: PLAN-x.md\nstatus: complete\n---\n",
+    )
+    .unwrap();
+    let target = dir.0.join("linked-log.md");
+    fs::write(&target, "debris-exempt: src/s.rs:6 -- linked\n").unwrap();
+    std::os::unix::fs::symlink(&target, linked.join("log.md")).unwrap();
+
+    let (code, stdout, stderr) = collect_ledger_lines_with(&dir.0, "debris-exempt", &[]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        stdout,
+        [
+            "TASK-1-a (log.md:3): debris-exempt: src/a.rs:1 -- TASK-1-a",
+            "TASK-3-c (log.md:3): debris-exempt: src/c.rs:3 -- TASK-3-c",
+            "TASK-6-s (log.md:1): debris-exempt: src/s.rs:6 -- linked",
+            "",
+        ]
+        .join("\n"),
+        "the nested pending task must stay out and the symlinked log must be read"
+    );
+}
+
+/// A relative `--dir` shaped like an awk assignment (`a=b`) still reads each
+/// task's log: every hit prints with the block under it.
+#[cfg(unix)]
+#[test]
+fn collect_ledger_lines_reads_logs_under_an_assignment_shaped_dir() {
+    if tools_missing() {
+        return;
+    }
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = fixture_dir("collect-ledger-assignment-dir");
+    fs::write(dir.0.join("PLAN-x.md"), "# Plan\n").unwrap();
+    for (name, item) in [("TASK-1-a", "one"), ("TASK-2-b", "two")] {
+        let task = dir.0.join("a=b").join(name);
+        fs::create_dir_all(&task).unwrap();
+        fs::write(
+            task.join("index.md"),
+            "---\nplan: PLAN-x.md\nstatus: complete\n---\n",
+        )
+        .unwrap();
+        fs::write(task.join("log.md"), format!("Follow-ups:\n- item {item}\n")).unwrap();
+    }
+    let (code, stdout, stderr) =
+        collect_ledger_lines_in(&dir.0, "Follow-ups:", &[("argc_dir", "a=b")], &dir.0);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        stdout,
+        [
+            "TASK-1-a (log.md:1): Follow-ups:",
+            "  - item one",
+            "TASK-2-b (log.md:1): Follow-ups:",
+            "  - item two",
+            "",
+        ]
+        .join("\n")
+    );
+}
+
+/// A failed mktemp is named in the tool output with the temp dir in play,
+/// and nothing is read; a run that succeeds leaves no temp file behind.
+#[cfg(unix)]
+#[test]
+fn collect_ledger_lines_names_a_failed_mktemp_and_leaves_no_temp_file() {
+    use std::os::unix::fs::PermissionsExt;
+    if tools_missing() {
+        return;
+    }
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = shared_tasks_fixture("collect-ledger-mktemp");
+    let tmp = dir.0.join("private-tmp");
+    fs::create_dir_all(&tmp).unwrap();
+    let tmp = tmp.to_str().unwrap();
+
+    let (code, stdout, stderr) =
+        collect_ledger_lines_with(&dir.0, "debris-exempt", &[("TMPDIR", tmp)]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("TASK-1-a (log.md:3)"), "{stdout}");
+    assert_eq!(
+        entries_in(Path::new(tmp)),
+        Vec::<String>::new(),
+        "the listing must be removed when the tool exits"
+    );
+
+    let bin = dir.0.join("mktemp-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let shim = bin.join("mktemp");
+    fs::write(
+        &shim,
+        "#!/bin/sh\necho 'mktemp: no temp files today' >&2\nexit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), env::var("PATH").unwrap_or_default());
+    let (code, stdout, stderr) = collect_ledger_lines_with(
+        &dir.0,
+        "debris-exempt",
+        &[("PATH", path.as_str()), ("TMPDIR", tmp)],
+    );
+    assert_eq!(code, 1, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        stdout,
+        format!("collect_ledger_lines: could not create a temp file under {tmp}\n"),
+        "stderr: {stderr}"
+    );
+}
+
+/// The built tool's python calls write no `__pycache__` into the installed
+/// agent dir, even with PYTHONDONTWRITEBYTECODE unset: assemble_pr_body.py
+/// imports plan_tasks, which would otherwise be compiled there.
+#[cfg(unix)]
+#[test]
+fn architect_tools_write_no_bytecode_into_the_agent_dir() {
+    if tools_missing() {
+        return;
+    }
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = pr_body_fixture("architect-no-bytecode", "Follow-ups:\n- first item\n");
+    let tool = engine_built_tool(&dir.0, "architect");
+    let agent = tool.parent().unwrap().to_path_buf();
+    let pycache = agent.join("__pycache__");
+    let _ = fs::remove_dir_all(&pycache);
+    let plan = dir.0.join("PLAN-x.md");
+    let plan = plan.to_str().unwrap();
+    let tasks = dir.0.join("tasks");
+    let tasks = tasks.to_str().unwrap();
+    let summary = dir.0.join("summary.md");
+    let summary = summary.to_str().unwrap();
+    for (args, expected) in [
+        (
+            [
+                "assemble_pr_body",
+                "--plan",
+                plan,
+                "--tasks-dir",
+                tasks,
+                "--summary-file",
+                summary,
+            ],
+            "## Tasks",
+        ),
+        (
+            [
+                "collect_ledger_lines",
+                "--tag",
+                "Follow-ups:",
+                "--plan",
+                plan,
+                "--dir",
+                tasks,
+            ],
+            "TASK-1-a (log.md:4): Follow-ups:",
+        ),
+    ] {
+        let (code, stdout, stderr) = run(bash()
+            .arg(&tool)
+            .args(args)
+            .env("LLM_ROOT_DIR", dir.0.join("config"))
+            .env("LLM_AGENT_ROOT_DIR", &agent)
+            .env("LLM_OUTPUT", "/dev/stdout")
+            .env_remove("PYTHONDONTWRITEBYTECODE")
+            .env_remove("PYTHONPYCACHEPREFIX")
+            .output()
+            .expect("spawn bash"));
+        assert_eq!(code, 0, "{}: stdout: {stdout}\nstderr: {stderr}", args[0]);
+        assert!(stdout.contains(expected), "{}: {stdout}", args[0]);
+        assert!(
+            !pycache.exists(),
+            "{} left {} behind",
+            args[0],
+            pycache.display()
+        );
+    }
+}
+
+/// A scratch repo with one empty commit, plus that commit's sha.
+#[cfg(unix)]
+fn debt_scan_repo(dir: &Path) -> (PathBuf, String) {
+    let repo = dir.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("spawn git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    git(&["init", "-q"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "base"]);
+    let base = git(&["rev-parse", "HEAD"]);
+    (repo, base)
+}
+
+/// Runs the engine-built sisyphus `debt_scan` tool with `args`. The tool
+/// sources LLM_PROMPT_UTILS_FILE, which the engine sets; debt_scan uses none
+/// of its helpers, so an empty stub keeps the run independent of the host's
+/// file and of `tput` and TERM.
+#[cfg(unix)]
+fn sisyphus_debt_scan(
+    dir: &Path,
+    tool: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> (i32, String, String) {
+    let prompt_utils = dir.join("prompt-utils.sh");
+    fs::write(&prompt_utils, "").unwrap();
+    let mut cmd = bash();
+    cmd.arg(tool)
+        .arg("debt_scan")
+        .args(args)
+        .env("LLM_ROOT_DIR", dir.join("config"))
+        .env("LLM_AGENT_ROOT_DIR", tool.parent().unwrap())
+        .env("LLM_PROMPT_UTILS_FILE", &prompt_utils)
+        .env("LLM_OUTPUT", "/dev/stdout")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GRAPH_STATE")
+        .env_remove("GRAPH_STATE_FILE");
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    run(cmd.output().expect("spawn bash"))
+}
+
+/// A graph state inherited from the calling node does not switch the tool
+/// into the scanner's graph mode: the caller gets the plain report for the
+/// repo it named, not a JSON envelope for the state's project_dir.
+#[cfg(unix)]
+#[test]
+fn sisyphus_debt_scan_tool_prints_the_plain_report_under_a_graph_state() {
+    if tools_missing() {
+        return;
+    }
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = fixture_dir("sisyphus-debt-scan-state");
+    let tool = engine_built_tool(&dir.0, "sisyphus");
+    let (repo, base) = debt_scan_repo(&dir.0);
+    fs::create_dir_all(repo.join("src")).unwrap();
+    fs::write(repo.join("src/x.rs"), "#[allow(dead_code)] fn x() {}\n").unwrap();
+    let (code, stdout, stderr) = sisyphus_debt_scan(
+        &dir.0,
+        &tool,
+        &["--base", &base, "--dir", repo.to_str().unwrap()],
+        &[("GRAPH_STATE", r#"{"project_dir":"/nonexistent"}"#)],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l == "src/x.rs:1 -- #[allow(dead_code)] fn x() {}"),
+        "{stdout}"
+    );
+    assert!(
+        serde_json::from_str::<Value>(&stdout).is_err(),
+        "the tool must not print the graph-mode JSON: {stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sisyphus_debt_scan_tool_requires_a_base() {
+    if tools_missing() {
+        return;
+    }
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = fixture_dir("sisyphus-debt-scan-no-base");
+    let tool = engine_built_tool(&dir.0, "sisyphus");
+    let (repo, _) = debt_scan_repo(&dir.0);
+    let (code, stdout, stderr) =
+        sisyphus_debt_scan(&dir.0, &tool, &["--dir", repo.to_str().unwrap()], &[]);
+    assert_ne!(code, 0, "a call without --base must fail: {stdout}");
+    assert!(stderr.contains("--base"), "{stderr}");
+}
+
+/// Without python3 on PATH the tool still answers, exit 0, with the
+/// DEBT_SCAN_FAILED report and the manual pipeline to run instead.
+#[cfg(unix)]
+#[test]
+fn sisyphus_debt_scan_tool_without_python3_reports_the_manual_pipeline() {
+    if tools_missing() {
+        return;
+    }
+    let dir = fixture_dir("sisyphus-debt-scan-no-python");
+    let tool = engine_built_tool(&dir.0, "sisyphus");
+    let (repo, base) = debt_scan_repo(&dir.0);
+    let bin = dir.0.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    for name in ["basename", "bash", "cat", "env"] {
+        let target = which::which(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+        std::os::unix::fs::symlink(target, bin.join(name)).unwrap();
+    }
+    let (code, stdout, stderr) = sisyphus_debt_scan(
+        &dir.0,
+        &tool,
+        &["--base", &base, "--dir", repo.to_str().unwrap()],
+        &[("PATH", bin.to_str().unwrap())],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.starts_with("DEBT_SCAN_FAILED: python3 is not on PATH"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("git ls-files --others --exclude-standard -z"),
+        "{stdout}"
+    );
+}
+
+/// tenancy_signal() flags ownership-shaped text, yet classify() keeps it out
+/// of the gauntlet's signal set, and the comment saying nothing calls it yet
+/// stays beside the regex.
+#[test]
+fn diff_signals_classify_leaves_the_tenancy_signal_out() {
+    let source = fs::read_to_string(asset(".shared/diff_signals.py")).unwrap();
+    let no_caller = "nothing calls tenancy_signal yet: it is kept here, shared-only,\n# ahead of the watch-round";
+    assert!(
+        source.replace("\r\n", "\n").contains(no_caller),
+        "diff_signals.py: missing {no_caller:?}"
+    );
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let added = "+ if row.org_id != caller.org_id: deny()";
+    let program = "import json, sys; sys.path.insert(0, sys.argv[1]); import diff_signals as d; \
+                   print(json.dumps({'classify': d.classify(['src/a.rs'], sys.argv[2]), \
+                   'tenancy': d.tenancy_signal(sys.argv[2])}))";
+    let (code, stdout, stderr) = run(Command::new("python3")
+        .arg("-B")
+        .arg("-c")
+        .arg(program)
+        .arg(asset(".shared"))
+        .arg(added)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("spawn python3"));
+    assert_eq!(code, 0, "{stderr}");
+    let out: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+    assert_eq!(out["tenancy"], Value::Bool(true), "{stdout}");
+    let signals = out["classify"]
+        .as_object()
+        .expect("classify returns a dict");
+    for key in signals.keys() {
+        let lower = key.to_lowercase();
+        assert!(
+            !lower.contains("tenan") && !lower.contains("owner"),
+            "classify() must not carry a tenancy signal: {key}"
+        );
+    }
+}
+
+fn parse_findings(findings: &Value) -> Value {
+    let prompt = format!(
+        "Verify these code-review findings against the working tree.\n\nProject: /tmp/p\n\nFindings (JSON):\n{findings}"
+    );
+    let output = Command::new("python3")
+        .arg(asset("finding-verifier/scripts/parse_findings.py"))
+        .env(
+            "GRAPH_STATE",
+            serde_json::json!({ "initial_prompt": prompt }).to_string(),
+        )
+        .env_remove("GRAPH_STATE_FILE")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("spawn python3");
+    let (code, stdout, stderr) = run(output);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("invalid JSON ({e}): {stdout}\nstderr: {stderr}"))
+}
+
+fn finding(id: &str, severity: &str) -> Value {
+    serde_json::json!({
+        "id": id, "severity": severity, "marker": "", "file": "src/a.rs",
+        "lines": "1", "title": "t", "block": "b",
+    })
+}
+
+/// NIT and SUGGESTION are whole words: a severity that merely contains the
+/// letters (UNIT, INITIAL, MONITOR) is unclassifiable and goes to the LLM
+/// parse instead of being skipped unverified.
+#[test]
+fn parse_findings_skips_only_whole_word_nits_and_suggestions() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    for severity in ["UNIT-level", "INITIAL", "MONITOR", "SANITIZE"] {
+        let out = parse_findings(&serde_json::json!([finding("f1", severity)]));
+        assert_eq!(str_field(&out, "_next"), "parse", "{severity}: {out}");
+        assert!(
+            str_field(&out, "parse_script_note").contains("unclassifiable"),
+            "{severity}: {out}"
+        );
+    }
+    for severity in ["NIT", "nitpick", "Nit: rename", "SUGGESTION"] {
+        let out = parse_findings(&serde_json::json!([finding("f1", severity)]));
+        assert_eq!(str_field(&out, "_next"), "verify_each", "{severity}: {out}");
+        assert_eq!(out["findings_list"], serde_json::json!([]), "{severity}");
+    }
+}
+
+/// An empty id is never invented: the parse falls back, naming the finding
+/// by its position in the array, skipped findings included.
+#[test]
+fn parse_findings_falls_back_on_an_empty_id() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    for id in ["", "  "] {
+        let out = parse_findings(&serde_json::json!([
+            finding("f1", "NIT"),
+            finding(id, "CRITICAL"),
+        ]));
+        assert_eq!(str_field(&out, "_next"), "parse", "{id:?}: {out}");
+        assert_eq!(
+            str_field(&out, "parse_script_note"),
+            "finding #1 has no id",
+            "{id:?}"
+        );
+    }
+}
+
+/// The parsed debt_hits default, as the sweep prompt renders it when the
+/// debt_scan node never ran: the YAML `''` escape decodes to the single
+/// quotes the manual grep needs.
+#[test]
+fn step_runner_debt_hits_default_parses_to_the_manual_fallback() {
+    let doc: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(asset("step-runner/graph.yaml")).unwrap())
+            .unwrap();
+    let hits = doc["initial_state"]["debt_hits"]
+        .as_str()
+        .expect("initial_state.debt_hits is a string");
+    assert!(
+        hits.starts_with("DEBT_SCAN_FAILED: the debt_scan node did not run."),
+        "{hits}"
+    );
+    let grep = r"grep -nE '^\+.*(#!?\[(allow|expect)\(|cfg_attr\(|todo!|unimplemented!|#\[ignore)'";
+    assert_eq!(hits.matches(grep).count(), 1, "{hits}");
+    assert!(hits.contains("fs_grep tool"), "{hits}");
+}
+
+/// plan_tasks.py run directly over `dir/tasks` for the fixture plan file in `dir`.
+#[cfg(unix)]
+fn plan_tasks(dir: &Path, extra_args: &[&str]) -> (i32, String, String) {
+    run(Command::new("python3")
+        .arg(asset("architect/plan_tasks.py"))
+        .arg("--plan")
+        .arg(dir.join("PLAN-x.md"))
+        .arg("--tasks-dir")
+        .arg(dir.join("tasks"))
+        .args(extra_args)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("spawn python3"))
+}
+
+/// A carriage return or an ESC in a task dir name, or in a `--tasks` id, is
+/// escaped in the NOTE, so a NOTE line can neither overwrite itself on a
+/// terminal nor carry a raw control sequence.
+#[cfg(unix)]
+#[test]
+fn plan_tasks_escapes_control_characters_in_notes() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = shared_tasks_fixture("plan-tasks-control-chars");
+    for name in ["TASK-7-r\rx", "TASK-8-e\u{1b}y"] {
+        let task = dir.0.join("tasks").join(name);
+        fs::create_dir_all(&task).unwrap();
+        fs::write(task.join("index.md"), "---\nplan: PLAN-x.md\n---\n").unwrap();
+    }
+    let (code, _, stderr) = plan_tasks(&dir.0, &["--tasks", "TASK-7,TASK-8,TASK-9\u{1b}[2J"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stderr.contains("plan_tasks: NOTE TASK-7-r\\rx: index.md has no status:; kept"),
+        "{stderr:?}"
+    );
+    assert!(
+        stderr.contains("plan_tasks: NOTE TASK-8-e\\x1by: index.md has no status:; kept"),
+        "{stderr:?}"
+    );
+    assert!(
+        stderr.contains("NOTE listed in --tasks but not found under the plan: TASK-9\\x1b[2J"),
+        "{stderr:?}"
+    );
+    assert!(
+        !stderr.contains('\r') && !stderr.contains('\u{1b}'),
+        "{stderr:?}"
+    );
+}
+
+/// A dir name counts as a task dir only when the id ends at a `-` or at the
+/// end of the name: a `.bak` suffix or trailing letters after the id's own
+/// optional letter do not make a task dir.
+#[cfg(unix)]
+#[test]
+fn plan_tasks_lists_only_dirs_whose_name_ends_at_the_task_id() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = fixture_dir("plan-tasks-dir-boundary");
+    fs::write(dir.0.join("PLAN-x.md"), "# Plan\n").unwrap();
+    for name in ["TASK-3.bak", "TASK-3cool", "TASK-3-real"] {
+        let task = dir.0.join("tasks").join(name);
+        fs::create_dir_all(&task).unwrap();
+        fs::write(
+            task.join("index.md"),
+            "---\nplan: PLAN-x.md\nstatus: complete\n---\n",
+        )
+        .unwrap();
+    }
+    let (code, stdout, stderr) = plan_tasks(&dir.0, &[]);
+    assert_eq!(code, 0, "{stderr}");
+    let listed: Vec<&str> = stdout
+        .split('\0')
+        .filter(|d| !d.is_empty())
+        .map(|d| d.rsplit('/').next().unwrap())
+        .collect();
+    assert_eq!(listed, ["TASK-3-real"], "{stdout:?}");
+}
+
+/// A `--tasks` member that exists under the plan but is not complete is
+/// named with its status, so the ledger read never ends in a bare `(none)`
+/// without saying why; without `--tasks` the pending task stays silent.
+#[cfg(unix)]
+#[test]
+fn plan_tasks_names_a_listed_member_that_is_not_complete() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = shared_tasks_fixture("plan-tasks-pending-member");
+    let (code, stdout, stderr) = plan_tasks(&dir.0, &["--tasks", "TASK-2"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, "", "a pending member is not listed");
+    assert!(
+        stderr
+            .contains("plan_tasks: NOTE TASK-2-b: listed in --tasks but status: pending; skipped"),
+        "{stderr}"
+    );
+    let (code, _, stderr) = plan_tasks(&dir.0, &[]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(!stderr.contains("TASK-2-b"), "{stderr}");
+}
+
+/// A `--tasks` value that names no id (blank, or commas only) is a usage
+/// error in both scripts, never a silent read of every task; an absent
+/// `--tasks` still means no filter.
+#[cfg(unix)]
+#[test]
+fn plan_tasks_and_assemble_pr_body_refuse_a_tasks_value_naming_no_id() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = pr_body_fixture("plan-tasks-empty-filter", "Follow-ups:\n- first item\n");
+    for value in ["", " ", ",", " , "] {
+        let (code, stdout, stderr) = plan_tasks(&dir.0, &["--tasks", value]);
+        assert_eq!(code, 2, "plan_tasks {value:?}: {stdout:?} {stderr}");
+        assert!(stderr.contains("--tasks names no task ids"), "{stderr}");
+        assert_eq!(stdout, "", "plan_tasks {value:?}");
+        let (code, stdout, stderr) =
+            assemble_pr_body_with(&dir.0, "PLAN-x.md", &["--tasks", value], &[]);
+        assert_eq!(code, 2, "assemble_pr_body {value:?}: {stdout} {stderr}");
+        assert!(stderr.contains("--tasks names no task ids"), "{stderr}");
+        assert!(!stdout.contains("## Tasks"), "{stdout}");
+    }
+    let (code, stdout, stderr) = plan_tasks(&dir.0, &[]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("TASK-1-a"), "{stdout:?}");
+}
+
+/// Every rendered `collect_ledger_lines --tag ...` call carries `--plan`,
+/// under both PR strategies, so no instruction sends the tool at the shared
+/// tasks dir without the plan that scopes it.
+#[test]
+fn architect_ledger_calls_always_name_the_plan() {
+    if tools_missing() {
+        return;
+    }
+    let script = format!(
+        "source '{}'; render_instructions '{}'",
+        asset(".shared/utils.sh").display(),
+        asset("architect/instructions.md").display()
+    );
+    let call = "collect_ledger_lines --tag";
+    for strategy in ["multi", "single"] {
+        let (code, stdout, stderr) = run(bash()
+            .arg("-c")
+            .arg(&script)
+            .env("LLM_AGENT_VAR_PR_STRATEGY", strategy)
+            .output()
+            .expect("spawn bash"));
+        assert_eq!(code, 0, "render under {strategy}: {stderr}");
+        let calls: Vec<&str> = stdout
+            .match_indices(call)
+            .map(|(at, _)| {
+                let rest = &stdout[at..];
+                let end = rest.find('`').unwrap_or(rest.len());
+                &rest[..end]
+            })
+            .collect();
+        assert!(
+            !calls.is_empty(),
+            "{strategy}: the hygiene brief must still collect its starting ledger with the tool"
+        );
+        for text in &calls {
+            assert!(
+                text.contains("--plan ") && text.contains("--dir "),
+                "{strategy}: a ledger call without --plan reads every plan's tasks: {text:?}"
+            );
+        }
+        assert!(
+            !stdout.contains("--tag <tag> --dir"),
+            "{strategy}: the body's ledger sections come from assemble_pr_body, not a second collection step"
+        );
+        assert_eq!(
+            stdout.contains("goes on every `collect_ledger_lines` call made for this group"),
+            strategy == "multi",
+            "{strategy}: the group-member rule for ledger calls renders only under multi"
+        );
+    }
+}
+
+/// Under `task_granularity=micro` the PR-body step keeps the tool's flat
+/// checklist and APPENDS a `## Batch gauntlets` section (with each batch's
+/// `batch-closed @ <sha>`): the micro render never asks the architect to
+/// regroup the checklist the tool prints, and the step-3 "you write ONLY the
+/// summary" contract survives in both granularities.
+#[test]
+fn architect_micro_render_appends_batch_gauntlets_without_regrouping_the_checklist() {
+    if tools_missing() {
+        return;
+    }
+    let script = format!(
+        "source '{}'; render_instructions '{}'",
+        asset(".shared/utils.sh").display(),
+        asset("architect/instructions.md").display()
+    );
+    let contract = "you write ONLY the summary";
+    for (granularity, micro) in [("micro", true), ("standard", false)] {
+        let (code, stdout, stderr) = run(bash()
+            .arg("-c")
+            .arg(&script)
+            .env("LLM_AGENT_VAR_TASK_GRANULARITY", granularity)
+            .output()
+            .expect("spawn bash"));
+        assert_eq!(code, 0, "render under {granularity}: {stderr}");
+        assert!(
+            stdout.contains(contract),
+            "{granularity}: the step-3 contract must survive: missing {contract:?}"
+        );
+        assert_eq!(
+            stdout.contains("APPEND a `## Batch gauntlets` section"),
+            micro,
+            "{granularity}: the appended section renders only under micro"
+        );
+        assert_eq!(
+            stdout.contains("`batch-closed @ <sha>` copied from the batch's `batch-closed` entry"),
+            micro,
+            "{granularity}"
+        );
+        assert!(
+            !stdout.contains("group the checklist") && !stdout.contains("BY BATCH"),
+            "{granularity}: the tool's checklist is never regrouped by hand: {stdout}"
+        );
+        assert!(
+            stdout.contains("`## Tasks` checklist stays as it prints it") == micro,
+            "{granularity}"
+        );
+    }
 }
 
 #[test]
@@ -1565,6 +3677,34 @@ fn step_runner_check_handoff_success_guards_null_design_decisions() {
     }
 }
 
+/// step-runner: a handoff that fails validation after its one retry ends the
+/// run instead of looping back to write_handoff.
+#[test]
+fn step_runner_check_handoff_second_failure_ends_failure() {
+    if tools_missing() {
+        return;
+    }
+    let dir = fixture_dir("check-handoff-twice");
+    let handoff = dir.0.join("handoff.md");
+    fs::write(&handoff, "---\nresult: complete\n---\n## Summary\n").unwrap();
+    let state = serde_json::json!({
+        "handoff_path": handoff.to_str().unwrap(),
+        "step_plan_path": "",
+        "handoff_attempts": 1,
+    });
+    let out = run_script_json("step-runner/scripts/check_handoff.sh", &dir.0, &state, &[]);
+    assert_eq!(str_field(&out, "_next"), "end_failure", "{out}");
+    let reason = str_field(&out, "blocking_reason");
+    assert!(
+        reason.starts_with("Handoff failed validation twice"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("- missing required section: ## Completed"),
+        "{reason}"
+    );
+}
+
 /// step-runner: every implement → verify cycle passes through
 /// route_coder_result, the single choke point that resets the bookkeeping.
 #[test]
@@ -1608,6 +3748,38 @@ fn step_runner_route_coder_result_failed_clears_gate_error() {
     assert_eq!(str_field(&out, "_next"), "end_failure", "{out}");
     assert_eq!(str_field(&out, "gate_error"), "", "{out}");
     assert_eq!(str_field(&out, "last_script_error"), "", "{out}");
+}
+
+/// route_sweep follows the edge-case sweep, whose tolerated script crash is
+/// recorded in `last_script_error`; every arm clears it so a later unrelated
+/// failure does not render the stale message.
+#[test]
+fn route_sweep_clears_the_last_script_error_on_every_arm() {
+    if tools_missing() {
+        return;
+    }
+    for (needs_review, skip_review, next) in [
+        (true, None, "independent_review"),
+        (false, None, "write_handoff"),
+        (true, Some("1"), "write_handoff"),
+    ] {
+        let mut cmd = bash();
+        cmd.arg(asset("step-runner/scripts/route_sweep.sh"))
+            .env(
+                "GRAPH_STATE",
+                serde_json::json!({ "needs_independent_review": needs_review }).to_string(),
+            )
+            .env_remove("GRAPH_STATE_FILE")
+            .env_remove("STEP_SKIP_REVIEW");
+        if let Some(skip) = skip_review {
+            cmd.env("STEP_SKIP_REVIEW", skip);
+        }
+        let (code, stdout, stderr) = run(cmd.output().expect("spawn bash"));
+        assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+        let out: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+        assert_eq!(str_field(&out, "_next"), next, "{out}");
+        assert_eq!(str_field(&out, "last_script_error"), "", "{out}");
+    }
 }
 
 #[test]
@@ -3146,7 +5318,9 @@ fn resolve_step_cuts_each_document_at_its_head_c_limit() {
 fn system_bash() -> Command {
     let system = Path::new("/bin/bash");
     if system.is_file() {
-        Command::new(system)
+        let mut cmd = Command::new(system);
+        cmd.env("PYTHONDONTWRITEBYTECODE", "1");
+        cmd
     } else {
         bash()
     }
@@ -4175,10 +6349,12 @@ fn bash_program_skips_a_system32_launcher_that_leads_path() {
     );
 }
 
-/// The two engineered fail-open edges stay as they were and the six
-/// routing gates each draw a "script crashed" edge in their README: five
-/// into end_failure, and coder's route_complexity into gate_approval, so a
-/// reader of the diagram sees where each crash lands.
+/// Each listed routing gate draws a "script crashed" edge in its agent's
+/// README to the node that crash lands on, so a reader of the diagram sees
+/// where each crash goes. The step-runner README also keeps its engineered
+/// fail-open edges, the debt_scan hop between verify_tests and
+/// edge_case_sweep, and check_handoff's "failed twice" edge into
+/// end_failure. Every README names where a crashed gate's error surfaces.
 #[test]
 fn readme_diagrams_draw_the_fail_closed_gate_edges_and_keep_the_open_ones() {
     for (agent, crash_edges, open_edges) in [
@@ -4188,10 +6364,14 @@ fn readme_diagrams_draw_the_fail_closed_gate_edges_and_keep_the_open_ones() {
                 ("route_staleness", "end_failure"),
                 ("route_sweep", "end_failure"),
                 ("route_review", "end_failure"),
+                ("debt_scan", "edge_case_sweep"),
             ][..],
             &[
                 "independent_review -. \"2 attempts failed\" .-> write_handoff",
                 "edge_case_sweep -. \"LLM fault\" .-> write_handoff",
+                "verify_tests -->|\"pass\"| debt_scan",
+                "debt_scan --> edge_case_sweep",
+                "check_handoff -->|\"failed twice\"| end_failure",
             ][..],
         ),
         (
@@ -4215,7 +6395,7 @@ fn readme_diagrams_draw_the_fail_closed_gate_edges_and_keep_the_open_ones() {
         for edge in open_edges {
             assert!(
                 readme.lines().any(|l| l.trim() == *edge),
-                "{agent} README lost the deliberate fail-open edge `{edge}`"
+                "{agent} README lost the edge `{edge}`"
             );
         }
         assert!(
