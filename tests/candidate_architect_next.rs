@@ -9,8 +9,9 @@
 //! marker map against the prose `architect/instructions.md` plus all 48 mode
 //! combinations walked to `end_complete`; several minutes, so opt-in).
 //! `audit_graph.py`, `check_session_block.sh` and `mode_matrix.py` need the
-//! Go `yq` by mikefarah and skip without it. Every battery and candidate gate
-//! run points `HOME`, `LLM_ROOT_DIR`, `COYOTE_CACHE_DIR`, `TMPDIR` and
+//! Go `yq` by mikefarah and skip without it, or fail when
+//! `ARCHITECT_NEXT_REQUIRE_YQ` is set. Every battery and candidate gate run
+//! points `HOME`, `LLM_ROOT_DIR`, `COYOTE_CACHE_DIR`, `TMPDIR` and
 //! `ARCHITECT_RUNS_ROOT` at a scratch directory; the review gauntlet's own
 //! scripts get a scratch `HOME` and `TMPDIR` only. Every run sets
 //! `PYTHONDONTWRITEBYTECODE=1`, so nothing under `assets/` or
@@ -46,7 +47,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "architect-next";
-const SMOKE_FLOOR: usize = 359;
+const SMOKE_FLOOR: usize = 365;
 const MATRIX_FLOOR: usize = 53;
 const _: () = assert!(MATRIX_FLOOR >= 53, "the matrix floor never drops below 53");
 
@@ -98,18 +99,30 @@ fn python3() -> Option<PathBuf> {
 
 /// `audit_graph.py` and `check_session_block.sh` are written against the Go
 /// `yq` by mikefarah; python-yq has a different syntax, so anything else
-/// skips.
+/// skips. A non-empty `ARCHITECT_NEXT_REQUIRE_YQ` turns every skip into a
+/// failure, so a lane that installs yq cannot pass by silently skipping.
 fn mikefarah_yq() -> Option<PathBuf> {
-    let Ok(yq) = which::which("yq") else {
-        eprintln!("skipping: yq not available");
-        return None;
+    let require = std::env::var_os("ARCHITECT_NEXT_REQUIRE_YQ").is_some_and(|v| !v.is_empty());
+    mikefarah_yq_at(which::which("yq").ok(), require)
+}
+
+/// The decision behind `mikefarah_yq` for the `yq` found on `PATH`, if any:
+/// the path when it is the mikefarah build, otherwise a skip, or a panic
+/// with the same reason when `require` is set.
+fn mikefarah_yq_at(found: Option<PathBuf>, require: bool) -> Option<PathBuf> {
+    let skip = |reason: String| {
+        if require {
+            panic!("ARCHITECT_NEXT_REQUIRE_YQ is set: {reason}");
+        }
+        eprintln!("skipping: {reason}");
+        None
+    };
+    let Some(yq) = found else {
+        return skip("yq not available".to_string());
     };
     let version = match Command::new(&yq).arg("--version").output() {
         Ok(version) => version,
-        Err(e) => {
-            eprintln!("skipping: yq --version could not run: {e}");
-            return None;
-        }
+        Err(e) => return skip(format!("yq --version could not run: {e}")),
     };
     let text = format!(
         "{}{}",
@@ -119,9 +132,31 @@ fn mikefarah_yq() -> Option<PathBuf> {
     if text.contains("mikefarah") {
         Some(yq)
     } else {
-        eprintln!("skipping: yq is not the mikefarah build");
-        None
+        skip("yq is not the mikefarah build".to_string())
     }
+}
+
+/// A scratch `yq` whose `--version` names python-yq, not the mikefarah build.
+fn python_yq_stub(scratch: &TempDirGuard) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let stub = scratch.0.join("yq");
+    fs::write(&stub, "#!/bin/sh\necho \"yq 3.4.3\"\n").unwrap();
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+    stub
+}
+
+#[test]
+#[should_panic(expected = "ARCHITECT_NEXT_REQUIRE_YQ is set: yq is not the mikefarah build")]
+fn required_yq_panics_on_a_non_mikefarah_build() {
+    let scratch = scratch_dir("yq-required");
+    mikefarah_yq_at(Some(python_yq_stub(&scratch)), true);
+}
+
+#[test]
+fn optional_yq_skips_a_non_mikefarah_build() {
+    let scratch = scratch_dir("yq-optional");
+    assert_eq!(mikefarah_yq_at(Some(python_yq_stub(&scratch)), false), None);
 }
 
 /// The current `PATH` with `yq_dir` in front, so the battery resolves the
@@ -2497,11 +2532,6 @@ fn info_by_name_lists_exactly_the_prose_twins_variables_in_order() {
         listed, twin,
         "--info variables must be the prose twin's list in order:\n{stdout}"
     );
-    assert_eq!(
-        listed.len(),
-        twin.len(),
-        "--info must list as many variables as the prose twin declares: {listed:?}"
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -4047,7 +4077,8 @@ fn graph_and_gate_budgets_equal_the_frozen_baseline() {
 
 /// The engine's per-node visit cap outlasts one full CI watch: `ci_poll`
 /// revisits itself up to `CI_MAX_ROUNDS` times before it routes the timeout,
-/// so a cap at or below that value ends the watch as an engine error.
+/// so a cap at or below that value ends the watch as an engine error. The
+/// cap covers four group PRs, each watched to that wall cap.
 #[test]
 fn loop_cap_exceeds_the_ci_poll_rounds_lib_computes() {
     let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
@@ -4070,8 +4101,8 @@ fn loop_cap_exceeds_the_ci_poll_rounds_lib_computes() {
     let values = parse_json_stdout("_lib CI_MAX_ROUNDS", &out);
     let rounds = values["CI_MAX_ROUNDS"].as_i64().unwrap();
     assert!(
-        cap > rounds,
-        "settings.max_loop_iterations {cap} does not exceed CI_MAX_ROUNDS {rounds}"
+        cap >= 4 * rounds,
+        "settings.max_loop_iterations {cap} does not cover four group PRs of CI_MAX_ROUNDS {rounds} polls each"
     );
 }
 
@@ -4758,14 +4789,20 @@ fn census_files(root: &Path) -> BTreeSet<String> {
 /// The README's recorded census is a live `diff -u` against the staging
 /// tree: the same set of differing files, each with the hunk count it
 /// states, and no file on one side only. The staging tree lives outside this
-/// repo, so the check runs only when `ARCHITECT_NEXT_STAGING_DIR` names it.
+/// repo, so the check runs only when `ARCHITECT_NEXT_STAGING_DIR` is set, and
+/// fails when that value is not a directory.
 #[test]
 fn readme_census_matches_a_live_diff_against_the_staging_tree() {
-    let staging = std::env::var_os("ARCHITECT_NEXT_STAGING_DIR").map(PathBuf::from);
-    let Some(staging) = staging.filter(|dir| dir.is_dir()) else {
-        println!("skipping: ARCHITECT_NEXT_STAGING_DIR unset or missing; census not checked");
+    let staging = std::env::var_os("ARCHITECT_NEXT_STAGING_DIR").filter(|v| !v.is_empty());
+    let Some(staging) = staging.map(PathBuf::from) else {
+        eprintln!("skipping: ARCHITECT_NEXT_STAGING_DIR unset or empty; census not checked");
         return;
     };
+    assert!(
+        staging.is_dir(),
+        "ARCHITECT_NEXT_STAGING_DIR is set but {} is not a directory",
+        staging.display()
+    );
     let ours = census_files(&candidate_dir());
     let theirs = census_files(&staging);
     let only_ours: Vec<&String> = ours.difference(&theirs).collect();
