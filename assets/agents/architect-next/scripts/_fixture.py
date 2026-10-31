@@ -16,11 +16,10 @@ FORK = "upstream"
 OWNER = ""
 HAS_OWNER_FILE = False
 CLOSE_COMMIT_MARKER = "chore(plan): complete"  # the planning commit subject on task close
-GIT_ENV = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
 
 
 def _git(repo, *a, check=True):
-    p = subprocess.run(["git", "-C", repo, *a], capture_output=True, text=True, env=GIT_ENV)
+    p = subprocess.run(["git", "-C", repo, *a], capture_output=True, text=True)
     if check and p.returncode != 0:
         raise RuntimeError(p.stderr)
     return p.stdout.strip()

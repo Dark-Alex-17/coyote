@@ -20,6 +20,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True
@@ -37,12 +38,20 @@ for _k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
     # a caller's repository variables (a git hook exports them) would point
     # every scratch-repo git call at the caller's own repository
     os.environ.pop(_k, None)
-for _k in [k for k in os.environ if k == "ARCHITECT_CORE_TOOLS" or (k.startswith("ARCHITECT_GH_") and k.endswith("_CMD"))]:
+for _k in [k for k in os.environ if k in ("ARCHITECT_CORE_TOOLS", "ARCHITECT_ASK_OWNER_BIN", "ARCHITECT_SLACK_PING_BIN") or (k.startswith("ARCHITECT_GH_") and k.endswith("_CMD"))]:
     # a caller's tool overrides would replace the scripts' own tools.sh and gh calls
     os.environ.pop(_k)
-# HOME is a scratch dir, so git has no user identity and on Linux refuses to
-# guess one; every gate that commits inherits this fixed identity instead
+for _k in [k for k in os.environ if k in ("GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT") or k.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))]:
+    # a caller's command-line git config would reach every scratch-repo git call
+    os.environ.pop(_k)
+# HOME is a scratch dir with no git identity. git refuses to guess one when
+# user.useConfigOnly is set or when the host name has no dot (it cannot build an
+# email), so the battery sets useConfigOnly on every host and every gate that
+# commits inherits this fixed identity instead
 os.environ.update({"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+os.environ.update({"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "user.useConfigOnly", "GIT_CONFIG_VALUE_0": "true"})
+# no system or user git config (signing, hooks) reaches a scratch repository
+os.environ.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"})
 
 import gates  # noqa: E402
 import _lib  # noqa: E402
@@ -57,11 +66,8 @@ def check(name, cond, detail=""):
     print(("ok   " if cond else "FAIL ") + name + (f"  ({detail})" if detail and not cond else ""))
 
 
-GIT_ENV = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
-
-
 def git(repo, *a, check_=True):
-    p = subprocess.run(["git", "-C", repo, *a], capture_output=True, text=True, env=GIT_ENV)
+    p = subprocess.run(["git", "-C", repo, *a], capture_output=True, text=True)
     if check_ and p.returncode != 0:
         raise RuntimeError(p.stderr)
     return p.stdout.strip()
@@ -196,7 +202,22 @@ for _k, _v in _saved_env.items():
         os.environ.pop(_k, None)
     else:
         os.environ[_k] = _v
-check("runs_root: battery env restored", _lib.runs_root() == os.environ["ARCHITECT_RUNS_ROOT"])
+check("runs_root: battery env restored",
+      all(os.environ.get(_k) == _v for _k, _v in _saved_env.items()) and _lib.runs_root() == _saved_env["ARCHITECT_RUNS_ROOT"],
+      {_k: os.environ.get(_k) for _k in _saved_env})
+
+_real_dt = _lib._dt
+_frozen_now = _real_dt.datetime(2026, 1, 2, 3, 4, 5, tzinfo=_real_dt.timezone.utc)
+_lib._dt = types.SimpleNamespace(datetime=types.SimpleNamespace(now=lambda tz=None: _frozen_now), timezone=_real_dt.timezone)
+try:
+    _ids = [_lib.new_run_id("same brief"), _lib.new_run_id("same brief")]
+finally:
+    _lib._dt = _real_dt
+check("new_run_id: one brief twice in the same second -> two ids, two run dirs",
+      _ids[0] != _ids[1] and _ids[1] == _ids[0] + "-2" and all(os.path.isdir(_lib.run_dir_for(i)) for i in _ids), _ids)
+check("RESUME_RE: matches a suffixed run id whole and still the plain form",
+      _lib.RESUME_RE.search("Architect run id: 20260102T030405-0badf00d-2 go").group(1) == "20260102T030405-0badf00d-2"
+      and _lib.RESUME_RE.search("Architect run id: 20260102T030405-0badf00d").group(1) == "20260102T030405-0badf00d")
 
 
 # ---------------------------------------------------------------- intake / re-entry (A2)
@@ -351,6 +372,16 @@ check("branch_setup: existing run branch -> checkout, never recreated", u["_next
 u = gates.branch_setup(base_state(pr_strategy="multi", **PS))
 check("branch_setup: multi -> no run branch (per-task stacks)" if not MULTI_IS_GROUPS else "branch_setup: multi -> group branch g1",
       (u["run_branch"] == "" if not MULTI_IS_GROUPS else u["run_branch"].endswith("-g1")))
+if MULTI_IS_GROUPS:
+    _skipped = gates._skip_empty_group(base_state(pr_strategy="multi", closeout_unit="g2", closeout_scope="group", group_index=2), {})
+    u = gates.branch_setup(base_state(pr_strategy="multi", group_index=3, skipped_group_indexes=_skipped["skipped_group_indexes"]))
+    check("branch_setup: group 3 after group 2 was skipped stacks on the g1 branch (the skipped group has no PR)",
+          _skipped["skipped_group_indexes"] == [2] and u["run_branch"] == "feat/PLAN-widgets-g3" and u["unit_base_branch"] == "feat/PLAN-widgets-g1",
+          f"{_skipped.get('skipped_group_indexes')} {u.get('unit_base_branch')}")
+    u = gates.branch_setup(base_state(pr_strategy="multi", group_index=2, skipped_group_indexes=[1]))
+    check("branch_setup: group 2 after group 1 was skipped is cut from the base branch",
+          u["run_branch"] == "feat/PLAN-widgets-g2" and u["unit_base_branch"] == "main", str(u.get("unit_base_branch")))
+    git(CODE, "checkout", "-q", "feat/PLAN-widgets-g1")
 
 # ---------------------------------------------------------------- select_tasks (B7) / eligibility / waves
 import copy  # noqa: E402
@@ -537,6 +568,11 @@ GNOGREEN = gauntlet_reply("BLOCKED", [("code-review", "GREEN (attention)", "NEED
 rl_none = gates.route_verdict(verdict_state(GNOGREEN, head="0000000"))["round_log"]
 gp = gates.verify_gate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", round_log=rl_none))["gauntlet_prompt"].splitlines()
 check("verify_gate: no Settled lanes line when no lane is whole-cell GREEN", "Re-review delta: 0000000..HEAD" in gp and not any("Settled lanes" in l for l in gp))
+rl_skip = {T1: [{"round": 1, "head": "0000000", "lanes": {"security": "GREEN"}, "lanes_with_findings": []},
+                {"round": 2, "head": "0000000", "lanes": {"security": "SKIPPED"}, "lanes_with_findings": []}]}
+gp = gates.verify_gate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", round_log=rl_skip))["gauntlet_prompt"].splitlines()
+check("verify_gate: a lane GREEN in round 1 but SKIPPED in round 2 is not settled in round 3 (prior round only)",
+      "Re-review delta: 0000000..HEAD" in gp and not any("Settled lanes" in l for l in gp), str([l for l in gp if "Settled" in l]))
 write(os.path.join(CODE, "dirty.txt"), "uncommitted\n")
 try:
     gp = gates.verify_gate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", round_log=copy.deepcopy(rl)))["gauntlet_prompt"]
@@ -578,6 +614,31 @@ GADVNUM = ("ADVERSARIAL_REVIEW: DIVERGES\nCriteria: 1/2 met.\nComplaints:\n1. Ac
 u = gates.route_verdict(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", verify_unit=T1, verify_lane="adversary", adversary_result=GADVNUM, round_log={T1: [{"round": 1, "head": "h"}]}))
 check("route_verdict: the adversary's numbered Complaints are the fix items",
       u["last_verdict"] == "BLOCKED" and u["fix_items"] == ["Acceptance criterion \"two\" -- Unmet -- api/h.go:10"])
+GADVDETAILS = ("ADVERSARIAL_REVIEW: DIVERGES\nCriteria: 1/2 met.\n\n<details><summary>verification</summary>\n\nGAUNTLET: PASS\n\n</details>\n\n"
+               "Complaints:\n1. Acceptance criterion \"two\" -- Unmet -- api/h.go:10\n")
+u = gates.route_verdict(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", verify_unit=T1, verify_lane="adversary", adversary_result=GADVDETAILS, round_log={T1: [{"round": 1, "head": "h"}]}))
+check("route_verdict: an adversary report with a <details> block above its Complaints still yields them as the fix items",
+      u["last_verdict"] == "BLOCKED" and u["fix_items"] == ["Acceptance criterion \"two\" -- Unmet -- api/h.go:10"], str(u.get("fix_items")))
+GADVLANE = ("ADVERSARIAL_REVIEW: CONFORMS\nCriteria: 2/2 met.\n\nVerification runs:\n| security | GREEN | PASS |\n| probe | GREEN | PASS |\n"
+            "USAGE_PROBE: PASS\n- api/widget.test.ts\n")
+check("_parse_gauntlet: an adversary report quoting a column-0 lane row reports no lanes",
+      gates._parse_gauntlet(GADVLANE, adversary_lane=True)[2] == {}, str(gates._parse_gauntlet(GADVLANE, adversary_lane=True)[2]))
+check("_parse_gauntlet: a probe row, USAGE_PROBE line and test-file path quoted in an adversary report yield no probe files",
+      gates._parse_gauntlet(GADVLANE, adversary_lane=True)[5] == [], str(gates._parse_gauntlet(GADVLANE, adversary_lane=True)[5]))
+u = gates.route_verdict(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", verify_unit=T1, verify_lane="adversary",
+                                   adversary_result=GADVLANE, round_log={T1: [{"round": 1, "head": "0000000"}]}))
+check("route_verdict: a probe PASS quoted in a CONFORMS adversary report starts no adopt round -> post_round",
+      u["_next"] == "post_round" and u.get("fix_source") != "probe_adopt", f"{u.get('_next')} {u.get('fix_source')}")
+rl_adv = u["round_log"]
+gp = gates.verify_gate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", round_log=rl_adv))["gauntlet_prompt"].splitlines()
+check("verify_gate: a lane row quoted in an adversary report settles no lane on the next head",
+      "Re-review delta: 0000000..HEAD" in gp and not any(l.startswith("Settled lanes:") for l in gp), str([l for l in gp if "Settled" in l]))
+GADVINC = ("ADVERSARIAL_REVIEW: DIVERGES\nCriteria: 1/2 met.\n\nVerification runs:\nUSAGE_PROBE: INCONCLUSIVE\n\n"
+           "Complaints:\n1. Acceptance criterion \"probe suite\" -- Unmet -- the probe tests were never added\n")
+u = gates.route_verdict(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", verify_unit=T1, verify_lane="adversary",
+                                   adversary_result=GADVINC, round_log={T1: [{"round": 1, "head": "h"}]}))
+check("route_verdict: a USAGE_PROBE: INCONCLUSIVE quoted in a DIVERGES adversary report is a fix round, never the probe_gap escalation",
+      u.get("_next") == "compose_delegation" and u.get("fix_source") == "review", f"{u.get('_next')} {u.get('fix_source')}")
 u = gates.route_verdict(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", verify_unit=T1, verify_lane="adversary",
                                    adversary_result="ADVERSARIAL_REVIEW: CONFORMS\nCriteria: 2/2 met (all with tests).\n\nVerification runs:\nGAUNTLET: BLOCKED\n", round_log={T1: [{"round": 1, "head": "h"}]}))
 check("route_verdict: on the adversary lane a CONFORMS report quoting GAUNTLET: BLOCKED -> post_round", u["last_verdict"] == "PASS" and u["_next"] == "post_round")
@@ -1101,6 +1162,21 @@ calls = core_calls(lambda: gates.pr_body(base_state(plan_path=PROMOTED, tasks=ts
 check("pr_body: PR-group mode -> assemble_pr_body --tasks <the closing group's task ids, comma-separated>", calls == [f"tasks={GROUP_TASKS} plan={PROMOTED}"], str(calls))
 calls = core_calls(lambda: gates.pr_body(base_state(plan_path=PROMOTED, tasks=ts_g, closeout_unit="g1", pr_summary_text="s", body_fix_rounds=RERUN_ONCE)), "assemble_pr_body")
 check("pr_body: single PR -> assemble_pr_body without --tasks", calls == [f"tasks=unset plan={PROMOTED}"], str(calls))
+_argc_prior = {k: os.environ.get(k) for k in ("argc_tasks", "argc_dir")}
+os.environ.update({"argc_tasks": "BOGUS-1,BOGUS-2", "argc_dir": "/nonexistent-argc-dir"})
+ARGC_TOOLS = os.path.join(TMP, "argc-tools", "tools.sh")
+write(ARGC_TOOLS, "collect_ledger_lines() { printf 'collect_ledger_lines tasks=%s dir=%s plan=%s\\n' \"${argc_tasks-unset}\" \"${argc_dir-unset}\" \"${argc_plan-unset}\" >> \""
+      + CORE_CALLS + "\"; echo '(none)'; }\n")
+try:
+    calls = core_calls(lambda: _lib.core_tool("collect_ledger_lines", plan=PROMOTED), "collect_ledger_lines", ARGC_TOOLS)
+finally:
+    for _k, _v in _argc_prior.items():
+        if _v is None:
+            os.environ.pop(_k)
+        else:
+            os.environ[_k] = _v
+check("core_tool: an inherited argc_* never reaches tools.sh (a stale argc_tasks would act as --tasks, a stale argc_dir as --dir)",
+      calls == [f"tasks=unset dir=unset plan={PROMOTED}"], str(calls))
 ts_skip = copy.deepcopy(ts_g)
 for t in ts_skip:
     t["status"] = "skipped" if t["id"] == T2 else "complete"
@@ -1122,6 +1198,49 @@ check("pr_body: assemble_pr_body fails in PR-group mode -> the fallback task lis
 calls = core_calls(lambda: gates.hygiene_create(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(ts_g), pr_strategy="multi", closeout_unit="g1", unit_base_sha=CODE_BASE,
                                                            run_branch="feat/PLAN-widgets", hygiene_units=[{"id": "g1", "members": [T1, T2]}])), "collect_ledger_lines")
 check("hygiene_create: PR-group mode -> collect_ledger_lines --plan <plan> --tasks <the group's members>", calls == [f"tasks={GROUP_TASKS} plan={PROMOTED}"], str(calls))
+if MULTI_IS_GROUPS:
+    ts_empty = copy.deepcopy(ts_g)
+    for t, s in zip(ts_empty, ("skipped", "failed", "complete")):
+        t["status"] = s
+    ts_empty.append({**copy.deepcopy(ts_g[0]), "id": "TASK-990", "status": "parked", "unit": "g1"})
+    _outs = []
+    core_calls(lambda: _outs.extend([
+        gates.group_closeout(base_state(plan_path=PROMOTED, tasks=ts_empty, pr_strategy="multi", closeout_unit="g1", closeout_scope="group")),
+        gates.group_closeout(base_state(plan_path=PROMOTED, tasks=ts_empty, pr_strategy="multi", closeout_unit="g1", closeout_scope="run")),
+        gates.pr_body(base_state(plan_path=PROMOTED, tasks=ts_empty, pr_strategy="multi", closeout_unit="g1", closeout_scope="group", pr_summary_text="s")),
+        gates.hygiene_create(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(ts_empty), pr_strategy="multi", closeout_unit="g1", unit_base_sha=CODE_BASE,
+                                        run_branch="feat/PLAN-widgets", hygiene_units=[{"id": "g1", "members": []}]))]), "assemble_pr_body")
+    calls = read_file(CORE_CALLS).splitlines()
+    _gc, _gc_run, _pb, _hy = _outs
+    check("group_closeout: a group with no complete task skips its PR (ledger + follow-up naming it) -> select_tasks, or finish_plan at run scope",
+          _gc["_next"] == "select_tasks" and _gc["closeout_done_for"] == "g1" and any("g1" in f for f in _gc["follow_ups"])
+          and any("g1 has no complete task" in d for d in _gc["decisions"]) and _gc_run["_next"] == "finish_plan", f"{_gc.get('_next')} {_gc_run.get('_next')}")
+    check("pr_body / hygiene_create: an empty group makes no core call, so none widens to the whole plan",
+          calls == [] and _pb["_next"] == "select_tasks" and _hy["_next"] == "hygiene_create" and _hy["hygiene_units"] == [], f"{calls} {_pb.get('_next')} {_hy.get('_next')}")
+    _sk = gates._skip_empty_group(base_state(pr_strategy="multi", closeout_unit="g2", closeout_scope="group", group_index=2, skipped_group_indexes=[1],
+                                             pr_number="98", pr_url="https://github.com/o/r/pull/98", integration_checked=True, integration_amended=True), {})
+    check("_skip_empty_group: records the group index and clears the per-group PR state, as flip_ready does",
+          _sk.get("skipped_group_indexes") == [1, 2] and _sk.get("pr_number") == "" and _sk.get("pr_url") == ""
+          and _sk.get("integration_checked") is False and _sk.get("integration_amended") is False,
+          str({k: _sk.get(k) for k in ("skipped_group_indexes", "pr_number", "pr_url", "integration_checked", "integration_amended")}))
+DIR_TOOLS = os.path.join(TMP, "dir-tools", "tools.sh")
+write(DIR_TOOLS, "record() { printf '%s dir=%s\\n' \"$1\" \"${argc_dir-${argc_tasks_dir-unset}}\" >> \"" + CORE_CALLS + "\"; }\n"
+                 "assemble_pr_body() { record assemble_pr_body; echo body > \"$argc_out\"; }\n"
+                 "collect_ledger_lines() { record collect_ledger_lines; echo '(none)'; }\n")
+_taskstore = gates.TASKSTORE
+gates.TASKSTORE = "dirstate"
+try:
+    core_calls(lambda: (
+        gates.hygiene_create(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(ts_g), unit_base_sha=CODE_BASE, run_branch="feat/PLAN-widgets",
+                                        hygiene_units=[{"id": "run", "members": [T1, T2]}])),
+        gates.pr_body(base_state(plan_path=PROMOTED, tasks=ts_g, pr_summary_text="s", body_fix_rounds=RERUN_ONCE)),
+        gates._collect(base_state(plan_path=PROMOTED), "Follow-ups:")), "assemble_pr_body", DIR_TOOLS)
+finally:
+    gates.TASKSTORE = _taskstore
+calls = read_file(CORE_CALLS).splitlines()
+_completed = os.path.join(base_state()["tasks_root"], "completed")
+check("dirstate: hygiene_create, pr_body and the report rollup all read the completed tasks dir",
+      calls == [f"collect_ledger_lines dir={_completed}", f"assemble_pr_body dir={_completed}", f"collect_ledger_lines dir={_completed}"], str(calls))
 calls = core_calls(lambda: gates.final_report(base_state(plan_path=PROMOTED, tasks=ts_g, pr_strategy="multi", closeout_unit="g2")), "collect_ledger_lines")
 check("final_report: every collect_ledger_lines call gets a non-empty --plan and no --tasks (the run report spans all groups)",
       len(calls) == 4 and all(c == f"tasks=unset plan={PROMOTED}" for c in calls), str(calls))

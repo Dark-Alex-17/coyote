@@ -42,12 +42,20 @@ for _k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
     # a caller's repository variables (a git hook exports them) would point
     # every scratch-repo git call at the caller's own repository
     os.environ.pop(_k, None)
-for _k in [k for k in os.environ if k == "ARCHITECT_CORE_TOOLS" or (k.startswith("ARCHITECT_GH_") and k.endswith("_CMD"))]:
+for _k in [k for k in os.environ if k in ("ARCHITECT_CORE_TOOLS", "ARCHITECT_ASK_OWNER_BIN", "ARCHITECT_SLACK_PING_BIN") or (k.startswith("ARCHITECT_GH_") and k.endswith("_CMD"))]:
     # a caller's tool overrides would replace the scripts' own tools.sh and gh calls
     os.environ.pop(_k)
-# HOME becomes a scratch dir, so git has no user identity and on Linux refuses
-# to guess one; every gate that commits inherits this fixed identity instead
+for _k in [k for k in os.environ if k in ("GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT") or k.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))]:
+    # a caller's command-line git config would reach every scratch-repo git call
+    os.environ.pop(_k)
+# HOME becomes a scratch dir with no git identity. git refuses to guess one when
+# user.useConfigOnly is set or when the host name has no dot (it cannot build an
+# email), so the walk sets useConfigOnly on every host and every gate that
+# commits inherits this fixed identity instead
 os.environ.update({"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+os.environ.update({"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "user.useConfigOnly", "GIT_CONFIG_VALUE_0": "true"})
+# no system or user git config (signing, hooks) reaches a scratch repository
+os.environ.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"})
 from _fixture import Store  # noqa: E402
 
 MAP_PATH = os.path.join(HERE, "marker_map.json")
@@ -110,11 +118,8 @@ def check_marker_map(instr_path, regen):
 
 
 # ---------------------------------------------------------------- 2. combination walk
-GIT_ENV = None
-
-
 def git(repo, *a, check_=True):
-    p = subprocess.run(["git", "-C", repo, *a], capture_output=True, text=True, env=GIT_ENV)
+    p = subprocess.run(["git", "-C", repo, *a], capture_output=True, text=True)
     if check_ and p.returncode != 0:
         raise RuntimeError(p.stderr)
     return p.stdout.strip()
@@ -246,6 +251,8 @@ class World:
 
 def load_graph():
     p = subprocess.run(["yq", "-o=json", ".", os.path.join(HERE, "..", "graph.yaml")], capture_output=True, text=True)
+    if p.returncode != 0:
+        sys.exit(f"yq failed to read graph.yaml (exit {p.returncode}): {p.stderr.strip()}")
     return json.loads(p.stdout)
 
 
@@ -414,13 +421,12 @@ def _walk_loop(nodes, state, cur, visited, asserts, log, gates, canned, run_chai
 
 
 def main():
-    global GIT_ENV
     regen = "--regen" in sys.argv
     instr = None
     if "--instructions" in sys.argv:
         instr = sys.argv[sys.argv.index("--instructions") + 1]
     import gates  # noqa: WPS433
-    from _lib import CORE_TOOLS_REL, FORK, MULTI_IS_GROUPS, STACK_LINKING  # noqa: WPS433
+    from _lib import CORE_TOOLS_REL  # noqa: WPS433
     gates.gate_name = lambda script: re.search(r'run\("([a-z0-9_]+)"\)', open(os.path.join(HERE, os.path.basename(script))).read()).group(1)
     if instr is None:
         instr = os.path.join(HERE, "..", "..", CORE_TOOLS_REL, "instructions.md")
@@ -430,6 +436,18 @@ def main():
         check("marker map: instructions.md located", False, instr)
 
     tmp_home = tempfile.mkdtemp(prefix="ax-matrix-home-")
+    try:
+        walk_combinations(tmp_home)
+    finally:
+        shutil.rmtree(tmp_home, ignore_errors=True)
+    fails = [n for n, ok in RESULTS if not ok]
+    print(f"\n{len(RESULTS) - len(fails)}/{len(RESULTS)} checks passed")
+    sys.exit(1 if fails else 0)
+
+
+def walk_combinations(tmp_home):
+    import gates  # noqa: WPS433
+    from _lib import CORE_TOOLS_REL, FORK, MULTI_IS_GROUPS, STACK_LINKING  # noqa: WPS433
     os.environ["HOME"] = tmp_home
     os.environ["ARCHITECT_RUNS_ROOT"] = os.path.join(tmp_home, "runs")
     os.environ["ARCHITECT_CI_SLEEP"] = "0"
@@ -438,7 +456,6 @@ def main():
     os.environ["ARCHITECT_GH_READY_CMD"] = "true"
     os.environ["ARCHITECT_GH_CHECKS_CMD"] = "echo '[{\"name\":\"build\",\"bucket\":\"pass\",\"link\":\"\"}]'"
     os.environ["ARCHITECT_SLACK_PING_BIN"] = os.path.join(tmp_home, "nope")
-    GIT_ENV = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
     # The REAL tools.sh through a scratch LLM_ROOT_DIR (copies only).
     root = os.path.join(tmp_home, "coyote")
     core = CORE_TOOLS_REL
@@ -511,7 +528,7 @@ def main():
             problems.append("a delegation rendered BOTH the single and the multi blocks")
         if any(d[0] != single for d in dele):
             problems.append("delegation single/multi block mismatch")
-        if any(d[2] != micro for d in dele if True) and not par:
+        if any(d[2] != micro for d in dele) and not par:
             problems.append("MODE block iff micro violated (sequential)")
         if any(d[3] != micro for d in dele):
             problems.append("Context pack pasted iff micro violated")
@@ -533,10 +550,6 @@ def main():
             problems.append("multi report lacks the stacks section")
         check(f"combo [{label}]", not problems, " | ".join(problems))
         shutil.rmtree(world.tmp, ignore_errors=True)
-    shutil.rmtree(tmp_home, ignore_errors=True)
-    fails = [n for n, ok in RESULTS if not ok]
-    print(f"\n{len(RESULTS) - len(fails)}/{len(RESULTS)} checks passed")
-    sys.exit(1 if fails else 0)
 
 
 if __name__ == "__main__":

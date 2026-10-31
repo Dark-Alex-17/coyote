@@ -9,17 +9,26 @@
 //! marker map against the prose `architect/instructions.md` plus all 48 mode
 //! combinations walked to `end_complete`; several minutes, so opt-in).
 //! `audit_graph.py`, `check_session_block.sh` and `mode_matrix.py` need the
-//! Go `yq` by mikefarah and skip without it. Every battery and candidate gate
-//! run points `HOME`, `LLM_ROOT_DIR`, `COYOTE_CACHE_DIR`, `TMPDIR` and
+//! Go `yq` by mikefarah and skip without it, or fail when
+//! `ARCHITECT_NEXT_REQUIRE_YQ` is set. Every battery and candidate gate run
+//! points `HOME`, `LLM_ROOT_DIR`, `COYOTE_CACHE_DIR`, `TMPDIR` and
 //! `ARCHITECT_RUNS_ROOT` at a scratch directory; the review gauntlet's own
 //! scripts get a scratch `HOME` and `TMPDIR` only. Every run sets
 //! `PYTHONDONTWRITEBYTECODE=1`, so nothing under `assets/` or
 //! `~/.config/coyote` is read or written, and every command that runs git
 //! or a gate ignores the system and user git config. Every git, script and
-//! binary command drops `LLM_AGENT_VAR_*` and the git repository variables
-//! (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`,
+//! binary command drops the git repository variables (`GIT_DIR`,
+//! `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`,
 //! `GIT_COMMON_DIR`), so a run from a git hook cannot reach the caller's
-//! repository.
+//! repository. Every script and binary command also drops `LLM_AGENT_VAR_*`
+//! and the gates' tool overrides (`ARCHITECT_CORE_TOOLS`,
+//! `ARCHITECT_ASK_OWNER_BIN`, `ARCHITECT_SLACK_PING_BIN`,
+//! `ARCHITECT_GH_*_CMD`). Every battery run drops `GIT_CONFIG_PARAMETERS` and
+//! every inherited `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_*` /
+//! `GIT_CONFIG_VALUE_*`, then sets `user.useConfigOnly=true` through
+//! `GIT_CONFIG_COUNT=1`, so git uses only the fixed identity the batteries
+//! set. Every binary run drops every inherited `COYOTE_*` variable before it
+//! sets its own `COYOTE_CONFIG_DIR` / `COYOTE_CACHE_DIR`.
 //!
 //! The reachability sweep that keeps both candidates out of every bundled
 //! agent lives in `candidate_sisyphus_next.rs` and already covers this name.
@@ -30,17 +39,21 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "architect-next";
-const SMOKE_FLOOR: usize = 349;
+const SMOKE_FLOOR: usize = 365;
 const MATRIX_FLOOR: usize = 53;
 const _: () = assert!(MATRIX_FLOOR >= 53, "the matrix floor never drops below 53");
+
+const BATTERY_LIMIT: Duration = Duration::from_secs(600);
+const MATRIX_LIMIT: Duration = Duration::from_secs(900);
+const GATE_LIMIT: Duration = Duration::from_secs(120);
 
 fn agents_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents")
@@ -86,13 +99,31 @@ fn python3() -> Option<PathBuf> {
 
 /// `audit_graph.py` and `check_session_block.sh` are written against the Go
 /// `yq` by mikefarah; python-yq has a different syntax, so anything else
-/// skips.
+/// skips. A non-empty `ARCHITECT_NEXT_REQUIRE_YQ` turns every skip into a
+/// failure, so a lane that installs yq cannot pass by silently skipping.
 fn mikefarah_yq() -> Option<PathBuf> {
-    let Ok(yq) = which::which("yq") else {
-        eprintln!("skipping: yq not available");
-        return None;
+    let require = std::env::var_os("ARCHITECT_NEXT_REQUIRE_YQ").is_some_and(|v| !v.is_empty());
+    mikefarah_yq_at(which::which("yq").ok(), require)
+}
+
+/// The decision behind `mikefarah_yq` for the `yq` found on `PATH`, if any:
+/// the path when it is the mikefarah build, otherwise a skip, or a panic
+/// with the same reason when `require` is set.
+fn mikefarah_yq_at(found: Option<PathBuf>, require: bool) -> Option<PathBuf> {
+    let skip = |reason: String| {
+        if require {
+            panic!("ARCHITECT_NEXT_REQUIRE_YQ is set: {reason}");
+        }
+        eprintln!("skipping: {reason}");
+        None
     };
-    let version = Command::new(&yq).arg("--version").output().ok()?;
+    let Some(yq) = found else {
+        return skip("yq not available".to_string());
+    };
+    let version = match Command::new(&yq).arg("--version").output() {
+        Ok(version) => version,
+        Err(e) => return skip(format!("yq --version could not run: {e}")),
+    };
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&version.stdout),
@@ -101,9 +132,31 @@ fn mikefarah_yq() -> Option<PathBuf> {
     if text.contains("mikefarah") {
         Some(yq)
     } else {
-        eprintln!("skipping: yq is not the mikefarah build");
-        None
+        skip("yq is not the mikefarah build".to_string())
     }
+}
+
+/// A scratch `yq` whose `--version` names python-yq, not the mikefarah build.
+fn python_yq_stub(scratch: &TempDirGuard) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let stub = scratch.0.join("yq");
+    fs::write(&stub, "#!/bin/sh\necho \"yq 3.4.3\"\n").unwrap();
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+    stub
+}
+
+#[test]
+#[should_panic(expected = "ARCHITECT_NEXT_REQUIRE_YQ is set: yq is not the mikefarah build")]
+fn required_yq_panics_on_a_non_mikefarah_build() {
+    let scratch = scratch_dir("yq-required");
+    mikefarah_yq_at(Some(python_yq_stub(&scratch)), true);
+}
+
+#[test]
+fn optional_yq_skips_a_non_mikefarah_build() {
+    let scratch = scratch_dir("yq-optional");
+    assert_eq!(mikefarah_yq_at(Some(python_yq_stub(&scratch)), false), None);
 }
 
 /// The current `PATH` with `yq_dir` in front, so the battery resolves the
@@ -115,9 +168,12 @@ fn path_with(yq_dir: &Path) -> OsString {
 }
 
 /// A command that runs inside the candidate dir with every path-bearing
-/// variable pointed at the scratch dir and no system or user git config.
+/// variable pointed at the scratch dir and no system, user or inherited
+/// command-line git config; it sets `user.useConfigOnly` the same way both
+/// batteries do.
 fn battery(program: &Path, scratch: &TempDirGuard) -> Command {
     let mut cmd = Command::new(program);
+    without_git_config_vars(&mut cmd);
     cmd.current_dir(candidate_dir())
         .env("HOME", scratch.0.join("home"))
         .env("LLM_ROOT_DIR", scratch.0.join("root"))
@@ -127,6 +183,9 @@ fn battery(program: &Path, scratch: &TempDirGuard) -> Command {
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "user.useConfigOnly")
+        .env("GIT_CONFIG_VALUE_0", "true")
         .env_remove("GRAPH_STATE")
         .env_remove("GRAPH_STATE_FILE");
     scrub_agent_vars(&mut cmd);
@@ -135,16 +194,60 @@ fn battery(program: &Path, scratch: &TempDirGuard) -> Command {
 }
 
 /// Drops every inherited `LLM_AGENT_VAR_*` variable and the gates' tool
-/// overrides (`ARCHITECT_CORE_TOOLS`, `ARCHITECT_GH_*_CMD`) from `cmd`, so a
-/// test run started inside an agent session does not hand that session's
-/// variables or tools to the batteries, the gates or the binary.
+/// overrides (`ARCHITECT_CORE_TOOLS`, `ARCHITECT_ASK_OWNER_BIN`,
+/// `ARCHITECT_SLACK_PING_BIN`, `ARCHITECT_GH_*_CMD`) from `cmd`, so a test run
+/// started inside an agent session does not hand that session's variables or
+/// tools to the batteries, the gates or the binary.
 fn scrub_agent_vars(cmd: &mut Command) -> &mut Command {
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();
         if name.starts_with("LLM_AGENT_VAR_")
-            || name == "ARCHITECT_CORE_TOOLS"
+            || matches!(
+                name.as_ref(),
+                "ARCHITECT_CORE_TOOLS" | "ARCHITECT_ASK_OWNER_BIN" | "ARCHITECT_SLACK_PING_BIN"
+            )
             || (name.starts_with("ARCHITECT_GH_") && name.ends_with("_CMD"))
         {
+            cmd.env_remove(key);
+        }
+    }
+    cmd
+}
+
+/// Drops `GIT_CONFIG_PARAMETERS` and every inherited `GIT_CONFIG_COUNT`,
+/// `GIT_CONFIG_KEY_*` and `GIT_CONFIG_VALUE_*` from `cmd`. It must run before
+/// the builder sets its own `GIT_CONFIG_COUNT` triple: an `env_remove` after
+/// an `env` for the same key removes it.
+fn without_git_config_vars(cmd: &mut Command) -> &mut Command {
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if name == "GIT_CONFIG_PARAMETERS"
+            || name == "GIT_CONFIG_COUNT"
+            || name.starts_with("GIT_CONFIG_KEY_")
+            || name.starts_with("GIT_CONFIG_VALUE_")
+        {
+            cmd.env_remove(key);
+        }
+    }
+    cmd
+}
+
+/// Drops every inherited `COYOTE_*` variable from a binary runner
+/// (`COYOTE_PROVIDER`, `COYOTE_PLATFORM`, `COYOTE_WORKSPACE_CONFIG_DIR`,
+/// `COYOTE_CONFIG_FILE` and the rest), so the caller's overrides cannot pick
+/// the binary's provider, platform or config. Every runner calls it before
+/// its first `.env`, so the `COYOTE_CONFIG_DIR` / `COYOTE_CACHE_DIR` it sets
+/// afterwards survive.
+fn scrub_coyote_env(cmd: &mut Command) -> &mut Command {
+    scrub_coyote_env_from(cmd, std::env::vars_os().map(|(key, _)| key))
+}
+
+fn scrub_coyote_env_from(
+    cmd: &mut Command,
+    names: impl IntoIterator<Item = OsString>,
+) -> &mut Command {
+    for key in names {
+        if key.to_string_lossy().starts_with("COYOTE_") {
             cmd.env_remove(key);
         }
     }
@@ -176,6 +279,65 @@ fn transcript(output: &Output) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )
+}
+
+/// Collects everything `stream` yields into a shared buffer, so a caller that
+/// gives up on the child can still read what arrived so far.
+fn drain(mut stream: impl Read + Send + 'static) -> (Arc<Mutex<Vec<u8>>>, thread::JoinHandle<()>) {
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&buf);
+    let handle = thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => sink.lock().unwrap().extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+    });
+    (buf, handle)
+}
+
+/// `cmd.output()` with a deadline: a child still running after `limit` is
+/// killed and the test panics with whatever it printed until then.
+fn output_with_timeout(cmd: &mut Command, limit: Duration, label: &str) -> Output {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("{label}: failed to spawn: {e}"));
+    let (stdout, stdout_reader) = drain(child.stdout.take().unwrap());
+    let (stderr, stderr_reader) = drain(child.stderr.take().unwrap());
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let partial = Output {
+                status: child.wait().unwrap(),
+                stdout: stdout.lock().unwrap().clone(),
+                stderr: stderr.lock().unwrap().clone(),
+            };
+            panic!(
+                "{label}: still running after {}s, killed\n{}",
+                limit.as_secs(),
+                transcript(&partial)
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    stdout_reader.join().unwrap();
+    stderr_reader.join().unwrap();
+    Output {
+        status,
+        stdout: std::mem::take(&mut *stdout.lock().unwrap()),
+        stderr: std::mem::take(&mut *stderr.lock().unwrap()),
+    }
 }
 
 fn assert_no_bytecode_under_candidate() {
@@ -211,15 +373,27 @@ fn summary_counts(stdout: &str, report: &str) -> (usize, usize) {
 }
 
 #[test]
+#[should_panic(expected = "still running after")]
+fn output_with_timeout_kills_a_child_past_its_limit() {
+    output_with_timeout(
+        Command::new("sh").args(["-c", "sleep 30"]),
+        Duration::from_millis(500),
+        "sleep",
+    );
+}
+
+#[test]
 fn audit_graph_reports_no_problems() {
     let Some(python) = python3() else { return };
     let Some(yq) = mikefarah_yq() else { return };
     let scratch = scratch_dir("audit");
-    let output = battery(&python, &scratch)
-        .env("PATH", path_with(yq.parent().unwrap()))
-        .args(["scripts/audit_graph.py", "."])
-        .output()
-        .unwrap();
+    let output = output_with_timeout(
+        battery(&python, &scratch)
+            .env("PATH", path_with(yq.parent().unwrap()))
+            .args(["scripts/audit_graph.py", "."]),
+        BATTERY_LIMIT,
+        "audit",
+    );
     let report = transcript(&output);
     assert!(output.status.success(), "{report}");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -234,10 +408,11 @@ fn audit_graph_reports_no_problems() {
 fn smoke_battery_passes_every_check() {
     let Some(python) = python3() else { return };
     let scratch = scratch_dir("smoke");
-    let output = battery(&python, &scratch)
-        .arg("scripts/smoke_test.py")
-        .output()
-        .unwrap();
+    let output = output_with_timeout(
+        battery(&python, &scratch).arg("scripts/smoke_test.py"),
+        BATTERY_LIMIT,
+        "smoke",
+    );
     let report = transcript(&output);
     assert!(output.status.success(), "{report}");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -275,7 +450,7 @@ fn smoke_summary_and_exit_code_cover_a_check_recorded_last() {
     let run = |copy: &Path| {
         let mut cmd = battery(&python, &scratch);
         cmd.current_dir(copy).arg("scripts/smoke_test.py");
-        cmd.output().unwrap()
+        output_with_timeout(&mut cmd, BATTERY_LIMIT, "smoke tally")
     };
 
     let pristine = run(&copy);
@@ -314,6 +489,40 @@ fn smoke_summary_and_exit_code_cover_a_check_recorded_last() {
     assert_no_bytecode_under_candidate();
 }
 
+/// The battery's `runs_root: battery env restored` check catches a restore
+/// loop that leaves `ARCHITECT_RUNS_ROOT` at the battery's own override.
+/// Driven on a scratch copy whose restore loop skips that variable.
+#[test]
+fn smoke_env_restore_check_fails_when_the_runs_root_is_not_restored() {
+    let Some(python) = python3() else { return };
+    let scratch = scratch_dir("restore");
+    let copy = scratch_candidate_copy(&scratch);
+    let script = copy.join("scripts").join("smoke_test.py");
+    let text = fs::read_to_string(&script).unwrap();
+    let restore_loop = "for _k, _v in _saved_env.items():\n";
+    assert_eq!(
+        text.matches(restore_loop).count(),
+        1,
+        "smoke_test.py must hold exactly one env restore loop"
+    );
+    let skipping = format!("{restore_loop}    if _k == \"ARCHITECT_RUNS_ROOT\": continue\n");
+    fs::write(&script, text.replacen(restore_loop, &skipping, 1)).unwrap();
+
+    let mut cmd = battery(&python, &scratch);
+    cmd.current_dir(&copy).arg("scripts/smoke_test.py");
+    let output = output_with_timeout(&mut cmd, BATTERY_LIMIT, "smoke restore");
+    let report = transcript(&output);
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("FAIL runs_root: battery env restored"),
+        "the restore check did not catch the unrestored runs root:\n{report}"
+    );
+    assert!(
+        !output.status.success(),
+        "an unrestored runs root must fail the battery:\n{report}"
+    );
+    assert_no_bytecode_under_candidate();
+}
+
 #[test]
 fn session_block_check_passes_under_mikefarah_yq() {
     let Some(yq) = mikefarah_yq() else { return };
@@ -322,11 +531,13 @@ fn session_block_check_passes_under_mikefarah_yq() {
         return;
     };
     let scratch = scratch_dir("session");
-    let output = battery(&bash, &scratch)
-        .env("PATH", path_with(yq.parent().unwrap()))
-        .arg("scripts/check_session_block.sh")
-        .output()
-        .unwrap();
+    let output = output_with_timeout(
+        battery(&bash, &scratch)
+            .env("PATH", path_with(yq.parent().unwrap()))
+            .arg("scripts/check_session_block.sh"),
+        BATTERY_LIMIT,
+        "session check",
+    );
     let report = transcript(&output);
     assert!(output.status.success(), "{report}");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -350,11 +561,13 @@ fn mode_matrix_walks_every_combination() {
     let Some(python) = python3() else { return };
     let Some(yq) = mikefarah_yq() else { return };
     let scratch = scratch_dir("matrix");
-    let output = battery(&python, &scratch)
-        .env("PATH", path_with(yq.parent().unwrap()))
-        .arg("scripts/mode_matrix.py")
-        .output()
-        .unwrap();
+    let output = output_with_timeout(
+        battery(&python, &scratch)
+            .env("PATH", path_with(yq.parent().unwrap()))
+            .arg("scripts/mode_matrix.py"),
+        MATRIX_LIMIT,
+        "mode matrix",
+    );
     let report = transcript(&output);
     assert!(output.status.success(), "{report}");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -397,11 +610,13 @@ fn mode_matrix_exits_before_the_walk_when_the_shared_utils_sh_is_missing_or_a_st
             Some(body) => fs::write(&utils, body).unwrap(),
             None => fs::remove_file(&utils).unwrap(),
         }
-        let output = battery(&python, &scratch)
-            .current_dir(agents.join(CANDIDATE))
-            .arg("scripts/mode_matrix.py")
-            .output()
-            .unwrap();
+        let output = output_with_timeout(
+            battery(&python, &scratch)
+                .current_dir(agents.join(CANDIDATE))
+                .arg("scripts/mode_matrix.py"),
+            MATRIX_LIMIT,
+            case,
+        );
         let report = transcript(&output);
         assert!(
             !output.status.success(),
@@ -430,6 +645,85 @@ fn mode_matrix_exits_before_the_walk_when_the_shared_utils_sh_is_missing_or_a_st
                 .unwrap()
                 .contains("set -euo pipefail"),
             "{case}: the shipped .shared/utils.sh was altered"
+        );
+        let left: Vec<String> = fs::read_dir(scratch.0.join("tmp"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("ax-matrix-"))
+            .collect();
+        assert!(
+            left.is_empty(),
+            "{case}: the matrix left its scratch dirs behind in TMPDIR: {left:?}\n{report}"
+        );
+    }
+}
+
+/// A `yq` that cannot read `graph.yaml` stops `mode_matrix.py` in
+/// `load_graph` with a message naming the exit code, not a JSON traceback.
+/// The stub answers `--version` like the mikefarah build and fails every
+/// other call, so the marker-map half passes and the walk reaches the read.
+#[test]
+fn mode_matrix_names_a_failed_yq_read_instead_of_a_traceback() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(python) = python3() else { return };
+    let scratch = scratch_dir("matrix-yq");
+    let stub_dir = scratch.0.join("bin");
+    fs::create_dir_all(&stub_dir).unwrap();
+    let stub = stub_dir.join("yq");
+    fs::write(
+        &stub,
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"yq (https://github.com/mikefarah/yq/) version v4.99.0\"; exit 0; fi\necho \"stub yq: boom\" >&2; exit 3\n",
+    )
+    .unwrap();
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = output_with_timeout(
+        battery(&python, &scratch)
+            .env("PATH", path_with(&stub_dir))
+            .arg("scripts/mode_matrix.py"),
+        MATRIX_LIMIT,
+        "matrix stub yq",
+    );
+    let report = transcript(&output);
+    assert!(
+        !output.status.success(),
+        "a failed yq read must fail the matrix:\n{report}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("yq failed to read graph.yaml (exit 3)"),
+        "{report}"
+    );
+    assert!(
+        !stdout.contains("Traceback") && !stderr.contains("Traceback"),
+        "{report}"
+    );
+    assert_no_bytecode_under_candidate();
+}
+
+/// `mode_matrix.py` carries no `if True` block standing in for a removed
+/// condition.
+#[test]
+fn mode_matrix_has_no_if_true_block() {
+    let script = fs::read_to_string(candidate_dir().join("scripts/mode_matrix.py")).unwrap();
+    assert!(
+        !script.contains("if True"),
+        "mode_matrix.py carries an `if True` block"
+    );
+}
+
+/// The batteries take their git identity from the process environment they
+/// set up; no script keeps a private `GIT_ENV` overlay of `os.environ` with
+/// its own author.
+#[test]
+fn no_battery_script_keeps_a_git_env_overlay() {
+    for name in ["smoke_test.py", "mode_matrix.py", "_fixture.py"] {
+        let text = fs::read_to_string(candidate_dir().join("scripts").join(name)).unwrap();
+        assert!(
+            !text.contains("GIT_ENV = {**os.environ, \"GIT_AUTHOR_NAME\""),
+            "{name} still carries a GIT_ENV identity overlay"
         );
     }
 }
@@ -510,11 +804,13 @@ fn batteries_never_consult_the_user_config_dir() {
     let planted = poison_user_config(&scratch);
     let home = scratch.0.join("home");
 
-    let audit = battery(&python, &scratch)
-        .env("PATH", path_with(yq.parent().unwrap()))
-        .args(["scripts/audit_graph.py", "."])
-        .output()
-        .unwrap();
+    let audit = output_with_timeout(
+        battery(&python, &scratch)
+            .env("PATH", path_with(yq.parent().unwrap()))
+            .args(["scripts/audit_graph.py", "."]),
+        BATTERY_LIMIT,
+        "poison audit",
+    );
     assert!(audit.status.success(), "{}", transcript(&audit));
     assert!(
         String::from_utf8_lossy(&audit.stdout)
@@ -524,10 +820,11 @@ fn batteries_never_consult_the_user_config_dir() {
         transcript(&audit)
     );
 
-    let smoke = battery(&python, &scratch)
-        .arg("scripts/smoke_test.py")
-        .output()
-        .unwrap();
+    let smoke = output_with_timeout(
+        battery(&python, &scratch).arg("scripts/smoke_test.py"),
+        BATTERY_LIMIT,
+        "poison smoke",
+    );
     let smoke_out = String::from_utf8_lossy(&smoke.stdout);
     assert!(smoke.status.success(), "{}", transcript(&smoke));
     assert!(
@@ -536,11 +833,13 @@ fn batteries_never_consult_the_user_config_dir() {
         transcript(&smoke)
     );
 
-    let session = battery(&bash, &scratch)
-        .env("PATH", path_with(yq.parent().unwrap()))
-        .arg("scripts/check_session_block.sh")
-        .output()
-        .unwrap();
+    let session = output_with_timeout(
+        battery(&bash, &scratch)
+            .env("PATH", path_with(yq.parent().unwrap()))
+            .arg("scripts/check_session_block.sh"),
+        BATTERY_LIMIT,
+        "poison session check",
+    );
     let out = String::from_utf8_lossy(&session.stdout);
     assert!(session.status.success(), "{}", transcript(&session));
     // The mirror is taken against the bundled prose config, not the
@@ -589,13 +888,14 @@ fn runs_root_under(
     for (key, value) in vars {
         cmd.env(key, value);
     }
-    let output = cmd
-        .args([
+    let output = output_with_timeout(
+        cmd.args([
             "-c",
             "import _lib; print(_lib.runs_root()); print(_lib.run_dir_for('r1'))",
-        ])
-        .output()
-        .unwrap();
+        ]),
+        GATE_LIMIT,
+        "runs_root",
+    );
     assert!(output.status.success(), "{}", transcript(&output));
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut lines = stdout.lines();
@@ -1032,28 +1332,78 @@ fn dry_run_config_dir_with(scratch: &TempDirGuard, copy_agents: bool) -> PathBuf
 /// The brief every dry run below starts from unless it re-enters a run.
 const DRY_RUN_PROMPT: &str = "Implement the plan at plans/PLAN-x.md";
 
-/// Every binary run in this file starts from a config dir that
-/// `dry_run_config_dir_with` wrote, the only `config.yaml` writer here, so
-/// none of them can reach the `uvx` launcher a CI host lacks.
+/// Panics unless `config_dir` holds an `mcp.json` that defines no server.
+/// Every binary runner calls it before it starts the binary, so no run here
+/// can reach the `uvx` launcher a CI host lacks.
+fn assert_scratch_mcp_json(config_dir: &Path) {
+    let path = config_dir.join("mcp.json");
+    let text =
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()));
+    let mcp: serde_json::Value = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("{} is not JSON ({e}): {text}", path.display()));
+    assert_eq!(
+        mcp,
+        json!({"mcpServers": {}}),
+        "{} must define no MCP server",
+        path.display()
+    );
+}
+
 #[test]
-fn every_scratch_config_dir_defines_no_mcp_server() {
+fn dry_run_config_dir_writes_an_mcp_json_with_no_server() {
     for copy_agents in [true, false] {
         let scratch = scratch_dir("mcpconfig");
         dry_run_config_dir_with(&scratch, copy_agents);
-        let mcp: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(scratch.0.join("mcp.json")).unwrap()).unwrap();
-        assert_eq!(mcp, json!({"mcpServers": {}}), "copy_agents={copy_agents}");
+        assert_scratch_mcp_json(&scratch.0);
     }
-    let source = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(file!())).unwrap();
-    let lines: Vec<&str> = source.lines().collect();
-    let writers = lines
-        .windows(2)
-        .filter(|w| w[0].trim() == "fs::write(" && w[1].trim().ends_with(".join(\"config.yaml\"),"))
-        .count();
-    assert_eq!(
-        writers, 1,
-        "a second config.yaml writer must also write mcp.json"
-    );
+}
+
+/// Asserts `needles` appear in `lines` in that order, each on a later line
+/// than the one before.
+fn assert_walk(lines: &[String], needles: &[&str], label: &str) {
+    let mut cursor = 0;
+    for needle in needles {
+        let hit = lines[cursor..].iter().position(|l| l.contains(needle));
+        let idx = hit.unwrap_or_else(|| {
+            panic!(
+                "{label}: {needle:?} missing after line {cursor}:\n{}",
+                lines.join("\n")
+            )
+        });
+        cursor += idx + 1;
+    }
+}
+
+/// The real-binary dry run of the candidate by name with `prompt`, from the
+/// scratch config dir, cache dir, `HOME` and `TMPDIR`, with every inherited
+/// run-dir, `COYOTE_*`, agent and git repository variable dropped.
+fn dry_run_command(scratch: &TempDirGuard, project: &Path, prompt: &str) -> Command {
+    let dir = &scratch.0;
+    assert_scratch_mcp_json(dir);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_coyote"));
+    scrub_coyote_env(&mut cmd);
+    cmd.args(["--agent", CANDIDATE, "--dry-run", prompt])
+        .current_dir(project)
+        .env("HOME", dir.join("home"))
+        .env("COYOTE_CONFIG_DIR", dir)
+        .env("COYOTE_CACHE_DIR", dir.join("cache"))
+        .env("TMPDIR", dir.join("tmp"))
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("NO_COLOR", "1")
+        .env_remove("ARCHITECT_RUNS_ROOT")
+        .env_remove("XDG_CACHE_HOME")
+        .env_remove("COYOTE_LOG_PATH")
+        .env_remove("IS_SANDBOX")
+        .env_remove("GRAPH_STATE")
+        .env_remove("GRAPH_STATE_FILE")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    scrub_agent_vars(&mut cmd);
+    without_git_repo_vars(&mut cmd);
+    cmd
 }
 
 /// Dry-runs the candidate by name through the real binary until the trace
@@ -1077,29 +1427,7 @@ fn dry_run_until_ask_user_with_prompt(
     label: &str,
     prompt: &str,
 ) -> Vec<String> {
-    let dir = &scratch.0;
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_coyote"));
-    cmd.args(["--agent", CANDIDATE, "--dry-run", prompt])
-        .current_dir(project)
-        .env("HOME", dir.join("home"))
-        .env("COYOTE_CONFIG_DIR", dir)
-        .env("COYOTE_CACHE_DIR", dir.join("cache"))
-        .env("TMPDIR", dir.join("tmp"))
-        .env("PYTHONDONTWRITEBYTECODE", "1")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("NO_COLOR", "1")
-        .env_remove("ARCHITECT_RUNS_ROOT")
-        .env_remove("XDG_CACHE_HOME")
-        .env_remove("COYOTE_LOG_PATH")
-        .env_remove("IS_SANDBOX")
-        .env_remove("GRAPH_STATE")
-        .env_remove("GRAPH_STATE_FILE")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    scrub_agent_vars(&mut cmd);
-    without_git_repo_vars(&mut cmd);
+    let mut cmd = dry_run_command(scratch, project, prompt);
     for (key, value) in extra_env {
         cmd.env(key, value);
     }
@@ -1221,17 +1549,7 @@ fn dry_run_by_name_walks_to_ask_user_and_pins_the_run_dir() {
     let dir = scratch.0.clone();
 
     let lines = dry_run_until_ask_user(&scratch, &project, &[], "cache dir");
-    let mut cursor = 0;
-    for needle in EXPECTED_WALK {
-        let hit = lines[cursor..].iter().position(|l| l.contains(needle));
-        let idx = hit.unwrap_or_else(|| {
-            panic!(
-                "cache dir: {needle:?} missing after line {cursor}:\n{}",
-                lines.join("\n")
-            )
-        });
-        cursor += idx + 1;
-    }
+    assert_walk(&lines, &EXPECTED_WALK, "cache dir");
     let runs_root = dir.join("cache").join(CANDIDATE).join("runs");
     single_run_under(&runs_root, "cache dir");
     // The engine's own tooling may populate `HOME` (uv caches and the like);
@@ -1287,17 +1605,7 @@ fn dry_run_by_name_from_an_empty_config_dir_installs_the_candidate_and_walks_to_
     );
 
     let lines = dry_run_until_ask_user(&scratch, &project, &[], "cold start");
-    let mut cursor = 0;
-    for needle in EXPECTED_WALK {
-        let hit = lines[cursor..].iter().position(|l| l.contains(needle));
-        let idx = hit.unwrap_or_else(|| {
-            panic!(
-                "cold start: {needle:?} missing after line {cursor}:\n{}",
-                lines.join("\n")
-            )
-        });
-        cursor += idx + 1;
-    }
+    assert_walk(&lines, &EXPECTED_WALK, "cold start");
     // What the engine installs is the shipped candidate, file for file and
     // byte for byte; the engine-managed `bin/` functions dir is its own.
     let installed = dir.join("agents").join(CANDIDATE);
@@ -1342,42 +1650,13 @@ fn dry_run_with_only_xdg_cache_home_puts_the_run_under_the_engines_cache_dir() {
     let xdg = dir.join("xdg");
     fs::create_dir_all(&xdg).unwrap();
 
-    // `dry_run_until_ask_user` pins `COYOTE_CACHE_DIR` to the scratch dir;
-    // this tier needs it absent, so drive the same command line by hand.
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_coyote"));
-    cmd.args(["--agent", CANDIDATE, "--dry-run", DRY_RUN_PROMPT])
-        .current_dir(&project)
-        .env("HOME", dir.join("home"))
-        .env("COYOTE_CONFIG_DIR", &dir)
-        .env("XDG_CACHE_HOME", &xdg)
-        .env("TMPDIR", dir.join("tmp"))
-        .env("PYTHONDONTWRITEBYTECODE", "1")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("NO_COLOR", "1")
-        .env_remove("COYOTE_CACHE_DIR")
-        .env_remove("ARCHITECT_RUNS_ROOT")
-        .env_remove("COYOTE_LOG_PATH")
-        .env_remove("IS_SANDBOX")
-        .env_remove("GRAPH_STATE")
-        .env_remove("GRAPH_STATE_FILE")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    scrub_agent_vars(&mut cmd);
-    without_git_repo_vars(&mut cmd);
+    // `dry_run_command` pins `COYOTE_CACHE_DIR` to the scratch dir and drops
+    // `XDG_CACHE_HOME`; this tier needs the reverse.
+    let mut cmd = dry_run_command(&scratch, &project, DRY_RUN_PROMPT);
+    cmd.env_remove("COYOTE_CACHE_DIR")
+        .env("XDG_CACHE_HOME", &xdg);
     let lines = run_until_ask_user(cmd, "xdg tier");
-    let mut cursor = 0;
-    for needle in EXPECTED_WALK {
-        let hit = lines[cursor..].iter().position(|l| l.contains(needle));
-        let idx = hit.unwrap_or_else(|| {
-            panic!(
-                "xdg tier: {needle:?} missing after line {cursor}:\n{}",
-                lines.join("\n")
-            )
-        });
-        cursor += idx + 1;
-    }
+    assert_walk(&lines, &EXPECTED_WALK, "xdg tier");
 
     let engine_cache = xdg.join("coyote");
     single_run_under(&engine_cache.join(CANDIDATE).join("runs"), "xdg tier");
@@ -1393,6 +1672,44 @@ fn dry_run_with_only_xdg_cache_home_puts_the_run_under_the_engines_cache_dir() {
     assert!(
         leaked.is_empty(),
         "xdg tier: run state leaked under HOME: {leaked:?}"
+    );
+    assert_no_bytecode_under_candidate();
+}
+
+/// With no `COYOTE_CACHE_DIR`, `XDG_CACHE_HOME` or `ARCHITECT_RUNS_ROOT`,
+/// the run lands under the platform cache dir the engine's
+/// `dirs::cache_dir()` resolves for the scratch `HOME`
+/// (`~/Library/Caches` on macOS, `~/.cache` on Linux), and `_lib.runs_root()`
+/// names that same root under the same environment.
+#[test]
+fn dry_run_with_no_cache_variable_puts_the_run_under_the_platform_cache_dir() {
+    let Some(python) = python3() else { return };
+    let scratch = scratch_dir("platformtier");
+    let project = dry_run_config_dir_with(&scratch, false);
+    let dir = scratch.0.clone();
+    let home = dir.join("home");
+    let platform_cache = if cfg!(target_os = "macos") {
+        home.join("Library").join("Caches")
+    } else {
+        home.join(".cache")
+    };
+    let runs = platform_cache.join("coyote").join(CANDIDATE).join("runs");
+
+    let mut cmd = dry_run_command(&scratch, &project, DRY_RUN_PROMPT);
+    cmd.env_remove("COYOTE_CACHE_DIR");
+    let lines = run_until_ask_user(cmd, "platform tier");
+    assert_walk(&lines, &EXPECTED_WALK, "platform tier");
+    single_run_under(&runs, "platform tier");
+    assert!(
+        fs::read_dir(dir.join("cache")).unwrap().next().is_none(),
+        "platform tier: a run landed in the scratch cache dir although COYOTE_CACHE_DIR was unset"
+    );
+
+    let (root, _) = runs_root_under(&python, &scratch, &[]);
+    assert_eq!(
+        PathBuf::from(&root),
+        runs,
+        "_lib.runs_root() and the binary disagree on the platform tier"
     );
     assert_no_bytecode_under_candidate();
 }
@@ -1422,22 +1739,16 @@ fn dry_run_with_the_run_id_in_the_prompt_re_enters_the_run_instead_of_starting_a
         "re-entry",
         &format!("Architect run id: {run_id} -- continue"),
     );
-    let mut cursor = 0;
-    for needle in [
-        "graph: architect-next (start: intake)",
-        "intake (script) done",
-        "resume_route (script) done",
-        "ask_user (input) start",
-    ] {
-        let hit = lines[cursor..].iter().position(|l| l.contains(needle));
-        let idx = hit.unwrap_or_else(|| {
-            panic!(
-                "re-entry: {needle:?} missing after line {cursor}:\n{}",
-                lines.join("\n")
-            )
-        });
-        cursor += idx + 1;
-    }
+    assert_walk(
+        &lines,
+        &[
+            "graph: architect-next (start: intake)",
+            "intake (script) done",
+            "resume_route (script) done",
+            "ask_user (input) start",
+        ],
+        "re-entry",
+    );
     assert!(
         !lines.iter().any(|l| l.contains("orient_read (llm) start")),
         "re-entry: the run was re-oriented from scratch instead of resumed:\n{}",
@@ -1479,21 +1790,15 @@ fn dry_run_with_an_unknown_run_id_in_the_prompt_starts_a_fresh_run() {
         "unknown id",
         &format!("Architect run id: {bogus} -- continue"),
     );
-    let mut cursor = 0;
-    for needle in [
-        "graph: architect-next (start: intake)",
-        "intake (script) done",
-        "ask_user (input) start",
-    ] {
-        let hit = lines[cursor..].iter().position(|l| l.contains(needle));
-        let idx = hit.unwrap_or_else(|| {
-            panic!(
-                "unknown id: {needle:?} missing after line {cursor}:\n{}",
-                lines.join("\n")
-            )
-        });
-        cursor += idx + 1;
-    }
+    assert_walk(
+        &lines,
+        &[
+            "graph: architect-next (start: intake)",
+            "intake (script) done",
+            "ask_user (input) start",
+        ],
+        "unknown id",
+    );
     assert!(
         !lines.iter().any(|l| l.contains("resume_route (script)")),
         "unknown id: an id with no durable state was resumed:\n{}",
@@ -1564,23 +1869,17 @@ fn dry_run_without_a_readable_design_doc_parks_on_need_design_doc_before_orienti
         let runs_root = scratch.0.join("cache").join(CANDIDATE).join("runs");
 
         let lines = dry_run_until_ask_user_with_prompt(&scratch, &project, &[], label, prompt);
-        let mut cursor = 0;
-        for needle in [
-            "graph: architect-next (start: intake)",
-            "intake (script) done",
-            "escalate_gate (script) done",
-            "ask_dispatch (script) done",
-            "ask_user (input) start",
-        ] {
-            let hit = lines[cursor..].iter().position(|l| l.contains(needle));
-            let idx = hit.unwrap_or_else(|| {
-                panic!(
-                    "{label}: {needle:?} missing after line {cursor}:\n{}",
-                    lines.join("\n")
-                )
-            });
-            cursor += idx + 1;
-        }
+        assert_walk(
+            &lines,
+            &[
+                "graph: architect-next (start: intake)",
+                "intake (script) done",
+                "escalate_gate (script) done",
+                "ask_dispatch (script) done",
+                "ask_user (input) start",
+            ],
+            label,
+        );
         assert!(
             !lines.iter().any(|l| l.contains("orient_read (llm)")),
             "{label}: the graph tried to orient a design doc it never had:\n{}",
@@ -1731,6 +2030,26 @@ fn description_names_no_file_outside_the_repo() {
     );
 }
 
+/// The shipped description reads on its own: it carries no letter-digit
+/// label pointing into a planning record the repo does not hold.
+#[test]
+fn description_carries_no_planning_label() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let doc: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let description = doc["description"]
+        .as_str()
+        .expect("graph.yaml carries a string description");
+    let label_re = fancy_regex::Regex::new(r"\b[A-Z][0-9]+\b").unwrap();
+    let labels: Vec<&str> = label_re
+        .find_iter(description)
+        .map(|m| m.unwrap().as_str())
+        .collect();
+    assert!(
+        labels.is_empty(),
+        "description carries {labels:?}:\n{description}"
+    );
+}
+
 /// Every shipped file is ASCII on disk (the README's em-dash row), and the
 /// marker map keeps exactly the `\u2014` JSON escapes the README counts, all
 /// of them inside `first` lines.
@@ -1817,10 +2136,10 @@ fn readme_toolchain_census_matches_the_live_grep() {
     );
     assert_eq!(
         gates_lines,
-        vec![41, 2614, 2623],
+        vec![41, 2628, 2637],
         "the gates.py toolchain hits moved; update the README census and its prose"
     );
-    for line in [2614, 2623] {
+    for line in [2628, 2637] {
         assert!(
             text.contains(&format!("`gates.py:{line}`")) || text.contains(&format!("`:{line}`")),
             "the README prose must cite gates.py:{line}"
@@ -1873,6 +2192,66 @@ fn readme_counts_match_the_graph_and_the_prose_twin() {
         ordinals,
         (first..first + regions as u64).collect::<Vec<_>>(),
         "marker_map.json ordinals must be contiguous"
+    );
+}
+
+/// The `(ordinal, condition, first content line)` triple of every
+/// `<!-- when:` region in `instructions`, extracted the way `mode_matrix.py`
+/// `live_markers()` does: the first following line that is neither blank nor
+/// a `<!-- when` / `<!-- end` marker, stripped and cut to 60 characters.
+fn live_marker_triples(instructions: &str) -> Vec<(u64, String, String)> {
+    let marker = fancy_regex::Regex::new(r"^\s*<!-- when:(\S+) -->\s*$").unwrap();
+    let boundary = fancy_regex::Regex::new(r"^\s*<!-- (when|end)").unwrap();
+    let lines: Vec<&str> = instructions.lines().collect();
+    let mut out = Vec::new();
+    for (at, line) in lines.iter().enumerate() {
+        let Some(caps) = marker.captures(line).unwrap() else {
+            continue;
+        };
+        let first = lines[at + 1..]
+            .iter()
+            .find(|next| !next.trim().is_empty() && !boundary.is_match(next).unwrap())
+            .map(|next| next.trim().chars().take(60).collect())
+            .unwrap_or_default();
+        out.push((out.len() as u64 + 1, caps[1].to_string(), first));
+    }
+    out
+}
+
+/// The same triples as `marker_map.json` records them, in file order.
+fn mapped_marker_triples(map: &str) -> Vec<(u64, String, String)> {
+    let map: Vec<serde_json::Value> = serde_json::from_str(map).unwrap();
+    map.iter()
+        .map(|e| {
+            (
+                e["ordinal"].as_u64().unwrap(),
+                e["condition"].as_str().unwrap().to_string(),
+                e["first"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// `marker_map.json` carries, in order, the same `(ordinal, condition,
+/// first)` triple for every marker region of the landed
+/// `architect/instructions.md` that the ignored mode-matrix run compares, so
+/// a reworded or added region fails the default run too.
+#[test]
+fn marker_map_triples_match_the_live_prose_markers() {
+    let live = live_marker_triples(
+        &fs::read_to_string(agents_dir().join("architect/instructions.md")).unwrap(),
+    );
+    let mapped = mapped_marker_triples(
+        &fs::read_to_string(candidate_dir().join("scripts/marker_map.json")).unwrap(),
+    );
+    assert!(
+        !live.is_empty(),
+        "architect/instructions.md has no marker region"
+    );
+    assert_eq!(live.len(), mapped.len(), "live regions vs mapped regions");
+    assert_eq!(
+        live, mapped,
+        "marker_map.json drifted (left: live, right: map)"
     );
 }
 
@@ -2032,10 +2411,14 @@ fn readme_census_row_dead_hygiene_guard_matches_the_shipped_gates() {
 }
 
 /// Runs `coyote --agent architect-next [extra..] --info` from a scratch
-/// config dir and returns its stdout, asserting a clean, error-free exit.
+/// config dir and returns its stdout, asserting a clean exit and no stderr
+/// line that is an error report (`Error:` / `error:`, the form an error
+/// returned from `main` takes) or an `[ERROR]` log record.
 fn info_by_name(scratch: &TempDirGuard, project: &Path, extra: &[&str], label: &str) -> String {
     let dir = &scratch.0;
+    assert_scratch_mcp_json(dir);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_coyote"));
+    scrub_coyote_env(&mut cmd);
     cmd.args(["--agent", CANDIDATE])
         .args(extra)
         .arg("--info")
@@ -2048,20 +2431,24 @@ fn info_by_name(scratch: &TempDirGuard, project: &Path, extra: &[&str], label: &
         .env_remove("ARCHITECT_RUNS_ROOT")
         .env_remove("XDG_CACHE_HOME")
         .env_remove("GRAPH_STATE")
-        .env_remove("GRAPH_STATE_FILE")
-        .stdin(Stdio::null());
+        .env_remove("GRAPH_STATE_FILE");
     scrub_agent_vars(&mut cmd);
     without_git_repo_vars(&mut cmd);
-    let output = cmd.output().unwrap();
+    let output = output_with_timeout(&mut cmd, GATE_LIMIT, label);
     assert!(
         output.status.success(),
         "{label}: --info failed\n{}",
         transcript(&output)
     );
-    let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let errors: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("Error:") || l.starts_with("error:") || l.contains("[ERROR]"))
+        .collect();
     assert!(
-        !stderr.contains("error"),
-        "{label}: --info reported an error\n{}",
+        errors.is_empty(),
+        "{label}: --info reported an error: {errors:?}\n{}",
         transcript(&output)
     );
     String::from_utf8_lossy(&output.stdout).into_owned()
@@ -2128,8 +2515,8 @@ fn info_by_name_lists_the_graph_and_seats_a_build_lock_override() {
 
 /// The variables block the binary renders for `coyote -a architect-next
 /// --info` is exactly the prose twin's variable list, name for name and in
-/// order (eleven entries, `build_lock` included), so a consumer sees no
-/// variable the twin lacks and misses none it has.
+/// order (`build_lock` included), so a consumer sees no variable the twin
+/// lacks and misses none it has.
 #[test]
 fn info_by_name_lists_exactly_the_prose_twins_variables_in_order() {
     let scratch = scratch_dir("info-vars");
@@ -2144,11 +2531,6 @@ fn info_by_name_lists_exactly_the_prose_twins_variables_in_order() {
     assert_eq!(
         listed, twin,
         "--info variables must be the prose twin's list in order:\n{stdout}"
-    );
-    assert_eq!(
-        listed.len(),
-        11,
-        "--info must list eleven variables: {listed:?}"
     );
 }
 
@@ -2172,7 +2554,7 @@ fn gate_json(gate: &str, state: &serde_json::Value, scratch: &TempDirGuard) -> s
     let mut cmd = battery(&python, scratch);
     cmd.arg(Path::new("scripts").join(format!("{gate}.py")))
         .env("GRAPH_STATE", state.to_string());
-    let out = cmd.output().unwrap();
+    let out = output_with_timeout(&mut cmd, GATE_LIMIT, gate);
     assert_no_bytecode_under_candidate();
     parse_json_stdout(gate, &out)
 }
@@ -2192,17 +2574,18 @@ fn gauntlet_script(
     let mut cmd = Command::new(python);
     scrub_agent_vars(&mut cmd);
     without_git_repo_vars(&mut cmd);
-    let out = cmd
-        .arg(&path)
-        .env("GRAPH_STATE", state.to_string())
-        .env("PYTHONDONTWRITEBYTECODE", "1")
-        .env("HOME", scratch.0.join("home"))
-        .env("TMPDIR", scratch.0.join("tmp"))
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env_remove("GRAPH_STATE_FILE")
-        .output()
-        .unwrap_or_else(|e| panic!("failed to invoke python3 {script}: {e}"));
+    let out = output_with_timeout(
+        cmd.arg(&path)
+            .env("GRAPH_STATE", state.to_string())
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .env("HOME", scratch.0.join("home"))
+            .env("TMPDIR", scratch.0.join("tmp"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env_remove("GRAPH_STATE_FILE"),
+        GATE_LIMIT,
+        script,
+    );
     parse_json_stdout(script, &out)
 }
 
@@ -2215,14 +2598,12 @@ fn two_commit_repo(scratch: &TempDirGuard) -> (PathBuf, String, String) {
     let run = |args: &[&str]| -> String {
         let mut cmd = Command::new(&git);
         without_git_repo_vars(&mut cmd);
-        let out = cmd
-            .args(args)
+        cmd.args(args)
             .current_dir(&project)
             .env("HOME", scratch.0.join("home"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .output()
-            .unwrap();
+            .env("GIT_CONFIG_GLOBAL", "/dev/null");
+        let out = output_with_timeout(&mut cmd, GATE_LIMIT, "git");
         assert!(out.status.success(), "git {args:?}\n{}", transcript(&out));
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     };
@@ -2955,12 +3336,13 @@ fn pr_body_fallback_lists_only_the_closing_groups_tasks() {
         ],
     });
     let mut cmd = battery(&python, &scratch);
-    let out = cmd
-        .arg(Path::new("scripts").join("pr_body.py"))
-        .env("GRAPH_STATE", state.to_string())
-        .env("ARCHITECT_CORE_TOOLS", &tools)
-        .output()
-        .unwrap();
+    let out = output_with_timeout(
+        cmd.arg(Path::new("scripts").join("pr_body.py"))
+            .env("GRAPH_STATE", state.to_string())
+            .env("ARCHITECT_CORE_TOOLS", &tools),
+        GATE_LIMIT,
+        "pr_body",
+    );
     assert_no_bytecode_under_candidate();
     parse_json_stdout("pr_body", &out);
     let body = fs::read_to_string(run_dir.join("pr-body.md")).unwrap();
@@ -3276,8 +3658,17 @@ fn no_prior_round_or_an_untracked_file_composes_no_re_review_lines() {
 /// with `plan_tasks.py`: a debris-exempt line and a `Follow-ups:` block
 /// written in a completed task's log come back, not the
 /// `(collect_ledger_lines unavailable ...)` fallback.
+///
+/// Only the upstream (frontmatter) task layout is built: `_lib.py` pins
+/// `FORK = "upstream"`, so the shipped candidate always uses the frontmatter
+/// task store and its dirstate branches never run from this directory.
 #[test]
 fn the_real_collect_ledger_lines_returns_debris_exempt_and_follow_up_lines() {
+    let lib = fs::read_to_string(candidate_dir().join("scripts/_lib.py")).unwrap();
+    assert!(
+        lib.lines().any(|l| l == "FORK = \"upstream\""),
+        "_lib.py no longer pins the upstream fork; cover the dirstate layout too"
+    );
     let Some(python) = python3() else {
         return;
     };
@@ -3310,8 +3701,7 @@ fn the_real_collect_ledger_lines_returns_debris_exempt_and_follow_up_lines() {
     let state = json!({"plan_path": plan, "tasks_root": ledger.join("tasks")});
 
     let mut cmd = battery(&python, &scratch);
-    let out = cmd
-        .current_dir(candidate_dir().join("scripts"))
+    cmd.current_dir(candidate_dir().join("scripts"))
         .args([
             "-c",
             "import json, sys\n\
@@ -3319,9 +3709,8 @@ fn the_real_collect_ledger_lines_returns_debris_exempt_and_follow_up_lines() {
              state = json.loads(sys.argv[1])\n\
              print(json.dumps({\"tools\": _lib.core_tools_path(), \"rows\": {t: gates._collect(state, t) for t in (\"debris-exempt\", \"Follow-ups:\")}}))\n",
             &state.to_string(),
-        ])
-        .output()
-        .unwrap();
+        ]);
+    let out = output_with_timeout(&mut cmd, GATE_LIMIT, "_collect");
     assert_no_bytecode_under_candidate();
     let collected = parse_json_stdout("_collect", &out);
     assert_eq!(
@@ -3414,18 +3803,19 @@ fn re_entry_has_no_session_ledger_and_the_readme_no_honesty_sentence() {
     assert!(honesty.is_empty(), "README.md: {honesty:?}");
 }
 
-/// The graph-level integer bounds as the staging baseline records them: the
-/// top-level agent limits and every integer under `settings`.
+/// The graph-level integer bounds of the shipped baseline (the staging
+/// values plus the README's frozen budgets row): the top-level agent limits
+/// and every integer under `settings`.
 const FROZEN_GRAPH_BOUNDS: &[(&str, i64)] = &[
     ("max_agent_depth", 10),
     ("max_concurrent_agents", 10),
-    ("settings.max_loop_iterations", 100),
+    ("settings.max_loop_iterations", 1000),
     ("settings.timeout", 0),
 ];
 
-/// Every integer field of every node in the staging baseline (`timeout`,
-/// `max_attempts`, `max_iterations`, `max_concurrency`); a node absent here
-/// declares none.
+/// Every integer field of every node in the shipped baseline (`timeout`,
+/// `max_attempts`, `max_iterations`, `max_concurrency`), the staging values
+/// plus the frozen budgets row; a node absent here declares none.
 const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("amend_plan", "max_iterations", 20),
     ("amend_plan", "timeout", 1800),
@@ -3439,6 +3829,7 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("author_plan", "timeout", 3600),
     ("batch_close", "timeout", 300),
     ("batch_fix_route", "timeout", 300),
+    ("batch_gauntlet_build", "timeout", 60),
     ("batch_triage", "max_iterations", 10),
     ("batch_triage", "timeout", 900),
     ("branch_setup", "timeout", 300),
@@ -3626,15 +4017,13 @@ fn graph_and_gate_budgets_equal_the_frozen_baseline() {
     };
     let scratch = scratch_dir("lib-bounds");
     let mut cmd = battery(&python, &scratch);
-    let out = cmd
-        .current_dir(candidate_dir().join("scripts"))
+    cmd.current_dir(candidate_dir().join("scripts"))
         .args([
             "-c",
             "import json, _lib\n\
              print(json.dumps({k: v for k, v in vars(_lib).items() if k.isupper() and type(v) is int}))\n",
-        ])
-        .output()
-        .unwrap();
+        ]);
+    let out = output_with_timeout(&mut cmd, GATE_LIMIT, "_lib integer constants");
     assert_no_bytecode_under_candidate();
     let values = parse_json_stdout("_lib integer constants", &out);
     let lib = fs::read_to_string(candidate_dir().join("scripts/_lib.py")).unwrap();
@@ -3683,6 +4072,37 @@ fn graph_and_gate_budgets_equal_the_frozen_baseline() {
     assert_eq!(
         script_bounds, expected,
         "_lib.py bounds moved (left: shipped)"
+    );
+}
+
+/// The engine's per-node visit cap outlasts one full CI watch: `ci_poll`
+/// revisits itself up to `CI_MAX_ROUNDS` times before it routes the timeout,
+/// so a cap at or below that value ends the watch as an engine error. The
+/// cap covers four group PRs, each watched to that wall cap.
+#[test]
+fn loop_cap_exceeds_the_ci_poll_rounds_lib_computes() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let shipped: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let cap = shipped["settings"]["max_loop_iterations"]
+        .as_i64()
+        .expect("graph.yaml sets an integer settings.max_loop_iterations");
+
+    let Some(python) = python3() else {
+        return;
+    };
+    let scratch = scratch_dir("lib-ci-rounds");
+    let mut cmd = battery(&python, &scratch);
+    cmd.current_dir(candidate_dir().join("scripts")).args([
+        "-c",
+        "import json, _lib\nprint(json.dumps({\"CI_MAX_ROUNDS\": _lib.CI_MAX_ROUNDS}))\n",
+    ]);
+    let out = output_with_timeout(&mut cmd, GATE_LIMIT, "_lib CI_MAX_ROUNDS");
+    assert_no_bytecode_under_candidate();
+    let values = parse_json_stdout("_lib CI_MAX_ROUNDS", &out);
+    let rounds = values["CI_MAX_ROUNDS"].as_i64().unwrap();
+    assert!(
+        cap >= 4 * rounds,
+        "settings.max_loop_iterations {cap} does not cover four group PRs of CI_MAX_ROUNDS {rounds} polls each"
     );
 }
 
@@ -3757,10 +4177,11 @@ fn every_llm_node_keeps_the_frozen_anomalies_channel() {
 /// Both batteries drop the agent variables, the tool overrides and the
 /// wrapper's git repository variables themselves, before they import a gate,
 /// so a direct run from a git hook or an agent session is as isolated as a
-/// run through the wrapper. After those drops, and still before the import,
-/// each sets a fixed git author and committer: its scratch `HOME` holds no
-/// identity and git on Linux will not guess one, so every gate commit would
-/// fail on a bare host.
+/// run through the wrapper. They also drop any inherited command-line git
+/// config before they set `user.useConfigOnly`. After those drops, and still
+/// before the import, each sets a fixed git author and committer: its scratch
+/// `HOME` holds no identity, and git refuses to guess one when
+/// `user.useConfigOnly` is set or the host name has no dot.
 #[test]
 fn batteries_drop_the_same_variables_as_the_wrapper() {
     let quoted = fancy_regex::Regex::new(r#""([A-Z_]+)""#).unwrap();
@@ -3784,12 +4205,21 @@ fn batteries_drop_the_same_variables_as_the_wrapper() {
         let git_at = find(&|l| l.starts_with("for _k in (\"GIT_DIR\""), "GIT_ loop");
         let tools_at = find(
             &|l| {
-                l == "for _k in [k for k in os.environ if k == \"ARCHITECT_CORE_TOOLS\" or (k.startswith(\"ARCHITECT_GH_\") and k.endswith(\"_CMD\"))]:"
+                l == "for _k in [k for k in os.environ if k in (\"ARCHITECT_CORE_TOOLS\", \"ARCHITECT_ASK_OWNER_BIN\", \"ARCHITECT_SLACK_PING_BIN\") or (k.startswith(\"ARCHITECT_GH_\") and k.endswith(\"_CMD\"))]:"
             },
-            "ARCHITECT_CORE_TOOLS / ARCHITECT_GH_*_CMD loop",
+            "ARCHITECT_CORE_TOOLS / ARCHITECT_*_BIN / ARCHITECT_GH_*_CMD loop",
+        );
+        let git_config_at = find(
+            &|l| {
+                l == "for _k in [k for k in os.environ if k in (\"GIT_CONFIG_PARAMETERS\", \"GIT_CONFIG_COUNT\") or k.startswith((\"GIT_CONFIG_KEY_\", \"GIT_CONFIG_VALUE_\"))]:"
+            },
+            "GIT_CONFIG_* loop",
         );
         assert!(
-            agent_at < import_at && git_at < import_at && tools_at < import_at,
+            agent_at < import_at
+                && git_at < import_at
+                && tools_at < import_at
+                && git_config_at < import_at,
             "{file} must drop the variables before it imports a gate"
         );
         let identity_at = find(
@@ -3799,6 +4229,26 @@ fn batteries_drop_the_same_variables_as_the_wrapper() {
         assert!(
             agent_at.max(git_at).max(tools_at) < identity_at && identity_at < import_at,
             "{file} must set the git identity after the drops and before it imports a gate"
+        );
+        let use_config_only_at = find(
+            &|l| {
+                l == "os.environ.update({\"GIT_CONFIG_COUNT\": \"1\", \"GIT_CONFIG_KEY_0\": \"user.useConfigOnly\", \"GIT_CONFIG_VALUE_0\": \"true\"})"
+            },
+            "user.useConfigOnly line",
+        );
+        assert!(
+            git_config_at < use_config_only_at && use_config_only_at < import_at,
+            "{file} must drop the inherited GIT_CONFIG_* before it sets its own, and both before it imports a gate"
+        );
+        let no_user_config_at = find(
+            &|l| {
+                l == "os.environ.update({\"GIT_CONFIG_NOSYSTEM\": \"1\", \"GIT_CONFIG_GLOBAL\": \"/dev/null\"})"
+            },
+            "GIT_CONFIG_NOSYSTEM / GIT_CONFIG_GLOBAL line",
+        );
+        assert!(
+            no_user_config_at < import_at,
+            "{file} must ignore the system and user git config before it imports a gate"
         );
         let identity: Vec<String> = quoted
             .captures_iter(lines[identity_at])
@@ -3824,6 +4274,7 @@ fn batteries_drop_the_same_variables_as_the_wrapper() {
             (agent_at, "    os.environ.pop(_k)"),
             (git_at, "    os.environ.pop(_k, None)"),
             (tools_at, "    os.environ.pop(_k)"),
+            (git_config_at, "    os.environ.pop(_k)"),
         ] {
             let body = lines[at + 1..]
                 .iter()
@@ -3832,6 +4283,95 @@ fn batteries_drop_the_same_variables_as_the_wrapper() {
             assert_eq!(*body, pop, "{file}: the loop at line {} pops", at + 1);
         }
     }
+}
+
+/// The variables `cmd` sets (`Some`) or removes (`None`) on top of the
+/// inherited environment.
+fn env_overrides(cmd: &Command) -> BTreeMap<String, Option<String>> {
+    cmd.get_envs()
+        .map(|(k, v)| {
+            (
+                k.to_string_lossy().into_owned(),
+                v.map(|v| v.to_string_lossy().into_owned()),
+            )
+        })
+        .collect()
+}
+
+/// The scrub removes every `COYOTE_*` name it is handed and nothing else, and
+/// a variable the builder sets after it survives. The names are passed in, so
+/// the test never touches the parent environment.
+#[test]
+fn scrub_coyote_env_removes_inherited_coyote_vars_but_keeps_later_sets() {
+    let mut cmd = Command::new("true");
+    scrub_coyote_env_from(
+        &mut cmd,
+        [
+            "COYOTE_PROVIDER",
+            "COYOTE_WORKSPACE_CONFIG_DIR",
+            "COYOTE_X_FAKE",
+            "NOT_COYOTE_X_FAKE",
+        ]
+        .map(OsString::from),
+    );
+    cmd.env("COYOTE_CONFIG_DIR", "/scratch");
+    let expected: BTreeMap<String, Option<String>> = [
+        ("COYOTE_CONFIG_DIR", Some("/scratch")),
+        ("COYOTE_PROVIDER", None),
+        ("COYOTE_WORKSPACE_CONFIG_DIR", None),
+        ("COYOTE_X_FAKE", None),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.map(str::to_string)))
+    .collect();
+    assert_eq!(env_overrides(&cmd), expected);
+}
+
+/// Every binary runner scrubs the inherited `COYOTE_*` variables before its
+/// first `.env`; a scrub placed after it would remove the runner's own
+/// `COYOTE_CONFIG_DIR` / `COYOTE_CACHE_DIR`.
+#[test]
+fn every_binary_runner_scrubs_coyote_env_before_its_first_env() {
+    let source = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(file!())).unwrap();
+    let needle = concat!("Command::new(env!(\"CARGO_BIN_EXE_", "coyote\"))");
+    let runners: Vec<usize> = source.match_indices(needle).map(|(at, _)| at).collect();
+    assert!(runners.len() >= 2, "found {} binary runners", runners.len());
+    for at in runners {
+        let rest = &source[at..];
+        let first_env = rest.find(".env(").expect("a binary runner sets no env");
+        let line = source[..at].lines().count() + 1;
+        assert!(
+            rest[..first_env].contains("scrub_coyote_env(&mut cmd);"),
+            "the binary runner at line {line} does not scrub COYOTE_* before its first .env"
+        );
+    }
+}
+
+/// `battery()` drops the inherited command-line git config before it sets its
+/// own `user.useConfigOnly` triple, the order both batteries use.
+#[test]
+fn battery_drops_inherited_git_config_before_it_sets_use_config_only() {
+    let scratch = scratch_dir("gitconfig");
+    let cmd = battery(Path::new("true"), &scratch);
+    let envs = env_overrides(&cmd);
+    for (key, value) in [
+        ("GIT_CONFIG_COUNT", "1"),
+        ("GIT_CONFIG_KEY_0", "user.useConfigOnly"),
+        ("GIT_CONFIG_VALUE_0", "true"),
+    ] {
+        assert_eq!(envs.get(key), Some(&Some(value.to_string())), "{key}");
+    }
+    let source = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(file!())).unwrap();
+    let body = &source[source.find("fn battery(").unwrap()..];
+    let body = &body[..body.find("\n}\n").unwrap()];
+    let drop_at = body
+        .find("without_git_config_vars(&mut cmd);")
+        .expect("battery() does not drop the inherited GIT_CONFIG_*");
+    let inject_at = body.find(".env(\"GIT_CONFIG_COUNT\", \"1\")").unwrap();
+    assert!(
+        drop_at < inject_at,
+        "battery() must drop the inherited GIT_CONFIG_* before it sets its own"
+    );
 }
 
 /// The README's adjustments-table row starting with `prefix`.
@@ -3957,12 +4497,47 @@ fn children_without_a_build_lock_declaration_never_consume_it() {
     );
 }
 
-/// The README's gauntlet grammar row records the boundary contract both
-/// ways (the producer guarantees it, the consumer defends it) and the one
-/// place this candidate's composer departs from the sisyphus-next twin.
+/// The README subsection under `### <title>`, up to the next `##` or `###`
+/// heading, with every whitespace run folded to one space so a pinned clause
+/// survives rewrapping.
+fn readme_subsection(title: &str) -> String {
+    let text = readme();
+    let heading = format!("\n### {title}\n");
+    let start = text
+        .find(&heading)
+        .unwrap_or_else(|| panic!("the README has no {heading:?} subsection"))
+        + heading.len();
+    let body = &text[start..];
+    let end = [body.find("\n## "), body.find("\n### ")]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(body.len());
+    body[..end].split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The README's Gauntlet grammar subsection records the boundary contract
+/// both ways (the producer guarantees it, the consumer defends it) and the
+/// one place this candidate's composer departs from the sisyphus-next twin;
+/// the adjustments row names the files and points at the subsection.
 #[test]
 fn readme_grammar_row_records_the_producer_guarantee_and_the_planning_store_divergence() {
-    let row = adjustments_row("| gauntlet grammar |");
+    let table_row = adjustments_row("| gauntlet grammar |");
+    for name in [
+        "`scripts/gates.py`",
+        "`_parse_gauntlet`",
+        "`route_verdict`",
+        "`wave_route`",
+        "`scripts/smoke_test.py`",
+        "`scripts/mode_matrix.py`",
+        "Gauntlet grammar subsection",
+    ] {
+        assert!(
+            table_row.contains(name),
+            "the grammar row lost {name:?}: {table_row}"
+        );
+    }
+    let row = readme_subsection("Gauntlet grammar");
     for clause in [
         "before the first column-0 `## Full lane reports` line (or before the first `<details>` when that heading is absent)",
         "first match winning",
@@ -4018,13 +4593,18 @@ fn readme_env_hygiene_and_ledger_rows_match_the_code() {
     let row = adjustments_row("| battery env hygiene |");
     assert!(row.contains("`LLM_AGENT_VAR_*`"), "{row}");
     assert!(row.contains("`ARCHITECT_CORE_TOOLS`"), "{row}");
+    assert!(row.contains("`ARCHITECT_ASK_OWNER_BIN`"), "{row}");
+    assert!(row.contains("`ARCHITECT_SLACK_PING_BIN`"), "{row}");
     assert!(row.contains("`ARCHITECT_GH_*_CMD`"), "{row}");
     for var in GIT_REPO_VARS {
         assert!(row.contains(&format!("`{var}`")), "{var} missing: {row}");
     }
     for clause in [
         "both set a fixed `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME` and `GIT_COMMITTER_EMAIL`",
-        "Neither drops `GIT_CONFIG_COUNT`",
+        "drop `GIT_CONFIG_PARAMETERS` and every inherited `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_*` and `GIT_CONFIG_VALUE_*`",
+        "then set `GIT_CONFIG_COUNT=1`, `GIT_CONFIG_KEY_0=user.useConfigOnly` and `GIT_CONFIG_VALUE_0=true`",
+        "set `GIT_CONFIG_NOSYSTEM=1` and `GIT_CONFIG_GLOBAL=/dev/null` so a direct run ignores the system and user git config",
+        "drops every inherited `COYOTE_*` variable",
         "holds an `mcp.json` that defines no server",
     ] {
         assert!(
@@ -4032,6 +4612,10 @@ fn readme_env_hygiene_and_ledger_rows_match_the_code() {
             "the env hygiene row lost {clause:?}: {row}"
         );
     }
+    assert!(
+        !row.contains("Neither drops `GIT_CONFIG_COUNT`"),
+        "the env hygiene row still says the batteries keep GIT_CONFIG_COUNT: {row}"
+    );
 
     let row = adjustments_row("| ledger rollup scope |");
     for clause in [
@@ -4048,22 +4632,38 @@ fn readme_env_hygiene_and_ledger_rows_match_the_code() {
         );
     }
     let gates = fs::read_to_string(candidate_dir().join("scripts/gates.py")).unwrap();
-    let lines: Vec<&str> = gates.lines().collect();
-    let mut calls = Vec::new();
-    for (at, line) in lines.iter().enumerate() {
-        if !line.contains("core_tool(\"collect_ledger_lines\"") {
-            continue;
-        }
-        let mut call = String::new();
-        for line in &lines[at..] {
-            call.push_str(line);
-            call.push('\n');
-            if line.trim_end().ends_with(')') {
-                break;
+    let ledger_calls = |text: &str| -> Vec<String> {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut calls = Vec::new();
+        for (at, line) in lines.iter().enumerate() {
+            if !line.contains("core_tool(\"collect_ledger_lines\"") {
+                continue;
             }
+            let mut call = String::new();
+            for line in &lines[at..] {
+                call.push_str(line);
+                call.push('\n');
+                if line.trim_end().ends_with(')') {
+                    break;
+                }
+            }
+            calls.push(call);
         }
-        calls.push(call);
-    }
+        calls
+    };
+    let body_of = |def: &str| -> String {
+        let lines: Vec<&str> = gates.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.starts_with(def))
+            .unwrap_or_else(|| panic!("gates.py has no {def:?}"));
+        let end = lines[start + 1..]
+            .iter()
+            .position(|l| l.starts_with("def "))
+            .map_or(lines.len(), |n| start + 1 + n);
+        lines[start..end].join("\n")
+    };
+    let calls = ledger_calls(&gates);
     assert_eq!(calls.len(), 2, "{calls:#?}");
     for call in &calls {
         assert!(
@@ -4071,11 +4671,62 @@ fn readme_env_hygiene_and_ledger_rows_match_the_code() {
             "{call}"
         );
     }
+    let hygiene = ledger_calls(&body_of("def hygiene_create("));
     assert_eq!(
-        calls.iter().filter(|c| c.contains("tasks=")).count(),
+        hygiene.len(),
         1,
-        "only the group-scoped hygiene call passes --tasks: {calls:#?}"
+        "hygiene_create must make exactly one collect_ledger_lines call: {hygiene:#?}"
     );
+    assert!(
+        hygiene[0].contains("tasks=group_tasks"),
+        "the hygiene call must pass the group members: {}",
+        hygiene[0]
+    );
+    let collect = ledger_calls(&body_of("def _collect("));
+    assert_eq!(collect.len(), 1, "{collect:#?}");
+    let passes_tasks = fancy_regex::Regex::new(r"\btasks=").unwrap();
+    assert!(
+        !passes_tasks.is_match(&collect[0]).unwrap(),
+        "the run report's _collect call must stay run-scoped: {}",
+        collect[0]
+    );
+}
+
+/// The README's gh command seams row names exactly the `ARCHITECT_GH_*_CMD`
+/// variables `gates.py` reads, so a seam added or dropped in the gates
+/// surfaces here.
+#[test]
+fn readme_gh_seam_row_names_exactly_the_seams_gates_reads() {
+    let seam_re = fancy_regex::Regex::new(r"ARCHITECT_GH_[A-Z_]+?_CMD").unwrap();
+    let names = |text: &str| -> BTreeSet<String> {
+        seam_re
+            .find_iter(text)
+            .map(|m| m.unwrap().as_str().to_string())
+            .collect()
+    };
+    let gates = fs::read_to_string(candidate_dir().join("scripts/gates.py")).unwrap();
+    let read: BTreeSet<String> = gates
+        .lines()
+        .filter(|l| l.contains("os.environ.get(\"ARCHITECT_GH_"))
+        .flat_map(names)
+        .collect();
+    assert!(
+        !read.is_empty(),
+        "gates.py reads no ARCHITECT_GH_*_CMD seam"
+    );
+    let row = adjustments_row("| gh command seams |");
+    assert_eq!(
+        names(&row),
+        read,
+        "the gh command seams row drifted from gates.py (left: README)"
+    );
+    for clause in [
+        "`bash -c`",
+        "operator's own environment",
+        "both batteries and the Rust wrapper drop any inherited value",
+    ] {
+        assert!(row.contains(clause), "the seams row lost {clause:?}: {row}");
+    }
 }
 
 /// The README's recorded battery figures are runs of the current batteries,
@@ -4102,5 +4753,91 @@ fn readme_battery_figures_meet_the_wrapper_floors() {
     assert!(
         readme().contains("session check last line\n`ok node ids / script paths consistent`"),
         "README lost the session check's literal last line"
+    );
+}
+
+/// The README's recorded census as `path -> hunk count`, parsed from the
+/// fenced block after "Recorded census against the staging tree".
+fn readme_census() -> BTreeMap<String, usize> {
+    let text = readme();
+    let intro = text
+        .find("Recorded census against the staging tree")
+        .expect("the README lost its staging census");
+    let open = intro + text[intro..].find("```\n").unwrap() + 4;
+    let close = open + text[open..].find("```").unwrap();
+    let row = fancy_regex::Regex::new(r"^(\S+)\s+(\d+) hunks?\s+\(.+\)$").unwrap();
+    text[open..close]
+        .lines()
+        .map(|line| {
+            let caps = row
+                .captures(line)
+                .unwrap()
+                .unwrap_or_else(|| panic!("unparseable census line {line:?}"));
+            (caps[1].to_string(), caps[2].parse().unwrap())
+        })
+        .collect()
+}
+
+/// Every file under `root` except bytecode caches, relative to `root`.
+fn census_files(root: &Path) -> BTreeSet<String> {
+    files_under(root)
+        .into_iter()
+        .filter(|rel| !rel.contains("__pycache__"))
+        .collect()
+}
+
+/// The README's recorded census is a live `diff -u` against the staging
+/// tree: the same set of differing files, each with the hunk count it
+/// states, and no file on one side only. The staging tree lives outside this
+/// repo, so the check runs only when `ARCHITECT_NEXT_STAGING_DIR` is set, and
+/// fails when that value is not a directory.
+#[test]
+fn readme_census_matches_a_live_diff_against_the_staging_tree() {
+    let staging = std::env::var_os("ARCHITECT_NEXT_STAGING_DIR").filter(|v| !v.is_empty());
+    let Some(staging) = staging.map(PathBuf::from) else {
+        eprintln!("skipping: ARCHITECT_NEXT_STAGING_DIR unset or empty; census not checked");
+        return;
+    };
+    assert!(
+        staging.is_dir(),
+        "ARCHITECT_NEXT_STAGING_DIR is set but {} is not a directory",
+        staging.display()
+    );
+    let ours = census_files(&candidate_dir());
+    let theirs = census_files(&staging);
+    let only_ours: Vec<&String> = ours.difference(&theirs).collect();
+    let only_staging: Vec<&String> = theirs.difference(&ours).collect();
+    assert!(
+        only_ours.is_empty() && only_staging.is_empty(),
+        "files on one side only: candidate {only_ours:?}, staging {only_staging:?}"
+    );
+
+    let mut live = BTreeMap::new();
+    for rel in &ours {
+        let out = output_with_timeout(
+            Command::new("diff")
+                .arg("-u")
+                .arg(staging.join(rel))
+                .arg(candidate_dir().join(rel)),
+            GATE_LIMIT,
+            "diff -u",
+        );
+        assert!(
+            matches!(out.status.code(), Some(0 | 1)),
+            "diff -u {rel}: {}",
+            transcript(&out)
+        );
+        let hunks = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.starts_with("@@"))
+            .count();
+        if hunks > 0 {
+            live.insert(rel.clone(), hunks);
+        }
+    }
+    assert_eq!(
+        live,
+        readme_census(),
+        "the README census drifted from the staging tree (left: live, right: README)"
     );
 }

@@ -72,7 +72,7 @@ HARD_TRIGGER_RE = re.compile(
     r"force-push|drop (table|column|data)|delete .*branch|rm -rf|Design question:",
     re.I,
 )
-RESUME_RE = re.compile(r"Architect run id:\s*([0-9]{8}T[0-9]{6}-[0-9a-f]{8})")
+RESUME_RE = re.compile(r"Architect run id:\s*([0-9]{8}T[0-9]{6}-[0-9a-f]{8}(?:-[0-9]+)?)")
 SISYPHUS_RUN_RE = re.compile(r"Sisyphus run id:\s*([0-9]{8}T[0-9]{6}-[0-9a-f]{8})")
 TASK_ID_RE = re.compile(r"\bTASK-\d{3,}\b")
 SHA_RE = re.compile(r"\b(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b")
@@ -177,10 +177,13 @@ def is_parallel(state):
 
 # ---------------------------------------------------------------- run dir (A2)
 def cache_dir():
-    """Coyote's cache directory, resolved the way the engine resolves it:
+    """Coyote's cache directory, in the engine's precedence order:
     `COYOTE_CACHE_DIR`, else `$XDG_CACHE_HOME/coyote`, else the platform cache
     directory joined with `coyote` (`~/Library/Caches` on macOS, `~/.cache` on
-    Linux, `%LOCALAPPDATA%` on Windows)."""
+    Linux, `%LOCALAPPDATA%` on Windows). One difference: the engine takes
+    `COYOTE_CACHE_DIR` or `XDG_CACHE_HOME` whenever it is set, even to the
+    empty string, while this treats an empty value as unset and falls through
+    to the next tier."""
     explicit = os.environ.get("COYOTE_CACHE_DIR")
     if explicit:
         return explicit
@@ -207,9 +210,20 @@ def runs_root():
 
 
 def new_run_id(brief):
+    """Claims a fresh run dir with `os.mkdir`, so two runs of one brief in the same
+    second get `<stamp>-<digest>` and `<stamp>-<digest>-2` instead of sharing a dir."""
     stamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%S")
     digest = hashlib.sha1((brief or "").encode("utf-8", "replace")).hexdigest()[:8]
-    return f"{stamp}-{digest}"
+    base = f"{stamp}-{digest}"
+    os.makedirs(runs_root(), exist_ok=True)
+    n = 1
+    while True:
+        run_id = base if n == 1 else f"{base}-{n}"
+        try:
+            os.mkdir(run_dir_for(run_id))
+            return run_id
+        except FileExistsError:
+            n += 1
 
 
 def run_dir_for(run_id):
@@ -441,7 +455,8 @@ def core_tool(name, timeout=600, **argc):
     path = core_tools_path()
     if not path:
         return False, f"{name}: architect tools.sh not found (LLM_ROOT_DIR unset and no sibling {CORE_TOOLS_REL}/)"
-    env = dict(os.environ)
+    # an inherited argc_* (a stale argc_tasks) would act as an option this call never passed
+    env = {k: v for k, v in os.environ.items() if not k.startswith("argc_")}
     env["LLM_OUTPUT"] = "/dev/stdout"
     env.setdefault("LLM_ROOT_DIR", os.path.abspath(os.path.join(os.path.dirname(path), "..", "..")))
     env["LLM_AGENT_ROOT_DIR"] = os.path.dirname(path)

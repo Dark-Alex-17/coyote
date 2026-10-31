@@ -666,7 +666,13 @@ def branch_setup(state):
             gi = as_int(state.get("group_index")) or 1
             u["group_index"] = gi
             branch = f"{_run_branch(state)}-g{gi}"
-            prev = f"{_run_branch(state)}-g{gi - 1}" if gi > 1 else ""
+            # A skipped group never gets a PR, so the stack continues from the
+            # last group that did.
+            skipped = {as_int(i) for i in as_list(state.get("skipped_group_indexes"))}
+            prev_gi = gi - 1
+            while prev_gi in skipped:
+                prev_gi -= 1
+            prev = f"{_run_branch(state)}-g{prev_gi}" if prev_gi >= 1 else ""
             if prev:
                 merged = _pr_merged(state, prev)
                 base = base if merged else prev
@@ -1121,6 +1127,9 @@ def verify_gate(state):
         last = rl[-1]
         if last.get("head") and last["head"] != head and not _code_tree_dirty(state, code):
             lines += [f"Re-review delta: {last['head']}..HEAD"]
+            # Only the immediately-prior round settles a lane, as the review
+            # gauntlet's own contract reads it: a lane GREEN two rounds ago but
+            # SKIPPED last round runs again rather than being carried forward.
             green = [l for l, v in as_dict(last.get("lanes")).items()
                      if l != "debris" and str(v).strip() == "GREEN" and l not in as_list(last.get("lanes_with_findings"))]
             if green:
@@ -1237,7 +1246,10 @@ def _probe_verdict(text):
 # The direct micro-mode adversary's report has no gauntlet header, so on that
 # lane its `ADVERSARIAL_REVIEW:` line is the only verdict (a `GAUNTLET:` line
 # quoted in its verification output is not one) and its complaints are the
-# numbered items under its column-0 `Complaints:` line.
+# numbered items under its column-0 `Complaints:` line, read from the whole
+# report. A lane row it quotes is not a lane verdict, so it reports no lanes
+# and the next round settles none; a quoted probe row or USAGE_PROBE line is
+# no probe verdict either, so it yields no probe files.
 def _parse_gauntlet(text, adversary_lane=False):
     header = _gauntlet_header(text)
     header_lines = header.splitlines()
@@ -1252,14 +1264,15 @@ def _parse_gauntlet(text, adversary_lane=False):
         incomplete = [x.strip() for x in m.group(1).split(",") if x.strip()]
     if "PIPELINE-FAULT" in text and not adversary_lane and not _has_verdict(header):
         incomplete = ["pipeline"]
-    lanes = {lane: status for lane, (status, _) in _lane_cells(header).items()}
     if adversary_lane:
+        lanes = {}
         blockers = []
-        sec = re.search(r"(?ims)^#+\s*(Blockers?|Divergences?|Complaints?)\s*\n(.*?)(?=^#+\s|\Z)", header)
+        sec = re.search(r"(?ims)^#+\s*(Blockers?|Divergences?|Complaints?)\s*\n(.*?)(?=^#+\s|\Z)", text)
         if sec:
             blockers = [l.strip()[1:].strip() for l in sec.group(2).splitlines() if l.strip().startswith(("-", "*"))]
-        start = next((i + 1 for i, l in enumerate(header_lines) if re.fullmatch(r"Complaints:[ \t]*", l)), len(header_lines))
-        for line in header_lines[start:]:
+        text_lines = text.splitlines()
+        start = next((i + 1 for i, l in enumerate(text_lines) if re.fullmatch(r"Complaints:[ \t]*", l)), len(text_lines))
+        for line in text_lines[start:]:
             if not line.strip():
                 break
             if m := re.match(r"\d+\.[ \t]+(.+)", line):
@@ -1268,6 +1281,7 @@ def _parse_gauntlet(text, adversary_lane=False):
             blockers = [l.strip()[1:].strip() for l in text.splitlines() if l.strip().startswith(("-", "*"))][:20] or ["adversary: DIVERGES (see report)"]
         blockers += [l.strip() for l in text.splitlines() if l.strip().startswith("debris: Implementation debris")]
     else:
+        lanes = {lane: status for lane, (status, _) in _lane_cells(header).items()}
         first = next((i for i, l in enumerate(header_lines) if l.startswith("|")), len(header_lines))
         rows = len(_lane_rows(header))
         start = first + rows if rows else 0
@@ -1279,7 +1293,7 @@ def _parse_gauntlet(text, adversary_lane=False):
         # same line in a lane reason or a lane report is not a blocker.
         blockers += [l.rstrip() for l in section or [] if l.startswith("debris: Implementation debris")]
     plan_root = bool(re.search(r"(?i)plan (itself )?is the root cause|impossible or contradictory criterion|criterion (is|cannot be) (impossible|unverifiable)", text))
-    probe_files = re.findall(TEST_FILE_RE, text) if _probe_verdict(text) == "PASS" else []
+    probe_files = re.findall(TEST_FILE_RE, text) if not adversary_lane and _probe_verdict(text) == "PASS" else []
     return verdict, incomplete, lanes, blockers, plan_root, probe_files
 
 
@@ -1296,7 +1310,7 @@ def route_verdict(state):
     has_verdict = "ADVERSARIAL_REVIEW:" in text if adversary_lane else _has_verdict(_gauntlet_header(text))
     if not text or text.startswith("Agent node failed") or not has_verdict:
         verdict, incomplete, blockers = "BLOCKED", incomplete or ["pipeline"], []
-    probe = _probe_verdict(text)
+    probe = "" if adversary_lane else _probe_verdict(text)
     rounds_log = dict(as_dict(state.get("round_log")))
     rl = rounds_log.setdefault(unit, [])
     if rl:
@@ -2634,6 +2648,13 @@ def hygiene_create(state):
         u["_next"] = "pr_summary" if (is_single(state) or MULTI_IS_GROUPS) else "stack_gate_final"
         return u
     unit = units[0]
+    group_tasks = ",".join(unit.get("members", [])) if MULTI_IS_GROUPS and not is_single(state) else None
+    if group_tasks == "":
+        ledger(state, u, f"hygiene: {unit['id']} has no complete member; chore skipped")
+        u["hygiene_done"] = list(as_list(state.get("hygiene_done"))) + [unit["id"]]
+        u["hygiene_units"] = units[1:]
+        u["_next"] = "hygiene_create"
+        return u
     code = state.get("code_repo_path", "")
     base_branch = state.get("base_branch_name") or "main"
     git(code, "fetch", "--quiet", "origin")
@@ -2650,9 +2671,8 @@ def hygiene_create(state):
             "hygiene_base_missing", f"The {scope_word} base (merge-base of origin/{base_branch} and {top}) is empty - the lint would fall back to the "
                                     "worktree and report a vacuous clean. Skip the hygiene pass (recorded), or stop?",
             [option("Stop and report", recommended=True), option("Skip the hygiene pass (recorded as a follow-up)")], hard_trigger=True))
-    group_tasks = ",".join(unit.get("members", [])) if MULTI_IS_GROUPS and not is_single(state) else None
-    ok, ledger_out = core_tool("collect_ledger_lines", tag="debris-exempt", dir=state.get("tasks_root", ""),
-                               plan=state.get("plan_path", ""), tasks=group_tasks or None)
+    ok, ledger_out = core_tool("collect_ledger_lines", tag="debris-exempt", dir=_completed_tasks_dir(state),
+                               plan=state.get("plan_path", ""), tasks=group_tasks)
     ledger_lines = ledger_out.strip() if ok else "(collect_ledger_lines unavailable: " + tail(ledger_out, 120) + ")"
     agents_dir = os.path.join(os.environ.get("LLM_ROOT_DIR", os.path.expanduser("~/.config/coyote")), "agents")
     lint_cmd = f"python3 {agents_dir}/.shared/debris.py {code} {base}"
@@ -2695,12 +2715,33 @@ def stack_gate_final(state):
     return u
 
 
+def _completed_tasks_dir(state):
+    """Where complete task files live: the store's `completed` dir under dirstate, the tasks root otherwise."""
+    return os.path.join(state.get("tasks_root", ""), "completed") if TASKSTORE == "dirstate" else state.get("tasks_root", "")
+
+
 def _group_members(state):
-    """The closing PR group's complete task ids, comma-separated as tools.sh `--tasks` takes them; None outside group mode."""
+    """The closing PR group's complete task ids, comma-separated as tools.sh `--tasks` takes them.
+
+    "" when the group has no complete task, None outside group mode. Unlike
+    `_hygiene_units`, this counts the group's own hygiene chore once it is complete.
+    """
     unit = state.get("closeout_unit")
     if is_single(state) or not MULTI_IS_GROUPS or not unit:
         return None
-    return ",".join(t["id"] for t in as_list(state.get("tasks")) if t.get("unit") == unit and t.get("status") == "complete") or None
+    return ",".join(t["id"] for t in as_list(state.get("tasks")) if t.get("unit") == unit and t.get("status") == "complete")
+
+
+def _skip_empty_group(state, u):
+    """Close out a PR group with no complete task without opening its PR."""
+    unit = state.get("closeout_unit")
+    ledger(state, u, f"group: {unit} has no complete task; its PR is skipped (follow-up)")
+    u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"PR group {unit} not opened: none of its tasks completed"]
+    u["closeout_done_for"] = unit
+    u["skipped_group_indexes"] = list(as_list(state.get("skipped_group_indexes"))) + [as_int(state.get("group_index")) or 1]
+    u.update({"pr_number": "", "pr_url": "", "integration_checked": False, "integration_amended": False})
+    u["_next"] = "select_tasks" if (u.get("closeout_scope") or state.get("closeout_scope")) == "group" else "finish_plan"
+    return u
 
 
 def pr_body(state):
@@ -2718,9 +2759,10 @@ def pr_body(state):
     hyg = as_list(state.get("hygiene_items"))
     if hyg:
         write_artifact(run_dir, "pr-hygiene.md", "\n".join(f"- {h}" for h in hyg))
-    tasks_dir = os.path.join(state.get("tasks_root", ""), "completed") if TASKSTORE == "dirstate" else state.get("tasks_root", "")
     members = _group_members(state)
-    ok, out = core_tool("assemble_pr_body", plan=state.get("plan_path", ""), tasks_dir=tasks_dir,
+    if members == "":
+        return _skip_empty_group(state, u)
+    ok, out = core_tool("assemble_pr_body", plan=state.get("plan_path", ""), tasks_dir=_completed_tasks_dir(state),
                         tasks=members,
                         summary_file=os.path.join(run_dir, "pr-summary.md"), out=os.path.join(run_dir, "pr-body.md"),
                         hygiene_file=os.path.join(run_dir, "pr-hygiene.md") if hyg else None,
@@ -2759,6 +2801,9 @@ def open_pr(state):
     if state.get("pr_number"):
         u["_next"] = "pr_round_comments"
         return u
+    # ARCHITECT_GH_{COMMENT,CREATE,CHECKS,LOG,READY}_CMD are test and operator seams: when set, the gate runs the
+    # value through `bash -c` (the checks one through `/bin/sh -c`) instead of the `gh` call, and a set checks seam
+    # also skips `gh run rerun`. Both batteries and the Rust wrapper strip inherited ones.
     cmd = os.environ.get("ARCHITECT_GH_CREATE_CMD")
     if cmd:
         rc, out = sh(["bash", "-c", cmd], timeout=120)
@@ -3031,9 +3076,8 @@ def finish_plan(state):
 
 
 def _collect(state, tag):
-    tasks_dir = os.path.join(state.get("tasks_root", ""), "completed") if TASKSTORE == "dirstate" else state.get("tasks_root", "")
     # No --tasks: the run report covers every PR group, not only the last one closed.
-    ok, out = core_tool("collect_ledger_lines", tag=tag, dir=tasks_dir, plan=state.get("plan_path", ""))
+    ok, out = core_tool("collect_ledger_lines", tag=tag, dir=_completed_tasks_dir(state), plan=state.get("plan_path", ""))
     if not ok:
         return [f"(collect_ledger_lines unavailable for {tag}: {tail(out, 100)})"]
     return [l for l in out.splitlines() if l.strip() and l.strip() != "(none)"]
@@ -3110,6 +3154,8 @@ def group_closeout(state):
     u["closeout_scope"] = state.get("closeout_scope") or "group"
     u.update({"integration_checked": False, "hygiene_units": []})
     ledger(state, u, f"group: close-out of {state.get('closeout_unit')} (scope {u['closeout_scope']})")
+    if _group_members(state) == "":
+        return _skip_empty_group(state, u)
     u["_next"] = "phase_f_gate"
     return u
 
