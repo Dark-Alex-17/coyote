@@ -45,6 +45,8 @@ import sys
 import time
 
 sys.dont_write_bytecode = True
+# Under PYTHONSAFEPATH sys.path[0] is not this directory.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # A missing helper module or name must still end in the crash stub below, so
 # the import error is kept here and raised inside the crash guard by main().
@@ -52,7 +54,7 @@ try:
     from report_text import one_line
 
     helper_import_error = None
-except ImportError as e:
+except Exception as e:  # noqa: BLE001 - any helper failure must reach the stub
     helper_import_error = e
 
 # Keep in sync with default_lanes.ALIASES — a caller-forced lane must
@@ -321,7 +323,8 @@ def main():
 try:
     main()
 except Exception as e:  # noqa: BLE001 — a builder crash must never kill the graph
-    fault = f"PIPELINE-FAULT: lane builder crashed — {e}; no lanes were run"
+    error = " ".join(str(e).splitlines()) if helper_import_error else one_line(e)
+    fault = f"PIPELINE-FAULT: lane builder crashed \u2014 {error}; no lanes were run"
     if crash_context["signals_error"]:
         fault = f"{crash_context['signals_error']}; {fault}"
     print(

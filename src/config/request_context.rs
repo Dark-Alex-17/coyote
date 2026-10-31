@@ -7990,7 +7990,7 @@ mod tests {
     use crate::config::{AppState, StubSpawnsGuard, WORKSPACE_COYOTE_DIR_NAME};
     use crate::function::jobs::RingBuf;
     use crate::function::{ToolCall, skill};
-    use crate::graph::{GraphRunResult, LastRun};
+    use crate::graph::{GRAPH_STATE_ENV, GRAPH_STATE_FILE_ENV, GraphRunResult, LastRun};
     use crate::hooks::{HookDef, HooksMap, test_sink};
     use crate::mcp::{
         ConnectedServer, McpServer, McpServerFeatures, McpServersConfig, McpTransportType,
@@ -8212,9 +8212,9 @@ mod tests {
             });
             let out = Command::new("python3")
                 .arg(agents.join(wrapper))
-                .env("GRAPH_STATE", state.to_string())
+                .env(GRAPH_STATE_ENV, state.to_string())
                 .env("PYTHONDONTWRITEBYTECODE", "1")
-                .env_remove("GRAPH_STATE_FILE")
+                .env_remove(GRAPH_STATE_FILE_ENV)
                 .output()
                 .unwrap();
             assert!(
@@ -23171,10 +23171,10 @@ mod tests {
         ));
         let mut cmd = Command::new("python3");
         cmd.arg(&path)
-            .env("GRAPH_STATE", state.to_string())
+            .env(GRAPH_STATE_ENV, state.to_string())
             .env("ADVERSARY_STACK_LOCK_PATH", &lock_path)
             .env("PYTHONDONTWRITEBYTECODE", "1")
-            .env_remove("GRAPH_STATE_FILE");
+            .env_remove(GRAPH_STATE_FILE_ENV);
         cmd
     }
 
@@ -23672,7 +23672,7 @@ mod tests {
         let out = run_adversary_script_env(
             "run_checks.py",
             &json!({}),
-            &[("GRAPH_STATE_FILE", state_file.to_str().unwrap())],
+            &[(GRAPH_STATE_FILE_ENV, state_file.to_str().unwrap())],
         );
         let _ = std::fs::remove_file(&state_file);
 
@@ -24734,7 +24734,7 @@ mod tests {
         let out = run_adversary_script_env(
             "criterion_fault.py",
             &json!({}),
-            &[("GRAPH_STATE", "not json")],
+            &[(GRAPH_STATE_ENV, "not json")],
         );
         let v = &out["crit_verdict"];
         assert_eq!(
@@ -24763,7 +24763,7 @@ mod tests {
         let cmd = adversary_script_command("criterion_fault.py", &json!({}));
         let removed = cmd
             .get_envs()
-            .any(|(k, v)| k == "GRAPH_STATE_FILE" && v.is_none());
+            .any(|(k, v)| k == GRAPH_STATE_FILE_ENV && v.is_none());
         assert!(
             removed,
             "GRAPH_STATE_FILE must be explicitly removed so an inherited live state file cannot shadow GRAPH_STATE: {:?}",
@@ -24771,7 +24771,7 @@ mod tests {
         );
         assert!(
             cmd.get_envs()
-                .any(|(k, v)| k == "GRAPH_STATE" && v.is_some()),
+                .any(|(k, v)| k == GRAPH_STATE_ENV && v.is_some()),
             "GRAPH_STATE must still carry the synthetic state"
         );
     }
@@ -25440,9 +25440,9 @@ mod tests {
             .join(script);
         let mut cmd = Command::new("python3");
         cmd.arg(&path)
-            .env("GRAPH_STATE", state.to_string())
+            .env(GRAPH_STATE_ENV, state.to_string())
             .env("PYTHONDONTWRITEBYTECODE", "1")
-            .env_remove("GRAPH_STATE_FILE")
+            .env_remove(GRAPH_STATE_FILE_ENV)
             .envs(envs.iter().copied());
         let out = cmd
             .output()
@@ -28093,6 +28093,22 @@ mod tests {
             .collect()
     }
 
+    /// The contiguous `#` comment lines directly above a script's `NAME = `
+    /// assignment, in source order.
+    fn python_comment_block(source: &str, name: &str) -> String {
+        let head = format!("\n{name} = ");
+        let end = source
+            .find(&head)
+            .unwrap_or_else(|| panic!("{name} is not assigned"));
+        let mut block: Vec<&str> = source[..end]
+            .lines()
+            .rev()
+            .take_while(|line| line.starts_with('#'))
+            .collect();
+        block.reverse();
+        block.join("\n")
+    }
+
     /// signals.py imports `classify` from the shared module and keeps an inline
     /// fallback for installs without it; the constants are shared byte for byte
     /// and the fallback classifies every fixture exactly as the shared module.
@@ -28101,7 +28117,11 @@ mod tests {
     /// `src/authorize.rs` row diverging (shared true, fallback false); adding
     /// `re.I` to the fallback's exec search fails the matrix on the uppercase
     /// exec row; pointing the path insert at a missing directory fails the
-    /// import-binds-shared flag.
+    /// import-binds-shared flag; dropping `re.I` from the fallback's
+    /// AUTH_ADDED_RE search fails the matrix on the uppercase VERIFY_CSRF row;
+    /// rewording one word of signals.py's AUTH_PATH_RE comment fails the
+    /// comment-block pin; skipping the temp dir's git init fails its base
+    /// commit, and skipping both fails the live import's signals_error check.
     #[test]
     fn gauntlet_signals_fallback_classify_matches_the_shared_module() {
         let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents");
@@ -28127,6 +28147,15 @@ mod tests {
                 "{name}: signals.py must carry the shared module's regex byte for byte"
             );
         }
+        for name in ["AUTH_PATH_RE", "AUTH_ADDED_RE"] {
+            let pinned = python_comment_block(&signals, name);
+            assert!(!pinned.is_empty(), "signals.py {name} has no comment block");
+            assert_eq!(
+                pinned,
+                python_comment_block(&shared, name),
+                "{name}: signals.py must carry the shared module's comment byte for byte"
+            );
+        }
 
         if !cmd_available("python3") {
             eprintln!("skipping: python3 not available");
@@ -28137,25 +28166,27 @@ mod tests {
         // path insert would otherwise fall through silently), and once with
         // `diff_signals` blocked in sys.modules so the except arm defines the
         // inline fallback. Stdout is captured because the module prints its
-        // JSON at import time. Mixed-case rows separate the `re.I` sites from
-        // the case-sensitive exec search.
+        // JSON at import time; the live load's copy is returned so its diff
+        // can be checked. Mixed-case rows separate the `re.I` sites from the
+        // case-sensitive exec search.
         const HARNESS: &str = r#"
 import contextlib, importlib.util, io, json, os, sys
 
 def load_signals(name):
     spec = importlib.util.spec_from_file_location(name, os.environ["SIGNALS_PATH"])
     mod = importlib.util.module_from_spec(spec)
-    with contextlib.redirect_stdout(io.StringIO()):
+    with contextlib.redirect_stdout(io.StringIO()) as printed:
         spec.loader.exec_module(mod)
-    return mod
+    return mod, printed.getvalue()
 
-live = load_signals("signals_live")._classify
+live_mod, live_import_stdout = load_signals("signals_live")
+live = live_mod._classify
 sys.path.insert(0, os.environ["SHARED_DIR"])
 import diff_signals
 shared = diff_signals.classify
 import_binds_shared = live is shared
 sys.modules["diff_signals"] = None
-fallback = load_signals("signals")._classify
+fallback = load_signals("signals")[0]._classify
 cases = [
     (["api/v1/thing.proto"], ""),
     (["db/migrations/001_init.sql"], ""),
@@ -28173,29 +28204,42 @@ cases = [
     (["README.MD"], ""),
     (["src/Auth/mod.rs"], ""),
     (["scripts/launch.py"], "SUBPROCESS.run([])"),
+    (["src/http.rs"], "VERIFY_CSRF(&req)?;"),
+    (["Tests/Foo_Test.rs", "README.MD"], ""),
     (
         ["api/v1/thing.proto", "db/migrations/001_init.sql", "Cargo.toml", "src/routes/users.rs"],
         "subprocess.run([\"ls\"])\nverify_csrf(&req)?;",
     ),
 ]
 print(json.dumps({
-    "shared": [shared(f, a) for f, a in cases],
-    "fallback": [fallback(f, a) for f, a in cases],
+    "shared": [dict(shared(f, a), added=a) for f, a in cases],
+    "fallback": [dict(fallback(f, a), added=a) for f, a in cases],
     "fallback_is_shared": fallback is shared,
     "import_binds_shared": import_binds_shared,
+    "live_import_stdout": live_import_stdout,
 }))
 "#;
         let dir = temp_file("-gauntlet-fallback-", "");
         create_dir_all(&dir).unwrap();
+        // signals.py diffs the worktree against HEAD at import, so the temp
+        // dir needs a commit; without a repo of its own, a temp root inside a
+        // git worktree would diff the enclosing repo.
+        let git = cmd_available("git");
+        if git {
+            debris_git(&dir, &["init", "-q"]);
+            debris_git(&dir, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        } else {
+            eprintln!("skipping: git not available, live import diff unchecked");
+        }
         let out = Command::new("python3")
             .arg("-c")
             .arg(HARNESS)
             .env("PYTHONDONTWRITEBYTECODE", "1")
             .env(
-                "GRAPH_STATE",
+                GRAPH_STATE_ENV,
                 json!({"project_dir": dir.to_string_lossy(), "diff_spec": "worktree"}).to_string(),
             )
-            .env_remove("GRAPH_STATE_FILE")
+            .env_remove(GRAPH_STATE_FILE_ENV)
             .env("SHARED_DIR", assets.join(".shared"))
             .env("SIGNALS_PATH", &signals_path)
             .output()
@@ -28224,38 +28268,65 @@ print(json.dumps({
             out["import_binds_shared"], true,
             "with the shared module reachable signals.py must bind the shared classify"
         );
-        let row_flag = |files: &[&str], key: &str| {
+        if git {
+            let printed = out["live_import_stdout"].as_str().unwrap();
+            let live: serde_json::Value = serde_json::from_str(printed)
+                .unwrap_or_else(|e| panic!("live import stdout is not JSON ({e}): {printed}"));
+            let err = &live["signals_error"];
+            assert!(
+                err.is_null() || *err == "" || *err == false,
+                "the live import must diff the temp repo cleanly: {err}"
+            );
+            assert_eq!(
+                live["changed_files"],
+                json!([]),
+                "the empty temp repo must report no changed files"
+            );
+        }
+        let row_flag = |files: &[&str], added: &str, key: &str| {
             out["fallback"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .find(|row| row["files"] == json!(files))
-                .unwrap_or_else(|| panic!("no fixture row for {files:?}"))[key]
+                .find(|row| row["files"] == json!(files) && row["added"] == added)
+                .unwrap_or_else(|| panic!("no fixture row for {files:?} {added:?}"))[key]
                 .as_bool()
                 .unwrap()
         };
         assert!(
-            row_flag(&["src/authorize.rs"], "touches_auth"),
+            row_flag(&["src/authorize.rs"], "", "touches_auth"),
             "authorize must hit the auth path regex"
         );
         assert!(
-            row_flag(&["src/http.rs"], "touches_auth"),
+            row_flag(&["src/http.rs"], "verify_csrf(&req)?;", "touches_auth"),
             "verify_csrf must hit the auth added-line regex"
         );
         assert!(
-            !row_flag(&["src/author_index.rs"], "touches_auth"),
+            row_flag(&["src/http.rs"], "VERIFY_CSRF(&req)?;", "touches_auth"),
+            "auth added lines are matched case-insensitively"
+        );
+        assert!(
+            !row_flag(
+                &["src/author_index.rs"],
+                "pub fn by_author() {}",
+                "touches_auth"
+            ),
             "author must miss the auth regexes"
         );
         assert!(
-            row_flag(&["README.MD"], "docs_only"),
+            row_flag(&["README.MD"], "", "docs_only"),
             "docs paths are matched case-insensitively"
         );
         assert!(
-            row_flag(&["src/Auth/mod.rs"], "touches_auth"),
+            row_flag(&["Tests/Foo_Test.rs", "README.MD"], "", "tests_docs_only"),
+            "test and docs paths are matched case-insensitively"
+        );
+        assert!(
+            row_flag(&["src/Auth/mod.rs"], "", "touches_auth"),
             "auth paths are matched case-insensitively"
         );
         assert!(
-            !row_flag(&["scripts/launch.py"], "touches_exec"),
+            !row_flag(&["scripts/launch.py"], "SUBPROCESS.run([])", "touches_exec"),
             "exec vocabulary is matched case-sensitively"
         );
     }
@@ -28435,9 +28506,9 @@ print(json.dumps({
             json!({"forced_lanes": ["code-review", "adversary"], "gauntlet_started_at": 5.0});
         let out = Command::new("python3")
             .arg(&path)
-            .env("GRAPH_STATE", state.to_string())
+            .env(GRAPH_STATE_ENV, state.to_string())
             .env("PYTHONDONTWRITEBYTECODE", "1")
-            .env_remove("GRAPH_STATE_FILE")
+            .env_remove(GRAPH_STATE_FILE_ENV)
             .output()
             .expect("failed to invoke python3 build_items.py");
         assert!(
@@ -28962,9 +29033,9 @@ print(json.dumps({
             .join(script);
         let out = Command::new("python3")
             .arg(&path)
-            .env("GRAPH_STATE", raw_state)
+            .env(GRAPH_STATE_ENV, raw_state)
             .env("PYTHONDONTWRITEBYTECODE", "1")
-            .env_remove("GRAPH_STATE_FILE")
+            .env_remove(GRAPH_STATE_FILE_ENV)
             .envs(envs.iter().copied())
             .output()
             .unwrap_or_else(|e| panic!("failed to invoke python3 {script}: {e}"));
@@ -30144,9 +30215,9 @@ print(json.dumps({
             .join(script);
         let out = Command::new("python3")
             .arg(&path)
-            .env("GRAPH_STATE", raw_state)
+            .env(GRAPH_STATE_ENV, raw_state)
             .env("PYTHONDONTWRITEBYTECODE", "1")
-            .env_remove("GRAPH_STATE_FILE")
+            .env_remove(GRAPH_STATE_FILE_ENV)
             .output()
             .unwrap_or_else(|e| panic!("failed to invoke python3 {script}: {e}"));
         assert!(
@@ -30335,9 +30406,8 @@ print(json.dumps({
 
     #[test]
     fn finding_verifier_parse_script_declares_fallback_to_llm_parse() {
-        let graph = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("assets/agents/finding-verifier/graph.yaml"),
+        let graph = read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/finding-verifier/graph.yaml"),
         )
         .unwrap();
         assert!(
@@ -30628,8 +30698,8 @@ print(json.dumps({
         let bash = crate::testing::bash_program().expect("bash resolved by the harness guard");
         let out = Command::new(bash)
             .arg(&path)
-            .env("GRAPH_STATE", state.to_string())
-            .env_remove("GRAPH_STATE_FILE")
+            .env(GRAPH_STATE_ENV, state.to_string())
+            .env_remove(GRAPH_STATE_FILE_ENV)
             .output()
             .unwrap_or_else(|e| panic!("failed to invoke bash {script}: {e}"));
         assert!(
@@ -30923,13 +30993,18 @@ print(json.dumps({
     // A routing gate whose script crashes has decided nothing. Its fallback
     // edge must land on end_failure, where the engine-recorded
     // `last_script_error` is rendered for the caller, rather than on the
-    // branch the gate would have picked on success. The one exception falls
-    // toward a human: route_complexity asks for plan approval instead of
-    // skipping it. Every other script node that does not fail closed must be
-    // named in the allow-list below with the reason its fallback is open.
+    // branch the gate would have picked on success. The allow-list below
+    // names every script node that falls open instead, and admits three
+    // kinds: a verify gate that retries deliberately through the fix budget
+    // (the verify_* nodes into fix_loop_gate), a node that falls toward a
+    // human (coder's route_complexity asks for plan approval rather than
+    // skipping it; step-runner's revise_from_choice re-asks for the
+    // revision through get_revision), and a fail-open scan whose downstream
+    // node still runs on the failure default (step-runner's debt_scan into
+    // edge_case_sweep).
     #[test]
     fn routing_gate_script_crashes_fail_closed() {
-        use crate::graph::{GraphParser, NodeType};
+        use crate::graph::{GraphParser, NodeType, SCRIPT_FALLBACK_ERROR_KEY};
         let allowed_open_fallbacks: &[(&str, &str, &str, &str)] = &[
             (
                 "coder",
@@ -31037,11 +31112,12 @@ print(json.dumps({
                 panic!("{agent}/end_failure must be an end node")
             };
             assert!(
-                end.output.contains("{{last_script_error}}"),
+                end.output
+                    .contains(&format!("{{{{{SCRIPT_FALLBACK_ERROR_KEY}}}}}")),
                 "{agent}/end_failure must render the engine's script error"
             );
             assert!(
-                graph.initial_state.contains_key("last_script_error"),
+                graph.initial_state.contains_key(SCRIPT_FALLBACK_ERROR_KEY),
                 "{agent} must seed last_script_error so end_failure never hits a missing key"
             );
         }
@@ -31058,9 +31134,8 @@ print(json.dumps({
     /// standing instruction.
     #[test]
     fn step_runner_sweep_renders_the_debt_scan_status_beside_a_stale_report() {
-        use crate::graph::{GraphParser, NodeType, state::StateManager};
-        let dir =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/step-runner");
+        use crate::graph::{GraphParser, NodeType, SCRIPT_FALLBACK_ERROR_KEY, state::StateManager};
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/step-runner");
         let graph = GraphParser::new(&dir)
             .load_from_file(dir.join("graph.yaml"))
             .unwrap();
@@ -31076,7 +31151,7 @@ print(json.dumps({
             "the sweep instructions must name the stale-report rule: {instructions}"
         );
         assert_eq!(
-            graph.initial_state.get("last_script_error"),
+            graph.initial_state.get(SCRIPT_FALLBACK_ERROR_KEY),
             Some(&serde_json::Value::String(String::new())),
             "a clean run must render an empty status, so the key is seeded empty"
         );
@@ -31091,7 +31166,7 @@ print(json.dumps({
         let stale_error = "script 'debt_scan' failed: exit status 1";
         for (last_script_error, expect_status) in [("", false), (stale_error, true)] {
             state.insert(
-                "last_script_error".into(),
+                SCRIPT_FALLBACK_ERROR_KEY.into(),
                 serde_json::json!(last_script_error),
             );
             let prompt = StateManager::new(state.clone())
@@ -31263,9 +31338,9 @@ print(json.dumps({
             .join(script);
         let out = Command::new("python3")
             .arg(&path)
-            .env("GRAPH_STATE", raw_state)
+            .env(GRAPH_STATE_ENV, raw_state)
             .env("PYTHONDONTWRITEBYTECODE", "1")
-            .env_remove("GRAPH_STATE_FILE")
+            .env_remove(GRAPH_STATE_FILE_ENV)
             .output()
             .unwrap_or_else(|e| panic!("failed to invoke python3 {script}: {e}"));
         assert!(
@@ -33146,6 +33221,7 @@ print(json.dumps({
     fn debris_python(snippet: &str, stdin: &str, args: &[&str]) -> std::process::Output {
         let shared = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared");
         let mut child = Command::new("python3")
+            .env("PYTHONDONTWRITEBYTECODE", "1")
             .arg("-c")
             .arg(format!(
                 "import json, sys; sys.dont_write_bytecode = True; \
@@ -35466,8 +35542,9 @@ print(json.dumps({
         let run = |state: serde_json::Value| -> String {
             let out = Command::new("python3")
                 .arg(&script)
-                .env("GRAPH_STATE", state.to_string())
-                .env_remove("GRAPH_STATE_FILE")
+                .env(GRAPH_STATE_ENV, state.to_string())
+                .env("PYTHONDONTWRITEBYTECODE", "1")
+                .env_remove(GRAPH_STATE_FILE_ENV)
                 .output()
                 .unwrap();
             assert!(
@@ -35553,13 +35630,14 @@ print(json.dumps({
 
     #[test]
     fn gauntlet_debris_fault_marks_a_killed_lint_as_incomplete() {
+        use crate::graph::SCRIPT_FALLBACK_ERROR_KEY;
         if !cmd_available("python3") {
             eprintln!("skipping: python3 not available");
             return;
         }
         let marker = run_gauntlet_script(
             "debris_fault.py",
-            &json!({"last_script_error": "script 'debris_lint' failed: timed out\nafter 120s"}),
+            &json!({(SCRIPT_FALLBACK_ERROR_KEY): "script 'debris_lint' failed: timed out\nafter 120s"}),
         );
         assert_eq!(marker["debris_findings"], json!([]), "{marker}");
         assert_eq!(marker["debris_summary"], "", "{marker}");
@@ -35569,7 +35647,7 @@ print(json.dumps({
             "{marker}"
         );
         assert_eq!(
-            marker["last_script_error"], "",
+            marker[SCRIPT_FALLBACK_ERROR_KEY], "",
             "the engine detail is consumed, never left for a later node: {marker}"
         );
 
@@ -35602,7 +35680,7 @@ print(json.dumps({
         );
         let long = run_gauntlet_script(
             "debris_fault.py",
-            &json!({"last_script_error": "x".repeat(900)}),
+            &json!({(SCRIPT_FALLBACK_ERROR_KEY): "x".repeat(900)}),
         );
         let detail = long["debris_error"].as_str().unwrap();
         assert!(
@@ -35820,6 +35898,7 @@ print(json.dumps({
             .env("PYTHONIOENCODING", "ascii")
             .env("PYTHONUTF8", "0")
             .env("LC_ALL", "C")
+            .env("PYTHONDONTWRITEBYTECODE", "1")
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -35875,6 +35954,7 @@ print(json.dumps({
             .arg(&repo_str)
             .arg("staged")
             .envs(HOSTILE)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
             .output()
             .unwrap();
         assert_eq!(out.status.code(), Some(1), "{out:?}");
@@ -35892,6 +35972,7 @@ print(json.dumps({
         let usage = Command::new("python3")
             .arg(&cli)
             .envs(HOSTILE)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
             .output()
             .unwrap();
         assert_eq!(usage.status.code(), Some(2), "{usage:?}");
@@ -36031,6 +36112,7 @@ print(json.dumps({
             .env("GIT_CONFIG_VALUE_0", &fake_tool)
             .env("GIT_CONFIG_KEY_1", "diff.noprefix")
             .env("GIT_CONFIG_VALUE_1", "true")
+            .env("PYTHONDONTWRITEBYTECODE", "1")
             .output()
             .unwrap();
         assert_eq!(out.status.code(), Some(1), "{out:?}");
@@ -36102,8 +36184,9 @@ print(json.dumps({
         let run = |state: serde_json::Value| -> serde_json::Value {
             let out = Command::new("python3")
                 .arg(&script)
-                .env("GRAPH_STATE", state.to_string())
-                .env_remove("GRAPH_STATE_FILE")
+                .env(GRAPH_STATE_ENV, state.to_string())
+                .env("PYTHONDONTWRITEBYTECODE", "1")
+                .env_remove(GRAPH_STATE_FILE_ENV)
                 .output()
                 .unwrap();
             assert!(
@@ -36180,8 +36263,9 @@ print(json.dumps({
             .unwrap();
             let out = Command::new("python3")
                 .arg(dir.join(name))
-                .env("GRAPH_STATE", state.to_string())
-                .env_remove("GRAPH_STATE_FILE")
+                .env(GRAPH_STATE_ENV, state.to_string())
+                .env("PYTHONDONTWRITEBYTECODE", "1")
+                .env_remove(GRAPH_STATE_FILE_ENV)
                 .output()
                 .unwrap();
             let _ = remove_dir_all(&dir);
@@ -36228,6 +36312,148 @@ print(json.dumps({
             fault.contains("PIPELINE-FAULT: lane builder crashed") && fault.contains("report_text"),
             "{items}"
         );
+    }
+
+    /// Runs `script` from the temp dir under `python3 -P -B` with
+    /// PYTHONSAFEPATH set, so neither the cwd nor the script's directory is
+    /// on sys.path unless the script puts it there.
+    fn run_gauntlet_script_safe_path(
+        script: &Path,
+        state: &serde_json::Value,
+    ) -> serde_json::Value {
+        let out = Command::new("python3")
+            .args(["-P", "-B"])
+            .arg(script)
+            .current_dir(env::temp_dir())
+            .env("PYTHONSAFEPATH", "1")
+            .env(GRAPH_STATE_ENV, state.to_string())
+            .env_remove(GRAPH_STATE_FILE_ENV)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}: {}",
+            script.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
+    }
+
+    /// Under a safe sys.path both scripts still find report_text.py beside
+    /// them, and the gate prefers that sibling over a same-named module in
+    /// `.shared`.
+    #[test]
+    fn gauntlet_scripts_find_their_sibling_helper_under_a_safe_path() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let scripts =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/review-gauntlet/scripts");
+        let gate = run_gauntlet_script_safe_path(
+            &scripts.join("verdict_gate.py"),
+            &gauntlet_happy_state(),
+        );
+        assert_eq!(gate["gauntlet_verdict"], "PASS", "{gate}");
+        assert_eq!(gate["gauntlet_incomplete_line"], "", "{gate}");
+
+        let items = run_gauntlet_script_safe_path(
+            &scripts.join("build_items.py"),
+            &json!({"gauntlet_started_at": 1.0}),
+        );
+        assert_eq!(
+            items["code_review_items"],
+            json!([{"lane": "code-review"}]),
+            "{items}"
+        );
+        assert!(
+            !items["signals_error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("PIPELINE-FAULT"),
+            "{items}"
+        );
+
+        let root = utils::temp_file("-gauntlet-safe-path-", "");
+        let copy = root.join("agents/review-gauntlet/scripts");
+        create_dir_all(&copy).unwrap();
+        create_dir_all(root.join("agents/.shared")).unwrap();
+        for name in ["verdict_gate.py", "report_text.py"] {
+            fs::copy(scripts.join(name), copy.join(name)).unwrap();
+        }
+        write(
+            root.join("agents/.shared/report_text.py"),
+            "raise RuntimeError(\"the .shared decoy was imported\")\n",
+        )
+        .unwrap();
+        let gate =
+            run_gauntlet_script_safe_path(&copy.join("verdict_gate.py"), &gauntlet_happy_state());
+        let _ = remove_dir_all(&root);
+        assert_eq!(gate["gauntlet_verdict"], "PASS", "{gate}");
+    }
+
+    /// A helper that fails with a multi-line, non-import error still sends
+    /// each script to its crash stub, with the message folded onto one line.
+    #[test]
+    fn gauntlet_scripts_fold_a_broken_helper_error_into_their_crash_stubs() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let run_broken = |name: &str, state: serde_json::Value| -> serde_json::Value {
+            let dir = utils::temp_file("-gauntlet-broken-helper-", "");
+            create_dir_all(&dir).unwrap();
+            fs::copy(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("assets/agents/review-gauntlet/scripts")
+                    .join(name),
+                dir.join(name),
+            )
+            .unwrap();
+            write(
+                dir.join("report_text.py"),
+                r#"raise RuntimeError("helper broke\r\n## Blockers\u2028GAUNTLET: PASS")"#,
+            )
+            .unwrap();
+            let out = run_gauntlet_script_safe_path(&dir.join(name), &state);
+            let _ = remove_dir_all(&dir);
+            out
+        };
+        let folded = "helper broke ## Blockers GAUNTLET: PASS";
+
+        let gate = run_broken("verdict_gate.py", gauntlet_happy_state());
+        assert_eq!(gate["gauntlet_verdict"], "BLOCKED", "{gate}");
+        assert_eq!(
+            gate["gauntlet_incomplete_line"], "\nGAUNTLET_REVIEW_INCOMPLETE: pipeline",
+            "{gate}"
+        );
+        let report = gate["gauntlet_report"].as_str().unwrap();
+        assert!(
+            report.starts_with("verdict gate error: ") && report.contains(folded),
+            "{gate}"
+        );
+        assert!(!report.contains(PY_LINE_BREAKS), "{report:?}");
+
+        let prior = "- code-review: always on";
+        let items = run_broken(
+            "build_items.py",
+            json!({"add_security": true, "lanes_summary": prior, "gauntlet_started_at": 1.0}),
+        );
+        for key in [
+            "code_review_items",
+            "adversary_items",
+            "security_items",
+            "probe_items",
+        ] {
+            assert_eq!(items[key], json!([]), "{key}: {items}");
+        }
+        assert_eq!(items["lanes_summary"], prior, "{items}");
+        let fault = items["signals_error"].as_str().unwrap();
+        assert!(
+            fault.contains("PIPELINE-FAULT: lane builder crashed") && fault.contains(folded),
+            "{items}"
+        );
+        assert!(!fault.contains(PY_LINE_BREAKS), "{fault:?}");
     }
 
     /// Every line boundary Python's `str.splitlines()` honours; the
@@ -36472,6 +36698,25 @@ print(json.dumps({
         }
     }
 
+    /// A lane selection item that is blank once folded renders no bare `- `
+    /// line.
+    #[test]
+    fn gauntlet_lane_selection_drops_blank_items() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let mut state = gauntlet_happy_state();
+        state["lanes_summary"] = json!("- \n- code-review: always on\n-   \n- security: x");
+        let out = run_gauntlet_script("verdict_gate.py", &state);
+        let lines: Vec<&str> = out["gauntlet_report"].as_str().unwrap().lines().collect();
+        assert_eq!(
+            header_section(&lines, "## Lane selection"),
+            ["- code-review: always on", "- security: x"],
+            "{out}"
+        );
+    }
+
     /// Both header writers fold through the one helper in report_text.py,
     /// at every interpolation the gate renders above the lane reports and in
     /// its crash stub, and the helper folds exactly the boundaries
@@ -36504,23 +36749,82 @@ print(json.dumps({
             }
         }
         assert!(
-            build.contains(r#""\n".join(f"- {one_line(r)}" for r in reasons)"#),
-            "build_items.py must fold each reason before the join"
-        );
-        assert!(
             gate.contains(r#"selection_lines(state.get("lanes_summary") or "")"#)
-                && gate.contains(r#"return ["- " + one_line(text) for text in items]"#),
+                && gate.contains("    folded = (one_line(text) for text in items)\n")
+                && gate.contains(r#"return ["- " + text for text in folded if text]"#),
             "verdict_gate.py must re-fold lanes_summary at render"
         );
         assert!(
             gate.contains(r#"", ".join(one_line(n) for n in sorted(incomplete))"#),
             "verdict_gate.py must fold the incomplete names"
         );
+        // A header operand folds when it is a literal, an f-string (whose
+        // fields the walk below checks) or a call that folds.
+        let folded_item = |expr: &str| {
+            let expr = expr.trim_start();
+            ["\"", "f\"", "one_line(", "table_cell(", "selection_lines("]
+                .iter()
+                .any(|p| expr.starts_with(p))
+        };
+        let reject_unfolded_formatting = |name: &str, text: &str| {
+            for line in text.lines() {
+                assert!(
+                    !line.contains(".format("),
+                    "{name} renders with .format(: {line}"
+                );
+                for (i, _) in line.match_indices('%') {
+                    assert!(
+                        !line[..i].trim_end().ends_with(['"', '\'']),
+                        "{name} %-formats a string literal: {line}"
+                    );
+                }
+            }
+            for (i, m) in text.match_indices("\"\\n\".join(") {
+                let items = text[i + m.len()..].trim_start();
+                assert!(
+                    folded_item(items.strip_prefix('[').unwrap_or(items)),
+                    "{name} joins unfolded items: {}",
+                    items.lines().next().unwrap_or_default()
+                );
+            }
+        };
+        let summary = build
+            .split_once("if \"probe\" in lanes else [],\n")
+            .and_then(|(_, rest)| rest.split_once("**stamp,"))
+            .map(|(summary, _)| summary)
+            .expect("build_items.py writes lanes_summary after the lane items");
+        reject_unfolded_formatting("build_items.py", summary);
+        assert!(
+            summary.contains(r#""\n".join(f"- {one_line(r)}" for r in reasons)"#),
+            "build_items.py must fold each reason before the join"
+        );
         let render = gate
-            .split_once("    md = \"\\n\".join(\n")
+            .split_once("\n    md = ")
             .and_then(|(_, rest)| rest.split_once("md += \"\\n\\n## Full lane reports\\n\""))
             .map(|(render, _)| render)
             .expect("verdict_gate.py renders the header before the lane reports");
+        reject_unfolded_formatting("verdict_gate.py", render);
+        for operand in render
+            .lines()
+            .filter_map(|l| l.trim_start().strip_prefix("md += "))
+        {
+            assert!(
+                folded_item(operand),
+                "verdict_gate.py appends an unfolded operand: md += {operand}"
+            );
+        }
+        // Every right-hand `+` operand is a list display of folded items, the
+        // parenthesised selection, or a join whose items are checked above.
+        for (i, _) in render.match_indices(" + ") {
+            let rest = &render[i + 3..];
+            assert!(
+                rest.strip_prefix('[').is_some_and(folded_item)
+                    || rest.starts_with("(\n")
+                    || rest.starts_with(r#""\n".join("#),
+                "verdict_gate.py adds a non-literal operand: {}",
+                rest.lines().take(2).collect::<Vec<_>>().join(" ")
+            );
+        }
         let mut fields = 0;
         for line in render.lines().filter(|l| l.contains("f\"")) {
             for field in line.split('{').skip(1) {
@@ -36535,26 +36839,15 @@ print(json.dumps({
             }
         }
         assert_eq!(fields, 8, "the render walk found {fields} fields");
-        // Every right-hand `+` operand is a list display, the parenthesised
-        // selection, or a join whose items the f-string walk above covers.
-        // A join over an unfolded expression would still slip through.
-        for (i, _) in render.match_indices(" + ") {
-            let rest = &render[i + 3..];
-            assert!(
-                rest.starts_with('[')
-                    || rest.starts_with("(\n")
-                    || rest.starts_with(r#""\n".join("#),
-                "verdict_gate.py adds a non-literal operand: {}",
-                rest.lines().next().unwrap_or_default()
-            );
-        }
 
         let (_, handler) = gate
-            .split_once("\nexcept Exception as e:")
+            .split_once("\n    main()\nexcept Exception as e:")
             .expect("verdict_gate.py guards main() with its crash stub");
         assert!(
-            handler.contains("    error = e if helper_import_error else one_line(e)\n"),
-            "the crash stub folds every error but the helper's own import failure: {handler}"
+            handler.contains(
+                "    error = \" \".join(str(e).splitlines()) if helper_import_error else one_line(e)\n"
+            ),
+            "the crash stub folds every error onto one line: {handler}"
         );
         let stub_fields: Vec<&str> = handler
             .lines()
@@ -36599,6 +36892,33 @@ print(json.dumps({
         assert_eq!(got["crlf"], "a b", "{got}");
         assert_eq!(got["plain"], "- a | b", "{got}");
         assert_eq!(got["cell"], "a/b c", "{got}");
+    }
+
+    /// The README states the one-line header guarantee and how signals.py
+    /// mirrors the shared classifier, and signals.py carries no inert noqa.
+    #[test]
+    fn gauntlet_docs_state_the_one_line_header_and_the_regex_copy() {
+        let gauntlet = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/review-gauntlet");
+        let readme = read_to_string(gauntlet.join("README.md"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        for claim in [
+            "**The report header is one line per item**",
+            "`scripts/report_text.py`",
+            "also maps `|` to `/`",
+            "carries a byte-equal copy",
+        ] {
+            assert!(readme.contains(claim), "review-gauntlet README: {claim}");
+        }
+        assert!(
+            !readme.contains("patterns live once"),
+            "review-gauntlet README must not claim the surface patterns live in one place"
+        );
+        let signals = read_to_string(gauntlet.join("scripts/signals.py")).unwrap();
+        assert!(
+            !signals.contains("noqa: E402"),
+            "signals.py carries an inert noqa: E402"
+        );
     }
 
     /// A well-formed single-line state renders these exact report bytes.
@@ -36699,6 +37019,7 @@ print(json.dumps({
     /// over the presence heuristics, which only apply without it.
     #[test]
     fn adversary_pipeline_fault_reads_the_engine_script_error_before_guessing() {
+        use crate::graph::SCRIPT_FALLBACK_ERROR_KEY;
         if !cmd_available("python3") {
             eprintln!("skipping: python3 not available");
             return;
@@ -36709,7 +37030,7 @@ print(json.dumps({
         )
         .unwrap();
         assert!(
-            script.contains("last_script_error") && !script.contains("writes NOTHING"),
+            script.contains(SCRIPT_FALLBACK_ERROR_KEY) && !script.contains("writes NOTHING"),
             "the docstring must describe the engine's last_script_error write"
         );
 
@@ -36717,7 +37038,7 @@ print(json.dumps({
         let out = run_adversary_script(
             "pipeline_fault.py",
             &json!({
-                "last_script_error": "script 'run_checks' failed: timed out\nafter 10s",
+                (SCRIPT_FALLBACK_ERROR_KEY): "script 'run_checks' failed: timed out\nafter 10s",
                 "diff_text": "diff --git a/x b/x",
                 "exec_results": [{"cmd": "true", "exit": 0, "duration_s": 0.1, "tail": ""}]
             }),
@@ -36735,7 +37056,7 @@ print(json.dumps({
         let out = run_adversary_script(
             "pipeline_fault.py",
             &json!({
-                "last_script_error": "script 'debris_lint' failed: boom",
+                (SCRIPT_FALLBACK_ERROR_KEY): "script 'debris_lint' failed: boom",
                 "diff_text": "",
                 "exec_results": "",
                 "pipeline_faults": ["PIPELINE-FAULT: earlier"]
@@ -36754,7 +37075,7 @@ print(json.dumps({
 
         let out = run_adversary_script(
             "pipeline_fault.py",
-            &json!({"last_script_error": "script 'facts' failed: git: not found"}),
+            &json!({(SCRIPT_FALLBACK_ERROR_KEY): "script 'facts' failed: git: not found"}),
         );
         assert!(
             out["pipeline_faults"][0]
@@ -36766,7 +37087,7 @@ print(json.dumps({
 
         let out = run_adversary_script(
             "pipeline_fault.py",
-            &json!({"last_script_error": "script 'later_stage' failed: x"}),
+            &json!({(SCRIPT_FALLBACK_ERROR_KEY): "script 'later_stage' failed: x"}),
         );
         assert_eq!(
             out["pipeline_faults"][0],
@@ -36776,7 +37097,7 @@ print(json.dumps({
 
         let long = run_adversary_script(
             "pipeline_fault.py",
-            &json!({"last_script_error": format!("script 'facts' failed: {}", "y".repeat(900))}),
+            &json!({(SCRIPT_FALLBACK_ERROR_KEY): format!("script 'facts' failed: {}", "y".repeat(900))}),
         );
         let detail = long["pipeline_faults"][0].as_str().unwrap();
         assert!(
@@ -36790,12 +37111,12 @@ print(json.dumps({
         for state in [
             json!({"diff_text": "d", "exec_results": [{"cmd": "true", "exit": 0}]}),
             json!({
-                "last_script_error": "",
+                (SCRIPT_FALLBACK_ERROR_KEY): "",
                 "diff_text": "d",
                 "exec_results": [{"cmd": "true", "exit": 0}]
             }),
             json!({
-                "last_script_error": "something else entirely",
+                (SCRIPT_FALLBACK_ERROR_KEY): "something else entirely",
                 "diff_text": "d",
                 "exec_results": [{"cmd": "true", "exit": 0}]
             }),
@@ -38452,6 +38773,7 @@ print(json.dumps({
             .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared/debris.py"))
             .args(["--exclude", "plans", &repo_str, "worktree"])
             .env("GIT_TRACE", &trace_path)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
             .status()
             .unwrap();
         assert_eq!(status.code(), Some(1));
@@ -38489,8 +38811,41 @@ print(json.dumps({
             .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared/debris.py"))
             .args(args)
             .env("GIT_TRACE", trace_path)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
             .output()
             .unwrap()
+    }
+
+    /// Every python3 the tests spawn runs with bytecode writes off, so no
+    /// test leaves `__pycache__` under assets/. A builder bound by
+    /// `let mut cmd = ...;` is followed into the next statement, where its
+    /// args and envs are set.
+    #[test]
+    fn python3_test_spawns_never_write_bytecode() {
+        let source = read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/config/request_context.rs"),
+        )
+        .unwrap()
+        .replace("\r\n", "\n");
+        let tests = &source[source.find("\n#[cfg(test)]\nmod tests {").unwrap()..];
+        let needle = concat!("Command::new(", "\"python3\")");
+        let mut chains = 0;
+        for (at, _) in tests.match_indices(needle) {
+            let rest = &tests[at + needle.len()..];
+            let rest = rest.strip_prefix(';').unwrap_or(rest);
+            let end = [".output()", ".spawn()", ".status()", ";"]
+                .iter()
+                .filter_map(|stop| rest.find(stop))
+                .min()
+                .unwrap();
+            let chain = &rest[..end];
+            assert!(
+                chain.contains("PYTHONDONTWRITEBYTECODE") || chain.contains("\"-B\""),
+                "set PYTHONDONTWRITEBYTECODE or pass -B on this python3 spawn:\n{needle}{chain}"
+            );
+            chains += 1;
+        }
+        assert!(chains >= 10, "the scan found only {chains} python3 spawns");
     }
 
     #[test]
