@@ -5,8 +5,10 @@ GRAPH_STATE/GRAPH_STATE_FILE; output is {"debt_hits": "<report>"} and the
 node's static `next:` routes onward. Fail-open: the shared script never exits
 non-zero for scan failures (it reports DEBT_SCAN_FAILED + the manual
 pipeline), and a hard crash of this shim falls forward on the node's declared
-`fallback:` edge (the same sweep its `next:` names) with the initial_state
-DEBT_SCAN_FAILED default still in `debt_hits`."""
+`fallback:` edge (the same sweep its `next:` names) with `debt_hits` left as
+it was: the initial_state DEBT_SCAN_FAILED default on the first pass, the
+previous pass's report on a later one (the sweep prompt treats that report as
+DEBT_SCAN_FAILED when the crash is recorded)."""
 
 import os
 import runpy

@@ -426,7 +426,7 @@ nodes:
          the "## Debt scan status" line starts with `script 'debt_scan'`, the
          scan did not run THIS pass and the section holds the PREVIOUS pass's
          report: treat the section as DEBT_SCAN_FAILED and run the manual
-         fallback the initial-state default quotes (the same text the scanner
+         fallback the initial-state default quotes (the same pipeline the scanner
          prints when it fails), then use that result instead. To the
          scan's list, add any env-gated or opt-in test the coder added
          (read the changed test files the coder result names). A marker

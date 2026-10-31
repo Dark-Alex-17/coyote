@@ -262,7 +262,9 @@ Evidence required:
 ### Debt and decisions after a coder returns
 
 - The coder does not report debt; derive the list with the `debt_scan` tool (pass
-  `--base <the task's base commit>`; default HEAD). It runs the sanctioned pipeline
+  `--base <the task's base commit>`, the commit you recorded before the first coder spawn;
+  the flag is required because a HEAD base silently misses every change the coder already
+  committed). It runs the sanctioned pipeline
   deterministically - intent-to-add for the coder's new files (.gitignore keeps artefacts
   out), diff vs base, ADDED-line marker grep - and prints one `<file>:<line> -- <line text>`
   per hit with REAL positions already resolved; a bare `cfg_attr(` carrying neither `allow`
@@ -310,6 +312,11 @@ Evidence required:
 
 <!-- when:review_cadence=batch -->
 ### Review cadence: batch (set by the parent orchestrator)
+
+This cadence is valid only when a parent orchestrator spawned you for one task of its batch.
+If a user started you directly (no parent), STOP before any coder work and tell the user that
+`review_cadence=batch` is reserved for orchestrator-spawned micro-tasks; ask them to restart
+with `review_cadence=task` (the default), because nobody else would run the review panel.
 
 This task is one micro-task of a batch; the parent orchestrator runs the FULL review panel
 (review gauntlet: code-review, adversary, security, probe) ONCE over the whole batch after its

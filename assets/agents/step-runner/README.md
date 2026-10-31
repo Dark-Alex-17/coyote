@@ -78,6 +78,7 @@ flowchart TD
     check_handoff{"check_handoff<br/>script"}
     check_handoff -->|"schema valid"| gate_user_review
     check_handoff -->|"one retry"| write_handoff
+    check_handoff -->|"failed twice"| end_failure
     gate_user_review{{"gate_user_review<br/>approval"}}
     gate_user_review -->|"approve"| end_success
     gate_user_review -->|"revise"| get_revision
@@ -105,8 +106,12 @@ End nodes emit sentinel outcomes for the caller:
   exhausted, a verification gate crashed twice (rendered as `Verification
   gate error:`), the handoff failed validation twice, or an orient/handoff
   LLM fault was recorded (rendered as `Pipeline fault:` in the output), or a
-  routing gate (`route_staleness`/`route_sweep`/`route_review`) crashed
-  (rendered as `Last script error:`).
+  script node whose fallback is `end_failure` crashed: a routing gate
+  (`route_staleness`/`route_sweep`/`route_review`), `resolve_step`,
+  `route_coder_result`, `fix_loop_gate`, `check_handoff` or `note_llm_fault`
+  (rendered as `Last script error:`). That section shows the most recent
+  script crash of the run, so a `debt_scan` crash earlier in the run can
+  still appear there when the step later fails for another reason.
 
 The step's debt list is derived mechanically rather than trusted from the
 coder's summary: a deterministic `debt_scan` script node (a thin shim over
@@ -155,7 +160,9 @@ Node crashes degrade the run visibly instead of masquerading as success:
 - `route_staleness`, `route_sweep` and `route_review` crashes end as
   `STEP_FAILED` with the engine's error under `Last script error:`. A routing
   gate that died has decided nothing, so the run does not proceed as if it
-  had chosen the optimistic branch.
+  had chosen the optimistic branch. `resolve_step`, `route_coder_result`,
+  `fix_loop_gate`, `check_handoff` and `note_llm_fault` crashes end the same
+  way.
 - `orient` and `write_handoff` faults route through `note_llm_fault`, which
   distills the engine's failure text into a `fault_note` rendered in the
   `STEP_FAILED` output — never an empty shell.
@@ -201,8 +208,7 @@ does not propagate to the spawned coder.
   parallel agents sharing one target directory serialise their gate runs
   (the spawned coder's own gates inherit the prefix: parent agent variables
   are cloned into the child; its ad-hoc cargo calls are not covered). The
-  whole gate
-  command runs under the prefix as one unit. Waiting on the lock counts
+  whole gate command runs under the prefix as one unit. Waiting on the lock counts
   toward the gate node's timeout (300 s format/lint, 600 s build, 1200 s
   tests), so prefer `flock -w <secs>` or raise those timeouts when runs are
   long. A gate killed by its timeout while still waiting leaves the lock

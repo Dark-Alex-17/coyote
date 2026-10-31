@@ -7,7 +7,7 @@ description: |
   finishes with ONE draft PR (CI checks watched to green) plus tracked follow-up tasks — or, with
   pr_strategy=multi, one stacked draft PR per plan-declared PR group. Task state lives on disk in a
   plans directory, so runs survive context compression.
-version: 2.13.0
+version: 2.14.0
 agent_session: temp
 auto_continue: true
 max_auto_continues: 100
@@ -91,8 +91,9 @@ global_tools:
 instructions: |
   Instructions are rendered dynamically: the `_instructions` tool (tools.sh) assembles them from
   instructions.md, resolving `<!-- when:... -->` conditional blocks against the agent variables
-  (autonomy, escalation_policy, parallel_tasks, pr_strategy). This static text is a placeholder
-  shown only when the dynamic render is unavailable (e.g. `--info`); it is never the live prompt.
+  (autonomy, escalation_policy, parallel_tasks, pr_strategy, task_granularity). This static text
+  is a placeholder shown only when the dynamic render is unavailable (e.g. `--info`); it is never
+  the live prompt.
 
 conversation_starters:
   - 'Implement the design doc at {{design_doc}} end to end'

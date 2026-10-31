@@ -43,10 +43,12 @@ MIGRATIONS_RE = r"migrations?/|\.sql$"
 # Tenancy / ownership-shaped added lines. Multi-tenant services often enforce
 # authorization by data ownership (org_id / account_id / customer_id checks,
 # "does this row belong to the caller") rather than by auth-named paths, so a
-# delta can re-order or weaken an ownership check without any AUTH_* hit. This
-# signal exists for watch-round narrowing classifiers (tenancy_signal); a
-# replay over three historical PR engagements showed exactly that shape; it
-# is deliberately NOT part of classify() so the gauntlet's signal set is unchanged.
+# delta can re-order or weaken an ownership check without any AUTH_* hit. A
+# replay over three historical PR engagements showed exactly that shape. It is
+# deliberately NOT part of classify() so the gauntlet's signal set is
+# unchanged, and nothing calls tenancy_signal yet: it is kept here, shared-only,
+# ahead of the watch-round narrowing classifiers it is meant for, so they
+# import one definition instead of growing their own copy.
 TENANCY_ADDED_RE = (
     r"owner|ownership|tenant|org[_-]?id|account[_-]?id|customer[_-]?id"
     r"|wrong[_ -]org|cross[_ -]tenant|authoriz|belongs"
