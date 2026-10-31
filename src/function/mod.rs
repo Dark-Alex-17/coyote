@@ -5555,7 +5555,7 @@ mod tests {
             "{python}"
         );
         assert!(
-            !python.contains(&crate::testing::TestConfigDirGuard::config_dir_env_name()),
+            !crate::testing::TestConfigDirGuard::mentions_config_dir_env(&python),
             "{python}"
         );
         assert!(!python.contains(&get_env_name("functions_dir")), "{python}");

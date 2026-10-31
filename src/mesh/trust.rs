@@ -7030,6 +7030,8 @@ mod tests {
         let waited = started.elapsed();
 
         assert!(err.contains("The mesh trust file lock"), "{err}");
+        assert!(err.contains("is held"), "{err}");
+        assert!(err.contains("try again"), "{err}");
         assert!(err.contains(&lock_path.display().to_string()), "{err}");
         assert!(
             waited >= EXCLUSIVE_LOCK_WAIT && waited < Duration::from_millis(2_500),

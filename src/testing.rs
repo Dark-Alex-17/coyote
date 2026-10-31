@@ -4,6 +4,7 @@ use crate::config::{WORKSPACE_COYOTE_DIR_NAME, memory};
 use crate::utils;
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use std::ffi::{OsStr, OsString};
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, Once, OnceLock};
 
@@ -292,17 +293,21 @@ impl TestConfigDirGuard {
         &self.cache_root
     }
 
-    /// The name of the config dir env var this guard pins, for tests that
-    /// check a rendered script never mentions it.
-    pub(crate) fn config_dir_env_name() -> String {
-        utils::get_env_name("config_dir")
+    /// Whether `text` names the config dir env var this guard pins, for
+    /// tests that check a rendered script never mentions it. The name stays
+    /// in this file so no test elsewhere can pin the var with it.
+    pub(crate) fn mentions_config_dir_env(text: &str) -> bool {
+        text.contains(&utils::get_env_name("config_dir"))
     }
 
     /// Unsets the config dir env var until the returned guard drops, which
     /// puts the pinned dir back, so a test can exercise the fallback for an
     /// unset config dir while every other dir stays pinned.
-    pub(crate) fn unset_config_dir_env(&self) -> EnvVarGuard {
-        EnvVarGuard::unset(Self::config_dir_env_name())
+    pub(crate) fn unset_config_dir_env(&self) -> ConfigDirUnset<'_> {
+        ConfigDirUnset {
+            _env: EnvVarGuard::unset(utils::get_env_name("config_dir")),
+            _guard: PhantomData,
+        }
     }
 }
 
@@ -312,6 +317,13 @@ impl Drop for TestConfigDirGuard {
         let _ = std::fs::remove_dir_all(&self.workspace_root);
         let _ = std::fs::remove_dir_all(&self.cache_root);
     }
+}
+
+/// Keeps the config dir env var unset; borrows the [`TestConfigDirGuard`]
+/// so it cannot outlive the pin it restores.
+pub(crate) struct ConfigDirUnset<'a> {
+    _env: EnvVarGuard,
+    _guard: PhantomData<&'a TestConfigDirGuard>,
 }
 
 /// Whether a process with `pid` still exists. A pid that exists but cannot

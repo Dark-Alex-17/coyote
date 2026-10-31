@@ -2,7 +2,7 @@ use crate::config::Session;
 use crate::mesh::identity::create_private_dir;
 use crate::mesh::mesh_cache_dir;
 use crate::mesh::redact_hashes;
-use crate::utils::fs::{ExclusiveLock, read_holder_pid, write_holder_pid};
+use crate::utils::fs::{ExclusiveLock, open_lock_file, read_holder_pid, write_holder_pid};
 
 use anyhow::{Context, Result, bail};
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -85,17 +85,29 @@ impl Drop for InstanceLock {
     }
 }
 
-/// Takes the `ExclusiveLock` on a mesh file's `.lock` sibling. The parent is created
-/// first (owner-only on unix) because the lock may be taken before the first write
-/// creates the file it guards, and the shared lock requires an existing directory.
+/// A mesh lock may be taken before the first write creates the file it guards, and the
+/// shared lock opener requires an existing directory, so the parent is created first
+/// (owner-only on unix).
+fn create_mesh_lock_parent(lock_path: &Path) -> Result<()> {
+    match lock_path.parent() {
+        Some(parent) => create_private_dir(parent),
+        None => Ok(()),
+    }
+}
+
+/// Opens a mesh lock file for a caller that does its own locking.
+pub(super) fn open_mesh_lock_file(lock_path: &Path) -> Result<File> {
+    create_mesh_lock_parent(lock_path)?;
+    open_lock_file(lock_path)
+}
+
+/// Takes the `ExclusiveLock` on a mesh file's `.lock` sibling.
 pub(super) fn acquire_mesh_lock(
     lock_path: &Path,
     what: &str,
     wait: Duration,
 ) -> Result<ExclusiveLock> {
-    if let Some(parent) = lock_path.parent() {
-        create_private_dir(parent)?;
-    }
+    create_mesh_lock_parent(lock_path)?;
     ExclusiveLock::acquire(lock_path, what, wait)
 }
 
@@ -257,6 +269,8 @@ mod tests {
         let waited = started.elapsed();
 
         assert!(err.contains("The mesh trust file lock"), "{err}");
+        assert!(err.contains("is held"), "{err}");
+        assert!(err.contains("try again"), "{err}");
         assert!(err.contains(&path.display().to_string()), "{err}");
         assert!(
             waited >= Duration::from_millis(300) && waited < Duration::from_secs(2),
