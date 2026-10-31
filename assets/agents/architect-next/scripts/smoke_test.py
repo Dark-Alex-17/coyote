@@ -50,6 +50,8 @@ for _k in [k for k in os.environ if k in ("GIT_CONFIG_PARAMETERS", "GIT_CONFIG_C
 # commits inherits this fixed identity instead
 os.environ.update({"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
 os.environ.update({"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "user.useConfigOnly", "GIT_CONFIG_VALUE_0": "true"})
+# no system or user git config (signing, hooks) reaches a scratch repository
+os.environ.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"})
 
 import gates  # noqa: E402
 import _lib  # noqa: E402

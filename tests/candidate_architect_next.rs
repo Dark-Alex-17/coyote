@@ -4098,6 +4098,16 @@ fn batteries_drop_the_same_variables_as_the_wrapper() {
             git_config_at < use_config_only_at && use_config_only_at < import_at,
             "{file} must drop the inherited GIT_CONFIG_* before it sets its own, and both before it imports a gate"
         );
+        let no_user_config_at = find(
+            &|l| {
+                l == "os.environ.update({\"GIT_CONFIG_NOSYSTEM\": \"1\", \"GIT_CONFIG_GLOBAL\": \"/dev/null\"})"
+            },
+            "GIT_CONFIG_NOSYSTEM / GIT_CONFIG_GLOBAL line",
+        );
+        assert!(
+            no_user_config_at < import_at,
+            "{file} must ignore the system and user git config before it imports a gate"
+        );
         let identity: Vec<String> = quoted
             .captures_iter(lines[identity_at])
             .map(|c| c.unwrap()[1].to_string())
@@ -4451,6 +4461,7 @@ fn readme_env_hygiene_and_ledger_rows_match_the_code() {
         "both set a fixed `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME` and `GIT_COMMITTER_EMAIL`",
         "drop `GIT_CONFIG_PARAMETERS` and every inherited `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_*` and `GIT_CONFIG_VALUE_*`",
         "then set `GIT_CONFIG_COUNT=1`, `GIT_CONFIG_KEY_0=user.useConfigOnly` and `GIT_CONFIG_VALUE_0=true`",
+        "set `GIT_CONFIG_NOSYSTEM=1` and `GIT_CONFIG_GLOBAL=/dev/null` so a direct run ignores the system and user git config",
         "drops every inherited `COYOTE_*` variable",
         "holds an `mcp.json` that defines no server",
     ] {
