@@ -1947,12 +1947,8 @@ async fn ask_loop(
         }
         ctx.session_abort = Some(abort_signal.clone());
         if with_embeddings {
-            if let Err(err) = input.use_embeddings(abort_signal.clone()).await {
-                if abort_signal.aborted_ctrlc() {
-                    print_turn_notice(ctx, turn_interrupt_notice(ctx, &abort_signal).await);
-                }
-                return Err(err);
-            }
+            let embeddings = input.use_embeddings(abort_signal.clone());
+            interruptible_step(ctx, &abort_signal, embeddings).await?;
             with_embeddings = false;
         }
         while ctx.is_compressing_session() {
@@ -2396,6 +2392,21 @@ async fn turn_interrupt_notice(ctx: &RequestContext, abort_signal: &AbortSignal)
     } else {
         interrupted_turn_notice(ctx)
     }
+}
+
+/// Awaits a step that runs before the turn's request, such as the RAG
+/// lookup, so a Ctrl-C that fails it prints the same notice (and, without a
+/// session, cancels the same background work) as an aborted request.
+async fn interruptible_step<T>(
+    ctx: &RequestContext,
+    abort_signal: &AbortSignal,
+    step: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    let result = step.await;
+    if result.is_err() && abort_signal.aborted_ctrlc() {
+        print_turn_notice(ctx, turn_interrupt_notice(ctx, abort_signal).await);
+    }
+    result
 }
 
 /// The notice for a sessionless turn whose interrupt is cancelling
@@ -10009,12 +10020,102 @@ local_hello() {\n\
         });
     }
 
+    /// A step that latches Ctrl-C and then fails, the way the RAG lookup's
+    /// abortable search fails on a press.
+    async fn ctrl_c_fails_the_step(abort_signal: AbortSignal) -> Result<()> {
+        abort_signal.set_ctrlc();
+        Err(anyhow!("Aborted."))
+    }
+
+    #[test]
+    fn sessionless_ctrl_c_that_fails_the_rag_lookup_cancels_background_tasks() {
+        run_async(async {
+            let mut ctx = sessionless_interruptible_ctx("sessionless-rag-abort");
+            let agent_abort = register_abort_aware_agent(&mut ctx, "a1");
+            let job_abort = register_abort_aware_job(&mut ctx, "j1");
+            let abort_signal = create_abort_signal();
+
+            let err = interruptible_step(
+                &ctx,
+                &abort_signal,
+                ctrl_c_fails_the_step(abort_signal.clone()),
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(err.to_string(), "Aborted.");
+            assert!(agent_abort.aborted_ctrlc(), "the agent must be cancelled");
+            assert!(job_abort.aborted_ctrlc(), "the job must be cancelled");
+            assert_eq!(
+                turn_notice_sink::drain(),
+                ["Turn interrupted; cancelling 2 background task(s)."]
+            );
+            yield_until_no_active_tasks(&ctx).await;
+        });
+    }
+
+    #[test]
+    fn session_ctrl_c_that_fails_the_rag_lookup_prints_the_two_stage_notice() {
+        run_async(async {
+            let mut ctx = interruptible_ctx("session-rag-abort");
+            let agent_abort = register_abort_aware_agent(&mut ctx, "a1");
+            let job_abort = register_abort_aware_job(&mut ctx, "j1");
+            let abort_signal = create_abort_signal();
+
+            let err = interruptible_step(
+                &ctx,
+                &abort_signal,
+                ctrl_c_fails_the_step(abort_signal.clone()),
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(err.to_string(), "Aborted.");
+            assert!(!agent_abort.aborted(), "the agent must be left running");
+            assert!(!job_abort.aborted(), "the job must be left running");
+            assert_eq!(
+                turn_notice_sink::drain(),
+                [
+                    "Turn interrupted; 2 background task(s) still running: a1 (agent), j1 (job). Press Ctrl-C again to cancel them, or type to continue."
+                ]
+            );
+        });
+    }
+
+    /// A step that fails without a press, or succeeds after one, is not an
+    /// interrupt of the turn and prints nothing.
+    #[test]
+    fn interruptible_step_is_silent_unless_ctrl_c_failed_it() {
+        run_async(async {
+            let mut ctx = interruptible_ctx("rag-step-silent");
+            let agent_abort = register_abort_aware_agent(&mut ctx, "a1");
+            let abort_signal = create_abort_signal();
+
+            let failed: Result<()> = Err(anyhow!("search failed"));
+            let err = interruptible_step(&ctx, &abort_signal, async { failed })
+                .await
+                .unwrap_err();
+            assert_eq!(err.to_string(), "search failed");
+
+            let latched = abort_signal.clone();
+            let ok = interruptible_step(&ctx, &abort_signal, async move {
+                latched.set_ctrlc();
+                Ok(7)
+            })
+            .await
+            .unwrap();
+            assert_eq!(ok, 7);
+
+            assert!(turn_notice_sink::drain().is_empty());
+            assert!(!agent_abort.aborted(), "nothing was cancelled");
+        });
+    }
+
     /// Every way a Ctrl-C ends the turn (the interrupted arm, an aborted
     /// request, an aborted graph turn, an aborted RAG lookup) prints through
     /// the one notice helper that branches on the session, so the sessionless
     /// notices reach the same stderr channel as the two-stage one, and the
-    /// idle-prompt second press keeps its hint. The RAG lookup has no test
-    /// seam, so this pin is its only cover.
+    /// idle-prompt second press keeps its hint.
     #[test]
     fn every_interrupt_path_prints_through_one_notice_channel() {
         let source = include_str!("mod.rs").replace("\r\n", "\n");
@@ -10022,10 +10123,17 @@ local_hello() {\n\
         let notice = "print_turn_notice(ctx, turn_interrupt_notice(ctx, &abort_signal).await);";
         let arm = format!("        if interrupted {{\n            {notice}\n        }} else {{\n");
         assert_eq!(production.matches(&arm).count(), 1);
-        let rag = format!(
-            "            if let Err(err) = input.use_embeddings(abort_signal.clone()).await {{\n                if abort_signal.aborted_ctrlc() {{\n                    {notice}\n                }}\n                return Err(err);\n            }}\n"
+        let rag = "            let embeddings = input.use_embeddings(abort_signal.clone());\n            interruptible_step(ctx, &abort_signal, embeddings).await?;\n";
+        assert_eq!(production.matches(rag).count(), 1);
+        assert_eq!(production.matches(".use_embeddings(").count(), 1);
+        let step = &production[production.find("async fn interruptible_step<").unwrap()..];
+        let step = &step[..step.find("\n}\n").unwrap()];
+        assert!(
+            step.contains(
+                "print_turn_notice(ctx, turn_interrupt_notice(ctx, abort_signal).await);"
+            ),
+            "{step}"
         );
-        assert_eq!(production.matches(&rag).count(), 1);
         let graph = format!(
             "                Err(err) => {{\n                    if abort_signal.aborted_ctrlc() {{\n                        {notice}\n                    }}\n                    return Err(err);\n                }}\n            }};\n            match turn {{\n"
         );
@@ -10034,7 +10142,7 @@ local_hello() {\n\
             "                    if abort_signal.aborted_ctrlc() {{\n                        {notice}\n                    }}\n                    ctx.on_chat_completion_error(app.as_ref(), &input);\n                    return Err(err);\n"
         );
         assert_eq!(production.matches(&aborted).count(), 1);
-        assert_eq!(production.matches(notice).count(), 4);
+        assert_eq!(production.matches(notice).count(), 3);
         assert_eq!(production.matches("print_turn_notice(").count(), 6);
         let helper = &production[production.find("async fn turn_interrupt_notice(").unwrap()..];
         let helper = &helper[..helper.find("\n}\n").unwrap()];
