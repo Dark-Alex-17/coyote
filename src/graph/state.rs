@@ -121,9 +121,7 @@ impl StateManager {
 
             Ok(StateRepresentation::File(path))
         } else {
-            if let Some(old) = self.temp_file.take() {
-                let _ = fs::remove_file(old);
-            }
+            self.cleanup();
             Ok(StateRepresentation::Inline(json))
         }
     }

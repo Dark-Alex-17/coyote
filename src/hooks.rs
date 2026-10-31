@@ -892,10 +892,11 @@ async fn run_hook(
 
 /// Marks every fd from 3 up close-on-exec. Linux does it in one
 /// close_range(2) call that covers every fd; where that is unavailable
-/// (other platforms, or kernels before 5.11) each fd below `fallback_cap` is
-/// marked with fcntl(2). closefrom(3) and F_CLOSEM are not used: they close
-/// the fds, which would take std's exec-error pipe with them. Returns
-/// whether every fd was reached, rather than only those below the cap.
+/// (other platforms, kernels before 5.11, or a seccomp filter that refuses
+/// it) each fd below `fallback_cap` is marked with fcntl(2). closefrom(3)
+/// and F_CLOSEM are not used: they close the fds, which would take std's
+/// exec-error pipe with them. Returns whether every fd was reached, rather
+/// than only those below the cap.
 #[cfg(unix)]
 fn mark_inherited_fds_cloexec(fallback_cap: libc::c_int) -> bool {
     #[cfg(target_os = "linux")]
@@ -2792,6 +2793,9 @@ mod tests {
 
             let has_close_range = kernel_has_close_range(&file);
 
+            // This marks every fd of the test process, which is harmless:
+            // std hands a child the fds it means to pass with dup2, which
+            // clears the flag.
             let reached_all = mark_inherited_fds_cloexec(cap);
 
             assert!(
