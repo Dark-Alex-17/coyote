@@ -1081,32 +1081,12 @@ mod tests {
         use serial_test::serial;
 
         fn with_config_dir<F: FnOnce(&Path)>(f: F) {
-            let unique = time::SystemTime::now()
-                .duration_since(time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let root = env::temp_dir().join(format!("coyote-user-mcp-test-{unique}"));
-            fs::create_dir_all(root.join(FUNCTIONS_DIR_NAME)).unwrap();
-            let config_env = get_env_name("config_dir");
-            let functions_env = get_env_name("functions_dir");
-            let prev_config = env::var_os(&config_env);
-            let prev_functions = env::var_os(&functions_env);
-            unsafe {
-                env::set_var(&config_env, &root);
-                env::set_var(&functions_env, root.join(FUNCTIONS_DIR_NAME));
-            }
-            f(&root);
-            unsafe {
-                match prev_config {
-                    Some(v) => env::set_var(&config_env, v),
-                    None => env::remove_var(&config_env),
-                }
-                match prev_functions {
-                    Some(v) => env::set_var(&functions_env, v),
-                    None => env::remove_var(&functions_env),
-                }
-            }
-            let _ = fs::remove_dir_all(&root);
+            let guard = testing::TestConfigDirGuard::new("user-mcp-test");
+            let functions = guard.path.join(FUNCTIONS_DIR_NAME);
+            fs::create_dir_all(&functions).unwrap();
+            let _functions_env =
+                testing::EnvVarGuard::set(get_env_name("functions_dir"), &functions);
+            f(&guard.path);
         }
 
         #[test]

@@ -3,6 +3,7 @@ pub mod mailbox;
 pub mod notification;
 pub mod taskqueue;
 
+use crate::config::child_sessions::ChildSessionRoot;
 use crate::function::jobs::RingBuf;
 use crate::utils::AbortSignal;
 use fmt::{Debug, Formatter};
@@ -41,6 +42,10 @@ pub struct AgentHandle {
     pub join_handle: JoinHandle<Result<AgentResult>>,
     pub child_supervisor: Option<Arc<RwLock<Supervisor>>>,
     pub session_id: Option<String>,
+    /// The root the child's sidecar lives under, captured at spawn so a
+    /// cancel or collect records on it even after the spawner's own
+    /// context has moved to another session.
+    pub child_session_root: Option<Arc<ChildSessionRoot>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -392,6 +397,7 @@ mod tests {
             join_handle,
             child_supervisor: None,
             session_id: None,
+            child_session_root: None,
         }
     }
 
@@ -462,6 +468,7 @@ mod tests {
             join_handle,
             child_supervisor: None,
             session_id: None,
+            child_session_root: None,
         };
         let mut sup = Supervisor::new(1, 3);
         sup.register(running_handle).unwrap();
@@ -503,6 +510,7 @@ mod tests {
             join_handle,
             child_supervisor: None,
             session_id: None,
+            child_session_root: None,
         };
         let mut sup = Supervisor::new(4, 3);
         sup.register(running_handle).unwrap();
@@ -539,6 +547,7 @@ mod tests {
             join_handle,
             child_supervisor: None,
             session_id: None,
+            child_session_root: None,
         };
         let mut child_sup = Supervisor::new(4, 3);
         child_sup.register(grandchild).unwrap();

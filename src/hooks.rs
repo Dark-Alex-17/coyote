@@ -114,6 +114,7 @@ pub enum HookEvent {
     SessionResumed,
     SessionEnded,
     SessionCompressed,
+    SessionDeleted,
     ToolStarted,
     ToolCompleted,
     ToolFailed,
@@ -165,6 +166,7 @@ impl HookEvent {
             HookEvent::SessionResumed => "session.resumed",
             HookEvent::SessionEnded => "session.ended",
             HookEvent::SessionCompressed => "session.compressed",
+            HookEvent::SessionDeleted => "session.deleted",
             HookEvent::ToolStarted => "tool.started",
             HookEvent::ToolCompleted => "tool.completed",
             HookEvent::ToolFailed => "tool.failed",
@@ -206,7 +208,7 @@ impl HookEvent {
         }
     }
 
-    pub(crate) const ALL: [HookEvent; 46] = [
+    pub(crate) const ALL: [HookEvent; 47] = [
         HookEvent::TurnStarted,
         HookEvent::TurnCompleted,
         HookEvent::TurnInterrupted,
@@ -215,6 +217,7 @@ impl HookEvent {
         HookEvent::SessionResumed,
         HookEvent::SessionEnded,
         HookEvent::SessionCompressed,
+        HookEvent::SessionDeleted,
         HookEvent::ToolStarted,
         HookEvent::ToolCompleted,
         HookEvent::ToolFailed,
@@ -902,6 +905,23 @@ async fn run_hook(
     // signalling hook children, which deliberately outlive coyote.
     #[cfg(unix)]
     command.process_group(0);
+    // A hook child outlives coyote, so any fd it inherits (a held file lock,
+    // say) stays open with it. std opens its fds close-on-exec, but other
+    // code and libraries may not; stdio 0-2 are already redirected above.
+    // The fds are marked close-on-exec rather than closed so std's own
+    // exec-error pipe survives and an exec failure still reaches spawn().
+    #[cfg(unix)]
+    {
+        let cap = inherited_fd_cap();
+        // SAFETY: the closure only makes the close_range(2) and fcntl(2)
+        // system calls, both async-signal-safe.
+        unsafe {
+            command.pre_exec(move || {
+                mark_inherited_fds_cloexec(cap);
+                Ok(())
+            });
+        }
+    }
     match command.spawn() {
         Ok(mut child) => {
             drop(ack);
@@ -919,6 +939,67 @@ async fn run_hook(
 
     if let Some(path) = payload_file {
         let _ = tokio::fs::remove_file(path).await;
+    }
+}
+
+/// Marks every fd from 3 up close-on-exec. Linux does it in one
+/// close_range(2) call that covers every fd; where that is unavailable
+/// (other platforms, kernels before 5.11, or a seccomp filter that refuses
+/// it) each fd below `fallback_cap` is marked with fcntl(2). closefrom(3)
+/// and F_CLOSEM are not used: they close the fds, which would take std's
+/// exec-error pipe with them. Returns whether every fd was reached, rather
+/// than only those below the cap.
+#[cfg(unix)]
+fn mark_inherited_fds_cloexec(fallback_cap: libc::c_int) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        const FIRST: libc::c_uint = 3;
+        // SAFETY: with CLOSE_RANGE_CLOEXEC, close_range only sets fd flags.
+        let marked = unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                FIRST,
+                libc::c_uint::MAX,
+                libc::CLOSE_RANGE_CLOEXEC,
+            )
+        };
+        if marked == 0 {
+            return true;
+        }
+    }
+    for fd in 3..fallback_cap {
+        // SAFETY: F_GETFD and F_SETFD only read and set the flags of `fd`,
+        // and fail harmlessly when it is not open.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
+    }
+    false
+}
+
+/// The exclusive upper bound of fds a hook child marks close-on-exec. It is
+/// computed in the parent because sysconf(3) is not async-signal-safe, and
+/// capped because macOS reports the RLIMIT_NOFILE soft limit, which can be
+/// effectively unlimited. Without close_range(2), fds at or above 65536 are
+/// deliberately left alone.
+#[cfg(unix)]
+fn inherited_fd_cap() -> libc::c_int {
+    // SAFETY: sysconf has no preconditions.
+    clamp_fd_cap(unsafe { libc::sysconf(libc::_SC_OPEN_MAX) })
+}
+
+/// Clamps a `sysconf(_SC_OPEN_MAX)` result to `1..=MAX_FD_CAP`; a failed or
+/// non-positive answer falls back to the cap itself.
+#[cfg(unix)]
+fn clamp_fd_cap(max: libc::c_long) -> libc::c_int {
+    const MAX_FD_CAP: libc::c_long = 65536;
+    if max <= 0 {
+        MAX_FD_CAP as libc::c_int
+    } else {
+        max.min(MAX_FD_CAP) as libc::c_int
     }
 }
 
@@ -1623,6 +1704,7 @@ mod tests {
             (HookEvent::SessionResumed, "session.resumed"),
             (HookEvent::SessionEnded, "session.ended"),
             (HookEvent::SessionCompressed, "session.compressed"),
+            (HookEvent::SessionDeleted, "session.deleted"),
             (HookEvent::ToolStarted, "tool.started"),
             (HookEvent::ToolCompleted, "tool.completed"),
             (HookEvent::ToolFailed, "tool.failed"),
@@ -1689,6 +1771,26 @@ mod tests {
             counts == [format!("({n} events)")],
             "README.md must say ({n} events) exactly once, where n = HookEvent::ALL.len(); found {counts:?}"
         );
+    }
+
+    #[test]
+    fn readme_event_count_matches_hook_event_all() {
+        let readme =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
+                .unwrap();
+        let counts: Vec<usize> = readme
+            .match_indices(" events)")
+            .filter_map(|(end, _)| {
+                let open = readme[..end].rfind('(')?;
+                readme[open + 1..end].parse().ok()
+            })
+            .collect();
+        assert_eq!(
+            counts.len(),
+            1,
+            "README.md must name the hook event count exactly once as `(<n> events)`, found {counts:?}"
+        );
+        assert_eq!(counts[0], HookEvent::ALL.len());
     }
 
     #[test]
@@ -2696,19 +2798,76 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         #[serial]
+        async fn exec_failure_reaches_the_spawn_error_branch() {
+            testing::install_log_collector();
+            let guard = TestConfigDirGuard::new("hooks-dispatch");
+            // An empty PATH directory leaves `sh` unresolvable, so the
+            // failure happens at exec time, after the pre_exec closure.
+            let empty_path = guard.path.join("empty-path");
+            create_dir_all(&empty_path).unwrap();
+            let hooks = vec![ResolvedHook {
+                name: "execfail-marker-a7e".to_string(),
+                full_name: "turn.failed.execfail-marker-a7e".to_string(),
+                command: "true".to_string(),
+                cwd: guard.path.clone(),
+            }];
+
+            fire_resolved(
+                HookEvent::TurnFailed,
+                hooks,
+                vec![("PATH".to_string(), empty_path.display().to_string())],
+                &[],
+                None,
+            );
+            drain_pending(Duration::from_secs(10)).await;
+
+            assert!(
+                testing::debug_snapshot().iter().any(|message| {
+                    message.contains("Failed to spawn hook 'turn.failed.execfail-marker-a7e'")
+                }),
+                "an exec failure must surface as a spawn error"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        #[serial]
         async fn fire_spawns_detached_with_envs() {
+            use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
             let guard = TestConfigDirGuard::new("hooks-dispatch");
             let out = guard.path.join("env-out");
+            let fds = guard.path.join("fds-out");
             let gate = guard.path.join("gate");
             let done = guard.path.join("done");
-            let command = r#"env > "$HOOK_OUT.tmp" && mv "$HOOK_OUT.tmp" "$HOOK_OUT"; until [ -e "$HOOK_GATE" ]; do sleep 0.05; done; : > "$HOOK_DONE""#;
+            // The stderr probe is the positive control: /dev/fd must report
+            // an fd the child does hold, or a "closed" answer proves nothing.
+            // The wait also ends once the guard's dir is gone, so a failed
+            // assertion cannot leave the child running with whatever fds it
+            // inherited.
+            let command = r#"{ for fd in 2 "$HOOK_FD"; do if [ -e "/dev/fd/$fd" ]; then echo open; else echo closed; fi; done; } > "$HOOK_FDS.tmp" && mv "$HOOK_FDS.tmp" "$HOOK_FDS"; env > "$HOOK_OUT.tmp" && mv "$HOOK_OUT.tmp" "$HOOK_OUT"; until [ -e "$HOOK_GATE" ] || [ ! -e "$HOOK_OUT" ]; do sleep 0.05; done; : > "$HOOK_DONE""#;
             let ctx = ctx_with_global_hooks(hooks_map("turn.completed", &[("envdump", command)]));
+            // F_DUPFD, unlike F_DUPFD_CLOEXEC, leaves the duplicate without
+            // close-on-exec, the way a careless library would.
+            let file = std::fs::File::create(guard.path.join("leaked")).unwrap();
+            // SAFETY: fcntl on an fd this test owns; the result is checked.
+            let raw = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 200) };
+            assert!(raw >= 200, "F_DUPFD returned {raw}");
+            // SAFETY: `raw` is a fresh fd nothing else owns, so the guard
+            // closes it even when an assertion below panics.
+            let leaked = unsafe { OwnedFd::from_raw_fd(raw) };
+            assert_eq!(
+                // SAFETY: F_GETFD only reads the flags of an open fd.
+                unsafe { libc::fcntl(leaked.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0
+            );
 
             fire(
                 HookEvent::TurnCompleted,
                 &ctx,
                 &[
                     ("HOOK_OUT", out.display().to_string()),
+                    ("HOOK_FDS", fds.display().to_string()),
+                    ("HOOK_FD", raw.to_string()),
                     ("HOOK_GATE", gate.display().to_string()),
                     ("HOOK_DONE", done.display().to_string()),
                 ],
@@ -2716,9 +2875,18 @@ mod tests {
             );
 
             wait_for("hook env dump", || out.exists()).await;
+            drop(leaked);
             assert!(
                 !done.exists(),
                 "dispatch must return before the hook completes"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&fds)
+                    .unwrap()
+                    .lines()
+                    .collect::<Vec<_>>(),
+                ["open", "closed"],
+                "stderr must be visible and the non-close-on-exec fd must not be"
             );
 
             let env_dump = std::fs::read_to_string(&out).unwrap();
@@ -2737,6 +2905,89 @@ mod tests {
 
             std::fs::write(&gate, "").unwrap();
             wait_for("hook completion", || done.exists()).await;
+        }
+
+        #[test]
+        fn the_fd_close_bound_is_sysconf_capped_at_65536() {
+            assert_eq!(clamp_fd_cap(-1), 65536);
+            assert_eq!(clamp_fd_cap(0), 65536);
+            assert_eq!(clamp_fd_cap(1024), 1024);
+            assert_eq!(clamp_fd_cap(65536), 65536);
+            assert_eq!(clamp_fd_cap(1 << 20), 65536);
+
+            // SAFETY: sysconf has no preconditions.
+            let host = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+            let expected = if host <= 0 { 65536 } else { host.min(65536) };
+            assert_eq!(libc::c_long::from(inherited_fd_cap()), expected);
+        }
+
+        /// The fcntl fallback stops at its cap; close_range, used wherever
+        /// the kernel has it, covers the fds above it too.
+        #[test]
+        #[serial]
+        fn fds_above_the_fallback_cap_are_marked_only_by_close_range() {
+            use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+            let guard = TestConfigDirGuard::new("hooks-dispatch");
+            let file = std::fs::File::create(guard.path.join("above-cap")).unwrap();
+            // The cap follows the fds the test gets: a busy test process may
+            // already hold any fixed number.
+            let below = dup_without_cloexec(&file, 3);
+            let cap = below.as_raw_fd() + 1;
+            let above = dup_without_cloexec(&file, cap);
+            let cloexec = |fd: &OwnedFd| {
+                // SAFETY: F_GETFD only reads the flags of an open fd.
+                let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+                flags & libc::FD_CLOEXEC != 0
+            };
+
+            let has_close_range = kernel_has_close_range(&file);
+
+            // This marks every fd of the test process, which is harmless:
+            // std hands a child the fds it means to pass with dup2, which
+            // clears the flag.
+            let reached_all = mark_inherited_fds_cloexec(cap);
+
+            assert!(
+                cloexec(&below),
+                "an fd below the fallback cap stayed inheritable"
+            );
+            assert_eq!(
+                reached_all, has_close_range,
+                "close_range must be used exactly where the kernel has it"
+            );
+            assert_eq!(
+                cloexec(&above),
+                reached_all,
+                "only close_range reaches fds at or above the fallback cap"
+            );
+
+            /// Probes close_range(2) with CLOSE_RANGE_CLOEXEC on a throwaway
+            /// fd: kernels before 5.11, and some seccomp profiles, refuse it.
+            fn kernel_has_close_range(file: &std::fs::File) -> bool {
+                #[cfg(target_os = "linux")]
+                {
+                    let probe = dup_without_cloexec(file, 3);
+                    let fd = probe.as_raw_fd() as libc::c_uint;
+                    // SAFETY: the call only sets the flags of `probe`.
+                    unsafe {
+                        libc::syscall(libc::SYS_close_range, fd, fd, libc::CLOSE_RANGE_CLOEXEC) == 0
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = file;
+                    false
+                }
+            }
+
+            fn dup_without_cloexec(file: &std::fs::File, min: libc::c_int) -> OwnedFd {
+                // SAFETY: fcntl on an fd this test owns; the result is checked.
+                let raw = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, min) };
+                assert!(raw >= min, "F_DUPFD returned {raw}");
+                // SAFETY: `raw` is a fresh fd nothing else owns.
+                unsafe { OwnedFd::from_raw_fd(raw) }
+            }
         }
 
         #[tokio::test(flavor = "multi_thread")]
@@ -2799,7 +3050,9 @@ mod tests {
             let out = guard.path.join("spawned");
             let gate = guard.path.join("gate");
             let done = guard.path.join("done");
-            let command = r#": > "$HOOK_OUT"; until [ -e "$HOOK_GATE" ]; do sleep 0.05; done; : > "$HOOK_DONE""#;
+            // The wait also ends once the guard's dir is gone, so a failed
+            // assertion cannot leave the child running.
+            let command = r#": > "$HOOK_OUT"; until [ -e "$HOOK_GATE" ] || [ ! -e "$HOOK_OUT" ]; do sleep 0.05; done; : > "$HOOK_DONE""#;
             let ctx =
                 ctx_with_global_hooks(hooks_map("session.ended", &[("drain-probe", command)]));
 

@@ -25,6 +25,7 @@ use crate::config::{
     builtin_agent_dir, builtin_agent_unavailable_reason, builtin_default_description,
     reserved_agent,
 };
+use crate::function::agents::TEAMMATE_ROSTER_HEADING;
 use crate::function::write_file_atomic;
 use crate::graph::session_turn::chat_tool_pool;
 use crate::graph::types::{RagNode, SessionBlock};
@@ -332,6 +333,7 @@ pub struct Agent {
     session_variables: Option<AgentVariables>,
     shared_dynamic_instructions: Option<String>,
     session_dynamic_instructions: Option<String>,
+    instructions_appendix: Option<String>,
     functions: Functions,
     rag: Option<Arc<Rag>>,
     graph_rags: HashMap<String, Arc<Rag>>,
@@ -339,6 +341,7 @@ pub struct Agent {
     vault: GlobalVault,
     is_graph: bool,
     graph_session: Option<Box<SessionBlock>>,
+    graph_carries: bool,
     enabled_tools: Option<Vec<String>>,
 }
 
@@ -396,6 +399,7 @@ impl Agent {
         let rag_path = paths::agent_rag_file(name, DEFAULT_AGENT_NAME);
         let mut graph_for_rag: Option<Graph> = None;
         let mut graph_session: Option<Box<SessionBlock>> = None;
+        let mut graph_carries = false;
         let mut agent_config = match (config_path.exists(), graph_path.exists()) {
             (true, true) => bail!(
                 "Agent '{name}' has both config.yaml and graph.yaml. A graph agent \
@@ -410,6 +414,7 @@ impl Agent {
                     .with_context(|| format!("Failed to load graph.yaml for agent '{name}'"))?;
                 let config = AgentConfig::from_graph(name, &graph);
                 graph_session = graph.session.clone().map(Box::new);
+                graph_carries = !graph.carry.is_empty();
                 graph_for_rag = Some(graph);
                 config
             }
@@ -561,15 +566,9 @@ impl Agent {
             && app.function_calling_support
             && !matches!(agent_config.memory, Some(false))
             && !matches!(app.memory, Some(false))
+            && memory::memory_index_exists(env::current_dir().ok().as_deref())
         {
-            let memory_exists = paths::global_memory_index_file().exists()
-                || env::current_dir()
-                    .ok()
-                    .and_then(|cwd| memory::discover_workspace_memory(&cwd))
-                    .is_some();
-            if memory_exists {
-                functions.append_memory_functions();
-            }
+            functions.append_memory_functions();
         }
 
         if !builtin && rag.is_some() && app.function_calling_support && graph_for_rag.is_none() {
@@ -586,6 +585,7 @@ impl Agent {
             session_variables: None,
             shared_dynamic_instructions: None,
             session_dynamic_instructions: None,
+            instructions_appendix: None,
             functions,
             rag,
             graph_rags,
@@ -593,6 +593,7 @@ impl Agent {
             vault: app_state.vault.clone(),
             is_graph: graph_for_rag.is_some(),
             graph_session,
+            graph_carries,
             enabled_tools: None,
         })
     }
@@ -703,6 +704,11 @@ impl Agent {
         self.graph_session.as_deref()
     }
 
+    /// Whether the graph declares `carry:` keys, session block or not.
+    pub fn graph_carries(&self) -> bool {
+        self.graph_carries
+    }
+
     pub fn functions(&self) -> &Functions {
         &self.functions
     }
@@ -772,12 +778,28 @@ impl Agent {
             .collect()
     }
 
+    /// The instructions the model is sent: the session's dynamic render,
+    /// else the shared one, else the configured text, followed by the
+    /// appendix when one is set. A teammate's roster is that appendix, so
+    /// it rides the system prompt whatever instruction source the agent
+    /// uses. A prompt resumed from an `agent_session` re-enters as the
+    /// session's dynamic text and still carries the previous run's roster;
+    /// peer ids are minted per run, so a roster section at the tail of that
+    /// text is cut whether or not this run appends a fresh one. The
+    /// configured text is the operator's own and is only cut when an
+    /// appendix replaces the section.
     pub fn interpolated_instructions(&self) -> String {
-        let mut output = self
-            .session_dynamic_instructions
-            .clone()
-            .or_else(|| self.shared_dynamic_instructions.clone())
-            .unwrap_or_else(|| self.config.instructions.clone());
+        let mut output = match (
+            &self.session_dynamic_instructions,
+            &self.shared_dynamic_instructions,
+        ) {
+            (Some(session), _) => without_roster(session).to_string(),
+            (None, Some(shared)) => shared.clone(),
+            (None, None) => self.config.instructions.clone(),
+        };
+        if let Some(appendix) = &self.instructions_appendix {
+            output = append_replacing_roster(&output, appendix);
+        }
 
         if self.graph_session.is_none() {
             self.push_builtin_tool_guidance(&mut output);
@@ -787,6 +809,13 @@ impl Agent {
         let output = render_tools_placeholder(&output, &tools);
 
         self.interpolate_text(&output)
+    }
+
+    /// Runtime text `interpolated_instructions` appends behind the
+    /// instructions. It is not config, so it is never exported or stored
+    /// as the agent's definition.
+    pub fn set_instructions_appendix(&mut self, text: impl Into<String>) {
+        self.instructions_appendix = Some(text.into());
     }
 
     fn push_builtin_tool_guidance(&self, output: &mut String) {
@@ -1029,6 +1058,7 @@ impl Agent {
             session_variables: None,
             shared_dynamic_instructions: None,
             session_dynamic_instructions: None,
+            instructions_appendix: None,
             functions: Functions::default(),
             rag: None,
             graph_rags: Default::default(),
@@ -1036,6 +1066,7 @@ impl Agent {
             vault: std::sync::Arc::new(Vault::default()),
             is_graph: false,
             graph_session: None,
+            graph_carries: false,
             enabled_tools: None,
         }
     }
@@ -1425,6 +1456,39 @@ fn render_tools_placeholder(text: &str, declarations: &[FunctionDeclaration]) ->
         .collect::<Vec<String>>()
         .join("\n");
     text.replace(tools_placeholder, &tools)
+}
+
+/// `base` with `appendix` behind a blank line, any roster section already
+/// at the tail of `base` cut first. The roster is always the trailing
+/// section, so the cut runs from its heading (at the start of the text or
+/// behind a blank line) to the end.
+fn append_replacing_roster(base: &str, appendix: &str) -> String {
+    let base = without_roster(base);
+    if base.is_empty() {
+        appendix.to_string()
+    } else {
+        format!("{base}\n\n{appendix}")
+    }
+}
+
+/// `text` up to its trailing roster section, trailing whitespace trimmed.
+fn without_roster(text: &str) -> &str {
+    roster_line(text)
+        .map_or(text, |start| &text[..start])
+        .trim_end()
+}
+
+/// Where the first roster heading line of `text` starts, if it has one.
+/// The heading counts only as a whole line: at the start of the text or
+/// behind a blank line, and ending the line.
+pub(crate) fn roster_line(text: &str) -> Option<usize> {
+    text.match_indices(TEAMMATE_ROSTER_HEADING)
+        .map(|(start, _)| start)
+        .find(|&start| {
+            let tail = &text[start + TEAMMATE_ROSTER_HEADING.len()..];
+            (start == 0 || text[..start].ends_with("\n\n"))
+                && (tail.is_empty() || tail.starts_with('\n'))
+        })
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -2425,6 +2489,155 @@ nodes: {}
             baseline.strip_prefix("hi").unwrap()
         );
         assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn interpolated_instructions_appendix_replaces_a_stale_roster_section() {
+        let stale = format!("{TEAMMATE_ROSTER_HEADING}\nYou are `graph_agent_x_deadbeef`.");
+        let fresh = format!("{TEAMMATE_ROSTER_HEADING}\nYou are `p1` (shards[0]).");
+        let agent = |instructions: &str| {
+            Agent::test_new(AgentConfig {
+                instructions: instructions.to_string(),
+                ..AgentConfig::default()
+            })
+        };
+
+        let mut with_stale = agent(&format!("Be brief.\n\n{stale}\n"));
+        with_stale.set_instructions_appendix(fresh.clone());
+        let output = with_stale.interpolated_instructions();
+        assert!(
+            output.starts_with(&format!("Be brief.\n\n{fresh}")),
+            "{output}"
+        );
+        assert_eq!(output.matches(TEAMMATE_ROSTER_HEADING).count(), 1);
+        assert!(!output.contains("deadbeef"), "{output}");
+
+        let mut empty = agent("");
+        empty.set_instructions_appendix(fresh.clone());
+        assert!(
+            empty.interpolated_instructions().starts_with(&fresh),
+            "{}",
+            empty.interpolated_instructions()
+        );
+
+        let untouched = agent(&format!("Be brief.\n\n{stale}"));
+        assert!(
+            untouched
+                .interpolated_instructions()
+                .starts_with(&format!("Be brief.\n\n{stale}")),
+            "{}",
+            untouched.interpolated_instructions()
+        );
+    }
+
+    /// The roster heading is a whole line or nothing. The operator's own
+    /// text may mention it mid-sentence (`Keep the ## Teammate roster
+    /// short.`) or open a line with it and keep writing (`## Teammate roster
+    /// is a myth.`); neither is a roster section, so neither is cut when
+    /// this run's roster is appended: the request carries both the sentence
+    /// and exactly one real section, in that order.
+    #[test]
+    fn usage_probe_a_roster_heading_inside_a_line_is_not_a_roster_section() {
+        let fresh = format!("{TEAMMATE_ROSTER_HEADING}\nYou are `p1` (shards[0]).");
+        for base in [
+            format!("Keep the {TEAMMATE_ROSTER_HEADING} short."),
+            format!("Be brief.\n\n{TEAMMATE_ROSTER_HEADING} is a myth."),
+            format!("Be brief.\n\n{TEAMMATE_ROSTER_HEADING}:\nnot a section either"),
+        ] {
+            let mut agent = Agent::test_new(AgentConfig {
+                instructions: base.clone(),
+                ..AgentConfig::default()
+            });
+            agent.set_instructions_appendix(fresh.clone());
+            let output = agent.interpolated_instructions();
+            assert!(
+                output.starts_with(&format!("{base}\n\n{fresh}")),
+                "the operator's sentence survives ahead of the appended roster:\n{output}"
+            );
+            assert_eq!(
+                output.matches(TEAMMATE_ROSTER_HEADING).count(),
+                2,
+                "one mention in the sentence, one real section:\n{output}"
+            );
+        }
+    }
+
+    /// `roster_line` finds a heading only as a whole line, and the cut
+    /// `without_roster` makes starts exactly there.
+    #[test]
+    fn roster_line_finds_the_heading_only_as_a_whole_line() {
+        let section = format!("{TEAMMATE_ROSTER_HEADING}\nYou are `p1`.");
+        for (text, expected) in [
+            (section.clone(), Some(0)),
+            (TEAMMATE_ROSTER_HEADING.to_string(), Some(0)),
+            (format!("Be brief.\n\n{section}"), Some(11)),
+            (
+                format!("Keep the {TEAMMATE_ROSTER_HEADING} short.\n\n{section}"),
+                Some(TEAMMATE_ROSTER_HEADING.len() + 18),
+            ),
+            (format!("Be brief.\n{section}"), None),
+            (
+                format!("Be brief.\n\n{TEAMMATE_ROSTER_HEADING} is a myth."),
+                None,
+            ),
+            (format!("Be brief.\n\n{TEAMMATE_ROSTER_HEADING}:\nno"), None),
+            ("Be brief.".to_string(), None),
+        ] {
+            assert_eq!(roster_line(&text), expected, "{text:?}");
+            let kept = expected.map_or(text.as_str(), |start| &text[..start]);
+            assert_eq!(without_roster(&text), kept.trim_end(), "{text:?}");
+        }
+    }
+
+    /// A resumed `agent_session` re-enters a `dynamic_instructions` agent as
+    /// the session's dynamic text, roster and all. That trailing section is
+    /// cut whether or not this run appends a fresh one: an unseated resume
+    /// is left with the stored text alone, a seated one with the stored text
+    /// plus this run's section. The configured text is the operator's own and
+    /// keeps a trailing section until an appendix replaces it.
+    #[test]
+    fn usage_probe_the_session_dynamic_text_drops_its_trailing_roster_without_an_appendix() {
+        let stale = format!("{TEAMMATE_ROSTER_HEADING}\nYou are `graph_agent_x_deadbeef`.");
+        let stored = format!("Be brief about cats.\n\n{stale}\n");
+        let mut dynamic = Agent::test_new(AgentConfig {
+            instructions: "Be brief.".to_string(),
+            dynamic_instructions: true,
+            ..AgentConfig::default()
+        });
+        dynamic
+            .update_session_dynamic_instructions(Some(stored.clone()), None)
+            .unwrap();
+
+        // Built-in tool guidance follows the instructions, so the prompt is
+        // judged by its head and by what it no longer carries.
+        let output = dynamic.interpolated_instructions();
+        assert!(
+            output.starts_with("Be brief about cats."),
+            "the stored dynamic text wins over the configured line and loses its roster:\n{output}"
+        );
+        assert!(!output.contains(TEAMMATE_ROSTER_HEADING), "{output}");
+        assert!(!output.contains("deadbeef"), "{output}");
+
+        let fresh = format!("{TEAMMATE_ROSTER_HEADING}\nYou are `p1` (shards[0]).");
+        dynamic.set_instructions_appendix(fresh.clone());
+        let output = dynamic.interpolated_instructions();
+        assert!(
+            output.starts_with(&format!("Be brief about cats.\n\n{fresh}")),
+            "{output}"
+        );
+        assert_eq!(
+            output.matches(TEAMMATE_ROSTER_HEADING).count(),
+            1,
+            "{output}"
+        );
+
+        // The configured text is only cut when an appendix replaces it.
+        let configured = Agent::test_new(AgentConfig {
+            instructions: stored.clone(),
+            ..AgentConfig::default()
+        });
+        let output = configured.interpolated_instructions();
+        assert!(output.starts_with(&stored), "{output}");
     }
 
     use crate::testing::TestConfigDirGuard;

@@ -2389,7 +2389,6 @@ mod tests {
     use crate::utils::get_env_name;
     use serial_test::serial;
     use std::env;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn safe_relative_path_accepts_plain_portable_components() {
@@ -2441,55 +2440,25 @@ mod tests {
         assert!(rendered.contains(&"core.longpaths=true".to_string()));
     }
 
+    /// The shared config dir guard plus a config file pinned to an empty
+    /// `config.yaml` inside it, which the vault tests load.
     struct TestVaultConfigGuard {
-        dir_key: String,
-        file_key: String,
-        previous_dir: Option<OsString>,
-        previous_file: Option<OsString>,
-        path: PathBuf,
+        _config_file_env: crate::testing::EnvVarGuard,
+        _config: crate::testing::TestConfigDirGuard,
     }
 
     impl TestVaultConfigGuard {
         fn new(label: &str) -> Self {
-            let dir_key = get_env_name("config_dir");
-            let file_key = get_env_name("config_file");
-            let previous_dir = env::var_os(&dir_key);
-            let previous_file = env::var_os(&file_key);
-            let unique = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let path = env::temp_dir().join(format!("coyote-vault-test-{label}-{unique}"));
-            fs::create_dir_all(&path).unwrap();
-            let config_path = path.join("config.yaml");
+            let config = crate::testing::TestConfigDirGuard::new(&format!("vault-test-{label}"));
+            let config_path = config.path.join("config.yaml");
             fs::write(&config_path, "{}").unwrap();
-            unsafe {
-                env::set_var(&dir_key, &path);
-                env::set_var(&file_key, &config_path);
-            }
             Self {
-                dir_key,
-                file_key,
-                previous_dir,
-                previous_file,
-                path,
+                _config_file_env: crate::testing::EnvVarGuard::set(
+                    get_env_name("config_file"),
+                    &config_path,
+                ),
+                _config: config,
             }
-        }
-    }
-
-    impl Drop for TestVaultConfigGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.previous_dir {
-                    Some(p) => env::set_var(&self.dir_key, p),
-                    None => env::remove_var(&self.dir_key),
-                }
-                match &self.previous_file {
-                    Some(p) => env::set_var(&self.file_key, p),
-                    None => env::remove_var(&self.file_key),
-                }
-            }
-            let _ = fs::remove_dir_all(&self.path);
         }
     }
 

@@ -209,6 +209,9 @@ fn validate_session_block(graph: &Graph, block: &SessionBlock) -> Result<()> {
         if !seen.insert(key.as_str()) {
             bail!("session.expose key '{key}' is listed more than once");
         }
+        if super::RESERVED_STATE_KEYS.contains(&key.as_str()) {
+            bail!("session.expose key '{key}' is reserved (the dispatcher seeds it)");
+        }
         if !state_key_is_declared(graph, key) {
             bail!(
                 "session.expose key '{key}' is not declared anywhere (add it to initial_state, or have a node write it via state_updates / output_schema)"
@@ -1487,6 +1490,31 @@ mod tests {
             err.contains("session.expose entry #0 is blank"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn rejects_reserved_expose_keys_before_the_declared_check() {
+        for key in super::super::RESERVED_STATE_KEYS {
+            let yaml = formatdoc! {r#"
+                name: session_graph
+                version: "1.0"
+                start: e
+                session:
+                  expose: [{key}]
+                  chat:
+                    instructions: "Answer."
+                nodes:
+                  e:
+                    type: end
+                "#};
+
+            let err = parser().load_from_string(&yaml).unwrap_err().to_string();
+
+            assert_eq!(
+                err,
+                format!("session.expose key '{key}' is reserved (the dispatcher seeds it)")
+            );
+        }
     }
 
     #[test]
