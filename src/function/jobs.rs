@@ -1194,11 +1194,35 @@ fn drain_output_file(path: &Path, offset: &Mutex<u64>, output_buf: &Mutex<RingBu
     }
 }
 
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
+struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
+
+impl AbortOnDrop {
+    fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self(Some(handle))
+    }
+
+    fn into_inner(mut self) -> tokio::task::JoinHandle<()> {
+        self.0
+            .take()
+            .expect("AbortOnDrop holds its handle until consumed")
+    }
+}
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
-        self.0.abort();
+        if let Some(handle) = &self.0 {
+            handle.abort();
+        }
+    }
+}
+
+/// Marks the job as finished however the task exits, including a
+/// cancel/abort dropping the future mid-await, so the pump stops prompting.
+struct ExitedOnDrop(Arc<AtomicBool>);
+
+impl Drop for ExitedOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
     }
 }
 
@@ -1281,6 +1305,7 @@ async fn run_process_job(
         .take()
         .ok_or_else(|| anyhow!("Failed to capture stderr"))?;
     let job_exited = Arc::new(AtomicBool::new(false));
+    let _exited_guard = ExitedOnDrop(Arc::clone(&job_exited));
     let job_prompt = snapshot
         .prompter
         .clone()
@@ -1292,10 +1317,18 @@ async fn run_process_job(
             reply: Arc::new(reply),
             exited: Arc::clone(&job_exited),
         });
-    let stdout_pump = tokio::spawn(pump_into_ring(stdout, Arc::clone(&output_buf), job_prompt));
-    let stderr_pump = tokio::spawn(pump_into_ring(stderr, Arc::clone(&output_buf), None));
+    let stdout_pump = AbortOnDrop::new(tokio::spawn(pump_into_ring(
+        stdout,
+        Arc::clone(&output_buf),
+        job_prompt,
+    )));
+    let stderr_pump = AbortOnDrop::new(tokio::spawn(pump_into_ring(
+        stderr,
+        Arc::clone(&output_buf),
+        None,
+    )));
     let file_offset = Arc::new(Mutex::new(0u64));
-    let file_tailer = AbortOnDrop(tokio::spawn({
+    let file_tailer = AbortOnDrop::new(tokio::spawn({
         let path = snapshot.output_file.clone();
         let offset = Arc::clone(&file_offset);
         let output_buf = Arc::clone(&output_buf);
@@ -1316,11 +1349,11 @@ async fn run_process_job(
                     snapshot.display_name,
                     spawned.elapsed()
                 );
+                job_exited.store(true, Ordering::Release);
                 kill_expired_job(&mut child, &state).await;
                 state.lock().pgid = None;
-                job_exited.store(true, Ordering::Release);
-                drain_pump(stdout_pump).await;
-                drain_pump(stderr_pump).await;
+                drain_pump(stdout_pump.into_inner()).await;
+                drain_pump(stderr_pump.into_inner()).await;
                 drop(file_tailer);
                 drain_output_file(&snapshot.output_file, &file_offset, &output_buf);
                 let output_bytes_captured = output_buf.lock().total_written();
@@ -1342,8 +1375,8 @@ async fn run_process_job(
     let status = match wait_result {
         Ok(status) => status,
         Err(err) => {
-            stdout_pump.abort();
-            stderr_pump.abort();
+            drop(stdout_pump);
+            drop(stderr_pump);
             bail!("Unable to run {}, {err}", snapshot.display_name);
         }
     };
@@ -1356,8 +1389,8 @@ async fn run_process_job(
     // this pgid could hit an innocent recycled pid.
     state.lock().pgid = None;
     job_exited.store(true, Ordering::Release);
-    drain_pump(stdout_pump).await;
-    drain_pump(stderr_pump).await;
+    drain_pump(stdout_pump.into_inner()).await;
+    drain_pump(stderr_pump.into_inner()).await;
     drop(file_tailer);
     drain_output_file(&snapshot.output_file, &file_offset, &output_buf);
     let output_bytes_captured = output_buf.lock().total_written();

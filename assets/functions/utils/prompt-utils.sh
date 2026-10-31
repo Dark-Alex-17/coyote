@@ -23,7 +23,9 @@
 # When Coyote offers a prompt channel (COYOTE_PROMPT_REPLY is set), confirm,
 # list, checkbox, input and password are answered through it; range and
 # editor always use the terminal. File descriptor 9 is reserved for the
-# channel's request stream while the helper is sourced.
+# channel's request stream while the helper is sourced. The channel answers
+# one prompt at a time: never run two helpers concurrently (background
+# subshells) in the same tool, or they will swallow each other's replies.
 #
 # - guard_operation   Prompt for permission to run an operation
 # - guard_path        Prompt for permission to perform path operations

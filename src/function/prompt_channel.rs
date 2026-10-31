@@ -1460,6 +1460,86 @@ echo "$ans" >> "$LLM_OUTPUT""#,
         );
     }
 
+    /// Cancelling a job aborts its task mid-await; the pump it leaves behind
+    /// must not raise a live prompt for a descendant that outlives the kill.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn cancelled_job_never_prompts_through_a_detached_descendant() {
+        require_tools();
+        let _guard = TestConfigDirGuard::new("prompt-job-cancel");
+        let _acp_off = AtomicFlagGuard::set(&ACP_SERVER, false);
+        let _headless_off = AtomicFlagGuard::set(&HEADLESS, false);
+        install_tool(
+            "jobcancel-x7x",
+            r#"( sleep 2; confirm "late? jl-x7x" >/dev/null ) & sleep 30"#,
+        );
+        let prompter = Arc::new(ScriptedPrompter::refusing());
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.ui = Arc::new(SilentSink);
+        ctx.prompter = Arc::clone(&prompter) as Arc<dyn Prompter>;
+        ctx.declared_function_names
+            .insert("jobcancel-x7x".to_string());
+
+        let started = jobs::handle_job_tool(
+            &mut ctx,
+            "job__start",
+            &json!({"tool": "jobcancel-x7x", "arguments": {}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(started["status"], "ok", "{started}");
+        let job_id = started["job_id"].as_str().unwrap().to_string();
+        let cancelled = jobs::handle_job_tool(&mut ctx, "job__cancel", &json!({"id": job_id}))
+            .await
+            .unwrap();
+        assert_eq!(cancelled["status"], "cancelled", "{cancelled}");
+        assert_eq!(cancelled["id"], job_id, "{cancelled}");
+
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert!(prompter.requests().is_empty(), "{:?}", prompter.requests());
+    }
+
+    /// A marker line that is not valid JSON is plain output: it lands in the
+    /// job's tail and nobody is asked anything.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn job_malformed_prompt_line_is_echoed_to_the_tail_and_never_prompts() {
+        require_tools();
+        let _guard = TestConfigDirGuard::new("prompt-job-malformed");
+        let _acp_off = AtomicFlagGuard::set(&ACP_SERVER, false);
+        let _headless_off = AtomicFlagGuard::set(&HEADLESS, false);
+        install_tool(
+            "jobbad-x7x",
+            r#"echo '{"coyote_prompt": not-json}'; exit 3"#,
+        );
+        let prompter = Arc::new(ScriptedPrompter::refusing());
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.ui = Arc::new(SilentSink);
+        ctx.prompter = Arc::clone(&prompter) as Arc<dyn Prompter>;
+        ctx.declared_function_names.insert("jobbad-x7x".to_string());
+
+        let started = jobs::handle_job_tool(
+            &mut ctx,
+            "job__start",
+            &json!({"tool": "jobbad-x7x", "arguments": {}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(started["status"], "ok", "{started}");
+        let job_id = started["job_id"].as_str().unwrap().to_string();
+        let collected = jobs::handle_job_tool(&mut ctx, "job__collect", &json!({"id": job_id}))
+            .await
+            .unwrap();
+
+        assert_eq!(collected["exit_code"], 3, "{collected}");
+        let tail = collected["output_tail"].as_str().unwrap();
+        assert!(
+            tail.contains(r#"{"coyote_prompt": not-json}"#),
+            "{collected}"
+        );
+        assert!(prompter.requests().is_empty(), "{:?}", prompter.requests());
+    }
+
     // Black-box contract of the bash helper's reply path, exercised the way
     // a tool author uses it: source the helper, call `confirm`/`list`/
     // `checkbox`/`input`/`password`/`guard_operation`/`guard_path`, read the

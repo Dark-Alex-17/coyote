@@ -2591,7 +2591,7 @@ pub fn run_llm_function(
             Some(server)
         }
         Some(Err(err)) => {
-            warn!("Prompt reply channel unavailable for '{command_name}': {err}");
+            debug!("Prompt reply channel unavailable for '{command_name}': {err}");
             None
         }
         None => None,
@@ -5856,7 +5856,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn eval_routes_user_prefix_to_user_handler() {
+        let _headless_off = crate::testing::AtomicFlagGuard::set(&HEADLESS, false);
         let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
         ctx.tool_scope.functions.append_user_interaction_functions();
 
