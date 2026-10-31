@@ -121,6 +121,7 @@ impl StateManager {
 
             Ok(StateRepresentation::File(path))
         } else {
+            self.cleanup();
             Ok(StateRepresentation::Inline(json))
         }
     }
@@ -644,6 +645,24 @@ mod tests {
         assert!(
             !second.exists(),
             "cleanup left the latest spill file behind"
+        );
+    }
+
+    #[test]
+    fn going_back_inline_removes_the_previous_spill_file() {
+        let big = "x".repeat(MAX_STATE_SIZE_BYTES + 1024);
+        let mut manager = manager_with(&[("blob", json!(big))]);
+        let spilled = manager.serialize_state().unwrap();
+        let spilled = spilled.as_file_path().unwrap().clone();
+        assert!(spilled.exists());
+
+        manager.merge_script_output(r#"{"blob": "small"}"#).unwrap();
+        let repr = manager.serialize_state().unwrap();
+
+        assert!(matches!(repr, StateRepresentation::Inline(_)));
+        assert!(
+            !spilled.exists(),
+            "the spill file outlived the return to an inline state"
         );
     }
 
