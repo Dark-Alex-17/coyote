@@ -28093,6 +28093,22 @@ mod tests {
             .collect()
     }
 
+    /// The contiguous `#` comment lines directly above a script's `NAME = `
+    /// assignment, in source order.
+    fn python_comment_block(source: &str, name: &str) -> String {
+        let head = format!("\n{name} = ");
+        let end = source
+            .find(&head)
+            .unwrap_or_else(|| panic!("{name} is not assigned"));
+        let mut block: Vec<&str> = source[..end]
+            .lines()
+            .rev()
+            .take_while(|line| line.starts_with('#'))
+            .collect();
+        block.reverse();
+        block.join("\n")
+    }
+
     /// signals.py imports `classify` from the shared module and keeps an inline
     /// fallback for installs without it; the constants are shared byte for byte
     /// and the fallback classifies every fixture exactly as the shared module.
@@ -28101,7 +28117,11 @@ mod tests {
     /// `src/authorize.rs` row diverging (shared true, fallback false); adding
     /// `re.I` to the fallback's exec search fails the matrix on the uppercase
     /// exec row; pointing the path insert at a missing directory fails the
-    /// import-binds-shared flag.
+    /// import-binds-shared flag; dropping `re.I` from the fallback's
+    /// AUTH_ADDED_RE search fails the matrix on the uppercase VERIFY_CSRF row;
+    /// rewording one word of signals.py's AUTH_PATH_RE comment fails the
+    /// comment-block pin; skipping the temp dir's git init fails its base
+    /// commit, and skipping both fails the live import's signals_error check.
     #[test]
     fn gauntlet_signals_fallback_classify_matches_the_shared_module() {
         let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents");
@@ -28127,6 +28147,15 @@ mod tests {
                 "{name}: signals.py must carry the shared module's regex byte for byte"
             );
         }
+        for name in ["AUTH_PATH_RE", "AUTH_ADDED_RE"] {
+            let pinned = python_comment_block(&signals, name);
+            assert!(!pinned.is_empty(), "signals.py {name} has no comment block");
+            assert_eq!(
+                pinned,
+                python_comment_block(&shared, name),
+                "{name}: signals.py must carry the shared module's comment byte for byte"
+            );
+        }
 
         if !cmd_available("python3") {
             eprintln!("skipping: python3 not available");
@@ -28137,25 +28166,27 @@ mod tests {
         // path insert would otherwise fall through silently), and once with
         // `diff_signals` blocked in sys.modules so the except arm defines the
         // inline fallback. Stdout is captured because the module prints its
-        // JSON at import time. Mixed-case rows separate the `re.I` sites from
-        // the case-sensitive exec search.
+        // JSON at import time; the live load's copy is returned so its diff
+        // can be checked. Mixed-case rows separate the `re.I` sites from the
+        // case-sensitive exec search.
         const HARNESS: &str = r#"
 import contextlib, importlib.util, io, json, os, sys
 
 def load_signals(name):
     spec = importlib.util.spec_from_file_location(name, os.environ["SIGNALS_PATH"])
     mod = importlib.util.module_from_spec(spec)
-    with contextlib.redirect_stdout(io.StringIO()):
+    with contextlib.redirect_stdout(io.StringIO()) as printed:
         spec.loader.exec_module(mod)
-    return mod
+    return mod, printed.getvalue()
 
-live = load_signals("signals_live")._classify
+live_mod, live_import_stdout = load_signals("signals_live")
+live = live_mod._classify
 sys.path.insert(0, os.environ["SHARED_DIR"])
 import diff_signals
 shared = diff_signals.classify
 import_binds_shared = live is shared
 sys.modules["diff_signals"] = None
-fallback = load_signals("signals")._classify
+fallback = load_signals("signals")[0]._classify
 cases = [
     (["api/v1/thing.proto"], ""),
     (["db/migrations/001_init.sql"], ""),
@@ -28173,20 +28204,33 @@ cases = [
     (["README.MD"], ""),
     (["src/Auth/mod.rs"], ""),
     (["scripts/launch.py"], "SUBPROCESS.run([])"),
+    (["src/http.rs"], "VERIFY_CSRF(&req)?;"),
+    (["Tests/Foo_Test.rs", "README.MD"], ""),
     (
         ["api/v1/thing.proto", "db/migrations/001_init.sql", "Cargo.toml", "src/routes/users.rs"],
         "subprocess.run([\"ls\"])\nverify_csrf(&req)?;",
     ),
 ]
 print(json.dumps({
-    "shared": [shared(f, a) for f, a in cases],
-    "fallback": [fallback(f, a) for f, a in cases],
+    "shared": [dict(shared(f, a), added=a) for f, a in cases],
+    "fallback": [dict(fallback(f, a), added=a) for f, a in cases],
     "fallback_is_shared": fallback is shared,
     "import_binds_shared": import_binds_shared,
+    "live_import_stdout": live_import_stdout,
 }))
 "#;
         let dir = temp_file("-gauntlet-fallback-", "");
         create_dir_all(&dir).unwrap();
+        // signals.py diffs the worktree against HEAD at import, so the temp
+        // dir needs a commit; without a repo of its own, a temp root inside a
+        // git worktree would diff the enclosing repo.
+        let git = cmd_available("git");
+        if git {
+            debris_git(&dir, &["init", "-q"]);
+            debris_git(&dir, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        } else {
+            eprintln!("skipping: git not available, live import diff unchecked");
+        }
         let out = Command::new("python3")
             .arg("-c")
             .arg(HARNESS)
@@ -28224,38 +28268,65 @@ print(json.dumps({
             out["import_binds_shared"], true,
             "with the shared module reachable signals.py must bind the shared classify"
         );
-        let row_flag = |files: &[&str], key: &str| {
+        if git {
+            let printed = out["live_import_stdout"].as_str().unwrap();
+            let live: serde_json::Value = serde_json::from_str(printed)
+                .unwrap_or_else(|e| panic!("live import stdout is not JSON ({e}): {printed}"));
+            let err = &live["signals_error"];
+            assert!(
+                err.is_null() || *err == "" || *err == false,
+                "the live import must diff the temp repo cleanly: {err}"
+            );
+            assert_eq!(
+                live["changed_files"],
+                json!([]),
+                "the empty temp repo must report no changed files"
+            );
+        }
+        let row_flag = |files: &[&str], added: &str, key: &str| {
             out["fallback"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .find(|row| row["files"] == json!(files))
-                .unwrap_or_else(|| panic!("no fixture row for {files:?}"))[key]
+                .find(|row| row["files"] == json!(files) && row["added"] == added)
+                .unwrap_or_else(|| panic!("no fixture row for {files:?} {added:?}"))[key]
                 .as_bool()
                 .unwrap()
         };
         assert!(
-            row_flag(&["src/authorize.rs"], "touches_auth"),
+            row_flag(&["src/authorize.rs"], "", "touches_auth"),
             "authorize must hit the auth path regex"
         );
         assert!(
-            row_flag(&["src/http.rs"], "touches_auth"),
+            row_flag(&["src/http.rs"], "verify_csrf(&req)?;", "touches_auth"),
             "verify_csrf must hit the auth added-line regex"
         );
         assert!(
-            !row_flag(&["src/author_index.rs"], "touches_auth"),
+            row_flag(&["src/http.rs"], "VERIFY_CSRF(&req)?;", "touches_auth"),
+            "auth added lines are matched case-insensitively"
+        );
+        assert!(
+            !row_flag(
+                &["src/author_index.rs"],
+                "pub fn by_author() {}",
+                "touches_auth"
+            ),
             "author must miss the auth regexes"
         );
         assert!(
-            row_flag(&["README.MD"], "docs_only"),
+            row_flag(&["README.MD"], "", "docs_only"),
             "docs paths are matched case-insensitively"
         );
         assert!(
-            row_flag(&["src/Auth/mod.rs"], "touches_auth"),
+            row_flag(&["Tests/Foo_Test.rs", "README.MD"], "", "tests_docs_only"),
+            "test and docs paths are matched case-insensitively"
+        );
+        assert!(
+            row_flag(&["src/Auth/mod.rs"], "", "touches_auth"),
             "auth paths are matched case-insensitively"
         );
         assert!(
-            !row_flag(&["scripts/launch.py"], "touches_exec"),
+            !row_flag(&["scripts/launch.py"], "SUBPROCESS.run([])", "touches_exec"),
             "exec vocabulary is matched case-sensitively"
         );
     }
