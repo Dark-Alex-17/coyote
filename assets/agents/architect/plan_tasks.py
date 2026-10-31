@@ -16,14 +16,18 @@ CLI: `plan_tasks.py --plan PLAN-<slug>.md --tasks-dir DIR [--tasks IDS]` prints
 one qualifying dir per NUL-terminated record (a dir name may hold a newline),
 as `<tasks-dir>/<rel>` with the dir spelled as given; NOTE lines go to stderr,
 one per line. A missing plan file or tasks dir is an error, never an empty listing.
+A `--tasks` value that names no id (blank or commas only) is a usage error.
+With `--labels` each dir record is followed by a second one, `<rel>` escaped to
+one printable line, for a caller that prints the dir next to its findings.
 """
 import argparse
 import os
 import re
 import sys
 
-TASK_DIR_RE = re.compile(r"^(TASK-\d+[a-z]?)")
+TASK_DIR_RE = re.compile(r"^(TASK-\d+[a-z]?)(?=-|$)")
 TASK_ID_RE = re.compile(r"^TASK-(\d+)([a-z]?)$")
+CONTROL_ESCAPES = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
 
 
 def read(path):
@@ -49,7 +53,8 @@ def frontmatter(text):
 def plan_identity(path):
     """The plan a path or `plan:` value names: its basename, a trailing `.md` dropped.
     Only that suffix goes, so `PLAN-a.b.md` and `PLAN-a.b` agree and `PLAN-a` does not."""
-    return os.path.basename(path).removesuffix(".md")
+    name = os.path.basename(path)
+    return name[:-3] if name.endswith(".md") else name
 
 
 def task_sort_key(task_id):
@@ -64,7 +69,9 @@ def parse_task_ids(text):
 
 def walk_tasks(tasks_dir, plan_id, only=None):
     """Yield (task_id, frontmatter, dir) for every task dir of the plan (any status,
-    `only` applied), in task order; `missing` collects listed ids never seen."""
+    `only` applied), in task order; `missing` collects listed ids never seen. An
+    unreadable index.md (frontmatter None) is yielded but never counts as seen,
+    since its plan is unknown."""
     rows, seen = [], set()
     for root, dirs, files in os.walk(tasks_dir):
         dirs.sort()
@@ -83,7 +90,8 @@ def walk_tasks(tasks_dir, plan_id, only=None):
                 continue
         if only is not None and task_id not in only:
             continue
-        seen.add(task_id)
+        if fm is not None:
+            seen.add(task_id)
         rows.append((task_id, fm, root))
     rows.sort(key=lambda r: task_sort_key(r[0]))
     missing = sorted(only - seen, key=task_sort_key) if only is not None else []
@@ -97,13 +105,57 @@ def is_complete(fm):
 
 def absent_fields(fm):
     """The selection fields index.md lacks (`plan:`, `status:`), in that order; a task
-    missing one is kept, and both consumers name it with the same NOTE."""
+    missing one is kept, and both consumers name it with `fieldless_note`."""
     return [f"{key}:" for key in ("plan", "status") if not fm.get(key)]
 
 
+def escape(text):
+    """`text` on one line with every non-printable character escaped."""
+    out = []
+    for ch in text:
+        if ch in CONTROL_ESCAPES:
+            out.append(CONTROL_ESCAPES[ch])
+        elif ch.isprintable():
+            out.append(ch)
+        elif ord(ch) <= 0xFF:
+            out.append(f"\\x{ord(ch):02x}")
+        elif ord(ch) <= 0xFFFF:
+            out.append(f"\\u{ord(ch):04x}")
+        else:
+            out.append(f"\\U{ord(ch):08x}")
+    return "".join(out)
+
+
 def label(root):
-    """A task dir name for a NOTE: one line, a newline in the name escaped."""
-    return os.path.basename(root).replace("\n", "\\n")
+    """A task dir name for a NOTE, escaped to one line."""
+    return escape(os.path.basename(root))
+
+
+def unreadable_note(base):
+    return f"{base}: index.md unreadable (plan unknown); skipped"
+
+
+def fieldless_note(base, absent):
+    return f"{base}: index.md has no {'/'.join(absent)}; kept"
+
+
+def not_complete_note(base, status):
+    return f"{base}: listed in --tasks but status: {status}; skipped"
+
+
+def missing_note(missing):
+    return "listed in --tasks but not found under the plan: " + ", ".join(escape(t) for t in missing)
+
+
+def task_filter(ap, tasks):
+    """The `--tasks` id set, None when the option is absent; a value naming no id
+    is a usage error (exit 2), never a silent "no filter"."""
+    if tasks is None:
+        return None
+    only = parse_task_ids(tasks)
+    if only is None:
+        ap.error("--tasks names no task ids")
+    return only
 
 
 def main(argv):
@@ -113,24 +165,30 @@ def main(argv):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--plan", required=True, help="PLAN-<slug>.md; its name, `.md` stripped, selects the tasks")
     ap.add_argument("--tasks-dir", required=True, help="tree searched recursively for TASK-NNN-*/index.md")
-    ap.add_argument("--tasks", default="", help="comma-separated task ids; keep only those")
+    ap.add_argument("--tasks", help="comma-separated task ids; keep only those")
+    ap.add_argument("--labels", action="store_true", help="follow each dir with its escaped path under --tasks-dir")
     args = ap.parse_args(argv)
+    only = task_filter(ap, args.tasks)
     if not os.path.isdir(args.tasks_dir):
         sys.exit(f"plan_tasks: tasks dir not found: {args.tasks_dir}")
     if not os.path.isfile(args.plan):
         sys.exit(f"plan_tasks: plan not found: {args.plan}")
-    rows, missing = walk_tasks(args.tasks_dir, plan_identity(args.plan), parse_task_ids(args.tasks))
+    rows, missing = walk_tasks(args.tasks_dir, plan_identity(args.plan), only)
     for _, fm, root in rows:
         if fm is None:
-            print(f"plan_tasks: NOTE {label(root)}: index.md unreadable; skipped", file=sys.stderr)
+            print(f"plan_tasks: NOTE {unreadable_note(label(root))}", file=sys.stderr)
             continue
         absent = absent_fields(fm)
         if absent:
-            print(f"plan_tasks: NOTE {label(root)}: index.md has no {'/'.join(absent)}; kept", file=sys.stderr)
+            print(f"plan_tasks: NOTE {fieldless_note(label(root), absent)}", file=sys.stderr)
         if is_complete(fm):
             print(root, end="\0")
+            if args.labels:
+                print(escape(os.path.relpath(root, args.tasks_dir)), end="\0")
+        elif only is not None:
+            print(f"plan_tasks: NOTE {not_complete_note(label(root), fm['status'])}", file=sys.stderr)
     if missing:
-        print("plan_tasks: NOTE listed in --tasks but not found under the plan: " + ", ".join(missing), file=sys.stderr)
+        print(f"plan_tasks: NOTE {missing_note(missing)}", file=sys.stderr)
     return 0
 
 

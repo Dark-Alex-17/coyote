@@ -112,7 +112,7 @@ initial_state:
   # Overwritten by the debt_scan node; this default is what edge_case_sweep
   # sees if that script crash-forwards, so it must carry the manual fallback.
   debt_hits: 'DEBT_SCAN_FAILED: the debt_scan node did not run. Manual fallback (<base> normally HEAD):
-    git ls-files --others --exclude-standard -z | xargs -0 -r git add -N -- && git diff --no-color --no-ext-diff <base> | grep -nE ''^\+.*(#!?\[(allow|expect)\(|cfg_attr\(|todo!|unimplemented!|#\[ignore)'' ;
+    git ls-files --others --exclude-standard -z | xargs -0 -r git add -N -- && git diff --no-color --no-ext-diff --no-textconv --no-relative <base> -- | grep -nE ''^\+.*(#!?\[(allow|expect)\(|cfg_attr\(|todo!|unimplemented!|#\[ignore)'' ;
     grep exit 1 with no lines = no debt; -n numbers the DIFF, so resolve each hit to its real <file:line> with the fs_grep tool: the hit text after the + is its pattern (regex metacharacters escaped) -- never paste diff text into a shell string -- and keep only matches in files the diff touched; bare cfg_attr( without allow|expect is not debt.'
   needs_independent_review: false
   review_report: ''
@@ -426,7 +426,7 @@ nodes:
          the "## Debt scan status" line starts with `script 'debt_scan'`, the
          scan did not run THIS pass and the section holds the PREVIOUS pass's
          report: treat the section as DEBT_SCAN_FAILED and run the manual
-         fallback the initial-state default quotes (the same text the scanner
+         fallback the initial-state default quotes (the same pipeline the scanner
          prints when it fails), then use that result instead. To the
          scan's list, add any env-gated or opt-in test the coder added
          (read the changed test files the coder result names). A marker

@@ -14,7 +14,7 @@ _instructions() {
 # @cmd Collect tagged ledger lines from the plan's completed tasks' log.md files - the grep-complete rollup for Phase F reports, hygiene briefs, and PR bodies (rejected-finding: / design-decision / Follow-ups: / debris-exempt / "(deferred by quality bar)"). Only task dirs whose index.md names the plan (`plan:`, with or without `.md`) and is `status: complete` are read, so a tasks dir shared by several plans never leaks another run's lines; a task whose index.md has no `plan:` or no `status:` field is kept and named in a NOTE. Prints one "<task> (log.md:NN): <line>" per hit grouped by task, with the block under a tag line (its bullets, up to a blank line, the next ## heading, or the next tag line) indented beneath it, or "(none)" - a missed line is a tool bug, not an attention slip.
 # @option --tag! Literal tag text to collect (fixed string, not a regex)
 # @option --plan! Path to PLAN-<slug>.md; its name with the `.md` stripped selects the tasks whose `plan:` field names it
-# @option --dir! Directory searched recursively for log.md files (the plans tasks dir)
+# @option --dir! The plans tasks dir, searched recursively for task dirs; each listed task's own log.md is read
 # @option --tasks Comma-separated task ids (TASK-a,TASK-b): read only those tasks - a PR group's members under pr_strategy=multi
 collect_ledger_lines() {
   local dir="${argc_dir}"
@@ -24,62 +24,56 @@ collect_ledger_lines() {
     return 1
   fi
   # The plan's completed task dirs (plan_tasks.py: same identity rule as
-  # assemble_pr_body), printed as <dir>/<rel> so the prefix strip below holds,
-  # one NUL-terminated record each: a dir name may hold a newline, and a
-  # newline split would hand its tail (`..`, say) to grep as a path of its
-  # own. The listing lands in a file because `$(...)` drops NUL bytes. Its
-  # NOTE lines go to fd 3, opened on LLM_OUTPUT outside the redirection, so
-  # with LLM_OUTPUT=/dev/stdout they reach the output, never the listing.
-  local -a scope=(--plan "${argc_plan}" --tasks-dir "${dir}")
+  # assemble_pr_body), as NUL-terminated <dir>/<rel> and escaped-label pairs:
+  # a dir name may hold a newline, and a newline split would hand its tail
+  # (`..`, say) to grep as a path of its own. The listing lands in a file
+  # because `$(...)` drops NUL bytes. Its NOTE lines go to fd 3, opened on
+  # LLM_OUTPUT outside the redirection, so with LLM_OUTPUT=/dev/stdout they
+  # reach the output, never the listing.
+  local -a scope=(--labels --plan "${argc_plan}" --tasks-dir "${dir}")
   [[ -n "${argc_tasks:-}" ]] && scope+=(--tasks "${argc_tasks}")
   local listing listed=0
-  listing=$(mktemp "${TMPDIR:-/tmp}/collect_ledger_lines.XXXXXX") || return 1
-  { python3 "$LLM_AGENT_ROOT_DIR/plan_tasks.py" "${scope[@]}" > "${listing}" 2>&3 || listed=$?; } 3>> "$LLM_OUTPUT"
+  if ! listing=$(mktemp "${TMPDIR:-/tmp}/collect_ledger_lines.XXXXXX"); then
+    echo "collect_ledger_lines: could not create a temp file under ${TMPDIR:-/tmp}" >> "$LLM_OUTPUT"
+    return 1
+  fi
+  # Expanded now: the local is gone by the time the shell exits.
+  trap "rm -f -- $(printf '%q' "${listing}")" EXIT
+  { python3 -B "$LLM_AGENT_ROOT_DIR/plan_tasks.py" "${scope[@]}" > "${listing}" 2>&3 || listed=$?; } 3>> "$LLM_OUTPUT"
   if [[ "${listed}" -ne 0 ]]; then
-    rm -f "${listing}"
     echo "collect_ledger_lines: could not list the plan's tasks under ${dir}" >> "$LLM_OUTPUT"
     return 1
   fi
-  local -a task_dirs=()
-  local d
-  while IFS= read -r -d '' d; do
-    [[ -n "${d}" ]] && task_dirs+=("${d}")
+  # Only <task dir>/log.md is read, never a log.md deeper down (a nested dir
+  # is a task of its own, listed or not on its own terms); [[ -f ]] follows a
+  # symlinked log.md the way assemble_pr_body does. -F: the tag is a literal,
+  # never a pattern; -I skips binaries; grep exit 1 (no matches) is the clean
+  # result, not an error.
+  # Each NN:line prints as <label> (log.md:NN): line, then the block under
+  # line NN indented (bullets and their indented wraps, verbatim), so a bare
+  # "Follow-ups:" line brings its bullets along. A column-0 line that is not a
+  # bullet is wrapped prose, not part of the block. awk reads the log on stdin
+  # because a file operand shaped like `a=b/...` is taken as an assignment.
+  local d label hit lineno found=0
+  while IFS= read -r -d '' d && IFS= read -r -d '' label; do
+    [[ -f "${d}/log.md" ]] || continue
+    while IFS= read -r hit; do
+      found=1
+      lineno="${hit%%:*}"
+      echo "${label} (log.md:${lineno}): ${hit#*:}" >> "$LLM_OUTPUT"
+      awk -v start="${lineno}" '
+        NR <= start { next }
+        /^[[:space:]]*$/ || /^## / { exit }
+        !/^[[:space:]]/ && !/^[-*][[:space:]]/ { exit }
+        { head = $0; sub(/^[[:space:]]*([-*][[:space:]]+)?/, "", head) }
+        head ~ /^(rejected-finding:|design-decision|Follow-ups:|HYGIENE:)/ { exit }
+        { print "  " $0 }
+      ' < "${d}/log.md" >> "$LLM_OUTPUT"
+    done < <(grep -nIF -- "${tag}" "${d}/log.md" 2>/dev/null || true)
   done < "${listing}"
-  rm -f "${listing}"
-  # -F: the tag is a literal, never a pattern; -I skips binaries; --null ends
-  # the file name with a NUL instead of `:` so a path holding a newline or a
-  # colon still parses; grep exit 1 (no matches) is the clean result, not an
-  # error. -r on each task dir keeps the file-name prefix whatever the count.
-  local hits
-  hits=$(mktemp "${TMPDIR:-/tmp}/collect_ledger_lines.XXXXXX") || return 1
-  if [[ ${#task_dirs[@]} -gt 0 ]]; then
-    grep -rInF --null --include=log.md -- "${tag}" "${task_dirs[@]}" > "${hits}" 2>/dev/null || true
-  fi
-  if [[ ! -s "${hits}" ]]; then
-    rm -f "${hits}"
+  if [[ "${found}" -eq 0 ]]; then
     echo "(none)" >> "$LLM_OUTPUT"
-    return 0
   fi
-  # <dir>/<task>/log.md NUL NN:line  ->  <task> (log.md:NN): line, then the
-  # block under line NN indented (bullets and their indented wraps, verbatim),
-  # so a bare "Follow-ups:" line brings its bullets along. A column-0 line
-  # that is not a bullet is wrapped prose, not part of the block.
-  local path rest rel task lineno
-  while IFS= read -r -d '' path && IFS= read -r rest; do
-    rel="${path#"${dir}"/}"
-    task="${rel%/log.md}"
-    lineno="${rest%%:*}"
-    echo "${task} (log.md:${lineno}): ${rest#*:}" >> "$LLM_OUTPUT"
-    awk -v start="${lineno}" '
-      NR <= start { next }
-      /^[[:space:]]*$/ || /^## / { exit }
-      !/^[[:space:]]/ && !/^[-*][[:space:]]/ { exit }
-      { head = $0; sub(/^[[:space:]]*([-*][[:space:]]+)?/, "", head) }
-      head ~ /^(rejected-finding:|design-decision|Follow-ups:|HYGIENE:)/ { exit }
-      { print "  " $0 }
-    ' "${path}" >> "$LLM_OUTPUT"
-  done < "${hits}"
-  rm -f "${hits}"
 }
 
 # @cmd Assemble the single draft PR's body from the plan + tasks tree: your summary file verbatim, the Quality bar line (plan frontmatter rigor, below production only), the task checklist (title + log.md completed-entry SHAs), and the grep-complete ledger sections (Review decisions / Hygiene pass / Design decisions, optional Follow-ups). Prints the body (and NOTE lines for anything it could not derive); review it, then pass it to gh pr create --body-file.
@@ -99,5 +93,5 @@ assemble_pr_body() {
   [[ -n "${argc_out:-}" ]] && args+=(--out "${argc_out}")
   [[ -n "${argc_followups:-}" ]] && args+=(--followups)
   # stderr carries the NOTE lines - the model must see them next to the body.
-  python3 "$LLM_AGENT_ROOT_DIR/assemble_pr_body.py" "${args[@]}" >> "$LLM_OUTPUT" 2>&1
+  python3 -B "$LLM_AGENT_ROOT_DIR/assemble_pr_body.py" "${args[@]}" >> "$LLM_OUTPUT" 2>&1
 }

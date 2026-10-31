@@ -2,8 +2,8 @@
 
 The conversational staff-engineer companion: codebase Q&A, problem diving, and design
 sessions with orchestrator-grade research fan-out - and zero implementation mandate.
-Built as a plain config agent, so it is useful standalone today and becomes the
-`chat:` agent for graph-based orchestrator sessions once graph sessions land.
+Built as a plain config agent, so it is useful standalone and doubles as the
+`chat:` agent for graph-based orchestrator sessions.
 
 ## What it is
 
@@ -40,4 +40,8 @@ coyote -a engineer --agent-variable project_dir ~/code/myrepo \
                    --agent-variable reference_root ~/code         # enable cross-repo reads
 ```
 
-Later (graph sessions): `session.chat.agent: engineer` in orchestrator graphs.
+Graph sessions: `session.chat.agent: engineer` in an orchestrator graph, with
+`chat_agent_for` set in that graph's `session.chat.variables`.
+
+Standalone handoffs land in `plans/engineer-handoffs/<slug>.md`, outside the
+numbered step handoffs a phased plan keeps in `plans/handoffs/`.

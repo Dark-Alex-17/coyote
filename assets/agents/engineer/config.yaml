@@ -1,6 +1,6 @@
 name: engineer
-description: Conversational staff-engineer companion - codebase Q&A, problem diving, and design sessions with orchestrator-grade research fan-out (explore/librarian/oracle teammates), but NO implementation. Usable standalone and, once graph sessions land, as the `chat:` agent for graph-based orchestrators.
-version: 1.0.0
+description: Conversational staff-engineer companion - codebase Q&A, problem diving, and design sessions with orchestrator-grade research fan-out (explore/librarian/oracle teammates), but NO implementation. Usable standalone and as the `chat:` agent for graph-based orchestrators.
+version: 1.1.0
 
 # Deliberately NOT agent_session: temp - this agent's value is the ACCUMULATED
 # conversation (design decisions, explored context, prior answers). Sessions
@@ -50,7 +50,7 @@ variables:
     description: Optional root directory holding sibling repos the conversation may read for cross-repo questions (consumers, legacy patterns, call sites). Empty = no sibling repos configured.
     default: ''
   - name: chat_agent_for
-    description: "Set by the graph-session machinery when this agent is attached as a session's chat lane ('architect' or 'sisyphus'); empty = standalone. Attached mode swaps the handoff protocol for DIRECT artifact updates (design docs/ledgers/logs in place; plan-shaped changes as amendment artifacts for the run's amend path - nothing skips the gatekeeper re-seal). Standalone default keeps the handoff behavior."
+    description: "Set by the graph author in the graph's `session.chat.variables` when this agent is attached as a session's chat lane ('architect' or 'sisyphus'); the engine forwards it and validates that it is declared here. Empty = standalone. Attached mode swaps the handoff protocol for DIRECT artifact updates (design docs/ledgers/logs in place; plan-shaped changes as amendment artifacts for the run's amend path - nothing skips the gatekeeper re-seal). Standalone default keeps the handoff behavior."
     default: ''
 
 mcp_servers:
@@ -76,8 +76,8 @@ global_tools:
 instructions: |
   Instructions are rendered dynamically: the `_instructions` tool (tools.sh) assembles them from
   instructions.md, resolving `<!-- when:... -->` conditional blocks against the agent variables
-  (chat_agent_for). This static text is a placeholder shown only when the dynamic render is
-  unavailable (e.g. `--info`); it is never the live prompt.
+  (chat_agent_for, reference_root). This static text is a placeholder shown only when the dynamic
+  render is unavailable (e.g. `--info`); it is never the live prompt.
 
 conversation_starters:
   - "Walk me through how <area> works in this repo"

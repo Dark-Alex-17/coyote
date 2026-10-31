@@ -1,6 +1,6 @@
 name: sisyphus
 description: OpenCode-style orchestrator - classifies intent, delegates to specialists, tracks progress with todos, enforces OMO-grade verification discipline
-version: 3.23.0
+version: 3.24.0
 
 agent_session: temp
 auto_continue: true
@@ -77,6 +77,7 @@ mcp_servers:
 global_tools:
   - ast_grep.sh
   - fs_read.sh
+  - fs_cat.sh
   - fs_grep.sh
   - fs_glob.sh
   - fs_ls.sh
@@ -88,8 +89,9 @@ global_tools:
 instructions: |
   Instructions are rendered dynamically: the `_instructions` tool (tools.sh) assembles them from
   instructions.md, resolving `<!-- when:... -->` conditional blocks against the agent variables
-  (parallel, observability_agent, escalation_policy). This static text is a placeholder shown only
-  when the dynamic render is unavailable (e.g. `--info`); it is never the live prompt.
+  (parallel, observability_agent, escalation_policy, review_cadence). This static text is a
+  placeholder shown only when the dynamic render is unavailable (e.g. `--info`); it is never the
+  live prompt.
 
 conversation_starters:
   - 'Add a new feature to the project'
