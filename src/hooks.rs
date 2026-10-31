@@ -894,9 +894,10 @@ async fn run_hook(
 /// close_range(2) call that covers every fd; where that is unavailable
 /// (other platforms, or kernels before 5.11) each fd below `fallback_cap` is
 /// marked with fcntl(2). closefrom(3) and F_CLOSEM are not used: they close
-/// the fds, which would take std's exec-error pipe with them.
+/// the fds, which would take std's exec-error pipe with them. Returns
+/// whether every fd was reached, rather than only those below the cap.
 #[cfg(unix)]
-fn mark_inherited_fds_cloexec(fallback_cap: libc::c_int) {
+fn mark_inherited_fds_cloexec(fallback_cap: libc::c_int) -> bool {
     #[cfg(target_os = "linux")]
     {
         const FIRST: libc::c_uint = 3;
@@ -910,7 +911,7 @@ fn mark_inherited_fds_cloexec(fallback_cap: libc::c_int) {
             )
         };
         if marked == 0 {
-            return;
+            return true;
         }
     }
     for fd in 3..fallback_cap {
@@ -923,6 +924,7 @@ fn mark_inherited_fds_cloexec(fallback_cap: libc::c_int) {
             }
         }
     }
+    false
 }
 
 /// The exclusive upper bound of fds a hook child marks close-on-exec. It is
@@ -2768,8 +2770,8 @@ mod tests {
             assert_eq!(libc::c_long::from(inherited_fd_cap()), expected);
         }
 
-        /// The fcntl fallback stops at its cap; Linux's close_range covers
-        /// the fds above it too.
+        /// The fcntl fallback stops at its cap; close_range, used wherever
+        /// the kernel has it, covers the fds above it too.
         #[test]
         #[serial]
         fn fds_above_the_fallback_cap_are_marked_only_by_close_range() {
@@ -2788,17 +2790,42 @@ mod tests {
                 flags & libc::FD_CLOEXEC != 0
             };
 
-            mark_inherited_fds_cloexec(cap);
+            let has_close_range = kernel_has_close_range(&file);
+
+            let reached_all = mark_inherited_fds_cloexec(cap);
 
             assert!(
                 cloexec(&below),
                 "an fd below the fallback cap stayed inheritable"
             );
             assert_eq!(
+                reached_all, has_close_range,
+                "close_range must be used exactly where the kernel has it"
+            );
+            assert_eq!(
                 cloexec(&above),
-                cfg!(target_os = "linux"),
+                reached_all,
                 "only close_range reaches fds at or above the fallback cap"
             );
+
+            /// Probes close_range(2) with CLOSE_RANGE_CLOEXEC on a throwaway
+            /// fd: kernels before 5.11, and some seccomp profiles, refuse it.
+            fn kernel_has_close_range(file: &std::fs::File) -> bool {
+                #[cfg(target_os = "linux")]
+                {
+                    let probe = dup_without_cloexec(file, 3);
+                    let fd = probe.as_raw_fd() as libc::c_uint;
+                    // SAFETY: the call only sets the flags of `probe`.
+                    unsafe {
+                        libc::syscall(libc::SYS_close_range, fd, fd, libc::CLOSE_RANGE_CLOEXEC) == 0
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = file;
+                    false
+                }
+            }
 
             fn dup_without_cloexec(file: &std::fs::File, min: libc::c_int) -> OwnedFd {
                 // SAFETY: fcntl on an fd this test owns; the result is checked.
