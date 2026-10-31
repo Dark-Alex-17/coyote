@@ -2,7 +2,8 @@ use super::todo::TODO_FUNCTION_PREFIX;
 use super::{FunctionDeclaration, JsonSchema};
 use crate::client::{Model, ModelType, call_chat_completions};
 use crate::config::child_sessions::{
-    self, CHILD_RUN_HISTORY, ChildMeta, ChildSessionRoot, ChildStatus, EffectiveStatus, RootFile,
+    self, CHILD_RUN_HISTORY, ChildMeta, ChildSessionRoot, ChildStatus, DirInspection,
+    EffectiveStatus, RootFile,
 };
 use crate::config::{
     Agent, AgentVariable, AgentVariables, AppConfig, AppState, Input, RequestContext, Role,
@@ -31,6 +32,7 @@ use log::{debug, warn};
 use parking_lot::RwLock;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -1338,11 +1340,27 @@ fn finish_child_meta(
 /// production aborts an agent task whose handle is later awaited (the
 /// refused-registration path aborts an unregistered one), so the abort arm
 /// only guards a future caller.
-fn task_join_error(error: &tokio::task::JoinError) -> String {
-    if error.is_panic() {
-        format!("agent task panicked: {error}")
-    } else {
-        format!("agent task was aborted before it finished: {error}")
+fn task_join_error(error: tokio::task::JoinError) -> String {
+    let task = error.id();
+    match error.try_into_panic() {
+        Ok(payload) => panicked_task_error(task, &*payload),
+        Err(error) => format!("agent task was aborted before it finished: {error}"),
+    }
+}
+
+/// The panic arm of `task_join_error`, worded as tokio words the join
+/// error, so the `agent.failed` hook fired from inside the panicking task
+/// and the sidecar written from its join error carry the same text.
+fn panicked_task_error(task: tokio::task::Id, payload: &(dyn std::any::Any + Send)) -> String {
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&'static str>().copied());
+    match message {
+        Some(message) => {
+            format!("agent task panicked: task {task} panicked with message {message:?}")
+        }
+        None => format!("agent task panicked: task {task} panicked"),
     }
 }
 
@@ -1506,6 +1524,11 @@ fn before_seat_flush() {}
 #[cfg(not(test))]
 fn after_child_run() {}
 
+/// The point in the spawn task where the child's run begins. A no-op
+/// outside tests.
+#[cfg(not(test))]
+fn before_child_run(_agent_name: &str) {}
+
 #[cfg(test)]
 fn before_seat_flush() {
     run_test_hook(&BEFORE_SEAT_FLUSH);
@@ -1514,6 +1537,31 @@ fn before_seat_flush() {
 #[cfg(test)]
 fn after_child_run() {
     run_test_hook(&AFTER_CHILD_RUN);
+}
+
+#[cfg(test)]
+fn before_child_run(agent_name: &str) {
+    let armed = PANIC_IN_CHILD_RUN.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let armed = slot.as_deref() == Some(agent_name);
+        if armed {
+            slot.take();
+        }
+        armed
+    });
+    if armed {
+        panic!("injected panic in the run of '{agent_name}'");
+    }
+}
+
+/// Runs `f` with the next run of a child of `agent_name` on this thread
+/// armed to panic as it begins.
+#[cfg(test)]
+fn with_panic_in_child_run<T>(agent_name: &str, f: impl FnOnce() -> T) -> T {
+    PANIC_IN_CHILD_RUN.with(|slot| *slot.borrow_mut() = Some(agent_name.to_string()));
+    let result = f();
+    PANIC_IN_CHILD_RUN.with(|slot| slot.borrow_mut().take());
+    result
 }
 
 #[cfg(test)]
@@ -1531,6 +1579,8 @@ thread_local! {
     static BEFORE_SEAT_FLUSH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
     static AFTER_CHILD_RUN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static PANIC_IN_CHILD_RUN: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -1642,6 +1692,86 @@ enum SidecarRestore {
     Failed(anyhow::Error),
 }
 
+/// Writes back the sidecar bytes a resume read before re-stamping `id`,
+/// under the root lock and never through a root that became a symlink.
+fn restore_resume_sidecar(root: &ChildSessionRoot, id: &str, saved_bytes: &str) -> SidecarRestore {
+    let dir = root.dir();
+    if refuse_symlinked_dir(&dir, "child session restored") {
+        return SidecarRestore::Failed(anyhow!(
+            "the child session root {} is a symlink or could not be inspected, so the sidecar was not restored",
+            dir.display()
+        ));
+    }
+    if !dir.is_dir() {
+        return SidecarRestore::RootGone;
+    }
+    let sidecar = root.child_meta_file(id);
+    let written = root.lock().and_then(|_lock| {
+        write_private_atomic(&sidecar, saved_bytes)
+            .with_context(|| format!("Failed to write {}", sidecar.display()))
+    });
+    match written {
+        Ok(()) => SidecarRestore::Done,
+        Err(restore_error) => SidecarRestore::Failed(restore_error),
+    }
+}
+
+/// Holds the pre-resume sidecar bytes between a resume's two locked steps.
+/// A resume future dropped meanwhile (a spawn cancelled by its spawner, or
+/// a graph node timing out while the transcript is compressed) restores
+/// them on drop, so the child is not left stamped running by a resume that
+/// never happened.
+struct ResumeSidecarGuard<'a> {
+    root: &'a ChildSessionRoot,
+    id: &'a str,
+    saved_bytes: String,
+    armed: bool,
+}
+
+impl ResumeSidecarGuard<'_> {
+    fn restore(mut self) -> SidecarRestore {
+        self.armed = false;
+        restore_resume_sidecar(self.root, self.id, &self.saved_bytes)
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ResumeSidecarGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let SidecarRestore::Failed(error) =
+            restore_resume_sidecar(self.root, self.id, &self.saved_bytes)
+        {
+            warn!(
+                "Abandoned resume of child session '{}' keeps its running stamp until this process exits: {error:#}",
+                self.id
+            );
+        }
+    }
+}
+
+/// Completes once the spawner is aborted: its root turn interrupted
+/// (`session_abort`), or, for a spawner that is itself a child, its own
+/// cancel (`task_abort`). Never completes when it has neither.
+async fn wait_spawner_abort(session_abort: Option<&AbortSignal>, task_abort: Option<&AbortSignal>) {
+    tokio::select! {
+        () = wait_optional_abort(session_abort) => {}
+        () = wait_optional_abort(task_abort) => {}
+    }
+}
+
+async fn wait_optional_abort(signal: Option<&AbortSignal>) {
+    match signal {
+        Some(signal) => wait_abort_signal(signal).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Seats the child on an existing child session under `root` and re-stamps
 /// its sidecar as running under the fresh agent id. Every refusal happens
 /// before the session file is touched, and the id is validated before any
@@ -1665,9 +1795,10 @@ enum SidecarRestore {
 /// that became a symlink is not followed for the restore. A transcript over
 /// the model window is compressed once between the two steps, with no lock
 /// held, so a sibling child finishing meanwhile is not kept waiting.
-/// Because that compression sits inside the unlocked step, a spawn future
-/// dropped while the summarizer runs leaves the provisional running stamp
-/// in place, and the child becomes resumable again once this process exits.
+/// Because that compression sits inside the unlocked step, a resume future
+/// dropped while the summarizer runs has its `ResumeSidecarGuard` write the
+/// saved bytes back through `restore_resume_sidecar`, the same restore a
+/// refused gate uses, rather than leaving the provisional running stamp.
 async fn resume_child_session(
     child_ctx: &mut RequestContext,
     root: &ChildSessionRoot,
@@ -1694,6 +1825,13 @@ async fn resume_child_session(
     }
     if !dir.is_dir() {
         return Err(no_child());
+    }
+    if child_sessions::inspect_dir(&root.children_dir(), "child session resumed")
+        != DirInspection::NotALink
+    {
+        bail!(
+            "no child session '{id}' under this session; its child session directory is a symlink or could not be inspected"
+        );
     }
     let sidecar = root.child_meta_file(id);
     let saved_bytes = {
@@ -1727,6 +1865,12 @@ async fn resume_child_session(
         root.save_child_meta(&meta)?;
         saved_bytes
     };
+    let restore = ResumeSidecarGuard {
+        root,
+        id,
+        saved_bytes,
+        armed: true,
+    };
     between_resume_phases();
 
     let path = root.child_session_file(id);
@@ -1743,24 +1887,7 @@ async fn resume_child_session(
     let mut session = match gated {
         Ok(session) => session,
         Err(error) => {
-            let restored = if refuse_symlinked_dir(&dir, "child session restored") {
-                SidecarRestore::Failed(anyhow!(
-                    "the child session root {} is a symlink or could not be inspected, so the sidecar was not restored",
-                    dir.display()
-                ))
-            } else if !dir.is_dir() {
-                SidecarRestore::RootGone
-            } else {
-                let written = root.lock().and_then(|_lock| {
-                    write_private_atomic(&sidecar, &saved_bytes)
-                        .with_context(|| format!("Failed to write {}", sidecar.display()))
-                });
-                match written {
-                    Ok(()) => SidecarRestore::Done,
-                    Err(restore_error) => SidecarRestore::Failed(restore_error),
-                }
-            };
-            return Err(match restored {
+            return Err(match restore.restore() {
                 SidecarRestore::Done => error,
                 SidecarRestore::RootGone => error.context(format!(
                     "the child session root {} was removed meanwhile; nothing of child '{id}' remains",
@@ -1772,16 +1899,15 @@ async fn resume_child_session(
             });
         }
     };
+    restore.disarm();
 
     session.set_owner_only(true);
     session.set_save_session(Some(true));
     child_ctx.agent_variables = Some(session.agent_variables().clone());
     child_ctx.session = Some(session);
-    if let Err(err) = child_ctx.checkpoint_session_to_disk(app_config.dry_run) {
-        warn!(
-            "Resumed child session was not written back for '{id}'; the stored copy stays as it was: {err:#}"
-        );
-    }
+    // checkpoint_session_to_disk already logged a failed write-back, and the
+    // stored copy stays the resume record until the child's next checkpoint.
+    let _ = child_ctx.checkpoint_session_to_disk(app_config.dry_run);
     Ok(())
 }
 
@@ -1817,6 +1943,7 @@ async fn load_and_gate(
         bail!("internal error: the child context already holds a session before '{id}' is loaded");
     }
     child_ctx.session = Some(session);
+    before_resume_compression().await;
     let compressed = compress_child_session(child_ctx).await;
     let session = child_ctx
         .session
@@ -1846,6 +1973,33 @@ async fn load_and_gate(
 #[cfg(not(test))]
 fn between_resume_phases() {}
 
+/// The point in a resume where an over-window transcript, already seated
+/// on the child context, is about to be compressed. A no-op outside tests.
+#[cfg(not(test))]
+async fn before_resume_compression() {}
+
+#[cfg(test)]
+async fn before_resume_compression() {
+    if let Some(parked) = PARK_RESUME_COMPRESSION.with(|slot| slot.borrow_mut().take()) {
+        parked.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Runs `f` with the next resume compression on this thread armed to never
+/// finish, as a summarizer that hangs does; `parked` turns true once a
+/// resume is waiting there.
+#[cfg(test)]
+fn with_resume_compression_parked<T>(
+    parked: Arc<std::sync::atomic::AtomicBool>,
+    f: impl FnOnce() -> T,
+) -> T {
+    PARK_RESUME_COMPRESSION.with(|slot| *slot.borrow_mut() = Some(parked));
+    let result = f();
+    PARK_RESUME_COMPRESSION.with(|slot| slot.borrow_mut().take());
+    result
+}
+
 #[cfg(test)]
 fn between_resume_phases() {
     if let Some(hook) = BETWEEN_RESUME_PHASES.with(|slot| slot.take()) {
@@ -1856,6 +2010,8 @@ fn between_resume_phases() {
 #[cfg(test)]
 thread_local! {
     static BETWEEN_RESUME_PHASES: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static PARK_RESUME_COMPRESSION: std::cell::RefCell<Option<Arc<std::sync::atomic::AtomicBool>>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -2048,16 +2204,27 @@ async fn build_child_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Spa
     // them; it also puts the cheap refusals ahead of the MCP spawn.
     let resumed_session_id = match (requested_session_id.as_deref(), root.as_deref()) {
         (Some(id), Some(root)) => {
-            resume_child_session(
-                &mut child_ctx,
-                root,
-                id,
-                &agent_name,
-                &agent_id,
-                variables.as_ref(),
-                &resolved_model,
-            )
-            .await?;
+            // A resume may compress the stored transcript with an LLM call,
+            // so it yields to the spawner being aborted. The dropped resume
+            // restores the sidecar, and the child context, which may still
+            // hold the session seated for compression, goes with the bail.
+            let session_abort = ctx.session_abort.clone();
+            let task_abort = ctx.task_abort.clone();
+            tokio::select! {
+                biased;
+                resumed = resume_child_session(
+                    &mut child_ctx,
+                    root,
+                    id,
+                    &agent_name,
+                    &agent_id,
+                    variables.as_ref(),
+                    &resolved_model,
+                ) => resumed?,
+                () = wait_spawner_abort(session_abort.as_ref(), task_abort.as_ref()) => {
+                    bail!("resume of '{id}' cancelled; the child session was left as it was");
+                }
+            }
             Some(id.to_string())
         }
         (Some(id), None) => {
@@ -2191,7 +2358,22 @@ fn launch_child_spawn(ctx: &mut RequestContext, spawn: Box<ChildSpawn>) -> Resul
     let spawn_root = root.clone();
 
     let join_handle = tokio::spawn(async move {
-        let result = run_child_agent(child_ctx, input, spawn_abort).await;
+        let run = async {
+            before_child_run(&spawn_agent_name);
+            run_child_agent(child_ctx, input, spawn_abort).await
+        };
+        // Only the run is caught: a panic there skips every exit write
+        // below, so its one terminal hook fires here, and the unwind goes
+        // on so the join error still reports the panic to the reclaim
+        // paths that record it on the sidecar.
+        let result = match futures_util::FutureExt::catch_unwind(AssertUnwindSafe(run)).await {
+            Ok(result) => result,
+            Err(payload) => {
+                let error = panicked_task_error(tokio::task::id(), &*payload);
+                result_hooks.fire(Some(&error), false);
+                std::panic::resume_unwind(payload);
+            }
+        };
         after_child_run();
 
         // A ctrl-c'd child reports cancelled whatever its run returned, so
@@ -2470,7 +2652,7 @@ async fn handle_collect(ctx: &mut RequestContext, args: &Value) -> Result<Value>
                 // A panicked task never reached its own exit write, so the
                 // sidecar would otherwise keep saying running.
                 Err(e) => {
-                    let error = task_join_error(&e);
+                    let error = task_join_error(e);
                     finish_child_meta(
                         child_session_root.as_deref(),
                         session_id.as_deref(),
@@ -2620,10 +2802,25 @@ fn handle_list_sessions(ctx: &mut RequestContext, args: &Value) -> Result<Value>
         },
     };
 
-    if refuse_symlinked_dir(&root.dir(), "child sessions listed") {
-        return Ok(empty_sessions_page(
-            "the child session root is a symlink; nothing is listed",
-        ));
+    let refused = match child_sessions::inspect_dir(&root.dir(), "child sessions listed") {
+        DirInspection::Symlink => Some("the child session root is a symlink; nothing is listed"),
+        DirInspection::Uninspectable => {
+            Some("the child session root could not be inspected; nothing is listed")
+        }
+        DirInspection::NotALink => {
+            match child_sessions::inspect_dir(&root.children_dir(), "child sessions listed") {
+                DirInspection::Symlink => {
+                    Some("the child session directory is a symlink; nothing is listed")
+                }
+                DirInspection::Uninspectable => {
+                    Some("the child session directory could not be inspected; nothing is listed")
+                }
+                DirInspection::NotALink => None,
+            }
+        }
+    };
+    if let Some(note) = refused {
+        return Ok(empty_sessions_page(note));
     }
     let mut children = root.list_children()?;
     children.sort_by(|a, b| {
@@ -2778,13 +2975,14 @@ async fn handle_cancel(ctx: &mut RequestContext, args: &Value) -> Result<Value> 
             }
 
             let cleanup = tokio::time::timeout(Duration::from_secs(5), join_handle).await;
+            let cleaned_up = cleanup.is_ok();
 
             // A task that panicked, whether before this cancel or while
             // tearing down after it, never reached its own exit write, and
             // this cancel consumes the handle, so the panic is recorded here
             // or nowhere. This overrides the cancelled record written above
             // for a task that was still running.
-            if let Ok(Err(join_error)) = &cleanup {
+            if let Ok(Err(join_error)) = cleanup {
                 finish_child_meta(
                     child_session_root.as_deref(),
                     session_id.as_deref(),
@@ -2795,11 +2993,12 @@ async fn handle_cancel(ctx: &mut RequestContext, args: &Value) -> Result<Value> 
 
             ctx.pending_tasks_guardrail_count = 0;
 
-            let message = match cleanup {
-                Ok(_) => format!("Cancelled agent '{agent_name}' and waited for cleanup."),
-                Err(_) => format!(
+            let message = if cleaned_up {
+                format!("Cancelled agent '{agent_name}' and waited for cleanup.")
+            } else {
+                format!(
                     "Cancelled agent '{agent_name}'; cleanup did not complete within 5s. Its descendants have been signalled and will tear down asynchronously."
-                ),
+                )
             };
 
             Ok(json!({
@@ -3295,7 +3494,7 @@ mod tests {
     use std::fs::{create_dir_all, read_to_string, remove_dir_all, write};
     use std::mem;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn default_app_state() -> Arc<AppState> {
@@ -3610,6 +3809,74 @@ mod tests {
         assert!(error.contains("missing.sh"), "{error}");
 
         assert!(hook_captures_named("t037_spawn_fail_completed").is_empty());
+    }
+
+    /// Spawns `agent_name` with its run armed to panic, reclaims it with
+    /// `reclaim`, and checks the one terminal hook the panic fires against
+    /// the sidecar the reclaim writes.
+    fn assert_a_panicked_run_fires_failed_once<F>(agent_name: &str, marker: &str, reclaim: F)
+    where
+        F: AsyncFnOnce(&mut RequestContext, &str),
+    {
+        write_graph_agent_with_hooks(agent_name, marker, false);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let (id, session_id) = with_panic_in_child_run(agent_name, || {
+            run_async(async {
+                let spawned = handle_spawn(&mut ctx, &json!({"agent": agent_name, "prompt": "hi"}))
+                    .await
+                    .unwrap();
+                assert_eq!(spawned["status"], "ok", "{spawned}");
+                let id = spawned["id"].as_str().unwrap().to_string();
+                reclaim(&mut ctx, &id).await;
+                (id, spawned["session_id"].as_str().unwrap().to_string())
+            })
+        });
+
+        let failed = hook_captures_named(&format!("{marker}_failed"));
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert_eq!(failed[0].envs["COYOTE_EVENT"], "agent.failed");
+        assert_eq!(failed[0].envs["COYOTE_AGENT_ID"], id);
+        let error = &failed[0].envs["COYOTE_AGENT_ERROR"];
+        assert!(error.contains("panicked"), "{error}");
+        let meta = child_meta_of(&ctx, &session_id);
+        assert_eq!(meta.status, ChildStatus::Failed, "{meta:?}");
+        assert_eq!(meta.error.as_ref(), Some(error), "{meta:?}");
+        assert!(hook_captures_named(&format!("{marker}_completed")).is_empty());
+        assert!(hook_captures_named(&format!("{marker}_interrupted")).is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn a_collected_child_whose_run_panics_fires_failed_once() {
+        let _guard = TestConfigDirGuard::new("agents-tests");
+        let _sink = hooks::test_sink::install();
+        let agent_name = unique_agent_name("test_hook_panic_collect");
+        assert_a_panicked_run_fires_failed_once(
+            &agent_name,
+            "panicked_run_collect",
+            async |ctx: &mut RequestContext, id: &str| {
+                let error = handle_collect(ctx, &json!({"id": id}))
+                    .await
+                    .expect_err("a panicked task is a failed collect");
+                assert!(format!("{error:#}").contains("panicked"), "{error:#}");
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_cancelled_child_whose_run_panics_fires_failed_once() {
+        let _guard = TestConfigDirGuard::new("agents-tests");
+        let _sink = hooks::test_sink::install();
+        let agent_name = unique_agent_name("test_hook_panic_cancel");
+        assert_a_panicked_run_fires_failed_once(
+            &agent_name,
+            "panicked_run_cancel",
+            async |ctx: &mut RequestContext, id: &str| {
+                let cancelled = handle_cancel(ctx, &json!({"id": id})).await.unwrap();
+                assert_eq!(cancelled["status"], "ok", "{cancelled}");
+            },
+        );
     }
 
     /// Spawns `agent_name`, sends it the `agent__cancel` signal before its
@@ -6097,7 +6364,9 @@ mod tests {
                 &args[..end]
             })
             .collect();
-        assert_eq!(fire_calls.len(), 3, "{fire_calls:?}");
+        // The panicked run's call passes `false`: a panic is a failure,
+        // whatever the abort signal says.
+        assert_eq!(fire_calls.len(), 4, "{fire_calls:?}");
         assert!(
             fire_calls
                 .iter()
@@ -7313,6 +7582,101 @@ mod tests {
             crate::utils::process::ALIVE_SET_CALLS.load(std::sync::atomic::Ordering::SeqCst),
             calls_before
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn list_sessions_does_not_follow_a_symlinked_children_dir() {
+        let _guard = TestConfigDirGuard::new("agents-tests");
+        let mut ctx = spawner_with_session("root");
+        let root = ctx.ensure_child_session_root().unwrap();
+        root.ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
+            .unwrap();
+        seed_sidecar(
+            &root,
+            "behindlink",
+            0,
+            ChildStatus::Completed,
+            ProcessStamp::current(),
+        );
+        let real = root.dir().parent().unwrap().join("real-children");
+        std::fs::rename(root.children_dir(), &real).unwrap();
+        std::os::unix::fs::symlink(&real, root.children_dir()).unwrap();
+
+        let page = list_sessions(&mut ctx, json!({})).unwrap();
+
+        assert_eq!(page["sessions"], json!([]));
+        assert_eq!(page["total"], json!(0));
+        assert_eq!(
+            page["note"],
+            json!("the child session directory is a symlink; nothing is listed")
+        );
+        assert!(root.list_children().is_err());
+    }
+
+    /// A root that cannot be inspected is not called a symlink.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn list_sessions_says_an_uninspectable_root_could_not_be_inspected() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = TestConfigDirGuard::new("agents-tests");
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: running as root, permission bits are bypassed");
+            return;
+        }
+        let mut ctx = spawner_with_session("root");
+        let root = ctx.ensure_child_session_root().unwrap();
+        root.ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
+            .unwrap();
+        let parent = root.dir().parent().unwrap().to_path_buf();
+        let mode = std::fs::metadata(&parent).unwrap().permissions().mode();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let page = list_sessions(&mut ctx, json!({}));
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(mode)).unwrap();
+
+        let page = page.unwrap();
+        assert_eq!(page["sessions"], json!([]));
+        assert_eq!(
+            page["note"],
+            json!("the child session root could not be inspected; nothing is listed")
+        );
+    }
+
+    /// A resume through a `children/` replaced by a symlink is refused
+    /// before the sidecar behind the link is read or re-stamped.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn resume_through_a_symlinked_children_dir_is_refused() {
+        let _guard = TestConfigDirGuard::new("agents-tests");
+        let agent_name = unique_agent_name("test_resume_symlinked_children");
+        write_config_only_agent(&agent_name);
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let (sid, _) = seed_completed_config_child(&mut ctx, &agent_name, json!({}));
+        let root = spawner_root(&ctx);
+        let real = root.dir().parent().unwrap().join("real-children");
+        std::fs::rename(root.children_dir(), &real).unwrap();
+        std::os::unix::fs::symlink(&real, root.children_dir()).unwrap();
+        let behind_the_link = real.join(
+            root.child_meta_file(&sid)
+                .strip_prefix(root.children_dir())
+                .unwrap(),
+        );
+        let before = read_to_string(&behind_the_link).unwrap();
+
+        let error = resume_error(
+            &mut ctx,
+            json!({"agent": agent_name, "prompt": "again", "session_id": sid}),
+        );
+
+        assert!(
+            error.contains("its child session directory is a symlink or could not be inspected"),
+            "{error}"
+        );
+        assert_eq!(read_to_string(&behind_the_link).unwrap(), before);
     }
 
     /// Under a dry run with no root the lister says the run records
@@ -8976,6 +9340,91 @@ mod tests {
         assert_eq!(on_disk.messages().len(), session.messages().len());
     }
 
+    /// Seeds a completed child of a fresh config-only agent whose
+    /// transcript is over the spawner's window, so resuming it compresses.
+    /// Returns the agent, the session id, its sidecar path and the sidecar
+    /// bytes before any resume.
+    fn seed_an_over_window_child(
+        ctx: &mut RequestContext,
+        prefix: &str,
+    ) -> (String, String, PathBuf, String) {
+        let agent_name = unique_agent_name(prefix);
+        write_config_only_agent(&agent_name);
+        let (sid, _) =
+            seed_completed_config_child_with_replies(ctx, &agent_name, &[LONG_REPLY, LONG_REPLY]);
+        ctx.model = windowed_test_model("tiny", 1);
+        let sidecar = spawner_root(ctx).child_meta_file(&sid);
+        let before = read_to_string(&sidecar).unwrap();
+        (agent_name, sid, sidecar, before)
+    }
+
+    /// Polls `spawn` until its resume waits in the parked compression.
+    async fn drive_until_parked<F: Future>(mut spawn: Pin<&mut F>, parked: &AtomicBool) {
+        while !parked.load(Ordering::SeqCst) {
+            assert!(
+                futures_util::poll!(spawn.as_mut()).is_pending(),
+                "the spawn finished before its resume reached the compression"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A spawn dropped while its resume compresses, as a graph node's
+    /// timeout drops it, leaves the sidecar as it was before the resume.
+    #[test]
+    #[serial]
+    fn a_resume_dropped_while_compressing_restores_the_sidecar() {
+        let _guard = TestConfigDirGuard::new("agents-tests");
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let (agent_name, sid, sidecar, before) =
+            seed_an_over_window_child(&mut ctx, "test_resume_dropped_compressing");
+        let args = json!({"agent": agent_name, "prompt": "again", "session_id": sid});
+        let parked = Arc::new(AtomicBool::new(false));
+
+        with_resume_compression_parked(Arc::clone(&parked), || {
+            run_async(async {
+                let mut spawn = std::pin::pin!(build_child_spawn(&mut ctx, &args));
+                drive_until_parked(spawn.as_mut(), &parked).await;
+                assert_ne!(read_to_string(&sidecar).unwrap(), before);
+            })
+        });
+
+        assert_eq!(read_to_string(&sidecar).unwrap(), before);
+    }
+
+    /// A spawner aborted while the resume it asked for compresses gets the
+    /// resume refused, and the sidecar is as it was before the resume.
+    #[test]
+    #[serial]
+    fn a_resume_whose_spawner_is_aborted_while_compressing_is_cancelled() {
+        let _guard = TestConfigDirGuard::new("agents-tests");
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let (agent_name, sid, sidecar, before) =
+            seed_an_over_window_child(&mut ctx, "test_resume_aborted_compressing");
+        let abort = create_abort_signal();
+        ctx.session_abort = Some(Arc::clone(&abort));
+        let args = json!({"agent": agent_name, "prompt": "again", "session_id": sid});
+        let parked = Arc::new(AtomicBool::new(false));
+
+        let built = with_resume_compression_parked(Arc::clone(&parked), || {
+            run_async(async {
+                let mut spawn = std::pin::pin!(build_child_spawn(&mut ctx, &args));
+                drive_until_parked(spawn.as_mut(), &parked).await;
+                abort.set_ctrlc();
+                spawn.await
+            })
+        });
+
+        let Err(error) = built else {
+            panic!("a resume cancelled by its spawner must not build a spawn");
+        };
+        assert_eq!(
+            format!("{error:#}"),
+            format!("resume of '{sid}' cancelled; the child session was left as it was")
+        );
+        assert_eq!(read_to_string(&sidecar).unwrap(), before);
+    }
+
     /// A resume whose compressed transcript cannot be written back still
     /// admits the child on the compressed transcript in memory; the stored
     /// copy is left exactly as it was and the failure is logged.
@@ -9055,13 +9504,14 @@ mod tests {
         let warns: Vec<String> = crate::testing::warn_snapshot()
             .into_iter()
             .skip(warned_before)
-            .filter(|m| m.contains("Resumed child session was not written back"))
+            .filter(|m| {
+                m.contains("Resumed child session was not written back")
+                    || m.contains("Failed to checkpoint session")
+            })
             .collect();
         assert_eq!(warns.len(), 1, "{warns:?}");
         assert!(
-            warns[0].contains(&format!(
-                "Resumed child session was not written back for '{sid}'; the stored copy stays as it was: "
-            )),
+            warns[0].starts_with(&format!("Failed to checkpoint session '{sid}': ")),
             "{warns:?}"
         );
     }
@@ -9172,14 +9622,13 @@ mod tests {
         assert_eq!(child_meta_of(&ctx, &sid).status, ChildStatus::Running);
     }
 
-    /// A resume future dropped after the re-stamp (the parent aborted while
-    /// the summarizer was running) restores nothing: the sidecar keeps this
-    /// process's running stamp, so a second resume in this process is
-    /// refused as still running, and the child resumes again once that pid
-    /// is dead, exactly like a child whose process exited mid-run.
+    /// A resume future torn down after the re-stamp (the parent aborted
+    /// while the summarizer was running) writes the pre-resume sidecar back
+    /// as it unwinds, so a second resume in this process is admitted rather
+    /// than refused as still running.
     #[test]
     #[serial]
-    fn usage_probe_a_resume_dropped_after_the_re_stamp_is_refused_until_this_process_exits() {
+    fn usage_probe_a_resume_dropped_after_the_re_stamp_restores_the_sidecar() {
         let _guard = TestConfigDirGuard::new("agents-tests");
         let agent_name = unique_agent_name("test_resume_dropped");
         write_config_only_agent(&agent_name);
@@ -9187,6 +9636,7 @@ mod tests {
         let (sid, _) = seed_completed_config_child(&mut ctx, &agent_name, json!({}));
         let root = spawner_root(&ctx);
         let stored_before = read_to_string(root.child_session_file(&sid)).unwrap();
+        let sidecar_before = read_to_string(root.child_meta_file(&sid)).unwrap();
         let live = ProcessStamp::current();
         assert_ne!(
             live.start, 0,
@@ -9206,35 +9656,16 @@ mod tests {
         );
         assert!(outcome.is_err(), "the hook must have torn the resume down");
 
-        let left = child_meta_of(&ctx, &sid);
-        assert_eq!(left.status, ChildStatus::Running);
-        assert_eq!(left.pid, live.pid);
-        assert_eq!(left.pid_start, live.start);
+        assert_eq!(
+            read_to_string(root.child_meta_file(&sid)).unwrap(),
+            sidecar_before
+        );
         assert_eq!(
             read_to_string(root.child_session_file(&sid)).unwrap(),
             stored_before,
             "a dropped resume never touched the session file"
         );
 
-        let retry = resume_error(&mut ctx, args.clone());
-        assert!(
-            retry.contains(&format!(
-                "'{sid}' is still running; collect or cancel it first"
-            )),
-            "{retry}"
-        );
-        assert_eq!(
-            child_meta_of(&ctx, &sid).pid,
-            live.pid,
-            "the refused retry leaves the dropped resume's stamp alone"
-        );
-
-        // Once the stamping process is gone the stamp reads dead and the
-        // child resumes; the sidecar then carries the new resume's stamp.
-        let mut meta = root.load_child_meta(&sid).unwrap().unwrap();
-        meta.pid = u32::MAX - 1;
-        root.save_child_meta(&meta).unwrap();
-        assert_eq!(meta.effective_status(), EffectiveStatus::Crashed);
         let spawn = build_ready_spawn(&mut ctx, args);
         assert_eq!(spawn.session_id.as_deref(), Some(sid.as_str()));
         let meta = child_meta_of(&ctx, &sid);
@@ -10536,13 +10967,13 @@ mod tests {
             (panicked, aborted)
         });
 
-        let panic_text = task_join_error(&panicked);
+        let panic_text = task_join_error(panicked);
         assert!(
             panic_text.starts_with("agent task panicked: "),
             "{panic_text}"
         );
         assert!(panic_text.contains("boom"), "{panic_text}");
-        let abort_text = task_join_error(&aborted);
+        let abort_text = task_join_error(aborted);
         assert!(
             abort_text.starts_with("agent task was aborted before it finished: "),
             "{abort_text}"
@@ -11602,7 +12033,8 @@ mod tests {
     /// the still-running gate to the provisional re-stamp, with no await in
     /// between, so two processes resuming one child cannot both pass the
     /// gate; and once more only to write the bytes read under the first lock
-    /// back after a later gate refuses. The session file is loaded between
+    /// back after a later gate refuses or the resume is dropped, through the
+    /// one restore its guard holds. The session file is loaded between
     /// the two, outside any lock, and the test seam sits there too. The
     /// first lock is taken only once the root is known to have a directory
     /// that is not a symlink, the second lock repeats both checks, and
@@ -11634,11 +12066,13 @@ mod tests {
         assert!(dir_check_at < lock_at && lock_at < load_at);
         assert!(load_at < gate_at && gate_at < bytes_at && bytes_at < restamp_at);
         assert!(restamp_at < save_at && save_at < seam_at && seam_at < session_load_at);
-        assert_eq!(resume.matches(".lock()").count(), 2);
+        let armed_at = resume.find("ResumeSidecarGuard {").unwrap();
+        assert!(save_at < armed_at && armed_at < seam_at);
+        assert_eq!(resume.matches(".lock()").count(), 1);
         assert!(!resume.contains("drop(_lock)"));
         assert!(!resume[..seam_at].contains(".await"));
         // The first lock lives in the block that yields `saved_bytes`; the
-        // second in the statement that writes them back after a refusal.
+        // second in the restore that writes them back.
         let first_scope = &resume[lock_at..lock_at + resume[lock_at..].find("\n    };\n").unwrap()];
         assert!(!first_scope.contains("load_from_path"), "{first_scope}");
         assert!(
@@ -11650,20 +12084,20 @@ mod tests {
             "{first_scope}"
         );
         assert!(!first_scope.contains(".await"), "{first_scope}");
-        let restore_at = resume.find("let restored = if ").unwrap();
-        let restore_scope = &resume
-            [restore_at..restore_at + resume[restore_at..].find("\n            };\n").unwrap()];
+        let restore_at = resume.find("restore.restore()").unwrap();
+        let restore_scope = fn_body("\nfn restore_resume_sidecar(");
         let second_lock_at = restore_scope.find("root.lock()").unwrap();
+        assert_eq!(restore_scope.matches(".lock()").count(), 1);
         assert!(
             restore_scope.find("refuse_symlinked_dir(&dir").unwrap() < second_lock_at,
             "{restore_scope}"
         );
         assert!(
-            restore_scope.find("} else if !dir.is_dir()").unwrap() < second_lock_at,
+            restore_scope.find("if !dir.is_dir()").unwrap() < second_lock_at,
             "{restore_scope}"
         );
         assert!(
-            restore_scope.contains("write_private_atomic(&sidecar, &saved_bytes)"),
+            restore_scope.contains("write_private_atomic(&sidecar, saved_bytes)"),
             "{restore_scope}"
         );
         assert!(

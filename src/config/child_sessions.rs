@@ -107,10 +107,10 @@ impl ChildSessionRoot {
     /// One that does not parse is replaced from `root` with a warning,
     /// since nothing in it could be kept. Anything other than a regular
     /// file in its place is an error that leaves it as found, and a
-    /// symlink at the directory's path is refused outright: children are
-    /// about to be written under it. The check and the write happen under
-    /// the root lock, so a second spawner, or a parent save, cannot slip a
-    /// record in between them.
+    /// symlink at the directory's path, or at `children/`, is refused
+    /// outright: children are about to be written under it. The check and
+    /// the write happen under the root lock, so a second spawner, or a
+    /// parent save, cannot slip a record in between them.
     pub(crate) fn ensure_dir(&self, root: &RootFile) -> Result<()> {
         let dir = self.dir();
         if refuse_symlinked_dir(&dir, "child session root") {
@@ -131,15 +131,29 @@ impl ChildSessionRoot {
             }
         }
         let children = self.children_dir();
+        if inspect_dir(&children, "child session directory") != DirInspection::NotALink {
+            bail!(
+                "Refusing to use {} as a child session directory: it is a symlink or cannot be inspected",
+                children.display()
+            );
+        }
         create_private_dir_all(&children)
             .with_context(|| format!("Failed to create {}", children.display()))
     }
 
     /// Every readable sidecar under `children/`, newest first, ties by
     /// session id. One corrupt sidecar is skipped with a warning so it
-    /// cannot hide the others.
+    /// cannot hide the others. A `children/` that is a symlink, or cannot
+    /// be inspected, is an error rather than a listing of wherever it
+    /// points.
     pub(crate) fn list_children(&self) -> Result<Vec<ChildMeta>> {
         let dir = self.children_dir();
+        if inspect_dir(&dir, "child sessions listed") != DirInspection::NotALink {
+            bail!(
+                "Refusing to list {}: it is a symlink or cannot be inspected",
+                dir.display()
+            );
+        }
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -288,7 +302,7 @@ fn root_file_disposition(path: &Path, caller: ProcessStamp) -> Result<RootDispos
         }
     };
     let recorded = last_process(&record);
-    if recorded == caller || recorded.is_alive() {
+    if recorded == caller || recorded.is_alive_or_start_unknown() {
         return Ok(RootDisposition::Keep);
     }
     record.last_pid = caller.pid;
@@ -605,25 +619,65 @@ pub(crate) fn unlink_parent_yaml(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// What a directory path is before anything is read or written through
+/// it, telling the two cases `refuse_symlinked_dir` refuses alike apart so
+/// a caller can word them honestly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirInspection {
+    /// A real directory, something else that is not a link, or nothing.
+    NotALink,
+    Symlink,
+    /// The path could not be inspected, so it may be a link.
+    Uninspectable,
+}
+
+/// Inspects `dir` without following a link, logging a refusal the way
+/// `refuse_symlinked_dir` does, with `reason`.
+pub(crate) fn inspect_dir(dir: &Path, reason: &str) -> DirInspection {
+    match std::fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            warn!(
+                "Refusing to touch {} ({reason}): it is a symlink",
+                dir.display()
+            );
+            DirInspection::Symlink
+        }
+        Ok(_) => DirInspection::NotALink,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => DirInspection::NotALink,
+        Err(error) => {
+            warn!("Failed to inspect {} ({reason}): {error}", dir.display());
+            DirInspection::Uninspectable
+        }
+    }
+}
+
 /// Removes a root directory, refusing to follow a symlink planted at its
 /// path. Retention must never fail an exit, so every error is a warning.
 /// The caller decides under the root lock and drops it before calling:
 /// the lock file is inside the directory, and Windows refuses to remove a
 /// directory holding an open handle.
-pub(crate) fn remove_dir(path: &Path, reason: &str) {
+/// Returns whether this call removed the directory; one already gone, a
+/// refused symlink and a failed removal all answer false.
+pub(crate) fn remove_dir(path: &Path, reason: &str) -> bool {
     if refuse_symlinked_dir(path, reason) {
-        return;
+        return false;
     }
     match std::fs::remove_dir_all(path) {
-        Ok(()) => info!(
-            "Removed child session directory {} ({reason})",
-            path.display()
-        ),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => warn!(
-            "Failed to remove child session directory {} ({reason}): {error}",
-            path.display()
-        ),
+        Ok(()) => {
+            info!(
+                "Removed child session directory {} ({reason})",
+                path.display()
+            );
+            true
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => {
+            warn!(
+                "Failed to remove child session directory {} ({reason}): {error}",
+                path.display()
+            );
+            false
+        }
     }
 }
 
@@ -2022,6 +2076,32 @@ updated_at: 2026-01-02T03:04:05Z
 
     #[test]
     #[serial]
+    fn ensure_dir_leaves_a_record_whose_start_unknown_writer_still_runs_byte_for_byte() {
+        install_log_collector();
+        let _cache = CacheDirGuard::new("child-sessions-ensure-start-unknown-writer");
+        let Some(start_unknown) = start_unknown_live_stamp() else {
+            return;
+        };
+        let root = ChildSessionRoot::Uid(Uuid::new_v4());
+        fs::create_dir_all(root.dir()).unwrap();
+        let mut live = abandoned_record();
+        live.last_pid = start_unknown.pid;
+        live.last_pid_start = start_unknown.start;
+        write_root(&root.dir(), &live);
+        let before = fs::read(root.root_file()).unwrap();
+        let foreign = ProcessStamp {
+            pid: 4242,
+            start: 1,
+        };
+
+        root.ensure_dir(&RootFile::seed_at(Utc::now(), foreign, None))
+            .unwrap();
+
+        assert_eq!(fs::read(root.root_file()).unwrap(), before);
+    }
+
+    #[test]
+    #[serial]
     fn ensure_dir_leaves_a_record_already_carrying_the_callers_stamp_byte_for_byte() {
         install_log_collector();
         let _cache = CacheDirGuard::new("child-sessions-ensure-same-stamp");
@@ -2380,10 +2460,10 @@ updated_at: 2026-01-02T03:04:05Z
         fs::create_dir_all(dir.join("children")).unwrap();
         fs::write(dir.join("root.yaml"), "version: 1\n").unwrap();
 
-        remove_dir(&dir, "test");
+        assert!(remove_dir(&dir, "test"));
         assert!(!dir.exists());
 
-        remove_dir(&dir, "test");
+        assert!(!remove_dir(&dir, "test"));
         assert!(!dir.exists());
     }
 
@@ -2451,7 +2531,7 @@ updated_at: 2026-01-02T03:04:05Z
         let link = cache.root.join("link");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        remove_dir(&link, "test");
+        assert!(!remove_dir(&link, "test"));
 
         assert!(
             fs::symlink_metadata(&link)
