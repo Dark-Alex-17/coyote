@@ -338,6 +338,16 @@ fn summary_counts(stdout: &str, report: &str) -> (usize, usize) {
 }
 
 #[test]
+#[should_panic(expected = "still running after")]
+fn output_with_timeout_kills_a_child_past_its_limit() {
+    output_with_timeout(
+        Command::new("sh").args(["-c", "sleep 30"]),
+        Duration::from_millis(500),
+        "sleep",
+    );
+}
+
+#[test]
 fn audit_graph_reports_no_problems() {
     let Some(python) = python3() else { return };
     let Some(yq) = mikefarah_yq() else { return };
@@ -440,6 +450,40 @@ fn smoke_summary_and_exit_code_cover_a_check_recorded_last() {
     assert!(
         !broken.status.success(),
         "a failure recorded last must fail the battery:\n{report}"
+    );
+    assert_no_bytecode_under_candidate();
+}
+
+/// The battery's `runs_root: battery env restored` check catches a restore
+/// loop that leaves `ARCHITECT_RUNS_ROOT` at the battery's own override.
+/// Driven on a scratch copy whose restore loop skips that variable.
+#[test]
+fn smoke_env_restore_check_fails_when_the_runs_root_is_not_restored() {
+    let Some(python) = python3() else { return };
+    let scratch = scratch_dir("restore");
+    let copy = scratch_candidate_copy(&scratch);
+    let script = copy.join("scripts").join("smoke_test.py");
+    let text = fs::read_to_string(&script).unwrap();
+    let restore_loop = "for _k, _v in _saved_env.items():\n";
+    assert_eq!(
+        text.matches(restore_loop).count(),
+        1,
+        "smoke_test.py must hold exactly one env restore loop"
+    );
+    let skipping = format!("{restore_loop}    if _k == \"ARCHITECT_RUNS_ROOT\": continue\n");
+    fs::write(&script, text.replacen(restore_loop, &skipping, 1)).unwrap();
+
+    let mut cmd = battery(&python, &scratch);
+    cmd.current_dir(&copy).arg("scripts/smoke_test.py");
+    let output = output_with_timeout(&mut cmd, BATTERY_LIMIT, "smoke restore");
+    let report = transcript(&output);
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("FAIL runs_root: battery env restored"),
+        "the restore check did not catch the unrestored runs root:\n{report}"
+    );
+    assert!(
+        !output.status.success(),
+        "an unrestored runs root must fail the battery:\n{report}"
     );
     assert_no_bytecode_under_candidate();
 }
@@ -575,6 +619,76 @@ fn mode_matrix_exits_before_the_walk_when_the_shared_utils_sh_is_missing_or_a_st
         assert!(
             left.is_empty(),
             "{case}: the matrix left its scratch dirs behind in TMPDIR: {left:?}\n{report}"
+        );
+    }
+}
+
+/// A `yq` that cannot read `graph.yaml` stops `mode_matrix.py` in
+/// `load_graph` with a message naming the exit code, not a JSON traceback.
+/// The stub answers `--version` like the mikefarah build and fails every
+/// other call, so the marker-map half passes and the walk reaches the read.
+#[test]
+fn mode_matrix_names_a_failed_yq_read_instead_of_a_traceback() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(python) = python3() else { return };
+    let scratch = scratch_dir("matrix-yq");
+    let stub_dir = scratch.0.join("bin");
+    fs::create_dir_all(&stub_dir).unwrap();
+    let stub = stub_dir.join("yq");
+    fs::write(
+        &stub,
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"yq (https://github.com/mikefarah/yq/) version v4.99.0\"; exit 0; fi\necho \"stub yq: boom\" >&2; exit 3\n",
+    )
+    .unwrap();
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = output_with_timeout(
+        battery(&python, &scratch)
+            .env("PATH", path_with(&stub_dir))
+            .arg("scripts/mode_matrix.py"),
+        MATRIX_LIMIT,
+        "matrix stub yq",
+    );
+    let report = transcript(&output);
+    assert!(
+        !output.status.success(),
+        "a failed yq read must fail the matrix:\n{report}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("yq failed to read graph.yaml (exit 3)"),
+        "{report}"
+    );
+    assert!(
+        !stdout.contains("Traceback") && !stderr.contains("Traceback"),
+        "{report}"
+    );
+    assert_no_bytecode_under_candidate();
+}
+
+/// `mode_matrix.py` carries no `if True` block standing in for a removed
+/// condition.
+#[test]
+fn mode_matrix_has_no_if_true_block() {
+    let script = fs::read_to_string(candidate_dir().join("scripts/mode_matrix.py")).unwrap();
+    assert!(
+        !script.contains("if True"),
+        "mode_matrix.py carries an `if True` block"
+    );
+}
+
+/// The batteries take their git identity from the process environment they
+/// set up; no script keeps a private `GIT_ENV` overlay of `os.environ` with
+/// its own author.
+#[test]
+fn no_battery_script_keeps_a_git_env_overlay() {
+    for name in ["smoke_test.py", "mode_matrix.py", "_fixture.py"] {
+        let text = fs::read_to_string(candidate_dir().join("scripts").join(name)).unwrap();
+        assert!(
+            !text.contains("GIT_ENV = {**os.environ, \"GIT_AUTHOR_NAME\""),
+            "{name} still carries a GIT_ENV identity overlay"
         );
     }
 }
@@ -1987,10 +2101,10 @@ fn readme_toolchain_census_matches_the_live_grep() {
     );
     assert_eq!(
         gates_lines,
-        vec![41, 2621, 2630],
+        vec![41, 2628, 2637],
         "the gates.py toolchain hits moved; update the README census and its prose"
     );
-    for line in [2621, 2630] {
+    for line in [2628, 2637] {
         assert!(
             text.contains(&format!("`gates.py:{line}`")) || text.contains(&format!("`:{line}`")),
             "the README prose must cite gates.py:{line}"
@@ -2282,11 +2396,10 @@ fn info_by_name(scratch: &TempDirGuard, project: &Path, extra: &[&str], label: &
         .env_remove("ARCHITECT_RUNS_ROOT")
         .env_remove("XDG_CACHE_HOME")
         .env_remove("GRAPH_STATE")
-        .env_remove("GRAPH_STATE_FILE")
-        .stdin(Stdio::null());
+        .env_remove("GRAPH_STATE_FILE");
     scrub_agent_vars(&mut cmd);
     without_git_repo_vars(&mut cmd);
-    let output = cmd.output().unwrap();
+    let output = output_with_timeout(&mut cmd, GATE_LIMIT, label);
     assert!(
         output.status.success(),
         "{label}: --info failed\n{}",
@@ -2455,14 +2568,12 @@ fn two_commit_repo(scratch: &TempDirGuard) -> (PathBuf, String, String) {
     let run = |args: &[&str]| -> String {
         let mut cmd = Command::new(&git);
         without_git_repo_vars(&mut cmd);
-        let out = cmd
-            .args(args)
+        cmd.args(args)
             .current_dir(&project)
             .env("HOME", scratch.0.join("home"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .output()
-            .unwrap();
+            .env("GIT_CONFIG_GLOBAL", "/dev/null");
+        let out = output_with_timeout(&mut cmd, GATE_LIMIT, "git");
         assert!(out.status.success(), "git {args:?}\n{}", transcript(&out));
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     };
@@ -4490,22 +4601,38 @@ fn readme_env_hygiene_and_ledger_rows_match_the_code() {
         );
     }
     let gates = fs::read_to_string(candidate_dir().join("scripts/gates.py")).unwrap();
-    let lines: Vec<&str> = gates.lines().collect();
-    let mut calls = Vec::new();
-    for (at, line) in lines.iter().enumerate() {
-        if !line.contains("core_tool(\"collect_ledger_lines\"") {
-            continue;
-        }
-        let mut call = String::new();
-        for line in &lines[at..] {
-            call.push_str(line);
-            call.push('\n');
-            if line.trim_end().ends_with(')') {
-                break;
+    let ledger_calls = |text: &str| -> Vec<String> {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut calls = Vec::new();
+        for (at, line) in lines.iter().enumerate() {
+            if !line.contains("core_tool(\"collect_ledger_lines\"") {
+                continue;
             }
+            let mut call = String::new();
+            for line in &lines[at..] {
+                call.push_str(line);
+                call.push('\n');
+                if line.trim_end().ends_with(')') {
+                    break;
+                }
+            }
+            calls.push(call);
         }
-        calls.push(call);
-    }
+        calls
+    };
+    let body_of = |def: &str| -> String {
+        let lines: Vec<&str> = gates.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.starts_with(def))
+            .unwrap_or_else(|| panic!("gates.py has no {def:?}"));
+        let end = lines[start + 1..]
+            .iter()
+            .position(|l| l.starts_with("def "))
+            .map_or(lines.len(), |n| start + 1 + n);
+        lines[start..end].join("\n")
+    };
+    let calls = ledger_calls(&gates);
     assert_eq!(calls.len(), 2, "{calls:#?}");
     for call in &calls {
         assert!(
@@ -4513,14 +4640,24 @@ fn readme_env_hygiene_and_ledger_rows_match_the_code() {
             "{call}"
         );
     }
-    let passes_tasks = fancy_regex::Regex::new(r"\btasks=").unwrap();
+    let hygiene = ledger_calls(&body_of("def hygiene_create("));
     assert_eq!(
-        calls
-            .iter()
-            .filter(|c| passes_tasks.is_match(c).unwrap())
-            .count(),
+        hygiene.len(),
         1,
-        "only the group-scoped hygiene call passes --tasks: {calls:#?}"
+        "hygiene_create must make exactly one collect_ledger_lines call: {hygiene:#?}"
+    );
+    assert!(
+        hygiene[0].contains("tasks=group_tasks"),
+        "the hygiene call must pass the group members: {}",
+        hygiene[0]
+    );
+    let collect = ledger_calls(&body_of("def _collect("));
+    assert_eq!(collect.len(), 1, "{collect:#?}");
+    let passes_tasks = fancy_regex::Regex::new(r"\btasks=").unwrap();
+    assert!(
+        !passes_tasks.is_match(&collect[0]).unwrap(),
+        "the run report's _collect call must stay run-scoped: {}",
+        collect[0]
     );
 }
 
