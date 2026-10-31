@@ -1791,6 +1791,26 @@ fn description_names_no_file_outside_the_repo() {
     );
 }
 
+/// The shipped description reads on its own: it carries no letter-digit
+/// label pointing into a planning record the repo does not hold.
+#[test]
+fn description_carries_no_planning_label() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let doc: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let description = doc["description"]
+        .as_str()
+        .expect("graph.yaml carries a string description");
+    let label_re = fancy_regex::Regex::new(r"\b[A-Z][0-9]+\b").unwrap();
+    let labels: Vec<&str> = label_re
+        .find_iter(description)
+        .map(|m| m.unwrap().as_str())
+        .collect();
+    assert!(
+        labels.is_empty(),
+        "description carries {labels:?}:\n{description}"
+    );
+}
+
 /// Every shipped file is ASCII on disk (the README's em-dash row), and the
 /// marker map keeps exactly the `\u2014` JSON escapes the README counts, all
 /// of them inside `first` lines.
@@ -3475,18 +3495,19 @@ fn re_entry_has_no_session_ledger_and_the_readme_no_honesty_sentence() {
     assert!(honesty.is_empty(), "README.md: {honesty:?}");
 }
 
-/// The graph-level integer bounds as the staging baseline records them: the
-/// top-level agent limits and every integer under `settings`.
+/// The graph-level integer bounds of the shipped baseline (the staging
+/// values plus the README's frozen budgets row): the top-level agent limits
+/// and every integer under `settings`.
 const FROZEN_GRAPH_BOUNDS: &[(&str, i64)] = &[
     ("max_agent_depth", 10),
     ("max_concurrent_agents", 10),
-    ("settings.max_loop_iterations", 100),
+    ("settings.max_loop_iterations", 1000),
     ("settings.timeout", 0),
 ];
 
-/// Every integer field of every node in the staging baseline (`timeout`,
-/// `max_attempts`, `max_iterations`, `max_concurrency`); a node absent here
-/// declares none.
+/// Every integer field of every node in the shipped baseline (`timeout`,
+/// `max_attempts`, `max_iterations`, `max_concurrency`), the staging values
+/// plus the frozen budgets row; a node absent here declares none.
 const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("amend_plan", "max_iterations", 20),
     ("amend_plan", "timeout", 1800),
@@ -3500,6 +3521,7 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("author_plan", "timeout", 3600),
     ("batch_close", "timeout", 300),
     ("batch_fix_route", "timeout", 300),
+    ("batch_gauntlet_build", "timeout", 60),
     ("batch_triage", "max_iterations", 10),
     ("batch_triage", "timeout", 900),
     ("branch_setup", "timeout", 300),
@@ -3744,6 +3766,39 @@ fn graph_and_gate_budgets_equal_the_frozen_baseline() {
     assert_eq!(
         script_bounds, expected,
         "_lib.py bounds moved (left: shipped)"
+    );
+}
+
+/// The engine's per-node visit cap outlasts one full CI watch: `ci_poll`
+/// revisits itself up to `CI_MAX_ROUNDS` times before it routes the timeout,
+/// so a cap at or below that value ends the watch as an engine error.
+#[test]
+fn loop_cap_exceeds_the_ci_poll_rounds_lib_computes() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let shipped: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let cap = shipped["settings"]["max_loop_iterations"]
+        .as_i64()
+        .expect("graph.yaml sets an integer settings.max_loop_iterations");
+
+    let Some(python) = python3() else {
+        return;
+    };
+    let scratch = scratch_dir("lib-ci-rounds");
+    let mut cmd = battery(&python, &scratch);
+    let out = cmd
+        .current_dir(candidate_dir().join("scripts"))
+        .args([
+            "-c",
+            "import json, _lib\nprint(json.dumps({\"CI_MAX_ROUNDS\": _lib.CI_MAX_ROUNDS}))\n",
+        ])
+        .output()
+        .unwrap();
+    assert_no_bytecode_under_candidate();
+    let values = parse_json_stdout("_lib CI_MAX_ROUNDS", &out);
+    let rounds = values["CI_MAX_ROUNDS"].as_i64().unwrap();
+    assert!(
+        cap > rounds,
+        "settings.max_loop_iterations {cap} does not exceed CI_MAX_ROUNDS {rounds}"
     );
 }
 
@@ -4259,6 +4314,43 @@ fn readme_env_hygiene_and_ledger_rows_match_the_code() {
         1,
         "only the group-scoped hygiene call passes --tasks: {calls:#?}"
     );
+}
+
+/// The README's gh command seams row names exactly the `ARCHITECT_GH_*_CMD`
+/// variables `gates.py` reads, so a seam added or dropped in the gates
+/// surfaces here.
+#[test]
+fn readme_gh_seam_row_names_exactly_the_seams_gates_reads() {
+    let seam_re = fancy_regex::Regex::new(r"ARCHITECT_GH_[A-Z_]+?_CMD").unwrap();
+    let names = |text: &str| -> BTreeSet<String> {
+        seam_re
+            .find_iter(text)
+            .map(|m| m.unwrap().as_str().to_string())
+            .collect()
+    };
+    let gates = fs::read_to_string(candidate_dir().join("scripts/gates.py")).unwrap();
+    let read: BTreeSet<String> = gates
+        .lines()
+        .filter(|l| l.contains("os.environ.get(\"ARCHITECT_GH_"))
+        .flat_map(names)
+        .collect();
+    assert!(
+        !read.is_empty(),
+        "gates.py reads no ARCHITECT_GH_*_CMD seam"
+    );
+    let row = adjustments_row("| gh command seams |");
+    assert_eq!(
+        names(&row),
+        read,
+        "the gh command seams row drifted from gates.py (left: README)"
+    );
+    for clause in [
+        "`bash -c`",
+        "operator's own environment",
+        "both batteries and the Rust wrapper drop any inherited value",
+    ] {
+        assert!(row.contains(clause), "the seams row lost {clause:?}: {row}");
+    }
 }
 
 /// The README's recorded battery figures are runs of the current batteries,

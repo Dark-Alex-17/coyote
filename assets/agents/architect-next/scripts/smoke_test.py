@@ -20,6 +20,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True
@@ -199,7 +200,22 @@ for _k, _v in _saved_env.items():
         os.environ.pop(_k, None)
     else:
         os.environ[_k] = _v
-check("runs_root: battery env restored", _lib.runs_root() == os.environ["ARCHITECT_RUNS_ROOT"])
+check("runs_root: battery env restored",
+      all(os.environ.get(_k) == _v for _k, _v in _saved_env.items()) and _lib.runs_root() == _saved_env["ARCHITECT_RUNS_ROOT"],
+      {_k: os.environ.get(_k) for _k in _saved_env})
+
+_real_dt = _lib._dt
+_frozen_now = _real_dt.datetime(2026, 1, 2, 3, 4, 5, tzinfo=_real_dt.timezone.utc)
+_lib._dt = types.SimpleNamespace(datetime=types.SimpleNamespace(now=lambda tz=None: _frozen_now), timezone=_real_dt.timezone)
+try:
+    _ids = [_lib.new_run_id("same brief"), _lib.new_run_id("same brief")]
+finally:
+    _lib._dt = _real_dt
+check("new_run_id: one brief twice in the same second -> two ids, two run dirs",
+      _ids[0] != _ids[1] and _ids[1] == _ids[0] + "-2" and all(os.path.isdir(_lib.run_dir_for(i)) for i in _ids), _ids)
+check("RESUME_RE: matches a suffixed run id whole and still the plain form",
+      _lib.RESUME_RE.search("Architect run id: 20260102T030405-0badf00d-2 go").group(1) == "20260102T030405-0badf00d-2"
+      and _lib.RESUME_RE.search("Architect run id: 20260102T030405-0badf00d").group(1) == "20260102T030405-0badf00d")
 
 
 # ---------------------------------------------------------------- intake / re-entry (A2)

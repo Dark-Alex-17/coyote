@@ -72,7 +72,7 @@ HARD_TRIGGER_RE = re.compile(
     r"force-push|drop (table|column|data)|delete .*branch|rm -rf|Design question:",
     re.I,
 )
-RESUME_RE = re.compile(r"Architect run id:\s*([0-9]{8}T[0-9]{6}-[0-9a-f]{8})")
+RESUME_RE = re.compile(r"Architect run id:\s*([0-9]{8}T[0-9]{6}-[0-9a-f]{8}(?:-[0-9]+)?)")
 SISYPHUS_RUN_RE = re.compile(r"Sisyphus run id:\s*([0-9]{8}T[0-9]{6}-[0-9a-f]{8})")
 TASK_ID_RE = re.compile(r"\bTASK-\d{3,}\b")
 SHA_RE = re.compile(r"\b(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b")
@@ -207,9 +207,20 @@ def runs_root():
 
 
 def new_run_id(brief):
+    """Claims a fresh run dir with `os.mkdir`, so two runs of one brief in the same
+    second get `<stamp>-<digest>` and `<stamp>-<digest>-2` instead of sharing a dir."""
     stamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%S")
     digest = hashlib.sha1((brief or "").encode("utf-8", "replace")).hexdigest()[:8]
-    return f"{stamp}-{digest}"
+    base = f"{stamp}-{digest}"
+    os.makedirs(runs_root(), exist_ok=True)
+    n = 1
+    while True:
+        run_id = base if n == 1 else f"{base}-{n}"
+        try:
+            os.mkdir(run_dir_for(run_id))
+            return run_id
+        except FileExistsError:
+            n += 1
 
 
 def run_dir_for(run_id):

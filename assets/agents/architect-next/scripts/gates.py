@@ -2792,6 +2792,9 @@ def open_pr(state):
     if state.get("pr_number"):
         u["_next"] = "pr_round_comments"
         return u
+    # ARCHITECT_GH_{COMMENT,CREATE,CHECKS,LOG,READY}_CMD are test and operator seams: when set, the gate runs the
+    # value through `bash -c` (the checks one through `/bin/sh -c`) instead of the `gh` call, and a set checks seam
+    # also skips `gh run rerun`. Both batteries and the Rust wrapper strip inherited ones.
     cmd = os.environ.get("ARCHITECT_GH_CREATE_CMD")
     if cmd:
         rc, out = sh(["bash", "-c", cmd], timeout=120)

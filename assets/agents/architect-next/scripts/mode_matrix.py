@@ -249,6 +249,8 @@ class World:
 
 def load_graph():
     p = subprocess.run(["yq", "-o=json", ".", os.path.join(HERE, "..", "graph.yaml")], capture_output=True, text=True)
+    if p.returncode != 0:
+        sys.exit(f"yq failed to read graph.yaml (exit {p.returncode}): {p.stderr.strip()}")
     return json.loads(p.stdout)
 
 
@@ -512,7 +514,7 @@ def main():
             problems.append("a delegation rendered BOTH the single and the multi blocks")
         if any(d[0] != single for d in dele):
             problems.append("delegation single/multi block mismatch")
-        if any(d[2] != micro for d in dele if True) and not par:
+        if any(d[2] != micro for d in dele) and not par:
             problems.append("MODE block iff micro violated (sequential)")
         if any(d[3] != micro for d in dele):
             problems.append("Context pack pasted iff micro violated")

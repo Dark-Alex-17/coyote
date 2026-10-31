@@ -10,7 +10,7 @@ description: |
   whetstone / engineer and the sisyphus delegate run as agent-node islands exactly
   as they ship. Candidate status: no agent lists this as spawnable, the facade
   agents/architect is untouched, and this directory is replaced by the facade at
-  cutover (D1) once the A9 artifact-equivalence replay passes. The run-or-chat session
+  cutover once the artifact-equivalence replay passes. The run-or-chat session
   surface is the facade's: work routes to the graph, conversation to the engineer.
 version: '1.0'
 
@@ -80,8 +80,9 @@ variables:
 
 settings:
   # Engine backstop only: every cycle carries its own named bound in a script. It counts visits per node per RUN, so for an
-  # orchestration it is a defect detector, not a budget (engine-ask G10).
-  max_loop_iterations: 100
+  # orchestration it is a defect detector, not a budget. ci_poll alone may revisit itself CI_MAX_ROUNDS (240) times per PR
+  # before it routes ci_status=timeout; 1000 covers four group PRs each watched to that wall cap and stays finite.
+  max_loop_iterations: 1000
   log_state_snapshots: true
   validate_before_run: true
   # Architect runs span hours-to-days (the facade's choice); the delegate and the
@@ -1475,6 +1476,7 @@ nodes:
     type: script
     description: Full panel over the batch delta (first member's BASE SHA..HEAD); narrowed on re-rounds.
     script: scripts/batch_gauntlet_build.py
+    timeout: 60
     fallback: end_failure
 
   batch_triage:

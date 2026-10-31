@@ -51,6 +51,8 @@ below. Later landings add their own rows.
 | engine facts | this README | agent-node resume: not available by decision (2026-10-28); E1 stays as the artifact contract; G6 escalation_timeout open |
 | battery env hygiene | `scripts/smoke_test.py`, `scripts/mode_matrix.py`, `tests/candidate_architect_next.rs` | both batteries drop every `LLM_AGENT_VAR_*` variable at start so they cannot inherit the agent variables of the process running them (`_lib.var` reads the mode variables through them), drop `ARCHITECT_CORE_TOOLS`, `ARCHITECT_ASK_OWNER_BIN`, `ARCHITECT_SLACK_PING_BIN` and every `ARCHITECT_GH_*_CMD` so a caller's tool overrides cannot replace the gates' own `tools.sh`, `ask_owner`, `slack_ping` and `gh` calls, and drop `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY` and `GIT_COMMON_DIR` the same way, so a run from a git hook (which exports them) commits in the scratch repositories, not the caller's; the smoke battery's recording `tools.sh` restores any prior `ARCHITECT_CORE_TOOLS` when its call returns. Both also drop `GIT_CONFIG_PARAMETERS` and every inherited `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_*` and `GIT_CONFIG_VALUE_*`, so a caller's command-line git config cannot reach the scratch repositories, then set `GIT_CONFIG_COUNT=1`, `GIT_CONFIG_KEY_0=user.useConfigOnly` and `GIT_CONFIG_VALUE_0=true`. After those drops both set a fixed `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME` and `GIT_COMMITTER_EMAIL`, which every gate and each battery's own git helper inherits: the scratch `HOME` holds no git identity, and git refuses to guess one when `user.useConfigOnly` is set or when the host name has no dot (it cannot build an email), so without the fixed identity every gate commit would fail on such a host; setting `user.useConfigOnly` makes every host behave that way. The Rust wrapper strips the repository variables from every git, script and binary command it starts and the agent variables and tool overrides from every script and binary command; it builds its scratch repository and runs the review-gauntlet scripts with `GIT_CONFIG_NOSYSTEM=1` and `GIT_CONFIG_GLOBAL=/dev/null`, so no system or user git config (signing, hooks) applies, and runs the batteries with the same `GIT_CONFIG_*` drop and `user.useConfigOnly` setting. Every binary command it starts drops every inherited `COYOTE_*` variable (`COYOTE_PROVIDER`, `COYOTE_PLATFORM`, `COYOTE_WORKSPACE_CONFIG_DIR`, `COYOTE_CONFIG_FILE` and the rest) before it sets its own `COYOTE_CONFIG_DIR` and `COYOTE_CACHE_DIR`. Every scratch config dir it starts the binary from holds an `mcp.json` that defines no server: the bundled one launches `engineer`'s `ddg-search` through `uvx`, which CI hosts lack, and the engine never installs over an existing file |
 | ledger rollup scope | `scripts/gates.py` `hygiene_create` / `_group_members` / `_skip_empty_group` / `group_closeout` / `pr_body` / `_collect` / `_completed_tasks_dir`, `scripts/smoke_test.py` | every `collect_ledger_lines` call passes `--plan`: the prose `architect/tools.sh` declares it required and hands it to `plan_tasks.py`, which exits `plan not found` without it, so staging's calls always fell back to `(collect_ledger_lines unavailable: ...)`. In multi-PR mode the group-scoped calls (`hygiene_create`'s starting ledger and `pr_body`'s `assemble_pr_body`) also pass `--tasks <group members>`, as the prose architect does, where the members are the closing group's complete tasks (a skipped, failed or parked member is not in the completed task store, so naming it would only cost a body fix round); the run report (`_collect`) passes no `--tasks` and stays run-scoped, because it covers every PR group. A group with no complete task makes no group-scoped call, since an empty `--tasks` would widen it to the whole plan: `group_closeout` skips that group's PR with a ledger line and a follow-up naming the group, then moves to the next group (or finishes the plan at run scope); `pr_body` skips an empty group the same way and `hygiene_create` skips its hygiene chore. Under the dirstate task store all three read the `completed` task dir, where complete tasks live. The smoke battery records each call's arguments and runs the real `tools.sh` over a scratch plan and task log |
+| frozen budgets | `graph.yaml` `settings.max_loop_iterations` and `batch_gauntlet_build`, `tests/candidate_architect_next.rs` | the engine counts `max_loop_iterations` per node per run and never resets it, and `ci_poll` revisits itself up to `CI_MAX_ROUNDS` (240) times per PR before it routes `ci_status=timeout`, so staging's cap of 100 ended a long CI watch as an engine error; the cap is now 1000, still a finite defect detector, which covers four group PRs each watched to the 240-poll wall cap, and the wrapper pins it above the `CI_MAX_ROUNDS` that `_lib.py` computes. `batch_gauntlet_build` declared no `timeout:`; it only sets the batch verify scope and routes to `verify_gate`, so it now carries `verify_gate`'s `timeout: 60` |
+| gh command seams | `scripts/gates.py` | `ARCHITECT_GH_COMMENT_CMD`, `ARCHITECT_GH_CREATE_CMD`, `ARCHITECT_GH_CHECKS_CMD`, `ARCHITECT_GH_LOG_CMD` and `ARCHITECT_GH_READY_CMD` replace the gates' `gh pr comment`, `gh pr create`, `gh pr checks`, `gh run view --log-failed` and `gh pr ready` calls; a set checks seam also skips `gh run rerun`. Each runs its value from the operator's own environment through `bash -c` (the checks seam through `/bin/sh -c`). They are test and operator seams, documented rather than gated: both batteries and the Rust wrapper drop any inherited value before they set their own |
 
 Recorded census against the staging tree (files that differ; hunks per file as counted by
 `diff -u <staging file> <file> | grep -c '^@@'`):
@@ -65,28 +67,31 @@ scripts/gates.py         13 hunks   (GREEN tuple retired; verify_gate: dirty-tre
 README.md                 2 hunks   (design-record aside in the status paragraph; run-state bullet, this section and the Verify section)
 ```
 
-Every other file is byte-identical to staging; the graph's node set, prompts, loop bounds
-and node timeouts are unchanged.
+Every other file is byte-identical to staging. The graph's node set and prompts are unchanged,
+and so is every loop bound and node timeout in `graph.yaml`, `scripts/_lib.py` and
+`scripts/gates.py` except two in `graph.yaml`: `settings.max_loop_iterations` is 1000 (staging
+100) and `batch_gauntlet_build` carries `timeout: 60` (staging none), as the frozen budgets row
+records.
 
 Toolchain census (the gates must stay project-agnostic; verification commands come
 from the brief, never from a hard-coded toolchain):
 
 ```
 $ grep -nE '\b(cargo|npm|pnpm|yarn|go (test|build)|pytest|mvn|gradle|make)\b' scripts/*.py
-scripts/_lib.py:547:    r"`[^`]+`|\b(go|cargo|npm|pnpm|yarn|make|pytest|python3?|bash|sh|grep|rg|curl|task|just|mvn|gradle|dotnet|bun)\b\s",
+scripts/_lib.py:558:    r"`[^`]+`|\b(go|cargo|npm|pnpm|yarn|make|pytest|python3?|bash|sh|grep|rg|curl|task|just|mvn|gradle|dotnet|bun)\b\s",
 scripts/gates.py:41:    r"yarn\.lock$|pnpm-lock\.yaml$|Cargo\.(toml|lock)$|requirements.*\.txt$|poetry\.lock$",
 scripts/gates.py:2621:        "file:line, at most 25 per run so iterate); identifiers that only make sense with the plan open; ...
 scripts/gates.py:2630:        "failing test to make it pass; you still do NOT edit the plan or task files -- report instead.\n\n"
 scripts/mode_matrix.py:174:`make run`
-scripts/mode_matrix.py:269:            ... "local_run_recipe": "`make run`",
-scripts/smoke_test.py:97:CODE_BASE = make_repo(CODE, {..., "CLAUDE.md": "Run `go test ./...` before committing.\n", ...
-scripts/smoke_test.py:156:`make run`
-scripts/smoke_test.py:470:u = gates.verify_gate(base_state(..., local_run_recipe="make run"))
-scripts/smoke_test.py:830:   ... "acceptance_criteria": ["`go test ./...`"], ...
-scripts/smoke_test.py:945:u = AA("probe_gap", "Supply the recipe: make run", ...)
+scripts/mode_matrix.py:271:            ... "local_run_recipe": "`make run`",
+scripts/smoke_test.py:98:CODE_BASE = make_repo(CODE, {..., "CLAUDE.md": "Run `go test ./...` before committing.\n", ...
+scripts/smoke_test.py:157:`make run`
+scripts/smoke_test.py:486:u = gates.verify_gate(base_state(..., local_run_recipe="make run"))
+scripts/smoke_test.py:846:   ... "acceptance_criteria": ["`go test ./...`"], ...
+scripts/smoke_test.py:961:u = AA("probe_gap", "Supply the recipe: make run", ...)
 ```
 
-None of these runs a toolchain: `_lib.py:547` is the alternation of the executable-criterion
+None of these runs a toolchain: `_lib.py:558` is the alternation of the executable-criterion
 classifier (`EXECUTABLE_RE` recognises a command-shaped acceptance criterion; it hardcodes no
 command), `gates.py:41` is the dependency-manifest regex (the hits are `yarn`/`pnpm` inside
 lockfile names), `gates.py:2621` and `:2630` are the English verb `make` in prompt prose, and
@@ -120,8 +125,9 @@ The wrapper's live test groups:
   falling back to the cache-dir tier;
 - graph and gates: `build_lock` position, the variable mirror (the candidate's variables
   match the prose `architect/config.yaml` name for name and default for default, without
-  `yq`), the description pin (`description_names_no_file_outside_the_repo`), toolchain
-  census, ASCII sweep, and the shim pin (every `scripts/<name>.py` shim calls
+  `yq`), the description pins (`description_names_no_file_outside_the_repo`, and no
+  letter-digit label in the description), toolchain census, ASCII sweep, and the shim pin
+  (every `scripts/<name>.py` shim calls
   `run("<name>")`, names `<name>` in its docstring, the shims map one-to-one onto the
   `type: script` nodes of `graph.yaml`, and every `run()` name is a key of `GATES` in
   `gates.py`);
@@ -129,14 +135,15 @@ The wrapper's live test groups:
   and `done` template, read by `route_verdict`, composed into the next round by
   `verify_gate` and narrowed through the gauntlet's real `signals.py` and `build_items.py`;
   the no-settled-lanes round; the parser rows; the planning-store dirty-tree rows;
-- budgets and channels: graph, node, `initial_state` and `_lib.py` bounds against a literal
-  copy of the staging values, the `anomalies` property on every llm node, and no
+- budgets and channels: graph, node, `initial_state` and `_lib.py` bounds against the shipped
+  baseline (the staging values plus the frozen budgets row), the loop cap above the
+  `CI_MAX_ROUNDS` that `_lib.py` computes, the `anomalies` property on every llm node, and no
   `inputs: build_lock` anywhere; the real `tools.sh` `collect_ledger_lines` rollup; both
   batteries drop the same variables as the wrapper;
 - README ground-truth pins: toolchain census, counts against the graph and the prose twin,
   the `build_lock` and E9 rows, `pr_body` passing `--tasks`, the dead-guard census row, the
-  grammar, V1, engine-facts, env hygiene and ledger rows, and the battery figures against the
-  wrapper floors;
+  grammar, V1, engine-facts, env hygiene, ledger and gh command seams rows, and the battery
+  figures against the wrapper floors;
 - real-binary dry runs: four by name (from a seeded config dir; from an empty config dir that
   installs the candidate; re-entry by run id in the prompt; an unknown run id in the prompt
   starts a fresh run), the XDG-tier dry run (only `XDG_CACHE_HOME` set, the run lands under
