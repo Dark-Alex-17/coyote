@@ -223,6 +223,7 @@ initial_state:
   closeout_scope: ''
   closeout_unit: ''
   closeout_done_for: ''
+  skipped_group_indexes: []
   current_task: ''
   current_unit: ''
   delegation_kind: 'implement'

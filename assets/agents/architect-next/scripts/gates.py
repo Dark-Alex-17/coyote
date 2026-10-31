@@ -666,7 +666,13 @@ def branch_setup(state):
             gi = as_int(state.get("group_index")) or 1
             u["group_index"] = gi
             branch = f"{_run_branch(state)}-g{gi}"
-            prev = f"{_run_branch(state)}-g{gi - 1}" if gi > 1 else ""
+            # A skipped group never gets a PR, so the stack continues from the
+            # last group that did.
+            skipped = {as_int(i) for i in as_list(state.get("skipped_group_indexes"))}
+            prev_gi = gi - 1
+            while prev_gi in skipped:
+                prev_gi -= 1
+            prev = f"{_run_branch(state)}-g{prev_gi}" if prev_gi >= 1 else ""
             if prev:
                 merged = _pr_merged(state, prev)
                 base = base if merged else prev
@@ -1242,7 +1248,8 @@ def _probe_verdict(text):
 # quoted in its verification output is not one) and its complaints are the
 # numbered items under its column-0 `Complaints:` line, read from the whole
 # report. A lane row it quotes is not a lane verdict, so it reports no lanes
-# and the next round settles none.
+# and the next round settles none; a quoted probe row or USAGE_PROBE line is
+# no probe verdict either, so it yields no probe files.
 def _parse_gauntlet(text, adversary_lane=False):
     header = _gauntlet_header(text)
     header_lines = header.splitlines()
@@ -1286,7 +1293,7 @@ def _parse_gauntlet(text, adversary_lane=False):
         # same line in a lane reason or a lane report is not a blocker.
         blockers += [l.rstrip() for l in section or [] if l.startswith("debris: Implementation debris")]
     plan_root = bool(re.search(r"(?i)plan (itself )?is the root cause|impossible or contradictory criterion|criterion (is|cannot be) (impossible|unverifiable)", text))
-    probe_files = re.findall(TEST_FILE_RE, text) if _probe_verdict(text) == "PASS" else []
+    probe_files = re.findall(TEST_FILE_RE, text) if not adversary_lane and _probe_verdict(text) == "PASS" else []
     return verdict, incomplete, lanes, blockers, plan_root, probe_files
 
 
@@ -1303,7 +1310,7 @@ def route_verdict(state):
     has_verdict = "ADVERSARIAL_REVIEW:" in text if adversary_lane else _has_verdict(_gauntlet_header(text))
     if not text or text.startswith("Agent node failed") or not has_verdict:
         verdict, incomplete, blockers = "BLOCKED", incomplete or ["pipeline"], []
-    probe = _probe_verdict(text)
+    probe = "" if adversary_lane else _probe_verdict(text)
     rounds_log = dict(as_dict(state.get("round_log")))
     rl = rounds_log.setdefault(unit, [])
     if rl:
@@ -2731,6 +2738,8 @@ def _skip_empty_group(state, u):
     ledger(state, u, f"group: {unit} has no complete task; its PR is skipped (follow-up)")
     u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"PR group {unit} not opened: none of its tasks completed"]
     u["closeout_done_for"] = unit
+    u["skipped_group_indexes"] = list(as_list(state.get("skipped_group_indexes"))) + [as_int(state.get("group_index")) or 1]
+    u.update({"pr_number": "", "pr_url": "", "integration_checked": False, "integration_amended": False})
     u["_next"] = "select_tasks" if (u.get("closeout_scope") or state.get("closeout_scope")) == "group" else "finish_plan"
     return u
 
