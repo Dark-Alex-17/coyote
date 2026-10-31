@@ -107,62 +107,102 @@ white() {
 # the terminal: the helper writes one request line to the tool's real stdout
 # and reads the answer line back from COYOTE_PROMPT_REPLY. Callers wrap the
 # helpers in $(...), which points fd 1 at the capture, so the real stdout is
-# saved on fd 9 once at source time.
-if [[ -n "${COYOTE_PROMPT_REPLY:-}" && -z "${_COYOTE_PROMPT_OUT:-}" ]]; then
+# saved on fd 9 once at source time. A channel handed over on fd 9 itself
+# would be clobbered by that save, so it is treated as absent.
+if [[ -n "${COYOTE_PROMPT_REPLY:-}" && "$COYOTE_PROMPT_REPLY" != /dev/fd/9 && -z "${_COYOTE_PROMPT_OUT:-}" ]]; then
   exec 9>&1
   _COYOTE_PROMPT_OUT=9
 fi
 
+_coyote_prompt_enabled() {
+  [[ -n "${COYOTE_PROMPT_REPLY:-}" && "$COYOTE_PROMPT_REPLY" != /dev/fd/9 && -n "${_COYOTE_PROMPT_OUT:-}" ]]
+}
+
+# _coyote_prompt_send <id> <action> <question> <options-json>
 _coyote_prompt_send() {
   declare id="$1"
   declare action="$2"
   declare question="$3"
+  declare options="$4"
   declare line
   line="$(jq -cn --arg id "$id" --arg action "$action" --arg question "$question" \
-    '{coyote_prompt:{id:$id,action:$action,question:$question,options:$ARGS.positional}}' \
-    --args "${@:4}")" || return 1
-  printf '%s\n' "$line" >&"${_COYOTE_PROMPT_OUT:-1}"
+    --argjson options "$options" \
+    '{coyote_prompt:{id:$id,action:$action,question:$question,options:$options}}')" || return 1
+  printf '%s\n' "$line" >&"$_COYOTE_PROMPT_OUT"
 }
 
-# _coyote_prompt <action> <question> [options...]
+# _coyote_prompt_map <action> <reply-line> <options-json>
 # Prints the answer in the same shape the terminal helpers print: confirm 1/0,
 # select the option index, checkbox the checked indices, input/password the
-# text. Returns 1 and prints nothing when the prompt was cancelled or the
-# reply is not usable, so callers fail closed.
-_coyote_prompt() {
+# text. Fails when the answer does not fit the action.
+_coyote_prompt_map() {
   declare action="$1"
-  declare question="$2"
-  declare id="p$$-$RANDOM"
-  declare reply
-
-  _coyote_prompt_send "$id" "$action" "$question" "${@:3}" || return 1
-  IFS= read -r reply <"$COYOTE_PROMPT_REPLY" || return 1
-
-  declare answer
+  declare reply="$2"
+  declare options="$3"
   case "$action" in
     confirm)
-      answer="$(printf '%s' "$reply" | jq -er \
-        'if .answer == true then 1 elif .answer == false then 0 else empty end')" || return 1
+      printf '%s' "$reply" | jq -er \
+        'if .answer == true then 1 elif .answer == false then 0 else empty end'
       ;;
     select)
-      answer="$(printf '%s' "$reply" | jq -er --args \
-        'if (.answer | type) == "string" then (.answer as $a | $ARGS.positional | index($a)) else empty end' \
-        "${@:3}")" || return 1
+      printf '%s' "$reply" | jq -er --argjson options "$options" \
+        'if (.answer | type) == "string" then (.answer as $a | $options | index($a)) else empty end'
       ;;
     checkbox)
-      answer="$(printf '%s' "$reply" | jq -er --args \
-        'if (.answer | type) == "array" then (.answer as $a | [$ARGS.positional | to_entries[] | select(.value | IN($a[])) | .key] | map(tostring) | join(" ")) else empty end' \
-        "${@:3}")" || return 1
+      printf '%s' "$reply" | jq -er --argjson options "$options" \
+        'if (.answer | type) == "array" then (.answer as $a | [$options | to_entries[] | select(.value | IN($a[])) | .key] | map(tostring) | join(" ")) else empty end'
       ;;
     input | password)
-      answer="$(printf '%s' "$reply" | jq -er \
-        'if (.answer | type) == "string" then .answer else empty end')" || return 1
+      printf '%s' "$reply" | jq -er \
+        'if (.answer | type) == "string" then .answer else empty end'
       ;;
     *)
       return 1
       ;;
   esac
+}
 
+# _coyote_prompt <action> <question> [options...]
+# Returns 1 and prints nothing when the prompt was cancelled, the channel
+# closed, or the reply is not usable, so callers fail closed.
+_coyote_prompt() {
+  declare action="$1"
+  declare question="$2"
+  declare options='[]'
+  if [[ $# -gt 2 ]]; then
+    options="$(printf '%s\n' "${@:3}" | jq -cRs 'split("\n") | .[:-1]')" || return 1
+  fi
+
+  # $RANDOM is not reseeded in $(...) subshells on bash < 5.1, so sibling
+  # prompts could mint the same id; the kernel's entropy is used instead.
+  declare id
+  id="p$$-$(head -c 8 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+  if [[ "$id" == "p$$-" ]]; then
+    id="p$$-$RANDOM-$SECONDS"
+  fi
+
+  _coyote_prompt_send "$id" "$action" "$question" "$options" || return 1
+
+  declare reply
+  while :; do
+    if ! IFS= read -r reply <"$COYOTE_PROMPT_REPLY"; then
+      show_error "prompt reply channel closed"
+      return 1
+    fi
+    if printf '%s' "$reply" | jq -e --arg id "$id" '.id == $id' >/dev/null 2>&1; then
+      break
+    fi
+  done
+
+  if printf '%s' "$reply" | jq -e '.answer == null' >/dev/null; then
+    return 1
+  fi
+
+  declare answer
+  if ! answer="$(_coyote_prompt_map "$action" "$reply" "$options")"; then
+    show_error "prompt reply unusable"
+    return 1
+  fi
   printf '%s' "$answer"
 }
 
@@ -242,7 +282,7 @@ _increment_selected() {
 
 # shellcheck disable=SC2154
 input() {
-  if [[ -n "${COYOTE_PROMPT_REPLY:-}" ]]; then
+  if _coyote_prompt_enabled; then
     _coyote_prompt input "$1"
     return $?
   fi
@@ -253,7 +293,7 @@ input() {
 }
 
 confirm() {
-  if [[ -n "${COYOTE_PROMPT_REPLY:-}" ]]; then
+  if _coyote_prompt_enabled; then
     _coyote_prompt confirm "$1"
     return $?
   fi
@@ -291,7 +331,7 @@ confirm() {
 }
 
 list() {
-  if [[ -n "${COYOTE_PROMPT_REPLY:-}" ]]; then
+  if _coyote_prompt_enabled; then
     _coyote_prompt select "$1" "${@:2}"
     return $?
   fi
@@ -339,7 +379,7 @@ list() {
 }
 
 checkbox() {
-  if [[ -n "${COYOTE_PROMPT_REPLY:-}" ]]; then
+  if _coyote_prompt_enabled; then
     _coyote_prompt checkbox "$1" "${@:2}"
     return $?
   fi
@@ -412,7 +452,7 @@ checkbox() {
 }
 
 password() {
-  if [[ -n "${COYOTE_PROMPT_REPLY:-}" ]]; then
+  if _coyote_prompt_enabled; then
     _coyote_prompt password "$1"
     return $?
   fi
@@ -592,7 +632,7 @@ open_link() {
 
 guard_operation() {
 	if [[ -z "$AUTO_CONFIRM" && -z "$LLM_AGENT_VAR_AUTO_CONFIRM" ]]; then
-		if [[ -n "${COYOTE_PROMPT_REPLY:-}" ]]; then
+		if _coyote_prompt_enabled; then
 			ans="$(confirm "${1:-Are you sure you want to continue?}")"
 		else
 			# 2>/dev/tty: keep the prompt off the host-captured stderr pipe so it
@@ -601,7 +641,7 @@ guard_operation() {
 		fi
 
 		if [[ "$ans" != 1 ]]; then
-			error "Operation aborted!" 2>&1
+			error "Operation aborted!" >&2
 			exit 1
 		fi
 	fi
@@ -857,7 +897,7 @@ guard_path() {
 	confirmation_prompt="$2"
 
 	if [[ ! "$path" == "$(pwd)"* && -z "$AUTO_CONFIRM" && -z "$LLM_AGENT_VAR_AUTO_CONFIRM" ]]; then
-		if [[ -n "${COYOTE_PROMPT_REPLY:-}" ]]; then
+		if _coyote_prompt_enabled; then
 			ans="$(confirm "$confirmation_prompt")"
 		else
 			# 2>/dev/tty: see guard_operation; prevents prompt text leaking via captured stderr.

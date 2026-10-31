@@ -7,7 +7,7 @@ use super::todo::TODO_FUNCTION_PREFIX;
 use super::user_interaction::USER_FUNCTION_PREFIX;
 use super::{FunctionDeclaration, JsonSchema, PATH_SEP, mcp_error_display, render_tool_result};
 use crate::config::{
-    McpRuntime, RequestContext, effective_max_concurrent_jobs, jobs_enabled, paths,
+    McpRuntime, RequestContext, UiKind, effective_max_concurrent_jobs, jobs_enabled, paths,
 };
 use crate::events::{self, Event, Origin};
 use crate::graph;
@@ -572,8 +572,7 @@ async fn handle_start(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
             result
         })
     } else {
-        let mut snapshot = build_env_snapshot(ctx, &tool, &arguments)?;
-        snapshot.job_id = job_id.clone();
+        let snapshot = build_env_snapshot(ctx, &job_id, &tool, &arguments)?;
         let task_state = Arc::clone(&state);
         let task_buf = Arc::clone(&output_buf);
         let task_notifications = Arc::clone(&ctx.notification_queue);
@@ -1010,6 +1009,7 @@ fn handle_list(ctx: &RequestContext) -> Result<Value> {
 /// assembly, resolved eagerly so the detached task owns everything it needs.
 fn build_env_snapshot(
     ctx: &RequestContext,
+    job_id: &str,
     tool: &str,
     arguments: &Value,
 ) -> Result<JobEnvSnapshot> {
@@ -1053,7 +1053,7 @@ fn build_env_snapshot(
     envs.insert("FORCE_COLOR".into(), "1".into());
     envs.entry("COYOTE_CURRENT_MODEL".to_string())
         .or_insert_with(|| ctx.current_model().id());
-    envs.entry("COYOTE_UI".to_string())
+    envs.entry(UiKind::ENV.to_string())
         .or_insert_with(|| ctx.ui_kind().as_str().to_string());
     let prompt_reply = match Server::open() {
         Ok(server) => {
@@ -1100,7 +1100,7 @@ fn build_env_snapshot(
             Origin::from(ctx),
         )),
         prompt_reply,
-        job_id: String::new(),
+        job_id: job_id.to_string(),
     })
 }
 
@@ -1237,8 +1237,11 @@ async fn run_process_job(
     #[cfg(unix)]
     command.process_group(0);
     let mut prompt_reply = snapshot.prompt_reply.take();
-    if let Some(server) = prompt_reply.as_ref() {
-        server.configure(command.as_std_mut());
+    match prompt_reply.as_ref() {
+        Some(server) => server.configure(command.as_std_mut()),
+        None => {
+            command.env_remove(prompt_channel::REPLY_ENV);
+        }
     }
     let spawned_child = command.spawn();
     if let Some(server) = prompt_reply.as_mut() {

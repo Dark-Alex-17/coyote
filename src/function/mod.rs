@@ -10,7 +10,8 @@ pub(crate) mod user_interaction;
 use crate::{
     client::ThinkingBlock,
     config::{
-        Agent, RequestContext, flatten_prompt_messages, resolve_prompt_args, sanitize_display_text,
+        Agent, RequestContext, UiKind, flatten_prompt_messages, resolve_prompt_args,
+        sanitize_display_text,
     },
     graph,
     utils::*,
@@ -1626,7 +1627,7 @@ impl ToolCall {
 
         envs.entry("COYOTE_CURRENT_MODEL".to_string())
             .or_insert_with(|| ctx.current_model().id());
-        envs.entry("COYOTE_UI".to_string())
+        envs.entry(UiKind::ENV.to_string())
             .or_insert_with(|| ctx.ui_kind().as_str().to_string());
 
         let json_data = if self.arguments.is_object() {
@@ -2598,8 +2599,11 @@ pub fn run_llm_function(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some(server) = reply.as_ref() {
-        server.configure(&mut command);
+    match reply.as_ref() {
+        Some(server) => server.configure(&mut command),
+        None => {
+            command.env_remove(prompt_channel::REPLY_ENV);
+        }
     }
     let spawned_child = command.spawn();
     if let Some(server) = reply.as_mut() {
