@@ -47,8 +47,10 @@ those rules are *structure*:
 - **Lane selection floor is deterministic** (`build_items.py`): code-review
   always runs; adversary runs when a spec/plan is present; security runs on
   attack-surface signals (auth/deps/exec paths or diff content - the surface
-  patterns live once in `agents/.shared/diff_signals.py`, shared with any
-  downstream watch-round classifier; `signals.py` keeps an inline fallback) or hardened
+  rules come from `agents/.shared/diff_signals.py`, shared with any
+  downstream watch-round classifier; `signals.py` carries a byte-equal copy
+  of its regex constants plus an inline fallback `classify`, held equal to
+  the shared module by a test) or hardened
   posture; probe runs when consumer-facing surface changed *and* a local-run
   recipe exists. The `select_lanes` LLM can only **widen** the set — a false
   flag never removes a rule-selected lane. `forced_lanes` from the caller
@@ -70,6 +72,13 @@ those rules are *structure*:
   `NEEDS-HUMAN` without 🔴 passes but
   is surfaced under *Human attention required*; probe `INCONCLUSIVE` blocks
   with an environment note — it is never treated as PASS or FAIL.
+- **The report header is one line per item**: everything above
+  `## Full lane reports` renders one line per table row, bullet or note.
+  Every value that is not a gate literal is folded through
+  `scripts/report_text.py`: `one_line` joins any line boundary into a space,
+  and `table_cell`, used for derived lane-table cells, also maps `|` to `/`
+  so a value cannot open another column. `lanes_summary` is folded again at
+  render time, whoever wrote it.
 - **Implementation debris is linted, not judged** (`debris_lint.py`, over the
   shared `.shared/debris.py`): every ADDED line of the diff is scanned for
   non-ASCII punctuation (dashes, ellipsis, arrows, section signs,

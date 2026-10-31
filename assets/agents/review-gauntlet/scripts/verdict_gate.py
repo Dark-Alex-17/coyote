@@ -65,6 +65,9 @@ import sys
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".shared"))
+# Under PYTHONSAFEPATH sys.path[0] is not this directory; report_text must
+# still resolve here, ahead of anything of the same name in .shared.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # A missing helper module or name must still end in the BLOCKED stub below,
 # so the import error is kept here and raised inside the crash guard by main().
@@ -72,7 +75,7 @@ try:
     from report_text import one_line, table_cell
 
     helper_import_error = None
-except ImportError as e:
+except Exception as e:  # noqa: BLE001 - any helper failure must reach the stub
     helper_import_error = e
 
 # Duplicated verbatim in the sibling gate script — the two copies must stay identical.
@@ -116,7 +119,8 @@ def selection_lines(summary):
             items[-1] += " " + line
         elif line.strip():
             items.append(line)
-    return ["- " + one_line(text) for text in items]
+    folded = (one_line(text) for text in items)
+    return ["- " + text for text in folded if text]
 
 
 def main():
@@ -493,9 +497,9 @@ def main():
 try:
     main()
 except Exception as e:  # noqa: BLE001 — the gate must never crash into a silent pass
-    # Without the helper the error is its own ImportError, whose message is
-    # one line; any other error may carry state text and is folded.
-    error = e if helper_import_error else one_line(e)
+    # Without the helper the error is the helper's own, which may span lines;
+    # splitlines() splits on exactly the boundaries one_line folds.
+    error = " ".join(str(e).splitlines()) if helper_import_error else one_line(e)
     print(
         json.dumps(
             {

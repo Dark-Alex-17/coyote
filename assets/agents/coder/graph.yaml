@@ -28,17 +28,41 @@ variables:
       Absolute path to the project directory. Defaults to "." which is the
       directory you invoked `coyote` from. Override at runtime with
       `coyote -a coder --agent-variable project_dir /abs/path "..."`.
+      Left at the default, the verify gates run in the git work tree that
+      holds every absolute planned file when that tree does not contain the
+      invocation directory (a spawned coder editing another checkout).
     default: '.'
+  - name: test_command
+    description: |
+      Test command the verify_tests gate runs instead of the detected one,
+      e.g. `cargo test --test my_suite` when the full suite does not fit the
+      gate's deadline. Takes precedence over the TEST_CMD environment
+      variable. Empty (the default) uses TEST_CMD, then detection.
+    default: ''
+  - name: build_timeout
+    description: |
+      Whole seconds verify_build may run before the gate kills the build
+      and ends the run with a TIMED OUT verdict, distinct from a red build.
+      0 disables the deadline. Keep it below the node's 1800 s timeout.
+    default: '900'
+  - name: test_timeout
+    description: |
+      Whole seconds verify_tests may run before the gate kills the suite
+      and ends the run with a TIMED OUT verdict, distinct from a red run
+      (a cold worktree's first full suite can need far more than a warm
+      one). 0 disables the deadline. Keep it below the node's 3600 s timeout.
+    default: '1800'
   - name: build_lock
     description: |
       Command prefix for every gate (build and tests), e.g. `flock /path/to/lock`
       so parallel agents sharing one target directory serialise their gate
       runs (the coder's own ad-hoc cargo calls are not covered). The whole
       gate command runs under the prefix as one unit. Waiting on the lock
-      counts toward the gate node's timeout (300 s build, 600 s tests), so
-      prefer `flock -w <secs>` or raise those timeouts when runs are long.
-      A gate killed by its timeout while still waiting leaves the lock
-      request queued; `-w` below the node timeout makes it give up instead
+      counts toward the gate's deadline (build_timeout / test_timeout, capped
+      by the nodes' 1800 s build, 3600 s tests timeouts), so prefer
+      `flock -w <secs>` or raise those deadlines when runs are long.
+      A gate killed while still waiting can leave the lock request queued;
+      `-w` below the deadline makes it give up instead
       of running later unobserved.
       The prefix is a shell fragment and is re-parsed: quote paths containing
       spaces (`flock '/tmp/my lock'`); `$VAR` inside it expands when the gate runs.
@@ -55,6 +79,7 @@ settings:
 
 initial_state:
   project_dir: ''
+  project_dir_defaulted: false
   fix_attempts: 0
   max_fix_attempts: 5
   fix_instructions: ''
@@ -418,23 +443,23 @@ nodes:
   verify_build:
     id: verify_build
     type: script
-    description: Run the project's check/build command. Routes to verify_tests on success, fix_loop_gate on failure.
+    description: Run the project's check/build command in project_dir, killed at build_timeout. Routes to verify_tests on success, fix_loop_gate on failure, end_failure on a timeout.
     script: scripts/verify_build.sh
-    timeout: 300
+    timeout: 1800
     fallback: fix_loop_gate
 
   verify_tests:
     id: verify_tests
     type: script
-    description: Run the project's test command. Routes to self_review on pass, fix_loop_gate on failure.
+    description: Run test_command (or the detected test command) in project_dir, killed at test_timeout. Routes to self_review on pass, fix_loop_gate on failure, end_failure on a timeout.
     script: scripts/verify_tests.sh
-    timeout: 600
+    timeout: 3600
     fallback: fix_loop_gate
 
   fix_loop_gate:
     id: fix_loop_gate
     type: script
-    description: Budget gate. Loops back to implement with fix_instructions populated, or terminates as end_failure. Reached via a verify_* fallback edge (engine-recorded `last_script_error`, or both gates still green) — re-runs verification once per cycle (from verify_build), then end_failure.
+    description: Budget gate. Loops back to implement with fix_instructions populated, or terminates as end_failure. Reached via a verify_* fallback edge (engine-recorded `last_script_error`, or both gates still green); re-runs verification once per cycle (from verify_build), then end_failure. A verify_* gate the engine killed at its node timeout ends the run at once with a TIMED OUT gate_error.
     script: scripts/fix_loop_gate.sh
     timeout: 5
     fallback: end_failure

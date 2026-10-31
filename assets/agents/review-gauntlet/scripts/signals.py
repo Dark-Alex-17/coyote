@@ -130,7 +130,7 @@ CONSUMER_RE = (
 PROTO_RE = r"\.proto$|buf\.(yaml|gen\.yaml)$"
 MIGRATIONS_RE = r"migrations?/|\.sql$"
 try:
-    from diff_signals import classify as _classify  # noqa: E402
+    from diff_signals import classify as _classify
 except Exception:  # noqa: BLE001 - fall back to the inline copy
 
     def _classify(files, added):

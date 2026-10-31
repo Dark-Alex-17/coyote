@@ -153,8 +153,20 @@ fn write_fixture(
     .unwrap();
 }
 
+/// Removes every inherited `COYOTE_*` variable, so a developer's own
+/// override (`COYOTE_CONFIG_FILE` beats the scratch config dir) never
+/// reaches the child; the harness then sets the ones it needs.
+fn scrub_coyote_env(cmd: &mut Command) -> &mut Command {
+    for (key, _) in std::env::vars_os() {
+        if key.to_str().is_some_and(|k| k.starts_with("COYOTE_")) {
+            cmd.env_remove(key);
+        }
+    }
+    cmd
+}
+
 fn run_coyote_with(dir: &Path, envs: &[(&str, &str)]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_coyote"))
+    scrub_coyote_env(&mut Command::new(env!("CARGO_BIN_EXE_coyote")))
         .args(["--agent", AGENT, "probe"])
         .current_dir(dir)
         .env("COYOTE_CONFIG_DIR", dir)
