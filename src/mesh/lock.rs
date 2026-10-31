@@ -1,14 +1,13 @@
 use crate::config::Session;
 use crate::mesh::identity::create_private_dir;
+use crate::mesh::mesh_cache_dir;
 use crate::mesh::redact_hashes;
-use crate::mesh::{mesh_cache_dir, refuse_symlink};
+use crate::utils::fs::{ExclusiveLock, read_holder_pid, write_holder_pid};
 
 use anyhow::{Context, Result, bail};
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io::{Read, Seek, Write};
 use std::path::Path;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Marks one session's mesh instance as owned by this process through a kernel advisory lock
 /// on `<cache_dir>/mesh/<instance_id>.lock`. Dropping the guard unlocks explicitly, and a
@@ -86,121 +85,28 @@ impl Drop for InstanceLock {
     }
 }
 
-/// How long `ExclusiveLock::acquire` keeps retrying before it refuses. Bounded because a
-/// REPL verb must never hang: the holder keeps the lock for one read-modify-write of a
-/// small file, so a wait this long means the holder is stuck, not busy.
-pub(super) const EXCLUSIVE_LOCK_WAIT: Duration = Duration::from_secs(2);
-pub(super) const EXCLUSIVE_LOCK_RETRY: Duration = Duration::from_millis(10);
-
-/// Serialises the writers of one shared file across every Coyote process on a config
-/// dir: a kernel advisory lock on the file's `.lock` sibling, held for one
-/// read-modify-write and dropped with it. Readers never take it; the file is replaced by
-/// rename, so a reader sees either whole version. The lock file is never removed, for
-/// the reason `InstanceLock` gives, and holds the holder's pid best effort to word a
-/// refusal. On Windows the lock is mandatory and the pid may be unreadable, which only
-/// shortens the refusal.
-#[derive(Debug)]
-pub(super) struct ExclusiveLock {
-    file: File,
-}
-
-impl ExclusiveLock {
-    /// Waits up to `wait`, retrying every `EXCLUSIVE_LOCK_RETRY`, then refuses naming
-    /// `what` (the list the lock guards) and the holder when its pid can be read.
-    pub(super) fn acquire(lock_path: &Path, what: &str, wait: Duration) -> Result<Self> {
-        let mut file = open_lock_file(lock_path)?;
-        let deadline = Instant::now() + wait;
-        loop {
-            match file.try_lock() {
-                Ok(()) => break,
-                Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
-                    thread::sleep(EXCLUSIVE_LOCK_RETRY);
-                }
-                Err(TryLockError::WouldBlock) => bail!(
-                    "Another Coyote process holds the mesh {what} lock '{}'{}; try again.",
-                    lock_path.display(),
-                    holder_suffix(read_holder_pid(&mut file))
-                ),
-                Err(TryLockError::Error(err)) => {
-                    return Err(err).with_context(|| {
-                        format!(
-                            "Failed to take the mesh {what} lock '{}'",
-                            lock_path.display()
-                        )
-                    });
-                }
-            }
-        }
-        if let Err(err) = write_holder_pid(&mut file) {
-            debug!(
-                "Mesh {what} lock '{}' holds no pid: {}",
-                lock_path.display(),
-                redact_hashes(&err.to_string())
-            );
-        }
-        Ok(Self { file })
-    }
-}
-
-impl Drop for ExclusiveLock {
-    fn drop(&mut self) {
-        if let Err(err) = self.file.unlock() {
-            warn!(
-                "Failed to release a mesh file lock: {}",
-                redact_hashes(&err.to_string())
-            );
-        }
-    }
-}
-
-pub(super) fn holder_suffix(pid: Option<u32>) -> String {
-    pid.map(|pid| format!(" (pid {pid})")).unwrap_or_default()
-}
-
-/// Opens `lock_path` without taking the lock. The parent is created first (owner-only on
-/// unix) because the lock may be taken before the first write creates the file it
-/// guards. The file holds a pid and nothing secret, so on Windows it keeps the
-/// permissions it inherits from the directory.
-pub(super) fn open_lock_file(lock_path: &Path) -> Result<File> {
+/// Takes the `ExclusiveLock` on a mesh file's `.lock` sibling. The parent is created
+/// first (owner-only on unix) because the lock may be taken before the first write
+/// creates the file it guards, and the shared lock requires an existing directory.
+pub(super) fn acquire_mesh_lock(
+    lock_path: &Path,
+    what: &str,
+    wait: Duration,
+) -> Result<ExclusiveLock> {
     if let Some(parent) = lock_path.parent() {
         create_private_dir(parent)?;
     }
-    refuse_symlink(lock_path)?;
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options
-        .open(lock_path)
-        .with_context(|| format!("Failed to open mesh lock '{}'", lock_path.display()))
-}
-
-/// For `read_holder_pid` in a process that finds the lock taken.
-pub(super) fn write_holder_pid(file: &mut File) -> std::io::Result<()> {
-    file.set_len(0)?;
-    file.write_all(std::process::id().to_string().as_bytes())
-}
-
-/// The content may be empty or partial while the holder is between `try_lock` and finishing
-/// its write, so `None` covers that window as well as unparseable leftovers and Windows,
-/// where reading a region another handle has locked fails. A killed holder never reaches
-/// this path: its death released the kernel lock. The pid is only ever used to word the
-/// refusal, so a stale or reused pid costs nothing but a misleading hint.
-pub(super) fn read_holder_pid(file: &mut File) -> Option<u32> {
-    let mut content = String::new();
-    file.rewind().ok()?;
-    file.read_to_string(&mut content).ok()?;
-    content.trim().parse().ok()
+    ExclusiveLock::acquire(lock_path, what, wait)
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::test_support::TempDir;
     use super::*;
+    use crate::utils::fs::EXCLUSIVE_LOCK_WAIT;
     use std::path::PathBuf;
+    use std::thread;
+    use std::time::Instant;
 
     const ID_A: &str = "0123456789abcdef0123456789abcdef";
     const ID_B: &str = "fedcba9876543210fedcba9876543210";
@@ -343,21 +249,21 @@ mod tests {
         let dir = TempDir::new("lock-exclusive-bounded");
         let path = dir.path.join("mesh").join("trust.yaml.lock");
 
-        let held = ExclusiveLock::acquire(&path, "trust file", Duration::ZERO).unwrap();
+        let held = acquire_mesh_lock(&path, "mesh trust file", Duration::ZERO).unwrap();
         let started = Instant::now();
-        let err = ExclusiveLock::acquire(&path, "trust file", Duration::from_millis(300))
+        let err = acquire_mesh_lock(&path, "mesh trust file", Duration::from_millis(300))
             .unwrap_err()
             .to_string();
         let waited = started.elapsed();
 
-        assert!(err.contains("holds the mesh trust file lock"), "{err}");
+        assert!(err.contains("The mesh trust file lock"), "{err}");
         assert!(err.contains(&path.display().to_string()), "{err}");
         assert!(
             waited >= Duration::from_millis(300) && waited < Duration::from_secs(2),
             "waited {waited:?}"
         );
         drop(held);
-        let _again = ExclusiveLock::acquire(&path, "trust file", Duration::ZERO).unwrap();
+        let _again = acquire_mesh_lock(&path, "mesh trust file", Duration::ZERO).unwrap();
         assert!(path.exists(), "releasing must not unlink the lock file");
     }
 
@@ -365,14 +271,14 @@ mod tests {
     fn exclusive_lock_is_taken_once_the_holder_lets_go() {
         let dir = TempDir::new("lock-exclusive-handover");
         let path = dir.path.join("mesh").join("shares.yaml.lock");
-        let held = ExclusiveLock::acquire(&path, "share list", Duration::ZERO).unwrap();
+        let held = acquire_mesh_lock(&path, "mesh share list", Duration::ZERO).unwrap();
         let releaser = thread::spawn(move || {
             thread::sleep(Duration::from_millis(100));
             drop(held);
         });
 
         let started = Instant::now();
-        let taken = ExclusiveLock::acquire(&path, "share list", EXCLUSIVE_LOCK_WAIT);
+        let taken = acquire_mesh_lock(&path, "mesh share list", EXCLUSIVE_LOCK_WAIT);
 
         assert!(taken.is_ok(), "{:?}", taken.err());
         assert!(started.elapsed() < EXCLUSIVE_LOCK_WAIT);

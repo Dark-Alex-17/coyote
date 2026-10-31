@@ -22,7 +22,7 @@
 
 use crate::config::paths;
 use crate::mesh::grants::GrantStore;
-use crate::mesh::lock::{EXCLUSIVE_LOCK_WAIT, ExclusiveLock};
+use crate::mesh::lock::acquire_mesh_lock;
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
 use crate::mesh::trust::same_hash;
 use crate::mesh::wire_path::WirePath;
@@ -30,6 +30,7 @@ use crate::mesh::write_atomically;
 use crate::mesh::{
     canonical_hash, canonicalize, hex_lower, mesh_cache_dir, mesh_config_dir, redact_hashes, short,
 };
+use crate::utils::fs::EXCLUSIVE_LOCK_WAIT;
 
 use anyhow::{Context, Result, anyhow, bail};
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
@@ -823,9 +824,9 @@ impl ShareSet {
             Layer::Global => (&self.locations.global, &mut self.global),
             Layer::Workspace => (&self.locations.workspace, &mut self.workspace),
         };
-        let _held = ExclusiveLock::acquire(
+        let _held = acquire_mesh_lock(
             &self.locations.global.with_added_extension("lock"),
-            "share list",
+            "mesh share list",
             EXCLUSIVE_LOCK_WAIT,
         )?;
         let on_disk = read_shares_file(path).map_err(|err| {

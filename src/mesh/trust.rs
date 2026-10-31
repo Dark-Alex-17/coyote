@@ -75,7 +75,7 @@ use crate::mesh::announce::is_control_or_invisible;
 use crate::mesh::envoy_sessions::{EnvoyMemoryError, EnvoyMemorySink, RememberedOf};
 use crate::mesh::idle::{IdleNotify, Origin};
 use crate::mesh::knock::KnockSurface;
-use crate::mesh::lock::{EXCLUSIVE_LOCK_WAIT, ExclusiveLock};
+use crate::mesh::lock::acquire_mesh_lock;
 use crate::mesh::node::MeshSlot;
 use crate::mesh::notify::Source;
 use crate::mesh::peers::{PeerRecord, PeerTable};
@@ -85,6 +85,7 @@ use crate::mesh::{
     canonical_hash, decode_hex, destination_address, hex_lower, mesh_config_dir, parse_rfc3339,
     redact_hashes, rfc3339_utc, short, write_atomically,
 };
+use crate::utils::fs::{EXCLUSIVE_LOCK_WAIT, ExclusiveLock};
 
 use anyhow::{Context, Result, anyhow, bail};
 use arc_swap::ArcSwapOption;
@@ -1073,7 +1074,7 @@ impl TrustStore {
     /// is on disk under the lock. Refused when the bytes on disk do not parse: the list
     /// is the user's and is not written over while it cannot be read.
     fn writing(&self) -> Result<Writing<'_>> {
-        let lock = ExclusiveLock::acquire(&self.lock_path, "trust file", EXCLUSIVE_LOCK_WAIT)?;
+        let lock = acquire_mesh_lock(&self.lock_path, "mesh trust file", EXCLUSIVE_LOCK_WAIT)?;
         let loaded = self.loaded();
         if let Some(why) = &loaded.last_reload_failure {
             bail!("{why} Nothing was written.");
@@ -3368,10 +3369,10 @@ mod tests {
         MeshHooks, RecordingHookSink, TrustHookObserver, env_value, one_fire,
     };
     use crate::mesh::knock::RecordingSurface;
-    use crate::mesh::lock::EXCLUSIVE_LOCK_RETRY;
     use crate::mesh::peers::{PEER_TTL, PeerSighting};
     use crate::mesh::session_destination_name;
     use crate::testing::{install_log_collector, warn_snapshot};
+    use crate::utils::fs::EXCLUSIVE_LOCK_RETRY;
 
     use rns_transport::destination::SingleInputDestination;
     use rns_transport::identity::PrivateIdentity;
@@ -7028,7 +7029,7 @@ mod tests {
             .to_string();
         let waited = started.elapsed();
 
-        assert!(err.contains("holds the mesh trust file lock"), "{err}");
+        assert!(err.contains("The mesh trust file lock"), "{err}");
         assert!(err.contains(&lock_path.display().to_string()), "{err}");
         assert!(
             waited >= EXCLUSIVE_LOCK_WAIT && waited < Duration::from_millis(2_500),

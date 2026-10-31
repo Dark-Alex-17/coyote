@@ -9,7 +9,6 @@
 //! neither recorded nor acknowledged, so the node keeps it for a later fetch, a bounded
 //! number of times.
 
-use crate::mesh::lock::{read_holder_pid, write_holder_pid};
 use crate::mesh::peers::PeerTable;
 use crate::mesh::propagation::{PropagationNode, lxmf_delivery_hash};
 use crate::mesh::request::{
@@ -19,6 +18,7 @@ use crate::mesh::request::{
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_cause, version_refusal};
 use crate::mesh::trust::{IdentityStanding, TrustStore};
 use crate::mesh::{canonical_hash, hex_lower, parse_rfc3339, rfc3339_utc, write_atomically};
+use crate::utils::fs::{read_holder_pid, write_holder_pid};
 
 use async_trait::async_trait;
 use lxmf_core::identity::PrivateIdentity as CorePrivateIdentity;

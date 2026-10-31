@@ -1,7 +1,7 @@
 use crate::config::paths;
-use crate::mesh::lock::{holder_suffix, open_lock_file, read_holder_pid, write_holder_pid};
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
 use crate::mesh::{mesh_config_dir, redact_hashes, refuse_symlink, rfc3339_utc, short};
+use crate::utils::fs::{holder_suffix, open_lock_file, read_holder_pid, write_holder_pid};
 #[cfg(windows)]
 use crate::utils::windows_acl;
 
@@ -56,7 +56,7 @@ impl IdentityLock {
     /// holder's included, and the pid only words a refusal.
     pub(crate) fn share(identity_path: &Path) -> Result<Self> {
         let path = lock_path(identity_path);
-        let mut file = open_lock_file(&path)?;
+        let mut file = open_identity_lock(&path)?;
         match file.try_lock_shared() {
             Ok(()) => {
                 if let Err(err) = write_holder_pid(&mut file) {
@@ -81,7 +81,7 @@ impl IdentityLock {
     /// Rotation's hold, refused while any process holds the lock shared or exclusively.
     pub(crate) fn exclusive(identity_path: &Path) -> Result<Self> {
         let path = lock_path(identity_path);
-        let mut file = open_lock_file(&path)?;
+        let mut file = open_identity_lock(&path)?;
         match file.try_lock() {
             Ok(()) => Self::hold(&path, file),
             Err(TryLockError::WouldBlock) => bail!(
@@ -114,6 +114,15 @@ impl Drop for IdentityLock {
 
 fn lock_path(identity_path: &Path) -> PathBuf {
     identity_path.with_added_extension("lock")
+}
+
+/// The node may take the lock before the identity is minted, so the mesh dir is created
+/// here: the shared opener requires an existing parent.
+fn open_identity_lock(lock_path: &Path) -> Result<File> {
+    if let Some(parent) = lock_path.parent() {
+        create_private_dir(parent)?;
+    }
+    open_lock_file(lock_path)
 }
 
 /// One retired identity, as the predecessors file records it. Only the public hash is kept;
