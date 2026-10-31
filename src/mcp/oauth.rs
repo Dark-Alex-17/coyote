@@ -4,7 +4,9 @@ use crate::client::oauth::{
 };
 use crate::config::paths;
 use crate::events::Origin;
-use crate::prompt::{PromptAction, PromptAnswer, PromptRequest, Prompter, ask, human_present};
+use crate::prompt::{
+    NO_HUMAN_FOR_OAUTH, PromptAction, PromptAnswer, PromptRequest, Prompter, ask, human_present,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use log::{debug, warn};
@@ -123,7 +125,7 @@ pub async fn run_mcp_oauth_flow(
     // Checked before discovery so a headless run never reaches the point
     // where a prompter's placeholder answer could be persisted as a client_id.
     if !human_present() {
-        bail!("OAuth sign-in needs an interactive terminal; run it without --headless");
+        bail!("{NO_HUMAN_FOR_OAUTH}");
     }
     let discovered = discover_oauth_metadata(server_url).await?;
     let metadata = discovered.metadata;
@@ -207,6 +209,9 @@ pub async fn run_mcp_oauth_flow(
 }
 
 fn ask_client_id(prompter: &dyn Prompter) -> Result<String> {
+    if !human_present() {
+        bail!("{NO_HUMAN_FOR_OAUTH}");
+    }
     let req = PromptRequest::new(
         PromptAction::Input,
         "Enter the OAuth client ID for this MCP server:",
@@ -731,6 +736,18 @@ mod tests {
         );
     }
 
+    #[test]
+    #[serial]
+    fn ask_client_id_bails_without_a_human_before_asking() {
+        let _headless = AtomicFlagGuard::set(&HEADLESS, true);
+        let prompter = ScriptedPrompter::refusing();
+
+        let err = ask_client_id(&prompter).unwrap_err();
+
+        assert_eq!(err.to_string(), NO_HUMAN_FOR_OAUTH);
+        assert!(prompter.requests().is_empty());
+    }
+
     /// The bogus server URL would surface as a connection error if the
     /// gate ran after discovery.
     #[tokio::test]
@@ -750,10 +767,7 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert_eq!(
-            err.to_string(),
-            "OAuth sign-in needs an interactive terminal; run it without --headless"
-        );
+        assert_eq!(err.to_string(), NO_HUMAN_FOR_OAUTH);
         assert!(prompter.requests().is_empty());
     }
 

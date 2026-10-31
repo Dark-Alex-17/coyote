@@ -6,7 +6,9 @@ use super::openai_oauth::OpenAIOAuthProvider;
 use super::{ClientConfig, ProviderModels};
 use crate::config::paths;
 use crate::events::Origin;
-use crate::prompt::{PromptAction, PromptAnswer, PromptRequest, Prompter, ask, human_present};
+use crate::prompt::{
+    NO_HUMAN_FOR_OAUTH, PromptAction, PromptAnswer, PromptRequest, Prompter, ask, human_present,
+};
 use anyhow::{Context, Error, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -969,7 +971,7 @@ fn build_token_request(
 
 fn ask_paste_input(prompter: &dyn Prompter) -> Result<(String, Option<String>)> {
     if !human_present() {
-        bail!("OAuth sign-in needs an interactive terminal; run it without --headless");
+        bail!("{NO_HUMAN_FOR_OAUTH}");
     }
     let req = PromptRequest::new(
         PromptAction::Input,
@@ -2069,10 +2071,7 @@ echo_pkce_in_token_exchange: true
 
         let err = ask_paste_input(&prompter).unwrap_err();
 
-        assert_eq!(
-            err.to_string(),
-            "OAuth sign-in needs an interactive terminal; run it without --headless"
-        );
+        assert_eq!(err.to_string(), NO_HUMAN_FOR_OAUTH);
         assert!(prompter.requests().is_empty());
     }
 

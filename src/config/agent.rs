@@ -1603,7 +1603,7 @@ mod tests {
     use super::*;
     use crate::prompt::{PromptAnswer, ScriptedPrompter};
     use crate::testing::{self, AtomicFlagGuard};
-    use crate::utils::HEADLESS;
+    use crate::utils::{ACP_SERVER, HEADLESS};
     use serial_test::serial;
 
     #[test]
@@ -1692,6 +1692,7 @@ mod tests {
     #[test]
     #[serial]
     fn may_ask_human_needs_an_interactive_tty_and_a_human() {
+        let _acp = AtomicFlagGuard::set(&ACP_SERVER, false);
         let headless = AtomicFlagGuard::set(&HEADLESS, true);
         assert!(!may_ask_human(true, true));
         drop(headless);

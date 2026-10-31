@@ -134,15 +134,17 @@ pub async fn handle_user_tool(
     cmd_name: &str,
     args: &Value,
 ) -> Result<Value> {
-    let action = cmd_name
-        .strip_prefix(USER_FUNCTION_PREFIX)
-        .unwrap_or(cmd_name);
+    let action = parse_action(
+        cmd_name
+            .strip_prefix(USER_FUNCTION_PREFIX)
+            .unwrap_or(cmd_name),
+    )?;
 
     if ACP_SERVER.load(Ordering::SeqCst) {
-        let answer = ctx.prompt(headless_request(ctx, action, args)?)?;
+        let answer = ctx.prompt(headless_request(ctx, action, args))?;
         let result = headless_value(answer)?;
         queue_acp_permission(json!({
-            "action": action,
+            "action": action.name(),
             "question": result["question"],
             "options": result["options"],
         }));
@@ -151,7 +153,7 @@ pub async fn handle_user_tool(
     }
 
     if HEADLESS.load(Ordering::SeqCst) {
-        return headless_value(ctx.prompt(headless_request(ctx, action, args)?)?);
+        return headless_value(ctx.prompt(headless_request(ctx, action, args))?);
     }
 
     let depth = ctx.current_depth;
@@ -163,12 +165,44 @@ pub async fn handle_user_tool(
     }
 }
 
-fn parse_action(action: &str) -> Result<PromptAction> {
+/// The prompts a `user__*` tool can raise: the [`PromptAction`]s a model may
+/// ask of the user, without the secret-bearing one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UserAction {
+    Select,
+    Confirm,
+    Input,
+    Checkbox,
+}
+
+impl UserAction {
+    fn name(self) -> &'static str {
+        match self {
+            UserAction::Select => "select",
+            UserAction::Confirm => "confirm",
+            UserAction::Input => "input",
+            UserAction::Checkbox => "checkbox",
+        }
+    }
+}
+
+impl From<UserAction> for PromptAction {
+    fn from(action: UserAction) -> Self {
+        match action {
+            UserAction::Select => PromptAction::Select,
+            UserAction::Confirm => PromptAction::Confirm,
+            UserAction::Input => PromptAction::Input,
+            UserAction::Checkbox => PromptAction::Checkbox,
+        }
+    }
+}
+
+fn parse_action(action: &str) -> Result<UserAction> {
     match action {
-        "select" => Ok(PromptAction::Select),
-        "confirm" => Ok(PromptAction::Confirm),
-        "input" => Ok(PromptAction::Input),
-        "checkbox" => Ok(PromptAction::Checkbox),
+        "select" => Ok(UserAction::Select),
+        "confirm" => Ok(UserAction::Confirm),
+        "input" => Ok(UserAction::Input),
+        "checkbox" => Ok(UserAction::Checkbox),
         _ => Err(anyhow!("Unknown user interaction: {action}")),
     }
 }
@@ -182,11 +216,10 @@ fn required_question(args: &Value) -> Result<&str> {
 /// The request a run with no human answers for itself. It tolerates the
 /// gaps a live prompt rejects (no question, unusable options) so the
 /// structured reply still reaches the model.
-fn headless_request(ctx: &RequestContext, action: &str, args: &Value) -> Result<PromptRequest> {
-    let action = parse_action(action)?;
+fn headless_request(ctx: &RequestContext, action: UserAction, args: &Value) -> PromptRequest {
     let question = args.get("question").and_then(Value::as_str).unwrap_or("");
     let options = parse_options(args).unwrap_or_default();
-    Ok(ctx.prompt_request(action, question, options, None))
+    ctx.prompt_request(action.into(), question, options, None)
 }
 
 /// Decodes the structured reply a headless prompter carries as text.
@@ -197,16 +230,15 @@ fn headless_value(answer: PromptAnswer) -> Result<Value> {
     }
 }
 
-fn handle_direct(ctx: &RequestContext, action: &str, args: &Value) -> Result<Value> {
-    let parsed = parse_action(action)?;
+fn handle_direct(ctx: &RequestContext, action: UserAction, args: &Value) -> Result<Value> {
     let question = required_question(args)?;
-    match parsed {
-        PromptAction::Select => {
+    match action {
+        UserAction::Select => {
             let req =
                 ctx.prompt_request(PromptAction::Select, question, parse_options(args)?, None);
             Ok(json!({ "answer": ctx.prompt(req)?.into_selected()? }))
         }
-        PromptAction::Confirm => {
+        UserAction::Confirm => {
             let req = ctx.prompt_request(
                 PromptAction::Confirm,
                 question,
@@ -216,7 +248,7 @@ fn handle_direct(ctx: &RequestContext, action: &str, args: &Value) -> Result<Val
             let answer = ctx.prompt(req)?.into_confirmed()?;
             Ok(json!({ "answer": if answer { "yes" } else { "no" } }))
         }
-        PromptAction::Input => {
+        UserAction::Input => {
             let req = ctx.prompt_request(
                 PromptAction::Input,
                 format!("{question}\nYour answer: "),
@@ -225,16 +257,15 @@ fn handle_direct(ctx: &RequestContext, action: &str, args: &Value) -> Result<Val
             );
             Ok(json!({ "answer": ctx.prompt(req)?.into_text()? }))
         }
-        PromptAction::Checkbox => {
+        UserAction::Checkbox => {
             let req =
                 ctx.prompt_request(PromptAction::Checkbox, question, parse_options(args)?, None);
             Ok(json!({ "answers": ctx.prompt(req)?.into_checked()? }))
         }
-        PromptAction::Password => bail!("'password' is not a user interaction"),
     }
 }
 
-async fn handle_escalated(ctx: &RequestContext, action: &str, args: &Value) -> Result<Value> {
+async fn handle_escalated(ctx: &RequestContext, action: UserAction, args: &Value) -> Result<Value> {
     let question = required_question(args)?.to_string();
 
     let options: Option<Vec<String>> = if args.get("options").is_some() {
@@ -265,7 +296,7 @@ async fn handle_escalated(ctx: &RequestContext, action: &str, args: &Value) -> R
     let escalation_id = new_escalation_id();
     let (tx, rx) = oneshot::channel();
 
-    let question = format!("[{action}] {question}");
+    let question = format!("[{}] {question}", action.name());
     let request = EscalationRequest {
         id: escalation_id.clone(),
         from_agent_id: from_agent_id.clone(),
@@ -352,7 +383,7 @@ mod tests {
     use crate::events::{Event, Origin, RecordingSink};
     use crate::function::agents::handle_agent_tool;
     use crate::hooks::{HookDef, HooksMap, test_sink};
-    use crate::prompt::ScriptedPrompter;
+    use crate::prompt::{ScriptedPrompter, prompt_events};
     use crate::supervisor::escalation::EscalationQueue;
     use crate::testing::AtomicFlagGuard;
     use crate::utils::drain_acp_permissions;
@@ -600,6 +631,21 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn escalated_unknown_action_is_reported_before_reaching_the_queue() {
+        let queue = Arc::new(EscalationQueue::new());
+        let (mut ctx, prompter) = scripted_ctx(vec![]);
+        ctx.current_depth = 1;
+        ctx.escalation_queue = Some(Arc::clone(&queue));
+        let err = handle_user_tool(&mut ctx, "user__dance", &json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "Unknown user interaction: dance");
+        assert!(queue.pending_summary().is_empty());
+        assert!(prompter.requests().is_empty());
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn direct_cancel_surfaces_as_the_inquire_wording() {
         let (mut ctx, _prompter) = scripted_ctx(vec![PromptAnswer::Cancelled]);
         let err = handle_user_tool(
@@ -652,31 +698,6 @@ mod tests {
         );
     }
 
-    /// The requested events carrying `question`, and the answered events
-    /// that share their id, out of a drain other tests may have written to.
-    fn prompt_events(events: Vec<Event>, question: &str) -> (Vec<Event>, Vec<Event>) {
-        let requested: Vec<Event> = events
-            .iter()
-            .filter(|event| {
-                matches!(event, Event::PromptRequested { question: q, .. } if q == question)
-            })
-            .cloned()
-            .collect();
-        let ids: Vec<&String> = requested
-            .iter()
-            .filter_map(|event| match event {
-                Event::PromptRequested { id, .. } => Some(id),
-                _ => None,
-            })
-            .collect();
-        let answered: Vec<Event> = events
-            .iter()
-            .filter(|event| matches!(event, Event::PromptAnswered { id, .. } if ids.contains(&id)))
-            .cloned()
-            .collect();
-        (requested, answered)
-    }
-
     #[test]
     fn escalation_timeout_defaults_to_unlimited() {
         assert_eq!(DEFAULT_ESCALATION_TIMEOUT_SECS, 0);
@@ -726,7 +747,7 @@ mod tests {
         parent_ctx.escalation_queue = Some(Arc::clone(&queue));
 
         let raise_args = json!({ "question": "which db?" });
-        let raise = handle_escalated(&child_ctx, "input", &raise_args);
+        let raise = handle_escalated(&child_ctx, UserAction::Input, &raise_args);
         let reply = async {
             // Bounded poll: on the current-thread runtime the raise future
             // submits before its first await, so this resolves immediately.
@@ -803,7 +824,7 @@ mod tests {
         child_ctx.self_agent_id = Some("esc-child-trunc".to_string());
 
         let raise_args = json!({ "question": "q".repeat(3000) });
-        let raise = handle_escalated(&child_ctx, "input", &raise_args);
+        let raise = handle_escalated(&child_ctx, UserAction::Input, &raise_args);
         let reply = async {
             // Bounded poll: on the current-thread runtime the raise future
             // submits before its first await, so this resolves immediately.

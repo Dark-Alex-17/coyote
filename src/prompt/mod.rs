@@ -23,6 +23,9 @@ pub(crate) fn human_present() -> bool {
     !(HEADLESS.load(Ordering::SeqCst) || ACP_SERVER.load(Ordering::SeqCst))
 }
 
+pub(crate) const NO_HUMAN_FOR_OAUTH: &str =
+    "OAuth sign-in needs an interactive terminal; run it without --headless";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptAction {
     Confirm,
@@ -391,6 +394,32 @@ impl Prompter for ScriptedPrompter {
     }
 }
 
+/// The requested events carrying `question` and the answered events that
+/// share their id, out of a drain other tests may have written to.
+#[cfg(test)]
+pub(crate) fn prompt_events(events: Vec<Event>, question: &str) -> (Vec<Event>, Vec<Event>) {
+    let requested: Vec<Event> = events
+        .iter()
+        .filter(
+            |event| matches!(event, Event::PromptRequested { question: q, .. } if q == question),
+        )
+        .cloned()
+        .collect();
+    let ids: Vec<&String> = requested
+        .iter()
+        .filter_map(|event| match event {
+            Event::PromptRequested { id, .. } => Some(id),
+            _ => None,
+        })
+        .collect();
+    let answered: Vec<Event> = events
+        .iter()
+        .filter(|event| matches!(event, Event::PromptAnswered { id, .. } if ids.contains(&id)))
+        .cloned()
+        .collect();
+    (requested, answered)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,31 +433,6 @@ mod tests {
             tool: tool.map(str::to_string),
             ..PromptRequest::new(action, "proceed? pm-4t8", Origin::detached())
         }
-    }
-
-    /// The requested events carrying `question` and the answered events that
-    /// share their id, out of a drain other tests may have written to.
-    fn prompt_events(events: Vec<Event>, question: &str) -> (Vec<Event>, Vec<Event>) {
-        let requested: Vec<Event> = events
-            .iter()
-            .filter(|event| {
-                matches!(event, Event::PromptRequested { question: q, .. } if q == question)
-            })
-            .cloned()
-            .collect();
-        let ids: Vec<&String> = requested
-            .iter()
-            .filter_map(|event| match event {
-                Event::PromptRequested { id, .. } => Some(id),
-                _ => None,
-            })
-            .collect();
-        let answered: Vec<Event> = events
-            .iter()
-            .filter(|event| matches!(event, Event::PromptAnswered { id, .. } if ids.contains(&id)))
-            .cloned()
-            .collect();
-        (requested, answered)
     }
 
     fn requested_id(requested: &[Event]) -> String {
@@ -514,6 +518,9 @@ mod tests {
         );
     }
 
+    /// The only `Password` pin: no `user__*` tool raises one, so the
+    /// variant stays exercised here alone until the vault prompts route
+    /// through the prompter.
     #[test]
     #[serial]
     fn ask_returns_a_password_but_publishes_it_redacted() {

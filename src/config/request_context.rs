@@ -1704,10 +1704,12 @@ impl RequestContext {
             )
         });
         if taken.is_some() {
-            // A "Yes for this session" answer lasts as long as the session.
-            // The memory is shared with forks and children, so a sessionless
-            // exit on a branch must leave the root's answers alone.
-            self.prompt_memory.clear();
+            // A "Yes for this session" answer lasts as long as the root's
+            // session. The memory is shared with forks, children and the
+            // isolated macro context, so only the root clears it.
+            if self.owns_prompt_memory() {
+                self.prompt_memory.clear();
+            }
             // The session is gone from ctx whether or not the save succeeds,
             // so the message that belonged to it stops being continuous
             // either way, and the turn state it scoped goes with it: a todo
@@ -1733,6 +1735,14 @@ impl RequestContext {
         self.child_session_root = None;
         exited.transpose()?;
         Ok(())
+    }
+
+    /// The root context, excluding the forked context an isolated macro
+    /// runs in (the only context with `macro_flag` set and
+    /// `macro_non_isolated` unset).
+    fn owns_prompt_memory(&self) -> bool {
+        let in_isolated_macro = self.macro_flag && !self.macro_non_isolated;
+        self.self_agent_id.is_none() && !in_isolated_macro
     }
 
     pub fn save_session(&mut self, name: Option<&str>, scope: Option<SessionScope>) -> Result<()> {
@@ -8144,7 +8154,7 @@ mod tests {
     use crate::mcp::{
         ConnectedServer, McpServer, McpServerFeatures, McpServersConfig, McpTransportType,
     };
-    use crate::prompt::ScriptedPrompter;
+    use crate::prompt::{ScriptedPrompter, prompt_events};
     use crate::supervisor::{
         AgentExitStatus, AgentHandle, AgentResult, JobHandle, JobResult, JobState, JobStatus,
     };
@@ -12293,6 +12303,51 @@ mod tests {
         assert_eq!(ctx.prompt_memory.auto_answer(&req), Some(true));
     }
 
+    fn remembered_session_exit(configure: impl FnOnce(&mut RequestContext)) -> Option<bool> {
+        let mut ctx = create_test_ctx();
+        configure(&mut ctx);
+        ctx.session = Some(Session::default());
+        ctx.prompt_memory.remember("fake_tool", "again? mem-own-5p");
+        let req = PromptRequest {
+            tool: Some("fake_tool".to_string()),
+            ..ctx.prompt_request(PromptAction::Confirm, "again? mem-own-5p", Vec::new(), None)
+        };
+
+        ctx.exit_session().unwrap();
+
+        ctx.prompt_memory.auto_answer(&req)
+    }
+
+    #[test]
+    fn exit_session_on_a_child_agent_keeps_the_shared_prompt_memory() {
+        assert_eq!(
+            remembered_session_exit(|ctx| ctx.self_agent_id = Some("child-9k".to_string())),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn exit_session_in_an_isolated_macro_keeps_the_shared_prompt_memory() {
+        assert_eq!(
+            remembered_session_exit(|ctx| {
+                ctx.macro_flag = true;
+                ctx.macro_non_isolated = false;
+            }),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn exit_session_in_a_non_isolated_macro_clears_prompt_memory() {
+        assert_eq!(
+            remembered_session_exit(|ctx| {
+                ctx.macro_flag = true;
+                ctx.macro_non_isolated = true;
+            }),
+            None
+        );
+    }
+
     fn remembered_request(ctx: &RequestContext) -> PromptRequest {
         PromptRequest {
             tool: Some("fake_tool".to_string()),
@@ -12311,24 +12366,14 @@ mod tests {
 
         let answer = ctx.prompt(remembered_request(&ctx)).unwrap();
         assert_eq!(answer, PromptAnswer::Confirmed(true));
-        let events = sink.drain();
-        let requested: Vec<&Event> = events
-            .iter()
-            .filter(|event| {
-                matches!(event, Event::PromptRequested { question, .. } if question == "run it? ysf-3m1")
-            })
-            .collect();
+        let (requested, answered) = prompt_events(sink.drain(), "run it? ysf-3m1");
         let [Event::PromptRequested { id, tool, .. }] = requested.as_slice() else {
             panic!("{requested:?}");
         };
         assert_eq!(tool.as_deref(), Some("fake_tool"));
-        let answered: Vec<&Event> = events
-            .iter()
-            .filter(|event| matches!(event, Event::PromptAnswered { id: a, .. } if a == id))
-            .collect();
         assert_eq!(
             answered,
-            vec![&Event::PromptAnswered {
+            vec![Event::PromptAnswered {
                 id: id.clone(),
                 answer: "yes".to_string(),
                 auto: true,

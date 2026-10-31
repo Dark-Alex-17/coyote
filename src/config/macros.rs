@@ -362,7 +362,7 @@ mod tests {
     use super::*;
     use crate::client::{ClientConfig, Model};
     use crate::config::{AppConfig, AppState, CommandPrefix, Session, WorkingMode};
-    use crate::prompt::{PromptAnswer, ScriptedPrompter};
+    use crate::prompt::{PromptAction, PromptAnswer, PromptRequest, ScriptedPrompter};
     use crate::testing::TestConfigDirGuard;
     use crate::utils::{create_abort_signal, get_env_name};
     use serial_test::serial;
@@ -1247,6 +1247,34 @@ variables:
         let requests = prompter.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].question, "Select role to delete:");
+    }
+
+    #[test]
+    #[serial]
+    fn isolated_macro_session_exit_keeps_the_live_ctx_prompt_memory() {
+        let _guard = TestConfigDirGuard::new("macros-tests");
+        write_macro_file(
+            "iso-session-macro",
+            "steps:\n  - \".session macro-s1\"\n  - \".exit session\"\n",
+        );
+        let mut ctx = test_ctx();
+        ctx.prompter = Arc::new(ScriptedPrompter::refusing());
+        ctx.prompt_memory.remember("fake_tool", "again? mac-mem-7r");
+        let req = PromptRequest {
+            tool: Some("fake_tool".to_string()),
+            ..ctx.prompt_request(PromptAction::Confirm, "again? mac-mem-7r", Vec::new(), None)
+        };
+
+        run_async(macro_execute(
+            &mut ctx,
+            "iso-session-macro",
+            None,
+            create_abort_signal(),
+        ))
+        .unwrap();
+
+        assert!(ctx.session.is_none());
+        assert_eq!(ctx.prompt_memory.auto_answer(&req), Some(true));
     }
 
     #[test]
