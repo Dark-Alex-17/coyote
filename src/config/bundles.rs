@@ -707,10 +707,8 @@ fn sanitize_name_segment(segment: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::{get_env_name, temp_file};
+    use crate::utils::temp_file;
     use serial_test::serial;
-    use std::env;
-    use std::ffi::OsString;
 
     struct TempStoreDir(PathBuf);
 
@@ -1404,30 +1402,16 @@ mod tests {
     #[test]
     #[serial]
     fn default_store_path_follows_the_config_dir() {
-        let dir = TempStoreDir::new("bundles-env");
-        let key = get_env_name("config_dir");
-        let previous: Option<OsString> = env::var_os(&key);
-        unsafe {
-            env::set_var(&key, &dir.0);
-        }
+        let guard = crate::testing::TestConfigDirGuard::new("bundles-env");
 
-        let result = (|| -> Result<()> {
-            let mut store = BundleStore::load()?;
-            assert!(store.bundle_names().is_empty());
-            store.upsert_bundle("omc", metadata("https://github.com/x/omc", "abc123"))?;
-            let reloaded = BundleStore::load()?;
-            assert!(reloaded.get("omc").is_some());
-            assert!(dir.store_path().is_file());
-            Ok(())
-        })();
-
-        unsafe {
-            match &previous {
-                Some(value) => env::set_var(&key, value),
-                None => env::remove_var(&key),
-            }
-        }
-        result.unwrap();
+        let mut store = BundleStore::load().unwrap();
+        assert!(store.bundle_names().is_empty());
+        store
+            .upsert_bundle("omc", metadata("https://github.com/x/omc", "abc123"))
+            .unwrap();
+        let reloaded = BundleStore::load().unwrap();
+        assert!(reloaded.get("omc").is_some());
+        assert!(guard.path.join("installed-bundles.yaml").is_file());
     }
 
     #[test]

@@ -32,6 +32,7 @@ mod update;
 #[cfg(test)]
 pub(crate) use self::agent::AgentConfig;
 pub(crate) use self::agent::default_max_agent_depth;
+pub(crate) use self::agent::roster_line;
 pub use self::agent::{
     Agent, AgentVariable, AgentVariables, complete_agent_variables, list_agents,
     list_agents_with_descriptions, load_agent_variables,
@@ -1627,6 +1628,67 @@ clients:
         assert_eq!(cfg.child_sessions, None);
     }
 
+    /// The spawn-source phrase every `child_sessions` note shares, so the
+    /// three yaml twins cannot drift apart on how a child comes to exist.
+    const CHILD_SESSIONS_SPAWN_PHRASE: &str = "`agent__spawn` (or a task queued with \
+         `agent__task_create` that names an `agent:`, once it is dispatched)";
+
+    /// Wrapped yaml comment lines joined into one line of prose, so a
+    /// phrase reads the same however the note is wrapped.
+    fn comment_prose(text: &str) -> String {
+        text.lines()
+            .map(|line| line.trim_start_matches([' ', '#']).trim_end())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The `# ---- Child Sessions ----` heading through the `child_sessions:`
+    /// line, read as LF text so a CRLF checkout compares the same bytes.
+    fn child_sessions_block(text: &str) -> String {
+        let text = text.replace("\r\n", "\n");
+        let start = text
+            .find("# ---- Child Sessions ----")
+            .expect("child sessions heading");
+        let block = &text[start..];
+        let key = block
+            .find("\nchild_sessions:")
+            .expect("child_sessions key after the heading");
+        let end = block[key + 1..]
+            .find('\n')
+            .map_or(block.len(), |offset| key + 1 + offset + 1);
+        block[..end].to_string()
+    }
+
+    #[test]
+    fn config_template_and_example_child_sessions_blocks_are_byte_identical() {
+        let example = include_str!("../../config.example.yaml");
+        let example_lf = example.replace("\r\n", "\n");
+        let block = child_sessions_block(CONFIG_TEMPLATE);
+        assert!(block.ends_with("not settable with .set)\n"), "{block}");
+        assert_eq!(block, child_sessions_block(example));
+        assert_eq!(
+            block,
+            child_sessions_block(&example_lf.replace('\n', "\r\n")),
+            "a CRLF checkout of the example compares as the same block"
+        );
+        let one_line = comment_prose(&block);
+        assert!(one_line.contains(CHILD_SESSIONS_SPAWN_PHRASE), "{one_line}");
+    }
+
+    #[test]
+    fn every_child_sessions_note_names_the_same_spawn_sources() {
+        let agent_example = include_str!("../../config.agent.example.yaml").replace("\r\n", "\n");
+        let agent_block = agent_example
+            .split("\nchild_sessions:")
+            .nth(1)
+            .expect("agent example declares child_sessions")
+            .split("\n\n")
+            .next()
+            .unwrap();
+        let one_line = comment_prose(agent_block);
+        assert!(one_line.contains(CHILD_SESSIONS_SPAWN_PHRASE), "{one_line}");
+    }
+
     #[test]
     fn bundled_explore_agent_runs_without_memory() {
         let config = include_str!("../../assets/agents/explore/config.yaml");
@@ -1874,13 +1936,7 @@ hooks:
     #[tokio::test]
     #[serial_test::serial]
     async fn info_flag_with_missing_config_skips_wizard_and_writes_nothing() {
-        let unique = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let tmp_dir = env::temp_dir().join(format!("coyote-info-bypass-{unique}"));
-        create_dir_all(&tmp_dir).unwrap();
-        let _config_dir = crate::testing::EnvVarGuard::set(get_env_name("config_dir"), &tmp_dir);
+        let guard = TestConfigDirGuard::new("info-bypass");
         let _config_file = crate::testing::EnvVarGuard::unset(get_env_name("config_file"));
         let _sandbox = crate::testing::EnvVarGuard::unset(SANDBOX_ENV_FLAG);
         let _provider = crate::testing::EnvVarGuard::unset(get_env_name("provider"));
@@ -1888,11 +1944,10 @@ hooks:
 
         let result = Config::load_with_interpolation(true, true).await;
 
-        let leftover: Vec<_> = read_dir(&tmp_dir)
+        let leftover: Vec<_> = read_dir(&guard.path)
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect();
-        let _ = fs::remove_dir_all(&tmp_dir);
         result.expect("inspection flags must load a default config without a config file");
         assert!(
             leftover.is_empty(),
@@ -1965,62 +2020,40 @@ hooks:
     fn models_override_loading_and_atomic_write() {
         use std::fs;
 
-        let unique = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let tmp_dir = env::temp_dir().join(format!("coyote-models-override-{unique}"));
-        create_dir_all(&tmp_dir).unwrap();
+        let _guard = TestConfigDirGuard::new("models-override");
 
-        let env_name = get_env_name("config_dir");
-        let prev = env::var_os(&env_name);
-        unsafe { env::set_var(&env_name, &tmp_dir) };
+        let path = paths::models_override_file();
+        let entry = || ProviderModels {
+            provider: "openai".into(),
+            oauth: None,
+            models: vec![client::ModelData::new("gpt-test")],
+        };
 
-        let result = std::panic::catch_unwind(|| {
-            let path = paths::models_override_file();
-            let entry = || ProviderModels {
-                provider: "openai".into(),
-                oauth: None,
-                models: vec![client::ModelData::new("gpt-test")],
-            };
+        // Missing override is unloadable.
+        assert!(paths::local_models_override().is_err());
 
-            // Missing override is unloadable.
-            assert!(paths::local_models_override().is_err());
+        // Corrupt override is unloadable.
+        fs::write(&path, "not: [valid").unwrap();
+        assert!(paths::local_models_override().is_err());
 
-            // Corrupt override is unloadable.
-            fs::write(&path, "not: [valid").unwrap();
-            assert!(paths::local_models_override().is_err());
+        // Version-mismatched override is unloadable.
+        let mismatched = ModelsOverride {
+            version: "0.0.0".into(),
+            list: vec![entry()],
+        };
+        fs::write(&path, serde_yaml::to_string(&mismatched).unwrap()).unwrap();
+        assert!(paths::local_models_override().is_err());
 
-            // Version-mismatched override is unloadable.
-            let mismatched = ModelsOverride {
-                version: "0.0.0".into(),
-                list: vec![entry()],
-            };
-            fs::write(&path, serde_yaml::to_string(&mismatched).unwrap()).unwrap();
-            assert!(paths::local_models_override().is_err());
-
-            // write_models_override goes through the sibling temp file and
-            // leaves a loadable override behind.
-            let written = write_models_override(vec![entry()]).unwrap();
-            assert_eq!(written, path);
-            let mut tmp_name = path.as_os_str().to_os_string();
-            tmp_name.push(format!(".{}.tmp", process::id()));
-            assert!(!PathBuf::from(tmp_name).exists());
-            let loaded = paths::local_models_override().unwrap();
-            assert_eq!(loaded.len(), 1);
-            assert_eq!(loaded[0].provider, "openai");
-        });
-
-        unsafe {
-            match prev {
-                Some(v) => env::set_var(&env_name, v),
-                None => env::remove_var(&env_name),
-            }
-        }
-        let _ = fs::remove_dir_all(&tmp_dir);
-        if let Err(panic) = result {
-            std::panic::resume_unwind(panic);
-        }
+        // write_models_override goes through the sibling temp file and
+        // leaves a loadable override behind.
+        let written = write_models_override(vec![entry()]).unwrap();
+        assert_eq!(written, path);
+        let mut tmp_name = path.as_os_str().to_os_string();
+        tmp_name.push(format!(".{}.tmp", process::id()));
+        assert!(!PathBuf::from(tmp_name).exists());
+        let loaded = paths::local_models_override().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].provider, "openai");
     }
 
     use crate::testing::TestConfigDirGuard;

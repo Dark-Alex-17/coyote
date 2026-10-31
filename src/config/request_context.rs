@@ -4,9 +4,9 @@ use super::input::TOOL_LOOP_CHECKPOINT_TEXT;
 use super::mcp_tool_policy::{McpToolPolicy, SkillMcpLayer, ToolFilter, expand_mcp_server_alias};
 use super::rag_cache::{RagCache, RagKey};
 use super::session::{
-    CompressionInfo, INTERRUPTED_RESPONSE_TEXT, KeepPolicy, Session, SessionScope,
-    SystemPromptSplit, keep_token_budget, labeled_session_names, merged_session_names,
-    min_reclaim_tokens, session_scope_dirs, valve_limit,
+    AUTONAME_LABEL_PREFIX, AUTONAME_PLACEHOLDER, CompressionInfo, INTERRUPTED_RESPONSE_TEXT,
+    KeepPolicy, Session, SessionScope, SystemPromptSplit, keep_token_budget, labeled_session_names,
+    merged_session_names, min_reclaim_tokens, session_scope_dirs, valve_limit,
 };
 use super::skill::{SKILL_SCAFFOLD, Skill};
 use super::skill_policy::SkillPolicy;
@@ -48,6 +48,7 @@ use crate::supervisor::Supervisor;
 use crate::supervisor::escalation::EscalationQueue;
 use crate::supervisor::mailbox::{Inbox, PeerRegistry};
 use crate::supervisor::notification::NotificationQueue;
+use crate::utils::fs::refuse_symlinked_dir;
 use crate::utils::process::ProcessStamp;
 use crate::utils::{
     AbortSignal, UserInterrupt, abortable_run_with_spinner, create_abort_signal, edit_file,
@@ -518,6 +519,10 @@ pub(crate) struct Parked {
     pub(crate) rag_key: Option<RagKey>,
 }
 
+/// A summarizer stand-in: the rendered summarization request in, the summary out.
+#[cfg(test)]
+type SummaryFetch = Arc<dyn Fn(&str) -> String + Send + Sync>;
+
 pub struct RequestContext {
     pub app: Arc<AppState>,
 
@@ -592,10 +597,6 @@ pub struct RequestContext {
     /// under. Resolved once per graph run by `ensure_child_session_root`;
     /// forks and children copy the parent's handle.
     pub(crate) child_session_root: Option<Arc<ChildSessionRoot>>,
-    /// Test seam: where `memory_config` starts workspace memory discovery
-    /// instead of the process cwd.
-    #[cfg(test)]
-    workspace_memory_root: Option<PathBuf>,
 
     pub supervisor: Option<Arc<RwLock<Supervisor>>>,
     pub parent_supervisor: Option<Arc<RwLock<Supervisor>>>,
@@ -639,6 +640,12 @@ pub struct RequestContext {
     pub top_level_agent_id: Option<String>,
 
     pub render_mode: RenderMode,
+
+    /// Test-only replacement for the summarizer call: given the rendered
+    /// summarization request text it returns the summary, so compression
+    /// pins run the real `compress_session` without a model.
+    #[cfg(test)]
+    pub(crate) test_summary_fetch: Option<SummaryFetch>,
 }
 
 impl RequestContext {
@@ -672,8 +679,6 @@ impl RequestContext {
             last_graph_branch: None,
             delegate: None,
             child_session_root: None,
-            #[cfg(test)]
-            workspace_memory_root: None,
             supervisor: None,
             parent_supervisor: None,
             self_agent_id: None,
@@ -695,6 +700,8 @@ impl RequestContext {
             task_abort: None,
             top_level_agent_id: None,
             render_mode: RenderMode::default(),
+            #[cfg(test)]
+            test_summary_fetch: None,
         }
     }
 
@@ -759,8 +766,6 @@ impl RequestContext {
             last_graph_branch: None,
             delegate: None,
             child_session_root: None,
-            #[cfg(test)]
-            workspace_memory_root: None,
             supervisor: None,
             parent_supervisor: None,
             self_agent_id: None,
@@ -782,6 +787,8 @@ impl RequestContext {
             task_abort: None,
             top_level_agent_id: None,
             render_mode: RenderMode::default(),
+            #[cfg(test)]
+            test_summary_fetch: None,
         };
         ctx.refresh_mcp_tool_filters();
         Ok(ctx)
@@ -881,8 +888,6 @@ impl RequestContext {
             last_graph_branch: self.last_graph_branch,
             delegate,
             child_session_root: self.child_session_root.clone(),
-            #[cfg(test)]
-            workspace_memory_root: self.workspace_memory_root.clone(),
             supervisor: self.supervisor.clone(),
             parent_supervisor: self.parent_supervisor.clone(),
             self_agent_id: self.self_agent_id.clone(),
@@ -906,6 +911,8 @@ impl RequestContext {
             // root flow that opened it may fire its terminal event.
             top_level_agent_id: None,
             render_mode: self.render_mode,
+            #[cfg(test)]
+            test_summary_fetch: self.test_summary_fetch.clone(),
         }
     }
 
@@ -951,8 +958,6 @@ impl RequestContext {
             last_graph_branch: None,
             delegate: None,
             child_session_root: parent.child_session_root.clone(),
-            #[cfg(test)]
-            workspace_memory_root: parent.workspace_memory_root.clone(),
             supervisor: None,
             parent_supervisor: parent.supervisor.clone(),
             self_agent_id: Some(self_agent_id),
@@ -974,6 +979,8 @@ impl RequestContext {
             task_abort: None,
             top_level_agent_id: None,
             render_mode: parent.render_mode,
+            #[cfg(test)]
+            test_summary_fetch: parent.test_summary_fetch.clone(),
         }
     }
 
@@ -1463,15 +1470,19 @@ impl RequestContext {
 
     fn labeled_autoname_sessions(&self) -> Vec<(String, Option<String>)> {
         let mut values = labeled_session_names(
-            &self.sessions_dir_for(SessionScope::Workspace).join("_"),
-            &self.sessions_dir_for(SessionScope::Global).join("_"),
+            &self
+                .sessions_dir_for(SessionScope::Workspace)
+                .join(AUTONAME_PLACEHOLDER),
+            &self
+                .sessions_dir_for(SessionScope::Global)
+                .join(AUTONAME_PLACEHOLDER),
         );
         values.sort_unstable_by(|a, b| b.0.cmp(&a.0));
         values
             .into_iter()
             .map(|(name, scope)| {
                 (
-                    format!("_/{}", sanitize_display_text(&name)),
+                    format!("{AUTONAME_LABEL_PREFIX}{}", sanitize_display_text(&name)),
                     Some(scope.to_string()),
                 )
             })
@@ -1698,6 +1709,9 @@ impl RequestContext {
         let mut fork = session.clone();
         fork.set_name(fork_name.clone());
         fork.clear_autoname();
+        // The fresh root below is removed without the root lock on failure:
+        // its uid was minted a few lines above, no parent file names it,
+        // and nothing else can learn of it before the fork is attached.
         let inherited = match session.uid() {
             Some(uid) => {
                 let old_root = ChildSessionRoot::Uid(uid);
@@ -1735,17 +1749,32 @@ impl RequestContext {
         }
 
         self.session = Some(fork);
-        // The fork owns its own child directory: its next spawn derives the
-        // root from the fork's uid, never from the original's.
+        // The fork owns its own child directory: its next spawn derives
+        // the root from the fork's uid, never from the original's. A
+        // process root inherited from before the session was attached
+        // would otherwise keep filing children under `_proc/` until exit.
+        // That state is unreachable once `use_session` settles the process
+        // root at attach; this mirror keeps the fork from ever filing
+        // children under `_proc/` should a session be attached another way.
+        if let Some(root) = self
+            .child_session_root
+            .take_if(|root| matches!(**root, ChildSessionRoot::Proc { .. }))
+        {
+            child_sessions::settle_parent_exit(&root, None);
+        }
         self.child_session_root = None;
         println!("Forked '{current_name}' → '{fork_name}'");
 
         Ok(())
     }
 
+    /// The uid directory goes under its root lock, like every other
+    /// deleter, so nothing else is mid-write when it does; the lock never
+    /// creates the directory, hence the existence check first.
     pub fn empty_session(&mut self) -> Result<()> {
         // Between turns the graph agent owns the slot; the leave makes sure.
         self.leave_delegate_turn();
+        let mut removed_dir = None;
         if let Some(session) = self.session.as_mut() {
             if let Some(agent) = self.agent.as_ref() {
                 session.sync_agent(agent);
@@ -1757,10 +1786,31 @@ impl RequestContext {
             }
             session.clear_messages();
             if let Some(uid) = session.uid() {
-                child_sessions::remove_dir(&ChildSessionRoot::Uid(uid).dir(), "session emptied");
+                let root = ChildSessionRoot::Uid(uid);
+                let dir = root.dir();
+                if !refuse_symlinked_dir(&dir, "session emptied") && dir.is_dir() {
+                    match root.lock() {
+                        Ok(lock) => {
+                            drop(lock);
+                            before_emptied_dir_removal(&dir);
+                            // Another process may remove the dir once the
+                            // lock is let go; only this call's removal is
+                            // announced.
+                            if child_sessions::remove_dir(&dir, "session emptied") {
+                                removed_dir = Some(dir);
+                            }
+                        }
+                        Err(error) => warn!("Keeping {}: {error:#}", dir.display()),
+                    }
+                }
             }
         } else {
             bail!("No session")
+        }
+        if let Some(dir) = removed_dir {
+            let mut extras = hooks::role_extras(self);
+            extras.push(("COYOTE_SESSION_PATH", dir.display().to_string()));
+            hooks::fire(HookEvent::SessionDeleted, self, &extras, None);
         }
         self.discontinuous_last_message();
         Ok(())
@@ -1866,22 +1916,35 @@ impl RequestContext {
         if let Some(session) = i.session_mut(&mut self.session) {
             let _ = session.add_message(&i, INTERRUPTED_RESPONSE_TEXT);
         }
-        self.checkpoint_session_to_disk(app.dry_run);
+        // The turn is already reporting an error, so this write's own
+        // failure is only logged. The session stays dirty: a root context
+        // retries it on its next flush, while a child's run ends here with
+        // no later flush.
+        let _ = self.checkpoint_session_to_disk(app.dry_run);
     }
 
-    pub(crate) fn checkpoint_session_to_disk(&mut self, dry_run: bool) {
+    /// Writes a dirty, auto-saving session to disk. A failed write is
+    /// logged; it is also returned for a child context, whose session file
+    /// is the record its spawner resumes from, so the child's run ends
+    /// failed instead of completing on a transcript that was never stored.
+    /// A root context keeps the warn-only behaviour its turn relies on.
+    pub(crate) fn checkpoint_session_to_disk(&mut self, dry_run: bool) -> Result<()> {
         if dry_run || !self.persists_session {
-            return;
+            return Ok(());
         }
         let Some(session) = self.session.as_mut() else {
-            return;
+            return Ok(());
         };
         if session.effective_save_session() != Some(true) {
-            return;
+            return Ok(());
         }
         if let Err(err) = session.flush() {
             warn!("Failed to checkpoint session '{}': {err:#}", session.name());
+            if self.self_agent_id.is_some() {
+                return Err(err).context("final session flush failed");
+            }
         }
+        Ok(())
     }
 
     /// Resolves, once, the directory identity this context's child sessions
@@ -2389,8 +2452,7 @@ impl RequestContext {
             return MemoryConfig::disabled();
         }
 
-        let root = self.workspace_memory_root_or_cwd();
-        let store = root.as_deref().map(MemoryStore::new);
+        let store = env::current_dir().ok().map(|cwd| MemoryStore::new(&cwd));
         let workspace = store.as_ref().and_then(|s| s.workspace.clone());
 
         let global_exists = paths::global_memory_index_file().exists();
@@ -2404,18 +2466,6 @@ impl RequestContext {
             enabled: true,
             workspace,
         }
-    }
-
-    #[cfg(not(test))]
-    fn workspace_memory_root_or_cwd(&self) -> Option<PathBuf> {
-        env::current_dir().ok()
-    }
-
-    #[cfg(test)]
-    fn workspace_memory_root_or_cwd(&self) -> Option<PathBuf> {
-        self.workspace_memory_root
-            .clone()
-            .or_else(|| env::current_dir().ok())
     }
 
     pub fn should_inject_memory(&self) -> bool {
@@ -2982,7 +3032,7 @@ impl RequestContext {
         }
         self.record_chat_completion(app, input, output, tool_results)?;
         if input.session(&self.session).is_some() {
-            self.checkpoint_session_to_disk(app.dry_run);
+            self.checkpoint_session_to_disk(app.dry_run)?;
         }
         Ok(())
     }
@@ -3021,7 +3071,7 @@ impl RequestContext {
             session.set_last_run(last_run);
         }
         if input.session(&self.session).is_some() {
-            self.checkpoint_session_to_disk(app.dry_run);
+            self.checkpoint_session_to_disk(app.dry_run)?;
         }
         Ok(())
     }
@@ -3093,7 +3143,9 @@ impl RequestContext {
         if trigger == CheckpointTrigger::SafetyValve {
             self.valve_checkpoint_floor = Some(session.tokens());
         }
-        self.checkpoint_session_to_disk(self.app.config.dry_run);
+        // A mid-loop checkpoint; `Session::save` leaves the session dirty,
+        // so the final flush at the end of the turn reports the failure.
+        let _ = self.checkpoint_session_to_disk(self.app.config.dry_run);
         self.last_message = Some(LastMessage::new(
             committed,
             TOOL_LOOP_CHECKPOINT_TEXT.to_string(),
@@ -3176,6 +3228,10 @@ impl RequestContext {
                 super::format_option_value(&app.memory_run_state_ttl_days),
             ),
             ("memory_round_chains", app.memory_round_chains.to_string()),
+            (
+                "child_sessions",
+                super::format_option_value(&app.child_sessions),
+            ),
             (
                 "workspace_instructions",
                 super::format_option_value(&app.workspace_instructions),
@@ -4582,7 +4638,9 @@ impl RequestContext {
     /// Deletes the selected agent data directories. The batch is refused
     /// whole when one of them holds the attached session's file: deleting
     /// that would settle the child session root this process still writes
-    /// under, and the next flush would re-create the file anyway.
+    /// under, and the next flush would re-create the file anyway. Every
+    /// session file unlinked is announced, including those removed before a
+    /// later failure stopped the batch.
     fn delete_agent_data_selection(&self, dir: &Path, names: &[String]) -> Result<()> {
         if let Some(attached) = self.attached_session_file() {
             for name in names {
@@ -4591,17 +4649,33 @@ impl RequestContext {
                 }
             }
         }
-        for name in names {
-            Self::delete_agent_data_dir(&dir.join(name))?;
+        let mut unlinked = Vec::new();
+        let result = names
+            .iter()
+            .try_for_each(|name| Self::delete_agent_data_dir(&dir.join(name), &mut unlinked));
+        for path in &unlinked {
+            let mut extras = hooks::role_extras(self);
+            extras.push(("COYOTE_SESSION_PATH", path.display().to_string()));
+            hooks::fire(HookEvent::SessionDeleted, self, &extras, None);
         }
-        Ok(())
+        result
     }
 
     /// Removes an agent's data directory, first unlinking every session file
     /// it holds one by one so each one's child session root forgets it (and
     /// goes when that was its last parent). A bare `remove_dir_all` would
-    /// leave those roots pointing at files that no longer exist.
-    fn delete_agent_data_dir(path: &Path) -> Result<()> {
+    /// leave those roots pointing at files that no longer exist. Each session
+    /// file unlinked is pushed onto `unlinked`, even when an error follows.
+    fn delete_agent_data_dir(path: &Path, unlinked: &mut Vec<PathBuf>) -> Result<()> {
+        let dir_is_symlink = std::fs::symlink_metadata(path)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false);
+        if dir_is_symlink {
+            bail!(
+                "Refusing to delete agent-data at '{}': it is a symlink",
+                path.display()
+            );
+        }
         let sessions = path.join(SESSIONS_DIR_NAME);
         // `read_dir` would follow a symlinked `sessions/`; `remove_dir_all`
         // below takes the link itself without following it.
@@ -4614,7 +4688,7 @@ impl RequestContext {
                 sessions.display()
             );
         } else {
-            Self::unlink_session_yamls_under(&sessions)?;
+            Self::unlink_session_yamls_under(&sessions, unlinked)?;
         }
         remove_dir_all(path)
             .with_context(|| format!("Failed to delete agent-data at '{}'", path.display()))
@@ -4622,8 +4696,9 @@ impl RequestContext {
 
     /// Routes every session file below `dir`, however deep, through
     /// `unlink_parent_yaml`. Symlinks are never followed: their targets'
-    /// session files and uid roots belong to whoever owns the target.
-    fn unlink_session_yamls_under(dir: &Path) -> Result<()> {
+    /// session files and uid roots belong to whoever owns the target. Each
+    /// file unlinked is pushed onto `unlinked`.
+    fn unlink_session_yamls_under(dir: &Path, unlinked: &mut Vec<PathBuf>) -> Result<()> {
         let entries = match read_dir(dir) {
             Ok(entries) => entries,
             Err(error)
@@ -4650,7 +4725,7 @@ impl RequestContext {
                     file.display()
                 );
             } else if file_type.is_dir() {
-                Self::unlink_session_yamls_under(&file)?;
+                Self::unlink_session_yamls_under(&file, unlinked)?;
             } else if file_type.is_file()
                 && file
                     .extension()
@@ -4659,6 +4734,7 @@ impl RequestContext {
                 child_sessions::unlink_parent_yaml(&file).with_context(|| {
                     format!("Failed to delete session file '{}'", file.display())
                 })?;
+                unlinked.push(file);
             }
         }
         Ok(())
@@ -4667,6 +4743,16 @@ impl RequestContext {
     fn delete_sessions(&self) -> Result<()> {
         let entries = self.session_delete_candidates();
         if entries.is_empty() {
+            // Every session on disk being the attached one is a refusal
+            // the user can act on, not an empty list.
+            if let Some(session) = self.session.as_ref()
+                && !self.session_delete_entries().is_empty()
+            {
+                bail!(
+                    "{}",
+                    self.session_in_use_message(session.name(), session.scope())
+                );
+            }
             bail!("No session to delete")
         }
         let labels: Vec<String> = entries
@@ -4738,23 +4824,40 @@ impl RequestContext {
     }
 
     /// Whether `name` in `scope` is the session this context has attached.
+    /// Decided on canonical paths when both files resolve, so a candidate
+    /// reaching the attached file through a symlinked sessions directory
+    /// is recognised; an unsaved session has no file yet and falls back to
+    /// the name and scope.
     fn is_attached_session(&self, name: &str, scope: SessionScope) -> bool {
-        self.session
-            .as_ref()
-            .is_some_and(|session| session.name() == name && session.scope() == scope)
+        let Some(session) = self.session.as_ref() else {
+            return false;
+        };
+        let candidate = std::fs::canonicalize(self.session_file_for(name, scope));
+        let attached = self
+            .attached_session_file()
+            .and_then(|path| std::fs::canonicalize(path).ok());
+        match (candidate, attached) {
+            (Ok(candidate), Some(attached)) => candidate == attached,
+            _ => session.name() == name && session.scope() == scope,
+        }
+    }
+
+    /// Deleting the attached session's own file would also settle the
+    /// child session root this process still writes under; the next flush
+    /// would re-create the file anyway, so the delete is refused instead.
+    fn session_in_use_message(&self, name: &str, scope: SessionScope) -> String {
+        format!(
+            "Cannot delete the {scope} session '{}' while it is in use; run '{}' first",
+            sanitize_display_text(name),
+            self.render_hints(".exit session")
+        )
     }
 
     fn delete_session_at(&self, name: &str, scope: SessionScope) -> Result<()> {
         let path = self.session_file_for(name, scope);
         let shown = sanitize_display_text(name);
-        // Deleting the attached session's own file would also settle the
-        // child session root this process still writes under; the next
-        // flush would re-create the file anyway, so refuse instead.
         if self.is_attached_session(name, scope) {
-            bail!(
-                "Cannot delete the {scope} session '{shown}' while it is in use; run '{}' first",
-                self.render_hints(".exit session")
-            );
+            bail!("{}", self.session_in_use_message(name, scope));
         }
         child_sessions::unlink_parent_yaml(&path).with_context(|| {
             format!(
@@ -4762,6 +4865,9 @@ impl RequestContext {
                 path.display()
             )
         })?;
+        let mut extras = hooks::role_extras(self);
+        extras.push(("COYOTE_SESSION_PATH", path.display().to_string()));
+        hooks::fire(HookEvent::SessionDeleted, self, &extras, None);
         println!("Deleted {scope} session '{shown}'");
         Ok(())
     }
@@ -5258,7 +5364,7 @@ impl RequestContext {
                         .is_some_and(|name| !graph::graph_supports_sessions(&name))
                     {
                         vec![]
-                    } else if args[0].starts_with("_/") {
+                    } else if args[0].starts_with(AUTONAME_LABEL_PREFIX) {
                         self.labeled_autoname_sessions()
                     } else {
                         self.labeled_sessions()
@@ -6168,6 +6274,15 @@ impl RequestContext {
             }
         }
         self.session = session;
+        // A process root resolved while sessionless would keep filing this
+        // session's children under `_proc/`; the session resolves its own
+        // uid root on the next spawn.
+        if let Some(root) = self
+            .child_session_root
+            .take_if(|root| matches!(**root, ChildSessionRoot::Proc { .. }))
+        {
+            child_sessions::settle_parent_exit(&root, None);
+        }
         self.graph_chat_fc_warned = false;
         // Adopt the session's todo state wholesale: a session without any todo
         // state resets ctx to defaults, so nothing leaks across a session switch.
@@ -6234,7 +6349,7 @@ impl RequestContext {
         ensure_reasoning_effort_supported(&agent)?;
 
         let mut validator_warned_about_memory = false;
-        if agent.graph_session().is_some() {
+        if agent.graph_session().is_some() || agent.graph_carries() {
             let graph = graph::GraphParser::new(paths::agent_data_dir(agent_name))
                 .load_from_file(paths::agent_graph_file(agent_name))
                 .with_context(|| format!("Failed to load graph.yaml for agent '{agent_name}'"))?;
@@ -6911,6 +7026,14 @@ impl RequestContext {
                 .map_err(|_| anyhow!("Compression LLM call timed out after 120 s"))?
         }
 
+        #[cfg(test)]
+        if let Some(fetch) = self.test_summary_fetch.clone() {
+            let fetch = move |input: Input| {
+                let summary = fetch(&input.text());
+                async move { Ok(summary) }
+            };
+            return self.compress_session_impl(keep_last_override, fetch).await;
+        }
         self.compress_session_impl(keep_last_override, timed_fetch)
             .await
     }
@@ -6949,10 +7072,10 @@ impl RequestContext {
                 match Model::retrieve_model(self.app.config.as_ref(), &model_id, ModelType::Chat) {
                     Ok(model) => Some(model),
                     Err(err) => {
-                        eprintln!(
-                            "Warning: compression model '{model_id}' could not be used ({err}); falling back to the current model '{}' for session compression",
+                        self.compression_notice(format!(
+                            "compression model '{model_id}' could not be used ({err}); falling back to the current model '{}' for session compression",
                             self.current_model().id()
-                        );
+                        ));
                         None
                     }
                 }
@@ -7055,9 +7178,9 @@ impl RequestContext {
                         start += first_message;
                         let previous = budget;
                         budget /= 2;
-                        eprintln!(
-                            "Warning: the summarizer rejected a ~{previous}-token chunk as too long ({err:#}); retrying with chunks of ~{budget} tokens or fewer"
-                        );
+                        self.compression_notice(format!(
+                            "the summarizer rejected a ~{previous}-token chunk as too long ({err:#}); retrying with chunks of ~{budget} tokens or fewer"
+                        ));
                         rejected = Some((chunk, err));
                         continue 'fold;
                     }
@@ -7130,14 +7253,55 @@ impl RequestContext {
                 Err(err)
             }
             Err(err) => {
-                eprintln!(
-                    "Warning: compression model '{}' failed: {err}; falling back to the current model '{}' for session compression",
+                self.compression_notice(format!(
+                    "compression model '{}' failed: {err}; falling back to the current model '{}' for session compression",
                     model.id(),
                     self.current_model().id()
-                );
+                ));
                 fetch(Input::detached_text(self, request)).await
             }
         }
+    }
+
+    /// A child agent has no terminal of its own, so its compression notices
+    /// go to the log rather than onto the parent's stderr, naming the child
+    /// session (or the agent id when none is named) so a reader of a log
+    /// shared by several children can tell whose notice it is.
+    fn compression_notice(&self, text: String) {
+        if let Some(agent_id) = self.self_agent_id.as_deref() {
+            let name = self
+                .session
+                .as_ref()
+                .map(Session::name)
+                .filter(|name| !name.is_empty())
+                .unwrap_or(agent_id);
+            warn!("{text} (child session '{name}')");
+            return;
+        }
+        let line = format!("Warning: {text}");
+        eprintln!("{line}");
+        #[cfg(test)]
+        Self::stderr_notices()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(line);
+    }
+
+    /// Every line `compression_notice` wrote to stderr. A global rather than
+    /// a thread-local because compression is async and may resume on another
+    /// thread; tests filter on a marker unique to them.
+    #[cfg(test)]
+    fn stderr_notices() -> &'static std::sync::Mutex<Vec<String>> {
+        static NOTICES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        &NOTICES
+    }
+
+    #[cfg(test)]
+    fn stderr_notices_snapshot() -> Vec<String> {
+        Self::stderr_notices()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     pub async fn autoname_session(&mut self, app: &AppConfig) -> Result<()> {
@@ -7344,6 +7508,27 @@ impl RequestContext {
         self.rag = Some(Arc::new(rag));
         Ok(())
     }
+}
+
+/// The point in `empty_session` after the root lock is let go and before
+/// the directory is removed. A no-op outside tests.
+#[cfg(not(test))]
+fn before_emptied_dir_removal(_dir: &Path) {}
+
+#[cfg(test)]
+fn before_emptied_dir_removal(dir: &Path) {
+    if let Some(hook) = BEFORE_EMPTIED_DIR_REMOVAL.with(|slot| slot.take()) {
+        hook(dir);
+    }
+}
+
+#[cfg(test)]
+type EmptiedDirHook = Box<dyn FnOnce(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_EMPTIED_DIR_REMOVAL: std::cell::RefCell<Option<EmptiedDirHook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Seeds a fresh session with the exchange `last_message` holds, stored the
@@ -7998,7 +8183,7 @@ mod tests {
     use crate::supervisor::{
         AgentExitStatus, AgentHandle, AgentResult, JobHandle, JobResult, JobState, JobStatus,
     };
-    use crate::testing::{install_log_collector, warn_snapshot};
+    use crate::testing::{EnvVarGuard, TestConfigDirGuard, install_log_collector, warn_snapshot};
     use crate::utils;
     use crate::utils::get_env_name;
     use crate::vault::Vault;
@@ -8058,101 +8243,121 @@ mod tests {
         let _ = list_all_models(&config);
     }
 
-    /// Pins both the config dir and the workspace config dir to absolute
-    /// temp paths so no `.coyote/` under the real CWD leaks into the test,
-    /// and clears the sessions-dir overrides (`COYOTE_SESSIONS_DIR`, plus
-    /// `HELPER_DATA_DIR` for the `helper` fixture agent) so Global-scope
-    /// writes cannot escape into the developer's real sessions dir. The
-    /// cache dir is pinned to a fresh temp dir as well, so anything a spawn
-    /// writes under the cache lands there instead of in the real cache.
-    struct TestConfigDirGuard {
-        keys: [(String, Option<std::ffi::OsString>); 5],
-        path: PathBuf,
-        workspace_root: PathBuf,
-        cache_root: PathBuf,
+    /// The shared config dir guard with the `helper` fixture agent's
+    /// `HELPER_DATA_DIR` override cleared too, so that agent's Global-scope
+    /// writes cannot escape into the developer's real sessions dir either.
+    struct HelperConfigDirGuard {
+        config: TestConfigDirGuard,
+        _helper_data_env: EnvVarGuard,
     }
 
-    impl TestConfigDirGuard {
+    impl HelperConfigDirGuard {
         fn new() -> Self {
-            let unique = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let path = env::temp_dir().join(format!("coyote-request-context-tests-{unique}"));
-            create_dir_all(&path).unwrap();
-            let workspace_root =
-                env::temp_dir().join(format!("coyote-request-context-ws-{unique}"));
-            let workspace_path = workspace_root.join(WORKSPACE_COYOTE_DIR_NAME);
-            create_dir_all(&workspace_path).unwrap();
-            let cache_root = env::temp_dir().join(format!("coyote-request-context-cache-{unique}"));
-            create_dir_all(&cache_root).unwrap();
-            let keys = [
-                (get_env_name("config_dir"), Some(path.as_os_str())),
-                (
-                    get_env_name("workspace_config_dir"),
-                    Some(workspace_path.as_os_str()),
-                ),
-                (get_env_name("sessions_dir"), None),
-                (
-                    format!("{}_DATA_DIR", utils::normalize_env_name("helper")),
-                    None,
-                ),
-                (get_env_name("cache_dir"), Some(cache_root.as_os_str())),
-            ]
-            .map(|(key, value)| {
-                let previous = env::var_os(&key);
-                unsafe {
-                    match value {
-                        Some(value) => env::set_var(&key, value),
-                        None => env::remove_var(&key),
-                    }
-                }
-                (key, previous)
-            });
             Self {
-                keys,
-                path,
-                workspace_root,
-                cache_root,
+                config: TestConfigDirGuard::new("request-context-tests"),
+                _helper_data_env: EnvVarGuard::unset(helper_data_dir_env()),
             }
         }
     }
 
-    impl Drop for TestConfigDirGuard {
-        fn drop(&mut self) {
-            for (key, previous) in &self.keys {
-                if let Some(previous) = previous {
-                    unsafe {
-                        env::set_var(key, previous);
-                    }
-                } else {
-                    unsafe {
-                        env::remove_var(key);
-                    }
-                }
-            }
-            let _ = remove_dir_all(&self.path);
-            let _ = remove_dir_all(&self.workspace_root);
-            let _ = remove_dir_all(&self.cache_root);
+    impl std::ops::Deref for HelperConfigDirGuard {
+        type Target = TestConfigDirGuard;
+
+        fn deref(&self) -> &TestConfigDirGuard {
+            &self.config
         }
+    }
+
+    fn helper_data_dir_env() -> String {
+        format!("{}_DATA_DIR", utils::normalize_env_name("helper"))
     }
 
     #[test]
     #[serial]
-    fn test_config_dir_guard_pins_the_cache_dir_and_restores_it_on_drop() {
-        let key = get_env_name("cache_dir");
-        let before = env::var_os(&key);
-        let cache_root = {
-            let guard = TestConfigDirGuard::new();
-            let pinned = env::var_os(&key).expect("cache dir pinned while the guard lives");
-            assert_eq!(PathBuf::from(&pinned), guard.cache_root);
-            assert!(guard.cache_root.is_dir());
-            assert_ne!(guard.cache_root, guard.path);
-            assert_ne!(guard.cache_root, guard.workspace_root);
-            guard.cache_root.clone()
+    fn helper_config_dir_guard_clears_the_helper_data_dir_and_restores_it_on_drop() {
+        let key = helper_data_dir_env();
+        let _outer = EnvVarGuard::set(&key, "/host/helper/data");
+        {
+            let _guard = HelperConfigDirGuard::new();
+            assert_eq!(env::var_os(&key), None);
+        }
+        assert_eq!(
+            env::var_os(&key).as_deref(),
+            Some(std::ffi::OsStr::new("/host/helper/data"))
+        );
+    }
+
+    /// The guard's memory-root pin, felt the way a prompt-building test
+    /// feels it. `memory_config()` starts its workspace walk at the process
+    /// cwd, and under `cargo test` that cwd sits inside a checkout whose
+    /// ancestors may carry a live `.coyote/memory/MEMORY.md`; with the guard
+    /// up the walk starts at the guard's own workspace root instead, so no
+    /// workspace memory is discovered and the rendered prompt carries no
+    /// workspace index lines under `<facts>`. An index planted under that
+    /// root is what the walk then finds (the pin steers discovery rather
+    /// than switching it off), and dropping the guard puts the variable back.
+    #[test]
+    #[serial]
+    fn usage_probe_the_guard_pins_the_workspace_memory_root_and_restores_it_on_drop() {
+        let key = memory::WORKSPACE_MEMORY_ROOT_TEST_ENV;
+        let before = env::var_os(key);
+        let workspace_root = {
+            let guard = HelperConfigDirGuard::new();
+            write_global_memory_store();
+            let pinned = env::var_os(key).expect("memory root pinned while the guard lives");
+            assert_eq!(PathBuf::from(&pinned), guard.workspace_root());
+            assert_eq!(
+                guard.workspace_root().join(WORKSPACE_COYOTE_DIR_NAME),
+                PathBuf::from(env::var_os(get_env_name("workspace_config_dir")).unwrap()),
+                "the pinned root is the parent of the pinned workspace config dir"
+            );
+
+            let mut ctx = create_test_ctx();
+            ctx.update_app_config(|app| {
+                app.workspace_instructions = Some(false);
+                app.skills_enabled = false;
+                app.memory = None;
+            });
+            let app = ctx.app.config.clone();
+            let config = ctx.memory_config();
+            assert!(config.enabled, "the guarded global store keeps memory on");
+            assert!(
+                config.workspace.is_none(),
+                "the walk never leaves the guard's workspace root: {:?}",
+                config.workspace
+            );
+            let role = ctx.extract_role(&app).unwrap();
+            let prompt = role.prompt();
+            assert!(
+                prompt.contains("<facts>\n# Memory\n</facts>\n"),
+                "only the global index rides in: {prompt}"
+            );
+
+            let index = paths::workspace_memory_dir_for(guard.workspace_root())
+                .join(crate::config::MEMORY_INDEX_FILE_NAME);
+            create_dir_all(index.parent().unwrap()).unwrap();
+            write(
+                &index,
+                "# Workspace Memory Index\n- planted under the pinned root\n",
+            )
+            .unwrap();
+            let config = ctx.memory_config();
+            assert_eq!(
+                config.workspace.as_ref().map(|w| w.workspace_root.clone()),
+                Some(guard.workspace_root().to_path_buf()),
+                "an index under the pinned root is the one the walk finds"
+            );
+            let role = ctx.extract_role(&app).unwrap();
+            let prompt = role.prompt();
+            assert!(
+                prompt.contains("# Workspace Memory Index")
+                    && prompt.contains("planted under the pinned root"),
+                "{prompt}"
+            );
+            guard.workspace_root().to_path_buf()
         };
-        assert_eq!(env::var_os(&key), before);
-        assert!(!cache_root.exists());
+        assert_eq!(env::var_os(key), before);
+        assert!(!workspace_root.exists());
     }
 
     fn default_app_state() -> Arc<AppState> {
@@ -8188,7 +8393,7 @@ mod tests {
             eprintln!("skipping: python3 or git not available");
             return;
         }
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
         let agents = paths::agents_data_dir();
@@ -8443,7 +8648,7 @@ mod tests {
     #[test]
     #[serial]
     fn set_command_prefix_updates_app_config_and_is_reported() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
         assert_eq!(ctx.command_prefix(), CommandPrefix::Dot);
 
@@ -8472,6 +8677,64 @@ mod tests {
         let values = ctx.repl_complete(".set", &["command_prefix", ""], "command_prefix ");
         let names: Vec<&str> = values.iter().map(|(v, _)| v.as_str()).collect();
         assert_eq!(names, ["dot", "slash", "both"]);
+    }
+
+    /// `child_sessions` is a config-file-only knob: `.set` refuses it as an
+    /// unknown key and completion never offers it, while `.info` reports the
+    /// effective value after the memory rows, leaving the compression rows
+    /// contiguous between `save_session` and `memory`.
+    #[test]
+    #[serial]
+    fn child_sessions_is_not_settable_but_is_reported_by_info() {
+        let _config = HelperConfigDirGuard::new();
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+
+        let err = run_async(ctx.update("child_sessions true", utils::create_abort_signal()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Unknown key 'child_sessions'"), "{err}");
+        assert!(!SET_COMPLETION_KEYS.contains(&"child_sessions"));
+
+        let child_sessions_row = |ctx: &RequestContext| {
+            let app = ctx.app.config.clone();
+            let info = ctx.sysinfo(&app).unwrap();
+            let lines: Vec<&str> = info.lines().collect();
+            let save_session = lines
+                .iter()
+                .position(|line| line.starts_with("save_session"))
+                .unwrap();
+            let memory = lines
+                .iter()
+                .position(|line| line.starts_with("memory "))
+                .unwrap();
+            assert!(
+                lines[save_session + 1..memory].iter().all(|line| [
+                    "compression_",
+                    "system_prompt_",
+                    "memory_facts_truncated"
+                ]
+                .iter()
+                .any(|prefix| line.starts_with(prefix))),
+                "compression and system prompt rows sit between save_session and memory:\n{info}"
+            );
+            let row = lines
+                .iter()
+                .position(|line| line.trim_start().starts_with("child_sessions"))
+                .unwrap_or_else(|| panic!("child_sessions row missing from:\n{info}"));
+            let round_chains = lines
+                .iter()
+                .position(|line| line.starts_with("memory_round_chains"))
+                .unwrap();
+            assert!(
+                row > round_chains,
+                "child_sessions sits after the memory rows:\n{info}"
+            );
+            lines[row].to_string()
+        };
+
+        assert!(child_sessions_row(&ctx).ends_with("null"));
+        ctx.update_app_config(|app| app.child_sessions = Some(false));
+        assert!(child_sessions_row(&ctx).ends_with("false"));
     }
 
     #[test]
@@ -8535,7 +8798,7 @@ mod tests {
     #[test]
     #[serial]
     fn memory_config_graph_agent_follows_the_session_block_memory_flag() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
 
         let ctx = graph_agent_ctx_with_memory_store(None);
         assert!(!ctx.memory_config().enabled, "block-less graph agent");
@@ -8560,7 +8823,7 @@ mod tests {
     #[test]
     #[serial]
     fn memory_tools_register_for_a_graph_agent_only_when_the_block_enables_memory() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
 
         let ctx = graph_agent_ctx_with_memory_store(None);
         assert!(
@@ -9863,6 +10126,163 @@ mod tests {
         assert_eq!(calls.get(), 2, "compression model, then the current model");
     }
 
+    /// Raises each compression notice once on contexts carrying
+    /// `self_agent_id`, returning the start of each notice's text (without
+    /// the `Warning: ` prefix); `tag` makes every start unique to the caller.
+    fn raise_compression_notices(self_agent_id: Option<&str>, tag: &str) -> Vec<String> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let with_identity = |mut ctx: RequestContext| {
+            ctx.self_agent_id = self_agent_id.map(str::to_string);
+            if self_agent_id.is_none() {
+                ctx.working_mode = WorkingMode::Repl;
+            }
+            ctx
+        };
+
+        let unusable = format!("nowhere-{tag}:model");
+        let mut ctx = with_identity(ctx_with_text_exchanges(1, 10));
+        ctx.app = Arc::new(AppState {
+            config: Arc::new(AppConfig {
+                compression_model: Some(unusable.clone()),
+                ..(*ctx.app.config).clone()
+            }),
+            ..(*ctx.app).clone()
+        });
+        runtime
+            .block_on(
+                ctx.compress_session_impl(Some(0), |_: Input| async { Ok("summary".to_string()) }),
+            )
+            .unwrap();
+
+        // ~8 x 150 estimated tokens against the 1_200-token budget; the
+        // summarizer rejects only the first chunk.
+        let overflow = format!("prompt is too long: rejected-{tag}");
+        let mut ctx = with_identity(ctx_with_text_exchanges(4, 600));
+        let calls = std::cell::Cell::new(0usize);
+        let calls_ref = &calls;
+        let overflow_ref = &overflow;
+        runtime
+            .block_on(
+                ctx.compress_session_impl(Some(0), move |_: Input| async move {
+                    calls_ref.set(calls_ref.get() + 1);
+                    if calls_ref.get() == 1 {
+                        return Err(anyhow!("{overflow_ref}"));
+                    }
+                    Ok("summary".to_string())
+                }),
+            )
+            .unwrap();
+
+        let failing =
+            Model::from_config("openai", &[ModelData::new(&format!("failing-{tag}"))]).remove(0);
+        let ctx = with_identity(ctx_with_text_exchanges(1, 10));
+        runtime
+            .block_on(
+                ctx.fetch_summary(Some(&failing), "request", &|_: Input| async {
+                    Err::<String, _>(anyhow!("rate limit reached"))
+                }),
+            )
+            .unwrap_err();
+
+        vec![
+            format!("compression model '{unusable}' could not be used ("),
+            format!(
+                "the summarizer rejected a ~1200-token chunk as too long ({overflow}); retrying with chunks of ~600 tokens or fewer"
+            ),
+            format!(
+                "compression model 'openai:failing-{tag}' failed: rate limit reached; falling back to the current model '"
+            ),
+        ]
+    }
+
+    #[test]
+    #[serial]
+    fn compression_notices_in_a_child_go_to_the_warn_log_not_stderr() {
+        install_log_collector();
+        let _guard = HelperConfigDirGuard::new();
+        let warns_before = warn_snapshot().len();
+        let stderr_before = RequestContext::stderr_notices_snapshot().len();
+
+        let notices = raise_compression_notices(Some("child"), "child-k3v");
+
+        let warns: Vec<String> = warn_snapshot().into_iter().skip(warns_before).collect();
+        let stderr: Vec<String> = RequestContext::stderr_notices_snapshot()
+            .into_iter()
+            .skip(stderr_before)
+            .collect();
+        for notice in &notices {
+            assert_eq!(
+                warns.iter().filter(|line| line.starts_with(notice)).count(),
+                1,
+                "{notice}: {warns:?}"
+            );
+            assert!(
+                !stderr.iter().any(|line| line.contains(notice)),
+                "{notice}: {stderr:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn compression_notices_in_the_repl_go_to_stderr_not_the_warn_log() {
+        install_log_collector();
+        let warns_before = warn_snapshot().len();
+        let stderr_before = RequestContext::stderr_notices_snapshot().len();
+
+        let notices = raise_compression_notices(None, "repl-k3v");
+
+        let warns: Vec<String> = warn_snapshot().into_iter().skip(warns_before).collect();
+        let stderr: Vec<String> = RequestContext::stderr_notices_snapshot()
+            .into_iter()
+            .skip(stderr_before)
+            .collect();
+        for notice in &notices {
+            let line = format!("Warning: {notice}");
+            assert_eq!(
+                stderr.iter().filter(|l| l.starts_with(&line)).count(),
+                1,
+                "{notice}: {stderr:?}"
+            );
+            assert!(
+                !warns.iter().any(|l| l.contains(notice)),
+                "{notice}: {warns:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn child_compression_notices_name_the_child_session_or_else_the_agent_id() {
+        install_log_collector();
+        let mut ctx = ctx_with_text_exchanges(0, 0);
+        ctx.self_agent_id = Some("agent-n4p".to_string());
+        ctx.session
+            .as_mut()
+            .unwrap()
+            .set_name("child-sess-n4p".to_string());
+        ctx.compression_notice("named notice n4p".to_string());
+        ctx.session.as_mut().unwrap().set_name(String::new());
+        ctx.compression_notice("unnamed notice n4p".to_string());
+
+        let warns = warn_snapshot();
+        assert!(
+            warns
+                .iter()
+                .any(|line| line == "named notice n4p (child session 'child-sess-n4p')"),
+            "{warns:?}"
+        );
+        assert!(
+            warns
+                .iter()
+                .any(|line| line == "unnamed notice n4p (child session 'agent-n4p')"),
+            "{warns:?}"
+        );
+    }
+
     #[test]
     fn plan_summarization_chunks_tags_each_chunk_with_its_first_message() {
         let model = Model::default();
@@ -9942,7 +10362,7 @@ mod tests {
     #[test]
     #[serial]
     fn compress_session_impl_bail_points_at_memory_larger_than_the_conversation() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let index = paths::global_memory_index_file();
         create_dir_all(index.parent().unwrap()).unwrap();
         let fact = format!("- {}\n", "x".repeat(158));
@@ -9981,7 +10401,7 @@ mod tests {
     #[serial]
     fn compress_session_impl_bail_keeps_the_keep_last_hint_when_the_conversation_outweighs_memory()
     {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         write_global_memory_store();
         let mut app = AppState::test_default();
         app.config = Arc::new(AppConfig {
@@ -10012,7 +10432,7 @@ mod tests {
     #[test]
     #[serial]
     fn extract_role_records_the_system_prompt_split_only_when_injecting_memory() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         write_global_memory_store();
         let ctx = create_test_ctx();
         let app = ctx.app.config.clone();
@@ -10048,7 +10468,7 @@ mod tests {
     #[test]
     #[serial]
     fn extract_role_records_a_memoryless_split_when_memory_is_off() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         write_global_memory_store();
         let mut app = AppState::test_default();
         app.config = Arc::new(AppConfig {
@@ -10066,7 +10486,7 @@ mod tests {
     #[test]
     #[serial]
     fn memory_role_tokens_pins_the_role_prompt_estimate() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut app = AppState::test_default();
         app.config = Arc::new(AppConfig {
             memory: Some(false),
@@ -10109,7 +10529,7 @@ mod tests {
     #[test]
     #[serial]
     fn memory_extract_role_prints_the_share_warning_once_per_process() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         write_global_memory_store();
         let mut ctx = create_test_ctx();
         let mut role = Role::new("windowed", "prompt");
@@ -10156,7 +10576,7 @@ mod tests {
     #[test]
     #[serial]
     fn memory_info_with_a_role_does_not_store_split_or_warn() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         write_global_memory_store();
         let mut ctx = create_test_ctx();
         let mut role = Role::new("windowed", "prompt");
@@ -10175,7 +10595,7 @@ mod tests {
     #[test]
     #[serial]
     fn memory_info_without_session_role_agent_or_rag_does_not_store_split_or_warn() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let index = paths::global_memory_index_file();
         create_dir_all(index.parent().unwrap()).unwrap();
         write(index, "# Memory\n- the user prefers terse answers\n").unwrap();
@@ -10203,7 +10623,7 @@ mod tests {
     #[test]
     #[serial]
     fn memory_info_with_a_session_does_not_store_split_or_warn() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         write_global_memory_store();
         let mut ctx = create_test_ctx();
         let mut session = Session::default();
@@ -10227,7 +10647,7 @@ mod tests {
     #[test]
     #[serial]
     fn memory_session_info_renders_n_a_before_a_split_exists() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let mut session = Session::default();
         session.set_model(windowed_model(20_000));
@@ -10246,7 +10666,7 @@ mod tests {
     #[test]
     #[serial]
     fn memory_tools_info_does_not_store_split_or_warn() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         write_global_memory_store();
         let mut ctx = create_test_ctx();
         let mut role = Role::new("windowed", "prompt");
@@ -10292,6 +10712,63 @@ mod tests {
 
         assert_eq!(ctx.last_prompt_token_usage, None);
         assert_eq!(ctx.valve_checkpoint_floor, None);
+    }
+
+    /// `compress_session` answers each summarization request through the
+    /// test seam when one is set and goes to the model otherwise, where a
+    /// client the config does not declare fails before any network round trip.
+    #[test]
+    fn compress_session_uses_the_test_summary_fetch_when_set() {
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            compression_keep_last: 2,
+            ..AppConfig::default()
+        });
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        let mut session = Session::default();
+        session.set_model(Model::from_config("test-seeded", &[ModelData::new("chat")]).remove(0));
+        ctx.session = Some(session);
+        for text in ["first", "second", "third"] {
+            let input = Input::from_str(&ctx, text, Some(Role::new("", ""))).unwrap();
+            ctx.session
+                .as_mut()
+                .unwrap()
+                .add_message(&input, "reply")
+                .unwrap();
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let err = runtime.block_on(ctx.compress_session()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Invalid model 'test-seeded:chat'"),
+            "{err:#}"
+        );
+        assert_eq!(ctx.session.as_ref().unwrap().messages().len(), 6);
+
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&requests);
+        ctx.test_summary_fetch = Some(Arc::new(move |request: &str| {
+            seen.lock().unwrap().push(request.to_string());
+            "seam summary".to_string()
+        }));
+        runtime.block_on(ctx.compress_session()).unwrap();
+
+        let session = ctx.session.as_ref().unwrap();
+        assert_eq!(session.messages().len(), 3, "{:?}", session.messages());
+        assert!(session.messages()[0].role == MessageRole::System);
+        assert!(
+            session.messages()[0]
+                .content
+                .to_text()
+                .contains("seam summary")
+        );
+        assert!(session.messages()[1].content.to_text().contains("third"));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert!(requests[0].contains("USER: first") && requests[0].contains("USER: second"));
     }
 
     #[test]
@@ -10984,7 +11461,7 @@ mod tests {
     #[test]
     #[serial]
     fn repl_complete_uninstall_offers_installed_bundle_names() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut store = BundleStore::load().unwrap();
         store
             .upsert_bundle(
@@ -11012,7 +11489,7 @@ mod tests {
     #[test]
     #[serial]
     fn repl_complete_install_offers_categories_and_bundles() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut store = BundleStore::load().unwrap();
         store
             .upsert_bundle(
@@ -11042,7 +11519,7 @@ mod tests {
     #[test]
     #[serial]
     fn exit_agent_clears_all_agent_state() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
         let agent_name = format!(
@@ -11086,7 +11563,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_does_not_carry_stale_rag_key() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
         let agent_name = format!(
@@ -11206,7 +11683,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_cancels_previous_supervisor() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
         let agent_name = format!(
@@ -11249,6 +11726,7 @@ mod tests {
                     join_handle,
                     child_supervisor: None,
                     session_id: None,
+                    child_session_root: None,
                 };
                 let old_sup = Arc::new(RwLock::new(Supervisor::new(4, 3)));
                 old_sup.write().register(handle).unwrap();
@@ -11266,7 +11744,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_inits_job_capable_supervisor_without_spawning() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
         let agent_name = format!(
@@ -11303,7 +11781,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_skips_supervisor_when_jobs_disabled() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let mut app = ctx.app.config.as_ref().clone();
         app.max_concurrent_jobs = Some(0);
@@ -11546,7 +12024,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_resets_the_graph_turn_state() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
         let agent_name = format!(
@@ -11578,7 +12056,7 @@ mod tests {
     #[test]
     #[serial]
     fn exit_session_breaks_continuity_and_resets_graph_state_even_when_the_save_fails() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let mut session = Session::default();
         session.set_name("pinned".into());
@@ -11857,7 +12335,7 @@ mod tests {
     #[test]
     #[serial]
     fn rebuild_tool_scope_mcp_disabled_skips_servers() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let app_state = app_state_with_mcp_config(false, &["github", "slack"]);
         let mut ctx = RequestContext::new(app_state, WorkingMode::Cmd);
         let app = ctx.app.config.clone();
@@ -11871,7 +12349,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_role_rolls_back_when_mcp_startup_fails() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let roles_dir = paths::roles_dir();
         create_dir_all(&roles_dir).unwrap();
         write(
@@ -11898,7 +12376,7 @@ mod tests {
     #[test]
     #[serial]
     fn rebuild_tool_scope_no_enabled_servers_yields_empty_runtime() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let app_state = app_state_with_mcp_config(true, &["github"]);
         let mut ctx = RequestContext::new(app_state, WorkingMode::Cmd);
         let app = ctx.app.config.clone();
@@ -11912,7 +12390,7 @@ mod tests {
     #[test]
     #[serial]
     fn rebuild_tool_scope_no_mcp_config_yields_empty_runtime() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let app_state = app_state_with_mcp_config(true, &[]);
         let mut ctx = RequestContext::new(app_state, WorkingMode::Cmd);
         let app = ctx.app.config.clone();
@@ -11926,7 +12404,7 @@ mod tests {
     #[test]
     #[serial]
     fn rebuild_tool_scope_preserves_tool_tracker() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let app_state = app_state_with_mcp_config(false, &[]);
         let mut ctx = RequestContext::new(app_state, WorkingMode::Cmd);
         let dummy = ToolCall {
@@ -11954,7 +12432,7 @@ mod tests {
     #[test]
     #[serial]
     fn rebuild_tool_scope_repl_mode_appends_user_interaction_functions() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let app_state = app_state_with_mcp_config(false, &[]);
         let mut ctx = RequestContext::new(app_state, WorkingMode::Repl);
         let app = ctx.app.config.clone();
@@ -11978,7 +12456,7 @@ mod tests {
     #[test]
     #[serial]
     fn rebuild_tool_scope_cmd_mode_no_user_interaction_functions() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let app_state = app_state_with_mcp_config(false, &[]);
         let mut ctx = RequestContext::new(app_state, WorkingMode::Cmd);
         let app = ctx.app.config.clone();
@@ -12002,7 +12480,7 @@ mod tests {
     #[test]
     #[serial]
     fn update_skills_enabled_false_removes_skill_meta_tools_from_scope() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let app_state = app_state_with_mcp_config(false, &[]);
         let mut ctx = RequestContext::new(app_state, WorkingMode::Repl);
         let app = ctx.app.config.clone();
@@ -12154,7 +12632,7 @@ mod tests {
     #[test]
     #[serial]
     fn rebuild_tool_scope_gates_job_functions_on_jobs_enabled() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let app_state = app_state_with_mcp_config(false, &[]);
         let mut ctx = RequestContext::new(app_state, WorkingMode::Cmd);
         let app = ctx.app.config.clone();
@@ -12193,7 +12671,7 @@ mod tests {
     #[test]
     #[serial]
     fn exit_agent_rebuild_retains_job_functions_when_enabled() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
 
@@ -12309,7 +12787,7 @@ mod tests {
     #[test]
     #[serial]
     fn select_functions_re_adds_skill_tools_when_agent_skills_enabled_not_false() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
         let agent_name = format!(
@@ -12346,7 +12824,7 @@ mod tests {
     #[test]
     #[serial]
     fn select_functions_preserves_infra_tools_under_agent_filter() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
         let agent_name = format!(
@@ -12395,7 +12873,7 @@ mod tests {
     #[test]
     #[serial]
     fn select_functions_graph_llm_node_gates_user_and_todo_tools_under_agent_filter() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
         let agent_name = format!(
@@ -12453,7 +12931,7 @@ mod tests {
     #[test]
     #[serial]
     fn select_functions_graph_llm_node_user_tool_opt_in_is_exact() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
         let agent_name = format!(
@@ -12493,7 +12971,7 @@ mod tests {
     #[test]
     #[serial]
     fn select_functions_graph_llm_node_todo_tools_cannot_be_opted_in() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
         let agent_name = format!(
@@ -12598,7 +13076,7 @@ mod tests {
     #[test]
     #[serial]
     fn select_functions_preserves_job_tools_under_agent_filter() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
         let agent_name = format!(
@@ -12688,7 +13166,7 @@ mod tests {
     #[test]
     #[serial]
     fn select_functions_suppresses_skill_tools_when_agent_skills_enabled_false() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
         let agent_name = format!(
@@ -13081,7 +13559,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_role_obj_errors_when_agent_active() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
         let agent_name = format!(
@@ -13402,7 +13880,7 @@ mod tests {
     #[test]
     #[serial]
     fn retrieve_role_from_markdown_file() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let roles_dir = paths::roles_dir();
         create_dir_all(&roles_dir).unwrap();
         write(
@@ -13420,7 +13898,7 @@ mod tests {
     #[test]
     #[serial]
     fn retrieve_role_builtin_exists() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let ctx = create_test_ctx();
         let names = paths::list_roles(true);
         if !names.is_empty() {
@@ -13432,7 +13910,7 @@ mod tests {
     #[test]
     #[serial]
     fn retrieve_role_nonexistent_errors() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let ctx = create_test_ctx();
         let result = ctx.retrieve_role(&ctx.app.config, "definitely_not_a_real_role_xyz");
         assert!(result.is_err());
@@ -13441,7 +13919,7 @@ mod tests {
     #[test]
     #[serial]
     fn retrieve_role_no_model_id_inherits_current_model() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let roles_dir = paths::roles_dir();
         create_dir_all(&roles_dir).unwrap();
         write(roles_dir.join("simple.md"), "You are helpful.").unwrap();
@@ -13454,7 +13932,7 @@ mod tests {
     #[test]
     #[serial]
     fn list_roles_finds_markdown_files() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let roles_dir = paths::roles_dir();
         create_dir_all(&roles_dir).unwrap();
         write(roles_dir.join("alpha.md"), "Alpha role").unwrap();
@@ -13470,7 +13948,7 @@ mod tests {
     #[test]
     #[serial]
     fn list_roles_empty_dir() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let roles_dir = paths::roles_dir();
         create_dir_all(&roles_dir).unwrap();
         let names = paths::list_roles(false);
@@ -13480,7 +13958,7 @@ mod tests {
     #[test]
     #[serial]
     fn session_new_from_ctx_captures_state() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let ctx = create_test_ctx();
         let session = Session::new_from_ctx(&ctx, &ctx.app.config, "test-session").unwrap();
         assert_eq!(session.name(), "test-session");
@@ -13490,7 +13968,7 @@ mod tests {
     #[test]
     #[serial]
     fn session_save_creates_file() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let ctx = create_test_ctx();
         let mut session = Session::new_from_ctx(&ctx, &ctx.app.config, "save-test").unwrap();
         let session_path = ctx.session_file("save-test");
@@ -13503,7 +13981,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_session_errors_when_already_in_session() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         ctx.session = Some(Session::default());
 
@@ -13522,7 +14000,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_session_creates_temp_session() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let sessions_dir = paths::local_dir("sessions");
         create_dir_all(&sessions_dir).unwrap();
 
@@ -13538,7 +14016,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_session_creates_named_session() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let sessions_dir = paths::local_dir("sessions");
         create_dir_all(&sessions_dir).unwrap();
 
@@ -13554,7 +14032,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_session_resets_graph_chat_fc_warned() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         ctx.graph_chat_fc_warned = true;
         let app = ctx.app.config.clone();
@@ -13574,7 +14052,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_session_prefers_workspace_file_over_global() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         write_session_file(
             &ctx,
@@ -13600,7 +14078,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_session_new_name_defaults_to_global_scope() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
 
@@ -13618,7 +14096,7 @@ mod tests {
     #[test]
     #[serial]
     fn save_session_workspace_flag_rehomes_session() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         write_session_file(&ctx, "notes", SessionScope::Global, "messages: []\n");
         let app = ctx.app.config.clone();
@@ -13644,7 +14122,7 @@ mod tests {
     #[test]
     #[serial]
     fn fork_session_preserves_workspace_scope() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         write_session_file(&ctx, "base", SessionScope::Workspace, "messages: []\n");
         let app = ctx.app.config.clone();
@@ -13668,7 +14146,7 @@ mod tests {
     #[test]
     #[serial]
     fn exit_session_autosaves_to_session_scope() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         write_session_file(&ctx, "ws-exit", SessionScope::Workspace, "messages: []\n");
         let app = ctx.app.config.clone();
@@ -13706,7 +14184,7 @@ mod tests {
     #[test]
     #[serial]
     fn after_chat_completion_flushes_an_autosaving_named_session() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (mut ctx, path) = loaded_session_ctx("per-turn");
         ctx.session.as_mut().unwrap().set_save_session(Some(true));
 
@@ -13739,7 +14217,7 @@ mod tests {
     #[test]
     #[serial]
     fn record_graph_run_stores_the_exchange_and_the_record_and_flushes_them_together() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (mut ctx, path) = loaded_session_ctx("graph-run");
         ctx.session.as_mut().unwrap().set_save_session(Some(true));
         let app = Arc::clone(&ctx.app.config);
@@ -13767,7 +14245,7 @@ mod tests {
     #[test]
     #[serial]
     fn record_graph_run_with_no_record_clears_a_stale_one() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (mut ctx, _path) = loaded_session_ctx("graph-run-clear");
         ctx.session
             .as_mut()
@@ -13789,7 +14267,7 @@ mod tests {
     #[test]
     #[serial]
     fn record_graph_run_on_a_dry_run_leaves_the_session_and_the_file_alone() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (mut ctx, path) = loaded_session_ctx("graph-run-dry");
         ctx.session.as_mut().unwrap().set_save_session(Some(true));
         ctx.session
@@ -13815,7 +14293,7 @@ mod tests {
     #[test]
     #[serial]
     fn record_graph_run_without_a_session_seats_only_the_last_message() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         ctx.session = None;
         let app = Arc::clone(&ctx.app.config);
@@ -13833,7 +14311,7 @@ mod tests {
     #[test]
     #[serial]
     fn after_chat_completion_leaves_the_file_alone_unless_autosaving() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         for save_session in [None, Some(false)] {
             let (mut ctx, path) = loaded_session_ctx("per-turn-off");
             let before = read_to_string(&path).unwrap();
@@ -13853,7 +14331,7 @@ mod tests {
     #[test]
     #[serial]
     fn after_chat_completion_honours_save_session_this_time() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (mut ctx, path) = loaded_session_ctx("per-turn-once");
         assert_eq!(ctx.session.as_ref().unwrap().save_session(), None);
         ctx.set_save_session_this_time().unwrap();
@@ -13866,7 +14344,7 @@ mod tests {
     #[test]
     #[serial]
     fn after_chat_completion_does_not_mint_a_path_for_a_temp_session() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         ctx.session = Some(Session::default());
         ctx.session.as_mut().unwrap().set_save_session(Some(true));
@@ -13888,7 +14366,7 @@ mod tests {
     #[test]
     #[serial]
     fn checkpoint_session_to_disk_skips_dry_run() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (mut ctx, path) = loaded_session_ctx("per-turn-dry");
         let before = read_to_string(&path).unwrap();
         ctx.session.as_mut().unwrap().set_save_session(Some(true));
@@ -13897,7 +14375,7 @@ mod tests {
 
         complete_turn(&mut ctx, "hello", "reply");
         let dry_run = ctx.app.config.dry_run;
-        ctx.checkpoint_session_to_disk(dry_run);
+        ctx.checkpoint_session_to_disk(dry_run).unwrap();
 
         assert_eq!(read_to_string(&path).unwrap(), before);
         assert!(ctx.session.as_ref().unwrap().dirty());
@@ -13925,7 +14403,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_branch_fork_never_checkpoints_the_root_session_file() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (mut branch, path) = forked_autosaving_ctx("per-turn-fork", false);
         let before = read_to_string(&path).unwrap();
 
@@ -13938,7 +14416,7 @@ mod tests {
     #[test]
     #[serial]
     fn the_root_context_checkpoints_its_own_session_file() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (mut ctx, path) = loaded_session_ctx("per-turn-root");
         ctx.session.as_mut().unwrap().set_save_session(Some(true));
         assert!(ctx.persists_session);
@@ -13949,12 +14427,54 @@ mod tests {
         assert!(!ctx.session.as_ref().unwrap().dirty());
     }
 
+    /// A root context's session is the user's own: a write failure is
+    /// logged and the turn goes on, the session staying dirty for the next
+    /// attempt. Only a child context turns the failure into an error.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn a_root_context_only_warns_when_its_session_cannot_be_written() {
+        use std::os::unix::fs::PermissionsExt;
+        let _config = HelperConfigDirGuard::new();
+        install_log_collector();
+        let (mut ctx, path) = loaded_session_ctx("per-turn-root-readonly");
+        ctx.session.as_mut().unwrap().set_save_session(Some(true));
+        assert!(ctx.self_agent_id.is_none());
+        let input = Input::from_str(&ctx, "hello", None).unwrap();
+        ctx.session
+            .as_mut()
+            .unwrap()
+            .add_message(&input, "reply")
+            .unwrap();
+        let sessions_dir = path.parent().unwrap().to_path_buf();
+        let before = read_to_string(&path).unwrap();
+        let warns_before = warn_snapshot().len();
+        std::fs::set_permissions(&sessions_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let _restore = crate::testing::RestoreMode(sessions_dir.clone(), 0o700);
+        if crate::testing::mode_bits_are_ignored_in(&sessions_dir) {
+            return;
+        }
+
+        let result = ctx.checkpoint_session_to_disk(false);
+
+        result.unwrap();
+        assert_eq!(read_to_string(&path).unwrap(), before);
+        assert!(ctx.session.as_ref().unwrap().dirty());
+        let new_warns: Vec<String> = warn_snapshot().into_iter().skip(warns_before).collect();
+        assert!(
+            new_warns.iter().any(|line| {
+                line.starts_with("Failed to checkpoint session 'per-turn-root-readonly': ")
+            }),
+            "{new_warns:?}"
+        );
+    }
+
     /// A REPL-root ctx whose loaded, auto-saving workspace session has just
     /// been written to disk, so any later dirtying is the test's own doing.
     fn clean_loaded_session_ctx(name: &str) -> RequestContext {
         let (mut ctx, _) = loaded_session_ctx(name);
         ctx.session.as_mut().unwrap().set_save_session(Some(true));
-        ctx.checkpoint_session_to_disk(false);
+        ctx.checkpoint_session_to_disk(false).unwrap();
         assert!(!ctx.session.as_ref().unwrap().dirty());
         ctx
     }
@@ -13970,7 +14490,7 @@ mod tests {
     #[test]
     #[serial]
     fn ensure_child_session_root_mints_a_uid_on_a_persisted_root_session_once() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = clean_loaded_session_ctx("child-root-mint");
         assert_eq!(session_uid(&ctx), None);
 
@@ -13989,11 +14509,11 @@ mod tests {
     #[test]
     #[serial]
     fn ensure_child_session_root_keeps_a_uid_the_session_already_has() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = clean_loaded_session_ctx("child-root-keep");
         let fixed = Uuid::new_v4();
         ctx.session.as_mut().unwrap().set_uid(Some(fixed));
-        ctx.checkpoint_session_to_disk(false);
+        ctx.checkpoint_session_to_disk(false).unwrap();
         assert!(!session_dirty(&ctx));
 
         let root = ctx.ensure_child_session_root().unwrap();
@@ -14016,7 +14536,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_child_shares_its_parents_child_session_root_and_never_resolves_its_own() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut parent = clean_loaded_session_ctx("child-root-child");
         let root = parent.ensure_child_session_root().unwrap();
         let mut child = RequestContext::new_for_child(
@@ -14044,7 +14564,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_fork_shares_a_resolved_root_and_never_mints_one_for_the_session() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = clean_loaded_session_ctx("child-root-fork");
         let root = ctx.ensure_child_session_root().unwrap();
         let mut fork = ctx.fork_for_branch();
@@ -14063,20 +14583,22 @@ mod tests {
         assert_eq!(*root, ChildSessionRoot::from_stamp(ProcessStamp::current()));
     }
 
+    /// The workspace memory pin is process-global, so this passes whether
+    /// or not forks and children copy anything; it trips if per-context
+    /// memory discovery state comes back and a copy drops it.
     #[test]
     #[serial]
-    fn forks_and_children_keep_the_workspace_memory_root() {
-        let guard = TestConfigDirGuard::new();
-        let workspace_index = paths::workspace_memory_index_file_for(&guard.workspace_root);
+    fn forks_and_children_resolve_the_pinned_workspace_memory() {
+        let guard = HelperConfigDirGuard::new();
+        let workspace_index = paths::workspace_memory_index_file_for(guard.workspace_root());
         create_dir_all(workspace_index.parent().unwrap()).unwrap();
         write(workspace_index, "# Workspace Memory\n").unwrap();
-        let expected_dir = MemoryStore::new(&guard.workspace_root)
+        let expected_dir = MemoryStore::new(guard.workspace_root())
             .workspace
             .map(|w| w.dir);
         assert!(expected_dir.is_some());
 
-        let mut ctx = create_test_ctx();
-        ctx.workspace_memory_root = Some(guard.workspace_root.clone());
+        let ctx = create_test_ctx();
         let fork = ctx.fork_for_branch();
         let child = RequestContext::new_for_child(
             Arc::clone(&ctx.app),
@@ -14087,29 +14609,10 @@ mod tests {
         );
 
         for copy in [&ctx, &fork, &child] {
-            assert_eq!(
-                copy.workspace_memory_root,
-                Some(guard.workspace_root.clone())
-            );
             let config = copy.memory_config();
             assert!(config.enabled);
             assert_eq!(config.workspace.map(|w| w.dir), expected_dir);
         }
-    }
-
-    #[test]
-    #[serial]
-    fn without_a_workspace_memory_root_memory_resolves_from_the_current_dir() {
-        let _guard = TestConfigDirGuard::new();
-        write_global_memory_store();
-        let ctx = create_test_ctx();
-        assert_eq!(ctx.workspace_memory_root, None);
-
-        let config = ctx.memory_config();
-
-        assert!(config.enabled);
-        let expected = MemoryStore::new(&env::current_dir().unwrap()).workspace;
-        assert_eq!(config.workspace.map(|w| w.dir), expected.map(|w| w.dir));
     }
 
     fn retention_time() -> chrono::DateTime<chrono::Utc> {
@@ -14193,7 +14696,7 @@ mod tests {
     #[test]
     #[serial]
     fn exit_session_retention_removes_a_never_saved_root_on_decline() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (mut ctx, path) = loaded_session_ctx("retention-decline-never-saved");
         assert!(!ctx.working_mode.is_repl());
         assert_eq!(ctx.session.as_ref().unwrap().save_session(), None);
@@ -14218,7 +14721,7 @@ mod tests {
     #[test]
     #[serial]
     fn exit_session_retention_prunes_every_child_of_a_declined_never_saved_parent() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (mut ctx, path) = loaded_session_ctx("retention-never-saved");
         assert!(matches!(ctx.working_mode, WorkingMode::Cmd));
         let root = attach_uid_root(&mut ctx, &path, None);
@@ -14237,7 +14740,7 @@ mod tests {
     #[test]
     #[serial]
     fn exit_session_retention_prunes_only_children_newer_than_the_last_save_on_decline() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (mut ctx, path) = loaded_session_ctx("retention-decline");
         assert!(!ctx.working_mode.is_repl());
         let saved_at = retention_time();
@@ -14271,7 +14774,7 @@ mod tests {
     #[test]
     #[serial]
     fn exit_session_retention_keeps_the_children_a_saving_exit_covers() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (mut ctx, path) = loaded_session_ctx("retention-saved");
         let now = chrono::Utc::now();
         let old_save = now - chrono::Duration::hours(1);
@@ -14307,7 +14810,7 @@ mod tests {
     #[test]
     #[serial]
     fn exit_session_retention_removes_the_root_when_saving_is_off() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (mut ctx, path) = loaded_session_ctx("retention-off");
         let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
         write_child(
@@ -14326,7 +14829,7 @@ mod tests {
     #[test]
     #[serial]
     fn exit_session_retention_removes_the_root_when_the_parent_file_is_gone() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (mut ctx, path) = loaded_session_ctx("retention-orphan");
         let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
         write_child(
@@ -14344,7 +14847,7 @@ mod tests {
     #[test]
     #[serial]
     fn exit_session_retention_removes_a_sessionless_process_root() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         assert!(ctx.session.is_none());
         let root = ChildSessionRoot::from_stamp(ProcessStamp::current());
@@ -14367,7 +14870,7 @@ mod tests {
     #[test]
     #[serial]
     fn exit_session_retention_settles_even_when_the_save_fails() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let mut session = Session::default();
         session.set_name("pinned".into());
@@ -14401,7 +14904,7 @@ mod tests {
     #[test]
     #[serial]
     fn delete_session_at_retention_follows_the_parent_paths() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let ctx = create_test_ctx();
 
         let solo_uid = Uuid::new_v4();
@@ -14468,7 +14971,7 @@ mod tests {
     #[test]
     #[serial]
     fn delete_session_at_retention_without_a_uid_touches_only_the_file() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let ctx = create_test_ctx();
         write_session_file(&ctx, "plain", SessionScope::Workspace, "messages: []\n");
         let path = ctx.session_file_for("plain", SessionScope::Workspace);
@@ -14514,7 +15017,7 @@ mod tests {
     #[test]
     #[serial]
     fn empty_session_removes_the_uid_dir_and_the_next_spawn_recreates_it_under_the_same_uid() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (mut ctx, path) = loaded_session_ctx("empty-children");
         let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
         write_child(&root, "sess_coder_0123456789ab", retention_time());
@@ -14533,10 +15036,304 @@ mod tests {
         assert!(!child_present(&root, "sess_coder_0123456789ab"));
     }
 
+    /// The empty decides under the uid root's lock like every other
+    /// deleter: a holder elsewhere keeps the directory, and the lock is
+    /// let go before the delete since its file lives inside.
+    #[test]
+    #[serial]
+    fn empty_session_keeps_a_uid_dir_whose_lock_another_holder_keeps() {
+        install_log_collector();
+        let _config = HelperConfigDirGuard::new();
+        let (mut ctx, path) = loaded_session_ctx("empty-locked");
+        let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
+        write_child(&root, "sess_coder_0123456789ab", retention_time());
+        let held =
+            crate::utils::fs::ExclusiveLock::acquire(&root.lock_file(), "test", Duration::ZERO)
+                .unwrap();
+
+        child_sessions::with_short_root_lock_wait(|| ctx.empty_session()).unwrap();
+
+        assert!(root.dir().is_dir());
+        assert!(child_present(&root, "sess_coder_0123456789ab"));
+        assert!(ctx.session.as_ref().unwrap().messages().is_empty());
+        let dir_text = root.dir().display().to_string();
+        assert!(
+            warn_snapshot()
+                .iter()
+                .any(|message| message.starts_with("Keeping ")
+                    && message.contains(&dir_text)
+                    && message.contains("is held")),
+            "{:?}",
+            warn_snapshot()
+        );
+
+        drop(held);
+        ctx.empty_session().unwrap();
+        assert!(!root.dir().exists());
+    }
+
+    #[test]
+    fn empty_session_locks_the_uid_dir_and_drops_the_lock_before_removing_it() {
+        let source = include_str!("request_context.rs").replace("\r\n", "\n");
+        let production = &source[..source.find("\n#[cfg(test)]\nmod tests {").unwrap()];
+        let start = production.find("\n    pub fn empty_session(").unwrap();
+        let body = &production[start..];
+        let body = &body[..body.find("\n    }\n").unwrap()];
+        assert_eq!(body.matches(".lock()").count(), 1, "{body}");
+        let lock_at = body.find(".lock()").unwrap();
+        let locked = &body[lock_at..];
+        assert_eq!(locked.matches("remove_dir(").count(), 1, "{body}");
+        assert_eq!(locked.matches("drop(lock);").count(), 1, "{body}");
+        assert!(
+            locked.find("drop(lock);").unwrap() < locked.find("remove_dir(").unwrap(),
+            "{body}"
+        );
+        assert!(body.find("dir.is_dir()").unwrap() < lock_at, "{body}");
+    }
+
+    fn proc_root_with_dir() -> ChildSessionRoot {
+        let root = ChildSessionRoot::from_stamp(ProcessStamp::current());
+        root.ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
+            .unwrap();
+        root
+    }
+
+    /// A process root resolved before the session was attached goes with
+    /// the attach: the session's children belong under its own uid.
+    #[test]
+    #[serial]
+    fn use_session_settles_a_process_root_resolved_while_sessionless() {
+        let _config = HelperConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let resolved = ctx.ensure_child_session_root().unwrap();
+        assert!(matches!(*resolved, ChildSessionRoot::Proc { .. }));
+        let proc_root = proc_root_with_dir();
+        assert_eq!(*resolved, proc_root);
+        write_session_file(
+            &ctx,
+            "after-proc",
+            SessionScope::Workspace,
+            "messages: []\n",
+        );
+        let app = ctx.app.config.clone();
+
+        run_async(ctx.use_session(&app, Some("after-proc"), utils::create_abort_signal())).unwrap();
+
+        assert!(!proc_root.dir().exists());
+        assert!(ctx.child_session_root.is_none());
+        let next = ctx.ensure_child_session_root().unwrap();
+        assert!(matches!(*next, ChildSessionRoot::Uid(_)), "{next:?}");
+    }
+
+    #[test]
+    #[serial]
+    fn fork_session_settles_an_inherited_process_root() {
+        let _config = HelperConfigDirGuard::new();
+        let (mut ctx, _path) = loaded_session_ctx("fork-from-proc");
+        let proc_root = proc_root_with_dir();
+        ctx.child_session_root = Some(Arc::new(proc_root.clone()));
+
+        ctx.fork_session(Some("fork-from-proc-fork")).unwrap();
+
+        assert!(!proc_root.dir().exists());
+        assert!(ctx.child_session_root.is_none());
+        let next = ctx.ensure_child_session_root().unwrap();
+        assert!(matches!(*next, ChildSessionRoot::Uid(_)), "{next:?}");
+    }
+
+    /// Saving an attached session under a new name is not a rename: the
+    /// old file stays, the root's identity now lists both saved copies, and
+    /// the children survive the exit even once the new file is gone, since
+    /// the old entry is still a parent that exists.
+    #[test]
+    #[serial]
+    fn usage_probe_save_session_under_a_new_name_keeps_the_old_file_and_both_parents_live() {
+        let _config = HelperConfigDirGuard::new();
+        let (mut ctx, old_path) = loaded_session_ctx("renamed-from");
+        let root = attach_uid_root(&mut ctx, &old_path, Some(retention_time()));
+        write_child(&root, "sess_coder_0123456789ab", retention_time());
+        ctx.session.as_mut().unwrap().set_save_session(Some(true));
+
+        ctx.save_session(Some("renamed-to"), None).unwrap();
+
+        let new_path = ctx.session_file_for("renamed-to", SessionScope::Workspace);
+        assert!(new_path.is_file());
+        assert!(
+            old_path.is_file(),
+            "the old copy is not removed by a save under a new name"
+        );
+        assert_eq!(ctx.session.as_ref().unwrap().name(), "renamed-to");
+        assert_eq!(session_uid(&ctx), Some(root_uid(&root)));
+        let record = child_sessions::RootFile::load(&root.root_file()).unwrap();
+        let canonical = |path: &Path| std::fs::canonicalize(path).unwrap();
+        assert!(record.parent_paths.contains(&canonical(&old_path)));
+        assert!(record.parent_paths.contains(&canonical(&new_path)));
+        assert_eq!(record.parent_paths.len(), 2);
+        assert!(child_present(&root, "sess_coder_0123456789ab"));
+
+        remove_file(&new_path).unwrap();
+        ctx.exit_session().unwrap();
+
+        assert!(root.dir().is_dir(), "the old copy keeps the root alive");
+        assert!(child_present(&root, "sess_coder_0123456789ab"));
+        assert!(ctx.session.is_none());
+        assert!(ctx.child_session_root.is_none());
+
+        remove_file(&old_path).unwrap();
+        child_sessions::settle_parent_exit(&root, None);
+        assert!(
+            !root.dir().exists(),
+            "with both copies gone the root has no parent left"
+        );
+    }
+
+    /// Only a process root is settled at the attach; a uid root already
+    /// cached stays as it is.
+    #[test]
+    #[serial]
+    fn use_session_leaves_a_cached_uid_root_alone() {
+        let _config = HelperConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let uid_root = ChildSessionRoot::Uid(Uuid::new_v4());
+        uid_root
+            .ensure_dir(&RootFile::seed(ProcessStamp::current(), None))
+            .unwrap();
+        ctx.child_session_root = Some(Arc::new(uid_root.clone()));
+        write_session_file(&ctx, "keep-uid", SessionScope::Workspace, "messages: []\n");
+        let app = ctx.app.config.clone();
+
+        run_async(ctx.use_session(&app, Some("keep-uid"), utils::create_abort_signal())).unwrap();
+
+        assert!(uid_root.dir().is_dir());
+        assert_eq!(
+            ctx.child_session_root.as_deref(),
+            Some(&uid_root),
+            "a cached uid root is not the attach's to settle"
+        );
+    }
+
+    /// A candidate that reaches the attached file through a symlinked
+    /// directory is the attached session, whatever it is called.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn is_attached_session_recognises_the_attached_file_through_a_symlink() {
+        let _config = HelperConfigDirGuard::new();
+        let (ctx, path) = loaded_session_ctx("linked");
+        let sessions_dir = path.parent().unwrap();
+        std::os::unix::fs::symlink(sessions_dir, sessions_dir.join("alias")).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(ctx.session_file_for("alias/linked", SessionScope::Workspace))
+                .unwrap(),
+            std::fs::canonicalize(&path).unwrap()
+        );
+
+        assert!(ctx.is_attached_session("linked", SessionScope::Workspace));
+        assert!(ctx.is_attached_session("alias/linked", SessionScope::Workspace));
+        assert!(!ctx.is_attached_session("linked", SessionScope::Global));
+        assert!(!ctx.is_attached_session("other", SessionScope::Workspace));
+    }
+
+    /// An unsaved session has no file to resolve, so the name and scope
+    /// decide.
+    #[test]
+    #[serial]
+    fn is_attached_session_falls_back_to_name_and_scope_for_an_unsaved_session() {
+        let _config = HelperConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let mut session = Session::default();
+        session.set_name("unsaved".to_string());
+        ctx.session = Some(session);
+        let scope = ctx.session.as_ref().unwrap().scope();
+        assert!(!ctx.session_file_for("unsaved", scope).exists());
+
+        assert!(ctx.is_attached_session("unsaved", scope));
+        assert!(!ctx.is_attached_session("other", scope));
+    }
+
+    /// When the attached session is the only one on disk the delete says
+    /// why it is refused instead of reporting nothing to delete.
+    #[test]
+    #[serial]
+    fn delete_sessions_refuses_with_the_in_use_message_when_only_the_attached_session_exists() {
+        let _config = HelperConfigDirGuard::new();
+        let (ctx, path) = loaded_session_ctx("only-one");
+        assert_eq!(ctx.session_delete_entries().len(), 1);
+        assert!(ctx.session_delete_candidates().is_empty());
+
+        let err = ctx.delete_sessions().unwrap_err();
+
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("while it is in use") && text.contains("only-one"),
+            "{text}"
+        );
+        assert!(path.is_file());
+    }
+
+    #[test]
+    #[serial]
+    fn delete_sessions_reports_nothing_to_delete_without_any_session_on_disk() {
+        let _config = HelperConfigDirGuard::new();
+        let ctx = create_test_ctx();
+        assert!(ctx.session_delete_entries().is_empty());
+
+        let err = ctx.delete_sessions().unwrap_err();
+
+        assert_eq!(format!("{err:#}"), "No session to delete");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn delete_agent_data_dir_refuses_a_symlinked_agent_dir() {
+        let _config = HelperConfigDirGuard::new();
+        let (agent_dir, root) = agent_data_with_session("coder", "main.yaml", None);
+        let alias = paths::agents_data_dir().join("alias");
+        std::os::unix::fs::symlink(&agent_dir, &alias).unwrap();
+
+        let err = RequestContext::delete_agent_data_dir(&alias, &mut Vec::new()).unwrap_err();
+
+        assert!(format!("{err:#}").contains("it is a symlink"), "{err:#}");
+        assert!(
+            std::fs::symlink_metadata(&alias)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            agent_dir
+                .join(SESSIONS_DIR_NAME)
+                .join("main.yaml")
+                .is_file()
+        );
+        assert!(root.dir().is_dir());
+        assert!(child_present(&root, "sess_coder_0123456789ab"));
+    }
+
+    #[test]
+    fn autoname_sessions_file_under_the_placeholder_constant() {
+        assert_eq!(AUTONAME_PLACEHOLDER, "_");
+        assert_eq!(AUTONAME_LABEL_PREFIX, concat!("_", "/"));
+        for source in [
+            include_str!("request_context.rs"),
+            include_str!("session.rs"),
+        ] {
+            let source = source.replace("\r\n", "\n");
+            let production = &source[..source.find("\n#[cfg(test)]\nmod tests").unwrap()];
+            assert!(!production.contains("join(\"_\")"));
+            let hand_spelled = production
+                .lines()
+                .filter(|line| !line.contains("const AUTONAME_LABEL_PREFIX"))
+                .any(|line| line.contains(concat!("\"_", "/\"")));
+            assert!(!hand_spelled, "the label prefix is spelled once");
+        }
+    }
+
     #[test]
     #[serial]
     fn fork_session_copies_the_children_under_a_new_uid_and_leaves_the_original_alone() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (mut ctx, path) = loaded_session_ctx("fork-children");
         let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
         let old_uid = root_uid(&root);
@@ -14604,7 +15401,7 @@ mod tests {
     #[test]
     #[serial]
     fn fork_session_of_a_session_without_children_drops_the_uid_and_creates_no_dir() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (mut ctx, path) = loaded_session_ctx("fork-childless");
         let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
         let old_uid = root_uid(&root);
@@ -14630,7 +15427,7 @@ mod tests {
     #[test]
     #[serial]
     fn fork_session_copies_a_child_whose_only_sidecar_does_not_parse() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (mut ctx, path) = loaded_session_ctx("fork-corrupt-child");
         let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
         let old_uid = root_uid(&root);
@@ -14653,7 +15450,7 @@ mod tests {
     #[test]
     #[serial]
     fn fork_session_leaves_an_in_flight_temp_file_behind() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (mut ctx, path) = loaded_session_ctx("fork-tmp-sibling");
         let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
         let sid = "sess_coder_0123456789ab";
@@ -14681,7 +15478,7 @@ mod tests {
     #[test]
     #[serial]
     fn fork_session_treats_a_children_dir_holding_only_temp_files_as_childless() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (mut ctx, path) = loaded_session_ctx("fork-only-tmp");
         let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
         write(root.children_dir().join("only.yaml.1.0.tmp"), "half").unwrap();
@@ -14702,7 +15499,7 @@ mod tests {
     #[test]
     #[serial]
     fn copy_children_into_skips_a_file_gone_since_the_listing() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let old = ChildSessionRoot::Uid(Uuid::new_v4());
         let new = ChildSessionRoot::Uid(Uuid::new_v4());
         let seed = RootFile::seed(ProcessStamp::current(), None);
@@ -14726,8 +15523,11 @@ mod tests {
     #[test]
     #[serial]
     fn fork_session_removes_the_new_uid_dir_when_a_child_cannot_be_copied() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "fork-uncopied-quiet-e3g";
         let (mut ctx, path) = loaded_session_ctx("fork-unreadable-child");
+        ctx.update_app_config(|app| app.hooks = hooks_map_of(&["session.deleted"], marker));
         let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
         let old_uid = root_uid(&root);
         let sid = "sess_coder_0123456789ab";
@@ -14763,13 +15563,20 @@ mod tests {
             "fork-unreadable-child"
         );
         assert_eq!(session_uid(&ctx), Some(old_uid));
+        assert!(
+            marker_captures(marker).is_empty(),
+            "a failed fork's cleanup is not an operator delete"
+        );
     }
 
     #[test]
     #[serial]
     fn fork_session_removes_the_new_uid_dir_when_the_fork_cannot_be_saved() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "fork-unsaved-quiet-u7d";
         let (mut ctx, path) = loaded_session_ctx("fork-unsaveable");
+        ctx.update_app_config(|app| app.hooks = hooks_map_of(&["session.deleted"], marker));
         let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
         let old_uid = root_uid(&root);
         let sid = "sess_coder_0123456789ab";
@@ -14802,12 +15609,16 @@ mod tests {
         assert_eq!(ctx.session.as_ref().unwrap().name(), "fork-unsaveable");
         assert_eq!(session_uid(&ctx), Some(old_uid));
         assert!(ctx.child_session_root.is_some());
+        assert!(
+            marker_captures(marker).is_empty(),
+            "a failed fork's cleanup is not an operator delete"
+        );
     }
 
     #[test]
     #[serial]
     fn fork_session_of_a_session_without_a_uid_writes_none() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (mut ctx, _) = loaded_session_ctx("fork-no-uid");
         assert_eq!(session_uid(&ctx), None);
 
@@ -14823,7 +15634,7 @@ mod tests {
     #[test]
     #[serial]
     fn exit_session_clears_the_child_session_root_so_the_next_session_resolves_its_own() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (mut ctx, path) = loaded_session_ctx("root-a");
         let root_a = attach_uid_root(&mut ctx, &path, Some(retention_time()));
         let uid_a = root_uid(&root_a);
@@ -14847,7 +15658,7 @@ mod tests {
     #[test]
     #[serial]
     fn exit_session_clears_the_child_session_root_even_when_the_save_fails() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let mut session = Session::default();
         session.set_name("pinned".into());
@@ -14890,10 +15701,10 @@ mod tests {
     #[test]
     #[serial]
     fn delete_agent_data_dir_takes_the_uid_roots_of_its_sessions_with_it() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (agent_dir, root) = agent_data_with_session("coder", "main.yaml", None);
 
-        RequestContext::delete_agent_data_dir(&agent_dir).unwrap();
+        RequestContext::delete_agent_data_dir(&agent_dir, &mut Vec::new()).unwrap();
 
         assert!(!agent_dir.exists());
         assert!(!root.dir().exists());
@@ -14902,10 +15713,10 @@ mod tests {
     #[test]
     #[serial]
     fn delete_agent_data_dir_follows_autonamed_sessions_too() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (agent_dir, root) = agent_data_with_session("coder", "_/20260102-auto.yaml", None);
 
-        RequestContext::delete_agent_data_dir(&agent_dir).unwrap();
+        RequestContext::delete_agent_data_dir(&agent_dir, &mut Vec::new()).unwrap();
 
         assert!(!agent_dir.exists());
         assert!(!root.dir().exists());
@@ -14914,10 +15725,10 @@ mod tests {
     #[test]
     #[serial]
     fn delete_agent_data_dir_follows_sessions_in_nested_subdirs() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (agent_dir, root) = agent_data_with_session("coder", "proj/run.yaml", None);
 
-        RequestContext::delete_agent_data_dir(&agent_dir).unwrap();
+        RequestContext::delete_agent_data_dir(&agent_dir, &mut Vec::new()).unwrap();
 
         assert!(!agent_dir.exists());
         assert!(!root.dir().exists());
@@ -14926,7 +15737,7 @@ mod tests {
     #[test]
     #[serial]
     fn delete_agent_data_dir_tolerates_a_plain_file_where_a_subdir_would_be() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (agent_dir, root) = agent_data_with_session("coder", "main.yaml", None);
         write(
             agent_dir.join(SESSIONS_DIR_NAME).join("_"),
@@ -14934,7 +15745,7 @@ mod tests {
         )
         .unwrap();
 
-        RequestContext::delete_agent_data_dir(&agent_dir).unwrap();
+        RequestContext::delete_agent_data_dir(&agent_dir, &mut Vec::new()).unwrap();
 
         assert!(!agent_dir.exists());
         assert!(!root.dir().exists());
@@ -14943,14 +15754,14 @@ mod tests {
     #[test]
     #[serial]
     fn delete_agent_data_dir_keeps_a_root_another_parent_still_names() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let ctx = create_test_ctx();
         write_session_file(&ctx, "other", SessionScope::Workspace, "messages: []\n");
         let other =
             std::fs::canonicalize(ctx.session_file_for("other", SessionScope::Workspace)).unwrap();
         let (agent_dir, root) = agent_data_with_session("coder", "main.yaml", Some(other.clone()));
 
-        RequestContext::delete_agent_data_dir(&agent_dir).unwrap();
+        RequestContext::delete_agent_data_dir(&agent_dir, &mut Vec::new()).unwrap();
 
         assert!(!agent_dir.exists());
         assert!(root.dir().is_dir());
@@ -14962,12 +15773,12 @@ mod tests {
     #[test]
     #[serial]
     fn delete_agent_data_dir_without_sessions_removes_the_dir() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let agent_dir = paths::agents_data_dir().join("plain");
         create_dir_all(&agent_dir).unwrap();
         write(agent_dir.join("config.yaml"), "name: plain\n").unwrap();
 
-        RequestContext::delete_agent_data_dir(&agent_dir).unwrap();
+        RequestContext::delete_agent_data_dir(&agent_dir, &mut Vec::new()).unwrap();
 
         assert!(!agent_dir.exists());
     }
@@ -14978,7 +15789,7 @@ mod tests {
     #[test]
     #[serial]
     fn delete_agent_data_dir_does_not_follow_a_symlinked_sessions_dir() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let target = _config.path.join("linked-sessions");
         create_dir_all(&target).unwrap();
         let yaml = target.join("x.yaml");
@@ -14995,7 +15806,7 @@ mod tests {
         create_dir_all(&agent_dir).unwrap();
         std::os::unix::fs::symlink(&target, agent_dir.join(SESSIONS_DIR_NAME)).unwrap();
 
-        RequestContext::delete_agent_data_dir(&agent_dir).unwrap();
+        RequestContext::delete_agent_data_dir(&agent_dir, &mut Vec::new()).unwrap();
 
         assert!(!agent_dir.exists());
         assert!(yaml.is_file());
@@ -15008,7 +15819,7 @@ mod tests {
     #[test]
     #[serial]
     fn delete_agent_data_dir_does_not_follow_a_symlinked_subdir() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let target = _config.path.join("linked-proj");
         create_dir_all(&target).unwrap();
         let yaml = target.join("x.yaml");
@@ -15025,7 +15836,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, agent_dir.join(SESSIONS_DIR_NAME).join("proj"))
             .unwrap();
 
-        RequestContext::delete_agent_data_dir(&agent_dir).unwrap();
+        RequestContext::delete_agent_data_dir(&agent_dir, &mut Vec::new()).unwrap();
 
         assert!(!agent_dir.exists());
         assert!(!own_root.dir().exists());
@@ -15040,7 +15851,7 @@ mod tests {
     #[test]
     #[serial]
     fn delete_agent_data_selection_refuses_the_attached_agent_and_deletes_nothing() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (agent_dir, root) = agent_data_with_session("coder", "main.yaml", None);
         let other_dir = paths::agents_data_dir().join("other");
         create_dir_all(&other_dir).unwrap();
@@ -15093,7 +15904,7 @@ mod tests {
     #[test]
     #[serial]
     fn agent_data_delete_candidates_leave_out_the_attached_agent() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (agent_dir, _root) = agent_data_with_session("coder", "main.yaml", None);
         create_dir_all(paths::agents_data_dir().join("other")).unwrap();
         let mut ctx = create_test_ctx();
@@ -15161,6 +15972,7 @@ mod tests {
             join_handle,
             child_supervisor: None,
             session_id: None,
+            child_session_root: None,
         }
     }
 
@@ -15214,7 +16026,7 @@ mod tests {
             eprintln!("skipping: bash not available");
             return;
         }
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let agent_name = format!(
             "cancel_wait_sleeper_{}",
             SystemTime::now()
@@ -15282,7 +16094,7 @@ mod tests {
     #[test]
     #[serial]
     fn cancel_background_tasks_and_wait_gives_up_at_the_budget_and_keeps_the_handle() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         install_log_collector();
         let (mut ctx, path) = loaded_session_ctx("cancel-wait-stuck");
         let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
@@ -15408,7 +16220,7 @@ mod tests {
     #[test]
     #[serial]
     fn delete_session_at_refuses_the_attached_session_and_keeps_its_root() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (mut ctx, path) = loaded_session_ctx("retention-live");
         let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
         write_child(&root, "sess_coder_0123456789ab", retention_time());
@@ -15444,7 +16256,7 @@ mod tests {
     #[test]
     #[serial]
     fn session_delete_candidates_leave_out_the_attached_session() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (ctx, _path) = loaded_session_ctx("retention-live");
         write_session_file(&ctx, "other", SessionScope::Workspace, "messages: []\n");
         write_session_file(
@@ -15475,7 +16287,7 @@ mod tests {
     #[test]
     #[serial]
     fn retention_temp_session_cleanup_follows_the_parent_paths() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
         let temp_path = ctx.session_file(TEMP_SESSION_NAME);
@@ -15548,7 +16360,7 @@ mod tests {
 
     /// Runs a one-node graph through `GraphExecutor` under `ctx`, the way a
     /// graph agent's dispatch does.
-    fn run_end_only_graph(config: &TestConfigDirGuard, ctx: &mut RequestContext) {
+    fn run_end_only_graph(config: &HelperConfigDirGuard, ctx: &mut RequestContext) {
         use crate::graph::{GraphExecutor, GraphParser};
 
         let dir = config.path.join("agents").join("uid-probe");
@@ -15569,7 +16381,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_graph_run_mints_the_session_uid_without_creating_a_sessions_dir() {
-        let config = TestConfigDirGuard::new();
+        let config = HelperConfigDirGuard::new();
         let mut ctx = clean_loaded_session_ctx("child-root-graph");
 
         run_end_only_graph(&config, &mut ctx);
@@ -15577,7 +16389,7 @@ mod tests {
         assert!(session_uid(&ctx).is_some());
         assert!(session_dirty(&ctx));
         assert!(
-            !config.cache_root.join("sessions").exists(),
+            !config.cache_root().join("sessions").exists(),
             "resolving a child session root must not create a directory"
         );
     }
@@ -15585,7 +16397,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_dry_run_graph_leaves_the_session_uid_unset() {
-        let config = TestConfigDirGuard::new();
+        let config = HelperConfigDirGuard::new();
         let mut ctx = clean_loaded_session_ctx("child-root-graph-dry");
         ctx.update_app_config(|app| app.dry_run = true);
 
@@ -15598,7 +16410,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_graph_run_with_child_sessions_off_leaves_the_session_uid_unset() {
-        let config = TestConfigDirGuard::new();
+        let config = HelperConfigDirGuard::new();
         let mut ctx = clean_loaded_session_ctx("child-root-graph-off");
         ctx.update_app_config(|app| app.child_sessions = Some(false));
 
@@ -15614,7 +16426,7 @@ mod tests {
     #[test]
     #[serial]
     fn after_chat_completion_on_a_detached_input_does_not_checkpoint_the_session() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (mut ctx, path) = loaded_session_ctx("per-turn-detached");
         ctx.session.as_mut().unwrap().set_save_session(Some(true));
         let before = read_to_string(&path).unwrap();
@@ -15633,7 +16445,7 @@ mod tests {
     #[test]
     #[serial]
     fn tool_loop_checkpoint_flushes_an_autosaving_named_session() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (mut ctx, path) = loaded_session_ctx("per-turn-checkpoint");
         let session = ctx.session.as_mut().unwrap();
         session.set_save_session(Some(true));
@@ -15657,7 +16469,7 @@ mod tests {
     #[test]
     #[serial]
     fn per_turn_flush_failure_does_not_fail_the_turn() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (mut ctx, path) = loaded_session_ctx("per-turn-broken");
         ctx.session.as_mut().unwrap().set_save_session(Some(true));
         // A regular file where the sessions dir was makes every write under
@@ -15675,7 +16487,7 @@ mod tests {
     #[test]
     #[serial]
     fn on_chat_completion_error_flushes_the_interrupted_checkpoint_to_disk() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (mut ctx, path) = loaded_session_ctx("per-turn-error");
         ctx.session.as_mut().unwrap().set_save_session(Some(true));
         let app = Arc::clone(&ctx.app.config);
@@ -15694,7 +16506,7 @@ mod tests {
     #[test]
     #[serial]
     fn on_chat_completion_error_honours_save_session_this_time() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (mut ctx, path) = loaded_session_ctx("per-turn-error-once");
         ctx.set_save_session_this_time().unwrap();
         let app = Arc::clone(&ctx.app.config);
@@ -15735,7 +16547,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_per_turn_file_reloads_with_every_exchange_before_exit_and_exit_adds_nothing() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (mut ctx, path) = loaded_session_ctx("per-turn-reload");
         ctx.working_mode = WorkingMode::Repl;
         ctx.session.as_mut().unwrap().set_save_session(Some(true));
@@ -15777,7 +16589,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_a_tool_round_never_flushes_the_session() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (mut ctx, path) = loaded_session_ctx("per-turn-tool-round");
         ctx.session.as_mut().unwrap().set_save_session(Some(true));
         let before = read_to_string(&path).unwrap();
@@ -15795,7 +16607,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_tool_loop_and_error_funnels_leave_the_file_alone_unless_autosaving() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         for save_session in [None, Some(false)] {
             let (mut ctx, path) = loaded_session_ctx("per-turn-funnels-off");
             let before = read_to_string(&path).unwrap();
@@ -15832,7 +16644,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_error_funnel_skips_dry_run() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (mut ctx, path) = loaded_session_ctx("per-turn-error-dry");
         let before = read_to_string(&path).unwrap();
         ctx.session.as_mut().unwrap().set_save_session(Some(true));
@@ -15849,7 +16661,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_failed_per_turn_write_recovers_on_the_next_turn_without_leftovers() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         install_log_collector();
         let (mut ctx, path) = loaded_session_ctx("per-turn-recover");
         ctx.session.as_mut().unwrap().set_save_session(Some(true));
@@ -15891,7 +16703,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_global_scope_named_session_is_written_per_turn_to_its_own_file() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         write_session_file(
             &ctx,
@@ -15924,7 +16736,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_temp_session_with_save_session_this_time_is_not_written_per_turn() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         ctx.session = Some(Session::default());
         ctx.set_save_session_this_time().unwrap();
@@ -15961,7 +16773,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_a_branch_fork_skips_the_tool_loop_and_error_funnels_too() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         for in_node in [true, false] {
             let (mut branch, path) = forked_autosaving_ctx("per-turn-fork-funnels", in_node);
             let before = read_to_string(&path).unwrap();
@@ -15999,7 +16811,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_a_fresh_named_session_gets_no_file_until_exit() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
         run_async(ctx.use_session(&app, Some("brand-new"), utils::create_abort_signal())).unwrap();
@@ -16049,11 +16861,11 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_checkpoint_without_a_session_is_a_no_op() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         assert!(ctx.session.is_none());
 
-        ctx.checkpoint_session_to_disk(false);
+        ctx.checkpoint_session_to_disk(false).unwrap();
         complete_turn(&mut ctx, "hello", "reply");
 
         assert!(ctx.session.is_none());
@@ -16073,7 +16885,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_the_root_context_flushes_at_every_funnel_whatever_in_graph_llm_node_says() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         for in_node in [true, false] {
             let (mut ctx, path) = loaded_session_ctx("per-turn-root-funnels");
             ctx.in_graph_llm_node = in_node;
@@ -16122,7 +16934,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_a_child_context_persists_the_session_it_loads() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let parent = create_test_ctx();
         write_session_file(
             &parent,
@@ -16162,7 +16974,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_a_detached_completion_defers_the_flush_to_the_next_attached_turn() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (mut ctx, path) = loaded_session_ctx("per-turn-deferred");
         ctx.session.as_mut().unwrap().set_save_session(Some(true));
         let before = read_to_string(&path).unwrap();
@@ -16200,7 +17012,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_per_turn_writes_begin_after_the_first_save_of_a_fresh_named_session() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
         run_async(ctx.use_session(&app, Some("saved-later"), utils::create_abort_signal()))
@@ -16265,7 +17077,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_a_branch_fork_ignores_save_session_this_time_too() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let (mut ctx, path) = loaded_session_ctx("per-turn-fork-once");
         ctx.set_save_session_this_time().unwrap();
         let mut branch = ctx.fork_for_branch();
@@ -16290,7 +17102,7 @@ mod tests {
     #[test]
     #[serial]
     fn list_sessions_merges_scopes_workspace_first() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let ctx = create_test_ctx();
         write_session_file(&ctx, "both", SessionScope::Global, "messages: []\n");
         write_session_file(&ctx, "both", SessionScope::Workspace, "messages: []\n");
@@ -16317,7 +17129,7 @@ mod tests {
     #[test]
     #[serial]
     fn repl_complete_session_labels_workspace_and_global() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let ctx = create_test_ctx();
         write_session_file(&ctx, "both", SessionScope::Global, "messages: []\n");
         write_session_file(&ctx, "both", SessionScope::Workspace, "messages: []\n");
@@ -16365,7 +17177,7 @@ mod tests {
     #[test]
     #[serial]
     fn save_session_failed_write_leaves_scope_and_path_untouched() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         write_session_file(&ctx, "notes", SessionScope::Global, "messages: []\n");
         let app = ctx.app.config.clone();
@@ -16390,7 +17202,7 @@ mod tests {
     #[test]
     #[serial]
     fn save_session_global_copy_stays_shadowed_by_workspace_twin() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
         run_async(ctx.use_session(&app, Some("notes"), utils::create_abort_signal())).unwrap();
@@ -16409,7 +17221,7 @@ mod tests {
     #[test]
     #[serial]
     fn save_session_scoped_temp_session_demands_a_name() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
         run_async(ctx.use_session(&app, None, utils::create_abort_signal())).unwrap();
@@ -16451,7 +17263,7 @@ mod tests {
     #[test]
     #[serial]
     fn fork_session_rejects_name_taken_in_other_scope() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         write_session_file(&ctx, "base", SessionScope::Global, "messages: []\n");
         write_session_file(&ctx, "taken", SessionScope::Workspace, "messages: []\n");
@@ -16477,7 +17289,7 @@ mod tests {
     #[test]
     #[serial]
     fn fork_session_rejects_the_reserved_temp_name() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         write_session_file(&ctx, "base", SessionScope::Workspace, "messages: []\n");
         let app = ctx.app.config.clone();
@@ -16502,7 +17314,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_session_autoname_prefers_workspace() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         write_session_file(
             &ctx,
@@ -16533,7 +17345,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_session_temp_branch_stays_global_when_workspace_temp_exists() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         write_session_file(
             &ctx,
@@ -16558,7 +17370,7 @@ mod tests {
     #[test]
     #[serial]
     fn repl_complete_agent_sessions_labels_workspace_and_global() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let ctx = create_test_ctx();
         for (dir, name) in [
             (paths::workspace_agent_sessions_dir("helper"), "both"),
@@ -16584,7 +17396,7 @@ mod tests {
     #[test]
     #[serial]
     fn repl_complete_autoname_sessions_labels_and_orders_newest_first() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let ctx = create_test_ctx();
         write_session_file(
             &ctx,
@@ -16638,7 +17450,7 @@ mod tests {
     #[test]
     #[serial]
     fn sysinfo_reports_both_sessions_dirs() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let ctx = create_test_ctx();
         let app = ctx.app.config.clone();
 
@@ -16651,7 +17463,7 @@ mod tests {
     #[test]
     #[serial]
     fn sysinfo_reports_sbx_kits_dir_row() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let ctx = create_test_ctx();
         let app = ctx.app.config.clone();
 
@@ -16671,7 +17483,7 @@ mod tests {
     #[test]
     #[serial]
     fn sysinfo_reports_effective_compression_rows() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
         let mut session = Session::default();
@@ -16726,7 +17538,7 @@ mod tests {
     #[test]
     #[serial]
     fn session_info_reports_the_stored_system_prompt_split() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let mut session = Session::default();
         session.set_model(windowed_model(20_000));
@@ -16767,7 +17579,7 @@ mod tests {
     #[test]
     #[serial]
     fn compression_info_rows_without_session_use_role_model_window() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         ctx.update_app_config(|app| {
             app.compression_threshold = 100_000;
@@ -16802,7 +17614,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_sessions_dir_for_is_agent_aware_in_both_scopes() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         ctx.agent = Some(Agent::test_new(AgentConfig {
             name: "helper".to_string(),
@@ -16843,7 +17655,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_agent_session_loads_and_autosaves_in_workspace_scope() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         ctx.agent = Some(Agent::test_new(AgentConfig {
             name: "helper".to_string(),
@@ -16889,7 +17701,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_save_session_global_flag_rehomes_workspace_session_back() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         write_session_file(&ctx, "notes", SessionScope::Workspace, "messages: []\n");
         let app = ctx.app.config.clone();
@@ -16925,7 +17737,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_save_session_rename_without_flag_keeps_workspace_scope() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         write_session_file(&ctx, "draft", SessionScope::Workspace, "messages: []\n");
         let app = ctx.app.config.clone();
@@ -16956,7 +17768,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_no_workspace_dir_behaves_like_before_and_creates_none() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let ctx_probe = create_test_ctx();
         write_session_file(&ctx_probe, "solo", SessionScope::Global, "messages: []\n");
         // A user with no `.coyote/` at all.
@@ -17009,7 +17821,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_session_info_reports_scope() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         write_session_file(&ctx, "ws-info", SessionScope::Workspace, "messages: []\n");
         let app = ctx.app.config.clone();
@@ -17041,7 +17853,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_workspace_temp_twin_is_ignored_and_untouched_on_exit() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         write_session_file(
             &ctx,
@@ -17087,7 +17899,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_explicit_temp_name_into_workspace_is_rejected_without_side_effects() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
         run_async(ctx.use_session(&app, None, utils::create_abort_signal())).unwrap();
@@ -17137,7 +17949,7 @@ mod tests {
         let _outer = crate::testing::EnvVarGuard::set(&key, &junk);
         let _outer_agent = crate::testing::EnvVarGuard::set("HELPER_DATA_DIR", &junk);
         {
-            let guard = TestConfigDirGuard::new();
+            let guard = HelperConfigDirGuard::new();
             assert!(crate::config::default_sessions_dir().starts_with(&guard.path));
             assert!(
                 paths::agent_sessions_dir("helper").starts_with(&guard.path),
@@ -17151,7 +17963,7 @@ mod tests {
     #[test]
     #[serial]
     fn session_delete_entries_list_both_twins_and_delete_one_scope_at_a_time() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let ctx = create_test_ctx();
         write_session_file(&ctx, "both", SessionScope::Global, "messages: []\n");
         write_session_file(&ctx, "both", SessionScope::Workspace, "messages: []\n");
@@ -17184,7 +17996,7 @@ mod tests {
     #[test]
     #[serial]
     fn session_list_rows_show_both_twins_and_mark_the_shadowed_global() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let ctx = create_test_ctx();
         write_session_file(&ctx, "both", SessionScope::Global, "messages: []\n");
         write_session_file(&ctx, "both", SessionScope::Workspace, "messages: []\n");
@@ -17208,7 +18020,7 @@ mod tests {
     #[serial]
     #[cfg(not(windows))]
     fn session_list_rows_strip_terminal_escapes() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let ctx = create_test_ctx();
         write_session_file(
             &ctx,
@@ -17234,7 +18046,7 @@ mod tests {
     #[serial]
     #[cfg(not(windows))]
     fn repl_complete_session_strips_terminal_escapes_from_names() {
-        let _config = TestConfigDirGuard::new();
+        let _config = HelperConfigDirGuard::new();
         let ctx = create_test_ctx();
         write_session_file(
             &ctx,
@@ -17269,7 +18081,7 @@ mod tests {
     #[test]
     #[serial]
     fn exit_session_roundtrip() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let sessions_dir = paths::local_dir("sessions");
         create_dir_all(&sessions_dir).unwrap();
 
@@ -17336,7 +18148,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_session_discriminates_session_started_from_session_resumed() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let sessions_dir = paths::local_dir("sessions");
         create_dir_all(&sessions_dir).unwrap();
         let _sink = test_sink::install();
@@ -17404,10 +18216,343 @@ mod tests {
         );
     }
 
+    fn session_paths_of(captures: &[test_sink::Capture]) -> BTreeSet<String> {
+        captures
+            .iter()
+            .map(|capture| capture.envs["COYOTE_SESSION_PATH"].clone())
+            .collect()
+    }
+
+    #[test]
+    #[serial]
+    fn delete_session_at_fires_session_deleted_with_the_yaml_path() {
+        let _config = HelperConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "sess-deleted-plain-w3c";
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.hooks = hooks_map_of(&["session.deleted"], marker));
+        ctx.role = Some(Role::new("deleting-role", "Prompt"));
+        write_session_file(&ctx, "doomed", SessionScope::Workspace, "messages: []\n");
+        let path = ctx.session_file_for("doomed", SessionScope::Workspace);
+
+        ctx.delete_session_at("doomed", SessionScope::Workspace)
+            .unwrap();
+
+        let captures = marker_captures(marker);
+        assert_eq!(captures.len(), 1, "{captures:?}");
+        assert_eq!(captures[0].event, HookEvent::SessionDeleted);
+        assert_eq!(
+            captures[0].envs["COYOTE_SESSION_PATH"],
+            path.display().to_string()
+        );
+        assert_eq!(
+            captures[0].envs.get("COYOTE_ROLE").map(String::as_str),
+            Some("deleting-role")
+        );
+    }
+
+    /// The uid root that goes with its last parent file is not announced
+    /// on its own: the one event names the session file.
+    #[test]
+    #[serial]
+    fn delete_session_at_fires_once_when_the_uid_root_goes_too() {
+        let _config = HelperConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "sess-deleted-uid-r7m";
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.hooks = hooks_map_of(&["session.deleted"], marker));
+        let uid = Uuid::new_v4();
+        write_session_file(
+            &ctx,
+            "rooted",
+            SessionScope::Workspace,
+            &uid_session_body(uid),
+        );
+        let path = ctx.session_file_for("rooted", SessionScope::Workspace);
+        let root = ChildSessionRoot::Uid(uid);
+        root.ensure_dir(&retention_root_file(
+            vec![std::fs::canonicalize(&path).unwrap()],
+            Some(retention_time()),
+        ))
+        .unwrap();
+        write_child(&root, "sess_coder_0123456789ab", retention_time());
+
+        ctx.delete_session_at("rooted", SessionScope::Workspace)
+            .unwrap();
+
+        assert!(!root.dir().exists());
+        let captures = marker_captures(marker);
+        assert_eq!(captures.len(), 1, "{captures:?}");
+        assert_eq!(
+            captures[0].envs["COYOTE_SESSION_PATH"],
+            path.display().to_string()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn delete_session_at_fires_nothing_when_refused_or_failed() {
+        let _config = HelperConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "sess-deleted-refused-k2p";
+        let (mut ctx, path) = loaded_session_ctx("deleted-live");
+        ctx.update_app_config(|app| app.hooks = hooks_map_of(&["session.deleted"], marker));
+
+        assert!(
+            ctx.delete_session_at("deleted-live", SessionScope::Workspace)
+                .is_err()
+        );
+        assert!(
+            ctx.delete_session_at("never-written", SessionScope::Workspace)
+                .is_err()
+        );
+
+        assert!(path.is_file());
+        assert!(marker_captures(marker).is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn delete_agent_data_selection_fires_session_deleted_once_per_session_file() {
+        let _config = HelperConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "sess-deleted-agent-data-h5t";
+        let (coder_dir, _) = agent_data_with_session("coder", "main.yaml", None);
+        agent_data_with_session("coder", "proj/run.yaml", None);
+        write(coder_dir.join("config.yaml"), "name: coder\n").unwrap();
+        let (other_dir, _) = agent_data_with_session("other", "_/20260102-auto.yaml", None);
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.hooks = hooks_map_of(&["session.deleted"], marker));
+        let names = ["coder".to_string(), "other".to_string()];
+
+        ctx.delete_agent_data_selection(&paths::agents_data_dir(), &names)
+            .unwrap();
+
+        let captures = marker_captures(marker);
+        assert_eq!(captures.len(), 3, "{captures:?}");
+        let expected: BTreeSet<String> = [
+            coder_dir.join(SESSIONS_DIR_NAME).join("main.yaml"),
+            coder_dir
+                .join(SESSIONS_DIR_NAME)
+                .join("proj")
+                .join("run.yaml"),
+            other_dir
+                .join(SESSIONS_DIR_NAME)
+                .join("_")
+                .join("20260102-auto.yaml"),
+        ]
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect();
+        assert_eq!(session_paths_of(&captures), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn delete_agent_data_selection_fires_nothing_for_symlinked_session_files() {
+        let _config = HelperConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "sess-deleted-agent-link-z9q";
+        let target = _config.path.join("linked-proj");
+        create_dir_all(&target).unwrap();
+        let yaml = target.join("x.yaml");
+        write(&yaml, "messages: []\n").unwrap();
+        let (agent_dir, _) = agent_data_with_session("coder", "main.yaml", None);
+        let sessions = agent_dir.join(SESSIONS_DIR_NAME);
+        std::os::unix::fs::symlink(&target, sessions.join("proj")).unwrap();
+        std::os::unix::fs::symlink(&yaml, sessions.join("link.yaml")).unwrap();
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.hooks = hooks_map_of(&["session.deleted"], marker));
+
+        ctx.delete_agent_data_selection(&paths::agents_data_dir(), &["coder".to_string()])
+            .unwrap();
+
+        assert!(yaml.is_file());
+        let captures = marker_captures(marker);
+        assert_eq!(
+            session_paths_of(&captures),
+            BTreeSet::from([sessions.join("main.yaml").display().to_string()])
+        );
+        assert_eq!(captures.len(), 1, "{captures:?}");
+    }
+
+    /// A session file unlinked before the batch fails is still announced:
+    /// the read-only `locked/` lets the walk through `sessions/` finish and
+    /// then stops the directory's removal, so `other` is never reached.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn delete_agent_data_selection_fires_for_files_unlinked_before_a_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let _config = HelperConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "sess-deleted-agent-partial-b4n";
+        let (coder_dir, _) = agent_data_with_session("coder", "main.yaml", None);
+        let (other_dir, other_root) = agent_data_with_session("other", "main.yaml", None);
+        let locked = coder_dir.join("locked");
+        create_dir_all(&locked).unwrap();
+        write(locked.join("notes.txt"), "kept\n").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let _restore = crate::testing::RestoreMode(locked.clone(), 0o700);
+        if crate::testing::mode_bits_are_ignored_in(&locked) {
+            return;
+        }
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.hooks = hooks_map_of(&["session.deleted"], marker));
+        let names = ["coder".to_string(), "other".to_string()];
+
+        let err = ctx
+            .delete_agent_data_selection(&paths::agents_data_dir(), &names)
+            .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("Failed to delete agent-data"),
+            "{err:#}"
+        );
+        let unlinked = coder_dir.join(SESSIONS_DIR_NAME).join("main.yaml");
+        assert!(!unlinked.exists());
+        assert!(
+            other_dir
+                .join(SESSIONS_DIR_NAME)
+                .join("main.yaml")
+                .is_file()
+        );
+        assert!(other_root.dir().is_dir());
+        let captures = marker_captures(marker);
+        assert_eq!(captures.len(), 1, "{captures:?}");
+        assert_eq!(
+            captures[0].envs["COYOTE_SESSION_PATH"],
+            unlinked.display().to_string()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn empty_session_fires_session_deleted_with_the_removed_uid_dir() {
+        let _config = HelperConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "sess-deleted-empty-f6v";
+        let (mut ctx, path) = loaded_session_ctx("empty-fires");
+        let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
+        write_child(&root, "sess_coder_0123456789ab", retention_time());
+        ctx.update_app_config(|app| app.hooks = hooks_map_of(&["session.deleted"], marker));
+
+        ctx.empty_session().unwrap();
+
+        assert!(!root.dir().exists());
+        let captures = marker_captures(marker);
+        assert_eq!(captures.len(), 1, "{captures:?}");
+        assert_eq!(
+            captures[0].envs["COYOTE_SESSION_PATH"],
+            root.dir().display().to_string()
+        );
+        assert_eq!(
+            captures[0]
+                .envs
+                .get("COYOTE_SESSION_ID")
+                .map(String::as_str),
+            Some("empty-fires"),
+            "the event names the attached session, which outlives the empty"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn empty_session_fires_nothing_while_another_holder_keeps_the_lock() {
+        let _config = HelperConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "sess-deleted-empty-locked-j1s";
+        let (mut ctx, path) = loaded_session_ctx("empty-locked-quiet");
+        let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
+        write_child(&root, "sess_coder_0123456789ab", retention_time());
+        ctx.update_app_config(|app| app.hooks = hooks_map_of(&["session.deleted"], marker));
+        let held =
+            crate::utils::fs::ExclusiveLock::acquire(&root.lock_file(), "test", Duration::ZERO)
+                .unwrap();
+
+        child_sessions::with_short_root_lock_wait(|| ctx.empty_session()).unwrap();
+
+        assert!(root.dir().is_dir());
+        assert!(marker_captures(marker).is_empty());
+        drop(held);
+    }
+
+    /// A dir another process removes once the lock is let go is not this
+    /// empty's deletion to announce.
+    #[test]
+    #[serial]
+    fn empty_session_fires_nothing_when_another_process_removes_the_dir_first() {
+        let _config = HelperConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "sess-deleted-empty-raced-q7k";
+        let (mut ctx, path) = loaded_session_ctx("empty-raced-quiet");
+        let root = attach_uid_root(&mut ctx, &path, Some(retention_time()));
+        write_child(&root, "sess_coder_0123456789ab", retention_time());
+        ctx.update_app_config(|app| app.hooks = hooks_map_of(&["session.deleted"], marker));
+        BEFORE_EMPTIED_DIR_REMOVAL.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(|dir: &Path| fs::remove_dir_all(dir).unwrap()));
+        });
+
+        ctx.empty_session().unwrap();
+
+        assert!(BEFORE_EMPTIED_DIR_REMOVAL.with(|slot| slot.borrow().is_none()));
+        assert!(!root.dir().exists());
+        assert!(marker_captures(marker).is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn empty_session_fires_nothing_without_a_uid_dir() {
+        let _config = HelperConfigDirGuard::new();
+        let _sink = test_sink::install();
+        let marker = "sess-deleted-empty-none-c8x";
+        let (mut ctx, _) = loaded_session_ctx("empty-no-uid");
+        ctx.update_app_config(|app| app.hooks = hooks_map_of(&["session.deleted"], marker));
+
+        ctx.empty_session().unwrap();
+        ctx.session.as_mut().unwrap().set_uid(Some(Uuid::new_v4()));
+        ctx.empty_session().unwrap();
+
+        assert!(marker_captures(marker).is_empty());
+    }
+
+    /// Only operator commands announce a deletion. Retention's own removals
+    /// (a root settled at parent exit, the startup sweep) and a failed
+    /// fork's cleanup have no context to fire from or must stay quiet.
+    #[test]
+    fn session_deleted_fires_only_from_the_operator_delete_paths() {
+        let child_sessions = include_str!("child_sessions.rs");
+        assert!(!child_sessions.contains("SessionDeleted"));
+        assert!(!child_sessions.contains("session.deleted"));
+        let source = include_str!("request_context.rs").replace("\r\n", "\n");
+        let production = &source[..source.find("\n#[cfg(test)]\nmod tests {").unwrap()];
+        assert!(!production.contains("\"session.deleted\""));
+        let heads = [
+            "\n    pub fn empty_session(",
+            "\n    fn delete_agent_data_selection(",
+            "\n    fn delete_session_at(",
+        ];
+        for head in heads {
+            let start = production.find(head).unwrap();
+            let body = &production[start..];
+            let body = &body[..body.find("\n    }\n").unwrap()];
+            assert_eq!(
+                body.matches("HookEvent::SessionDeleted").count(),
+                1,
+                "{head}"
+            );
+        }
+        assert_eq!(
+            production.matches("HookEvent::SessionDeleted").count(),
+            heads.len()
+        );
+    }
+
     #[test]
     #[serial]
     fn exit_session_fires_session_ended_only_with_a_session() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let _sink = test_sink::install();
         let marker = "sess-ended-w5c";
 
@@ -17439,7 +18584,7 @@ mod tests {
     #[test]
     #[serial]
     fn chat_completion_seams_fire_no_turn_events_in_child_contexts() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let _sink = test_sink::install();
         let marker = "child-turn-b4h";
 
@@ -17471,7 +18616,7 @@ mod tests {
     #[test]
     #[serial]
     fn top_level_agent_bracket_fires_started_and_completed_once() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let _sink = test_sink::install();
         let marker = "agent-top-ok-m2s";
         let agent_name = unique_name("hook_agent");
@@ -17522,7 +18667,7 @@ mod tests {
     #[test]
     #[serial]
     fn top_level_agent_failure_fires_agent_failed_with_error() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let _sink = test_sink::install();
         let marker = "agent-top-err-f7d";
         let agent_name = unique_name("hook_agent");
@@ -17558,7 +18703,7 @@ mod tests {
     #[test]
     #[serial]
     fn top_level_agent_ctrlc_fires_agent_interrupted_not_failed() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let _sink = test_sink::install();
         let marker = "agent-top-int-r6t";
         let agent_name = unique_name("hook_agent");
@@ -17596,7 +18741,7 @@ mod tests {
     #[test]
     #[serial]
     fn top_level_agent_ctrlc_without_error_fires_agent_interrupted() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let _sink = test_sink::install();
         let marker = "agent-top-int-noerr-v4d";
         let agent_name = unique_name("hook_agent");
@@ -17636,7 +18781,7 @@ mod tests {
     #[test]
     #[serial]
     fn idle_prompt_ctrlc_then_ctrld_exit_fires_agent_completed() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let _sink = test_sink::install();
         let marker = "agent-top-idle-cc-w2b";
         let agent_name = unique_name("hook_agent");
@@ -17676,7 +18821,7 @@ mod tests {
     #[test]
     #[serial]
     fn top_level_agent_helpers_noop_without_agent() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let _sink = test_sink::install();
         let marker = "agent-top-role-only-c9k";
 
@@ -17702,7 +18847,7 @@ mod tests {
     #[test]
     #[serial]
     fn exit_agent_closes_top_level_agent_bracket() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let _sink = test_sink::install();
         let marker = "agent-top-exit-v3p";
         let agent_name = unique_name("hook_agent");
@@ -17732,7 +18877,7 @@ mod tests {
     #[test]
     #[serial]
     fn resolved_hooks_resolves_role_hooks_held_by_fresh_session() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let sessions_dir = paths::local_dir("sessions");
         create_dir_all(&sessions_dir).unwrap();
 
@@ -17759,7 +18904,7 @@ mod tests {
     #[test]
     #[serial]
     fn resolved_hooks_resolves_role_hooks_after_session_resume() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let sessions_dir = paths::local_dir("sessions");
         create_dir_all(&sessions_dir).unwrap();
         let roles_dir = paths::roles_dir();
@@ -17839,7 +18984,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_session_adopts_persisted_todo_state() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         ctx.init_todo_list("stale goal");
         ctx.pause_auto_continue("stale question");
@@ -17856,7 +19001,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_session_without_todo_state_resets_ctx() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         ctx.init_todo_list("stale goal");
         ctx.add_todo("stale task");
@@ -17879,7 +19024,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_session_new_session_carries_in_flight_todo_state() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         ctx.init_todo_list("Ship feature");
         ctx.add_todo("Write code");
@@ -17898,7 +19043,7 @@ mod tests {
     #[test]
     #[serial]
     fn restored_pause_resumes_in_ctx_and_session_mirror() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         write_paused_todo_session(&ctx, "paused");
         let app = ctx.app.config.clone();
@@ -17922,7 +19067,7 @@ mod tests {
     #[test]
     #[serial]
     fn exit_session_resets_todo_and_pause_state() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         write_paused_todo_session(&ctx, "paused-exit");
         let app = ctx.app.config.clone();
@@ -17940,7 +19085,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_role_obj_and_exit_role_full_cycle() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
 
         ctx.use_role_obj(Role::new("test-role", "test prompt"))
@@ -17955,7 +19100,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_role_obj_twice_replaces_role() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
 
         ctx.use_role_obj(Role::new("first", "prompt 1")).unwrap();
@@ -17968,7 +19113,7 @@ mod tests {
     #[test]
     #[serial]
     fn list_macros_finds_yaml_files() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let macros_dir = paths::macros_dir();
         create_dir_all(&macros_dir).unwrap();
         write(macros_dir.join("greet.yaml"), "steps:\n  - \".help\"").unwrap();
@@ -17982,7 +19127,7 @@ mod tests {
     #[test]
     #[serial]
     fn list_rags_finds_yaml_files() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let rags_dir = paths::rags_dir();
         create_dir_all(&rags_dir).unwrap();
         write(rags_dir.join("docs.yaml"), "embedding_model: test").unwrap();
@@ -17994,7 +19139,7 @@ mod tests {
     #[test]
     #[serial]
     fn list_rags_empty_dir() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let rags_dir = paths::rags_dir();
         create_dir_all(&rags_dir).unwrap();
         assert!(paths::list_rags().is_empty());
@@ -18003,7 +19148,7 @@ mod tests {
     #[test]
     #[serial]
     fn list_rags_does_not_list_the_kits_directory() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let rags_dir = paths::rags_dir();
         let kit_dir = rags_dir.join("kits").join("rag-docs");
         create_dir_all(&kit_dir).unwrap();
@@ -18019,7 +19164,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_errors_when_already_in_session() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         ctx.session = Some(Session::default());
 
@@ -18061,7 +19206,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_errors_when_already_in_session_even_without_session_name() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         ctx.session = Some(Session::default());
 
@@ -18103,7 +19248,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_errors_when_graph_agent_given_explicit_session() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
 
         let app = ctx.app.config.clone();
@@ -18143,7 +19288,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_skips_inherited_session_for_graph_agent() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         ctx.update_app_config(|app| app.agent_session = Some("inherited".to_string()));
 
@@ -18197,7 +19342,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_engages_an_explicit_session_for_a_block_graph_agent() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_block_graph_agent");
         write_graph_agent(&agent_name, GRAPH_SESSION_BLOCK);
         let mut ctx = create_test_ctx();
@@ -18213,7 +19358,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_engages_the_inherited_session_for_a_block_graph_agent() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_block_graph_agent");
         write_graph_agent(&agent_name, GRAPH_SESSION_BLOCK);
         let mut ctx = create_test_ctx();
@@ -18240,7 +19385,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_refuses_a_block_graph_agent_whose_chat_tools_are_denied() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let tools_dir = paths::global_tools_dir();
         create_dir_all(&tools_dir).unwrap();
         write(
@@ -18293,7 +19438,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_engages_a_block_graph_agent_whose_chat_tools_name_write_and_exec_globals() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         write_global_tool_stubs(&["fs_write", "execute_command"]);
         let agent_name = unique_name("test_block_graph_agent");
         write_graph_agent(
@@ -18313,7 +19458,7 @@ mod tests {
     #[serial]
     fn use_agent_refuses_a_block_graph_agent_whose_chat_tools_name_undeclared_write_and_exec_globals()
      {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         write_global_tool_stubs(&["fs_read"]);
         let agent_name = unique_name("test_block_graph_agent");
         write_graph_agent(
@@ -18346,7 +19491,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_refuses_a_block_graph_agent_whose_chat_tools_name_an_agent_local_tool() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_block_graph_agent");
         write_graph_agent(
             &agent_name,
@@ -18382,7 +19527,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_refuses_a_block_graph_agent_whose_chat_tools_need_function_calling() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let tools_dir = paths::global_tools_dir();
         create_dir_all(&tools_dir).unwrap();
         write(
@@ -18416,7 +19561,7 @@ mod tests {
     #[serial]
     fn use_agent_accepts_a_skill_tool_by_name_and_only_warns_when_skills_are_off() {
         install_log_collector();
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_block_graph_agent");
         write_graph_agent(
             &agent_name,
@@ -18479,7 +19624,7 @@ mod tests {
     #[serial]
     fn use_agent_warns_once_for_memory_on_a_non_fc_chat_model() {
         install_log_collector();
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let model_name = unique_name("plain");
         let agent_name = unique_name("test_block_graph_agent");
         write_graph_agent(
@@ -18524,7 +19669,7 @@ mod tests {
     #[test]
     #[serial]
     fn session_role_at_engage_carries_the_memory_section_with_the_cap_the_chat_model_earns() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         write_global_memory_store();
         let prompt_for = |block: &str| -> String {
             let agent_name = unique_name("test_block_graph_agent");
@@ -18628,19 +19773,18 @@ mod tests {
     #[test]
     #[serial]
     fn chat_agent_is_the_agent_slot_while_no_delegate_is_engaged() {
-        let guard = TestConfigDirGuard::new();
+        let guard = HelperConfigDirGuard::new();
         write_global_memory_store();
-        let workspace_index = paths::workspace_memory_index_file_for(&guard.workspace_root);
+        let workspace_index = paths::workspace_memory_index_file_for(guard.workspace_root());
         create_dir_all(workspace_index.parent().unwrap()).unwrap();
         write(workspace_index, "# Workspace Memory\n").unwrap();
-        let workspace_root = Some(guard.workspace_root.clone());
         let deterministic_prompt = |app: &mut AppConfig| {
             app.workspace_instructions = Some(false);
             app.skills_enabled = false;
             app.function_calling_support = true;
             app.memory = None;
         };
-        let store = MemoryStore::new(&guard.workspace_root);
+        let store = MemoryStore::new(guard.workspace_root());
         assert!(store.workspace.is_some());
         let memory_section = memory::build_memory_section(
             &store,
@@ -18660,7 +19804,6 @@ mod tests {
         let expected_workspace_dir = store.workspace.as_ref().map(|w| w.dir.clone());
 
         let mut ctx = create_test_ctx();
-        ctx.workspace_memory_root = workspace_root.clone();
         ctx.update_app_config(deterministic_prompt);
         let app = ctx.app.config.clone();
         assert!(ctx.agent.is_none());
@@ -18671,7 +19814,6 @@ mod tests {
         assert_eq!(ctx.extract_role(&app).unwrap().prompt(), memory_tail);
 
         let mut ctx = create_test_ctx();
-        ctx.workspace_memory_root = workspace_root.clone();
         ctx.update_app_config(deterministic_prompt);
         let app = ctx.app.config.clone();
         ctx.agent = Some(Agent::test_new(AgentConfig {
@@ -18698,7 +19840,6 @@ mod tests {
             let agent_name = unique_name("test_block_graph_agent");
             write_graph_agent(&agent_name, extra);
             let mut ctx = create_test_ctx();
-            ctx.workspace_memory_root = workspace_root.clone();
             ctx.update_app_config(deterministic_prompt);
             ctx.model = fc_model("agent-model");
             let app = ctx.app.config.clone();
@@ -18861,7 +20002,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_leaves_the_context_untouched_when_the_chat_agent_fails_to_init() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
         let chat_agent_dir = paths::agent_data_dir(&chat_agent);
@@ -18895,7 +20036,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_leaves_the_context_untouched_when_the_chat_agent_mcp_fails() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
         write_chat_agent(&chat_agent, "instructions: hi\nmcp_servers:\n  - fixture\n");
@@ -18933,7 +20074,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_names_the_chat_agent_when_it_needs_mcp_but_mcp_support_is_off() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
         write_chat_agent(&chat_agent, "instructions: hi\nmcp_servers:\n  - fixture\n");
@@ -18963,7 +20104,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_drops_the_chat_agent_when_the_graph_agents_own_mcp_fails() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
         write_chat_agent(
@@ -19008,7 +20149,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_requires_the_chat_agents_variables_unless_the_block_seeds_them() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
         write_chat_agent(
@@ -19065,7 +20206,7 @@ mod tests {
     #[test]
     #[serial]
     fn the_chat_agent_keeps_the_engage_time_interactivity_through_the_identity_reset() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
         write_chat_agent(
@@ -19095,7 +20236,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_seats_a_new_session_on_the_graph_agents_model_with_the_chat_agents_prompt() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
         write_chat_agent(
@@ -19142,7 +20283,7 @@ mod tests {
     #[test]
     #[serial]
     fn extract_role_overlays_the_swapped_in_chat_agents_knobs_without_touching_the_session() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
         write_chat_agent(&chat_agent, "instructions: hi\n");
@@ -19206,7 +20347,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_refuses_a_chat_agent_whose_reasoning_effort_its_model_lacks() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
         write_chat_agent(&chat_agent, "instructions: hi\nreasoning_effort: high\n");
@@ -19235,7 +20376,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_reseats_the_chat_agents_recorded_variables_on_resume() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
         write_chat_agent(
@@ -19335,7 +20476,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_seats_shared_variables_when_resuming_a_session_born_inline() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
         write_chat_agent(
@@ -19382,7 +20523,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_resumed_session_born_inline_persists_the_re_seated_chat_agent_without_a_new_exchange() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
         write_chat_agent(
@@ -19429,7 +20570,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_reseats_a_session_born_under_another_chat_agent() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_delegating_graph_agent");
         let old_chat_agent = unique_name("test_old_chat_agent");
         let chat_agent = unique_name("test_chat_agent");
@@ -19471,7 +20612,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_resumes_without_prompting_for_the_chat_agents_recorded_variables() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
         write_chat_agent(
@@ -19513,7 +20654,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_seeds_a_resumed_mismatch_from_the_block_when_the_chat_agent_has_no_default() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_delegating_graph_agent");
         let old_chat_agent = unique_name("test_old_chat_agent");
         let chat_agent = unique_name("test_chat_agent");
@@ -19555,7 +20696,7 @@ mod tests {
     #[test]
     #[serial]
     fn exit_agent_session_reseeds_the_chat_agents_shared_variables_in_the_repl() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
         write_chat_agent(
@@ -19613,7 +20754,7 @@ mod tests {
         if skip_step_runner_bash_harness() {
             return;
         }
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
         write_chat_agent(
@@ -19744,7 +20885,7 @@ mod tests {
     #[test]
     #[serial]
     fn empty_session_keeps_the_chat_agent_on_the_session() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
         write_chat_agent(&chat_agent, "instructions: Be brief.\n");
@@ -19773,7 +20914,7 @@ mod tests {
     #[test]
     #[serial]
     fn empty_session_puts_the_graph_agent_back_before_syncing() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
         write_chat_agent(&chat_agent, "instructions: Be brief.\n");
@@ -19806,7 +20947,7 @@ mod tests {
     #[test]
     #[serial]
     fn exit_agent_session_puts_the_graph_agent_back_before_leaving() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
         write_chat_agent(&chat_agent, "instructions: Be brief.\n");
@@ -19839,7 +20980,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_session_puts_the_graph_agent_back_before_seating_the_delegate() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
         write_chat_agent(
@@ -19923,7 +21064,7 @@ mod tests {
     #[test]
     #[serial]
     fn init_delegate_session_variables_puts_the_graph_agent_back_before_seating() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let (agent_name, chat_agent) = engage_and_swap_in_the_chat_agent(&mut ctx);
 
@@ -19950,7 +21091,7 @@ mod tests {
     #[test]
     #[serial]
     fn init_agent_session_variables_puts_the_graph_agent_back_before_seating() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let (agent_name, chat_agent) = engage_and_swap_in_the_chat_agent(&mut ctx);
 
@@ -19983,7 +21124,7 @@ mod tests {
     #[test]
     #[serial]
     fn exit_agent_keeps_the_chat_agent_parked_when_the_session_save_fails() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         write_global_memory_store();
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
@@ -20050,7 +21191,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_seated_stage_failure_of_the_chat_agent_drops_it_and_keeps_the_graph_agent() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
         write_chat_agent(
@@ -20257,7 +21398,7 @@ mod tests {
     #[test]
     #[serial]
     fn exit_session_clears_the_chat_agents_session_variables_in_either_slot() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
         write_chat_agent(
@@ -20324,7 +21465,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_drops_the_chat_agent_when_the_session_itself_is_refused() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         write_global_memory_store();
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
@@ -20408,7 +21549,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_drops_the_chat_agent_when_seating_is_refused_after_the_sessions_rebuild() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         write_global_memory_store();
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
@@ -20463,7 +21604,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_reports_a_failed_rebuild_alongside_the_refused_seating() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
         write_chat_agent(&chat_agent, "instructions: hi\n");
@@ -20522,7 +21663,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_refuses_a_graph_agent_needing_mcp_before_building_its_chat_agent() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
         let chat_agent_dir = paths::agent_data_dir(&chat_agent);
@@ -20565,7 +21706,7 @@ mod tests {
     #[test]
     #[serial]
     fn enter_and_leave_delegate_turn_swap_the_agent_tool_scope_and_rag() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         write_global_memory_store();
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
@@ -20744,7 +21885,7 @@ mod tests {
     #[test]
     #[serial]
     fn refresh_tool_scope_rebuilds_the_swapped_in_delegates_own_servers() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
         write_chat_agent(
@@ -20801,7 +21942,7 @@ mod tests {
     #[test]
     #[serial]
     fn fork_for_branch_takes_the_parked_graph_agent_during_a_delegated_turn() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
         write_chat_agent(
@@ -20886,7 +22027,7 @@ mod tests {
     #[test]
     #[serial]
     fn exit_agent_drops_the_chat_agents_mcp_handles() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
         write_chat_agent(
@@ -20928,7 +22069,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_inits_the_supervisor_when_only_the_chat_agent_can_spawn() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_delegating_graph_agent");
         let engaged = |spawn: bool| -> RequestContext {
             let chat_agent = unique_name("test_chat_agent");
@@ -20955,7 +22096,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_sizes_the_supervisor_field_by_field_to_the_larger_agent() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
         write_chat_agent(
@@ -20989,7 +22130,7 @@ mod tests {
     #[test]
     #[serial]
     fn graph_agents_pool_carries_memory_tools_iff_the_chat_agent_has_memory_on() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         write_global_memory_store();
         let agent_name = unique_name("test_delegating_graph_agent");
         let memory_tools = |memory: bool| -> BTreeSet<String> {
@@ -21017,7 +22158,7 @@ mod tests {
     #[test]
     #[serial]
     fn memory_tools_declared_in_the_graph_agents_pool_run_inside_a_forked_node() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         write_global_memory_store();
         let agent_name = unique_name("test_delegating_graph_agent");
         let chat_agent = unique_name("test_chat_agent");
@@ -21054,7 +22195,7 @@ mod tests {
     #[test]
     #[serial]
     fn delegates_pool_carries_memory_tools_by_its_own_preference() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         write_global_memory_store();
         let agent_name = unique_name("test_delegating_graph_agent");
         let delegate_memory_tools = |app_memory: Option<bool>, memory: bool| -> BTreeSet<String> {
@@ -21089,7 +22230,7 @@ mod tests {
     #[test]
     #[serial]
     fn config_agent_with_tools_selection_is_unchanged() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         write_global_memory_store();
         let agent_name = unique_name("test_config_agent");
         let agent_dir = paths::agent_data_dir(&agent_name);
@@ -21150,7 +22291,7 @@ mod tests {
     #[test]
     #[serial]
     fn repl_complete_agent_sessions_lists_both_scopes_for_a_block_graph_agent() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_block_graph_agent");
         write_graph_agent(&agent_name, GRAPH_SESSION_BLOCK);
         let ctx = create_test_ctx();
@@ -21177,7 +22318,7 @@ mod tests {
     #[test]
     #[serial]
     fn repl_complete_agent_sessions_lists_none_for_a_blockless_graph_agent() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_blockless_graph_agent");
         write_graph_agent(
             &agent_name,
@@ -21204,7 +22345,7 @@ mod tests {
     #[test]
     #[serial]
     fn repl_complete_session_lists_none_inside_a_blockless_graph_agent() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_blockless_graph_agent");
         write_graph_agent(&agent_name, "");
         let mut ctx = create_test_ctx();
@@ -21224,7 +22365,7 @@ mod tests {
     #[test]
     #[serial]
     fn usage_probe_repl_complete_session_lists_both_scopes_inside_a_block_graph_agent() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_block_graph_agent");
         write_graph_agent(&agent_name, GRAPH_SESSION_BLOCK);
         let mut ctx = create_test_ctx();
@@ -21253,7 +22394,7 @@ mod tests {
     #[test]
     #[serial]
     fn exit_session_autosaves_a_graph_agent_temp_session_with_its_last_run() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let agent_name = unique_name("test_block_graph_agent");
         write_graph_agent(&agent_name, GRAPH_SESSION_BLOCK);
         let mut ctx = create_test_ctx();
@@ -21304,7 +22445,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_with_a_session_fires_session_started_for_a_block_graph_agent() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let _sink = test_sink::install();
         let marker = "graph-sess-started-t3k";
         let agent_name = unique_name("test_block_graph_agent");
@@ -21329,7 +22470,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_with_a_persisted_session_fires_session_resumed_for_a_block_graph_agent() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let _sink = test_sink::install();
         let marker = "graph-sess-resumed-p7w";
         let agent_name = unique_name("test_block_graph_agent");
@@ -21361,7 +22502,7 @@ mod tests {
     #[test]
     #[serial]
     fn exit_session_fires_session_ended_for_a_block_graph_agent() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let _sink = test_sink::install();
         let marker = "graph-sess-ended-c2v";
         let agent_name = unique_name("test_block_graph_agent");
@@ -21385,7 +22526,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_suppresses_inherited_session_in_isolated_macro() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         ctx.macro_flag = true;
         ctx.update_app_config(|app| app.agent_session = Some("inherited".to_string()));
@@ -21418,7 +22559,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_engages_inherited_session_in_non_isolated_macro() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         ctx.macro_flag = true;
         ctx.macro_non_isolated = true;
@@ -21452,7 +22593,7 @@ mod tests {
     #[test]
     #[serial]
     fn use_agent_resets_pre_agent_todo_state() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         // No session attached: use_agent bails on an existing one, so the
         // pre-agent state only ever lives on the bare ctx.
@@ -21526,7 +22667,7 @@ mod tests {
     #[test]
     #[serial]
     fn install_builtin_agents_force_overwrites_only_with_force() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
 
         Agent::install_builtin_agents(InstallMode::Skip).unwrap();
         let file =
@@ -21551,7 +22692,7 @@ mod tests {
     #[test]
     #[serial]
     fn install_builtin_agents_removes_stale_definition_files() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
 
         Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
@@ -21612,7 +22753,7 @@ mod tests {
     #[test]
     #[serial]
     fn install_builtin_agents_removes_stale_graph_for_config_agent() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
 
         Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
@@ -21633,7 +22774,7 @@ mod tests {
     fn install_builtin_agents_reconciles_hooks_subdir_via_manifest() {
         use crate::config::builtin_manifest::BUILTIN_MANIFEST_FILE;
 
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
 
         Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
@@ -21692,7 +22833,7 @@ mod tests {
     #[test]
     #[serial]
     fn install_builtin_skills_force_overwrites_only_with_force() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
 
         Skill::install_builtin_skills(false).unwrap();
         let file = paths::skill_file("git-master");
@@ -21717,7 +22858,7 @@ mod tests {
     #[test]
     #[serial]
     fn install_builtin_skills_installs_all_bundled() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
 
         Skill::install_builtin_skills(false).unwrap();
         assert!(paths::skill_file("git-master").exists());
@@ -21729,7 +22870,7 @@ mod tests {
     #[test]
     #[serial]
     fn bundled_assets_pin_task_queue_guidance() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
         // 1. Architect instructions: the parallel-mode "Task-queue mirroring"
@@ -21799,7 +22940,7 @@ mod tests {
     #[test]
     #[serial]
     fn bundled_assets_pin_review_incomplete_escalation() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
         // Every anchor is a single-line prefix so re-wrapping cannot break
@@ -21976,7 +23117,7 @@ mod tests {
     #[test]
     #[serial]
     fn bundled_assets_pin_verification_commands_as_declared_variable() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
         const VARIABLES_FORM: &str =
@@ -22170,7 +23311,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("config.yaml for '{name}' failed to load: {e}"))
         }
 
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
         for (name, expected) in [
@@ -22301,7 +23442,7 @@ mod tests {
                 .collect()
         }
 
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
 
         Agent::install_builtin_agents(InstallMode::Skip).unwrap();
         Skill::install_builtin_skills(false).unwrap();
@@ -22337,9 +23478,9 @@ mod tests {
 
         // Warning baseline for the shipped graphs: `_next`-routed unreachable
         // nodes, plus variable-shadowing on `coder` and `step-runner` (they
-        // declare variables whose names are also `initial_state` keys). A new
-        // rule that fires on a shipped asset (or a new bundled graph) must be
-        // recorded here deliberately.
+        // declare variables whose names are also `initial_state` keys). A
+        // new rule that fires on a shipped asset (or a new bundled graph)
+        // must be recorded here deliberately.
         let expected_warnings = BTreeMap::from([
             ("adversary".to_string(), Vec::new()),
             // The architect candidate routes almost everything through
@@ -22700,7 +23841,7 @@ mod tests {
         use crate::parsers::bash::build_bash_tool;
         use std::collections::HashSet;
 
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         Functions::install_builtin_global_tools(false).unwrap();
         Agent::install_builtin_agents(InstallMode::Skip).unwrap();
         Skill::install_builtin_skills(false).unwrap();
@@ -22846,7 +23987,7 @@ mod tests {
         use crate::graph::GraphParser;
         use crate::graph::types::NodeType;
 
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         Functions::install_builtin_global_tools(false).unwrap();
         Agent::install_builtin_agents(InstallMode::Skip).unwrap();
         Skill::install_builtin_skills(false).unwrap();
@@ -23035,7 +24176,7 @@ mod tests {
             .chain(["output", "choice", "input"])
             .collect();
 
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         Agent::install_builtin_agents(InstallMode::Skip).unwrap();
 
         let mut checked = Vec::new();
@@ -32070,7 +33211,7 @@ print(json.dumps({
     #[test]
     #[serial]
     fn install_functions_force_preserves_user_mcp_json() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
 
         Functions::install_builtin_global_tools(false).unwrap();
         let mcp = paths::mcp_config_file();
@@ -32088,7 +33229,7 @@ print(json.dumps({
     #[test]
     #[serial]
     fn install_mcp_config_merges_existing() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
 
         Functions::install_mcp_config().unwrap();
         let mcp = paths::mcp_config_file();
@@ -32288,7 +33429,7 @@ print(json.dumps({
     #[test]
     #[serial]
     fn select_functions_hides_job_tools_under_empty_agent_filter() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
         let agent_name = format!(
@@ -32327,7 +33468,7 @@ print(json.dumps({
     #[test]
     #[serial]
     fn select_functions_when_jobs_disabled_is_byte_identical_to_no_jobs_baseline() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let app_state = app_state_with_mcp_config(false, &[]);
         let mut ctx = RequestContext::new(app_state, WorkingMode::Repl);
         let app = ctx.app.config.clone();
@@ -32451,7 +33592,7 @@ print(json.dumps({
     #[test]
     #[serial]
     fn use_agent_cancels_running_jobs_of_previous_supervisor() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
         let agent_name = format!(
@@ -32491,7 +33632,7 @@ print(json.dumps({
     #[test]
     #[serial]
     fn exit_agent_cancels_running_jobs() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
 
@@ -32541,6 +33682,7 @@ print(json.dumps({
             join_handle,
             child_supervisor: None,
             session_id: None,
+            child_session_root: None,
         })
         .unwrap();
         sup.register(make_running_job(job_sig.clone())).unwrap();
@@ -32617,7 +33759,7 @@ print(json.dumps({
     #[test]
     #[serial]
     fn rebuild_tool_scope_populates_filters_from_a_filtered_role() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = RequestContext::new(mcp_app_state(&["gh"]), WorkingMode::Cmd);
         let mut role = Role::new("dev", "prompt");
         role.set_mcp_tools(Some(gh_get_only_map()));
@@ -32638,7 +33780,7 @@ print(json.dumps({
     #[test]
     #[serial]
     fn mid_node_skill_load_keeps_node_filter_layer() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = RequestContext::new(mcp_app_state(&["gh"]), WorkingMode::Cmd);
         ctx.update_app_config(|app| app.mcp_server_support = false);
         ctx.active_node_mcp_tools = Some(("n1".to_string(), gh_get_only_map()));
@@ -32673,7 +33815,7 @@ print(json.dumps({
     #[test]
     #[serial]
     fn set_skills_enabled_does_not_drop_filters() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = RequestContext::new(mcp_app_state(&["gh"]), WorkingMode::Cmd);
         let mut role = Role::new("dev", "prompt");
         role.set_mcp_tools(Some(gh_get_only_map()));
@@ -32694,7 +33836,7 @@ print(json.dumps({
         // enforced only by the filter refresh that runs after the
         // assignment. Drive the real use_session against a session file on
         // disk to prove that refresh happens.
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = RequestContext::new(mcp_app_state(&["gh"]), WorkingMode::Cmd);
         let session_path = ctx.session_file("persisted");
         ensure_parent_exists(&session_path).unwrap();
@@ -32727,7 +33869,7 @@ print(json.dumps({
         // stays on the local filesystem; the externally-backed attach path
         // needs a live vector store and cannot run here, but it funnels
         // through the same tool-scope refresh.
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = RequestContext::new(mcp_app_state(&["gh"]), WorkingMode::Cmd);
         let mut role = Role::new("dev", "prompt");
         role.set_mcp_tools(Some(gh_get_only_map()));
@@ -32759,7 +33901,7 @@ print(json.dumps({
     #[test]
     #[serial]
     fn use_agent_applies_agent_filters_without_a_session() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let config_path = paths::agent_config_file("filterer");
         ensure_parent_exists(&config_path).unwrap();
         write(
@@ -32785,7 +33927,7 @@ print(json.dumps({
     #[test]
     #[serial]
     fn use_temp_role_recomputes_filters() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = RequestContext::new(mcp_app_state(&["gh"]), WorkingMode::Cmd);
         let mut role = Role::new("dev", "prompt");
         role.set_mcp_tools(Some(gh_get_only_map()));
@@ -33107,7 +34249,7 @@ print(json.dumps({
     #[test]
     #[serial]
     fn set_mcp_tools_rejects_graph_agents_on_both_arms() {
-        let _guard = TestConfigDirGuard::new();
+        let _guard = HelperConfigDirGuard::new();
         let mut ctx = RequestContext::new(mcp_app_state(&["gh"]), WorkingMode::Cmd);
         let app = ctx.app.config.clone();
         let agent_name = format!(

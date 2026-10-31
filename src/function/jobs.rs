@@ -1558,6 +1558,7 @@ mod tests {
             join_handle,
             child_supervisor: None,
             session_id: None,
+            child_session_root: None,
         };
         let mut sup = Supervisor::new(4, 3);
         sup.register(handle).unwrap();

@@ -7,8 +7,11 @@
 //! scrubbed sandbox/provider env so host state cannot leak in.
 
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, process};
 
@@ -21,6 +24,23 @@ impl Drop for TempDirGuard {
 }
 
 const AGENT: &str = "echo-graph";
+
+/// The built binary every run here spawns; the one place the harness
+/// names it, so a test that needs its directory reads it from here.
+const COYOTE_BIN: &str = env!("CARGO_BIN_EXE_coyote");
+
+/// The workspace-memory root override the unit-test guards set; it mirrors
+/// `WORKSPACE_MEMORY_ROOT_TEST_ENV` in `src/config/memory.rs`, which an
+/// integration test cannot import from the binary crate.
+const TEST_WORKSPACE_MEMORY_ROOT_ENV: &str = "COYOTE_TEST_WORKSPACE_MEMORY_ROOT";
+
+/// The first line of every workspace index the memory probes plant; it
+/// rides under `<facts>` exactly when that workspace index does.
+const WORKSPACE_HEADER: &str = "# Workspace Memory Index";
+
+/// The `name:` the fixture graph declares; the run-time logger keys its
+/// `[graph:<name>]` prefix on `graph.name`, not on the agent directory.
+const GRAPH_NAME: &str = "echo-graph";
 
 /// The block-less graph from the local-run recipe; `session_block` is
 /// appended verbatim so each case controls exactly the top-level block.
@@ -135,23 +155,57 @@ fn scrub_coyote_env(cmd: &mut Command) -> &mut Command {
 
 /// The real binary over `dir` with `args`, from a scrubbed env and no TTY.
 fn run_with(dir: &Path, args: &[&str]) -> Output {
+    run_with_env(dir, args, &[])
+}
+
+/// `run_with` plus extra environment pairs applied after the scrub, for
+/// cases that pin a host knob (the log level) rather than inherit it.
+fn run_with_env(dir: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
+    run_from(dir, dir, args, extra_env)
+}
+
+/// `run_with_env` with the process started in `cwd` instead of the config
+/// dir, for cases where the directory the binary runs from is the lever
+/// (workspace discovery walks up from it).
+fn run_from(cwd: &Path, dir: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
     let home = dir.join("home");
-    scrub_coyote_env(&mut Command::new(env!("CARGO_BIN_EXE_coyote")))
+    let binary = Path::new(COYOTE_BIN);
+    scrub_coyote_env(&mut Command::new(binary))
         .args(args)
-        .current_dir(dir)
+        .current_dir(cwd)
         .env("COYOTE_CONFIG_DIR", dir)
         .env("COYOTE_CACHE_DIR", dir.join("cache"))
         .env("HOME", &home)
         .env("USERPROFILE", &home)
         .env("NO_COLOR", "1")
+        .env("PATH", pinned_path(binary.parent().unwrap()))
         .env_remove("COYOTE_LOG_PATH")
         .env_remove("COYOTE_WORKSPACE_CONFIG_DIR")
         .env_remove("IS_SANDBOX")
         .env_remove("COYOTE_PROVIDER")
         .env_remove("COYOTE_PLATFORM")
+        // The unit-test guard's workspace-memory pin; a shipped binary
+        // ignores it, and a run here starts without it unless a case sets it.
+        .env_remove(TEST_WORKSPACE_MEMORY_ROOT_ENV)
+        .envs(extra_env.iter().copied())
         .stdin(Stdio::null())
         .output()
         .unwrap()
+}
+
+/// A PATH holding only `bin_dir` (the built binary's own directory) and the
+/// system shell directories, so the fixture's `sh`/`bash` hooks and tool
+/// scripts resolve the same way on every host and nothing else on the
+/// developer's PATH can leak into a run. Twin of `pinned_path` in
+/// tests/graph_session_repl_binary.rs; change both together.
+fn pinned_path(bin_dir: &Path) -> std::ffi::OsString {
+    let system_dirs: Vec<PathBuf> = if cfg!(windows) {
+        let system_root = env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+        vec![Path::new(&system_root).join("System32")]
+    } else {
+        vec![PathBuf::from("/usr/bin"), PathBuf::from("/bin")]
+    };
+    env::join_paths(std::iter::once(bin_dir.to_path_buf()).chain(system_dirs)).unwrap()
 }
 
 fn stdout_of(output: &Output) -> String {
@@ -244,6 +298,785 @@ fn a_graph_with_a_valid_session_block_runs_like_one_without() {
     }
 }
 
+/// Reads the echoed request a dry-run teammate returned (a YAML message
+/// list) into `(role, content)` pairs.
+fn echoed_messages(echo: &str) -> Vec<(String, String)> {
+    let doc: serde_yaml::Value = serde_yaml::from_str(echo)
+        .unwrap_or_else(|e| panic!("a teammate's output is not the echoed request ({e}):\n{echo}"));
+    doc.as_sequence()
+        .unwrap_or_else(|| panic!("the echoed request is not a message list:\n{echo}"))
+        .iter()
+        .map(|message| {
+            let role = message["role"]
+                .as_str()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let content = match &message["content"] {
+                serde_yaml::Value::String(text) => text.clone(),
+                other => serde_yaml::to_string(other).unwrap_or_default(),
+            };
+            (role, content)
+        })
+        .collect()
+}
+
+/// A config agent that runs on its own named session (`agent_session`), so
+/// a dry-run call echoes the full message list it would have sent rather
+/// than the flattened role text.
+fn write_sessioned_config_agent(dir: &Path, name: &str) {
+    let agent_dir = dir.join("agents").join(name);
+    fs::create_dir_all(&agent_dir).unwrap();
+    fs::write(
+        agent_dir.join("config.yaml"),
+        format!(
+            "name: {name}\ndescription: A helper.\ninstructions: Be brief.\nagent_session: t\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// Two config agents fanned out in one super-step with `teammates: true`
+/// each run as a teammate of the other. Under dry run every model call
+/// echoes the request it would have sent, so the state the fan-out leaves
+/// behind shows exactly what each teammate was told: the roster rides the
+/// System message (after the agent's own instructions), names the agent's
+/// own seat by the node id and the other node as the peer, and the User
+/// message is the bare `prompt:` of the node with no roster in it. Without
+/// `teammates: true` neither request carries a roster. A script node dumps
+/// the raw state to a file so the oracle does not depend on how the end
+/// node's markdown is rendered.
+#[test]
+fn usage_probe_config_teammates_in_a_fan_out_get_the_roster_in_the_system_prompt_only() {
+    if cfg!(windows) {
+        eprintln!("skipping: the fan-out joins through a bash script");
+        return;
+    }
+    for teammates in [true, false] {
+        let dir = fresh_config_dir("teammate-roster");
+        let _guard = TempDirGuard(dir.clone());
+        write_fixture(&dir, "");
+        write_sessioned_config_agent(&dir, "alpha");
+        write_sessioned_config_agent(&dir, "beta");
+        let agent_dir = dir.join("agents").join(AGENT);
+        let scripts = agent_dir.join("scripts");
+        fs::create_dir_all(&scripts).unwrap();
+        fs::write(scripts.join("fan.sh"), "#!/usr/bin/env bash\nprintf '{}'\n").unwrap();
+        let dump = dir.join("state.json");
+        fs::write(
+            scripts.join("dump.sh"),
+            format!(
+                "#!/usr/bin/env bash\n\
+                 out='{}'\n\
+                 if [ -n \"${{GRAPH_STATE_FILE:-}}\" ]; then cp \"$GRAPH_STATE_FILE\" \"$out\"; \
+                 else printf '%s' \"$GRAPH_STATE\" > \"$out\"; fi\n\
+                 printf '{{}}'\n",
+                dump.display()
+            ),
+        )
+        .unwrap();
+        let flag = if teammates { "teammates: true, " } else { "" };
+        fs::write(
+            agent_dir.join("graph.yaml"),
+            format!(
+                "name: echo-graph\n\
+                 version: \"1.0\"\n\
+                 initial_state: {{ a: \"\", b: \"\" }}\n\
+                 start: fan\n\
+                 nodes:\n\
+                 \x20 fan: {{ type: script, script: scripts/fan.sh, next: [worker_a, worker_b] }}\n\
+                 \x20 worker_a: {{ type: agent, agent: alpha, prompt: \"hi from a\", {flag}state_updates: {{ a: \"{{{{output}}}}\" }}, next: join }}\n\
+                 \x20 worker_b: {{ type: agent, agent: beta, prompt: \"hi from b\", {flag}state_updates: {{ b: \"{{{{output}}}}\" }}, next: join }}\n\
+                 \x20 join: {{ type: script, script: scripts/dump.sh, next: done }}\n\
+                 \x20 done: {{ type: end, output: \"done\" }}\n"
+            ),
+        )
+        .unwrap();
+
+        let output = run_with(&dir, &["-a", AGENT, "go"]);
+        let text = format!("{}\n{}", stderr_of(&output), stdout_of(&output));
+        assert!(
+            output.status.success()
+                && !text.contains("panicked")
+                && stdout_of(&output).lines().any(|l| l == "done"),
+            "teammates={teammates}: the fan-out completes: exit {:?}\n{text}",
+            output.status
+        );
+        let state = fs::read_to_string(&dump).unwrap_or_else(|e| {
+            panic!("teammates={teammates}: the join dumped no state ({e}):\n{text}")
+        });
+        let state: serde_json::Value = serde_json::from_str(&state).unwrap();
+
+        for (key, own, peer, prompt) in [
+            ("a", "worker_a", "worker_b", "hi from a"),
+            ("b", "worker_b", "worker_a", "hi from b"),
+        ] {
+            let echo = state[key].as_str().unwrap_or_else(|| {
+                panic!("teammates={teammates}: state.{key} is not the echo:\n{state}")
+            });
+            let messages = echoed_messages(echo);
+            let (first_role, system) = &messages[0];
+            assert_eq!(first_role, "system", "teammates={teammates} {key}:\n{echo}");
+            let users: Vec<&String> = messages
+                .iter()
+                .filter(|(role, _)| role == "user")
+                .map(|(_, content)| content)
+                .collect();
+            assert_eq!(
+                users,
+                vec![prompt],
+                "teammates={teammates} {key}: the User message is the bare node prompt:\n{echo}"
+            );
+            if teammates {
+                assert!(
+                    system.starts_with("Be brief.\n\n## Teammate roster\n"),
+                    "{key}: the roster follows the agent's own instructions in the System message:\n{system}"
+                );
+                assert!(
+                    system.contains(&format!("({own})")) && system.contains("You are `"),
+                    "{key}: the roster names this teammate's own seat by node id:\n{system}"
+                );
+                assert!(
+                    system.contains(peer),
+                    "{key}: the roster names the other node as a peer:\n{system}"
+                );
+                assert_eq!(
+                    echo.matches("## Teammate roster").count(),
+                    1,
+                    "{key}: exactly one roster in the whole request:\n{echo}"
+                );
+            } else {
+                assert!(
+                    !echo.contains("Teammate roster"),
+                    "{key}: no roster without `teammates: true`:\n{echo}"
+                );
+            }
+        }
+    }
+}
+
+/// The fan-out graph the roster probes share: `fan` splits into two
+/// `teammates: true` agent nodes on config agents `alpha` / `beta`, `join`
+/// dumps the raw state (each teammate's echoed request) to `dump`.
+fn write_roster_fan_out(dir: &Path, dump: &Path) {
+    let agent_dir = dir.join("agents").join(AGENT);
+    let scripts = agent_dir.join("scripts");
+    fs::create_dir_all(&scripts).unwrap();
+    fs::write(scripts.join("fan.sh"), "#!/usr/bin/env bash\nprintf '{}'\n").unwrap();
+    fs::write(
+        scripts.join("dump.sh"),
+        format!(
+            "#!/usr/bin/env bash\n\
+             out='{}'\n\
+             if [ -n \"${{GRAPH_STATE_FILE:-}}\" ]; then cp \"$GRAPH_STATE_FILE\" \"$out\"; \
+             else printf '%s' \"$GRAPH_STATE\" > \"$out\"; fi\n\
+             printf '{{}}'\n",
+            dump.display()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        agent_dir.join("graph.yaml"),
+        "name: echo-graph\n\
+         version: \"1.0\"\n\
+         initial_state: { a: \"\", b: \"\" }\n\
+         start: fan\n\
+         nodes:\n\
+         \x20 fan: { type: script, script: scripts/fan.sh, next: [worker_a, worker_b] }\n\
+         \x20 worker_a: { type: agent, agent: alpha, prompt: \"hi from a\", teammates: true, state_updates: { a: \"{{output}}\" }, next: join }\n\
+         \x20 worker_b: { type: agent, agent: beta, prompt: \"hi from b\", teammates: true, state_updates: { b: \"{{output}}\" }, next: join }\n\
+         \x20 join: { type: script, script: scripts/dump.sh, next: done }\n\
+         \x20 done: { type: end, output: \"done\" }\n",
+    )
+    .unwrap();
+}
+
+/// Runs the roster fan-out and returns the echoed requests keyed `a` / `b`.
+fn run_roster_fan_out(label: &str, dir: &Path, dump: &Path) -> serde_json::Value {
+    let output = run_with(dir, &["-a", AGENT, "go"]);
+    let text = format!("{}\n{}", stderr_of(&output), stdout_of(&output));
+    assert!(
+        output.status.success()
+            && !text.contains("panicked")
+            && stdout_of(&output).lines().any(|l| l == "done"),
+        "{label}: the fan-out completes: exit {:?}\n{text}",
+        output.status
+    );
+    let state = fs::read_to_string(dump)
+        .unwrap_or_else(|e| panic!("{label}: the join dumped no state ({e}):\n{text}"));
+    serde_json::from_str(&state).unwrap()
+}
+
+/// A teammate that keeps an `agent_session` is RESUMED on the next run:
+/// the model sees the stored message list, including the System row saved
+/// under the previous run. That row carried the previous run's roster, whose
+/// seat ids are minted per run, so a resumed teammate must be re-told the
+/// current roster: exactly one `## Teammate roster`, naming this run's node
+/// ids, with the stale seat gone, while the earlier exchange survives in
+/// order and the new User message is still the bare node prompt. From a cold
+/// start the previous run is a hand-written session file: the stored System
+/// row is the agent's instructions plus a roster for a seat that no longer
+/// exists.
+#[test]
+fn usage_probe_a_resumed_agent_session_teammate_is_re_told_the_current_roster() {
+    if cfg!(windows) {
+        eprintln!("skipping: the fan-out joins through a bash script");
+        return;
+    }
+    const STALE_SEAT: &str = "graph_agent_alpha_deadbeef";
+    let dir = fresh_config_dir("teammate-resumed-roster");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, "");
+    write_sessioned_config_agent(&dir, "alpha");
+    write_sessioned_config_agent(&dir, "beta");
+    let dump = dir.join("state.json");
+    write_roster_fan_out(&dir, &dump);
+
+    // alpha's `agent_session: t` from an earlier run: the stored System row
+    // is the instructions plus that run's roster, followed by one exchange.
+    let stale_system = format!(
+        "Be brief.\n\n## Teammate roster\nYou are `{STALE_SEAT}` (worker_a). Peers: `graph_agent_beta_cafef00d` (worker_b)."
+    );
+    let sessions = dir.join("agents").join("alpha").join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(
+        sessions.join("t.yaml"),
+        format!(
+            "model: dryrun:dry-model\n\
+             agent_instructions: {system:?}\n\
+             messages:\n\
+             \x20 - role: system\n\
+             \x20   content: {system:?}\n\
+             \x20 - role: user\n\
+             \x20   content: earlier\n\
+             \x20 - role: assistant\n\
+             \x20   content: noted\n",
+            system = stale_system
+        ),
+    )
+    .unwrap();
+
+    let state = run_roster_fan_out("resumed", &dir, &dump);
+    let echo = state["a"]
+        .as_str()
+        .unwrap_or_else(|| panic!("state.a is not the echo:\n{state}"));
+    let messages = echoed_messages(echo);
+    let (first_role, system) = &messages[0];
+    assert_eq!(first_role, "system", "{echo}");
+    assert!(
+        system.starts_with("Be brief.\n\n## Teammate roster\n"),
+        "the resumed System row is the instructions plus a roster:\n{system}"
+    );
+    assert!(
+        system.contains("(worker_a)") && system.contains("worker_b"),
+        "the roster names this run's own seat and peer:\n{system}"
+    );
+    assert!(
+        !echo.contains(STALE_SEAT) && !echo.contains("cafef00d"),
+        "the previous run's seat ids are gone from the whole request:\n{echo}"
+    );
+    assert_eq!(
+        echo.matches("## Teammate roster").count(),
+        1,
+        "exactly one roster after the re-adoption:\n{echo}"
+    );
+    let roles: Vec<&str> = messages.iter().map(|(role, _)| role.as_str()).collect();
+    assert_eq!(
+        roles,
+        ["system", "user", "assistant", "user"],
+        "the earlier exchange survives in order ahead of the new prompt:\n{echo}"
+    );
+    let users: Vec<&String> = messages
+        .iter()
+        .filter(|(role, _)| role == "user")
+        .map(|(_, content)| content)
+        .collect();
+    assert_eq!(
+        users,
+        vec!["earlier", "hi from a"],
+        "the stored User text is untouched and the new one is the bare prompt:\n{echo}"
+    );
+
+    // The fresh teammate in the same run is unaffected by its peer's resume.
+    let echo_b = state["b"].as_str().unwrap();
+    assert_eq!(echo_b.matches("## Teammate roster").count(), 1, "{echo_b}");
+    assert!(!echo_b.contains(STALE_SEAT), "{echo_b}");
+}
+
+/// A teammate whose instructions come from its `_instructions` hook every
+/// turn (`dynamic_instructions: true`) still carries the roster: the roster
+/// is appended after whatever text the hook produced, so the System row
+/// starts with the hook's text and ends with exactly one roster naming this
+/// run's seats. The hook's text differs from the static `instructions:`
+/// line on purpose, proving the roster rode the dynamic branch and not a
+/// stale static copy.
+#[test]
+fn usage_probe_a_dynamic_instructions_teammate_carries_the_roster_after_the_rendered_text() {
+    if cfg!(windows) {
+        eprintln!("skipping: the fan-out joins through a bash script");
+        return;
+    }
+    let dir = fresh_config_dir("teammate-dynamic-roster");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, "");
+    write_sessioned_config_agent(&dir, "beta");
+    let alpha_dir = dir.join("agents").join("alpha");
+    fs::create_dir_all(&alpha_dir).unwrap();
+    fs::write(
+        alpha_dir.join("config.yaml"),
+        "name: alpha\n\
+         description: A helper.\n\
+         instructions: Be brief.\n\
+         dynamic_instructions: true\n\
+         agent_session: t\n",
+    )
+    .unwrap();
+    fs::write(
+        alpha_dir.join("tools.sh"),
+        "#!/usr/bin/env bash\n\
+         set -eo pipefail\n\
+         # @env LLM_OUTPUT=/dev/stdout\n\
+         # @describe alpha tools\n\
+         \n\
+         # @cmd Dynamic instructions hook.\n\
+         _instructions() { printf 'Be brief about cats.' >> \"$LLM_OUTPUT\"; }\n",
+    )
+    .unwrap();
+    let dump = dir.join("state.json");
+    write_roster_fan_out(&dir, &dump);
+
+    let state = run_roster_fan_out("dynamic", &dir, &dump);
+    let echo = state["a"]
+        .as_str()
+        .unwrap_or_else(|| panic!("state.a is not the echo:\n{state}"));
+    let messages = echoed_messages(echo);
+    let (first_role, system) = &messages[0];
+    assert_eq!(first_role, "system", "{echo}");
+    assert!(
+        system.starts_with("Be brief about cats.\n\n## Teammate roster\n"),
+        "the roster follows the hook's dynamic instructions:\n{system}"
+    );
+    assert!(
+        !system.starts_with("Be brief.\n"),
+        "the static `instructions:` line did not win over the dynamic hook:\n{system}"
+    );
+    assert!(
+        system.contains("(worker_a)") && system.contains("worker_b"),
+        "the roster names this run's own seat and peer:\n{system}"
+    );
+    assert_eq!(
+        echo.matches("## Teammate roster").count(),
+        1,
+        "exactly one roster in the whole request:\n{echo}"
+    );
+    let users: Vec<&String> = messages
+        .iter()
+        .filter(|(role, _)| role == "user")
+        .map(|(_, content)| content)
+        .collect();
+    assert_eq!(
+        users,
+        vec!["hi from a"],
+        "the User message is the bare node prompt:\n{echo}"
+    );
+}
+
+/// A single PLAIN agent node (no `teammates: true`) on config agent `alpha`,
+/// followed by the same state dump the roster fan-out uses: `worker` is the
+/// start node, `join` dumps the raw state to `dump`.
+fn write_plain_resume_graph(dir: &Path, dump: &Path) {
+    write_roster_fan_out(dir, dump);
+    fs::write(
+        dir.join("agents").join(AGENT).join("graph.yaml"),
+        "name: echo-graph\n\
+         version: \"1.0\"\n\
+         initial_state: { a: \"\" }\n\
+         start: worker\n\
+         nodes:\n\
+         \x20 worker: { type: agent, agent: alpha, prompt: \"hi from a\", state_updates: { a: \"{{output}}\" }, next: join }\n\
+         \x20 join: { type: script, script: scripts/dump.sh, next: done }\n\
+         \x20 done: { type: end, output: \"done\" }\n",
+    )
+    .unwrap();
+}
+
+/// Writes alpha's stored `agent_session: t` from an earlier run: `system`
+/// is both the System row and `agent_instructions`, followed by one
+/// exchange; `extra` is spliced in as further top-level session fields.
+fn write_alpha_session(dir: &Path, system: &str, extra: &str) {
+    let sessions = dir.join("agents").join("alpha").join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(
+        sessions.join("t.yaml"),
+        format!(
+            "model: dryrun:dry-model\n\
+             agent_instructions: {system:?}\n\
+             {extra}\
+             messages:\n\
+             \x20 - role: system\n\
+             \x20   content: {system:?}\n\
+             \x20 - role: user\n\
+             \x20   content: earlier\n\
+             \x20 - role: assistant\n\
+             \x20   content: noted\n",
+        ),
+    )
+    .unwrap();
+}
+
+/// Resuming a stored `agent_session` from a PLAIN agent node (no
+/// `teammates: true`) is the unseated shape: this run has no roster to
+/// append, yet the stored System row may carry the previous run's roster
+/// for seats that no longer exist. That row is re-adopted from the agent's
+/// own instructions, so the model sees exactly `Be brief.` with no roster
+/// text anywhere, the earlier exchange in order and the bare node prompt.
+/// A stored session that never carried a roster is the ordinary resume: it
+/// keeps speaking with the System row it was saved under, even though the
+/// configured instructions differ, so nothing re-adopts it.
+#[test]
+fn usage_probe_an_unseated_resume_drops_a_stored_roster_and_leaves_a_plain_row_alone() {
+    if cfg!(windows) {
+        eprintln!("skipping: the state dump goes through a bash script");
+        return;
+    }
+    const STALE_SEAT: &str = "graph_agent_alpha_deadbeef";
+    for (label, stored_system, expected_system) in [
+        (
+            "stale roster",
+            format!(
+                "Be brief.\n\n## Teammate roster\nYou are `{STALE_SEAT}` (worker_a). Peers: `graph_agent_beta_cafef00d` (worker_b)."
+            ),
+            "Be brief.".to_string(),
+        ),
+        (
+            "no roster",
+            "Old prompt from the stored run.".to_string(),
+            "Old prompt from the stored run.".to_string(),
+        ),
+    ] {
+        let dir = fresh_config_dir("unseated-resume");
+        let _guard = TempDirGuard(dir.clone());
+        write_fixture(&dir, "");
+        write_sessioned_config_agent(&dir, "alpha");
+        let dump = dir.join("state.json");
+        write_plain_resume_graph(&dir, &dump);
+        write_alpha_session(&dir, &stored_system, "");
+
+        let state = run_roster_fan_out(label, &dir, &dump);
+        let echo = state["a"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{label}: state.a is not the echo:\n{state}"));
+        let messages = echoed_messages(echo);
+        let (first_role, system) = &messages[0];
+        assert_eq!(first_role, "system", "{label}:\n{echo}");
+        // A re-adopted row is the agent's prompt, which the built-in tool
+        // guidance follows; a row left alone is sent exactly as stored.
+        assert!(
+            system.starts_with(&expected_system),
+            "{label}: the System row the resumed agent speaks with:\n{echo}"
+        );
+        if label == "no roster" {
+            assert_eq!(
+                system, &expected_system,
+                "{label}: nothing re-adopts a roster-less row:\n{echo}"
+            );
+        }
+        assert!(
+            !echo.contains("Teammate roster") && !echo.contains(STALE_SEAT),
+            "{label}: no roster text anywhere in the request:\n{echo}"
+        );
+        let roles: Vec<&str> = messages.iter().map(|(role, _)| role.as_str()).collect();
+        assert_eq!(
+            roles,
+            ["system", "user", "assistant", "user"],
+            "{label}:\n{echo}"
+        );
+        let users: Vec<&String> = messages
+            .iter()
+            .filter(|(role, _)| role == "user")
+            .map(|(_, content)| content)
+            .collect();
+        assert_eq!(users, vec!["earlier", "hi from a"], "{label}:\n{echo}");
+    }
+}
+
+/// The same unseated resume for a `dynamic_instructions` agent: the stored
+/// session re-enters as the session's dynamic text, so the model sees the
+/// text the earlier run stored (not what the hook says today) with its
+/// trailing roster cut, and nothing else.
+#[test]
+fn usage_probe_an_unseated_dynamic_instructions_resume_keeps_the_stored_text_minus_its_roster() {
+    if cfg!(windows) {
+        eprintln!("skipping: the state dump goes through a bash script");
+        return;
+    }
+    let dir = fresh_config_dir("unseated-dynamic-resume");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, "");
+    let alpha_dir = dir.join("agents").join("alpha");
+    fs::create_dir_all(&alpha_dir).unwrap();
+    fs::write(
+        alpha_dir.join("config.yaml"),
+        "name: alpha\n\
+         description: A helper.\n\
+         instructions: Be brief.\n\
+         dynamic_instructions: true\n\
+         agent_session: t\n",
+    )
+    .unwrap();
+    fs::write(
+        alpha_dir.join("tools.sh"),
+        "#!/usr/bin/env bash\n\
+         set -eo pipefail\n\
+         # @env LLM_OUTPUT=/dev/stdout\n\
+         # @describe alpha tools\n\
+         \n\
+         # @cmd Dynamic instructions hook.\n\
+         _instructions() { printf 'Be brief about dogs.' >> \"$LLM_OUTPUT\"; }\n",
+    )
+    .unwrap();
+    let dump = dir.join("state.json");
+    write_plain_resume_graph(&dir, &dump);
+    write_alpha_session(
+        &dir,
+        "Be brief about cats.\n\n## Teammate roster\nYou are `graph_agent_alpha_deadbeef` (worker_a).",
+        "",
+    );
+
+    let state = run_roster_fan_out("dynamic unseated", &dir, &dump);
+    let echo = state["a"]
+        .as_str()
+        .unwrap_or_else(|| panic!("state.a is not the echo:\n{state}"));
+    let messages = echoed_messages(echo);
+    let (first_role, system) = &messages[0];
+    assert_eq!(first_role, "system", "{echo}");
+    assert!(
+        system.starts_with("Be brief about cats."),
+        "the stored dynamic text, roster cut, hook text not re-run:\n{echo}"
+    );
+    assert!(
+        !echo.contains("Teammate roster") && !echo.contains("deadbeef"),
+        "{echo}"
+    );
+    assert!(
+        !echo.contains("dogs"),
+        "the stored session is not re-rendered by the hook:\n{echo}"
+    );
+    let users: Vec<&String> = messages
+        .iter()
+        .filter(|(role, _)| role == "user")
+        .map(|(_, content)| content)
+        .collect();
+    assert_eq!(users, vec!["earlier", "hi from a"], "{echo}");
+}
+
+/// A teammate resumed on a COMPRESSED `agent_session`: the stored System row
+/// is the prompt of the run that compressed it followed by the summary, and
+/// `compressed_system_prompt` holds that prompt. Re-adoption replaces only
+/// the prompt at the head of the row, so the summary survives behind this
+/// run's prompt and roster. When the row no longer starts with the stored
+/// prompt, nothing is rewritten: the row is sent as stored and the run log
+/// says why.
+#[test]
+fn usage_probe_a_compressed_resume_keeps_its_summary_and_a_drifted_row_is_left_alone() {
+    if cfg!(windows) {
+        eprintln!("skipping: the fan-out joins through a bash script");
+        return;
+    }
+    const STALE_SEAT: &str = "graph_agent_alpha_deadbeef";
+    const SUMMARY: &str = "Summary: earlier we settled on cats.";
+    let stale_system = format!(
+        "Be brief.\n\n## Teammate roster\nYou are `{STALE_SEAT}` (worker_a). Peers: `graph_agent_beta_cafef00d` (worker_b)."
+    );
+    for (label, stored_prompt, row) in [
+        (
+            "prefix hit",
+            stale_system.clone(),
+            format!("{stale_system}\n\n{SUMMARY}"),
+        ),
+        (
+            "prefix miss",
+            "Be brief.".to_string(),
+            format!("Something else entirely.\n\n{stale_system}\n\n{SUMMARY}"),
+        ),
+    ] {
+        let dir = fresh_config_dir("compressed-resume");
+        let _guard = TempDirGuard(dir.clone());
+        write_fixture(&dir, "");
+        write_sessioned_config_agent(&dir, "alpha");
+        write_sessioned_config_agent(&dir, "beta");
+        let dump = dir.join("state.json");
+        write_roster_fan_out(&dir, &dump);
+        let sessions = dir.join("agents").join("alpha").join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            sessions.join("t.yaml"),
+            format!(
+                "model: dryrun:dry-model\n\
+                 agent_instructions: {stale_system:?}\n\
+                 compressed_system_prompt: {stored_prompt:?}\n\
+                 messages:\n\
+                 \x20 - role: system\n\
+                 \x20   content: {row:?}\n\
+                 \x20 - role: user\n\
+                 \x20   content: earlier\n\
+                 \x20 - role: assistant\n\
+                 \x20   content: noted\n",
+            ),
+        )
+        .unwrap();
+
+        let output = run_with_env(&dir, &["-a", AGENT, "go"], &[("COYOTE_LOG_LEVEL", "warn")]);
+        let text = format!("{}\n{}", stderr_of(&output), stdout_of(&output));
+        assert!(
+            output.status.success()
+                && !text.contains("panicked")
+                && stdout_of(&output).lines().any(|l| l == "done"),
+            "{label}: the fan-out completes: exit {:?}\n{text}",
+            output.status
+        );
+        let state: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&dump).unwrap()).unwrap();
+        let echo = state["a"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{label}: state.a is not the echo:\n{state}"));
+        let messages = echoed_messages(echo);
+        let (first_role, system) = &messages[0];
+        assert_eq!(first_role, "system", "{label}:\n{echo}");
+        let log = fs::read_to_string(dir.join("cache").join("coyote.log")).unwrap_or_default();
+        let kept_line = "keeps its summary row: it does not start with the stored prompt";
+        if label == "prefix hit" {
+            assert!(
+                system.starts_with("Be brief.\n\n## Teammate roster\n"),
+                "{label}: this run's prompt and roster lead the row:\n{system}"
+            );
+            assert!(
+                system.ends_with(&format!("\n\n{SUMMARY}")),
+                "{label}: the summary survives behind the fresh prompt:\n{system}"
+            );
+            assert!(
+                system.contains("(worker_a)") && system.contains("worker_b"),
+                "{label}: the roster names this run's seats:\n{system}"
+            );
+            assert!(
+                !echo.contains(STALE_SEAT) && !echo.contains("cafef00d"),
+                "{label}: the stale seats are gone:\n{echo}"
+            );
+            assert_eq!(
+                echo.matches("## Teammate roster").count(),
+                1,
+                "{label}:\n{echo}"
+            );
+            assert!(
+                !log.contains(kept_line),
+                "{label}: nothing to warn about:\n{log}"
+            );
+        } else {
+            assert_eq!(
+                system, &row,
+                "{label}: a row that drifted from the stored prompt is sent as stored:\n{echo}"
+            );
+            assert_eq!(
+                log.lines()
+                    .filter(|l| l.contains("[WARN]") && l.contains(kept_line))
+                    .count(),
+                1,
+                "{label}: the run log says once why the row was left alone:\n{log}"
+            );
+        }
+        let users: Vec<&String> = messages
+            .iter()
+            .filter(|(role, _)| role == "user")
+            .map(|(_, content)| content)
+            .collect();
+        assert_eq!(users, vec!["earlier", "hi from a"], "{label}:\n{echo}");
+    }
+}
+
+/// Declaring `carry:` lifts the engage-time validator pass onto a block-less
+/// graph, but not the session rule: a graph agent without a `session:` block
+/// is still refused a `--session`, with the teaching sentence, and no session
+/// file (and so no carried state) is written. The same graph takes the
+/// session the moment a block exists.
+#[test]
+fn usage_probe_a_carry_only_graph_is_still_refused_a_session() {
+    const TEACHING: &str = "Graph-based agent 'echo-graph' has no `session:` block in its graph.yaml, \
+         so it cannot hold a session. Add a `session:` block (see the Graph Agents \
+         wiki page, \"Sessions\") to enable one.";
+    let dir = fresh_config_dir("carry-no-session");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, "carry: [said]\n");
+    let config = dir.join("config.yaml");
+    let text = fs::read_to_string(&config).unwrap();
+    fs::write(
+        &config,
+        text.replace("dry_run: true\n", "dry_run: false\nsave_session: true\n"),
+    )
+    .unwrap();
+
+    let output = run_with(&dir, &["-a", AGENT, "--session", "s", "hello"]);
+    let text = format!("{}\n{}", stderr_of(&output), stdout_of(&output));
+    assert!(
+        !output.status.success() && !text.contains("panicked"),
+        "a carry-only graph cannot take a session: exit {:?}\n{text}",
+        output.status
+    );
+    assert!(
+        text.contains(TEACHING),
+        "the refusal carries the teaching sentence:\n{text}"
+    );
+    let sessions = dir.join("agents").join(AGENT).join("sessions");
+    assert!(
+        !sessions.join("s.yaml").exists(),
+        "a refused session writes no file:\n{text}"
+    );
+
+    // The same graph with a block holds the session and carries `said`.
+    let dir = fresh_config_dir("carry-with-session");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, "");
+    let config = dir.join("config.yaml");
+    let text = fs::read_to_string(&config).unwrap();
+    fs::write(
+        &config,
+        text.replace("dry_run: true\n", "dry_run: false\nsave_session: true\n"),
+    )
+    .unwrap();
+    fs::write(
+        dir.join("agents").join(AGENT).join("graph.yaml"),
+        "name: echo-graph\n\
+         version: \"1.0\"\n\
+         initial_state: { said: \"\" }\n\
+         carry: [said]\n\
+         start: done\n\
+         nodes:\n\
+         \x20 done: { type: end, output: \"{{initial_prompt}}\", state_updates: { said: \"{{initial_prompt}}\" } }\n\
+         session:\n\
+         \x20 chat:\n\
+         \x20   instructions: Answer.\n",
+    )
+    .unwrap();
+    let output = run_with(&dir, &["-a", AGENT, "--session", "s", "hello"]);
+    let text = format!("{}\n{}", stderr_of(&output), stdout_of(&output));
+    assert!(
+        output.status.success() && !text.contains("panicked"),
+        "the same graph with a block takes the session: exit {:?}\n{text}",
+        output.status
+    );
+    let yaml = fs::read_to_string(
+        dir.join("agents")
+            .join(AGENT)
+            .join("sessions")
+            .join("s.yaml"),
+    )
+    .unwrap_or_else(|e| panic!("the session file was not written ({e}):\n{text}"));
+    let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+    assert_eq!(
+        doc["last_run"]["carried"]["said"].as_str(),
+        Some("hello"),
+        "the carried key is recorded on the session:\n{yaml}"
+    );
+}
+
 #[test]
 fn every_documented_session_block_mistake_fails_at_graph_load() {
     const HINT: &str = "Optional top-level block: `session` (keys: expose, route, chat).";
@@ -304,6 +1137,11 @@ fn every_documented_session_block_mistake_fails_at_graph_load() {
             "blank expose entry",
             "session:\n  expose: [\"  \"]\n  chat:\n    instructions: Answer.\n",
             &["session.expose entry #0 is blank"],
+        ),
+        (
+            "reserved expose key",
+            "session:\n  expose: [previous_turns]\n  chat:\n    instructions: Answer.\n",
+            &["session.expose key 'previous_turns' is reserved (the dispatcher seeds it)"],
         ),
         (
             "session is a scalar",
@@ -1268,6 +2106,413 @@ fn usage_probe_carry_list_rules_hold_from_a_cold_start() {
     }
 }
 
+/// A `carry:` list with no `session:` block loads, but the agent is told at
+/// engage that nothing is carried between REPL turns until a block exists:
+/// one warning line on stderr. `-e hello` is shell-execute mode, so this
+/// pins only the engage half; the run-time copy in the log is pinned by
+/// `usage_probe_carry_without_a_session_block_is_warned_in_the_run_log_too`.
+#[test]
+fn usage_probe_carry_without_a_session_block_warns_once_at_engage() {
+    const WARNING: &str = "Warning: carry: is declared but the graph has no session: block; nothing is carried between REPL turns until one exists (a child resumed by session_id still carries)";
+    let dir = fresh_config_dir("carry-warn");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, "carry: [said]\n");
+
+    let output = run_echo(&dir);
+
+    assert_echoes_hello("carry without a session block", &output);
+    let stderr = stderr_of(&output);
+    assert_eq!(
+        stderr.lines().filter(|line| *line == WARNING).count(),
+        1,
+        "expected exactly one carry warning:\n{stderr}"
+    );
+    assert!(stderr.is_ascii(), "non-ASCII warning text:\n{stderr}");
+
+    let dir = fresh_config_dir("carry-block");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(
+        &dir,
+        "carry: [said]\nsession:\n  chat:\n    instructions: Answer.\n",
+    );
+    let output = run_echo(&dir);
+    assert_echoes_hello("carry with a session block", &output);
+    assert!(
+        !stderr_of(&output).contains("carry:"),
+        "a graph with a session block carries, so no warning:\n{}",
+        stderr_of(&output)
+    );
+}
+
+/// A one-shot run under `--session` records the exchange and the run on the
+/// session the way a REPL turn does, so the next turn on that session reads
+/// the one-shot back through `previous_turns`. The graph is end-only, so no
+/// model is called and the fixture can leave dry run (which records nothing
+/// by contract); `save_session: true` saves the one-shot's session without a
+/// prompt.
+#[test]
+fn usage_probe_a_one_shot_run_under_a_session_is_read_back_by_the_next_turn() {
+    let dir = fresh_config_dir("one-shot");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, "");
+    let config = dir.join("config.yaml");
+    let text = fs::read_to_string(&config).unwrap();
+    assert!(
+        text.contains("dry_run: true\n"),
+        "the shared fixture is expected to opt into dry run:\n{text}"
+    );
+    fs::write(
+        &config,
+        text.replace("dry_run: true\n", "dry_run: false\nsave_session: true\n"),
+    )
+    .unwrap();
+    let agent_dir = dir.join("agents").join(AGENT);
+    fs::write(
+        agent_dir.join("graph.yaml"),
+        "name: echo-graph\n\
+         version: \"1.0\"\n\
+         initial_state: { said: \"\" }\n\
+         start: done\n\
+         nodes:\n\
+         \x20 done: { type: end, output: \"prev=[{{previous_turns}}] now={{initial_prompt}}\" }\n\
+         session:\n\
+         \x20 chat:\n\
+         \x20   instructions: Answer.\n",
+    )
+    .unwrap();
+
+    let first = run_with(&dir, &["-a", AGENT, "--session", "s", "hello"]);
+    let first_text = format!("{}\n{}", stderr_of(&first), stdout_of(&first));
+    assert!(
+        first.status.success() && !first_text.contains("panicked"),
+        "one-shot: exit {:?}\n{first_text}",
+        first.status
+    );
+    assert!(
+        stdout_of(&first)
+            .lines()
+            .any(|line| line == "prev=[] now=hello"),
+        "the first run sees no earlier turns:\n{first_text}"
+    );
+    let saved = agent_dir.join("sessions").join("s.yaml");
+    let yaml = fs::read_to_string(&saved)
+        .unwrap_or_else(|e| panic!("the session file was not written ({e}):\n{first_text}"));
+    let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+    assert_eq!(
+        doc["last_run"]["prompt"].as_str(),
+        Some("hello"),
+        "last_run.prompt is the one-shot prompt:\n{yaml}"
+    );
+    assert_eq!(
+        doc["last_run"]["output"].as_str(),
+        Some("prev=[] now=hello"),
+        "last_run.output is the one-shot output:\n{yaml}"
+    );
+
+    fs::create_dir_all(dir.join("macros")).unwrap();
+    fs::write(
+        dir.join("macros/resume.yaml"),
+        "isolated: false\nsteps:\n  - \".run again\"\n",
+    )
+    .unwrap();
+    let second = run_with(&dir, &["-a", AGENT, "--session", "s", "--macro", "resume"]);
+    let second_text = format!("{}\n{}", stderr_of(&second), stdout_of(&second));
+    assert!(
+        second.status.success() && !second_text.contains("panicked"),
+        "resume: exit {:?}\n{second_text}",
+        second.status
+    );
+    let stdout = stdout_of(&second);
+    assert!(
+        stdout.contains("prev=[user: hello\nassistant: prev=[] now=hello] now=again"),
+        "the next turn reads the one-shot exchange back:\n{second_text}"
+    );
+}
+
+/// The engage-time stderr line is only half of the carry warning: a graph
+/// RUN re-validates the graph and sends the same sentence to the log file
+/// (the executor's validation warnings go to the logger, not the terminal).
+/// `-e hello` is shell-execute mode and never runs the graph, so this
+/// drives a real run with a positional prompt; an operator reading
+/// `<cache>/coyote.log` afterwards sees the engage copy and exactly one
+/// run-time copy at WARN under the graph's own prefix, in the same words.
+/// A graph with a session block logs nothing about `carry:`.
+#[test]
+fn usage_probe_carry_without_a_session_block_is_warned_in_the_run_log_too() {
+    const SENTENCE: &str = "carry: is declared but the graph has no session: block; nothing is carried between REPL turns until one exists (a child resumed by session_id still carries)";
+    assert!(BASE_GRAPH.starts_with(&format!("name: {GRAPH_NAME}\n")));
+    let dir = fresh_config_dir("carry-log");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, "carry: [said]\n");
+
+    let output = run_with_env(
+        &dir,
+        &["-a", AGENT, "hello"],
+        &[("COYOTE_LOG_LEVEL", "warn")],
+    );
+    let text = format!("{}\n{}", stderr_of(&output), stdout_of(&output));
+    assert!(
+        output.status.success()
+            && !text.contains("panicked")
+            && stdout_of(&output).lines().any(|l| l == "hello"),
+        "the graph run completes and the end node echoes the prompt: exit {:?}\n{text}",
+        output.status
+    );
+    let stderr = stderr_of(&output);
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|l| *l == format!("Warning: {SENTENCE}"))
+            .count(),
+        1,
+        "the engage line is printed once:\n{stderr}"
+    );
+
+    let log_path = dir.join("cache").join("coyote.log");
+    let log = fs::read_to_string(&log_path).unwrap_or_else(|e| {
+        panic!(
+            "the run writes {} ({e}); stderr:\n{}",
+            log_path.display(),
+            stderr_of(&output)
+        )
+    });
+    let run_time: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains(&format!("[graph:{GRAPH_NAME}] {SENTENCE}")))
+        .collect();
+    assert_eq!(
+        run_time.len(),
+        1,
+        "one graph run logs the run-time carry warning exactly once:\n{log}"
+    );
+    assert!(
+        run_time[0].contains("[WARN]") && run_time[0].is_ascii(),
+        "the run-time copy is a WARN line in ASCII:\n{}",
+        run_time[0]
+    );
+    assert!(
+        log.lines()
+            .any(|l| l.contains("[WARN]") && l.contains(&format!("Warning: {SENTENCE}"))),
+        "the engage copy is logged at WARN as well:\n{log}"
+    );
+
+    let dir = fresh_config_dir("carry-log-block");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(
+        &dir,
+        "carry: [said]\nsession:\n  chat:\n    instructions: Answer.\n",
+    );
+    let output = run_with_env(
+        &dir,
+        &["-a", AGENT, "hello"],
+        &[("COYOTE_LOG_LEVEL", "warn")],
+    );
+    assert!(
+        output.status.success() && stdout_of(&output).lines().any(|l| l == "hello"),
+        "carry with a session block runs: exit {:?}\n{}",
+        output.status,
+        stderr_of(&output)
+    );
+    let log = fs::read_to_string(dir.join("cache").join("coyote.log")).unwrap_or_default();
+    assert!(
+        !log.contains("carry:"),
+        "a graph with a session block carries, so the run logs nothing about carry:\n{log}"
+    );
+}
+
+/// `previous_turns` has a byte budget. Once a session holds more one-shot
+/// exchanges than fit, the next turn sees the newest ones whole, oldest
+/// first, behind one `[N earlier turn(s) omitted]` line whose count equals
+/// the exchanges that fell off; no dropped prompt leaks into the text. The
+/// one-shots run a graph whose end node prints a fixed word, so each
+/// exchange has a known size; the graph is rewritten before the reading
+/// turn (the session file is keyed by agent, not by graph content).
+#[test]
+fn usage_probe_a_session_past_the_turn_budget_drops_the_oldest_exchanges_whole() {
+    let dir = fresh_config_dir("turn-budget");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, "");
+    let config = dir.join("config.yaml");
+    let text = fs::read_to_string(&config).unwrap();
+    fs::write(
+        &config,
+        text.replace("dry_run: true\n", "dry_run: false\nsave_session: true\n"),
+    )
+    .unwrap();
+    let agent_dir = dir.join("agents").join(AGENT);
+    let graph = |output: &str| {
+        format!(
+            "name: echo-graph\n\
+             version: \"1.0\"\n\
+             initial_state: {{ said: \"\" }}\n\
+             start: done\n\
+             nodes:\n\
+             \x20 done: {{ type: end, output: \"{output}\" }}\n\
+             session:\n\
+             \x20 chat:\n\
+             \x20   instructions: Answer.\n"
+        )
+    };
+    fs::write(agent_dir.join("graph.yaml"), graph("ok")).unwrap();
+
+    // Four exchanges of roughly 8 KiB each: more than the 24 KiB budget, so
+    // at least one must fall off and at least one must stay whole.
+    let markers = ["one", "two", "three", "four"];
+    let pad = "a".repeat(8 * 1024);
+    for marker in markers {
+        let prompt = format!("{marker} {pad}");
+        let output = run_with(&dir, &["-a", AGENT, "--session", "s", &prompt]);
+        assert!(
+            output.status.success() && stdout_of(&output).lines().any(|l| l == "ok"),
+            "one-shot {marker}: exit {:?}\n{}",
+            output.status,
+            stderr_of(&output)
+        );
+    }
+
+    fs::write(
+        agent_dir.join("graph.yaml"),
+        graph("prev=[{{previous_turns}}] now={{initial_prompt}}"),
+    )
+    .unwrap();
+    fs::create_dir_all(dir.join("macros")).unwrap();
+    fs::write(
+        dir.join("macros/resume.yaml"),
+        "isolated: false\nsteps:\n  - \".run tail\"\n",
+    )
+    .unwrap();
+    let output = run_with(&dir, &["-a", AGENT, "--session", "s", "--macro", "resume"]);
+    let text = format!("{}\n{}", stderr_of(&output), stdout_of(&output));
+    assert!(
+        output.status.success() && !text.contains("panicked"),
+        "reading turn: exit {:?}\n{text}",
+        output.status
+    );
+    let stdout = stdout_of(&output);
+    let start = stdout
+        .find("prev=[")
+        .unwrap_or_else(|| panic!("the reading turn rendered previous_turns:\n{text}"));
+    let end = stdout[start..]
+        .find("] now=tail")
+        .map(|i| start + i)
+        .unwrap_or_else(|| panic!("the rendered turns close before `now=tail`:\n{text}"));
+    let rendered = &stdout[start + "prev=[".len()..end];
+
+    let omitted_line = rendered
+        .lines()
+        .next()
+        .unwrap_or_else(|| panic!("previous_turns is not empty:\n{text}"));
+    let dropped: usize = omitted_line
+        .strip_prefix('[')
+        .and_then(|l| l.strip_suffix(" earlier turn(s) omitted]"))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("the first line counts the dropped turns, got {omitted_line:?}"));
+    assert!(
+        dropped >= 1 && dropped < markers.len(),
+        "some but not all exchanges fell off the budget (dropped {dropped})"
+    );
+    let kept: Vec<usize> = markers
+        .iter()
+        .filter_map(|m| rendered.find(&format!("user: {m} ")))
+        .collect();
+    assert_eq!(
+        kept.len(),
+        markers.len() - dropped,
+        "the kept exchanges plus the omitted count add up to every one-shot:\n{rendered}"
+    );
+    assert!(
+        kept.windows(2).all(|w| w[0] < w[1]),
+        "kept exchanges render oldest first:\n{rendered}"
+    );
+    for dropped_marker in &markers[..dropped] {
+        assert!(
+            !rendered.contains(&format!("user: {dropped_marker} ")),
+            "the oldest exchange `{dropped_marker}` is dropped whole, not cut:\n{rendered}"
+        );
+    }
+    assert_eq!(
+        rendered.matches("assistant: ok").count(),
+        markers.len() - dropped,
+        "every kept exchange carries its whole reply:\n{rendered}"
+    );
+}
+
+/// A state too large for the environment is handed to a script node as a
+/// temp file named by `GRAPH_STATE_FILE`. From the script's point of view
+/// that file is owner-only (0600): nothing else on the host reads the graph
+/// state while the node runs, and the file is gone once the run ends. The
+/// script reports the mode and the path back through its JSON stdout, the
+/// end node echoes the mode, and the test checks the path after exit. A
+/// positional prompt drives the graph (`-e` is shell-execute mode).
+#[cfg(unix)]
+#[test]
+fn usage_probe_the_graph_state_spill_file_is_owner_only_and_removed_after_the_run() {
+    let dir = fresh_config_dir("spill-mode");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, "");
+    let agent_dir = dir.join("agents").join(AGENT);
+    let scripts = agent_dir.join("scripts");
+    fs::create_dir_all(&scripts).unwrap();
+    // `stat -c` is GNU, `stat -f` is BSD/macOS; whichever answers wins.
+    fs::write(
+        scripts.join("probe.sh"),
+        "#!/usr/bin/env bash\n\
+         if [ -z \"${GRAPH_STATE_FILE:-}\" ]; then\n\
+         \x20 printf '{\"mode\":\"inline\",\"spill\":\"\"}'\n\
+         \x20 exit 0\n\
+         fi\n\
+         m=$(stat -c %a \"$GRAPH_STATE_FILE\" 2>/dev/null || stat -f %Lp \"$GRAPH_STATE_FILE\")\n\
+         printf '{\"mode\":\"%s\",\"spill\":\"%s\"}' \"$m\" \"$GRAPH_STATE_FILE\"\n",
+    )
+    .unwrap();
+    // 48 KiB of payload: past the 32 KiB inline ceiling by a margin that
+    // does not depend on the JSON framing around it.
+    let blob = "x".repeat(48 * 1024);
+    fs::write(
+        agent_dir.join("graph.yaml"),
+        format!(
+            "name: echo-graph\n\
+             version: \"1.0\"\n\
+             initial_state: {{ said: \"\", mode: \"\", spill: \"\", blob: \"{blob}\" }}\n\
+             start: probe\n\
+             nodes:\n\
+             \x20 probe: {{ type: script, script: scripts/probe.sh, next: done }}\n\
+             \x20 done: {{ type: end, output: \"mode={{{{mode}}}} spill={{{{spill}}}}\" }}\n"
+        ),
+    )
+    .unwrap();
+
+    let output = run_with(&dir, &["-a", AGENT, "hello"]);
+    let text = format!("{}\n{}", stderr_of(&output), stdout_of(&output));
+    assert!(
+        output.status.success() && !text.contains("panicked"),
+        "spill run: exit {:?}\n{text}",
+        output.status
+    );
+    let line = stdout_of(&output)
+        .lines()
+        .rev()
+        .find(|l| l.starts_with("mode="))
+        .unwrap_or_else(|| panic!("the end node reports the probe's findings:\n{text}"))
+        .to_string();
+    let spill = line
+        .split_once(" spill=")
+        .map(|(_, p)| p.trim().to_string())
+        .unwrap_or_default();
+    assert!(
+        line.starts_with("mode=600 "),
+        "the spill file is owner-only while the script runs (got {line:?}):\n{text}"
+    );
+    assert!(
+        !spill.is_empty() && spill.ends_with(".json"),
+        "the script saw a real spill path (got {spill:?}):\n{text}"
+    );
+    assert!(
+        !Path::new(&spill).exists(),
+        "the spill file {spill} is removed once the run ends"
+    );
+}
+
 /// `graph.example.yaml` enables the `ddg-search` MCP server, which the
 /// bundled `mcp.json` launches through `uvx`. That launcher is not on every
 /// host (the CI runners lack it), and a cold start of the example tries to
@@ -1352,7 +2597,7 @@ fn usage_probe_example_carry_fixture_is_line_ending_independent() {
     );
     let crlf = lf.replace('\n', "\r\n");
     assert!(
-        crlf.contains("\r\n# carry:\r\n#   - final_report\r\n"),
+        crlf.contains(&COMMENTED_CARRY.replace('\n', "\r\n")),
         "CRLF fixture must present the carry block with CRLF bytes"
     );
     assert!(
@@ -1432,4 +2677,628 @@ fn usage_probe_uncommenting_the_example_carry_block_loads_from_a_cold_start() {
             );
         }
     }
+}
+
+/// Graph-Agents.md says `previous_turns` is reserved like `initial_prompt`:
+/// declaring it in `initial_state` or as a `variables[]` name fails at graph
+/// load with the quoted text, from a cold start, before any model or script
+/// runs. The same graph with the declaration dropped loads and runs.
+#[test]
+fn usage_probe_a_reserved_previous_turns_declaration_fails_at_graph_load() {
+    const GRAPH_TAIL: &str = "start: done\n\
+        nodes:\n\
+        \x20 done: { type: end, output: \"{{initial_prompt}}\" }\n";
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "previous_turns in initial_state",
+            "initial_state: { said: \"\", previous_turns: x }\n",
+            "initial_state key 'previous_turns' is reserved (the dispatcher seeds it)",
+        ),
+        (
+            "previous_turns as a variable name",
+            "initial_state: { said: \"\" }\n\
+             variables:\n\
+             \x20 - name: previous_turns\n\
+             \x20   description: the earlier turns\n\
+             \x20   default: none\n",
+            "variables[] name 'previous_turns' is reserved",
+        ),
+    ];
+    for (label, head, expected) in cases {
+        let dir = fresh_config_dir("reserved-turns");
+        let _guard = TempDirGuard(dir.clone());
+        write_fixture(&dir, "");
+        let graph = dir.join("agents").join(AGENT).join("graph.yaml");
+        fs::write(
+            &graph,
+            format!(
+                "name: echo-graph\nversion: \"1.0\"\ndescription: Echoes the prompt.\n{head}{GRAPH_TAIL}"
+            ),
+        )
+        .unwrap();
+        let output = run_echo(&dir);
+        assert_fails_at_graph_load(label, &output, &[expected]);
+        // The run never reached the graph: the dry-run echo is absent.
+        assert!(
+            !stdout_of(&output).lines().any(|line| line == "hello"),
+            "{label}: the graph ran despite the reserved key:\n{}",
+            stdout_of(&output)
+        );
+
+        // Control: the same graph without the reserved declaration runs.
+        let clean = head
+            .replace(", previous_turns: x", "")
+            .replace("previous_turns", "earlier_turns");
+        fs::write(
+            &graph,
+            format!(
+                "name: echo-graph\nversion: \"1.0\"\ndescription: Echoes the prompt.\n{clean}{GRAPH_TAIL}"
+            ),
+        )
+        .unwrap();
+        assert_echoes_hello(&format!("{label} (control)"), &run_echo(&dir));
+    }
+}
+
+/// A loopback chat-completions server that answers every request with one
+/// fixed assistant message and keeps every request body it saw. It stands
+/// in for the model so a plain prompt can cross the route classifier in the
+/// real binary without a live provider; the end-only graph never asks for a
+/// second completion. One connection per request (`Connection: close`); a
+/// request asking for `stream: true` is answered as an event stream.
+struct StubModel {
+    port: u16,
+    requests: Arc<Mutex<Vec<String>>>,
+}
+
+impl StubModel {
+    fn answering(content: &str) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let requests: Arc<Mutex<Vec<String>>> = Arc::default();
+        let seen = Arc::clone(&requests);
+        let whole = serde_json::json!({
+            "id": "stub",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "stub-model",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": content },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+        })
+        .to_string();
+        let delta = serde_json::json!({
+            "id": "stub",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "stub-model",
+            "choices": [{
+                "index": 0,
+                "delta": { "role": "assistant", "content": content },
+                "finish_reason": "stop"
+            }]
+        })
+        .to_string();
+        let streamed = format!("data: {delta}\n\ndata: [DONE]\n\n");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut raw = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let (header_end, content_length) = loop {
+                    let Ok(n) = stream.read(&mut chunk) else {
+                        break (None, 0);
+                    };
+                    if n == 0 {
+                        break (None, 0);
+                    }
+                    raw.extend_from_slice(&chunk[..n]);
+                    if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&raw[..pos]).to_ascii_lowercase();
+                        let length = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        break (Some(pos + 4), length);
+                    }
+                };
+                let Some(header_end) = header_end else {
+                    continue;
+                };
+                while raw.len() < header_end + content_length {
+                    let Ok(n) = stream.read(&mut chunk) else {
+                        break;
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&chunk[..n]);
+                }
+                let body = String::from_utf8_lossy(&raw[header_end..]).into_owned();
+                seen.lock().unwrap().push(body);
+                let compact: String = raw[header_end..]
+                    .iter()
+                    .filter(|b| !b.is_ascii_whitespace())
+                    .map(|&b| b as char)
+                    .collect();
+                let (content_type, reply) = if compact.contains("\"stream\":true") {
+                    ("text/event-stream", &streamed)
+                } else {
+                    ("application/json", &whole)
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        Self { port, requests }
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+/// A live (non-dry-run) fixture whose only model is the stub: a graph agent
+/// with a session block whose end node prints `ran=<prompt>`, `save_session`
+/// on so the exit saves `s` without a prompt, and a `helper` role for the
+/// `.role <name> <text>` form.
+fn write_stub_model_fixture(dir: &Path, stub: &StubModel) {
+    write_fixture(dir, "session:\n  chat:\n    instructions: Answer.\n");
+    let vault_pass = dir.join("vault-pass");
+    fs::write(
+        dir.join("config.yaml"),
+        format!(
+            "model: stub:stub-model\n\
+             dry_run: false\n\
+             save_session: true\n\
+             vault_password_file: '{vault_pass}'\n\
+             clients:\n\
+             \x20 - type: openai\n\
+             \x20   name: stub\n\
+             \x20   auth: none\n\
+             \x20   api_key: 'unused'\n\
+             \x20   api_base: http://127.0.0.1:{port}/v1\n\
+             \x20   models:\n\
+             \x20     - name: stub-model\n\
+             \x20       max_input_tokens: 100000\n\
+             \x20       supports_function_calling: true\n\
+             save: false\n\
+             memory: false\n\
+             skills_enabled: true\n\
+             stream: false\n",
+            vault_pass = vault_pass.display(),
+            port = stub.port,
+        ),
+    )
+    .unwrap();
+    let agent_dir = dir.join("agents").join(AGENT);
+    fs::write(
+        agent_dir.join("graph.yaml"),
+        "name: echo-graph\n\
+         version: \"1.0\"\n\
+         initial_state: { said: \"\" }\n\
+         start: done\n\
+         nodes:\n\
+         \x20 done: { type: end, output: \"ran={{initial_prompt}}\" }\n\
+         session:\n\
+         \x20 chat:\n\
+         \x20   instructions: Answer.\n",
+    )
+    .unwrap();
+    fs::create_dir_all(dir.join("roles")).unwrap();
+    fs::write(dir.join("roles").join("helper.md"), "You are terse.\n").unwrap();
+}
+
+/// One REPL turn as a macro, then `.save session` so the headless macro
+/// arm (which saves nothing on its own) leaves `s.yaml` on disk for the
+/// test to read; a turn that recorded nothing still writes the file.
+fn run_macro_against_stub(dir: &Path, step: &str) -> Output {
+    fs::create_dir_all(dir.join("macros")).unwrap();
+    fs::write(
+        dir.join("macros/turn.yaml"),
+        format!("isolated: false\nsteps:\n  - {step}\n  - \".save session\"\n"),
+    )
+    .unwrap();
+    // Loopback must not be sent through a host proxy.
+    run_with_env(
+        dir,
+        &["-a", AGENT, "--session", "s", "--macro", "turn"],
+        &[
+            ("NO_PROXY", "127.0.0.1,localhost"),
+            ("no_proxy", "127.0.0.1,localhost"),
+        ],
+    )
+}
+
+/// A plain prompt on a graph agent with a session block crosses the route
+/// classifier (one model call, answered here by the stub with `run`), the
+/// graph runs, and the turn is recorded: `last_run` names the prompt and
+/// the output, and the exchange sits in `messages`. The `.role <name>
+/// <text>` form of the same prompt is detached from the session: it crosses
+/// the same classifier and runs the same graph, but records NOTHING - no
+/// `last_run`, no exchange - so the next turn on `s` has no earlier turn to
+/// read. Both halves run the real binary from a cold config dir.
+#[test]
+fn usage_probe_a_role_prefixed_prompt_runs_the_graph_unrecorded_while_a_plain_one_is_recorded() {
+    let stub = StubModel::answering("{\"decision\":\"run\"}");
+
+    // Plain prompt: attached, classified, run, recorded.
+    let dir = fresh_config_dir("routed-plain");
+    let _guard = TempDirGuard(dir.clone());
+    write_stub_model_fixture(&dir, &stub);
+    let plain = run_macro_against_stub(&dir, "\"hi there\"");
+    let plain_text = format!("{}\n{}", stderr_of(&plain), stdout_of(&plain));
+    assert!(
+        plain.status.success() && !plain_text.contains("panicked"),
+        "plain prompt: exit {:?}\n{plain_text}",
+        plain.status
+    );
+    assert!(
+        stdout_of(&plain).lines().any(|l| l == "ran=hi there"),
+        "the classifier routed the plain prompt to a run:\n{plain_text}"
+    );
+    let classifier_calls = stub.requests();
+    assert_eq!(
+        classifier_calls.len(),
+        1,
+        "one plain prompt costs exactly one model call (the classifier):\n{classifier_calls:#?}"
+    );
+    assert!(
+        classifier_calls[0].contains("New message: hi there")
+            && classifier_calls[0].contains("has_last_run: false"),
+        "the classifier saw the typed text and an empty session:\n{}",
+        classifier_calls[0]
+    );
+    let saved = dir
+        .join("agents")
+        .join(AGENT)
+        .join("sessions")
+        .join("s.yaml");
+    let yaml = fs::read_to_string(&saved)
+        .unwrap_or_else(|e| panic!("the session file was not written ({e}):\n{plain_text}"));
+    let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+    assert_eq!(
+        doc["last_run"]["prompt"].as_str(),
+        Some("hi there"),
+        "last_run.prompt is the bare typed prompt:\n{yaml}"
+    );
+    assert_eq!(
+        doc["last_run"]["output"].as_str(),
+        Some("ran=hi there"),
+        "last_run.output is the graph output:\n{yaml}"
+    );
+    let roles: Vec<&str> = doc["messages"]
+        .as_sequence()
+        .map(|m| m.iter().filter_map(|m| m["role"].as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        roles,
+        vec!["system", "user", "assistant"],
+        "the routed run stores the block's prompt row and one exchange:\n{yaml}"
+    );
+
+    // `.role helper <text>`: detached, classified, run, NOT recorded.
+    let dir = fresh_config_dir("routed-role");
+    let _guard = TempDirGuard(dir.clone());
+    write_stub_model_fixture(&dir, &stub);
+    let detached = run_macro_against_stub(&dir, "\".role helper hi there\"");
+    let detached_text = format!("{}\n{}", stderr_of(&detached), stdout_of(&detached));
+    assert!(
+        detached.status.success() && !detached_text.contains("panicked"),
+        "role-prefixed prompt: exit {:?}\n{detached_text}",
+        detached.status
+    );
+    assert!(
+        stdout_of(&detached).lines().any(|l| l == "ran=hi there"),
+        "the role-prefixed prompt still runs the graph:\n{detached_text}"
+    );
+    let calls = stub.requests();
+    assert_eq!(
+        calls.len(),
+        2,
+        "the detached prompt crossed the classifier too (one more model call):\n{calls:#?}"
+    );
+    assert!(
+        calls[1].contains("New message: hi there"),
+        "the classifier saw the role-prefixed text:\n{}",
+        calls[1]
+    );
+    let saved = dir
+        .join("agents")
+        .join(AGENT)
+        .join("sessions")
+        .join("s.yaml");
+    let yaml = fs::read_to_string(&saved)
+        .unwrap_or_else(|e| panic!("`.save session` wrote no file ({e}):\n{detached_text}"));
+    let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+    assert!(
+        doc.get("last_run").is_none_or(|run| run.is_null()),
+        "a detached run records no last_run:\n{yaml}"
+    );
+    assert!(
+        !yaml.contains("hi there"),
+        "a detached run stores no exchange:\n{yaml}"
+    );
+
+    // The next turn on `s` has nothing to read back.
+    let graph = dir.join("agents").join(AGENT).join("graph.yaml");
+    let text = fs::read_to_string(&graph).unwrap();
+    fs::write(
+        &graph,
+        text.replace(
+            "output: \"ran={{initial_prompt}}\"",
+            "output: \"prev=[{{previous_turns}}] now={{initial_prompt}}\"",
+        ),
+    )
+    .unwrap();
+    let next = run_macro_against_stub(&dir, "\".run later\"");
+    let next_text = format!("{}\n{}", stderr_of(&next), stdout_of(&next));
+    assert!(
+        next.status.success() && !next_text.contains("panicked"),
+        "next turn: exit {:?}\n{next_text}",
+        next.status
+    );
+    assert!(
+        stdout_of(&next).lines().any(|l| l == "prev=[] now=later"),
+        "nothing from the detached turn reaches previous_turns:\n{next_text}"
+    );
+    assert_eq!(
+        stub.requests().len(),
+        2,
+        "`.run` is forced and never asks the classifier"
+    );
+}
+
+/// Every run of the real binary here gets a PATH of exactly the built
+/// binary's own directory followed by the system shell directories, so a
+/// script node (which the engine runs through the `bash` on PATH) sees that
+/// value and nothing from the developer's PATH. The only other entries are
+/// the ones the engine itself prepends from inside the fixture's config dir
+/// (its tool shim directories). The script reports the PATH it ran with
+/// through its JSON stdout and the end node echoes it; the expectation is
+/// spelled from the documented shape, not read back from the fixture helper.
+#[cfg(unix)]
+#[test]
+fn usage_probe_a_script_node_runs_with_only_the_binary_dir_and_the_system_shells_on_path() {
+    let dir = fresh_config_dir("pinned-path");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, "");
+    let agent_dir = dir.join("agents").join(AGENT);
+    let scripts = agent_dir.join("scripts");
+    fs::create_dir_all(&scripts).unwrap();
+    fs::write(
+        scripts.join("path.sh"),
+        "#!/usr/bin/env bash\n\
+         printf '{\"seen\":\"%s\"}' \"$PATH\"\n",
+    )
+    .unwrap();
+    fs::write(
+        agent_dir.join("graph.yaml"),
+        "name: echo-graph\n\
+         version: \"1.0\"\n\
+         initial_state: { said: \"\", seen: \"\" }\n\
+         start: probe\n\
+         nodes:\n\
+         \x20 probe: { type: script, script: scripts/path.sh, next: done }\n\
+         \x20 done: { type: end, output: \"path=<{{seen}}>\" }\n",
+    )
+    .unwrap();
+
+    let output = run_with(&dir, &["-a", AGENT, "hello"]);
+    let text = format!("{}\n{}", stderr_of(&output), stdout_of(&output));
+    assert!(
+        output.status.success() && !text.contains("panicked"),
+        "path run: exit {:?}\n{text}",
+        output.status
+    );
+    let bin_dir = Path::new(COYOTE_BIN).parent().unwrap();
+    let line = stdout_of(&output)
+        .lines()
+        .rev()
+        .find(|l| l.starts_with("path=<"))
+        .unwrap_or_else(|| panic!("the end node reports the script's PATH:\n{text}"))
+        .to_string();
+    let seen = line
+        .strip_prefix("path=<")
+        .and_then(|rest| rest.strip_suffix('>'))
+        .unwrap_or_else(|| panic!("unexpected report shape {line:?}"));
+    let from_outside_the_fixture: Vec<&str> = seen
+        .split(':')
+        .filter(|entry| !Path::new(entry).starts_with(&dir))
+        .collect();
+    assert_eq!(
+        from_outside_the_fixture,
+        [bin_dir.to_str().unwrap(), "/usr/bin", "/bin"],
+        "beyond the engine's own shim dirs under the fixture, the child PATH is the binary dir plus /usr/bin:/bin:\n{text}"
+    );
+    assert!(
+        seen.ends_with("/usr/bin:/bin"),
+        "the system shell directories come last and in order:\n{line}"
+    );
+}
+
+/// `TEST_WORKSPACE_MEMORY_ROOT_ENV` is a copy of the source const, so a
+/// rename there would leave the probe below setting (and the harness
+/// scrubbing) a variable the binary never reads; this keeps the two equal.
+#[test]
+fn the_test_memory_root_env_name_matches_the_source_const() {
+    let source_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/config/memory.rs");
+    let source = fs::read_to_string(&source_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", source_path.display()));
+    let needle =
+        format!("WORKSPACE_MEMORY_ROOT_TEST_ENV: &str = \"{TEST_WORKSPACE_MEMORY_ROOT_ENV}\"");
+    assert!(
+        source.contains(&needle),
+        "{} no longer declares {needle}",
+        source_path.display()
+    );
+}
+
+/// The shipped binary discovers workspace memory by walking up from the
+/// directory it runs in, and the `TEST_WORKSPACE_MEMORY_ROOT_ENV` pin
+/// the unit-test guards set is a test-build seam: a real run that carries
+/// it still reads the index above its cwd. The dry-run model echoes the
+/// whole system prompt, so the workspace index lines under `<facts>` are
+/// observable on stdout.
+#[test]
+fn usage_probe_the_shipped_binary_walks_up_from_its_cwd_for_workspace_memory_and_ignores_the_test_root_pin()
+ {
+    const GLOBAL_LINE: &str = "- global fact from the fixture";
+    const WORKSPACE_LINE: &str = "- workspace fact planted by the probe";
+    let dir = fresh_config_dir("workspace-memory");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture_on(
+        &dir,
+        "",
+        Host {
+            memory: true,
+            ..RECIPE_HOST
+        },
+    );
+    fs::create_dir_all(dir.join("memory")).unwrap();
+    fs::write(
+        dir.join("memory").join("MEMORY.md"),
+        format!("{GLOBAL_LINE}\n"),
+    )
+    .unwrap();
+    // The index sits one level above the cwd so the walk has to climb.
+    let workspace = dir.join("ws");
+    let nested = workspace.join("nested");
+    let index_dir = workspace.join(".coyote").join("memory");
+    fs::create_dir_all(&nested).unwrap();
+    fs::create_dir_all(&index_dir).unwrap();
+    fs::write(
+        index_dir.join("MEMORY.md"),
+        format!("{WORKSPACE_HEADER}\n{WORKSPACE_LINE}\n"),
+    )
+    .unwrap();
+    // A sibling with no index anywhere above it short of the temp root.
+    let elsewhere = dir.join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+
+    let memory_block = |output: &Output, label: &str| -> String {
+        let text = format!("{}\n{}", stderr_of(output), stdout_of(output));
+        assert!(
+            output.status.success() && !text.contains("panicked"),
+            "{label}: exit {:?}\n{text}",
+            output.status
+        );
+        let stdout = stdout_of(output);
+        let start = stdout.find("<memory>").unwrap_or_else(|| {
+            panic!("{label}: the dry-run echo carries the memory section:\n{text}")
+        });
+        let end = stdout[start..]
+            .find("</memory>")
+            .unwrap_or_else(|| panic!("{label}: the memory section closes:\n{text}"));
+        stdout[start..start + end].to_string()
+    };
+
+    // 1. From under the workspace: both indexes ride the prompt.
+    let from_workspace = memory_block(
+        &run_from(&nested, &dir, &["-e", "hello"], &[]),
+        "walk from the nested cwd",
+    );
+    assert!(from_workspace.contains("<facts>"), "{from_workspace}");
+    assert!(from_workspace.contains(GLOBAL_LINE), "{from_workspace}");
+    assert!(
+        from_workspace.contains(WORKSPACE_HEADER),
+        "{from_workspace}"
+    );
+    assert!(from_workspace.contains(WORKSPACE_LINE), "{from_workspace}");
+
+    // 2. Same cwd with the test pin aimed at an index-less dir: the shipped
+    //    binary renders the very same block, so the pin changed nothing.
+    let with_pin = memory_block(
+        &run_from(
+            &nested,
+            &dir,
+            &["-e", "hello"],
+            &[(TEST_WORKSPACE_MEMORY_ROOT_ENV, elsewhere.to_str().unwrap())],
+        ),
+        "the test pin on a real run",
+    );
+    assert_eq!(
+        with_pin, from_workspace,
+        "the pin is inert outside test builds"
+    );
+
+    // 3. From the index-less sibling: the global index alone.
+    let from_elsewhere = memory_block(
+        &run_from(&elsewhere, &dir, &["-e", "hello"], &[]),
+        "walk from a cwd with no index above it",
+    );
+    assert!(from_elsewhere.contains(GLOBAL_LINE), "{from_elsewhere}");
+    assert!(
+        !from_elsewhere.contains(WORKSPACE_HEADER),
+        "{from_elsewhere}"
+    );
+    assert!(!from_elsewhere.contains(WORKSPACE_LINE), "{from_elsewhere}");
+}
+
+/// The converse of the probe above: a pin aimed AT a workspace that holds
+/// an index cannot pull that index into a real run whose cwd has none.
+#[test]
+fn usage_probe_the_shipped_binary_does_not_load_workspace_memory_from_a_pinned_root() {
+    const GLOBAL_LINE: &str = "- global fact for the converse probe";
+    const WORKSPACE_LINE: &str = "- workspace fact only the pin points at";
+    let dir = fresh_config_dir("workspace-memory-pin");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture_on(
+        &dir,
+        "",
+        Host {
+            memory: true,
+            ..RECIPE_HOST
+        },
+    );
+    fs::create_dir_all(dir.join("memory")).unwrap();
+    fs::write(
+        dir.join("memory").join("MEMORY.md"),
+        format!("{GLOBAL_LINE}\n"),
+    )
+    .unwrap();
+    let pinned = dir.join("pinned");
+    let index_dir = pinned.join(".coyote").join("memory");
+    fs::create_dir_all(&index_dir).unwrap();
+    fs::write(
+        index_dir.join("MEMORY.md"),
+        format!("{WORKSPACE_HEADER}\n{WORKSPACE_LINE}\n"),
+    )
+    .unwrap();
+    let cwd = dir.join("plain");
+    fs::create_dir_all(&cwd).unwrap();
+
+    let output = run_from(
+        &cwd,
+        &dir,
+        &["-e", "hello"],
+        &[(TEST_WORKSPACE_MEMORY_ROOT_ENV, pinned.to_str().unwrap())],
+    );
+    let text = format!("{}\n{}", stderr_of(&output), stdout_of(&output));
+    assert!(
+        output.status.success() && !text.contains("panicked"),
+        "exit {:?}\n{text}",
+        output.status
+    );
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.contains(GLOBAL_LINE),
+        "the global index still rides:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains(WORKSPACE_LINE),
+        "the pinned root's index leaked into a real run:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains(WORKSPACE_HEADER),
+        "no workspace index header without one above the cwd:\n{stdout}"
+    );
 }

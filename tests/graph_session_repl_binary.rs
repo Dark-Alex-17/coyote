@@ -20,11 +20,47 @@ use std::{env, process};
 
 struct TempDirGuard(PathBuf);
 
+/// Teardown budget for the hook race: the binary only waits for a hook's
+/// spawn, so the capture shell that closes a turn can still be writing its
+/// log while the directory is removed. Each teardown phase (waiting for
+/// the closing log, retrying the removal) gets its own budget so a slow
+/// hook cannot eat the retries. Bounded waits, never asserted on.
+const TEARDOWN_BUDGET: Duration = Duration::from_secs(2);
+const TEARDOWN_POLL: Duration = Duration::from_millis(50);
+/// The events whose capture closes a turn once `turn.started` has fired.
+const TURN_CLOSING_EVENTS: [&str; 2] = ["turn.completed", "turn.failed"];
+
 impl Drop for TempDirGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        if env_log(&self.0, TURN_EVENTS[0]).exists() {
+            let closed = |dir: &Path| {
+                TURN_CLOSING_EVENTS
+                    .iter()
+                    .any(|event| env_log(dir, event).exists())
+            };
+            let settled = Instant::now() + TEARDOWN_BUDGET;
+            while !closed(&self.0) && Instant::now() < settled {
+                thread::sleep(TEARDOWN_POLL);
+            }
+        }
+        let retry_until = Instant::now() + TEARDOWN_BUDGET;
+        let mut result = fs::remove_dir_all(&self.0);
+        while result.is_err() && Instant::now() < retry_until {
+            thread::sleep(TEARDOWN_POLL);
+            result = fs::remove_dir_all(&self.0);
+        }
+        if let Err(error) = result
+            && self.0.exists()
+        {
+            eprintln!("leaked temp dir {}: {error}", self.0.display());
+        }
     }
 }
+
+/// The workspace-memory root override the unit-test guards set; it mirrors
+/// `WORKSPACE_MEMORY_ROOT_TEST_ENV` in `src/config/memory.rs`, which an
+/// integration test cannot import from the binary crate.
+const TEST_WORKSPACE_MEMORY_ROOT_ENV: &str = "COYOTE_TEST_WORKSPACE_MEMORY_ROOT";
 
 const GRAPH_AGENT: &str = "echo-graph";
 const CONFIG_AGENT: &str = "probe";
@@ -163,7 +199,8 @@ fn scrub_coyote_env(cmd: &mut Command) -> &mut Command {
 
 fn run_coyote(dir: &Path, args: &[&str]) -> Output {
     let home = dir.join("home");
-    scrub_coyote_env(&mut Command::new(env!("CARGO_BIN_EXE_coyote")))
+    let binary = Path::new(env!("CARGO_BIN_EXE_coyote"));
+    scrub_coyote_env(&mut Command::new(binary))
         .args(args)
         .current_dir(dir)
         .env("COYOTE_CONFIG_DIR", dir)
@@ -171,14 +208,33 @@ fn run_coyote(dir: &Path, args: &[&str]) -> Output {
         .env("HOME", &home)
         .env("USERPROFILE", &home)
         .env("NO_COLOR", "1")
+        .env("PATH", pinned_path(binary.parent().unwrap()))
         .env_remove("COYOTE_LOG_PATH")
         .env_remove("COYOTE_WORKSPACE_CONFIG_DIR")
         .env_remove("IS_SANDBOX")
         .env_remove("COYOTE_PROVIDER")
         .env_remove("COYOTE_PLATFORM")
+        // The unit-test guard's workspace-memory pin; a shipped binary
+        // ignores it, and a run here starts without it.
+        .env_remove(TEST_WORKSPACE_MEMORY_ROOT_ENV)
         .stdin(Stdio::null())
         .output()
         .unwrap()
+}
+
+/// A PATH holding only `bin_dir` (the built binary's own directory) and the
+/// system shell directories, so the fixture's `sh` hooks and bash scripts
+/// resolve the same way on every host and nothing else on the developer's
+/// PATH can leak into a run. Twin of `pinned_path` in
+/// tests/graph_session_block_binary.rs; change both together.
+fn pinned_path(bin_dir: &Path) -> std::ffi::OsString {
+    let system_dirs: Vec<PathBuf> = if cfg!(windows) {
+        let system_root = env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+        vec![Path::new(&system_root).join("System32")]
+    } else {
+        vec![PathBuf::from("/usr/bin"), PathBuf::from("/bin")]
+    };
+    env::join_paths(std::iter::once(bin_dir.to_path_buf()).chain(system_dirs)).unwrap()
 }
 
 fn stdout_of(output: &Output) -> String {
@@ -2823,4 +2879,200 @@ fn usage_probe_a_live_block_removal_keeps_recording_while_carrying_and_clears_th
         messages_after_one + 6,
         "{four:?}"
     );
+}
+
+/// Graph-Agents.md: under a session the dispatcher seeds `previous_turns`
+/// with the session's earlier exchanges as `user: ...` / `assistant: ...`
+/// lines, skipping the System row; without a session the key is `""`. The
+/// recipe's dry run records nothing, so the saved session file is left
+/// byte-for-byte as it was and `<cache>/sessions` never appears.
+#[test]
+fn usage_probe_previous_turns_renders_the_sessions_exchanges_and_nothing_without_one() {
+    const TURNS_GRAPH: &str = "name: echo-graph\n\
+        version: \"1.0\"\n\
+        description: Echoes the earlier turns.\n\
+        initial_state: { said: \"\" }\n\
+        start: done\n\
+        nodes:\n\
+        \x20 done: { type: end, output: \"turns<{{previous_turns}}>\" }\n";
+    const DEMO: &str = "model: dryrun:dry-model\n\
+        messages:\n\
+        \x20 - role: system\n\
+        \x20   content: ROLE PROMPT NEVER RENDERED\n\
+        \x20 - role: user\n\
+        \x20   content: hello\n\
+        \x20 - role: assistant\n\
+        \x20   content: 'before: '\n";
+    let dir = fresh_config_dir("previous-turns");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, RECIPE_BLOCK);
+    let agent_dir = dir.join("agents").join(GRAPH_AGENT);
+    fs::write(
+        agent_dir.join("graph.yaml"),
+        format!("{TURNS_GRAPH}{RECIPE_BLOCK}"),
+    )
+    .unwrap();
+    fs::create_dir_all(agent_dir.join("sessions")).unwrap();
+    let saved = agent_dir.join("sessions").join("demo.yaml");
+    fs::write(&saved, DEMO).unwrap();
+
+    write_macro(&dir, "turns", &[".run again"]);
+    let under = run_coyote(
+        &dir,
+        &["-a", GRAPH_AGENT, "--session", "demo", "--macro", "turns"],
+    );
+    let text = combined(&under);
+    assert!(
+        under.status.success() && !text.contains("panicked"),
+        "under a session: exit {:?}\n{text}",
+        under.status
+    );
+    let stdout = stdout_of(&under);
+    assert!(
+        stdout.contains("turns<user: hello\nassistant: before: >"),
+        "the run renders the earlier exchange as user/assistant lines:\n{text}"
+    );
+    assert!(
+        !stdout.contains("ROLE PROMPT NEVER RENDERED"),
+        "the System row never reaches previous_turns:\n{text}"
+    );
+    assert_eq!(
+        fs::read_to_string(&saved).unwrap(),
+        DEMO,
+        "the dry run leaves the saved session file as it was"
+    );
+    assert!(
+        !dir.join("cache").join("sessions").exists(),
+        "the dry run forces child sessions off: no root under <cache>/sessions"
+    );
+
+    let loose = run_coyote(&dir, &["-a", GRAPH_AGENT, "--macro", "turns"]);
+    let text = combined(&loose);
+    assert!(
+        loose.status.success() && !text.contains("panicked"),
+        "without a session: exit {:?}\n{text}",
+        loose.status
+    );
+    assert!(
+        stdout_of(&loose).contains("turns<>"),
+        "without a session previous_turns is the empty string:\n{text}"
+    );
+}
+
+/// `child_sessions` is a config-file knob, not a `.set` one: from a cold
+/// start the value the config file holds shows in the `.info` table, and
+/// `.set child_sessions true` is refused as an unknown key the way the
+/// config comments promise ("not settable with .set"). A refused step ends
+/// the macro like any other failing step, so the refusal is the last line
+/// of the run and the run reports failure without panicking.
+#[test]
+fn usage_probe_child_sessions_shows_in_info_and_is_refused_by_set_from_a_cold_start() {
+    let dir = fresh_config_dir("child-sessions-knob");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, "");
+    let config = dir.join("config.yaml");
+    let mut text = fs::read_to_string(&config).unwrap();
+    text.push_str("child_sessions: false\n");
+    fs::write(&config, text).unwrap();
+    write_macro(
+        &dir,
+        "knob",
+        &[".info", ".set child_sessions true", "hello"],
+    );
+
+    let output = run_coyote(&dir, &["--macro", "knob"]);
+    let text = combined(&output);
+    assert!(
+        !output.status.success() && !text.contains("panicked"),
+        "a refused `.set` fails the macro without a panic: exit {:?}\n{text}",
+        output.status
+    );
+    let row = stdout_of(&output)
+        .lines()
+        .find(|line| line.trim_start().starts_with("child_sessions"))
+        .unwrap_or_else(|| panic!("`.info` lists a child_sessions row:\n{text}"))
+        .to_string();
+    assert!(
+        row.trim_end().ends_with("false"),
+        "the row reports the config file's value:\n{row}\n{text}"
+    );
+    assert!(
+        text.contains("Unknown key 'child_sessions'"),
+        "`.set` refuses the knob as an unknown key:\n{text}"
+    );
+    assert!(
+        !stdout_of(&output).lines().any(|line| line == "hello"),
+        "the macro stops at the refused step:\n{text}"
+    );
+}
+
+/// The refusal does not depend on the value: `.set child_sessions` with the
+/// value the config file already holds, with `null` (the `.set` spelling for
+/// "unset"), and with `true` all end in the same `Unknown key` line and a
+/// failed run, and none of them touches the config file. The `.info` row
+/// tracks the file alone: `true` when the file says so, `null` when the key
+/// is absent.
+#[test]
+fn usage_probe_set_refuses_child_sessions_for_every_value_shape_and_info_tracks_the_file() {
+    let dir = fresh_config_dir("child-sessions-shapes");
+    let _guard = TempDirGuard(dir.clone());
+    write_fixture(&dir, "");
+    let config = dir.join("config.yaml");
+    let base = fs::read_to_string(&config).unwrap();
+    assert!(
+        !base.contains("child_sessions"),
+        "the fixture config leaves the knob unset:\n{base}"
+    );
+
+    // Key absent: the row reports null.
+    write_macro(&dir, "info", &[".info"]);
+    let absent = run_coyote(&dir, &["--macro", "info"]);
+    let row = |output: &Output| -> String {
+        let text = combined(output);
+        assert!(
+            output.status.success() && !text.contains("panicked"),
+            "`.info` run: exit {:?}\n{text}",
+            output.status
+        );
+        stdout_of(output)
+            .lines()
+            .find(|line| line.starts_with("child_sessions"))
+            .unwrap_or_else(|| panic!("`.info` lists a child_sessions row:\n{text}"))
+            .trim_end()
+            .to_string()
+    };
+    assert!(row(&absent).ends_with("null"), "{}", row(&absent));
+
+    // Key true in the file: the row reports true.
+    fs::write(&config, format!("{base}child_sessions: true\n")).unwrap();
+    assert!(
+        row(&run_coyote(&dir, &["--macro", "info"])).ends_with("true"),
+        "the row follows the file's value"
+    );
+
+    // Every value shape is refused the same way and leaves the file alone.
+    let with_true = fs::read_to_string(&config).unwrap();
+    for (label, value) in [
+        ("the value the file already holds", "true"),
+        ("the opposite value", "false"),
+        ("the unset spelling", "null"),
+    ] {
+        write_macro(&dir, "shape", &[&format!(".set child_sessions {value}")]);
+        let output = run_coyote(&dir, &["--macro", "shape"]);
+        let text = combined(&output);
+        assert!(
+            !output.status.success() && !text.contains("panicked"),
+            "{label}: a refused `.set` fails the run without a panic: exit {:?}\n{text}",
+            output.status
+        );
+        assert!(
+            text.contains("Unknown key 'child_sessions'"),
+            "{label}: the refusal names the key:\n{text}"
+        );
+        assert_eq!(
+            fs::read_to_string(&config).unwrap(),
+            with_true,
+            "{label}: a refused `.set` never rewrites the config file"
+        );
+    }
 }
