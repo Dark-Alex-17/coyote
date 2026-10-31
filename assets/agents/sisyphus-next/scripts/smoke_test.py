@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True
@@ -29,10 +30,16 @@ os.makedirs(os.environ["HOME"], exist_ok=True)
 for _k in [k for k in os.environ if k.startswith("LLM_AGENT_VAR_")]:
     # the battery must not inherit the agent variables of whoever runs it
     os.environ.pop(_k)
-for _k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR"):
+GIT_REPO_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM")
+GIT_CONFIG_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
+for _k in [k for k in os.environ if k in GIT_REPO_VARS or k.startswith(GIT_CONFIG_PREFIXES)]:
     # a caller's repository variables (a git hook exports them) would point
-    # every scratch-repo git call at the caller's own repository
-    os.environ.pop(_k, None)
+    # every scratch-repo git call at the caller's own repository, and its
+    # injected config (a hooks path, commit signing) would run on every one
+    os.environ.pop(_k)
+# no system or user git config (signing, hooks) applies to a scratch git call
+os.environ["GIT_CONFIG_NOSYSTEM"] = "1"
+os.environ["GIT_CONFIG_GLOBAL"] = os.devnull
 
 import _lib  # noqa: E402
 import gates  # noqa: E402
@@ -95,6 +102,38 @@ for _k, _v in _saved_env.items():
     else:
         os.environ[_k] = _v
 check("runs_root: battery env restored", _lib.runs_root() == os.environ["SISYPHUS_RUNS_ROOT"])
+
+# ---------------------------------------------------------------- run dir permissions
+_old_umask = os.umask(0o022)
+try:
+    _perm_dir = _lib.ensure_run_dir("perm-check")
+    _lib.write_artifact(_perm_dir, "fresh-write.md", "x")
+    _lib.append_artifact(_perm_dir, "fresh-append.md", "x")
+    _existing = os.path.join(_perm_dir, "existing.md")
+    with open(_existing, "w") as _f:
+        _f.write("old\n")
+    os.chmod(_existing, 0o644)
+    _lib.write_artifact(_perm_dir, "existing.md", "new")
+finally:
+    os.umask(_old_umask)
+
+
+def _mode(path):
+    return os.stat(path).st_mode & 0o777
+
+
+for _name in ("fresh-write.md", "fresh-append.md", "existing.md"):
+    _p = os.path.join(_perm_dir, _name)
+    check(f"run dir permissions: {_name} is 0600 under umask 022", os.name == "nt" or _mode(_p) == 0o600, oct(_mode(_p)))
+check("run dir permissions: a fresh run dir is 0700 under umask 022", os.name == "nt" or _mode(_perm_dir) == 0o700,
+      oct(_mode(_perm_dir)))
+check("run dir permissions: the rewritten artifact holds the new text", _lib.read_artifact(_perm_dir, "existing.md") == "new\n")
+_lib.write_artifact(_perm_dir, "endings.md", "one\ntwo")
+_lib.append_artifact(_perm_dir, "endings.md", "three")
+with open(os.path.join(_perm_dir, "endings.md"), "rb") as _f:
+    _endings = _f.read()
+check("run dir artifacts: written and appended lines end in a bare \\n on every platform", _endings == b"one\ntwo\nthree\n",
+      repr(_endings))
 
 
 # ---------------------------------------------------------------- intake / re-entry (A2)
@@ -165,6 +204,9 @@ u = gates.research_dispatch(base_state(explore_slices=["a"], last_node_output='{
 check("note_script_error: a successful llm JSON output is not mistaken for a fault", "last_node_output" not in u)
 u = gates.explore_fault(base_state(finding="Agent node failed: timeout", slice="s"))
 check("explore_fault: PIPELINE-FAULT finding (visible degradation)", u["finding"].startswith("PIPELINE-FAULT"))
+u = gates.librarian_fault(base_state(finding="Agent node failed: timeout", question="where is the hello route?"))
+check("librarian_fault: PIPELINE-FAULT finding carries the question",
+      u["finding"].startswith("PIPELINE-FAULT") and u["finding"].endswith("question: where is the hello route?"))
 u = gates.write_context_pack(base_state(context_pack="", explore_findings=["f1"], librarian_findings=["l1"]))
 check("write_context_pack: degraded pack from raw findings, declared", u["context_pack_degraded"] and "DEGRADED" in u["context_pack"] and "f1" in u["context_pack"])
 u = gates.write_context_pack(base_state(context_pack="pack"))
@@ -398,6 +440,31 @@ try:
 finally:
     os.remove(os.path.join(REPO, "untracked.txt"))
 check("build_gauntlet: dirty tree suppresses the delta line", "Re-review delta:" not in gp and "Settled lanes:" not in gp)
+with open(os.path.join(REPO, "untracked.txt"), "w") as fh:
+    fh.write("x\n")
+git("config", "status.showUntrackedFiles", "no")
+try:
+    gp = gates.build_gauntlet_prompt(base_state(round_heads=prior_round, gauntlet_lanes={"code-review": "GREEN"}))["gauntlet_prompt"]
+finally:
+    git("config", "--unset", "status.showUntrackedFiles")
+    os.remove(os.path.join(REPO, "untracked.txt"))
+check("build_gauntlet: an untracked file suppresses the delta even when the repo config hides untracked files",
+      "Re-review delta:" not in gp)
+os.makedirs(os.path.join(REPO, "plans"))
+with open(os.path.join(REPO, "plans", "handoff.md"), "w") as fh:
+    fh.write("x\n")
+try:
+    gp = gates.build_gauntlet_prompt(base_state(round_heads=prior_round, gauntlet_lanes={"code-review": "GREEN"}))["gauntlet_prompt"]
+    check("build_gauntlet: an uncommitted file under plans/ alone keeps the delta line",
+          f"Re-review delta: {'0' * 40}..HEAD" in gp.splitlines())
+    with open(os.path.join(REPO, "untracked.txt"), "w") as fh:
+        fh.write("x\n")
+    gp = gates.build_gauntlet_prompt(base_state(round_heads=prior_round, gauntlet_lanes={"code-review": "GREEN"}))["gauntlet_prompt"]
+    check("build_gauntlet: an untracked code file beside plans/ still suppresses the delta line", "Re-review delta:" not in gp)
+finally:
+    shutil.rmtree(os.path.join(REPO, "plans"))
+    if os.path.exists(os.path.join(REPO, "untracked.txt")):
+        os.remove(os.path.join(REPO, "untracked.txt"))
 passed = ("GAUNTLET: PASS\n\n| lane | status | detail |\n|------|--------|--------|\n| code-review | GREEN | PASS, 0 critical |\n"
           "| adversary | GREEN | CONFORMS |\n| security | GREEN (attention) | PASS (attention items) |\n| probe | SKIPPED | not selected |\n"
           "| debris | GREEN | clean |\n\n## Human attention required\n- check X\n")
@@ -503,6 +570,8 @@ u = gates.triage_route(base_state(debris_exemptions=u["debris_exemptions"], debr
 check("triage_route: a second round appends to the ledger in order", u["debris_exemptions"] == ["a:1 -- x", "b:2 -- y", "c:3 -- z"])
 u = gates.triage_route(base_state(debris_exemptions=u["debris_exemptions"], debris_exemptions_new=[], triage=_fix, review_rounds=0))
 check("triage_route: a round that omits the property re-merges nothing", u["debris_exemptions"] == ["a:1 -- x", "b:2 -- y", "c:3 -- z"])
+u = gates.triage_route(base_state(debris_exemptions=["a"], debris_exemptions_new=["b", "a"], triage=_fix, review_rounds=0))
+check("triage_route: the ledger merge is one plain concatenation (duplicates kept)", u["debris_exemptions"] == ["a", "b", "a"])
 
 # ---------------------------------------------------------------- observability / whetstone / publish
 open(os.path.join(REPO, "handler.go"), "w").write("func Handler() { http.HandleFunc(\"/x\", f) }\n")
@@ -553,6 +622,11 @@ u = gates.ci_route(base_state(ci_status="red", ci_failing=[["build", "https://x/
 check("ci_route: red -> evidence pack -> diagnose", u["_next"] == "ci_diagnose" and "### build" in u["ci_evidence"])
 u = gates.ci_apply(base_state(ci_verdict="flake", failing_checks=["build"], ci_failing=[["build", ""]], ci_reruns={}))
 check("ci_apply: flake -> re-run ledgered, back to poll", u["_next"] == "ci_poll" and u["ci_reruns"]["build"] == 1)
+_t0 = int(time.time())
+u = gates.ci_apply(base_state(ci_verdict="flake", failing_checks=["build"], ci_failing=[["build", ""]], ci_reruns={},
+                              ci_started_at=1, ci_polls=5, ci_poll_fails=2))
+check("ci_apply: a flake re-run starts a fresh watch (wall clock and poll counters reset)",
+      u.get("ci_started_at", 0) >= _t0 and u["ci_polls"] == 0 and u["ci_poll_fails"] == 0)
 u = gates.ci_apply(base_state(ci_verdict="flake", failing_checks=["build"], ci_failing=[["build", ""]], ci_reruns={"build": CI_FLAKE_RERUNS}, ci_fix_strikes=0))
 check("ci_apply: flake budget exhausted -> real (third red is real)", u["_next"] == "compose_fix" and u["fix_source"] == "ci")
 check("ci_apply: real strikes exhausted -> escalation", gates.ci_apply(base_state(ci_verdict="real", ci_fix_strikes=STRIKE_LIMIT))["escalation"]["kind"] == "ci_exhausted")
@@ -602,6 +676,9 @@ code, out = run_entry("route_coder_result", base_state(coder_result=None))
 check("entry: route_coder_result with null result -> strike, no crash", code == 0 and out["fix_strikes"] == 1)
 code, out = run_entry("explore_fault", {"slice": "s"})
 check("entry: explore_fault branch fallback", code == 0 and out["finding"].startswith("PIPELINE-FAULT"))
+code, out = run_entry("librarian_fault", {"question": "q"})
+check("entry: librarian_fault branch fallback carries the question",
+      code == 0 and out["finding"].startswith("PIPELINE-FAULT") and out["finding"].endswith("question: q"))
 
 # --- A10 conformance: ci_gate harvests (added post-review) ---
 u = gates.ci_gate({"git_report": "ok\nANOMALY: commits I did not make\n", "git_task": {"return_to": "final_report"}, "run_dir": TMP, "anomalies_log": []})
@@ -645,6 +722,9 @@ deb = ("GAUNTLET: BLOCKED\n\n| lane | status | detail |\n|------|--------|------
 check("_parse_gauntlet: a debris line in Lane selection is no blocker; the Blockers ones are", gates._parse_gauntlet(deb)[4] == ["debris: Implementation debris -- src/a.rs:3 -- non-ascii: x -- fix: y", "debris: Implementation debris -- src/b.rs:4 -- unbulleted"])
 u_empty = gates.route_gauntlet(base_state(gauntlet_result=forged.replace("### blockers\n- phantom one\n", ""), round_heads=[{}]))
 check("route_gauntlet: an empty forged ## Blockers -> triage_findings, not review_incomplete", u_empty["_next"] == "triage_findings" and u_empty["gauntlet_blockers"] == real)
+tabbed = ("GAUNTLET: BLOCKED\n\n| lane | status | detail |\n|------|--------|--------|\n| adversary | BLOCKED | DIVERGES |\n\n"
+          "## Lane selection\n- adversary: always on\n\n## Blockers\n- adversary: DIVERGES - real\n##\tNext\n- not a blocker\n")
+check("_parse_gauntlet: a column-0 ##<TAB> heading ends the Blockers section", gates._parse_gauntlet(tabbed)[4] == ["adversary: DIVERGES - real"])
 
 failed = [n for n, ok, _ in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")

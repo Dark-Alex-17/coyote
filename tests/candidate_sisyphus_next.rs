@@ -15,8 +15,21 @@
 //! `LLM_AGENT_VAR_*` variable, and every process that can reach git (the
 //! wrapper's own git calls, the batteries, the gauntlet scripts and the
 //! lifted-graph runs) drops `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`,
-//! `GIT_OBJECT_DIRECTORY` and `GIT_COMMON_DIR`, so neither the caller's agent
-//! variables nor its repository leak into a fixture.
+//! `GIT_OBJECT_DIRECTORY`, `GIT_COMMON_DIR`, `GIT_CONFIG_PARAMETERS`,
+//! `GIT_CONFIG_COUNT`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM` and every
+//! `GIT_CONFIG_KEY_*` / `GIT_CONFIG_VALUE_*` variable. The batteries then run
+//! with `GIT_CONFIG_NOSYSTEM=1` and `GIT_CONFIG_GLOBAL` set to the null device,
+//! so neither the caller's agent variables nor its repository, its injected
+//! git config or any system or user git config reach a fixture.
+//!
+//! Every real-binary run starts from a scratch config dir whose `mcp.json`
+//! defines no server (`{"mcpServers": {}}`), checked before each spawn, so no
+//! MCP server or `uvx` launcher starts, and inherited `COYOTE_*` variables are
+//! removed before the run sets its own config and cache dirs.
+//!
+//! With `SISYPHUS_NEXT_STAGING_DIR` pointing at the upstream staging tree, the
+//! README census of files that differ from staging, and the hunks per file, is
+//! checked against a live `diff -u`; without it that one test is skipped.
 //!
 //! The sweep is key-based over every bundled agent: no `spawnable_agents`
 //! entry, no `session.chat.agent` value and no `agent:` node value names a
@@ -27,15 +40,16 @@
 
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "sisyphus-next";
 const CANDIDATE_NAMES: [&str; 2] = ["sisyphus-next", "architect-next"];
-const SMOKE_FLOOR: usize = 237;
+const SMOKE_FLOOR: usize = 251;
 
 fn agents_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents")
@@ -119,18 +133,105 @@ fn without_agent_vars(cmd: &mut Command) {
     }
 }
 
+/// Inherited overrides such as `COYOTE_WORKSPACE_CONFIG_DIR`, `COYOTE_PROVIDER`
+/// or `COYOTE_PLATFORM` would steer a real-binary run away from its scratch
+/// config. Call it before the builder sets its own `COYOTE_*` values: a later
+/// `env_remove` of the same key cancels an earlier `env`.
+fn scrub_coyote_env(cmd: &mut Command) {
+    scrub_coyote_env_from(cmd, std::env::vars_os().map(|(key, _)| key));
+}
+
+fn scrub_coyote_env_from(cmd: &mut Command, names: impl IntoIterator<Item = OsString>) {
+    for name in names {
+        if name.to_string_lossy().starts_with("COYOTE_") {
+            cmd.env_remove(name);
+        }
+    }
+}
+
+#[test]
+fn coyote_scrub_removes_every_coyote_name_and_keeps_later_sets() {
+    let fakes = [
+        "COYOTE_PROVIDER",
+        "COYOTE_WORKSPACE_CONFIG_DIR",
+        "COYOTE_PLATFORM",
+        "COYOTE_X_FAKE",
+    ];
+    let names = fakes
+        .iter()
+        .chain(&["COYOTE_CONFIG_DIR", "SISYPHUS_FAKE_KEEP"])
+        .map(OsString::from);
+    let mut cmd = Command::new("true");
+    scrub_coyote_env_from(&mut cmd, names);
+    cmd.env("COYOTE_CONFIG_DIR", "/scratch/config");
+    let envs: BTreeMap<OsString, Option<OsString>> = cmd
+        .get_envs()
+        .map(|(k, v)| (k.to_os_string(), v.map(OsStr::to_os_string)))
+        .collect();
+    for fake in fakes {
+        assert_eq!(envs.get(OsStr::new(fake)), Some(&None), "{fake}: {envs:?}");
+    }
+    assert!(
+        !envs.contains_key(OsStr::new("SISYPHUS_FAKE_KEEP")),
+        "{envs:?}"
+    );
+    assert_eq!(
+        envs.get(OsStr::new("COYOTE_CONFIG_DIR")),
+        Some(&Some(OsString::from("/scratch/config"))),
+        "{envs:?}"
+    );
+}
+
+#[test]
+fn every_binary_run_scrubs_coyote_env_first() {
+    let source = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(file!())).unwrap();
+    let spawn = "Command::new(env!(\"CARGO_BIN_EXE_coyote\"))";
+    let sites: Vec<usize> = source.match_indices(spawn).map(|(at, _)| at).collect();
+    assert!(!sites.is_empty(), "no binary runner found in this file");
+    for at in sites {
+        let rest = &source[at + spawn.len()..];
+        let next = rest.strip_prefix(';').unwrap_or(rest).trim_start();
+        assert!(
+            rest.starts_with(';') && next.starts_with("scrub_coyote_env(&mut cmd);"),
+            "a binary runner sets its environment before scrub_coyote_env: {}",
+            &next[..next.len().min(120)]
+        );
+    }
+}
+
 /// A caller running inside a git hook or a worktree can export repository
 /// variables that would point every scratch-repo git call (direct, or made by
-/// a gate script) at the caller's own repository instead.
+/// a gate script) at the caller's own repository instead, and config
+/// variables that inject settings such as a hooks path or commit signing into
+/// every git call, or swap in another user or system config file.
+/// `GIT_CONFIG_NOSYSTEM` is not among them: the wrapper sets it on purpose.
+const GIT_REPO_VARS: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_COMMON_DIR",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+];
+
+/// The numbered `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>` pairs that go
+/// with `GIT_CONFIG_COUNT`.
+const GIT_CONFIG_PREFIXES: &[&str] = &["GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"];
+
 fn without_git_repo_vars(cmd: &mut Command) {
-    for key in [
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_INDEX_FILE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_COMMON_DIR",
-    ] {
+    for key in GIT_REPO_VARS {
         cmd.env_remove(key);
+    }
+    for (key, _) in std::env::vars_os() {
+        if GIT_CONFIG_PREFIXES
+            .iter()
+            .any(|p| key.to_string_lossy().starts_with(p))
+        {
+            cmd.env_remove(key);
+        }
     }
 }
 
@@ -149,6 +250,8 @@ fn battery(program: &Path, scratch: &TempDirGuard) -> Command {
         .env_remove("GRAPH_STATE_FILE");
     without_agent_vars(&mut cmd);
     without_git_repo_vars(&mut cmd);
+    cmd.env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null");
     cmd
 }
 
@@ -238,6 +341,230 @@ fn smoke_battery_passes_every_check() {
     assert_no_bytecode_under_candidate();
 }
 
+/// The quoted strings of the one-line tuple literal `name = (...)` in
+/// smoke_test.py.
+fn smoke_tuple(name: &str) -> BTreeSet<String> {
+    let smoke = fs::read_to_string(candidate_dir().join("scripts/smoke_test.py")).unwrap();
+    let prefix = format!("{name} = (");
+    let line = smoke
+        .lines()
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("smoke_test.py has no one-line {name} tuple"));
+    line.split('"')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn smoke_git_scrub_lists_equal_the_wrappers() {
+    let set =
+        |items: &[&str]| -> BTreeSet<String> { items.iter().map(|s| s.to_string()).collect() };
+    assert_eq!(smoke_tuple("GIT_REPO_VARS"), set(GIT_REPO_VARS));
+    assert_eq!(smoke_tuple("GIT_CONFIG_PREFIXES"), set(GIT_CONFIG_PREFIXES));
+}
+
+/// Config injected through `GIT_CONFIG_COUNT` after the wrapper's own scrub
+/// points the hooks path at a failing pre-commit hook, so the battery's
+/// scratch `git commit` passes only because smoke_test.py drops it.
+#[test]
+fn smoke_battery_drops_git_config_injected_through_the_environment() {
+    let Some(python) = python3() else { return };
+    let scratch = scratch_dir("smoke-git-config");
+    let hooks = scratch.0.join("hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("pre-commit");
+    fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = battery(&python, &scratch)
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", &hooks)
+        .arg("scripts/smoke_test.py")
+        .output()
+        .unwrap();
+    let report = transcript(&output);
+    assert!(output.status.success(), "{report}");
+    let (passed, total) = smoke_summary(&String::from_utf8_lossy(&output.stdout));
+    assert_eq!(passed, total, "{report}");
+    assert_no_bytecode_under_candidate();
+}
+
+/// A user config file swapped in through `GIT_CONFIG_GLOBAL` after the
+/// wrapper's own settings points the hooks path at a failing pre-commit hook,
+/// so the battery's scratch `git commit` passes only because smoke_test.py
+/// replaces it with the null device.
+#[test]
+fn smoke_battery_ignores_a_user_config_swapped_in_through_the_environment() {
+    let Some(python) = python3() else { return };
+    let scratch = scratch_dir("smoke-git-global");
+    let hooks = scratch.0.join("hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("pre-commit");
+    fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    let global = scratch.0.join("gitconfig");
+    fs::write(
+        &global,
+        format!("[core]\n\thooksPath = {}\n", hooks.display()),
+    )
+    .unwrap();
+    let output = battery(&python, &scratch)
+        .env("GIT_CONFIG_GLOBAL", &global)
+        .arg("scripts/smoke_test.py")
+        .output()
+        .unwrap();
+    let report = transcript(&output);
+    assert!(output.status.success(), "{report}");
+    let (passed, total) = smoke_summary(&String::from_utf8_lossy(&output.stdout));
+    assert_eq!(passed, total, "{report}");
+    assert_no_bytecode_under_candidate();
+}
+
+#[test]
+fn readme_hygiene_row_lists_the_scrubbed_git_variables() {
+    let readme = fs::read_to_string(candidate_dir().join("README.md")).unwrap();
+    let row = readme
+        .lines()
+        .find(|l| l.starts_with("| battery env hygiene |"))
+        .expect("README has a battery env hygiene row");
+    let list = "`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, \
+                `GIT_COMMON_DIR`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_GLOBAL`, \
+                `GIT_CONFIG_SYSTEM` and every variable starting with `GIT_CONFIG_KEY_` or \
+                `GIT_CONFIG_VALUE_` are dropped";
+    assert!(row.contains(list), "missing {list:?} in: {row}");
+    for name in GIT_REPO_VARS.iter().chain(GIT_CONFIG_PREFIXES) {
+        assert!(
+            row.contains(&format!("`{name}`")),
+            "{name} missing from: {row}"
+        );
+    }
+    let neutral = "then the battery sets `GIT_CONFIG_NOSYSTEM=1` and `GIT_CONFIG_GLOBAL` to the \
+                   null device, so no system or user git config applies to a scratch git call";
+    assert!(row.contains(neutral), "missing {neutral:?} in: {row}");
+    assert!(
+        !row.contains("never reaches a scratch git call"),
+        "the row overclaims again: {row}"
+    );
+}
+
+#[test]
+fn readme_hygiene_row_states_the_wrapper_run_isolation() {
+    let readme = fs::read_to_string(candidate_dir().join("README.md")).unwrap();
+    let row = readme
+        .lines()
+        .find(|l| l.starts_with("| battery env hygiene |"))
+        .expect("README has a battery env hygiene row");
+    let sentence = "Every real-binary run of the Rust wrapper starts from a scratch config dir \
+                    whose `mcp.json` defines no server (`{\"mcpServers\": {}}`), checked before \
+                    each spawn, so no MCP server or `uvx` launcher starts, and inherited \
+                    `COYOTE_*` variables are removed before the run sets its own config and \
+                    cache dirs";
+    assert!(row.contains(sentence), "missing {sentence:?} in: {row}");
+    assert!(row.contains("`tests/candidate_sisyphus_next.rs`"), "{row}");
+}
+
+/// Hunks in `diff -u old new`, or `None` when the files are identical. A file
+/// missing on one side is diffed against `/dev/null`, so it still differs.
+fn hunk_count(old: &Path, new: &Path) -> Option<usize> {
+    let side = |p: &Path| {
+        if p.is_file() {
+            p.to_path_buf()
+        } else {
+            PathBuf::from("/dev/null")
+        }
+    };
+    let output = Command::new("diff")
+        .arg("-u")
+        .arg(side(old))
+        .arg(side(new))
+        .output()
+        .unwrap();
+    match output.status.code() {
+        Some(0) => None,
+        Some(1) => Some(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter(|l| l.starts_with("@@"))
+                .count(),
+        ),
+        _ => panic!(
+            "diff -u {} {}: {}",
+            old.display(),
+            new.display(),
+            transcript(&output)
+        ),
+    }
+}
+
+/// The rows of the README's staging census block: file name to hunk count,
+/// `None` for a row that gives no count.
+fn readme_census_rows(readme: &str) -> BTreeMap<String, Option<usize>> {
+    let block: Vec<&str> = readme
+        .lines()
+        .skip_while(|l| !l.starts_with("Recorded census against the staging tree"))
+        .skip_while(|l| *l != "```")
+        .skip(1)
+        .take_while(|l| *l != "```")
+        .collect();
+    assert!(!block.is_empty(), "the README staging census block is gone");
+    block
+        .iter()
+        .map(|line| {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            let count = match words.get(2) {
+                Some(&"hunk" | &"hunks") => Some(words[1].parse().unwrap()),
+                _ => None,
+            };
+            (words[0].to_string(), count)
+        })
+        .collect()
+}
+
+#[test]
+fn readme_census_matches_a_live_diff_against_staging() {
+    // The staging tree lives outside this repository, so the check runs only
+    // on a host that has it.
+    let staging = std::env::var_os("SISYPHUS_NEXT_STAGING_DIR").map(PathBuf::from);
+    let Some(staging) = staging.filter(|p| p.is_dir()) else {
+        eprintln!(
+            "skipping the staging census: SISYPHUS_NEXT_STAGING_DIR is unset or not a directory"
+        );
+        return;
+    };
+    let ours = candidate_dir();
+    let tracked = |root: &Path| {
+        files_under(root)
+            .into_iter()
+            .filter(|f| {
+                !Path::new(f)
+                    .components()
+                    .any(|c| c.as_os_str() == "__pycache__")
+            })
+            .collect::<BTreeSet<String>>()
+    };
+    let names: BTreeSet<String> = tracked(&staging).union(&tracked(&ours)).cloned().collect();
+    let live: BTreeMap<String, Option<usize>> = names
+        .into_iter()
+        .filter_map(|name| {
+            let hunks = hunk_count(&staging.join(&name), &ours.join(&name))?;
+            let count = (name != "README.md").then_some(hunks);
+            Some((name, count))
+        })
+        .collect();
+    let recorded = readme_census_rows(&fs::read_to_string(ours.join("README.md")).unwrap());
+    assert_eq!(
+        recorded.get("README.md"),
+        Some(&None),
+        "README.md is listed as differing, with no count"
+    );
+    assert_eq!(
+        live, recorded,
+        "the README staging census no longer matches diff -u (left: live, right: README)"
+    );
+}
+
 #[test]
 fn session_block_check_passes_under_mikefarah_yq() {
     let Some(yq) = mikefarah_yq() else { return };
@@ -280,6 +607,26 @@ fn debt_scan_declares_its_fallback_next_to_next() {
         node["fallback"].as_str(),
         Some("bookkeeping_scan"),
         "debt_scan has no fallback edge: a script crash forwards only on fallback, so the fail-open default would never reach bookkeeping_scan"
+    );
+}
+
+/// `assess_fault` is the fail-safe after `assess` dies, so a crash of the
+/// fault shim itself must still reach `route_intent`, which asks when the
+/// intent is missing.
+#[test]
+fn assess_fault_declares_its_fallback_next_to_next() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let doc: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let node = &doc["nodes"]["assess_fault"];
+    assert_eq!(
+        node["next"].as_str(),
+        Some("route_intent"),
+        "assess_fault next"
+    );
+    assert_eq!(
+        node["fallback"].as_str(),
+        Some("route_intent"),
+        "assess_fault has no fallback edge: a script crash forwards only on fallback, so the run would end instead of asking"
     );
 }
 
@@ -949,9 +1296,24 @@ fn write_dry_run_config(dir: &Path) {
     fs::write(dir.join("mcp.json"), "{\"mcpServers\": {}}\n").unwrap();
 }
 
-/// Every binary run in this file starts from a config dir that
-/// `write_dry_run_config` wrote, the only `config.yaml` writer here, so none
-/// of them can reach the `uvx` launcher a CI host lacks.
+/// Panics unless `dir/mcp.json` exists and defines no server, so a
+/// real-binary run from `dir` cannot reach the `uvx` launcher a CI host lacks.
+fn assert_no_mcp_server(dir: &Path) {
+    let path = dir.join("mcp.json");
+    let text = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{}: no readable mcp.json ({e})", path.display()));
+    let mcp: serde_json::Value = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("{}: not JSON ({e})", path.display()));
+    assert_eq!(
+        mcp,
+        json!({"mcpServers": {}}),
+        "{} defines an MCP server",
+        path.display()
+    );
+}
+
+/// The config dir `write_dry_run_config` builds passes the guard
+/// `run_lifted_graph` applies before every spawn.
 #[test]
 fn every_scratch_config_dir_defines_no_mcp_server() {
     let scratch = scratch_dir("mcpconfig");
@@ -959,16 +1321,45 @@ fn every_scratch_config_dir_defines_no_mcp_server() {
     let mcp: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(scratch.0.join("mcp.json")).unwrap()).unwrap();
     assert_eq!(mcp, json!({"mcpServers": {}}));
-    let source = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(file!())).unwrap();
-    let lines: Vec<&str> = source.lines().collect();
-    let writers = lines
-        .windows(2)
-        .filter(|w| w[0].trim() == "fs::write(" && w[1].trim().ends_with(".join(\"config.yaml\"),"))
-        .count();
-    assert_eq!(
-        writers, 1,
-        "a second config.yaml writer must also write mcp.json"
-    );
+    assert_no_mcp_server(&scratch.0);
+}
+
+#[test]
+fn the_mcp_guard_rejects_a_missing_or_populated_mcp_json() {
+    let scratch = scratch_dir("mcpguard");
+    let missing = scratch.0.join("missing");
+    let populated = scratch.0.join("populated");
+    for dir in [&missing, &populated] {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("config.yaml"), "model: dryrun:dry-model\n").unwrap();
+    }
+    fs::write(
+        populated.join("mcp.json"),
+        "{\"mcpServers\": {\"git\": {\"command\": \"uvx\", \"args\": [\"mcp-server-git\"]}}}\n",
+    )
+    .unwrap();
+    for dir in [&missing, &populated] {
+        assert!(
+            std::panic::catch_unwind(|| assert_no_mcp_server(dir)).is_err(),
+            "the guard accepted {}",
+            dir.display()
+        );
+    }
+}
+
+#[test]
+fn a_lifted_graph_run_refuses_a_config_dir_without_mcp_json() {
+    let scratch = scratch_dir("mcpspawn");
+    fs::write(scratch.0.join("config.yaml"), "model: dryrun:dry-model\n").unwrap();
+    let dump = scratch.0.join("dump.json");
+    let payload =
+        std::panic::catch_unwind(|| run_lifted_graph(&scratch.0, "probe-mcp", &dump, "mcpspawn"))
+            .expect_err("run_lifted_graph spawned without an mcp.json");
+    let message = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_default();
+    assert!(message.contains("no readable mcp.json"), "{message}");
 }
 
 /// Runs the real binary on a lifted graph under `dir/agents/<agent>/` and
@@ -980,6 +1371,7 @@ fn run_lifted_graph(
     label: &str,
 ) -> (serde_json::Value, Output) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_coyote"));
+    scrub_coyote_env(&mut cmd);
     cmd.args(["--agent", agent, "probe"])
         .current_dir(dir)
         .env("HOME", dir.join("home"))
@@ -987,13 +1379,13 @@ fn run_lifted_graph(
         .env("COYOTE_CACHE_DIR", dir.join("cache"))
         .env("PYTHONDONTWRITEBYTECODE", "1")
         .env("NO_COLOR", "1")
-        .env_remove("COYOTE_LOG_PATH")
         .env_remove("IS_SANDBOX")
         .env_remove("GRAPH_STATE")
         .env_remove("GRAPH_STATE_FILE")
         .stdin(std::process::Stdio::null());
     without_agent_vars(&mut cmd);
     without_git_repo_vars(&mut cmd);
+    assert_no_mcp_server(dir);
     let output = cmd.output().unwrap();
     let report = transcript(&output);
     assert!(output.status.success(), "{label}: {report}");
@@ -1495,8 +1887,19 @@ fn gates_carry_exactly_the_recorded_divergences_from_staging() {
         assert!(update.contains(reset), "{reset} missing from {update}");
     }
     assert!(
-        route.contains("for e in as_list(state.get(\"debris_exemptions\")):\n        if e not in exemptions:\n            exemptions.append(e)\n"),
-        "the merge lines stay byte-equal to staging: {route}"
+        !route.contains("for e in as_list(state.get(\"debris_exemptions\")):"),
+        "the no-op re-merge loop is gone: {route}"
+    );
+    let merges: Vec<&str> = route
+        .lines()
+        .filter(|l| l.contains("debris_exemptions\")))"))
+        .collect();
+    assert_eq!(
+        merges,
+        [
+            "    exemptions = list(as_list(state.get(\"debris_exemptions\"))) + [e for e in as_list(state.get(\"debris_exemptions_new\", [])) if e]"
+        ],
+        "the ledger is merged once, by the concatenation line"
     );
     let graph = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
     let shipped: serde_yaml::Value = serde_yaml::from_str(&graph).unwrap();
@@ -2009,6 +2412,7 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
     "fix_round",
     "fix_strikes",
     "obs_rounds",
+    "oracle_retries",
     "owner_polls",
     "reask_rounds",
     "rejected_rounds",
@@ -2037,9 +2441,19 @@ const FROZEN_SCRIPT_BOUNDS: &[(&str, &str)] = &[
 ];
 
 fn is_constant_name(s: &str) -> bool {
-    let mut chars = s.chars();
+    let mut chars = s.trim_start_matches('_').chars();
     chars.next().is_some_and(|c| c.is_ascii_uppercase())
         && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+#[test]
+fn constant_names_may_start_with_underscores_before_an_uppercase_letter() {
+    for name in ["X", "STRIKE_LIMIT", "_X", "__X", "_PRIVATE_LIMIT", "A1_B"] {
+        assert!(is_constant_name(name), "{name} rejected");
+    }
+    for name in ["", "_", "__", "_x", "x", "Strike", "_1X", "1X"] {
+        assert!(!is_constant_name(name), "{name} accepted");
+    }
 }
 
 /// A right-hand side built only from integer literals, constant names and
@@ -2799,6 +3213,174 @@ fn readme_pins_the_artifact_re_entry_and_engine_fact_rows() {
     );
 }
 
+#[test]
+fn readme_ci_budget_row_separates_per_watch_from_per_run_counters() {
+    let readme = fs::read_to_string(candidate_dir().join("README.md")).unwrap();
+    let section = readme
+        .split("\n## ")
+        .find(|s| s.starts_with("Landed-upstream adjustments"))
+        .expect("README has a Landed-upstream adjustments section");
+    let row = section
+        .lines()
+        .find(|l| l.starts_with("| CI budget nesting |"))
+        .unwrap_or_else(|| panic!("missing CI budget nesting row:\n{section}"));
+    for sentence in [
+        "Per-watch budgets are `ci_polls`, `ci_poll_fails` and `ci_started_at`: they reset every time a watch starts (`ci_gate`, the owner's re-run answer, a flake re-run).",
+        "Per-run budgets are `ci_reruns` (per check, `CI_FLAKE_RERUNS`) and `ci_fix_strikes` (`STRIKE_LIMIT`).",
+    ] {
+        assert!(row.contains(sentence), "missing {sentence:?} in {row}");
+    }
+}
+
+/// Every entry shim dispatches `run("<its own stem>")`, that name is a key of
+/// the `GATES` dict in gates.py, and every `GATES` key has its shim.
+#[test]
+fn entry_shims_and_the_gates_dict_name_each_other() {
+    let scripts = candidate_dir().join("scripts");
+    let gates = fs::read_to_string(scripts.join("gates.py")).unwrap();
+    let open = "\nGATES = {";
+    let start = gates.find(open).expect("gates.py defines GATES") + open.len();
+    let end = gates[start..].find("\n}").expect("the GATES dict closes") + start;
+    let key_re = fancy_regex::Regex::new(r#""([a-z_]+)":"#).unwrap();
+    let keys: BTreeSet<String> = key_re
+        .captures_iter(&gates[start..end])
+        .map(|c| c.unwrap()[1].to_string())
+        .collect();
+    assert!(keys.len() > 40, "GATES holds only {} keys", keys.len());
+
+    let run_re = fancy_regex::Regex::new(r#"\brun\("([^"]*)"\)"#).unwrap();
+    let mut shims = BTreeSet::new();
+    for entry in fs::read_dir(&scripts).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|e| e != "py") {
+            continue;
+        }
+        let text = fs::read_to_string(&path).unwrap();
+        if !text.contains("from gates import run") {
+            continue;
+        }
+        let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+        let literals: Vec<String> = run_re
+            .captures_iter(&text)
+            .map(|c| c.unwrap()[1].to_string())
+            .collect();
+        assert_eq!(literals, std::slice::from_ref(&stem), "{}", path.display());
+        assert!(keys.contains(&stem), "{stem} is not a GATES key");
+        shims.insert(stem);
+    }
+    assert_eq!(
+        keys, shims,
+        "GATES keys and entry shims differ (left: GATES, right: shims)"
+    );
+}
+
+/// `audit_graph.py` reports a shim whose `run()` literal is not a `GATES` key
+/// or is not the shim's own stem, instead of treating it as a gate with no
+/// `_next` edges.
+#[test]
+fn audit_graph_reports_a_shim_naming_a_wrong_gate() {
+    let Some(python) = python3() else { return };
+    let Some(yq) = mikefarah_yq() else { return };
+    let scratch = scratch_dir("audit-shim");
+    let copy = scratch_candidate_copy(&scratch);
+    let shim = copy.join("scripts").join("assess_fault.py");
+    let original = fs::read_to_string(&shim).unwrap();
+    assert!(original.contains("run(\"assess_fault\")"), "{original}");
+    let cases = [
+        (
+            "missing_gate",
+            vec![
+                "assess_fault: entry script names unknown gate missing_gate",
+                "assess_fault: entry script names gate missing_gate, not assess_fault",
+            ],
+        ),
+        (
+            "intake",
+            vec!["assess_fault: entry script names gate intake, not assess_fault"],
+        ),
+    ];
+    for (literal, expected) in cases {
+        fs::write(
+            &shim,
+            original.replace("run(\"assess_fault\")", &format!("run(\"{literal}\")")),
+        )
+        .unwrap();
+        let output = battery(&python, &scratch)
+            .current_dir(&copy)
+            .env("PATH", path_with(yq.parent().unwrap()))
+            .args(["scripts/audit_graph.py", "."])
+            .output()
+            .unwrap();
+        let report = transcript(&output);
+        assert!(!output.status.success(), "{report}");
+        let problems = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find(|l| l.starts_with("PROBLEMS: "))
+            .unwrap_or_else(|| panic!("no PROBLEMS line\n{report}"))
+            .to_string();
+        for line in &expected {
+            assert!(problems.contains(line), "missing {line:?}\n{report}");
+        }
+        if expected.len() == 1 {
+            assert!(!problems.contains("unknown gate"), "{report}");
+        }
+    }
+}
+
+#[test]
+fn cache_dir_docstring_claims_only_the_shared_precedence() {
+    let lib = fs::read_to_string(candidate_dir().join("scripts").join("_lib.py")).unwrap();
+    let open = "def cache_dir():\n    \"\"\"";
+    let start = lib.find(open).expect("_lib.py defines cache_dir") + open.len();
+    let end = lib[start..].find("\"\"\"").expect("the docstring closes") + start;
+    let doc = lib[start..end]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(!doc.contains("the way the engine resolves it"), "{doc}");
+    for phrase in [
+        "the same precedence as the engine for the two environment tiers",
+        "approximates the engine's platform tier",
+        "the engine treats a set-but-empty variable as set",
+        "from the `dirs` crate",
+        "falls back to the temp dir",
+    ] {
+        assert!(doc.contains(phrase), "missing {phrase:?} in {doc}");
+    }
+}
+
+#[test]
+fn readme_pins_the_run_dir_modes_and_the_checks_seam_trust() {
+    let readme = fs::read_to_string(candidate_dir().join("README.md")).unwrap();
+    let section = readme
+        .split("\n## ")
+        .find(|s| s.starts_with("Landed-upstream adjustments"))
+        .expect("README has a Landed-upstream adjustments section");
+    let row = section
+        .lines()
+        .find(|l| l.starts_with("| run-dir permissions and the checks seam |"))
+        .unwrap_or_else(|| panic!("missing run-dir permissions row:\n{section}"));
+    for sentence in [
+        "Run dirs are created 0700 and every artifact written into them is 0600, whatever the umask;",
+        "it is an operator-environment test seam that `ci_poll` runs through the shell in place of `gh pr checks`, so it carries the same trust as the process environment that sets it.",
+    ] {
+        assert!(row.contains(sentence), "missing {sentence:?} in {row}");
+    }
+    let gates = fs::read_to_string(candidate_dir().join("scripts").join("gates.py")).unwrap();
+    let lines: Vec<&str> = gates.lines().collect();
+    let seam = lines
+        .iter()
+        .position(|l| l.contains("subprocess.run(cmd, shell=True"))
+        .expect("ci_poll runs the checks seam through the shell");
+    assert!(
+        lines[seam - 1]
+            .trim_start()
+            .starts_with("# Operator-environment test seam run through the shell"),
+        "the shell=True line carries its trust-model comment: {}",
+        lines[seam - 1]
+    );
+}
+
 /// A clean one-commit repository plus the cold round-1 state a gauntlet
 /// round-trip starts from (`build_gauntlet_prompt` already merged, so
 /// `round_heads` holds round 1 at the first sha).
@@ -3328,8 +3910,8 @@ fn children_without_a_build_lock_declaration_never_consume_it() {
         .expect("README has a build_lock threading row");
     for clause in [
         "a child that declares no `build_lock` does not consume it",
-        "Those six declare no `build_lock` and do not consume it themselves: the inherited \
-         value reaches them, but nothing in them runs a build under it",
+        "does not consume it: the inherited value reaches those six, but nothing in them runs \
+         a build under it (no file of theirs names `build_lock`, `gate_prefix` or `run_gate`)",
     ] {
         assert!(
             row.contains(clause),
@@ -3337,6 +3919,10 @@ fn children_without_a_build_lock_declaration_never_consume_it() {
              build_lock ({clause:?}): {row}"
         );
     }
+    assert!(
+        !row.contains("do not consume it themselves"),
+        "the threading row repeats the not-consumed sentence: {row}"
+    );
     for agent in expected {
         assert!(row.contains(agent), "{agent} missing from: {row}");
     }
@@ -3372,6 +3958,10 @@ fn readme_grammar_row_scopes_the_look_alike_guarantee_to_the_parsed_sections() {
     assert!(
         !row.contains("guaranteed by the producer"),
         "the row describes the producer's one-line obligation as current behaviour: {row}"
+    );
+    assert!(
+        row.contains("up to the next column-0 `##` followed by a space or tab, and"),
+        "the section end must match `_gauntlet_section`'s `##[ \\t]`: {row}"
     );
 }
 
