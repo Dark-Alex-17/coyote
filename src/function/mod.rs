@@ -2604,6 +2604,10 @@ pub fn run_llm_function(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // The bash helper exports the fd it saved stdout on; a nested coyote's
+    // tools must not inherit that marker or they would write requests to
+    // the outer pump.
+    command.env_remove(prompt_channel::OUT_FD_ENV);
     match reply.as_ref() {
         Some(server) => server.configure(&mut command),
         None => {
@@ -2635,12 +2639,21 @@ pub fn run_llm_function(
     // raised to the user as prompts for a tool already reported finished.
     let tool_exited = Arc::new(AtomicBool::new(false));
     let stdout_tool_exited = Arc::clone(&tool_exited);
+    // Once the drain grace runs out the pump is detached and anything a
+    // surviving descendant writes is dropped rather than attributed to a
+    // tool already reported finished.
+    let pump_detached = Arc::new(AtomicBool::new(false));
+    let stdout_detached = Arc::clone(&pump_detached);
+    let stderr_detached = Arc::clone(&pump_detached);
     let stdout_thread = thread::spawn(move || {
         let mut buffer = [0; 1024];
         let mut reader = stdout;
         let mut lines = prompt_channel::LineAssembler::default();
         let served = stdout_io.prompter.as_ref().zip(reply.as_ref());
         let emit = |chunk: &[u8]| {
+            if stdout_detached.load(Ordering::Acquire) {
+                return;
+            }
             stdout_sink.lock().extend_from_slice(chunk);
             events::bus().publish(Event::ToolOutputChunk {
                 call_id: stdout_io.call_id.clone().unwrap_or_default(),
@@ -2670,11 +2683,11 @@ pub fn run_llm_function(
                         let request = live.and_then(|(prompter, server)| {
                             prompter
                                 .parse_line(&line, &stdout_tool, stdout_io.call_id.clone(), None)
-                                .map(|req| (prompter, server, req))
+                                .map(|parsed| (prompter, server, parsed))
                         });
                         match request {
-                            Some((prompter, server, req)) => {
-                                prompt_channel::handle_prompt_line(prompter, server, req);
+                            Some((prompter, server, parsed)) => {
+                                prompt_channel::handle_prompt_line(prompter, server, parsed);
                             }
                             None => {
                                 emit(&line);
@@ -2699,6 +2712,9 @@ pub fn run_llm_function(
         while let Ok(n) = reader.read(&mut buffer) {
             if n == 0 {
                 break;
+            }
+            if stderr_detached.load(Ordering::Acquire) {
+                continue;
             }
             let chunk = &buffer[0..n];
             stderr_sink.lock().extend_from_slice(chunk);
@@ -2738,6 +2754,7 @@ pub fn run_llm_function(
                 "Tool process '{command_name}' killed after {:.1?} (timeout)",
                 spawned.elapsed()
             );
+            tool_exited.store(true, Ordering::Release);
             let _ = child.kill();
             let _ = child.wait();
             drop(stdout_thread);
@@ -2762,6 +2779,7 @@ pub fn run_llm_function(
                 "Tool process '{command_name}' killed after {:.1?} (abort)",
                 spawned.elapsed()
             );
+            tool_exited.store(true, Ordering::Release);
             let _ = child.kill();
             let _ = child.wait();
             drop(stdout_thread);
@@ -2787,9 +2805,12 @@ pub fn run_llm_function(
             Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 let _ = pump.join();
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => debug!(
-                "Tool '{command_name}' exited but a descendant still holds its {stream:?} pipe; detaching the pump"
-            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                pump_detached.store(true, Ordering::Release);
+                debug!(
+                    "Tool '{command_name}' exited but a descendant still holds its {stream:?} pipe; detaching the pump"
+                );
+            }
         }
     };
     drain(stdout_thread, stdout_done_rx, OutputStream::Stdout);

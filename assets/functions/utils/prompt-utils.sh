@@ -115,8 +115,7 @@ white() {
 # saved on fd 9 once at source time. A channel handed over on fd 9 itself
 # would be clobbered by that save, so it is treated as absent.
 if [[ -n "${COYOTE_PROMPT_REPLY:-}" && "$COYOTE_PROMPT_REPLY" != /dev/fd/9 && -z "${_COYOTE_PROMPT_OUT:-}" ]]; then
-  exec 9>&1
-  export _COYOTE_PROMPT_OUT=9
+  exec 9>&1 && export _COYOTE_PROMPT_OUT=9
 fi
 
 _coyote_prompt_enabled() {
@@ -155,7 +154,7 @@ _coyote_prompt_map() {
       ;;
     checkbox)
       printf '%s' "$reply" | jq -er --argjson options "$options" \
-        'if (.answer | type) == "array" then (.answer as $a | [$options | to_entries[] | select(.value | IN($a[])) | .key] | map(tostring) | join(" ")) else empty end'
+        'if (.answer | type) == "array" and ((.answer - $options) | length) == 0 then (.answer as $a | [$options | to_entries[] | select(.value as $v | $a | index($v) != null) | .key] | map(tostring) | join(" ")) else empty end'
       ;;
     input | password)
       printf '%s' "$reply" | jq -er \
@@ -636,7 +635,7 @@ open_link() {
 }
 
 guard_operation() {
-	if [[ -z "$AUTO_CONFIRM" && -z "$LLM_AGENT_VAR_AUTO_CONFIRM" ]]; then
+	if [[ -z "${AUTO_CONFIRM:-}" && -z "${LLM_AGENT_VAR_AUTO_CONFIRM:-}" ]]; then
 		# `|| ans=""`: a cancelled prompt returns 1, which errexit would turn into a silent exit here.
 		if _coyote_prompt_enabled; then
 			ans="$(confirm "${1:-Are you sure you want to continue?}")" || ans=""
@@ -902,7 +901,7 @@ guard_path() {
 	path="$(_to_real_path "$1")"
 	confirmation_prompt="$2"
 
-	if [[ ! "$path" == "$(pwd)"* && -z "$AUTO_CONFIRM" && -z "$LLM_AGENT_VAR_AUTO_CONFIRM" ]]; then
+	if [[ ! "$path" == "$(pwd)"* && -z "${AUTO_CONFIRM:-}" && -z "${LLM_AGENT_VAR_AUTO_CONFIRM:-}" ]]; then
 		if _coyote_prompt_enabled; then
 			ans="$(confirm "$confirmation_prompt")" || ans=""
 		else

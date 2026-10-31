@@ -20,6 +20,10 @@ use std::process::Command;
 use std::sync::Arc;
 
 pub(crate) const REPLY_ENV: &str = "COYOTE_PROMPT_REPLY";
+/// Exported by the bash helper once it has saved its stdout on a spare fd.
+/// A tool spawned by Coyote must never inherit it: a nested run's helper
+/// would skip its own save and write requests to the outer pump.
+pub(crate) const OUT_FD_ENV: &str = "_COYOTE_PROMPT_OUT";
 pub(crate) const MARKER: &[u8] = b"{\"coyote_prompt\"";
 
 /// A tail without a newline is held back only this long; past it the tool
@@ -160,9 +164,9 @@ impl ToolPrompter {
         tool: &str,
         call_id: Option<String>,
         job_id: Option<String>,
-    ) -> Option<PromptRequest> {
+    ) -> Option<ParsedRequest> {
         match parse_request(line, tool, call_id, job_id, self.origin.clone()) {
-            Ok(req) => Some(req),
+            Ok(parsed) => Some(parsed),
             Err(err) => {
                 warn!("Malformed prompt line from tool '{tool}': {err}");
                 None
@@ -201,11 +205,20 @@ impl ToolPrompter {
 /// Asks and writes the reply line. A prompter failure, an answer of the
 /// wrong shape or a choice outside the offered options all answer `null`,
 /// so the tool fails closed instead of hanging or acting on a bad value.
-pub(crate) fn handle_prompt_line(prompter: &ToolPrompter, reply: &Server, req: PromptRequest) {
+/// Chosen options go back as the raw text the tool sent, since that is what
+/// the tool matches its answer against.
+pub(crate) fn handle_prompt_line(prompter: &ToolPrompter, reply: &Server, parsed: ParsedRequest) {
+    let ParsedRequest { req, raw_options } = parsed;
     let id = req.id.clone();
     let tool = req.tool.clone().unwrap_or_default();
     let action = req.action;
     let options = req.options.clone();
+    let raw = |choice: &String| {
+        options
+            .iter()
+            .position(|option| option == choice)
+            .map(|index| raw_options[index].clone())
+    };
     let answer = prompter.answer(req);
     let value = match &answer {
         Err(err) => {
@@ -220,24 +233,30 @@ pub(crate) fn handle_prompt_line(prompter: &ToolPrompter, reply: &Server, req: P
             Value::Null
         }
         Ok(PromptAnswer::Selected(choice))
-            if action == PromptAction::Select
-                && !options.is_empty()
-                && !options.contains(choice) =>
+            if action == PromptAction::Select && !options.is_empty() =>
         {
-            warn!(
-                "Tool '{tool}' prompt '{id}': answer '{choice}' is not one of the offered options; answering null"
-            );
-            Value::Null
+            match raw(choice) {
+                Some(raw) => json!(raw),
+                None => {
+                    warn!(
+                        "Tool '{tool}' prompt '{id}': answer '{choice}' is not one of the offered options; answering null"
+                    );
+                    Value::Null
+                }
+            }
         }
         Ok(PromptAnswer::Checked(choices))
-            if action == PromptAction::Checkbox
-                && !options.is_empty()
-                && choices.iter().any(|choice| !options.contains(choice)) =>
+            if action == PromptAction::Checkbox && !options.is_empty() =>
         {
-            warn!(
-                "Tool '{tool}' prompt '{id}': answer {choices:?} includes a choice outside the offered options; answering null"
-            );
-            Value::Null
+            match choices.iter().map(raw).collect::<Option<Vec<_>>>() {
+                Some(raw) => json!(raw),
+                None => {
+                    warn!(
+                        "Tool '{tool}' prompt '{id}': answer {choices:?} includes a choice outside the offered options; answering null"
+                    );
+                    Value::Null
+                }
+            }
         }
         Ok(_) => answer_value(&answer),
     };
@@ -300,15 +319,21 @@ struct WireRequest {
     default: Option<Value>,
 }
 
-/// Question and option text come from the tool, so terminal escapes are
-/// stripped before the prompter paints them.
+/// A request as the prompter sees it plus the option text as the tool sent
+/// it. Question and options are sanitised before the prompter paints them,
+/// but a chosen option must go back verbatim or the tool cannot match it.
+pub(crate) struct ParsedRequest {
+    pub(crate) req: PromptRequest,
+    raw_options: Vec<String>,
+}
+
 pub(crate) fn parse_request(
     line: &[u8],
     tool: &str,
     call_id: Option<String>,
     job_id: Option<String>,
     origin: Origin,
-) -> Result<PromptRequest> {
+) -> Result<ParsedRequest> {
     let wire: WireLine = serde_json::from_slice(line)?;
     let wire = wire.coyote_prompt;
     let action = [
@@ -321,21 +346,23 @@ pub(crate) fn parse_request(
     .into_iter()
     .find(|action| action.name() == wire.action)
     .ok_or_else(|| anyhow!("unknown prompt action '{}'", wire.action))?;
-    Ok(PromptRequest {
-        id: wire.id,
-        action,
-        question: sanitize_display_text(&wire.question),
-        options: wire
-            .options
-            .unwrap_or_default()
-            .iter()
-            .map(|option| sanitize_display_text(option))
-            .collect(),
-        default: wire.default,
-        tool: Some(tool.to_string()),
-        call_id,
-        job_id,
-        origin,
+    let raw_options = wire.options.unwrap_or_default();
+    Ok(ParsedRequest {
+        req: PromptRequest {
+            id: wire.id,
+            action,
+            question: sanitize_display_text(&wire.question),
+            options: raw_options
+                .iter()
+                .map(|option| sanitize_display_text(option))
+                .collect(),
+            default: wire.default,
+            tool: Some(tool.to_string()),
+            call_id,
+            job_id,
+            origin,
+        },
+        raw_options,
     })
 }
 
@@ -522,6 +549,11 @@ mod tests {
     /// The reply line a scripted answer produces for `req`, read back from
     /// the child's end of a fresh server.
     fn reply_for(prompter: ScriptedPrompter, req: PromptRequest) -> Value {
+        let raw_options = req.options.clone();
+        reply_for_parsed(prompter, ParsedRequest { req, raw_options })
+    }
+
+    fn reply_for_parsed(prompter: ScriptedPrompter, parsed: ParsedRequest) -> Value {
         let server = Server::open().unwrap();
         let child_end = server.child_end.as_ref().unwrap().try_clone().unwrap();
         let prompter = ToolPrompter::new(
@@ -529,7 +561,7 @@ mod tests {
             Arc::new(PromptMemory::default()),
             Origin::detached(),
         );
-        handle_prompt_line(&prompter, &server, req);
+        handle_prompt_line(&prompter, &server, parsed);
         let mut line = String::new();
         std::io::BufReader::new(std::fs::File::from(child_end))
             .read_line(&mut line)
@@ -728,7 +760,8 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
             Some("job_1".to_string()),
             Origin::detached(),
         )
-        .unwrap();
+        .unwrap()
+        .req;
 
         assert_eq!(req.id, "p9");
         assert_eq!(req.action, PromptAction::Select);
@@ -757,7 +790,9 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
     fn parse_request_tolerates_null_options() {
         let line = r#"{"coyote_prompt": {"id": "p1", "action": "select", "question": "q", "options": null}}"#;
 
-        let req = parse_request(line.as_bytes(), "t", None, None, Origin::detached()).unwrap();
+        let req = parse_request(line.as_bytes(), "t", None, None, Origin::detached())
+            .unwrap()
+            .req;
 
         assert!(req.options.is_empty());
     }
@@ -770,10 +805,11 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
         }})
         .to_string();
 
-        let req = parse_request(line.as_bytes(), "t", None, None, Origin::detached()).unwrap();
+        let parsed = parse_request(line.as_bytes(), "t", None, None, Origin::detached()).unwrap();
 
-        assert_eq!(req.question, "which?");
-        assert_eq!(req.options, vec!["a", "b"]);
+        assert_eq!(parsed.req.question, "which?");
+        assert_eq!(parsed.req.options, vec!["a", "b"]);
+        assert_eq!(parsed.raw_options, vec!["\u{1b}[31ma", "b"]);
     }
 
     #[test]
@@ -858,6 +894,26 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
         );
 
         assert_eq!(reply, json!({"id": id, "answer": null}));
+    }
+
+    #[test]
+    #[serial]
+    fn chosen_option_is_replied_with_the_text_the_tool_sent() {
+        let raw = "\u{1b}[31mred\u{1b}[0m";
+        let line = json!({"coyote_prompt": {
+            "id": "p-raw", "action": "select", "question": "Colour? raw-x7x",
+            "options": [raw, "b"]
+        }})
+        .to_string();
+        let parsed = parse_request(line.as_bytes(), "t", None, None, Origin::detached()).unwrap();
+        assert_eq!(parsed.req.options, vec!["red", "b"]);
+
+        let reply = reply_for_parsed(
+            ScriptedPrompter::new(vec![PromptAnswer::Selected("red".to_string())]),
+            parsed,
+        );
+
+        assert_eq!(reply, json!({"id": "p-raw", "answer": raw}));
     }
 
     #[test]
@@ -1040,6 +1096,8 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
 
     /// The helper keeps a second handle on the tool's stdout pipe which a
     /// background descendant inherits, so EOF never arrives while it runs.
+    /// A request that descendant makes after the tool exited is answered
+    /// null without reaching the prompter.
     #[test]
     #[serial]
     fn tool_returns_once_it_exits_even_if_a_descendant_holds_its_pipes() {
@@ -1047,7 +1105,11 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
         let _guard = TestConfigDirGuard::new("prompt-detached");
         install_tool(
             "bg-x7x",
-            "sleep 30 >/dev/null 2>&1 &\necho done >> \"$LLM_OUTPUT\"",
+            concat!(
+                "sleep 30 >/dev/null 2>&1 &\n",
+                "( sleep 1; confirm \"late? late-x7x\" >/dev/null; echo \"late=$?\" >&2 ) &\n",
+                "echo done >> \"$LLM_OUTPUT\"",
+            ),
         );
         let prompter = Arc::new(ScriptedPrompter::refusing());
         let started = std::time::Instant::now();
@@ -1064,6 +1126,30 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
             "{:?}",
             started.elapsed()
         );
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        assert!(prompter.requests().is_empty(), "{:?}", prompter.requests());
+    }
+
+    /// The helper exports the fd it saved stdout on; a tool must start
+    /// without that marker or it would skip its own save and write requests
+    /// to whatever fd 9 happens to be.
+    #[test]
+    #[serial]
+    fn inherited_saved_fd_marker_is_scrubbed_before_the_tool_starts() {
+        require_tools();
+        let _guard = TestConfigDirGuard::new("prompt-outfd");
+        let _ambient = EnvVarGuard::set(OUT_FD_ENV, "9");
+        install_tool("outfd-x7x", "confirm \"Go? outfd-x7x\" >> \"$LLM_OUTPUT\"");
+        let prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Confirmed(true)]));
+
+        let output = run_tool(
+            "outfd-x7x",
+            tool_envs(),
+            io_with(&prompter, Arc::new(PromptMemory::default())),
+        );
+
+        assert_eq!(output["output"], "1");
+        assert_eq!(prompter.requests().len(), 1);
     }
 
     #[test]
@@ -1168,10 +1254,9 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
         );
     }
 
-    /// Usage-probe pin: a tool that drew a progress line without a newline
-    /// and then prompts (the spec's "request may follow unterminated
-    /// output") must get its answer, keep the partial output, and never
-    /// leak the request line to the display.
+    /// A tool that drew a progress line without a newline and then prompts
+    /// must get its answer, keep the partial output, and never leak the
+    /// request line to the display.
     #[test]
     #[serial]
     fn prompt_after_unterminated_output_round_trips_end_to_end() {
@@ -1251,9 +1336,11 @@ echo "$ans" >> "$LLM_OUTPUT""#,
     async fn background_job_prompts_through_the_ring_pump_and_completes() {
         require_tools();
         let _guard = TestConfigDirGuard::new("prompt-job");
+        let _acp_off = AtomicFlagGuard::set(&ACP_SERVER, false);
+        let _headless_off = AtomicFlagGuard::set(&HEADLESS, false);
         install_tool(
             "jobask-x7x",
-            r#"ans="$(confirm "Proceed? job-x7x")"; echo "answer=$ans"; echo DONE > "$LLM_OUTPUT""#,
+            r#"ans="$(confirm "Proceed? job-x7x")"; echo "answer=$ans"; echo "ui=$COYOTE_UI"; echo DONE > "$LLM_OUTPUT""#,
         );
         let prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Confirmed(true)]));
         let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
@@ -1277,13 +1364,9 @@ echo "$ans" >> "$LLM_OUTPUT""#,
         assert_eq!(collected["status"], "completed", "{collected}");
         assert_eq!(collected["exit_code"], 0);
         assert_eq!(collected["result"], json!({"output": "DONE\n"}));
-        assert!(
-            collected["output_tail"]
-                .as_str()
-                .unwrap()
-                .contains("answer=1"),
-            "{collected}"
-        );
+        let tail = collected["output_tail"].as_str().unwrap();
+        assert!(tail.contains("answer=1"), "{collected}");
+        assert!(tail.contains("ui=repl"), "{collected}");
         let requests = prompter.requests();
         assert_eq!(requests.len(), 1, "{requests:?}");
         assert_eq!(requests[0].question, "Proceed? job-x7x");
@@ -1828,11 +1911,10 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             fs::remove_dir_all(&dir).ok();
         }
 
-        // Usage-probe pins (spec-first, black-box). The spec: "reply read
-        // with `read -r line` until the id matches"; "cancel -> helper exits
-        // 1 and the tool's stderr carries its usual message"; the shipped
-        // tools (`execute_command.sh`, `fs_rm.sh`, ...) and the `run-tool.sh`
-        // shim all run under `set -e`.
+        // Replies are read until the id matches; a cancel makes the helper
+        // exit 1 with its usual stderr message. The shipped tools
+        // (`execute_command.sh`, `fs_rm.sh`, ...) and the `run-tool.sh` shim
+        // all run under `set -e`, so the guards are exercised that way too.
 
         #[test]
         fn reply_lines_for_other_ids_are_skipped_until_ours_arrives() {
@@ -1994,6 +2076,200 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             assert_eq!(run.request_lines().len(), 2, "{}", run.stdout);
             // Nothing picked / nothing typed is a valid answer, not a cancel.
             assert_eq!(run.other_lines(), vec!["v=[] rc=0", "v=[] rc=0"]);
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        // The helpers' return conventions must hold whatever shell options
+        // and option texts a tool author brings along, and the channel the
+        // host hands a tool must still be there one `bash` deeper.
+
+        #[test]
+        fn helpers_keep_their_conventions_under_strict_mode_and_a_custom_ifs() {
+            require_tools();
+            let dir = scratch_dir("strict");
+            // `set -euo pipefail` plus a whitespace-free IFS is the common
+            // "strict mode" prologue; an unset variable or a word-splitting
+            // assumption on the protocol path would surface here.
+            // `set +u` before the guard: its AUTO_CONFIRM short-circuit is the
+            // pre-protocol code (`[[ -z "$AUTO_CONFIRM" ]]`) and has never
+            // tolerated nounset; that is outside the protocol contract.
+            let body = format!(
+                "set -euo pipefail; IFS=$'\\n\\t'; {}; {}; {}; {}; \
+                 set +u; guard_operation \"Go on?\"; echo \"guard rc=$?\"",
+                capture("confirm \"Go?\""),
+                capture("list \"Pick\" a b c"),
+                capture("checkbox \"Pick many\" a b c"),
+                capture("input \"Name?\"")
+            );
+            let run = run_helper(
+                &dir,
+                Some(&[
+                    json!(true),
+                    json!("c"),
+                    json!(["a", "b", "c"]),
+                    json!("Bob Smith"),
+                    json!(true),
+                ]),
+                &body,
+                false,
+            );
+            assert_eq!(run.code, 0, "{}\n{}", run.stdout, run.stderr);
+            assert_eq!(run.request_lines().len(), 5, "{}", run.stdout);
+            assert_eq!(
+                run.other_lines(),
+                vec![
+                    "v=[1] rc=0",
+                    "v=[2] rc=0",
+                    "v=[0 1 2] rc=0",
+                    "v=[Bob Smith] rc=0",
+                    "guard rc=0",
+                ],
+                "{}\n{}",
+                run.stdout,
+                run.stderr
+            );
+            assert!(run.stderr.is_empty(), "{}", run.stderr);
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn options_are_matched_exactly_whatever_their_text() {
+            require_tools();
+            let dir = scratch_dir("options");
+            // Spaces, quotes, regex metacharacters, non-ASCII and an option that
+            // is a prefix of another: the request must carry them verbatim and
+            // the printed index must come from an exact match.
+            let options = [
+                "foo",
+                "foo.bar",
+                "two words",
+                "say \"hi\"",
+                "a+b*",
+                "ünï", // debris-exempt: the fixture is the non-ASCII option under test
+                "10",
+                "1",
+            ];
+            let quoted: Vec<String> = options
+                .iter()
+                .map(|opt| format!("'{}'", opt.replace('\'', "'\\''")))
+                .collect();
+            let quoted = quoted.join(" ");
+            for (answer, index) in [
+                ("foo", 0),
+                ("foo.bar", 1),
+                ("two words", 2),
+                ("say \"hi\"", 3),
+                ("a+b*", 4),
+                ("ünï", 5), // debris-exempt: see the fixture above
+                ("1", 7),
+            ] {
+                let run = run_helper(
+                    &dir,
+                    Some(&[json!(answer)]),
+                    &capture(&format!("list \"Pick\" {quoted}")),
+                    false,
+                );
+                let requests = run.request_lines();
+                assert_eq!(requests.len(), 1, "{answer}: {}", run.stdout);
+                assert_eq!(
+                    requests[0]["coyote_prompt"]["options"],
+                    json!(options),
+                    "{answer}: options must reach the host verbatim"
+                );
+                assert_eq!(
+                    run.other_lines(),
+                    vec![format!("v=[{index}] rc=0")],
+                    "{answer}: {}\n{}",
+                    run.stdout,
+                    run.stderr
+                );
+            }
+
+            let run = run_helper(
+                &dir,
+                Some(&[json!(["1", "two words", "foo.bar"])]),
+                &capture(&format!("checkbox \"Pick many\" {quoted}")),
+                false,
+            );
+            assert_eq!(run.request_lines().len(), 1, "{}", run.stdout);
+            let printed = run.other_lines();
+            assert_eq!(printed.len(), 1, "{}", run.stdout);
+            let mut indices: Vec<&str> = printed[0]
+                .trim_start_matches("v=[")
+                .split("] rc=")
+                .next()
+                .unwrap()
+                .split(' ')
+                .collect();
+            indices.sort_unstable();
+            assert_eq!(
+                indices,
+                vec!["1", "2", "7"],
+                "{}\n{}",
+                run.stdout,
+                run.stderr
+            );
+            assert!(printed[0].ends_with("rc=0"), "{}", run.stdout);
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn an_option_with_a_control_character_is_sent_verbatim_and_index_mapped() {
+            require_tools();
+            let dir = scratch_dir("tab-option");
+
+            let run = run_helper(
+                &dir,
+                Some(&[json!("a\tb")]),
+                &capture("list \"Pick\" $'a\\tb' plain"),
+                false,
+            );
+
+            let requests = run.request_lines();
+            assert_eq!(requests.len(), 1, "{}", run.stdout);
+            assert_eq!(
+                requests[0]["coyote_prompt"]["options"],
+                json!(["a\tb", "plain"])
+            );
+            assert_eq!(
+                run.other_lines(),
+                vec!["v=[0] rc=0"],
+                "{}\n{}",
+                run.stdout,
+                run.stderr
+            );
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn a_nested_bash_script_inherits_the_channel() {
+            require_tools();
+            let dir = scratch_dir("nested");
+            // A tool that shells out to another script which sources the helper
+            // itself: the reply fd and the real stdout are inherited, so the
+            // inner prompt must round-trip exactly like an outer one.
+            let inner = dir.join("inner.sh");
+            fs::write(
+                &inner,
+                "source \"$PROMPT_UTILS\"\nv=\"$(confirm \"Inner?\")\"; echo \"inner v=[$v] rc=$?\"\n",
+            )
+            .unwrap();
+            let body = format!(
+                "a=\"$(confirm \"Outer?\")\"; echo \"outer a=[$a]\"; bash \"{}\"; echo \"after rc=$?\"",
+                inner.display()
+            );
+            let run = run_helper(&dir, Some(&[json!(true), json!(false)]), &body, false);
+            assert_eq!(run.code, 0, "{}\n{}", run.stdout, run.stderr);
+            let requests = run.request_lines();
+            assert_eq!(requests.len(), 2, "{}", run.stdout);
+            assert_eq!(requests[1]["coyote_prompt"]["question"], "Inner?");
+            assert_eq!(
+                run.other_lines(),
+                vec!["outer a=[1]", "inner v=[0] rc=0", "after rc=0"],
+                "{}\n{}",
+                run.stdout,
+                run.stderr
+            );
             fs::remove_dir_all(&dir).ok();
         }
     }

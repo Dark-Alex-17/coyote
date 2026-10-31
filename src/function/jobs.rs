@@ -33,6 +33,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use std::{env, fs};
 use tokio::io::AsyncReadExt;
@@ -210,6 +211,9 @@ struct JobPrompt {
     prompter: ToolPrompter,
     /// Shared with the blocking task that writes the reply.
     reply: Arc<Server>,
+    /// Set once the job process is reaped; request lines read after that
+    /// come from a surviving descendant and are answered null.
+    exited: Arc<AtomicBool>,
 }
 
 /// The complete context an MCP job task owns. The runtime holds ONLY the
@@ -1130,7 +1134,12 @@ async fn pump_into_ring(
                     match classified {
                         Classified::Output(bytes) => output_buf.lock().push(&bytes),
                         Classified::Prompt(line) => {
-                            let Some(req) = prompt.prompter.parse_line(
+                            if prompt.exited.load(Ordering::Acquire) {
+                                output_buf.lock().push(&line);
+                                prompt_channel::reject_line(&prompt.reply, &prompt.tool, &line);
+                                continue;
+                            }
+                            let Some(parsed) = prompt.prompter.parse_line(
                                 &line,
                                 &prompt.tool,
                                 None,
@@ -1140,11 +1149,11 @@ async fn pump_into_ring(
                                 prompt_channel::reject_line(&prompt.reply, &prompt.tool, &line);
                                 continue;
                             };
-                            let id = req.id.clone();
+                            let id = parsed.req.id.clone();
                             let prompter = prompt.prompter.clone();
                             let reply = Arc::clone(&prompt.reply);
                             let served = tokio::task::spawn_blocking(move || {
-                                prompt_channel::handle_prompt_line(&prompter, &reply, req)
+                                prompt_channel::handle_prompt_line(&prompter, &reply, parsed)
                             })
                             .await;
                             if let Err(err) = served {
@@ -1237,6 +1246,7 @@ async fn run_process_job(
         .kill_on_drop(true);
     #[cfg(unix)]
     command.process_group(0);
+    command.env_remove(prompt_channel::OUT_FD_ENV);
     let mut prompt_reply = snapshot.prompt_reply.take();
     match prompt_reply.as_ref() {
         Some(server) => server.configure(command.as_std_mut()),
@@ -1270,6 +1280,7 @@ async fn run_process_job(
         .stderr
         .take()
         .ok_or_else(|| anyhow!("Failed to capture stderr"))?;
+    let job_exited = Arc::new(AtomicBool::new(false));
     let job_prompt = snapshot
         .prompter
         .clone()
@@ -1279,6 +1290,7 @@ async fn run_process_job(
             tool: snapshot.display_name.clone(),
             prompter,
             reply: Arc::new(reply),
+            exited: Arc::clone(&job_exited),
         });
     let stdout_pump = tokio::spawn(pump_into_ring(stdout, Arc::clone(&output_buf), job_prompt));
     let stderr_pump = tokio::spawn(pump_into_ring(stderr, Arc::clone(&output_buf), None));
@@ -1306,6 +1318,7 @@ async fn run_process_job(
                 );
                 kill_expired_job(&mut child, &state).await;
                 state.lock().pgid = None;
+                job_exited.store(true, Ordering::Release);
                 drain_pump(stdout_pump).await;
                 drain_pump(stderr_pump).await;
                 drop(file_tailer);
@@ -1342,6 +1355,7 @@ async fn run_process_job(
     // pid-reuse guard: the child is reaped, so a later group kill against
     // this pgid could hit an innocent recycled pid.
     state.lock().pgid = None;
+    job_exited.store(true, Ordering::Release);
     drain_pump(stdout_pump).await;
     drain_pump(stderr_pump).await;
     drop(file_tailer);
