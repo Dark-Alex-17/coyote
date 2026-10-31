@@ -2149,6 +2149,34 @@ updated_at: 2026-01-02T03:04:05Z
         );
     }
 
+    /// A symlink where `children/` goes is refused, so no child is ever
+    /// written into the link's target.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn ensure_dir_refuses_a_symlinked_children_dir_and_writes_nothing_through_it() {
+        let cache = CacheDirGuard::new("child-sessions-ensure-link-children");
+        let root = ChildSessionRoot::Uid(Uuid::new_v4());
+        let target = cache.root.join("elsewhere-children");
+        fs::create_dir_all(&target).unwrap();
+        fs::create_dir_all(root.dir()).unwrap();
+        std::os::unix::fs::symlink(&target, root.children_dir()).unwrap();
+
+        let error = root.ensure_dir(&fixture_root()).unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("as a child session directory"),
+            "{error:#}"
+        );
+        assert!(
+            fs::symlink_metadata(root.children_dir())
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+    }
+
     #[test]
     #[serial]
     fn note_parent_saved_at_accumulates_each_parent_path_once() {
