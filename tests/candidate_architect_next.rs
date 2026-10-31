@@ -46,7 +46,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "architect-next";
-const SMOKE_FLOOR: usize = 349;
+const SMOKE_FLOOR: usize = 359;
 const MATRIX_FLOOR: usize = 53;
 const _: () = assert!(MATRIX_FLOOR >= 53, "the matrix floor never drops below 53");
 
@@ -1527,6 +1527,44 @@ fn dry_run_with_only_xdg_cache_home_puts_the_run_under_the_engines_cache_dir() {
     assert_no_bytecode_under_candidate();
 }
 
+/// With no `COYOTE_CACHE_DIR`, `XDG_CACHE_HOME` or `ARCHITECT_RUNS_ROOT`,
+/// the run lands under the platform cache dir the engine's
+/// `dirs::cache_dir()` resolves for the scratch `HOME`
+/// (`~/Library/Caches` on macOS, `~/.cache` on Linux), and `_lib.runs_root()`
+/// names that same root under the same environment.
+#[test]
+fn dry_run_with_no_cache_variable_puts_the_run_under_the_platform_cache_dir() {
+    let Some(python) = python3() else { return };
+    let scratch = scratch_dir("platformtier");
+    let project = dry_run_config_dir_with(&scratch, false);
+    let dir = scratch.0.clone();
+    let home = dir.join("home");
+    let platform_cache = if cfg!(target_os = "macos") {
+        home.join("Library").join("Caches")
+    } else {
+        home.join(".cache")
+    };
+    let runs = platform_cache.join("coyote").join(CANDIDATE).join("runs");
+
+    let mut cmd = dry_run_command(&scratch, &project, DRY_RUN_PROMPT);
+    cmd.env_remove("COYOTE_CACHE_DIR");
+    let lines = run_until_ask_user(cmd, "platform tier");
+    assert_walk(&lines, &EXPECTED_WALK, "platform tier");
+    single_run_under(&runs, "platform tier");
+    assert!(
+        fs::read_dir(dir.join("cache")).unwrap().next().is_none(),
+        "platform tier: a run landed in the scratch cache dir although COYOTE_CACHE_DIR was unset"
+    );
+
+    let (root, _) = runs_root_under(&python, &scratch, &[]);
+    assert_eq!(
+        PathBuf::from(&root),
+        runs,
+        "_lib.runs_root() and the binary disagree on the platform tier"
+    );
+    assert_no_bytecode_under_candidate();
+}
+
 /// The README's run-state bullet: "A prompt containing `Architect run id:
 /// <id>` re-enters that run." After a first dry run has created
 /// `<cache>/architect-next/runs/<id>/`, a second dry run whose prompt names
@@ -2005,6 +2043,66 @@ fn readme_counts_match_the_graph_and_the_prose_twin() {
         ordinals,
         (first..first + regions as u64).collect::<Vec<_>>(),
         "marker_map.json ordinals must be contiguous"
+    );
+}
+
+/// The `(ordinal, condition, first content line)` triple of every
+/// `<!-- when:` region in `instructions`, extracted the way `mode_matrix.py`
+/// `live_markers()` does: the first following line that is neither blank nor
+/// a `<!-- when` / `<!-- end` marker, stripped and cut to 60 characters.
+fn live_marker_triples(instructions: &str) -> Vec<(u64, String, String)> {
+    let marker = fancy_regex::Regex::new(r"^\s*<!-- when:(\S+) -->\s*$").unwrap();
+    let boundary = fancy_regex::Regex::new(r"^\s*<!-- (when|end)").unwrap();
+    let lines: Vec<&str> = instructions.lines().collect();
+    let mut out = Vec::new();
+    for (at, line) in lines.iter().enumerate() {
+        let Some(caps) = marker.captures(line).unwrap() else {
+            continue;
+        };
+        let first = lines[at + 1..]
+            .iter()
+            .find(|next| !next.trim().is_empty() && !boundary.is_match(next).unwrap())
+            .map(|next| next.trim().chars().take(60).collect())
+            .unwrap_or_default();
+        out.push((out.len() as u64 + 1, caps[1].to_string(), first));
+    }
+    out
+}
+
+/// The same triples as `marker_map.json` records them, in file order.
+fn mapped_marker_triples(map: &str) -> Vec<(u64, String, String)> {
+    let map: Vec<serde_json::Value> = serde_json::from_str(map).unwrap();
+    map.iter()
+        .map(|e| {
+            (
+                e["ordinal"].as_u64().unwrap(),
+                e["condition"].as_str().unwrap().to_string(),
+                e["first"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// `marker_map.json` carries, in order, the same `(ordinal, condition,
+/// first)` triple for every marker region of the landed
+/// `architect/instructions.md` that the ignored mode-matrix run compares, so
+/// a reworded or added region fails the default run too.
+#[test]
+fn marker_map_triples_match_the_live_prose_markers() {
+    let live = live_marker_triples(
+        &fs::read_to_string(agents_dir().join("architect/instructions.md")).unwrap(),
+    );
+    let mapped = mapped_marker_triples(
+        &fs::read_to_string(candidate_dir().join("scripts/marker_map.json")).unwrap(),
+    );
+    assert!(
+        !live.is_empty(),
+        "architect/instructions.md has no marker region"
+    );
+    assert_eq!(live.len(), mapped.len(), "live regions vs mapped regions");
+    assert_eq!(
+        live, mapped,
+        "marker_map.json drifted (left: live, right: map)"
     );
 }
 
@@ -3419,8 +3517,17 @@ fn no_prior_round_or_an_untracked_file_composes_no_re_review_lines() {
 /// with `plan_tasks.py`: a debris-exempt line and a `Follow-ups:` block
 /// written in a completed task's log come back, not the
 /// `(collect_ledger_lines unavailable ...)` fallback.
+///
+/// Only the upstream (frontmatter) task layout is built: `_lib.py` pins
+/// `FORK = "upstream"`, so the shipped candidate always uses the frontmatter
+/// task store and its dirstate branches never run from this directory.
 #[test]
 fn the_real_collect_ledger_lines_returns_debris_exempt_and_follow_up_lines() {
+    let lib = fs::read_to_string(candidate_dir().join("scripts/_lib.py")).unwrap();
+    assert!(
+        lib.lines().any(|l| l == "FORK = \"upstream\""),
+        "_lib.py no longer pins the upstream fork; cover the dirstate layout too"
+    );
     let Some(python) = python3() else {
         return;
     };
@@ -4238,12 +4345,47 @@ fn children_without_a_build_lock_declaration_never_consume_it() {
     );
 }
 
-/// The README's gauntlet grammar row records the boundary contract both
-/// ways (the producer guarantees it, the consumer defends it) and the one
-/// place this candidate's composer departs from the sisyphus-next twin.
+/// The README subsection under `### <title>`, up to the next `##` or `###`
+/// heading, with every whitespace run folded to one space so a pinned clause
+/// survives rewrapping.
+fn readme_subsection(title: &str) -> String {
+    let text = readme();
+    let heading = format!("\n### {title}\n");
+    let start = text
+        .find(&heading)
+        .unwrap_or_else(|| panic!("the README has no {heading:?} subsection"))
+        + heading.len();
+    let body = &text[start..];
+    let end = [body.find("\n## "), body.find("\n### ")]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(body.len());
+    body[..end].split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The README's Gauntlet grammar subsection records the boundary contract
+/// both ways (the producer guarantees it, the consumer defends it) and the
+/// one place this candidate's composer departs from the sisyphus-next twin;
+/// the adjustments row names the files and points at the subsection.
 #[test]
 fn readme_grammar_row_records_the_producer_guarantee_and_the_planning_store_divergence() {
-    let row = adjustments_row("| gauntlet grammar |");
+    let table_row = adjustments_row("| gauntlet grammar |");
+    for name in [
+        "`scripts/gates.py`",
+        "`_parse_gauntlet`",
+        "`route_verdict`",
+        "`wave_route`",
+        "`scripts/smoke_test.py`",
+        "`scripts/mode_matrix.py`",
+        "Gauntlet grammar subsection",
+    ] {
+        assert!(
+            table_row.contains(name),
+            "the grammar row lost {name:?}: {table_row}"
+        );
+    }
+    let row = readme_subsection("Gauntlet grammar");
     for clause in [
         "before the first column-0 `## Full lane reports` line (or before the first `<details>` when that heading is absent)",
         "first match winning",
@@ -4432,5 +4574,85 @@ fn readme_battery_figures_meet_the_wrapper_floors() {
     assert!(
         readme().contains("session check last line\n`ok node ids / script paths consistent`"),
         "README lost the session check's literal last line"
+    );
+}
+
+/// The README's recorded census as `path -> hunk count`, parsed from the
+/// fenced block after "Recorded census against the staging tree".
+fn readme_census() -> BTreeMap<String, usize> {
+    let text = readme();
+    let intro = text
+        .find("Recorded census against the staging tree")
+        .expect("the README lost its staging census");
+    let open = intro + text[intro..].find("```\n").unwrap() + 4;
+    let close = open + text[open..].find("```").unwrap();
+    let row = fancy_regex::Regex::new(r"^(\S+)\s+(\d+) hunks?\s+\(.+\)$").unwrap();
+    text[open..close]
+        .lines()
+        .map(|line| {
+            let caps = row
+                .captures(line)
+                .unwrap()
+                .unwrap_or_else(|| panic!("unparseable census line {line:?}"));
+            (caps[1].to_string(), caps[2].parse().unwrap())
+        })
+        .collect()
+}
+
+/// Every file under `root` except bytecode caches, relative to `root`.
+fn census_files(root: &Path) -> BTreeSet<String> {
+    files_under(root)
+        .into_iter()
+        .filter(|rel| !rel.contains("__pycache__"))
+        .collect()
+}
+
+/// The README's recorded census is a live `diff -u` against the staging
+/// tree: the same set of differing files, each with the hunk count it
+/// states, and no file on one side only. The staging tree lives outside this
+/// repo, so the check runs only when `ARCHITECT_NEXT_STAGING_DIR` names it.
+#[test]
+fn readme_census_matches_a_live_diff_against_the_staging_tree() {
+    let staging = std::env::var_os("ARCHITECT_NEXT_STAGING_DIR").map(PathBuf::from);
+    let Some(staging) = staging.filter(|dir| dir.is_dir()) else {
+        println!("skipping: ARCHITECT_NEXT_STAGING_DIR unset or missing; census not checked");
+        return;
+    };
+    let ours = census_files(&candidate_dir());
+    let theirs = census_files(&staging);
+    let only_ours: Vec<&String> = ours.difference(&theirs).collect();
+    let only_staging: Vec<&String> = theirs.difference(&ours).collect();
+    assert!(
+        only_ours.is_empty() && only_staging.is_empty(),
+        "files on one side only: candidate {only_ours:?}, staging {only_staging:?}"
+    );
+
+    let mut live = BTreeMap::new();
+    for rel in &ours {
+        let out = output_with_timeout(
+            Command::new("diff")
+                .arg("-u")
+                .arg(staging.join(rel))
+                .arg(candidate_dir().join(rel)),
+            GATE_LIMIT,
+            "diff -u",
+        );
+        assert!(
+            matches!(out.status.code(), Some(0 | 1)),
+            "diff -u {rel}: {}",
+            transcript(&out)
+        );
+        let hunks = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.starts_with("@@"))
+            .count();
+        if hunks > 0 {
+            live.insert(rel.clone(), hunks);
+        }
+    }
+    assert_eq!(
+        live,
+        readme_census(),
+        "the README census drifted from the staging tree (left: live, right: README)"
     );
 }

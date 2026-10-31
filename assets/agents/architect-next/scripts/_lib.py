@@ -177,10 +177,13 @@ def is_parallel(state):
 
 # ---------------------------------------------------------------- run dir (A2)
 def cache_dir():
-    """Coyote's cache directory, resolved the way the engine resolves it:
+    """Coyote's cache directory, in the engine's precedence order:
     `COYOTE_CACHE_DIR`, else `$XDG_CACHE_HOME/coyote`, else the platform cache
     directory joined with `coyote` (`~/Library/Caches` on macOS, `~/.cache` on
-    Linux, `%LOCALAPPDATA%` on Windows)."""
+    Linux, `%LOCALAPPDATA%` on Windows). One difference: the engine takes
+    `COYOTE_CACHE_DIR` or `XDG_CACHE_HOME` whenever it is set, even to the
+    empty string, while this treats an empty value as unset and falls through
+    to the next tier."""
     explicit = os.environ.get("COYOTE_CACHE_DIR")
     if explicit:
         return explicit
