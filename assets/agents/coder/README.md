@@ -114,6 +114,7 @@ Environment overrides honored by the script nodes:
   Under a `build_lock` prefix the inner shell sees only exported variables;
   a gate command must not depend on the gate script's own locals.
 - `TEST_CMD` — skip detection for tests.
+- The `test_command` graph variable: the test gate runs this instead of the detected command (`TEST_CMD` still wins). Use it for a project whose full suite does not fit the gate's timeout: hand the gate a targeted command and leave the full suite to the review.
 - `COYOTE_GATE_OUTPUT_MAX_BYTES` — cap on each gate transcript kept in state
   (default 64 KiB; keeps the head ¼ and tail ¾, trimming the middle).
 - `CODER_AUTOAPPROVE=1` — bypass the approval gate (for non-interactive runs

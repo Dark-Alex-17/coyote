@@ -1,0 +1,694 @@
+use crate::mesh::hex_lower;
+use crate::mesh::protocol::{VersionRefusal, describe_version};
+use crate::mesh::request::error::RefusalCode;
+#[cfg(test)]
+use crate::mesh::request::frame::RequestId;
+use crate::mesh::request::frame::{Envelope, EnvelopeError, PathHash};
+use crate::mesh::request::handler::{Admission, InboundRequest, Reply, RequestHandler};
+use crate::mesh::request::short;
+use crate::mesh::trust::{
+    BindingConflict, Decision, IdentityStanding, KeyChangeOutcome, OriginVerdict, Rule, TrustStore,
+};
+
+use async_trait::async_trait;
+use parking_lot::RwLock;
+use rmpv::Value;
+use rns_transport::destination::link::LinkId;
+use rns_transport::hash::{ADDRESS_HASH_SIZE, AddressHash};
+use rns_transport::identity::Identity;
+use std::collections::HashMap;
+use std::fmt;
+use std::sync::Arc;
+use std::time::SystemTime;
+
+pub(crate) const KNOCK_PATH: &str = "/knock";
+pub(crate) const STATUS_PATH: &str = "/status";
+pub(crate) const MESSAGE_PATH: &str = "/message";
+pub(crate) const LIST_PATH: &str = "/list";
+pub(crate) const FETCH_PATH: &str = "/fetch";
+pub(crate) const ACCESS_PATH: &str = "/access";
+/// Every path this dispatcher knows by name: `/knock` served by the dispatcher itself, the
+/// rest pre-seeded without a provider until the slot registers one. The one list every
+/// path check and generator reads, so none of them can drift from the routes.
+pub(crate) const KNOWN_PATHS: [&str; 6] = [
+    KNOCK_PATH,
+    STATUS_PATH,
+    MESSAGE_PATH,
+    LIST_PATH,
+    FETCH_PATH,
+    ACCESS_PATH,
+];
+
+/// Frames above this are refused: outbound before anything touches the wire, inbound by the
+/// node's destination, which is armed with it, so the library refuses an oversize request
+/// at advertisement time before any of it transfers and drops an oversize packet-form one
+/// before any handler runs.
+pub(crate) const MAX_REQUEST_PAYLOAD_BYTES: usize = 256 * 1024;
+
+/// The bound on a `/fetch` RESPONSE alone: the largest file a node serves plus room for the
+/// frame and the reply's other keys. Every other path, and every request, keeps
+/// `MAX_REQUEST_PAYLOAD_BYTES`. The requester arms the bound on each request through the
+/// library's `max_response_size`, which refuses a response at its advertisement, packet or
+/// Resource, before any of it transfers, or after assembly when the assembled bytes exceed
+/// it.
+pub(crate) const MAX_FETCH_RESPONSE_BYTES: usize =
+    (crate::config::mesh_config::MAX_FETCH_FILE_BYTES as usize) + 4096;
+
+fn path_name(path_hash: PathHash) -> Option<&'static str> {
+    KNOWN_PATHS
+        .into_iter()
+        .find(|path| PathHash::of(path) == path_hash)
+}
+
+/// One request the dispatcher has let through. `identity` is proven on the link and
+/// `destination_hash` is the requester's own instance, derived from the origin it named and
+/// that identity. The test recorders also see the request id and the path, so a test can
+/// tell which request arrived.
+pub(crate) struct AdmittedRequest {
+    pub link_id: LinkId,
+    pub identity: Identity,
+    pub destination_hash: AddressHash,
+    #[cfg(test)]
+    pub request_id: RequestId,
+    #[cfg(test)]
+    pub path_hash: PathHash,
+    pub body: Value,
+}
+
+/// Everything about who may ask has been settled before a handler runs.
+#[async_trait]
+pub(crate) trait Handler: Send + Sync {
+    async fn handle(&self, request: AdmittedRequest) -> Reply;
+}
+
+/// Where knocks go: an identity the user trusts asking from an instance the user has not
+/// trusted yet, or introducing itself on `/knock` outright.
+pub(crate) trait KnockSink: Send + Sync {
+    fn knock(&self, knock: KnockEvent);
+}
+
+pub(crate) struct KnockEvent {
+    pub identity_hash: String,
+    /// The knocking instance: the requester's destination, bound to its proven identity.
+    pub destination_hash: String,
+    /// Lower-hex, the origin name hash that with `identity_hash` derives
+    /// `destination_hash`; kept so the derivation can be checked again later.
+    pub name_hash: String,
+    pub link_id: LinkId,
+    pub path_hash: PathHash,
+    /// The request body, carried only for `/knock`, where it is the knocker's introduction.
+    /// It is attacker-controlled: a sink that renders it must length-cap it and strip
+    /// control characters first.
+    pub data: Option<Value>,
+}
+
+/// Notes each knock in the debug log and nothing more.
+#[cfg(all(test, unix))]
+pub(crate) struct LoggingKnockSink;
+
+#[cfg(all(test, unix))]
+impl KnockSink for LoggingKnockSink {
+    fn knock(&self, knock: KnockEvent) {
+        debug!(
+            "Mesh knock from {} for destination {} on link {} via {}{}",
+            short(&knock.identity_hash),
+            short(&knock.destination_hash),
+            knock.link_id.to_hex_string(),
+            describe_path(knock.path_hash),
+            if knock.data.is_some() {
+                " with an introduction"
+            } else {
+                ""
+            }
+        );
+    }
+}
+
+/// An answer to an allowed request that no handler could give. It travels as a msgpack
+/// map, which no reading of the wire can confuse with a refusal code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DispatchError {
+    UnknownPath { path_hash: String },
+    NoProvider { path: String },
+}
+
+impl DispatchError {
+    pub(crate) fn to_value(&self) -> Value {
+        let (kind, key, detail) = match self {
+            Self::UnknownPath { path_hash } => ("unknown_path", "path_hash", path_hash),
+            Self::NoProvider { path } => ("no_provider", "path", path),
+        };
+        Value::Map(vec![
+            (Value::from("error"), Value::from(kind)),
+            (Value::from(key), Value::from(detail.as_str())),
+        ])
+    }
+
+    /// Reads a dispatch error off the wire. The detail is peer-controlled and ends up in
+    /// user-facing text, so only a path this node knows or a well-formed path hash is
+    /// accepted; anything else reads as no dispatch error at all.
+    pub(crate) fn from_value(value: &Value) -> Option<Self> {
+        let entries = value.as_map()?;
+        let field = |name: &str| {
+            entries
+                .iter()
+                .find(|(key, _)| key.as_str() == Some(name))
+                .and_then(|(_, value)| value.as_str())
+        };
+        match field("error")? {
+            "unknown_path" => {
+                let path_hash = field("path_hash")?;
+                let well_formed = path_hash.len() == 2 * ADDRESS_HASH_SIZE
+                    && path_hash.chars().all(|c| c.is_ascii_hexdigit());
+                well_formed.then(|| Self::UnknownPath {
+                    path_hash: path_hash.to_string(),
+                })
+            }
+            "no_provider" => {
+                let path = field("path")?;
+                let known = KNOWN_PATHS.contains(&path);
+                known.then(|| Self::NoProvider {
+                    path: path.to_string(),
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReservedPath(pub String);
+
+impl fmt::Display for ReservedPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "The mesh path {} is served by the dispatcher itself and cannot be registered",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for ReservedPath {}
+
+enum Route {
+    Provided(Arc<dyn Handler>),
+    /// A path this node knows but nothing serves yet.
+    NoProvider(&'static str),
+}
+
+/// The trust gate in front of every handler. Identity comes first: a peer the trust list
+/// does not name gets no reply and the envelope is never read, and `handle` reads the
+/// identity's standing again so a peer untrusted or blocked after `admit` let it through
+/// still gets no reply.
+///
+/// The protocol version comes next, before the body is read: an envelope naming a version
+/// this node does not speak is answered with the version refusal and nothing else is
+/// judged, on every path alike, so a peer on another version learns that and only that.
+///
+/// Destination comes third, and it is the requester's own: each request names the instance
+/// asking, the destination judged is derived from that name and the identity proven on
+/// the link, so a peer can only claim instances that are its own. A body that names no
+/// instance is refused without a knock. A known identity asking from an instance it is
+/// not trusted on is refused, and knocks when that is only because nobody trusted it
+/// there yet; when the instance it names is one the list binds to another identity, the
+/// store marks that record instead and no knock is filed. Both verdicts are the store's;
+/// nothing here reads the trust file or ranks rules itself. Under
+/// `mesh.collision_protection` an identity trusted for all destinations is refused the
+/// same way when the peer table holds its instance under another such identity: no
+/// record to mark, the human told once, verdict and owner line judged at one instant.
+pub(crate) struct Dispatcher {
+    trust: Arc<TrustStore>,
+    knocks: Arc<dyn KnockSink>,
+    /// Read for the length of a lookup only; a handler runs with the lock released.
+    routes: RwLock<HashMap<PathHash, Route>>,
+}
+
+impl Dispatcher {
+    pub(crate) fn new(trust: Arc<TrustStore>, knocks: Arc<dyn KnockSink>) -> Self {
+        let mut routes = HashMap::new();
+        routes.insert(
+            PathHash::of(KNOCK_PATH),
+            Route::Provided(Arc::new(KnockHandler)),
+        );
+        for path in KNOWN_PATHS.into_iter().filter(|path| *path != KNOCK_PATH) {
+            routes.insert(PathHash::of(path), Route::NoProvider(path));
+        }
+        Self {
+            trust,
+            knocks,
+            routes: RwLock::new(routes),
+        }
+    }
+
+    /// Serves `path` with `handler`, returning the handler it displaces, if any. A
+    /// placeholder counts as nothing displaced. `/knock` is the dispatcher's own: registering
+    /// it is refused and the routes are left as they were.
+    pub(crate) fn register(
+        &self,
+        path: &str,
+        handler: Arc<dyn Handler>,
+    ) -> Result<Option<Arc<dyn Handler>>, ReservedPath> {
+        let path_hash = PathHash::of(path);
+        if path_hash == PathHash::of(KNOCK_PATH) {
+            return Err(ReservedPath(path.to_string()));
+        }
+        let displaced = match self
+            .routes
+            .write()
+            .insert(path_hash, Route::Provided(handler))
+        {
+            Some(Route::Provided(previous)) => Some(previous),
+            Some(Route::NoProvider(_)) | None => None,
+        };
+        Ok(displaced)
+    }
+
+    /// Answers a verdict the store refused under `rule`, `collisions` being the records the
+    /// origin re-derives under another identity. A default-closed refusal knocks first,
+    /// since nobody has trusted the instance yet. A blocked identity hears nothing, as it
+    /// would have from `admit`: the block may have landed after `handle` read its standing,
+    /// and the refusal taxonomy promises blocked peers silence either way. An identity
+    /// naming an instance bound to another identity does not knock: the store's key-change
+    /// error to the human replaces the knock. A denied requester over a colliding record is
+    /// refused for the deny and still marks the record: the human is told in every case.
+    /// An identity-changed refusal over no record is a presence collision, told the same
+    /// way with nothing marked; `now` is the instant the verdict was judged at, so the
+    /// peer table rows the line sees expired are the rows the verdict saw expired.
+    pub(super) fn refusal(
+        &self,
+        rule: Rule,
+        collisions: &[BindingConflict],
+        knock: KnockEvent,
+        now: SystemTime,
+        log: &dyn Fn(&str, &str),
+    ) -> Reply {
+        let id8 = short(&knock.identity_hash).to_string();
+        match rule {
+            Rule::IdentityBlocked => {
+                log(&id8, "dropped: blocked identity");
+                Reply::Silent
+            }
+            Rule::DefaultClosed => {
+                self.knocks.knock(knock);
+                log(&id8, &format!("refused: {rule:?} (knocked)"));
+                self.refuse()
+            }
+            Rule::IdentityChanged | Rule::DestinationDenied => {
+                log(&id8, &format!("refused: {rule:?}"));
+                if !collisions.is_empty() || rule == Rule::IdentityChanged {
+                    self.trust.note_key_change(
+                        &knock.identity_hash,
+                        &knock.name_hash,
+                        KeyChangeOutcome::Refused,
+                        now,
+                    );
+                }
+                self.refuse()
+            }
+            _ => {
+                log(&id8, &format!("refused: {rule:?}"));
+                self.refuse()
+            }
+        }
+    }
+
+    /// The one place a refusal is built, so every refusal is the same bytes on the wire
+    /// whichever rule produced it.
+    fn refuse(&self) -> Reply {
+        Reply::Code(RefusalCode::NoAccess)
+    }
+
+    /// `handle` with the instant the verdict and the owner line are judged at. One instant
+    /// decides which peer table rows have expired for both, so a presence collision at
+    /// the edge of `PEER_TTL` is never refused without its line or told without being
+    /// refused.
+    pub(super) async fn handle_at(&self, request: InboundRequest, now: SystemTime) -> Reply {
+        let path = describe_path(request.path_hash);
+        let (request_id, link_id) = (request.request_id, request.link_id);
+        let log = |id8: &str, outcome: &str| {
+            debug!(
+                "Mesh request {request_id} for {path} from {id8} on link {}: {outcome}",
+                link_id.to_hex_string()
+            );
+        };
+        let Some(identity) = request.identity else {
+            log("anonymous", "dropped: unauthenticated");
+            return Reply::Silent;
+        };
+        let identity_hex = identity.address_hash.to_hex_string();
+        let dropped = match self.trust.identity_standing(&identity_hex) {
+            IdentityStanding::Trusted { .. } => None,
+            IdentityStanding::Unknown => Some("dropped: unknown identity"),
+            IdentityStanding::Blocked => Some("dropped: blocked identity"),
+        };
+        if let Some(outcome) = dropped {
+            log(short(&identity_hex), outcome);
+            return Reply::Silent;
+        }
+        let envelope = match Envelope::from_value(request.data) {
+            Ok(envelope) => envelope,
+            Err(EnvelopeError::UnsupportedVersion { found }) => {
+                log(
+                    short(&identity_hex),
+                    &format!(
+                        "refused: unsupported protocol version {}",
+                        describe_version(found)
+                    ),
+                );
+                return Reply::Value(VersionRefusal::current(found).to_value());
+            }
+            Err(EnvelopeError::Malformed) => {
+                log(short(&identity_hex), "refused: unverifiable origin");
+                return self.refuse();
+            }
+        };
+        let OriginVerdict {
+            verdict,
+            destination: destination_hash,
+            collisions,
+        } = self
+            .trust
+            .authorize_origin_at(&identity.address_hash, &envelope.origin.0, now);
+        let rule = verdict.rule;
+        match verdict.decision {
+            Decision::Refuse => {
+                let data = (request.path_hash == PathHash::of(KNOCK_PATH)).then_some(envelope.body);
+                self.refusal(
+                    rule,
+                    &collisions,
+                    KnockEvent {
+                        identity_hash: identity_hex,
+                        destination_hash: destination_hash.to_hex_string(),
+                        name_hash: hex_lower(&envelope.origin.0),
+                        link_id,
+                        path_hash: request.path_hash,
+                        data,
+                    },
+                    now,
+                    &log,
+                )
+            }
+            Decision::Allow => {
+                // Only an identity trusted for all destinations can be admitted over a
+                // colliding record; the human hears of it as a warning, the record is
+                // marked, and the request is served all the same. With no colliding record
+                // `authorize_origin_at` has already paid the memo lookup and, on a miss,
+                // the peer-table scan; a served request pays nothing more here.
+                if !collisions.is_empty() {
+                    self.trust.note_key_change(
+                        &identity_hex,
+                        &hex_lower(&envelope.origin.0),
+                        KeyChangeOutcome::Served,
+                        now,
+                    );
+                }
+                let route = self
+                    .routes
+                    .read()
+                    .get(&request.path_hash)
+                    .map(|route| match route {
+                        Route::Provided(handler) => Route::Provided(handler.clone()),
+                        Route::NoProvider(path) => Route::NoProvider(path),
+                    });
+                match route {
+                    None => {
+                        // The transport only delivers paths registered on the destination,
+                        // and those are the routes seeded here, so this is a path registered
+                        // there without a route; nothing is owed to the requester for it.
+                        log(
+                            short(&identity_hex),
+                            &format!("dropped: no route for a registered path ({rule:?})"),
+                        );
+                        Reply::Silent
+                    }
+                    Some(Route::NoProvider(path)) => {
+                        log(short(&identity_hex), &format!("no provider: {rule:?}"));
+                        Reply::Value(
+                            DispatchError::NoProvider {
+                                path: path.to_string(),
+                            }
+                            .to_value(),
+                        )
+                    }
+                    Some(Route::Provided(handler)) => {
+                        let over = if collisions.is_empty() {
+                            ""
+                        } else {
+                            " (over a colliding record)"
+                        };
+                        log(short(&identity_hex), &format!("served: {rule:?}{over}"));
+                        handler
+                            .handle(AdmittedRequest {
+                                link_id,
+                                identity,
+                                destination_hash,
+                                #[cfg(test)]
+                                request_id,
+                                #[cfg(test)]
+                                path_hash: request.path_hash,
+                                body: envelope.body,
+                            })
+                            .await
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl RequestHandler for Dispatcher {
+    fn admit(&self, link_id: LinkId, identity: Option<&Identity>) -> Admission {
+        let (id8, outcome) = match identity {
+            None => ("anonymous".to_string(), "dropped: unauthenticated"),
+            Some(identity) => {
+                let identity_hex = identity.address_hash.to_hex_string();
+                let outcome = match self.trust.identity_standing(&identity_hex) {
+                    IdentityStanding::Trusted { .. } => return Admission::Admit,
+                    IdentityStanding::Unknown => "dropped: unknown identity",
+                    IdentityStanding::Blocked => "dropped: blocked identity",
+                };
+                (short(&identity_hex).to_string(), outcome)
+            }
+        };
+        debug!(
+            "Mesh request (envelope not yet read) from {id8} on link {}: {outcome}",
+            link_id.to_hex_string()
+        );
+        Admission::Drop
+    }
+
+    async fn handle(&self, request: InboundRequest) -> Reply {
+        self.handle_at(request, SystemTime::now()).await
+    }
+}
+
+pub(crate) fn describe_path(path_hash: PathHash) -> String {
+    match path_name(path_hash) {
+        Some(name) => name.to_string(),
+        None => format!("hash {path_hash}"),
+    }
+}
+
+/// `/knock` itself. Reaching here means the knocking instance is already trusted, so
+/// there is nothing to knock for: the request is acknowledged with nil and never reaches
+/// the knock sink, where a trusted peer looping on `/knock` would push out real knocks.
+struct KnockHandler;
+
+#[async_trait]
+impl Handler for KnockHandler {
+    async fn handle(&self, request: AdmittedRequest) -> Reply {
+        let identity_hex = request.identity.address_hash.to_hex_string();
+        let destination_hex = request.destination_hash.to_hex_string();
+        debug!(
+            "Mesh knock from {} on link {} is not a knock: already trusted from {}",
+            short(&identity_hex),
+            request.link_id.to_hex_string(),
+            short(&destination_hex)
+        );
+        Reply::Value(Value::Nil)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mesh::destination_address;
+    use crate::mesh::request::frame::{NAME_HASH_LEN, OriginName};
+    use crate::mesh::test_support::TrustList;
+    use crate::testing::{debug_snapshot, install_log_collector};
+    use rns_transport::identity::PrivateIdentity;
+    use rns_transport::rand_core::OsRng;
+    use std::sync::Mutex;
+
+    #[test]
+    fn no_provider_with_an_unknown_path_is_not_a_dispatch_error() {
+        let value = DispatchError::NoProvider {
+            path: "\u{1b}]0;x\u{07}/status".to_string(),
+        }
+        .to_value();
+        assert_eq!(DispatchError::from_value(&value), None);
+    }
+
+    #[test]
+    fn unknown_path_with_a_malformed_hash_is_not_a_dispatch_error() {
+        let value = DispatchError::UnknownPath {
+            path_hash: "z".repeat(300),
+        }
+        .to_value();
+        assert_eq!(DispatchError::from_value(&value), None);
+    }
+
+    #[test]
+    fn well_formed_dispatch_errors_round_trip() {
+        for error in [
+            DispatchError::NoProvider {
+                path: STATUS_PATH.to_string(),
+            },
+            DispatchError::UnknownPath {
+                path_hash: PathHash::of(STATUS_PATH).to_string(),
+            },
+        ] {
+            assert_eq!(DispatchError::from_value(&error.to_value()), Some(error));
+        }
+    }
+
+    /// `/list` and `/fetch` are paths this node knows by name alongside the first three:
+    /// each is named in the log, and a `no_provider` refusal naming any of them decodes
+    /// to the typed error the client maps to "peer does not share files", while a path
+    /// outside the list is logged by hash and refused as a dispatch error.
+    #[test]
+    fn every_known_path_is_named_and_its_no_provider_refusal_round_trips() {
+        assert_eq!(
+            KNOWN_PATHS,
+            [
+                KNOCK_PATH,
+                STATUS_PATH,
+                MESSAGE_PATH,
+                LIST_PATH,
+                FETCH_PATH,
+                ACCESS_PATH
+            ]
+        );
+        for path in KNOWN_PATHS {
+            assert_eq!(describe_path(PathHash::of(path)), path);
+            let error = DispatchError::NoProvider {
+                path: path.to_string(),
+            };
+            assert_eq!(
+                DispatchError::from_value(&error.to_value()),
+                Some(error),
+                "{path}"
+            );
+        }
+        let unknown = "/shares";
+        assert_eq!(
+            describe_path(PathHash::of(unknown)),
+            format!("hash {}", PathHash::of(unknown))
+        );
+        let error = DispatchError::NoProvider {
+            path: unknown.to_string(),
+        };
+        assert_eq!(DispatchError::from_value(&error.to_value()), None);
+    }
+
+    struct NoKnocks;
+
+    impl KnockSink for NoKnocks {
+        fn knock(&self, _: KnockEvent) {}
+    }
+
+    #[derive(Default)]
+    struct Recorder(Mutex<Option<AdmittedRequest>>);
+
+    #[async_trait]
+    impl Handler for Recorder {
+        async fn handle(&self, request: AdmittedRequest) -> Reply {
+            *self.0.lock().unwrap() = Some(request);
+            Reply::Value(Value::Nil)
+        }
+    }
+
+    /// A served request reaches its handler as it arrived: the request id and the path
+    /// hash are the inbound request's own, the body is the envelope's and the identity is
+    /// the one proven on the link.
+    #[tokio::test]
+    async fn a_served_request_reaches_its_handler_as_it_arrived() {
+        const ORIGIN: [u8; NAME_HASH_LEN] = [7; NAME_HASH_LEN];
+        let identity = *PrivateIdentity::new_from_rand(OsRng).as_identity();
+        let identity_hex = identity.address_hash.to_hex_string();
+        let destination = destination_address(&ORIGIN, &identity.address_hash);
+        let (store, _tmp) = TrustList::default()
+            .identity(&identity_hex, true)
+            .open("dispatch-forwarding");
+        let dispatcher = Dispatcher::new(store, Arc::new(NoKnocks));
+        let recorder = Arc::new(Recorder::default());
+        dispatcher.register(STATUS_PATH, recorder.clone()).unwrap();
+
+        let link_id = LinkId::new_from_rand(OsRng);
+        let request_id = RequestId::from([7u8; 16]);
+        let body = Value::from("body");
+        let reply = RequestHandler::handle(
+            &dispatcher,
+            InboundRequest {
+                link_id,
+                identity: Some(identity),
+                request_id,
+                path_hash: PathHash::of(STATUS_PATH),
+                data: Envelope::new(OriginName(ORIGIN), body.clone()).into_value(),
+            },
+        )
+        .await;
+
+        assert!(matches!(reply, Reply::Value(Value::Nil)));
+        let admitted = recorder.0.lock().unwrap().take().unwrap();
+        assert_eq!(admitted.request_id, request_id);
+        assert_eq!(admitted.path_hash, PathHash::of(STATUS_PATH));
+        assert_eq!(admitted.body, body);
+        assert_eq!(admitted.link_id, link_id);
+        assert_eq!(admitted.identity.address_hash, identity.address_hash);
+        assert_eq!(admitted.destination_hash, destination);
+    }
+
+    /// Every path the destination registers is seeded as a route, so a request for a path
+    /// with no route can only come from a registration the dispatcher never heard of. It
+    /// is served nothing and logged by hash, with the rule that admitted the peer.
+    #[tokio::test]
+    async fn a_trusted_request_for_a_path_without_a_route_is_dropped_silently() {
+        install_log_collector();
+        const ORIGIN: [u8; NAME_HASH_LEN] = [9; NAME_HASH_LEN];
+        let identity = *PrivateIdentity::new_from_rand(OsRng).as_identity();
+        let identity_hex = identity.address_hash.to_hex_string();
+        let (store, _tmp) = TrustList::default()
+            .identity(&identity_hex, true)
+            .open("dispatch-no-route");
+        let dispatcher = Dispatcher::new(store, Arc::new(NoKnocks));
+
+        let link_id = LinkId::new_from_rand(OsRng);
+        let request_id = RequestId::from([9u8; 16]);
+        let path_hash = PathHash::of("/shares");
+        let reply = RequestHandler::handle(
+            &dispatcher,
+            InboundRequest {
+                link_id,
+                identity: Some(identity),
+                request_id,
+                path_hash,
+                data: Envelope::new(OriginName(ORIGIN), Value::Nil).into_value(),
+            },
+        )
+        .await;
+
+        assert!(matches!(reply, Reply::Silent));
+        let line = format!(
+            "Mesh request {request_id} for hash {path_hash} from {} on link {}: dropped: no route for a registered path (IdentityTrusted)",
+            short(&identity_hex),
+            link_id.to_hex_string()
+        );
+        assert!(
+            debug_snapshot().contains(&line),
+            "the no-route drop must be logged: {line:?}"
+        );
+    }
+}

@@ -34,6 +34,33 @@ pub fn safe_join_path<T1: AsRef<Path>, T2: AsRef<Path>>(
     }
 }
 
+/// Whether `name` is a device name Windows reserves in every directory: `CON`, `PRN`,
+/// `AUX`, `NUL`, `COM0` to `COM9`, `LPT0` to `LPT9` and the same with a superscript `¹ ² ³`
+/// as the digit; case-insensitively, with any extension, and after the trailing dots
+/// and spaces Win32 silently drops from a name before matching. Only the stem (the text
+/// before the first `.`) is compared, so `NUL.txt` and `con .txt` are reserved too.
+///
+/// Bundle installs (`install_remote::is_safe_component`) and mesh wire paths share this
+/// one predicate on purpose: both guard filenames that must be creatable on Windows.
+pub fn is_windows_reserved_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or("").trim_end_matches(' ');
+    let lower = stem.to_ascii_lowercase();
+    if matches!(lower.as_str(), "con" | "prn" | "aux" | "nul") {
+        return true;
+    }
+    let Some(port) = lower
+        .strip_prefix("com")
+        .or_else(|| lower.strip_prefix("lpt"))
+    else {
+        return false;
+    };
+    let mut digits = port.chars();
+    matches!(
+        (digits.next(), digits.next()),
+        (Some('0'..='9' | '\u{B9}' | '\u{B2}' | '\u{B3}'), None)
+    )
+}
+
 pub async fn expand_glob_paths<T: AsRef<str>>(
     paths: &[T],
     bail_non_exist: bool,
@@ -90,6 +117,19 @@ pub fn resolve_home_dir(path: &str) -> String {
     }
 
     path
+}
+
+/// The inverse of `resolve_home_dir` for display: `~` for the home directory itself,
+/// `~/rest` for a path under it, and any other path as it is.
+pub fn home_relative(path: &Path) -> String {
+    let Some(rest) = dirs::home_dir().and_then(|home| path.strip_prefix(home).ok()) else {
+        return path.display().to_string();
+    };
+    if rest.as_os_str().is_empty() {
+        "~".to_string()
+    } else {
+        format!("~/{}", rest.display())
+    }
 }
 
 fn parse_glob(path_str: &str) -> Result<ParseGlobResult> {
@@ -255,6 +295,21 @@ fn is_valid_extension(suffixes: Option<&Vec<String>>, path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+
+    /// Serial with every test that points `HOME` elsewhere while it runs.
+    #[test]
+    #[serial]
+    fn home_relative_abbreviates_under_home_keeps_other_paths_and_names_home_itself() {
+        let home = dirs::home_dir().expect("a home directory");
+        assert_eq!(home_relative(&home.join("notes/a.md")), "~/notes/a.md");
+        assert_eq!(home_relative(&home), "~");
+        assert_eq!(
+            home_relative(Path::new("/inbox/peer/a.md")),
+            "/inbox/peer/a.md"
+        );
+        assert_eq!(home_relative(Path::new("notes/a.md")), "notes/a.md");
+    }
 
     #[test]
     fn test_parse_glob() {

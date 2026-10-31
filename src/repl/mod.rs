@@ -1,10 +1,17 @@
 mod completer;
 mod highlighter;
+pub(crate) mod idle;
+pub(crate) mod mesh;
+#[cfg(test)]
+pub(crate) mod mesh_share_vectors;
+mod printer;
 mod prompt;
 mod replay;
 
 use self::completer::ReplCompleter;
 use self::highlighter::ReplHighlighter;
+use self::idle::IdleDriver;
+use self::printer::PromptPrinter;
 use self::prompt::ReplPrompt;
 
 use crate::client::{
@@ -12,9 +19,10 @@ use crate::client::{
     call_chat_completions_streaming_quiet, init_client, oauth,
 };
 use crate::config::{
-    AgentVariables, AppConfig, AssertState, CommandPrefix, Input, LastMessage, MacroState,
-    RequestContext, Session, SessionScope, StateFlags, TURN_INTERRUPTED_TEXT,
-    flatten_prompt_messages, macro_execute, resolve_prompt_args, sanitize_display_text,
+    AgentVariables, AppConfig, AssertState, CommandPrefix, EnvoyRunner, Input, LastMessage,
+    MacroState, MeshDigestDriver, MeshHookBridge, RequestContext, Session, SessionScope,
+    StateFlags, TURN_INTERRUPTED_TEXT, flatten_prompt_messages, macro_execute,
+    publish_mesh_snapshot, resolve_prompt_args, sanitize_display_text,
 };
 use crate::config::{AssetCategory, paths};
 use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail, pending_tasks};
@@ -22,6 +30,9 @@ use crate::graph::dispatch::{GraphTurn, run_graph_turn};
 use crate::graph::llm::{CompletionFuture, CompletionRunner};
 use crate::graph::route::Branch;
 use crate::hooks::{self, HookEvent};
+use crate::mesh::events::MeshHookSink;
+use crate::mesh::notify::NotificationSink;
+use crate::mesh::snapshot::TurnState;
 use crate::render::render_error;
 use crate::supervisor::{Supervisor, TaskKind};
 use crate::utils::{
@@ -144,7 +155,7 @@ pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
     5. Otherwise, continue with the next pending item now. Call tools immediately."
 };
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 66]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 95]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -176,6 +187,151 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 66]> = LazyLock::new(|| {
         ReplCommand::new(
             ".mcp disable",
             "Disable a single MCP server in the current context",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh on",
+            "Join the mesh for this session only; config.yaml is not changed",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh off",
+            "Leave the mesh and drop the mesh__* tools",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh peers",
+            "List the nodes heard on the mesh",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh knocks",
+            "List the untrusted nodes that knocked",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh info",
+            "Show the mesh settings and this node, or one peer",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh status",
+            "Show this node's status card, set its objective, or fetch a peer's card",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh brief",
+            "Show the brief your envoy answers peers with, or set its note or mode",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh inbox",
+            "Drain the peer messages waiting for this node",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh pending",
+            "List the questions this node asked and the ones peers escalated to you",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh answer",
+            "Answer an escalated question, or follow up on one this node asked",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh dismiss",
+            "Dismiss an escalated question: the asker hears that you declined, or nothing with --silent",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh message",
+            "Send your own text to one peer, bypassing the model",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh broadcast",
+            "Send a bulletin to every trusted peer with a known path",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh trust",
+            "Trust one instance, or every instance of an identity, or prune stale trusted instances",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh untrust",
+            "Stop serving one trusted instance (its identity stays known), or withdraw an identity grant; its instances stay trusted on their own",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh forget",
+            "Erase everything this node knows of an identity: grants, blocks, knocks and envoy memory; it becomes a stranger",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh block",
+            "Refuse one instance without a knock, or silence a whole identity; `block` remembers where `untrust` only stops serving",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh unblock",
+            "Lift a block on an instance or an identity; it grants nothing, so only trust the list still holds serves it afterwards",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh rotate",
+            "Mint a new mesh identity while the node is off; peers must re-trust the new one",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh sync",
+            "Sync the messages a propagation node holds for this node now",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh knock",
+            "Ask an untrusted peer to trust this instance, with an optional intro",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh allow",
+            "Share files matching a pattern with every trusted peer, or with one peer",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh deny",
+            "Never share files matching a pattern, whatever `allow` says; a share rule, not a peer refusal (that is `block`)",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh unshare",
+            "Remove the allow or deny share rule that holds a pattern",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh shares",
+            "List the share rules and the file each came from, or the files a peer can fetch",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh grant",
+            "Grant a peer's access request: once for a while, or standing in the share list",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh refuse",
+            "Refuse a peer's access request",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh fetch",
+            "Fetch one file a trusted peer shares into this node's staging inbox",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh memory",
+            "Forget what the envoy remembers of a peer's threads: one identity, one of its threads, or everything",
             AssertState::pass(),
         ),
         ReplCommand::new(
@@ -458,21 +614,43 @@ pub struct Repl {
     editor: Reedline,
     prompt: ReplPrompt,
     abort_signal: AbortSignal,
+    idle: Option<IdleDriver>,
+    digest: MeshDigestDriver,
+    envoy: Arc<EnvoyRunner>,
+    mesh_hooks: Arc<MeshHookBridge>,
 }
 
 impl Repl {
     pub fn init(ctx: RequestContext) -> Result<Self> {
         let app = Arc::clone(&ctx.app.config);
+        publish_mesh_snapshot(&ctx, TurnState::idle_now());
+        let printer = Arc::new(PromptPrinter::new());
+        ctx.app
+            .mesh
+            .set_notifier(Arc::clone(&printer) as Arc<dyn NotificationSink>);
+        let mesh_hooks = MeshHookBridge::new(Arc::clone(&ctx.app));
+        ctx.app
+            .mesh
+            .set_hook_sink(Arc::clone(&mesh_hooks) as Arc<dyn MeshHookSink>);
+        let app_state = Arc::clone(&ctx.app);
         let ctx = Arc::new(RwLock::new(ctx));
-        let editor = Self::create_editor(Arc::clone(&ctx), app.as_ref())?;
+        let editor = Self::create_editor(Arc::clone(&ctx), app.as_ref(), &printer)?;
         let prompt = ReplPrompt::new(Arc::clone(&ctx));
         let abort_signal = create_abort_signal();
+        // Last, so a failed editor set-up leaves no loop task behind.
+        let idle = IdleDriver::start(Arc::clone(&ctx), Arc::clone(&app_state));
+        let envoy = EnvoyRunner::start(app_state);
+        envoy.attach();
 
         Ok(Self {
             ctx,
             editor,
             prompt,
             abort_signal,
+            idle: Some(idle),
+            digest: MeshDigestDriver::new(),
+            envoy,
+            mesh_hooks,
         })
     }
 
@@ -505,7 +683,10 @@ impl Repl {
             };
             if !compressed.is_empty() || !active.is_empty() {
                 let app = Arc::clone(&self.ctx.read().app.config);
-                replay::render(app.as_ref(), &compressed, &active)?;
+                // Replaying history is best-effort: a render failure must not skip shutdown.
+                if let Err(err) = replay::render(app.as_ref(), &compressed, &active) {
+                    render_error(err);
+                }
                 let last_msgs: &[Message] = if !active.is_empty() {
                     &active
                 } else {
@@ -538,6 +719,24 @@ impl Repl {
         // OSC 11 / DA1 responses) so they don't get injected into the prompt.
         drain_stale_tty_input();
 
+        if mesh::autostart_wanted(&self.ctx.read()) {
+            // The digest is observed and refreshed at turn boundaries only, so the brief
+            // is assembled at the first one, exactly as after a `.mesh on` typed in a turn.
+            let result = {
+                let mut ctx = self.ctx.write();
+                publish_mesh_snapshot(&ctx, TurnState::working_now());
+                let result = mesh::autostart(&mut ctx).await;
+                self.envoy.refresh(&ctx.app);
+                self.mesh_hooks.refresh(&ctx.app);
+                publish_mesh_snapshot(&ctx, TurnState::idle_now());
+                result
+            };
+            if let Err(err) = result {
+                render_error(err);
+                println!()
+            }
+        }
+
         print_pause_banner(&self.ctx.read());
 
         loop {
@@ -552,8 +751,20 @@ impl Repl {
                     self.abort_signal.reset();
                     let result = {
                         let mut ctx = self.ctx.write();
-                        run_repl_command(&mut ctx, self.abort_signal.clone(), &line).await
+                        publish_mesh_snapshot(&ctx, TurnState::working_now());
+                        let result =
+                            run_repl_command(&mut ctx, self.abort_signal.clone(), &line).await;
+                        self.envoy.refresh(&ctx.app);
+                        self.mesh_hooks.refresh(&ctx.app);
+                        self.digest.observe_session(&ctx);
+                        publish_mesh_snapshot(&ctx, TurnState::idle_now());
+                        result
                     };
+                    // An exiting turn, or one Ctrl-D cut short, spawns nothing: shutdown
+                    // below would only abort it.
+                    if !matches!(result, Ok(true)) && !self.abort_signal.aborted_ctrld() {
+                        self.digest.maybe_refresh(&self.ctx);
+                    }
                     match result {
                         Ok(exit) => {
                             if exit {
@@ -597,6 +808,23 @@ impl Repl {
             }
         }
 
+        // Notifier first: lines from children and the envoy winding down under `stop`
+        // then reach stderr instead of a printer the loop above no longer drains.
+        self.ctx.read().app.mesh.clear_notifier();
+        self.digest.shutdown().await;
+        if let Some(idle) = self.idle.take() {
+            idle.stop().await;
+        }
+        self.envoy.stop().await;
+        // Cloned so the context guard is not held across the await.
+        let mesh = Arc::clone(&self.ctx.read().app.mesh);
+        if let Err(err) = mesh.stop().await {
+            render_error(err);
+        }
+        // After the node's own `mesh.stopped`, so nothing left in the slot can run hooks
+        // against a session on its way out.
+        mesh.clear_hook_sink();
+
         {
             // Holding the context guard across the wait follows the turn loop,
             // which holds the write guard across run_repl_command; the
@@ -613,7 +841,11 @@ impl Repl {
         exit_result
     }
 
-    fn create_editor(ctx: Arc<RwLock<RequestContext>>, app: &AppConfig) -> Result<Reedline> {
+    fn create_editor(
+        ctx: Arc<RwLock<RequestContext>>,
+        app: &AppConfig,
+        printer: &PromptPrinter,
+    ) -> Result<Reedline> {
         let completer = ReplCompleter::new(Arc::clone(&ctx));
         let highlighter = ReplHighlighter::new(Arc::clone(&ctx));
         let menu = Self::create_menu();
@@ -629,6 +861,7 @@ impl Repl {
             .with_menu(menu)
             .with_edit_mode(edit_mode)
             .with_cursor_config(cursor_config)
+            .with_external_printer(printer.attach())
             .with_quick_completions(true)
             .with_partial_completions(true)
             .use_bracketed_paste(true)
@@ -748,15 +981,11 @@ pub async fn run_repl_command(
 pub async fn run_repl_command_with_prefix(
     ctx: &mut RequestContext,
     abort_signal: AbortSignal,
-    mut line: &str,
+    line: &str,
     prefix: CommandPrefix,
 ) -> Result<bool> {
     ctx.pending_tasks_guardrail_count = 0;
-    if let Ok(Some(captures)) = MULTILINE_RE.captures(line)
-        && let Some(text_match) = captures.get(1)
-    {
-        line = text_match.as_str();
-    }
+    let line = unwrap_multiline(line);
     match parse_command(line, prefix) {
         Some((cmd, args)) => match cmd.as_ref() {
             ".help" => {
@@ -1096,6 +1325,9 @@ pub async fn run_repl_command_with_prefix(
                     let (compressed, active) = replay::snapshot(session);
                     replay::render(app.as_ref(), &compressed, &active)?;
                 }
+                // Entering a session is the other moment `mesh.enabled: true` joins; the
+                // notice lands after the replay.
+                mesh::after_session_entered(ctx).await;
                 print_pause_banner(ctx);
             }
             ".install" => match parse_repl_install(args) {
@@ -1159,6 +1391,11 @@ pub async fn run_repl_command_with_prefix(
                     if let Some(session) = &ctx.session {
                         let (compressed, active) = replay::snapshot(session);
                         replay::render(app.as_ref(), &compressed, &active)?;
+                    }
+                    // `use_agent` refuses a held session, so a session here was entered by
+                    // it (named here or the agent's default) and joins like a `.session`.
+                    mesh::after_session_entered(ctx).await;
+                    if ctx.session.is_some() {
                         print_pause_banner(ctx);
                     }
                 }
@@ -1198,7 +1435,22 @@ pub async fn run_repl_command_with_prefix(
                 }
             },
             ".fork" => {
-                ctx.fork_session(args)?;
+                // The session switch comes last and cannot fail, so a refused rekey never
+                // leaves the context in the fork while the node still serves the original.
+                let pending = ctx.prepare_fork(args)?;
+                match ctx.app.mesh.rekey(pending.rekey.clone()).await {
+                    Ok(()) => {
+                        let forked = ctx.commit_fork(pending);
+                        println!("Forked '{}' into '{}'", forked.from, forked.to);
+                    }
+                    Err(err) => {
+                        let (from, to) = (pending.from.clone(), pending.to.clone());
+                        ctx.abandon_fork(pending);
+                        return Err(err.context(format!(
+                            "Could not fork '{from}' into '{to}': the mesh node could not be re-keyed onto the fork, so you are still in '{from}' and the node still serves it; the fork file was removed"
+                        )));
+                    }
+                }
             }
             ".save" => match split_first_arg(args) {
                 Some(("role", name)) => {
@@ -1365,9 +1617,7 @@ pub async fn run_repl_command_with_prefix(
                     let policy = ctx.macro_policy();
                     match policy.find(name).map(|row| &row.state) {
                         Some(state) if state.is_invocable() => {
-                            // macro_execute recurses back into run_repl_command; boxing here
-                            // keeps its future out of this already-huge state machine.
-                            Box::pin(macro_execute(ctx, name, extra, abort_signal.clone())).await?;
+                            run_macro_from_prompt(ctx, name, extra, abort_signal.clone()).await?;
                         }
                         Some(MacroState::DisabledRuntime) => bail!(
                             r#"Macro '{name}' is disabled. Re-enable it with "{} {name}""#,
@@ -1385,7 +1635,7 @@ pub async fn run_repl_command_with_prefix(
                                 let app = Arc::clone(&ctx.app.config);
                                 ctx.new_macro(app.as_ref(), name)?;
                             } else {
-                                Box::pin(macro_execute(ctx, name, extra, abort_signal.clone()))
+                                run_macro_from_prompt(ctx, name, extra, abort_signal.clone())
                                     .await?;
                             }
                         }
@@ -1633,6 +1883,10 @@ pub async fn run_repl_command_with_prefix(
                         .await?;
                 }
                 Some("session") => {
+                    // The node's instance id belongs to the session being exited; the
+                    // session goes even when the node refuses to stop, and that refusal
+                    // is reported once the exit is done.
+                    let left = mesh::before_session_left(ctx).await;
                     // With nothing to settle this is a no-op, not a sweep of
                     // every job and agent the user left running.
                     if ctx.session.is_some() || ctx.child_session_root.is_some() {
@@ -1646,11 +1900,15 @@ pub async fn run_repl_command_with_prefix(
                     let app = Arc::clone(&ctx.app.config);
                     ctx.bootstrap_tools(app.as_ref(), true, abort_signal.clone())
                         .await?;
+                    left?;
                 }
                 Some("rag") => {
                     ctx.exit_rag()?;
                 }
                 Some("agent") => {
+                    // The agent's session, when it holds one, goes with the agent, so the
+                    // mesh is left first exactly as on `.exit session`.
+                    let left = mesh::before_session_left(ctx).await;
                     // `exit_agent` settles the session's child directory
                     // before it tears the agent's children down.
                     if ctx.session.is_some() || ctx.child_session_root.is_some() {
@@ -1660,6 +1918,7 @@ pub async fn run_repl_command_with_prefix(
                     ctx.exit_agent(app.as_ref())?;
                     ctx.bootstrap_tools(app.as_ref(), true, abort_signal.clone())
                         .await?;
+                    left?;
                 }
                 Some(_) => unknown_command(ctx)?,
                 None => {
@@ -1725,12 +1984,18 @@ pub async fn run_repl_command_with_prefix(
                     )
                 }
             },
+            ".mesh" => {
+                if ctx.macro_flag {
+                    bail!("Cannot perform this operation because you are in a macro")
+                }
+                mesh::run(ctx, abort_signal.clone(), args).await?;
+            }
             _ => {
                 let name = cmd.strip_prefix('.').unwrap_or(&cmd);
                 let policy = ctx.macro_policy();
                 match policy.find(name).map(|row| &row.state) {
                     Some(MacroState::Enabled) => {
-                        Box::pin(macro_execute(ctx, name, args, abort_signal.clone())).await?;
+                        run_macro_from_prompt(ctx, name, args, abort_signal.clone()).await?;
                     }
                     Some(MacroState::DisabledRuntime) => bail!(
                         r#"Macro '{name}' is disabled. Re-enable it with "{} {name}""#,
@@ -2342,6 +2607,25 @@ fn pause_banner_text(ctx: &RequestContext) -> Option<String> {
     ))
 }
 
+/// A macro run from the prompt (`.macro <name>`, or the macro's own name as a command).
+/// Its steps run under the macro flag, so a `.session` or `.agent` step does not join
+/// by itself; once the macro is done and the flag is back to the REPL's, a session it
+/// left entered joins by the usual gate. The one-shot `--macro` run reaches
+/// `macro_execute` from main.rs, never through here, so it keeps never joining. A
+/// failed step still joins the session the earlier steps entered, and is then reported.
+async fn run_macro_from_prompt(
+    ctx: &mut RequestContext,
+    name: &str,
+    args: Option<&str>,
+    abort_signal: AbortSignal,
+) -> Result<()> {
+    // macro_execute recurses back into run_repl_command; boxing here keeps its future
+    // out of that already-huge state machine.
+    let result = Box::pin(macro_execute(ctx, name, args, abort_signal)).await;
+    mesh::after_session_entered(ctx).await;
+    result
+}
+
 fn print_pause_banner(ctx: &RequestContext) {
     if let Some(text) = pause_banner_text(ctx) {
         eprintln!(
@@ -2611,18 +2895,20 @@ fn parse_repl_uninstall(args: Option<&str>) -> ReplUninstallDispatch {
 }
 
 fn repl_save_session_help() -> String {
-    r#"Save the current session to a file.
+    format!(
+        r#"Save the current session to a file.
 
 Usage:
   .save session [name] [--workspace|--global]
 
 Flags:
-  --workspace   Save under .coyote/ in the current workspace
+  --workspace   Save under {}/ in the current workspace
   --global      Save under the global config dir
 
 Without a flag the session is re-saved wherever it currently lives; a brand-new
-session lives in the global scope. Re-homing a session never deletes the old file."#
-        .to_string()
+session lives in the global scope. Re-homing a session never deletes the old file."#,
+        paths::workspace_config_dir_name()
+    )
 }
 
 #[derive(Debug, PartialEq)]
@@ -2713,6 +2999,22 @@ fn parse_command(line: &str, prefix: CommandPrefix) -> Option<(Cow<'_, str>, Opt
         }
         _ => None,
     }
+}
+
+pub(crate) fn unwrap_multiline(line: &str) -> &str {
+    if let Ok(Some(captures)) = MULTILINE_RE.captures(line)
+        && let Some(text_match) = captures.get(1)
+    {
+        return text_match.as_str();
+    }
+    line
+}
+
+/// The command token the REPL would dispatch on for `line`, after
+/// unwrapping a `:::` multiline fence; `None` when the line is not a
+/// command.
+pub(crate) fn command_head(line: &str, prefix: CommandPrefix) -> Option<Cow<'_, str>> {
+    parse_command(unwrap_multiline(line), prefix).map(|(cmd, _)| cmd)
 }
 
 fn try_extract_shell_command(line: &str) -> Option<&str> {
@@ -2856,6 +3158,11 @@ mod tests {
     use crate::graph::llm::test_support::{boxed_completion, completion_runner};
     use crate::graph::route::ROUTE_ROLE_NAME;
     use crate::hooks::{HookDef, HooksMap, test_sink};
+    use crate::mesh::test_support::TempDir;
+    #[cfg(unix)]
+    use crate::mesh::test_support::started_runtime;
+    use crate::testing::EnvVarGuard;
+    use crate::utils::get_env_name;
     use anyhow::anyhow;
     use serde_json::json;
     use serial_test::serial;
@@ -3881,6 +4188,27 @@ local_hello() {\n\
             let session = ctx.session.as_ref().unwrap();
             assert_eq!(session.auto_continue_paused(), None);
             assert_eq!(session.last_run().unwrap().prompt, "hello");
+        });
+    }
+
+    /// A `.mesh` line typed under a graph agent with a session block is a
+    /// command: it is parsed off the line before the prompt path, so it never
+    /// reaches the run|chat classifier and records no run.
+    #[test]
+    #[serial]
+    fn mesh_command_under_a_session_block_graph_agent_is_dispatched_not_classified() {
+        let _guard = crate::testing::TestConfigDirGuard::new("repl");
+        let name = unique("repl_mesh_cmd_block");
+        write_graph_agent(&name, SESSION_BLOCK);
+        run_async(async {
+            let mut ctx = engage_graph_agent(repl_ctx(), &name).await;
+
+            repl_command(&mut ctx, ".mesh info").await.unwrap();
+
+            assert_eq!(ctx.last_graph_branch, None);
+            let session = ctx.session.as_ref().unwrap();
+            assert!(session.last_run().is_none());
+            assert!(session.messages().is_empty());
         });
     }
 
@@ -8119,6 +8447,15 @@ local_hello() {\n\
     }
 
     #[test]
+    fn parse_command_mesh_dispatches_under_the_configured_prefix() {
+        assert_eq!(
+            parse_command("/mesh trust abc", CommandPrefix::Slash),
+            Some((Cow::Owned(".mesh".to_string()), Some("trust abc")))
+        );
+        assert!(parse_command("/mesh status", CommandPrefix::Dot).is_none());
+    }
+
+    #[test]
     fn repl_help_text_renders_slash_rows_and_prose() {
         let help = repl_help_text(CommandPrefix::Slash);
         assert!(
@@ -8434,8 +8771,8 @@ local_hello() {\n\
     }
 
     #[test]
-    fn repl_commands_has_66_entries() {
-        assert_eq!(REPL_COMMANDS.len(), 66);
+    fn repl_commands_has_95_entries() {
+        assert_eq!(REPL_COMMANDS.len(), 95);
     }
 
     #[test]
@@ -8443,6 +8780,346 @@ local_hello() {\n\
         let help = repl_help_text(CommandPrefix::Dot);
         assert!(help.lines().any(|line| line.starts_with(".run ")), "{help}");
         assert!(builtin_command_names().contains(&"run"));
+    }
+
+    #[test]
+    fn mesh_verbs_and_repl_commands_never_drift() {
+        let commands: Vec<(&str, &str)> = REPL_COMMANDS
+            .iter()
+            .filter_map(|cmd| {
+                cmd.name
+                    .strip_prefix(".mesh ")
+                    .map(|verb| (verb, cmd.description))
+            })
+            .collect();
+        let verbs: Vec<(&str, &str)> = mesh::VERBS
+            .iter()
+            .map(|(verb, description, _)| (*verb, *description))
+            .collect();
+        assert_eq!(commands.len(), 29);
+        assert_eq!(commands, verbs);
+    }
+
+    #[test]
+    fn the_envoy_sees_the_context_replaced_by_the_command_before_the_digest_observes_it() {
+        // Needles are assembled at runtime so this test's own text does not match.
+        let strip = |s: &str| s.split_whitespace().collect::<String>();
+        let source = strip(include_str!("mod.rs"));
+        let command = strip(
+            &[
+                "run_repl_",
+                "command(&mut ctx, self.abort_signal.clone(), &line)",
+            ]
+            .concat(),
+        );
+        let refresh = strip(&["self.envoy.", "refresh(&ctx.app)"].concat());
+        let observe = strip(&["self.digest.", "observe_session(&ctx)"].concat());
+        let envoy_stop = strip(&["self.envoy.", "stop().await;"].concat());
+        let mesh_stop = strip(&["if let Err(err) = mesh.", "stop().await"].concat());
+        let run_start = strip(&["pub async fn run(", "&mut self)"].concat());
+        let replay_checked = strip(&["if let Err(err) = replay::", "render("].concat());
+        let replay_propagated =
+            strip(&["replay::", "render(app.as_ref(), &compressed, &active)?"].concat());
+
+        let position = |needle: &str| {
+            let first = source
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} missing"));
+            assert_eq!(source.rfind(needle), Some(first), "{needle} not unique");
+            first
+        };
+        // The autostart block refreshes the same hooks, so the refresh is located
+        // relative to the per-turn command rather than as a unique needle.
+        let position_after = |start: usize, needle: &str| {
+            start
+                + source[start..]
+                    .find(needle)
+                    .unwrap_or_else(|| panic!("{needle} missing after {start}"))
+        };
+        let command_at = position(&command);
+        let refresh_at = position_after(command_at, &refresh);
+        let observe_at = position(&observe);
+        assert!(
+            command_at < refresh_at,
+            "envoy refresh must follow the command"
+        );
+        assert!(
+            refresh_at < observe_at,
+            "digest must observe after the envoy refresh"
+        );
+        let mesh_stop_at = position(&mesh_stop);
+        assert!(
+            position(&envoy_stop) < mesh_stop_at,
+            "the node must stop after the envoy on shutdown"
+        );
+        let run_at = position(&run_start);
+        let replay_at = position(&replay_checked);
+        assert!(
+            run_at < replay_at && replay_at < mesh_stop_at,
+            "the history replay in Repl::run must precede the node's stop"
+        );
+        assert!(
+            !source[run_at..mesh_stop_at].contains(&replay_propagated),
+            "a replay failure in Repl::run must not skip the shutdown"
+        );
+    }
+
+    #[test]
+    fn the_mesh_autostarts_inside_repl_run_before_the_first_prompt() {
+        let strip = |s: &str| s.split_whitespace().collect::<String>();
+        let source = strip(include_str!("mod.rs"));
+        let run_start = strip(&["pub async fn run(", "&mut self)"].concat());
+        let gate = strip(&["if mesh::autostart_", "wanted(&self.ctx.read()) {"].concat());
+        let autostart = strip(&["mesh::auto", "start(&mut ctx).await"].concat());
+        let surfaced = strip(
+            &[
+                "if let Err(err) = result { render_",
+                "error(err); println!() }",
+            ]
+            .concat(),
+        );
+        let banner = strip(&["print_pause_", "banner(&self.ctx.read());"].concat());
+        let read_line = strip(&["self.editor.", "read_line(&self.prompt)"].concat());
+
+        let position = |needle: &str| {
+            let first = source
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} missing"));
+            assert_eq!(source.rfind(needle), Some(first), "{needle} not unique");
+            first
+        };
+        let run_at = position(&run_start);
+        let gate_at = position(&gate);
+        let autostart_at = position(&autostart);
+        let surfaced_at = position(&surfaced);
+        let banner_at = position(&banner);
+        assert!(
+            run_at < gate_at && gate_at < autostart_at,
+            "Repl::run joins only when config.yaml enables the mesh"
+        );
+        assert!(
+            autostart_at < surfaced_at && surfaced_at < banner_at,
+            "an autostart failure is rendered and the REPL goes on to its banner"
+        );
+        assert!(
+            banner_at < position(&read_line),
+            "the join must settle before the first prompt is read"
+        );
+    }
+
+    /// Every REPL path that enters a session passes `mesh::after_session_entered` once the
+    /// session is in use and its history replayed, and every path that exits one passes
+    /// `mesh::before_session_left` first, reporting a refused stop only after the exit.
+    /// The paths, in source order: the `.session` arm (its graph-agent bail first), the
+    /// `.agent <name> [session]` arm, `.exit session`, `.exit agent`, and a macro run from
+    /// the prompt, which joins once its steps are done. The enumeration is closed against
+    /// the non-test half of this file: every `use_session`, `use_agent`, `exit_session`,
+    /// `exit_agent_session`, `exit_agent` and `macro_execute` call is one of those, the
+    /// REPL's own shutdown stops the node before its `exit_session`, and `.fork`, the one
+    /// session switch, re-keys the running node onto the fork instead of leaving.
+    #[test]
+    fn every_session_enter_and_leave_path_passes_the_mesh_join_and_leave_sites() {
+        let strip = |s: &str| s.split_whitespace().collect::<String>();
+        let whole = strip(include_str!("mod.rs"));
+        let tests_start = whole
+            .find(&strip(&["#[cfg(te", "st)] mod tests {"].concat()))
+            .expect("the test module opens the test half of the file");
+        let source = &whole[..tests_start];
+        let position = |needle: &str| {
+            let first = source
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} missing"));
+            assert_eq!(source.rfind(needle), Some(first), "{needle} not unique");
+            first
+        };
+        let position_after = |start: usize, needle: &str| {
+            start
+                + source[start..]
+                    .find(needle)
+                    .unwrap_or_else(|| panic!("{needle} missing after {start}"))
+        };
+        let count = |needle: &str| source.matches(needle).count();
+        let join_site = strip(&["mesh::after_session_", "entered(ctx).await;"].concat());
+        let leave_site = strip(&["let left = mesh::before_session_", "left(ctx).await;"].concat());
+        let reported = strip(&[".await?; left", "?; }"].concat());
+        let replayed =
+            strip(&["replay::render(app.as_ref(), &compressed, &act", "ive)?; }"].concat());
+
+        // The transitions themselves, each named once here and nowhere else.
+        let use_session = position(&strip(
+            &[
+                "ctx.use_",
+                "session(app.as_ref(), args, abort_signal.clone())",
+            ]
+            .concat(),
+        ));
+        let use_agent = position(&strip(
+            &[
+                "ctx.use_",
+                "agent(app.as_ref(), agent_name, session_name, abort_signal.clone())",
+            ]
+            .concat(),
+        ));
+        let agent_session_exited = position(&strip(&["ctx.exit_agent_", "session()?;"].concat()));
+        let session_exited = position(&strip(&["} else { ctx.exit_", "session()?; }"].concat()));
+        let agent_exited = position(&strip(&["ctx.exit_", "agent(app.as_ref())?;"].concat()));
+        let macro_run = position(&strip(
+            &[
+                "Box::pin(macro_",
+                "execute(ctx, name, args, abort_signal)).await;",
+            ]
+            .concat(),
+        ));
+        let shutdown_stop = position(&strip(
+            &["if let Err(err) = mesh.", "stop().await"].concat(),
+        ));
+        let shutdown_exit = position(&strip(&["self.ctx.write().exit_", "session();"].concat()));
+        assert_eq!(count(&strip("ctx.use_session(")), 1, "one `.session` entry");
+        assert_eq!(count(&strip("ctx.use_agent(")), 1, "one `.agent` entry");
+        assert_eq!(
+            count(&strip("exit_session()")),
+            2,
+            "`.exit session` and the REPL's shutdown"
+        );
+        assert_eq!(count(&strip("exit_agent_session()")), 1);
+        assert_eq!(count(&strip("exit_agent(app.as_ref())")), 1);
+        assert_eq!(
+            count(&strip("macro_execute(ctx")),
+            1,
+            "every macro run from the prompt goes through run_macro_from_prompt"
+        );
+        assert_eq!(
+            count(&strip("run_macro_from_prompt(ctx,")),
+            3,
+            "`.macro <name>`, `.macro <name> <args>` for a macro that is not enabled, and the macro's own name"
+        );
+        assert_eq!(
+            count(&join_site),
+            3,
+            "the join site: .session, .agent, a macro from the prompt"
+        );
+        assert_eq!(
+            count(&leave_site),
+            2,
+            "the leave site: .exit session, .exit agent"
+        );
+
+        // `.session`: graph bail, use_session, replay, join, banner.
+        let session_arm = position(&strip(&["\".sess", "ion\" => {"].concat()));
+        // The same bail guards `.undo`, so it is located relative to the arm.
+        let graph_bail = position_after(
+            session_arm,
+            &strip(&["bail!(\"{}\", graph::no_session_", "block_text(&name));"].concat()),
+        );
+        let session_replayed = position_after(use_session, &replayed);
+        let session_join = position_after(use_session, &join_site);
+        let session_banner = position_after(use_session, &strip("print_pause_banner(ctx); }"));
+        assert!(
+            session_arm < graph_bail && graph_bail < use_session,
+            "a graph agent bails before any session or mesh code"
+        );
+        assert!(
+            use_session < session_replayed
+                && session_replayed < session_join
+                && session_join < session_banner,
+            "the `.session` join follows the entered session's replay and precedes the banner"
+        );
+
+        // `.agent <name> [session]`: use_agent, replay, join, banner (only with a session).
+        let agent_replayed = position_after(use_agent, &replayed);
+        let agent_join = position_after(use_agent, &join_site);
+        let agent_banner = position_after(
+            use_agent,
+            &strip("if ctx.session.is_some() { print_pause_banner(ctx); }"),
+        );
+        assert!(
+            session_join < use_agent
+                && use_agent < agent_replayed
+                && agent_replayed < agent_join
+                && agent_join < agent_banner,
+            "the `.agent` join follows the entered session's replay and precedes the banner"
+        );
+        assert!(
+            !source[use_agent..agent_join].contains(&strip("exit_session")),
+            "nothing between use_agent and the join exits the session"
+        );
+
+        // `.exit session`: leave, exit (agent session or plain), report.
+        let exit_session_arm = position(&strip(
+            &[
+                "Some(\"session\") => { // The node's instance id belongs to the sess",
+                "ion being exited;",
+            ]
+            .concat(),
+        ));
+        let exit_session_left = position_after(exit_session_arm, &leave_site);
+        let exit_session_reported = position_after(exit_session_arm, &reported);
+        assert!(
+            exit_session_arm < exit_session_left
+                && exit_session_left < agent_session_exited
+                && agent_session_exited < session_exited
+                && session_exited < exit_session_reported,
+            "the mesh is left before the session is exited; a refused stop is reported after"
+        );
+
+        // `.exit agent`: leave, exit_agent (which takes the agent's session out), report.
+        let exit_agent_arm = position(&strip(
+            &[
+                "Some(\"agent\") => { // The agent's sess",
+                "ion, when it holds one, goes with the agent,",
+            ]
+            .concat(),
+        ));
+        let exit_agent_left = position_after(exit_agent_arm, &leave_site);
+        let exit_agent_reported = position_after(exit_agent_arm, &reported);
+        assert!(
+            exit_session_reported < exit_agent_arm
+                && exit_agent_arm < exit_agent_left
+                && exit_agent_left < agent_exited
+                && agent_exited < exit_agent_reported,
+            "the mesh is left before the agent takes its session out; a refused stop is reported after"
+        );
+        let rag_arm = position(&strip(
+            &["Some(\"rag\") => { ctx.exit_", "rag()?; }"].concat(),
+        ));
+        assert!(rag_arm < exit_agent_arm, "arm order: session, rag, agent");
+        assert!(
+            !source[exit_session_left..exit_agent_reported]
+                .contains(&strip("set_mesh_enabled_for_session")),
+            "leaving on an exit does not touch the in-memory `mesh.enabled`"
+        );
+
+        // A macro from the prompt: its steps run first, the join gate asks once it is done.
+        let macro_join = position_after(macro_run, &join_site);
+        let macro_result = position_after(macro_run, &strip("result }"));
+        assert!(
+            exit_agent_reported < macro_run && macro_run < macro_join && macro_join < macro_result,
+            "a macro from the prompt joins the session its steps left entered before its result is reported"
+        );
+
+        // The REPL's shutdown and the one session switch.
+        assert!(
+            shutdown_stop < shutdown_exit && shutdown_exit < session_arm,
+            "Repl::run stops the node before exiting the session it served"
+        );
+        let rekey = position(&strip(
+            &["ctx.app.mesh.re", "key(pending.rekey.clone()).await"].concat(),
+        ));
+        let committed = position(&strip(&["ctx.commit_", "fork(pending)"].concat()));
+        assert!(
+            rekey < committed,
+            "`.fork` re-keys the node before switching the session"
+        );
+        assert_eq!(count(&strip("commit_fork(")), 1);
+    }
+
+    #[test]
+    fn one_shot_entry_points_never_autostart_the_mesh() {
+        let main = include_str!("../main.rs");
+        assert!(
+            !main.contains("autostart"),
+            "main.rs must reach the mesh autostart only through Repl::run"
+        );
     }
 
     #[test]
@@ -8742,14 +9419,27 @@ local_hello() {\n\
         }
     }
 
-    // Usage probe (spec-first, criterion 5): `-h/--help` wins from ANY
+    #[test]
+    #[serial]
+    fn repl_save_session_help_names_the_workspace_config_dir_the_process_runs_with() {
+        let _override = EnvVarGuard::set(get_env_name("workspace_config_dir"), ".cfg-help");
+
+        let help = repl_save_session_help();
+
+        assert!(
+            help.contains("  --workspace   Save under .cfg-help/ in the current workspace\n"),
+            "{help}"
+        );
+    }
+
+    // `-h/--help` wins from ANY
     // position — including when it is preceded by a token that would
     // otherwise route to Usage (unknown `-` flag) or Conflict (both scope
     // flags) — while, absent help, an unknown `-` token still routes to
     // Usage even when a valid scope flag is present, and a repeated
     // identical flag stays idempotent for `--workspace` too.
     #[test]
-    fn usage_probe_save_session_help_prescan_beats_usage_and_conflict() {
+    fn save_session_help_prescan_beats_usage_and_conflict() {
         for input in [
             "--bogus -h",
             "-h --bogus",
@@ -9029,6 +9719,26 @@ local_hello() {\n\
     }
 
     #[test]
+    fn command_head_unwraps_multiline_fence() {
+        let head = |line| command_head(line, CommandPrefix::Dot);
+        assert_eq!(head("::: .mesh trust abc :::").as_deref(), Some(".mesh"));
+        assert_eq!(head(":::\n.mesh status\n:::").as_deref(), Some(".mesh"));
+    }
+
+    #[test]
+    fn command_head_returns_command_token_without_args() {
+        let head = |line| command_head(line, CommandPrefix::Dot);
+        assert_eq!(head(".model x").as_deref(), Some(".model"));
+        assert_eq!(head("  .mesh").as_deref(), Some(".mesh"));
+    }
+
+    #[test]
+    fn command_head_prose_returns_none() {
+        assert_eq!(command_head("hello world", CommandPrefix::Dot), None);
+        assert_eq!(command_head("::: echo .mesh :::", CommandPrefix::Dot), None);
+    }
+
+    #[test]
     fn try_extract_shell_command_strips_bang() {
         assert_eq!(try_extract_shell_command("!ls"), Some("ls"));
         assert_eq!(try_extract_shell_command("!ls -la"), Some("ls -la"));
@@ -9244,6 +9954,96 @@ local_hello() {\n\
         assert!(
             child_signal.aborted_ctrlc(),
             "the child must still be cancelled"
+        );
+    }
+
+    /// A REPL ctx holding a named session, with sessions saved under a temp dir for the
+    /// guard's lifetime. Callers must be `#[serial]`: the sessions dir is process env.
+    fn fork_ctx(tag: &str) -> (RequestContext, TempDir, EnvVarGuard) {
+        let sessions_dir = TempDir::new(tag);
+        let env = EnvVarGuard::set(get_env_name("sessions_dir"), &sessions_dir.path);
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Repl);
+        let mut session = Session::default();
+        session.set_name("original".to_string());
+        ctx.session = Some(session);
+        (ctx, sessions_dir, env)
+    }
+
+    #[test]
+    #[serial]
+    fn fork_command_with_mesh_off_writes_fork_and_switches_to_it() {
+        let (mut ctx, sessions_dir, _env) = fork_ctx("repl-fork-mesh-off");
+        run_async(async {
+            let result = Box::pin(run_repl_command(
+                &mut ctx,
+                create_abort_signal(),
+                ".fork branch",
+            ))
+            .await;
+
+            result.expect("forking with the mesh off must succeed");
+        });
+
+        assert!(sessions_dir.path.join("original.yaml").exists());
+        assert!(sessions_dir.path.join("branch.yaml").exists());
+        let live = ctx.session.as_ref().unwrap();
+        assert_eq!(live.name(), "branch");
+        assert!(live.mesh_instance_id().is_some());
+    }
+
+    /// The rekey is refused hermetically by giving the ctx's session a lineage id other
+    /// than the one the node serves: `MeshRuntime::rekey` bails on that mismatch before it
+    /// takes any lock or touches the transport, so no second process or pre-held lock is
+    /// needed. The fork's own id is minted inside `prepare_fork`, so holding its lock ahead
+    /// of time is not an option.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn fork_command_with_refused_rekey_leaves_context_and_node_on_original() {
+        let (mut ctx, sessions_dir, _env) = fork_ctx("repl-fork-refused");
+        let original_id = ctx
+            .session
+            .as_mut()
+            .unwrap()
+            .ensure_mesh_instance_id()
+            .to_string();
+        run_async(async {
+            let started = started_runtime("repl-fork-refused-node").await;
+            let served_id = started.runtime.instance_id().await;
+            assert_ne!(served_id, original_id);
+            ctx.app.mesh.install(started.runtime.clone()).unwrap();
+
+            let err = Box::pin(run_repl_command(
+                &mut ctx,
+                create_abort_signal(),
+                ".fork branch",
+            ))
+            .await
+            .expect_err("a refused rekey must fail the fork");
+
+            let err = format!("{err:#}");
+            assert!(
+                err.contains("Could not fork 'original' into 'branch'"),
+                "{err}"
+            );
+            assert!(err.contains("you are still in 'original'"), "{err}");
+            assert!(
+                err.contains(&format!("serving instance {served_id}")),
+                "{err}"
+            );
+            assert_eq!(started.runtime.instance_id().await, served_id);
+
+            assert!(ctx.app.mesh.stop().await.unwrap());
+            started.relay_handle.abort();
+        });
+
+        let live = ctx.session.as_ref().unwrap();
+        assert_eq!(live.name(), "original");
+        assert_eq!(live.mesh_instance_id(), Some(original_id.as_str()));
+        assert!(sessions_dir.path.join("original.yaml").exists());
+        assert!(
+            !sessions_dir.path.join("branch.yaml").exists(),
+            "the fork file must be removed when the rekey is refused"
         );
     }
 

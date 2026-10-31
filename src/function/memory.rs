@@ -17,7 +17,7 @@ use crate::config::memory::{
     create_workspace_memory, find_workspace_git_root, today_string, workspace_search_bounds,
 };
 use crate::config::paths;
-use crate::config::{RequestContext, RoundChains, WORKSPACE_COYOTE_DIR_NAME};
+use crate::config::{Agent, RequestContext, RoundChains};
 
 pub const MEMORY_FUNCTION_PREFIX: &str = "memory__";
 
@@ -395,6 +395,12 @@ pub fn memory_function_declarations() -> Vec<FunctionDeclaration> {
 }
 
 pub fn handle_memory_tool(ctx: &mut RequestContext, cmd_name: &str, args: &Value) -> Result<Value> {
+    if ctx.agent.as_ref().is_some_and(Agent::is_builtin) {
+        return Ok(json!({
+            "status": "error",
+            "message": "Memory tools are never available to a built-in agent.",
+        }));
+    }
     if !ctx.should_register_memory_tools() {
         bail!("Memory tools are disabled (memory off or function calling unavailable).");
     }
@@ -1208,11 +1214,12 @@ fn workspace_write_dir_from(
     if let Some(git_root) = git_root() {
         return bootstrap_workspace_memory(&git_root);
     }
-    if start.join(WORKSPACE_COYOTE_DIR_NAME).is_dir() {
+    let home = paths::workspace_memory_home_name();
+    if start.join(home).is_dir() {
         return create_workspace_memory(start, false);
     }
     bail!(
-        "no workspace memory discoverable, not inside a git repository, and no .coyote directory here. \
+        "no workspace memory discoverable, not inside a git repository, and no {home} directory here. \
          If you want workspace memory, run `coyote --init-memory workspace`."
     )
 }
@@ -2140,6 +2147,41 @@ mod tests {
         assert_eq!(saved.frontmatter.expires, None);
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn handle_memory_tool_refuses_a_builtin_agent_before_dispatch() {
+        use crate::config::{Agent, AgentConfig, AppConfig, AppState, WorkingMode};
+        use std::sync::Arc;
+
+        let app = AppState {
+            config: Arc::new(AppConfig {
+                memory: Some(true),
+                ..Default::default()
+            }),
+            ..AppState::test_default()
+        };
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        ctx.agent = Some(Agent::test_new(AgentConfig {
+            name: "envoy".into(),
+            memory: Some(true),
+            ..Default::default()
+        }));
+        assert!(ctx.agent.as_ref().unwrap().is_builtin());
+
+        for action in ["list", "read", "write", "lint", "nosuch"] {
+            let result = handle_memory_tool(
+                &mut ctx,
+                &format!("{MEMORY_FUNCTION_PREFIX}{action}"),
+                &json!({"name": "x", "content": "y", "description": "z", "scope": "global"}),
+            )
+            .unwrap();
+            assert_eq!(result["status"], "error", "{action}: {result}");
+            assert_eq!(
+                result["message"], "Memory tools are never available to a built-in agent.",
+                "{action}: {result}"
+            );
+        }
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use super::{FunctionDeclaration, JsonSchema};
-use crate::config::RequestContext;
+use crate::config::{Agent, RequestContext};
 
 use anyhow::{Result, anyhow};
 use indexmap::IndexMap;
@@ -59,6 +59,13 @@ pub async fn handle_rag_tool(
         .strip_prefix(RAG_FUNCTION_PREFIX)
         .unwrap_or(cmd_name);
 
+    if ctx.agent.as_ref().is_some_and(Agent::is_builtin) {
+        return Ok(json!({
+            "status": "error",
+            "message": "RAG tools are never available to a built-in agent.",
+        }));
+    }
+
     match action {
         "query" => handle_query(ctx, args).await,
         _ => Err(anyhow!("Unknown RAG action: {action}")),
@@ -98,4 +105,40 @@ async fn handle_query(ctx: &RequestContext, args: &Value) -> Result<Value> {
         "count": chunks_json.len(),
         "chunks": chunks_json,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AgentConfig, AppState, WorkingMode};
+    use std::sync::Arc;
+
+    #[test]
+    fn handle_rag_tool_refuses_a_builtin_agent_before_dispatch() {
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.agent = Some(Agent::test_new(AgentConfig {
+            name: "envoy".into(),
+            ..Default::default()
+        }));
+        assert!(ctx.agent.as_ref().unwrap().is_builtin());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for action in ["query", "nosuch"] {
+            let result = runtime
+                .block_on(handle_rag_tool(
+                    &mut ctx,
+                    &format!("{RAG_FUNCTION_PREFIX}{action}"),
+                    &json!({"query": "q"}),
+                ))
+                .unwrap();
+            assert_eq!(result["status"], "error", "{action}: {result}");
+            assert_eq!(
+                result["message"], "RAG tools are never available to a built-in agent.",
+                "{action}: {result}"
+            );
+        }
+    }
 }

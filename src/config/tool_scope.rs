@@ -482,6 +482,10 @@ pub fn resolve_prompt_args(
     (provided, missing)
 }
 
+/// Longest escape sequence the sanitiser skips over. Real CSI/OSC sequences are a few dozen
+/// chars; an unterminated one in hostile text would otherwise swallow everything after it.
+const MAX_ESCAPE_SEQUENCE_CHARS: usize = 128;
+
 pub fn sanitize_display_text(text: &str) -> String {
     let mut sanitized = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -490,7 +494,7 @@ pub fn sanitize_display_text(text: &str) -> String {
             match chars.next() {
                 // CSI: skip everything up to and including the final byte.
                 Some('[') => {
-                    for next in chars.by_ref() {
+                    for next in chars.by_ref().take(MAX_ESCAPE_SEQUENCE_CHARS) {
                         if matches!(next, '\u{40}'..='\u{7e}') {
                             break;
                         }
@@ -498,7 +502,8 @@ pub fn sanitize_display_text(text: &str) -> String {
                 }
                 // OSC: skip until BEL or the ESC \ string terminator.
                 Some(']') => {
-                    while let Some(next) = chars.next() {
+                    for _ in 0..MAX_ESCAPE_SEQUENCE_CHARS {
+                        let Some(next) = chars.next() else { break };
                         if next == '\u{07}' {
                             break;
                         }
@@ -1501,6 +1506,16 @@ mod tests {
     #[test]
     fn sanitize_display_text_maps_control_chars_to_spaces() {
         assert_eq!(sanitize_display_text("a\nb\tc\rd\u{7}e"), "a b c d e");
+    }
+
+    #[test]
+    fn sanitize_display_text_gives_up_on_unterminated_escape_sequences() {
+        let csi = format!("\u{1b}[{}TRAILER", "9".repeat(300));
+        assert!(sanitize_display_text(&csi).contains("TRAILER"), "{csi:?}");
+        let osc = format!("\u{1b}]{}TRAILER", "9".repeat(300));
+        assert!(sanitize_display_text(&osc).contains("TRAILER"), "{osc:?}");
+        assert!(!sanitize_display_text(&csi).contains('\u{1b}'));
+        assert!(!sanitize_display_text(&osc).contains('\u{1b}'));
     }
 
     #[tokio::test]
