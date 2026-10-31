@@ -179,6 +179,7 @@ fn run_script(
         .env_remove("TEST_CMD")
         .env_remove("FORMAT_CMD")
         .env_remove("LINT_CMD")
+        .env_remove("LLM_AGENT_VAR_TEST_COMMAND")
         .env_remove("LLM_AGENT_VAR_BUILD_LOCK");
     for (k, v) in envs {
         cmd.env(k, v);
@@ -704,15 +705,16 @@ fn micro_granularity_and_batch_cadence_are_declared_as_a_pair() {
 }
 
 /// Rendering the Sisyphus instructions under `review_cadence=batch` drops the
-/// gauntlet section and keeps the batch section; the `debris-exempt` rule the
-/// batch section leans on lives outside both blocks, so either cadence
-/// renders it.
+/// gauntlet section and keeps the batch section, with its refusal to run
+/// batch cadence without a parent; the `debris-exempt` rule the batch section
+/// leans on lives outside both blocks, so either cadence renders it.
 #[test]
 fn sisyphus_cadence_blocks_render_exclusively_and_share_the_debris_rule() {
     if tools_missing() {
         return;
     }
     let hoisted = "a `Debris exemptions:` heading (`<file:line> -- <reason>`)";
+    let standalone_stop = "If a user started you directly (no parent), STOP before any coder work and tell the user that";
     let script = format!(
         "source '{}'; render_instructions '{}'",
         asset(".shared/utils.sh").display(),
@@ -740,6 +742,11 @@ fn sisyphus_cadence_blocks_render_exclusively_and_share_the_debris_rule() {
         assert!(stdout.contains(present), "{cadence}: missing {present:?}");
         assert!(!stdout.contains(absent), "{cadence}: leaked {absent:?}");
         assert!(stdout.contains(hoisted), "{cadence}: missing {hoisted:?}");
+        assert_eq!(
+            stdout.contains(standalone_stop),
+            cadence == "batch",
+            "{cadence}: the standalone STOP sentence belongs to the batch block only"
+        );
     }
 }
 
@@ -1124,6 +1131,96 @@ fn engineer_agent_surface_is_consistent() {
             "engineer/instructions.md names {name} as an own fs tool but config.yaml does not grant {tool}: {global_tools:?}"
         );
     }
+}
+
+#[test]
+fn sisyphus_config_grants_fs_cat() {
+    let doc: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(asset("sisyphus/config.yaml")).unwrap()).unwrap();
+    let global_tools: Vec<&str> = doc["global_tools"]
+        .as_sequence()
+        .expect("sisyphus/config.yaml: global_tools")
+        .iter()
+        .map(|t| t.as_str().expect("global_tools entry is a string"))
+        .collect();
+    assert!(
+        global_tools.contains(&"fs_cat.sh"),
+        "sisyphus/config.yaml: global_tools must grant fs_cat.sh: {global_tools:?}"
+    );
+}
+
+/// engineer/instructions.md as a session sees it: the shell render resolves
+/// the `when:` blocks from LLM_AGENT_VAR_*, then the engine replaces each
+/// `{{name}}` with the variable's value. Returns both stages.
+fn render_engineer(vars: &[(&str, &str)]) -> (String, String) {
+    let script = format!(
+        "source '{}'; render_instructions '{}'",
+        asset(".shared/utils.sh").display(),
+        asset("engineer/instructions.md").display()
+    );
+    let mut cmd = bash();
+    cmd.arg("-c").arg(&script);
+    for name in ["project_dir", "reference_root", "chat_agent_for"] {
+        cmd.env_remove(format!("LLM_AGENT_VAR_{}", name.to_uppercase()));
+    }
+    for (name, value) in vars {
+        cmd.env(format!("LLM_AGENT_VAR_{}", name.to_uppercase()), value);
+    }
+    let (code, rendered, stderr) = run(cmd.output().expect("spawn bash"));
+    assert_eq!(code, 0, "render engineer/instructions.md: {stderr}");
+    let mut text = rendered.clone();
+    for (name, value) in vars {
+        text = text.replace(&format!("{{{{{name}}}}}"), value);
+    }
+    (rendered, text)
+}
+
+#[test]
+fn engineer_instructions_render_reference_root_project_dir_and_handoff_path() {
+    if tools_missing() {
+        return;
+    }
+    let bullet = "Cross-repo questions are first-class";
+
+    let (rendered, text) = render_engineer(&[
+        ("project_dir", "/work/repo"),
+        ("reference_root", ""),
+        ("chat_agent_for", ""),
+    ]);
+    assert!(
+        !rendered.lines().any(|l| l.contains(bullet)),
+        "an empty reference_root must drop the cross-repo bullet:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("{{reference_root}}"),
+        "an empty reference_root must leave no placeholder to substitute:\n{rendered}"
+    );
+    assert!(
+        text.contains("The primary repository for this conversation is /work/repo;"),
+        "project_dir not substituted:\n{text}"
+    );
+    assert!(
+        text.contains("plans/engineer-handoffs/<slug>.md"),
+        "standalone render must name the engineer handoff path:\n{text}"
+    );
+    assert!(
+        !text.contains("plans/handoffs/<slug>.md"),
+        "plans/handoffs/ holds phased-plan step handoffs, not engineer ones:\n{text}"
+    );
+
+    let (rendered, text) = render_engineer(&[
+        ("project_dir", "/work/repo"),
+        ("reference_root", "/srv/repos"),
+        ("chat_agent_for", ""),
+    ]);
+    assert!(
+        rendered.contains(bullet),
+        "a set reference_root must keep the cross-repo bullet:\n{rendered}"
+    );
+    assert!(
+        text.contains("sibling repos live under\n  /srv/repos"),
+        "reference_root not substituted into the bullet:\n{text}"
+    );
 }
 
 /// run_checks.py wraps each declared command in the `build_lock` prefix and
@@ -2706,10 +2803,6 @@ fn sisyphus_debt_scan_tool_without_python3_reports_the_manual_pipeline() {
     if tools_missing() {
         return;
     }
-    if which::which("python3").is_err() {
-        eprintln!("skipping: python3 not available");
-        return;
-    }
     let dir = fixture_dir("sisyphus-debt-scan-no-python");
     let tool = engine_built_tool(&dir.0, "sisyphus");
     let (repo, base) = debt_scan_repo(&dir.0);
@@ -2734,6 +2827,49 @@ fn sisyphus_debt_scan_tool_without_python3_reports_the_manual_pipeline() {
         stdout.contains("git ls-files --others --exclude-standard -z"),
         "{stdout}"
     );
+}
+
+/// tenancy_signal() flags ownership-shaped text, yet classify() keeps it out
+/// of the gauntlet's signal set, and the comment saying nothing calls it yet
+/// stays beside the regex.
+#[test]
+fn diff_signals_classify_leaves_the_tenancy_signal_out() {
+    let source = fs::read_to_string(asset(".shared/diff_signals.py")).unwrap();
+    let no_caller = "nothing calls tenancy_signal yet: it is kept here, shared-only,\n# ahead of the watch-round";
+    assert!(
+        source.replace("\r\n", "\n").contains(no_caller),
+        "diff_signals.py: missing {no_caller:?}"
+    );
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let added = "+ if row.org_id != caller.org_id: deny()";
+    let program = "import json, sys; sys.path.insert(0, sys.argv[1]); import diff_signals as d; \
+                   print(json.dumps({'classify': d.classify(['src/a.rs'], sys.argv[2]), \
+                   'tenancy': d.tenancy_signal(sys.argv[2])}))";
+    let (code, stdout, stderr) = run(Command::new("python3")
+        .arg("-B")
+        .arg("-c")
+        .arg(program)
+        .arg(asset(".shared"))
+        .arg(added)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("spawn python3"));
+    assert_eq!(code, 0, "{stderr}");
+    let out: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+    assert_eq!(out["tenancy"], Value::Bool(true), "{stdout}");
+    let signals = out["classify"]
+        .as_object()
+        .expect("classify returns a dict");
+    for key in signals.keys() {
+        let lower = key.to_lowercase();
+        assert!(
+            !lower.contains("tenan") && !lower.contains("owner"),
+            "classify() must not carry a tenancy signal: {key}"
+        );
+    }
 }
 
 fn parse_findings(findings: &Value) -> Value {
