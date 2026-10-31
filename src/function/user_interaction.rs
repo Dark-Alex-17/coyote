@@ -177,12 +177,7 @@ enum UserAction {
 
 impl UserAction {
     fn name(self) -> &'static str {
-        match self {
-            UserAction::Select => "select",
-            UserAction::Confirm => "confirm",
-            UserAction::Input => "input",
-            UserAction::Checkbox => "checkbox",
-        }
+        PromptAction::from(self).name()
     }
 }
 
@@ -215,7 +210,9 @@ fn required_question(args: &Value) -> Result<&str> {
 
 /// The request a run with no human answers for itself. It tolerates the
 /// gaps a live prompt rejects (no question, unusable options) so the
-/// structured reply still reaches the model.
+/// structured reply still reaches the model. Options are normalised the
+/// way a live prompt reads them: a string-encoded array is decoded and
+/// non-string elements are dropped.
 fn headless_request(ctx: &RequestContext, action: UserAction, args: &Value) -> PromptRequest {
     let question = args.get("question").and_then(Value::as_str).unwrap_or("");
     let options = parse_options(args).unwrap_or_default();
@@ -422,6 +419,26 @@ mod tests {
             "options": options,
             "guidance": HEADLESS_GUIDANCE,
         })
+    }
+
+    #[test]
+    #[serial]
+    fn headless_drops_non_string_options() {
+        let _headless = AtomicFlagGuard::set(&HEADLESS, true);
+        let mut ctx = cmd_ctx();
+        let args = json!({ "question": "q-hl-mixed-3f", "options": [1, "a", null] });
+        let v = run_user_tool(&mut ctx, "user__select", args);
+        assert_eq!(v, headless_json("select", "q-hl-mixed-3f", json!(["a"])));
+    }
+
+    #[test]
+    #[serial]
+    fn headless_accepts_a_string_encoded_options_array() {
+        let _headless = AtomicFlagGuard::set(&HEADLESS, true);
+        let mut ctx = cmd_ctx();
+        let args = json!({ "question": "q-hl-str-8d", "options": "[\"a\",\"b\"]" });
+        let v = run_user_tool(&mut ctx, "user__select", args);
+        assert_eq!(v, headless_json("select", "q-hl-str-8d", json!(["a", "b"])));
     }
 
     #[test]

@@ -12131,6 +12131,17 @@ mod tests {
             let ctx = RequestContext::new(default_app_state(), mode);
             let seat = format!("{:?}", ctx.prompter);
             assert!(seat.starts_with("InquirePrompter"), "{mode:?}: {seat}");
+            let inquire = ctx
+                .prompter
+                .as_any()
+                .downcast_ref::<InquirePrompter>()
+                .unwrap_or_else(|| panic!("{mode:?}: {seat}"));
+            // The prompter records "Yes for this session" into the same
+            // memory the context replays from.
+            assert!(
+                Arc::ptr_eq(&ctx.prompt_memory, inquire.memory()),
+                "{mode:?}"
+            );
         }
     }
 

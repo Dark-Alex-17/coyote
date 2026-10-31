@@ -24,7 +24,7 @@ pub(crate) fn human_present() -> bool {
 }
 
 pub(crate) const NO_HUMAN_FOR_OAUTH: &str =
-    "OAuth sign-in needs an interactive terminal; run it without --headless";
+    "OAuth sign-in needs an interactive terminal; run it without --headless or --acp-server";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptAction {
@@ -159,6 +159,10 @@ impl PromptAnswer {
 /// has no human to ask answers at once.
 pub trait Prompter: Send + Sync + fmt::Debug {
     fn prompt(&self, req: PromptRequest) -> Result<PromptAnswer>;
+
+    /// Lets a test look at the seated prompter behind the trait object.
+    #[cfg(test)]
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 /// Confirms a tool already waved through with "Yes for this session", keyed
@@ -245,6 +249,11 @@ impl InquirePrompter {
         Self { memory }
     }
 
+    #[cfg(test)]
+    pub(crate) fn memory(&self) -> &Arc<PromptMemory> {
+        &self.memory
+    }
+
     fn select(req: &PromptRequest) -> Result<PromptAnswer, InquireError> {
         let mut options = req.options.clone();
         options.push(CUSTOM_MULTI_CHOICE_ANSWER_OPTION.to_string());
@@ -307,6 +316,11 @@ impl Prompter for InquirePrompter {
             Err(err) => Err(err.into()),
         }
     }
+
+    #[cfg(test)]
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// Answers for a run with no human: the reply is the structured
@@ -331,6 +345,11 @@ pub(crate) fn headless_reply(req: &PromptRequest) -> Value {
 impl Prompter for HeadlessPrompter {
     fn prompt(&self, req: PromptRequest) -> Result<PromptAnswer> {
         Ok(PromptAnswer::Text(headless_reply(&req).to_string()))
+    }
+
+    #[cfg(test)]
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
@@ -391,6 +410,10 @@ impl Prompter for ScriptedPrompter {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(req);
         Ok(answer)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
