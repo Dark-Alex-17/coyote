@@ -41,6 +41,8 @@ HINT = "\U0001f4a1"  # 💡
 
 REQUIRED_FIELDS = ("id", "severity", "file", "lines", "title", "block")
 
+SKIP_WORDS = re.compile(r"\bSUGGESTION\b|\bNIT(?:PICK)?\b")
+
 
 def load_state():
     path = os.environ.get("GRAPH_STATE_FILE")
@@ -69,7 +71,7 @@ def classify(sev, marker):
     upper = text.upper()
     if "CRITICAL" in upper or "WARNING" in upper:
         return True
-    if "SUGGESTION" in upper or "NITPICK" in upper or "NIT" in upper:
+    if SKIP_WORDS.search(upper):
         return False
     return None
 
@@ -126,9 +128,11 @@ def main():
             fall_back(f"finding #{i} severity unclassifiable: {entry['severity']!r}")
         if not wanted:
             continue  # 🟢/💡 post unverified by design
+        if not entry["id"].strip():
+            fall_back(f"finding #{i} has no id")
         findings_list.append(
             {
-                "id": entry["id"] or f"f{i + 1}",
+                "id": entry["id"],
                 "severity": entry["severity"],
                 "path": entry["file"],
                 "lines": entry["lines"],

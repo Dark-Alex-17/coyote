@@ -434,6 +434,31 @@ fn verify_scripts_survive_300kb_failing_transcript() {
     }
 }
 
+/// step-runner: with no test command configured or detected, verify_tests
+/// still moves on to debt_scan, but says the gate did not run rather than
+/// reporting a green suite.
+#[test]
+fn step_runner_verify_tests_without_a_test_command_reports_gate_not_run() {
+    if tools_missing() {
+        return;
+    }
+    let dir = fixture_dir("verify-tests-no-cmd");
+    let out = run_script_json(
+        "step-runner/scripts/verify_tests.sh",
+        &dir.0,
+        &project_state(&dir.0),
+        &[],
+    );
+    assert_eq!(str_field(&out, "_next"), "debt_scan", "{out}");
+    let output = str_field(&out, "tests_output");
+    assert!(output.starts_with("(GATE NOT RUN"), "{output}");
+    assert!(
+        output.contains("This is NOT evidence that tests passed"),
+        "{output}"
+    );
+    assert!(!output.contains("Ran: "), "{output}");
+}
+
 /// The `build_lock` graph variable wraps every gate command as ONE unit. Each
 /// command reads `$GATE_SEEN` in a child shell so only the prefix can set it.
 /// The compound leg proves the second `&&` half is also under the prefix, and
@@ -2561,7 +2586,250 @@ fn architect_tools_write_no_bytecode_into_the_agent_dir() {
     }
 }
 
-/// plan_tasks.py run directly over `dir/tasks` for the plan `dir/PLAN-x.md`.
+/// A scratch repo with one empty commit, plus that commit's sha.
+#[cfg(unix)]
+fn debt_scan_repo(dir: &Path) -> (PathBuf, String) {
+    let repo = dir.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("spawn git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    git(&["init", "-q"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "base"]);
+    let base = git(&["rev-parse", "HEAD"]);
+    (repo, base)
+}
+
+/// Runs the engine-built sisyphus `debt_scan` tool with `args`. The tool
+/// sources LLM_PROMPT_UTILS_FILE, which the engine sets; debt_scan uses none
+/// of its helpers, so an empty stub keeps the run independent of the host's
+/// file and of `tput` and TERM.
+#[cfg(unix)]
+fn sisyphus_debt_scan(
+    dir: &Path,
+    tool: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> (i32, String, String) {
+    let prompt_utils = dir.join("prompt-utils.sh");
+    fs::write(&prompt_utils, "").unwrap();
+    let mut cmd = bash();
+    cmd.arg(tool)
+        .arg("debt_scan")
+        .args(args)
+        .env("LLM_ROOT_DIR", dir.join("config"))
+        .env("LLM_AGENT_ROOT_DIR", tool.parent().unwrap())
+        .env("LLM_PROMPT_UTILS_FILE", &prompt_utils)
+        .env("LLM_OUTPUT", "/dev/stdout")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GRAPH_STATE")
+        .env_remove("GRAPH_STATE_FILE");
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    run(cmd.output().expect("spawn bash"))
+}
+
+/// A graph state inherited from the calling node does not switch the tool
+/// into the scanner's graph mode: the caller gets the plain report for the
+/// repo it named, not a JSON envelope for the state's project_dir.
+#[cfg(unix)]
+#[test]
+fn sisyphus_debt_scan_tool_prints_the_plain_report_under_a_graph_state() {
+    if tools_missing() {
+        return;
+    }
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = fixture_dir("sisyphus-debt-scan-state");
+    let tool = engine_built_tool(&dir.0, "sisyphus");
+    let (repo, base) = debt_scan_repo(&dir.0);
+    fs::create_dir_all(repo.join("src")).unwrap();
+    fs::write(repo.join("src/x.rs"), "#[allow(dead_code)] fn x() {}\n").unwrap();
+    let (code, stdout, stderr) = sisyphus_debt_scan(
+        &dir.0,
+        &tool,
+        &["--base", &base, "--dir", repo.to_str().unwrap()],
+        &[("GRAPH_STATE", r#"{"project_dir":"/nonexistent"}"#)],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l == "src/x.rs:1 -- #[allow(dead_code)] fn x() {}"),
+        "{stdout}"
+    );
+    assert!(
+        serde_json::from_str::<Value>(&stdout).is_err(),
+        "the tool must not print the graph-mode JSON: {stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sisyphus_debt_scan_tool_requires_a_base() {
+    if tools_missing() {
+        return;
+    }
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = fixture_dir("sisyphus-debt-scan-no-base");
+    let tool = engine_built_tool(&dir.0, "sisyphus");
+    let (repo, _) = debt_scan_repo(&dir.0);
+    let (code, stdout, stderr) =
+        sisyphus_debt_scan(&dir.0, &tool, &["--dir", repo.to_str().unwrap()], &[]);
+    assert_ne!(code, 0, "a call without --base must fail: {stdout}");
+    assert!(stderr.contains("--base"), "{stderr}");
+}
+
+/// Without python3 on PATH the tool still answers, exit 0, with the
+/// DEBT_SCAN_FAILED report and the manual pipeline to run instead.
+#[cfg(unix)]
+#[test]
+fn sisyphus_debt_scan_tool_without_python3_reports_the_manual_pipeline() {
+    if tools_missing() {
+        return;
+    }
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = fixture_dir("sisyphus-debt-scan-no-python");
+    let tool = engine_built_tool(&dir.0, "sisyphus");
+    let (repo, base) = debt_scan_repo(&dir.0);
+    let bin = dir.0.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    for name in ["basename", "bash", "cat", "env"] {
+        let target = which::which(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+        std::os::unix::fs::symlink(target, bin.join(name)).unwrap();
+    }
+    let (code, stdout, stderr) = sisyphus_debt_scan(
+        &dir.0,
+        &tool,
+        &["--base", &base, "--dir", repo.to_str().unwrap()],
+        &[("PATH", bin.to_str().unwrap())],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.starts_with("DEBT_SCAN_FAILED: python3 is not on PATH"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("git ls-files --others --exclude-standard -z"),
+        "{stdout}"
+    );
+}
+
+fn parse_findings(findings: &Value) -> Value {
+    let prompt = format!(
+        "Verify these code-review findings against the working tree.\n\nProject: /tmp/p\n\nFindings (JSON):\n{findings}"
+    );
+    let output = Command::new("python3")
+        .arg(asset("finding-verifier/scripts/parse_findings.py"))
+        .env(
+            "GRAPH_STATE",
+            serde_json::json!({ "initial_prompt": prompt }).to_string(),
+        )
+        .env_remove("GRAPH_STATE_FILE")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("spawn python3");
+    let (code, stdout, stderr) = run(output);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("invalid JSON ({e}): {stdout}\nstderr: {stderr}"))
+}
+
+fn finding(id: &str, severity: &str) -> Value {
+    serde_json::json!({
+        "id": id, "severity": severity, "marker": "", "file": "src/a.rs",
+        "lines": "1", "title": "t", "block": "b",
+    })
+}
+
+/// NIT and SUGGESTION are whole words: a severity that merely contains the
+/// letters (UNIT, INITIAL, MONITOR) is unclassifiable and goes to the LLM
+/// parse instead of being skipped unverified.
+#[test]
+fn parse_findings_skips_only_whole_word_nits_and_suggestions() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    for severity in ["UNIT-level", "INITIAL", "MONITOR", "SANITIZE"] {
+        let out = parse_findings(&serde_json::json!([finding("f1", severity)]));
+        assert_eq!(str_field(&out, "_next"), "parse", "{severity}: {out}");
+        assert!(
+            str_field(&out, "parse_script_note").contains("unclassifiable"),
+            "{severity}: {out}"
+        );
+    }
+    for severity in ["NIT", "nitpick", "Nit: rename", "SUGGESTION"] {
+        let out = parse_findings(&serde_json::json!([finding("f1", severity)]));
+        assert_eq!(str_field(&out, "_next"), "verify_each", "{severity}: {out}");
+        assert_eq!(out["findings_list"], serde_json::json!([]), "{severity}");
+    }
+}
+
+/// An empty id is never invented: the parse falls back, naming the finding
+/// by its position in the array, skipped findings included.
+#[test]
+fn parse_findings_falls_back_on_an_empty_id() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    for id in ["", "  "] {
+        let out = parse_findings(&serde_json::json!([
+            finding("f1", "NIT"),
+            finding(id, "CRITICAL"),
+        ]));
+        assert_eq!(str_field(&out, "_next"), "parse", "{id:?}: {out}");
+        assert_eq!(
+            str_field(&out, "parse_script_note"),
+            "finding #1 has no id",
+            "{id:?}"
+        );
+    }
+}
+
+/// The parsed debt_hits default, as the sweep prompt renders it when the
+/// debt_scan node never ran: the YAML `''` escape decodes to the single
+/// quotes the manual grep needs.
+#[test]
+fn step_runner_debt_hits_default_parses_to_the_manual_fallback() {
+    let doc: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(asset("step-runner/graph.yaml")).unwrap())
+            .unwrap();
+    let hits = doc["initial_state"]["debt_hits"]
+        .as_str()
+        .expect("initial_state.debt_hits is a string");
+    assert!(
+        hits.starts_with("DEBT_SCAN_FAILED: the debt_scan node did not run."),
+        "{hits}"
+    );
+    let grep = r"grep -nE '^\+.*(#!?\[(allow|expect)\(|cfg_attr\(|todo!|unimplemented!|#\[ignore)'";
+    assert_eq!(hits.matches(grep).count(), 1, "{hits}");
+    assert!(hits.contains("fs_grep tool"), "{hits}");
+}
+
+/// plan_tasks.py run directly over `dir/tasks` for the fixture plan file in `dir`.
 #[cfg(unix)]
 fn plan_tasks(dir: &Path, extra_args: &[&str]) -> (i32, String, String) {
     run(Command::new("python3")
@@ -2613,7 +2881,8 @@ fn plan_tasks_escapes_control_characters_in_notes() {
 }
 
 /// A dir name counts as a task dir only when the id ends at a `-` or at the
-/// end of the name: `TASK-3.bak` and `TASK-3cool` are not task 3 or task 3c.
+/// end of the name: a `.bak` suffix or trailing letters after the id's own
+/// optional letter do not make a task dir.
 #[cfg(unix)]
 #[test]
 fn plan_tasks_lists_only_dirs_whose_name_ends_at_the_task_id() {
@@ -3270,6 +3539,34 @@ fn step_runner_check_handoff_success_guards_null_design_decisions() {
             "state {state} -> {out}"
         );
     }
+}
+
+/// step-runner: a handoff that fails validation after its one retry ends the
+/// run instead of looping back to write_handoff.
+#[test]
+fn step_runner_check_handoff_second_failure_ends_failure() {
+    if tools_missing() {
+        return;
+    }
+    let dir = fixture_dir("check-handoff-twice");
+    let handoff = dir.0.join("handoff.md");
+    fs::write(&handoff, "---\nresult: complete\n---\n## Summary\n").unwrap();
+    let state = serde_json::json!({
+        "handoff_path": handoff.to_str().unwrap(),
+        "step_plan_path": "",
+        "handoff_attempts": 1,
+    });
+    let out = run_script_json("step-runner/scripts/check_handoff.sh", &dir.0, &state, &[]);
+    assert_eq!(str_field(&out, "_next"), "end_failure", "{out}");
+    let reason = str_field(&out, "blocking_reason");
+    assert!(
+        reason.starts_with("Handoff failed validation twice"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("- missing required section: ## Completed"),
+        "{reason}"
+    );
 }
 
 /// step-runner: every implement → verify cycle passes through
@@ -4885,7 +5182,9 @@ fn resolve_step_cuts_each_document_at_its_head_c_limit() {
 fn system_bash() -> Command {
     let system = Path::new("/bin/bash");
     if system.is_file() {
-        Command::new(system)
+        let mut cmd = Command::new(system);
+        cmd.env("PYTHONDONTWRITEBYTECODE", "1");
+        cmd
     } else {
         bash()
     }
@@ -5914,10 +6213,12 @@ fn bash_program_skips_a_system32_launcher_that_leads_path() {
     );
 }
 
-/// The two engineered fail-open edges stay as they were and the six
-/// routing gates each draw a "script crashed" edge in their README: five
-/// into end_failure, and coder's route_complexity into gate_approval, so a
-/// reader of the diagram sees where each crash lands.
+/// Each listed routing gate draws a "script crashed" edge in its agent's
+/// README to the node that crash lands on, so a reader of the diagram sees
+/// where each crash goes. The step-runner README also keeps its engineered
+/// fail-open edges, the debt_scan hop between verify_tests and
+/// edge_case_sweep, and check_handoff's "failed twice" edge into
+/// end_failure. Every README names where a crashed gate's error surfaces.
 #[test]
 fn readme_diagrams_draw_the_fail_closed_gate_edges_and_keep_the_open_ones() {
     for (agent, crash_edges, open_edges) in [
@@ -5934,6 +6235,7 @@ fn readme_diagrams_draw_the_fail_closed_gate_edges_and_keep_the_open_ones() {
                 "edge_case_sweep -. \"LLM fault\" .-> write_handoff",
                 "verify_tests -->|\"pass\"| debt_scan",
                 "debt_scan --> edge_case_sweep",
+                "check_handoff -->|\"failed twice\"| end_failure",
             ][..],
         ),
         (
@@ -5957,7 +6259,7 @@ fn readme_diagrams_draw_the_fail_closed_gate_edges_and_keep_the_open_ones() {
         for edge in open_edges {
             assert!(
                 readme.lines().any(|l| l.trim() == *edge),
-                "{agent} README lost the deliberate fail-open edge `{edge}`"
+                "{agent} README lost the edge `{edge}`"
             );
         }
         assert!(
