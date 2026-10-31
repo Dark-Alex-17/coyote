@@ -1527,23 +1527,37 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             }
         }
 
+        /// Reply lines the harness plants that no request asked for.
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Stray {
+            None,
+            /// A foreign-id reply before every real one.
+            Before,
+            /// A foreign-id reply after every real one: the next helper has
+            /// to skip it and the last one must still sit in the pipe when
+            /// the tool reads the channel itself.
+            After,
+            /// A foreign-id reply and a line that is not JSON, then the
+            /// channel closes without ever answering the request.
+            ThenClose,
+        }
+
         /// Runs `body` in a bash that sourced the helper with a live reply
         /// channel; request lines the shell writes are answered from
         /// `answers` in order (`null` once they run out; `None` closes the
         /// channel before the first read). `detach` puts the shell in its
         /// own session so `/dev/tty` cannot be opened.
         fn run_helper(dir: &Path, answers: Option<&[Value]>, body: &str, detach: bool) -> Run {
-            run_helper_opts(dir, answers, body, detach, false)
+            run_helper_opts(dir, answers, body, detach, Stray::None)
         }
 
-        /// `run_helper` with `stray`: every real reply is preceded by a reply
-        /// line carrying an id no request asked for.
+        /// `run_helper` with a [`Stray`] policy for unasked-for reply lines.
         fn run_helper_opts(
             dir: &Path,
             answers: Option<&[Value]>,
             body: &str,
             detach: bool,
-            stray: bool,
+            stray: Stray,
         ) -> Run {
             let mut server = Server::open().unwrap();
             let mut cmd = Command::new(bash_program().unwrap());
@@ -1572,7 +1586,7 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             }
             let mut child = cmd.spawn().expect("spawn bash");
             server.spawned();
-            let server = answers.is_some().then_some(server);
+            let mut server = answers.is_some().then_some(server);
             let mut stderr = child.stderr.take().unwrap();
             let stderr_thread = std::thread::spawn(move || {
                 let mut text = String::new();
@@ -1583,15 +1597,33 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             let mut stdout = String::new();
             for line in std::io::BufReader::new(child.stdout.take().unwrap()).lines() {
                 let line = line.unwrap();
+                let mut close_channel = false;
                 if is_request_line(&line)
                     && let Some(server) = server.as_ref()
                 {
                     let req: Value = serde_json::from_str(&line).unwrap();
                     let id = req["coyote_prompt"]["id"].as_str().unwrap();
-                    if stray {
-                        server.reply("not-this-request", &json!(false));
+                    match stray {
+                        Stray::None => server.reply(id, answers.next().unwrap_or(&Value::Null)),
+                        Stray::Before => {
+                            server.reply("not-this-request", &json!(false));
+                            server.reply(id, answers.next().unwrap_or(&Value::Null));
+                        }
+                        Stray::After => {
+                            server.reply(id, answers.next().unwrap_or(&Value::Null));
+                            server.reply("not-this-request", &json!(false));
+                        }
+                        Stray::ThenClose => {
+                            server.reply("not-this-request", &json!(false));
+                            let mut writer = &server.writer;
+                            writer.write_all(b"this is not json\n").unwrap();
+                            writer.flush().unwrap();
+                            close_channel = true;
+                        }
                     }
-                    server.reply(id, answers.next().unwrap_or(&Value::Null));
+                }
+                if close_channel {
+                    server = None;
                 }
                 stdout.push_str(&line);
                 stdout.push('\n');
@@ -2011,7 +2043,7 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                 Some(&[json!(true), json!("b")]),
                 "a=\"$(confirm \"One?\")\"; b=\"$(list \"Two?\" a b c)\"; echo \"a=[$a] b=[$b]\"",
                 false,
-                true,
+                Stray::Before,
             );
             assert_eq!(run.code, 0, "{}\n{}", run.stdout, run.stderr);
             assert_eq!(run.request_lines().len(), 2, "{}", run.stdout);
@@ -2669,6 +2701,101 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                     );
                 }
             }
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn each_helper_consumes_exactly_one_reply_line() {
+            require_tools();
+            let dir = scratch_dir("one-line");
+            // A reply the helper did not ask for sits behind every real one.
+            // The second helper must skip the first decoy and stop at its own
+            // reply; the decoy behind that must still be in the pipe when the
+            // tool reads the channel itself, and nothing may follow it.
+            let body = "a=\"$(confirm \"One?\")\"; b=\"$(list \"Two?\" a b c)\"; \
+                        IFS= read -r -t 5 rest <\"$COYOTE_PROMPT_REPLY\"; rc=$?; \
+                        IFS= read -r -t 1 more <\"$COYOTE_PROMPT_REPLY\"; \
+                        echo \"a=[$a] b=[$b] rc=$rc more=[$more]\"; echo \"rest=$rest\"";
+            let run = run_helper_opts(
+                &dir,
+                Some(&[json!(true), json!("b")]),
+                body,
+                false,
+                Stray::After,
+            );
+            assert_eq!(run.code, 0, "{}\n{}", run.stdout, run.stderr);
+            assert_eq!(run.request_lines().len(), 2, "{}", run.stdout);
+            let lines = run.other_lines();
+            assert_eq!(lines.len(), 2, "{}\n{}", run.stdout, run.stderr);
+            assert_eq!(lines[0], "a=[1] b=[1] rc=0 more=[]", "{}", run.stderr);
+            let rest: Value = serde_json::from_str(lines[1].trim_start_matches("rest="))
+                .unwrap_or_else(|err| panic!("leftover is not the decoy ({err}): {}", lines[1]));
+            assert_eq!(rest["id"], json!("not-this-request"), "{}", run.stdout);
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn strays_and_junk_before_a_closed_channel_still_fail_closed() {
+            require_tools();
+            let dir = scratch_dir("stray-eof");
+            // The id-matching loop must give up at EOF rather than spin or
+            // take a foreign reply: a stray id, a line that is not JSON and
+            // then a closed channel leave every helper on the cancel path.
+            for call in [
+                "confirm \"Go?\"",
+                "list \"Pick\" a b",
+                "checkbox \"Pick\" a b",
+                "input \"Name?\"",
+                "password \"Secret?\"",
+            ] {
+                let run = run_helper_opts(&dir, Some(&[]), &capture(call), false, Stray::ThenClose);
+                assert_eq!(run.request_lines().len(), 1, "{call}: {}", run.stdout);
+                assert_eq!(
+                    run.other_lines(),
+                    vec!["v=[] rc=1"],
+                    "{call}: {}\n{}",
+                    run.stdout,
+                    run.stderr
+                );
+                assert!(
+                    run.stderr.contains("prompt reply channel closed"),
+                    "{call}: {}",
+                    run.stderr
+                );
+            }
+            let run = run_helper_opts(
+                &dir,
+                Some(&[]),
+                "guard_operation \"Really?\"; echo continued",
+                false,
+                Stray::ThenClose,
+            );
+            assert_eq!(run.code, 1, "{}\n{}", run.stdout, run.stderr);
+            assert!(run.stderr.contains("Operation aborted!"), "{}", run.stderr);
+            assert!(!run.stdout.contains("continued"), "{}", run.stdout);
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn a_reply_longer_than_the_request_carry_cap_is_printed_whole() {
+            require_tools();
+            let dir = scratch_dir("big-reply");
+            // The 64 KiB carry cap bounds request lines on the host side; the
+            // reply path has no such limit and the helper prints all of it.
+            let big = "x".repeat(CARRY_CAP + 6_000);
+            let run = run_helper(
+                &dir,
+                Some(&[json!(big)]),
+                "v=\"$(input \"Big?\")\"; rc=$?; echo \"len=${#v} rc=$rc\"",
+                false,
+            );
+            assert_eq!(run.request_lines().len(), 1, "{}", run.stdout);
+            assert_eq!(
+                run.other_lines(),
+                vec![format!("len={} rc=0", CARRY_CAP + 6_000).as_str()],
+                "{}",
+                run.stderr
+            );
             fs::remove_dir_all(&dir).ok();
         }
     }
