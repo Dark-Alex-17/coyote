@@ -2745,7 +2745,10 @@ pub fn run_llm_function(
                 break status;
             }
             Ok(None) => {}
-            Err(err) => bail!("Unable to run {command_name}, {err}"),
+            Err(err) => {
+                tool_exited.store(true, Ordering::Release);
+                bail!("Unable to run {command_name}, {err}")
+            }
         }
         if let Some(deadline) = deadline
             && Instant::now() >= deadline
@@ -2755,6 +2758,7 @@ pub fn run_llm_function(
                 spawned.elapsed()
             );
             tool_exited.store(true, Ordering::Release);
+            pump_detached.store(true, Ordering::Release);
             let _ = child.kill();
             let _ = child.wait();
             drop(stdout_thread);
@@ -2780,6 +2784,7 @@ pub fn run_llm_function(
                 spawned.elapsed()
             );
             tool_exited.store(true, Ordering::Release);
+            pump_detached.store(true, Ordering::Release);
             let _ = child.kill();
             let _ = child.wait();
             drop(stdout_thread);

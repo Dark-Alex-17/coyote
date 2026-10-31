@@ -71,6 +71,8 @@ impl Server {
     /// exec, and only that one.
     pub(crate) fn configure(&self, cmd: &mut Command) {
         let fd = self.child_fd;
+        // SAFETY: the closure runs between fork and exec and only calls
+        // fcntl, which is async-signal-safe; it touches no shared state.
         unsafe {
             cmd.pre_exec(move || {
                 let flags = libc::fcntl(fd, libc::F_GETFD);
@@ -1375,6 +1377,89 @@ echo "$ans" >> "$LLM_OUTPUT""#,
         assert_eq!(requests[0].call_id, None);
     }
 
+    /// The path a real tool call takes: `ToolCall::eval` against a context
+    /// whose prompter is seated. The tool's `confirm` must reach THAT
+    /// prompter tagged with the tool name and the call id, the request line
+    /// must stay off the displayed output, and a "Yes for this session"
+    /// remembered in the context's own memory must replay without asking.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn eval_path_hands_the_seated_prompter_and_memory_to_the_tool() {
+        require_tools();
+        let _guard = TestConfigDirGuard::new("prompt-eval");
+        let _acp_off = AtomicFlagGuard::set(&ACP_SERVER, false);
+        let _headless_off = AtomicFlagGuard::set(&HEADLESS, false);
+        install_tool(
+            "evalask-x7x",
+            r#"ans="$(confirm "Go? eval-x7x")"; printf 'ans=%s' "$ans" >> "$LLM_OUTPUT""#,
+        );
+        let prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]));
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.ui = Arc::new(SilentSink);
+        ctx.prompter = Arc::clone(&prompter) as Arc<dyn Prompter>;
+        ctx.tool_scope
+            .functions
+            .append_declaration(FunctionDeclaration {
+                name: "evalask-x7x".to_string(),
+                description: String::new(),
+                parameters: JsonSchema::default(),
+                agent: false,
+            });
+        let sink = RecordingSink::install();
+
+        let first = ToolCall::new(
+            "evalask-x7x".to_string(),
+            json!({}),
+            Some("id-eval-x7x".to_string()),
+        )
+        .eval(&mut ctx)
+        .await
+        .unwrap();
+
+        assert_eq!(first, json!({"output": "ans=0"}));
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert_eq!(requests[0].action, PromptAction::Confirm);
+        assert_eq!(requests[0].question, "Go? eval-x7x");
+        assert_eq!(requests[0].tool.as_deref(), Some("evalask-x7x"));
+        assert_eq!(requests[0].call_id.as_deref(), Some("id-eval-x7x"));
+        assert_eq!(requests[0].job_id, None);
+        let chunks = stdout_chunks(&sink.drain(), "id-eval-x7x");
+        assert!(!chunks.contains("coyote_prompt"), "{chunks}");
+
+        // Yes-for-session lives on the context; remembering it there alone
+        // must be enough for the next call to go through unasked.
+        ctx.prompt_memory.remember("evalask-x7x", "Go? eval-x7x");
+        let second = ToolCall::new(
+            "evalask-x7x".to_string(),
+            json!({}),
+            Some("id-eval2-x7x".to_string()),
+        )
+        .eval(&mut ctx)
+        .await
+        .unwrap();
+
+        assert_eq!(second, json!({"output": "ans=1"}));
+        assert_eq!(
+            prompter.requests().len(),
+            1,
+            "a remembered answer must not reach the prompter again"
+        );
+        let (requested, answered) = prompt_events(sink.drain(), "Go? eval-x7x");
+        let [Event::PromptRequested { id, call_id, .. }] = requested.as_slice() else {
+            panic!("{requested:?}");
+        };
+        assert_eq!(call_id.as_deref(), Some("id-eval2-x7x"));
+        assert_eq!(
+            answered,
+            vec![Event::PromptAnswered {
+                id: id.clone(),
+                answer: "yes".to_string(),
+                auto: true,
+            }]
+        );
+    }
+
     // Black-box contract of the bash helper's reply path, exercised the way
     // a tool author uses it: source the helper, call `confirm`/`list`/
     // `checkbox`/`input`/`password`/`guard_operation`/`guard_path`, read the
@@ -1467,6 +1552,7 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                 .current_dir(dir)
                 .env_remove("AUTO_CONFIRM")
                 .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+                .env_remove(OUT_FD_ENV)
                 .env(REPLY_ENV, server.env_value())
                 .env("PROMPT_UTILS", HELPER)
                 .stdin(Stdio::null())
@@ -2268,6 +2354,37 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                 vec!["outer a=[1]", "inner v=[0] rc=0", "after rc=0"],
                 "{}\n{}",
                 run.stdout,
+                run.stderr
+            );
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn sourcing_the_helper_twice_keeps_a_single_channel() {
+            require_tools();
+            let dir = scratch_dir("resource");
+            // Tool libraries routinely re-source the helper. The second
+            // source must neither save fd 9 over the already-saved copy nor
+            // lose the channel: one request, the usual answer, no noise.
+            let body = format!(
+                "source \"$PROMPT_UTILS\"; {}",
+                capture("confirm \"Again?\"")
+            );
+            let run = run_helper(&dir, Some(&[json!(true)]), &body, false);
+            assert_eq!(run.code, 0, "{}\n{}", run.stdout, run.stderr);
+            let requests = run.request_lines();
+            assert_eq!(requests.len(), 1, "{}", run.stdout);
+            assert_eq!(requests[0]["coyote_prompt"]["question"], "Again?");
+            assert_eq!(
+                run.other_lines(),
+                vec!["v=[1] rc=0"],
+                "{}\n{}",
+                run.stdout,
+                run.stderr
+            );
+            assert!(
+                run.stderr.is_empty(),
+                "re-sourcing must stay silent: {}",
                 run.stderr
             );
             fs::remove_dir_all(&dir).ok();

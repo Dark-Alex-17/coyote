@@ -33,15 +33,15 @@ mod tests {
         let _acp_off = AtomicFlagGuard::set(&ACP_SERVER, false);
         let ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
 
-        let headless_off = AtomicFlagGuard::set(&HEADLESS, false);
+        let _headless_off = AtomicFlagGuard::set(&HEADLESS, false);
         assert_eq!(ctx.ui_kind(), UiKind::Repl);
         assert_eq!(ctx.ui_kind().as_str(), "repl");
-        drop(headless_off);
 
         let headless_on = AtomicFlagGuard::set(&HEADLESS, true);
         assert_eq!(ctx.ui_kind(), UiKind::Headless);
         assert_eq!(ctx.ui_kind().as_str(), "headless");
         drop(headless_on);
+        assert_eq!(ctx.ui_kind(), UiKind::Repl);
 
         let _acp_on = AtomicFlagGuard::set(&ACP_SERVER, true);
         assert_eq!(ctx.ui_kind(), UiKind::Headless);
