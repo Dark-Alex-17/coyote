@@ -1707,6 +1707,64 @@ fn assemble_pr_body_keeps_a_split_task_suffix() {
     );
 }
 
+/// An all-digit SHA counts when the log marks it as a commit (`@ `,
+/// `commit `, backticks), while a bare all-digit token such as a date is
+/// still not a SHA and leaves the task with the no-SHAs NOTE.
+#[cfg(unix)]
+#[test]
+fn assemble_pr_body_reads_an_all_digit_sha_only_where_marked() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = pr_body_fixture("assemble-pr-body-digit-sha", "Follow-ups:\n- first item\n");
+    for (name, title, log) in [
+        (
+            "TASK-5-e",
+            "E",
+            "## 2026-10-30 - completed\nLanded on 20261030 @ 1234567.\n",
+        ),
+        (
+            "TASK-6-f",
+            "F",
+            "## 2026-10-30 - completed\nCOMMIT 7654321 and `1111111`.\n",
+        ),
+        (
+            "TASK-7-g",
+            "G",
+            "## 2026-10-30 - completed\nLanded on 20261030.\n",
+        ),
+    ] {
+        let task = dir.0.join("tasks").join(name);
+        fs::create_dir_all(&task).unwrap();
+        fs::write(
+            task.join("index.md"),
+            format!("---\nplan: PLAN-x.md\nstatus: complete\ntitle: \"{title}\"\n---\n"),
+        )
+        .unwrap();
+        fs::write(task.join("log.md"), log).unwrap();
+    }
+    let (code, stdout, stderr) = assemble_pr_body(&dir.0);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("\n- [x] TASK-5 - E (`1234567`)\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("\n- [x] TASK-6 - F (`7654321`, `1111111`)\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("\n- [x] TASK-7 - G (commit SHAs: none recorded in log.md)\n"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("20261030"), "{stdout}");
+    assert!(
+        stderr.contains("NOTE TASK-7: no commit SHAs in the log.md `completed` entry"),
+        "{stderr}"
+    );
+}
+
 /// The architect's PR-body directive renders in both strategies; only the
 /// `multi` render adds the `--tasks` group filter, since a single-PR run
 /// wants every complete task of the plan.
@@ -2130,8 +2188,10 @@ fn collect_ledger_lines_names_a_task_without_plan_or_status_fields() {
 
 /// A task whose index.md exists but cannot be read is skipped with a NOTE
 /// naming the dir, its log.md stays unread, and the other tasks still list.
-/// Skipped where mode bits do not bind (root, or a filesystem that ignores
-/// them), since the unreadable state cannot be produced there.
+/// Its plan is unknown, so a `--tasks` listing of its id also reports the id
+/// as not found under the plan. Skipped where mode bits do not bind (root,
+/// or a filesystem that ignores them), since the unreadable state cannot be
+/// produced there.
 #[cfg(unix)]
 #[test]
 fn collect_ledger_lines_names_an_unreadable_index_and_skips_the_task() {
@@ -2160,11 +2220,17 @@ fn collect_ledger_lines_names_an_unreadable_index_and_skips_the_task() {
         return;
     }
     let (code, stdout, stderr) = collect_ledger_lines_with(&dir.0, "debris-exempt", &[]);
+    let (listed_code, _, listed_stderr) = plan_tasks(&dir.0, &["--tasks", "TASK-6"]);
     fs::set_permissions(&index, fs::Permissions::from_mode(0o644)).unwrap();
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     assert!(
-        stdout.contains("plan_tasks: NOTE TASK-6-u: index.md unreadable; skipped"),
+        stdout.contains("plan_tasks: NOTE TASK-6-u: index.md unreadable (plan unknown); skipped"),
         "the unreadable task must be named: {stdout}"
+    );
+    assert_eq!(listed_code, 0, "{listed_stderr}");
+    assert!(
+        listed_stderr.contains("NOTE listed in --tasks but not found under the plan: TASK-6"),
+        "an unreadable index.md must not count as found under the plan: {listed_stderr}"
     );
     assert!(
         !stdout.contains("UNREAD-SENTINEL"),
@@ -2233,6 +2299,138 @@ fn collect_ledger_lines_keeps_a_newline_named_task_dir_as_one_path() {
         stdout.contains("TASK-1-a (log.md:3): debris-exempt: src/a.rs:1 -- TASK-1-a"),
         "{stdout}"
     );
+}
+
+/// plan_tasks.py run directly over `dir/tasks` for the plan `dir/PLAN-x.md`.
+#[cfg(unix)]
+fn plan_tasks(dir: &Path, extra_args: &[&str]) -> (i32, String, String) {
+    run(Command::new("python3")
+        .arg(asset("architect/plan_tasks.py"))
+        .arg("--plan")
+        .arg(dir.join("PLAN-x.md"))
+        .arg("--tasks-dir")
+        .arg(dir.join("tasks"))
+        .args(extra_args)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("spawn python3"))
+}
+
+/// A carriage return or an ESC in a task dir name, or in a `--tasks` id, is
+/// escaped in the NOTE, so a NOTE line can neither overwrite itself on a
+/// terminal nor carry a raw control sequence.
+#[cfg(unix)]
+#[test]
+fn plan_tasks_escapes_control_characters_in_notes() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = shared_tasks_fixture("plan-tasks-control-chars");
+    for name in ["TASK-7-r\rx", "TASK-8-e\u{1b}y"] {
+        let task = dir.0.join("tasks").join(name);
+        fs::create_dir_all(&task).unwrap();
+        fs::write(task.join("index.md"), "---\nplan: PLAN-x.md\n---\n").unwrap();
+    }
+    let (code, _, stderr) = plan_tasks(&dir.0, &["--tasks", "TASK-7,TASK-8,TASK-9\u{1b}[2J"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stderr.contains("plan_tasks: NOTE TASK-7-r\\rx: index.md has no status:; kept"),
+        "{stderr:?}"
+    );
+    assert!(
+        stderr.contains("plan_tasks: NOTE TASK-8-e\\x1by: index.md has no status:; kept"),
+        "{stderr:?}"
+    );
+    assert!(
+        stderr.contains("NOTE listed in --tasks but not found under the plan: TASK-9\\x1b[2J"),
+        "{stderr:?}"
+    );
+    assert!(
+        !stderr.contains('\r') && !stderr.contains('\u{1b}'),
+        "{stderr:?}"
+    );
+}
+
+/// A dir name counts as a task dir only when the id ends at a `-` or at the
+/// end of the name: `TASK-3.bak` and `TASK-3cool` are not task 3 or task 3c.
+#[cfg(unix)]
+#[test]
+fn plan_tasks_lists_only_dirs_whose_name_ends_at_the_task_id() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = fixture_dir("plan-tasks-dir-boundary");
+    fs::write(dir.0.join("PLAN-x.md"), "# Plan\n").unwrap();
+    for name in ["TASK-3.bak", "TASK-3cool", "TASK-3-real"] {
+        let task = dir.0.join("tasks").join(name);
+        fs::create_dir_all(&task).unwrap();
+        fs::write(
+            task.join("index.md"),
+            "---\nplan: PLAN-x.md\nstatus: complete\n---\n",
+        )
+        .unwrap();
+    }
+    let (code, stdout, stderr) = plan_tasks(&dir.0, &[]);
+    assert_eq!(code, 0, "{stderr}");
+    let listed: Vec<&str> = stdout
+        .split('\0')
+        .filter(|d| !d.is_empty())
+        .map(|d| d.rsplit('/').next().unwrap())
+        .collect();
+    assert_eq!(listed, ["TASK-3-real"], "{stdout:?}");
+}
+
+/// A `--tasks` member that exists under the plan but is not complete is
+/// named with its status, so the ledger read never ends in a bare `(none)`
+/// without saying why; without `--tasks` the pending task stays silent.
+#[cfg(unix)]
+#[test]
+fn plan_tasks_names_a_listed_member_that_is_not_complete() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = shared_tasks_fixture("plan-tasks-pending-member");
+    let (code, stdout, stderr) = plan_tasks(&dir.0, &["--tasks", "TASK-2"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, "", "a pending member is not listed");
+    assert!(
+        stderr
+            .contains("plan_tasks: NOTE TASK-2-b: listed in --tasks but status: pending; skipped"),
+        "{stderr}"
+    );
+    let (code, _, stderr) = plan_tasks(&dir.0, &[]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(!stderr.contains("TASK-2-b"), "{stderr}");
+}
+
+/// A `--tasks` value that names no id (blank, or commas only) is a usage
+/// error in both scripts, never a silent read of every task; an absent
+/// `--tasks` still means no filter.
+#[cfg(unix)]
+#[test]
+fn plan_tasks_and_assemble_pr_body_refuse_a_tasks_value_naming_no_id() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = pr_body_fixture("plan-tasks-empty-filter", "Follow-ups:\n- first item\n");
+    for value in ["", " ", ",", " , "] {
+        let (code, stdout, stderr) = plan_tasks(&dir.0, &["--tasks", value]);
+        assert_eq!(code, 2, "plan_tasks {value:?}: {stdout:?} {stderr}");
+        assert!(stderr.contains("--tasks names no task ids"), "{stderr}");
+        assert_eq!(stdout, "", "plan_tasks {value:?}");
+        let (code, stdout, stderr) =
+            assemble_pr_body_with(&dir.0, "PLAN-x.md", &["--tasks", value], &[]);
+        assert_eq!(code, 2, "assemble_pr_body {value:?}: {stdout} {stderr}");
+        assert!(stderr.contains("--tasks names no task ids"), "{stderr}");
+        assert!(!stdout.contains("## Tasks"), "{stdout}");
+    }
+    let (code, stdout, stderr) = plan_tasks(&dir.0, &[]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("TASK-1-a"), "{stdout:?}");
 }
 
 /// Every rendered `collect_ledger_lines --tag ...` call carries `--plan`,

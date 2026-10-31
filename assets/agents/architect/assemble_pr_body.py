@@ -37,7 +37,13 @@ import sys
 import plan_tasks
 from plan_tasks import frontmatter, plan_identity, read
 
-SHA_RE = re.compile(r"\b(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b")
+# A bare token needs a hex letter, so dates and counts never read as SHAs; an
+# all-digit token counts only where the log marks it as a commit.
+SHA_RE = re.compile(
+    r"(?:(?<=@ )|(?<=(?i:commit) ))[0-9]{7,40}\b"
+    r"|(?<=`)[0-9]{7,40}(?=`)"
+    r"|\b(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b"
+)
 HEX_WORDS = {"deadbeef", "cafebabe"}
 # Tags that open an entry; an entry stops at the next of these on its line or below it.
 ENTRY_TAGS = ("rejected-finding:", "design-decision", "Follow-ups:", "HYGIENE:")
@@ -57,11 +63,11 @@ def find_tasks(tasks_dir, plan_id, only=None):
     for task_id, fm, root in rows:
         base = plan_tasks.label(root)
         if fm is None:
-            note(f"{base}: index.md unreadable; skipped")
+            note(plan_tasks.unreadable_note(base))
             continue
         absent = plan_tasks.absent_fields(fm)
         if absent:
-            note(f"{base}: index.md has no {'/'.join(absent)}; kept")
+            note(plan_tasks.fieldless_note(base, absent))
         if not plan_tasks.is_complete(fm):
             skipped.append(f"{base} (status: {fm.get('status', '')})")
             continue
@@ -74,7 +80,7 @@ def find_tasks(tasks_dir, plan_id, only=None):
     if skipped:
         note("excluded from the checklist (not `status: complete`): " + ", ".join(skipped))
     if missing:
-        note("listed in --tasks but not found under the plan: " + ", ".join(missing))
+        note(plan_tasks.missing_note(missing))
     return found
 
 
@@ -172,13 +178,14 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--plan", required=True, help="PLAN-<slug>.md (rigor from frontmatter; its name, `.md` stripped, filters tasks)")
     ap.add_argument("--tasks-dir", required=True, help="tree searched recursively for TASK-NNN-*/index.md")
-    ap.add_argument("--tasks", default="", help="comma-separated task ids (TASK-a,TASK-b); keeps only those in the checklist and ledger rollups - a PR group's members")
+    ap.add_argument("--tasks", help="comma-separated task ids (TASK-a,TASK-b); keeps only those in the checklist and ledger rollups - a PR group's members")
     ap.add_argument("--summary-file", required=True, help="file holding the Problem/Approach summary, pasted verbatim")
     ap.add_argument("--hygiene-file", help="file holding the kept HYGIENE items, pasted verbatim (else derived from `HYGIENE:` ledger lines)")
     ap.add_argument("--quality-note", default="", help="text appended to the Quality bar line (e.g. deferred-hardening task ids)")
     ap.add_argument("--followups", action="store_true", help="append a `## Follow-up / manual actions` section from `Follow-ups:` ledger lines")
     ap.add_argument("--out", help="also write the body to this file")
     args = ap.parse_args()
+    only = plan_tasks.task_filter(ap, args.tasks)
 
     for p in (args.plan, args.summary_file) + ((args.hygiene_file,) if args.hygiene_file else ()):
         if not os.path.isfile(p):
@@ -188,7 +195,6 @@ def main():
 
     plan_base = os.path.basename(args.plan)
     plan_fm = frontmatter(read(args.plan))
-    only = plan_tasks.parse_task_ids(args.tasks)
     tasks = find_tasks(args.tasks_dir, plan_identity(args.plan), only)
     if not tasks:
         note(f"no tasks under {args.tasks_dir} belong to {plan_base} - checklist left empty")
