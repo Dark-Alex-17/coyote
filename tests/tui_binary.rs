@@ -3,6 +3,9 @@
 //! up) the tty it ran on must come back in its cooked, echoing state. Each
 //! case runs the binary on a pseudo-terminal under a bash wrapper that
 //! reports the exit code and `stty -a` afterwards, so the file is unix-only.
+//! The cases run one at a time: each spawn forks a session leader and takes
+//! a controlling tty, and a fork landing between another test's `openpty`
+//! and its `exec` has failed the spawn with a garbled errno.
 #![cfg(unix)]
 
 mod common;
@@ -13,6 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, fs, iter, process};
 
 use common::pty::{Pty, strip_ansi};
+use serial_test::serial;
 
 /// Covers the keyboard-enhancement probe, which waits two seconds for an
 /// answer a pseudo-terminal never gives.
@@ -196,8 +200,12 @@ fn child_pid(transcript: &str) -> i32 {
 /// Also the one place a REPL command's `print!` output is seen through the
 /// fd capture: in-process tests never see it, because libtest diverts
 /// `print!` before it reaches fd 1. `.info` is taller than the screen, so
-/// the marker is its last row.
+/// the marker is its last row. The table is a `Command` cell inside the
+/// alternate screen, so once the screen is left nothing of it may reach
+/// the terminal the shell gets back: the only bytes after the leave are
+/// the wrapper's own report.
 #[test]
+#[serial]
 fn a_command_prints_into_the_transcript_and_ctrl_d_leaves_the_tty_cooked() {
     let dir = fresh_config_dir("ctrl-d");
     let _guard = TempDirGuard(dir.clone());
@@ -207,16 +215,32 @@ fn a_command_prints_into_the_transcript_and_ctrl_d_leaves_the_tty_cooked() {
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
     pty.send(b".info\r").unwrap();
     pty.wait_for("log_path", PTY_DEADLINE).unwrap();
+    // Let the capture settle so a late forward would have happened.
+    pty.read_for(Duration::from_millis(500));
     pty.send(b"\x04").unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
 
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
     assert_tty_restored(&transcript);
+
+    let raw = pty.raw();
+    let left = rfind(raw, LEAVE_ALT).expect("the alternate screen was never left");
+    let after = strip_ansi(&String::from_utf8_lossy(&raw[left..]));
+    let report_at = after.find("exit=").expect("no exit= line after the leave");
+    let between = after[..report_at].trim();
+    for marker in ["log_path", "model", "dryrun:dry-model", "config_file"] {
+        assert!(
+            !between.contains(marker),
+            "`.info` output ({marker:?}) reached the real terminal after the \
+             alternate screen was left: {between:?}"
+        );
+    }
 }
 
 /// The TUI treats SIGTERM as an orderly quit and exits 0 (the REPL's
 /// default disposition would be 143).
 #[test]
+#[serial]
 fn sigterm_leaves_the_tty_cooked() {
     let dir = fresh_config_dir("sigterm");
     let _guard = TempDirGuard(dir.clone());
@@ -233,7 +257,11 @@ fn sigterm_leaves_the_tty_cooked() {
     assert_tty_restored(&transcript);
 }
 
+/// The panic hook restores the terminal before delegating to the original
+/// hook: the alternate screen must be left BEFORE the panic message is
+/// printed, or the message lands on a screen that is about to vanish.
 #[test]
+#[serial]
 fn a_panic_after_entering_the_alternate_screen_still_restores_the_tty() {
     let dir = fresh_config_dir("panic");
     let _guard = TempDirGuard(dir.clone());
@@ -243,16 +271,28 @@ fn a_panic_after_entering_the_alternate_screen_still_restores_the_tty() {
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
 
     assert_eq!(exit_code(&transcript), 101, "{transcript}");
-    assert!(
-        transcript.contains("COYOTE_TUI_PANIC_AT_START"),
-        "the panic message did not reach the terminal:\n{transcript}"
-    );
     assert_tty_restored(&transcript);
+
+    let raw = pty.raw();
+    let entered = find(raw, ENTER_ALT, 0).expect("the alternate screen was never entered");
+    let left = find(raw, LEAVE_ALT, entered).expect("the alternate screen was never left");
+    let message = find(raw, b"COYOTE_TUI_PANIC_AT_START", entered)
+        .expect("the panic message never reached the terminal");
+    assert!(
+        left < message,
+        "the panic message was printed while still on the alternate screen \
+         (leave at {left}, message at {message}):\n{transcript}"
+    );
+    assert!(
+        find(raw, PASTE_OFF, entered).is_some_and(|off| off < message),
+        "bracketed paste was still on when the panic message was printed"
+    );
 }
 
 /// Without a tty on stdin the TUI refuses to start, says why on the
 /// terminal it does have, and exits 1.
 #[test]
+#[serial]
 fn without_a_tty_on_stdin_the_tui_refuses_to_start() {
     let dir = fresh_config_dir("no-tty");
     let _guard = TempDirGuard(dir.clone());
@@ -360,6 +400,7 @@ fn is_rgb_sgr(params: &[u16]) -> bool {
 /// before leaving it, and the support probe is sent before the reader
 /// starts.
 #[test]
+#[serial]
 fn enter_and_leave_sequences_mirror_around_the_alternate_screen() {
     let dir = fresh_config_dir("mirror");
     let _guard = TempDirGuard(dir.clone());
@@ -404,6 +445,7 @@ fn enter_and_leave_sequences_mirror_around_the_alternate_screen() {
 
 /// SIGHUP runs the same leave path as SIGTERM.
 #[test]
+#[serial]
 fn sighup_leaves_the_tty_cooked() {
     let dir = fresh_config_dir("sighup");
     let _guard = TempDirGuard(dir.clone());
@@ -502,6 +544,7 @@ fn assert_repainted_after(pty: &mut Pty, re_entered: usize, what: &str) {
 /// raw mode and key handling restored, and the usual clean exit still
 /// works afterwards.
 #[test]
+#[serial]
 fn ctrl_z_hands_the_terminal_to_the_shell_and_fg_takes_it_back() {
     let dir = fresh_config_dir("ctrl-z");
     let _guard = TempDirGuard(dir.clone());
@@ -535,6 +578,7 @@ fn ctrl_z_hands_the_terminal_to_the_shell_and_fg_takes_it_back() {
 /// After `fg` the UI must repaint its screen on its own, not come back
 /// blank until some later change touches enough cells.
 #[test]
+#[serial]
 fn resuming_after_ctrl_z_repaints_the_screen() {
     let dir = fresh_config_dir("ctrl-z-repaint");
     let _guard = TempDirGuard(dir.clone());
@@ -556,6 +600,7 @@ fn resuming_after_ctrl_z_repaints_the_screen() {
 /// (alternate screen left) and come back to a repainted screen that still
 /// takes keys.
 #[test]
+#[serial]
 fn an_editor_shell_out_comes_back_to_a_repainted_screen() {
     let dir = fresh_config_dir("editor");
     let _guard = TempDirGuard(dir.clone());
@@ -609,6 +654,7 @@ fn wait_for_rendered_reply(pty: &mut Pty) -> String {
 /// the rendered reply lands in the transcript while the UI stays live
 /// enough to take Ctrl+D afterwards.
 #[test]
+#[serial]
 fn a_typed_prompt_gets_a_dry_run_reply_in_the_transcript() {
     let dir = fresh_config_dir("reply");
     let _guard = TempDirGuard(dir.clone());
@@ -646,6 +692,7 @@ fn a_typed_prompt_gets_a_dry_run_reply_in_the_transcript() {
 /// (The REPL behaves the same way on this path: dry-run turns are never
 /// recorded, so the session is dirtied through a setting instead.)
 #[test]
+#[serial]
 fn exit_session_shows_the_save_modal_and_saves_on_y() {
     let dir = fresh_config_dir("exit-session");
     let _guard = TempDirGuard(dir.clone());
@@ -712,6 +759,7 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
 /// `NO_COLOR` is honoured without stripping bold or underline. The
 /// rendered markdown reply is the colourful part of a dry run.
 #[test]
+#[serial]
 fn no_color_paints_no_colour_but_keeps_bold_or_underline() {
     let dir = fresh_config_dir("no-color");
     let _guard = TempDirGuard(dir.clone());
@@ -739,6 +787,7 @@ fn no_color_paints_no_colour_but_keeps_bold_or_underline() {
 /// truecolor. `spawn_tui` removes `COLORTERM`, so no RGB SGR may reach the
 /// terminal.
 #[test]
+#[serial]
 fn without_colorterm_no_rgb_colour_reaches_the_terminal() {
     let dir = fresh_config_dir("no-truecolor");
     let _guard = TempDirGuard(dir.clone());
@@ -762,4 +811,204 @@ fn without_colorterm_no_rgb_colour_reaches_the_terminal() {
         sgrs.iter().any(|p| is_colour_sgr(p)),
         "no colour at all was painted on a 256-colour terminal: {sgrs:?}"
     );
+}
+
+/// The stdout half of the tty check: stdin is the tty and stdout a file,
+/// the shape of `coyote > log`. The refusal goes to the terminal (stderr),
+/// nothing of the alternate screen reaches the file, and the exit code
+/// is 1.
+#[test]
+#[serial]
+fn without_a_tty_on_stdout_the_tui_refuses_to_start() {
+    let dir = fresh_config_dir("no-tty-stdout");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let captured = dir.join("stdout.log");
+    let wrapper = format!(
+        "'{{coyote}}' <{{stdin}} >'{}' & cpid=$!; echo \"cpid=$cpid\"; wait $cpid; rc=$?; {{report}}",
+        captured.display()
+    );
+    let mut pty = spawn_tui_under(&dir, &[], &wrapper, "/dev/tty");
+
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+
+    assert!(
+        transcript.contains("No TTY for "),
+        "no clear refusal reached the terminal:\n{transcript}"
+    );
+    assert_eq!(exit_code(&transcript), 1, "{transcript}");
+    assert!(
+        find(pty.raw(), ENTER_ALT, 0).is_none(),
+        "the alternate screen was entered on the terminal while stdout was a file:\n{transcript}"
+    );
+    let file = fs::read(&captured).unwrap_or_default();
+    assert!(
+        find(&file, ENTER_ALT, 0).is_none(),
+        "alt-screen escapes were written into the stdout file: {:?}",
+        String::from_utf8_lossy(&file)
+    );
+    assert_tty_restored(&transcript);
+}
+
+/// Opens the `.exit session` "Save session?" modal on a dirty session and
+/// then sends `signal` to the binary. Nobody is left to answer, so the
+/// signal arm must leave the screen after the modal was shown and exit
+/// without waiting on the question.
+fn signal_during_the_save_modal(scenario: &str, signal: libc::c_int) {
+    let dir = fresh_config_dir(scenario);
+    let _guard = TempDirGuard(dir.clone());
+    write_config(&dir, None);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    let transcript = pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let pid = child_pid(&transcript);
+    pty.send(b".session\r").unwrap();
+    pty.wait_for("temp", PTY_DEADLINE).unwrap();
+    pty.send(b".set skills_enabled false\r").unwrap();
+    pty.read_for(Duration::from_millis(800));
+    pty.send(b".exit session\r").unwrap();
+    pty.wait_for("Save session?", PTY_DEADLINE).unwrap();
+    let modal_at = pty.raw().len();
+
+    // SAFETY: kill takes a pid and a signal number and touches no memory.
+    assert_eq!(unsafe { libc::kill(pid, signal) }, 0);
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+    assert!(
+        find(pty.raw(), LEAVE_ALT, modal_at.saturating_sub(16)).is_some(),
+        "signal {signal} during the save modal never left the alternate screen:\n{transcript}"
+    );
+}
+
+/// The terminal went away with the "Save session?" modal up.
+#[test]
+#[serial]
+fn sighup_while_the_save_modal_is_open_still_exits_and_leaves_the_screen() {
+    signal_during_the_save_modal("sighup-modal", libc::SIGHUP);
+}
+
+/// A SIGTERM with the modal up: the same arm as SIGHUP, with the terminal
+/// still there to see the result. The dirty session is dropped unsaved,
+/// as the REPL's default disposition would drop it, and that is still an
+/// orderly exit.
+#[test]
+#[serial]
+fn sigterm_while_the_save_modal_is_open_still_exits_and_leaves_the_screen() {
+    signal_during_the_save_modal("sigterm-modal", libc::SIGTERM);
+}
+
+/// A window resize on the real tty (SIGWINCH) must bring a fresh frame with
+/// the chrome repainted at the new size, and the UI keeps taking keys
+/// afterwards.
+#[test]
+#[serial]
+fn a_window_resize_repaints_the_screen_and_keys_still_work() {
+    let dir = fresh_config_dir("resize");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let before = pty.raw().len();
+    pty.resize(20, 60).unwrap();
+    assert_repainted_after(&mut pty, before, "a resize to 60x20");
+
+    pty.send(b".info\r").unwrap();
+    pty.wait_for("log_path", PTY_DEADLINE)
+        .expect("keys were not handled after the resize");
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// The TUI is a provisional `COYOTE_UI=tui` branch: any other value leaves
+/// the existing REPL in charge, which never touches the alternate screen.
+#[test]
+#[serial]
+fn any_other_coyote_ui_value_starts_the_plain_repl() {
+    let dir = fresh_config_dir("repl-branch");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let mut pty = spawn_tui(&dir, &[("COYOTE_UI", "repl")]);
+
+    let transcript = pty.wait_for("Welcome to", PTY_DEADLINE).unwrap();
+    assert!(
+        find(pty.raw(), ENTER_ALT, 0).is_none(),
+        "COYOTE_UI=repl entered the alternate screen:\n{transcript}"
+    );
+    pty.read_for(Duration::from_millis(500));
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert!(
+        find(pty.raw(), ENTER_ALT, 0).is_none(),
+        "COYOTE_UI=repl entered the alternate screen:\n{transcript}"
+    );
+    assert_tty_restored(&transcript);
+}
+
+/// Teardown mirrors `Repl::run`: `top_level_agent_finished` fires the
+/// agent's `agent.completed` hook and `tui::run` awaits
+/// `hooks::drain_pending` before returning, so a Ctrl+D under `--agent`
+/// leaves the hook's marker behind. The hook is an agent-scoped global
+/// hook admitted through `global_hooks: ["*"]`.
+#[test]
+#[serial]
+fn ctrl_d_under_an_agent_fires_the_completed_hook_before_exit() {
+    let dir = fresh_config_dir("hook-drain");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let marker = dir.join("agent-completed.log");
+    let mut config = fs::read_to_string(dir.join("config.yaml")).unwrap();
+    config.push_str(&format!(
+        "hooks:\n\
+         \x20 agent.completed:\n\
+         \x20   - name: mark\n\
+         \x20     command: 'echo COMPLETED >> \"{}\"'\n",
+        marker.display()
+    ));
+    fs::write(dir.join("config.yaml"), config).unwrap();
+    let agent_dir = dir.join("agents/probe-agent");
+    fs::create_dir_all(&agent_dir).unwrap();
+    fs::write(
+        agent_dir.join("config.yaml"),
+        "name: probe-agent\n\
+         description: usage probe agent\n\
+         version: 0.1.0\n\
+         instructions: |\n\
+         \x20 You are a probe agent. Reply briefly.\n\
+         global_hooks:\n\
+         \x20 - \"*\"\n",
+    )
+    .unwrap();
+    let wrapper = WAIT_WRAPPER.replace("'{coyote}'", "'{coyote}' --agent probe-agent");
+    let mut pty = spawn_tui_under(&dir, &[], &wrapper, "/dev/tty");
+
+    pty.wait_for("Type a prompt", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(500));
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let fired = fs::read_to_string(&marker)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| *line == "COMPLETED")
+            .count();
+        if fired == 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline && fired == 0,
+            "agent.completed fired {fired} times after Ctrl+D (expected once):\n{transcript}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }

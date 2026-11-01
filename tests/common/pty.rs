@@ -123,6 +123,28 @@ impl Pty {
         }
     }
 
+    /// Like `wait_for`, but only text the child wrote at or after raw
+    /// offset `from` counts, so a needle that already appeared earlier in
+    /// the session (the footer's "no session", say) has to appear again.
+    pub fn wait_for_after(
+        &mut self,
+        needle: &str,
+        from: usize,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<String> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let since = strip_ansi(&String::from_utf8_lossy(
+                &self.raw[from.min(self.raw.len())..],
+            ));
+            if since.contains(needle) {
+                return Ok(since);
+            }
+            let text = strip_ansi(&String::from_utf8_lossy(&self.raw));
+            self.pump(deadline, timeout, needle, &text)?;
+        }
+    }
+
     /// Reads the master until the raw (unstripped) bytes contain `needle`
     /// at or after offset `from`, and returns the index where it starts.
     /// Lets a test assert the order of terminal control sequences, which
@@ -225,6 +247,24 @@ impl Pty {
         use std::io::Write;
         self.master.write_all(bytes)?;
         self.master.flush()
+    }
+
+    /// Changes the terminal's size, which the kernel reports to the child's
+    /// foreground process group as SIGWINCH, the way a user dragging the
+    /// window edge does.
+    pub fn resize(&mut self, rows: u16, cols: u16) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let size = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: TIOCSWINSZ reads one winsize through a valid pointer.
+        if unsafe { libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ as _, &size) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
     }
 }
 
