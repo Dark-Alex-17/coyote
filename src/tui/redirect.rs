@@ -57,12 +57,37 @@ mod unix {
     /// thread is never joined: a child the command spawned (an MCP server
     /// whose stderr is inherited) can hold the write end for the whole
     /// session, so `finish` waits only for quiescence, snapshots what has
-    /// arrived, and leaves the thread to forward anything later.
+    /// arrived, and leaves the thread to forward anything later. A guard
+    /// dropped without `finish` (the turn's future was cancelled) still
+    /// puts the fds back.
     pub(crate) struct FdRedirect {
-        saved_stdout: OwnedFd,
-        saved_stderr: OwnedFd,
-        write_end: OwnedFd,
+        saved: Option<SavedFds>,
+        write_end: Option<OwnedFd>,
         shared: Arc<Shared>,
+    }
+
+    struct SavedFds {
+        stdout: OwnedFd,
+        stderr: OwnedFd,
+    }
+
+    impl SavedFds {
+        fn save() -> io::Result<Self> {
+            Ok(Self {
+                stdout: dup_cloexec(libc::STDOUT_FILENO)?,
+                stderr: dup_cloexec(libc::STDERR_FILENO)?,
+            })
+        }
+
+        fn restore(&self) {
+            flush_std_streams();
+            if let Err(err) = dup2(self.stdout.as_raw_fd(), libc::STDOUT_FILENO) {
+                warn!("Failed to restore stdout after a command turn: {err}");
+            }
+            if let Err(err) = dup2(self.stderr.as_raw_fd(), libc::STDERR_FILENO) {
+                warn!("Failed to restore stderr after a command turn: {err}");
+            }
+        }
     }
 
     fn dup_cloexec(fd: i32) -> io::Result<OwnedFd> {
@@ -145,11 +170,10 @@ mod unix {
         pub(crate) fn begin(late: impl Fn(String) + Send + 'static) -> io::Result<Self> {
             flush_std_streams();
             let (read_end, write_end) = pipe()?;
-            let saved_stdout = dup_cloexec(libc::STDOUT_FILENO)?;
-            let saved_stderr = dup_cloexec(libc::STDERR_FILENO)?;
+            let saved = SavedFds::save()?;
             dup2(write_end.as_raw_fd(), libc::STDOUT_FILENO)?;
             if let Err(err) = dup2(write_end.as_raw_fd(), libc::STDERR_FILENO) {
-                let _ = dup2(saved_stdout.as_raw_fd(), libc::STDOUT_FILENO);
+                saved.restore();
                 return Err(err);
             }
             let shared = Arc::new(Shared {
@@ -162,35 +186,24 @@ mod unix {
                 changed: Condvar::new(),
             });
             let thread_shared = Arc::clone(&shared);
-            std::thread::Builder::new()
+            if let Err(err) = std::thread::Builder::new()
                 .name("tui-fd-drain".into())
-                .spawn(move || drain(read_end, thread_shared, late))?;
+                .spawn(move || drain(read_end, thread_shared, late))
+            {
+                saved.restore();
+                return Err(err);
+            }
             Ok(Self {
-                saved_stdout,
-                saved_stderr,
-                write_end,
+                saved: Some(saved),
+                write_end: Some(write_end),
                 shared,
             })
         }
 
         /// Puts fds 1 and 2 back and returns what the pipe received so far.
-        pub(crate) fn finish(self) -> String {
-            flush_std_streams();
-            let Self {
-                saved_stdout,
-                saved_stderr,
-                write_end,
-                shared,
-            } = self;
-            if let Err(err) = dup2(saved_stdout.as_raw_fd(), libc::STDOUT_FILENO) {
-                warn!("Failed to restore stdout after a command turn: {err}");
-            }
-            if let Err(err) = dup2(saved_stderr.as_raw_fd(), libc::STDERR_FILENO) {
-                warn!("Failed to restore stderr after a command turn: {err}");
-            }
-            drop(saved_stdout);
-            drop(saved_stderr);
-            drop(write_end);
+        pub(crate) fn finish(mut self) -> String {
+            self.restore_fds();
+            let shared = Arc::clone(&self.shared);
 
             let started = Instant::now();
             let mut drained = shared.drained.lock().unwrap_or_else(|p| p.into_inner());
@@ -212,6 +225,26 @@ mod unix {
             }
             drained.detached = true;
             String::from_utf8_lossy(&std::mem::take(&mut drained.buf)).into_owned()
+        }
+
+        /// Restores fds 1 and 2 and closes this side of the pipe; the
+        /// drain thread sees EOF once no child holds the write end.
+        fn restore_fds(&mut self) {
+            if let Some(saved) = self.saved.take() {
+                saved.restore();
+            }
+            self.write_end.take();
+        }
+    }
+
+    impl Drop for FdRedirect {
+        fn drop(&mut self) {
+            self.restore_fds();
+            self.shared
+                .drained
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .detached = true;
         }
     }
 
@@ -307,6 +340,23 @@ mod unix {
             assert!(!captured.contains("late-r3x"), "{captured}");
             let late = rx.recv_timeout(Duration::from_secs(2)).unwrap();
             assert!(late.contains("late-r3x"), "{late}");
+        }
+
+        /// A guard that goes away without `finish` (its turn was cancelled)
+        /// still hands fd 1 back: a marker written afterwards reaches the
+        /// outer capture, not the pipe.
+        #[test]
+        #[serial]
+        fn dropping_an_unfinished_guard_restores_the_fds() {
+            let (saved, reader) = capture_stdout();
+            let guard = FdRedirect::begin(|_| {}).unwrap();
+            write_fd1(b"inside-r4x\n");
+            drop(guard);
+            write_fd1(b"after-drop-r4x\n");
+            let outside = release_harness_output(saved, reader, "after-drop-r4x\n");
+
+            assert!(outside.contains("after-drop-r4x"), "{outside}");
+            assert!(!outside.contains("inside-r4x"), "{outside}");
         }
     }
 }

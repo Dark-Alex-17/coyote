@@ -5,7 +5,7 @@
 
 use crate::client::SseEvent;
 use crate::config::AppConfig;
-use crate::events::{Event, EventSink, NoticeKind, OutputStream};
+use crate::events::{Event, EventSink, NoticeKind, Origin, OutputStream};
 use crate::hooks::HookEvent;
 use crate::prompt::{PromptAnswer, PromptRequest, Prompter};
 use crate::turn::UiSink;
@@ -143,6 +143,12 @@ fn hook_tool_name(envs: &[(String, String)]) -> Option<String> {
         .map(|(_, value)| value.clone())
 }
 
+/// Only the root turn's own tools drive the status row; a child agent's
+/// tool starting or finishing says nothing about what the root is doing.
+fn is_root(origin: &Origin) -> bool {
+    origin.agent_id.is_none() && origin.depth == 0
+}
+
 impl EventSink for TuiSink {
     fn on_event(&self, event: &Event) {
         match event {
@@ -154,12 +160,14 @@ impl EventSink for TuiSink {
             Event::Hook {
                 event: HookEvent::ToolStarted,
                 envs,
+                origin,
                 ..
-            } => self.send(UiMsg::ToolRunning(hook_tool_name(envs))),
+            } if is_root(origin) => self.send(UiMsg::ToolRunning(hook_tool_name(envs))),
             Event::Hook {
                 event: HookEvent::ToolCompleted | HookEvent::ToolFailed,
+                origin,
                 ..
-            } => self.send(UiMsg::ToolRunning(None)),
+            } if is_root(origin) => self.send(UiMsg::ToolRunning(None)),
             _ => {}
         }
     }

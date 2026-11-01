@@ -63,4 +63,16 @@ mod tests {
         drop(tui_on);
         assert_eq!(ctx.ui_kind(), UiKind::Repl);
     }
+
+    /// No human is present headless even if the UI flag is somehow still
+    /// set, so headless wins.
+    #[test]
+    #[serial]
+    fn headless_outranks_the_tui_flag() {
+        let _acp_off = AtomicFlagGuard::set(&ACP_SERVER, false);
+        let _headless_on = AtomicFlagGuard::set(&HEADLESS, true);
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Repl);
+        assert_eq!(ctx.ui_kind(), UiKind::Headless);
+    }
 }

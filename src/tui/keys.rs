@@ -87,6 +87,8 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             KeyCode::Esc if ctx.turn_running => Action::Interrupt,
             KeyCode::Esc => Action::Nothing,
             KeyCode::Char('z') if ctrl => Action::Suspend,
+            // The editor would inherit fds 1 and 2 on the turn's capture pipe.
+            KeyCode::Char('o') if ctrl && ctx.turn_running => Action::Nothing,
             KeyCode::Char('o') if ctrl => Action::OpenEditor,
             KeyCode::Char('l') if ctrl => Action::ScheduleFrame,
             KeyCode::Char('j') if ctrl => Action::InsertNewline,
@@ -173,6 +175,7 @@ mod tests {
             (ctrl('j'), IDLE, Action::InsertNewline),
             (ctrl('z'), IDLE, Action::Suspend),
             (ctrl('o'), IDLE, Action::OpenEditor),
+            (ctrl('o'), running, Action::Nothing),
             (ctrl('l'), IDLE, Action::ScheduleFrame),
         ];
         for (key, ctx, expected) in cases {

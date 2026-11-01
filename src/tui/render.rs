@@ -13,11 +13,22 @@ use ratatui::text::{Line, Span, Text};
 const ESC: char = '\x1b';
 
 /// Keeps SGR sequences and drops everything else a terminal would act on:
-/// OSC strings (hyperlinks, titles), non-SGR CSI (cursor moves, erases),
-/// other escape pairs and C0 controls other than newline and tab.
+/// OSC, DCS, SOS, PM and APC strings (hyperlinks, titles, terminal
+/// queries), non-SGR CSI (cursor moves, erases), other escape pairs and
+/// C0 controls other than newline and tab.
 pub(crate) fn sanitize_ansi(text: &str) -> String {
     scrub(text, true)
 }
+
+/// Drops every escape sequence, SGR included; for text that is drawn as
+/// plain lines rather than parsed for colour.
+pub(crate) fn plain_text(text: &str) -> String {
+    scrub(text, false)
+}
+
+/// Introducers of the control strings that run until ST (`ESC \`) or BEL:
+/// OSC, DCS, SOS, PM and APC.
+const STRING_INTRODUCERS: [char; 5] = [']', 'P', 'X', '^', '_'];
 
 fn scrub(text: &str, keep_sgr: bool) -> String {
     let chars: Vec<char> = text.chars().collect();
@@ -48,7 +59,7 @@ fn scrub(text: &str, keep_sgr: bool) -> String {
                     out.extend(&chars[start..i.min(chars.len())]);
                 }
             }
-            Some(']') => {
+            Some(c) if STRING_INTRODUCERS.contains(c) => {
                 i += 2;
                 loop {
                     match chars.get(i) {
@@ -267,6 +278,24 @@ mod tests {
         assert_eq!(sanitize_ansi(input), "link up \x1b[1mbold\x1b[0m");
         assert_eq!(sanitize_ansi("\x1b(Bx\x1b=y\tz\n"), "xy\tz\n");
         assert_eq!(sanitize_ansi("\x1b]0;title\x1b\\after"), "after");
+    }
+
+    /// A spinner frame caught in the fd capture: the cursor move and the
+    /// hide-cursor sequence go, the braille glyph stays. The other string
+    /// controls end at ST or BEL like an OSC does.
+    #[test]
+    fn sanitize_drops_control_strings_and_keeps_the_spinner_glyph() {
+        assert_eq!(sanitize_ansi("\x1b[0G\u{280b}\x1b[?25l"), "\u{280b}");
+        assert_eq!(
+            plain_text("\x1b[0G\u{280b}\x1b[?25l \x1b[1mx\x1b[0m"),
+            "\u{280b} x"
+        );
+        assert_eq!(sanitize_ansi("a\x1bPq#0;2;0;0;0\x1b\\b"), "ab");
+        assert_eq!(
+            sanitize_ansi("a\x1bXsos\x07b\x1b^pm\x1b\\c\x1b_apc\x07d"),
+            "abcd"
+        );
+        assert_eq!(sanitize_ansi("a\x1b_unterminated"), "a");
     }
 
     #[test]

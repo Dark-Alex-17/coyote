@@ -61,11 +61,39 @@ const HOTKEY_IDLE: Duration = Duration::from_secs(1);
 const TOOL_OUTPUT_TAIL: usize = 20;
 const COMPOSER_MIN_ROWS: u16 = 3;
 const COMPOSER_MAX_ROWS: u16 = 8;
-const CONFIRM_HINT: &str =
-    "y = yes  n = no  a = yes for this session (tool prompts only)  Esc = cancel";
+const CONFIRM_HINT: &str = "y = yes  n = no  Esc = cancel";
+const TOOL_CONFIRM_HINT: &str = "y = yes  n = no  a = yes for this session  Esc = cancel";
 const INPUT_HINT: &str = "Enter = answer  Esc = cancel";
+/// How long the status row waits between two ticks of its elapsed time.
+const STATUS_TICK: Duration = Duration::from_secs(1);
+/// How long `flush_typeahead` waits for one more queued event, and how
+/// many it drops at most, so a terminal that keeps talking cannot hold the
+/// loop.
+const TYPEAHEAD_GRACE: Duration = Duration::from_millis(5);
+const TYPEAHEAD_LIMIT: usize = 50;
 
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
+
+/// The UI's own fixed colours. `no_color` keeps the attributes and drops
+/// the colour, which is what `NO_COLOR` asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChromeKind {
+    Notice(NoticeKind),
+    Error,
+}
+
+fn chrome_style(kind: ChromeKind, no_color: bool) -> Style {
+    let (colour, style) = match kind {
+        ChromeKind::Notice(NoticeKind::ToolWarning) => (Some(Color::Yellow), Style::new()),
+        ChromeKind::Notice(NoticeKind::Routing) => (None, Style::new()),
+        ChromeKind::Notice(_) => (None, DIM),
+        ChromeKind::Error => (Some(Color::Red), Style::new()),
+    };
+    match colour {
+        Some(colour) if !no_color => style.fg(colour),
+        _ => style,
+    }
+}
 
 struct ActiveGuard;
 
@@ -110,7 +138,7 @@ fn late_output(tx: UnboundedSender<UiMsg>) -> impl Fn(String) + Send + 'static {
     move |text| {
         let _ = tx.send(UiMsg::Notice {
             kind: NoticeKind::Routing,
-            text,
+            text: render::plain_text(&text),
         });
     }
 }
@@ -298,6 +326,7 @@ impl Cell {
     }
 
     fn lines(&mut self, width: u16, renderer: &mut Renderer) -> Vec<Line<'static>> {
+        let no_color = *crate::utils::NO_COLOR;
         match self {
             Cell::User { text, cache } => cache.get(width, || {
                 render::plain_lines(
@@ -312,15 +341,11 @@ impl Cell {
                 cache,
             } => cache.lines(source, *done, width, renderer),
             Cell::Notice { kind, text, cache } => {
-                let style = match kind {
-                    NoticeKind::ToolWarning => Style::new().fg(Color::Yellow),
-                    NoticeKind::Routing => Style::new(),
-                    _ => DIM,
-                };
+                let style = chrome_style(ChromeKind::Notice(*kind), no_color);
                 cache.get(width, || render::plain_lines(text, width, style))
             }
             Cell::Error { text, cache } => cache.get(width, || {
-                render::plain_lines(text, width, Style::new().fg(Color::Red))
+                render::plain_lines(text, width, chrome_style(ChromeKind::Error, no_color))
             }),
             Cell::Command {
                 name,
@@ -346,6 +371,9 @@ struct TurnStatus {
     busy: Option<String>,
     thinking_since: Option<Instant>,
     tool: Option<String>,
+    /// Index of the turn's first cell; tool output never merges into a
+    /// cell before it.
+    first_cell: usize,
 }
 
 struct PendingPrompt {
@@ -470,6 +498,7 @@ impl App {
 
     /// Records that a line left for the work task.
     pub(crate) fn begin_turn(&mut self, line: &str, command: bool) {
+        let first_cell = self.cells.len();
         if !command {
             self.cells.push(Cell::user(line));
         }
@@ -478,6 +507,7 @@ impl App {
             busy: None,
             thinking_since: None,
             tool: None,
+            first_cell,
         });
         self.schedule_frame();
     }
@@ -495,7 +525,7 @@ impl App {
         } else if !outcome.captured.trim().is_empty() {
             self.cells.push(Cell::notice(
                 NoticeKind::Routing,
-                outcome.captured.trim_end().to_string(),
+                render::plain_text(&outcome.captured).trim_end().to_string(),
             ));
         }
         if let Some(error) = &outcome.error {
@@ -635,7 +665,15 @@ impl App {
             },
             UiMsg::StreamDone => self.close_stream(),
             UiMsg::AssistantText(text) => match self.cells.last_mut() {
-                Some(Cell::Assistant { done, .. }) if !*done => *done = true,
+                Some(Cell::Assistant {
+                    source,
+                    done,
+                    cache,
+                }) if !*done => {
+                    *source = text;
+                    *done = true;
+                    *cache = RenderCache::default();
+                }
                 _ => self.cells.push(Cell::assistant(text, true)),
             },
             UiMsg::Notice { kind, text } => self.cells.push(Cell::notice(kind, text)),
@@ -693,21 +731,23 @@ impl App {
 
     fn append_tool_output(&mut self, call_id: Option<String>, bytes: &[u8]) {
         let text = String::from_utf8_lossy(bytes);
-        let index = self
-            .cells
-            .iter()
-            .rposition(|cell| matches!(cell, Cell::Text { call_id: id, .. } if *id == call_id));
-        let index = match index {
-            Some(index) => index,
-            None => {
-                self.cells.push(Cell::Text {
-                    call_id,
-                    lines: Vec::new(),
-                    open_line: false,
-                });
-                self.cells.len() - 1
-            }
-        };
+        let first_cell = self
+            .turn
+            .as_ref()
+            .map_or(usize::MAX, |turn| turn.first_cell);
+        let last = self.cells.len().checked_sub(1);
+        let continues_last = last.is_some_and(|index| {
+            index >= first_cell
+                && matches!(&self.cells[index], Cell::Text { call_id: id, .. } if *id == call_id)
+        });
+        if !continues_last {
+            self.cells.push(Cell::Text {
+                call_id,
+                lines: Vec::new(),
+                open_line: false,
+            });
+        }
+        let index = self.cells.len() - 1;
         let Cell::Text {
             lines, open_line, ..
         } = &mut self.cells[index]
@@ -753,7 +793,11 @@ impl App {
                 secs(turn.started)
             )
         };
-        Some(format!("{state}  Esc to interrupt"))
+        if self.prompts.is_empty() {
+            Some(format!("{state}  Esc to interrupt"))
+        } else {
+            Some(state)
+        }
     }
 
     fn bottom_pane_rows(&self) -> u16 {
@@ -799,9 +843,15 @@ impl App {
             },
             footer,
         );
+    }
 
+    /// Records the draw; while a turn runs the elapsed-time row asks for
+    /// its next tick here, after the scheduler has forgotten the frame
+    /// that was just drawn.
+    pub(crate) fn frame_drawn(&mut self) {
+        self.frames.frame_drawn();
         if self.turn.is_some() {
-            self.frames.schedule_frame_in(Duration::from_secs(1));
+            self.frames.schedule_frame_in(STATUS_TICK);
         }
     }
 }
@@ -887,10 +937,10 @@ impl Widget for PromptModal<'_> {
                 }
             }
         }
-        let hint_text = if self.0.field.is_some() {
-            INPUT_HINT
-        } else {
-            CONFIRM_HINT
+        let hint_text = match (&self.0.field, &req.tool) {
+            (Some(_), _) => INPUT_HINT,
+            (None, Some(_)) => TOOL_CONFIRM_HINT,
+            (None, None) => CONFIRM_HINT,
         };
         Paragraph::new(Line::from(Span::styled(hint_text, DIM))).render(hint, buf);
     }
@@ -921,6 +971,9 @@ async fn join(task: &mut Option<Task>) -> Done {
 struct Termination {
     term: tokio::signal::unix::Signal,
     hup: tokio::signal::unix::Signal,
+    /// Raw mode turns Ctrl+C into a key, so SIGINT here is always a
+    /// `kill -INT` and gets the same orderly leave as SIGTERM.
+    int: tokio::signal::unix::Signal,
 }
 
 #[cfg(unix)]
@@ -930,6 +983,7 @@ impl Termination {
         Ok(Self {
             term: signal(SignalKind::terminate())?,
             hup: signal(SignalKind::hangup())?,
+            int: signal(SignalKind::interrupt())?,
         })
     }
 
@@ -937,6 +991,7 @@ impl Termination {
         tokio::select! {
             _ = self.term.recv() => {}
             _ = self.hup.recv() => {}
+            _ = self.int.recv() => {}
         }
     }
 }
@@ -976,40 +1031,38 @@ enum Leave {
     Lost(tokio::task::JoinError),
 }
 
-fn editor_command() -> String {
-    std::env::var("VISUAL")
-        .or_else(|_| std::env::var("EDITOR"))
-        .ok()
-        .filter(|editor| !editor.trim().is_empty())
-        .unwrap_or_else(|| "vi".to_string())
-}
-
-/// Edits `text` in `$VISUAL`/`$EDITOR` through a temp file.
-fn edit_in_editor(text: &str) -> std::io::Result<String> {
-    let path = std::env::temp_dir().join(format!("coyote-compose-{}.md", std::process::id()));
-    std::fs::write(&path, text)?;
-    let editor = editor_command();
-    let mut parts = shell_words::split(&editor)
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
-    if parts.is_empty() {
-        parts.push("vi".to_string());
+/// Edits `text` in `editor` (resolved the way the REPL resolves its buffer
+/// editor) through a private, freshly created temp file, so no other user
+/// can pre-plant a file or symlink at the path.
+fn edit_in_editor(editor: &str, text: &str) -> std::io::Result<String> {
+    let path = crate::utils::temp_file("-tui-", ".md");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    let status = std::process::Command::new(&parts[0])
-        .args(&parts[1..])
-        .arg(&path)
-        .status();
+    {
+        use std::io::Write;
+        options.open(&path)?.write_all(text.as_bytes())?;
+    }
+    let status = std::process::Command::new(editor).arg(&path).status();
     let edited = std::fs::read_to_string(&path);
     let _ = std::fs::remove_file(&path);
     status?;
     Ok(edited?.trim_end_matches('\n').to_string())
 }
 
-/// Reads and drops whatever the terminal queued while the editor ran.
+/// Reads and drops whatever the terminal queued while the editor ran,
+/// including events still in flight when it exited.
 async fn flush_typeahead(stream: &mut EventStream) {
-    while tokio::time::timeout(Duration::ZERO, stream.next())
-        .await
-        .is_ok_and(|event| event.is_some())
-    {}
+    for _ in 0..TYPEAHEAD_LIMIT {
+        let drained = tokio::time::timeout(TYPEAHEAD_GRACE, stream.next()).await;
+        if !drained.is_ok_and(|event| event.is_some()) {
+            break;
+        }
+    }
 }
 
 pub async fn run(mut ctx: RequestContext) -> Result<()> {
@@ -1048,6 +1101,7 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
         tx,
         ctx,
         &abort,
+        &auto_cancel,
     )
     .await;
 
@@ -1059,27 +1113,18 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
             print!("{captured}");
             result
         }
-        Leave::Abandoned => {
-            auto_cancel.store(true, Ordering::SeqCst);
-            match ctx {
-                Some(ctx) => match spawn_exit(ctx, abort.clone()).await {
-                    Ok((_, result, captured)) => {
-                        print!("{captured}");
-                        result
-                    }
-                    Err(err) => Err(err.into()),
-                },
-                None => Ok(()),
-            }
-        }
+        Leave::Abandoned => match ctx {
+            Some(ctx) => match spawn_exit(ctx, abort.clone()).await {
+                Ok((_, result, captured)) => {
+                    print!("{captured}");
+                    result
+                }
+                Err(err) => Err(err.into()),
+            },
+            None => Ok(()),
+        },
         Leave::Lost(err) => Err(err.into()),
     };
-    if let Err(err) = &result {
-        eprintln!(
-            "{}",
-            crate::utils::error_text(&crate::utils::pretty_error(err))
-        );
-    }
     crate::hooks::drain_pending(EXIT_HOOK_DRAIN_TIMEOUT).await;
     result.map(|_| ())
 }
@@ -1094,6 +1139,7 @@ async fn run_loop(
     tx: UnboundedSender<UiMsg>,
     ctx: RequestContext,
     abort: &AbortSignal,
+    auto_cancel: &AtomicBool,
 ) -> (Leave, Option<RequestContext>) {
     let mut ctx = Some(ctx);
     let mut task: Option<Task> = None;
@@ -1108,15 +1154,29 @@ async fn run_loop(
         };
         match step {
             Step::Signal | Step::Input(None) | Step::Input(Some(Err(_))) => {
-                if let Some(Task::Turn { handle, .. }) = task.take() {
-                    abort.set_ctrlc();
-                    if let Ok(Ok((returned, _))) =
-                        tokio::time::timeout(EXIT_CANCEL_WAIT, handle).await
-                    {
-                        ctx = Some(returned);
-                    }
-                }
+                // Nobody is left to answer: prompts not yet asked cancel
+                // themselves, the queued ones are cancelled here, and only
+                // then is the turn told to stop.
+                auto_cancel.store(true, Ordering::SeqCst);
                 app.cancel_prompts();
+                match task.take() {
+                    Some(Task::Turn { handle, .. }) => {
+                        abort.set_ctrlc();
+                        if let Ok(Ok((returned, _))) =
+                            tokio::time::timeout(EXIT_CANCEL_WAIT, handle).await
+                        {
+                            ctx = Some(returned);
+                        }
+                    }
+                    Some(Task::Exit(handle)) => {
+                        if let Ok(Ok((returned, result, captured))) =
+                            tokio::time::timeout(EXIT_CANCEL_WAIT, handle).await
+                        {
+                            return (Leave::Finished(result, captured), Some(returned));
+                        }
+                    }
+                    None => {}
+                }
                 return (Leave::Abandoned, ctx);
             }
             Step::Input(Some(Ok(event))) => {
@@ -1157,17 +1217,29 @@ async fn run_loop(
                         }
                     }
                     Some(Command::OpenEditor) => {
-                        *stream = EventStream::new();
                         let text = app.composer_text();
-                        match screen.with_terminal_released(|| edit_in_editor(&text)) {
-                            Ok(Ok(edited)) => app.set_composer_text(&edited),
-                            Ok(Err(err)) => app.handle_msg(UiMsg::Notice {
+                        match app.config.editor() {
+                            Ok(editor) => {
+                                *stream = EventStream::new();
+                                match screen
+                                    .with_terminal_released(|| edit_in_editor(&editor, &text))
+                                {
+                                    Ok(Ok(edited)) => app.set_composer_text(&edited),
+                                    Ok(Err(err)) => app.handle_msg(UiMsg::Notice {
+                                        kind: NoticeKind::ToolWarning,
+                                        text: format!("Editor failed: {err}"),
+                                    }),
+                                    Err(err) => {
+                                        warn!("Failed to re-enter the alternate screen: {err}")
+                                    }
+                                }
+                                flush_typeahead(stream).await;
+                            }
+                            Err(err) => app.handle_msg(UiMsg::Notice {
                                 kind: NoticeKind::ToolWarning,
-                                text: format!("Editor failed: {err}"),
+                                text: err.to_string(),
                             }),
-                            Err(err) => warn!("Failed to re-enter the alternate screen: {err}"),
                         }
-                        flush_typeahead(stream).await;
                         app.schedule_frame();
                     }
                     Some(Command::Redraw) => {
@@ -1185,7 +1257,7 @@ async fn run_loop(
                 if let Err(err) = screen.draw(|frame| app.render(frame)) {
                     warn!("Failed to draw a frame: {err}");
                 }
-                app.frames.frame_drawn();
+                app.frame_drawn();
             }
             Step::Work(done) => match *done {
                 Done::Turn(joined) => {
@@ -1232,7 +1304,7 @@ mod tests {
     use super::*;
     use crate::client::{ClientConfig, Model};
     use crate::config::{AppState, Session, SessionScope, WorkingMode};
-    use crate::events::Origin;
+    use crate::events::{Event, Origin};
     use crate::prompt::Prompter;
     use crate::testing::TestConfigDirGuard;
     use crossterm::event::{KeyCode, KeyModifiers};
@@ -1824,6 +1896,190 @@ mod tests {
             Some(Command::Submit("edited line".to_string()))
         );
         assert_eq!(harness.app.composer_text(), "");
+    }
+
+    /// The elapsed-time row keeps ticking: the tick is asked for after the
+    /// scheduler forgets the frame just drawn, so it is not wiped with it.
+    #[test]
+    fn the_status_row_ticks_once_a_second_while_a_turn_runs() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("work", false);
+        harness.render();
+        harness.app.frame_drawn();
+        let due = harness.app.frames.due_at().expect("a tick is pending");
+        harness.clock.advance(STATUS_TICK);
+        assert!(due <= harness.clock.now());
+        let rendered = harness.draw();
+        assert!(
+            rendered.contains("Working . 1s  Esc to interrupt"),
+            "{rendered}"
+        );
+
+        harness.app.end_turn("work", false, &TurnOutcome::default());
+        harness.render();
+        harness.app.frame_drawn();
+        assert_eq!(harness.app.frames.due_at(), None);
+    }
+
+    #[test]
+    fn the_status_row_names_thinking_and_the_running_tool() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("work", false);
+        harness.app.handle_msg(UiMsg::ThinkingStarted);
+        harness.clock.advance(Duration::from_secs(3));
+        let rendered = harness.draw();
+        assert!(rendered.contains("Thinking for 3s"), "{rendered}");
+
+        harness
+            .app
+            .handle_msg(UiMsg::ToolRunning(Some("fs_write".to_string())));
+        let rendered = harness.draw();
+        assert!(rendered.contains("Running fs_write"), "{rendered}");
+        harness.app.handle_msg(UiMsg::ToolRunning(None));
+        harness.app.handle_msg(UiMsg::ThinkingStopped);
+        let rendered = harness.draw();
+        assert!(rendered.contains("Working . 3s"), "{rendered}");
+    }
+
+    /// A child agent's tool hooks leave the root's status row alone.
+    #[test]
+    fn only_root_tool_hooks_drive_the_status_row() {
+        use crate::hooks::HookEvent;
+        let (tx, mut rx) = unbounded_channel();
+        let sink = TuiSink::new(tx);
+        let hook = |origin: Origin| Event::Hook {
+            event: HookEvent::ToolStarted,
+            envs: vec![("COYOTE_TOOL_NAME".to_string(), "fs_write".to_string())],
+            payload: None,
+            origin,
+        };
+        sink.on_event(&hook(Origin {
+            agent_id: Some("agent_1".to_string()),
+            depth: 1,
+        }));
+        sink.on_event(&hook(Origin {
+            agent_id: None,
+            depth: 1,
+        }));
+        assert!(rx.try_recv().is_err());
+        sink.on_event(&hook(Origin::detached()));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(UiMsg::ToolRunning(Some(tool))) if tool == "fs_write"
+        ));
+    }
+
+    /// The final text of a reply is authoritative: it replaces whatever
+    /// the stream had accumulated and closes the cell.
+    #[test]
+    fn assistant_text_replaces_an_open_stream_cell() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("hi", false);
+        harness
+            .app
+            .handle_msg(UiMsg::TextDelta("partial".to_string()));
+        harness
+            .app
+            .handle_msg(UiMsg::AssistantText("the whole reply".to_string()));
+        assert_eq!(harness.app.cells.len(), 2);
+        assert!(matches!(
+            &harness.app.cells[1],
+            Cell::Assistant { source, done: true, .. } if source == "the whole reply"
+        ));
+        harness
+            .app
+            .handle_msg(UiMsg::AssistantText("a second reply".to_string()));
+        assert_eq!(harness.app.cells.len(), 3);
+    }
+
+    #[test]
+    fn chrome_colours_are_dropped_under_no_color_but_attributes_stay() {
+        for kind in [
+            ChromeKind::Notice(NoticeKind::ToolWarning),
+            ChromeKind::Error,
+        ] {
+            assert!(chrome_style(kind, false).fg.is_some(), "{kind:?}");
+            assert_eq!(chrome_style(kind, true).fg, None, "{kind:?}");
+        }
+        let dim = ChromeKind::Notice(NoticeKind::Checkpoint);
+        for no_color in [false, true] {
+            let style = chrome_style(dim, no_color);
+            assert_eq!(style.fg, None);
+            assert!(style.add_modifier.contains(Modifier::DIM));
+        }
+    }
+
+    /// What a prompt turn printed around the modal becomes a notice with
+    /// its escapes removed; the spinner's glyph is text and stays.
+    #[test]
+    fn captured_output_becomes_a_clean_notice() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("ask", false);
+        harness.app.end_turn(
+            "ask",
+            false,
+            &TurnOutcome {
+                captured: "\x1b[0G\u{280b}\x1b[?25l Thinking\x1b[1m!\x1b[0m\n".to_string(),
+                ..TurnOutcome::default()
+            },
+        );
+        assert!(matches!(
+            harness.app.cells.last(),
+            Some(Cell::Notice { text, .. }) if text == "\u{280b} Thinking!"
+        ));
+    }
+
+    /// Anonymous tool output continues the cell it is streaming into, but
+    /// never one left over from an earlier turn.
+    #[test]
+    fn anonymous_tool_output_never_joins_an_older_turn() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn(".run", true);
+        harness.app.handle_msg(UiMsg::ToolOutput {
+            call_id: None,
+            bytes: b"first".to_vec(),
+        });
+        harness.app.handle_msg(UiMsg::ToolOutput {
+            call_id: None,
+            bytes: b" turn\n".to_vec(),
+        });
+        assert_eq!(harness.app.cells.len(), 1);
+        harness.app.end_turn(".run", true, &TurnOutcome::default());
+        let cells_after_first = harness.app.cells.len();
+
+        harness.app.begin_turn(".run", true);
+        harness.app.handle_msg(UiMsg::ToolOutput {
+            call_id: None,
+            bytes: b"second turn\n".to_vec(),
+        });
+        assert_eq!(harness.app.cells.len(), cells_after_first + 1);
+        assert!(matches!(
+            harness.app.cells.last(),
+            Some(Cell::Text { call_id: None, lines, .. }) if lines == &["second turn"]
+        ));
+        assert!(matches!(
+            &harness.app.cells[0],
+            Cell::Text { lines, .. } if lines == &["first turn"]
+        ));
+    }
+
+    /// With a modal up the strip's interrupt hint would contradict the
+    /// modal's own `Esc = cancel`.
+    #[test]
+    fn the_interrupt_hint_yields_to_an_open_modal() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("ask", false);
+        assert!(harness.draw().contains("Esc to interrupt"));
+        let _asker = ask_on_a_thread(&mut harness, confirm_request(None));
+        let rendered = harness.draw();
+        assert!(!rendered.contains("Esc to interrupt"), "{rendered}");
+        assert!(rendered.contains(CONFIRM_HINT), "{rendered}");
+        assert!(!rendered.contains("yes for this session"), "{rendered}");
+        harness.clock.advance(HOTKEY_IDLE);
+        harness.press(KeyCode::Esc);
+        let _asker = ask_on_a_thread(&mut harness, confirm_request(Some("fs_write")));
+        assert!(harness.draw().contains(TOOL_CONFIRM_HINT));
+        harness.press(KeyCode::Esc);
     }
 
     fn fn_body<'a>(source: &'a str, signature: &str) -> &'a str {
