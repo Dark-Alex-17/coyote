@@ -8841,9 +8841,9 @@
   - name: minimax/minimax-m3.1-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.075
-    output_price: 0.3
-    cache_read_price: 0.0075
+    input_price: 0.15
+    output_price: 0.6
+    cache_read_price: 0.015
     max_output_tokens: 524288
     supports_vision: true
     supports_function_calling: true
@@ -10204,9 +10204,8 @@
   - name: openai/gpt-oss-120b
     type: chat
     max_input_tokens: 131072
-    input_price: 0.15
-    output_price: 0.6
-    cache_read_price: 0.075
+    input_price: 0.017
+    output_price: 0.065
     max_output_tokens: 65536
     supports_function_calling: true
   - name: openai/gpt-oss-120b:batch
@@ -10219,10 +10218,10 @@
   - name: openai/gpt-oss-20b
     type: chat
     max_input_tokens: 131072
-    input_price: 0.018
-    output_price: 0.09
-    cache_read_price: 0.009
-    max_output_tokens: 32768
+    input_price: 0.03
+    output_price: 0.13
+    cache_read_price: 0.03
+    max_output_tokens: 117964
     supports_function_calling: true
   - name: openai/gpt-oss-20b:batch
     type: chat
@@ -11234,17 +11233,17 @@
   - name: z-ai/glm-5.3
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.0699
-    output_price: 1.4
-    cache_read_price: 0.0689
+    input_price: 0.08
+    output_price: 3.6
+    cache_read_price: 0.076
     max_output_tokens: 943718
     supports_function_calling: true
   - name: z-ai/glm-5.3-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.0149
-    output_price: 0.1543
-    cache_read_price: 0.0149
+    input_price: 0.0285
+    output_price: 0.0923
+    cache_read_price: 0.0285
     max_output_tokens: 131072
     supports_vision: true
     supports_function_calling: true
@@ -11334,9 +11333,9 @@
   - name: ~deepseek/deepseek-flash-latest
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.0108
-    output_price: 0.0828
-    cache_read_price: 0.009
+    input_price: 0.035
+    output_price: 0.5
+    cache_read_price: 0.005
     max_output_tokens: 943718
     supports_vision: true
     supports_function_calling: true
@@ -11455,9 +11454,9 @@
   - name: ~z-ai/glm-flash-latest
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.0149
-    output_price: 0.1543
-    cache_read_price: 0.0149
+    input_price: 0.0285
+    output_price: 0.0923
+    cache_read_price: 0.0285
     max_output_tokens: 131072
     supports_vision: true
     supports_function_calling: true
