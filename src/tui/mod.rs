@@ -423,6 +423,9 @@ pub(crate) struct App {
     composer: TextArea<'static>,
     prompts: VecDeque<PendingPrompt>,
     turn: Option<TurnStatus>,
+    /// The teardown task owns the context: nothing new can be submitted,
+    /// interrupted or quit until it reports back.
+    exiting: bool,
     footer: FooterInfo,
     usage: String,
     last_keystroke: Option<Instant>,
@@ -449,6 +452,7 @@ impl App {
             composer,
             prompts: VecDeque::new(),
             turn: None,
+            exiting: false,
             footer,
             usage: String::new(),
             last_keystroke: None,
@@ -537,6 +541,11 @@ impl App {
         self.schedule_frame();
     }
 
+    pub(crate) fn begin_exit(&mut self) {
+        self.exiting = true;
+        self.schedule_frame();
+    }
+
     fn close_stream(&mut self) {
         if let Some(Cell::Assistant { done, .. }) = self.cells.last_mut() {
             *done = true;
@@ -548,7 +557,7 @@ impl App {
             .last_keystroke
             .is_none_or(|at| self.clock.now().duration_since(at) >= HOTKEY_IDLE);
         KeyContext {
-            turn_running: self.turn.is_some(),
+            turn_running: self.turn.is_some() || self.exiting,
             composer_empty: self.composer.is_empty(),
             modal: self.prompts.front().map(PendingPrompt::kind),
             idle_ok,
@@ -599,8 +608,8 @@ impl App {
                 self.set_composer_text("");
                 None
             }
-            Action::Interrupt => Some(Command::Interrupt),
-            Action::Quit => Some(Command::Quit),
+            Action::Interrupt => (!self.exiting).then_some(Command::Interrupt),
+            Action::Quit => (!self.exiting).then_some(Command::Quit),
             Action::Suspend => Some(Command::Suspend),
             Action::OpenEditor => Some(Command::OpenEditor),
             Action::ScheduleFrame => Some(Command::Redraw),
@@ -779,6 +788,9 @@ impl App {
     }
 
     fn status_text(&self) -> Option<String> {
+        if self.exiting {
+            return Some("Leaving...".to_string());
+        }
         let turn = self.turn.as_ref()?;
         let now = self.clock.now();
         let secs = |since: Instant| now.duration_since(since).as_secs();
@@ -1171,6 +1183,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> (Leave, Option<
                 // themselves, the queued ones are cancelled here, and only
                 // then is the turn told to stop.
                 auto_cancel.store(true, Ordering::SeqCst);
+                app.begin_exit();
                 app.cancel_prompts();
                 match task.take() {
                     Some(Task::Turn { handle, .. }) => {
@@ -1307,6 +1320,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> (Leave, Option<
             && task.is_none()
             && let Some(ctx) = ctx.take()
         {
+            app.begin_exit();
             task = Some(Task::Exit(spawn_exit(ctx, abort.clone())));
         }
     }
@@ -1952,6 +1966,32 @@ mod tests {
         harness.app.handle_msg(UiMsg::ThinkingStopped);
         let rendered = harness.draw();
         assert!(rendered.contains("Working . 3s"), "{rendered}");
+    }
+
+    /// Once the teardown task owns the context the keys that would start
+    /// something new (a line, the editor, an interrupt, another quit) are
+    /// inert, typing still works, and the strip says what is happening.
+    #[test]
+    fn teardown_keys_do_nothing_new_and_the_strip_says_leaving() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.type_text("draft");
+        harness.app.begin_exit();
+        assert!(harness.app.key_context().turn_running);
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert_eq!(harness.press(KeyCode::Esc), None);
+        for c in ['o', 'd', 'c'] {
+            assert_eq!(
+                harness
+                    .app
+                    .handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)),
+                None,
+                "Ctrl+{c} during teardown"
+            );
+        }
+        harness.type_text("!");
+        assert_eq!(harness.app.composer_text(), "draft!");
+        let rendered = harness.draw();
+        assert!(rendered.contains("Leaving..."), "{rendered}");
     }
 
     /// A child agent's tool hooks leave the root's status row alone.
