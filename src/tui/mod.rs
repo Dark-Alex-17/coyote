@@ -1098,11 +1098,13 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
         FooterInfo::from_ctx(&ctx),
     )?;
 
+    // Armed first: a signal landing between the screen entering and the
+    // loop's first select must reach the loop, not the default handler.
+    let termination = Termination::arm()?;
     let mut screen = Screen::enter()?;
     if std::env::var(PANIC_AT_START_ENV).as_deref() == Ok("1") {
         panic!("{PANIC_AT_START_ENV} requested a panic after entering the alternate screen");
     }
-    let termination = Termination::arm()?;
     app.schedule_frame();
     let mut shell = Shell {
         app: &mut app,
@@ -2115,13 +2117,15 @@ mod tests {
         assert!(fn_body(utils, "pub fn drain_stale_tty_input").contains("crate::tui::active()"));
     }
 
-    /// The keyboard-enhancement probe reads the tty, so the screen must be
+    /// The signal handlers are armed before the terminal changes modes,
+    /// and the keyboard-enhancement probe reads the tty, so the screen is
     /// entered before the event stream takes stdin.
     #[test]
-    fn the_screen_is_entered_before_the_event_stream_starts() {
+    fn run_arms_signals_enters_the_screen_then_starts_the_event_stream() {
         let run = fn_body(include_str!("mod.rs"), "pub async fn run(");
+        let arm = run.find("Termination::arm()").unwrap();
         let enter = run.find("Screen::enter()").unwrap();
         let stream = run.find("EventStream::new()").unwrap();
-        assert!(enter < stream);
+        assert!(arm < enter && enter < stream);
     }
 }

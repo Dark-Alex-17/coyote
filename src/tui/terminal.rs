@@ -280,6 +280,15 @@ impl Screen {
     }
 }
 
+/// An early `?` or an unwind between `enter` and the explicit `leave` in
+/// the run loop still restores the terminal; after that `leave` this is a
+/// no-op.
+impl Drop for Screen {
+    fn drop(&mut self) {
+        let _ = self.leave();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

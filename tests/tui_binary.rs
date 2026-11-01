@@ -833,7 +833,7 @@ fn without_a_tty_on_stdout_the_tui_refuses_to_start() {
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
 
     assert!(
-        transcript.contains("No TTY for "),
+        transcript.contains("No TTY for TUI"),
         "no clear refusal reached the terminal:\n{transcript}"
     );
     assert_eq!(exit_code(&transcript), 1, "{transcript}");

@@ -675,12 +675,15 @@ async fn run(
             result
         }
         true => {
-            if !*IS_STDOUT_TERMINAL {
+            // The TUI does its own tty check (stdin and stdout) and names
+            // itself in the refusal.
+            let tui = env::var(config::UiKind::ENV).as_deref() == Ok("tui");
+            if !tui && !*IS_STDOUT_TERMINAL {
                 bail!("No TTY for REPL")
             }
             maybe_spawn_models_refresh(&ctx.app.config);
             config::child_sessions::sweep_orphans();
-            if env::var(config::UiKind::ENV).as_deref() == Ok("tui") {
+            if tui {
                 return tui::run(ctx).await;
             }
             start_interactive(ctx).await
