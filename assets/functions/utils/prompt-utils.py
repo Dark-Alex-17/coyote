@@ -109,7 +109,11 @@ def _prompt_channel(action, question, options):
             _show_error("prompt request channel unavailable")
             return None
         while True:
-            raw = replies.readline()
+            try:
+                raw = replies.readline()
+            except OSError:
+                _show_error("prompt reply channel closed")
+                return None
             if raw == b"":
                 _show_error("prompt reply channel closed")
                 return None
@@ -133,7 +137,7 @@ def _open_tty():
     # Built the way getpass does it: open("/dev/tty", "r+") wraps the fd in a
     # BufferedRandom, whose seek test fails on a Linux tty (ESPIPE), so the
     # open would raise and the fallback would silently take over.
-    fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+    fd = os.open("/dev/tty", os.O_RDWR | getattr(os, "O_NOCTTY", 0))
     return io.TextIOWrapper(io.FileIO(fd, "w+"), write_through=True)
 
 

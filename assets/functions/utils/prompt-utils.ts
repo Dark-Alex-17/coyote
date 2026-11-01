@@ -170,7 +170,13 @@ function promptChannel(action: Action, question: string, options: string[]): Ans
   let reply: Record<string, unknown> | undefined;
   try {
     for (;;) {
-      const line = readLine(fd);
+      let line: string | null;
+      try {
+        line = readLine(fd);
+      } catch {
+        showError("prompt reply channel closed");
+        return null;
+      }
       if (line === null) {
         showError("prompt reply channel closed");
         return null;
