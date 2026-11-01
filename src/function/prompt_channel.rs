@@ -3028,8 +3028,8 @@ echo "$ans" >> "$LLM_OUTPUT""#,
         }
 
         /// Hands each stdout line of `child` to `on_line` from a forwarding
-        /// thread, so a helper that goes quiet mid-run is killed after 10 s
-        /// instead of parking the test on a blocking read.
+        /// thread, so a helper that has not closed its stdout within 10 s of
+        /// starting is killed instead of parking the test on a blocking read.
         fn pump_stdout(child: &mut Child, what: &str, mut on_line: impl FnMut(String)) {
             let stdout = child.stdout.take().unwrap();
             let (tx, rx) = std::sync::mpsc::channel();
@@ -3049,7 +3049,7 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                         child.kill().ok();
                         child.wait().ok();
-                        panic!("{what}: no output from the child for 10 s");
+                        panic!("{what}: the child did not finish within 10 s");
                     }
                 }
             }

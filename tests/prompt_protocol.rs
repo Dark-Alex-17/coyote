@@ -391,6 +391,7 @@ fn python_password_restores_echo_after_ctrl_c() {
         !transcript.contains("password-length="),
         "password returned despite the interrupt:\n{transcript}"
     );
+    assert_hidden_read_was_interrupted(&transcript);
     assert_echo_restored(&transcript);
 }
 
@@ -418,8 +419,167 @@ fn typescript_password_restores_echo_after_ctrl_c() {
         !transcript.contains("password-length="),
         "password returned despite the interrupt:\n{transcript}"
     );
+    assert_hidden_read_was_interrupted(&transcript);
     assert_echo_restored(&transcript);
 }
+
+/// `password` puts the terminal back the way it found it, not into some
+/// fixed mode: a terminal whose echo was already off before the prompt must
+/// still have echo off once the read completes.
+#[test]
+fn typescript_password_keeps_a_pre_prompt_echo_off_after_the_read() {
+    let Some(runtime) = ts_runtime() else {
+        return;
+    };
+    let dir = fresh_config_dir("tty-ts-password-keep-noecho");
+    let _guard = TempDirGuard(dir.clone());
+    let helper = dir.join("prompt-utils.ts");
+    fs::copy(TS_HELPER, &helper).unwrap();
+    let driver = dir.join("driver.ts");
+    fs::write(&driver, typescript_password_driver("pw-ts-k33p")).unwrap();
+    let transcript = run_password_in_pty_with(
+        ECHO_OFF_PRELUDE,
+        &format!(
+            "NODE_NO_WARNINGS=1 {runtime} \"{}\" \"{}\"",
+            driver.display(),
+            helper.display()
+        ),
+        "pw-ts-k33p",
+        |pty| pty.send(b"hunter2zq\n"),
+    );
+    assert!(
+        transcript.contains("password-length=9"),
+        "password did not return the typed text:\n{transcript}"
+    );
+    assert_echo_still_off(&transcript);
+}
+
+#[test]
+fn python_password_keeps_a_pre_prompt_echo_off_after_the_read() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = fresh_config_dir("tty-py-password-keep-noecho");
+    let _guard = TempDirGuard(dir.clone());
+    let driver = dir.join("driver.py");
+    fs::write(&driver, python_password_driver("pw-py-k33p")).unwrap();
+    let transcript = run_password_in_pty_with(
+        ECHO_OFF_PRELUDE,
+        &format!("python3 \"{}\" \"{PY_HELPER}\"", driver.display()),
+        "pw-py-k33p",
+        |pty| pty.send(b"hunter2zq\n"),
+    );
+    assert!(
+        transcript.contains("password-length=9"),
+        "password did not return the typed text:\n{transcript}"
+    );
+    assert_echo_still_off(&transcript);
+}
+
+/// The interrupt path restores the snapshot too, so Ctrl-C on a terminal
+/// that began with echo off must not switch echo on.
+#[test]
+fn typescript_password_keeps_a_pre_prompt_echo_off_after_ctrl_c() {
+    let Some(runtime) = ts_runtime() else {
+        return;
+    };
+    let dir = fresh_config_dir("tty-ts-password-keep-noecho-intr");
+    let _guard = TempDirGuard(dir.clone());
+    let helper = dir.join("prompt-utils.ts");
+    fs::copy(TS_HELPER, &helper).unwrap();
+    let driver = dir.join("driver.ts");
+    fs::write(&driver, typescript_password_driver("pw-ts-k1nt")).unwrap();
+    let transcript = run_password_in_pty_with(
+        ECHO_OFF_PRELUDE,
+        &format!(
+            "NODE_NO_WARNINGS=1 {runtime} \"{}\" \"{}\"",
+            driver.display(),
+            helper.display()
+        ),
+        "pw-ts-k1nt",
+        interrupt_mid_read,
+    );
+    assert!(
+        !transcript.contains("password-length="),
+        "password returned despite the interrupt:\n{transcript}"
+    );
+    assert_echo_still_off(&transcript);
+}
+
+#[test]
+fn python_password_keeps_a_pre_prompt_echo_off_after_ctrl_c() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = fresh_config_dir("tty-py-password-keep-noecho-intr");
+    let _guard = TempDirGuard(dir.clone());
+    let driver = dir.join("driver.py");
+    fs::write(&driver, python_password_driver("pw-py-k1nt")).unwrap();
+    let transcript = run_password_in_pty_with(
+        ECHO_OFF_PRELUDE,
+        &format!("python3 \"{}\" \"{PY_HELPER}\"", driver.display()),
+        "pw-py-k1nt",
+        interrupt_mid_read,
+    );
+    assert!(
+        !transcript.contains("password-length="),
+        "password returned despite the interrupt:\n{transcript}"
+    );
+    assert_echo_still_off(&transcript);
+}
+
+/// When `stty` cannot be found the TypeScript helper must say so and still
+/// read the secret in the clear rather than fail: the tool runs with a PATH
+/// that holds only the interpreter and `sh`, while the wrapper keeps its own
+/// PATH for the `stty -a` report.
+#[test]
+fn typescript_password_without_stty_warns_and_still_reads() {
+    let Some(runtime) = ts_runtime() else {
+        return;
+    };
+    let Ok(runtime_path) = which::which(runtime) else {
+        eprintln!("skipping: {runtime} not on PATH");
+        return;
+    };
+    let dir = fresh_config_dir("tty-ts-password-nostty");
+    let _guard = TempDirGuard(dir.clone());
+    let bin = dir.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    std::os::unix::fs::symlink(&runtime_path, bin.join(runtime)).unwrap();
+    std::os::unix::fs::symlink(which::which("sh").unwrap(), bin.join("sh")).unwrap();
+    let helper = dir.join("prompt-utils.ts");
+    fs::copy(TS_HELPER, &helper).unwrap();
+    let driver = dir.join("driver.ts");
+    fs::write(&driver, typescript_password_driver("pw-ts-n0st")).unwrap();
+    let transcript = run_password_in_pty(
+        &format!(
+            "PATH=\"{}\" NODE_NO_WARNINGS=1 \"{}\" \"{}\" \"{}\"",
+            bin.display(),
+            runtime_path.display(),
+            driver.display(),
+            helper.display()
+        ),
+        "pw-ts-n0st",
+        |pty| pty.send(b"hunter2zq\n"),
+    );
+    assert!(
+        transcript.contains("Password input may be echoed"),
+        "no warning about the missing stty:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("password-length=9"),
+        "password did not return the typed text without stty:\n{transcript}"
+    );
+    assert_echo_restored(&transcript);
+}
+
+/// Shell run by the pty wrapper before the tool: turns echo off on the
+/// terminal and proves it, so a later `echo` in the report is the helper's
+/// doing.
+const ECHO_OFF_PRELUDE: &str =
+    "stty -echo </dev/tty; echo \"pre-flags: $(stty -a </dev/tty | tr -s '\\n\\t' '  ')\";";
 
 fn python_password_driver(marker: &str) -> String {
     format!(
@@ -454,10 +614,21 @@ fn run_password_in_pty(
     marker: &str,
     interact: impl FnOnce(&mut Pty) -> std::io::Result<()>,
 ) -> String {
+    run_password_in_pty_with("", tool, marker, interact)
+}
+
+/// `run_password_in_pty` with a shell `prelude` the wrapper runs on the
+/// terminal before starting the tool (for example to change its mode).
+fn run_password_in_pty_with(
+    prelude: &str,
+    tool: &str,
+    marker: &str,
+    interact: impl FnOnce(&mut Pty) -> std::io::Result<()>,
+) -> String {
     let mut cmd = Command::new("bash");
     cmd.arg("-c")
         .arg(format!(
-            "exec </dev/null; trap ':' INT; out=$(mktemp); {tool} >\"$out\" 2>&1; rc=$?; \
+            "exec </dev/null; trap ':' INT; {prelude} out=$(mktemp); {tool} >\"$out\" 2>&1; rc=$?; \
              cat \"$out\"; rm -f \"$out\"; echo \"tool-exit=$rc\"; \
              echo \"tty-flags: $(stty -a </dev/tty | tr -s '\\n\\t' '  ')\"; echo tty-probe-done"
         ))
@@ -480,15 +651,23 @@ fn interrupt_mid_read(pty: &mut Pty) -> std::io::Result<()> {
     pty.send(b"\x03")
 }
 
+/// The keystrokes typed before the interrupt must not show on the terminal
+/// (echo was really off when it arrived) and the helper must have taken the
+/// hidden path, not the warned, echoed one.
+fn assert_hidden_read_was_interrupted(transcript: &str) {
+    assert!(
+        !transcript.contains("zq"),
+        "the terminal echoed keystrokes typed before the interrupt:\n{transcript}"
+    );
+    assert!(
+        !transcript.contains("Warning: Password input may be echoed."),
+        "the helper fell back to an echoed read:\n{transcript}"
+    );
+}
+
 /// The `stty -a` report the wrapper printed must list `echo` as on.
 fn assert_echo_restored(transcript: &str) {
-    let flags = transcript
-        .lines()
-        .find_map(|line| line.strip_prefix("tty-flags: "))
-        .unwrap_or_else(|| panic!("no tty-flags line in the transcript:\n{transcript}"));
-    let tokens: Vec<&str> = flags
-        .split(|c: char| c.is_whitespace() || c == ';')
-        .collect();
+    let tokens = tty_flag_tokens(transcript, "tty-flags: ");
     assert!(
         !tokens.contains(&"-echo"),
         "the terminal was left with echo off after password:\n{transcript}"
@@ -497,6 +676,31 @@ fn assert_echo_restored(transcript: &str) {
         tokens.contains(&"echo"),
         "stty did not report the echo flag at all:\n{transcript}"
     );
+}
+
+/// The prelude's report must show echo off (the precondition held) and the
+/// final report must still show it off.
+fn assert_echo_still_off(transcript: &str) {
+    let before = tty_flag_tokens(transcript, "pre-flags: ");
+    assert!(
+        before.contains(&"-echo"),
+        "the prelude did not turn echo off before the prompt:\n{transcript}"
+    );
+    let after = tty_flag_tokens(transcript, "tty-flags: ");
+    assert!(
+        after.contains(&"-echo"),
+        "password switched echo on although it was off before the prompt:\n{transcript}"
+    );
+}
+
+fn tty_flag_tokens<'a>(transcript: &'a str, prefix: &str) -> Vec<&'a str> {
+    let flags = transcript
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix))
+        .unwrap_or_else(|| panic!("no {prefix}line in the transcript:\n{transcript}"));
+    flags
+        .split(|c: char| c.is_whitespace() || c == ';')
+        .collect()
 }
 
 fn assert_options_on_separate_lines(transcript: &str) {
@@ -698,12 +902,16 @@ fn ts_runtime() -> Option<&'static str> {
 }
 
 fn fresh_config_dir(scenario: &str) -> PathBuf {
+    // The clock alone is not unique: tests run in parallel and macOS reports
+    // whole microseconds, so two callers can land in the same tick.
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
     let dir = env::temp_dir().join(format!(
-        "coyote-prompt-protocol-{scenario}-{}-{unique}",
+        "coyote-prompt-protocol-{scenario}-{}-{unique}-{sequence}",
         process::id()
     ));
     fs::create_dir_all(dir.join("home")).unwrap();
