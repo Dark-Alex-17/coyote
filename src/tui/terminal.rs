@@ -11,8 +11,8 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
-    disable_raw_mode, enable_raw_mode, is_raw_mode_enabled, supports_keyboard_enhancement,
+    BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate, EnterAlternateScreen,
+    LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -34,6 +34,11 @@ static PANIC_FD: AtomicI32 = AtomicI32::new(-1);
 /// Whether the keyboard enhancement flags are currently pushed, so the
 /// leave path pops them exactly when the enter path pushed them.
 static ENHANCEMENT_PUSHED: AtomicBool = AtomicBool::new(false);
+/// Whether `enter` has run without a matching `leave`. Keyed here rather
+/// than on crossterm's raw-mode flag because a command handler may toggle
+/// raw mode itself mid-session, which must not make `leave` skip the
+/// restore.
+static SCREEN_ENTERED: AtomicBool = AtomicBool::new(false);
 static PANIC_HOOK: Once = Once::new();
 
 /// One terminal mode toggled on enter and back off on leave. The `bool` is
@@ -170,6 +175,7 @@ fn restore_from_static() {
 /// Switches the terminal into the UI's modes.
 pub(crate) fn enter(writer: &mut impl Write, enhancement: bool) -> io::Result<()> {
     install_panic_hook();
+    SCREEN_ENTERED.store(true, Ordering::SeqCst);
     for step in enter_sequence(enhancement) {
         step.apply(writer)?;
         if step == TerminalStep::KeyboardEnhancement(true) {
@@ -179,11 +185,11 @@ pub(crate) fn enter(writer: &mut impl Write, enhancement: bool) -> io::Result<()
     Ok(())
 }
 
-/// Restores the terminal; a no-op when raw mode is already off, so the
-/// panic hook and the normal exit path can both call it. Keeps going past
-/// a failed step so the later modes still get restored.
+/// Restores the terminal; a no-op unless `enter` ran since the last call,
+/// so the panic hook and the normal exit path can both call it. Keeps
+/// going past a failed step so the later modes still get restored.
 pub(crate) fn leave(writer: &mut impl Write) -> io::Result<()> {
-    if !is_raw_mode_enabled()? {
+    if !SCREEN_ENTERED.swap(false, Ordering::SeqCst) {
         return Ok(());
     }
     let enhancement = ENHANCEMENT_PUSHED.swap(false, Ordering::SeqCst);
@@ -197,6 +203,29 @@ pub(crate) fn leave(writer: &mut impl Write) -> io::Result<()> {
         Some(err) => Err(err),
         None => Ok(()),
     }
+}
+
+/// One frame bracketed by a synchronized update so the terminal paints it
+/// atomically.
+pub(crate) fn draw_frame<W: Write>(
+    terminal: &mut Terminal<CrosstermBackend<W>>,
+    render: impl FnOnce(&mut ratatui::Frame),
+) -> io::Result<()> {
+    execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+    let drawn = terminal.draw(render).map(|_| ());
+    let ended = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+    drawn.and(ended)
+}
+
+/// Clears the terminal and forgets both of ratatui's buffers so the next
+/// `draw` repaints every cell. `Terminal::clear` is not used because it
+/// starts with a cursor-position query, which blocks until the event
+/// stream answers it, and nothing polls that stream here.
+fn repaint_from_scratch<W: Write>(terminal: &mut Terminal<CrosstermBackend<W>>) -> io::Result<()> {
+    execute!(terminal.backend_mut(), Clear(ClearType::All))?;
+    terminal.current_buffer_mut().reset();
+    terminal.swap_buffers();
+    Ok(())
 }
 
 /// The alternate screen the UI draws on, with the terminal modes it owns.
@@ -224,17 +253,12 @@ impl Screen {
         })
     }
 
-    /// One frame, bracketed by a synchronized update so the terminal
-    /// paints it atomically.
     pub(crate) fn draw(&mut self, render: impl FnOnce(&mut ratatui::Frame)) -> io::Result<()> {
-        execute!(self.terminal.backend_mut(), BeginSynchronizedUpdate)?;
-        let drawn = self.terminal.draw(render).map(|_| ());
-        let ended = execute!(self.terminal.backend_mut(), EndSynchronizedUpdate);
-        drawn.and(ended)
+        draw_frame(&mut self.terminal, render)
     }
 
     pub(crate) fn clear(&mut self) -> io::Result<()> {
-        self.terminal.clear()
+        repaint_from_scratch(&mut self.terminal)
     }
 
     pub(crate) fn leave(&mut self) -> io::Result<()> {
@@ -251,7 +275,7 @@ impl Screen {
         enter(self.terminal.backend_mut(), self.enhancement)?;
         disable_raw_mode()?;
         enable_raw_mode()?;
-        self.terminal.clear()?;
+        repaint_from_scratch(&mut self.terminal)?;
         Ok(value)
     }
 }
@@ -259,6 +283,42 @@ impl Screen {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::layout::Rect;
+    use ratatui::widgets::Paragraph;
+    use ratatui::{TerminalOptions, Viewport};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SharedBuf {
+        fn take(&self) -> String {
+            String::from_utf8_lossy(&std::mem::take(&mut *self.0.lock().unwrap())).into_owned()
+        }
+    }
+
+    /// A terminal writing into `buf`; the fixed viewport keeps ratatui
+    /// from asking the (absent) terminal for its size.
+    fn buffer_terminal(buf: &SharedBuf) -> Terminal<CrosstermBackend<SharedBuf>> {
+        Terminal::with_options(
+            CrosstermBackend::new(buf.clone()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 20, 4)),
+            },
+        )
+        .unwrap()
+    }
 
     #[test]
     fn leave_sequence_is_the_strict_mirror_of_enter() {
@@ -285,14 +345,57 @@ mod tests {
         );
     }
 
-    /// Without raw mode on there is nothing to undo, so `leave` writes no
-    /// bytes and a second call is just as quiet.
+    /// Without an `enter` on record there is nothing to undo, so `leave`
+    /// writes no bytes and a second call is just as quiet.
     #[test]
-    fn leave_with_raw_mode_off_is_a_no_op_twice() {
+    fn leave_without_a_prior_enter_is_a_no_op_twice() {
+        SCREEN_ENTERED.store(false, Ordering::SeqCst);
         let mut out = Vec::new();
         leave(&mut out).unwrap();
         leave(&mut out).unwrap();
         assert!(out.is_empty(), "{out:?}");
+    }
+
+    /// The repaint helper never asks the terminal anything: a buffer that
+    /// cannot answer a cursor-position query gets the clear and the next
+    /// frame paints every cell, including the ones unchanged since before.
+    #[test]
+    fn repaint_from_scratch_clears_and_repaints_every_cell_without_a_query() {
+        let out = SharedBuf::default();
+        let mut terminal = buffer_terminal(&out);
+        let paint = |frame: &mut ratatui::Frame| {
+            frame.render_widget(Paragraph::new("cell-x7x"), frame.area());
+        };
+        terminal.draw(paint).unwrap();
+        out.take();
+        terminal.draw(paint).unwrap();
+        assert!(
+            !out.take().contains("cell-x7x"),
+            "an unchanged frame should paint nothing"
+        );
+
+        repaint_from_scratch(&mut terminal).unwrap();
+        let bytes = out.take();
+        assert!(bytes.contains("\x1b[2J"), "{bytes:?}");
+        assert!(!bytes.contains("\x1b[6n"), "{bytes:?}");
+        terminal.draw(paint).unwrap();
+        assert!(
+            out.take().contains("cell-x7x"),
+            "the frame after a repaint must paint every cell"
+        );
+    }
+
+    #[test]
+    fn a_frame_is_bracketed_by_a_synchronized_update() {
+        let out = SharedBuf::default();
+        let mut terminal = buffer_terminal(&out);
+        draw_frame(&mut terminal, |frame| {
+            frame.render_widget(Paragraph::new("x"), frame.area());
+        })
+        .unwrap();
+        let bytes = out.take();
+        assert!(bytes.starts_with("\x1b[?2026h"), "{bytes:?}");
+        assert!(bytes.ends_with("\x1b[?2026l"), "{bytes:?}");
     }
 
     #[test]
