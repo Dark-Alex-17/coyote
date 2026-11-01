@@ -74,9 +74,7 @@ pub enum Event {
         line: String,
     },
     TextDelta(String),
-    #[allow(dead_code)] // TASK-312
     ThinkingStarted,
-    #[allow(dead_code)] // TASK-312
     ThinkingStopped,
     AssistantText {
         text: String,
@@ -145,7 +143,6 @@ pub struct EventBus {
 }
 
 impl EventBus {
-    #[allow(dead_code)] // TASK-312
     pub fn subscribe(&self, sink: Arc<dyn EventSink>) -> SubscriptionId {
         let id = SubscriptionId(self.next_id.fetch_add(1, Ordering::SeqCst));
         self.sinks

@@ -66,7 +66,7 @@ pub(crate) const EXIT_HOOK_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Ceiling on how long an exiting session waits for its cancelled background
 /// agents to finish writing their status before the session itself settles.
-const EXIT_CANCEL_WAIT: Duration = Duration::from_secs(5);
+pub(crate) const EXIT_CANCEL_WAIT: Duration = Duration::from_secs(5);
 
 const CANCELLED_TASKS_HINT: &str =
     "Cancelled the background task(s) left running by the interrupted turn.";
@@ -2091,7 +2091,10 @@ Press Ctrl+C while the model is working to interrupt the turn; press it again at
     prefix.render_hints(&text).into_owned()
 }
 
-fn parse_command(line: &str, prefix: CommandPrefix) -> Option<(Cow<'_, str>, Option<&str>)> {
+pub(crate) fn parse_command(
+    line: &str,
+    prefix: CommandPrefix,
+) -> Option<(Cow<'_, str>, Option<&str>)> {
     match COMMAND_RE.captures(line) {
         Ok(Some(captures)) => {
             let cmd = prefix.normalize(captures.get(1)?.as_str())?;

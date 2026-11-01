@@ -1,4 +1,5 @@
 use super::{ApiStatusError, ThinkingBlock, TokenUsage, ToolCall, catch_error};
+use crate::events::{Event, bus};
 use crate::utils::AbortSignal;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -183,8 +184,13 @@ impl SseHandler {
         message
     }
 
+    /// The adapters deliver a thinking block only once it is complete, so
+    /// the started/stopped pair brackets its arrival rather than the
+    /// model's actual thinking time.
     pub fn thinking_block(&mut self, block: ThinkingBlock) {
+        bus().publish(Event::ThinkingStarted);
         self.thinking.push(block);
+        bus().publish(Event::ThinkingStopped);
     }
 
     /// Merges a usage update into the accumulator; later non-None fields win.
@@ -567,6 +573,44 @@ mod tests {
 
         handler.text("hello").unwrap();
         assert!(handler.has_received_visible_output());
+    }
+
+    /// Records only what this thread publishes: the bus is shared with
+    /// every other test handing over thinking blocks at the same time, and
+    /// `publish` runs each sink on the publishing thread.
+    struct ThisThreadSink {
+        thread: std::thread::ThreadId,
+        events: std::sync::Mutex<Vec<Event>>,
+    }
+
+    impl crate::events::EventSink for ThisThreadSink {
+        fn on_event(&self, event: &Event) {
+            if std::thread::current().id() == self.thread {
+                self.events.lock().unwrap().push(event.clone());
+            }
+        }
+    }
+
+    #[test]
+    fn a_thinking_block_publishes_started_then_stopped() {
+        let sink = std::sync::Arc::new(ThisThreadSink {
+            thread: std::thread::current().id(),
+            events: std::sync::Mutex::new(Vec::new()),
+        });
+        let subscription =
+            bus().subscribe(
+                std::sync::Arc::clone(&sink) as std::sync::Arc<dyn crate::events::EventSink>
+            );
+        let (mut handler, _rx) = new_handler();
+        handler.thinking_block(ThinkingBlock::Thinking {
+            thinking: "hmm".to_string(),
+            signature: "sig".to_string(),
+        });
+        bus().unsubscribe(subscription);
+        assert_eq!(
+            *sink.events.lock().unwrap(),
+            vec![Event::ThinkingStarted, Event::ThinkingStopped]
+        );
     }
 
     /// Claude splits usage across events: `message_start` carries the input

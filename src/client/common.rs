@@ -722,11 +722,6 @@ pub async fn call_chat_completions_streaming(
 pub enum StreamTarget {
     /// The process terminal through `ctx.ui`.
     Terminal,
-    /// Forward every `SseEvent` to a channel the caller consumes. Under
-    /// `RenderMode::Silent` the handler drops text, so the channel sees
-    /// only `Done`.
-    #[allow(dead_code)] // TASK-312
-    Channel(UnboundedSender<SseEvent>),
 }
 
 /// Republishes each text delta on the event bus and hands the event on to
@@ -782,13 +777,6 @@ pub async fn call_chat_completions_streaming_to(
                 ui.stream(client.app_config(), sink_rx, abort_signal.clone()),
             );
             (send_ret, render_ret)
-        }
-        StreamTarget::Channel(out) => {
-            let (send_ret, ()) = tokio::join!(
-                client.chat_completions_streaming(input, &mut handler),
-                forward_deltas(rx, out),
-            );
-            (send_ret, Ok(()))
         }
     };
 

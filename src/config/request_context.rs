@@ -1069,10 +1069,12 @@ impl RequestContext {
     /// What kind of surface answers this run's prompts, exported to tools as
     /// `COYOTE_UI`. Mirrors the branch `default_prompter` seats from.
     pub(crate) fn ui_kind(&self) -> UiKind {
-        if human_present() {
-            UiKind::Repl
-        } else {
+        if !human_present() {
             UiKind::Headless
+        } else if crate::tui::active() {
+            UiKind::Tui
+        } else {
+            UiKind::Repl
         }
     }
 
@@ -1093,8 +1095,10 @@ impl RequestContext {
         self.self_agent_id.is_none() || self.session_abort.is_some()
     }
 
+    /// The full-screen UI reads the keyboard itself and turns Esc into an
+    /// abort, so no spinner may install a SIGINT listener while it runs.
     pub(crate) fn interrupt_policy(&self) -> UserInterrupt {
-        if self.user_interrupts_here() {
+        if self.user_interrupts_here() && !crate::tui::active() {
             UserInterrupt::Owned
         } else {
             UserInterrupt::NotOwned
@@ -11730,6 +11734,17 @@ mod tests {
             "agent_test_1".to_string(),
         );
         assert_eq!(child.interrupt_policy(), UserInterrupt::NotOwned);
+    }
+
+    /// Under the full-screen UI the loop owns the keyboard, so even the
+    /// root turn's spinners must not arm SIGINT.
+    #[test]
+    #[serial]
+    fn interrupt_policy_is_not_owned_while_the_tui_is_active() {
+        let root = create_test_ctx();
+        assert_eq!(root.interrupt_policy(), UserInterrupt::Owned);
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        assert_eq!(root.interrupt_policy(), UserInterrupt::NotOwned);
     }
 
     /// A seeded child hands out the very signal `agent__cancel` sets; the

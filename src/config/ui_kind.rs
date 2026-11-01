@@ -3,6 +3,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UiKind {
     Repl,
+    Tui,
     Headless,
 }
 
@@ -13,6 +14,7 @@ impl UiKind {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Repl => "repl",
+            Self::Tui => "tui",
             Self::Headless => "headless",
         }
     }
@@ -45,5 +47,20 @@ mod tests {
 
         let _acp_on = AtomicFlagGuard::set(&ACP_SERVER, true);
         assert_eq!(ctx.ui_kind(), UiKind::Headless);
+    }
+
+    #[test]
+    #[serial]
+    fn ui_kind_is_tui_while_the_full_screen_ui_owns_the_terminal() {
+        let _acp_off = AtomicFlagGuard::set(&ACP_SERVER, false);
+        let _headless_off = AtomicFlagGuard::set(&HEADLESS, false);
+        let ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Repl);
+        assert_eq!(ctx.ui_kind(), UiKind::Repl);
+
+        let tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        assert_eq!(ctx.ui_kind(), UiKind::Tui);
+        assert_eq!(ctx.ui_kind().as_str(), "tui");
+        drop(tui_on);
+        assert_eq!(ctx.ui_kind(), UiKind::Repl);
     }
 }

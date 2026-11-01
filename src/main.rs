@@ -18,6 +18,7 @@ mod sandbox;
 mod supervisor;
 #[cfg(test)]
 mod testing;
+mod tui;
 mod turn;
 mod vault;
 
@@ -679,6 +680,9 @@ async fn run(
             }
             maybe_spawn_models_refresh(&ctx.app.config);
             config::child_sessions::sweep_orphans();
+            if env::var(config::UiKind::ENV).as_deref() == Ok("tui") {
+                return tui::run(ctx).await;
+            }
             start_interactive(ctx).await
         }
     }
