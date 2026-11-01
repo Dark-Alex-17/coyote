@@ -228,6 +228,11 @@ where
     abortable_run_with_spinner_rx(task, spinner_rx, abort_signal, policy).await
 }
 
+/// Under the full-screen UI no spinner runs and no SIGINT listener is
+/// armed, whatever the caller's `policy` says: the frames would land in the
+/// turn's fd capture as escape garbage, and the spinner's abort polling
+/// would read keystrokes the UI's event stream owns. The UI turns Esc into
+/// `set_ctrlc`, which `run_abortable` still honours.
 pub async fn abortable_run_with_spinner_rx<F, T>(
     task: F,
     spinner_rx: UnboundedReceiver<SpinnerEvent>,
@@ -237,6 +242,10 @@ pub async fn abortable_run_with_spinner_rx<F, T>(
 where
     F: Future<Output = Result<T>>,
 {
+    if crate::tui::active() {
+        let (done_tx, _done_rx) = oneshot::channel();
+        return run_abortable(task, &abort_signal, UserInterrupt::NotOwned, done_tx).await;
+    }
     if *IS_STDOUT_TERMINAL {
         let (done_tx, done_rx) = oneshot::channel();
         let (task_ret, spinner_ret) = tokio::join!(
@@ -442,6 +451,43 @@ mod tests {
         });
     }
 
+    /// While the full-screen UI owns the terminal the choke point runs the
+    /// task bare: the abort signal still ends it, well before the task
+    /// would have, and a task that finishes hands its value back.
+    #[tokio::test]
+    #[serial]
+    async fn under_the_tui_the_task_runs_bare_and_still_aborts_on_the_signal() {
+        let _tui = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let abort_signal = create_abort_signal();
+        set_ctrlc_soon(&abort_signal);
+        let (_, spinner_rx) = Spinner::create("Thinking");
+        let started = std::time::Instant::now();
+        let err = abortable_run_with_spinner_rx(
+            async {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                Ok(())
+            },
+            spinner_rx,
+            abort_signal,
+            UserInterrupt::Owned,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("Aborted"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        let (_, spinner_rx) = Spinner::create("Thinking");
+        let value = abortable_run_with_spinner_rx(
+            async { Ok(42) },
+            spinner_rx,
+            create_abort_signal(),
+            UserInterrupt::Owned,
+        )
+        .await
+        .unwrap();
+        assert_eq!(value, 42);
+    }
+
     async fn run<F, T>(task: F, abort_signal: &AbortSignal, policy: UserInterrupt) -> Result<T>
     where
         F: Future<Output = Result<T>>,
@@ -590,10 +636,12 @@ mod tests {
     /// turn and says so with the `Owned` literal, or forwards its caller's
     /// `policy`; a new call site has to pick one of those on purpose. The
     /// `NotOwned` literal itself belongs only to the derivation in
-    /// `request_context.rs` and the match in this file. The census assumes
-    /// the production half of a file ends at a `\n#[cfg(test)]\nmod tests`
-    /// marker, and `call_args` is not string-literal aware, so a paren or
-    /// comma inside a quoted argument miscounts.
+    /// `request_context.rs` and, in this file, the match and the
+    /// full-screen UI's choke point in `abortable_run_with_spinner_rx`. The
+    /// census assumes the production half of a file ends at a
+    /// `\n#[cfg(test)]\nmod tests` marker, and `call_args` is not
+    /// string-literal aware, so a paren or comma inside a quoted argument
+    /// miscounts.
     #[test]
     fn interrupt_policy_is_derived_at_three_sites_and_owned_literally_elsewhere() {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -652,7 +700,7 @@ mod tests {
             not_owned_literals,
             BTreeMap::from([
                 ("config/request_context.rs".to_string(), 1),
-                ("utils/spinner.rs".to_string(), 1),
+                ("utils/spinner.rs".to_string(), 2),
             ])
         );
         assert!(unpinned.is_empty(), "{}", unpinned.join("\n"));

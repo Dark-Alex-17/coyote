@@ -1096,7 +1096,8 @@ impl RequestContext {
     }
 
     /// The full-screen UI reads the keyboard itself and turns Esc into an
-    /// abort, so no spinner may install a SIGINT listener while it runs.
+    /// abort, so the derivation says `NotOwned` while it runs; the spinner
+    /// entry point enforces the same rule for sites that pass a literal.
     pub(crate) fn interrupt_policy(&self) -> UserInterrupt {
         if self.user_interrupts_here() && !crate::tui::active() {
             UserInterrupt::Owned

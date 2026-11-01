@@ -1825,4 +1825,36 @@ mod tests {
         );
         assert_eq!(harness.app.composer_text(), "");
     }
+
+    fn fn_body<'a>(source: &'a str, signature: &str) -> &'a str {
+        let start = source
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} not found"));
+        let body = &source[start..];
+        &body[..body.find("\n}\n").unwrap()]
+    }
+
+    /// The two stdin readers outside this module stand down while the UI
+    /// owns the terminal: no spinner polls the keyboard and no stale-input
+    /// drain toggles raw mode under the event stream.
+    #[test]
+    fn every_other_stdin_reader_checks_the_tui_flag() {
+        let spinner = include_str!("../utils/spinner.rs");
+        assert!(
+            fn_body(spinner, "pub async fn abortable_run_with_spinner_rx")
+                .contains("crate::tui::active()")
+        );
+        let utils = include_str!("../utils/mod.rs");
+        assert!(fn_body(utils, "pub fn drain_stale_tty_input").contains("crate::tui::active()"));
+    }
+
+    /// The keyboard-enhancement probe reads the tty, so the screen must be
+    /// entered before the event stream takes stdin.
+    #[test]
+    fn the_screen_is_entered_before_the_event_stream_starts() {
+        let run = fn_body(include_str!("mod.rs"), "pub async fn run(");
+        let enter = run.find("Screen::enter()").unwrap();
+        let stream = run.find("EventStream::new()").unwrap();
+        assert!(enter < stream);
+    }
 }

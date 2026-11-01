@@ -150,7 +150,9 @@ pub fn drain_stale_tty_input() {
     use crossterm::event::{poll, read};
     use std::time::{Duration, Instant};
 
-    if !io::stdin().is_terminal() {
+    // Under the full-screen UI the event stream owns stdin; reading here
+    // would steal its keystrokes and toggle the raw mode it set.
+    if crate::tui::active() || !io::stdin().is_terminal() {
         return;
     }
 
