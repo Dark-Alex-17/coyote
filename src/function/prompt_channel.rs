@@ -501,7 +501,10 @@ mod tests {
     }
 
     fn tool_envs() -> HashMap<String, String> {
-        HashMap::from([("TERM".to_string(), "dumb".to_string())])
+        HashMap::from([
+            ("TERM".to_string(), "dumb".to_string()),
+            ("NODE_NO_WARNINGS".to_string(), "1".to_string()),
+        ])
     }
 
     fn io_with(prompter: &Arc<ScriptedPrompter>, memory: Arc<PromptMemory>) -> ToolIo {
@@ -2877,6 +2880,1405 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                 run.stderr
             );
             fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// Python and TypeScript tools reach the channel through their own
+    /// helpers, loaded by path from the env vars the shims export. The
+    /// fixture and cancel tests go through the real shim builder; the
+    /// contract modules drive each helper directly, the way `bash_contract`
+    /// does for the shell one.
+    mod script_clients {
+        use super::*;
+        use std::path::{Path, PathBuf};
+        use std::process::Stdio;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        const PY_HELPER: &str = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/functions/utils/prompt-utils.py"
+        );
+        const TS_HELPER: &str = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/functions/utils/prompt-utils.ts"
+        );
+
+        fn scratch_dir(tag: &str) -> PathBuf {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "coyote-prompt-script-{tag}-{}-{nanos}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        fn python_available() -> bool {
+            if which::which("python3").is_err() {
+                eprintln!("skipping: python3 not available");
+                return false;
+            }
+            true
+        }
+
+        /// The command that runs a `.ts` file: `node` when it strips types
+        /// itself without a word on stderr (the contract cases require it
+        /// empty), else `tsx`; None, with the reason printed, when neither.
+        fn ts_runtime() -> Option<&'static str> {
+            let dir = scratch_dir("ts-probe");
+            let probe = dir.join("probe.ts");
+            fs::write(&probe, "const n: number = 1;\nconsole.log(n);\n").unwrap();
+            let run_probe = || {
+                Command::new("node")
+                    .arg(&probe)
+                    .env("NODE_NO_WARNINGS", "1")
+                    .stdin(Stdio::null())
+                    .output()
+            };
+            let clean = |out: &std::io::Result<std::process::Output>| {
+                out.as_ref()
+                    .is_ok_and(|out| out.status.success() && out.stderr.is_empty())
+            };
+            let mut probe_result = run_probe();
+            if !clean(&probe_result) {
+                probe_result = run_probe();
+            }
+            fs::remove_dir_all(&dir).ok();
+            if clean(&probe_result) {
+                return Some("node");
+            }
+            if which::which("tsx").is_ok() {
+                return Some("tsx");
+            }
+            let (status, stderr) = match &probe_result {
+                Ok(out) => (
+                    out.status.to_string(),
+                    String::from_utf8_lossy(&out.stderr).trim().to_string(),
+                ),
+                Err(err) => ("not spawned".to_string(), err.to_string()),
+            };
+            eprintln!(
+                "skipping: node cannot run TypeScript cleanly ({status}; stderr: {stderr}) and tsx is not installed"
+            );
+            None
+        }
+
+        /// Copies a shipped helper into the active config's utils dir, where
+        /// the shim's env var points, writes `body` as a tool source and has
+        /// the real shim builder turn it into a runnable binary.
+        fn install_script_tool(helper: &str, tool_file: &str, body: &str) {
+            let utils = crate::config::paths::global_utils_dir();
+            fs::create_dir_all(&utils).unwrap();
+            fs::copy(helper, utils.join(Path::new(helper).file_name().unwrap())).unwrap();
+            let tools = crate::config::paths::global_tools_dir();
+            fs::create_dir_all(&tools).unwrap();
+            fs::write(tools.join(tool_file), body).unwrap();
+            fs::create_dir_all(crate::config::paths::functions_bin_dir()).unwrap();
+            crate::function::Functions::build_global_function_binary(tool_file, None).unwrap();
+        }
+
+        /// Like `run_tool`, with the JSON argument the shims insist on.
+        fn run_shim_tool(name: &str, io: ToolIo) -> Value {
+            let result = run_llm_function(
+                name.to_string(),
+                vec!["{}".to_string()],
+                tool_envs(),
+                None,
+                None,
+                io,
+                None,
+            )
+            .unwrap()
+            .unwrap_or_default();
+            match serde_json::from_str::<Value>(&result) {
+                Ok(error) if error.get("tool_call_error").is_some() => error,
+                _ => json!({"output": result}),
+            }
+        }
+
+        fn round_trip_prompter() -> Arc<ScriptedPrompter> {
+            Arc::new(ScriptedPrompter::new(vec![
+                PromptAnswer::Confirmed(true),
+                PromptAnswer::Selected("b".to_string()),
+                PromptAnswer::Checked(vec!["a".to_string(), "c".to_string()]),
+                PromptAnswer::Text("hello".to_string()),
+                PromptAnswer::Text("s3cret".to_string()),
+            ]))
+        }
+
+        fn assert_round_trip(
+            tool: &str,
+            prompter: &ScriptedPrompter,
+            sink: &RecordingSink,
+            output: &Value,
+            expected: &str,
+        ) {
+            assert_eq!(output["output"], expected, "{output}");
+            let requests = prompter.requests();
+            assert_eq!(requests.len(), 5, "{requests:?}");
+            let actions: Vec<PromptAction> = requests.iter().map(|req| req.action).collect();
+            assert_eq!(
+                actions,
+                vec![
+                    PromptAction::Confirm,
+                    PromptAction::Select,
+                    PromptAction::Checkbox,
+                    PromptAction::Input,
+                    PromptAction::Password,
+                ]
+            );
+            for req in &requests {
+                assert_eq!(req.tool.as_deref(), Some(tool));
+                assert_eq!(req.call_id.as_deref(), Some("call-x7x"));
+                assert_eq!(req.job_id, None);
+            }
+            assert_eq!(requests[0].question, format!("Delete? {tool}"));
+            assert!(requests[0].options.is_empty());
+            assert_eq!(requests[1].options, vec!["a", "b", "c"]);
+            assert_eq!(requests[2].options, vec!["a", "b", "c"]);
+            let chunks = stdout_chunks(&sink.drain(), "call-x7x");
+            assert!(!chunks.contains("coyote_prompt"), "{chunks}");
+        }
+
+        fn assert_cancelled(output: &Value, prompter: &ScriptedPrompter, question: &str) {
+            assert!(
+                output["tool_call_error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("exited with code 1"),
+                "{output}"
+            );
+            assert!(
+                output["stderr"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("Operation aborted!"),
+                "{output}"
+            );
+            assert_eq!(output.get("output"), None, "{output}");
+            assert_eq!(prompter.requests().len(), 1);
+            assert_eq!(prompter.requests()[0].question, question);
+        }
+
+        const PY_IMPORT: &str = "import importlib.util, os, sys\n\
+            sys.dont_write_bytecode = True\n\
+            spec = importlib.util.spec_from_file_location(\"prompt_utils\", os.environ[\"LLM_PROMPT_UTILS_PY\"])\n\
+            prompt_utils = importlib.util.module_from_spec(spec); spec.loader.exec_module(prompt_utils)\n";
+
+        fn ts_tool(runtime: &str, body: &str) -> String {
+            let shebang = if runtime == "node" {
+                "#!/usr/bin/env node\n"
+            } else {
+                ""
+            };
+            format!(
+                "{shebang}import {{ pathToFileURL }} from \"node:url\";\n\
+                 export async function run(): Promise<string> {{\n\
+                 \x20 const prompt = await import(pathToFileURL(process.env.LLM_PROMPT_UTILS_TS!).href);\n\
+                 {body}\n\
+                 }}\n"
+            )
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn python_tool_round_trips_every_action_through_the_shim() {
+            if !python_available() {
+                return;
+            }
+            let _guard = TestConfigDirGuard::new("prompt-py");
+            install_script_tool(
+                PY_HELPER,
+                "ask-py-x7x.py",
+                &format!(
+                    "#!/usr/bin/env python3\n{PY_IMPORT}\n\
+                     def run(**kwargs):\n\
+                     \x20   answers = [\n\
+                     \x20       prompt_utils.confirm(\"Delete? ask-py-x7x\"),\n\
+                     \x20       prompt_utils.select(\"Pick one ask-py-x7x\", [\"a\", \"b\", \"c\"]),\n\
+                     \x20       prompt_utils.checkbox(\"Pick many ask-py-x7x\", [\"a\", \"b\", \"c\"]),\n\
+                     \x20       prompt_utils.input(\"Name? ask-py-x7x\"),\n\
+                     \x20       prompt_utils.password(\"Secret? ask-py-x7x\"),\n\
+                     \x20   ]\n\
+                     \x20   return \"\".join(f\"{{answer}}\\n\" for answer in answers)\n"
+                ),
+            );
+            let prompter = round_trip_prompter();
+            let sink = RecordingSink::install();
+
+            let output = run_shim_tool(
+                "ask-py-x7x",
+                io_with(&prompter, Arc::new(PromptMemory::default())),
+            );
+
+            // Python reprs: bool, index, list of indices, then the two texts.
+            assert_round_trip(
+                "ask-py-x7x",
+                &prompter,
+                &sink,
+                &output,
+                "True\n1\n[0, 2]\nhello\ns3cret\n",
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn typescript_tool_round_trips_every_action_through_the_shim() {
+            let Some(runtime) = ts_runtime() else {
+                return;
+            };
+            let _guard = TestConfigDirGuard::new("prompt-ts");
+            install_script_tool(
+                TS_HELPER,
+                "ask-ts-x7x.ts",
+                &ts_tool(
+                    runtime,
+                    "  const answers = [\n\
+                     \x20   prompt.confirm(\"Delete? ask-ts-x7x\"),\n\
+                     \x20   prompt.select(\"Pick one ask-ts-x7x\", [\"a\", \"b\", \"c\"]),\n\
+                     \x20   prompt.checkbox(\"Pick many ask-ts-x7x\", [\"a\", \"b\", \"c\"]),\n\
+                     \x20   prompt.input(\"Name? ask-ts-x7x\"),\n\
+                     \x20   prompt.password(\"Secret? ask-ts-x7x\"),\n\
+                     \x20 ];\n\
+                     \x20 return answers.map((a) => `${JSON.stringify(a)}\\n`).join(\"\");",
+                ),
+            );
+            let prompter = round_trip_prompter();
+            let sink = RecordingSink::install();
+
+            let output = run_shim_tool(
+                "ask-ts-x7x",
+                io_with(&prompter, Arc::new(PromptMemory::default())),
+            );
+
+            // JSON: bool, index, array of indices, then the two quoted texts.
+            assert_round_trip(
+                "ask-ts-x7x",
+                &prompter,
+                &sink,
+                &output,
+                "true\n1\n[0,2]\n\"hello\"\n\"s3cret\"\n",
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn cancel_fails_the_guarded_python_tool_closed() {
+            if !python_available() {
+                return;
+            }
+            let _guard = TestConfigDirGuard::new("prompt-py-cancel");
+            install_script_tool(
+                PY_HELPER,
+                "cancel-py-x7x.py",
+                &format!(
+                    "#!/usr/bin/env python3\n{PY_IMPORT}\n\
+                     def run(**kwargs):\n\
+                     \x20   os.environ.pop(\"AUTO_CONFIRM\", None)\n\
+                     \x20   os.environ.pop(\"LLM_AGENT_VAR_AUTO_CONFIRM\", None)\n\
+                     \x20   prompt_utils.guard_operation(\"Delete? cancel-py-x7x\")\n\
+                     \x20   return \"reached\\n\"\n"
+                ),
+            );
+            let prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Cancelled]));
+
+            let output = run_shim_tool(
+                "cancel-py-x7x",
+                io_with(&prompter, Arc::new(PromptMemory::default())),
+            );
+
+            assert_cancelled(&output, &prompter, "Delete? cancel-py-x7x");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn cancel_fails_the_guarded_typescript_tool_closed() {
+            let Some(runtime) = ts_runtime() else {
+                return;
+            };
+            let _guard = TestConfigDirGuard::new("prompt-ts-cancel");
+            install_script_tool(
+                TS_HELPER,
+                "cancel-ts-x7x.ts",
+                &ts_tool(
+                    runtime,
+                    "  delete process.env[\"AUTO_CONFIRM\"];\n\
+                     \x20 delete process.env[\"LLM_AGENT_VAR_AUTO_CONFIRM\"];\n\
+                     \x20 prompt.guardOperation(\"Delete? cancel-ts-x7x\");\n\
+                     \x20 return \"reached\\n\";",
+                ),
+            );
+            let prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Cancelled]));
+
+            let output = run_shim_tool(
+                "cancel-ts-x7x",
+                io_with(&prompter, Arc::new(PromptMemory::default())),
+            );
+
+            assert_cancelled(&output, &prompter, "Delete? cancel-ts-x7x");
+        }
+
+        struct Run {
+            /// Stdout minus the request lines.
+            printed: Vec<String>,
+            requests: usize,
+            /// The `coyote_prompt` object of every request line, in order.
+            wire: Vec<Value>,
+            stderr: String,
+            code: i32,
+        }
+
+        /// Runs `cmd` with a live reply channel; each request line it writes
+        /// is answered from `answers` in order (`null` once they run out,
+        /// `None` closes the channel before the first read), preceded by a
+        /// foreign-id reply when `stray_first` is set.
+        fn drive(cmd: Command, answers: Option<&[Value]>, stray_first: bool) -> Run {
+            drive_env(cmd, answers, stray_first, &[])
+        }
+
+        /// `drive` with extra environment set after the auto-confirm
+        /// variables are scrubbed, so a case can opt back into one of them.
+        fn drive_env(
+            mut cmd: Command,
+            answers: Option<&[Value]>,
+            stray_first: bool,
+            env: &[(&str, &str)],
+        ) -> Run {
+            let mut server = Server::open().unwrap();
+            cmd.env_remove("AUTO_CONFIRM")
+                .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+                .env_remove(OUT_FD_ENV)
+                .envs(env.iter().copied())
+                .env(REPLY_ENV, server.env_value())
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            server.configure(&mut cmd);
+            let mut child = cmd.spawn().unwrap();
+            server.spawned();
+            let server = answers.is_some().then_some(server);
+            let mut stderr = child.stderr.take().unwrap();
+            let stderr_thread = std::thread::spawn(move || {
+                let mut text = String::new();
+                std::io::Read::read_to_string(&mut stderr, &mut text).unwrap();
+                text
+            });
+            let mut answers = answers.unwrap_or_default().iter();
+            let mut printed = Vec::new();
+            let mut requests = 0;
+            let mut wire = Vec::new();
+            for line in std::io::BufReader::new(child.stdout.take().unwrap()).lines() {
+                let line = line.unwrap();
+                if line.trim_start().as_bytes().starts_with(MARKER) {
+                    requests += 1;
+                    let req: Value = serde_json::from_str(&line).unwrap();
+                    wire.push(req["coyote_prompt"].clone());
+                    if let Some(server) = server.as_ref() {
+                        let id = req["coyote_prompt"]["id"].as_str().unwrap();
+                        if stray_first {
+                            server.reply("not-this-request", &json!(false));
+                        }
+                        server.reply(id, answers.next().unwrap_or(&Value::Null));
+                    }
+                } else {
+                    printed.push(line);
+                }
+            }
+            Run {
+                printed,
+                requests,
+                wire,
+                code: child.wait().unwrap().code().unwrap_or(-1),
+                stderr: stderr_thread.join().unwrap(),
+            }
+        }
+
+        /// Runs `cmd` with no reply channel in its environment and no
+        /// controlling terminal (its own session, stdin at /dev/null), the
+        /// shape of a headless run, and counts any request line it emits.
+        fn drive_without_channel(mut cmd: Command) -> Run {
+            cmd.env_remove("AUTO_CONFIRM")
+                .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+                .env_remove(OUT_FD_ENV)
+                .env_remove(REPLY_ENV)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            // SAFETY: setsid is async-signal-safe and touches no shared state.
+            unsafe {
+                cmd.pre_exec(|| {
+                    if libc::setsid() < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let out = cmd.output().unwrap();
+            let mut printed = Vec::new();
+            let mut requests = 0;
+            let mut wire = Vec::new();
+            for line in out.stdout.lines() {
+                let line = line.unwrap();
+                if line.trim_start().as_bytes().starts_with(MARKER) {
+                    requests += 1;
+                    let req: Value = serde_json::from_str(&line).unwrap();
+                    wire.push(req["coyote_prompt"].clone());
+                } else {
+                    printed.push(line);
+                }
+            }
+            Run {
+                printed,
+                requests,
+                wire,
+                code: out.status.code().unwrap_or(-1),
+                stderr: String::from_utf8(out.stderr).unwrap(),
+            }
+        }
+
+        /// Without a channel or a terminal a helper must stay silent on
+        /// stdout (no request line) and give the missing answer.
+        fn check_no_channel(run: Run, none: &str) {
+            assert_eq!(run.requests, 0, "request sent without a channel");
+            assert_eq!(run.code, 0, "{}", run.stderr);
+            assert_eq!(run.printed, vec![none], "{}", run.stderr);
+        }
+
+        /// What a language prints for the two booleans, a missing answer
+        /// and the checkbox indices; everything else prints the same.
+        struct Contract {
+            confirm_true: &'static str,
+            confirm_false: &'static str,
+            none: &'static str,
+            checked: &'static str,
+        }
+
+        fn check_contract(eval: impl Fn(&str, Option<&[Value]>, bool) -> Run, shape: &Contract) {
+            let confirm = "confirm(\"Go?\")";
+            for (answer, printed) in [(true, shape.confirm_true), (false, shape.confirm_false)] {
+                let run = eval(confirm, Some(&[json!(answer)]), false);
+                assert_eq!(run.code, 0, "{}", run.stderr);
+                assert_eq!(run.requests, 1);
+                assert_eq!(run.printed, vec![printed]);
+                assert!(run.stderr.is_empty(), "{}", run.stderr);
+            }
+
+            let select = "select(\"Pick\", [\"a\", \"b\", \"c\"])";
+            let run = eval(select, Some(&[json!("b")]), false);
+            assert_eq!(run.printed, vec!["1"], "{}", run.stderr);
+
+            let run = eval(
+                "checkbox(\"Pick\", [\"a\", \"b\", \"c\"])",
+                Some(&[json!(["c", "a"])]),
+                false,
+            );
+            assert_eq!(run.printed, vec![shape.checked], "{}", run.stderr);
+
+            let run = eval(confirm, Some(&[Value::Null]), false);
+            assert_eq!(run.printed, vec![shape.none], "{}", run.stderr);
+            assert!(run.stderr.is_empty(), "cancel is silent: {}", run.stderr);
+
+            let run = eval(confirm, Some(&[json!(true)]), true);
+            assert_eq!(run.printed, vec![shape.confirm_true], "{}", run.stderr);
+
+            let run = eval(select, Some(&[json!("zzz")]), false);
+            assert_eq!(run.printed, vec![shape.none], "{}", run.stderr);
+            assert!(
+                run.stderr.contains("prompt reply unusable"),
+                "{}",
+                run.stderr
+            );
+
+            let run = eval(confirm, None, false);
+            assert_eq!(run.printed, vec![shape.none], "{}", run.stderr);
+            assert!(
+                run.stderr.contains("prompt reply channel closed"),
+                "{}",
+                run.stderr
+            );
+        }
+
+        /// One guard call evaluated with `env` added and `cwd` as the working
+        /// directory; `continued` is what the language prints for the guard's
+        /// return value when it lets the tool carry on.
+        type GuardEval<'a> = &'a dyn Fn(&str, Option<&[Value]>, &[(&str, &str)], &Path) -> Run;
+
+        /// The bash guards' contract, mirrored: the auto-confirm variables
+        /// short-circuit before any request is sent, anything but an exact
+        /// `true` aborts with exit 1 and `Operation aborted!` on stderr, and
+        /// `guard_path` stays silent for paths inside the working directory
+        /// (by components, so a sibling sharing the prefix still asks, and
+        /// by where a path really lands, so a new file under a symlink that
+        /// points outside asks too).
+        fn check_guards(eval: GuardEval<'_>, continued: &str, cwd: &Path) {
+            fs::create_dir_all(cwd.join("sub")).unwrap();
+            let sibling = PathBuf::from(format!("{}-sibling", cwd.display()));
+            fs::create_dir_all(&sibling).unwrap();
+            std::os::unix::fs::symlink(&sibling, cwd.join("link")).unwrap();
+            std::os::unix::fs::symlink(sibling.join("missing.txt"), cwd.join("dangling")).unwrap();
+            let op = "guard_operation(\"Really?\")";
+
+            let run = eval(op, Some(&[json!(true)]), &[], cwd);
+            assert_eq!(run.code, 0, "{}", run.stderr);
+            assert_eq!(run.requests, 1);
+            assert_eq!(run.printed, vec![continued]);
+            assert!(run.stderr.is_empty(), "{}", run.stderr);
+
+            for (label, answers) in [
+                ("false", Some(&[json!(false)][..])),
+                ("cancelled", Some(&[Value::Null][..])),
+                ("string yes", Some(&[json!("yes")][..])),
+                ("channel closed", None),
+            ] {
+                let run = eval(op, answers, &[], cwd);
+                assert_eq!(run.code, 1, "{label}: {}", run.stderr);
+                assert_eq!(run.requests, 1, "{label}");
+                assert!(run.printed.is_empty(), "{label}: {:?}", run.printed);
+                assert!(
+                    run.stderr.contains("Operation aborted!"),
+                    "{label}: {}",
+                    run.stderr
+                );
+            }
+
+            for var in ["AUTO_CONFIRM", "LLM_AGENT_VAR_AUTO_CONFIRM"] {
+                let run = eval(op, Some(&[json!(false)]), &[(var, "1")], cwd);
+                assert_eq!(run.code, 0, "{var}: {}", run.stderr);
+                assert_eq!(
+                    run.requests, 0,
+                    "{var} must short-circuit before any request"
+                );
+                assert_eq!(run.printed, vec![continued], "{var}");
+                assert!(run.stderr.is_empty(), "{var}: {}", run.stderr);
+            }
+
+            let inside = [
+                "sub/file.txt".to_string(),
+                "sub/../sub/./x".to_string(),
+                ".".to_string(),
+                cwd.join("sub").display().to_string(),
+            ];
+            for path in &inside {
+                let run = eval(
+                    &format!("guard_path(\"{path}\", \"Touch?\")"),
+                    Some(&[json!(false)]),
+                    &[],
+                    cwd,
+                );
+                assert_eq!(run.code, 0, "{path}: {}", run.stderr);
+                assert_eq!(run.requests, 0, "{path} is inside cwd and must not ask");
+                assert_eq!(run.printed, vec![continued], "{path}");
+            }
+
+            let outside = [
+                "../outside.txt".to_string(),
+                "sub/../../x".to_string(),
+                format!("{}-sibling/f", cwd.display()),
+                "/".to_string(),
+                "link/new.txt".to_string(),
+                "link/../escaped.txt".to_string(),
+                "dangling".to_string(),
+            ];
+            for path in &outside {
+                let expr = format!("guard_path(\"{path}\", \"Touch?\")");
+                let run = eval(&expr, Some(&[json!(true)]), &[], cwd);
+                assert_eq!(run.code, 0, "{path}: {}", run.stderr);
+                assert_eq!(run.requests, 1, "{path} is outside cwd and must ask");
+                assert_eq!(run.printed, vec![continued], "{path}");
+
+                let run = eval(&expr, Some(&[json!(false)]), &[], cwd);
+                assert_eq!(run.code, 1, "{path}: {}", run.stderr);
+                assert!(
+                    run.stderr.contains("Operation aborted!"),
+                    "{path}: {}",
+                    run.stderr
+                );
+
+                let run = eval(&expr, Some(&[json!(false)]), &[("AUTO_CONFIRM", "1")], cwd);
+                assert_eq!(run.code, 0, "{path}: {}", run.stderr);
+                assert_eq!(
+                    run.requests, 0,
+                    "{path}: AUTO_CONFIRM must skip the question"
+                );
+            }
+            fs::remove_dir_all(&sibling).ok();
+        }
+
+        /// Replies that fit no action: a string for `confirm`, an unknown
+        /// option inside a `checkbox` list, a number for `input`. Each prints
+        /// the missing answer and names the problem on stderr.
+        fn check_unusable_shapes(eval: impl Fn(&str, Option<&[Value]>, bool) -> Run, none: &str) {
+            for (expr, answer) in [
+                ("confirm(\"Go?\")", json!("yes")),
+                (
+                    "checkbox(\"Pick\", [\"a\", \"b\", \"c\"])",
+                    json!(["a", "zzz"]),
+                ),
+                ("input(\"Name?\")", json!(42)),
+                ("select(\"Pick\", [\"a\", \"b\", \"c\"])", json!(1)),
+            ] {
+                let run = eval(expr, Some(std::slice::from_ref(&answer)), false);
+                assert_eq!(run.code, 0, "{expr}: {}", run.stderr);
+                assert_eq!(run.printed, vec![none], "{expr} with {answer}");
+                assert!(
+                    run.stderr.contains("prompt reply unusable"),
+                    "{expr}: {}",
+                    run.stderr
+                );
+            }
+        }
+
+        /// The request line carries the tool's text verbatim however awkward
+        /// it is (quotes, a newline, non-ASCII, a backslash), as one JSON
+        /// line the host can parse, and every prompt in a process mints a
+        /// fresh `p<pid>-<16 hex>` id. `second` is how the language names
+        /// the helper module for a second call inside one expression.
+        fn check_wire(
+            eval: impl Fn(&str, Option<&[Value]>, bool) -> Run,
+            second: &str,
+            text_printed: &str,
+            one: &str,
+        ) {
+            let question = "He said \"hi\"\nline2 \u{e9}\u{2713} \\ back";
+            let run = eval(
+                "input(\"He said \\\"hi\\\"\\nline2 \\u00e9\\u2713 \\\\ back\")",
+                Some(&[json!("x")]),
+                false,
+            );
+            assert_eq!(run.code, 0, "{}", run.stderr);
+            assert_eq!(run.requests, 1, "{:?}", run.wire);
+            assert_eq!(run.wire[0]["action"], "input");
+            assert_eq!(run.wire[0]["question"], question, "{}", run.wire[0]);
+            assert_eq!(run.wire[0]["options"], json!([]));
+            assert_eq!(run.printed, vec![text_printed], "{}", run.stderr);
+
+            let run = eval(
+                "select(\"Pick\", [\"a\", \"b\\\"q\", \"\\u00e9\"])",
+                Some(&[json!("b\"q")]),
+                false,
+            );
+            assert_eq!(run.code, 0, "{}", run.stderr);
+            assert_eq!(run.wire[0]["options"], json!(["a", "b\"q", "\u{e9}"]));
+            assert_eq!(run.printed, vec![one], "{}", run.stderr);
+
+            let run = eval(
+                &format!("confirm(\"A\"), {second}confirm(\"B\")"),
+                Some(&[json!(true), json!(false)]),
+                false,
+            );
+            assert_eq!(run.code, 0, "{}", run.stderr);
+            assert_eq!(run.requests, 2, "{:?}", run.wire);
+            let ids: Vec<&str> = run
+                .wire
+                .iter()
+                .map(|req| req["id"].as_str().unwrap())
+                .collect();
+            assert_ne!(ids[0], ids[1], "two prompts shared an id");
+            for id in &ids {
+                let (pid, hex) = id
+                    .strip_prefix('p')
+                    .and_then(|rest| rest.split_once('-'))
+                    .unwrap_or_else(|| panic!("id {id} is not p<pid>-<hex>"));
+                assert!(
+                    !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()),
+                    "{id}"
+                );
+                assert!(
+                    hex.len() == 16 && hex.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "{id}"
+                );
+            }
+            assert_eq!(
+                ids[0].split_once('-').unwrap().0,
+                ids[1].split_once('-').unwrap().0
+            );
+            assert_eq!(run.wire[0]["question"], "A");
+            assert_eq!(run.wire[1]["question"], "B");
+        }
+
+        /// `inner`, run by a bash tool inside `$(...)` after it sourced
+        /// prompt-utils.sh: the request must leave through the fd the bash
+        /// helper saved (`_COYOTE_PROMPT_OUT`), not the capture, and the
+        /// helper's answer must be what the capture receives.
+        fn nested_in_bash(inner: &Command) -> Command {
+            fn quote(arg: &std::ffi::OsStr) -> String {
+                format!("'{}'", arg.to_str().unwrap().replace('\'', "'\\''"))
+            }
+            let words: Vec<String> = std::iter::once(inner.get_program())
+                .chain(inner.get_args())
+                .map(quote)
+                .collect();
+            let mut cmd = Command::new(bash_program().unwrap());
+            for (key, value) in inner.get_envs() {
+                match value {
+                    Some(value) => cmd.env(key, value),
+                    None => cmd.env_remove(key),
+                };
+            }
+            cmd.arg("-c").arg(format!(
+                "source {}; out=\"$({})\"; echo \"captured: $out\"",
+                quote(HELPER.as_ref()),
+                words.join(" ")
+            ));
+            cmd
+        }
+
+        fn check_nested_in_bash(inner: &Command, one: &str) {
+            let run = drive(nested_in_bash(inner), Some(&[json!("b")]), false);
+            assert_eq!(run.code, 0, "{}", run.stderr);
+            assert_eq!(run.requests, 1, "{:?}", run.wire);
+            assert_eq!(run.wire[0]["action"], "select");
+            assert_eq!(
+                run.printed,
+                vec![format!("captured: {one}")],
+                "{}",
+                run.stderr
+            );
+            assert!(run.stderr.is_empty(), "{}", run.stderr);
+        }
+
+        /// Like `drive`, but every reply is preceded, in the same write, by
+        /// lines the helper must skip: text that is not JSON, a blank line,
+        /// an object without an id and a reply for another id. The bash
+        /// helper loops until `.id` matches; the twins must do the same.
+        fn drive_through_junk(mut cmd: Command, answers: &[Value]) -> Run {
+            let mut server = Server::open().unwrap();
+            cmd.env_remove("AUTO_CONFIRM")
+                .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+                .env_remove(OUT_FD_ENV)
+                .env(REPLY_ENV, server.env_value())
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            server.configure(&mut cmd);
+            let mut child = cmd.spawn().unwrap();
+            server.spawned();
+            let mut stderr = child.stderr.take().unwrap();
+            let stderr_thread = std::thread::spawn(move || {
+                let mut text = String::new();
+                std::io::Read::read_to_string(&mut stderr, &mut text).unwrap();
+                text
+            });
+            let mut answers = answers.iter();
+            let mut printed = Vec::new();
+            let mut requests = 0;
+            let mut wire = Vec::new();
+            for line in std::io::BufReader::new(child.stdout.take().unwrap()).lines() {
+                let line = line.unwrap();
+                if line.trim_start().as_bytes().starts_with(MARKER) {
+                    requests += 1;
+                    let req: Value = serde_json::from_str(&line).unwrap();
+                    let id = req["coyote_prompt"]["id"].as_str().unwrap().to_string();
+                    wire.push(req["coyote_prompt"].clone());
+                    let answer = answers.next().unwrap_or(&Value::Null);
+                    let batch = format!(
+                        "this is not json\n\n{{\"answer\":true}}\n\
+                         {{\"id\":\"p1-0000000000000000\",\"answer\":false}}\n\
+                         {}\n",
+                        json!({"id": id, "answer": answer})
+                    );
+                    let mut writer = &server.writer;
+                    writer.write_all(batch.as_bytes()).unwrap();
+                    writer.flush().unwrap();
+                } else {
+                    printed.push(line);
+                }
+            }
+            Run {
+                printed,
+                requests,
+                wire,
+                code: child.wait().unwrap().code().unwrap_or(-1),
+                stderr: stderr_thread.join().unwrap(),
+            }
+        }
+
+        /// `drive_without_channel` with `COYOTE_PROMPT_REPLY` naming the fd
+        /// the bash helper reserves for its saved stdout, which every helper
+        /// treats as no channel at all.
+        fn drive_with_reserved_fd(mut cmd: Command) -> Run {
+            cmd.env_remove("AUTO_CONFIRM")
+                .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+                .env_remove(OUT_FD_ENV)
+                .env(REPLY_ENV, "/dev/fd/9")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            // SAFETY: setsid is async-signal-safe and touches no shared state.
+            unsafe {
+                cmd.pre_exec(|| {
+                    if libc::setsid() < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let out = cmd.output().unwrap();
+            let printed = out
+                .stdout
+                .lines()
+                .map(Result::unwrap)
+                .filter(|line| !line.trim_start().as_bytes().starts_with(MARKER))
+                .collect();
+            let requests = out
+                .stdout
+                .lines()
+                .map(Result::unwrap)
+                .filter(|line| line.trim_start().as_bytes().starts_with(MARKER))
+                .count();
+            Run {
+                printed,
+                requests,
+                wire: Vec::new(),
+                code: out.status.code().unwrap_or(-1),
+                stderr: String::from_utf8(out.stderr).unwrap(),
+            }
+        }
+
+        /// Edges of the wire contract the broad checks leave out: junk on
+        /// the channel is skipped until our id; options are matched by text
+        /// (a duplicate yields its first index, a dash or empty option is an
+        /// option like any other); an empty checkbox list and an empty input
+        /// are valid answers, not cancels; a number is unusable for confirm
+        /// and a bare string for checkbox; `guard_operation` asks its default
+        /// question when given none.
+        fn check_edges(
+            command: impl Fn(&str) -> Command,
+            none: &str,
+            confirm_true: &str,
+            empty_list: &str,
+            empty_text: &str,
+        ) {
+            let run = drive_through_junk(command("confirm(\"Go?\")"), &[json!(true)]);
+            assert_eq!(run.code, 0, "{}", run.stderr);
+            assert_eq!(run.requests, 1, "{:?}", run.wire);
+            assert_eq!(run.printed, vec![confirm_true], "{}", run.stderr);
+            assert!(run.stderr.is_empty(), "{}", run.stderr);
+
+            for (expr, answer, printed) in [
+                ("select(\"Pick\", [\"dup\", \"dup\"])", json!("dup"), "0"),
+                (
+                    "select(\"Pick\", [\"-x\", \"--y\", \"\"])",
+                    json!("--y"),
+                    "1",
+                ),
+                ("select(\"Pick\", [\"-x\", \"--y\", \"\"])", json!(""), "2"),
+                ("checkbox(\"Pick\", [\"a\", \"b\"])", json!([]), empty_list),
+                ("input(\"Name?\")", json!(""), empty_text),
+            ] {
+                let run = drive(command(expr), Some(std::slice::from_ref(&answer)), false);
+                assert_eq!(run.code, 0, "{expr}: {}", run.stderr);
+                assert_eq!(
+                    run.printed,
+                    vec![printed],
+                    "{expr} with {answer}: {}",
+                    run.stderr
+                );
+                assert!(run.stderr.is_empty(), "{expr}: {}", run.stderr);
+            }
+
+            for (expr, answer) in [
+                ("confirm(\"Go?\")", json!(1)),
+                ("checkbox(\"Pick\", [\"a\", \"b\"])", json!("a")),
+            ] {
+                let run = drive(command(expr), Some(std::slice::from_ref(&answer)), false);
+                assert_eq!(run.code, 0, "{expr}: {}", run.stderr);
+                assert_eq!(run.printed, vec![none], "{expr} with {answer}");
+                assert!(
+                    run.stderr.contains("prompt reply unusable"),
+                    "{expr}: {}",
+                    run.stderr
+                );
+            }
+
+            let run = drive(command("guard_operation()"), Some(&[json!(true)]), false);
+            assert_eq!(run.code, 0, "{}", run.stderr);
+            assert_eq!(run.requests, 1, "{:?}", run.wire);
+            assert_eq!(run.wire[0]["action"], "confirm");
+            assert_eq!(
+                run.wire[0]["question"], "Are you sure you want to continue?",
+                "{}",
+                run.wire[0]
+            );
+
+            check_no_channel(drive_with_reserved_fd(command("confirm(\"Go?\")")), none);
+        }
+
+        /// `drive` with a reply channel the host holds open, answering each
+        /// request with the raw line `line(id)` instead of a well-formed
+        /// reply, so a case can send an object the host never would.
+        fn drive_raw(mut cmd: Command, line: impl Fn(&str) -> String) -> Run {
+            let mut server = Server::open().unwrap();
+            cmd.env_remove("AUTO_CONFIRM")
+                .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+                .env_remove(OUT_FD_ENV)
+                .env(REPLY_ENV, server.env_value())
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            server.configure(&mut cmd);
+            let mut child = cmd.spawn().unwrap();
+            server.spawned();
+            let mut stderr = child.stderr.take().unwrap();
+            let stderr_thread = std::thread::spawn(move || {
+                let mut text = String::new();
+                std::io::Read::read_to_string(&mut stderr, &mut text).unwrap();
+                text
+            });
+            let mut printed = Vec::new();
+            let mut requests = 0;
+            let mut wire = Vec::new();
+            for out in std::io::BufReader::new(child.stdout.take().unwrap()).lines() {
+                let out = out.unwrap();
+                if out.trim_start().as_bytes().starts_with(MARKER) {
+                    requests += 1;
+                    let req: Value = serde_json::from_str(&out).unwrap();
+                    let id = req["coyote_prompt"]["id"].as_str().unwrap().to_string();
+                    wire.push(req["coyote_prompt"].clone());
+                    let mut writer = &server.writer;
+                    writer.write_all(line(&id).as_bytes()).unwrap();
+                    writer.write_all(b"\n").unwrap();
+                } else {
+                    printed.push(out);
+                }
+            }
+            Run {
+                printed,
+                requests,
+                wire,
+                code: child.wait().unwrap().code().unwrap_or(-1),
+                stderr: stderr_thread.join().unwrap(),
+            }
+        }
+
+        /// Runs `cmd` with `COYOTE_PROMPT_REPLY` naming `reply`, a path the
+        /// helper cannot open, in its own session with no terminal. Nothing
+        /// answers a request here, so a helper that sends one before it
+        /// finds the channel dead would block; the child is killed after
+        /// ten seconds and the exit code reports it.
+        fn drive_with_dead_reply(mut cmd: Command, reply: &str) -> Run {
+            cmd.env_remove("AUTO_CONFIRM")
+                .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+                .env_remove(OUT_FD_ENV)
+                .env(REPLY_ENV, reply)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            // SAFETY: setsid is async-signal-safe and touches no shared state.
+            unsafe {
+                cmd.pre_exec(|| {
+                    if libc::setsid() < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let mut child = cmd.spawn().unwrap();
+            let mut stdout = child.stdout.take().unwrap();
+            let mut stderr = child.stderr.take().unwrap();
+            let stdout_thread = std::thread::spawn(move || {
+                let mut text = String::new();
+                std::io::Read::read_to_string(&mut stdout, &mut text).unwrap();
+                text
+            });
+            let stderr_thread = std::thread::spawn(move || {
+                let mut text = String::new();
+                std::io::Read::read_to_string(&mut stderr, &mut text).unwrap();
+                text
+            });
+            let started = std::time::Instant::now();
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if started.elapsed() > std::time::Duration::from_secs(10) {
+                    child.kill().ok();
+                    break child.wait().unwrap();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            };
+            let stdout = stdout_thread.join().unwrap();
+            let mut printed = Vec::new();
+            let mut requests = 0;
+            for out in stdout.lines() {
+                if out.trim_start().as_bytes().starts_with(MARKER) {
+                    requests += 1;
+                } else {
+                    printed.push(out.to_string());
+                }
+            }
+            Run {
+                printed,
+                requests,
+                wire: Vec::new(),
+                code: status.code().unwrap_or(-1),
+                stderr: stderr_thread.join().unwrap(),
+            }
+        }
+
+        /// Edges the bash contract pins that the broad checks leave out for
+        /// the other two languages: a reply path the helper cannot open (a
+        /// missing file, an fd the tool never inherited) fails closed without
+        /// a request and without blocking, and a guard over it still aborts;
+        /// a reply for our id with no `answer` key is a cancel, not an error;
+        /// a checkbox answer that repeats an option yields each index once.
+        fn check_probe_edges(
+            command: impl Fn(&str) -> Command,
+            none: &str,
+            checked_once: &str,
+            dir: &Path,
+        ) {
+            let missing = dir.join("missing").join("reply");
+            for reply in [missing.to_str().unwrap(), "/dev/fd/97"] {
+                let started = std::time::Instant::now();
+                let run = drive_with_dead_reply(command("confirm(\"Go?\")"), reply);
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(9),
+                    "{reply}: the helper must not block on an unopenable reply path"
+                );
+                assert_eq!(run.requests, 0, "{reply}: request sent over a dead channel");
+                assert_eq!(run.code, 0, "{reply}: {}", run.stderr);
+                assert_eq!(run.printed, vec![none], "{reply}: {}", run.stderr);
+                assert!(
+                    run.stderr.contains("prompt re"),
+                    "{reply}: a dead channel is reported on stderr: {}",
+                    run.stderr
+                );
+
+                let run = drive_with_dead_reply(command("guard_operation(\"Really?\")"), reply);
+                assert_eq!(run.requests, 0, "{reply}: request sent over a dead channel");
+                assert_eq!(run.code, 1, "{reply}: a guard over a dead channel aborts");
+                assert!(
+                    run.stderr.contains("Operation aborted!"),
+                    "{reply}: {}",
+                    run.stderr
+                );
+            }
+
+            let run = drive_raw(command("confirm(\"Go?\")"), |id| {
+                format!("{{\"id\":\"{id}\"}}")
+            });
+            assert_eq!(run.code, 0, "{}", run.stderr);
+            assert_eq!(run.requests, 1, "{:?}", run.wire);
+            assert_eq!(run.printed, vec![none], "{}", run.stderr);
+            assert!(
+                run.stderr.is_empty(),
+                "a reply without an answer is a silent cancel: {}",
+                run.stderr
+            );
+
+            let run = drive(
+                command("checkbox(\"Pick\", [\"a\", \"b\", \"c\"])"),
+                Some(&[json!(["a", "a"])]),
+                false,
+            );
+            assert_eq!(run.code, 0, "{}", run.stderr);
+            assert_eq!(run.printed, vec![checked_once], "{}", run.stderr);
+            assert!(run.stderr.is_empty(), "{}", run.stderr);
+        }
+
+        mod py_contract {
+            use super::*;
+
+            const PY_DRIVER: &str = "import importlib.util, sys\n\
+                sys.dont_write_bytecode = True\n\
+                spec = importlib.util.spec_from_file_location(\"prompt_utils\", sys.argv[1])\n\
+                prompt_utils = importlib.util.module_from_spec(spec)\n\
+                spec.loader.exec_module(prompt_utils)\n";
+
+            fn py_command(expr: &str) -> Command {
+                let mut cmd = Command::new("python3");
+                cmd.arg("-c")
+                    .arg(format!("{PY_DRIVER}print(prompt_utils.{expr})\n"))
+                    .arg(PY_HELPER);
+                cmd
+            }
+
+            fn run_py(expr: &str, answers: Option<&[Value]>, stray_first: bool) -> Run {
+                drive(py_command(expr), answers, stray_first)
+            }
+
+            fn run_py_in(
+                expr: &str,
+                answers: Option<&[Value]>,
+                env: &[(&str, &str)],
+                cwd: &Path,
+            ) -> Run {
+                let mut cmd = py_command(expr);
+                cmd.current_dir(cwd);
+                drive_env(cmd, answers, false, env)
+            }
+
+            #[test]
+            fn helper_honours_the_channel_contract() {
+                if !python_available() {
+                    return;
+                }
+                check_contract(
+                    run_py,
+                    &Contract {
+                        confirm_true: "True",
+                        confirm_false: "False",
+                        none: "None",
+                        checked: "[0, 2]",
+                    },
+                );
+            }
+
+            #[test]
+            fn guards_mirror_the_bash_contract() {
+                if !python_available() {
+                    return;
+                }
+                let cwd = scratch_dir("py-guards");
+                check_guards(&run_py_in, "None", &cwd);
+                fs::remove_dir_all(&cwd).ok();
+            }
+
+            #[test]
+            fn replies_of_the_wrong_shape_are_unusable() {
+                if !python_available() {
+                    return;
+                }
+                check_unusable_shapes(run_py, "None");
+            }
+
+            #[test]
+            fn no_channel_and_no_terminal_falls_closed_without_a_request() {
+                if !python_available() {
+                    return;
+                }
+                check_no_channel(
+                    drive_without_channel(py_command("confirm(\"Go?\")")),
+                    "None",
+                );
+            }
+
+            #[test]
+            fn request_lines_carry_the_text_verbatim_with_fresh_ids() {
+                if !python_available() {
+                    return;
+                }
+                check_wire(run_py, "prompt_utils.", "x", "1");
+            }
+
+            #[test]
+            fn requests_escape_a_bash_tools_capture_through_its_saved_stdout() {
+                if !python_available() || bash_program().is_none() {
+                    return;
+                }
+                check_nested_in_bash(&py_command("select(\"Pick\", [\"a\", \"b\", \"c\"])"), "1");
+            }
+
+            #[test]
+            fn wire_edges_mirror_the_bash_helper() {
+                if !python_available() {
+                    return;
+                }
+                check_edges(py_command, "None", "True", "[]", "");
+            }
+
+            #[test]
+            fn dead_channel_and_answerless_reply_fail_closed() {
+                if !python_available() {
+                    return;
+                }
+                let dir = scratch_dir("py-probe-edges");
+                check_probe_edges(py_command, "None", "[0]", &dir);
+                fs::remove_dir_all(&dir).ok();
+            }
+        }
+
+        mod ts_contract {
+            use super::*;
+
+            /// A driver in `dir` that prints `expr` through `stringify`,
+            /// importing the helper from a copy beside it: under the repo
+            /// the helper sits below a package.json without a `type` field,
+            /// and node warns about that on stderr, which the contract
+            /// requires empty.
+            fn ts_command(runtime: &str, dir: &Path, expr: &str, stringify: &str) -> Command {
+                let helper = dir.join("prompt-utils.ts");
+                fs::copy(TS_HELPER, &helper).unwrap();
+                let driver = dir.join("driver.ts");
+                fs::write(
+                    &driver,
+                    format!(
+                        "import {{ pathToFileURL }} from \"node:url\";\n\
+                         const prompt = await import(pathToFileURL(process.argv[2]).href);\n\
+                         console.log(({stringify})(prompt.{expr}));\n"
+                    ),
+                )
+                .unwrap();
+                let mut cmd = Command::new(runtime);
+                cmd.arg(&driver).arg(&helper);
+                cmd.env("NODE_NO_WARNINGS", "1");
+                cmd
+            }
+
+            fn run_ts(
+                runtime: &str,
+                dir: &Path,
+                expr: &str,
+                answers: Option<&[Value]>,
+                stray_first: bool,
+            ) -> Run {
+                drive(
+                    ts_command(runtime, dir, expr, "JSON.stringify"),
+                    answers,
+                    stray_first,
+                )
+            }
+
+            fn run_ts_in(
+                runtime: &str,
+                dir: &Path,
+                expr: &str,
+                answers: Option<&[Value]>,
+                env: &[(&str, &str)],
+                cwd: &Path,
+            ) -> Run {
+                // Guards return undefined, which JSON.stringify alone would
+                // print as an empty line.
+                let mut cmd = ts_command(runtime, dir, expr, "(v) => String(JSON.stringify(v))");
+                cmd.current_dir(cwd);
+                drive_env(cmd, answers, false, env)
+            }
+
+            #[test]
+            fn helper_honours_the_channel_contract() {
+                let Some(runtime) = ts_runtime() else {
+                    return;
+                };
+                let dir = scratch_dir("ts-contract");
+                check_contract(
+                    |expr, answers, stray_first| run_ts(runtime, &dir, expr, answers, stray_first),
+                    &Contract {
+                        confirm_true: "true",
+                        confirm_false: "false",
+                        none: "null",
+                        checked: "[0,2]",
+                    },
+                );
+                fs::remove_dir_all(&dir).ok();
+            }
+
+            #[test]
+            fn guards_mirror_the_bash_contract() {
+                let Some(runtime) = ts_runtime() else {
+                    return;
+                };
+                let dir = scratch_dir("ts-guards");
+                let cwd = scratch_dir("ts-guards-cwd");
+                check_guards(
+                    &|expr, answers, env, cwd| run_ts_in(runtime, &dir, expr, answers, env, cwd),
+                    "undefined",
+                    &cwd,
+                );
+                fs::remove_dir_all(&dir).ok();
+                fs::remove_dir_all(&cwd).ok();
+            }
+
+            #[test]
+            fn replies_of_the_wrong_shape_are_unusable() {
+                let Some(runtime) = ts_runtime() else {
+                    return;
+                };
+                let dir = scratch_dir("ts-shapes");
+                check_unusable_shapes(
+                    |expr, answers, stray_first| run_ts(runtime, &dir, expr, answers, stray_first),
+                    "null",
+                );
+                fs::remove_dir_all(&dir).ok();
+            }
+
+            #[test]
+            fn no_channel_and_no_terminal_falls_closed_without_a_request() {
+                let Some(runtime) = ts_runtime() else {
+                    return;
+                };
+                let dir = scratch_dir("ts-no-channel");
+                check_no_channel(
+                    drive_without_channel(ts_command(
+                        runtime,
+                        &dir,
+                        "confirm(\"Go?\")",
+                        "JSON.stringify",
+                    )),
+                    "null",
+                );
+                fs::remove_dir_all(&dir).ok();
+            }
+
+            #[test]
+            fn request_lines_carry_the_text_verbatim_with_fresh_ids() {
+                let Some(runtime) = ts_runtime() else {
+                    return;
+                };
+                let dir = scratch_dir("ts-wire");
+                check_wire(
+                    |expr, answers, stray_first| run_ts(runtime, &dir, expr, answers, stray_first),
+                    "prompt.",
+                    "\"x\"",
+                    "1",
+                );
+                fs::remove_dir_all(&dir).ok();
+            }
+
+            #[test]
+            fn requests_escape_a_bash_tools_capture_through_its_saved_stdout() {
+                let Some(runtime) = ts_runtime() else {
+                    return;
+                };
+                if bash_program().is_none() {
+                    return;
+                }
+                let dir = scratch_dir("ts-nested");
+                check_nested_in_bash(
+                    &ts_command(
+                        runtime,
+                        &dir,
+                        "select(\"Pick\", [\"a\", \"b\", \"c\"])",
+                        "JSON.stringify",
+                    ),
+                    "1",
+                );
+                fs::remove_dir_all(&dir).ok();
+            }
+
+            #[test]
+            fn wire_edges_mirror_the_bash_helper() {
+                let Some(runtime) = ts_runtime() else {
+                    return;
+                };
+                let dir = scratch_dir("ts-edges");
+                check_edges(
+                    |expr| ts_command(runtime, &dir, expr, "(v) => String(JSON.stringify(v))"),
+                    "null",
+                    "true",
+                    "[]",
+                    "\"\"",
+                );
+                fs::remove_dir_all(&dir).ok();
+            }
+
+            #[test]
+            fn dead_channel_and_answerless_reply_fail_closed() {
+                let Some(runtime) = ts_runtime() else {
+                    return;
+                };
+                let dir = scratch_dir("ts-probe-edges");
+                check_probe_edges(
+                    |expr| ts_command(runtime, &dir, expr, "(v) => String(JSON.stringify(v))"),
+                    "null",
+                    "[0]",
+                    &dir,
+                );
+                fs::remove_dir_all(&dir).ok();
+            }
         }
     }
 }

@@ -35,7 +35,7 @@ async function main(): Promise<void> {
     "{functions_dir_env}",
     join(binDir, "{functions_dir_rel}"),
   );
-  setupEnv(rootDir, rawData);
+  setupEnv(rootDir, functionsDir, rawData);
 
   const toolPath = join(functionsDir, "tools", "{function_name}.ts");
   await run(toolPath, "run", toolData);
@@ -69,11 +69,12 @@ function parseArgv(): string {
   return toolData;
 }
 
-function setupEnv(rootDir: string, rawData: string): void {
+function setupEnv(rootDir: string, functionsDir: string, rawData: string): void {
   loadEnv(join(rootDir, ".env"));
   process.env["LLM_ROOT_DIR"] = rootDir;
   process.env["LLM_TOOL_NAME"] = "{function_name}";
   process.env["LLM_TOOL_CACHE_DIR"] = join(rootDir, "cache", "{function_name}");
+  process.env["LLM_PROMPT_UTILS_TS"] = resolve(functionsDir, "utils", "prompt-utils.ts");
   process.env["LLM_TOOL_RAW_JSON"] = rawData;
 }
 

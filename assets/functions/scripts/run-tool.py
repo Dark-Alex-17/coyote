@@ -48,7 +48,7 @@ def main():
     self_dir = os.path.dirname(os.path.abspath(__file__))
     root_dir = resolve_dir("{root_dir_env}", os.path.join(self_dir, "{root_dir_rel}"))
     functions_dir = resolve_dir("{functions_dir_env}", os.path.join(self_dir, "{functions_dir_rel}"))
-    setup_env(root_dir, raw_data)
+    setup_env(root_dir, functions_dir, raw_data)
 
     tool_path = os.path.join(functions_dir, "tools", "{function_name}.py")
     run(tool_path, "run", tool_data)
@@ -81,11 +81,14 @@ def parse_argv():
     return tool_data
 
 
-def setup_env(root_dir, raw_data):
+def setup_env(root_dir, functions_dir, raw_data):
     load_env(os.path.join(root_dir, ".env"))
     os.environ["LLM_ROOT_DIR"] = root_dir
     os.environ["LLM_TOOL_NAME"] = "{function_name}"
     os.environ["LLM_TOOL_CACHE_DIR"] = os.path.join(root_dir, "cache", "{function_name}")
+    os.environ["LLM_PROMPT_UTILS_PY"] = os.path.abspath(
+        os.path.join(functions_dir, "utils", "prompt-utils.py")
+    )
     os.environ["LLM_TOOL_RAW_JSON"] = raw_data
 
 

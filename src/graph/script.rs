@@ -182,6 +182,20 @@ fn build_default_envs(agent_data_dir: &Path) -> HashMap<String, String> {
             .into_owned(),
     );
     envs.insert(
+        "LLM_PROMPT_UTILS_PY".to_string(),
+        paths::global_utils_dir()
+            .join("prompt-utils.py")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    envs.insert(
+        "LLM_PROMPT_UTILS_TS".to_string(),
+        paths::global_utils_dir()
+            .join("prompt-utils.ts")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    envs.insert(
         "LLM_AGENT_DATA_DIR".to_string(),
         agent_data_dir.to_string_lossy().into_owned(),
     );
@@ -267,6 +281,31 @@ mod tests {
             state_updates: None,
             fallback: None,
             timeout,
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn default_envs_point_every_prompt_helper_at_the_functions_utils_dir() {
+        let functions_dir = temp_file("-graph-functions-dir-", "");
+        let _functions = crate::testing::EnvVarGuard::set(
+            crate::utils::get_env_name("functions_dir"),
+            &functions_dir,
+        );
+
+        let envs = build_default_envs(Path::new("/agent-data"));
+
+        let utils = functions_dir.join("utils");
+        for (key, file) in [
+            ("LLM_PROMPT_UTILS_FILE", "prompt-utils.sh"),
+            ("LLM_PROMPT_UTILS_PY", "prompt-utils.py"),
+            ("LLM_PROMPT_UTILS_TS", "prompt-utils.ts"),
+        ] {
+            assert_eq!(
+                envs.get(key).map(String::as_str),
+                Some(utils.join(file).to_str().unwrap()),
+                "{key}"
+            );
         }
     }
 
