@@ -21,4 +21,11 @@ receive Coyote as a combined work, your rights and obligations for the work as
 a whole are governed by the AGPL-3.0-only license; the MIT notice is retained
 to satisfy the attribution requirements of the MIT-licensed portions.
 
+The full-screen terminal UI under src/tui/ follows design shapes from the
+Codex CLI (https://github.com/openai/codex), Copyright (c) OpenAI, which is
+distributed under the Apache License, Version 2.0: the coalescing frame
+scheduler, the stable/tail split for a streaming reply, the bottom-pane modal
+that replaces the composer, and the detached drain of captured output. No
+Codex source files are copied; the shapes were reimplemented for Coyote.
+
 See CREDITS.md for additional background and attribution.

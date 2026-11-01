@@ -28,7 +28,6 @@ pub fn detached(cmd: &mut Command) -> &mut Command {
 /// A child running with a pseudo-terminal as its controlling tty and as
 /// all three standard streams; the test holds the master side.
 #[cfg(unix)]
-#[allow(dead_code)] // TASK-312
 pub struct Pty {
     master: std::fs::File,
     child: std::process::Child,
@@ -37,21 +36,28 @@ pub struct Pty {
 
 #[cfg(unix)]
 impl Pty {
-    #[allow(dead_code)] // TASK-312
+    /// Spawns on a 100x40 terminal, the size the fixture `tput` reports.
     pub fn spawn(mut cmd: Command) -> std::io::Result<Pty> {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use std::os::unix::process::CommandExt;
 
         let mut master: libc::c_int = -1;
         let mut slave: libc::c_int = -1;
-        // SAFETY: both out-pointers are valid ints; name, termios and winsize may be null.
+        let mut size = libc::winsize {
+            ws_row: 40,
+            ws_col: 100,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: both out-pointers are valid ints, `size` is a valid
+        // winsize; name and termios may be null.
         let rc = unsafe {
             libc::openpty(
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                std::ptr::null_mut(),
+                &mut size,
             )
         };
         if rc != 0 {
@@ -62,6 +68,12 @@ impl Pty {
             unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
         let master_fd = master.as_raw_fd();
         let slave_fd = slave.as_raw_fd();
+        for fd in [master_fd, slave_fd] {
+            // SAFETY: fcntl with F_SETFD takes no pointers; the result is checked.
+            if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
         // SAFETY: the hook calls only async-signal-safe libc functions on
         // descriptors that stay open in the parent until after spawn returns.
         unsafe {
@@ -73,6 +85,8 @@ impl Pty {
                 if libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0) == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
+                // dup2 clears close-on-exec on 0, 1 and 2; the originals
+                // still carry it, and closing them here is belt and braces.
                 for fd in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
                     if libc::dup2(slave_fd, fd) == -1 {
                         return Err(std::io::Error::last_os_error());
@@ -94,7 +108,6 @@ impl Pty {
 
     /// Reads the master until the stripped transcript contains `needle` and
     /// returns the whole stripped transcript so far.
-    #[allow(dead_code)] // TASK-312
     pub fn wait_for(
         &mut self,
         needle: &str,
@@ -148,7 +161,6 @@ impl Pty {
         }
     }
 
-    #[allow(dead_code)] // TASK-312
     pub fn send(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         use std::io::Write;
         self.master.write_all(bytes)?;
@@ -172,7 +184,9 @@ fn closed_early(needle: &str, text: &str) -> std::io::Error {
     )
 }
 
-/// Drops CSI and OSC escape sequences, leaving the printable text.
+/// Drops CSI, OSC and two-byte escape sequences, leaving the printable
+/// text. A CSI is parameter bytes, then intermediate bytes, then one final
+/// byte; a non-CSI escape may carry one intermediate before its final.
 #[cfg(unix)]
 fn strip_ansi(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
@@ -187,7 +201,10 @@ fn strip_ansi(text: &str) -> String {
         match chars.get(i + 1) {
             Some('[') => {
                 i += 2;
-                while matches!(chars.get(i), Some(c) if ('\x20'..='\x3f').contains(c)) {
+                while matches!(chars.get(i), Some(c) if ('\x30'..='\x3f').contains(c)) {
+                    i += 1;
+                }
+                while matches!(chars.get(i), Some(c) if ('\x20'..='\x2f').contains(c)) {
                     i += 1;
                 }
                 i += 1;
@@ -208,9 +225,39 @@ fn strip_ansi(text: &str) -> String {
                     }
                 }
             }
+            Some(c) if ('\x20'..='\x2f').contains(c) => i += 3,
             Some(_) => i += 2,
             None => i += 1,
         }
     }
     out
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::strip_ansi;
+
+    #[test]
+    fn csi_with_intermediate_bytes_is_dropped_whole() {
+        // Kitty keyboard pop (`ESC [ < u`) and a DEC private mode reset
+        // (`ESC [ ? 2004 l`), both with a space intermediate variant.
+        assert_eq!(strip_ansi("a\x1b[<ub"), "ab");
+        assert_eq!(strip_ansi("a\x1b[?2004lb"), "ab");
+        assert_eq!(strip_ansi("a\x1b[2 qb"), "ab");
+        assert_eq!(strip_ansi("a\x1b[1;31mb\x1b[0m"), "ab");
+    }
+
+    #[test]
+    fn non_csi_escapes_with_an_intermediate_are_dropped_whole() {
+        assert_eq!(strip_ansi("x\x1b(By"), "xy");
+        assert_eq!(strip_ansi("x\x1b=y\x1b>z"), "xyz");
+        assert_eq!(strip_ansi("x\x1b]0;title\x07y\x1b]8;;\x1b\\z"), "xyz");
+    }
+
+    #[test]
+    fn a_truncated_escape_at_the_end_does_not_panic() {
+        assert_eq!(strip_ansi("tail\x1b"), "tail");
+        assert_eq!(strip_ansi("tail\x1b["), "tail");
+        assert_eq!(strip_ansi("tail\x1b]"), "tail");
+    }
 }

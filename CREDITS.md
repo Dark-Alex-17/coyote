@@ -11,6 +11,16 @@ Fowler's *Refactoring* (ch. 3); the deep-module vocabulary builds on John
 Ousterhout's *A Philosophy of Software Design* and Michael Feathers'
 *Working Effectively with Legacy Code*.
 
+## Codex CLI
+
+The full-screen terminal UI (`src/tui/`) borrows its overall shape from the
+[Codex CLI](https://github.com/openai/codex) by OpenAI, licensed under the
+Apache License 2.0: a frame scheduler that folds every redraw request between
+two draws into one, a streaming reply split into a stable part rendered once
+per width and a live tail, a prompt modal that takes the composer's place, and
+a capture of command output that never waits on a lingering child. The code is
+Coyote's own; only the design was followed.
+
 ## AIChat
 Coyote originally started as a fork of the fantastic
 [AIChat CLI](https://github.com/sigoden/aichat). The initial goal was simply
