@@ -11720,6 +11720,7 @@ mod tests {
     /// A spawned child must not carry the SIGINT arm on any of its spinners,
     /// or the first Ctrl-C of a turn would kill every child mid-request.
     #[test]
+    #[serial]
     fn interrupt_policy_is_owned_for_root_and_not_owned_for_spawned_child() {
         let root = create_test_ctx();
         assert_eq!(root.interrupt_policy(), UserInterrupt::Owned);

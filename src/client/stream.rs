@@ -577,7 +577,8 @@ mod tests {
 
     /// Records only what this thread publishes: the bus is shared with
     /// every other test handing over thinking blocks at the same time, and
-    /// `publish` runs each sink on the publishing thread.
+    /// `publish` runs each sink on the publishing thread. Unsubscribes on
+    /// drop so a failed assertion leaves no sink behind on the bus.
     struct ThisThreadSink {
         thread: std::thread::ThreadId,
         events: std::sync::Mutex<Vec<Event>>,
@@ -591,24 +592,42 @@ mod tests {
         }
     }
 
+    struct ThisThreadRecording {
+        sink: std::sync::Arc<ThisThreadSink>,
+        subscription: crate::events::SubscriptionId,
+    }
+
+    impl ThisThreadRecording {
+        fn install() -> Self {
+            let sink = std::sync::Arc::new(ThisThreadSink {
+                thread: std::thread::current().id(),
+                events: std::sync::Mutex::new(Vec::new()),
+            });
+            let subscription =
+                bus()
+                    .subscribe(std::sync::Arc::clone(&sink)
+                        as std::sync::Arc<dyn crate::events::EventSink>);
+            Self { sink, subscription }
+        }
+    }
+
+    impl Drop for ThisThreadRecording {
+        fn drop(&mut self) {
+            bus().unsubscribe(self.subscription);
+        }
+    }
+
     #[test]
+    #[serial_test::serial]
     fn a_thinking_block_publishes_started_then_stopped() {
-        let sink = std::sync::Arc::new(ThisThreadSink {
-            thread: std::thread::current().id(),
-            events: std::sync::Mutex::new(Vec::new()),
-        });
-        let subscription =
-            bus().subscribe(
-                std::sync::Arc::clone(&sink) as std::sync::Arc<dyn crate::events::EventSink>
-            );
+        let recording = ThisThreadRecording::install();
         let (mut handler, _rx) = new_handler();
         handler.thinking_block(ThinkingBlock::Thinking {
             thinking: "hmm".to_string(),
             signature: "sig".to_string(),
         });
-        bus().unsubscribe(subscription);
         assert_eq!(
-            *sink.events.lock().unwrap(),
+            *recording.sink.events.lock().unwrap(),
             vec![Event::ThinkingStarted, Event::ThinkingStopped]
         );
     }

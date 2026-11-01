@@ -1444,6 +1444,7 @@ mod tests {
     #[serial]
     fn a_dry_run_turn_streams_into_the_transcript() {
         run_async(async {
+            let _guard = TestConfigDirGuard::new("tui-stream");
             let mut ctx = chat_ctx();
             let (tx, mut rx) = seat_tui(&mut ctx);
             let mut harness = Harness::for_ctx(&ctx);
