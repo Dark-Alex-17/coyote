@@ -31,7 +31,7 @@ use ratatui::widgets::{Paragraph, Widget};
 use ratatui_textarea::TextArea;
 use redirect::FdRedirect;
 use render::{RenderCache, Renderer};
-use sink::{TuiPrompter, TuiSink, UiMsg};
+use sink::{TuiPrompter, TuiSink, UiMsg, unattended_answer};
 use std::collections::VecDeque;
 use std::io::IsTerminal;
 use std::sync::Arc;
@@ -779,11 +779,11 @@ impl App {
         }
     }
 
-    /// Answers every queued prompt `Cancelled`; used when the UI is about
-    /// to go away without a human to ask.
-    fn cancel_prompts(&mut self) {
+    /// Gives every queued prompt its unattended answer; used when the UI
+    /// is about to go away without a human to ask.
+    fn abandon_prompts(&mut self) {
         while let Some(prompt) = self.prompts.pop_front() {
-            let _ = prompt.reply.send(PromptAnswer::Cancelled);
+            let _ = prompt.reply.send(unattended_answer(&prompt.req));
         }
     }
 
@@ -1179,12 +1179,12 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> (Leave, Option<
         };
         match step {
             Step::Signal | Step::Input(None) | Step::Input(Some(Err(_))) => {
-                // Nobody is left to answer: prompts not yet asked cancel
-                // themselves, the queued ones are cancelled here, and only
+                // Nobody is left to answer: prompts not yet asked answer
+                // themselves, the queued ones are answered here, and only
                 // then is the turn told to stop.
                 auto_cancel.store(true, Ordering::SeqCst);
                 app.begin_exit();
-                app.cancel_prompts();
+                app.abandon_prompts();
                 match task.take() {
                     Some(Task::Turn { handle, .. }) => {
                         abort.set_ctrlc();
@@ -1300,13 +1300,13 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> (Leave, Option<
                             ctx = Some(returned);
                         }
                         Err(err) => {
-                            app.cancel_prompts();
+                            app.abandon_prompts();
                             return (Leave::Lost(err), None);
                         }
                     }
                 }
                 Done::Exit(joined) => {
-                    app.cancel_prompts();
+                    app.abandon_prompts();
                     return match joined {
                         Ok((returned, result, captured)) => {
                             (Leave::Finished(result, captured), Some(returned))
@@ -1847,6 +1847,45 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// With nobody left to answer, a yes/no question takes its default and
+    /// anything else is cancelled, whether the prompter is already marked
+    /// unattended or the question was queued when the UI gave up.
+    #[test]
+    fn unattended_prompts_take_the_confirm_default_and_cancel_the_rest() {
+        let (tx, _rx) = unbounded_channel();
+        let prompter = TuiPrompter::new(tx, Arc::new(AtomicBool::new(true)));
+        let save = PromptRequest {
+            default: Some(serde_json::json!(false)),
+            ..confirm_request(None)
+        };
+        assert_eq!(
+            prompter.prompt(save).unwrap(),
+            PromptAnswer::Confirmed(false)
+        );
+        let opt_in = PromptRequest {
+            default: Some(serde_json::json!(true)),
+            ..confirm_request(None)
+        };
+        assert_eq!(
+            prompter.prompt(opt_in).unwrap(),
+            PromptAnswer::Confirmed(true)
+        );
+        assert_eq!(
+            prompter.prompt(confirm_request(Some("fs_write"))).unwrap(),
+            PromptAnswer::Confirmed(false)
+        );
+        let input = PromptRequest::new(PromptAction::Input, "Name:", Origin::detached());
+        assert_eq!(prompter.prompt(input).unwrap(), PromptAnswer::Cancelled);
+
+        let mut harness = Harness::standalone(80, 24);
+        let asker = ask_on_a_thread(&mut harness, confirm_request(None));
+        harness.app.abandon_prompts();
+        assert_eq!(
+            asker.join().unwrap().unwrap(),
+            PromptAnswer::Confirmed(false)
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@ use crate::client::SseEvent;
 use crate::config::AppConfig;
 use crate::events::{Event, EventSink, NoticeKind, Origin, OutputStream};
 use crate::hooks::HookEvent;
-use crate::prompt::{PromptAnswer, PromptRequest, Prompter};
+use crate::prompt::{PromptAction, PromptAnswer, PromptRequest, Prompter};
 use crate::turn::UiSink;
 use crate::utils::AbortSignal;
 use anyhow::Result;
@@ -173,13 +173,29 @@ impl EventSink for TuiSink {
     }
 }
 
+/// What a question gets when nobody is left to answer it. A yes/no
+/// question takes its default (no, when it has none) so a teardown with a
+/// dirty session still completes, the way the REPL's default signal
+/// disposition would have dropped it; every other kind is cancelled.
+pub(crate) fn unattended_answer(req: &PromptRequest) -> PromptAnswer {
+    match req.action {
+        PromptAction::Confirm => PromptAnswer::Confirmed(
+            req.default
+                .as_ref()
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        ),
+        _ => PromptAnswer::Cancelled,
+    }
+}
+
 /// Asks the human through the UI loop and blocks until the modal answers.
 /// Synchronous by contract: the asking code sits on a work task or inside
 /// a blocking tool, never on the UI loop itself.
 pub(crate) struct TuiPrompter {
     tx: UnboundedSender<UiMsg>,
     /// Set once the UI is going away without a human to ask: every prompt
-    /// is answered `Cancelled` at once.
+    /// gets its [`unattended_answer`] at once.
     auto_cancel: Arc<AtomicBool>,
 }
 
@@ -200,17 +216,18 @@ impl fmt::Debug for TuiPrompter {
 impl Prompter for TuiPrompter {
     fn prompt(&self, req: PromptRequest) -> Result<PromptAnswer> {
         if self.auto_cancel.load(Ordering::SeqCst) {
-            return Ok(PromptAnswer::Cancelled);
+            return Ok(unattended_answer(&req));
         }
+        let unattended = unattended_answer(&req);
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         let msg = UiMsg::Prompt {
             req: Box::new(req),
             reply: reply_tx,
         };
         if self.tx.send(msg).is_err() {
-            return Ok(PromptAnswer::Cancelled);
+            return Ok(unattended);
         }
-        Ok(reply_rx.recv().unwrap_or(PromptAnswer::Cancelled))
+        Ok(reply_rx.recv().unwrap_or(unattended))
     }
 
     #[cfg(test)]
