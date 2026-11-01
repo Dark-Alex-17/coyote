@@ -246,31 +246,39 @@ function snapshotTty(tty: Terminal): string | null {
   }
 }
 
+const ECHO_UNAVAILABLE = Symbol("echo unavailable");
+
 // The hidden read belongs to a short-lived sh child, because a blocking
 // fs.readSync never lets a SIGINT handler run, so Ctrl-C would be swallowed
-// with echo still off. The parent snapshots the terminal mode before turning
-// echo off (so keystrokes typed early are not echoed either) and restores
-// that snapshot once the child returns; the child's trap restores the same
-// snapshot when a signal kills it before the parent gets the chance, since
-// SIGINT reaches both and node dies inside execFileSync without running its
-// finally. The user's newline is swallowed with the rest of the hidden
-// input, so one is written for them. End of input before a line makes the
-// child exit non-zero, which surfaces here as null, the same cancel every
+// with echo still off. The child installs its trap before any mode change,
+// then turns echo off and prints the prompt itself, so there is no window in
+// which a keystroke can be echoed or a signal can leave the terminal
+// unrestored. The parent only holds the snapshot taken beforehand and puts it
+// back once the child returns; the child's trap restores the same snapshot
+// when a signal kills it first, since SIGINT reaches both and node dies
+// inside execFileSync without running its finally. The prompt travels on the
+// child's stderr, which is bound to the terminal output. A failed stty exits
+// 2 so the caller can fall back to an echoed read with a warning; end of
+// input before a line exits 1 and surfaces as null, the same cancel every
 // other helper reports.
-function readHidden(tty: Terminal, saved: string): string | null {
+function readHidden(tty: Terminal, saved: string, prompt: string): string | null | typeof ECHO_UNAVAILABLE {
   try {
     const line = execFileSync(
       "sh",
-      ["-c", "trap 'stty \"$COYOTE_TTY_SAVED\"' EXIT INT TERM; IFS= read -r l || exit 1; printf %s \"$l\""],
+      [
+        "-c",
+        "trap 'stty \"$COYOTE_TTY_SAVED\"' EXIT INT TERM; stty -echo || exit 2; " +
+          'printf %s "$COYOTE_TTY_PROMPT" >&2; IFS= read -r l || exit 1; printf %s "$l"',
+      ],
       {
-        stdio: [tty.input, "pipe", "ignore"],
+        stdio: [tty.input, "pipe", tty.output],
         encoding: "utf8",
-        env: { ...process.env, COYOTE_TTY_SAVED: saved },
+        env: { ...process.env, COYOTE_TTY_SAVED: saved, COYOTE_TTY_PROMPT: prompt },
       },
     );
     return stripCr(line);
-  } catch {
-    return null;
+  } catch (err) {
+    return (err as { status?: number | null }).status === 2 ? ECHO_UNAVAILABLE : null;
   }
 }
 
@@ -282,16 +290,24 @@ function ttyLine(prompt: string, optionLines: string[] = [], hidden = false): st
       return stripCr(readLine(tty.input));
     }
     const saved = snapshotTty(tty);
-    if (saved === null || !stty(tty, "-echo")) {
+    if (saved === null) {
       writeAll(tty.output, "Warning: Password input may be echoed.\n" + prompt);
       return stripCr(readLine(tty.input));
     }
+    let hiddenReadRan = false;
     try {
-      writeAll(tty.output, prompt);
-      return readHidden(tty, saved);
+      const result = readHidden(tty, saved, prompt);
+      if (result === ECHO_UNAVAILABLE) {
+        writeAll(tty.output, "Warning: Password input may be echoed.\n" + prompt);
+        return stripCr(readLine(tty.input));
+      }
+      hiddenReadRan = true;
+      return result;
     } finally {
       stty(tty, saved);
-      writeAll(tty.output, "\n");
+      if (hiddenReadRan) {
+        writeAll(tty.output, "\n");
+      }
     }
   } finally {
     tty.close();
