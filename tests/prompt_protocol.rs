@@ -530,6 +530,115 @@ fn python_password_keeps_a_pre_prompt_echo_off_after_ctrl_c() {
     assert_echo_still_off(&transcript);
 }
 
+/// The interrupt character arriving the very instant the prompt shows, with
+/// nothing typed first, must leave the terminal as it was: no window exists
+/// in which the hidden read has changed the mode but cannot yet undo it.
+#[test]
+fn typescript_password_restores_echo_after_an_immediate_ctrl_c() {
+    let Some(runtime) = ts_runtime() else {
+        return;
+    };
+    let dir = fresh_config_dir("tty-ts-password-intr-0ms");
+    let _guard = TempDirGuard(dir.clone());
+    let helper = dir.join("prompt-utils.ts");
+    fs::copy(TS_HELPER, &helper).unwrap();
+    let driver = dir.join("driver.ts");
+    fs::write(&driver, typescript_password_driver("pw-ts-0ms1")).unwrap();
+    let transcript = run_password_in_pty(
+        &format!(
+            "NODE_NO_WARNINGS=1 {runtime} \"{}\" \"{}\"",
+            driver.display(),
+            helper.display()
+        ),
+        "pw-ts-0ms1",
+        interrupt_immediately,
+    );
+    assert!(
+        !transcript.contains("password-length="),
+        "password returned despite the interrupt:\n{transcript}"
+    );
+    assert!(
+        !transcript.contains("Warning: Password input may be echoed."),
+        "the helper fell back to an echoed read:\n{transcript}"
+    );
+    assert_echo_restored(&transcript);
+}
+
+#[test]
+fn python_password_restores_echo_after_an_immediate_ctrl_c() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = fresh_config_dir("tty-py-password-intr-0ms");
+    let _guard = TempDirGuard(dir.clone());
+    let driver = dir.join("driver.py");
+    fs::write(&driver, python_password_driver("pw-py-0ms1")).unwrap();
+    let transcript = run_password_in_pty(
+        &format!("python3 \"{}\" \"{PY_HELPER}\"", driver.display()),
+        "pw-py-0ms1",
+        interrupt_immediately,
+    );
+    assert!(
+        !transcript.contains("password-length="),
+        "password returned despite the interrupt:\n{transcript}"
+    );
+    assert_echo_restored(&transcript);
+}
+
+/// Same instant interrupt on a terminal that began with echo off: the
+/// restore must put back the snapshot, not switch echo on.
+#[test]
+fn typescript_password_keeps_a_pre_prompt_echo_off_after_an_immediate_ctrl_c() {
+    let Some(runtime) = ts_runtime() else {
+        return;
+    };
+    let dir = fresh_config_dir("tty-ts-password-keep-noecho-intr-0ms");
+    let _guard = TempDirGuard(dir.clone());
+    let helper = dir.join("prompt-utils.ts");
+    fs::copy(TS_HELPER, &helper).unwrap();
+    let driver = dir.join("driver.ts");
+    fs::write(&driver, typescript_password_driver("pw-ts-0msk")).unwrap();
+    let transcript = run_password_in_pty_with(
+        ECHO_OFF_PRELUDE,
+        &format!(
+            "NODE_NO_WARNINGS=1 {runtime} \"{}\" \"{}\"",
+            driver.display(),
+            helper.display()
+        ),
+        "pw-ts-0msk",
+        interrupt_immediately,
+    );
+    assert!(
+        !transcript.contains("password-length="),
+        "password returned despite the interrupt:\n{transcript}"
+    );
+    assert_echo_still_off(&transcript);
+}
+
+#[test]
+fn python_password_keeps_a_pre_prompt_echo_off_after_an_immediate_ctrl_c() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = fresh_config_dir("tty-py-password-keep-noecho-intr-0ms");
+    let _guard = TempDirGuard(dir.clone());
+    let driver = dir.join("driver.py");
+    fs::write(&driver, python_password_driver("pw-py-0msk")).unwrap();
+    let transcript = run_password_in_pty_with(
+        ECHO_OFF_PRELUDE,
+        &format!("python3 \"{}\" \"{PY_HELPER}\"", driver.display()),
+        "pw-py-0msk",
+        interrupt_immediately,
+    );
+    assert!(
+        !transcript.contains("password-length="),
+        "password returned despite the interrupt:\n{transcript}"
+    );
+    assert_echo_still_off(&transcript);
+}
+
 /// When `stty` cannot be found the TypeScript helper must say so and still
 /// read the secret in the clear rather than fail: the tool runs with a PATH
 /// that holds only the interpreter and `sh`, while the wrapper keeps its own
@@ -549,6 +658,14 @@ fn typescript_password_without_stty_warns_and_still_reads() {
     fs::create_dir_all(&bin).unwrap();
     std::os::unix::fs::symlink(&runtime_path, bin.join(runtime)).unwrap();
     std::os::unix::fs::symlink(which::which("sh").unwrap(), bin.join("sh")).unwrap();
+    // tsx is a node program; it needs node reachable on the restricted PATH.
+    if runtime != "node" {
+        let Ok(node_path) = which::which("node") else {
+            eprintln!("skipping: {runtime} needs node on PATH and node is not available");
+            return;
+        };
+        std::os::unix::fs::symlink(node_path, bin.join("node")).unwrap();
+    }
     let helper = dir.join("prompt-utils.ts");
     fs::copy(TS_HELPER, &helper).unwrap();
     let driver = dir.join("driver.ts");
@@ -646,21 +763,44 @@ fn run_password_in_pty_with(
 
 /// Types part of a secret, then sends the terminal's interrupt character.
 fn interrupt_mid_read(pty: &mut Pty) -> std::io::Result<()> {
-    pty.send(b"zq")?;
+    pty.send(TYPED_BEFORE_INTERRUPT)?;
     thread::sleep(Duration::from_millis(100));
     pty.send(b"\x03")
 }
 
+/// Sends the interrupt character the moment the prompt text is seen, with
+/// no keystrokes and no delay before it.
+fn interrupt_immediately(pty: &mut Pty) -> std::io::Result<()> {
+    pty.send(b"\x03")
+}
+
+/// Keystrokes `interrupt_mid_read` types: a sequence no temp-dir name or
+/// traceback would contain by chance.
+const TYPED_BEFORE_INTERRUPT: &[u8] = b"zq9xq";
+
 /// The keystrokes typed before the interrupt must not show on the terminal
 /// (echo was really off when it arrived) and the helper must have taken the
-/// hidden path, not the warned, echoed one.
+/// hidden path, not the warned, echoed one. Only the region the terminal
+/// echoed is inspected: after the prompt marker, before the replayed tool
+/// output, with interpreter traceback lines left out.
 fn assert_hidden_read_was_interrupted(transcript: &str) {
+    let start = transcript.find("Secret? ").unwrap_or(0);
+    let end = transcript.find("tool-exit=").unwrap_or(transcript.len());
+    let echoed: String = transcript[start..end]
+        .lines()
+        .filter(|line| {
+            let line = line.trim_start();
+            !(line.starts_with("Traceback") || line.starts_with("File \""))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let typed = std::str::from_utf8(TYPED_BEFORE_INTERRUPT).unwrap();
     assert!(
-        !transcript.contains("zq"),
+        !echoed.contains(typed),
         "the terminal echoed keystrokes typed before the interrupt:\n{transcript}"
     );
     assert!(
-        !transcript.contains("Warning: Password input may be echoed."),
+        !echoed.contains("Warning: Password input may be echoed."),
         "the helper fell back to an echoed read:\n{transcript}"
     );
 }
@@ -799,6 +939,66 @@ fn macro_run_exports_the_python_prompt_helper_to_python_tools() {
         "the python tool did not get a loadable LLM_PROMPT_UTILS_PY and COYOTE_UI=repl\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert_eq!(fake.served(), 2, "stdout:\n{stdout}");
+}
+
+/// A Python tool that really asks through the channel while nobody can
+/// answer (the binary runs detached from any terminal with stdin on
+/// /dev/null) must get the cancel answer and fail closed: `confirm` returns
+/// None, the run finishes, and it never reports a confirmed answer.
+#[test]
+fn macro_run_cancels_a_python_tools_prompt_when_nobody_can_answer() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = fresh_config_dir("helper-py-prompt");
+    let _guard = TempDirGuard(dir.clone());
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "fixture_prompt_py".to_string(),
+            arguments: "{}".to_string(),
+        },
+        Reply::Text("fixture done".to_string()),
+    ]);
+    write_config(&dir, &fake);
+    write_tool(
+        &dir,
+        "fixture_prompt_py.py",
+        "#!/usr/bin/env python3\n\
+         import importlib.util\n\
+         import os\n\
+         \n\
+         \n\
+         def run():\n\
+         \x20   \"\"\"Ask the user through the prompt helper and report the answer.\"\"\"\n\
+         \x20   spec = importlib.util.spec_from_file_location(\"prompt_utils\", os.environ[\"LLM_PROMPT_UTILS_PY\"])\n\
+         \x20   prompt_utils = importlib.util.module_from_spec(spec)\n\
+         \x20   spec.loader.exec_module(prompt_utils)\n\
+         \x20   line = f\"fixture confirm: {prompt_utils.confirm('Go ahead? pw-py-m4cro')!r}\"\n\
+         \x20   print(line, flush=True)\n\
+         \x20   return line\n",
+    );
+    write_macro(&dir, "prompt", "Call the fixture prompt py tool");
+
+    let output = run_coyote(&dir, &["--macro", "prompt"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.code().is_some(),
+        "the run did not finish on its own\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("fixture confirm: True") && !stderr.contains("fixture confirm: True"),
+        "the prompt was answered yes with nobody there\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("coyote_prompt") && !stderr.contains("coyote_prompt"),
+        "a raw request line leaked into the user-facing output\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("fixture confirm: None"),
+        "the helper did not report the cancelled prompt as None\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
 }
 
 /// The TypeScript twin: `LLM_PROMPT_UTILS_TS` names an absolute, existing

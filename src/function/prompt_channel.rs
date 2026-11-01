@@ -2892,6 +2892,7 @@ echo "$ans" >> "$LLM_OUTPUT""#,
         use super::*;
         use std::path::{Path, PathBuf};
         use std::process::{Child, ExitStatus, Stdio};
+        use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::{SystemTime, UNIX_EPOCH};
 
         const PY_HELPER: &str = concat!(
@@ -2904,16 +2905,27 @@ echo "$ans" >> "$LLM_OUTPUT""#,
         );
 
         fn scratch_dir(tag: &str) -> PathBuf {
+            // Tests run in parallel and the clock here ticks in microseconds.
+            static SEQUENCE: AtomicU64 = AtomicU64::new(0);
             let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
+            let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let dir = std::env::temp_dir().join(format!(
-                "coyote-prompt-script-{tag}-{}-{nanos}",
+                "coyote-prompt-script-{tag}-{}-{nanos}-{sequence}",
                 std::process::id()
             ));
             fs::create_dir_all(&dir).unwrap();
             dir
+        }
+
+        struct RemoveOnDrop(PathBuf);
+
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                fs::remove_dir_all(&self.0).ok();
+            }
         }
 
         fn python_available() -> bool {
@@ -3469,17 +3481,19 @@ echo "$ans" >> "$LLM_OUTPUT""#,
         /// return value when it lets the tool carry on.
         type GuardEval<'a> = &'a dyn Fn(&str, Option<&[Value]>, &[(&str, &str)], &Path) -> Run;
 
-        /// The bash guards' contract, mirrored: the auto-confirm variables
-        /// short-circuit before any request is sent, anything but an exact
-        /// `true` aborts with exit 1 and `Operation aborted!` on stderr, and
-        /// `guard_path` stays silent for paths inside the working directory
-        /// (by components, so a sibling sharing the prefix still asks, and
-        /// by where a path really lands, so a new file under a symlink that
-        /// points outside asks too).
+        /// The bash guards' contract: the auto-confirm variables short-circuit
+        /// before any request is sent, anything but an exact `true` aborts
+        /// with exit 1 and `Operation aborted!` on stderr, and `guard_path`
+        /// stays silent for paths inside the working directory. The
+        /// containment check here is tighter than bash's string-prefix match:
+        /// it compares path components, so a sibling sharing the prefix still
+        /// asks, and it looks at where a path really lands, so a new file
+        /// under a symlink that points outside asks too.
         fn check_guards(eval: GuardEval<'_>, continued: &str, cwd: &Path) {
             fs::create_dir_all(cwd.join("sub")).unwrap();
             let sibling = PathBuf::from(format!("{}-sibling", cwd.display()));
             fs::create_dir_all(&sibling).unwrap();
+            let _sibling_guard = RemoveOnDrop(sibling.clone());
             std::os::unix::fs::symlink(&sibling, cwd.join("link")).unwrap();
             std::os::unix::fs::symlink(sibling.join("missing.txt"), cwd.join("dangling")).unwrap();
             let op = "guard_operation(\"Really?\")";
@@ -3567,7 +3581,6 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                     "{path}: AUTO_CONFIRM must skip the question"
                 );
             }
-            fs::remove_dir_all(&sibling).ok();
         }
 
         /// Replies that fit no action: a string for `confirm`, an unknown
@@ -4379,6 +4392,50 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                 assert!(
                     read_file_sync_calls.is_empty(),
                     "the reply must not be read to EOF: {read_file_sync_calls:?}"
+                );
+            }
+
+            /// A SIGINT between turning echo off and installing the restore
+            /// would leave the terminal dark, so the only `stty -echo` lives
+            /// in the sh child, after its trap, and the parent's stty calls
+            /// are limited to the snapshot and the restore.
+            #[test]
+            fn hidden_read_changes_the_terminal_only_inside_the_trapped_child() {
+                let source = fs::read_to_string(TS_HELPER).unwrap();
+                let echo_off: Vec<&str> = source
+                    .lines()
+                    .filter(|line| line.contains("stty -echo"))
+                    .collect();
+                assert_eq!(
+                    echo_off.len(),
+                    1,
+                    "expected exactly one `stty -echo` line: {echo_off:?}"
+                );
+                let line = echo_off[0];
+                assert!(
+                    line.contains("trap '") && line.contains("EXIT INT TERM"),
+                    "`stty -echo` is not on the trapped child line: {line}"
+                );
+                assert!(
+                    line.find("trap").unwrap() < line.find("stty -echo").unwrap(),
+                    "the trap must be installed before echo goes off: {line}"
+                );
+                for line in source
+                    .lines()
+                    .filter(|line| line.contains("execFileSync(\"stty\""))
+                {
+                    assert!(
+                        line.contains("[\"-g\"]") || line.contains("[mode]"),
+                        "parent-side stty call carries a literal mode: {line}"
+                    );
+                }
+                let parent_echo_off: Vec<&str> = source
+                    .lines()
+                    .filter(|line| line.contains("stty(tty, \"-echo\")"))
+                    .collect();
+                assert!(
+                    parent_echo_off.is_empty(),
+                    "the parent must not turn echo off itself: {parent_echo_off:?}"
                 );
             }
         }
