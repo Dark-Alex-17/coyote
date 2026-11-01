@@ -1,0 +1,28 @@
+---
+source: src/tui/mod.rs
+expression: narrow.clone()
+---
+"> explain                               "
+"                                        "
+"A first paragraph long enough to wrap   "
+"when the screen is narrow, which is what"
+"a resize does to it.                    "
+"                                        "
+"• one bullet                            "
+"• two bullets                           "
+"                                        "
+"A closing line.                         "
+"                                        "
+"checkpoint saved                        "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+" Type a prompt or a .command; Enter send"
+"                                        "
+"                                        "
+"openai:test-model . no session . agents "

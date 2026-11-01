@@ -1,0 +1,24 @@
+---
+source: src/tui/mod.rs
+expression: rendered
+---
+"> run the tool                                              "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"                                                            "
+"Working . 0s  Esc to interrupt                              "
+"hello                                                       "
+"                                                            "
+"                                                            "
+"openai:test-model . no session . agents 0 . jobs 0          "

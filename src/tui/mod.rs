@@ -795,7 +795,7 @@ impl App {
         frame.render_widget(
             FooterBar {
                 left: self.footer.text(),
-                right: self.usage.clone(),
+                right: render::styled_line(&self.usage),
             },
             footer,
         );
@@ -839,7 +839,7 @@ impl Widget for StatusStrip {
 
 struct FooterBar {
     left: String,
-    right: String,
+    right: Line<'static>,
 }
 
 impl Widget for FooterBar {
@@ -849,8 +849,8 @@ impl Widget for FooterBar {
             return;
         }
         Paragraph::new(Line::from(Span::styled(self.left, DIM))).render(area, buf);
-        if !self.right.is_empty() {
-            Paragraph::new(Line::from(Span::styled(self.right, DIM)))
+        if self.right.width() > 0 {
+            Paragraph::new(self.right.patch_style(DIM))
                 .right_aligned()
                 .render(area, buf);
         }
@@ -1224,5 +1224,604 @@ async fn run_loop(
         {
             task = Some(Task::Exit(spawn_exit(ctx, abort.clone())));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::{ClientConfig, Model};
+    use crate::config::{AppState, Session, SessionScope, WorkingMode};
+    use crate::events::Origin;
+    use crate::prompt::Prompter;
+    use crate::testing::TestConfigDirGuard;
+    use crossterm::event::{KeyCode, KeyModifiers};
+    use events::ManualClock;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use serial_test::serial;
+    use std::future::Future;
+
+    fn plain_config() -> Arc<AppConfig> {
+        Arc::new(AppConfig {
+            highlight: false,
+            ..Default::default()
+        })
+    }
+
+    fn chat_ctx() -> RequestContext {
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            dry_run: true,
+            highlight: false,
+            clients: vec![ClientConfig::default()],
+            memory: Some(false),
+            workspace_instructions: Some(false),
+            stream: true,
+            ..Default::default()
+        });
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Repl);
+        ctx.model = Model::new("openai", "test-model");
+        ctx
+    }
+
+    struct Harness {
+        clock: Arc<ManualClock>,
+        app: App,
+        terminal: Terminal<TestBackend>,
+    }
+
+    impl Harness {
+        fn new(width: u16, height: u16, config: Arc<AppConfig>, footer: FooterInfo) -> Self {
+            let clock = Arc::new(ManualClock::new());
+            let app = App::new(
+                Arc::clone(&clock) as Arc<dyn Clock>,
+                config,
+                Arc::new(PromptMemory::default()),
+                footer,
+            )
+            .unwrap();
+            let terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            Self {
+                clock,
+                app,
+                terminal,
+            }
+        }
+
+        fn standalone(width: u16, height: u16) -> Self {
+            let footer = FooterInfo {
+                model: "openai:test-model".to_string(),
+                ..FooterInfo::default()
+            };
+            Self::new(width, height, plain_config(), footer)
+        }
+
+        fn for_ctx(ctx: &RequestContext) -> Self {
+            Self::new(
+                80,
+                24,
+                Arc::clone(&ctx.app.config),
+                FooterInfo::from_ctx(ctx),
+            )
+        }
+
+        fn render(&mut self) {
+            self.terminal.draw(|frame| self.app.render(frame)).unwrap();
+        }
+
+        /// `TestBackend` cannot print a zero-width buffer, so the tiny
+        /// screens go through `render` instead.
+        fn draw(&mut self) -> String {
+            self.render();
+            self.terminal.backend().to_string()
+        }
+
+        fn resize(&mut self, width: u16, height: u16) {
+            self.terminal.backend_mut().resize(width, height);
+            self.app.handle_input(TermInput::Resize);
+        }
+
+        fn press(&mut self, code: KeyCode) -> Option<Command> {
+            self.app.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
+        }
+
+        fn type_text(&mut self, text: &str) {
+            for c in text.chars() {
+                self.press(KeyCode::Char(c));
+            }
+        }
+    }
+
+    /// Seats the UI's sink and prompter on `ctx` the way `run` does and
+    /// hands back the loop's inbox.
+    fn seat_tui(ctx: &mut RequestContext) -> (UnboundedSender<UiMsg>, UnboundedReceiver<UiMsg>) {
+        let (tx, rx) = unbounded_channel();
+        ctx.ui = Arc::new(TuiSink::new(tx.clone()));
+        ctx.prompter = Arc::new(TuiPrompter::new(
+            tx.clone(),
+            Arc::new(AtomicBool::new(false)),
+        ));
+        (tx, rx)
+    }
+
+    fn confirm_request(tool: Option<&str>) -> PromptRequest {
+        PromptRequest {
+            tool: tool.map(str::to_string),
+            ..PromptRequest::new(
+                PromptAction::Confirm,
+                "Proceed? tui-x7x",
+                Origin::detached(),
+            )
+        }
+    }
+
+    /// Asks through the prompter on its own thread, the way a tool would,
+    /// and delivers the request to the app.
+    fn ask_on_a_thread(
+        harness: &mut Harness,
+        req: PromptRequest,
+    ) -> std::thread::JoinHandle<Result<PromptAnswer>> {
+        let (tx, mut rx) = unbounded_channel();
+        let prompter = TuiPrompter::new(tx, Arc::new(AtomicBool::new(false)));
+        let asker = std::thread::spawn(move || prompter.prompt(req));
+        let msg = rx.blocking_recv().expect("the prompter sends the request");
+        harness.app.handle_msg(msg);
+        asker
+    }
+
+    fn duplicated_adjacent_rows(rendered: &str) -> usize {
+        let rows: Vec<&str> = rendered
+            .lines()
+            .map(str::trim_end)
+            .filter(|row| !row.trim_matches(['"', ' ']).is_empty())
+            .collect();
+        rows.windows(2).filter(|pair| pair[0] == pair[1]).count()
+    }
+
+    /// Drives a turn on a runtime whose workers have the stack headroom
+    /// `run_repl_command` needs in debug builds; a default 2 MiB worker
+    /// overflows and aborts the whole test binary.
+    fn run_async<F>(f: F) -> F::Output
+    where
+        F: Future + Send,
+        F::Output: Send,
+    {
+        const STACK: usize = 8 * 1024 * 1024;
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(STACK)
+                .spawn_scoped(scope, || {
+                    tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(2)
+                        .thread_stack_size(STACK)
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(f)
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+        })
+    }
+
+    #[test]
+    fn text_deltas_grow_the_live_reply_in_place() {
+        let mut harness = Harness::standalone(80, 24);
+        harness
+            .app
+            .handle_msg(UiMsg::UsageUpdated("\x1b[36m[low] \x1b[0m".to_string()));
+        harness.app.begin_turn("tell me a story", false);
+        for (i, delta) in [
+            "Once upon a **time**",
+            " there was a paragraph.\n\nThen a second one,",
+            " still arriving.",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            harness.app.handle_msg(UiMsg::TextDelta(delta.to_string()));
+            let rendered = harness.draw();
+            insta::assert_snapshot!(format!("text_delta_{}", i + 1), rendered);
+        }
+        assert_eq!(harness.app.cells.len(), 2);
+        assert!(matches!(
+            &harness.app.cells[1],
+            Cell::Assistant { source, done: false, .. }
+                if source.ends_with("second one, still arriving.")
+        ));
+        harness.app.handle_msg(UiMsg::StreamDone);
+        assert!(matches!(
+            &harness.app.cells[1],
+            Cell::Assistant { done: true, .. }
+        ));
+    }
+
+    /// The harness reports from other test threads land in the fd capture
+    /// too, so the captured text is dropped before the final frame.
+    #[test]
+    #[serial]
+    fn a_dry_run_turn_streams_into_the_transcript() {
+        run_async(async {
+            let mut ctx = chat_ctx();
+            let (tx, mut rx) = seat_tui(&mut ctx);
+            let mut harness = Harness::for_ctx(&ctx);
+            harness.app.begin_turn("hello", false);
+            let mut handle = spawn_turn(ctx, create_abort_signal(), "hello".to_string(), tx);
+
+            let mut first_delta = None;
+            let (mut returned, outcome) = loop {
+                tokio::select! {
+                    biased;
+                    Some(msg) = rx.recv() => {
+                        let delta = matches!(msg, UiMsg::TextDelta(_));
+                        harness.app.handle_msg(msg);
+                        if delta {
+                            let rendered = harness.draw();
+                            if first_delta.is_none() {
+                                first_delta = Some(rendered);
+                            }
+                        }
+                    }
+                    joined = &mut handle => break joined.unwrap(),
+                }
+            };
+            while let Ok(msg) = rx.try_recv() {
+                harness.app.handle_msg(msg);
+            }
+            let first_delta = first_delta.expect("the dry run streamed at least one delta");
+            insta::assert_snapshot!("stream_first_delta", first_delta);
+
+            assert!(!outcome.exit);
+            assert_eq!(outcome.error, None);
+            harness.app.end_turn(
+                "hello",
+                false,
+                &TurnOutcome {
+                    captured: String::new(),
+                    ..outcome
+                },
+            );
+            harness.app.sync_from_ctx(&mut returned);
+            let final_frame = harness.draw();
+            insta::assert_snapshot!("stream_final", final_frame.clone());
+            assert_ne!(first_delta, final_frame);
+            assert!(matches!(
+                harness.app.cells.last(),
+                Some(Cell::Assistant { source, done: true, .. }) if source.contains("hello")
+            ));
+        });
+    }
+
+    /// Under the test harness `print!` is diverted into libtest's own
+    /// buffer before it reaches fd 1, so the command's text cannot be seen
+    /// here; the pty test on the binary pins that. This pins the turn's
+    /// shape: it runs the REPL command, ends clean and leaves one cell.
+    #[test]
+    #[serial]
+    fn a_command_turn_becomes_one_preformatted_cell() {
+        run_async(async {
+            let _guard = TestConfigDirGuard::new("tui-info");
+            let mut ctx = chat_ctx();
+            let (tx, mut rx) = seat_tui(&mut ctx);
+            let mut harness = Harness::for_ctx(&ctx);
+            harness.app.begin_turn(".info", true);
+            let (mut returned, outcome) =
+                spawn_turn(ctx, create_abort_signal(), ".info".to_string(), tx)
+                    .await
+                    .unwrap();
+            while let Ok(msg) = rx.try_recv() {
+                harness.app.handle_msg(msg);
+            }
+            assert_eq!(outcome.error, None);
+            harness.app.end_turn(".info", true, &outcome);
+            harness.app.sync_from_ctx(&mut returned);
+
+            let commands: Vec<&Cell> = harness
+                .app
+                .cells
+                .iter()
+                .filter(|cell| matches!(cell, Cell::Command { .. }))
+                .collect();
+            assert_eq!(commands.len(), 1);
+            let Cell::Command { name, .. } = commands[0] else {
+                unreachable!()
+            };
+            assert_eq!(name, ".info");
+            assert!(harness.app.turn.is_none());
+            let rendered = harness.draw();
+            assert!(rendered.contains("> .info"), "{rendered}");
+        });
+    }
+
+    /// A command's output is painted as it came: an aligned column stays
+    /// aligned and a row wider than the screen is clipped, not wrapped.
+    #[test]
+    fn command_output_keeps_its_columns_and_clips() {
+        let mut harness = Harness::standalone(100, 30);
+        harness.app.begin_turn(".info", true);
+        let wide = "x".repeat(120);
+        let output = format!(
+            "model                         openai:test-model\n\
+             temperature                   -\n\
+             \x1b[1mbold_key\x1b[0m                      value\n\
+             {wide}\n"
+        );
+        harness.app.end_turn(
+            ".info",
+            true,
+            &TurnOutcome {
+                exit: false,
+                error: None,
+                captured: output,
+            },
+        );
+        let rendered = harness.draw();
+        insta::assert_snapshot!("info_command_cell_100x30", rendered.clone());
+        assert!(rendered.contains("\"model                         openai:test-model"));
+        assert_eq!(duplicated_adjacent_rows(&rendered), 0);
+    }
+
+    #[test]
+    #[serial]
+    fn exit_session_asks_to_save_through_the_modal() {
+        run_async(async {
+            let guard = TestConfigDirGuard::new("tui-exit");
+            let mut ctx = chat_ctx();
+            let (tx, mut rx) = seat_tui(&mut ctx);
+            let mut session = Session::default();
+            session.set_name("tui-exit-x7x".to_string());
+            session.set_save_session(None);
+            session.mark_dirty();
+            ctx.session = Some(session);
+            let sessions_dir = ctx.sessions_dir_for(SessionScope::Global);
+            assert!(sessions_dir.starts_with(&guard.path));
+            let mut harness = Harness::for_ctx(&ctx);
+            harness.app.begin_turn(".exit session", true);
+            let mut handle =
+                spawn_turn(ctx, create_abort_signal(), ".exit session".to_string(), tx);
+
+            loop {
+                tokio::select! {
+                    biased;
+                    Some(msg) = rx.recv() => {
+                        let prompt = matches!(msg, UiMsg::Prompt { .. });
+                        harness.app.handle_msg(msg);
+                        if prompt {
+                            break;
+                        }
+                    }
+                    joined = &mut handle => panic!("the turn ended without asking: {:?}", joined.unwrap().1),
+                }
+            }
+            let prompt = harness.app.prompts.front().unwrap();
+            assert_eq!(prompt.req.question, "Save session?");
+            assert_eq!(
+                prompt.kind(),
+                ModalKind::Confirm {
+                    default: false,
+                    tool: false
+                }
+            );
+            insta::assert_snapshot!("exit_session_save_modal", harness.draw());
+
+            harness.clock.advance(HOTKEY_IDLE);
+            assert_eq!(harness.press(KeyCode::Char('y')), None);
+            assert!(harness.app.prompts.is_empty());
+            let (_returned, outcome) = handle.await.unwrap();
+            assert!(!outcome.exit);
+            assert_eq!(outcome.error, None);
+            assert!(
+                sessions_dir.join("tui-exit-x7x.yaml").is_file(),
+                "{outcome:?}"
+            );
+        });
+    }
+
+    /// A tool sleeping on the work task never stalls the composer: keys
+    /// and a resize are handled and drawn while the tool is still running.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn the_composer_stays_responsive_while_a_tool_sleeps() {
+        run_async(async {
+            use crate::function::{ToolIo, run_llm_function};
+            use std::collections::HashMap;
+            use std::fs;
+            use std::os::unix::fs::PermissionsExt;
+
+            let _guard = TestConfigDirGuard::new("tui-sleep");
+            let bin = crate::config::paths::functions_bin_dir();
+            fs::create_dir_all(&bin).unwrap();
+            let tool = bin.join("sleep_x7x");
+            fs::write(&tool, "#!/usr/bin/env bash\nsleep 2\n").unwrap();
+            fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+
+            let (tx, _rx) = unbounded_channel();
+            let mut harness = Harness::standalone(80, 24);
+            harness.app.begin_turn("run the tool", false);
+            let started = Instant::now();
+            let handle = tokio::task::spawn_blocking(move || {
+                run_llm_function(
+                    "sleep_x7x".to_string(),
+                    vec![],
+                    HashMap::from([("TERM".to_string(), "dumb".to_string())]),
+                    None,
+                    None,
+                    ToolIo::new(Arc::new(TuiSink::new(tx)), None, 0),
+                    None,
+                )
+            });
+
+            harness.type_text("hello");
+            harness.draw();
+            harness.resize(60, 20);
+            let rendered = harness.draw();
+            let typed_at = started.elapsed();
+            assert!(!handle.is_finished(), "the tool finished in {typed_at:?}");
+            assert!(typed_at < Duration::from_secs(2), "{typed_at:?}");
+            assert_eq!(harness.app.composer_text(), "hello");
+            insta::assert_snapshot!("sleeping_tool_composer_responsive", rendered);
+
+            handle.await.unwrap().unwrap();
+            assert!(started.elapsed() >= Duration::from_secs(2));
+        });
+    }
+
+    #[test]
+    fn confirm_modal_hotkeys_answer_the_asking_thread() {
+        for (key, expected) in [
+            (KeyCode::Char('y'), PromptAnswer::Confirmed(true)),
+            (KeyCode::Char('n'), PromptAnswer::Confirmed(false)),
+            (KeyCode::Esc, PromptAnswer::Cancelled),
+            (KeyCode::Enter, PromptAnswer::Confirmed(true)),
+        ] {
+            let mut harness = Harness::standalone(80, 24);
+            let asker = ask_on_a_thread(&mut harness, confirm_request(None));
+            assert_eq!(harness.press(key), None);
+            assert_eq!(asker.join().unwrap().unwrap(), expected, "{key:?}");
+            assert!(harness.app.prompts.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_hotkey_right_after_typing_is_not_an_answer() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.type_text("draft");
+        let asker = ask_on_a_thread(&mut harness, confirm_request(None));
+        harness.clock.advance(Duration::from_millis(200));
+        assert_eq!(harness.press(KeyCode::Char('y')), None);
+        assert_eq!(harness.app.prompts.len(), 1);
+        assert!(!asker.is_finished());
+        harness.clock.advance(Duration::from_millis(800));
+        assert_eq!(harness.press(KeyCode::Char('y')), None);
+        assert_eq!(
+            asker.join().unwrap().unwrap(),
+            PromptAnswer::Confirmed(true)
+        );
+        assert_eq!(harness.app.composer_text(), "draft");
+    }
+
+    #[test]
+    fn yes_for_this_session_answers_and_is_remembered_for_the_tool() {
+        let mut harness = Harness::standalone(80, 24);
+        let req = confirm_request(Some("fs_write"));
+        assert_eq!(harness.app.prompt_memory.auto_answer(&req), None);
+        let asker = ask_on_a_thread(&mut harness, req.clone());
+        assert!(harness.draw().contains("tool: fs_write"));
+        assert_eq!(harness.press(KeyCode::Char('a')), None);
+        assert_eq!(
+            asker.join().unwrap().unwrap(),
+            PromptAnswer::Confirmed(true)
+        );
+        assert_eq!(harness.app.prompt_memory.auto_answer(&req), Some(true));
+    }
+
+    #[test]
+    fn an_input_modal_types_into_its_own_field_and_sends_it() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.type_text("draft");
+        let req = PromptRequest::new(PromptAction::Input, "Session name:", Origin::detached());
+        let asker = ask_on_a_thread(&mut harness, req);
+        harness.type_text("notes");
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert_eq!(
+            asker.join().unwrap().unwrap(),
+            PromptAnswer::Text("notes".to_string())
+        );
+        assert_eq!(harness.app.composer_text(), "draft");
+    }
+
+    #[test]
+    fn unsupported_prompt_kinds_are_cancelled_at_once() {
+        let mut harness = Harness::standalone(80, 24);
+        let req = PromptRequest::new(PromptAction::Select, "Pick one", Origin::detached());
+        let asker = ask_on_a_thread(&mut harness, req);
+        assert_eq!(asker.join().unwrap().unwrap(), PromptAnswer::Cancelled);
+        assert!(harness.app.prompts.is_empty());
+        assert!(matches!(
+            harness.app.cells.last(),
+            Some(Cell::Notice {
+                kind: NoticeKind::ToolWarning,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_resize_and_back_reflows_without_duplicating_rows() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("explain", false);
+        harness.app.handle_msg(UiMsg::TextDelta(
+            "A first paragraph long enough to wrap when the screen is narrow, which is \
+             what a resize does to it.\n\n- one bullet\n- two bullets\n\nA closing line."
+                .to_string(),
+        ));
+        harness.app.handle_msg(UiMsg::StreamDone);
+        harness
+            .app
+            .end_turn("explain", false, &TurnOutcome::default());
+        harness.app.handle_msg(UiMsg::Notice {
+            kind: NoticeKind::Checkpoint,
+            text: "checkpoint saved".to_string(),
+        });
+
+        let wide = harness.draw();
+        insta::assert_snapshot!("resize_80x24", wide.clone());
+        harness.resize(40, 24);
+        let narrow = harness.draw();
+        insta::assert_snapshot!("resize_40x24", narrow.clone());
+        harness.resize(80, 24);
+        let wide_again = harness.draw();
+
+        assert_eq!(wide, wide_again);
+        assert_ne!(wide, narrow);
+        assert_eq!(duplicated_adjacent_rows(&wide), 0, "{wide}");
+        assert_eq!(duplicated_adjacent_rows(&narrow), 0, "{narrow}");
+    }
+
+    #[test]
+    fn every_widget_survives_a_tiny_screen() {
+        for (width, height) in [(1, 1), (0, 0), (3, 2)] {
+            let mut harness = Harness::standalone(width, height);
+            harness.app.begin_turn("hi", false);
+            harness
+                .app
+                .handle_msg(UiMsg::TextDelta("reply".to_string()));
+            harness
+                .app
+                .handle_msg(UiMsg::UsageUpdated("12 tokens".to_string()));
+            harness.render();
+            let _asker = ask_on_a_thread(&mut harness, confirm_request(Some("fs_write")));
+            harness.render();
+            harness.press(KeyCode::Esc);
+        }
+    }
+
+    #[test]
+    fn the_footer_strips_the_right_prompt_colours() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.handle_msg(UiMsg::UsageUpdated(
+            "\x1b[36m[low] \x1b[35m$0.0012 \x1b[0m".to_string(),
+        ));
+        let rendered = harness.draw();
+        assert!(rendered.contains("[low] $0.0012"), "{rendered}");
+        assert!(!rendered.contains('\x1b'), "{rendered:?}");
+    }
+
+    #[test]
+    fn a_pending_prefill_lands_in_the_composer_on_idle_return() {
+        let mut ctx = chat_ctx();
+        ctx.pending_prefill = Some("edited line".to_string());
+        let mut harness = Harness::for_ctx(&ctx);
+        harness.app.sync_from_ctx(&mut ctx);
+        assert_eq!(harness.app.composer_text(), "edited line");
+        assert_eq!(ctx.pending_prefill, None);
+        assert_eq!(
+            harness.press(KeyCode::Enter),
+            Some(Command::Submit("edited line".to_string()))
+        );
+        assert_eq!(harness.app.composer_text(), "");
     }
 }

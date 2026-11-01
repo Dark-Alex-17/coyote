@@ -1,0 +1,28 @@
+---
+source: src/tui/mod.rs
+expression: rendered
+---
+"> tell me a story                                                               "
+"                                                                                "
+"Once upon a time                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"Working . 0s  Esc to interrupt                                                  "
+" Type a prompt or a .command; Enter sends                                       "
+"                                                                                "
+"                                                                                "
+"openai:test-model . no session . agents 0 . jobs 0                        [low] "

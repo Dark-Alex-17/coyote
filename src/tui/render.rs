@@ -122,6 +122,15 @@ pub(crate) fn preformatted_lines(output: &str) -> Vec<Line<'static>> {
     styled_lines(&sanitize_ansi(output.trim_end_matches(['\n', '\r'])))
 }
 
+/// The first line of already-painted text; the footer's usage readout
+/// comes from the REPL's right prompt with its colours still in.
+pub(crate) fn styled_line(ansi: &str) -> Line<'static> {
+    preformatted_lines(ansi)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+}
+
 /// The REPL's markdown renderer kept warm between frames.
 pub(crate) struct Renderer {
     markdown: MarkdownRender,

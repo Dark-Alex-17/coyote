@@ -1,0 +1,28 @@
+---
+source: src/tui/mod.rs
+expression: harness.draw()
+---
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"Working . 0s  Esc to interrupt                                                  "
+"Save session?                                                                   "
+"                                                                                "
+"y = yes  n = no  a = yes for this session (tool prompts only)  Esc = cancel     "
+"openai:test-model . tui-exit-x7x . agents 0 . jobs 0                            "
