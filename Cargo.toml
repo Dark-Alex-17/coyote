@@ -152,6 +152,16 @@ arboard = { version = "3.3.0", default-features = false }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_System_Pipes",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Console",
+  "Win32_Security",
+  "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 ctor = "1.0.13"
 insta = { version = "1", features = ["yaml"] }
