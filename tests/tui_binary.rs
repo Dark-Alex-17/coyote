@@ -707,25 +707,19 @@ fn exit_session_shows_the_save_modal_and_saves_on_y() {
     pty.read_for(Duration::from_millis(800));
     pty.send(b".exit session\r").unwrap();
     pty.wait_for("Save session?", PTY_DEADLINE).unwrap();
-    // A bare hotkey only counts after 1 s of typing idle, so a `y` on the
-    // heels of the Enter that opened the modal is dropped and the modal
-    // stays up ...
-    pty.send(b"y").unwrap();
-    let early = pty.read_for(Duration::from_millis(600));
-    assert!(
-        !early.contains("ession name"),
-        "a hotkey inside the typing-idle gap was accepted:\n{early}"
-    );
-    // ... while the same key after the gap answers it. (Ratatui repaints
-    // only changed cells, so the modal title's unchanged `S` is absent
-    // from the stream.)
-    std::thread::sleep(Duration::from_millis(900));
+    // A bare hotkey only counts once typing has been idle for a second
+    // (pinned by the ManualClock unit test), so wait the gap out before
+    // answering. Ratatui repaints only changed cells, so the modal
+    // title's unchanged `S` is absent from the stream.
+    pty.read_for(Duration::from_millis(1200));
     pty.send(b"y").unwrap();
     pty.wait_for("ession name", PTY_DEADLINE).unwrap();
-    std::thread::sleep(Duration::from_millis(300));
+    let named_at = pty.raw().len();
     pty.send(b"probe-saved\r").unwrap();
-    pty.wait_for("no session", PTY_DEADLINE).unwrap();
-    std::thread::sleep(Duration::from_millis(300));
+    // The footer said "no session" at startup too; only a fresh one means
+    // the session was written and closed.
+    pty.wait_for_after("no session", named_at, PTY_DEADLINE)
+        .unwrap();
     pty.send(b"\x04").unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
