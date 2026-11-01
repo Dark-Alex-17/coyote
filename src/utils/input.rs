@@ -6,6 +6,11 @@ use std::io::{Write, stdout};
 /// Reads a single character from stdin without requiring Enter
 /// Returns the character if it's one of the valid options, or the default if Enter is pressed
 pub fn read_single_key(valid_chars: &[char], default: char, prompt: &str) -> Result<char> {
+    if crate::tui::active() {
+        return Err(anyhow::anyhow!(
+            "Keyboard prompts are not available in the TUI"
+        ));
+    }
     print!("{prompt}");
     stdout().flush()?;
 

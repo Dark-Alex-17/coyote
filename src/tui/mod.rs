@@ -1088,8 +1088,13 @@ fn edit_in_editor(editor: &str, text: &str) -> std::io::Result<String> {
 }
 
 /// Reads and drops whatever the terminal queued while the editor ran,
-/// including events still in flight when it exited.
-async fn flush_typeahead(stream: &mut EventStream) {
+/// including events still in flight when it exited. Gives up after
+/// `TYPEAHEAD_LIMIT` events so a stream that never goes quiet cannot hold
+/// the loop.
+async fn flush_typeahead<S>(stream: &mut S)
+where
+    S: futures_util::Stream<Item = std::io::Result<crossterm::event::Event>> + Unpin,
+{
     for _ in 0..TYPEAHEAD_LIMIT {
         let drained = tokio::time::timeout(TYPEAHEAD_GRACE, stream.next()).await;
         if !drained.is_ok_and(|event| event.is_some()) {
@@ -1642,6 +1647,46 @@ mod tests {
         });
     }
 
+    /// The `.info` listing reaches its cell as printed: label column,
+    /// value column, model row first. (Under libtest the turn's `print!`
+    /// never reaches the fd capture, so the listing is taken from the
+    /// context directly; the pty case pins the capture on the binary.)
+    #[test]
+    #[serial]
+    fn the_info_listing_keeps_its_rows_in_the_command_cell() {
+        let _guard = TestConfigDirGuard::new("tui-info-rows");
+        let ctx = chat_ctx();
+        let info = ctx.info(&ctx.app.config).unwrap();
+        let model_row = info
+            .lines()
+            .find(|row| row.starts_with("model "))
+            .expect("the listing has a model row");
+        assert!(model_row.contains("openai:test-model"), "{model_row:?}");
+
+        // Tall enough to hold the whole listing, so no row scrolls off.
+        let mut harness = Harness::new(
+            100,
+            80,
+            Arc::clone(&ctx.app.config),
+            FooterInfo::from_ctx(&ctx),
+        );
+        harness.app.begin_turn(".info", true);
+        harness.app.end_turn(
+            ".info",
+            true,
+            &TurnOutcome {
+                captured: info.clone(),
+                ..TurnOutcome::default()
+            },
+        );
+        let Some(Cell::Command { output, .. }) = harness.app.cells.last() else {
+            panic!("the command turn left no Command cell");
+        };
+        assert_eq!(output, &info);
+        let rendered = harness.draw();
+        assert!(rendered.contains(model_row), "{rendered}");
+    }
+
     /// A command's output is painted as it came: an aligned column stays
     /// aligned and a row wider than the screen is clipped, not wrapped.
     #[test]
@@ -2068,6 +2113,19 @@ mod tests {
         ));
     }
 
+    /// Thinking events reach the status row through the sink, the same
+    /// way the tool hooks do.
+    #[test]
+    fn thinking_events_pass_through_the_sink() {
+        let (tx, mut rx) = unbounded_channel();
+        let sink = TuiSink::new(tx);
+        sink.on_event(&Event::ThinkingStarted);
+        assert!(matches!(rx.try_recv(), Ok(UiMsg::ThinkingStarted)));
+        sink.on_event(&Event::ThinkingStopped);
+        assert!(matches!(rx.try_recv(), Ok(UiMsg::ThinkingStopped)));
+        assert!(rx.try_recv().is_err());
+    }
+
     /// The final text of a reply is authoritative: it replaces whatever
     /// the stream had accumulated and closes the cell.
     #[test]
@@ -2196,12 +2254,307 @@ mod tests {
         harness.press(KeyCode::Esc);
     }
 
+    /// A terminal that never goes quiet cannot hold the loop after the
+    /// editor: the flush stops at its limit.
+    #[tokio::test]
+    async fn the_typeahead_flush_stops_at_its_limit() {
+        let mut polled = 0;
+        let mut stream = futures_util::stream::repeat_with(|| {
+            polled += 1;
+            Ok::<_, std::io::Error>(crossterm::event::Event::FocusGained)
+        });
+        flush_typeahead(&mut stream).await;
+        drop(stream);
+        assert_eq!(polled, TYPEAHEAD_LIMIT);
+    }
+
     fn fn_body<'a>(source: &'a str, signature: &str) -> &'a str {
         let start = source
             .find(signature)
             .unwrap_or_else(|| panic!("{signature} not found"));
         let body = &source[start..];
         &body[..body.find("\n}\n").unwrap()]
+    }
+
+    /// A `(file, function)` pair under `src/` whose body reads the
+    /// keyboard directly, with whether that body checks the TUI flag.
+    struct KeyboardReader {
+        file: String,
+        function: String,
+        gated: bool,
+    }
+
+    /// The name on a `fn` line, if the line declares one.
+    fn declared_fn(line: &str) -> Option<&str> {
+        let mut rest = line.trim_start();
+        if rest.starts_with("//") {
+            return None;
+        }
+        loop {
+            if let Some(after) = rest.strip_prefix("pub") {
+                rest = match after.strip_prefix('(') {
+                    Some(scoped) => &scoped[scoped.find(')')? + 1..],
+                    None => after,
+                }
+                .trim_start();
+            } else if let Some(after) = ["async ", "unsafe ", "const "]
+                .iter()
+                .find_map(|prefix| rest.strip_prefix(prefix))
+            {
+                rest = after;
+            } else {
+                break;
+            }
+        }
+        let name = rest.strip_prefix("fn ")?;
+        let end = name.find(['(', '<'])?;
+        Some(&name[..end])
+    }
+
+    /// Every direct keyboard read outside this module: crossterm's
+    /// `read`/`poll`, `read_single_key`, and inquire's prompt builders
+    /// (nothing else under `src/` constructs a `Text`, `Select` or the like).
+    fn keyboard_readers() -> Vec<KeyboardReader> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        fn at_word_start(line: &str, at: usize) -> bool {
+            line[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
+        }
+        const NEEDLES: [&str; 8] = [
+            "event::read(",
+            "event::poll(",
+            "read_single_key(",
+            "Confirm::new(",
+            "Select::new(",
+            "MultiSelect::new(",
+            "Text::new(",
+            "Password::new(",
+        ];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let src = root.join("src");
+        let mut files = Vec::new();
+        walk(&src, &mut files);
+        files.sort();
+        let mut readers: Vec<KeyboardReader> = Vec::new();
+        for path in files {
+            if path.starts_with(src.join("tui")) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            for (index, line) in lines.iter().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                let hit = NEEDLES.iter().any(|needle| {
+                    line.match_indices(needle)
+                        .any(|(at, _)| at_word_start(line, at))
+                });
+                if !hit {
+                    continue;
+                }
+                let fn_index = (0..=index)
+                    .rev()
+                    .find(|i| declared_fn(lines[*i]).is_some())
+                    .unwrap_or_else(|| {
+                        panic!("{}:{} is outside any fn", path.display(), index + 1)
+                    });
+                let fn_line = lines[fn_index];
+                let indent = &fn_line[..fn_line.len() - fn_line.trim_start().len()];
+                let close = format!("{indent}}}");
+                let body_end = (fn_index..lines.len())
+                    .find(|i| lines[*i] == close || (*i == fn_index && fn_line.ends_with('}')))
+                    .unwrap();
+                let body = lines[fn_index..=body_end].join("\n");
+                let file = path.strip_prefix(root).unwrap().display().to_string();
+                let function = declared_fn(fn_line).unwrap().to_string();
+                if readers
+                    .iter()
+                    .any(|r| r.file == file && r.function == function)
+                {
+                    continue;
+                }
+                readers.push(KeyboardReader {
+                    gated: body.contains("crate::tui::active()"),
+                    file,
+                    function,
+                });
+            }
+        }
+        readers
+    }
+
+    /// Every direct keyboard reader outside this module either checks the
+    /// TUI flag or is listed here with the reason it stays REPL-only, so a
+    /// new reader cannot appear without a decision about the TUI.
+    #[test]
+    fn every_direct_keyboard_reader_is_gated_or_accounted_for() {
+        const DIRECT_TTY: &str =
+            "reaches the tty directly; routing through ctx.prompter is a follow-up";
+        const BEFORE_UI: &str = "first-run config wizard; runs before any UI starts";
+        const CLI_ONLY: &str = "a CLI flow (-e, --mcp); the process never reaches a UI";
+        const REPL_PROMPTER: &str =
+            "the REPL's Prompter; the TUI seats TuiPrompter on ctx.prompter instead";
+        const VIA_GATE: &str = "calls read_single_key, which refuses under the TUI";
+        const REPL_PAINTER: &str =
+            "polled by the spinner and the REPL stream painter, both replaced under the TUI";
+        let allowlist: &[(&str, &str, &str)] = &[
+            (
+                "src/client/common.rs",
+                "create_openai_compatible_client_config",
+                BEFORE_UI,
+            ),
+            (
+                "src/client/common.rs",
+                "set_client_models_config",
+                BEFORE_UI,
+            ),
+            ("src/client/common.rs", "select_model", BEFORE_UI),
+            ("src/client/common.rs", "prompt_input_string", BEFORE_UI),
+            ("src/client/macros.rs", "create_client_config", BEFORE_UI),
+            ("src/config/agent.rs", "init", DIRECT_TTY),
+            ("src/config/agent.rs", "init_graph_rags", DIRECT_TTY),
+            ("src/config/bundles.rs", "resolve_bundle_name", DIRECT_TTY),
+            ("src/config/conflict.rs", "select_choice", DIRECT_TTY),
+            (
+                "src/config/install_remote.rs",
+                "resolve_obsolete",
+                DIRECT_TTY,
+            ),
+            (
+                "src/config/install_remote.rs",
+                "uninstall_bundle",
+                DIRECT_TTY,
+            ),
+            (
+                "src/config/install_remote.rs",
+                "select_uninstall_candidate",
+                DIRECT_TTY,
+            ),
+            (
+                "src/config/install_remote.rs",
+                "resolve_uninstall_action",
+                DIRECT_TTY,
+            ),
+            (
+                "src/config/install_remote.rs",
+                "resolve_mcp_conflict",
+                DIRECT_TTY,
+            ),
+            (
+                "src/config/install_remote.rs",
+                "prompt_for_each_secret",
+                DIRECT_TTY,
+            ),
+            ("src/config/mod.rs", "confirm_asset_overwrite", VIA_GATE),
+            ("src/config/mod.rs", "create_config_file", BEFORE_UI),
+            ("src/config/mod.rs", "create_config_file_sandbox", BEFORE_UI),
+            ("src/config/request_context.rs", "new_role", DIRECT_TTY),
+            ("src/config/request_context.rs", "save_role", DIRECT_TTY),
+            ("src/config/request_context.rs", "new_macro", DIRECT_TTY),
+            (
+                "src/config/request_context.rs",
+                "use_session_recording_rebuild",
+                DIRECT_TTY,
+            ),
+            ("src/config/update.rs", "run_self_update", DIRECT_TTY),
+            ("src/main.rs", "shell_execute", CLI_ONLY),
+            ("src/main.rs", "resolve_oauth_client", DIRECT_TTY),
+            ("src/mcp/manage.rs", "handle_remove", CLI_ONLY),
+            ("src/mcp/manage.rs", "handle_add", CLI_ONLY),
+            ("src/mcp/manage.rs", "provision_secrets", CLI_ONLY),
+            ("src/prompt/mod.rs", "select", REPL_PROMPTER),
+            ("src/prompt/mod.rs", "confirm", REPL_PROMPTER),
+            ("src/prompt/mod.rs", "prompt", REPL_PROMPTER),
+            ("src/rag/mod.rs", "attach", DIRECT_TTY),
+            ("src/rag/mod.rs", "sync_documents", DIRECT_TTY),
+            ("src/rag/mod.rs", "select_embedding_model", DIRECT_TTY),
+            ("src/rag/mod.rs", "select_rag_driver", DIRECT_TTY),
+            ("src/rag/mod.rs", "select_extractor_model", DIRECT_TTY),
+            ("src/rag/mod.rs", "set_chunk_size", DIRECT_TTY),
+            ("src/rag/mod.rs", "set_graph_hops", DIRECT_TTY),
+            ("src/rag/mod.rs", "set_chunk_overlay", DIRECT_TTY),
+            ("src/rag/mod.rs", "add_documents", DIRECT_TTY),
+            (
+                "src/rag/mod.rs",
+                "resolve_or_create_api_key_secret",
+                DIRECT_TTY,
+            ),
+            (
+                "src/repl/mod.rs",
+                "run_repl_command_with_prefix",
+                DIRECT_TTY,
+            ),
+            (
+                "src/utils/abort_signal.rs",
+                "drain_terminal_events",
+                REPL_PAINTER,
+            ),
+            ("src/vault/mod.rs", "add_secret", DIRECT_TTY),
+            ("src/vault/mod.rs", "update_secret", DIRECT_TTY),
+            (
+                "src/vault/utils.rs",
+                "create_vault_password_file",
+                DIRECT_TTY,
+            ),
+            ("src/vault/utils.rs", "prompt_provider_choice", DIRECT_TTY),
+            ("src/vault/utils.rs", "prompt_aws_provider", DIRECT_TTY),
+            ("src/vault/utils.rs", "prompt_gcp_provider", DIRECT_TTY),
+            ("src/vault/utils.rs", "prompt_azure_provider", DIRECT_TTY),
+            ("src/vault/utils.rs", "prompt_gopass_provider", DIRECT_TTY),
+            (
+                "src/vault/utils.rs",
+                "prompt_one_password_provider",
+                DIRECT_TTY,
+            ),
+        ];
+        let readers = keyboard_readers();
+        assert!(!readers.is_empty());
+        let unaccounted: Vec<String> = readers
+            .iter()
+            .filter(|r| !r.gated)
+            .filter(|r| {
+                !allowlist
+                    .iter()
+                    .any(|(file, function, _)| *file == r.file && *function == r.function)
+            })
+            .map(|r| format!("{}:{}", r.file, r.function))
+            .collect();
+        assert!(
+            unaccounted.is_empty(),
+            "keyboard readers neither gated on crate::tui::active() nor allowlisted:\n{}",
+            unaccounted.join("\n")
+        );
+        let stale: Vec<String> = allowlist
+            .iter()
+            .filter(|(file, function, _)| {
+                !readers
+                    .iter()
+                    .any(|r| r.file == *file && r.function == *function && !r.gated)
+            })
+            .map(|(file, function, _)| format!("{file}:{function}"))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "allowlist entries with no matching ungated reader:\n{}",
+            stale.join("\n")
+        );
+        assert!(
+            readers.iter().any(|r| r.file == "src/utils/input.rs"
+                && r.function == "read_single_key"
+                && r.gated)
+        );
     }
 
     /// The two stdin readers outside this module stand down while the UI

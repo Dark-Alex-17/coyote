@@ -625,6 +625,59 @@ fn an_editor_shell_out_comes_back_to_a_repainted_screen() {
     assert_tty_restored(&transcript);
 }
 
+/// While the editor is up the keyboard is the editor's: the event stream
+/// is stopped before the terminal is released and only restarted after
+/// the editor returns. A line typed into an editor that reads the tty
+/// comes back through the file into the composer, once; none of it is
+/// replayed into the composer as typeahead or submitted as a prompt.
+#[test]
+#[serial]
+fn keys_typed_while_the_editor_runs_reach_the_editor_not_the_composer() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = fresh_config_dir("editor-typeahead");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let editor = dir.join("line-editor.sh");
+    fs::write(
+        &editor,
+        "#!/bin/sh\nIFS= read -r line </dev/tty\nprintf '%s' \"$line\" > \"$1\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&editor, fs::Permissions::from_mode(0o755)).unwrap();
+    let editor = editor.to_str().unwrap();
+    let mut pty = spawn_tui(&dir, &[("EDITOR", editor), ("VISUAL", editor)]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let before = pty.raw().len();
+    pty.send(b"\x0f").unwrap();
+    let left = pty
+        .wait_for_raw(LEAVE_ALT, before, PTY_DEADLINE)
+        .expect("Ctrl-O did not release the terminal for the editor");
+    // Raw mode is switched off a few syscalls after the leave sequence is
+    // written; a line sent before that misses the line discipline and the
+    // editor's read never ends.
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b"typed-x7x\r").unwrap();
+    let re_entered = wait_for_re_entry(&mut pty, left);
+    pty.wait_for_after("typed-x7x", re_entered, PTY_DEADLINE)
+        .expect("the edited line did not come back into the composer");
+    pty.read_for(Duration::from_millis(500));
+    let since_re_entry = strip_ansi(&String::from_utf8_lossy(&pty.raw()[re_entered..]));
+    assert_eq!(
+        since_re_entry.matches("typed-x7x").count(),
+        1,
+        "the typed line was painted more than once after the editor returned \
+         (replayed as typeahead or submitted):\n{since_re_entry}"
+    );
+    assert!(!since_re_entry.contains("Working"), "{since_re_entry}");
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
 /// The dry-run model echoes the role prompt plus the user's text, so a
 /// markdown prompt comes back rendered: `**zebra**` loses its asterisks and
 /// the inline code its backticks. Ratatui's diffing paints words with
