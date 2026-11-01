@@ -309,6 +309,196 @@ fn typescript_password_without_channel_hides_the_typed_text() {
     );
 }
 
+/// Both script helpers restore the terminal's echo flag once `password`
+/// has read its line: the probe reads the secret the moment the prompt
+/// shows, then the wrapper reports `stty -a` on the same terminal.
+#[test]
+fn python_password_restores_echo_after_the_read() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = fresh_config_dir("tty-py-password-restore");
+    let _guard = TempDirGuard(dir.clone());
+    let driver = dir.join("driver.py");
+    fs::write(&driver, python_password_driver("pw-py-r3s")).unwrap();
+    let transcript = run_password_in_pty(
+        &format!("python3 \"{}\" \"{PY_HELPER}\"", driver.display()),
+        "pw-py-r3s",
+        |pty| pty.send(b"hunter2zq\n"),
+    );
+    assert!(
+        transcript.contains("password-length=9"),
+        "password did not return the typed text:\n{transcript}"
+    );
+    assert!(
+        !transcript.contains("hunter2zq"),
+        "password echoed the typed text on the terminal:\n{transcript}"
+    );
+    assert_echo_restored(&transcript);
+}
+
+#[test]
+fn typescript_password_restores_echo_after_the_read() {
+    let Some(runtime) = ts_runtime() else {
+        return;
+    };
+    let dir = fresh_config_dir("tty-ts-password-restore");
+    let _guard = TempDirGuard(dir.clone());
+    let helper = dir.join("prompt-utils.ts");
+    fs::copy(TS_HELPER, &helper).unwrap();
+    let driver = dir.join("driver.ts");
+    fs::write(&driver, typescript_password_driver("pw-ts-r3s")).unwrap();
+    let transcript = run_password_in_pty(
+        &format!(
+            "NODE_NO_WARNINGS=1 {runtime} \"{}\" \"{}\"",
+            driver.display(),
+            helper.display()
+        ),
+        "pw-ts-r3s",
+        |pty| pty.send(b"hunter2zq\n"),
+    );
+    assert!(
+        transcript.contains("password-length=9"),
+        "password did not return the typed text:\n{transcript}"
+    );
+    assert!(
+        !transcript.contains("hunter2zq"),
+        "password echoed the typed text on the terminal:\n{transcript}"
+    );
+    assert_echo_restored(&transcript);
+}
+
+/// Ctrl-C while `password` waits must not leave the terminal with echo
+/// off: whatever turned echo off for the read has to turn it back on when
+/// the read is interrupted, as bash's `read -s` and Python's getpass do.
+#[test]
+fn python_password_restores_echo_after_ctrl_c() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = fresh_config_dir("tty-py-password-intr");
+    let _guard = TempDirGuard(dir.clone());
+    let driver = dir.join("driver.py");
+    fs::write(&driver, python_password_driver("pw-py-1nt")).unwrap();
+    let transcript = run_password_in_pty(
+        &format!("python3 \"{}\" \"{PY_HELPER}\"", driver.display()),
+        "pw-py-1nt",
+        interrupt_mid_read,
+    );
+    assert!(
+        !transcript.contains("password-length="),
+        "password returned despite the interrupt:\n{transcript}"
+    );
+    assert_echo_restored(&transcript);
+}
+
+#[test]
+fn typescript_password_restores_echo_after_ctrl_c() {
+    let Some(runtime) = ts_runtime() else {
+        return;
+    };
+    let dir = fresh_config_dir("tty-ts-password-intr");
+    let _guard = TempDirGuard(dir.clone());
+    let helper = dir.join("prompt-utils.ts");
+    fs::copy(TS_HELPER, &helper).unwrap();
+    let driver = dir.join("driver.ts");
+    fs::write(&driver, typescript_password_driver("pw-ts-1nt")).unwrap();
+    let transcript = run_password_in_pty(
+        &format!(
+            "NODE_NO_WARNINGS=1 {runtime} \"{}\" \"{}\"",
+            driver.display(),
+            helper.display()
+        ),
+        "pw-ts-1nt",
+        interrupt_mid_read,
+    );
+    assert!(
+        !transcript.contains("password-length="),
+        "password returned despite the interrupt:\n{transcript}"
+    );
+    assert_echo_restored(&transcript);
+}
+
+fn python_password_driver(marker: &str) -> String {
+    format!(
+        "import importlib.util, sys\n\
+         sys.dont_write_bytecode = True\n\
+         spec = importlib.util.spec_from_file_location(\"prompt_utils\", sys.argv[1])\n\
+         m = importlib.util.module_from_spec(spec)\n\
+         spec.loader.exec_module(m)\n\
+         v = m.password(\"Secret? {marker}\")\n\
+         print(\"password-length=\" + str(None if v is None else len(v)))\n"
+    )
+}
+
+fn typescript_password_driver(marker: &str) -> String {
+    format!(
+        "import {{ pathToFileURL }} from \"node:url\";\n\
+         const prompt = await import(pathToFileURL(process.argv[2]).href);\n\
+         const v = prompt.password(\"Secret? {marker}\");\n\
+         console.log(\"password-length=\" + (v === null ? \"null\" : String(v.length)));\n"
+    )
+}
+
+/// Runs `tool` on a pty behind a bash wrapper that survives the tool's
+/// SIGINT (a handler, not an ignore, so the tool itself keeps the default
+/// disposition), waits for `marker` in the prompt, lets `interact` drive
+/// the terminal and finally reports the terminal's line discipline flags.
+/// The tool's own stdio is kept off the terminal (and replayed afterwards)
+/// so an interpreter's exit-time reset of its standard fds cannot stand in
+/// for the helper restoring what it changed.
+fn run_password_in_pty(
+    tool: &str,
+    marker: &str,
+    interact: impl FnOnce(&mut Pty) -> std::io::Result<()>,
+) -> String {
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c")
+        .arg(format!(
+            "exec </dev/null; trap ':' INT; out=$(mktemp); {tool} >\"$out\" 2>&1; rc=$?; \
+             cat \"$out\"; rm -f \"$out\"; echo \"tool-exit=$rc\"; \
+             echo \"tty-flags: $(stty -a </dev/tty | tr -s '\\n\\t' '  ')\"; echo tty-probe-done"
+        ))
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env_remove("COYOTE_PROMPT_REPLY")
+        .env_remove("_COYOTE_PROMPT_OUT")
+        .env_remove("AUTO_CONFIRM")
+        .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+        .env("TERM", "xterm");
+    let mut pty = Pty::spawn(cmd).unwrap();
+    pty.wait_for(marker, PTY_DEADLINE).unwrap();
+    interact(&mut pty).unwrap();
+    pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap()
+}
+
+/// Types part of a secret, then sends the terminal's interrupt character.
+fn interrupt_mid_read(pty: &mut Pty) -> std::io::Result<()> {
+    pty.send(b"zq")?;
+    thread::sleep(Duration::from_millis(100));
+    pty.send(b"\x03")
+}
+
+/// The `stty -a` report the wrapper printed must list `echo` as on.
+fn assert_echo_restored(transcript: &str) {
+    let flags = transcript
+        .lines()
+        .find_map(|line| line.strip_prefix("tty-flags: "))
+        .unwrap_or_else(|| panic!("no tty-flags line in the transcript:\n{transcript}"));
+    let tokens: Vec<&str> = flags
+        .split(|c: char| c.is_whitespace() || c == ';')
+        .collect();
+    assert!(
+        !tokens.contains(&"-echo"),
+        "the terminal was left with echo off after password:\n{transcript}"
+    );
+    assert!(
+        tokens.contains(&"echo"),
+        "stty did not report the echo flag at all:\n{transcript}"
+    );
+}
+
 fn assert_options_on_separate_lines(transcript: &str) {
     let holds = |needle: &str| transcript.lines().any(|line| line.contains(needle));
     assert!(holds("1) a"), "first option missing:\n{transcript}");
@@ -472,21 +662,38 @@ fn ts_runtime() -> Option<&'static str> {
     let _guard = TempDirGuard(dir.clone());
     let probe = dir.join("probe.ts");
     fs::write(&probe, "const n: number = 1;\nconsole.log(n);\n").unwrap();
-    let node_runs_ts = Command::new("node")
-        .arg(&probe)
-        .env("NODE_NO_WARNINGS", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success());
-    if node_runs_ts {
+    let run_probe = || {
+        Command::new("node")
+            .arg(&probe)
+            .env("NODE_NO_WARNINGS", "1")
+            .stdin(Stdio::null())
+            .output()
+    };
+    let clean = |out: &std::io::Result<Output>| {
+        out.as_ref()
+            .is_ok_and(|out| out.status.success() && out.stderr.is_empty())
+    };
+    // A cold node start can print a one-off warning; one retry absorbs it.
+    let mut probe_result = run_probe();
+    if !clean(&probe_result) {
+        probe_result = run_probe();
+    }
+    if clean(&probe_result) {
         return Some("node");
     }
     if which::which("tsx").is_ok() {
         return Some("tsx");
     }
-    eprintln!("skipping: node cannot run TypeScript natively and tsx is not installed");
+    let (status, stderr) = match &probe_result {
+        Ok(out) => (
+            out.status.to_string(),
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ),
+        Err(err) => ("not spawned".to_string(), err.to_string()),
+    };
+    eprintln!(
+        "skipping: node cannot run TypeScript cleanly ({status}; stderr: {stderr}) and tsx is not installed"
+    );
     None
 }
 

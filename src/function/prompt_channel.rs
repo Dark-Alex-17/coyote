@@ -3027,6 +3027,35 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             }
         }
 
+        /// Hands each stdout line of `child` to `on_line` from a forwarding
+        /// thread, so a helper that goes quiet mid-run is killed after 10 s
+        /// instead of parking the test on a blocking read.
+        fn pump_stdout(child: &mut Child, what: &str, mut on_line: impl FnMut(String)) {
+            let stdout = child.stdout.take().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                for line in std::io::BufReader::new(stdout).lines() {
+                    if tx.send(line.unwrap()).is_err() {
+                        break;
+                    }
+                }
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                match rx.recv_timeout(remaining) {
+                    Ok(line) => on_line(line),
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        child.kill().ok();
+                        child.wait().ok();
+                        panic!("{what}: no output from the child for 10 s");
+                    }
+                }
+            }
+            reader.join().unwrap();
+        }
+
         fn assert_round_trip(
             tool: &str,
             prompter: &ScriptedPrompter,
@@ -3107,10 +3136,10 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             if !python_available() {
                 return;
             }
-            let _guard = TestConfigDirGuard::new("prompt-py");
+            let guard = TestConfigDirGuard::new("prompt-py");
             let _functions = crate::testing::EnvVarGuard::set(
                 crate::utils::get_env_name("functions_dir"),
-                _guard.path.join("functions"),
+                guard.path.join("functions"),
             );
             install_script_tool(
                 PY_HELPER,
@@ -3152,10 +3181,10 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             let Some(runtime) = ts_runtime() else {
                 return;
             };
-            let _guard = TestConfigDirGuard::new("prompt-ts");
+            let guard = TestConfigDirGuard::new("prompt-ts");
             let _functions = crate::testing::EnvVarGuard::set(
                 crate::utils::get_env_name("functions_dir"),
-                _guard.path.join("functions"),
+                guard.path.join("functions"),
             );
             install_script_tool(
                 TS_HELPER,
@@ -3196,10 +3225,10 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             if !python_available() {
                 return;
             }
-            let _guard = TestConfigDirGuard::new("prompt-py-cancel");
+            let guard = TestConfigDirGuard::new("prompt-py-cancel");
             let _functions = crate::testing::EnvVarGuard::set(
                 crate::utils::get_env_name("functions_dir"),
-                _guard.path.join("functions"),
+                guard.path.join("functions"),
             );
             install_script_tool(
                 PY_HELPER,
@@ -3229,10 +3258,10 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             let Some(runtime) = ts_runtime() else {
                 return;
             };
-            let _guard = TestConfigDirGuard::new("prompt-ts-cancel");
+            let guard = TestConfigDirGuard::new("prompt-ts-cancel");
             let _functions = crate::testing::EnvVarGuard::set(
                 crate::utils::get_env_name("functions_dir"),
-                _guard.path.join("functions"),
+                guard.path.join("functions"),
             );
             install_script_tool(
                 TS_HELPER,
@@ -3304,8 +3333,7 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             let mut printed = Vec::new();
             let mut requests = 0;
             let mut wire = Vec::new();
-            for line in std::io::BufReader::new(child.stdout.take().unwrap()).lines() {
-                let line = line.unwrap();
+            pump_stdout(&mut child, "drive_env", |line| {
                 if line.trim_start().as_bytes().starts_with(MARKER) {
                     requests += 1;
                     let req: Value = serde_json::from_str(&line).unwrap();
@@ -3320,13 +3348,14 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                 } else {
                     printed.push(line);
                 }
-            }
+            });
+            let code = wait_or_kill(&mut child, "drive_env").code().unwrap_or(-1);
             Run {
                 printed,
                 requests,
                 wire,
                 stderr: stderr_thread.join().unwrap(),
-                code: wait_or_kill(&mut child, "drive_env").code().unwrap_or(-1),
+                code,
             }
         }
 
@@ -3700,8 +3729,7 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             let mut printed = Vec::new();
             let mut requests = 0;
             let mut wire = Vec::new();
-            for line in std::io::BufReader::new(child.stdout.take().unwrap()).lines() {
-                let line = line.unwrap();
+            pump_stdout(&mut child, "drive_through_junk", |line| {
                 if line.trim_start().as_bytes().starts_with(MARKER) {
                     requests += 1;
                     let req: Value = serde_json::from_str(&line).unwrap();
@@ -3720,15 +3748,16 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                 } else {
                     printed.push(line);
                 }
-            }
+            });
+            let code = wait_or_kill(&mut child, "drive_through_junk")
+                .code()
+                .unwrap_or(-1);
             Run {
                 printed,
                 requests,
                 wire,
                 stderr: stderr_thread.join().unwrap(),
-                code: wait_or_kill(&mut child, "drive_through_junk")
-                    .code()
-                    .unwrap_or(-1),
+                code,
             }
         }
 
@@ -3867,8 +3896,7 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             let mut printed = Vec::new();
             let mut requests = 0;
             let mut wire = Vec::new();
-            for out in std::io::BufReader::new(child.stdout.take().unwrap()).lines() {
-                let out = out.unwrap();
+            pump_stdout(&mut child, "drive_raw", |out| {
                 if out.trim_start().as_bytes().starts_with(MARKER) {
                     requests += 1;
                     let req: Value = serde_json::from_str(&out).unwrap();
@@ -3880,13 +3908,14 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                 } else {
                     printed.push(out);
                 }
-            }
+            });
+            let code = wait_or_kill(&mut child, "drive_raw").code().unwrap_or(-1);
             Run {
                 printed,
                 requests,
                 wire,
                 stderr: stderr_thread.join().unwrap(),
-                code: wait_or_kill(&mut child, "drive_raw").code().unwrap_or(-1),
+                code,
             }
         }
 
@@ -3925,9 +3954,9 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                 std::io::Read::read_to_string(&mut stderr, &mut text).unwrap();
                 text
             });
+            let status = wait_or_kill(&mut child, "drive_with_dead_reply");
             let stdout = stdout_thread.join().unwrap();
             let stderr = stderr_thread.join().unwrap();
-            let status = wait_or_kill(&mut child, "drive_with_dead_reply");
             let mut printed = Vec::new();
             let mut requests = 0;
             for out in stdout.lines() {
@@ -3948,10 +3977,11 @@ echo "$ans" >> "$LLM_OUTPUT""#,
 
         /// Edges the bash contract pins that the broad checks leave out for
         /// the other two languages: a reply path the helper cannot open (a
-        /// missing file, an fd the tool never inherited) fails closed without
-        /// a request and without blocking, and a guard over it still aborts;
-        /// a reply for our id with no `answer` key is a cancel, not an error;
-        /// a checkbox answer that repeats an option yields each index once.
+        /// missing file, an fd the tool never inherited) or a request fd it
+        /// never inherited fails closed without a request and without
+        /// blocking, and a guard over it still aborts; a reply for our id
+        /// with no `answer` key is a cancel, not an error; a checkbox answer
+        /// that repeats an option yields each index once.
         fn check_probe_edges(
             command: impl Fn(&str) -> Command,
             none: &str,
@@ -3960,12 +3990,7 @@ echo "$ans" >> "$LLM_OUTPUT""#,
         ) {
             let missing = dir.join("missing").join("reply");
             for reply in [missing.to_str().unwrap(), "/dev/fd/97"] {
-                let started = std::time::Instant::now();
                 let run = drive_with_dead_reply(command("confirm(\"Go?\")"), reply);
-                assert!(
-                    started.elapsed() < std::time::Duration::from_secs(9),
-                    "{reply}: the helper must not block on an unopenable reply path"
-                );
                 assert_eq!(run.requests, 0, "{reply}: request sent over a dead channel");
                 assert_eq!(run.code, 0, "{reply}: {}", run.stderr);
                 assert_eq!(run.printed, vec![none], "{reply}: {}", run.stderr);
@@ -3985,6 +4010,28 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                     run.stderr
                 );
             }
+
+            let dead_out = [(OUT_FD_ENV, "97")];
+            let run = drive_env(command("confirm(\"Go?\")"), Some(&[]), false, &dead_out);
+            assert_eq!(run.requests, 0, "request sent over a dead request fd");
+            assert_eq!(run.code, 0, "{}", run.stderr);
+            assert_eq!(run.printed, vec![none], "{}", run.stderr);
+            assert_eq!(
+                run.stderr.trim_end(),
+                "prompt request channel unavailable",
+                "a dead request fd is reported on stderr: {}",
+                run.stderr
+            );
+
+            let run = drive_env(
+                command("guard_operation(\"Go?\")"),
+                Some(&[]),
+                false,
+                &dead_out,
+            );
+            assert_eq!(run.requests, 0, "request sent over a dead request fd");
+            assert_eq!(run.code, 1, "a guard over a dead request fd aborts");
+            assert!(run.stderr.contains("Operation aborted!"), "{}", run.stderr);
 
             let run = drive_raw(command("confirm(\"Go?\")"), |id| {
                 format!("{{\"id\":\"{id}\"}}")
