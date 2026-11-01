@@ -61,8 +61,6 @@ const HOTKEY_IDLE: Duration = Duration::from_secs(1);
 const TOOL_OUTPUT_TAIL: usize = 20;
 const COMPOSER_MIN_ROWS: u16 = 3;
 const COMPOSER_MAX_ROWS: u16 = 8;
-const CONFIRM_HINT: &str = "y = yes  n = no  Esc = cancel";
-const TOOL_CONFIRM_HINT: &str = "y = yes  n = no  a = yes for this session  Esc = cancel";
 const INPUT_HINT: &str = "Enter = answer  Esc = cancel";
 /// How long the status row waits between two ticks of its elapsed time.
 const STATUS_TICK: Duration = Duration::from_secs(1);
@@ -92,6 +90,16 @@ fn chrome_style(kind: ChromeKind, no_color: bool) -> Style {
     match colour {
         Some(colour) if !no_color => style.fg(colour),
         _ => style,
+    }
+}
+
+/// The key legend under a yes/no question, naming what a bare Enter answers.
+fn confirm_hint(default: bool, tool: bool) -> String {
+    let enter = if default { "yes" } else { "no" };
+    if tool {
+        format!("y = yes  n = no  a = yes for this session  Enter = {enter}  Esc = cancel")
+    } else {
+        format!("y = yes  n = no  Enter = {enter}  Esc = cancel")
     }
 }
 
@@ -949,10 +957,9 @@ impl Widget for PromptModal<'_> {
                 }
             }
         }
-        let hint_text = match (&self.0.field, &req.tool) {
-            (Some(_), _) => INPUT_HINT,
-            (None, Some(_)) => TOOL_CONFIRM_HINT,
-            (None, None) => CONFIRM_HINT,
+        let hint_text = match self.0.kind() {
+            ModalKind::Input => INPUT_HINT.to_string(),
+            ModalKind::Confirm { default, tool } => confirm_hint(default, tool),
         };
         Paragraph::new(Line::from(Span::styled(hint_text, DIM))).render(hint, buf);
     }
@@ -2156,7 +2163,8 @@ mod tests {
     }
 
     /// With a modal up the strip's interrupt hint would contradict the
-    /// modal's own `Esc = cancel`.
+    /// modal's own `Esc = cancel`. The hint also names what Enter answers,
+    /// which follows the request's default.
     #[test]
     fn the_interrupt_hint_yields_to_an_open_modal() {
         let mut harness = Harness::standalone(80, 24);
@@ -2165,12 +2173,26 @@ mod tests {
         let _asker = ask_on_a_thread(&mut harness, confirm_request(None));
         let rendered = harness.draw();
         assert!(!rendered.contains("Esc to interrupt"), "{rendered}");
-        assert!(rendered.contains(CONFIRM_HINT), "{rendered}");
-        assert!(!rendered.contains("yes for this session"), "{rendered}");
+        assert!(
+            rendered.contains("y = yes  n = no  Enter = yes  Esc = cancel"),
+            "{rendered}"
+        );
         harness.clock.advance(HOTKEY_IDLE);
         harness.press(KeyCode::Esc);
         let _asker = ask_on_a_thread(&mut harness, confirm_request(Some("fs_write")));
-        assert!(harness.draw().contains(TOOL_CONFIRM_HINT));
+        assert!(
+            harness
+                .draw()
+                .contains("y = yes  n = no  a = yes for this session  Enter = yes  Esc = cancel")
+        );
+        harness.press(KeyCode::Esc);
+        let no_by_default = PromptRequest {
+            default: Some(serde_json::json!(false)),
+            ..confirm_request(None)
+        };
+        let _asker = ask_on_a_thread(&mut harness, no_by_default);
+        let rendered = harness.draw();
+        assert!(rendered.contains("Enter = no"), "{rendered}");
         harness.press(KeyCode::Esc);
     }
 
