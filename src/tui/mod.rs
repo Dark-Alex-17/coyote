@@ -1031,6 +1031,20 @@ enum Leave {
     Lost(tokio::task::JoinError),
 }
 
+/// The handles the loop holds between steps. `app`, `screen` and `abort`
+/// are borrowed because `run` still needs them for the teardown after the
+/// loop returns; the rest live and die with the loop.
+struct Shell<'a> {
+    app: &'a mut App,
+    screen: &'a mut Screen,
+    stream: EventStream,
+    termination: Termination,
+    rx: UnboundedReceiver<UiMsg>,
+    tx: UnboundedSender<UiMsg>,
+    abort: &'a AbortSignal,
+    auto_cancel: &'a AtomicBool,
+}
+
 /// Edits `text` in `editor` (resolved the way the REPL resolves its buffer
 /// editor) through a private, freshly created temp file, so no other user
 /// can pre-plant a file or symlink at the path.
@@ -1088,22 +1102,20 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
     if std::env::var(PANIC_AT_START_ENV).as_deref() == Ok("1") {
         panic!("{PANIC_AT_START_ENV} requested a panic after entering the alternate screen");
     }
-    let mut termination = Termination::arm()?;
-    let mut stream = EventStream::new();
+    let termination = Termination::arm()?;
     app.schedule_frame();
-
-    let (leave, ctx) = run_loop(
-        &mut app,
-        &mut screen,
-        &mut stream,
-        &mut termination,
+    let mut shell = Shell {
+        app: &mut app,
+        screen: &mut screen,
+        stream: EventStream::new(),
+        termination,
         rx,
         tx,
-        ctx,
-        &abort,
-        &auto_cancel,
-    )
-    .await;
+        abort: &abort,
+        auto_cancel: &auto_cancel,
+    };
+
+    let (leave, ctx) = run_loop(&mut shell, ctx).await;
 
     if let Err(err) = screen.leave() {
         warn!("Failed to restore the terminal: {err}");
@@ -1129,18 +1141,17 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
     result.map(|_| ())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_loop(
-    app: &mut App,
-    screen: &mut Screen,
-    stream: &mut EventStream,
-    termination: &mut Termination,
-    mut rx: UnboundedReceiver<UiMsg>,
-    tx: UnboundedSender<UiMsg>,
-    ctx: RequestContext,
-    abort: &AbortSignal,
-    auto_cancel: &AtomicBool,
-) -> (Leave, Option<RequestContext>) {
+async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> (Leave, Option<RequestContext>) {
+    let Shell {
+        app,
+        screen,
+        stream,
+        termination,
+        rx,
+        tx,
+        abort,
+        auto_cancel,
+    } = shell;
     let mut ctx = Some(ctx);
     let mut task: Option<Task> = None;
     let mut quit_requested = false;
