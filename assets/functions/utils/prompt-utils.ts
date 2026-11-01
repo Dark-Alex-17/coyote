@@ -8,7 +8,7 @@
 //
 // The env var is exported by the global tool shims (run-tool.py / run-tool.ts)
 // and by graph script nodes; the agent-scoped shims (run-agent.py /
-// run-agent.ts) do not export it yet.
+// run-agent.ts) do not export it.
 //
 // Under plain `node`, a package.json without a "type" field above this file
 // makes node print a MODULE_TYPELESS_PACKAGE_JSON warning on stderr the first
@@ -238,21 +238,35 @@ function stty(tty: Terminal, mode: string): boolean {
   }
 }
 
+function snapshotTty(tty: Terminal): string | null {
+  try {
+    return execFileSync("stty", ["-g"], { stdio: [tty.input, "pipe", "ignore"], encoding: "utf8" }).trim();
+  } catch {
+    return null;
+  }
+}
+
 // The hidden read belongs to a short-lived sh child, because a blocking
 // fs.readSync never lets a SIGINT handler run, so Ctrl-C would be swallowed
-// with echo still off. Echo is already off when the child starts (ttyLine
-// turns it off before the prompt is written, so keystrokes typed early are
-// not echoed either); the child saves and restores that state however it
-// ends, and the caller turns echo back on afterwards. The user's newline is
-// swallowed with the rest of the hidden input, so one is written for them.
-// End of input before a line makes the child exit non-zero, which surfaces
-// here as null, the same cancel every other helper reports.
-function readHidden(tty: Terminal): string | null {
+// with echo still off. The parent snapshots the terminal mode before turning
+// echo off (so keystrokes typed early are not echoed either) and restores
+// that snapshot once the child returns; the child's trap restores the same
+// snapshot when a signal kills it before the parent gets the chance, since
+// SIGINT reaches both and node dies inside execFileSync without running its
+// finally. The user's newline is swallowed with the rest of the hidden
+// input, so one is written for them. End of input before a line makes the
+// child exit non-zero, which surfaces here as null, the same cancel every
+// other helper reports.
+function readHidden(tty: Terminal, saved: string): string | null {
   try {
     const line = execFileSync(
       "sh",
-      ["-c", "s=$(stty -g); stty -echo; trap 'stty \"$s\"' EXIT INT TERM; IFS= read -r l || exit 1; printf '%s' \"$l\""],
-      { stdio: [tty.input, "pipe", "ignore"], encoding: "utf8" },
+      ["-c", "trap 'stty \"$COYOTE_TTY_SAVED\"' EXIT INT TERM; IFS= read -r l || exit 1; printf %s \"$l\""],
+      {
+        stdio: [tty.input, "pipe", "ignore"],
+        encoding: "utf8",
+        env: { ...process.env, COYOTE_TTY_SAVED: saved },
+      },
     );
     return stripCr(line);
   } catch {
@@ -267,16 +281,16 @@ function ttyLine(prompt: string, optionLines: string[] = [], hidden = false): st
       writeAll(tty.output, optionLines.join("") + prompt);
       return stripCr(readLine(tty.input));
     }
-    if (!stty(tty, "-g")) {
+    const saved = snapshotTty(tty);
+    if (saved === null || !stty(tty, "-echo")) {
       writeAll(tty.output, "Warning: Password input may be echoed.\n" + prompt);
       return stripCr(readLine(tty.input));
     }
-    stty(tty, "-echo");
     try {
       writeAll(tty.output, prompt);
-      return readHidden(tty);
+      return readHidden(tty, saved);
     } finally {
-      stty(tty, "echo");
+      stty(tty, saved);
       writeAll(tty.output, "\n");
     }
   } finally {

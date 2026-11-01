@@ -7,7 +7,7 @@
 #
 # The env var is exported by the global tool shims (run-tool.py / run-tool.ts)
 # and by graph script nodes; the agent-scoped shims (run-agent.py /
-# run-agent.ts) do not export it yet.
+# run-agent.ts) do not export it.
 #
 # Helpers: confirm, select, checkbox, input, password, guard_operation,
 # guard_path. confirm returns a bool, select the index of the chosen option,
@@ -105,7 +105,7 @@ def _prompt_channel(action, question, options):
     with replies:
         try:
             _send_request(json.dumps({"coyote_prompt": request}) + "\n")
-        except OSError:
+        except (OSError, OverflowError, ValueError):
             _show_error("prompt request channel unavailable")
             return None
         while True:
@@ -167,10 +167,9 @@ def _tty_list(question, options):
 
 
 def _parse_index(text, options):
-    try:
-        index = int(text) - 1
-    except ValueError:
+    if not (text.isascii() and text.isdigit()):
         return None
+    index = int(text) - 1
     if 0 <= index < len(options):
         return index
     return None
