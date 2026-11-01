@@ -1571,12 +1571,15 @@ echo "$ans" >> "$LLM_OUTPUT""#,
 
         /// A unique scratch directory per test, so `guard_path` has a known pwd.
         fn scratch_dir(tag: &str) -> PathBuf {
+            // Tests run in parallel and the clock here ticks in microseconds.
+            static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
+            let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let dir = std::env::temp_dir().join(format!(
-                "coyote-prompt-utils-{tag}-{}-{nanos}",
+                "coyote-prompt-utils-{tag}-{}-{nanos}-{sequence}",
                 std::process::id()
             ));
             fs::create_dir_all(&dir).unwrap();
@@ -4068,6 +4071,64 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             assert!(run.stderr.is_empty(), "{}", run.stderr);
         }
 
+        /// A reply path that opens but cannot be read (a directory) fails
+        /// closed like a dead one: the helper returns its "none", notes the
+        /// channel on stderr, and never surfaces a traceback or stack trace
+        /// to the tool. Where the failure lands depends on the runtime:
+        /// Python's `open` refuses a directory up front, so no request
+        /// escapes and the note is the request-channel one; node's
+        /// `openSync` succeeds and `readSync` fails, so one request escapes
+        /// and the note is the reply-channel one. A guard over it aborts.
+        fn check_directory_reply(command: impl Fn(&str) -> Command, none: &str, dir: &Path) {
+            let reply_dir = dir.join("reply-is-a-directory");
+            fs::create_dir_all(&reply_dir).unwrap();
+            let reply = reply_dir.to_str().unwrap();
+
+            let run = drive_with_dead_reply(command("confirm(\"Go?\")"), reply);
+            assert_eq!(run.code, 0, "directory reply path: {}", run.stderr);
+            assert_eq!(
+                run.printed,
+                vec![none],
+                "directory reply path: {}",
+                run.stderr
+            );
+            assert!(
+                run.requests <= 1,
+                "directory reply path: {} requests escaped",
+                run.requests
+            );
+            let expected_note = if run.requests == 1 {
+                "prompt reply channel closed"
+            } else {
+                "prompt request channel unavailable"
+            };
+            assert!(
+                run.stderr.contains(expected_note),
+                "directory reply path: expected {expected_note:?} on stderr: {}",
+                run.stderr
+            );
+            for leak in ["Traceback", "IsADirectoryError", "EISDIR", "\n    at "] {
+                assert!(
+                    !run.stderr.contains(leak),
+                    "directory reply path leaked {leak:?} to stderr: {}",
+                    run.stderr
+                );
+            }
+
+            let run = drive_with_dead_reply(command("guard_operation(\"Really?\")"), reply);
+            assert_eq!(run.code, 1, "a guard over a directory reply path aborts");
+            assert!(
+                run.stderr.contains("Operation aborted!"),
+                "directory reply path: {}",
+                run.stderr
+            );
+            assert!(
+                !run.stderr.contains("Traceback") && !run.stderr.contains("\n    at "),
+                "directory reply path leaked a stack trace: {}",
+                run.stderr
+            );
+        }
+
         mod py_contract {
             use super::*;
 
@@ -4177,6 +4238,16 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                 }
                 let dir = scratch_dir("py-probe-edges");
                 check_probe_edges(py_command, "None", "[0]", &dir);
+                fs::remove_dir_all(&dir).ok();
+            }
+
+            #[test]
+            fn a_directory_as_reply_path_fails_closed_without_a_traceback() {
+                if !python_available() {
+                    return;
+                }
+                let dir = scratch_dir("py-directory-reply");
+                check_directory_reply(py_command, "None", &dir);
                 fs::remove_dir_all(&dir).ok();
             }
         }
@@ -4364,6 +4435,20 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                     |expr| ts_command(runtime, &dir, expr, "(v) => String(JSON.stringify(v))"),
                     "null",
                     "[0]",
+                    &dir,
+                );
+                fs::remove_dir_all(&dir).ok();
+            }
+
+            #[test]
+            fn a_directory_as_reply_path_fails_closed_without_a_traceback() {
+                let Some(runtime) = ts_runtime() else {
+                    return;
+                };
+                let dir = scratch_dir("ts-directory-reply");
+                check_directory_reply(
+                    |expr| ts_command(runtime, &dir, expr, "(v) => String(JSON.stringify(v))"),
+                    "null",
                     &dir,
                 );
                 fs::remove_dir_all(&dir).ok();

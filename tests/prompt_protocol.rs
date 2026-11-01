@@ -474,6 +474,7 @@ fn python_password_keeps_a_pre_prompt_echo_off_after_the_read() {
         transcript.contains("password-length=9"),
         "password did not return the typed text:\n{transcript}"
     );
+    assert_python_took_the_hidden_path(&transcript);
     assert_echo_still_off(&transcript);
 }
 
@@ -527,6 +528,7 @@ fn python_password_keeps_a_pre_prompt_echo_off_after_ctrl_c() {
         !transcript.contains("password-length="),
         "password returned despite the interrupt:\n{transcript}"
     );
+    assert_python_took_the_hidden_path(&transcript);
     assert_echo_still_off(&transcript);
 }
 
@@ -583,6 +585,7 @@ fn python_password_restores_echo_after_an_immediate_ctrl_c() {
         !transcript.contains("password-length="),
         "password returned despite the interrupt:\n{transcript}"
     );
+    assert_python_took_the_hidden_path(&transcript);
     assert_echo_restored(&transcript);
 }
 
@@ -636,6 +639,7 @@ fn python_password_keeps_a_pre_prompt_echo_off_after_an_immediate_ctrl_c() {
         !transcript.contains("password-length="),
         "password returned despite the interrupt:\n{transcript}"
     );
+    assert_python_took_the_hidden_path(&transcript);
     assert_echo_still_off(&transcript);
 }
 
@@ -777,6 +781,16 @@ fn interrupt_immediately(pty: &mut Pty) -> std::io::Result<()> {
 /// Keystrokes `interrupt_mid_read` types: a sequence no temp-dir name or
 /// traceback would contain by chance.
 const TYPED_BEFORE_INTERRUPT: &[u8] = b"zq9xq";
+
+/// getpass falls back to an echoed read with a warning when it cannot
+/// control the terminal; the echo checks only mean something on the hidden
+/// path, so that warning must be absent.
+fn assert_python_took_the_hidden_path(transcript: &str) {
+    assert!(
+        !transcript.contains("Warning: Password input may be echoed."),
+        "getpass fell back to an echoed read:\n{transcript}"
+    );
+}
 
 /// The keystrokes typed before the interrupt must not show on the terminal
 /// (echo was really off when it arrived) and the helper must have taken the
