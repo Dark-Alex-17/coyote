@@ -2891,7 +2891,7 @@ echo "$ans" >> "$LLM_OUTPUT""#,
     mod script_clients {
         use super::*;
         use std::path::{Path, PathBuf};
-        use std::process::Stdio;
+        use std::process::{Child, ExitStatus, Stdio};
         use std::time::{SystemTime, UNIX_EPOCH};
 
         const PY_HELPER: &str = concat!(
@@ -2942,6 +2942,7 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                 out.as_ref()
                     .is_ok_and(|out| out.status.success() && out.stderr.is_empty())
             };
+            // A cold node start can print a one-off warning; one retry absorbs it.
             let mut probe_result = run_probe();
             if !clean(&probe_result) {
                 probe_result = run_probe();
@@ -3007,6 +3008,23 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                 PromptAnswer::Text("hello".to_string()),
                 PromptAnswer::Text("s3cret".to_string()),
             ]))
+        }
+
+        /// Reaps `child`, killing it after 10 s so a wedged helper fails the
+        /// test instead of hanging it. Drain the child's pipes first.
+        fn wait_or_kill(child: &mut Child, what: &str) -> ExitStatus {
+            let started = std::time::Instant::now();
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    return status;
+                }
+                if started.elapsed() > std::time::Duration::from_secs(10) {
+                    child.kill().ok();
+                    child.wait().ok();
+                    panic!("{what}: child still running after 10 s");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
         }
 
         fn assert_round_trip(
@@ -3090,6 +3108,10 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                 return;
             }
             let _guard = TestConfigDirGuard::new("prompt-py");
+            let _functions = crate::testing::EnvVarGuard::set(
+                crate::utils::get_env_name("functions_dir"),
+                _guard.path.join("functions"),
+            );
             install_script_tool(
                 PY_HELPER,
                 "ask-py-x7x.py",
@@ -3131,6 +3153,10 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                 return;
             };
             let _guard = TestConfigDirGuard::new("prompt-ts");
+            let _functions = crate::testing::EnvVarGuard::set(
+                crate::utils::get_env_name("functions_dir"),
+                _guard.path.join("functions"),
+            );
             install_script_tool(
                 TS_HELPER,
                 "ask-ts-x7x.ts",
@@ -3171,6 +3197,10 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                 return;
             }
             let _guard = TestConfigDirGuard::new("prompt-py-cancel");
+            let _functions = crate::testing::EnvVarGuard::set(
+                crate::utils::get_env_name("functions_dir"),
+                _guard.path.join("functions"),
+            );
             install_script_tool(
                 PY_HELPER,
                 "cancel-py-x7x.py",
@@ -3200,6 +3230,10 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                 return;
             };
             let _guard = TestConfigDirGuard::new("prompt-ts-cancel");
+            let _functions = crate::testing::EnvVarGuard::set(
+                crate::utils::get_env_name("functions_dir"),
+                _guard.path.join("functions"),
+            );
             install_script_tool(
                 TS_HELPER,
                 "cancel-ts-x7x.ts",
@@ -3291,8 +3325,8 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                 printed,
                 requests,
                 wire,
-                code: child.wait().unwrap().code().unwrap_or(-1),
                 stderr: stderr_thread.join().unwrap(),
+                code: wait_or_kill(&mut child, "drive_env").code().unwrap_or(-1),
             }
         }
 
@@ -3691,8 +3725,10 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                 printed,
                 requests,
                 wire,
-                code: child.wait().unwrap().code().unwrap_or(-1),
                 stderr: stderr_thread.join().unwrap(),
+                code: wait_or_kill(&mut child, "drive_through_junk")
+                    .code()
+                    .unwrap_or(-1),
             }
         }
 
@@ -3849,8 +3885,8 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                 printed,
                 requests,
                 wire,
-                code: child.wait().unwrap().code().unwrap_or(-1),
                 stderr: stderr_thread.join().unwrap(),
+                code: wait_or_kill(&mut child, "drive_raw").code().unwrap_or(-1),
             }
         }
 
@@ -3889,18 +3925,9 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                 std::io::Read::read_to_string(&mut stderr, &mut text).unwrap();
                 text
             });
-            let started = std::time::Instant::now();
-            let status = loop {
-                if let Some(status) = child.try_wait().unwrap() {
-                    break status;
-                }
-                if started.elapsed() > std::time::Duration::from_secs(10) {
-                    child.kill().ok();
-                    break child.wait().unwrap();
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            };
             let stdout = stdout_thread.join().unwrap();
+            let stderr = stderr_thread.join().unwrap();
+            let status = wait_or_kill(&mut child, "drive_with_dead_reply");
             let mut printed = Vec::new();
             let mut requests = 0;
             for out in stdout.lines() {
@@ -3915,7 +3942,7 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                 requests,
                 wire: Vec::new(),
                 code: status.code().unwrap_or(-1),
-                stderr: stderr_thread.join().unwrap(),
+                stderr,
             }
         }
 
@@ -3942,8 +3969,9 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                 assert_eq!(run.requests, 0, "{reply}: request sent over a dead channel");
                 assert_eq!(run.code, 0, "{reply}: {}", run.stderr);
                 assert_eq!(run.printed, vec![none], "{reply}: {}", run.stderr);
-                assert!(
-                    run.stderr.contains("prompt re"),
+                assert_eq!(
+                    run.stderr.trim_end(),
+                    "prompt request channel unavailable",
                     "{reply}: a dead channel is reported on stderr: {}",
                     run.stderr
                 );
@@ -3994,6 +4022,7 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                 cmd.arg("-c")
                     .arg(format!("{PY_DRIVER}print(prompt_utils.{expr})\n"))
                     .arg(PY_HELPER);
+                cmd.env("PYTHONDONTWRITEBYTECODE", "1");
                 cmd
             }
 
@@ -4278,6 +4307,32 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                     &dir,
                 );
                 fs::remove_dir_all(&dir).ok();
+            }
+
+            /// The host keeps the channel's write end open, so a helper that
+            /// waited for EOF would hang: the reply must come through a
+            /// bounded readSync loop on the opened fd.
+            #[test]
+            fn helper_reads_the_reply_with_a_readsync_loop() {
+                let source = fs::read_to_string(TS_HELPER).unwrap();
+                assert!(
+                    source.contains("fs.readSync("),
+                    "reply read is not a readSync loop"
+                );
+                assert!(
+                    source.contains("fs.openSync(process.env[REPLY_ENV]"),
+                    "reply path is not opened from the channel env var"
+                );
+                let read_file_sync_calls: Vec<&str> = source
+                    .lines()
+                    .filter(|line| {
+                        !line.trim_start().starts_with("//") && line.contains("readFileSync(")
+                    })
+                    .collect();
+                assert!(
+                    read_file_sync_calls.is_empty(),
+                    "the reply must not be read to EOF: {read_file_sync_calls:?}"
+                );
             }
         }
     }

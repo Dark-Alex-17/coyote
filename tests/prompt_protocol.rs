@@ -88,6 +88,7 @@ fn python_confirm_without_channel_reads_the_controlling_terminal() {
         .arg(format!(
             "exec </dev/null; python3 -c '{driver}' \"{PY_HELPER}\""
         ))
+        .env("PYTHONDONTWRITEBYTECODE", "1")
         .env_remove("COYOTE_PROMPT_REPLY")
         .env_remove("_COYOTE_PROMPT_OUT")
         .env_remove("AUTO_CONFIRM")
@@ -163,6 +164,7 @@ fn python_select_without_channel_reads_the_controlling_terminal() {
         .arg(format!(
             "exec </dev/null; python3 -c '{driver}' \"{PY_HELPER}\""
         ))
+        .env("PYTHONDONTWRITEBYTECODE", "1")
         .env_remove("COYOTE_PROMPT_REPLY")
         .env_remove("_COYOTE_PROMPT_OUT")
         .env_remove("AUTO_CONFIRM")
@@ -217,6 +219,93 @@ fn typescript_select_without_channel_reads_the_controlling_terminal() {
     assert!(
         !transcript.contains("coyote_prompt"),
         "select wrote a protocol line without a channel:\n{transcript}"
+    );
+}
+
+/// The Python helper's `password` fallback reads the secret from the
+/// terminal with echo off: the typed text never appears in the transcript,
+/// only the caller's report of its length does.
+#[test]
+fn python_password_without_channel_hides_the_typed_text() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let driver = "import importlib.util, sys\n\
+        sys.dont_write_bytecode = True\n\
+        spec = importlib.util.spec_from_file_location(\"prompt_utils\", sys.argv[1])\n\
+        m = importlib.util.module_from_spec(spec)\n\
+        spec.loader.exec_module(m)\n\
+        v = m.password(\"Secret? pw-py-x7x\")\n\
+        print(\"password-length=\" + str(None if v is None else len(v)))\n";
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c")
+        .arg(format!(
+            "exec </dev/null; python3 -c '{driver}' \"{PY_HELPER}\""
+        ))
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env_remove("COYOTE_PROMPT_REPLY")
+        .env_remove("_COYOTE_PROMPT_OUT")
+        .env_remove("AUTO_CONFIRM")
+        .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+        .env("TERM", "xterm");
+    let mut pty = Pty::spawn(cmd).unwrap();
+    pty.wait_for("pw-py-x7x", PTY_DEADLINE).unwrap();
+    pty.send(b"hunter2zq\n").unwrap();
+    let transcript = pty.wait_for("password-length=9", PTY_DEADLINE).unwrap();
+    assert!(
+        !transcript.contains("hunter2zq"),
+        "password echoed the typed text on the terminal:\n{transcript}"
+    );
+    assert!(
+        !transcript.contains("coyote_prompt"),
+        "password wrote a protocol line without a channel:\n{transcript}"
+    );
+}
+
+/// The TypeScript helper's `password` fallback, same shape: its hidden
+/// read goes through a child that turns echo off on the terminal.
+#[test]
+fn typescript_password_without_channel_hides_the_typed_text() {
+    let Some(runtime) = ts_runtime() else {
+        return;
+    };
+    let dir = fresh_config_dir("tty-ts-password");
+    let _guard = TempDirGuard(dir.clone());
+    let helper = dir.join("prompt-utils.ts");
+    fs::copy(TS_HELPER, &helper).unwrap();
+    let driver = dir.join("driver.ts");
+    fs::write(
+        &driver,
+        "import { pathToFileURL } from \"node:url\";\n\
+         const prompt = await import(pathToFileURL(process.argv[2]).href);\n\
+         const v = prompt.password(\"Secret? pw-ts-x7x\");\n\
+         console.log(\"password-length=\" + (v === null ? \"null\" : String(v.length)));\n",
+    )
+    .unwrap();
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c")
+        .arg(format!(
+            "exec </dev/null; NODE_NO_WARNINGS=1 {runtime} \"{}\" \"{}\"",
+            driver.display(),
+            helper.display()
+        ))
+        .env_remove("COYOTE_PROMPT_REPLY")
+        .env_remove("_COYOTE_PROMPT_OUT")
+        .env_remove("AUTO_CONFIRM")
+        .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+        .env("TERM", "xterm");
+    let mut pty = Pty::spawn(cmd).unwrap();
+    pty.wait_for("pw-ts-x7x", PTY_DEADLINE).unwrap();
+    pty.send(b"hunter2zq\n").unwrap();
+    let transcript = pty.wait_for("password-length=9", PTY_DEADLINE).unwrap();
+    assert!(
+        !transcript.contains("hunter2zq"),
+        "password echoed the typed text on the terminal:\n{transcript}"
+    );
+    assert!(
+        !transcript.contains("coyote_prompt"),
+        "password wrote a protocol line without a channel:\n{transcript}"
     );
 }
 
@@ -512,6 +601,7 @@ fn run_coyote(dir: &Path, args: &[&str]) -> Output {
         .env("PATH", path)
         .env_remove("COLORTERM")
         .env_remove("IS_SANDBOX")
+        .env_remove("_COYOTE_PROMPT_OUT")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
