@@ -5,6 +5,10 @@
 #   spec = importlib.util.spec_from_file_location("prompt_utils", os.environ["LLM_PROMPT_UTILS_PY"])
 #   prompt_utils = importlib.util.module_from_spec(spec); spec.loader.exec_module(prompt_utils)
 #
+# The env var is exported by the global tool shims (run-tool.py / run-tool.ts)
+# and by graph script nodes; the agent-scoped shims (run-agent.py /
+# run-agent.ts) do not export it yet.
+#
 # Helpers: confirm, select, checkbox, input, password, guard_operation,
 # guard_path. confirm returns a bool, select the index of the chosen option,
 # checkbox the chosen indices in option order, input and password the text.
@@ -54,15 +58,19 @@ def _channel_enabled():
     return reply != "" and reply != "/dev/fd/9"
 
 
+def _write_all(fd, data):
+    while data:
+        data = data[os.write(fd, data):]
+
+
 def _send_request(line):
     out_fd = os.environ.get(OUT_FD_ENV, "")
+    data = line.encode("utf-8")
     if out_fd.isascii() and out_fd.isdigit():
-        data = line.encode("utf-8")
-        while data:
-            data = data[os.write(int(out_fd), data):]
+        _write_all(int(out_fd), data)
         return
-    sys.stdout.write(line)
     sys.stdout.flush()
+    _write_all(1, data)
 
 
 def _map_answer(action, answer, options):
@@ -107,7 +115,7 @@ def _prompt_channel(action, question, options):
                 return None
             try:
                 reply = json.loads(raw.decode("utf-8", errors="replace"))
-            except ValueError:
+            except (ValueError, RecursionError):
                 continue
             if isinstance(reply, dict) and reply.get("id") == prompt_id:
                 break

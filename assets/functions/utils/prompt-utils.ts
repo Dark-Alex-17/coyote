@@ -6,6 +6,10 @@
 //   import { pathToFileURL } from "node:url";
 //   const prompt = await import(pathToFileURL(process.env.LLM_PROMPT_UTILS_TS!).href);
 //
+// The env var is exported by the global tool shims (run-tool.py / run-tool.ts)
+// and by graph script nodes; the agent-scoped shims (run-agent.py /
+// run-agent.ts) do not export it yet.
+//
 // Under plain `node`, a package.json without a "type" field above this file
 // makes node print a MODULE_TYPELESS_PACKAGE_JSON warning on stderr the first
 // time it loads.
@@ -51,7 +55,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { execFileSync, execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 
 const REPLY_ENV = "COYOTE_PROMPT_REPLY";
@@ -227,33 +231,29 @@ function stripControl(text: string): string {
 
 function stty(tty: Terminal, mode: string): boolean {
   try {
-    execSync(`stty ${mode}`, { stdio: [tty.input, "ignore", "ignore"] });
+    execFileSync("stty", [mode], { stdio: [tty.input, "ignore", "ignore"] });
     return true;
   } catch {
     return false;
   }
 }
 
-// The first stty call only probes for a terminal; the hidden read itself
-// belongs to a short-lived sh child, because a blocking fs.readSync never
-// lets a SIGINT handler run, so Ctrl-C would be swallowed with echo still
-// off. The child's trap turns echo back on however it ends. The user's
-// newline is swallowed with the rest of the hidden input, so one is written
-// for them. End of input before a line makes the child exit non-zero, which
-// surfaces here as null, the same cancel every other helper reports.
+// The hidden read belongs to a short-lived sh child, because a blocking
+// fs.readSync never lets a SIGINT handler run, so Ctrl-C would be swallowed
+// with echo still off. Echo is already off when the child starts (ttyLine
+// turns it off before the prompt is written, so keystrokes typed early are
+// not echoed either); the child saves and restores that state however it
+// ends, and the caller turns echo back on afterwards. The user's newline is
+// swallowed with the rest of the hidden input, so one is written for them.
+// End of input before a line makes the child exit non-zero, which surfaces
+// here as null, the same cancel every other helper reports.
 function readHidden(tty: Terminal): string | null {
-  if (!stty(tty, "-echo")) {
-    writeAll(tty.output, "Warning: Password input may be echoed.\n");
-    return stripCr(readLine(tty.input));
-  }
-  stty(tty, "echo");
   try {
     const line = execFileSync(
       "sh",
-      ["-c", "stty -echo; trap 'stty echo' EXIT INT TERM; IFS= read -r l || exit 1; printf '%s' \"$l\""],
+      ["-c", "s=$(stty -g); stty -echo; trap 'stty \"$s\"' EXIT INT TERM; IFS= read -r l || exit 1; printf '%s' \"$l\""],
       { stdio: [tty.input, "pipe", "ignore"], encoding: "utf8" },
     );
-    writeAll(tty.output, "\n");
     return stripCr(line);
   } catch {
     return null;
@@ -263,8 +263,22 @@ function readHidden(tty: Terminal): string | null {
 function ttyLine(prompt: string, optionLines: string[] = [], hidden = false): string | null {
   const tty = openTerminal();
   try {
-    writeAll(tty.output, optionLines.join("") + prompt);
-    return hidden ? readHidden(tty) : stripCr(readLine(tty.input));
+    if (!hidden) {
+      writeAll(tty.output, optionLines.join("") + prompt);
+      return stripCr(readLine(tty.input));
+    }
+    if (!stty(tty, "-g")) {
+      writeAll(tty.output, "Warning: Password input may be echoed.\n" + prompt);
+      return stripCr(readLine(tty.input));
+    }
+    stty(tty, "-echo");
+    try {
+      writeAll(tty.output, prompt);
+      return readHidden(tty);
+    } finally {
+      stty(tty, "echo");
+      writeAll(tty.output, "\n");
+    }
   } finally {
     tty.close();
   }
