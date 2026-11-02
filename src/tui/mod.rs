@@ -1240,15 +1240,17 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
     if let Err(err) = screen.leave() {
         warn!("Failed to restore the terminal: {err}");
     }
+    // What the exit printed goes to the restored terminal with its colours
+    // but without anything that could move the cursor or change a mode.
     let result = match leave {
         Leave::Finished(result, captured) => {
-            print!("{captured}");
+            print!("{}", render::sanitize_ansi(&captured));
             result
         }
         Leave::Abandoned => match ctx {
             Some(ctx) => match spawn_exit(ctx, abort.clone()).await {
                 Ok((_, result, captured)) => {
-                    print!("{captured}");
+                    print!("{}", render::sanitize_ansi(&captured));
                     result
                 }
                 Err(err) => Err(err.into()),

@@ -105,26 +105,11 @@ mod unix {
         Ok(unsafe { OwnedFd::from_raw_fd(dup) })
     }
 
-    fn set_cloexec(fd: i32) -> io::Result<()> {
-        // SAFETY: fcntl with F_SETFD takes no pointers; the result is checked.
-        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
+    /// Both ends close-on-exec from birth, so no child forked meanwhile
+    /// can inherit the capture pipe.
     fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
-        let mut fds = [0; 2];
-        // SAFETY: `fds` is a valid two-element array for pipe to fill.
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: both ends were just created by pipe and nothing else owns them.
-        let (read_end, write_end) =
-            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-        set_cloexec(read_end.as_raw_fd())?;
-        set_cloexec(write_end.as_raw_fd())?;
-        Ok((read_end, write_end))
+        let (read_end, write_end) = io::pipe()?;
+        Ok((read_end.into(), write_end.into()))
     }
 
     fn dup2(from: i32, to: i32) -> io::Result<()> {
