@@ -31,11 +31,14 @@ CI_FLAKE_RERUNS = 2       # section 10.12: max 2 re-runs per check per PR
 CI_POLL_SLEEP = 60        # pr-watch/scripts/poll_pr.py SLEEP_SECS
 CI_POLL_FAILS = 3         # pr-watch/scripts/poll_pr.py MAX_CONSECUTIVE_FAILS
 CI_WALL_SECS = 14400      # coder/graph.yaml settings.timeout (hardware-bound wall clock)
+GH_CALL_SECS = 90         # one gh subprocess call; node timeouts budget their sleep plus this per call
 REVIEW_POLL_SLEEP = 600   # review comments arrive on a human timescale, so the watch reads every ten minutes
 REVIEW_MAX_POLLS = 80     # per run; stays below settings.max_loop_iterations (100), which caps visits per node
 REVIEW_WALL_SECS = REVIEW_MAX_POLLS * REVIEW_POLL_SLEEP  # the poll budget expressed as wall clock
 REVIEW_MAX_ROUNDS = STRIKE_LIMIT  # review fix rounds per run, the 3-strike family bound
 REVIEW_CI_POLL_BUDGET = 60  # a fix round starts only while ci_polls_run is below this, leaving the next CI watch headroom under the per-node cap
+REVIEW_CI_POLL_CEILING = 90  # review mode stops the CI watch here, below the per-node visit cap of 100
+RESOLVE_DEADLINE_SECS = 480  # below the pr_review_resolve node timeout of 600 with one GH_CALL_SECS call of margin
 TAIL_CHARS = 6000         # trim_output class: evidence tails handed to llm nodes
 
 # Fork constants (the ONLY script-level fork deltas; design doc section 7).
