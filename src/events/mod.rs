@@ -74,7 +74,9 @@ pub enum Event {
         line: String,
     },
     TextDelta(String),
+    /// No origin yet: every non-silent SseHandler publishes these.
     ThinkingStarted,
+    /// No origin yet: every non-silent SseHandler publishes these.
     ThinkingStopped,
     AssistantText {
         text: String,

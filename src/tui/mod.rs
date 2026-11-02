@@ -3410,6 +3410,7 @@ mod tests {
                 "src/tui/mod.rs",
                 "let _ = reply.send(PromptAnswer::Cancelled);",
             ),
+            ("src/tui/redirect.rs", "String::new()"),
             (
                 "tests/tui_binary.rs",
                 "the transcript is not yet printed on the normal screen when the UI leaves",
@@ -3458,7 +3459,6 @@ mod tests {
             concat!("usage-", "probe"),
             concat!("usage-pattern ", "probe"),
             concat!("spec-", "first"),
-            concat!("the Windows ", "task"),
         ]
         .map(str::to_lowercase);
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));

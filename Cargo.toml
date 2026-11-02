@@ -153,7 +153,7 @@ arboard = { version = "3.3.0", default-features = false }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-# Consumed by the Windows prompt reply channel (TASK-316); nothing else uses it yet.
+# Windows named-pipe prompt reply channel; no consumer in this crate yet.
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_System_Pipes",
