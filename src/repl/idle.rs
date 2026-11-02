@@ -411,8 +411,9 @@ impl DriverLoop {
     }
 
     fn flush_model_notes(&mut self, ctx: &RequestContext) {
+        let prefix = ctx.app.mesh.command_prefix().load();
         for note in self.pending_model_notes.drain(..) {
-            ctx.notification_queue.push_mesh(note);
+            ctx.notification_queue.push_mesh(note.with_hints_in(prefix));
         }
         if self.dropped_model_notes > 0 {
             let dropped = std::mem::take(&mut self.dropped_model_notes);

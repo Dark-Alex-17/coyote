@@ -21,7 +21,7 @@ use crate::client::{
 use crate::config::{
     AgentVariables, AppConfig, AssertState, CommandPrefix, EnvoyRunner, Input, LastMessage,
     MacroState, MeshDigestDriver, MeshHookBridge, RequestContext, Session, SessionScope,
-    StateFlags, TURN_INTERRUPTED_TEXT, flatten_prompt_messages, macro_execute,
+    StateFlags, TURN_INTERRUPTED_TEXT, flatten_prompt_messages, install_live_prefix, macro_execute,
     publish_mesh_snapshot, resolve_prompt_args, sanitize_display_text,
 };
 use crate::config::{AssetCategory, paths};
@@ -33,7 +33,7 @@ use crate::hooks::{self, HookEvent};
 use crate::mesh::events::MeshHookSink;
 use crate::mesh::notify::NotificationSink;
 use crate::mesh::snapshot::TurnState;
-use crate::render::render_error;
+use crate::render::render_command_error;
 use crate::supervisor::{Supervisor, TaskKind};
 use crate::utils::{
     AbortSignal, SHELL, TaskCancelGuard, UserInterrupt, abortable_run_with_spinner,
@@ -624,7 +624,9 @@ impl Repl {
     pub fn init(ctx: RequestContext) -> Result<Self> {
         let app = Arc::clone(&ctx.app.config);
         publish_mesh_snapshot(&ctx, TurnState::idle_now());
-        let printer = Arc::new(PromptPrinter::new());
+        let command_prefix = ctx.app.mesh.command_prefix().clone();
+        install_live_prefix(&command_prefix);
+        let printer = Arc::new(PromptPrinter::new(command_prefix));
         ctx.app
             .mesh
             .set_notifier(Arc::clone(&printer) as Arc<dyn NotificationSink>);
@@ -652,6 +654,10 @@ impl Repl {
             envoy,
             mesh_hooks,
         })
+    }
+
+    fn command_prefix(&self) -> CommandPrefix {
+        self.ctx.read().app.mesh.command_prefix().load()
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -685,7 +691,7 @@ impl Repl {
                 let app = Arc::clone(&self.ctx.read().app.config);
                 // Replaying history is best-effort: a render failure must not skip shutdown.
                 if let Err(err) = replay::render(app.as_ref(), &compressed, &active) {
-                    render_error(err);
+                    render_command_error(err, self.command_prefix());
                 }
                 let last_msgs: &[Message] = if !active.is_empty() {
                     &active
@@ -732,7 +738,7 @@ impl Repl {
                 result
             };
             if let Err(err) = result {
-                render_error(err);
+                render_command_error(err, self.command_prefix());
                 println!()
             }
         }
@@ -776,7 +782,7 @@ impl Repl {
                             }
                         }
                         Err(err) => {
-                            render_error(err);
+                            render_command_error(err, self.command_prefix());
                             println!()
                         }
                     }
@@ -819,7 +825,7 @@ impl Repl {
         // Cloned so the context guard is not held across the await.
         let mesh = Arc::clone(&self.ctx.read().app.mesh);
         if let Err(err) = mesh.stop().await {
-            render_error(err);
+            render_command_error(err, self.command_prefix());
         }
         // After the node's own `mesh.stopped`, so nothing left in the slot can run hooks
         // against a session on its way out.
@@ -3480,6 +3486,10 @@ mod tests {
         let mut app = (*ctx.app).clone();
         app.config = Arc::new(config);
         ctx.app = Arc::new(app);
+        ctx.app
+            .mesh
+            .command_prefix()
+            .store(ctx.app.config.command_prefix);
     }
 
     /// Engages the graph agent `name` on `ctx` with a session whose model

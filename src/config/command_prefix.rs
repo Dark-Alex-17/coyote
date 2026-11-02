@@ -1,13 +1,16 @@
 use crate::repl::builtin_command_names;
 
 use anyhow::bail;
+use arc_swap::ArcSwap;
 use serde::Deserialize;
 use std::borrow::Cow;
 use std::fmt;
 use std::str::FromStr;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, OnceLock};
 
 static BUILTIN_NAMES: LazyLock<Vec<&'static str>> = LazyLock::new(builtin_command_names);
+
+static LIVE_PREFIX: OnceLock<LivePrefix> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -94,6 +97,78 @@ fn is_hint_name(rest: &str) -> bool {
     len > 0 && BUILTIN_NAMES.contains(&&rest[..len])
 }
 
+/// The prefix a running session renders hints in. Clones share one value, so a store
+/// through any of them is what the next load through every other sees.
+#[derive(Clone, Default)]
+pub struct LivePrefix(Arc<ArcSwap<CommandPrefix>>);
+
+impl LivePrefix {
+    pub fn load(&self) -> CommandPrefix {
+        **self.0.load()
+    }
+
+    pub fn store(&self, prefix: CommandPrefix) {
+        self.0.store(Arc::new(prefix));
+    }
+}
+
+/// Makes `live` the prefix `live_prefix` reads. The first install wins: one REPL owns
+/// the terminal for the life of the process.
+pub fn install_live_prefix(live: &LivePrefix) {
+    LIVE_PREFIX.get_or_init(|| live.clone());
+}
+
+/// The prefix of the session that owns the terminal, for output sinks that are handed
+/// no context; dot until one is installed.
+pub fn live_prefix() -> CommandPrefix {
+    #[cfg(test)]
+    if let Some(prefix) = live_prefix_override::current() {
+        return prefix;
+    }
+    LIVE_PREFIX
+        .get()
+        .map_or_else(CommandPrefix::default, LivePrefix::load)
+}
+
+#[cfg(test)]
+pub(crate) mod live_prefix_override {
+    //! Stands in for the installed prefix while a guard is held, so a test can drive the
+    //! context-free sinks without a REPL. Process-global: tests using it must be
+    //! `#[serial]`.
+
+    use super::{CommandPrefix, LivePrefix};
+    use std::sync::Mutex;
+
+    static OVERRIDE: Mutex<Option<LivePrefix>> = Mutex::new(None);
+
+    #[must_use]
+    pub fn install(live: LivePrefix) -> OverrideGuard {
+        *OVERRIDE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(live);
+        OverrideGuard
+    }
+
+    pub struct OverrideGuard;
+
+    impl Drop for OverrideGuard {
+        fn drop(&mut self) {
+            OVERRIDE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+        }
+    }
+
+    pub(super) fn current() -> Option<CommandPrefix> {
+        OVERRIDE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(LivePrefix::load)
+    }
+}
+
 impl FromStr for CommandPrefix {
     type Err = anyhow::Error;
 
@@ -123,6 +198,35 @@ impl fmt::Display for CommandPrefix {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod live {
+        use super::*;
+        use serial_test::serial;
+
+        #[test]
+        fn a_store_through_one_clone_is_what_every_clone_loads() {
+            let live = LivePrefix::default();
+            let held = live.clone();
+            assert_eq!(held.load(), CommandPrefix::Dot);
+            live.store(CommandPrefix::Slash);
+            assert_eq!(held.load(), CommandPrefix::Slash);
+            held.store(CommandPrefix::Both);
+            assert_eq!(live.load(), CommandPrefix::Both);
+        }
+
+        #[test]
+        #[serial]
+        fn live_prefix_follows_the_override_while_it_is_held() {
+            let live = LivePrefix::default();
+            {
+                let _guard = live_prefix_override::install(live.clone());
+                assert_eq!(live_prefix(), CommandPrefix::Dot);
+                live.store(CommandPrefix::Slash);
+                assert_eq!(live_prefix(), CommandPrefix::Slash);
+            }
+            assert_eq!(live_prefix(), CommandPrefix::Dot, "nothing is installed in tests");
+        }
+    }
 
     #[derive(Deserialize, Debug)]
     struct Holder {

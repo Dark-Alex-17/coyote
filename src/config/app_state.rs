@@ -91,6 +91,7 @@ impl AppState {
             functions.append_job_functions();
         }
         let mesh = Arc::new(MeshSlot::default());
+        mesh.command_prefix().store(config.command_prefix);
         // `mesh` was just created empty, so the predicate is false here and nothing is
         // appended. The guarded call is kept so every append site reads the same way.
         if mesh_tools_available(&config, &mesh) {

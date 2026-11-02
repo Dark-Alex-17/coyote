@@ -1,5 +1,5 @@
 use crate::config::mesh_config::{MeshBrief, MeshInterface, mesh_settings_rows};
-use crate::config::{MeshConfig, RequestContext, paths};
+use crate::config::{CommandPrefix, MeshConfig, RequestContext, live_prefix, paths};
 use crate::function::mesh::trust_label;
 use crate::mesh::access::GrantKind;
 use crate::mesh::brief::{Brief, BriefSource};
@@ -879,7 +879,7 @@ fn drain_inbox(ctx: &RequestContext) -> Result<()> {
         .filter(|correlation| correlation.reply.is_some())
         .map(|correlation| correlation.record.id)
         .collect();
-    out_text(&render_inbox(
+    out_path_text(&render_inbox(
         &rows,
         &awaiting_collect,
         terminal_width(),
@@ -976,7 +976,7 @@ fn purge_inbox_files(ctx: &RequestContext, yes: bool, dry_run: bool) -> Result<(
             ));
         }
         lines.push(DRY_RUN_NOTHING_CHANGED.to_string());
-        out_text(&lines.join("\n"));
+        out_path_text(&lines.join("\n"));
         return Ok(());
     }
     let question = format!(
@@ -1171,7 +1171,7 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         Answering::Peer(destination) => {
             out_text(&sending_notice(&destination));
             if let Some(attachment) = &attachment {
-                out_text(&attaching_notice(attachment, &destination));
+                out_path_text(&attaching_notice(attachment, &destination));
             }
             result_follows();
             match attachment {
@@ -1189,7 +1189,7 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             let destination = &correlation.record.peer_destination;
             out_text(&sending_notice(destination));
             if let Some(attachment) = &attachment {
-                out_text(&attaching_notice(attachment, destination));
+                out_path_text(&attaching_notice(attachment, destination));
             }
             result_follows();
             let out = outbound_answer(
@@ -1489,7 +1489,7 @@ async fn message(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         )
     ));
     if let Some(attachment) = &attachment {
-        out_text(&attaching_notice(attachment, &destination));
+        out_path_text(&attaching_notice(attachment, &destination));
     }
     if !confirm_or_flag("Send it?", "--yes", yes_first || outgoing.yes)? {
         out_text("Nothing was sent.");
@@ -2076,14 +2076,14 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
             unreachable_head(&destination)
         ),
         Err(Unrouted::Interrupted) => {
-            out_text(&format!(
+            out_path_text(&format!(
                 "Fetch of `{shown}` interrupted; nothing was staged."
             ));
             return Ok(());
         }
     };
     let peer = short(&destination);
-    out_text(&format!(
+    out_path_text(&format!(
         "Fetching `{shown}` from {peer} over the mesh (up to {} s)...",
         FILE_FETCH_REQUEST_TIMEOUT.as_secs()
     ));
@@ -2091,13 +2091,13 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     let outcome = tokio::select! {
         outcome = runtime.fetch_file(&desc, &args.path, args.if_sha256) => outcome,
         _ = wait_user_interrupt(Some(abort_signal)) => {
-            out_text(&format!("Fetch of `{shown}` interrupted; nothing was staged."));
+            out_path_text(&format!("Fetch of `{shown}` interrupted; nothing was staged."));
             return Ok(());
         }
     };
     match outcome {
         Ok(Fetched::Staged { path, size, sha256 }) => {
-            out_text(&format!(
+            out_path_text(&format!(
                 "Staged `{shown}` from {peer}: {size} bytes, sha256 {}, at {}.",
                 hex_lower(&sha256),
                 path.display()
@@ -2106,7 +2106,7 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
                 "The file is the peer's; move it into the tree yourself if you want it there.",
             );
         }
-        Ok(Fetched::NotModified { .. }) => out_text(&format!(
+        Ok(Fetched::NotModified { .. }) => out_path_text(&format!(
             "The peer's copy of `{shown}` still has the sha256 you hold; nothing was fetched."
         )),
         Ok(Fetched::NotShared) => {
@@ -3628,7 +3628,7 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             },
         ));
     if held {
-        out_text(&already);
+        out_path_text(&already);
         return Ok(());
     }
     let lift = if force {
@@ -3636,7 +3636,7 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     } else {
         ""
     };
-    out_text(&format!(
+    out_path_text(&format!(
         "{} write to {}: allow `{pattern}` for {audience}{lift}.",
         intent_verb(dry_run),
         target.written_to()
@@ -3676,15 +3676,15 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             .changed;
     }
     if !changed {
-        out_text(&already);
+        out_path_text(&already);
         return Ok(());
     }
-    out_text(&format!(
+    out_path_text(&format!(
         "Allowed `{pattern}` for {audience}; written to {}.",
         target.written_to()
     ));
     if force {
-        out_text(&format!(
+        out_path_text(&format!(
             "The built-in deny for `{pattern}` is lifted by an override in the same file."
         ));
     }
@@ -3750,10 +3750,10 @@ fn deny(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             pattern: pattern.clone(),
         },
     ) {
-        out_text(&already);
+        out_path_text(&already);
         return Ok(());
     }
-    out_text(&format!(
+    out_path_text(&format!(
         "{} write to {}: deny `{pattern}` to every peer.",
         intent_verb(dry_run),
         target.written_to()
@@ -3780,12 +3780,12 @@ fn deny(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         target.write_scope(),
     )?;
     if applied.changed {
-        out_text(&format!(
+        out_path_text(&format!(
             "Denied `{pattern}` to every peer; written to {}.",
             target.written_to()
         ));
     } else {
-        out_text(&already);
+        out_path_text(&already);
     }
     Ok(())
 }
@@ -3892,7 +3892,7 @@ fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let total: usize = targets.iter().map(|(_, held)| held.len()).sum();
     let matches = describe_matches(&set, &pattern, &root, case_insensitive)?;
     if total > 1 {
-        out_text(&format!("`{pattern}` is held by:"));
+        out_path_text(&format!("`{pattern}` is held by:"));
         for (layer, held) in &targets {
             for holder in held {
                 let scope = match &holder.peer {
@@ -3903,12 +3903,12 @@ fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                         format!(" (scoped to no peer: `{}`)", shown_pattern(text))
                     }
                 };
-                out_text(&format!("  {}{scope} in {}", holder.kind, path_of(*layer)));
+                out_path_text(&format!("  {}{scope} in {}", holder.kind, path_of(*layer)));
             }
         }
     }
     for (layer, held) in &targets {
-        out_text(&format!(
+        out_path_text(&format!(
             "{} remove the {} for `{pattern}` from {}.",
             intent_verb(dry_run),
             kind_list(held),
@@ -3953,7 +3953,7 @@ fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             },
             scope,
         )?;
-        out_text(&format!(
+        out_path_text(&format!(
             "Removed the {} for `{pattern}` from {}.",
             kind_list(held),
             path_of(*layer)
@@ -4002,9 +4002,9 @@ fn shares(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             case,
         )
     } else {
-        render_share_rules(&set, &peer_ref, peer.as_deref())
+        render_share_rules(&set, &peer_ref, peer.as_deref(), ctx.command_prefix())
     };
-    out_text(&text);
+    out_path_text(&text);
     Ok(())
 }
 
@@ -4202,7 +4202,14 @@ fn listed_paths(paths: &[String]) -> String {
         .join(", ")
 }
 
-fn render_share_rules(set: &ShareSet, peer: &PeerRef<'_>, scoped_to: Option<&str>) -> String {
+/// The listing is printed byte for byte for its patterns' sake, so the two hints it can
+/// carry are rendered in `prefix` here.
+fn render_share_rules(
+    set: &ShareSet,
+    peer: &PeerRef<'_>,
+    scoped_to: Option<&str>,
+    prefix: CommandPrefix,
+) -> String {
     let locations = set.locations();
     let effective = scoped_to.is_some().then(|| set.effective(peer));
     let rows: Vec<[String; 4]> = set
@@ -4256,14 +4263,16 @@ fn render_share_rules(set: &ShareSet, peer: &PeerRef<'_>, scoped_to: Option<&str
     if rows.is_empty() {
         if let Some(hash) = scoped_to {
             return format!(
-                "No share rule applies to peer {}; `.mesh shares` lists every rule.",
-                short(hash)
+                "No share rule applies to peer {}; {}",
+                short(hash),
+                prefix.render_hints("`.mesh shares` lists every rule.")
             );
         }
         return format!(
-            "No share rules in {} or {}. `.mesh allow docs/**` shares docs/ with every trusted peer.",
+            "No share rules in {} or {}. {}",
             locations.global.display(),
-            locations.workspace.display()
+            locations.workspace.display(),
+            prefix.render_hints("`.mesh allow docs/**` shares docs/ with every trusted peer.")
         );
     }
     let presence = |path: &Path| if path.exists() { "" } else { " (absent)" };
@@ -5698,20 +5707,29 @@ fn mesh_table(header: &[&str]) -> comfy_table::Table {
     table
 }
 
+/// Prints `text` with its command hints in the live prefix, as the human types them.
 pub(crate) fn out_text(text: &str) {
-    #[cfg(test)]
-    capture::push(capture::Stream::Out, text);
-    println!("{text}");
+    out_path_text(&live_prefix().render_hints(text));
 }
 
 pub(crate) fn err_text(text: &str) {
+    let text = live_prefix().render_hints(text);
     #[cfg(test)]
-    capture::push(capture::Stream::Err, text);
+    capture::push(capture::Stream::Err, &text);
     if err_text_coloured() {
-        eprintln!("{}", nu_ansi_term::Color::Yellow.paint(text));
+        eprintln!("{}", nu_ansi_term::Color::Yellow.paint(text.as_ref()));
     } else {
         eprintln!("{text}");
     }
+}
+
+/// Prints `text` byte for byte, for lines that carry a path or a share pattern: a hint
+/// rewrite would turn the file `.vault/key` into `/vault/key`, since `.vault` is also a
+/// command.
+pub(crate) fn out_path_text(text: &str) {
+    #[cfg(test)]
+    capture::push(capture::Stream::Out, text);
+    println!("{text}");
 }
 
 #[cfg(test)]
@@ -8705,7 +8723,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             identity: &identity,
             destination: &destination,
         };
-        let text = render_share_rules(&fx.set(), &peer, None);
+        let text = render_share_rules(&fx.set(), &peer, None, CommandPrefix::Dot);
         assert_eq!(fx.placeholders(&text), SHARES_SNAPSHOT);
     }
 
@@ -11376,6 +11394,162 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
 
         fn err_of(ctx: &mut RequestContext, line: &str) -> String {
             run_async(run(ctx, line)).unwrap_err().to_string()
+        }
+
+        mod command_prefix_sinks {
+            use super::*;
+            use crate::config::{CommandPrefix, LivePrefix, live_prefix_override};
+            use crate::mesh::notify::{Notification, NotificationSink, Source};
+            use crate::render::command_error_text;
+            use crate::repl::printer::PromptPrinter;
+
+            /// Each prefix with the sigil a `.set command_prefix` line takes under it and
+            /// the way its hints spell the mesh command.
+            const PREFIXES: [(CommandPrefix, char, &str); 3] = [
+                (CommandPrefix::Dot, '.', ".mesh"),
+                (CommandPrefix::Slash, '/', "/mesh"),
+                (CommandPrefix::Both, '.', ".mesh"),
+            ];
+
+            fn installed(prefix: CommandPrefix) -> live_prefix_override::OverrideGuard {
+                let live = LivePrefix::default();
+                live.store(prefix);
+                live_prefix_override::install(live)
+            }
+
+            fn set_prefix(ctx: &mut RequestContext, prefix: CommandPrefix) {
+                let sigil = ctx.command_prefix().display();
+                run_async(run(ctx, &format!("{sigil}set command_prefix {prefix}"))).unwrap();
+            }
+
+            #[test]
+            #[serial]
+            fn out_and_err_text_record_and_print_the_rendered_hint() {
+                for (prefix, _, mesh) in PREFIXES {
+                    let _prefix = installed(prefix);
+                    let _capture = capture::install();
+                    out_text(MESH_OFF);
+                    err_text("Not trusted yet; `.mesh trust 1a2b3c4d` trusts it.");
+                    assert_eq!(
+                        capture::lines(),
+                        [
+                            (
+                                capture::Stream::Out,
+                                format!("Mesh is off. Run `{mesh} on` first.")
+                            ),
+                            (
+                                capture::Stream::Err,
+                                format!("Not trusted yet; `{mesh} trust 1a2b3c4d` trusts it.")
+                            ),
+                        ],
+                        "{prefix}"
+                    );
+                }
+            }
+
+            #[test]
+            #[serial]
+            fn out_path_text_prints_a_dotted_path_unchanged_under_slash() {
+                let _prefix = installed(CommandPrefix::Slash);
+                let _capture = capture::install();
+                out_path_text("Staged `.vault/key` from 1a2b3c4d.");
+                out_text("Staged `.vault/key` from 1a2b3c4d.");
+                assert_eq!(
+                    stdout_of_capture(),
+                    [
+                        "Staged `.vault/key` from 1a2b3c4d.",
+                        "Staged `/vault/key` from 1a2b3c4d.",
+                    ],
+                    "the path sink leaves the path alone; the hint sink would not"
+                );
+            }
+
+            fn stdout_of_capture() -> Vec<String> {
+                capture::lines()
+                    .into_iter()
+                    .filter(|(stream, _)| *stream == capture::Stream::Out)
+                    .map(|(_, text)| text)
+                    .collect()
+            }
+
+            /// The node-off line of `.mesh info` and the `.mesh off` pointer follow the
+            /// prefix the session was switched to, as do the refusals `.mesh pending` and
+            /// `.mesh knocks` raise while the mesh is off.
+            #[test]
+            #[serial]
+            fn mesh_verbs_spell_their_hints_in_the_configured_prefix() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-prefix-verbs");
+                for (prefix, sigil, mesh) in PREFIXES {
+                    let mut ctx = off_ctx();
+                    ctx.mesh_enabled_in_config = true;
+                    let _prefix =
+                        live_prefix_override::install(ctx.app.mesh.command_prefix().clone());
+                    set_prefix(&mut ctx, prefix);
+                    let _capture = capture::install();
+
+                    run_async(run(&mut ctx, &format!("{sigil}mesh info"))).unwrap();
+                    run_async(run(&mut ctx, &format!("{sigil}mesh off"))).unwrap();
+
+                    let out = stdout_of_capture();
+                    assert_eq!(out[0], format!("node: off - {mesh} on joins"), "{prefix}");
+                    assert_eq!(
+                        out.last().unwrap(),
+                        &format!(
+                            "Mesh is already off for this session (it stays off for the rest of this run; `{mesh} on` joins again)."
+                        ),
+                        "{prefix}"
+                    );
+                    for verb in ["pending", "knocks"] {
+                        let err = run_async(run(&mut ctx, &format!("{sigil}mesh {verb}")))
+                            .unwrap_err();
+                        assert_eq!(
+                            command_error_text(&err, ctx.app.mesh.command_prefix().load()),
+                            format!("Error: Mesh is off. Run `{mesh} on` first."),
+                            "{prefix} {verb}"
+                        );
+                    }
+                }
+            }
+
+            /// `.set command_prefix slash` in a running session reaches the next line
+            /// `out_text` and the prompt printer print, with no mesh restart: both read
+            /// the slot's live prefix, which is the handle `Repl::init` installs.
+            #[test]
+            #[serial]
+            fn set_command_prefix_changes_the_next_printed_line() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-prefix-live");
+                let mut ctx = off_ctx();
+                let live = ctx.app.mesh.command_prefix().clone();
+                let _prefix = live_prefix_override::install(live.clone());
+                let printer = PromptPrinter::new(live);
+                let attached = printer.attach();
+                let knock = || {
+                    Notification::new(Source::Knock, "Tia knocked; `.mesh trust 1a2b3c4d` lets it in")
+                        .render()
+                };
+                let _capture = capture::install();
+
+                run_async(run(&mut ctx, ".mesh info")).unwrap();
+                printer.notify(knock());
+                set_prefix(&mut ctx, CommandPrefix::Slash);
+                run_async(run(&mut ctx, "/mesh info")).unwrap();
+                printer.notify(knock());
+
+                let infos: Vec<String> = stdout_of_capture()
+                    .into_iter()
+                    .filter(|line| line.starts_with("node: off"))
+                    .collect();
+                assert_eq!(infos, ["node: off - .mesh on joins", "node: off - /mesh on joins"]);
+                // The shipped printer paints its prefix when colour is on, so only the
+                // body is compared.
+                for mesh in [".mesh", "/mesh"] {
+                    let line = attached.get_line().expect("a notified line");
+                    assert!(
+                        line.ends_with(&format!(" Tia knocked; `{mesh} trust 1a2b3c4d` lets it in")),
+                        "{line:?}"
+                    );
+                }
+            }
         }
 
         /// One inbox block's `.mesh inbox` output as logical lines: the header, then each

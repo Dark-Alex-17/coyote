@@ -8,7 +8,10 @@ pub use self::markdown::{MarkdownRender, RenderOptions};
 use self::stream::{markdown_stream, raw_stream};
 
 use crate::utils::{AbortSignal, IS_STDOUT_TERMINAL, pretty_error, stderr_error_text};
-use crate::{client::SseEvent, config::AppConfig};
+use crate::{
+    client::SseEvent,
+    config::{AppConfig, CommandPrefix},
+};
 
 use anyhow::Result;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -50,4 +53,45 @@ async fn drain_silently(
 
 pub fn render_error(err: anyhow::Error) {
     eprintln!("{}", stderr_error_text(&pretty_error(&err)));
+}
+
+/// `render_error` for an error a REPL command raised: its command hints are shown in
+/// `prefix`, the way the human types them.
+pub fn render_command_error(err: anyhow::Error, prefix: CommandPrefix) {
+    eprintln!("{}", stderr_error_text(&command_error_text(&err, prefix)));
+}
+
+pub(crate) fn command_error_text(err: &anyhow::Error, prefix: CommandPrefix) -> String {
+    prefix.render_hints(&pretty_error(err)).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod command_prefix_sinks {
+        use super::*;
+
+        #[test]
+        fn command_error_hints_follow_the_prefix() {
+            let err = anyhow::anyhow!(
+                "No path to 1a2b3c4d is known; nothing was sent. `.mesh peers` lists what this node has heard from."
+            )
+            .context("`.mesh message` failed");
+            for (prefix, sigil) in [
+                (CommandPrefix::Dot, '.'),
+                (CommandPrefix::Slash, '/'),
+                (CommandPrefix::Both, '.'),
+            ] {
+                let text = command_error_text(&err, prefix);
+                assert_eq!(
+                    text,
+                    format!(
+                        "Error: `{sigil}mesh message` failed\n\nCaused by:\n    No path to 1a2b3c4d is known; nothing was sent. `{sigil}mesh peers` lists what this node has heard from."
+                    ),
+                    "{prefix}"
+                );
+            }
+        }
+    }
 }

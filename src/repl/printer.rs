@@ -1,3 +1,4 @@
+use crate::config::LivePrefix;
 use crate::mesh::notify::{NotificationSink, RenderedNotification, Source};
 use crate::utils::{NO_COLOR, tool_name_text_forced};
 
@@ -31,20 +32,23 @@ pub struct PromptPrinter {
     /// Settled once at construction: the prefixes are painted in the tool-call name
     /// colour, or every row is plain text.
     colour: bool,
+    /// Read per notification, so a `.set command_prefix` shows on the next line.
+    command_prefix: LivePrefix,
 }
 
 impl PromptPrinter {
-    pub fn new() -> Self {
-        Self::with_colour(PROMPT_PRINTER_CAPACITY, !*NO_COLOR)
+    pub fn new(command_prefix: LivePrefix) -> Self {
+        Self::with_colour(PROMPT_PRINTER_CAPACITY, !*NO_COLOR, command_prefix)
     }
 
-    fn with_colour(cap: usize, colour: bool) -> Self {
+    fn with_colour(cap: usize, colour: bool, command_prefix: LivePrefix) -> Self {
         let printer = ExternalPrinter::new(cap);
         Self {
             sender: printer.sender(),
             unattached: Mutex::new(Some(printer)),
             dropped: AtomicUsize::new(0),
             colour,
+            command_prefix,
         }
     }
 
@@ -78,7 +82,8 @@ impl PromptPrinter {
 impl NotificationSink for PromptPrinter {
     /// Never blocks: the queue is drained on the editor thread, and a caller waiting on it
     /// from inside a turn would wait until the next prompt. A full queue drops the
-    /// notification and the next one that fits carries the count.
+    /// notification and the next one that fits carries the count. Command hints are
+    /// rewritten before the rows are wrapped, so the widths measured are the ones printed.
     fn notify(&self, rendered: RenderedNotification) {
         let dropped = self.dropped.swap(0, Ordering::AcqRel);
         let mut rows = Vec::new();
@@ -92,8 +97,14 @@ impl NotificationSink for PromptPrinter {
             rows.push(self.paint_prefix(format!("{prefix} ({dropped} {noun} dropped)"), prefix));
         }
         let prefix = rendered.source().prefix();
+        let command_prefix = self.command_prefix.load();
+        let lines: Vec<String> = rendered
+            .lines()
+            .iter()
+            .map(|line| command_prefix.render_hints(line).into_owned())
+            .collect();
         rows.extend(
-            wrap_rows(rendered.lines(), prefix, terminal_width())
+            wrap_rows(&lines, prefix, terminal_width())
                 .into_iter()
                 .map(|row| self.paint_prefix(row, prefix)),
         );
@@ -167,11 +178,98 @@ mod tests {
     use std::sync::Arc;
 
     fn plain(cap: usize) -> PromptPrinter {
-        PromptPrinter::with_colour(cap, false)
+        PromptPrinter::with_colour(cap, false, LivePrefix::default())
     }
 
     fn painted(cap: usize) -> PromptPrinter {
-        PromptPrinter::with_colour(cap, true)
+        PromptPrinter::with_colour(cap, true, LivePrefix::default())
+    }
+
+    mod command_prefix_sinks {
+        use super::*;
+        use crate::config::CommandPrefix;
+
+        const PREFIXES: [(CommandPrefix, &str); 3] = [
+            (CommandPrefix::Dot, ".mesh"),
+            (CommandPrefix::Slash, "/mesh"),
+            (CommandPrefix::Both, ".mesh"),
+        ];
+
+        fn printer_under(prefix: CommandPrefix) -> PromptPrinter {
+            let live = LivePrefix::default();
+            live.store(prefix);
+            PromptPrinter::with_colour(PROMPT_PRINTER_CAPACITY, false, live)
+        }
+
+        /// The idle lines a person acts on: a knock, an access request, and the envoy
+        /// escalating a question to them.
+        #[test]
+        fn idle_lines_spell_their_hints_in_the_prefix() {
+            for (prefix, mesh) in PREFIXES {
+                let printer = printer_under(prefix);
+                let attached = printer.attach();
+                for (source, text, expected) in [
+                    (
+                        Source::Knock,
+                        "Tia knocked; `.mesh trust 1a2b3c4d` lets it in",
+                        format!("[mesh:knock] Tia knocked; `{mesh} trust 1a2b3c4d` lets it in"),
+                    ),
+                    (
+                        Source::Access,
+                        "Tia asks for 2 paths; `.mesh pending` lists it",
+                        format!("[mesh:access] Tia asks for 2 paths; `{mesh} pending` lists it"),
+                    ),
+                    (
+                        Source::Message,
+                        "envoy escalated to the human; answer with `.mesh answer 1a2b3c4d`",
+                        format!(
+                            "[mesh:message] envoy escalated to the human; answer with `{mesh} answer 1a2b3c4d`"
+                        ),
+                    ),
+                ] {
+                    printer.notify(Notification::new(source, text).render());
+                    assert_eq!(attached.get_line(), Some(expected), "{prefix}");
+                }
+            }
+        }
+
+        /// The hint is rewritten before the rows are measured, so a wrapped line keeps
+        /// the width bound and carries the rendered hint, never the typed one.
+        #[test]
+        fn a_wrapped_line_is_rendered_before_it_is_measured() {
+            let printer = printer_under(CommandPrefix::Slash);
+            let attached = printer.attach();
+            let body = format!("{} then `.mesh trust 1a2b3c4d`", "x".repeat(450));
+            printer.notify(Notification::new(Source::Knock, body.as_str()).render());
+            let payload = attached.get_line().expect("payload queued");
+            let rows: Vec<String> = payload.lines().map(str::to_string).collect();
+            assert!(rows.len() > 1, "{rows:?}");
+            for row in &rows {
+                assert!(display_width(row) <= terminal_width().max(MIN_WRAP_WIDTH), "{row:?}");
+            }
+            assert_eq!(
+                bodies(&rows, Source::Knock.prefix()),
+                body.replace(".mesh", "/mesh")
+            );
+        }
+
+        #[test]
+        fn the_dropped_count_row_is_left_as_it_is() {
+            let printer = PromptPrinter::with_colour(1, false, {
+                let live = LivePrefix::default();
+                live.store(CommandPrefix::Slash);
+                live
+            });
+            let attached = printer.attach();
+            printer.notify(Notification::new(Source::Knock, "first").render());
+            printer.notify(Notification::new(Source::Knock, "dropped").render());
+            assert_eq!(attached.get_line().as_deref(), Some("[mesh:knock] first"));
+            printer.notify(Notification::new(Source::Knock, "`.mesh knocks` lists it").render());
+            assert_eq!(
+                attached.get_line().as_deref(),
+                Some("[mesh] (1 notification dropped)\n[mesh:knock] `/mesh knocks` lists it")
+            );
+        }
     }
 
     #[test]
@@ -187,7 +285,7 @@ mod tests {
     /// row is the plain snapshot or the painted one by `NO_COLOR` alone.
     #[test]
     fn new_follows_the_process_colour_decision() {
-        let printer = PromptPrinter::new();
+        let printer = PromptPrinter::new(LivePrefix::default());
         let attached = printer.attach();
         printer.notify(Notification::new(Source::Knock, "hi").render());
         let expected = if *NO_COLOR {

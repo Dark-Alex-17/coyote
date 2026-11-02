@@ -2,7 +2,7 @@ use crate::config::mesh_config::{
     DEFAULT_LOCAL_RNSD_INSTANCE, DEFAULT_LOCAL_RNSD_PORT, EnvoyMemoryConfig, MeshConfig,
     MeshInterface,
 };
-use crate::config::{ForkRekey, Session, paths};
+use crate::config::{ForkRekey, LivePrefix, Session, paths};
 use crate::mesh::access::{AccessHandler, AccessRouting, AccessSurface, put_back};
 use crate::mesh::announce::{
     AnnounceAppData, HEARTBEAT_PERIOD_SECS, HEARTBEAT_SECS, REANNOUNCE_FLOOR_SECS,
@@ -3460,6 +3460,10 @@ impl OwnEntryMarks {
 /// `own_entries` marks the inbox entries this node filed itself, written as they are
 /// filed and read by `is_from_self`; `stop` and `rekey` leave it alone, so an entry filed
 /// before a `.mesh off` or a re-key still reads as this node's.
+///
+/// `command_prefix` is the session's configured prefix, kept in step with the config by
+/// whoever writes it, so every line printed for the human shows command hints the way
+/// the human types them.
 #[derive(Default)]
 pub(crate) struct MeshSlot {
     inner: RwLock<Option<Arc<MeshRuntime>>>,
@@ -3481,6 +3485,7 @@ pub(crate) struct MeshSlot {
     correlations: Correlations,
     model_notes: ModelNotes,
     inbound: parking_lot::Mutex<Option<Arc<InboundStore>>>,
+    command_prefix: LivePrefix,
     #[cfg(test)]
     envoy_memory_override: ArcSwapOption<EnvoySessions>,
 }
@@ -3488,6 +3493,10 @@ pub(crate) struct MeshSlot {
 impl MeshSlot {
     pub(crate) fn get(&self) -> Option<Arc<MeshRuntime>> {
         self.inner.read().clone()
+    }
+
+    pub(crate) fn command_prefix(&self) -> &LivePrefix {
+        &self.command_prefix
     }
 
     pub(crate) fn limits(&self) -> &Arc<PeerLimits> {
@@ -3856,9 +3865,10 @@ impl MeshSlot {
             Some(sink) => sink.notify(rendered),
             None => {
                 use std::io::Write as _;
+                let prefix = self.command_prefix.load();
                 let mut stderr = std::io::stderr().lock();
                 for line in rendered.lines() {
-                    let _ = writeln!(stderr, "{line}");
+                    let _ = writeln!(stderr, "{}", prefix.render_hints(line));
                 }
             }
         }

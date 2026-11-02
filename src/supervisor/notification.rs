@@ -1,6 +1,9 @@
+use crate::config::CommandPrefix;
+
 use fmt::{Debug, Formatter};
 use log::debug;
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::fmt;
 
 /// Who vouches for an event when the queue is drained. `Supervisor` events name a handle
@@ -40,6 +43,15 @@ pub struct SystemNotification {
 }
 
 impl SystemNotification {
+    /// This event with the command hints in its next step written in `prefix`; the
+    /// other fields name things, not commands, and stay as they are.
+    pub fn with_hints_in(mut self, prefix: CommandPrefix) -> Self {
+        if let Cow::Owned(rendered) = prefix.render_hints(&self.next_action) {
+            self.next_action = rendered;
+        }
+        self
+    }
+
     /// The serialised shape names `count` only when it says something, so an entry
     /// standing for one event reads as it always has.
     pub fn to_value(&self) -> Value {
@@ -261,6 +273,36 @@ impl Debug for NotificationQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod command_prefix_sinks {
+        use super::*;
+
+        #[test]
+        fn only_the_next_step_hint_follows_the_prefix() {
+            let typed = mesh_notification(
+                "peer_ask",
+                "peer:1a2b3c4d",
+                "mesh",
+                true,
+                "the human was asked; wait for `.mesh answer q1` instead of replying".into(),
+            );
+            for (prefix, mesh) in [
+                (CommandPrefix::Dot, ".mesh"),
+                (CommandPrefix::Slash, "/mesh"),
+                (CommandPrefix::Both, ".mesh"),
+            ] {
+                let mut expected = typed.to_value();
+                expected["next_action"] = json!(format!(
+                    "the human was asked; wait for `{mesh} answer q1` instead of replying"
+                ));
+                assert_eq!(
+                    typed.clone().with_hints_in(prefix).to_value(),
+                    expected,
+                    "{prefix}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn job_notification_success_shape() {

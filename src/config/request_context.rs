@@ -1492,6 +1492,10 @@ impl RequestContext {
         let mut app_state = (*self.app).clone();
         app_state.config = Arc::new(app_config);
         self.app = Arc::new(app_state);
+        self.app
+            .mesh
+            .command_prefix()
+            .store(self.app.config.command_prefix);
     }
 
     pub fn command_prefix(&self) -> CommandPrefix {

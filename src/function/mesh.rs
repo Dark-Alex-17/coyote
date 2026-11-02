@@ -1,5 +1,5 @@
 use super::{FunctionDeclaration, JsonSchema};
-use crate::config::{Agent, RequestContext};
+use crate::config::{Agent, CommandPrefix, RequestContext};
 use crate::mesh::access::{
     ACCESS_MAX_PATHS, ACCESS_REASON_MAX_CHARS, AccessError, AccessOutcome, AccessRefusal,
     AccessRequestOutcome,
@@ -35,6 +35,7 @@ use indexmap::IndexMap;
 use log::debug;
 use rns_transport::destination::DestinationDesc;
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 use tokio::io::AsyncReadExt;
@@ -442,6 +443,9 @@ pub fn mesh_function_declarations() -> Vec<FunctionDeclaration> {
     ]
 }
 
+/// Command hints in the result's prose (`message`, `next_action`) are written in the
+/// session's prefix. A running node's `list` and `fetch` results come back untouched:
+/// their prose quotes the peer's paths, which a hint rewrite would mangle.
 pub async fn handle_mesh_tool(
     ctx: &mut RequestContext,
     cmd_name: &str,
@@ -450,6 +454,7 @@ pub async fn handle_mesh_tool(
     let action = cmd_name
         .strip_prefix(MESH_FUNCTION_PREFIX)
         .unwrap_or(cmd_name);
+    let prefix = ctx.app.mesh.command_prefix().load();
 
     if ctx.in_graph_llm_node {
         return Ok(json!({
@@ -466,23 +471,52 @@ pub async fn handle_mesh_tool(
     }
 
     let Some(runtime) = ctx.app.mesh.get() else {
-        return Ok(json!({
+        return Ok(with_prose_hints(json!({
             "status": "error",
             "message": "The mesh is not on in this session. Run `.mesh on` in the REPL (it is session-scoped; config.yaml is not changed).",
-        }));
+        }), prefix));
     };
 
-    match action {
+    let result = match action {
         "peers" => handle_peers(&runtime, args).await,
         "send" => handle_send(&ctx.app.mesh, &runtime, args).await,
         "ask" => handle_ask(ctx, &runtime, args).await,
         "collect" => handle_collect(ctx, args).await,
         "check_inbox" => Ok(handle_check_inbox(&ctx.app.mesh)),
         "broadcast" => handle_broadcast(&runtime, args).await,
-        "list" => handle_list(&runtime, args).await,
-        "fetch" => handle_fetch(&runtime, args).await,
+        "list" => return handle_list(&runtime, args).await,
+        "fetch" => return handle_fetch(&runtime, args).await,
         "request_access" => handle_request_access(&ctx.app.mesh, args).await,
         _ => bail!("Unknown mesh action: {action}"),
+    }?;
+    Ok(with_prose_hints(result, prefix))
+}
+
+fn with_prose_hints(mut value: Value, prefix: CommandPrefix) -> Value {
+    render_prose_hints(&mut value, prefix);
+    value
+}
+
+fn render_prose_hints(value: &mut Value, prefix: CommandPrefix) {
+    match value {
+        Value::Object(fields) => {
+            for (key, field) in fields.iter_mut() {
+                match field {
+                    Value::String(text) if matches!(key.as_str(), "message" | "next_action") => {
+                        if let Cow::Owned(rendered) = prefix.render_hints(text) {
+                            *text = rendered;
+                        }
+                    }
+                    _ => render_prose_hints(field, prefix),
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                render_prose_hints(item, prefix);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -499,8 +533,9 @@ pub(crate) fn merge_slot_notes(ctx: &RequestContext) {
     {
         return;
     }
+    let prefix = ctx.app.mesh.command_prefix().load();
     for note in ctx.app.mesh.take_model_notes() {
-        ctx.notification_queue.push_mesh(note);
+        ctx.notification_queue.push_mesh(note.with_hints_in(prefix));
     }
 }
 
@@ -1700,6 +1735,92 @@ mod tests {
 
     fn peer_message(kind: PeerKind, id: &str, in_reply_to: Option<&str>) -> PeerMessage {
         PeerMessage::new(raw_message(kind, id, in_reply_to))
+    }
+
+    mod command_prefix_sinks {
+        use super::*;
+
+        const PREFIXES: [(CommandPrefix, &str); 3] = [
+            (CommandPrefix::Dot, ".mesh"),
+            (CommandPrefix::Slash, "/mesh"),
+            (CommandPrefix::Both, ".mesh"),
+        ];
+
+        #[tokio::test]
+        async fn the_mesh_off_result_changes_only_the_hint_prefix() {
+            for (prefix, mesh) in PREFIXES {
+                let mut ctx = plain_ctx();
+                ctx.app.mesh.command_prefix().store(prefix);
+                for action in ACTIONS {
+                    let result = handle_mesh_tool(
+                        &mut ctx,
+                        &format!("{MESH_FUNCTION_PREFIX}{action}"),
+                        &json!({}),
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        result.to_string(),
+                        json!({
+                            "status": "error",
+                            "message": format!("The mesh is not on in this session. Run `{mesh} on` in the REPL (it is session-scoped; config.yaml is not changed)."),
+                        })
+                        .to_string(),
+                        "{prefix} {action}"
+                    );
+                }
+            }
+        }
+
+        /// Only the prose keys are rewritten, at any depth; a path, peer text and the
+        /// shape of the value stay as they were.
+        #[test]
+        fn prose_hints_rewrite_message_and_next_action_and_nothing_else() {
+            let typed = json!({
+                "status": "error",
+                "message": "Not trusted; `.mesh trust 1a2b3c4d` trusts it.",
+                "path": ".vault/key",
+                "refused": [{
+                    "next_action": "wait for `.mesh answer q1`",
+                    "text": ".info from the peer",
+                }],
+            });
+            for (prefix, mesh) in PREFIXES {
+                let rendered = with_prose_hints(typed.clone(), prefix);
+                let expected = json!({
+                    "status": "error",
+                    "message": format!("Not trusted; `{mesh} trust 1a2b3c4d` trusts it."),
+                    "path": ".vault/key",
+                    "refused": [{
+                        "next_action": format!("wait for `{mesh} answer q1`"),
+                        "text": ".info from the peer",
+                    }],
+                });
+                assert_eq!(rendered.to_string(), expected.to_string(), "{prefix}");
+            }
+        }
+
+        #[test]
+        fn merged_slot_notes_carry_the_hint_in_the_prefix() {
+            for (prefix, mesh) in PREFIXES {
+                let ctx = mesh_ctx();
+                ctx.app.mesh.command_prefix().store(prefix);
+                ctx.app
+                    .mesh
+                    .record_envoy_escalated(peer_message(PeerKind::Ask, "q1", None), "q1");
+
+                merge_slot_notes(&ctx);
+                let notes = drain_live_notifications(&ctx);
+
+                assert_eq!(notes.len(), 1, "{notes:?}");
+                assert_eq!(
+                    notes[0]["next_action"],
+                    format!("the human was asked; wait for `{mesh} answer q1` instead of replying"),
+                    "{prefix}"
+                );
+                assert_eq!(notes[0]["event"], "peer_ask", "{prefix}");
+            }
+        }
     }
 
     fn open_question(slot: &MeshSlot, id: &str) {
