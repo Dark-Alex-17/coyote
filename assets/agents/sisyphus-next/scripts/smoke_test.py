@@ -30,6 +30,9 @@ os.makedirs(os.environ["HOME"], exist_ok=True)
 for _k in [k for k in os.environ if k.startswith("LLM_AGENT_VAR_")]:
     # the battery must not inherit the agent variables of whoever runs it
     os.environ.pop(_k)
+for _k in [k for k in os.environ if k.startswith("SISYPHUS_GH_") or k in ("SISYPHUS_CI_SLEEP", "SISYPHUS_REVIEW_SLEEP")]:
+    # a caller's seams would replace the battery's fixtures
+    os.environ.pop(_k)
 GIT_REPO_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM")
 GIT_CONFIG_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
 for _k in [k for k in os.environ if k in GIT_REPO_VARS or k.startswith(GIT_CONFIG_PREFIXES)]:
@@ -43,8 +46,8 @@ os.environ["GIT_CONFIG_GLOBAL"] = os.devnull
 
 import _lib  # noqa: E402
 import gates  # noqa: E402
-from _lib import (CI_FLAKE_RERUNS, CLARIFY_MAX, REASK_MAX, RERUN_ONCE, STRIKE_LIMIT, SUBTASK_MAX,  # noqa: E402
-                  option, escalation)
+from _lib import (CI_FLAKE_RERUNS, CI_POLL_FAILS, CLARIFY_MAX, REASK_MAX, RERUN_ONCE, REVIEW_CI_POLL_BUDGET,  # noqa: E402
+                  REVIEW_MAX_POLLS, REVIEW_MAX_ROUNDS, REVIEW_WALL_SECS, STRIKE_LIMIT, SUBTASK_MAX, option, escalation)
 
 RESULTS = []
 
@@ -679,6 +682,291 @@ check("entry: explore_fault branch fallback", code == 0 and out["finding"].start
 code, out = run_entry("librarian_fault", {"question": "q"})
 check("entry: librarian_fault branch fallback carries the question",
       code == 0 and out["finding"].startswith("PIPELINE-FAULT") and out["finding"].endswith("question: q"))
+
+# --- pr_tracking review watch ---
+os.environ["SISYPHUS_REVIEW_SLEEP"] = "0"
+_REVIEW_DOC = os.path.join(TMP, "review-doc.json")
+_RESOLVED = os.path.join(TMP, "resolved.txt")
+_HEAD = subprocess.run(["git", "-C", REPO, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+_now = int(time.time())
+
+
+def rs(**over):
+    return base_state(**{"pr_tracking": "review", "ci_owner": True, "pr_ref": "7", "flip_ready": True,
+                         "git_report": "https://github.com/o/r/pull/7", "pr_review_started_at": _now, **over})
+
+
+def review_doc(state="OPEN", decision="", reviews=(), comments=(), threads=()):
+    doc = {"state": state, "reviewDecision": decision, "headRefOid": "abc", "reviews": list(reviews),
+           "comments": list(comments), "reviewThreads": list(threads)}
+    with open(_REVIEW_DOC, "w") as fh:
+        json.dump(doc, fh)
+    os.environ["SISYPHUS_GH_REVIEWS_CMD"] = f"cat '{_REVIEW_DOC}'"
+    return doc
+
+
+def thread(tid, comments, resolved=False, outdated=False):
+    return {"id": tid, "isResolved": resolved, "isOutdated": outdated, "path": "src/a.py", "line": 3,
+            "comments": [{"id": cid, "author": "rev", "body": body, "url": f"https://github.com/o/r/pull/7#{cid}"}
+                         for cid, body in comments]}
+
+
+u = gates.ci_route(base_state(ci_status="green", flip_ready=True))
+check("pr_tracking ci: ci_route green -> flip with the ci-mode text unchanged",
+      u["_next"] == "git_ops" and u["decisions"] == ["ci: green -> flip to ready"]
+      and u["git_task"] == {"kind": "flip_ready", "return_to": "final_report", "flip_ready": True,
+                            "text": "CI is green and the verification loop is complete: flip the PR to ready (gh pr ready)."})
+check("pr_tracking ci: ci_gate flip_ready on an owned PR -> final_report",
+      gates.ci_gate(base_state(git_task={"kind": "flip_ready"}, ci_owner=True))["_next"] == "final_report")
+os.environ["SISYPHUS_GH_CHECKS_CMD"] = "echo '[{\"name\":\"build\",\"bucket\":\"pass\"}]'"
+check("pr_tracking ci: ci_poll counts no ci_polls_run",
+      "ci_polls_run" not in gates.ci_poll(base_state(git_report="pull/5", ci_polls=0, ci_started_at=_now)))
+check("pr_tracking review: ci_poll counts every visit in ci_polls_run",
+      gates.ci_poll(rs(ci_polls=0, ci_started_at=_now, ci_polls_run=4))["ci_polls_run"] == 5)
+_pending = [{"id": "t1", "kind": "thread", "url": "https://github.com/o/r/pull/7#c1", "text": "rename foo", "action": "fix"}]
+u = gates.pr_gate(base_state(git_actions={"commit": True, "push": True, "open_pr": True}, ci_owner=True, pr_review_pending=_pending))
+check("pr_tracking ci: pr_gate with pending review items -> the normal publish task", u["git_task"]["kind"] == "publish")
+_esc = gates.ci_apply(base_state(ci_verdict="real", ci_fix_strikes=STRIKE_LIMIT))["escalation"]
+check("pr_tracking ci: ci_apply exhausted keeps its question and options",
+      _esc["question"] == f"CI still red after {STRIKE_LIMIT} fix rounds. How to proceed?"
+      and [o["text"] for o in _esc["options"]] == ["Resume with one more coder fix round", "Leave the PR in draft and report"])
+_esc = gates.ci_apply(base_state(ci_verdict="infra"))["escalation"]
+check("pr_tracking ci: ci_apply infra keeps its question",
+      _esc["question"] == "CI failed for infrastructure reasons (runner lost / timeout / 429 / cancelled). Wait and re-watch, or leave in draft?")
+check("pr_tracking ci: the report carries no review-watch line",
+      "PR review watch" not in gates.final_report(base_state(ci_status="green", pr_review_addressed=_pending))["report"])
+
+u = gates.ci_gate(base_state(pr_tracking="review", git_task={"kind": "publish", "return_to": "ci_gate", "open_pr": True},
+                             delegated=False, git_report="opened https://github.com/o/r/pull/7"))
+check("pr_tracking review: the first watch start records pr_ref", u["_next"] == "ci_poll" and u["pr_ref"] == "7")
+u = gates.ci_gate(rs(git_task={"kind": "flip_ready"}, pr_review_started_at=0, pr_review_watch_polls=4))
+check("pr_tracking review: ci_gate flip_ready -> pr_review_poll with started_at set",
+      u["_next"] == "pr_review_poll" and u["pr_review_started_at"] >= _now and u["pr_review_watch_polls"] == 0
+      and "review-watch: PR #7 watching" in u["decisions"])
+u = gates.ci_gate(rs(git_task={"kind": "flip_ready"}, pr_review_started_at=5))
+check("pr_tracking review: a later watch start keeps the run's started_at", "pr_review_started_at" not in u)
+u = gates.ci_route(rs(ci_status="green"))
+check("pr_tracking review: ci_route green after the flip -> pr_review_poll, no flip task",
+      u["_next"] == "pr_review_poll" and "git_task" not in u and "ci: green -> back to the review watch" in u["decisions"])
+u = gates.ci_route(rs(ci_status="green", flip_ready=False))
+check("pr_tracking review: ci_route green before the flip -> the flip task", u.get("git_task", {}).get("kind") == "flip_ready")
+u = gates.ci_gate(base_state(pr_tracking="review", git_task={"kind": "publish", "return_to": "ci_gate", "open_pr": True},
+                             delegated=True, git_report="https://github.com/o/r/pull/5"))
+check("pr_tracking review: a delegated run logs the not-started line",
+      u["_next"] == "final_report" and "review-watch: not started: PR lifecycle owned by the parent orchestrator" in u["decisions"])
+u = gates.ci_gate(base_state(git_task={"kind": "publish", "return_to": "ci_gate", "open_pr": True}, delegated=True,
+                             git_report="https://github.com/o/r/pull/5"))
+check("pr_tracking ci: a delegated run logs no review-watch line", not any("review-watch" in d for d in u["decisions"]))
+
+review_doc(decision="APPROVED", comments=[{"id": "k9", "author": "rev", "body": "nit: typo"}])
+u = gates.pr_review_poll(rs(pr_review_polls=0, pr_review_watch_polls=0))
+check("pr_tracking review: poll approved -> route", u["pr_review_status"] == "approved" and u["_next"] == "pr_review_route"
+      and u["pr_review_polls"] == 1 and u["pr_review_watch_polls"] == 1)
+review_doc(reviews=[{"id": "r1", "state": "CHANGES_REQUESTED", "author": "rev", "body": "x"},
+                    {"id": "r2", "state": "APPROVED", "author": "rev", "body": ""}])
+check("pr_tracking review: no reviewDecision -> the last verdict review decides approval",
+      gates.pr_review_poll(rs(pr_review_seen=["r1"]))["pr_review_status"] == "approved")
+u = gates.pr_review_route(rs(pr_review_status="approved", pr_review_items=[{"id": "k9", "kind": "comment", "url": "", "body": "nit: typo"}]))
+check("pr_tracking review: approved -> final_report, ledgered, open items left as follow-ups",
+      u["_next"] == "final_report" and "review-watch: PR #7 approved" in u["decisions"]
+      and u["follow_ups"] == ["Left open after approval: k9: nit: typo"])
+
+review_doc(
+    reviews=[{"id": "r1", "state": "COMMENTED", "author": "rev", "body": ""},
+             {"id": "r2", "state": "CHANGES_REQUESTED", "author": "rev", "body": ""},
+             {"id": "r3", "state": "COMMENTED", "author": "bot", "body": "## Review round N @ abc"}],
+    comments=[{"id": "k1", "author": "bot", "body": "## Update @ abc"}, {"id": "k2", "author": "rev", "body": "Can you add a test?"}],
+    threads=[thread("t1", [("c1", "please rename foo"), ("c2", "Addressed in abc")]), thread("t2", [("c3", "old")], resolved=True),
+             thread("t3", [("c4", "stale")], outdated=True), thread("t4", [("c5", "Addressed in abc")])])
+u = gates.pr_review_poll(rs())
+_items = u["pr_review_items"]
+check("pr_tracking review: poll comments -> items without own-marked bodies, resolved or outdated threads",
+      u["pr_review_status"] == "comments" and u["_next"] == "pr_review_route" and [i["id"] for i in _items] == ["t1", "r2", "k2"])
+check("pr_tracking review: a thread item joins its unseen comments and records every comment id",
+      _items[0]["body"] == "please rename foo" and _items[0]["seen_ids"] == ["c1", "c2"] and _items[0]["url"].endswith("#c1"))
+check("pr_tracking review: an empty CHANGES_REQUESTED body gets the stock text",
+      _items[1]["body"] == "Changes requested (see the review threads)")
+check("pr_tracking review: route comments -> pr_review_triage",
+      gates.pr_review_route(rs(pr_review_status="comments", pr_review_items=_items))["_next"] == "pr_review_triage")
+u = gates.pr_review_apply(rs(pr_review_items=_items, pr_review_fix=[{"id": "t1", "text": "rename foo to bar"}, {"id": "r2", "text": "address the threads"}],
+                             pr_review_noaction=[{"id": "k2", "reason": "a test already covers it"}], pr_review_judgment=[]))
+_round = u
+check("pr_tracking review: apply fixes -> compose_fix, round 1, fix_source pr_review",
+      u["_next"] == "compose_fix" and u["fix_source"] == "pr_review" and u["pr_review_rounds"] == 1
+      and u["fix_items"] == ["https://github.com/o/r/pull/7#c1: rename foo to bar", "r2: address the threads"]
+      and "review-watch: PR #7 2 new item(s) -> fix round 1/3" in u["decisions"])
+check("pr_tracking review: apply sets pending with fix and skip actions",
+      [(p["id"], p["action"]) for p in u["pr_review_pending"]] == [("t1", "fix"), ("r2", "fix"), ("k2", "skip")])
+check("pr_tracking review: apply marks every item and comment id seen", set(u["pr_review_seen"]) == {"t1", "c1", "c2", "r2", "k2"})
+check("pr_tracking review: apply resets the three triage lists",
+      u["pr_review_fix"] == [] and u["pr_review_judgment"] == [] and u["pr_review_noaction"] == [])
+u = gates.compose_fix(rs(fix_source="pr_review", fix_items=_round["fix_items"], fix_round=1))
+check("pr_tracking review: compose_fix lists the reviewer requests",
+      u["fix_instructions"].splitlines() == [
+          "Address these PR review comments (verbatim reviewer requests on the open PR; each line is <url or id>: <request>):",
+          "- https://github.com/o/r/pull/7#c1: rename foo to bar", "- r2: address the threads"])
+u = gates.pr_gate(rs(git_actions={"commit": True, "push": True, "open_pr": True}, pr_review_pending=_round["pr_review_pending"]))
+_t = u["git_task"]
+check("pr_tracking review: pr_gate -> review_update task (push, no PR, no draft change)",
+      u["_next"] == "git_ops" and _t["kind"] == "review_update" and _t["return_to"] == "ci_gate" and _t["push"] and _t["commit"]
+      and not _t["open_pr"] and not _t["draft"] and not _t["flip_ready"])
+check("pr_tracking review: the review_update text names the Update comment and every item",
+      "## Update @ <full head SHA>" in _t["text"] and "Do NOT open a PR" in _t["text"] and "rename foo to bar" in _t["text"]
+      and "a test already covers it" in _t["text"])
+os.environ["SISYPHUS_GH_RESOLVE_CMD"] = f"echo \"$SISYPHUS_THREAD_ID $SISYPHUS_REPLY_BODY\" >> '{_RESOLVED}'"
+u = gates.ci_gate(rs(git_task=_t, pr_review_pending=_round["pr_review_pending"], pr_review_rounds=1, ci_polls=9, ci_poll_fails=2, ci_started_at=1))
+check("pr_tracking review: ci_gate review_update resolves the fixed threads only",
+      open(_RESOLVED).read() == f"t1 Addressed in {_HEAD}\n")
+check("pr_tracking review: ci_gate review_update -> ci_poll with reset budgets",
+      u["_next"] == "ci_poll" and u["ci_polls"] == 0 and u["ci_poll_fails"] == 0 and u["ci_started_at"] >= _now and "ci_owner" not in u)
+check("pr_tracking review: ci_gate review_update moves pending to addressed and ledgers the push",
+      u["pr_review_pending"] == [] and len(u["pr_review_addressed"]) == 3
+      and f"review-watch: PR #7 fix round 1 pushed @ {_HEAD}; 1 thread(s) resolved" in u["decisions"])
+os.environ["SISYPHUS_GH_RESOLVE_CMD"] = "exit 1"
+u = gates.ci_gate(rs(git_task=_t, pr_review_pending=_round["pr_review_pending"], pr_review_rounds=1))
+check("pr_tracking review: a failed resolve is noted in the push line",
+      f"review-watch: PR #7 fix round 1 pushed @ {_HEAD}; 0 thread(s) resolved (1 failed: t1)" in u["decisions"])
+u = gates.pr_review_poll(rs(pr_review_seen=_round["pr_review_seen"], pr_review_watch_polls=1))
+check("pr_tracking review: seen ids stop re-triggering -> pending self-loop",
+      u["pr_review_status"] == "pending" and u["_next"] == "pr_review_poll" and u["pr_review_items"] == [])
+r = gates.final_report(rs(ci_status="green", pr_review_status="pending", pr_review_rounds=1,
+                          pr_review_addressed=gates.ci_gate(rs(git_task=_t, pr_review_pending=_round["pr_review_pending"]))["pr_review_addressed"]))["report"]
+check("pr_tracking review: the report carries the watch line and the addressed section before the debt list",
+      "- PR review watch: pending after 1 fix round(s)" in r and "- fix: https://github.com/o/r/pull/7#c1: rename foo to bar" in r
+      and "- skip: k2: a test already covers it" in r
+      and r.index("- CI: green") < r.index("- PR review watch:") < r.index("## PR review feedback addressed") < r.index("Debt left behind:"))
+
+u = gates.ci_apply(rs(ci_verdict="real", ci_fix_strikes=STRIKE_LIMIT))
+check("pr_tracking review: CI red with the fix budget spent -> ci_exhausted, review text, stop: ci_red",
+      u.get("escalation", {}).get("kind") == "ci_exhausted" and u["escalation"]["question"].startswith("Review watch stopped: CI still red after")
+      and [o["text"] for o in u["escalation"]["options"] if o["recommended"]] == ["Stop watching and report"]
+      and "review-watch: PR #7 stop: ci_red" in u["decisions"])
+u = gates.ci_apply(rs(ci_verdict="infra"))
+check("pr_tracking review: CI infra -> ci_infra, review text, stop: ci_infra",
+      u.get("escalation", {}).get("kind") == "ci_infra" and "Review watch stopped: CI failed for an external cause" in u["escalation"]["question"]
+      and "review-watch: PR #7 stop: ci_infra" in u["decisions"])
+
+review_doc(state="MERGED", decision="APPROVED")
+check("pr_tracking review: a MERGED PR wins over approval", gates.pr_review_poll(rs())["pr_review_status"] == "merged")
+review_doc(state="CLOSED", threads=[thread("t9", [("c9", "fix it")])])
+check("pr_tracking review: a CLOSED PR wins over new comments", gates.pr_review_poll(rs())["pr_review_status"] == "closed")
+u = gates.pr_review_route(rs(pr_review_status="merged"))
+check("pr_tracking review: merged externally -> pr_review_closed escalation + ledger",
+      u.get("escalation", {}).get("kind") == "pr_review_closed" and "review-watch: PR #7 merged externally" in u["decisions"])
+u = gates.pr_review_route(rs(pr_review_status="closed"))
+check("pr_tracking review: closed externally -> pr_review_closed escalation + ledger",
+      u.get("escalation", {}).get("kind") == "pr_review_closed" and "review-watch: PR #7 closed externally" in u["decisions"])
+u = aa("pr_review_closed", "Stop watching and report", pr_review_status="merged")
+check("pr_tracking review: apply_answer closed stop -> final_report",
+      u["_next"] == "final_report" and u["follow_ups"] == ["PR review watch stopped: PR merged externally"])
+u = aa("pr_review_closed", "Keep watching (the PR was reopened)", pr_review_watch_polls=3)
+check("pr_tracking review: apply_answer closed keep -> pr_review_poll with the watch reset",
+      u["_next"] == "pr_review_poll" and u["pr_review_watch_polls"] == 0)
+
+review_doc()
+u = gates.pr_review_poll(rs(pr_review_polls=REVIEW_MAX_POLLS))
+check("pr_tracking review: polls past REVIEW_MAX_POLLS -> wall_cap", u["pr_review_status"] == "wall_cap" and u["_next"] == "pr_review_route")
+check("pr_tracking review: the last poll inside REVIEW_MAX_POLLS still reads",
+      gates.pr_review_poll(rs(pr_review_polls=REVIEW_MAX_POLLS - 1))["pr_review_status"] == "pending")
+check("pr_tracking review: started_at past REVIEW_WALL_SECS -> wall_cap",
+      gates.pr_review_poll(rs(pr_review_started_at=_now - REVIEW_WALL_SECS - 60))["pr_review_status"] == "wall_cap")
+u = gates.pr_review_route(rs(pr_review_status="wall_cap", pr_review_polls=REVIEW_MAX_POLLS + 1))
+check("pr_tracking review: wall_cap -> pr_review_exhausted, stop only, ledgered",
+      u.get("escalation", {}).get("kind") == "pr_review_exhausted" and [o["text"] for o in u["escalation"]["options"]] == ["Stop watching and report"]
+      and "review-watch: PR #7 stop: wall_cap" in u["decisions"])
+os.environ["SISYPHUS_GH_REVIEWS_CMD"] = "exit 3"
+u = gates.pr_review_poll(rs(pr_review_poll_fails=CI_POLL_FAILS - 2))
+check("pr_tracking review: a failed read below CI_POLL_FAILS -> retry", u["_next"] == "pr_review_poll" and u["pr_review_poll_fails"] == CI_POLL_FAILS - 1)
+os.environ["SISYPHUS_GH_REVIEWS_CMD"] = "echo not-json"
+u = gates.pr_review_poll(rs(pr_review_poll_fails=CI_POLL_FAILS - 1))
+check("pr_tracking review: CI_POLL_FAILS bad reads -> poll_error", u["pr_review_status"] == "poll_error" and u["_next"] == "pr_review_route")
+u = gates.pr_review_route(rs(pr_review_status="poll_error", pr_review_poll_fails=CI_POLL_FAILS))
+check("pr_tracking review: poll_error -> pr_review_exhausted with a retry option",
+      u.get("escalation", {}).get("kind") == "pr_review_exhausted" and "Retry the review watch" in [o["text"] for o in u["escalation"]["options"]])
+check("pr_tracking review: an unknown status is treated as poll_error",
+      gates.pr_review_route(rs(pr_review_status="weird"))["pr_review_status"] == "poll_error")
+u = aa("pr_review_exhausted", "Retry the review watch", pr_review_poll_fails=3, pr_review_polls=40)
+check("pr_tracking review: apply_answer exhausted retry -> pr_review_poll, run poll count kept",
+      u["_next"] == "pr_review_poll" and u["pr_review_poll_fails"] == 0 and "pr_review_polls" not in u)
+u = aa("pr_review_exhausted", "Stop watching and report", pr_review_status="wall_cap")
+check("pr_tracking review: apply_answer exhausted stop -> final_report",
+      u["_next"] == "final_report" and u["follow_ups"] == ["PR review watch stopped (wall_cap)"])
+u = gates.pr_review_route(rs(pr_review_status="comments", pr_review_items=_items, pr_review_rounds=REVIEW_MAX_ROUNDS))
+check("pr_tracking review: REVIEW_MAX_ROUNDS rounds with new items -> pr_review_round_cap",
+      u.get("escalation", {}).get("kind") == "pr_review_round_cap" and u["pr_review_status"] == "round_cap"
+      and "review-watch: PR #7 stop: round_cap" in u["decisions"] and "please rename foo" in u["escalation"]["evidence"])
+check("pr_tracking review: one round below the cap still triages",
+      gates.pr_review_route(rs(pr_review_status="comments", pr_review_items=_items, pr_review_rounds=REVIEW_MAX_ROUNDS - 1))["_next"] == "pr_review_triage")
+u = gates.pr_review_route(rs(pr_review_status="comments", pr_review_items=_items, ci_polls_run=REVIEW_CI_POLL_BUDGET))
+check("pr_tracking review: ci_polls_run at REVIEW_CI_POLL_BUDGET -> pr_review_round_cap naming the budget",
+      u.get("escalation", {}).get("kind") == "pr_review_round_cap" and f"budget {REVIEW_CI_POLL_BUDGET}" in u["escalation"]["question"])
+u = aa("pr_review_round_cap", "Stop watching and report", pr_review_items=_items)
+check("pr_tracking review: apply_answer round_cap -> final_report listing the open items",
+      u["_next"] == "final_report" and u["follow_ups"][0].startswith("PR review watch stopped at the round cap; open items: ")
+      and "r2" in u["follow_ups"][0])
+
+u = gates.pr_review_apply(rs(pr_review_items=_items, pr_review_fix=[{"id": "r2", "text": "address the threads"}],
+                             pr_review_judgment=[{"id": "t1", "question": "Rename foo, or keep the public name?"}],
+                             pr_review_noaction=[{"id": "k2", "reason": "covered"}]))
+_judge = u["escalation"]
+_queue = u["pr_review_queue"]
+check("pr_tracking review: a judgment item -> pr_review_owner_judgment, hard trigger, fixes queued",
+      _judge["kind"] == "pr_review_owner_judgment" and _judge["hard_trigger"] is True
+      and _judge["question"].startswith("PR review comment(s) need owner judgment:") and "#c1" in _judge["question"]
+      and [q["id"] for q in u["pr_review_queue"]] == ["r2"] and len(_judge["options"]) == 3)
+
+
+def judge(answer, **over):
+    return gates.apply_answer(rs(**{"escalation": _judge, "last_answer": answer, "pr_review_queue": _queue, **over}))
+
+
+_a = judge("Fix them as the reviewer asks")
+check("pr_tracking review: apply_answer judgment fix -> compose_fix with the queue and the judged items",
+      _a["_next"] == "compose_fix" and _a["pr_review_rounds"] == 1 and _a["fix_items"][0] == "r2: address the threads"
+      and _a["fix_items"][1] == "https://github.com/o/r/pull/7#c1: please rename foo")
+check("pr_tracking review: apply_answer judgment skip with an empty queue -> pr_review_poll",
+      judge("Skip them and keep watching", pr_review_queue=[])["_next"] == "pr_review_poll")
+_a = judge("Skip them and keep watching")
+check("pr_tracking review: apply_answer judgment skip with a queue -> the queue alone is the round",
+      _a["_next"] == "compose_fix" and _a["fix_items"] == ["r2: address the threads"]
+      and ("t1", "skip") in [(p["id"], p["action"]) for p in _a["pr_review_pending"]])
+_a = judge("Stop watching and report")
+check("pr_tracking review: apply_answer judgment stop -> final_report listing them",
+      _a["_next"] == "final_report" and "Rename foo, or keep the public name?" in _a["follow_ups"][0])
+u = gates.pr_review_apply(rs(pr_review_items=_items, pr_review_fix=[], pr_review_judgment=[], pr_review_noaction=[],
+                             last_node_output="LLM node failed: timeout"))
+check("pr_tracking review: triage died -> every item needs owner judgment",
+      u.get("escalation", {}).get("kind") == "pr_review_owner_judgment" and len(u["escalation"]["data"]["judgment"]) == len(_items)
+      and u["pr_review_judgment"] == [])
+u = gates.pr_review_apply(rs(pr_review_items=_items[2:], pr_review_noaction=[{"id": "k2", "reason": "covered"}],
+                             pr_review_fix=[{"id": "zz", "text": "invented"}], pr_review_watch_polls=5))
+check("pr_tracking review: only no_action -> back to the watch, recorded as skipped",
+      u["_next"] == "pr_review_poll" and u["pr_review_watch_polls"] == 0 and u["pr_review_addressed"][0]["action"] == "skip")
+check("pr_tracking review: a triage id naming no item is ledgered and dropped",
+      any("unknown item 'zz'" in d for d in u["decisions"]) and "pr_review_rounds" not in u)
+
+_raw = {"data": {"repository": {"pullRequest": {
+    "state": "OPEN", "reviewDecision": None, "headRefOid": "abc",
+    "reviews": {"nodes": [{"id": "r1", "state": "COMMENTED", "body": "b", "author": {"login": "al"}}]},
+    "comments": {"nodes": [{"id": "k1", "body": "hi", "author": {"login": "bo"}}]},
+    "reviewThreads": {"nodes": [{"id": "t1", "isResolved": False, "isOutdated": False, "path": "a.py", "line": 3,
+                                 "comments": {"nodes": [{"id": "c1", "body": "x", "url": "u", "author": {"login": "al"}}]}}]}}}}}
+_norm = {"state": "OPEN", "reviewDecision": "", "headRefOid": "abc",
+         "reviews": [{"id": "r1", "state": "COMMENTED", "author": "al", "body": "b"}],
+         "comments": [{"id": "k1", "author": "bo", "body": "hi"}],
+         "reviewThreads": [{"id": "t1", "isResolved": False, "isOutdated": False, "path": "a.py", "line": 3,
+                            "comments": [{"id": "c1", "author": "al", "body": "x", "url": "u"}]}]}
+check("pr_tracking review: _normalize_pr_review on a raw GraphQL response equals the normalized doc",
+      gates._normalize_pr_review(_raw) == _norm and gates._normalize_pr_review(_norm) == _norm)
+check("pr_tracking review: _normalize_pr_review rejects a response naming no PR",
+      gates._normalize_pr_review({"errors": [{"message": "x"}]}) is None and gates._normalize_pr_review({"data": {}}) is None)
+check("pr_tracking review: bounds stay under max_loop_iterations 100",
+      REVIEW_MAX_POLLS + REVIEW_MAX_ROUNDS + 1 < 100 and REVIEW_CI_POLL_BUDGET < 100)
+review_doc(decision="APPROVED")
+code, out = run_entry("pr_review_poll", rs())
+check("entry: pr_review_poll via GRAPH_STATE", code == 0 and out["pr_review_status"] == "approved")
+os.environ.pop("SISYPHUS_GH_REVIEWS_CMD")
+os.environ.pop("SISYPHUS_GH_RESOLVE_CMD")
 
 # --- A10 conformance: ci_gate harvests (added post-review) ---
 u = gates.ci_gate({"git_report": "ok\nANOMALY: commits I did not make\n", "git_task": {"return_to": "final_report"}, "run_dir": TMP, "anomalies_log": []})
