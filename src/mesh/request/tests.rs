@@ -2410,9 +2410,10 @@ pub(crate) mod network {
     }
 
     /// Every way a settled reply can fail to go out ends the same: the settlement is
-    /// dropped unsent and the adapter says why, under the request's id. The reply over
-    /// the cap is refused before the library sees it; every other failure reaches the
-    /// adapter as the response outcome the library resolved.
+    /// dropped unsent and one warn says why, under the request's id. The reply over the
+    /// destination's response cap is refused by the library, which warns itself; every
+    /// other failure reaches the adapter as the response outcome the library resolved,
+    /// and the adapter warns.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_settled_reply_is_sent_once_delivered_and_dropped_unsent_when_it_cannot_go_out() {
         install_log_collector();
@@ -2528,27 +2529,37 @@ pub(crate) mod network {
         .await;
         assert!(dropped.load(Ordering::SeqCst));
 
-        // A frame no requester would accept is dropped before it costs a transfer.
+        // A frame no requester would accept is refused by the library under the
+        // destination's response cap before it costs a transfer: one warn, no second
+        // from the adapter, and the settlement dropped unsent.
         let body = Value::Binary(vec![0x5a; MAX_FETCH_RESPONSE_BYTES + 1]);
         let (reply, sent, dropped) = settled(body.clone());
         *handler.reply.lock() = Some(reply);
         let (in_flight, link_id, request_id) = handler.hold(&requester, &desc).await;
         let encoded = ResponseFrame::new(request_id, body).encode().len();
         handler.release.notify_one();
-        let warned = format!(
-            "Failed to send mesh response {request_id} on link {}: {encoded} bytes over the {MAX_FETCH_RESPONSE_BYTES} byte response cap",
-            link_id.to_hex_string()
+        let refused = format!(
+            "tp: response {request_id} on link {link_id} refused, {encoded}B exceeds the destination response limit {MAX_FETCH_RESPONSE_BYTES}B"
         );
-        wait_until("the adapter to refuse the oversize reply", || {
-            warn_snapshot().iter().any(|message| message == &warned)
-        })
-        .await;
-        assert!(!sent.load(Ordering::SeqCst));
         wait_until("the unsent settlement to be dropped", || {
             dropped.load(Ordering::SeqCst)
         })
         .await;
-        in_flight.abort();
+        assert!(!sent.load(Ordering::SeqCst));
+        let about_this_reply: Vec<String> = warn_snapshot()
+            .into_iter()
+            .filter(|message| message.contains(&request_id.to_string()))
+            .collect();
+        assert_eq!(about_this_reply, vec![refused]);
+        assert_eq!(
+            timeout(SHORT_REQUEST_TIMEOUT * 2, in_flight)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err(),
+            timed_out("/echo"),
+            "the requester hears nothing"
+        );
 
         // The link is torn down while the handler holds its reply; the library finds no
         // link to send on, the outcome is `NotSent` and the settlement is dropped unsent.

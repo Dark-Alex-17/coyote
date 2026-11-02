@@ -54,8 +54,8 @@ use crate::mesh::protocol::{Compatibility, MESH_PROTOCOL_MIN_SUPPORTED, MESH_PRO
 use crate::mesh::request::RequestHandler;
 use crate::mesh::request::{
     ACCESS_PATH, Dispatcher, Envelope, FETCH_PATH, KNOCK_PATH, KNOWN_PATHS, LIST_PATH,
-    LibraryHandler, MAX_REQUEST_PAYLOAD_BYTES, MESSAGE_PATH, OriginName, RefusalCode,
-    RemoteRefusal, RequestError, RequestOptions, STATUS_PATH, redact_hashes,
+    LibraryHandler, MAX_FETCH_RESPONSE_BYTES, MAX_REQUEST_PAYLOAD_BYTES, MESSAGE_PATH, OriginName,
+    RefusalCode, RemoteRefusal, RequestError, RequestOptions, STATUS_PATH, redact_hashes,
     request as link_request, short,
 };
 use crate::mesh::shares::ShareLocations;
@@ -1857,9 +1857,10 @@ pub(crate) fn session_destination_name(instance_id: &str) -> DestinationName {
 /// `deadline`. A destination registered but left without its announce data is
 /// deregistered again, best effort, and the error says whether that worked. The
 /// destination is armed with `MAX_REQUEST_PAYLOAD_BYTES`:
-/// coyote-rns-transport 0.17.0 refuses an oversize request at the advertisement, before it
+/// coyote-rns-transport 0.18.0 refuses an oversize request at the advertisement, before it
 /// reaches a handler (a request that travels as a resource; a packet-form one over the cap
-/// is dropped).
+/// is dropped). It is also armed with `MAX_FETCH_RESPONSE_BYTES`, the widest bound any
+/// requester accepts, so a reply no peer could take is refused before it costs a transfer.
 async fn register_destination(
     transport: &Transport,
     identity: &TransportIdentity,
@@ -1872,6 +1873,9 @@ async fn register_destination(
     let mut destination = SingleInputDestination::new(identity.clone(), name);
     destination
         .set_max_request_size(MAX_REQUEST_PAYLOAD_BYTES)
+        .expect("the cap setter is infallible");
+    destination
+        .set_max_response_size(MAX_FETCH_RESPONSE_BYTES)
         .expect("the cap setter is infallible");
     let registered = register_request_paths(&mut destination, request_handler)?;
     let hash = destination.desc.address_hash;

@@ -13,12 +13,10 @@ mod tests;
 
 #[cfg(all(test, unix))]
 pub(crate) use dispatch::LoggingKnockSink;
-#[cfg(test)]
-pub(crate) use dispatch::MAX_FETCH_RESPONSE_BYTES;
 pub(crate) use dispatch::{
     ACCESS_PATH, AdmittedRequest, DispatchError, Dispatcher, FETCH_PATH, Handler, KNOCK_PATH,
-    KNOWN_PATHS, KnockEvent, KnockSink, LIST_PATH, MAX_REQUEST_PAYLOAD_BYTES, MESSAGE_PATH,
-    STATUS_PATH, describe_path,
+    KNOWN_PATHS, KnockEvent, KnockSink, LIST_PATH, MAX_FETCH_RESPONSE_BYTES,
+    MAX_REQUEST_PAYLOAD_BYTES, MESSAGE_PATH, STATUS_PATH, describe_path,
 };
 pub(crate) use error::{RefusalCode, RemoteRefusal, RequestError, refusal_remedy, request_remedy};
 pub(crate) use frame::{Envelope, NAME_HASH_LEN, OriginName};

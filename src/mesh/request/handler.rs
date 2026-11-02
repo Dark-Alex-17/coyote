@@ -1,4 +1,3 @@
-use crate::mesh::request::dispatch::MAX_FETCH_RESPONSE_BYTES;
 use crate::mesh::request::error::RefusalCode;
 use crate::mesh::request::frame::{PathHash, RequestId};
 
@@ -8,7 +7,7 @@ use rmpv::Value;
 use rns_transport::destination::link::LinkId;
 use rns_transport::destination::request::{
     InboundRequest as LibraryInboundRequest, RequestHandler as LibraryRequestHandler,
-    RequestResponse, ResponseFrame as LibraryResponseFrame, ResponseOutcome,
+    RequestResponse, ResponseOutcome,
 };
 use rns_transport::identity::Identity;
 use rns_transport::resource::OutboundResult;
@@ -158,15 +157,17 @@ impl LibraryHandler {
     }
 
     /// Runs Coyote's handler under one permit and maps its reply onto the library's.
-    /// `None` is a request the handler was never entered for, answers nothing to, or
-    /// whose settled reply no peer could take. A settled reply that is handed back is
-    /// confirmed by the response outcome the library resolves once it has sent it,
-    /// awaited on a detached task: the permit covers the handler, not the transfer, and
-    /// neither it nor `HANDLER_TIMEOUT` bounds that transfer.
+    /// `None` is a request the handler was never entered for or answers nothing to. Only
+    /// a settled reply arms the request's outcome tracker; it is confirmed by the response
+    /// outcome the library resolves once it has sent it, awaited on a detached task: the
+    /// permit covers the handler, not the transfer, and neither it nor `HANDLER_TIMEOUT`
+    /// bounds that transfer. A reply over the destination's response cap is refused by
+    /// the library, which warns once and sends nothing; the outcome reads `TooLarge` and
+    /// the settlement is dropped unsent.
     async fn reply(
         &self,
         permit: OwnedSemaphorePermit,
-        mut request: LibraryInboundRequest,
+        request: LibraryInboundRequest,
     ) -> Option<RequestResponse> {
         // Bound first so it drops last, after everything the request does.
         let _permit = permit;
@@ -177,13 +178,15 @@ impl LibraryHandler {
         }
         #[cfg(test)]
         self.admitted.fetch_add(1, Ordering::SeqCst);
-        let outcome = request.track_outcome();
+        let identity = request.remote_identity().copied();
+        let path_hash = request.path_hash();
+        let (data, tracker) = request.into_parts();
         let inbound = InboundRequest {
             link_id,
-            identity: request.remote_identity().copied(),
+            identity,
             request_id,
-            path_hash: request.path_hash(),
-            data: request.into_data(),
+            path_hash,
+            data,
         };
         let reply = match timeout(self.handler_timeout, handler.handle(inbound)).await {
             Ok(reply) => reply,
@@ -201,25 +204,20 @@ impl LibraryHandler {
             Reply::Code(code) => Some(RequestResponse::Value(code.to_wire())),
             Reply::Silent => None,
             Reply::Settled { value, settlement } => {
-                // The library's frame for this value, measured against
-                // `MAX_FETCH_RESPONSE_BYTES`, the widest bound any requester accepts: a
-                // reply no peer could take is dropped before it costs a transfer. A
-                // `Reply::Value` is not measured here; the requester's bound for the path
-                // drops what is over.
-                let frame = LibraryResponseFrame::new(request_id, value);
-                let encoded = frame.encode().len();
-                if encoded > MAX_FETCH_RESPONSE_BYTES {
-                    warn!(
-                        "Failed to send mesh response {request_id} on link {}: {encoded} bytes over the {MAX_FETCH_RESPONSE_BYTES} byte response cap",
-                        link_id.to_hex_string()
-                    );
-                    drop_unsent(settlement);
-                    return None;
-                }
+                // Armed before this handler returns, as the library requires.
+                let outcome = tracker.outcome();
                 tokio::spawn(async move {
                     match outcome.await {
                         ResponseOutcome::Packet
                         | ResponseOutcome::Resource(OutboundResult::Complete) => settlement.sent(),
+                        // The library has already warned about the refusal.
+                        ResponseOutcome::TooLarge { len, max } => {
+                            debug!(
+                                "Mesh response {request_id} on link {} was refused: {len} bytes over the {max} byte response cap",
+                                link_id.to_hex_string()
+                            );
+                            drop_unsent(settlement);
+                        }
                         // The two success variants are the exhaustive success set.
                         verdict => {
                             warn!(
@@ -230,7 +228,7 @@ impl LibraryHandler {
                         }
                     }
                 });
-                Some(RequestResponse::Value(frame.into_body()))
+                Some(RequestResponse::Value(value))
             }
         }
     }
