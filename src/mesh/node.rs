@@ -3039,6 +3039,7 @@ async fn watch_interfaces(
                     slot.push_idle(IdleNotify {
                         source: Source::Mesh,
                         text: format!("{label} connected"),
+                        verbatim: Vec::new(),
                         origin: Origin::Local,
                         model_note: None,
                     });
@@ -3085,6 +3086,7 @@ async fn watch_interfaces(
                     slot.push_idle(IdleNotify {
                         source: Source::Mesh,
                         text: line,
+                        verbatim: Vec::new(),
                         origin: Origin::Local,
                         model_note: None,
                     });
@@ -3865,10 +3867,9 @@ impl MeshSlot {
             Some(sink) => sink.notify(rendered),
             None => {
                 use std::io::Write as _;
-                let prefix = self.command_prefix.load();
                 let mut stderr = std::io::stderr().lock();
-                for line in rendered.lines() {
-                    let _ = writeln!(stderr, "{}", prefix.render_hints(line));
+                for line in rendered.render_notification_lines(self.command_prefix.load()) {
+                    let _ = writeln!(stderr, "{line}");
                 }
             }
         }
@@ -3943,7 +3944,11 @@ impl MeshSlot {
         match self.idle.load_full() {
             Some(sink) => sink.push(note).is_ok(),
             None => {
-                self.notify(Notification::new(note.source, note.text));
+                self.notify(Notification::with_verbatim(
+                    note.source,
+                    note.text,
+                    note.verbatim,
+                ));
                 true
             }
         }
@@ -4009,6 +4014,7 @@ impl MeshSlot {
             self.push_idle(IdleNotify {
                 source: Source::Message,
                 text,
+                verbatim: Vec::new(),
                 origin: Origin::Peer(short(&record.peer_identity).to_string()),
                 model_note: None,
             });
@@ -4223,6 +4229,7 @@ impl MeshSlot {
                 source: Source::Message,
                 origin: Origin::Peer(id8.clone()),
                 text,
+                verbatim: Vec::new(),
                 model_note: None,
             });
         }
@@ -4293,6 +4300,7 @@ impl MeshSlot {
             source: Source::Message,
             origin: Origin::Peer(id8),
             text,
+            verbatim: Vec::new(),
             model_note: None,
         });
     }
@@ -4315,6 +4323,7 @@ impl MeshSlot {
             source: Source::Message,
             origin: Origin::Peer(id8),
             text,
+            verbatim: Vec::new(),
             model_note: None,
         });
     }
@@ -4348,6 +4357,7 @@ impl MeshSlot {
             source: Source::Message,
             origin: Origin::Peer(id8),
             text: format!("envoy escalated to the human; {summary}"),
+            verbatim: Vec::new(),
             model_note: None,
         });
     }
@@ -4615,6 +4625,7 @@ impl MeshSlot {
             source: Source::Message,
             origin: Origin::Peer(short(&record.peer_identity).to_string()),
             text,
+            verbatim: Vec::new(),
             model_note: None,
         });
     }
@@ -4746,6 +4757,7 @@ impl MeshSlot {
             source,
             origin: Origin::Peer(id8),
             text,
+            verbatim: Vec::new(),
             model_note: None,
         });
     }
@@ -5773,6 +5785,7 @@ mod tests {
         IdleNotify {
             source: Source::Message,
             text: text.to_string(),
+            verbatim: Vec::new(),
             origin: Origin::Peer("deadbeef".into()),
             model_note: Some(Box::new(
                 crate::supervisor::notification::mesh_notification(

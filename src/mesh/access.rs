@@ -827,10 +827,12 @@ impl AccessSurface for MeshSlot {
             path_count: request.paths.len(),
         });
         let label = self.peer_label(&identity_hash, &destination_hash);
+        let (text, verbatim) = access_text(&label, &request, root.as_deref());
         self.push_idle(IdleNotify {
             source: Source::Access,
             origin: Origin::Peer(id8.clone()),
-            text: access_text(&label, &request, root.as_deref()),
+            text,
+            verbatim,
             model_note: None,
         });
         debug!(
@@ -1526,7 +1528,9 @@ fn path_set(paths: &[String]) -> BTreeSet<&str> {
 /// backtick inside them made an apostrophe, so peer text cannot close its own quotes and
 /// pose as the frame. Paths and the reason are cut to their display caps so the
 /// notification caps never reach the verbs.
-fn access_text(label: &str, request: &ValidAccess, root: Option<&Path>) -> String {
+/// The consent prompt and the indices of its lines that quote the peer's label or paths;
+/// only the closing hint line is left for the sink to spell in the command prefix.
+fn access_text(label: &str, request: &ValidAccess, root: Option<&Path>) -> (String, Vec<usize>) {
     let who = label.replace('"', "'");
     let count = request.paths.len();
     let plural = if count == 1 { "" } else { "s" };
@@ -1557,7 +1561,8 @@ fn access_text(label: &str, request: &ValidAccess, root: Option<&Path>) -> Strin
         "{reason}grant: .mesh grant {id} [--standing] | refuse: .mesh refuse {id}",
         id = request.id,
     ));
-    lines.join("\n")
+    let verbatim = (0..lines.len() - 1).collect();
+    (lines.join("\n"), verbatim)
 }
 
 fn shown(text: &str, max_chars: usize) -> String {
@@ -1769,6 +1774,82 @@ mod tests {
 
     fn store_of(slot: &MeshSlot) -> Arc<InboundStore> {
         slot.inbound_store().unwrap()
+    }
+
+    mod command_prefix_paths {
+        use super::*;
+        use crate::config::{CommandPrefix, LivePrefix};
+        use crate::mesh::notify::NotificationSink;
+        use crate::repl::printer::{PROMPT_PRINTER_CAPACITY, PromptPrinter};
+
+        const PATHS: [&str; 2] = [".vault", ".vault/key"];
+
+        /// The access line a peer asking for a `.vault` directory and a `.vault/key`
+        /// file raises, as `access_text` builds it.
+        fn access_note(tag: &str) -> Notification {
+            let fixture = bare_slot(tag);
+            fs::create_dir_all(fixture.root.join(".vault")).unwrap();
+            fixture
+                .slot
+                .admit_access(inbound(&identity(), "a-1", &PATHS, "need it"));
+            let note = fixture.idle.0.lock().pop().expect("one access line");
+            Notification::with_verbatim(note.source, note.text, note.verbatim)
+        }
+
+        fn assert_paths_kept_and_hints_slashed(text: &str) {
+            assert!(text.contains("`.vault` ("), "{text}");
+            assert!(text.contains("`.vault/key` ("), "{text}");
+            assert!(!text.contains("/vault"), "{text}");
+            assert!(
+                text.ends_with("grant: /mesh grant a-1 [--standing] | refuse: /mesh refuse a-1"),
+                "{text}"
+            );
+        }
+
+        #[test]
+        fn the_fallback_keeps_the_paths_and_slashes_the_hints() {
+            let rendered = access_note("access-prefix-fallback").render();
+            let lines = rendered.render_notification_lines(CommandPrefix::Slash);
+            assert_eq!(lines.len(), rendered.lines().len());
+            assert_paths_kept_and_hints_slashed(&lines.join("\n"));
+            assert_eq!(
+                rendered.render_notification_lines(CommandPrefix::Dot),
+                rendered.lines()
+            );
+        }
+
+        /// With no idle driver the line goes through `push_idle`'s fallback to the
+        /// installed printer, which wraps after rendering; the row bodies are rejoined so
+        /// the check holds at any terminal width.
+        #[test]
+        fn the_printer_keeps_the_paths_and_slashes_the_hints() {
+            let live = LivePrefix::default();
+            live.store(CommandPrefix::Slash);
+            let printer = Arc::new(PromptPrinter::with_colour(
+                PROMPT_PRINTER_CAPACITY,
+                false,
+                live,
+            ));
+            let attached = printer.attach();
+            let slot = MeshSlot::default();
+            slot.set_notifier(Arc::clone(&printer) as Arc<dyn NotificationSink>);
+            let note = access_note("access-prefix-printer");
+            assert!(slot.push_idle(IdleNotify {
+                source: note.source,
+                text: note.text,
+                verbatim: note.verbatim,
+                origin: Origin::Peer("1a2b3c4d".into()),
+                model_note: None,
+            }));
+
+            let payload = attached.get_line().expect("payload queued");
+            let prefix = format!("{} ", Source::Access.prefix());
+            let bodies: String = payload
+                .lines()
+                .map(|row| row.strip_prefix(&prefix).expect("every row is prefixed"))
+                .collect();
+            assert_paths_kept_and_hints_slashed(&bodies);
+        }
     }
 
     fn access_records(slot: &MeshSlot) -> Vec<InboundRecord> {

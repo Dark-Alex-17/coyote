@@ -870,6 +870,7 @@ impl EnvoyRunner {
             source: Source::Message,
             origin: Origin::Peer(short(&message.source_identity).to_string()),
             text: escalation_line(&card.who, question, &message.message_id),
+            verbatim: Vec::new(),
             model_note: None,
         });
         if let Some(hold) = hold {
@@ -937,6 +938,7 @@ impl EnvoyRunner {
                 "the envoy could not tell {} its question was escalated: {why}",
                 card.who
             ),
+            verbatim: Vec::new(),
             model_note: None,
         });
     }
@@ -1080,6 +1082,7 @@ impl EnvoyRunner {
                     "the envoy's reply to {} could not be sent: {why}{retry}",
                     card.who
                 ),
+                verbatim: Vec::new(),
                 model_note: None,
             });
         } else if settles_question {

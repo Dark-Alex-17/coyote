@@ -1900,6 +1900,7 @@ impl TrustStore {
             source: Source::Mesh,
             origin: Origin::Peer(short(seen_identity).to_string()),
             text,
+            verbatim: Vec::new(),
             model_note: None,
         });
         if shown {

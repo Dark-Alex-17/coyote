@@ -4,7 +4,7 @@ pub(crate) mod idle;
 pub(crate) mod mesh;
 #[cfg(test)]
 pub(crate) mod mesh_share_vectors;
-mod printer;
+pub(crate) mod printer;
 mod prompt;
 mod replay;
 
@@ -33,7 +33,7 @@ use crate::hooks::{self, HookEvent};
 use crate::mesh::events::MeshHookSink;
 use crate::mesh::notify::NotificationSink;
 use crate::mesh::snapshot::TurnState;
-use crate::render::render_command_error;
+use crate::render::{MeshVerbError, render_command_error, render_error};
 use crate::supervisor::{Supervisor, TaskKind};
 use crate::utils::{
     AbortSignal, SHELL, TaskCancelGuard, UserInterrupt, abortable_run_with_spinner,
@@ -691,7 +691,7 @@ impl Repl {
                 let app = Arc::clone(&self.ctx.read().app.config);
                 // Replaying history is best-effort: a render failure must not skip shutdown.
                 if let Err(err) = replay::render(app.as_ref(), &compressed, &active) {
-                    render_command_error(err, self.command_prefix());
+                    render_error(err);
                 }
                 let last_msgs: &[Message] = if !active.is_empty() {
                     &active
@@ -738,7 +738,7 @@ impl Repl {
                 result
             };
             if let Err(err) = result {
-                render_command_error(err, self.command_prefix());
+                render_command_error(MeshVerbError::wrap(err), self.command_prefix());
                 println!()
             }
         }
@@ -825,7 +825,7 @@ impl Repl {
         // Cloned so the context guard is not held across the await.
         let mesh = Arc::clone(&self.ctx.read().app.mesh);
         if let Err(err) = mesh.stop().await {
-            render_command_error(err, self.command_prefix());
+            render_error(err);
         }
         // After the node's own `mesh.stopped`, so nothing left in the slot can run hooks
         // against a session on its way out.
@@ -1994,7 +1994,9 @@ pub async fn run_repl_command_with_prefix(
                 if ctx.macro_flag {
                     bail!("Cannot perform this operation because you are in a macro")
                 }
-                mesh::run(ctx, abort_signal.clone(), args).await?;
+                mesh::run(ctx, abort_signal.clone(), args)
+                    .await
+                    .map_err(MeshVerbError::wrap)?;
             }
             _ => {
                 let name = cmd.strip_prefix('.').unwrap_or(&cmd);
@@ -8883,8 +8885,8 @@ local_hello() {\n\
         let autostart = strip(&["mesh::auto", "start(&mut ctx).await"].concat());
         let surfaced = strip(
             &[
-                "if let Err(err) = result { render_",
-                "error(err); println!() }",
+                "if let Err(err) = result { render_command_",
+                "error(MeshVerbError::wrap(err), self.command_prefix()); println!() }",
             ]
             .concat(),
         );

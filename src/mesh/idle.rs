@@ -49,11 +49,12 @@ pub(crate) enum Origin {
 
 /// One event for the driver. `text` is the human line; `model_note`, when present, is the
 /// same event for the model's transcript. The model note is boxed so a note handed back
-/// on overflow stays small.
+/// on overflow stays small. `verbatim` carries `Notification::verbatim` through.
 #[derive(Debug)]
 pub(crate) struct IdleNotify {
     pub(crate) source: Source,
     pub(crate) text: String,
+    pub(crate) verbatim: Vec<usize>,
     pub(crate) origin: Origin,
     pub(crate) model_note: Option<Box<SystemNotification>>,
 }

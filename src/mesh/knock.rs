@@ -642,6 +642,7 @@ impl KnockGate {
             source: Source::Knock,
             origin: Origin::Peer(id8.to_string()),
             text: knock_text(&knock, display_name.as_deref(), cached),
+            verbatim: Vec::new(),
             model_note: None,
         });
         if !shown {

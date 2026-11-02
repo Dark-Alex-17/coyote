@@ -3,6 +3,7 @@
 //! `crate::supervisor::notification`, whose `SystemNotification` queue is
 //! merged into tool results for the model to read. Nothing here goes to the model.
 
+use crate::config::CommandPrefix;
 use crate::mesh::display_text;
 
 /// Peer-supplied text reaches the terminal through this path, so both dimensions of a
@@ -53,6 +54,9 @@ impl Source {
 pub(crate) struct Notification {
     pub(crate) source: Source,
     pub(crate) text: String,
+    /// Indices of the lines of `text` that quote peer-named paths. Sinks print them as
+    /// they are, so a path such as `.vault` is never mistaken for a command hint.
+    pub(crate) verbatim: Vec<usize>,
 }
 
 impl Notification {
@@ -60,6 +64,19 @@ impl Notification {
         Self {
             source,
             text: text.into(),
+            verbatim: Vec::new(),
+        }
+    }
+
+    pub(crate) fn with_verbatim(
+        source: Source,
+        text: impl Into<String>,
+        verbatim: Vec<usize>,
+    ) -> Self {
+        Self {
+            source,
+            text: text.into(),
+            verbatim,
         }
     }
 
@@ -69,30 +86,42 @@ impl Notification {
     /// rest collapses into a count. Text that renders to nothing still yields the bare
     /// prefix so the event is never silent.
     pub(crate) fn render_lines(&self) -> Vec<String> {
+        self.render_marked_lines()
+            .into_iter()
+            .map(|(line, _)| line)
+            .collect()
+    }
+
+    fn render_marked_lines(&self) -> Vec<(String, bool)> {
         let prefix = self.source.prefix();
         // Split before sanitising: `sanitize_display_text` maps `\n` to a space.
-        let mut lines: Vec<String> = self
+        let mut lines: Vec<(String, bool)> = self
             .text
             .split('\n')
-            .map(|piece| piece.strip_suffix('\r').unwrap_or(piece))
-            .filter_map(|piece| display_text(piece, NOTIFICATION_LINE_MAX_CHARS))
-            .map(|line| format!("{prefix} {line}"))
+            .enumerate()
+            .filter_map(|(index, piece)| {
+                let piece = piece.strip_suffix('\r').unwrap_or(piece);
+                display_text(piece, NOTIFICATION_LINE_MAX_CHARS)
+                    .map(|line| (format!("{prefix} {line}"), self.verbatim.contains(&index)))
+            })
             .collect();
         if lines.is_empty() {
-            return vec![prefix.to_string()];
+            return vec![(prefix.to_string(), false)];
         }
         if lines.len() > NOTIFICATION_MAX_LINES {
             let more = lines.len() - NOTIFICATION_MAX_LINES;
             lines.truncate(NOTIFICATION_MAX_LINES);
-            lines.push(format!("{prefix} (+{more} more lines)"));
+            lines.push((format!("{prefix} (+{more} more lines)"), false));
         }
         lines
     }
 
     pub(crate) fn render(self) -> RenderedNotification {
+        let (lines, verbatim) = self.render_marked_lines().into_iter().unzip();
         RenderedNotification {
             source: self.source,
-            lines: self.render_lines(),
+            lines,
+            verbatim,
         }
     }
 }
@@ -104,6 +133,7 @@ impl Notification {
 pub(crate) struct RenderedNotification {
     source: Source,
     lines: Vec<String>,
+    verbatim: Vec<bool>,
 }
 
 impl RenderedNotification {
@@ -113,6 +143,22 @@ impl RenderedNotification {
 
     pub(crate) fn lines(&self) -> &[String] {
         &self.lines
+    }
+
+    /// The lines with command hints spelled in `prefix`, leaving verbatim lines as they
+    /// are. Every sink that prints a notification goes through this.
+    pub(crate) fn render_notification_lines(&self, prefix: CommandPrefix) -> Vec<String> {
+        self.lines
+            .iter()
+            .zip(&self.verbatim)
+            .map(|(line, &verbatim)| {
+                if verbatim {
+                    line.clone()
+                } else {
+                    prefix.render_hints(line).into_owned()
+                }
+            })
+            .collect()
     }
 }
 

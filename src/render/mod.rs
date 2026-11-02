@@ -14,6 +14,7 @@ use crate::{
 };
 
 use anyhow::Result;
+use std::fmt;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 pub async fn render_stream(
@@ -55,14 +56,42 @@ pub fn render_error(err: anyhow::Error) {
     eprintln!("{}", stderr_error_text(&pretty_error(&err)));
 }
 
-/// `render_error` for an error a REPL command raised: its command hints are shown in
-/// `prefix`, the way the human types them.
+/// `render_error` for an error a REPL command raised. A `.mesh` error, marked by
+/// `MeshVerbError`, shows its command hints in `prefix`, the way the human types them;
+/// any other error is rendered as `render_error` would.
 pub fn render_command_error(err: anyhow::Error, prefix: CommandPrefix) {
     eprintln!("{}", stderr_error_text(&command_error_text(&err, prefix)));
 }
 
 pub(crate) fn command_error_text(err: &anyhow::Error, prefix: CommandPrefix) -> String {
-    prefix.render_hints(&pretty_error(err)).into_owned()
+    let text = pretty_error(err);
+    if err.downcast_ref::<MeshVerbError>().is_none() {
+        return text;
+    }
+    prefix.render_hints(&text).into_owned()
+}
+
+/// Marks an error the `.mesh` verb raised. Display and source pass straight through, so
+/// the rendered chain reads exactly as the wrapped error's would.
+#[derive(Debug)]
+pub struct MeshVerbError(anyhow::Error);
+
+impl MeshVerbError {
+    pub fn wrap(err: anyhow::Error) -> anyhow::Error {
+        anyhow::Error::new(Self(err))
+    }
+}
+
+impl fmt::Display for MeshVerbError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for MeshVerbError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.chain().nth(1)
+    }
 }
 
 #[cfg(test)]
@@ -74,10 +103,10 @@ mod tests {
 
         #[test]
         fn command_error_hints_follow_the_prefix() {
-            let err = anyhow::anyhow!(
+            let err = MeshVerbError::wrap(anyhow::anyhow!(
                 "No path to 1a2b3c4d is known; nothing was sent. `.mesh peers` lists what this node has heard from."
             )
-            .context("`.mesh message` failed");
+            .context("`.mesh message` failed"));
             for (prefix, sigil) in [
                 (CommandPrefix::Dot, '.'),
                 (CommandPrefix::Slash, '/'),
@@ -89,6 +118,40 @@ mod tests {
                     format!(
                         "Error: `{sigil}mesh message` failed\n\nCaused by:\n    No path to 1a2b3c4d is known; nothing was sent. `{sigil}mesh peers` lists what this node has heard from."
                     ),
+                    "{prefix}"
+                );
+            }
+        }
+
+        #[test]
+        fn the_mesh_marker_leaves_the_rendered_chain_unchanged() {
+            let inner = || {
+                anyhow::anyhow!("root cause")
+                    .context("middle")
+                    .context("`.mesh trust` failed")
+            };
+            let marked = MeshVerbError::wrap(inner());
+            assert_eq!(pretty_error(&marked), pretty_error(&inner()));
+            assert_eq!(format!("{marked:#}"), format!("{:#}", inner()));
+            assert_eq!(
+                command_error_text(&marked, CommandPrefix::Dot),
+                pretty_error(&inner())
+            );
+        }
+
+        /// Only `.mesh` errors are rendered: another command's error keeps a typed
+        /// `.session` hint as it was written under every prefix.
+        #[test]
+        fn an_unmarked_error_is_rendered_as_it_was_raised() {
+            let err = anyhow::anyhow!("No session is active; `.session` starts one.");
+            for prefix in [
+                CommandPrefix::Dot,
+                CommandPrefix::Slash,
+                CommandPrefix::Both,
+            ] {
+                assert_eq!(
+                    command_error_text(&err, prefix),
+                    pretty_error(&err),
                     "{prefix}"
                 );
             }

@@ -327,16 +327,24 @@ impl DriverLoop {
         let IdleNotify {
             source,
             text,
+            verbatim,
             origin,
             model_note,
         } = note;
+        let model_note = model_note.map(|note| *note);
         match origin {
             Origin::Local => {
-                self.deliver(source, text, model_note.map(|note| *note));
+                self.deliver(
+                    Notification::with_verbatim(source, text, verbatim),
+                    model_note,
+                );
             }
             Origin::Peer(peer) => {
                 if exempt_from_folding(source) {
-                    self.deliver(source, text, model_note.map(|note| *note));
+                    self.deliver(
+                        Notification::with_verbatim(source, text, verbatim),
+                        model_note,
+                    );
                     return;
                 }
                 if self.coalescer.fold_repeat(&peer, source, &text) {
@@ -345,7 +353,10 @@ impl DriverLoop {
                 let now = tokio::time::Instant::now().into_std();
                 if self.rate_limiter.admit(source, now) {
                     self.coalescer.remember_delivered(&peer, source, &text);
-                    self.deliver(source, text, model_note.map(|note| *note));
+                    self.deliver(
+                        Notification::with_verbatim(source, text, verbatim),
+                        model_note,
+                    );
                 } else {
                     self.coalescer.fold(&peer);
                 }
@@ -353,8 +364,8 @@ impl DriverLoop {
         }
     }
 
-    fn deliver(&mut self, source: Source, text: String, model_note: Option<SystemNotification>) {
-        self.app.mesh.notify(Notification::new(source, text));
+    fn deliver(&mut self, note: Notification, model_note: Option<SystemNotification>) {
+        self.app.mesh.notify(note);
         if let Some(model_note) = model_note {
             if self.pending_model_notes.len() >= IDLE_PENDING_NOTES_MAX
                 && self.pending_model_notes.pop_front().is_some()
@@ -640,6 +651,7 @@ mod tests {
         IdleNotify {
             source: Source::Mesh,
             text: text.to_string(),
+            verbatim: Vec::new(),
             origin: Origin::Local,
             model_note: model_note.map(Box::new),
         }
@@ -649,6 +661,7 @@ mod tests {
         IdleNotify {
             source: Source::Message,
             text: text.to_string(),
+            verbatim: Vec::new(),
             origin: Origin::Peer(peer.to_string()),
             model_note: model_note.map(Box::new),
         }

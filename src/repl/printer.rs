@@ -41,7 +41,7 @@ impl PromptPrinter {
         Self::with_colour(PROMPT_PRINTER_CAPACITY, !*NO_COLOR, command_prefix)
     }
 
-    fn with_colour(cap: usize, colour: bool, command_prefix: LivePrefix) -> Self {
+    pub(crate) fn with_colour(cap: usize, colour: bool, command_prefix: LivePrefix) -> Self {
         let printer = ExternalPrinter::new(cap);
         Self {
             sender: printer.sender(),
@@ -97,12 +97,7 @@ impl NotificationSink for PromptPrinter {
             rows.push(self.paint_prefix(format!("{prefix} ({dropped} {noun} dropped)"), prefix));
         }
         let prefix = rendered.source().prefix();
-        let command_prefix = self.command_prefix.load();
-        let lines: Vec<String> = rendered
-            .lines()
-            .iter()
-            .map(|line| command_prefix.render_hints(line).into_owned())
-            .collect();
+        let lines = rendered.render_notification_lines(self.command_prefix.load());
         rows.extend(
             wrap_rows(&lines, prefix, terminal_width())
                 .into_iter()
@@ -201,6 +196,13 @@ mod tests {
             PromptPrinter::with_colour(PROMPT_PRINTER_CAPACITY, false, live)
         }
 
+        /// The payload's rows rejoined into one body per prefix, so an assertion holds at
+        /// whatever width the terminal running the test wraps them to.
+        fn unwrapped(payload: &str, prefix: &str) -> String {
+            let rows: Vec<String> = payload.lines().map(str::to_string).collect();
+            bodies(&rows, prefix)
+        }
+
         /// The idle lines a person acts on: a knock, an access request, and the envoy
         /// escalating a question to them.
         #[test]
@@ -212,23 +214,24 @@ mod tests {
                     (
                         Source::Knock,
                         "Tia knocked; `.mesh trust 1a2b3c4d` lets it in",
-                        format!("[mesh:knock] Tia knocked; `{mesh} trust 1a2b3c4d` lets it in"),
+                        format!("Tia knocked; `{mesh} trust 1a2b3c4d` lets it in"),
                     ),
                     (
                         Source::Access,
                         "Tia asks for 2 paths; `.mesh pending` lists it",
-                        format!("[mesh:access] Tia asks for 2 paths; `{mesh} pending` lists it"),
+                        format!("Tia asks for 2 paths; `{mesh} pending` lists it"),
                     ),
                     (
                         Source::Message,
                         "envoy escalated to the human; answer with `.mesh answer 1a2b3c4d`",
                         format!(
-                            "[mesh:message] envoy escalated to the human; answer with `{mesh} answer 1a2b3c4d`"
+                            "envoy escalated to the human; answer with `{mesh} answer 1a2b3c4d`"
                         ),
                     ),
                 ] {
                     printer.notify(Notification::new(source, text).render());
-                    assert_eq!(attached.get_line(), Some(expected), "{prefix}");
+                    let payload = attached.get_line().expect("payload queued");
+                    assert_eq!(unwrapped(&payload, source.prefix()), expected, "{prefix}");
                 }
             }
         }
@@ -267,10 +270,10 @@ mod tests {
             printer.notify(Notification::new(Source::Knock, "first").render());
             printer.notify(Notification::new(Source::Knock, "dropped").render());
             assert_eq!(attached.get_line().as_deref(), Some("[mesh:knock] first"));
-            printer.notify(Notification::new(Source::Knock, "`.mesh knocks` lists it").render());
+            printer.notify(Notification::new(Source::Knock, "`.mesh knocks`").render());
             assert_eq!(
                 attached.get_line().as_deref(),
-                Some("[mesh] (1 notification dropped)\n[mesh:knock] `/mesh knocks` lists it")
+                Some("[mesh] (1 notification dropped)\n[mesh:knock] `/mesh knocks`")
             );
         }
     }

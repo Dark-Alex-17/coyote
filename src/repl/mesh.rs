@@ -346,7 +346,10 @@ pub(crate) async fn after_session_entered(ctx: &mut RequestContext) {
     if let Err(err) = autostart(ctx).await {
         // The REPL's own error rendering, so the refusal looks the same as a typed
         // `.mesh on` that failed, followed by the blank line the REPL leaves after one.
-        crate::render::render_error(err);
+        crate::render::render_command_error(
+            crate::render::MeshVerbError::wrap(err),
+            ctx.command_prefix(),
+        );
         out_text("");
     }
 }
@@ -3991,7 +3994,7 @@ fn shares(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let text = if args.effective {
         let case = root_case(ctx, &root)?;
         if let Err(err) = set.rules(&peer_ref, case.unwrap_or(false)) {
-            err_text(&shown_refusal(&format!("{err:#}")));
+            err_path_text(&shown_refusal(&format!("{err:#}")));
             return Ok(());
         }
         render_effective_shares(
@@ -4053,7 +4056,7 @@ async fn grant(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         .transpose()?;
     let kind = match &target {
         Some(target) => {
-            out_text(&format!(
+            out_path_text(&format!(
                 "Will write to {}: allow {} for identity {}.",
                 target.written_to(),
                 listed_paths(&record.paths),
@@ -4064,7 +4067,7 @@ async fn grant(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             }
         }
         None => {
-            out_text(&format!(
+            out_path_text(&format!(
                 "Paths asked for: {}.",
                 listed_paths(&record.paths)
             ));
@@ -4713,7 +4716,7 @@ fn describe_matches(
         BROAD_MATCH_LIMIT + 1,
     )?;
     let words = breadth_words(&count);
-    out_text(&format!(
+    out_path_text(&format!(
         "`{pattern}` matches {words} file(s) under {}.",
         root.display()
     ));
@@ -5713,14 +5716,7 @@ pub(crate) fn out_text(text: &str) {
 }
 
 pub(crate) fn err_text(text: &str) {
-    let text = live_prefix().render_hints(text);
-    #[cfg(test)]
-    capture::push(capture::Stream::Err, &text);
-    if err_text_coloured() {
-        eprintln!("{}", nu_ansi_term::Color::Yellow.paint(text.as_ref()));
-    } else {
-        eprintln!("{text}");
-    }
+    err_path_text(&live_prefix().render_hints(text));
 }
 
 /// Prints `text` byte for byte, for lines that carry a path or a share pattern: a hint
@@ -5730,6 +5726,17 @@ pub(crate) fn out_path_text(text: &str) {
     #[cfg(test)]
     capture::push(capture::Stream::Out, text);
     println!("{text}");
+}
+
+/// The stderr twin of `out_path_text`.
+pub(crate) fn err_path_text(text: &str) {
+    #[cfg(test)]
+    capture::push(capture::Stream::Err, text);
+    if err_text_coloured() {
+        eprintln!("{}", nu_ansi_term::Color::Yellow.paint(text));
+    } else {
+        eprintln!("{text}");
+    }
 }
 
 #[cfg(test)]
@@ -11452,13 +11459,13 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             fn out_path_text_prints_a_dotted_path_unchanged_under_slash() {
                 let _prefix = installed(CommandPrefix::Slash);
                 let _capture = capture::install();
-                out_path_text("Staged `.vault/key` from 1a2b3c4d.");
-                out_text("Staged `.vault/key` from 1a2b3c4d.");
+                out_path_text("Staged `.vault` from 1a2b3c4d.");
+                out_text("Staged `.vault` from 1a2b3c4d.");
                 assert_eq!(
                     stdout_of_capture(),
                     [
-                        "Staged `.vault/key` from 1a2b3c4d.",
-                        "Staged `/vault/key` from 1a2b3c4d.",
+                        "Staged `.vault` from 1a2b3c4d.",
+                        "Staged `/vault` from 1a2b3c4d.",
                     ],
                     "the path sink leaves the path alone; the hint sink would not"
                 );
@@ -13751,6 +13758,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     assert!(ctx.app.mesh.push_idle(IdleNotify {
                         source: Source::Mesh,
                         text: "still routed".to_string(),
+                        verbatim: Vec::new(),
                         origin: Origin::Local,
                         model_note: None,
                     }));
@@ -14434,6 +14442,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     assert!(ctx.app.mesh.push_idle(IdleNotify {
                         source: Source::Mesh,
                         text: "routed after on".to_string(),
+                        verbatim: Vec::new(),
                         origin: Origin::Local,
                         model_note: None,
                     }));
@@ -28549,6 +28558,74 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     });
                 }
 
+                mod command_prefix_paths {
+                    use super::*;
+                    use crate::config::live_prefix_override;
+
+                    /// Under slash every line of `.mesh deny` quotes a dotted pattern as
+                    /// it was typed: the match count, the intent and the result alike.
+                    #[test]
+                    #[serial]
+                    fn deny_quotes_a_dotted_pattern_the_same_on_every_line() {
+                        let _guard = TestConfigDirGuard::new("repl-mesh-deny-dotted");
+                        let _capture = capture::install();
+                        let _script = prompt_script::install(&[]);
+                        run_async(async {
+                            let mut fx = ShareFixture::new(
+                                "repl-mesh-deny-dotted",
+                                &[".vault/key", "docs/a.md"],
+                            )
+                            .await;
+                            let _prefix = live_prefix_override::install(
+                                fx.ctx.app.mesh.command_prefix().clone(),
+                            );
+                            run(&mut fx.ctx, ".set command_prefix slash").await.unwrap();
+
+                            let out = out_of(&mut fx.ctx, "/mesh deny .vault/** --yes")
+                                .await
+                                .unwrap();
+
+                            let quoting: Vec<&str> =
+                                out.lines().filter(|line| line.contains("vault")).collect();
+                            assert_eq!(quoting.len(), 3, "{out}");
+                            for line in quoting {
+                                assert!(line.contains("`.vault/**`"), "{out}");
+                                assert!(!line.contains("/vault"), "{out}");
+                            }
+                            assert_eq!(fx.entries(), [deny_entry(Layer::Global, ".vault/**")]);
+                            fx.stop().await;
+                        });
+                    }
+
+                    /// The refusal leaves the REPL as a `.mesh` error, so its hint is
+                    /// spelled in the prefix while the dotted file it quotes stays a path.
+                    #[test]
+                    #[serial]
+                    fn a_builtin_deny_refusal_keeps_the_path_and_slashes_the_hint() {
+                        let _guard = TestConfigDirGuard::new("repl-mesh-allow-dotted");
+                        let _capture = capture::install();
+                        let _script = prompt_script::install(&[]);
+                        run_async(async {
+                            let mut fx =
+                                ShareFixture::new("repl-mesh-allow-dotted", &[".vault/server.key"])
+                                    .await;
+                            let live = fx.ctx.app.mesh.command_prefix().clone();
+                            let _prefix = live_prefix_override::install(live.clone());
+                            run(&mut fx.ctx, ".set command_prefix slash").await.unwrap();
+
+                            let err = run(&mut fx.ctx, "/mesh allow .vault/server.key")
+                                .await
+                                .unwrap_err();
+
+                            assert_eq!(
+                                crate::render::command_error_text(&err, live.load()),
+                                "Error: `.vault/server.key` is under the built-in deny, so an allow alone would share nothing; `/mesh allow .vault/server.key --force --global` lifts it for this one file."
+                            );
+                            fx.stop().await;
+                        });
+                    }
+                }
+
                 #[test]
                 #[serial]
                 fn unshare_removes_the_allow_or_deny_that_holds_the_pattern() {
@@ -33966,6 +34043,39 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 use super::*;
                 use crate::mesh::mesh_config_dir;
                 use crate::mesh::shares::{RawEntry, RawKind, Served};
+
+                mod command_prefix_paths {
+                    use super::*;
+                    use crate::config::live_prefix_override;
+
+                    /// A peer asked for the `.vault` directory: under slash the grant
+                    /// names it as asked, never as the `/vault` command.
+                    #[test]
+                    #[serial]
+                    fn grant_names_a_dotted_path_as_the_peer_asked_for_it() {
+                        let _guard = TestConfigDirGuard::new("repl-mesh-grant-dotted");
+                        let _capture = capture::install();
+                        let _script = prompt_script::install(&[]);
+                        run_async(async {
+                            let mut fx = PeerFixture::new("repl-mesh-grant-dotted").await;
+                            let _prefix = live_prefix_override::install(
+                                fx.ctx.app.mesh.command_prefix().clone(),
+                            );
+                            run(&mut fx.ctx, ".set command_prefix slash").await.unwrap();
+                            fx.file("a-1", InboundKind::Access, &[".vault"]);
+
+                            let out = out_of(&mut fx.ctx, "/mesh grant a-1").await.unwrap();
+
+                            assert_eq!(
+                                out.lines().next(),
+                                Some("Paths asked for: `.vault`."),
+                                "{out}"
+                            );
+                            assert!(!out.contains("/vault"), "{out}");
+                            fx.stop().await;
+                        });
+                    }
+                }
 
                 #[test]
                 #[serial]
