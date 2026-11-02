@@ -4363,22 +4363,28 @@ fn brief_confirmations_under_slash_name_their_next_command_with_the_slash_sigil(
 
 /// The `local` interface kind at a real cold start, with a `local` entry nothing answers
 /// at first. One entry carries both overrides, so on every platform it points at an
-/// endpoint only this test can open: the held loopback `port` where rnsd has no abstract
+/// endpoint only this test opens: a closed loopback `port` where rnsd has no abstract
 /// socket, the abstract socket `@rns/<instance>` under a name no rnsd uses where it has.
+/// The port is closed rather than held because a dial to a bound socket that is not
+/// listening is not refused everywhere, and the refusal is what the test reads.
 struct LocalRnsd {
-    held: HeldPort,
+    port: u16,
     instance: String,
 }
 
 impl LocalRnsd {
     fn absent() -> Self {
-        let held = HeldPort::hold();
-        let instance = format!("coyote-probe-{}", held.port);
-        Self { held, instance }
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let instance = format!("coyote-probe-{port}");
+        Self { port, instance }
     }
 
     fn port(&self) -> u16 {
-        self.held.port
+        self.port
     }
 
     fn instance(&self) -> &str {
@@ -4390,16 +4396,15 @@ impl LocalRnsd {
         if cfg!(any(target_os = "linux", target_os = "android")) {
             format!("@rns/{}", self.instance)
         } else {
-            format!("127.0.0.1:{}", self.held.port)
+            format!("127.0.0.1:{}", self.port)
         }
     }
 
     /// Stands in for rnsd's shared-instance listener at the endpoint from now on: every
-    /// connection is accepted and held silent, which satisfies the node's probe and the
-    /// shared-instance client it attaches alike.
+    /// connection is accepted and held silent.
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     fn listen(&mut self) {
-        self.held.open();
+        hold_connections(TcpListener::bind(("127.0.0.1", self.port)).unwrap());
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -4423,7 +4428,7 @@ impl LocalRnsd {
 /// A `local`-only config through the real binary, as the shipped default is used: with
 /// nothing listening at the endpoint the bare `.mesh info` already shows the entry as
 /// `local rnsd at <endpoint>` and keys `reach` on it, `.mesh on` is refused with the
-/// endpoint, the kind, the probe's reason and the loopback hint, and nothing is started
+/// endpoint, the kind, the client's dial failure and the loopback hint, and nothing is started
 /// (no `mesh.started`, `.mesh peers` still says the mesh is off). Once a listener answers
 /// there the same `.mesh on` joins: the summary names the entry, the node's row reads
 /// `local rnsd at <endpoint>  connected`, `reach` keeps the endpoint, no WARNING is
@@ -4471,6 +4476,14 @@ fn a_local_only_node_is_refused_until_rnsd_listens_then_joins_through_it() {
         )),
         "{refused:?}"
     );
+    if cfg!(not(any(target_os = "linux", target_os = "android"))) {
+        assert!(
+            refused.contains(&format!(
+                "is not reachable: nothing is listening at {endpoint}."
+            )),
+            "the refusal names the refused dial: {refused:?}"
+        );
+    }
     assert!(
         refused.contains("start rnsd or fix mesh.interfaces."),
         "{refused:?}"
