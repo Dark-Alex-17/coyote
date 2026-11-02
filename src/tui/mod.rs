@@ -1145,10 +1145,17 @@ where
     }
 }
 
-pub async fn run(mut ctx: RequestContext) -> Result<()> {
+/// The UI needs the keyboard and the screen on a terminal; refused before
+/// anything else is started on its behalf.
+pub fn ensure_tty() -> Result<()> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         bail!("No TTY for TUI")
     }
+    Ok(())
+}
+
+pub async fn run(mut ctx: RequestContext) -> Result<()> {
+    ensure_tty()?;
     let _active = ActiveGuard::set();
     let (tx, rx) = unbounded_channel();
     let auto_cancel = Arc::new(AtomicBool::new(false));
@@ -2707,6 +2714,24 @@ mod tests {
         );
         let utils = include_str!("../utils/mod.rs");
         assert!(fn_body(utils, "pub fn drain_stale_tty_input").contains("crate::tui::active()"));
+    }
+
+    /// A keyboard prompt asked while the UI owns the terminal is refused
+    /// outright: it comes back at once, on a thread that would otherwise
+    /// be stuck on a read of stdin that the event stream owns.
+    #[test]
+    #[serial]
+    fn read_single_key_refuses_under_the_tui_without_touching_stdin() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&TUI_ACTIVE, true);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::utils::read_single_key(&['y', 'n'], 'n', "ask? "));
+        });
+        let answer = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the gate must answer without reading stdin");
+        let err = answer.unwrap_err().to_string();
+        assert!(err.contains("not available in the TUI"), "{err}");
     }
 
     /// A task id in the source names the owner of a debt marker and
