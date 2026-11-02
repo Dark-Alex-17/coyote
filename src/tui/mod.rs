@@ -3154,12 +3154,18 @@ mod tests {
             "unimplemented!",
             concat!("#[", "ignore"),
         ];
-        // The prompt reply channel has no non-unix implementation yet; its
-        // bail carries the id of the work that adds one.
-        let allowlisted: &[(&str, &str)] = &[(
-            "src/function/prompt_channel.rs",
-            "bail!(\"Prompt reply channel is not implemented on this platform\")",
-        )];
+        // Each entry is a refusal or a parked test whose line carries the
+        // id of the work that removes it.
+        let allowlisted: &[(&str, &str)] = &[
+            (
+                "src/function/prompt_channel.rs",
+                "bail!(\"Prompt reply channel is not implemented on this platform\")",
+            ),
+            (
+                "tests/tui_binary.rs",
+                "the transcript is not yet printed on the normal screen when the UI leaves",
+            ),
+        ];
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut offenders = Vec::new();
         for dir in ["src", "tests"] {

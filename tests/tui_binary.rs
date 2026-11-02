@@ -2549,3 +2549,355 @@ fn a_reply_with_a_link_shows_its_text_and_leaks_no_osc_8() {
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
     assert_tty_restored(&transcript);
 }
+
+// ---------------------------------------------------------------------
+// The interrupt keys at rest and mid-turn, and what the normal screen
+// shows once the UI has left.
+// ---------------------------------------------------------------------
+
+/// Ctrl+C on an idle, empty composer quits exactly as Ctrl+D does: the
+/// alternate screen is left once, the process exits 0, the tty is cooked.
+#[test]
+#[serial]
+fn ctrl_c_on_an_idle_empty_composer_quits_like_ctrl_d() {
+    let dir = fresh_config_dir("ctrl-c-idle-empty");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(1200));
+    pty.send(b"\x03").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        1,
+        "Ctrl+C on an idle empty composer must leave the alternate screen exactly once:\n{transcript}"
+    );
+}
+
+/// Ctrl+C while the composer holds a draft clears the draft and nothing
+/// else: the UI stays up, the draft is never submitted (Enter afterwards
+/// starts no turn and the model sees no request), and the composer still
+/// takes a command.
+#[test]
+#[serial]
+fn ctrl_c_with_a_draft_clears_the_composer_and_does_not_quit() {
+    let dir = fresh_config_dir("ctrl-c-draft");
+    let _guard = TempDirGuard(dir.clone());
+    let fake = FakeLlm::start(vec![Reply::Text("must never be requested k4m".to_string())]);
+    write_fake_llm_config(&dir, &fake);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b"draft to discard q9x").unwrap();
+    pty.wait_for("draft to discard q9x", PTY_DEADLINE)
+        .expect("the typed draft never reached the composer");
+    pty.read_for(Duration::from_millis(1200));
+    let cleared_at = pty.raw().len();
+    pty.send(b"\x03").unwrap();
+    pty.read_for(Duration::from_millis(800));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[cleared_at..]));
+    assert!(
+        !since.contains("exit="),
+        "Ctrl+C with a draft in the composer quit the UI:\n{since}"
+    );
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "Ctrl+C with a draft in the composer left the alternate screen:\n{since}"
+    );
+
+    // Enter now must find an empty composer: no turn, no request.
+    pty.send(b"\r").unwrap();
+    pty.read_for(Duration::from_millis(1200));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[cleared_at..]));
+    assert!(
+        !since.contains("Working"),
+        "Enter after Ctrl+C started a turn, so the draft was not cleared:\n{since}"
+    );
+    assert_eq!(
+        fake.served(),
+        0,
+        "the discarded draft reached the model:\n{since}"
+    );
+
+    let info_at = pty.raw().len();
+    pty.send(b".info\r").unwrap();
+    pty.wait_for_after("log_path", info_at, PTY_DEADLINE)
+        .expect("keys were not handled after Ctrl+C cleared the draft");
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+    assert_eq!(fake.served(), 0, "{transcript}");
+}
+
+/// Ctrl+C while a turn runs is the same soft interrupt as Esc: the held
+/// stream ends at once, the process does NOT exit, the rest of the reply
+/// never lands, and the next command is handled well before the model
+/// would have let go.
+#[test]
+#[serial]
+fn ctrl_c_during_a_held_stream_interrupts_the_turn_and_the_ui_stays_up() {
+    let dir = fresh_config_dir("ctrl-c-interrupt");
+    let _guard = TempDirGuard(dir.clone());
+    let release = dir.join("never-released");
+    let fake = FakeLlm::start(vec![
+        Reply::Streamed(vec![
+            Chunk::Text("first half cc-a1".to_string()),
+            Chunk::WaitFor(release),
+            Chunk::Text(" tail cc-b2".to_string()),
+        ]),
+        Reply::Text("fresh reply after ctrl-c s3".to_string()),
+    ]);
+    write_fake_llm_config(&dir, &fake);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b"stream and hold\r").unwrap();
+    wait_for_squeezed(&mut pty, "first half cc-a1", "the first delta");
+    pty.wait_for("Esc to interrupt", PTY_DEADLINE)
+        .expect("the status row never offered Esc to interrupt");
+    let pressed = std::time::Instant::now();
+    let pressed_at = pty.raw().len();
+    pty.send(b"\x03").unwrap();
+    pty.read_for(Duration::from_millis(500));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[pressed_at..]));
+    assert!(
+        !since.contains("exit="),
+        "Ctrl+C during a running turn quit the UI instead of interrupting the turn:\n{since}"
+    );
+
+    let info_at = pty.raw().len();
+    pty.send(b".info\r").unwrap();
+    let transcript = pty
+        .wait_for_after("log_path", info_at, PTY_DEADLINE)
+        .expect("keys were not handled after the Ctrl+C interrupt");
+    assert!(
+        pressed.elapsed() < Duration::from_secs(6),
+        "the command ran only after the fake gave up holding the stream, not on Ctrl+C"
+    );
+    let squeezed: String = transcript.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        !squeezed.contains("tailcc-b2"),
+        "the interrupted stream's tail still reached the screen:\n{transcript}"
+    );
+
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b"next prompt\r").unwrap();
+    let transcript = wait_for_squeezed(
+        &mut pty,
+        "fresh reply after ctrl-c s3",
+        "the reply to the turn after the interrupt",
+    );
+    assert_eq!(fake.served(), 2, "{transcript}");
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// With a session open, Esc on a held stream behaves as the REPL's Ctrl+C
+/// does: a "Response interrupted" notice lands in the transcript, the
+/// partial text already streamed is kept, both survive a full repaint
+/// once the UI is idle again, and the rest of the reply never arrives.
+#[test]
+#[serial]
+fn esc_mid_stream_leaves_an_interrupted_cell_in_the_transcript() {
+    let dir = fresh_config_dir("esc-interrupted-cell");
+    let _guard = TempDirGuard(dir.clone());
+    let release = dir.join("never-released");
+    let fake = FakeLlm::start(vec![Reply::Streamed(vec![
+        Chunk::Text("partial text before esc e5p".to_string()),
+        Chunk::WaitFor(release),
+        Chunk::Text(" tail never shown e5q".to_string()),
+    ])]);
+    write_fake_llm_config(&dir, &fake);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    // The partial-text path needs a session; without one the streaming
+    // call fails the turn with "Aborted." (the REPL does the same).
+    pty.send(b".session\r").unwrap();
+    pty.wait_for("temp", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(500));
+    pty.send(b"stream and hold\r").unwrap();
+    wait_for_squeezed(&mut pty, "partial text before esc e5p", "the first delta");
+    pty.wait_for("Esc to interrupt", PTY_DEADLINE)
+        .expect("the status row never offered Esc to interrupt");
+    let pressed_at = pty.raw().len();
+    pty.send(b"\x1b").unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    let since = loop {
+        pty.read_for(Duration::from_millis(200));
+        let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[pressed_at..]));
+        if since.to_lowercase().contains("interrupted") {
+            break since;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no cell said the turn was interrupted after Esc:\n{since}"
+        );
+    };
+    assert!(
+        !since.contains("exit="),
+        "Esc during a running turn quit the UI:\n{since}"
+    );
+    // A resize forces a full repaint: the partial text and the interrupted
+    // cell must both still be on the idle screen.
+    pty.read_for(Duration::from_millis(800));
+    let repaint_at = pty.raw().len();
+    pty.resize(38, 100).unwrap();
+    pty.wait_for_after("temp", repaint_at, PTY_DEADLINE)
+        .expect("the screen was not repainted after the resize");
+    pty.read_for(Duration::from_millis(500));
+    let repainted = strip_ansi(&String::from_utf8_lossy(&pty.raw()[repaint_at..]));
+    let squeezed: String = repainted.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        squeezed.contains("partialtextbeforeesce5p"),
+        "the partial text streamed before Esc vanished from the transcript:\n{repainted}"
+    );
+    assert!(
+        repainted.to_lowercase().contains("interrupted"),
+        "the interrupted cell did not survive to the idle screen:\n{repainted}"
+    );
+    assert!(
+        !squeezed.contains("tailnevershowne5q"),
+        "the interrupted stream's tail reached the screen:\n{repainted}"
+    );
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// Without a session, Esc on a held stream fails the turn the way the
+/// REPL's Ctrl+C does there: an "Aborted." error cell, no partial text
+/// kept, and the UI stays up and keeps taking keys.
+#[test]
+#[serial]
+fn esc_mid_stream_without_a_session_shows_the_aborted_error_and_stays_up() {
+    let dir = fresh_config_dir("esc-aborted-no-session");
+    let _guard = TempDirGuard(dir.clone());
+    let release = dir.join("never-released");
+    let fake = FakeLlm::start(vec![Reply::Streamed(vec![
+        Chunk::Text("partial before esc n8a".to_string()),
+        Chunk::WaitFor(release),
+        Chunk::Text(" tail never shown n8b".to_string()),
+    ])]);
+    write_fake_llm_config(&dir, &fake);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b"stream and hold\r").unwrap();
+    wait_for_squeezed(&mut pty, "partial before esc n8a", "the first delta");
+    pty.wait_for("Esc to interrupt", PTY_DEADLINE)
+        .expect("the status row never offered Esc to interrupt");
+    let pressed_at = pty.raw().len();
+    pty.send(b"\x1b").unwrap();
+    let since = pty
+        .wait_for_after("Aborted.", pressed_at, Duration::from_secs(6))
+        .expect("no Aborted. error followed Esc on a session-less stream");
+    assert!(
+        !since.contains("exit="),
+        "Esc during a running turn quit the UI:\n{since}"
+    );
+
+    let info_at = pty.raw().len();
+    pty.send(b".info\r").unwrap();
+    let transcript = pty
+        .wait_for_after("log_path", info_at, PTY_DEADLINE)
+        .expect("keys were not handled after the interrupt");
+    let squeezed: String = transcript.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        !squeezed.contains("tailnevershownn8b"),
+        "the interrupted stream's tail reached the screen:\n{transcript}"
+    );
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// A lone Esc on an idle, empty composer is not a quit: the UI stays on
+/// the alternate screen and keeps taking keys.
+#[test]
+#[serial]
+fn esc_on_an_idle_empty_composer_does_not_quit() {
+    let dir = fresh_config_dir("esc-idle");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(1200));
+    let pressed_at = pty.raw().len();
+    pty.send(b"\x1b").unwrap();
+    pty.read_for(Duration::from_millis(1000));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[pressed_at..]));
+    assert!(!since.contains("exit="), "a lone Esc quit the UI:\n{since}");
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "a lone Esc left the alternate screen:\n{since}"
+    );
+
+    let info_at = pty.raw().len();
+    pty.send(b".info\r").unwrap();
+    pty.wait_for_after("log_path", info_at, PTY_DEADLINE)
+        .expect("keys were not handled after a lone Esc");
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// On exit the committed transcript is written to the normal screen: after
+/// a turn, Ctrl+D leaves the alternate screen and the user's prompt and the
+/// reply are printed where the shell prompt will follow.
+#[test]
+#[serial]
+#[ignore = "the transcript is not yet printed on the normal screen when the UI leaves"] // TASK-317
+fn ctrl_d_prints_the_committed_transcript_on_the_normal_screen() {
+    let dir = fresh_config_dir("ctrl-d-dump");
+    let _guard = TempDirGuard(dir.clone());
+    let fake = FakeLlm::start(vec![Reply::Text("the reply to keep v7k".to_string())]);
+    write_fake_llm_config(&dir, &fake);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b"prompt to keep u6j\r").unwrap();
+    wait_for_squeezed(&mut pty, "the reply to keep v7k", "the reply");
+    pty.read_for(Duration::from_millis(800));
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+
+    let raw = pty.raw();
+    let left = rfind(raw, LEAVE_ALT).expect("the alternate screen was never left");
+    let after = strip_ansi(&String::from_utf8_lossy(&raw[left..]));
+    let report_at = after.find("exit=").expect("no exit= line after the leave");
+    let between: String = after[..report_at]
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    for marker in ["prompttokeepu6j", "thereplytokeepv7k"] {
+        assert!(
+            between.contains(marker),
+            "the committed transcript ({marker:?}) was not printed on the normal screen \
+             after the alternate screen was left: {:?}",
+            after[..report_at].trim()
+        );
+    }
+}
