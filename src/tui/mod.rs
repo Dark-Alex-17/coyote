@@ -15,7 +15,7 @@ mod terminal;
 use crate::config::{AppConfig, RequestContext};
 use crate::events::{EventSink, NoticeKind, SubscriptionId};
 use crate::prompt::{PromptAction, PromptAnswer, PromptMemory, PromptRequest};
-use crate::repl::{EXIT_CANCEL_WAIT, EXIT_HOOK_DRAIN_TIMEOUT, parse_command, run_repl_command};
+use crate::repl::{EXIT_CANCEL_WAIT, EXIT_HOOK_DRAIN_TIMEOUT, is_command, run_repl_command};
 use crate::utils::{AbortSignal, create_abort_signal};
 use anyhow::{Result, bail};
 use crossterm::event::{EventStream, KeyEvent};
@@ -1453,8 +1453,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                     Some(Command::Submit(line)) => {
                         if let Some(ctx) = ctx.take() {
                             abort.reset();
-                            let command =
-                                parse_command(&line, ctx.app.config.command_prefix).is_some();
+                            let command = is_command(&line, ctx.app.config.command_prefix);
                             app.begin_turn(&line, command);
                             task = Some(Task::Turn {
                                 handle: spawn_turn(ctx, abort.clone(), line, tx.clone()),

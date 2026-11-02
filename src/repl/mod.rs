@@ -749,15 +749,11 @@ pub async fn run_repl_command(
 pub async fn run_repl_command_with_prefix(
     ctx: &mut RequestContext,
     abort_signal: AbortSignal,
-    mut line: &str,
+    line: &str,
     prefix: CommandPrefix,
 ) -> Result<bool> {
     ctx.pending_tasks_guardrail_count = 0;
-    if let Ok(Some(captures)) = MULTILINE_RE.captures(line)
-        && let Some(text_match) = captures.get(1)
-    {
-        line = text_match.as_str();
-    }
+    let line = unfence(line);
     match parse_command(line, prefix) {
         Some((cmd, args)) => match cmd.as_ref() {
             ".help" => {
@@ -2104,6 +2100,22 @@ pub(crate) fn parse_command(
         }
         _ => None,
     }
+}
+
+/// The text inside a `::: ... :::` multi-line fence, or the line itself
+/// when it has none. Every surface classifies a submitted line through
+/// this, so a fenced command runs and is shown as a command everywhere.
+pub(crate) fn unfence(line: &str) -> &str {
+    match MULTILINE_RE.captures(line) {
+        Ok(Some(captures)) => captures.get(1).map_or(line, |text| text.as_str()),
+        _ => line,
+    }
+}
+
+/// Whether a submitted line, fence stripped, is a command rather than a
+/// message for the model.
+pub(crate) fn is_command(line: &str, prefix: CommandPrefix) -> bool {
+    parse_command(unfence(line), prefix).is_some()
 }
 
 fn try_extract_shell_command(line: &str) -> Option<&str> {
@@ -8417,6 +8429,20 @@ local_hello() {\n\
             parse_command(".", CommandPrefix::Dot),
             Some((Cow::Borrowed("."), None))
         );
+    }
+
+    /// A command inside the multi-line fence is a command on every
+    /// surface: the dispatcher runs it and the UI shows it as one.
+    #[test]
+    fn a_fenced_command_is_classified_as_a_command() {
+        assert_eq!(unfence("::: .info :::"), ".info ");
+        assert_eq!(unfence(":::\n.info session\n:::"), ".info session\n");
+        assert_eq!(unfence(".info"), ".info");
+        assert_eq!(unfence("::: unterminated"), "::: unterminated");
+        assert!(is_command("::: .info :::", CommandPrefix::Dot));
+        assert!(is_command(".info", CommandPrefix::Dot));
+        assert!(!is_command("::: plain chat :::", CommandPrefix::Dot));
+        assert!(!is_command("::: .info :::", CommandPrefix::Slash));
     }
 
     #[test]
