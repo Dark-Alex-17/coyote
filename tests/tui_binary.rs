@@ -716,6 +716,42 @@ fn an_editor_shell_out_comes_back_to_a_repainted_screen() {
     assert_tty_restored(&transcript);
 }
 
+/// An editor that leaves the tty with echo and canonical mode off must
+/// not have the last word: the UI puts the line discipline back to its
+/// own starting point before taking the terminal again, so what Ctrl+D
+/// restores at the end is the user's shell state, not the editor's.
+#[test]
+#[serial]
+fn an_editor_that_changes_the_tty_modes_does_not_decide_what_exit_restores() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = fresh_config_dir("editor-stty");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let editor = dir.join("stty-editor.sh");
+    fs::write(&editor, "#!/bin/sh\nstty -echo -icanon </dev/tty\nexit 0\n").unwrap();
+    fs::set_permissions(&editor, fs::Permissions::from_mode(0o755)).unwrap();
+    let editor = editor.to_str().unwrap();
+    let mut pty = spawn_tui(&dir, &[("EDITOR", editor), ("VISUAL", editor)]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let before = pty.raw().len();
+    pty.send(b"\x0f").unwrap();
+    let left = pty
+        .wait_for_raw(LEAVE_ALT, before, PTY_DEADLINE)
+        .expect("Ctrl-O did not release the terminal for the editor");
+    let re_entered = wait_for_re_entry(&mut pty, left);
+    assert_repainted_after(&mut pty, re_entered, "the editor shell-out");
+    pty.send(b".info\r").unwrap();
+    pty.wait_for_after("log_path", re_entered, PTY_DEADLINE)
+        .expect("keys were not handled after the editor returned");
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
 /// While the editor is up the keyboard is the editor's: the event stream
 /// is stopped before the terminal is released and only restarted after
 /// the editor returns. A line typed into an editor that reads the tty

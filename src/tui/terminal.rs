@@ -143,6 +143,29 @@ pub(crate) fn open_tty_writer() -> io::Result<TtyWriter> {
     Ok(io::stdout())
 }
 
+/// The tty's current line-discipline settings.
+#[cfg(unix)]
+fn tty_modes(fd: i32) -> io::Result<libc::termios> {
+    let mut modes = std::mem::MaybeUninit::<libc::termios>::uninit();
+    // SAFETY: tcgetattr fills one termios through a valid pointer; the
+    // result is checked before the value is read.
+    if unsafe { libc::tcgetattr(fd, modes.as_mut_ptr()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a zero return means tcgetattr initialised `modes`.
+    Ok(unsafe { modes.assume_init() })
+}
+
+#[cfg(unix)]
+fn set_tty_modes(fd: i32, modes: &libc::termios) -> io::Result<()> {
+    // SAFETY: tcsetattr reads one termios through a valid pointer; the
+    // result is checked.
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, modes) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Installs the restoring panic hook in front of whatever hook is current.
 /// Returns whether this call installed it; later calls are no-ops.
 pub(crate) fn install_panic_hook() -> bool {
@@ -278,6 +301,13 @@ pub(crate) struct Screen {
     enhancement: bool,
     #[cfg(unix)]
     fd: i32,
+    /// The line discipline as it was before raw mode first came on. Raw
+    /// mode is restored from crossterm's own snapshot, which it takes on
+    /// the first `enable_raw_mode` after a `disable_raw_mode`; a child
+    /// run with the terminal released may change the modes in between,
+    /// so the re-entry puts these back first.
+    #[cfg(unix)]
+    cooked: libc::termios,
 }
 
 impl Screen {
@@ -290,6 +320,8 @@ impl Screen {
         let writer = open_tty_writer()?;
         #[cfg(unix)]
         let fd = std::os::fd::AsRawFd::as_raw_fd(&writer);
+        #[cfg(unix)]
+        let cooked = tty_modes(fd)?;
         let mut terminal = Terminal::new(CrosstermBackend::new(writer))?;
         #[cfg(unix)]
         PANIC_FD.store(fd, Ordering::SeqCst);
@@ -305,6 +337,8 @@ impl Screen {
             enhancement,
             #[cfg(unix)]
             fd,
+            #[cfg(unix)]
+            cooked,
         })
     }
 
@@ -314,6 +348,16 @@ impl Screen {
     fn arm_panic_hook(&self) {
         #[cfg(unix)]
         PANIC_FD.store(self.fd, Ordering::SeqCst);
+    }
+
+    #[cfg(unix)]
+    fn restore_cooked_modes(&self) -> io::Result<()> {
+        set_tty_modes(self.fd, &self.cooked)
+    }
+
+    #[cfg(not(unix))]
+    fn restore_cooked_modes(&self) -> io::Result<()> {
+        Ok(())
     }
 
     pub(crate) fn draw(&mut self, render: impl FnOnce(&mut ratatui::Frame)) -> io::Result<()> {
@@ -341,16 +385,18 @@ impl Screen {
     }
 
     /// Hands the terminal to `f` in its normal modes (a suspended shell, an
-    /// editor), then takes it back: re-enters, re-applies raw mode so a
-    /// child that changed the termios state leaves no trace, and clears so
-    /// the next frame repaints everything.
+    /// editor), then takes it back: puts the line discipline back to its
+    /// pre-UI state so a child that changed it (an editor leaving echo
+    /// off) leaves no trace in what the final `leave` restores, re-enters,
+    /// and clears so the next frame repaints everything.
     pub(crate) fn with_terminal_released<T>(&mut self, f: impl FnOnce() -> T) -> io::Result<T> {
         self.leave()?;
         let value = f();
+        if let Err(err) = self.restore_cooked_modes() {
+            warn!("Failed to restore the terminal modes after the terminal was released: {err}");
+        }
         enter(self.terminal.backend_mut(), self.enhancement)?;
         self.arm_panic_hook();
-        disable_raw_mode()?;
-        enable_raw_mode()?;
         repaint_from_scratch(&mut self.terminal)?;
         Ok(value)
     }
