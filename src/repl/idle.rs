@@ -671,6 +671,44 @@ mod tests {
         mesh_notification("mesh_message", id, "peer", true, "read it".into())
     }
 
+    mod command_prefix_sinks {
+        use super::*;
+        use crate::config::CommandPrefix;
+
+        /// The driver hands the model's copy of an event to the context's queue with
+        /// its next step spelled in the slot's prefix.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn flushed_model_notes_spell_their_hint_in_the_prefix() {
+            let ctx = test_ctx(None);
+            ctx.try_read()
+                .unwrap()
+                .app
+                .mesh
+                .command_prefix()
+                .store(CommandPrefix::Slash);
+            let driver = start_driver(&ctx);
+            let typed = mesh_notification(
+                "peer_ask",
+                "q1",
+                "peer",
+                true,
+                "wait for `.mesh answer q1` instead of replying".into(),
+            );
+
+            driver
+                .handle()
+                .push(note("asked", Some(typed)))
+                .expect("queued");
+            let flushed = wait_for_note(&ctx, |note| note.id == "q1").await;
+
+            assert_eq!(
+                flushed.next_action,
+                "wait for `/mesh answer q1` instead of replying"
+            );
+            driver.stop().await;
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn model_note_lands_in_the_queue_installed_after_an_agent_switch() {
         let ctx = test_ctx(None);

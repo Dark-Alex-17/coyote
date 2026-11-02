@@ -11408,7 +11408,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             use crate::config::{CommandPrefix, LivePrefix, live_prefix_override};
             use crate::mesh::notify::{Notification, NotificationSink, Source};
             use crate::render::command_error_text;
-            use crate::repl::printer::PromptPrinter;
+            use crate::repl::printer::{PROMPT_PRINTER_CAPACITY, PromptPrinter};
 
             /// Each prefix with the sigil a `.set command_prefix` line takes under it and
             /// the way its hints spell the mesh command.
@@ -11528,15 +11528,9 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 let mut ctx = off_ctx();
                 let live = ctx.app.mesh.command_prefix().clone();
                 let _prefix = live_prefix_override::install(live.clone());
-                let printer = PromptPrinter::new(live);
+                let printer = PromptPrinter::with_colour(PROMPT_PRINTER_CAPACITY, false, live);
                 let attached = printer.attach();
-                let knock = || {
-                    Notification::new(
-                        Source::Knock,
-                        "Tia knocked; `.mesh trust 1a2b3c4d` lets it in",
-                    )
-                    .render()
-                };
+                let knock = || Notification::new(Source::Knock, "`.mesh trust 1a2b`").render();
                 let _capture = capture::install();
 
                 run_async(run(&mut ctx, ".mesh info")).unwrap();
@@ -11553,15 +11547,10 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     infos,
                     ["node: off - .mesh on joins", "node: off - /mesh on joins"]
                 );
-                // The shipped printer paints its prefix when colour is on, so only the
-                // body is compared.
                 for mesh in [".mesh", "/mesh"] {
-                    let line = attached.get_line().expect("a notified line");
-                    assert!(
-                        line.ends_with(&format!(
-                            " Tia knocked; `{mesh} trust 1a2b3c4d` lets it in"
-                        )),
-                        "{line:?}"
+                    assert_eq!(
+                        attached.get_line(),
+                        Some(format!("[mesh:knock] `{mesh} trust 1a2b`"))
                     );
                 }
             }
@@ -26162,6 +26151,116 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 });
             }
 
+            mod command_prefix_refusals {
+                use super::*;
+                use crate::config::{CommandPrefix, live_prefix_override};
+                use crate::render::command_error_text;
+
+                const PREFIXES: [(CommandPrefix, char, &str); 3] = [
+                    (CommandPrefix::Dot, '.', ".mesh"),
+                    (CommandPrefix::Slash, '/', "/mesh"),
+                    (CommandPrefix::Both, '.', ".mesh"),
+                ];
+
+                /// The refusals of the trust verbs and of `.mesh message` leave the REPL
+                /// as `.mesh` errors, so each hint they carry is spelled in the prefix the
+                /// session was switched to.
+                #[test]
+                #[serial]
+                fn trust_and_message_refusals_spell_their_hints_in_the_prefix() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-prefix-refusals");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let started = started_runtime("repl-mesh-prefix-refusals").await;
+                        let mut ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                        let live = ctx.app.mesh.command_prefix().clone();
+                        let _prefix = live_prefix_override::install(live.clone());
+                        let (unheard, _, _) = announced_peer();
+                        let (heard, _) = heard_peer(&started.runtime, "Tia", SystemTime::now());
+                        let unknown_identity = hex_lower(&[0x5b; 16]);
+                        let never_heard = hex_lower(&[0x6c; 16]);
+
+                        for (prefix, sigil, mesh) in PREFIXES {
+                            let typed = ctx.command_prefix().display();
+                            run(&mut ctx, &format!("{typed}set command_prefix {prefix}"))
+                                .await
+                                .unwrap();
+                            for (line, hint) in [
+                                (format!("trust {unheard} --yes"), "knocks"),
+                                (
+                                    format!("untrust --identity {unknown_identity}"),
+                                    "trust --identity",
+                                ),
+                                ("block nothex00".to_string(), "peers"),
+                                (format!("message {heard} hi"), "peers"),
+                                (format!("message {never_heard} hi"), "peers"),
+                            ] {
+                                let err = run(&mut ctx, &format!("{sigil}mesh {line}"))
+                                    .await
+                                    .unwrap_err();
+                                let text = command_error_text(&err, live.load());
+                                assert!(
+                                    text.contains(&format!("{mesh} {hint}")),
+                                    "{prefix} {line}: {text}"
+                                );
+                                if prefix == CommandPrefix::Slash {
+                                    assert!(!text.contains(".mesh"), "{line}: {text}");
+                                }
+                            }
+                        }
+
+                        assert!(ctx.app.mesh.stop().await.unwrap());
+                        started.relay_handle.abort();
+                    });
+                }
+
+                /// A live `.mesh knocks` listing under slash points at `/mesh trust`.
+                #[test]
+                #[serial]
+                fn the_knocks_listing_spells_its_hints_in_the_prefix() {
+                    use crate::mesh::knock::{InboundKnock, KnockVia};
+                    use std::time::Instant;
+
+                    let _guard = TestConfigDirGuard::new("repl-mesh-prefix-knocks");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let started = started_runtime("repl-mesh-prefix-knocks").await;
+                        let mut ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                        let _prefix =
+                            live_prefix_override::install(ctx.app.mesh.command_prefix().clone());
+                        run(&mut ctx, ".set command_prefix slash").await.unwrap();
+                        let runtime = started.runtime.clone();
+                        let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                        let trusted_dest = heard_trusted_peer(&runtime, slot);
+                        let identity = identity_of(&runtime.trust(), &trusted_dest);
+                        let start = Instant::now();
+                        for n in 0..5u8 {
+                            runtime.knock_gate().admit(
+                                InboundKnock {
+                                    identity_hash: identity.clone(),
+                                    destination_hash: hex_lower(&[n; 16]),
+                                    name_hash: String::new(),
+                                    via: KnockVia::Direct,
+                                    intro: None,
+                                },
+                                start,
+                                SystemTime::now(),
+                            );
+                        }
+
+                        let out = out_of(&mut ctx, "/mesh knocks").await.unwrap();
+
+                        assert!(out.contains("/mesh trust "), "{out}");
+                        assert!(!out.contains(".mesh"), "{out}");
+                        assert!(ctx.app.mesh.stop().await.unwrap());
+                        started.relay_handle.abort();
+                    });
+                }
+            }
+
             /// A well-formed trust file of the layout this program wrote before the SCOPE
             /// rename (`version: 1`; the current trust file is `2`), as an operator upgrading
             /// in place would have on disk. The literal `1` is deliberate: a fixture built
@@ -28560,7 +28659,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
 
                 mod command_prefix_paths {
                     use super::*;
-                    use crate::config::live_prefix_override;
+                    use crate::config::{CommandPrefix, live_prefix_override};
 
                     /// Under slash every line of `.mesh deny` quotes a dotted pattern as
                     /// it was typed: the match count, the intent and the result alike.
@@ -28620,6 +28719,52 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             assert_eq!(
                                 crate::render::command_error_text(&err, live.load()),
                                 "Error: `.vault/server.key` is under the built-in deny, so an allow alone would share nothing; `/mesh allow .vault/server.key --force --global` lifts it for this one file."
+                            );
+                            fx.stop().await;
+                        });
+                    }
+
+                    /// With no rules the listing's two pointers are spelled in the prefix,
+                    /// while the share-file paths it names are printed as they are.
+                    #[test]
+                    #[serial]
+                    fn the_empty_share_listings_spell_their_hints_in_the_prefix() {
+                        let _guard = TestConfigDirGuard::new("repl-mesh-shares-empty-prefix");
+                        let _capture = capture::install();
+                        run_async(async {
+                            let mut fx =
+                                ShareFixture::new("repl-mesh-shares-empty-prefix", &[]).await;
+                            let _prefix = live_prefix_override::install(
+                                fx.ctx.app.mesh.command_prefix().clone(),
+                            );
+                            run(&mut fx.ctx, ".set command_prefix slash").await.unwrap();
+
+                            let out = out_of(&mut fx.ctx, "/mesh shares").await.unwrap();
+                            assert!(
+                                out.ends_with(
+                                    "`/mesh allow docs/**` shares docs/ with every trusted peer."
+                                ),
+                                "{out}"
+                            );
+                            assert!(out.contains(&fx.global().to_string()), "{out}");
+
+                            let (_, set) = share_set(&fx.ctx).unwrap();
+                            let hash = hex_lower(&[0x4d; 16]);
+                            let scoped = render_share_rules(
+                                &set,
+                                &PeerRef {
+                                    identity: &hash,
+                                    destination: &hash,
+                                },
+                                Some(&hash),
+                                CommandPrefix::Slash,
+                            );
+                            assert_eq!(
+                                scoped,
+                                format!(
+                                    "No share rule applies to peer {}; `/mesh shares` lists every rule.",
+                                    short(&hash)
+                                )
                             );
                             fx.stop().await;
                         });
@@ -34047,6 +34192,34 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 mod command_prefix_paths {
                     use super::*;
                     use crate::config::live_prefix_override;
+
+                    /// A live `.mesh pending` listing under slash names the grant and
+                    /// refuse commands as `/mesh` while the request id stays as filed.
+                    #[test]
+                    #[serial]
+                    fn the_pending_listing_spells_its_hints_in_the_prefix() {
+                        let _guard = TestConfigDirGuard::new("repl-mesh-pending-prefix");
+                        let _capture = capture::install();
+                        let _script = prompt_script::install(&[]);
+                        run_async(async {
+                            let mut fx = PeerFixture::new("repl-mesh-pending-prefix").await;
+                            let _prefix = live_prefix_override::install(
+                                fx.ctx.app.mesh.command_prefix().clone(),
+                            );
+                            run(&mut fx.ctx, ".set command_prefix slash").await.unwrap();
+                            fx.file("a-1", InboundKind::Access, &["docs/y.md"]);
+
+                            let out = out_of(&mut fx.ctx, "/mesh pending").await.unwrap();
+
+                            assert!(
+                                out.lines().any(|line| line
+                                    == "  grant: /mesh grant a-1 | refuse: /mesh refuse a-1"),
+                                "{out}"
+                            );
+                            assert!(!out.contains(".mesh"), "{out}");
+                            fx.stop().await;
+                        });
+                    }
 
                     /// A peer asked for the `.vault` directory: under slash the grant
                     /// names it as asked, never as the `/vault` command.
