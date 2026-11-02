@@ -2499,3 +2499,53 @@ fn a_non_streamed_reply_lands_in_the_transcript_and_the_ui_stays_live() {
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
     assert_tty_restored(&transcript);
 }
+
+/// OSC 8 hyperlinks and other raw escapes are stripped before the rendered
+/// markdown reaches `ansi-to-tui`: a reply carrying a link shows the link's
+/// text in the transcript, no OSC 8 introducer reaches the tty and no
+/// fragment of one (`]8;;`) is painted as visible text.
+#[test]
+#[serial]
+fn a_reply_with_a_link_shows_its_text_and_leaks_no_osc_8() {
+    let dir = fresh_config_dir("osc8-link");
+    let _guard = TempDirGuard(dir.clone());
+    let fake = FakeLlm::start(vec![Reply::Text(
+        "see [the fixture page r2x](https://example.invalid/r2x-page) for more".to_string(),
+    )]);
+    write_fake_llm_config(&dir, &fake);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b"link please\r").unwrap();
+    let transcript = wait_for_squeezed(&mut pty, "the fixture page r2x", "the link's text");
+    assert_eq!(fake.served(), 1, "{transcript}");
+    // Let the reply settle fully before inspecting the bytes.
+    pty.read_for(Duration::from_millis(600));
+
+    let raw = pty.raw();
+    let settled_at = raw.len();
+    assert!(
+        find(raw, b"\x1b]8;", 0).is_none(),
+        "an OSC 8 sequence reached the tty through the frame:\n{}",
+        strip_ansi(&String::from_utf8_lossy(raw))
+    );
+    let visible = strip_ansi(&String::from_utf8_lossy(raw));
+    assert!(
+        !visible.contains("]8;;"),
+        "an OSC 8 fragment was painted as text:\n{visible}"
+    );
+    assert!(
+        !visible.contains('\x1b'),
+        "a raw escape byte survived into the visible transcript:\n{visible:?}"
+    );
+
+    // The UI is still live afterwards.
+    pty.send(b".info\r").unwrap();
+    pty.wait_for_after("log_path", settled_at, PTY_DEADLINE)
+        .expect("`.info` after the linked reply never rendered");
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}

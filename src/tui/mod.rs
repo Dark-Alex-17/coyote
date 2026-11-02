@@ -632,6 +632,9 @@ impl App {
         let command = match action {
             Action::Submit => {
                 let text = self.composer_text();
+                // Enter is a keystroke too: a confirm raised by the turn
+                // just submitted must not be answered by a repeated Enter.
+                self.last_keystroke = Some(self.clock.now());
                 if text.trim().is_empty() {
                     None
                 } else {
@@ -2116,6 +2119,29 @@ mod tests {
             PromptAnswer::Confirmed(true)
         );
         assert!(harness.app.prompts.is_empty());
+    }
+
+    /// Enter that submits a line is a keystroke for the idle gate: a confirm
+    /// raised by the turn just submitted is not answered by a repeated Enter.
+    #[test]
+    fn enter_right_after_submitting_does_not_answer_a_fresh_confirm() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.type_text("call the tool");
+        harness.clock.advance(HOTKEY_IDLE);
+        assert!(matches!(
+            harness.press(KeyCode::Enter),
+            Some(Command::Submit(_))
+        ));
+        let asker = ask_on_a_thread(&mut harness, confirm_request(None));
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert_eq!(harness.app.prompts.len(), 1);
+        assert!(!asker.is_finished());
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert_eq!(
+            asker.join().unwrap().unwrap(),
+            PromptAnswer::Confirmed(true)
+        );
     }
 
     #[test]
