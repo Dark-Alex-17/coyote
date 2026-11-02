@@ -280,6 +280,7 @@ initial_state:
   pr_review_noaction: []
   pr_review_queue: []
   pr_review_pending: []
+  pr_review_reply_pending: []
   pr_review_addressed: []
   # --- report ---
   report: ''
@@ -1837,7 +1838,7 @@ nodes:
   pr_review_apply:
     id: pr_review_apply
     type: script
-    description: Triage lists as edges - fixes start a review fix round (B16 rounds), judgment escalates, no_action resumes the watch.
+    description: Triage lists as edges - fixes start a review fix round (B16 rounds), judgment escalates, no_action replies to its threads (pr_review_reply) or resumes the watch.
     script: scripts/pr_review_apply.py
     timeout: 120
     fallback: final_report
@@ -1845,8 +1846,16 @@ nodes:
   pr_review_resolve:
     id: pr_review_resolve
     type: script
-    description: After a review fix push, confirm the remote PR head is local HEAD, then reply to and resolve the fixed threads under RESOLVE_DEADLINE_SECS and re-watch CI.
+    description: After a review fix push, confirm the remote PR head is local HEAD, then under RESOLVE_DEADLINE_SECS reply to and resolve the fixed threads, reply without resolving to the skipped ones, and re-watch CI.
     script: scripts/pr_review_resolve.py
+    timeout: 600
+    fallback: final_report
+
+  pr_review_reply:
+    id: pr_review_reply
+    type: script
+    description: Reply without resolving to the no-change review threads under RESOLVE_DEADLINE_SECS (nothing was pushed, so no head check), then resume the watch.
+    script: scripts/pr_review_reply.py
     timeout: 600
     fallback: final_report
 

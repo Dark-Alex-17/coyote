@@ -761,9 +761,14 @@ def apply_answer(state):
         elif a == "skip" and queue:
             _start_review_round(state, u, queue, noaction + skipped)
         elif a == "skip":
-            u["pr_review_addressed"] = list(as_list(state.get("pr_review_addressed"))) + [
-                {**n, "action": "skip"} for n in noaction + skipped]
-            u["_next"] = "pr_review_poll"
+            addressed = [{**n, "action": "skip"} for n in noaction + skipped]
+            u["pr_review_addressed"] = list(as_list(state.get("pr_review_addressed"))) + addressed
+            threads = [x for x in addressed if x.get("kind") == "thread"]
+            if threads:
+                u["pr_review_reply_pending"] = threads
+                u["_next"] = "pr_review_reply"
+            else:
+                u["_next"] = "pr_review_poll"
         else:
             open_items = [f"{_item_ref(j)}: {j.get('question', '')}" for j in judged] + \
                          [f"{_item_ref(q)}: {q.get('text', '')}" for q in queue]
@@ -1673,26 +1678,39 @@ def pr_review_resolve(state):
             f"{head or 'unreadable'}), so no review thread was resolved. How to proceed?",
             [option("Retry the push check"), option("Stop watching and report", recommended=True)]))
     pending = [p for p in as_list(state.get("pr_review_pending")) if isinstance(p, dict)]
-    resolved, failed, left = 0, [], []
+    resolved, replied, reply_failed, resolve_failed, left = 0, 0, [], [], []
     for p in pending:
-        if p.get("kind") != "thread" or p.get("action") != "fix":
+        if p.get("kind") != "thread":
             continue
         tid = str(p.get("id") or "")
-        # A thread costs two gh calls; the second must start by the deadline.
-        if time.time() - started + GH_CALL_SECS > RESOLVE_DEADLINE_SECS:
+        fix = p.get("action") == "fix"
+        # A fixed thread costs two gh calls and a no-change thread one; the last must start by the deadline.
+        if time.time() - started + (GH_CALL_SECS if fix else 0) > RESOLVE_DEADLINE_SECS:
             left.append(tid)
-        elif _resolve_thread(state, tid, f"Addressed in {head}\n\n{OWN_MARKER}"):
+        elif not fix:
+            if _reply_thread(state, tid, f"Not changed: {p.get('reason', '')}\n\n{OWN_MARKER}"):
+                replied += 1
+            else:
+                reply_failed.append(tid)
+        elif not _reply_thread(state, tid, f"Addressed in {head}\n\n{OWN_MARKER}"):
+            reply_failed.append(tid)
+        elif _resolve_thread(state, tid):
             resolved += 1
         else:
-            failed.append(tid)
+            resolve_failed.append(tid)
+    follow_ups = [f"Review thread {t}: reply failed" for t in reply_failed] + [
+        f"Review thread {t}: resolve failed" for t in resolve_failed]
     if left:
         ledger(state, u, f"review-watch: PR #{pr} {len(left)} thread(s) left unresolved (deadline)")
-        u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
-            f"Review threads left unresolved at the resolve deadline: {', '.join(left)}"]
+        follow_ups.append(f"Review threads left unresolved at the resolve deadline: {', '.join(left)}")
+    if follow_ups:
+        u["follow_ups"] = list(as_list(state.get("follow_ups"))) + follow_ups
     line = (f"review-watch: PR #{pr} fix round {as_int(state.get('pr_review_rounds'))} pushed @ {head}; "
-            f"{resolved} thread(s) resolved")
-    if failed:
-        line += f" ({len(failed)} failed: {', '.join(failed)})"
+            f"{resolved} thread(s) resolved, {replied} no-change thread(s) replied")
+    if reply_failed:
+        line += f"; {len(reply_failed)} reply failed: {', '.join(reply_failed)}"
+    if resolve_failed:
+        line += f"; {len(resolve_failed)} resolve failed: {', '.join(resolve_failed)}"
     ledger(state, u, line)
     u["pr_review_addressed"] = list(as_list(state.get("pr_review_addressed"))) + pending
     u["pr_review_pending"] = []
@@ -1702,26 +1720,67 @@ def pr_review_resolve(state):
     return u
 
 
+def pr_review_reply(state):
+    u = {}
+    started = time.time()
+    pr = _pr_ref(state)
+    replied, failed, left = 0, [], []
+    for p in [p for p in as_list(state.get("pr_review_reply_pending")) if isinstance(p, dict)]:
+        tid = str(p.get("id") or "")
+        if time.time() - started > RESOLVE_DEADLINE_SECS:
+            left.append(tid)
+        elif _reply_thread(state, tid, f"Not changed: {p.get('reason', '')}\n\n{OWN_MARKER}"):
+            replied += 1
+        else:
+            failed.append(tid)
+    line = f"review-watch: PR #{pr} {replied} no-change thread(s) replied"
+    if failed:
+        line += f"; {len(failed)} reply failed: {', '.join(failed)}"
+    ledger(state, u, line)
+    follow_ups = [f"Review thread {t}: reply failed" for t in failed]
+    if left:
+        ledger(state, u, f"review-watch: PR #{pr} {len(left)} no-change thread(s) left without a reply (deadline)")
+        follow_ups.append(f"Review threads left without a reply at the reply deadline: {', '.join(left)}")
+    if follow_ups:
+        u["follow_ups"] = list(as_list(state.get("follow_ups"))) + follow_ups
+    u["pr_review_reply_pending"] = []
+    u.update({"pr_review_watch_polls": 0, "pr_review_poll_fails": 0})
+    u["_next"] = "pr_review_poll"
+    return u
+
+
 REPLY_MUTATION = ("mutation($id:ID!,$body:String!){addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$id,"
                   "body:$body}){comment{id}}}")
 RESOLVE_MUTATION = "mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{isResolved}}}"
 
 
-def _resolve_thread(state, thread_id, body):
+def _reply_thread(state, thread_id, body):
+    root = state.get("git_root") or state.get("project_dir") or "."
+    cmd = os.environ.get("SISYPHUS_GH_REPLY_CMD")
+    try:
+        if cmd:
+            # Operator-environment test seam run through the shell; it carries the same trust as the process environment.
+            p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=GH_CALL_SECS,
+                               env={**os.environ, "SISYPHUS_THREAD_ID": thread_id, "SISYPHUS_REPLY_BODY": body})
+        else:
+            p = subprocess.run(["gh", "api", "graphql", "-f", f"query={REPLY_MUTATION}", "-f", f"id={thread_id}",
+                                "-f", f"body={body}"], cwd=root, capture_output=True, text=True, timeout=GH_CALL_SECS)
+        return p.returncode == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _resolve_thread(state, thread_id):
     root = state.get("git_root") or state.get("project_dir") or "."
     cmd = os.environ.get("SISYPHUS_GH_RESOLVE_CMD")
     try:
         if cmd:
             # Operator-environment test seam run through the shell; it carries the same trust as the process environment.
             p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=GH_CALL_SECS,
-                               env={**os.environ, "SISYPHUS_THREAD_ID": thread_id, "SISYPHUS_REPLY_BODY": body})
-            return p.returncode == 0
-        p = subprocess.run(["gh", "api", "graphql", "-f", f"query={REPLY_MUTATION}", "-f", f"id={thread_id}",
-                            "-f", f"body={body}"], cwd=root, capture_output=True, text=True, timeout=GH_CALL_SECS)
-        if p.returncode != 0:
-            return False
-        p = subprocess.run(["gh", "api", "graphql", "-f", f"query={RESOLVE_MUTATION}", "-f", f"id={thread_id}"],
-                           cwd=root, capture_output=True, text=True, timeout=GH_CALL_SECS)
+                               env={**os.environ, "SISYPHUS_THREAD_ID": thread_id})
+        else:
+            p = subprocess.run(["gh", "api", "graphql", "-f", f"query={RESOLVE_MUTATION}", "-f", f"id={thread_id}"],
+                               cwd=root, capture_output=True, text=True, timeout=GH_CALL_SECS)
         return p.returncode == 0
     except Exception:  # noqa: BLE001
         return False
@@ -2269,11 +2328,16 @@ def pr_review_apply(state):
     if fixes:
         return _start_review_round(state, u, fixes, noaction)
     ledger(state, u, f"review-watch: PR #{pr} {len(noaction)} item(s) need no change")
-    u["pr_review_addressed"] = list(as_list(state.get("pr_review_addressed"))) + [
-        {"id": n.get("id"), "kind": n.get("kind"), "url": n.get("url", ""), "reason": n.get("reason", ""), "action": "skip"}
-        for n in noaction]
+    addressed = [{"id": n.get("id"), "kind": n.get("kind"), "url": n.get("url", ""), "reason": n.get("reason", ""),
+                  "action": "skip"} for n in noaction]
+    u["pr_review_addressed"] = list(as_list(state.get("pr_review_addressed"))) + addressed
     u.update({"pr_review_watch_polls": 0, "pr_review_poll_fails": 0})
-    u["_next"] = "pr_review_poll"
+    threads = [a for a in addressed if a["kind"] == "thread"]
+    if threads:
+        u["pr_review_reply_pending"] = threads
+        u["_next"] = "pr_review_reply"
+    else:
+        u["_next"] = "pr_review_poll"
     return u
 
 
@@ -2396,7 +2460,7 @@ GATES = {
     "observability_route": observability_route, "whetstone_gate": whetstone_gate, "pr_gate": pr_gate,
     "ci_gate": ci_gate, "ci_poll": ci_poll, "ci_route": ci_route, "ci_apply": ci_apply,
     "pr_review_poll": pr_review_poll, "pr_review_route": pr_review_route, "pr_review_apply": pr_review_apply,
-    "pr_review_resolve": pr_review_resolve,
+    "pr_review_resolve": pr_review_resolve, "pr_review_reply": pr_review_reply,
     "final_report": final_report,
 }
 
