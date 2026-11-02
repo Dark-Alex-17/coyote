@@ -168,6 +168,9 @@ pub fn run_loader_command(path: &str, extension: &str, loader_command: &str) -> 
 }
 
 pub fn edit_file(editor: &str, path: &Path) -> Result<()> {
+    if crate::tui::active() {
+        bail!("Editing files is not available in the TUI yet; use Ctrl+O to edit the composer");
+    }
     let mut child = Command::new(editor).arg(path).spawn()?;
     child.wait()?;
     Ok(())

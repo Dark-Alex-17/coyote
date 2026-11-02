@@ -14,7 +14,9 @@ mod other {
     pub(crate) struct FdRedirect;
 
     impl FdRedirect {
-        pub(crate) fn begin(_late: impl Fn(String) + Send + 'static) -> std::io::Result<Self> {
+        pub(crate) fn begin(
+            _late: impl Fn(String) + Send + Sync + 'static,
+        ) -> std::io::Result<Self> {
             Ok(Self)
         }
 
@@ -48,6 +50,7 @@ mod unix {
     struct Shared {
         drained: Mutex<Drained>,
         changed: Condvar,
+        late: Box<dyn Fn(String) + Send + Sync>,
     }
 
     /// Fds 1 and 2 redirected into a pipe for the guard's lifetime.
@@ -58,8 +61,10 @@ mod unix {
     /// whose stderr is inherited) can hold the write end for the whole
     /// session, so `finish` waits only for quiescence, snapshots what has
     /// arrived, and leaves the thread to forward anything later. A guard
-    /// dropped without `finish` (the turn's future was cancelled) still
-    /// puts the fds back.
+    /// dropped without `finish` (the turn's future was cancelled or
+    /// panicked) still puts the fds back and hands what the pipe holds to
+    /// the late-output callback, so a panic message printed into the pipe
+    /// is not lost with the cell it would have gone to.
     pub(crate) struct FdRedirect {
         saved: Option<SavedFds>,
         write_end: Option<OwnedFd>,
@@ -135,7 +140,7 @@ mod unix {
         let _ = io::stderr().flush();
     }
 
-    fn drain(read_end: OwnedFd, shared: Arc<Shared>, late: impl Fn(String)) {
+    fn drain(read_end: OwnedFd, shared: Arc<Shared>) {
         let mut reader = std::fs::File::from(read_end);
         let mut chunk = [0u8; 4096];
         loop {
@@ -157,7 +162,7 @@ mod unix {
             };
             shared.changed.notify_all();
             if let Some(text) = forward {
-                late(text);
+                (shared.late)(text);
             }
         }
         shared.drained.lock().unwrap_or_else(|p| p.into_inner()).eof = true;
@@ -166,8 +171,9 @@ mod unix {
 
     impl FdRedirect {
         /// Points fds 1 and 2 at a fresh pipe. `late` receives output that
-        /// arrives after `finish` from a writer still holding the pipe.
-        pub(crate) fn begin(late: impl Fn(String) + Send + 'static) -> io::Result<Self> {
+        /// arrives after `finish` from a writer still holding the pipe, and
+        /// everything buffered when the guard is dropped unfinished.
+        pub(crate) fn begin(late: impl Fn(String) + Send + Sync + 'static) -> io::Result<Self> {
             flush_std_streams();
             let (read_end, write_end) = pipe()?;
             let saved = SavedFds::save()?;
@@ -184,11 +190,12 @@ mod unix {
                     detached: false,
                 }),
                 changed: Condvar::new(),
+                late: Box::new(late),
             });
             let thread_shared = Arc::clone(&shared);
             if let Err(err) = std::thread::Builder::new()
                 .name("tui-fd-drain".into())
-                .spawn(move || drain(read_end, thread_shared, late))
+                .spawn(move || drain(read_end, thread_shared))
             {
                 saved.restore();
                 return Err(err);
@@ -240,11 +247,18 @@ mod unix {
     impl Drop for FdRedirect {
         fn drop(&mut self) {
             self.restore_fds();
-            self.shared
-                .drained
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .detached = true;
+            let buffered = {
+                let mut drained = self
+                    .shared
+                    .drained
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                drained.detached = true;
+                std::mem::take(&mut drained.buf)
+            };
+            if !buffered.is_empty() {
+                (self.shared.late)(String::from_utf8_lossy(&buffered).into_owned());
+            }
         }
     }
 
@@ -357,6 +371,30 @@ mod unix {
 
             assert!(outside.contains("after-drop-r4x"), "{outside}");
             assert!(!outside.contains("inside-r4x"), "{outside}");
+        }
+
+        /// What the pipe already holds when an unfinished guard is dropped
+        /// (a panic message, say) goes to the late callback rather than
+        /// away with the guard.
+        #[test]
+        #[serial]
+        fn dropping_an_unfinished_guard_forwards_what_it_buffered() {
+            let (saved, reader) = capture_stdout();
+            let (tx, rx) = mpsc::channel();
+            let guard = FdRedirect::begin(move |text| {
+                let _ = tx.send(text);
+            })
+            .unwrap();
+            write_fd1(b"buffered-r5x\n");
+            // Give the drain thread time to move the bytes into the buffer,
+            // so it is the drop that forwards them.
+            std::thread::sleep(Duration::from_millis(100));
+            drop(guard);
+            let outside = release_harness_output(saved, reader, "");
+
+            let late = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(late.contains("buffered-r5x"), "{late}");
+            assert!(!outside.contains("buffered-r5x"), "{outside}");
         }
     }
 }

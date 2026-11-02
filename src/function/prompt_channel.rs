@@ -1338,6 +1338,21 @@ echo "$ans" >> "$LLM_OUTPUT""#,
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
+    async fn tool_env_says_tui_while_the_full_screen_ui_owns_the_terminal() {
+        require_tools();
+        let _guard = TestConfigDirGuard::new("prompt-ui-tui");
+        install_tool(
+            "uiprobe-x7x",
+            "printf '%s' \"$COYOTE_UI\" >> \"$LLM_OUTPUT\"",
+        );
+        let _acp_off = AtomicFlagGuard::set(&ACP_SERVER, false);
+        let _headless_off = AtomicFlagGuard::set(&HEADLESS, false);
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        assert_eq!(probe_ui_env().await, json!({"output": "tui"}));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
     async fn background_job_prompts_through_the_ring_pump_and_completes() {
         require_tools();
         let _guard = TestConfigDirGuard::new("prompt-job");

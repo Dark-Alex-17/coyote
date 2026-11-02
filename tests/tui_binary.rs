@@ -705,6 +705,63 @@ fn keys_typed_while_the_editor_runs_reach_the_editor_not_the_composer() {
     assert_tty_restored(&transcript);
 }
 
+/// Ctrl+C while the editor has the terminal is the editor's to handle,
+/// but the tty delivers SIGINT to the whole foreground group, coyote
+/// included. The latched signal is forgotten when the screen comes back:
+/// the UI is still up afterwards and leaves only on Ctrl+D. Run under the
+/// job-control wrapper, which keeps the shell out of that group the way a
+/// user's shell is.
+#[test]
+#[serial]
+fn a_ctrl_c_meant_for_the_editor_does_not_end_the_session() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = fresh_config_dir("editor-ctrl-c");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let editor = dir.join("int-editor.sh");
+    // The read survives the interrupt so the editor ends on the line that
+    // follows, not on the signal.
+    fs::write(
+        &editor,
+        "#!/bin/sh\ntrap '' INT\nIFS= read -r x </dev/tty\n: > \"$1\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&editor, fs::Permissions::from_mode(0o755)).unwrap();
+    let editor = editor.to_str().unwrap();
+    let mut pty = spawn_tui_under(
+        &dir,
+        &[("EDITOR", editor), ("VISUAL", editor)],
+        JOB_CONTROL_WRAPPER,
+        "/dev/tty",
+    );
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let before = pty.raw().len();
+    pty.send(b"\x0f").unwrap();
+    let left = pty
+        .wait_for_raw(LEAVE_ALT, before, PTY_DEADLINE)
+        .expect("Ctrl-O did not release the terminal for the editor");
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b"\x03").unwrap();
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b"\r").unwrap();
+    let re_entered = wait_for_re_entry(&mut pty, left);
+    assert_repainted_after(&mut pty, re_entered, "the interrupted editor");
+    pty.read_for(Duration::from_millis(1500));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[re_entered..]));
+    assert!(
+        !since.contains("exit="),
+        "the editor's Ctrl+C ended the session:\n{since}"
+    );
+    assert!(since.contains("Type a prompt"), "{since}");
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
 /// The dry-run model echoes the role prompt plus the user's text, so a
 /// markdown prompt comes back rendered: `**zebra**` loses its asterisks and
 /// the inline code its backticks. Ratatui's diffing paints words with

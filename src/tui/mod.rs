@@ -1013,6 +1013,17 @@ impl Termination {
             _ = self.int.recv() => {}
         }
     }
+
+    /// Forgets a signal that landed while the terminal was released. The
+    /// editor and coyote share the foreground process group, so a Ctrl+C
+    /// meant for the editor also reaches coyote, where it would otherwise
+    /// sit latched and end the session at the next select.
+    fn discard_pending(&mut self) {
+        use futures_util::FutureExt;
+        for signal in [&mut self.term, &mut self.hup, &mut self.int] {
+            while signal.recv().now_or_never().flatten().is_some() {}
+        }
+    }
 }
 
 #[cfg(not(unix))]
@@ -1027,6 +1038,8 @@ impl Termination {
     async fn recv(&mut self) {
         std::future::pending().await
     }
+
+    fn discard_pending(&mut self) {}
 }
 
 enum Step {
@@ -1062,6 +1075,35 @@ struct Shell<'a> {
     tx: UnboundedSender<UiMsg>,
     abort: &'a AbortSignal,
     auto_cancel: &'a AtomicBool,
+}
+
+/// Answers a question raised once nobody is left to see it; any other
+/// message has no screen left to go to.
+fn answer_unattended(msg: UiMsg) {
+    if let UiMsg::Prompt { req, reply } = msg {
+        let _ = reply.send(unattended_answer(&req));
+    }
+}
+
+/// Waits up to `EXIT_CANCEL_WAIT` for a work task after the UI gave up,
+/// answering every prompt it raises meanwhile so the asker never sits on
+/// the reply until the deadline. `None` when the task did not finish in
+/// time or panicked.
+async fn join_unattended<T>(handle: JoinHandle<T>, rx: &mut UnboundedReceiver<UiMsg>) -> Option<T> {
+    while let Ok(msg) = rx.try_recv() {
+        answer_unattended(msg);
+    }
+    tokio::pin!(handle);
+    let joined = tokio::time::timeout(EXIT_CANCEL_WAIT, async {
+        loop {
+            tokio::select! {
+                joined = &mut handle => return joined,
+                Some(msg) = rx.recv() => answer_unattended(msg),
+            }
+        }
+    })
+    .await;
+    joined.ok()?.ok()
 }
 
 /// Edits `text` in `editor` (resolved the way the REPL resolves its buffer
@@ -1142,6 +1184,7 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
     };
 
     let (leave, ctx) = run_loop(&mut shell, ctx).await;
+    let mut rx = shell.rx;
 
     if let Err(err) = screen.leave() {
         warn!("Failed to restore the terminal: {err}");
@@ -1161,7 +1204,16 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
             },
             None => Ok(()),
         },
-        Leave::Lost(err) => Err(err.into()),
+        Leave::Lost(err) => {
+            // The panic hook printed into the turn's capture pipe; the
+            // guard forwarded that on its way out and nothing drew it.
+            while let Ok(msg) = rx.try_recv() {
+                if let UiMsg::Notice { text, .. } = msg {
+                    eprintln!("{text}");
+                }
+            }
+            Err(err.into())
+        }
     };
     crate::hooks::drain_pending(EXIT_HOOK_DRAIN_TIMEOUT).await;
     result.map(|_| ())
@@ -1192,23 +1244,21 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> (Leave, Option<
         match step {
             Step::Signal | Step::Input(None) | Step::Input(Some(Err(_))) => {
                 // Nobody is left to answer: prompts not yet asked answer
-                // themselves, the queued ones are answered here, and only
-                // then is the turn told to stop.
+                // themselves, the queued and in-flight ones are answered
+                // here, and only then is the turn told to stop.
                 auto_cancel.store(true, Ordering::SeqCst);
                 app.begin_exit();
                 app.abandon_prompts();
                 match task.take() {
                     Some(Task::Turn { handle, .. }) => {
                         abort.set_ctrlc();
-                        if let Ok(Ok((returned, _))) =
-                            tokio::time::timeout(EXIT_CANCEL_WAIT, handle).await
-                        {
+                        if let Some((returned, _)) = join_unattended(handle, rx).await {
                             ctx = Some(returned);
                         }
                     }
                     Some(Task::Exit(handle)) => {
-                        if let Ok(Ok((returned, result, captured))) =
-                            tokio::time::timeout(EXIT_CANCEL_WAIT, handle).await
+                        if let Some((returned, result, captured)) =
+                            join_unattended(handle, rx).await
                         {
                             return (Leave::Finished(result, captured), Some(returned));
                         }
@@ -1248,6 +1298,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> (Leave, Option<
                                 // SAFETY: raise takes a signal number and no pointers.
                                 unsafe { libc::raise(libc::SIGTSTP) };
                             });
+                            termination.discard_pending();
                             if let Err(err) = released {
                                 warn!("Failed to re-enter the alternate screen: {err}");
                             }
@@ -1259,9 +1310,10 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> (Leave, Option<
                         match app.config.editor() {
                             Ok(editor) => {
                                 *stream = EventStream::new();
-                                match screen
-                                    .with_terminal_released(|| edit_in_editor(&editor, &text))
-                                {
+                                let edited = screen
+                                    .with_terminal_released(|| edit_in_editor(&editor, &text));
+                                termination.discard_pending();
+                                match edited {
                                     Ok(Ok(edited)) => app.set_composer_text(&edited),
                                     Ok(Err(err)) => app.handle_msg(UiMsg::Notice {
                                         kind: NoticeKind::ToolWarning,
@@ -1940,6 +1992,35 @@ mod tests {
         );
     }
 
+    /// Once the UI has given up, a question already in the inbox and one
+    /// raised while the work task is still being waited for are both
+    /// answered unattended; the asker never sits on the reply until the
+    /// deadline.
+    #[tokio::test]
+    async fn prompts_raised_after_the_ui_gave_up_are_answered_unattended() {
+        let (tx, mut rx) = unbounded_channel();
+        let prompter = Arc::new(TuiPrompter::new(tx, Arc::new(AtomicBool::new(false))));
+
+        let queued = Arc::clone(&prompter);
+        let early = std::thread::spawn(move || queued.prompt(confirm_request(None)));
+        while rx.is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let late = Arc::clone(&prompter);
+        let handle = tokio::task::spawn_blocking(move || {
+            let answer = late.prompt(PromptRequest {
+                default: Some(serde_json::json!(true)),
+                ..confirm_request(None)
+            });
+            (answer, early.join().unwrap())
+        });
+        let started = Instant::now();
+        let (late_answer, early_answer) = join_unattended(handle, &mut rx).await.unwrap();
+        assert!(started.elapsed() < EXIT_CANCEL_WAIT);
+        assert_eq!(early_answer.unwrap(), PromptAnswer::Confirmed(false));
+        assert_eq!(late_answer.unwrap(), PromptAnswer::Confirmed(true));
+    }
+
     #[test]
     fn a_resize_and_back_reflows_without_duplicating_rows() {
         let mut harness = Harness::standalone(80, 24);
@@ -2330,8 +2411,9 @@ mod tests {
     }
 
     /// Every direct keyboard read outside this module: crossterm's
-    /// `read`/`poll`, `read_single_key`, and inquire's prompt builders
-    /// (nothing else under `src/` constructs a `Text`, `Select` or the like).
+    /// `read`/`poll`, `read_single_key`, `edit_file` (which hands the tty
+    /// to `$EDITOR`), and inquire's prompt builders (nothing else under
+    /// `src/` constructs a `Text`, `Select` or the like).
     fn keyboard_readers() -> Vec<KeyboardReader> {
         fn at_word_start(line: &str, at: usize) -> bool {
             line[..at]
@@ -2339,10 +2421,11 @@ mod tests {
                 .next_back()
                 .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
         }
-        const NEEDLES: [&str; 8] = [
+        const NEEDLES: [&str; 9] = [
             "event::read(",
             "event::poll(",
             "read_single_key(",
+            "edit_file(",
             "Confirm::new(",
             "Select::new(",
             "MultiSelect::new(",
@@ -2412,6 +2495,7 @@ mod tests {
         const REPL_PROMPTER: &str =
             "the REPL's Prompter; the TUI seats TuiPrompter on ctx.prompter instead";
         const VIA_GATE: &str = "calls read_single_key, which refuses under the TUI";
+        const VIA_EDIT_GATE: &str = "calls edit_file, which refuses under the TUI";
         const REPL_PAINTER: &str =
             "polled by the spinner and the REPL stream painter, both replaced under the TUI";
         let allowlist: &[(&str, &str, &str)] = &[
@@ -2465,9 +2549,44 @@ mod tests {
             ("src/config/mod.rs", "confirm_asset_overwrite", VIA_GATE),
             ("src/config/mod.rs", "create_config_file", BEFORE_UI),
             ("src/config/mod.rs", "create_config_file_sandbox", BEFORE_UI),
+            (
+                "src/config/request_context.rs",
+                "edit_config",
+                VIA_EDIT_GATE,
+            ),
+            (
+                "src/config/request_context.rs",
+                "edit_mcp_config",
+                VIA_EDIT_GATE,
+            ),
+            (
+                "src/config/request_context.rs",
+                "edit_session",
+                VIA_EDIT_GATE,
+            ),
+            (
+                "src/config/request_context.rs",
+                "edit_agent_config",
+                VIA_EDIT_GATE,
+            ),
             ("src/config/request_context.rs", "new_role", DIRECT_TTY),
             ("src/config/request_context.rs", "save_role", DIRECT_TTY),
             ("src/config/request_context.rs", "new_macro", DIRECT_TTY),
+            (
+                "src/config/request_context.rs",
+                "upsert_role",
+                VIA_EDIT_GATE,
+            ),
+            (
+                "src/config/request_context.rs",
+                "upsert_skill",
+                VIA_EDIT_GATE,
+            ),
+            (
+                "src/config/request_context.rs",
+                "edit_rag_docs",
+                VIA_EDIT_GATE,
+            ),
             (
                 "src/config/request_context.rs",
                 "use_session_recording_rebuild",
@@ -2560,6 +2679,11 @@ mod tests {
                 && r.function == "read_single_key"
                 && r.gated)
         );
+        assert!(
+            readers
+                .iter()
+                .any(|r| r.file == "src/utils/command.rs" && r.function == "edit_file" && r.gated)
+        );
     }
 
     /// The two stdin readers outside this module stand down while the UI
@@ -2596,15 +2720,17 @@ mod tests {
         }
         let id_prefix = concat!("TA", "SK-");
         let own_id = concat!("TA", "SK-", "312");
+        // The attribute forms are split too: a diff scan for added lint
+        // suppressions must not find them spelled out here.
         let debt_markers = [
-            "#[allow(",
-            "#![allow(",
-            "#[expect(",
-            "#![expect(",
+            concat!("#[", "allow("),
+            concat!("#![", "allow("),
+            concat!("#[", "expect("),
+            concat!("#![", "expect("),
             "cfg_attr(",
             "todo!",
             "unimplemented!",
-            "#[ignore",
+            concat!("#[", "ignore"),
         ];
         // Owned by the Windows task: the prompt reply channel's missing twin.
         let allowlisted: &[(&str, &str)] = &[(

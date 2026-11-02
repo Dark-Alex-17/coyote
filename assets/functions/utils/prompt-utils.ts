@@ -50,8 +50,8 @@
 // (/dev/tty, else stderr for text and stdin for input); password turns echo
 // off for its read when stty can reach that terminal.
 //
-// COYOTE_UI is "repl" when a human can answer and "headless" when nobody can;
-// tools may branch on it before asking.
+// COYOTE_UI is "repl" or "tui" when a human can answer and "headless" when
+// nobody can; tools may branch on it before asking.
 
 import * as fs from "node:fs";
 import * as path from "node:path";

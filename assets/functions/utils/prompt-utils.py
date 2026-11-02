@@ -32,8 +32,8 @@
 # The channel answers one prompt at a time: never run two helpers
 # concurrently in the same tool, or they will swallow each other's replies.
 #
-# COYOTE_UI is "repl" when a human can answer and "headless" when nobody can;
-# tools may branch on it before asking.
+# COYOTE_UI is "repl" or "tui" when a human can answer and "headless" when
+# nobody can; tools may branch on it before asking.
 
 import getpass
 import io
