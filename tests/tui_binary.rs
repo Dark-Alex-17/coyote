@@ -256,6 +256,10 @@ fn sigterm_leaves_the_tty_cooked() {
 
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
     assert_tty_restored(&transcript);
+    assert!(
+        find(pty.raw(), LEAVE_ALT, 0).is_some(),
+        "SIGTERM never left the alternate screen:\n{transcript}"
+    );
 }
 
 /// The panic hook restores the terminal before delegating to the original
@@ -304,6 +308,7 @@ fn without_a_tty_on_stdin_the_tui_refuses_to_start() {
 
     assert!(transcript.contains("No TTY for TUI"), "{transcript}");
     assert_eq!(exit_code(&transcript), 1, "{transcript}");
+    assert_tty_restored(&transcript);
     assert!(
         find(pty.raw(), ENTER_ALT, 0).is_none(),
         "the alternate screen was entered without a tty:\n{transcript}"
@@ -386,7 +391,8 @@ fn sgr_params(raw: &[u8]) -> Vec<Vec<u16>> {
                 );
             }
         }
-        rest = &rest[end + 1..];
+        let final_byte = rest[end..].chars().next().map_or(1, char::len_utf8);
+        rest = &rest[end + final_byte..];
     }
     out
 }

@@ -64,8 +64,8 @@ mod tests {
         assert_eq!(ctx.ui_kind(), UiKind::Repl);
     }
 
-    /// No human is present headless even if the UI flag is somehow still
-    /// set, so headless wins.
+    /// No human is present when headless, even if the UI flag is somehow
+    /// still set, so headless wins.
     #[test]
     #[serial]
     fn headless_outranks_the_tui_flag() {

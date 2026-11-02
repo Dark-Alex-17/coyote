@@ -164,10 +164,17 @@ pub fn spawn_spinner(message: &str) -> Spinner {
     spawn_spinner_with(SpinnerInner::default(), message)
 }
 
-/// Returns a dark handle when the thread cannot be spawned: sends fail
-/// harmlessly and `stop` has no ack to wait for.
+/// Returns a dark handle when the thread cannot be spawned, and under the
+/// full-screen UI without trying (the frames would land in the turn's fd
+/// capture): sends fail harmlessly and `stop` has no ack to wait for.
 fn spawn_spinner_with(mut inner: SpinnerInner, message: &str) -> Spinner {
     let (tx, spinner_rx) = std_mpsc::channel();
+    if crate::tui::active() {
+        return Spinner {
+            tx: SpinnerTx::Std(tx),
+            cleared: None,
+        };
+    }
     let (cleared_tx, cleared_rx) = std_mpsc::channel();
     let mut spinner = Spinner {
         tx: SpinnerTx::Std(tx),
@@ -441,6 +448,24 @@ mod tests {
 
         spinner.stop();
         assert_eq!(cleared.load(Ordering::SeqCst), 1);
+    }
+
+    /// Under the full-screen UI the thread-backed spinner is inert: no
+    /// thread takes the message, so there is never a frame to clear, and
+    /// `stop` has no ack to wait for.
+    #[test]
+    #[serial]
+    fn under_the_tui_a_spawned_spinner_is_inert() {
+        let _tui = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let cleared = Arc::new(AtomicUsize::new(0));
+        let spinner = spawn_spinner_with(SpinnerInner::observed(cleared.clone()), "Thinking");
+        std::thread::sleep(FRAME_INTERVAL * 2);
+
+        let started = std::time::Instant::now();
+        spinner.stop();
+
+        assert!(started.elapsed() < STOP_ACK_DEADLINE / 2);
+        assert_eq!(cleared.load(Ordering::SeqCst), 0);
     }
 
     fn set_ctrlc_soon(abort_signal: &AbortSignal) {
