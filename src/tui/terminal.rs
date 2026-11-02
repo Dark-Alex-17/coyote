@@ -166,9 +166,8 @@ fn restore_from_static() {
     {
         use std::mem::ManuallyDrop;
         use std::os::fd::FromRawFd;
-        // Taken, not read: a `Screen::enter` failing on another thread
-        // swaps the slot too, so exactly one of the two sees the fd and
-        // the hook never writes through a descriptor about to be closed.
+        // Taken, not read: the slot has a single taker, so a second panic
+        // (or a `Screen` tearing down after this swap) finds it empty.
         let fd = PANIC_FD.swap(-1, Ordering::SeqCst);
         if fd < 0 {
             return;
