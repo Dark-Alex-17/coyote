@@ -675,7 +675,7 @@ async fn run(
             result
         }
         true => {
-            let tui = env::var(config::UiKind::ENV).as_deref() == Ok("tui");
+            let tui = env::var(config::UiKind::ENV).as_deref() == Ok(config::UiKind::Tui.as_str());
             if tui {
                 tui::ensure_tty()?;
             } else if !*IS_STDOUT_TERMINAL {

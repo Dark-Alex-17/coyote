@@ -2,7 +2,7 @@
 source: src/tui/mod.rs
 expression: harness.draw()
 ---
-"                                                                                "
+"> .exit session                                                                 "
 "                                                                                "
 "                                                                                "
 "                                                                                "

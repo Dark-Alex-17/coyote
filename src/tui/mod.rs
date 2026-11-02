@@ -180,10 +180,13 @@ pub(crate) fn spawn_turn(
     ui: UnboundedSender<UiMsg>,
 ) -> JoinHandle<(RequestContext, TurnOutcome)> {
     spawn_work(async move {
-        let guard = match FdRedirect::begin(late_output(ui)) {
+        let guard = match FdRedirect::begin(late_output(ui.clone())) {
             Ok(guard) => Some(guard),
             Err(err) => {
-                warn!("Running the turn without output capture: {err}");
+                let _ = ui.send(UiMsg::Notice {
+                    kind: NoticeKind::ToolWarning,
+                    text: format!("Running the turn without output capture: {err}"),
+                });
                 None
             }
         };
@@ -383,7 +386,9 @@ impl Cell {
             } => lines
                 .get_or_insert_with(|| {
                     let mut lines = vec![Line::from(Span::styled(format!("> {name}"), DIM))];
-                    lines.extend(render::preformatted_lines(output));
+                    if !output.is_empty() {
+                        lines.extend(render::preformatted_lines(output));
+                    }
                     lines
                 })
                 .clone(),
@@ -529,10 +534,18 @@ impl App {
         self.schedule_frame();
     }
 
-    /// Records that a line left for the work task.
+    /// Records that a line left for the work task. A command gets its cell
+    /// now, so the transcript shows what is running under a modal the
+    /// command raises; the output fills in when the turn ends.
     pub(crate) fn begin_turn(&mut self, line: &str, command: bool) {
         let first_cell = self.cells.len();
-        if !command {
+        if command {
+            self.cells.push(Cell::Command {
+                name: line.to_string(),
+                output: String::new(),
+                lines: None,
+            });
+        } else {
             self.cells.push(Cell::user(line));
         }
         self.turn = Some(TurnStatus {
@@ -547,14 +560,20 @@ impl App {
 
     /// Commits what the work task brought back.
     pub(crate) fn end_turn(&mut self, line: &str, command: bool, outcome: &TurnOutcome) {
-        self.turn = None;
+        let first_cell = self.turn.take().map(|turn| turn.first_cell);
         self.close_stream();
         if command {
-            self.cells.push(Cell::Command {
-                name: line.to_string(),
-                output: outcome.captured.clone(),
-                lines: None,
-            });
+            match first_cell.and_then(|index| self.cells.get_mut(index)) {
+                Some(Cell::Command { output, lines, .. }) => {
+                    *output = outcome.captured.clone();
+                    *lines = None;
+                }
+                _ => self.cells.push(Cell::Command {
+                    name: line.to_string(),
+                    output: outcome.captured.clone(),
+                    lines: None,
+                }),
+            }
         } else if !outcome.captured.trim().is_empty() {
             self.cells.push(Cell::notice(
                 NoticeKind::Routing,
@@ -1236,6 +1255,9 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
 
     let (leave, ctx) = run_loop(&mut shell, ctx).await;
     let mut rx = shell.rx;
+    // Whatever ended the loop, no screen is left to ask on: a question
+    // raised during the teardown below answers itself.
+    auto_cancel.store(true, Ordering::SeqCst);
 
     if let Err(err) = screen.leave() {
         warn!("Failed to restore the terminal: {err}");
@@ -2397,7 +2419,7 @@ mod tests {
             call_id: None,
             bytes: b" turn\n".to_vec(),
         });
-        assert_eq!(harness.app.cells.len(), 1);
+        assert_eq!(harness.app.cells.len(), 2);
         harness.app.end_turn(".run", true, &TurnOutcome::default());
         let cells_after_first = harness.app.cells.len();
 
@@ -2406,13 +2428,13 @@ mod tests {
             call_id: None,
             bytes: b"second turn\n".to_vec(),
         });
-        assert_eq!(harness.app.cells.len(), cells_after_first + 1);
+        assert_eq!(harness.app.cells.len(), cells_after_first + 2);
         assert!(matches!(
             harness.app.cells.last(),
             Some(Cell::Text { call_id: None, lines, .. }) if lines == &["second turn"]
         ));
         assert!(matches!(
-            &harness.app.cells[0],
+            &harness.app.cells[1],
             Cell::Text { lines, .. } if lines == &["first turn"]
         ));
     }
@@ -2832,6 +2854,23 @@ mod tests {
             .expect("the gate must answer without reading stdin");
         let err = answer.unwrap_err().to_string();
         assert!(err.contains("not available in the TUI"), "{err}");
+    }
+
+    /// `.edit` on a file is refused the same way: no editor is spawned
+    /// onto the capture pipe (the name given is not a program at all).
+    #[test]
+    #[serial]
+    fn edit_file_refuses_under_the_tui_without_spawning_an_editor() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&TUI_ACTIVE, true);
+        let err = crate::utils::edit_file(
+            "definitely-not-an-editor-x7x",
+            std::path::Path::new("/dev/null"),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("not available in the TUI"),
+            "{err}"
+        );
     }
 
     /// A task id in the source names the owner of a debt marker and

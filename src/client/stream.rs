@@ -186,8 +186,13 @@ impl SseHandler {
 
     /// The adapters deliver a thinking block only once it is complete, so
     /// the started/stopped pair brackets its arrival rather than the
-    /// model's actual thinking time.
+    /// model's actual thinking time. A silent handler keeps the block and
+    /// publishes nothing, like it does for text.
     pub fn thinking_block(&mut self, block: ThinkingBlock) {
+        if self.silent {
+            self.thinking.push(block);
+            return;
+        }
         bus().publish(Event::ThinkingStarted);
         self.thinking.push(block);
         bus().publish(Event::ThinkingStopped);
@@ -630,6 +635,21 @@ mod tests {
             *recording.sink.events.lock().unwrap(),
             vec![Event::ThinkingStarted, Event::ThinkingStopped]
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_silent_handler_keeps_a_thinking_block_without_publishing() {
+        let recording = ThisThreadRecording::install();
+        let (mut handler, _rx) = new_handler();
+        handler.set_silent(true);
+        handler.thinking_block(ThinkingBlock::Thinking {
+            thinking: "hmm".to_string(),
+            signature: "sig".to_string(),
+        });
+        assert!(recording.sink.events.lock().unwrap().is_empty());
+        let (_, _, thinking, _) = handler.take();
+        assert_eq!(thinking.len(), 1);
     }
 
     /// Claude splits usage across events: `message_start` carries the input

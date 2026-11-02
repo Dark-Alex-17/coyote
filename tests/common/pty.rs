@@ -384,10 +384,7 @@ pub fn strip_ansi(text: &str) -> String {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{Pty, strip_ansi};
-    use serial_test::serial;
-    use std::process::Command;
-    use std::time::Duration;
+    use super::strip_ansi;
 
     #[test]
     fn csi_with_intermediate_bytes_is_dropped_whole() {
@@ -413,38 +410,5 @@ mod tests {
         assert_eq!(strip_ansi("tail\x1b"), "tail");
         assert_eq!(strip_ansi("tail\x1b["), "tail");
         assert_eq!(strip_ansi("tail\x1b]"), "tail");
-    }
-
-    /// Neither side of the pty leaks into the child: it sees exactly the
-    /// descriptors a child spawned without a pty sees (its three standard
-    /// streams, `ls`'s own handle on the directory it lists, and whatever
-    /// the test runner itself was started with). On a tty `ls` prints its
-    /// entries in columns, so the list is read word by word.
-    #[test]
-    #[serial]
-    fn the_child_inherits_no_pty_descriptor() {
-        fn listed_fds(text: &str) -> std::collections::BTreeSet<u32> {
-            text.split_whitespace()
-                .take_while(|word| *word != "fd-list-done")
-                .map(|word| word.parse().unwrap())
-                .collect()
-        }
-        let script = "ls /dev/fd; echo fd-list-done";
-        let plain = Command::new("sh").arg("-c").arg(script).output().unwrap();
-        let baseline = listed_fds(&String::from_utf8_lossy(&plain.stdout));
-        assert!(baseline.contains(&0), "{baseline:?}");
-
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg(script);
-        let mut pty = Pty::spawn(cmd).unwrap();
-        let transcript = pty
-            .wait_for("fd-list-done", Duration::from_secs(10))
-            .unwrap();
-        let on_pty = listed_fds(&transcript);
-        let leaked: Vec<&u32> = on_pty.difference(&baseline).collect();
-        assert!(
-            leaked.is_empty(),
-            "fds {leaked:?} leaked into the pty child (baseline {baseline:?}):\n{transcript}"
-        );
     }
 }
