@@ -2446,3 +2446,62 @@ fn a_terminal_answering_the_keyboard_probe_gets_flags_pushed_and_releases_are_ig
         "flags must be popped before leaving the alternate screen (push={push}, pop={pop}, leave={leave_alt})"
     );
 }
+
+/// A user who turns streaming off in their config still gets the reply:
+/// a non-streamed assistant message (one JSON body, no SSE) lands in the
+/// transcript as a rendered cell, the busy status row clears, and the UI
+/// keeps taking keys afterwards.
+#[test]
+#[serial]
+fn a_non_streamed_reply_lands_in_the_transcript_and_the_ui_stays_live() {
+    let dir = fresh_config_dir("no-stream");
+    let _guard = TempDirGuard(dir.clone());
+    let fake = FakeLlm::start(vec![
+        Reply::Text("whole reply at once w4n".to_string()),
+        Reply::Text("second whole reply w4o".to_string()),
+    ]);
+    write_fake_llm_config(&dir, &fake);
+    // Same config with streaming turned off at the top level.
+    let config = dir.join("config.yaml");
+    let text = fs::read_to_string(&config).unwrap();
+    assert!(
+        text.contains("stream: true\n"),
+        "fixture config lost its stream key"
+    );
+    fs::write(&config, text.replace("stream: true\n", "stream: false\n")).unwrap();
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b"first\r").unwrap();
+    wait_for_squeezed(
+        &mut pty,
+        "whole reply at once w4n",
+        "the non-streamed reply",
+    );
+    assert_eq!(fake.served(), 1);
+
+    // The turn is over: the busy row must stop repainting.
+    pty.read_for(Duration::from_millis(400));
+    let settled_at = pty.raw().len();
+    pty.read_for(Duration::from_millis(1600));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[settled_at..]));
+    assert!(
+        !since.contains("Esc to interrupt") && !since.contains("Working"),
+        "the busy status row kept repainting after a non-streamed reply:\n{since}"
+    );
+
+    // And a second turn still works, with the first still on screen.
+    pty.send(b"second\r").unwrap();
+    let text = wait_for_squeezed(&mut pty, "second whole reply w4o", "the second reply");
+    let squeezed: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        squeezed.contains("wholereplyatoncew4n"),
+        "the first reply vanished from the transcript once the second arrived:\n{text}"
+    );
+    assert_eq!(fake.served(), 2);
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
