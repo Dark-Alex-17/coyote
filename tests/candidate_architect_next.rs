@@ -47,7 +47,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "architect-next";
-const SMOKE_FLOOR: usize = 423;
+const SMOKE_FLOOR: usize = 515;
 const MATRIX_FLOOR: usize = 53;
 const _: () = assert!(MATRIX_FLOOR >= 53, "the matrix floor never drops below 53");
 
@@ -3887,10 +3887,10 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("branch_setup", "timeout", 300),
     ("checklist_librarian", "max_attempts", 2),
     ("checklist_librarian", "timeout", 3600),
-    ("ci_apply", "timeout", 120),
+    ("ci_apply", "timeout", 300),
     ("ci_diagnose", "timeout", 600),
     ("ci_evidence", "timeout", 300),
-    ("ci_poll", "timeout", 120),
+    ("ci_poll", "timeout", 180),
     ("claim_task", "timeout", 600),
     ("compose_delegation", "timeout", 60),
     ("consult_navigator", "max_attempts", 1),
@@ -3936,8 +3936,9 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("promote_verify", "timeout", 600),
     ("review_apply", "timeout", 120),
     ("review_poll", "timeout", 900),
+    ("review_route", "timeout", 120),
     ("review_triage", "timeout", 600),
-    ("review_update", "timeout", 300),
+    ("review_update", "timeout", 1020),
     ("run_adversary", "max_attempts", 1),
     ("run_adversary", "timeout", 7200),
     ("run_gauntlet", "max_attempts", 1),
@@ -3970,6 +3971,7 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
     "body_fix_rounds",
     "ci_poll_fails",
     "ci_polls",
+    "ci_polls_run",
     "ci_rounds",
     "ci_started_at",
     "design_rounds",
@@ -3983,6 +3985,7 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
     "review_fix_rounds",
     "review_poll_fails",
     "review_polls",
+    "review_polls_run",
     "review_rounds",
     "review_started_at",
     "wave_fix_rounds",
@@ -4001,9 +4004,11 @@ const FROZEN_SCRIPT_BOUNDS: &[(&str, &str, &str, i64)] = &[
     ("CI_WALL_SECS", "", "14400", 14400),
     ("CONFLICT_CYCLES_MAX", "", "2", 2),
     ("DESIGN_ROUNDS_MAX", "", "STRIKE_LIMIT", 3),
+    ("GH_CALL_SECS", "", "90", 90),
     ("OWNER_POLL_MAX", "", "2", 2),
     ("OWNER_POLL_MINUTES", "", "25", 25),
     ("OWNER_WAIT_MINUTES", "", "30", 30),
+    ("POLL_VISIT_BUDGET", "", "950", 950),
     ("RERUN_ONCE", "", "1", 1),
     (
         "REVIEW_MAX_POLLS",
@@ -4013,6 +4018,7 @@ const FROZEN_SCRIPT_BOUNDS: &[(&str, &str, &str, i64)] = &[
     ),
     ("REVIEW_MAX_ROUNDS", "", "STRIKE_LIMIT", 3),
     ("REVIEW_POLL_SLEEP", "", "600", 600),
+    ("REVIEW_UPDATE_BUDGET", "", "600", 600),
     ("REVIEW_WALL_SECS", "", "86400", 86400),
     ("STRIKE_LIMIT", "", "3", 3),
     ("TAIL_CHARS", "", "6000", 6000),
@@ -4187,6 +4193,111 @@ fn loop_cap_exceeds_the_ci_and_review_poll_rounds_lib_computes() {
         assert!(
             bound(name) < cap,
             "{name} {} is not below settings.max_loop_iterations {cap}",
+            bound(name)
+        );
+    }
+}
+
+fn lib_ints(names: &[&str], label: &str) -> Option<serde_json::Value> {
+    let python = python3()?;
+    let scratch = scratch_dir(label);
+    let mut cmd = battery(&python, &scratch);
+    let keys: Vec<String> = names.iter().map(|n| format!("{n:?}")).collect();
+    cmd.current_dir(candidate_dir().join("scripts")).args([
+        "-c",
+        &format!(
+            "import json, _lib\nprint(json.dumps({{k: getattr(_lib, k) for k in ({},)}}))\n",
+            keys.join(", ")
+        ),
+    ]);
+    let out = output_with_timeout(&mut cmd, GATE_LIMIT, label);
+    assert_no_bytecode_under_candidate();
+    Some(parse_json_stdout(label, &out))
+}
+
+/// A poll node sleeps and then makes one gh call, so its timeout has to
+/// outlast both: an engine kill mid-sleep leaves the PR status from the
+/// previous visit standing as if it were fresh. `review_update` spends up to
+/// `REVIEW_UPDATE_BUDGET` on thread replies, and four gh calls fall outside
+/// that budget: the PR head read before it, the reply and resolve of the
+/// thread that straddles it, and the closing update comment.
+#[test]
+fn poll_node_timeouts_cover_the_sleep_and_one_gh_call() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let shipped: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let timeout = |node: &str| {
+        shipped["nodes"][node]["timeout"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("graph.yaml gives {node} an integer timeout"))
+    };
+
+    let Some(values) = lib_ints(
+        &[
+            "GH_CALL_SECS",
+            "CI_POLL_SLEEP",
+            "REVIEW_POLL_SLEEP",
+            "REVIEW_UPDATE_BUDGET",
+        ],
+        "lib-poll-timeouts",
+    ) else {
+        return;
+    };
+    let bound = |name: &str| values[name].as_i64().unwrap();
+    let gh = bound("GH_CALL_SECS");
+    for (node, sleep) in [
+        ("ci_poll", "CI_POLL_SLEEP"),
+        ("review_poll", "REVIEW_POLL_SLEEP"),
+    ] {
+        assert!(
+            timeout(node) > bound(sleep) + gh,
+            "{node} timeout {} does not outlast {sleep} {} plus GH_CALL_SECS {gh}",
+            timeout(node),
+            bound(sleep)
+        );
+    }
+    let budget = bound("REVIEW_UPDATE_BUDGET");
+    assert!(
+        timeout("review_update") >= budget + 4 * gh,
+        "review_update timeout {} does not cover REVIEW_UPDATE_BUDGET {budget} plus four GH_CALL_SECS {gh}",
+        timeout("review_update")
+    );
+}
+
+/// `POLL_VISIT_BUDGET` counts poll visits across the whole run so the watch
+/// stops by name before the engine's per-node cap ends it as an error, yet
+/// still lets one full CI watch and one full review watch run to their wall
+/// caps. The run-wide counters it is checked against start at zero.
+#[test]
+fn poll_visit_budget_stops_the_watch_before_the_engine_cap() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let shipped: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let cap = shipped["settings"]["max_loop_iterations"]
+        .as_i64()
+        .expect("graph.yaml sets an integer settings.max_loop_iterations");
+    for seed in ["ci_polls_run", "review_polls_run"] {
+        assert_eq!(
+            shipped["initial_state"][seed].as_i64(),
+            Some(0),
+            "initial_state does not seed {seed} at 0"
+        );
+    }
+
+    let Some(values) = lib_ints(
+        &["POLL_VISIT_BUDGET", "CI_MAX_ROUNDS", "REVIEW_MAX_POLLS"],
+        "lib-poll-visit-budget",
+    ) else {
+        return;
+    };
+    let bound = |name: &str| values[name].as_i64().unwrap();
+    let budget = bound("POLL_VISIT_BUDGET");
+    assert!(
+        budget < cap,
+        "POLL_VISIT_BUDGET {budget} is not below settings.max_loop_iterations {cap}"
+    );
+    for name in ["CI_MAX_ROUNDS", "REVIEW_MAX_POLLS"] {
+        assert!(
+            budget >= bound(name),
+            "POLL_VISIT_BUDGET {budget} does not fit one full watch of {name} {}",
             bound(name)
         );
     }
