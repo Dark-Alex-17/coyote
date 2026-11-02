@@ -3238,6 +3238,22 @@ mod tests {
         );
     }
 
+    /// The UI's design follows the Codex CLI; both attribution files name
+    /// it and point at its licence.
+    #[test]
+    fn the_codex_attribution_names_the_repo_and_its_licence_in_both_files() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for file in ["NOTICE", "CREDITS.md"] {
+            let text = std::fs::read_to_string(root.join(file)).unwrap();
+            for needle in [
+                "https://github.com/openai/codex",
+                "https://github.com/openai/codex/blob/main/LICENSE",
+            ] {
+                assert!(text.contains(needle), "{file} lacks {needle}");
+            }
+        }
+    }
+
     /// The signal handlers are armed before the terminal changes modes,
     /// and the keyboard-enhancement probe reads the tty, so the screen is
     /// entered before the event stream takes stdin.
