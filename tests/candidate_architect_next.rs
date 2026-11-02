@@ -47,7 +47,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "architect-next";
-const SMOKE_FLOOR: usize = 515;
+const SMOKE_FLOOR: usize = 584;
 const MATRIX_FLOOR: usize = 53;
 const _: () = assert!(MATRIX_FLOOR >= 53, "the matrix floor never drops below 53");
 
@@ -3860,7 +3860,7 @@ fn re_entry_has_no_session_ledger_and_the_readme_no_honesty_sentence() {
 const FROZEN_GRAPH_BOUNDS: &[(&str, i64)] = &[
     ("max_agent_depth", 10),
     ("max_concurrent_agents", 10),
-    ("settings.max_loop_iterations", 1000),
+    ("settings.max_loop_iterations", 1500),
     ("settings.timeout", 0),
 ];
 
@@ -3887,9 +3887,9 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("branch_setup", "timeout", 300),
     ("checklist_librarian", "max_attempts", 2),
     ("checklist_librarian", "timeout", 3600),
-    ("ci_apply", "timeout", 300),
+    ("ci_apply", "timeout", 390),
     ("ci_diagnose", "timeout", 600),
-    ("ci_evidence", "timeout", 300),
+    ("ci_evidence", "timeout", 390),
     ("ci_poll", "timeout", 180),
     ("claim_task", "timeout", 600),
     ("compose_delegation", "timeout", 60),
@@ -3904,7 +3904,7 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("explore_slice_team", "timeout", 1800),
     ("final_report", "timeout", 300),
     ("finish_plan", "timeout", 600),
-    ("flip_ready", "timeout", 300),
+    ("flip_ready", "timeout", 390),
     ("gate1", "max_attempts", 2),
     ("gate1", "timeout", 3600),
     ("gate2", "max_attempts", 2),
@@ -4005,10 +4005,17 @@ const FROZEN_SCRIPT_BOUNDS: &[(&str, &str, &str, i64)] = &[
     ("CONFLICT_CYCLES_MAX", "", "2", 2),
     ("DESIGN_ROUNDS_MAX", "", "STRIKE_LIMIT", 3),
     ("GH_CALL_SECS", "", "90", 90),
+    ("GH_LOOP_SECS", "", "180", 180),
     ("OWNER_POLL_MAX", "", "2", 2),
     ("OWNER_POLL_MINUTES", "", "25", 25),
     ("OWNER_WAIT_MINUTES", "", "30", 30),
-    ("POLL_VISIT_BUDGET", "", "950", 950),
+    ("PERM_LOOKUPS_PER_POLL", "", "2", 2),
+    (
+        "POLL_VISIT_BUDGET",
+        "",
+        "4 * CI_MAX_ROUNDS + CI_MAX_ROUNDS",
+        1200,
+    ),
     ("RERUN_ONCE", "", "1", 1),
     (
         "REVIEW_MAX_POLLS",
@@ -4215,12 +4222,18 @@ fn lib_ints(names: &[&str], label: &str) -> Option<serde_json::Value> {
     Some(parse_json_stdout(label, &out))
 }
 
-/// A poll node sleeps and then makes one gh call, so its timeout has to
-/// outlast both: an engine kill mid-sleep leaves the PR status from the
-/// previous visit standing as if it were fresh. `review_update` spends up to
-/// `REVIEW_UPDATE_BUDGET` on thread replies, and four gh calls fall outside
-/// that budget: the PR head read before it, the reply and resolve of the
-/// thread that straddles it, and the closing update comment.
+/// A poll node sleeps and then makes its gh calls, so its timeout has to
+/// outlast all of them: an engine kill mid-sleep leaves the PR status from
+/// the previous visit standing as if it were fresh. `ci_poll` makes one call;
+/// `review_poll` makes the review read plus up to `PERM_LOOKUPS_PER_POLL`
+/// permission reads. `review_update` spends up to `REVIEW_UPDATE_BUDGET` on
+/// thread replies, and four gh calls fall outside that budget: the PR head
+/// read before it, the reply and resolve of the thread that straddles it, and
+/// the closing update comment. `ci_apply`, `ci_evidence` and `flip_ready`
+/// stop starting looped gh calls once `GH_LOOP_SECS` has passed, so the call
+/// started just inside that limit runs a full `GH_CALL_SECS` past it; one
+/// more call outside the loop and a 30 second margin for the gate's own work
+/// fill the rest of the timeout.
 #[test]
 fn poll_node_timeouts_cover_the_sleep_and_one_gh_call() {
     let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
@@ -4234,7 +4247,9 @@ fn poll_node_timeouts_cover_the_sleep_and_one_gh_call() {
     let Some(values) = lib_ints(
         &[
             "GH_CALL_SECS",
+            "GH_LOOP_SECS",
             "CI_POLL_SLEEP",
+            "PERM_LOOKUPS_PER_POLL",
             "REVIEW_POLL_SLEEP",
             "REVIEW_UPDATE_BUDGET",
         ],
@@ -4244,29 +4259,42 @@ fn poll_node_timeouts_cover_the_sleep_and_one_gh_call() {
     };
     let bound = |name: &str| values[name].as_i64().unwrap();
     let gh = bound("GH_CALL_SECS");
-    for (node, sleep) in [
-        ("ci_poll", "CI_POLL_SLEEP"),
-        ("review_poll", "REVIEW_POLL_SLEEP"),
-    ] {
-        assert!(
-            timeout(node) > bound(sleep) + gh,
-            "{node} timeout {} does not outlast {sleep} {} plus GH_CALL_SECS {gh}",
-            timeout(node),
-            bound(sleep)
-        );
-    }
+    let ci_sleep = bound("CI_POLL_SLEEP");
+    assert!(
+        timeout("ci_poll") > ci_sleep + gh,
+        "ci_poll timeout {} does not outlast CI_POLL_SLEEP {ci_sleep} plus GH_CALL_SECS {gh}",
+        timeout("ci_poll")
+    );
+    let review_sleep = bound("REVIEW_POLL_SLEEP");
+    let lookups = bound("PERM_LOOKUPS_PER_POLL");
+    assert!(
+        timeout("review_poll") > review_sleep + (1 + lookups) * gh,
+        "review_poll timeout {} does not outlast REVIEW_POLL_SLEEP {review_sleep} plus {} GH_CALL_SECS {gh} \
+         (the review read and PERM_LOOKUPS_PER_POLL {lookups} permission reads)",
+        timeout("review_poll"),
+        1 + lookups
+    );
     let budget = bound("REVIEW_UPDATE_BUDGET");
     assert!(
         timeout("review_update") >= budget + 4 * gh,
         "review_update timeout {} does not cover REVIEW_UPDATE_BUDGET {budget} plus four GH_CALL_SECS {gh}",
         timeout("review_update")
     );
+    let gh_loop = bound("GH_LOOP_SECS");
+    for node in ["ci_apply", "ci_evidence", "flip_ready"] {
+        assert!(
+            timeout(node) >= gh_loop + 2 * gh + 30,
+            "{node} timeout {} does not cover GH_LOOP_SECS {gh_loop} plus two GH_CALL_SECS {gh} plus 30",
+            timeout(node)
+        );
+    }
 }
 
 /// `POLL_VISIT_BUDGET` counts poll visits across the whole run so the watch
 /// stops by name before the engine's per-node cap ends it as an error, yet
-/// still lets one full CI watch and one full review watch run to their wall
-/// caps. The run-wide counters it is checked against start at zero.
+/// still lets four group PRs each run a CI watch to its wall cap with at
+/// least a quarter of one watch to spare, and fits one full review watch. The
+/// run-wide counters it is checked against start at zero.
 #[test]
 fn poll_visit_budget_stops_the_watch_before_the_engine_cap() {
     let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
@@ -4293,6 +4321,11 @@ fn poll_visit_budget_stops_the_watch_before_the_engine_cap() {
     assert!(
         budget < cap,
         "POLL_VISIT_BUDGET {budget} is not below settings.max_loop_iterations {cap}"
+    );
+    let rounds = bound("CI_MAX_ROUNDS");
+    assert!(
+        budget >= 4 * rounds + rounds / 4,
+        "POLL_VISIT_BUDGET {budget} leaves no headroom over four group PRs of CI_MAX_ROUNDS {rounds} polls each"
     );
     for name in ["CI_MAX_ROUNDS", "REVIEW_MAX_POLLS"] {
         assert!(
