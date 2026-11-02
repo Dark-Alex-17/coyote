@@ -1480,9 +1480,9 @@ fn the_child_inherits_no_pty_descriptor() {
 }
 
 // ---------------------------------------------------------------------
-// Usage-probe scenarios driven by a scripted model: a real tool call in
-// the full-screen UI, so the prompt modal, the busy UI and the signal arm
-// are seen on a pty rather than through a TestBackend.
+// Scenarios driven by a scripted model: a real tool call in the
+// full-screen UI, so the prompt modal, the busy UI and the signal arm are
+// seen on a pty rather than through a TestBackend.
 // ---------------------------------------------------------------------
 
 /// The dry-run config with its only client pointed at `fake` instead, so a

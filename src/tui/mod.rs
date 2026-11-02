@@ -3104,7 +3104,8 @@ mod tests {
             "unimplemented!",
             concat!("#[", "ignore"),
         ];
-        // Owned by the Windows task: the prompt reply channel's missing twin.
+        // The prompt reply channel has no non-unix implementation yet; its
+        // bail carries the id of the work that adds one.
         let allowlisted: &[(&str, &str)] = &[(
             "src/function/prompt_channel.rs",
             "bail!(\"Prompt reply channel is not implemented on this platform\")",
@@ -3137,6 +3138,45 @@ mod tests {
         assert!(
             offenders.is_empty(),
             "task ids outside a debt marker:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// Comments in the UI's sources describe the code, not the process
+    /// that produced it: none carries the vocabulary of a plan or a
+    /// review. The needles are spelled in halves so this test's source
+    /// does not match itself.
+    #[test]
+    fn ui_comments_carry_no_planning_vocabulary() {
+        let needles = [
+            concat!("acceptance ", "criteri"),
+            concat!("usage-", "probe"),
+            concat!("usage-pattern ", "probe"),
+            concat!("spec-", "first"),
+            concat!("the Windows ", "task"),
+        ]
+        .map(str::to_lowercase);
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = rust_files(&root.join("src/tui"));
+        files.extend(rust_files(&root.join("tests/common")));
+        files.push(root.join("tests/tui_binary.rs"));
+        let mut offenders = Vec::new();
+        for path in files {
+            let file = path.strip_prefix(root).unwrap().display().to_string();
+            let text = std::fs::read_to_string(&path).unwrap();
+            for (index, line) in text.lines().enumerate() {
+                if !line.trim_start().starts_with("//") {
+                    continue;
+                }
+                let lower = line.to_lowercase();
+                if needles.iter().any(|needle| lower.contains(needle)) {
+                    offenders.push(format!("{file}:{}: {}", index + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "planning vocabulary in comments:\n{}",
             offenders.join("\n")
         );
     }
