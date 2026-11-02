@@ -559,21 +559,16 @@ impl App {
     }
 
     /// Commits what the work task brought back.
-    pub(crate) fn end_turn(&mut self, line: &str, command: bool, outcome: &TurnOutcome) {
+    pub(crate) fn end_turn(&mut self, command: bool, outcome: &TurnOutcome) {
         let first_cell = self.turn.take().map(|turn| turn.first_cell);
         self.close_stream();
         if command {
-            match first_cell.and_then(|index| self.cells.get_mut(index)) {
-                Some(Cell::Command { output, lines, .. }) => {
-                    *output = outcome.captured.clone();
-                    *lines = None;
-                }
-                _ => self.cells.push(Cell::Command {
-                    name: line.to_string(),
-                    output: outcome.captured.clone(),
-                    lines: None,
-                }),
-            }
+            let index = first_cell.expect("end_turn follows begin_turn");
+            let Cell::Command { output, lines, .. } = &mut self.cells[index] else {
+                panic!("begin_turn pushed a Command cell for a command turn");
+            };
+            *output = outcome.captured.clone();
+            *lines = None;
         } else if !outcome.captured.trim().is_empty() {
             self.cells.push(Cell::notice(
                 NoticeKind::Routing,
@@ -1029,7 +1024,6 @@ impl Widget for PromptModal<'_> {
 enum Task {
     Turn {
         handle: JoinHandle<(RequestContext, TurnOutcome)>,
-        line: String,
         command: bool,
     },
     Exit(JoinHandle<(RequestContext, Result<()>, String)>),
@@ -1355,8 +1349,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> (Leave, Option<
                                 parse_command(&line, ctx.app.config.command_prefix).is_some();
                             app.begin_turn(&line, command);
                             task = Some(Task::Turn {
-                                handle: spawn_turn(ctx, abort.clone(), line.clone(), tx.clone()),
-                                line,
+                                handle: spawn_turn(ctx, abort.clone(), line, tx.clone()),
                                 command,
                             });
                         }
@@ -1429,12 +1422,12 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> (Leave, Option<
             }
             Step::Work(done) => match *done {
                 Done::Turn(joined) => {
-                    let Some(Task::Turn { line, command, .. }) = task.take() else {
+                    let Some(Task::Turn { command, .. }) = task.take() else {
                         continue;
                     };
                     match joined {
                         Ok((mut returned, outcome)) => {
-                            app.end_turn(&line, command, &outcome);
+                            app.end_turn(command, &outcome);
                             app.sync_from_ctx(&mut returned);
                             if outcome.exit {
                                 quit_requested = true;
@@ -1719,7 +1712,6 @@ mod tests {
             assert!(!outcome.exit);
             assert_eq!(outcome.error, None);
             harness.app.end_turn(
-                "hello",
                 false,
                 &TurnOutcome {
                     captured: String::new(),
@@ -1758,7 +1750,7 @@ mod tests {
                 harness.app.handle_msg(msg);
             }
             assert_eq!(outcome.error, None);
-            harness.app.end_turn(".info", true, &outcome);
+            harness.app.end_turn(true, &outcome);
             harness.app.sync_from_ctx(&mut returned);
 
             let commands: Vec<&Cell> = harness
@@ -1803,7 +1795,6 @@ mod tests {
         );
         harness.app.begin_turn(".info", true);
         harness.app.end_turn(
-            ".info",
             true,
             &TurnOutcome {
                 captured: info.clone(),
@@ -1832,7 +1823,6 @@ mod tests {
              {wide}\n"
         );
         harness.app.end_turn(
-            ".info",
             true,
             &TurnOutcome {
                 exit: false,
@@ -2169,9 +2159,7 @@ mod tests {
                 .to_string(),
         ));
         harness.app.handle_msg(UiMsg::StreamDone);
-        harness
-            .app
-            .end_turn("explain", false, &TurnOutcome::default());
+        harness.app.end_turn(false, &TurnOutcome::default());
         harness.app.handle_msg(UiMsg::Notice {
             kind: NoticeKind::Checkpoint,
             text: "checkpoint saved".to_string(),
@@ -2252,7 +2240,7 @@ mod tests {
             "{rendered}"
         );
 
-        harness.app.end_turn("work", false, &TurnOutcome::default());
+        harness.app.end_turn(false, &TurnOutcome::default());
         harness.render();
         harness.app.frame_drawn();
         assert_eq!(harness.app.frames.due_at(), None);
@@ -2392,7 +2380,6 @@ mod tests {
         let mut harness = Harness::standalone(80, 24);
         harness.app.begin_turn("ask", false);
         harness.app.end_turn(
-            "ask",
             false,
             &TurnOutcome {
                 captured: "\x1b[0G\u{280b}\x1b[?25l Thinking\x1b[1m!\x1b[0m\n".to_string(),
@@ -2420,7 +2407,7 @@ mod tests {
             bytes: b" turn\n".to_vec(),
         });
         assert_eq!(harness.app.cells.len(), 2);
-        harness.app.end_turn(".run", true, &TurnOutcome::default());
+        harness.app.end_turn(true, &TurnOutcome::default());
         let cells_after_first = harness.app.cells.len();
 
         harness.app.begin_turn(".run", true);

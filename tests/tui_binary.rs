@@ -1642,7 +1642,7 @@ fn typing_while_a_tool_sleeps_reaches_the_composer_and_submits_afterwards() {
 /// SIGTERM while a work task is still running (a tool blocked mid-turn)
 /// still runs the leave path: the alternate screen is left, the tty is
 /// cooked and the exit is orderly. How long that takes is reported, not
-/// pinned: the plan bounds no exit time while a work task owns the context.
+/// pinned: no exit deadline applies while a work task owns the context.
 #[test]
 #[serial]
 fn sigterm_during_a_running_tool_still_leaves_the_tty_cooked() {
