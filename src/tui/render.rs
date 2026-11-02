@@ -1,8 +1,9 @@
 //! Turns a cell's source into ratatui lines at a given width. Markdown
-//! goes through the REPL's renderer so both surfaces paint the same way,
-//! then gets wrapped, scrubbed of every escape that is not a colour or
-//! attribute, and parsed back into styled spans. A streaming reply is split
-//! into a stable part, rendered once per width, and a live tail.
+//! goes through the REPL's renderer, wrapping at that width, so both
+//! surfaces paint the same way; the result is scrubbed of every escape
+//! that is not a colour or attribute and parsed back into styled spans. A
+//! streaming reply is split into a stable part, rendered once per width,
+//! and a live tail.
 
 use crate::render::{MarkdownRender, RenderOptions};
 use ansi_to_tui::IntoText;
@@ -148,7 +149,7 @@ pub(crate) struct Renderer {
 }
 
 impl Renderer {
-    /// Wrapping is done here per width, so the renderer runs unwrapped.
+    /// The width is set per call; `init` would otherwise size it from fd 1.
     pub(crate) fn new(options: RenderOptions) -> Result<Self> {
         let markdown = MarkdownRender::init(RenderOptions {
             wrap: None,
@@ -157,10 +158,16 @@ impl Renderer {
         Ok(Self { markdown })
     }
 
+    /// Markdown laid out at `width` by the renderer itself: it wraps prose
+    /// and lists on word boundaries and sizes tables to fit, where wrapping
+    /// its painted output afterwards would break border rows mid-cell. Code
+    /// lines follow the `wrap_code` option and are otherwise clipped by the
+    /// view.
     pub(crate) fn markdown(&mut self, source: &str, width: u16) -> Vec<Line<'static>> {
         if source.is_empty() {
             return Vec::new();
         }
+        self.markdown.set_wrap_width(Some(width.max(1)));
         let mut ansi = self.markdown.render(source);
         let pending_table = self.markdown.finalize();
         if !pending_table.is_empty() {
@@ -174,7 +181,7 @@ impl Renderer {
         if fence_open(source) {
             self.markdown.render("```");
         }
-        styled_lines(&sanitize_ansi(&wrap_lines(&ansi, width)))
+        styled_lines(&sanitize_ansi(&ansi))
     }
 }
 
@@ -345,6 +352,58 @@ mod tests {
         for line in &lines {
             assert!(line.width() <= 12, "{line:?}");
         }
+    }
+
+    /// A table wider than the view is laid out to the width by the
+    /// renderer, so every row still begins at a border and nothing is cut
+    /// off mid-cell.
+    #[test]
+    fn a_table_wider_than_the_view_keeps_every_border_row_whole() {
+        let mut renderer = Renderer::new(RenderOptions::default()).unwrap();
+        let source = "| name | description | status |\n\
+                      |---|---|---|\n\
+                      | alpha | the first of the three columns | ok |\n\
+                      | beta | the second one, longer than the view | fine |\n";
+        let lines = renderer.markdown(source, 30);
+        assert!(lines.len() >= 5, "{lines:?}");
+        for line in &lines {
+            let text = line.to_string();
+            assert!(
+                text.starts_with(['┌', '╞', '├', '│', '└']),
+                "a row does not start at a border: {text:?}"
+            );
+            assert!(line.width() <= 30, "{text:?}");
+        }
+        let body = lines.iter().map(Line::to_string).collect::<String>();
+        assert!(body.contains("longer"), "{body}");
+    }
+
+    /// A fenced code line longer than the view stays one line with its
+    /// highlighting whole; the view clips it. Wrapping the painted output
+    /// by column would cut through an escape sequence.
+    #[test]
+    fn a_long_code_line_is_left_whole_for_the_view_to_clip() {
+        let theme: Theme = decode_bin(DARK_THEME).unwrap();
+        let mut renderer = Renderer::new(RenderOptions {
+            theme: Some(theme),
+            truecolor: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let value = "v".repeat(40);
+        let source = format!("```rust\nlet name = \"{value}\";\n```");
+        let lines = renderer.markdown(&source, 20);
+        let code: Vec<&Line<'static>> = lines
+            .iter()
+            .filter(|line| !line.to_string().starts_with("```"))
+            .collect();
+        assert_eq!(code.len(), 1, "{lines:?}");
+        assert!(code[0].width() > 20, "{lines:?}");
+        assert!(code[0].to_string().contains(&value), "{lines:?}");
+        assert!(
+            every_span(&lines).all(|span| !span.content.contains(ESC)),
+            "{lines:?}"
+        );
     }
 
     #[test]

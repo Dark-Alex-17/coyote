@@ -697,6 +697,12 @@ impl MarkdownRender {
         })
     }
 
+    /// Overrides the width `init` derived from the terminal; `None` turns
+    /// wrapping off. Tables and lists are laid out to this width too.
+    pub fn set_wrap_width(&mut self, width: Option<u16>) {
+        self.wrap_width = width;
+    }
+
     pub fn render(&mut self, text: &str) -> String {
         text.split('\n')
             .filter_map(|line| self.render_line_mut(line))
