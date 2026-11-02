@@ -471,10 +471,13 @@ pub async fn handle_mesh_tool(
     }
 
     let Some(runtime) = ctx.app.mesh.get() else {
-        return Ok(with_prose_hints(json!({
-            "status": "error",
-            "message": "The mesh is not on in this session. Run `.mesh on` in the REPL (it is session-scoped; config.yaml is not changed).",
-        }), prefix));
+        return Ok(with_prose_hints(
+            json!({
+                "status": "error",
+                "message": "The mesh is not on in this session. Run `.mesh on` in the REPL (it is session-scoped; config.yaml is not changed).",
+            }),
+            prefix,
+        ));
     };
 
     let result = match action {

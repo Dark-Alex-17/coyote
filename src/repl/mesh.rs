@@ -11500,8 +11500,8 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         "{prefix}"
                     );
                     for verb in ["pending", "knocks"] {
-                        let err = run_async(run(&mut ctx, &format!("{sigil}mesh {verb}")))
-                            .unwrap_err();
+                        let err =
+                            run_async(run(&mut ctx, &format!("{sigil}mesh {verb}"))).unwrap_err();
                         assert_eq!(
                             command_error_text(&err, ctx.app.mesh.command_prefix().load()),
                             format!("Error: Mesh is off. Run `{mesh} on` first."),
@@ -11524,8 +11524,11 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 let printer = PromptPrinter::new(live);
                 let attached = printer.attach();
                 let knock = || {
-                    Notification::new(Source::Knock, "Tia knocked; `.mesh trust 1a2b3c4d` lets it in")
-                        .render()
+                    Notification::new(
+                        Source::Knock,
+                        "Tia knocked; `.mesh trust 1a2b3c4d` lets it in",
+                    )
+                    .render()
                 };
                 let _capture = capture::install();
 
@@ -11539,13 +11542,18 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     .into_iter()
                     .filter(|line| line.starts_with("node: off"))
                     .collect();
-                assert_eq!(infos, ["node: off - .mesh on joins", "node: off - /mesh on joins"]);
+                assert_eq!(
+                    infos,
+                    ["node: off - .mesh on joins", "node: off - /mesh on joins"]
+                );
                 // The shipped printer paints its prefix when colour is on, so only the
                 // body is compared.
                 for mesh in [".mesh", "/mesh"] {
                     let line = attached.get_line().expect("a notified line");
                     assert!(
-                        line.ends_with(&format!(" Tia knocked; `{mesh} trust 1a2b3c4d` lets it in")),
+                        line.ends_with(&format!(
+                            " Tia knocked; `{mesh} trust 1a2b3c4d` lets it in"
+                        )),
                         "{line:?}"
                     );
                 }

@@ -224,7 +224,11 @@ mod tests {
                 live.store(CommandPrefix::Slash);
                 assert_eq!(live_prefix(), CommandPrefix::Slash);
             }
-            assert_eq!(live_prefix(), CommandPrefix::Dot, "nothing is installed in tests");
+            assert_eq!(
+                live_prefix(),
+                CommandPrefix::Dot,
+                "nothing is installed in tests"
+            );
         }
     }
 

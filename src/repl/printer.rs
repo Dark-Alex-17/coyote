@@ -245,7 +245,10 @@ mod tests {
             let rows: Vec<String> = payload.lines().map(str::to_string).collect();
             assert!(rows.len() > 1, "{rows:?}");
             for row in &rows {
-                assert!(display_width(row) <= terminal_width().max(MIN_WRAP_WIDTH), "{row:?}");
+                assert!(
+                    display_width(row) <= terminal_width().max(MIN_WRAP_WIDTH),
+                    "{row:?}"
+                );
             }
             assert_eq!(
                 bodies(&rows, Source::Knock.prefix()),
