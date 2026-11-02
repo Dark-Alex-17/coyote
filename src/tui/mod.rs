@@ -1953,9 +1953,10 @@ mod tests {
         ));
     }
 
-    /// With nobody left to answer, a yes/no question takes its default and
-    /// anything else is cancelled, whether the prompter is already marked
-    /// unattended or the question was queued when the UI gave up.
+    /// With nobody left to answer, coyote's own yes/no question takes its
+    /// default, a tool's is refused whatever default the tool supplied,
+    /// and anything else is cancelled, whether the prompter is already
+    /// marked unattended or the question was queued when the UI gave up.
     #[test]
     fn unattended_prompts_take_the_confirm_default_and_cancel_the_rest() {
         let (tx, _rx) = unbounded_channel();
@@ -1978,6 +1979,14 @@ mod tests {
         );
         assert_eq!(
             prompter.prompt(confirm_request(Some("fs_write"))).unwrap(),
+            PromptAnswer::Confirmed(false)
+        );
+        let tool_opt_in = PromptRequest {
+            default: Some(serde_json::json!(true)),
+            ..confirm_request(Some("fs_write"))
+        };
+        assert_eq!(
+            prompter.prompt(tool_opt_in).unwrap(),
             PromptAnswer::Confirmed(false)
         );
         let input = PromptRequest::new(PromptAction::Input, "Name:", Origin::detached());
