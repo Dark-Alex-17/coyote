@@ -3045,6 +3045,256 @@ fn ctrl_d_prints_the_committed_transcript_on_the_normal_screen() {
 }
 
 // ---------------------------------------------------------------------
+// Shifted answers on the confirm modal, a narrow screen, fenced commands
+// and the editor-backed commands the UI refuses.
+// ---------------------------------------------------------------------
+
+/// A confirm tool whose question is long enough to need several rows on
+/// a narrow screen.
+const LONG_QUESTION: &str =
+    "Really continue with this long question that needs several rows at forty columns? q9d-wide";
+
+/// The recording confirm tool asking [`LONG_QUESTION`] instead.
+fn long_question_confirm_tool() -> String {
+    RECORDING_CONFIRM_TOOL.replace("Really do it? q9d-q", LONG_QUESTION)
+}
+
+fn squeezed(text: &str) -> String {
+    text.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// The yes/no modal takes a shifted answer too: `Y` is a yes (the tool
+/// reads `1`) and `N` is a no (`0`), exactly like their lowercase twins.
+/// Two turns in one session, so the second modal is also proof the UI
+/// re-arms after the first.
+#[test]
+#[serial]
+fn uppercase_y_and_n_answer_a_tools_confirm_like_their_lowercase_twins() {
+    let dir = fresh_config_dir("tool-confirm-upper");
+    let _guard = TempDirGuard(dir.clone());
+    let out_yes = dir.join("confirm-answer-yes");
+    let out_no = dir.join("confirm-answer-no");
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "fixture_confirm_rec".to_string(),
+            arguments: format!("{{\"out\": \"{}\"}}", out_yes.display()),
+        },
+        Reply::Text("fixture upper yes u7y".to_string()),
+        Reply::ToolCall {
+            name: "fixture_confirm_rec".to_string(),
+            arguments: format!("{{\"out\": \"{}\"}}", out_no.display()),
+        },
+        Reply::Text("fixture upper no u7n".to_string()),
+    ]);
+    write_fake_llm_config(&dir, &fake);
+    write_tool(&dir, "fixture_confirm_rec.sh", RECORDING_CONFIRM_TOOL);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b"call the confirm tool\r").unwrap();
+    pty.wait_for("q9d-q", PTY_DEADLINE)
+        .expect("the tool's confirm question never reached the screen");
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"Y").unwrap();
+    wait_for_file(&mut pty, &out_yes, "the tool's recorded answer to Y");
+    let transcript = wait_for_squeezed(&mut pty, "fixture upper yes u7y", "the reply after Y");
+    assert_eq!(
+        fs::read_to_string(&out_yes).unwrap().trim(),
+        "1",
+        "`Y` on the confirm modal did not reach the tool as a yes:\n{transcript}"
+    );
+
+    let second = pty.raw().len();
+    pty.send(b"call the confirm tool again\r").unwrap();
+    pty.wait_for_after("q9d-q", second, PTY_DEADLINE)
+        .expect("the second confirm question never reached the screen");
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"N").unwrap();
+    wait_for_file(&mut pty, &out_no, "the tool's recorded answer to N");
+    let transcript = wait_for_squeezed(&mut pty, "fixture upper no u7n", "the reply after N");
+    assert_eq!(
+        fs::read_to_string(&out_no).unwrap().trim(),
+        "0",
+        "`N` on the confirm modal did not reach the tool as a no:\n{transcript}"
+    );
+    assert!(
+        !transcript.contains("coyote_prompt"),
+        "a raw prompt-protocol line reached the screen:\n{transcript}"
+    );
+    assert_eq!(fake.served(), 4, "{transcript}");
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// On a 40-column screen a confirm question longer than the width is
+/// wrapped, not clipped: every character of it is on screen when the
+/// modal is up, and `y` still answers it.
+#[test]
+#[serial]
+fn a_long_confirm_question_is_fully_visible_on_a_forty_column_screen() {
+    let dir = fresh_config_dir("tool-confirm-narrow");
+    let _guard = TempDirGuard(dir.clone());
+    let out = dir.join("confirm-answer");
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "fixture_confirm_rec".to_string(),
+            arguments: format!("{{\"out\": \"{}\"}}", out.display()),
+        },
+        Reply::Text("fixture narrow done n4w".to_string()),
+    ]);
+    write_fake_llm_config(&dir, &fake);
+    write_tool(
+        &dir,
+        "fixture_confirm_rec.sh",
+        &long_question_confirm_tool(),
+    );
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.resize(24, 40).unwrap();
+    pty.read_for(Duration::from_millis(500));
+    let before = pty.raw().len();
+    pty.send(b"call the confirm tool\r").unwrap();
+    let modal = pty
+        .wait_for_after("q9d-wide", before, PTY_DEADLINE)
+        .expect("the tool's confirm question never reached the 40-column screen");
+    // Let the modal finish painting before reading it back.
+    pty.read_for(Duration::from_millis(500));
+    let modal = format!(
+        "{modal}{}",
+        strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]))
+    );
+    let shown = squeezed(&modal);
+    assert!(
+        shown.contains(&squeezed(LONG_QUESTION)),
+        "the confirm question was clipped on a 40-column screen; printable bytes since the \
+         prompt was sent:\n{modal}"
+    );
+
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"y").unwrap();
+    wait_for_file(&mut pty, &out, "the tool's recorded answer");
+    let transcript = wait_for_squeezed(
+        &mut pty,
+        "fixture narrow done n4w",
+        "the reply after the tool",
+    );
+    assert_eq!(
+        fs::read_to_string(&out).unwrap().trim(),
+        "1",
+        "{transcript}"
+    );
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// A `.command` wrapped in the REPL's `:::` multi-line fence is still a
+/// command: pasted as three lines and submitted, `.info` yields its table
+/// in the transcript instead of going to the model as a prompt (a dry-run
+/// reply would only echo the fence back). The table is taller than the
+/// screen, so the rows checked are its last ones.
+#[test]
+#[serial]
+fn a_fenced_dot_command_runs_as_a_command_and_not_as_a_prompt() {
+    let dir = fresh_config_dir("fenced-command");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let before = pty.raw().len();
+    pty.send(b"\x1b[200~:::\r.info\r:::\x1b[201~").unwrap();
+    pty.wait_for_after(".info", before, PTY_DEADLINE)
+        .expect("the pasted fence never reached the composer");
+    pty.read_for(Duration::from_millis(300));
+    let submitted = pty.raw().len();
+    pty.send(b"\r").unwrap();
+    let since = pty
+        .wait_for_after("log_path", submitted, PTY_DEADLINE)
+        .expect("the fenced `.info` did not run as a command");
+    assert!(
+        since.contains("config_dir") && since.contains("dry_run"),
+        "the `.info` table's tail is incomplete:\n{since}"
+    );
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// `.skill <name>` opens `$EDITOR` in the REPL; the UI refuses it instead
+/// and must do so before anything is written: no skill file appears
+/// under the config dir, the editor is never launched, and the UI keeps
+/// taking keys.
+#[test]
+#[serial]
+fn dot_skill_under_the_tui_is_refused_before_it_writes_anything() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = fresh_config_dir("skill-refused");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let launched = dir.join("editor-launched");
+    let editor = dir.join("recording-editor.sh");
+    fs::write(
+        &editor,
+        format!("#!/bin/sh\n: > '{}'\nexit 0\n", launched.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&editor, fs::Permissions::from_mode(0o755)).unwrap();
+    let editor = editor.to_str().unwrap();
+    let mut pty = spawn_tui(&dir, &[("EDITOR", editor), ("VISUAL", editor)]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let files_before = walk(&dir);
+    let before = pty.raw().len();
+    pty.send(b".skill probe-skill-zq7\r").unwrap();
+    let since = pty
+        .wait_for_after("not available in the TUI", before, PTY_DEADLINE)
+        .expect("`.skill` was not refused with the TUI notice");
+    pty.read_for(Duration::from_millis(500));
+
+    let new_files: Vec<PathBuf> = walk(&dir)
+        .into_iter()
+        .filter(|path| !files_before.contains(path))
+        .filter(|path| !path.to_string_lossy().contains("/cache/"))
+        .collect();
+    let skill_files: Vec<&PathBuf> = new_files
+        .iter()
+        .filter(|path| path.to_string_lossy().contains("probe-skill-zq7"))
+        .collect();
+    assert!(
+        skill_files.is_empty(),
+        "the refused `.skill` still wrote {skill_files:?}:\n{since}"
+    );
+    assert!(
+        !launched.exists(),
+        "the refused `.skill` still launched the editor:\n{since}"
+    );
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "the refused `.skill` released the terminal:\n{since}"
+    );
+
+    pty.send(b".info\r").unwrap();
+    pty.wait_for_after("log_path", before, PTY_DEADLINE)
+        .expect("keys were not handled after the refused `.skill`");
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+// ---------------------------------------------------------------------
 // The pty harness itself: the escape stripper every assertion above
 // reads through, and the descriptor hygiene of the spawn.
 // ---------------------------------------------------------------------
