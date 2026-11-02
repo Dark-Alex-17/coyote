@@ -443,9 +443,10 @@ pub fn mesh_function_declarations() -> Vec<FunctionDeclaration> {
     ]
 }
 
-/// Command hints in the result's prose (`message`, `next_action`) are written in the
-/// session's prefix. A running node's `list` and `fetch` results come back untouched:
-/// their prose quotes the peer's paths, which a hint rewrite would mangle.
+/// Command hints in the result's top-level prose (`message`, `next_action`) are written
+/// in the session's prefix; nested values carry peer content and are never touched. Of
+/// a running node's `list` and `fetch` results only this node's refusals are rendered:
+/// every other answer quotes the peer's paths, which a hint rewrite would mangle.
 pub async fn handle_mesh_tool(
     ctx: &mut RequestContext,
     cmd_name: &str,
@@ -487,40 +488,31 @@ pub async fn handle_mesh_tool(
         "collect" => handle_collect(ctx, args).await,
         "check_inbox" => Ok(handle_check_inbox(&ctx.app.mesh)),
         "broadcast" => handle_broadcast(&runtime, args).await,
-        "list" => return handle_list(&runtime, args).await,
-        "fetch" => return handle_fetch(&runtime, args).await,
+        "list" => return Ok(refusal_hints(handle_list(&runtime, args).await?, prefix)),
+        "fetch" => return Ok(refusal_hints(handle_fetch(&runtime, args).await?, prefix)),
         "request_access" => handle_request_access(&ctx.app.mesh, args).await,
         _ => bail!("Unknown mesh action: {action}"),
     }?;
     Ok(with_prose_hints(result, prefix))
 }
 
-fn with_prose_hints(mut value: Value, prefix: CommandPrefix) -> Value {
-    render_prose_hints(&mut value, prefix);
-    value
+fn refusal_hints(result: Value, prefix: CommandPrefix) -> Value {
+    if result["status"] == "error" {
+        with_prose_hints(result, prefix)
+    } else {
+        result
+    }
 }
 
-fn render_prose_hints(value: &mut Value, prefix: CommandPrefix) {
-    match value {
-        Value::Object(fields) => {
-            for (key, field) in fields.iter_mut() {
-                match field {
-                    Value::String(text) if matches!(key.as_str(), "message" | "next_action") => {
-                        if let Cow::Owned(rendered) = prefix.render_hints(text) {
-                            *text = rendered;
-                        }
-                    }
-                    _ => render_prose_hints(field, prefix),
-                }
-            }
+fn with_prose_hints(mut value: Value, prefix: CommandPrefix) -> Value {
+    for key in ["message", "next_action"] {
+        if let Some(Value::String(text)) = value.get_mut(key)
+            && let Cow::Owned(rendered) = prefix.render_hints(text)
+        {
+            *text = rendered;
         }
-        Value::Array(items) => {
-            for item in items {
-                render_prose_hints(item, prefix);
-            }
-        }
-        _ => {}
     }
+    value
 }
 
 /// Moves the notes the slot queued while this turn held the context onto the context's
@@ -1775,13 +1767,14 @@ mod tests {
             }
         }
 
-        /// Only the prose keys are rewritten, at any depth; a path, peer text and the
-        /// shape of the value stay as they were.
+        /// Only the top-level prose keys are rewritten; a path, nested peer content and
+        /// the shape of the value stay as they were.
         #[test]
-        fn prose_hints_rewrite_message_and_next_action_and_nothing_else() {
+        fn prose_hints_rewrite_top_level_message_and_next_action_and_nothing_else() {
             let typed = json!({
                 "status": "error",
                 "message": "Not trusted; `.mesh trust 1a2b3c4d` trusts it.",
+                "next_action": "run `.mesh trust 1a2b3c4d`",
                 "path": ".vault/key",
                 "refused": [{
                     "next_action": "wait for `.mesh answer q1`",
@@ -1793,13 +1786,43 @@ mod tests {
                 let expected = json!({
                     "status": "error",
                     "message": format!("Not trusted; `{mesh} trust 1a2b3c4d` trusts it."),
+                    "next_action": format!("run `{mesh} trust 1a2b3c4d`"),
                     "path": ".vault/key",
                     "refused": [{
-                        "next_action": format!("wait for `{mesh} answer q1`"),
+                        "next_action": "wait for `.mesh answer q1`",
                         "text": ".info from the peer",
                     }],
                 });
                 assert_eq!(rendered.to_string(), expected.to_string(), "{prefix}");
+            }
+        }
+
+        /// This node's refusal of a list or fetch is rendered; the peer's answers,
+        /// `not_shared` among them, are not, so a quoted `.vault` keeps its dot.
+        #[test]
+        fn list_and_fetch_render_only_their_refusals() {
+            let refusal = json!({
+                "status": "error",
+                "kind": "unknown_destination",
+                "message": "No path is known. `.mesh peers` shows when it was last heard.",
+            });
+            let not_shared = json!({
+                "status": "not_shared",
+                "path": ".vault",
+                "message": "`.vault` is not shared with this node.",
+                "next_action": "mesh__request_access --paths .vault",
+            });
+            for (prefix, mesh) in PREFIXES {
+                assert_eq!(
+                    refusal_hints(refusal.clone(), prefix)["message"],
+                    format!("No path is known. `{mesh} peers` shows when it was last heard."),
+                    "{prefix}"
+                );
+                assert_eq!(
+                    refusal_hints(not_shared.clone(), prefix),
+                    not_shared,
+                    "{prefix}"
+                );
             }
         }
 
@@ -8999,6 +9022,54 @@ mod tests {
 
             assert!(live.ctx.app.mesh.stop().await.unwrap());
             live.stub.stop().await;
+        }
+
+        mod command_prefix_sinks {
+            use super::*;
+            use crate::config::CommandPrefix;
+
+            /// Under slash the not-trusted refusal of a fetch teaches `/mesh trust`, while
+            /// a `not_shared` answer quoting `.vault/key` comes back byte for byte.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[serial]
+            async fn a_fetch_refusal_is_slashed_and_a_not_shared_answer_is_not() {
+                let _guard = TestConfigDirGuard::new("mesh-tool-fetch-prefix");
+                let started = started_runtime("mesh-tool-fetch-prefix").await;
+                let mut ctx = plain_ctx();
+                ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                ctx.app.mesh.command_prefix().store(CommandPrefix::Slash);
+                let stranger = derived_sighting("prefix-stranger", None);
+                let stranger_to = stranger.destination_hash.clone();
+                started.runtime.peers().observe(stranger, SystemTime::now());
+
+                let refused = handle_mesh_tool(
+                    &mut ctx,
+                    &format!("{MESH_FUNCTION_PREFIX}fetch"),
+                    &json!({"peer": stranger_to, "path": ".vault/key"}),
+                )
+                .await
+                .unwrap();
+                assert_eq!(refused["kind"], "not_trusted", "{refused}");
+                let message = refused["message"].as_str().unwrap();
+                assert!(message.contains("/mesh trust"), "{refused}");
+                assert!(!message.contains(".mesh trust"), "{refused}");
+                assert!(message.is_ascii(), "{refused}");
+
+                let answered = fetch_result(
+                    &stranger_to,
+                    ".vault/key",
+                    Ok(Fetched::NotShared),
+                    &NotSharedReason::Unknown,
+                )
+                .await;
+                assert_eq!(
+                    refusal_hints(answered.clone(), CommandPrefix::Slash),
+                    answered
+                );
+                assert!(answered.to_string().contains(".vault/key"), "{answered}");
+                assert!(ctx.app.mesh.stop().await.unwrap());
+                started.relay_handle.abort();
+            }
         }
 
         /// All three file tools refuse a never-trusted destination as `not_trusted` and a
