@@ -695,6 +695,10 @@ os.environ["SISYPHUS_REVIEW_SLEEP"] = "0"
 _REVIEW_DOC = os.path.join(TMP, "review-doc.json")
 _RESOLVED = os.path.join(TMP, "resolved.txt")
 _REPLIED = os.path.join(TMP, "replied.txt")
+_PERM_LOG = os.path.join(TMP, "perm.txt")
+# every poll reads a permission for a non-OWNER trusted association, so the real gh call must never run here
+_PERM_DEFAULT = "echo write"
+os.environ["SISYPHUS_GH_PERM_CMD"] = _PERM_DEFAULT
 _HEAD = subprocess.run(["git", "-C", REPO, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
 _now = int(time.time())
 
@@ -711,6 +715,10 @@ def seam_log(path):
 def log_seams():
     os.environ["SISYPHUS_GH_REPLY_CMD"] = f"echo \"$SISYPHUS_THREAD_ID|$SISYPHUS_REPLY_BODY\" >> '{_REPLIED}'"
     os.environ["SISYPHUS_GH_RESOLVE_CMD"] = f"echo \"$SISYPHUS_THREAD_ID\" >> '{_RESOLVED}'"
+
+
+def perm_seam(out):
+    os.environ["SISYPHUS_GH_PERM_CMD"] = f"echo \"$SISYPHUS_LOGIN\" >> '{_PERM_LOG}'; {out}"
 
 
 def rs(**over):
@@ -1295,7 +1303,7 @@ check("pr_tracking review: route untrusted -> pr_review_owner_judgment, hard tri
       _untrusted_esc["kind"] == "pr_review_owner_judgment" and _untrusted_esc["hard_trigger"] is True
       and u["pr_review_status"] == "owner_judgment" and _untrusted_esc["data"] == {"untrusted": _untrusted}
       and _untrusted_esc["question"].startswith(
-          "PR review comment(s) from accounts outside OWNER/MEMBER/COLLABORATOR need owner judgment "
+          "PR review comment(s) from accounts outside OWNER/MEMBER/COLLABORATOR or without write access need owner judgment "
           "(bodies withheld; read them on GitHub):")
       and "- https://github.com/o/r/pull/7#c7 by rev (FIRST_TIME_CONTRIBUTOR)" in _untrusted_esc["question"]
       and "- r7 by mallory (NONE)" in _untrusted_esc["question"]
@@ -1445,7 +1453,8 @@ review_doc(comments=[{"id": "k9", "author": "mallory", "association": "CONTRIBUT
            threads=[thread("t9", [("c9", f"{_SECRET}\n\n{gates.OWN_MARKER}")], association="NONE")])
 u = gates.pr_review_poll(rs())
 check("pr_tracking review: an untrusted comment with the own marker is not own: untrusted, no body",
-      u["pr_review_status"] == "comments" and u["pr_review_items"] == []
+      not gates._own_comment(f"x\n\n{gates.OWN_MARKER}", "CONTRIBUTOR")
+      and u["pr_review_status"] == "comments" and u["pr_review_items"] == []
       and [i["id"] for i in u["pr_review_untrusted"]] == ["t9", "k9"]
       and all("body" not in i for i in u["pr_review_untrusted"]) and _SECRET not in json.dumps(u["pr_review_untrusted"]))
 review_doc(threads=[thread("t9", [("c9", f"Addressed in {_SHA40}")]),
@@ -1460,6 +1469,69 @@ review_doc(comments=[{"id": "k9", "author": "mallory", "association": "NONE", "b
 u = gates.pr_review_poll(rs())
 check("pr_tracking review: an untrusted legacy-prefix body is not own",
       u["pr_review_items"] == [] and [i["id"] for i in u["pr_review_untrusted"]] == ["r9", "k9"])
+
+
+def perm_lines(u):
+    return [d for d in u.get("decisions", []) if " permission " in d]
+
+
+perm_seam("echo read")
+review_doc(comments=[{"id": "k30", "author": "carol", "association": "COLLABORATOR", "body": _SECRET}])
+u = gates.pr_review_poll(rs())
+check("pr_tracking review: a COLLABORATOR with read permission is untrusted: body withheld",
+      u["pr_review_items"] == [] and [i["id"] for i in u["pr_review_untrusted"]] == ["k30"]
+      and _SECRET not in json.dumps(u["pr_review_untrusted"]) and u["pr_review_perms"] == {"carol": False}
+      and seam_log(_PERM_LOG) == "carol\n")
+review_doc(comments=[{"id": "k31", "author": "own", "association": "OWNER", "body": "please add a test"}])
+u = gates.pr_review_poll(rs())
+check("pr_tracking review: an OWNER is trusted without a permission read",
+      [i["id"] for i in u["pr_review_items"]] == ["k31"] and u["pr_review_untrusted"] == []
+      and seam_log(_PERM_LOG) == "" and perm_lines(u) == [])
+perm_seam("exit 1")
+review_doc(comments=[{"id": "k32", "author": "dave", "association": "MEMBER", "body": _SECRET}])
+u = gates.pr_review_poll(rs())
+check("pr_tracking review: a failed permission read is untrusted",
+      u["pr_review_items"] == [] and [i["id"] for i in u["pr_review_untrusted"]] == ["k32"]
+      and u["pr_review_perms"] == {"dave": False} and seam_log(_PERM_LOG) == "dave\n")
+perm_seam("echo write")
+review_doc(comments=[{"id": "k33", "author": "rev", "body": "add a test"}, {"id": "k34", "author": "rev", "body": "and a doc"},
+                     {"id": "k35", "author": "erin", "association": "COLLABORATOR", "body": "rename bar"}],
+           threads=[thread("t33", [("c33", "rename foo")])])
+u = gates.pr_review_poll(rs())
+_perm_first = seam_log(_PERM_LOG)
+_u2 = gates.pr_review_poll(rs(pr_review_perms=u["pr_review_perms"]))
+check("pr_tracking review: permissions are read once per login and a seeded cache reads none",
+      _perm_first == "rev\nerin\n" and u["pr_review_perms"] == {"rev": True, "erin": True}
+      and [i["id"] for i in u["pr_review_items"]] == ["t33", "k33", "k34", "k35"]
+      and seam_log(_PERM_LOG) == "" and _u2["pr_review_items"] == u["pr_review_items"] and perm_lines(_u2) == [])
+perm_seam("echo '{\"permission\":\"admin\",\"role_name\":\"admin\"}'")
+review_doc(comments=[{"id": "k36", "author": "frank", "body": "add a test"}])
+u = gates.pr_review_poll(rs())
+check("pr_tracking review: a JSON admin permission is trusted",
+      [i["id"] for i in u["pr_review_items"]] == ["k36"] and u["pr_review_perms"] == {"frank": True}
+      and seam_log(_PERM_LOG) == "frank\n")
+perm_seam("echo write")
+review_doc(comments=[{"id": "k37", "author": "mallory", "association": "CONTRIBUTOR", "body": _SECRET},
+                     {"id": "k38", "author": "eve", "association": "NONE", "body": _SECRET}])
+u = gates.pr_review_poll(rs())
+check("pr_tracking review: a CONTRIBUTOR or NONE association is untrusted without a permission read",
+      u["pr_review_items"] == [] and [i["id"] for i in u["pr_review_untrusted"]] == ["k37", "k38"]
+      and seam_log(_PERM_LOG) == "" and "pr_review_perms" not in u)
+perm_seam("echo read")
+review_doc(reviews=[{"id": "r30", "state": "APPROVED", "author": "carol", "association": "COLLABORATOR", "body": ""}])
+u = gates.pr_review_poll(rs())
+check("pr_tracking review: an approval from a COLLABORATOR with read permission does not approve",
+      u["pr_review_status"] == "pending" and seam_log(_PERM_LOG) == "carol\n")
+perm_seam("case \"$SISYPHUS_LOGIN\" in rev) echo write;; carol) echo read;; *) exit 1;; esac")
+review_doc(comments=[{"id": "k39", "author": "rev", "body": "add a test"}, {"id": "k40", "author": "rev", "body": "and a doc"},
+                     {"id": "k41", "author": "carol", "association": "COLLABORATOR", "body": "x"},
+                     {"id": "k42", "author": "dave", "body": "y"}])
+u = gates.pr_review_poll(rs())
+check("pr_tracking review: one permission ledger line per login",
+      perm_lines(u) == ["review-watch: PR #7 rev permission write", "review-watch: PR #7 carol permission read",
+                        "review-watch: PR #7 dave permission unreadable"]
+      and seam_log(_PERM_LOG) == "rev\ncarol\ndave\n")
+os.environ["SISYPHUS_GH_PERM_CMD"] = _PERM_DEFAULT
 u = gates.ci_gate(base_state(pr_tracking="review", git_task={"kind": "publish", "return_to": "ci_gate", "open_pr": False},
                              delegated=True, git_report="pushed"))
 check("pr_tracking review: a delegated run without open_pr logs no not-started line",
