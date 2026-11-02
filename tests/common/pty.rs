@@ -38,42 +38,12 @@ pub struct Pty {
 impl Pty {
     /// Spawns on a 100x40 terminal, the size the fixture `tput` reports.
     pub fn spawn(mut cmd: Command) -> std::io::Result<Pty> {
-        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::fd::AsRawFd;
         use std::os::unix::process::CommandExt;
 
-        let mut master: libc::c_int = -1;
-        let mut slave: libc::c_int = -1;
-        let mut size = libc::winsize {
-            ws_row: 40,
-            ws_col: 100,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        // SAFETY: both out-pointers are valid ints, `size` is a valid
-        // winsize; name and termios may be null.
-        let rc = unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &mut size,
-            )
-        };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: openpty just created both descriptors and nothing else owns them.
-        let (master, slave) =
-            unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+        let (master, slave) = open_pair(40, 100)?;
         let master_fd = master.as_raw_fd();
         let slave_fd = slave.as_raw_fd();
-        for fd in [master_fd, slave_fd] {
-            // SAFETY: fcntl with F_SETFD takes no pointers; the result is checked.
-            if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-        }
         // SAFETY: the hook calls only async-signal-safe libc functions on
         // descriptors that stay open in the parent until after spawn returns.
         unsafe {
@@ -189,6 +159,12 @@ impl Pty {
     /// included.
     pub fn raw(&self) -> &[u8] {
         &self.raw
+    }
+
+    /// The master side's descriptor, for checks on its flags.
+    pub fn master_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        self.master.as_raw_fd()
     }
 
     /// One poll-and-read step; errors with the stripped transcript when
@@ -317,6 +293,49 @@ impl Drop for Pty {
     }
 }
 
+/// Opens a master/slave pair of the given size with close-on-exec set on
+/// both, so neither leaks into a child's descriptor table past the dup2
+/// that `spawn` does for the standard streams.
+#[cfg(unix)]
+pub fn open_pair(
+    rows: u16,
+    cols: u16,
+) -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
+    let mut size = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: both out-pointers are valid ints, `size` is a valid
+    // winsize; name and termios may be null.
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut size,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: openpty just created both descriptors and nothing else owns them.
+    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    for fd in [master.as_raw_fd(), slave.as_raw_fd()] {
+        // SAFETY: fcntl with F_SETFD takes no pointers; the result is checked.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok((master, slave))
+}
+
 #[cfg(unix)]
 fn closed_early(needle: &str, text: &str) -> std::io::Error {
     std::io::Error::new(
@@ -380,35 +399,4 @@ pub fn strip_ansi(text: &str) -> String {
         }
     }
     out
-}
-
-#[cfg(all(test, unix))]
-mod tests {
-    use super::strip_ansi;
-
-    #[test]
-    fn csi_with_intermediate_bytes_is_dropped_whole() {
-        // Kitty keyboard pop (`ESC [ < 1 u`, also without its count) and a
-        // DEC private mode reset (`ESC [ ? 2004 l`), plus a space
-        // intermediate variant.
-        assert_eq!(strip_ansi("a\x1b[<1ub"), "ab");
-        assert_eq!(strip_ansi("a\x1b[<ub"), "ab");
-        assert_eq!(strip_ansi("a\x1b[?2004lb"), "ab");
-        assert_eq!(strip_ansi("a\x1b[2 qb"), "ab");
-        assert_eq!(strip_ansi("a\x1b[1;31mb\x1b[0m"), "ab");
-    }
-
-    #[test]
-    fn non_csi_escapes_with_an_intermediate_are_dropped_whole() {
-        assert_eq!(strip_ansi("x\x1b(By"), "xy");
-        assert_eq!(strip_ansi("x\x1b=y\x1b>z"), "xyz");
-        assert_eq!(strip_ansi("x\x1b]0;title\x07y\x1b]8;;\x1b\\z"), "xyz");
-    }
-
-    #[test]
-    fn a_truncated_escape_at_the_end_does_not_panic() {
-        assert_eq!(strip_ansi("tail\x1b"), "tail");
-        assert_eq!(strip_ansi("tail\x1b["), "tail");
-        assert_eq!(strip_ansi("tail\x1b]"), "tail");
-    }
 }

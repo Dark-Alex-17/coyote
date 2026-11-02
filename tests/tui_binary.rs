@@ -2901,3 +2901,63 @@ fn ctrl_d_prints_the_committed_transcript_on_the_normal_screen() {
         );
     }
 }
+
+// ---------------------------------------------------------------------
+// The pty harness itself: the escape stripper every assertion above
+// reads through, and the descriptor hygiene of the spawn.
+// ---------------------------------------------------------------------
+
+#[test]
+fn csi_with_intermediate_bytes_is_dropped_whole() {
+    // Kitty keyboard pop (`ESC [ < 1 u`, also without its count) and a
+    // DEC private mode reset (`ESC [ ? 2004 l`), plus a space
+    // intermediate variant.
+    assert_eq!(strip_ansi("a\x1b[<1ub"), "ab");
+    assert_eq!(strip_ansi("a\x1b[<ub"), "ab");
+    assert_eq!(strip_ansi("a\x1b[?2004lb"), "ab");
+    assert_eq!(strip_ansi("a\x1b[2 qb"), "ab");
+    assert_eq!(strip_ansi("a\x1b[1;31mb\x1b[0m"), "ab");
+}
+
+#[test]
+fn non_csi_escapes_with_an_intermediate_are_dropped_whole() {
+    assert_eq!(strip_ansi("x\x1b(By"), "xy");
+    assert_eq!(strip_ansi("x\x1b=y\x1b>z"), "xyz");
+    assert_eq!(strip_ansi("x\x1b]0;title\x07y\x1b]8;;\x1b\\z"), "xyz");
+}
+
+#[test]
+fn a_truncated_escape_at_the_end_does_not_panic() {
+    assert_eq!(strip_ansi("tail\x1b"), "tail");
+    assert_eq!(strip_ansi("tail\x1b["), "tail");
+    assert_eq!(strip_ansi("tail\x1b]"), "tail");
+}
+
+fn has_cloexec(fd: std::os::fd::RawFd) -> bool {
+    // SAFETY: fcntl with F_GETFD takes no pointers; -1 reads as "not set".
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    flags != -1 && flags & libc::FD_CLOEXEC != 0
+}
+
+/// Both halves of the pair carry close-on-exec from the moment they are
+/// opened, and the master keeps it across the spawn, so a child that is
+/// not the one being driven cannot inherit either end.
+#[test]
+#[serial]
+fn the_pty_pair_is_close_on_exec_on_both_sides() {
+    use std::os::fd::AsRawFd;
+
+    let (master, slave) = common::pty::open_pair(40, 100).unwrap();
+    assert!(has_cloexec(master.as_raw_fd()), "master lacks FD_CLOEXEC");
+    assert!(has_cloexec(slave.as_raw_fd()), "slave lacks FD_CLOEXEC");
+    drop((master, slave));
+
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c").arg("echo spawned-ok");
+    let mut pty = Pty::spawn(cmd).unwrap();
+    assert!(
+        has_cloexec(pty.master_fd()),
+        "the master lost FD_CLOEXEC across the spawn"
+    );
+    pty.wait_for("spawned-ok", PTY_DEADLINE).unwrap();
+}
