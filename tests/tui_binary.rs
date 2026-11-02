@@ -2291,3 +2291,204 @@ fn a_tool_run_from_the_tui_sees_coyote_ui_tui() {
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
     assert_tty_restored(&transcript);
 }
+
+/// A confirm tool that also records the answer it got at `out`, so a
+/// test can see the value the modal produced rather than only the
+/// model's follow-up.
+const RECORDING_CONFIRM_TOOL: &str = "#!/usr/bin/env bash\n\
+    \n\
+    # @describe Ask the user before continuing and record the answer.\n\
+    # @option --out! Where to write the answer.\n\
+    \n\
+    # @env LLM_OUTPUT=/dev/stdout The output path\n\
+    \n\
+    # shellcheck disable=SC1090\n\
+    source \"$LLM_PROMPT_UTILS_FILE\"\n\
+    \n\
+    main() {\n\
+    \x20   local out v\n\
+    \x20   out=\"$(jq -r '.out' <<< \"$LLM_TOOL_RAW_JSON\")\"\n\
+    \x20   v=\"$(confirm \"Really do it? q9d-q\")\"\n\
+    \x20   printf '%s' \"${v:-cancelled}\" > \"$out\"\n\
+    \x20   echo \"fixture confirm: ${v:-cancelled} q9d-r\" >> \"$LLM_OUTPUT\"\n\
+    }\n";
+
+/// `TuiPrompter` answers a Confirm modal both ways: `n` is a real "no"
+/// (the tool reads `0`, not a cancellation), the turn still finishes with
+/// the model's follow-up, and the UI keeps taking keys afterwards.
+#[test]
+#[serial]
+fn declining_a_tools_confirm_with_n_gives_the_tool_a_no_and_the_turn_still_finishes() {
+    let dir = fresh_config_dir("tool-confirm-no");
+    let _guard = TempDirGuard(dir.clone());
+    let out = dir.join("confirm-answer");
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "fixture_confirm_rec".to_string(),
+            arguments: format!("{{\"out\": \"{}\"}}", out.display()),
+        },
+        Reply::Text("fixture declined t6k".to_string()),
+    ]);
+    write_fake_llm_config(&dir, &fake);
+    write_tool(&dir, "fixture_confirm_rec.sh", RECORDING_CONFIRM_TOOL);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b"call the confirm tool\r").unwrap();
+    pty.wait_for("q9d-q", PTY_DEADLINE)
+        .expect("the tool's confirm question never reached the screen");
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"n").unwrap();
+    wait_for_file(&mut pty, &out, "the tool's recorded answer");
+    let transcript =
+        wait_for_squeezed(&mut pty, "fixture declined t6k", "the reply after the tool");
+    assert_eq!(
+        fs::read_to_string(&out).unwrap().trim(),
+        "0",
+        "`n` on the confirm modal did not reach the tool as a no:\n{transcript}"
+    );
+    assert!(
+        !transcript.contains("coyote_prompt"),
+        "a raw prompt-protocol line reached the screen:\n{transcript}"
+    );
+    assert_eq!(fake.served(), 2, "{transcript}");
+
+    pty.send(b".info\r").unwrap();
+    pty.wait_for("log_path", PTY_DEADLINE)
+        .expect("keys were not handled after the declined confirm");
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// Keys typed the moment the alternate screen appears, while the
+/// keyboard-enhancement probe is still waiting for its answer, are not
+/// lost: they land in the composer once the reader starts and Enter then
+/// submits them as the first turn. Nothing is echoed cooked onto the
+/// screen either.
+#[test]
+#[serial]
+fn keys_typed_during_startup_land_in_the_composer_and_submit() {
+    let dir = fresh_config_dir("startup-typeahead");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for_raw(ENTER_ALT, 0, PTY_DEADLINE)
+        .expect("the alternate screen was never entered");
+    pty.send(b"**early** typed x4b").unwrap();
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let composed = pty.read_for(Duration::from_millis(300));
+    // Cells that stay blank between frames are skipped by the diff, so the
+    // composer's spaces may not be in the byte stream: compare squeezed.
+    let squeezed_composed: String = composed.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        squeezed_composed.contains("**early**typedx4b"),
+        "text typed during startup never reached the composer:\n{composed}"
+    );
+    pty.send(b"\r").unwrap();
+    let deadline = std::time::Instant::now() + PTY_DEADLINE;
+    loop {
+        let text = pty.read_for(Duration::from_millis(200));
+        let squeezed: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        // The rendered dry-run reply drops the asterisks the prompt kept.
+        if squeezed.contains("earlytypedx4b") && text.matches("x4b").count() >= 2 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Enter did not submit the text typed during startup:\n{text}"
+        );
+    }
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// On a terminal that answers the keyboard-enhancement probe (kitty,
+/// ghostty, wezterm, foot) the flags are pushed after alt-screen entry
+/// and popped before it is left, and with them on, a key *release* the
+/// terminal reports in the kitty encoding must not type into the
+/// composer (`KeyEventKind::Press` only) while a kitty-encoded press
+/// still does.
+#[test]
+#[serial]
+fn a_terminal_answering_the_keyboard_probe_gets_flags_pushed_and_releases_are_ignored() {
+    let dir = fresh_config_dir("kitty-flags");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    let probe = pty
+        .wait_for_raw(b"\x1b[?u", 0, PTY_DEADLINE)
+        .expect("the keyboard-enhancement support probe (CSI ? u) was never sent");
+    // A kitty-protocol terminal answers "flags currently 0" and then the
+    // primary device attributes the probe pairs the query with (CSI c).
+    pty.wait_for_raw(b"\x1b[c", probe, PTY_DEADLINE)
+        .expect("the probe never asked for primary device attributes");
+    pty.send(b"\x1b[?0u\x1b[?62;22c").unwrap();
+    if let Err(err) = pty.wait_for("no session", PTY_DEADLINE) {
+        panic!(
+            "the UI never came up after the terminal answered the keyboard probe: {err}\n\
+             raw bytes since the probe: {:?}",
+            String::from_utf8_lossy(&pty.raw()[probe..])
+        );
+    }
+
+    let raw = pty.raw();
+    let enter_alt = find(raw, ENTER_ALT, 0).expect("the alternate screen was never entered");
+    let push = find_keyboard_push(raw, 0)
+        .expect("the terminal answered the probe but the flags were never pushed");
+    assert!(
+        enter_alt < push,
+        "flags pushed before alt-screen entry (enter={enter_alt}, push={push})"
+    );
+    assert!(probe < push, "flags pushed before the probe was sent");
+
+    pty.send(b"qz7").unwrap();
+    pty.read_for(Duration::from_millis(300));
+    // kitty encoding: CSI <codepoint> ; <mods>:<event-type> u; type 3 is release.
+    pty.send(b"\x1b[107;1:3u").unwrap();
+    pty.read_for(Duration::from_millis(300));
+    // ...and type 1 is press.
+    pty.send(b"\x1b[109;1:1u").unwrap();
+    pty.read_for(Duration::from_millis(300));
+    // Submitting shows the composer's exact contents twice: the prompt echo
+    // and the dry-run reply, both painted whole rather than cell by cell.
+    pty.send(b"\r").unwrap();
+    let deadline = std::time::Instant::now() + PTY_DEADLINE;
+    let text = loop {
+        let text = pty.read_for(Duration::from_millis(200));
+        let squeezed: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            !squeezed.contains("qz7k"),
+            "a kitty key *release* typed into the composer:\n{text}"
+        );
+        if squeezed.matches("qz7m").count() >= 2 {
+            break text;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a kitty-encoded key press did not reach the composer (or Enter did not submit it):\n{text}"
+        );
+    };
+    assert!(
+        !text.contains("qz7mk") && !text.contains("qz7km"),
+        "a kitty key *release* typed into the composer:\n{text}"
+    );
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+    let raw = pty.raw();
+    let leave_alt = rfind(raw, LEAVE_ALT).expect("the alternate screen was never left");
+    let pop = rfind_keyboard_pop(raw).expect("flags pushed but never popped");
+    assert!(
+        push < pop && pop < leave_alt,
+        "flags must be popped before leaving the alternate screen (push={push}, pop={pop}, leave={leave_alt})"
+    );
+}
