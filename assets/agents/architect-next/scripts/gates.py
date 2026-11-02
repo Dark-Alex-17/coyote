@@ -22,7 +22,7 @@ from _lib import (  # noqa: E402
     CI_WALL_SECS, CODE_VAR, CONFLICT_CYCLES_MAX, CONVENTIONS_LINE, CORE_TOOLS_REL, DESIGN_ROUNDS_MAX,
     GATE1_HOUSE_LINE, GH_CALL_SECS, IDIOM_LINE, IS_UPSTREAM, LOG_EVENT_LINE, MODE_ENUMS, MULTI_IS_GROUPS,
     NO_COMMIT_MAIN_LINE, OWNER_POLL_MAX, OWNER_POLL_MINUTES, OWNER_REMOTE_INPUT, OWNER_WAIT_MINUTES,
-    PLANNING_VAR, POLL_VISIT_BUDGET, PR_TRACKING_ENUM, PR_URL_RE, PROBE_HOUSE_NOTE, REPO_HINT, RERUN_ONCE, RESUME_RE,
+    PERM_LOOKUPS_PER_POLL, PLANNING_VAR, POLL_VISIT_BUDGET, PR_TRACKING_ENUM, PR_URL_RE, PROBE_HOUSE_NOTE, REPO_HINT, RERUN_ONCE, RESUME_RE,
     REVIEW_MAX_POLLS, REVIEW_MAX_ROUNDS, REVIEW_POLL_SLEEP, REVIEW_UPDATE_BUDGET, REVIEW_WALL_SECS, SHA_RE, SIBLING_HINT,
     SISYPHUS_RUN_RE, STACK_LINKING, STORE_LABEL, STORE_TOOL_PREFIX, STRIKE_LIMIT, TASKSTORE, TASK_ID_RE,
     TEST_FILE_RE, VERIFY_CMD_SECS, VERIFY_SET_SECS, WAVE_CAP,
@@ -2883,11 +2883,12 @@ def open_pr(state):
     if state.get("pr_number"):
         u["_next"] = "pr_round_comments"
         return u
-    # ARCHITECT_GH_{COMMENT,CREATE,CHECKS,HEAD,LOG,READY,RERUN,REVIEWS,RESOLVE,VIEW}_CMD are test and operator seams:
+    # ARCHITECT_GH_{COMMENT,CREATE,CHECKS,HEAD,LOG,PERM,READY,RERUN,REVIEWS,RESOLVE,VIEW}_CMD are test and operator seams:
     # when set, the gate runs the value through `bash -c` (the checks and reviews ones through `/bin/sh -c`) instead of
-    # the `gh` call. Positional args: comment gets the PR number and body, head the PR number, rerun the run id,
-    # resolve the review thread id and reply body, view the PR or branch and the JSON field. With no rerun seam, a set
-    # checks seam skips `gh run rerun`. Both batteries and the Rust wrapper strip inherited ones.
+    # the `gh` call. Positional args: comment gets the PR number and body, head the PR number, perm the reviewer login
+    # (it prints the permission word), rerun the run id, resolve the review thread id and reply body, view the PR or
+    # branch and the JSON field. With no rerun seam, a set checks seam skips `gh run rerun`. Both batteries and the
+    # Rust wrapper strip inherited ones.
     cmd = os.environ.get("ARCHITECT_GH_CREATE_CMD")
     if cmd:
         rc, out = sh(["bash", "-c", cmd], timeout=GH_CALL_SECS)
@@ -3211,7 +3212,9 @@ REPLY_MUTATION = ("mutation($thread: ID!, $body: String!) { addPullRequestReview
                   "{pullRequestReviewThreadId: $thread, body: $body}) { comment { id } } }")
 RESOLVE_MUTATION = "mutation($thread: ID!) { resolveReviewThread(input: {threadId: $thread}) { thread { id isResolved } } }"
 OWN_COMMENT_PREFIXES = ("## Update @", "## Review round", "## Batch review round")
-TRUSTED_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR")
+# The association is only a pre-filter: a member or collaborator is trusted once the repo grants them one of these.
+PERMISSION_ASSOCIATIONS = ("MEMBER", "COLLABORATOR")
+TRUSTED_PERMISSIONS = ("admin", "maintain", "write")
 OWN_REPLY_RE = re.compile(r"Addressed in [0-9a-f]{7,40}")
 # Every comment and reply the gates post ends with this; the prefixes and the reply pattern above only recognise
 # comments posted before it existed.
@@ -3227,17 +3230,51 @@ def _login(obj):
     return as_dict(obj.get("author")).get("login") or ""
 
 
-def _trusted(obj):
-    return obj.get("authorAssociation") in TRUSTED_ASSOCIATIONS
+def _permission(state, u, login):
+    """The login's permission word on the repo, cached in review_permissions; '' when the read failed, which is not cached."""
+    perms = {**as_dict(state.get("review_permissions")), **as_dict(u.get("review_permissions"))}
+    if login in perms or not login:
+        return perms.get(login, "")
+    cmd = os.environ.get("ARCHITECT_GH_PERM_CMD")
+    if cmd:
+        rc, out = sh(["bash", "-c", cmd, "_", login], timeout=GH_CALL_SECS)
+    else:
+        rc, out = sh(["gh", "api", f"repos/{{owner}}/{{repo}}/collaborators/{login}/permission", "--jq", ".permission"],
+                     cwd=state.get("code_repo_path", ""), timeout=GH_CALL_SECS)
+    word = out.strip() if rc == 0 else ""
+    if word:
+        u["review_permissions"] = {**perms, login: word}
+    return word
 
 
-def _first_untrusted(objs):
-    return next((o for o in objs if not _trusted(o)), None)
+def _trusted(state, u, obj):
+    assoc = obj.get("authorAssociation")
+    if assoc == "OWNER":
+        return True
+    return assoc in PERMISSION_ASSOCIATIONS and _permission(state, u, _login(obj)) in TRUSTED_PERMISSIONS
 
 
-def _own_comment(c):
+def _first_untrusted(state, u, objs):
+    return next((o for o in objs if not _trusted(state, u, o)), None)
+
+
+def _own_comment(state, u, c):
     body = c.get("body") or ""
-    return _trusted(c) and (OWN_MARKER in body or body.lstrip().startswith(OWN_COMMENT_PREFIXES) or bool(OWN_REPLY_RE.fullmatch(body.strip())))
+    return _trusted(state, u, c) and (OWN_MARKER in body or body.lstrip().startswith(OWN_COMMENT_PREFIXES) or bool(OWN_REPLY_RE.fullmatch(body.strip())))
+
+
+def _poll_permissions(state, u, pr):
+    """Every member and collaborator author's permission, '' for a failed read, or None when more uncached logins
+    remain than one poll may look up; the logins it did read stay cached for the next poll."""
+    cached = as_dict(state.get("review_permissions"))
+    authors = [c for t in _nodes(pr, "reviewThreads") for c in _thread_comments(t)] + _nodes(pr, "reviews") + _nodes(pr, "comments")
+    logins = (_login(o) for o in authors if o.get("authorAssociation") in PERMISSION_ASSOCIATIONS)
+    wanted = [login for login in dict.fromkeys(logins) if login and login not in cached]
+    read = {login: _permission(state, u, login) for login in wanted[:PERM_LOOKUPS_PER_POLL]}
+    if len(wanted) > PERM_LOOKUPS_PER_POLL:
+        ledger(state, u, f"review-watch: PR #{state.get('pr_number')} permission lookups deferred: {len(wanted) - PERM_LOOKUPS_PER_POLL} login(s)")
+        return None
+    return {**cached, **read}
 
 
 def _review_read(state):
@@ -3260,32 +3297,36 @@ def _review_read(state):
     return pr if pr.get("state") else None
 
 
-def _review_items(pr, seen):
+def _review_items(state, u, pr, seen):
     """New review items as (trusted, untrusted); an untrusted item is built without its body, so the text stays on the PR."""
     found = []
+
+    def own(c):
+        return _own_comment(state, u, c)
+
     for t in _nodes(pr, "reviewThreads"):
         cs = _thread_comments(t)
         # A resolved thread is only read again when someone answered after the watch's own reply.
-        if t.get("isResolved") and not (cs and not _own_comment(cs[-1]) and any(_own_comment(c) for c in cs[:-1])):
+        if t.get("isResolved") and not (cs and not own(cs[-1]) and any(own(c) for c in cs[:-1])):
             continue
         # Keyed by the newest reviewer comment, so a reply on a thread already handled surfaces again;
         # the watch's own reply does not.
-        latest = next((c.get("id") for c in reversed(cs) if not _own_comment(c)), "")
-        bad = _first_untrusted(c for c in cs if not _own_comment(c))
-        found.append((bad, bool(cs) and _own_comment(cs[0]), {
+        latest = next((c.get("id") for c in reversed(cs) if not own(c)), "")
+        bad = _first_untrusted(state, u, (c for c in cs if not own(c)))
+        found.append((bad, bool(cs) and own(cs[0]), {
             "id": f"thread:{t.get('id')}:{latest}", "kind": "thread", "author": _login(cs[0]) if cs else "",
             "body": "\n\n".join(c.get("body") or "" for c in cs), "path": t.get("path") or "", "thread_id": t.get("id") or "",
             "outdated": bool(t.get("isOutdated"))}))
     for r in _nodes(pr, "reviews"):
         if r.get("state") in ("CHANGES_REQUESTED", "COMMENTED") and (r.get("body") or "").strip():
-            found.append((_first_untrusted([r]), _own_comment(r),
+            found.append((_first_untrusted(state, u, [r]), own(r),
                           {"id": f"review:{r.get('id')}", "kind": "review", "author": _login(r), "body": r["body"], "path": "", "thread_id": ""}))
     for c in _nodes(pr, "comments"):
-        found.append((_first_untrusted([c]), _own_comment(c),
+        found.append((_first_untrusted(state, u, [c]), own(c),
                       {"id": f"comment:{c.get('id')}", "kind": "comment", "author": _login(c), "body": c.get("body") or "", "path": "", "thread_id": ""}))
     trusted, untrusted = [], []
-    for bad, own, i in found:
-        if i["id"] in seen or own:
+    for bad, is_own, i in found:
+        if i["id"] in seen or is_own:
             continue
         if bad is None:
             trusted.append(i)
@@ -3302,7 +3343,7 @@ def _thread_comments(t):
     return root + cs if root and root[0].get("id") not in {c.get("id") for c in cs} else cs
 
 
-def _approved(pr):
+def _approved(state, u, pr):
     """GitHub's reviewDecision when it has one; without it, each author's latest verdict decides."""
     decision = pr.get("reviewDecision")
     if decision:
@@ -3314,7 +3355,7 @@ def _approved(pr):
             latest[_login(r)] = r
     verdicts = list(latest.values())
     return not any(r["state"] == "CHANGES_REQUESTED" for r in verdicts) and any(
-        r["state"] == "APPROVED" and head and as_dict(r.get("commit")).get("oid") == head and _trusted(r) for r in verdicts)
+        r["state"] == "APPROVED" and head and as_dict(r.get("commit")).get("oid") == head and _trusted(state, u, r) for r in verdicts)
 
 
 def _overflowed(pr):
@@ -3354,15 +3395,21 @@ def review_poll(state):
         u["_next"] = "review_route" if fails >= CI_POLL_FAILS else "review_poll"
         return u
     u["review_poll_fails"] = 0
-    items, untrusted = _review_items(pr, set(as_list(state.get("review_seen"))))
     overflow = _overflowed(pr)
-    if pr["state"] == "MERGED":
-        u.update({"review_status": "merged", "_next": "review_route"})
-    elif pr["state"] == "CLOSED":
-        u.update({"review_status": "closed", "_next": "review_route"})
-    elif overflow:
+    if pr["state"] in ("MERGED", "CLOSED"):
+        u.update({"review_status": pr["state"].lower(), "_next": "review_route"})
+        return u
+    if overflow:
         u.update({"review_status": "truncated", "review_truncated": overflow, "_next": "review_route"})
-    elif _approved(pr):
+        return u
+    perms = _poll_permissions(state, u, pr)
+    if perms is None:
+        u.update({"review_status": "pending", "_next": "review_poll"})
+        return u
+    # A failed read is not cached, so this poll classifies with its own reads, failures included, instead of retrying them.
+    view = dict(state, review_permissions=perms)
+    items, untrusted = _review_items(view, u, pr, set(as_list(state.get("review_seen"))))
+    if _approved(view, u, pr):
         u.update({"review_status": "approved", "_next": "review_route"})
     elif items or untrusted:
         u.update({"review_status": "comments", "review_items": items, "review_untrusted": untrusted, "_next": "review_route"})
@@ -3405,7 +3452,8 @@ def review_route(state):
         u["review_status"] = "owner_judgment"
         listed = "\n".join(f"- {i['id']} by {i['author'] or 'unknown'} ({i['association'] or 'NONE'})" for i in untrusted)
         return raise_escalation(state, u, escalation(
-            "review_owner_judgment", f"New review activity on PR #{pr} is from author(s) who are not an owner, member or collaborator:\n{listed}\n"
+            "review_owner_judgment", f"New review activity on PR #{pr} is from author(s) who are not trusted: not an owner, "
+                                     f"or a member or collaborator without write access:\n{listed}\n"
                                      "The watch did not read the body: read it on the PR. Skip it and keep watching, or stop watching?",
             [option("Skip it and keep watching"), option("Stop watching and report", recommended=True)],
             hard_trigger=True, data={"items": [i["id"] for i in untrusted], "untrusted": True}))

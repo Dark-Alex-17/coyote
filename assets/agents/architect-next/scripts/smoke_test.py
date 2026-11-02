@@ -1141,6 +1141,8 @@ check("group_closeout -> phase_f_gate", gates.group_closeout(base_state(closeout
 _review_saved = {k: os.environ.get(k) for k in ("ARCHITECT_GH_REVIEWS_CMD", "ARCHITECT_GH_RESOLVE_CMD", "ARCHITECT_GH_COMMENT_CMD", "ARCHITECT_GH_READY_CMD",
                                                 "ARCHITECT_GH_HEAD_CMD")}
 REVIEW_CALLS = os.path.join(TMP, "review-calls.txt")
+# the review fixtures' member and collaborator authors are trusted only with write permission; the permission rows drop this stub
+os.environ["ARCHITECT_GH_PERM_CMD"] = "echo write"
 
 
 def reviews(pr_state="OPEN", decision="", head="h2", reviews_=(), comments=(), threads=(), wrap=True):
@@ -1220,8 +1222,8 @@ THREAD = {"id": "TH1", "isResolved": False, "path": "src/a.go",
 RESOLVED = {"id": "TH2", "isResolved": True, "path": "src/b.go", "comments": {"nodes": [{"id": "C2", "body": "old note", "authorAssociation": "MEMBER", "author": {"login": "bob"}}]}}
 CHANGES = {"id": "R2", "state": "CHANGES_REQUESTED", "body": "add a test for the empty widget", "authorAssociation": "MEMBER", "author": {"login": "bob"}, "commit": {"oid": "h2"}}
 ISSUE = {"id": "I1", "body": "please update the docs", "authorAssociation": "MEMBER", "author": {"login": "carol"}}
-OWN = [{"id": "I2", "body": "## Update @ abc", "authorAssociation": "MEMBER", "author": {"login": "me"}},
-       {"id": "I3", "body": "## Review round 1 @ h", "authorAssociation": "MEMBER", "author": {"login": "me"}}]
+OWN = [{"id": "I2", "body": "## Update @ abc", "authorAssociation": "OWNER", "author": {"login": "me"}},
+       {"id": "I3", "body": "## Review round 1 @ h", "authorAssociation": "OWNER", "author": {"login": "me"}}]
 reviews(reviews_=[CHANGES], comments=[ISSUE, *OWN], threads=[THREAD, RESOLVED])
 u = gates.review_poll(base_state(**WATCH))
 ITEMS = u.get("review_items", [])
@@ -1561,17 +1563,17 @@ def thread(tid, *cs):
 
 try:
     for assoc in ("NONE", "CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", None):
-        tr, un = gates._review_items({"comments": {"nodes": [by("X1", assoc)]}}, set())
+        tr, un = gates._review_items({}, {}, {"comments": {"nodes": [by("X1", assoc)]}}, set())
         got = un[0] if un else {}
         check(f"review trust: a comment with association {assoc or '(missing)'} -> untrusted, stored without a body key",
               tr == [] and len(un) == 1 and sorted(got) == UNTRUSTED_KEYS and got.get("association") == (assoc or "") and got.get("author") == "eve", (tr, un))
     for assoc in ("OWNER", "MEMBER", "COLLABORATOR"):
-        tr, un = gates._review_items({"comments": {"nodes": [by("X1", assoc, body="looks off")]}}, set())
+        tr, un = gates._review_items({}, {}, {"comments": {"nodes": [by("X1", assoc, body="looks off")]}}, set())
         check(f"review trust: a comment with association {assoc} -> trusted with its body", un == [] and len(tr) == 1 and tr[0].get("body") == "looks off", (tr, un))
-    tr, un = gates._review_items({"reviewThreads": {"nodes": [thread("TH7", by("C7", "MEMBER", body="fine", login="bob"), by("C8", "NONE"))]}}, set())
+    tr, un = gates._review_items({}, {}, {"reviewThreads": {"nodes": [thread("TH7", by("C7", "MEMBER", body="fine", login="bob"), by("C8", "NONE"))]}}, set())
     check("review trust: a thread with one trusted and one untrusted comment -> untrusted, named by the untrusted author, no body",
           tr == [] and len(un) == 1 and "body" not in un[0] and un[0].get("author") == "eve" and un[0].get("thread_id") == "TH7", (tr, un))
-    tr, un = gates._review_items({"reviewThreads": {"nodes": [thread("TH8", by("C9", "MEMBER", body="fine", login="bob"), by("C10", "MEMBER", body="Addressed in abc1234")),
+    tr, un = gates._review_items({}, {}, {"reviewThreads": {"nodes": [thread("TH8", by("C9", "MEMBER", body="fine", login="bob"), by("C10", "MEMBER", body="Addressed in abc1234")),
                                                              thread("TH9", by("C11", "MEMBER", body="fine", login="bob"), by("C12", "NONE", body="Addressed in abc1234")),
                                                              thread("TH10", by("C13", "MEMBER", body="fine", login="bob"), by("C14", "NONE", body="Addressed in abc1234, " + SENTINEL))]}}, set())
     check("review trust: a trusted bare 'Addressed in <sha>' reply is own and not the thread key; from an untrusted author, bare or not, it is untrusted",
@@ -1608,7 +1610,7 @@ try:
           RU.get("_next") == "escalate_gate" and ESC.get("kind") == "review_owner_judgment" and ESC.get("hard_trigger") is True
           and [(o["text"], o["recommended"]) for o in ESC.get("options", [])] == [("Skip it and keep watching", False), ("Stop watching and report", True)]
           and ESC.get("data") == {"items": UIDS, "untrusted": True} and RU.get("review_status") == "owner_judgment"
-          and "not an owner, member or collaborator" in ESC.get("question", "") and "read it on the PR" in ESC.get("question", "")
+          and "not an owner, or a member or collaborator without write access" in ESC.get("question", "") and "read it on the PR" in ESC.get("question", "")
           and ledgered(RU, "review-watch: PR #99 untrusted comment:I7 by eve (NONE) -> owner judgment")
           and ledgered(RU, "review-watch: PR #99 untrusted review:R7 by eve (CONTRIBUTOR) -> owner judgment"), RU)
     check("review trust: review_route keeps the trusted items for a later triage and marks nothing seen",
@@ -1771,17 +1773,17 @@ try:
           round_body.startswith("## Review round 1 @ h1") and posted_round == f"{round_body}\n\n{gates.OWN_MARKER}", posted_round[-200:])
 
     MARKED = f"anything at all\n\n{gates.OWN_MARKER}"
-    check("own marker: a trusted comment carrying the marker is own", gates._own_comment(by("O1", "MEMBER", body=MARKED)))
-    tr, un = gates._review_items({"comments": {"nodes": [by("O2", "NONE", body=MARKED)]}}, set())
+    check("own marker: a trusted comment carrying the marker is own", gates._own_comment({}, {}, by("O1", "MEMBER", body=MARKED)))
+    tr, un = gates._review_items({}, {}, {"comments": {"nodes": [by("O2", "NONE", body=MARKED)]}}, set())
     check("own marker: an untrusted comment carrying the marker is not own -> an untrusted item",
-          not gates._own_comment(by("O2", "NONE", body=MARKED)) and tr == [] and [i["id"] for i in un] == ["comment:O2"], (tr, un))
+          not gates._own_comment({}, {}, by("O2", "NONE", body=MARKED)) and tr == [] and [i["id"] for i in un] == ["comment:O2"], (tr, un))
     # comments the watch posted before the marker existed still carry only the heading
     check("own marker: a trusted '## Update @' comment without the marker is still own (legacy prefix)",
-          gates._own_comment(by("O3", "OWNER", body="## Update @ abc1234\n\n- x: abc1234")))
-    tr, un = gates._review_items({"comments": {"nodes": [by("O4", "MEMBER", body="please fix the docs")]}}, set())
+          gates._own_comment({}, {}, by("O3", "OWNER", body="## Update @ abc1234\n\n- x: abc1234")))
+    tr, un = gates._review_items({}, {}, {"comments": {"nodes": [by("O4", "MEMBER", body="please fix the docs")]}}, set())
     check("own marker: a trusted comment with no marker or own prefix is not own -> a trusted item",
-          not gates._own_comment(by("O4", "MEMBER", body="please fix the docs")) and [i["id"] for i in tr] == ["comment:O4"] and un == [], (tr, un))
-    tr, un = gates._review_items({"reviewThreads": {"nodes": [thread("TH20", by("C20", "MEMBER", body="fine", login="bob"), by("C21", "MEMBER", body=reply or MARKED))]}}, set())
+          not gates._own_comment({}, {}, by("O4", "MEMBER", body="please fix the docs")) and [i["id"] for i in tr] == ["comment:O4"] and un == [], (tr, un))
+    tr, un = gates._review_items({}, {}, {"reviewThreads": {"nodes": [thread("TH20", by("C20", "MEMBER", body="fine", login="bob"), by("C21", "MEMBER", body=reply or MARKED))]}}, set())
     check("own marker: the thread key skips a marked own reply and keys on the newest reviewer comment", [i["id"] for i in tr] == ["thread:TH20:C20"] and un == [], (tr, un))
 finally:
     for _k, _v in _seam_saved.items():
@@ -1803,21 +1805,21 @@ def resolved(tid, *cs):
 
 try:
     check("watch threads: REVIEW_QUERY asks for isOutdated on review threads", "isResolved isOutdated path" in gates.REVIEW_QUERY)
-    tr, un = gates._review_items({"reviewThreads": {"nodes": [{**thread("TH30", by("C30", "MEMBER", body="still wrong", login="bob")), "isOutdated": True},
+    tr, un = gates._review_items({}, {}, {"reviewThreads": {"nodes": [{**thread("TH30", by("C30", "MEMBER", body="still wrong", login="bob")), "isOutdated": True},
                                                              thread("TH31", by("C31", "MEMBER", body="and here", login="bob"))]}}, set())
     check("watch threads: an unresolved outdated thread -> an item with outdated True; a current one -> outdated False",
           [(i["id"], i.get("outdated")) for i in tr] == [("thread:TH30:C30", True), ("thread:TH31:C31", False)] and un == [], (tr, un))
     FRESH = resolved("TH32", by("C32", "MEMBER", body="rename this", login="bob"), by("C33", "MEMBER", body=OWN_REPLY),
                      by("C34", "MEMBER", body="the rename missed a caller", login="bob"))
-    tr, un = gates._review_items({"reviewThreads": {"nodes": [FRESH]}}, {"thread:TH32:C32"})
+    tr, un = gates._review_items({}, {}, {"reviewThreads": {"nodes": [FRESH]}}, {"thread:TH32:C32"})
     check("watch threads: a resolved thread with an own reply then a newer trusted comment -> surfaces under the new key with its body",
           [i["id"] for i in tr] == ["thread:TH32:C34"] and "the rename missed a caller" in tr[0].get("body", "") and tr[0].get("outdated") is False and un == [],
           (tr, un))
-    tr, un = gates._review_items({"reviewThreads": {"nodes": [
+    tr, un = gates._review_items({}, {}, {"reviewThreads": {"nodes": [
         resolved("TH33", by("C35", "MEMBER", body="rename this", login="bob"), by("C36", "MEMBER", body=OWN_REPLY)),
         resolved("TH34", by("C37", "MEMBER", body="rename this", login="bob"), by("C38", "MEMBER", body="never mind", login="bob"))]}}, set())
     check("watch threads: a resolved thread whose newest comment is own, or with no own comment at all -> skipped", tr == [] and un == [], (tr, un))
-    tr, un = gates._review_items({"reviewThreads": {"nodes": [{**resolved("TH35", by("C39", "MEMBER", body="rename this", login="bob"),
+    tr, un = gates._review_items({}, {}, {"reviewThreads": {"nodes": [{**resolved("TH35", by("C39", "MEMBER", body="rename this", login="bob"),
                                                                           by("C40", "MEMBER", body=OWN_REPLY), by("C41", "NONE")), "isOutdated": True}]}}, set())
     check("watch threads: a resolved thread with an own reply then an untrusted newer comment -> an untrusted item with outdated and no body",
           tr == [] and [i["id"] for i in un] == ["thread:TH35:C41"] and sorted(un[0]) == sorted(UNTRUSTED_KEYS + ["outdated"])
@@ -1985,6 +1987,113 @@ try:
           and u.get("review_status") == "", u)
 finally:
     for _k, _v in _watch_saved.items():
+        if _v is None:
+            os.environ.pop(_k, None)
+        else:
+            os.environ[_k] = _v
+
+# ---------------------------------------------------------------- permission: a member or collaborator is trusted only with write access
+PERM_ENV = ("ARCHITECT_GH_REVIEWS_CMD", "PATH")
+_perm_saved = {k: os.environ.get(k) for k in PERM_ENV}
+PERM_CALLS = os.path.join(TMP, "perm-calls.txt")
+PERM_WORDS = {"rita": "read", "tess": "triage", "will": "write", "mae": "maintain", "ada": "admin"}
+
+
+def perm_stub(**extra):
+    """A permission seam that records each login it is asked about; a login with no word fails the read."""
+    if os.path.isfile(PERM_CALLS):
+        os.remove(PERM_CALLS)
+    cases = " ".join(f"{login}) echo {word};;" for login, word in {**PERM_WORDS, **extra}.items())
+    os.environ["ARCHITECT_GH_PERM_CMD"] = f"echo \"$1\" >> {PERM_CALLS}; case \"$1\" in {cases} *) exit 1;; esac"
+
+
+def perm_calls():
+    return read_file(PERM_CALLS).splitlines() if os.path.isfile(PERM_CALLS) else []
+
+
+try:
+    for login, assoc, want in (("rita", "COLLABORATOR", False), ("tess", "COLLABORATOR", False), ("will", "COLLABORATOR", True),
+                               ("mae", "MEMBER", True), ("ada", "MEMBER", True)):
+        perm_stub()
+        tr, un = gates._review_items({}, {}, {"comments": {"nodes": [by("P1", assoc, login=login)]}}, set())
+        ok = (un == [] and [i.get("body") for i in tr] == [SENTINEL]) if want else (tr == [] and len(un) == 1 and "body" not in un[0] and no_sentinel(un))
+        check(f"permission: a {assoc} with {PERM_WORDS[login]} -> {'trusted with its body' if want else 'untrusted, no body'}, one lookup",
+              ok and perm_calls() == [login], (tr, un, perm_calls()))
+    for assoc, want in (("OWNER", True), ("NONE", False), ("CONTRIBUTOR", False), (None, False)):
+        perm_stub()
+        tr, un = gates._review_items({}, {}, {"comments": {"nodes": [by("P1", assoc, login="will")]}}, set())
+        check(f"permission: association {assoc or '(missing)'} -> {'trusted' if want else 'untrusted'} with no lookup",
+              perm_calls() == [] and len(tr if want else un) == 1 and (un if want else tr) == [], (tr, un, perm_calls()))
+
+    perm_stub()
+    reviews(comments=[by("P2", "COLLABORATOR", login="fay"), by("P3", "COLLABORATOR", login="fay")])
+    u = gates.review_poll(base_state(**WATCH))
+    check("permission: a failed read -> untrusted for this poll, read once, not cached",
+          u.get("review_status") == "comments" and u.get("review_items") == [] and [i["id"] for i in u.get("review_untrusted", [])] == ["comment:P2", "comment:P3"]
+          and perm_calls() == ["fay"] and "review_permissions" not in u and no_sentinel(u), (u, perm_calls()))
+    perm_stub(fay="write")
+    u = gates.review_poll(base_state(**WATCH))
+    check("permission: a later successful read -> trusted and cached",
+          [i["id"] for i in u.get("review_items", [])] == ["comment:P2", "comment:P3"] and u.get("review_untrusted") == []
+          and u.get("review_permissions") == {"fay": "write"} and perm_calls() == ["fay"], (u, perm_calls()))
+
+    perm_stub()
+    reviews(comments=[by("P4", "COLLABORATOR", login="will", body="rename it")])
+    u1 = gates.review_poll(base_state(**WATCH, review_permissions={"ada": "admin"}))
+    u2 = gates.review_poll(base_state(**WATCH, review_permissions=u1.get("review_permissions", {})))
+    check("permission: two polls with the same login -> one lookup; review_permissions carries it merged with the earlier cache",
+          perm_calls() == ["will"] and u1.get("review_permissions") == {"ada": "admin", "will": "write"} and "review_permissions" not in u2
+          and [i.get("body") for i in u2.get("review_items", [])] == ["rename it"], (u1, u2, perm_calls()))
+
+    THREE = [by("P5", "COLLABORATOR", login="rita"), by("P6", "COLLABORATOR", login="will", body="w"), by("P7", "MEMBER", login="mae", body="m")]
+    perm_stub()
+    reviews(comments=THREE)
+    u1 = gates.review_poll(base_state(**WATCH))
+    check("permission: three uncached logins in one poll -> two lookups, pending -> review_poll, deferral ledgered, nothing seen or classified",
+          perm_calls() == ["rita", "will"] and u1.get("review_status") == "pending" and u1.get("_next") == "review_poll"
+          and ledgered(u1, "review-watch: PR #99 permission lookups deferred: 1 login(s)") and u1.get("review_permissions") == {"rita": "read", "will": "write"}
+          and not {"review_items", "review_untrusted", "review_seen", "escalation"} & set(u1), (u1, perm_calls()))
+    u2 = gates.review_poll(base_state(**WATCH, review_permissions=u1.get("review_permissions", {})))
+    check("permission: the next poll with the cache reads only the third login and classifies every item",
+          perm_calls() == ["rita", "will", "mae"] and u2.get("review_status") == "comments"
+          and [i["id"] for i in u2.get("review_items", [])] == ["comment:P6", "comment:P7"]
+          and [i["id"] for i in u2.get("review_untrusted", [])] == ["comment:P5"], (u2, perm_calls()))
+    perm_stub()
+    reviews(comments=THREE[1:])
+    u = gates.review_poll(base_state(**WATCH))
+    check("permission: exactly PERM_LOOKUPS_PER_POLL uncached logins -> all read and classified in the same poll",
+          perm_calls() == ["will", "mae"] and u.get("review_status") == "comments" and len(u.get("review_items", [])) == 2, (u, perm_calls()))
+
+    for login, want in (("rita", "pending"), ("will", "approved")):
+        perm_stub()
+        reviews(reviews_=[{"id": "R9", "state": "APPROVED", "body": "", "authorAssociation": "COLLABORATOR", "author": {"login": login}, "commit": {"oid": "h2"}}])
+        u = gates.review_poll(base_state(**WATCH))
+        check(f"permission: empty reviewDecision + an APPROVED review on head by a COLLABORATOR with {PERM_WORDS[login]} -> {want}",
+              u.get("review_status") == want and perm_calls() == [login], (u.get("review_status"), perm_calls()))
+
+    perm_stub()
+    MARKED_BY_READER = by("P8", "COLLABORATOR", body=f"x {gates.OWN_MARKER}", login="rita")
+    tr, un = gates._review_items({}, {}, {"comments": {"nodes": [MARKED_BY_READER]}}, set())
+    check("permission: a read-only COLLABORATOR's comment carrying the own marker is not own -> an untrusted item",
+          not gates._own_comment({}, {}, MARKED_BY_READER) and tr == [] and [i["id"] for i in un] == ["comment:P8"], (tr, un))
+
+    os.environ.pop("ARCHITECT_GH_PERM_CMD")
+    os.environ["PATH"] = os.path.join(TMP, "fakebin") + os.pathsep + _perm_saved["PATH"]
+    seam_calls()
+    got = gates._permission(base_state(), {}, "will")
+    check("permission: with no seam, the read is gh api on the collaborator permission endpoint; an empty answer -> ''",
+          got == "" and seam_calls() == ["gh api repos/{owner}/{repo}/collaborators/will/permission --jq .permission"], got)
+
+    OPEN_PR = ast.get_source_segment(GATES_SRC, next(n for n in GATES_AST.body if isinstance(n, ast.FunctionDef) and n.name == "open_pr"))
+    check("permission: the open_pr seam comment names ARCHITECT_GH_PERM_CMD and its login arg",
+          re.search(r"# ARCHITECT_GH_\{[A-Z,]*\bPERM\b[A-Z,]*\}_CMD", OPEN_PR) and "perm the reviewer login" in OPEN_PR)
+    check("permission: PERM_LOOKUPS_PER_POLL is 2 and the review_poll node timeout covers the sleep, the review read and every lookup",
+          _lib.PERM_LOOKUPS_PER_POLL == 2 and NODES["review_poll"]["timeout"] > REVIEW_POLL_SLEEP + (1 + _lib.PERM_LOOKUPS_PER_POLL) * GH_CALL_SECS,
+          NODES["review_poll"]["timeout"])
+    check("permission: review_permissions seeded empty in initial_state", SEEDS.get("review_permissions") == {})
+finally:
+    os.environ.pop("ARCHITECT_GH_PERM_CMD", None)
+    for _k, _v in _perm_saved.items():
         if _v is None:
             os.environ.pop(_k, None)
         else:

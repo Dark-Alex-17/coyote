@@ -356,6 +356,7 @@ initial_state:
   review_items: []
   review_truncated: []
   review_untrusted: []
+  review_permissions: {}
   review_seen: []
   review_watching: false
   review_after: ''

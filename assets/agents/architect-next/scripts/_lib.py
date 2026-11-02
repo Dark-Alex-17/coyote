@@ -43,6 +43,7 @@ REVIEW_WALL_SECS = 86400  # review watch: one day without approval escalates
 REVIEW_MAX_POLLS = REVIEW_WALL_SECS // REVIEW_POLL_SLEEP  # review polls cap, derived (144)
 REVIEW_MAX_ROUNDS = STRIKE_LIMIT  # review fix rounds per PR
 REVIEW_UPDATE_BUDGET = 600  # review_update: seconds of thread replies before the rest wait for the next round
+PERM_LOOKUPS_PER_POLL = 2  # review_poll: uncached permission reads per poll, so the sleep plus every gh call fits the node timeout
 POLL_VISIT_BUDGET = 950   # below settings.max_loop_iterations so the watch stops by name before the engine cap
 PR_TRACKING_ENUM = ("ci", "review")
 VERIFY_CMD_SECS = 900     # gauntlet: each verification command <= 15 min
