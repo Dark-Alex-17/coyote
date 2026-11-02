@@ -8,7 +8,8 @@ use std::io::{Write, stdout};
 pub fn read_single_key(valid_chars: &[char], default: char, prompt: &str) -> Result<char> {
     if crate::tui::active() {
         return Err(anyhow::anyhow!(
-            "Keyboard prompts are not available in the TUI"
+            "Keyboard prompts are not available in the TUI; unanswered: {}",
+            prompt.trim()
         ));
     }
     print!("{prompt}");

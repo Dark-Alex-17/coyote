@@ -2652,8 +2652,9 @@ mod tests {
 
     /// Every direct keyboard read outside this module: crossterm's
     /// `read`/`poll`, `read_single_key`, `edit_file` (which hands the tty
-    /// to `$EDITOR`), and inquire's prompt builders (nothing else under
-    /// `src/` constructs a `Text`, `Select` or the like).
+    /// to `$EDITOR`), `run_command` (a child on the inherited tty), and
+    /// inquire's prompt builders (nothing else under `src/` constructs a
+    /// `Text`, `Select` or the like).
     fn keyboard_readers() -> Vec<KeyboardReader> {
         fn at_word_start(line: &str, at: usize) -> bool {
             line[..at]
@@ -2661,11 +2662,12 @@ mod tests {
                 .next_back()
                 .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
         }
-        const NEEDLES: [&str; 9] = [
+        const NEEDLES: [&str; 10] = [
             "event::read(",
             "event::poll(",
             "read_single_key(",
             "edit_file(",
+            "run_command(",
             "Confirm::new(",
             "Select::new(",
             "MultiSelect::new(",
@@ -2736,6 +2738,7 @@ mod tests {
             "the REPL's Prompter; the TUI seats TuiPrompter on ctx.prompter instead";
         const VIA_GATE: &str = "calls read_single_key, which refuses under the TUI";
         const VIA_EDIT_GATE: &str = "calls edit_file, which refuses under the TUI";
+        const VIA_RUN_GATE: &str = "calls run_command, which refuses under the TUI";
         const REPL_PAINTER: &str =
             "polled by the spinner and the REPL stream painter, both replaced under the TUI";
         let allowlist: &[(&str, &str, &str)] = &[
@@ -2860,6 +2863,7 @@ mod tests {
                 "run_repl_command_with_prefix",
                 DIRECT_TTY,
             ),
+            ("src/repl/mod.rs", "handle_shell_passthrough", VIA_RUN_GATE),
             (
                 "src/utils/abort_signal.rs",
                 "drain_terminal_events",
@@ -2969,6 +2973,20 @@ mod tests {
             std::path::Path::new("/dev/null"),
         )
         .unwrap_err();
+        assert!(
+            err.to_string().contains("not available in the TUI"),
+            "{err}"
+        );
+    }
+
+    /// `!cmd` is refused the same way: no shell is spawned onto the raw
+    /// tty and the capture pipe (the name given is not a program at all).
+    #[test]
+    #[serial]
+    fn run_command_refuses_under_the_tui_without_spawning_a_child() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&TUI_ACTIVE, true);
+        let err = crate::utils::run_command("definitely-not-a-shell-x7x", &["-c", "true"], None)
+            .unwrap_err();
         assert!(
             err.to_string().contains("not available in the TUI"),
             "{err}"

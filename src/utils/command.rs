@@ -78,7 +78,21 @@ pub fn detect_shell() -> Shell {
     Shell::new(name, cmd, shell_arg)
 }
 
+/// Runs `cmd` on the inherited descriptors and returns its exit code. The
+/// shell passthrough and `-e` come through here, so under the TUI, where
+/// the child would inherit a raw tty and the capture pipe, it refuses.
 pub fn run_command<T: AsRef<OsStr>>(
+    cmd: &str,
+    args: &[T],
+    envs: Option<HashMap<String, String>>,
+) -> Result<i32> {
+    if crate::tui::active() {
+        bail!("Shell passthrough is not available in the TUI yet");
+    }
+    wait_for_status(cmd, args, envs)
+}
+
+fn wait_for_status<T: AsRef<OsStr>>(
     cmd: &str,
     args: &[T],
     envs: Option<HashMap<String, String>>,
@@ -155,7 +169,9 @@ pub fn run_loader_command(path: &str, extension: &str, loader_command: &str) -> 
         }
         Ok(stdout)
     } else {
-        let status = run_command(cmd, args, None).with_context(|| {
+        // A loader writes to its output file and reads nothing from the
+        // keyboard, so it stays usable under the TUI.
+        let status = wait_for_status(cmd, args, None).with_context(|| {
             format!("Unable to run `{cmd_eval}`, Perhaps '{cmd}' is not installed?")
         })?;
         if status != 0 {
@@ -169,7 +185,7 @@ pub fn run_loader_command(path: &str, extension: &str, loader_command: &str) -> 
 
 pub fn edit_file(editor: &str, path: &Path) -> Result<()> {
     if crate::tui::active() {
-        bail!("Editing files is not available in the TUI yet; use Ctrl+O to edit the composer");
+        bail!("Editing files is not available in the TUI yet");
     }
     let mut child = Command::new(editor).arg(path).spawn()?;
     child.wait()?;
