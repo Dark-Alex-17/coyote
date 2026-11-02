@@ -85,6 +85,7 @@ impl Notification {
     /// `NOTIFICATION_LINE_MAX_CHARS`, blank lines gone. Past `NOTIFICATION_MAX_LINES` the
     /// rest collapses into a count. Text that renders to nothing still yields the bare
     /// prefix so the event is never silent.
+    #[cfg(test)]
     pub(crate) fn render_lines(&self) -> Vec<String> {
         self.render_marked_lines()
             .into_iter()
@@ -141,6 +142,7 @@ impl RenderedNotification {
         self.source
     }
 
+    #[cfg(test)]
     pub(crate) fn lines(&self) -> &[String] {
         &self.lines
     }
