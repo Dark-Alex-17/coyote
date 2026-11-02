@@ -948,13 +948,26 @@ check("pr_tracking review: ci_poll one below REVIEW_CI_POLL_CEILING still reads 
       gates.ci_poll(rs(ci_polls=0, ci_started_at=_now, ci_polls_run=_lib.REVIEW_CI_POLL_CEILING - 2))["ci_status"] == "green")
 check("pr_tracking ci: ci_poll never poll_caps",
       gates.ci_poll(base_state(git_report="pull/5", ci_polls=0, ci_started_at=_now, ci_polls_run=500))["ci_status"] == "green")
+u = gates.ci_poll(rs(ci_polls=0, ci_started_at=_now, ci_polls_run=500, **_pre_flip))
+check("pr_tracking review: ci_poll before the flip counts no ci_polls_run and never poll_caps",
+      "ci_polls_run" not in u and u["ci_status"] == "green")
+u = gates.ci_route(rs(ci_status="poll_cap", ci_polls_run=500, **_pre_flip))
+check("pr_tracking review: ci_route poll_cap before the flip raises no Review watch text",
+      "Review watch" not in json.dumps(u) and not any("review-watch" in d for d in u.get("decisions", [])))
+u = aa("ci_poll_cap", "Stop watching and report", pr_tracking="review")
+check("pr_tracking review: apply_answer ci_poll_cap before the flip -> the CI watch follow-up",
+      u["_next"] == "final_report" and "Review watch" not in json.dumps(u)
+      and u["follow_ups"] == [f"CI watch stopped: the run's CI polls reached the ceiling ({_lib.REVIEW_CI_POLL_CEILING})"])
+u = aa("ci_poll_cap", "Stop watching and report")
+check("pr_tracking ci: apply_answer ci_poll_cap -> the CI watch follow-up",
+      u["follow_ups"] == [f"CI watch stopped: the run's CI polls reached the ceiling ({_lib.REVIEW_CI_POLL_CEILING})"])
 u = gates.ci_route(rs(ci_status="poll_cap", ci_polls_run=_lib.REVIEW_CI_POLL_CEILING))
 check("pr_tracking review: ci_route poll_cap -> ci_poll_cap escalation naming the ceiling and the count + ledger",
       u["escalation"]["kind"] == "ci_poll_cap" and f"({_lib.REVIEW_CI_POLL_CEILING}) after {_lib.REVIEW_CI_POLL_CEILING} poll(s)" in u["escalation"]["question"]
       and [(o["text"], o["recommended"]) for o in u["escalation"]["options"]] == [("Stop watching and report", True)]
       and "review-watch: PR #7 stop: ci_poll_cap" in u["decisions"])
-u = aa("ci_poll_cap", "Stop watching and report")
-check("pr_tracking review: apply_answer ci_poll_cap -> final_report with the ceiling follow-up",
+u = gates.apply_answer(rs(escalation=escalation("ci_poll_cap", "q", []), last_answer="Stop watching and report"))
+check("pr_tracking review: apply_answer ci_poll_cap after the flip -> final_report with the ceiling follow-up",
       u["_next"] == "final_report"
       and u["follow_ups"] == [f"Review watch stopped: the run's CI polls reached REVIEW_CI_POLL_CEILING ({_lib.REVIEW_CI_POLL_CEILING})"])
 u = gates.pr_gate(rs(git_actions={"commit": True, "push": True, "open_pr": True}, pr_review_pending=[]))
@@ -977,6 +990,42 @@ os.environ["SISYPHUS_GH_RERUN_CMD"] = f"echo \"rerun $SISYPHUS_RUN_ID\" >> '{_SE
 u = gates.ci_apply(rs(ci_verdict="flake", ci_failing=[["build", "https://github.com/o/r/actions/runs/4242/job/1"]], ci_reruns={}))
 check("pr_tracking review: ci_apply flake re-runs through SISYPHUS_GH_RERUN_CMD",
       open(_SEAM_LOG).read() == "log 4242\nrerun 4242\n" and u["_next"] == "ci_poll" and u["ci_reruns"] == {"build": 1})
+_RUN_CALLS = os.path.join(TMP, "run-calls.txt")
+
+
+def run_calls():
+    if not os.path.exists(_RUN_CALLS):
+        return []
+    with open(_RUN_CALLS) as fh:
+        calls = fh.read().split()
+    os.remove(_RUN_CALLS)
+    return calls
+
+
+def run_link(run_id):
+    return f"https://github.com/o/r/actions/runs/{run_id}/job/1"
+
+
+os.environ["SISYPHUS_GH_RUN_LOG_CMD"] = f"echo \"$SISYPHUS_RUN_ID\" >> '{_RUN_CALLS}'; echo \"log-of-$SISYPHUS_RUN_ID\""
+u = gates.ci_route(base_state(ci_status="red", ci_failing=[["build", run_link(11)], ["lint", run_link(11)], ["test", run_link(22)]]))
+_ev = u["ci_evidence"]
+check("pr_tracking ci: ci_route red fetches each distinct run's failed log once and heads every check",
+      run_calls() == ["11", "22"] and all(f"### {n}\n" in _ev for n in ("build", "lint", "test"))
+      and _ev.count("log-of-11") == 1 and "(failed log of run 11 is above)" in _ev and u["_next"] == "ci_diagnose")
+u = gates.ci_route(rs(ci_status="red", ci_failing=[[f"c{i}", run_link(i)] for i in range(1, 6)]))
+_ev = u["ci_evidence"]
+check("pr_tracking review: ci_route red fetches at most CI_LOG_RUNS_MAX run logs and notes the rest",
+      run_calls() == [str(i) for i in range(1, _lib.CI_LOG_RUNS_MAX + 1)] and all(f"### c{i}\n" in _ev for i in range(1, 6))
+      and _ev.count("(log not fetched: CI_LOG_RUNS_MAX reached)") == 5 - _lib.CI_LOG_RUNS_MAX)
+os.environ["SISYPHUS_GH_RERUN_CMD"] = f"echo \"$SISYPHUS_RUN_ID\" >> '{_RUN_CALLS}'"
+u = gates.ci_apply(base_state(ci_verdict="flake", ci_failing=[["build", run_link(33)], ["lint", run_link(33)]], ci_reruns={}))
+check("pr_tracking ci: ci_apply flake re-runs a shared run once and bumps ci_reruns for every check",
+      run_calls() == ["33"] and u["ci_reruns"] == {"build": 1, "lint": 1} and u["_next"] == "ci_poll"
+      and all(f"flake-rerun: {n} (re-run 1/{CI_FLAKE_RERUNS})" in u["decisions"] for n in ("build", "lint")))
+u = gates.ci_apply(rs(ci_verdict="flake", ci_failing=[[f"c{i}", run_link(i)] for i in range(1, 6)], ci_reruns={}))
+check("pr_tracking review: ci_apply flake re-runs at most CI_LOG_RUNS_MAX runs",
+      run_calls() == [str(i) for i in range(1, _lib.CI_LOG_RUNS_MAX + 1)]
+      and u["ci_reruns"] == {f"c{i}": 1 for i in range(1, 6)})
 os.environ.pop("SISYPHUS_GH_RUN_LOG_CMD")
 os.environ.pop("SISYPHUS_GH_RERUN_CMD")
 
@@ -1217,6 +1266,37 @@ check("pr_tracking review: node timeouts cover their sleep plus one GH_CALL_SECS
       _lib.REVIEW_POLL_SLEEP + _lib.GH_CALL_SECS < node_timeout("pr_review_poll")
       and _lib.CI_POLL_SLEEP + _lib.GH_CALL_SECS < node_timeout("ci_poll")
       and _lib.RESOLVE_DEADLINE_SECS + _lib.GH_CALL_SECS < node_timeout("pr_review_resolve"))
+check("pr_tracking ci: ci_route and ci_apply timeouts cover CI_LOG_RUNS_MAX GH_CALL_SECS calls",
+      node_timeout("ci_route") > _lib.CI_LOG_RUNS_MAX * _lib.GH_CALL_SECS
+      and node_timeout("ci_apply") > _lib.CI_LOG_RUNS_MAX * _lib.GH_CALL_SECS)
+_stale = {"ci_status": "red", "ci_failing": [["build", ""]]}
+_starts = {
+    "pr_review_resolve": gates.pr_review_resolve(rs(pr_review_pending=[], **_stale)),
+    "ci_gate push_fix": gates.ci_gate(rs(git_task={"kind": "push_fix", "return_to": "ci_gate"}, **_stale)),
+    "the first watch start": gates.ci_gate(base_state(
+        pr_tracking="review", git_task={"kind": "publish", "return_to": "ci_gate", "open_pr": True}, delegated=False,
+        git_report="opened https://github.com/o/r/pull/7", **_stale)),
+    "a flake re-run": gates.ci_apply(rs(ci_verdict="flake", ci_reruns={}, **_stale)),
+    "a keep-waiting answer": aa("ci_exhausted", "Keep waiting (re-run the watch)", **_stale),
+}
+for _start, u in _starts.items():
+    check(f"pr_tracking review: {_start} resets ci_status and ci_failing",
+          u["_next"] == "ci_poll" and u["ci_status"] == "" and u["ci_failing"] == [], _start)
+u = gates.ci_route(rs(ci_status="green", last_script_error="timeout after 180s", ci_poll_fails=0))
+check("pr_tracking review: a stale green after a ci_poll node error is one read failure and a retry",
+      u["_next"] == "ci_poll" and u["ci_poll_fails"] == 1 and u["last_script_error"] == ""
+      and "review-watch: PR #7 CI read failed (poll node error); retry" in u["decisions"] and "escalation" not in u)
+u = gates.ci_route(rs(ci_status="green", last_script_error="killed", ci_poll_fails=CI_POLL_FAILS - 1))
+check("pr_tracking review: a ci_poll node error at CI_POLL_FAILS -> the review poll_error escalation",
+      u["_next"] == "escalate_gate" and u["ci_poll_fails"] == CI_POLL_FAILS and u["escalation"]["kind"] == "ci_exhausted"
+      and u["escalation"]["question"]
+      == "Review watch stopped: CI watch ended without a verdict (poll_error). Keep waiting, or stop watching?"
+      and "review-watch: PR #7 CI read failed (poll node error); retry" in u["decisions"]
+      and "review-watch: PR #7 stop: ci_poll_error" in u["decisions"])
+u = gates.ci_route(base_state(ci_status="green", last_script_error="killed", ci_poll_fails=0))
+check("pr_tracking ci: a ci_poll node error keeps the status routing",
+      u["_next"] == "git_ops" and u["git_task"]["kind"] == "flip_ready" and "ci_poll_fails" not in u
+      and not any("review-watch" in d for d in u["decisions"]))
 review_doc(decision="APPROVED")
 code, out = run_entry("pr_review_poll", rs())
 check("entry: pr_review_poll via GRAPH_STATE", code == 0 and out["pr_review_status"] == "approved")
