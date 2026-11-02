@@ -319,6 +319,8 @@ const ENTER_ALT: &[u8] = b"\x1b[?1049h";
 const LEAVE_ALT: &[u8] = b"\x1b[?1049l";
 const PASTE_ON: &[u8] = b"\x1b[?2004h";
 const PASTE_OFF: &[u8] = b"\x1b[?2004l";
+const CURSOR_HIDE: &[u8] = b"\x1b[?25l";
+const CURSOR_SHOW: &[u8] = b"\x1b[?25h";
 
 fn find(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     haystack[from.min(haystack.len())..]
@@ -336,6 +338,22 @@ fn count(haystack: &[u8], needle: &[u8]) -> usize {
         .windows(needle.len())
         .filter(|w| *w == needle)
         .count()
+}
+
+/// The UI hides the cursor on every frame and never positions one, so
+/// the only `show` is the leave sequence's: it must come after the last
+/// `hide` and before `before`, the offset at which the shell or the
+/// wrapper's report took over the terminal.
+fn assert_cursor_shown_before(raw: &[u8], before: usize, what: &str) {
+    let window = &raw[..before];
+    let shown = rfind(window, CURSOR_SHOW)
+        .unwrap_or_else(|| panic!("the cursor was never shown before {what}"));
+    let hidden = rfind(window, CURSOR_HIDE);
+    assert!(
+        hidden.is_none_or(|hidden| hidden < shown),
+        "the cursor was hidden again after it was shown, before {what} \
+         (hide={hidden:?}, show={shown})"
+    );
 }
 
 /// Kitty keyboard push (`ESC [ > <flags> u`) or pop (`ESC [ < <count> u`),
@@ -518,6 +536,7 @@ fn suspend_and_check_handback(pty: &mut Pty, before_suspend: usize) -> usize {
         find(pty.raw(), PASTE_OFF, before_suspend).is_some_and(|off| off < stopped_marker),
         "bracketed paste was still enabled when the shell got the terminal back"
     );
+    assert_cursor_shown_before(pty.raw(), stopped_marker, "the shell regained the terminal");
     let flags = stopped
         .lines()
         .find_map(|line| line.strip_prefix("stopped-tty-flags: "))
@@ -1724,6 +1743,8 @@ fn sigterm_during_a_running_tool_still_leaves_the_tty_cooked() {
         find(pty.raw(), LEAVE_ALT, signalled_at.saturating_sub(16)).is_some(),
         "SIGTERM during the tool never left the alternate screen:\n{transcript}"
     );
+    let exit_line = find(pty.raw(), b"exit=", signalled_at).expect("the wrapper reported the exit");
+    assert_cursor_shown_before(pty.raw(), exit_line, "the exit report");
     assert!(
         took < Duration::from_secs(5),
         "the exit waited the tool out instead of aborting it: {took:?}"

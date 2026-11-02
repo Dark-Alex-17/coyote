@@ -5,6 +5,7 @@
 //! descriptor before the default hook prints.
 
 use anyhow::Result;
+use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -47,6 +48,10 @@ static PANIC_HOOK: Once = Once::new();
 pub(crate) enum TerminalStep {
     RawMode(bool),
     AlternateScreen(bool),
+    /// Ratatui hides the cursor on every frame and only shows it again
+    /// from `Terminal`'s Drop, which a hard exit, a suspend and the panic
+    /// hook never reach; the leave sequence shows it itself.
+    CursorHidden(bool),
     BracketedPaste(bool),
     MouseCapture(bool),
     KeyboardEnhancement(bool),
@@ -58,6 +63,7 @@ impl TerminalStep {
         match self {
             Self::RawMode(on) => Self::RawMode(!on),
             Self::AlternateScreen(on) => Self::AlternateScreen(!on),
+            Self::CursorHidden(on) => Self::CursorHidden(!on),
             Self::BracketedPaste(on) => Self::BracketedPaste(!on),
             Self::MouseCapture(on) => Self::MouseCapture(!on),
             Self::KeyboardEnhancement(on) => Self::KeyboardEnhancement(!on),
@@ -70,6 +76,8 @@ impl TerminalStep {
             Self::RawMode(false) => disable_raw_mode(),
             Self::AlternateScreen(true) => execute!(writer, EnterAlternateScreen),
             Self::AlternateScreen(false) => execute!(writer, LeaveAlternateScreen),
+            Self::CursorHidden(true) => execute!(writer, Hide),
+            Self::CursorHidden(false) => execute!(writer, Show),
             Self::BracketedPaste(true) => execute!(writer, EnableBracketedPaste),
             Self::BracketedPaste(false) => execute!(writer, DisableBracketedPaste),
             Self::MouseCapture(true) => execute!(writer, EnableMouseCapture),
@@ -90,6 +98,7 @@ pub(crate) fn enter_sequence(enhancement: bool) -> Vec<TerminalStep> {
     let mut steps = vec![
         TerminalStep::RawMode(true),
         TerminalStep::AlternateScreen(true),
+        TerminalStep::CursorHidden(true),
         TerminalStep::BracketedPaste(true),
         TerminalStep::MouseCapture(true),
     ];
@@ -431,7 +440,8 @@ mod tests {
             assert_eq!(mirrored, enter);
             assert_eq!(enter[0], TerminalStep::RawMode(true));
             assert_eq!(enter[1], TerminalStep::AlternateScreen(true));
-            assert_eq!(enter[2], TerminalStep::BracketedPaste(true));
+            assert_eq!(enter[2], TerminalStep::CursorHidden(true));
+            assert_eq!(enter[3], TerminalStep::BracketedPaste(true));
             assert_eq!(*leave.last().unwrap(), TerminalStep::RawMode(false));
         }
         assert_eq!(
@@ -485,8 +495,8 @@ mod tests {
     }
 
     /// `leave` undoes an `enter` once: the full mirror on the first call
-    /// (pop, then the modes, then the alternate screen), nothing on the
-    /// second.
+    /// (pop, then the modes, then the cursor shown inside the alternate
+    /// screen before it is left), nothing on the second.
     #[test]
     #[serial]
     fn leave_restores_once_and_is_silent_afterwards() {
@@ -497,6 +507,8 @@ mod tests {
         assert_eq!(count(&out, b"\x1b[?1049l"), 1, "{out:?}");
         assert_eq!(count(&out, b"\x1b[<1u"), 1, "{out:?}");
         assert!(find(&out, b"\x1b[<1u") < find(&out, b"\x1b[?1049l"));
+        assert_eq!(count(&out, b"\x1b[?25h"), 1, "{out:?}");
+        assert!(find(&out, b"\x1b[?25h") < find(&out, b"\x1b[?1049l"));
         assert!(!SCREEN_ENTERED.load(Ordering::SeqCst));
         assert!(!ENHANCEMENT_PUSHED.load(Ordering::SeqCst));
 
