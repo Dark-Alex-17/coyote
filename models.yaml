@@ -923,9 +923,9 @@
   - name: gemma-4-26b-a4b-it
     type: chat
     max_input_tokens: 262144
-    input_price: 0.02
-    output_price: 0.06
-    cache_read_price: 0.01
+    input_price: 0.064
+    output_price: 0.193
+    cache_read_price: 0.032
     max_output_tokens: 32768
     supports_vision: true
     supports_function_calling: true
@@ -8483,9 +8483,9 @@
   - name: google/gemma-4-26b-a4b-it
     type: chat
     max_input_tokens: 262144
-    input_price: 0.02
-    output_price: 0.06
-    cache_read_price: 0.01
+    input_price: 0.064
+    output_price: 0.193
+    cache_read_price: 0.032
     max_output_tokens: 32768
     supports_vision: true
     supports_function_calling: true
@@ -8665,9 +8665,9 @@
   - name: meta-llama/llama-3.2-3b-instruct
     type: chat
     max_input_tokens: 131072
-    input_price: 0.05
-    output_price: 0.33
-    max_output_tokens: 117964
+    input_price: 0.0509
+    output_price: 0.335
+    max_output_tokens: 72000
   - name: meta-llama/llama-3.3-70b-instruct
     type: chat
     max_input_tokens: 131072
@@ -8759,7 +8759,7 @@
     input_price: 1.25
     output_price: 4.25
     cache_read_price: 0.15
-    max_output_tokens: 131072
+    max_output_tokens: 943718
     supports_vision: true
     supports_function_calling: true
   - name: meta/muse-wonder
@@ -8841,9 +8841,9 @@
   - name: minimax/minimax-m3.1-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.075
-    output_price: 0.3
-    cache_read_price: 0.0075
+    input_price: 0.15
+    output_price: 0.6
+    cache_read_price: 0.015
     max_output_tokens: 524288
     supports_vision: true
     supports_function_calling: true
@@ -10483,8 +10483,8 @@
   - name: qwen/qwen3-coder-30b-a3b-instruct
     type: chat
     max_input_tokens: 262144
-    input_price: 0.15
-    output_price: 0.6
+    input_price: 0.07
+    output_price: 0.28
     max_output_tokens: 235929
     supports_function_calling: true
   - name: qwen/qwen3-coder-flash
@@ -10694,7 +10694,7 @@
     supports_function_calling: true
   - name: qwen/qwen3.8-27b
     type: chat
-    max_input_tokens: 1000000
+    max_input_tokens: 1024000
     input_price: 0.15
     output_price: 1.875
     cache_read_price: 0.0375
