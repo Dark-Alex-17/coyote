@@ -213,7 +213,7 @@ impl LibraryHandler {
                         // The library has already warned about the refusal.
                         ResponseOutcome::TooLarge { len, max } => {
                             debug!(
-                                "Mesh response {request_id} on link {} was refused: {len} bytes over the {max} byte response cap",
+                                "Mesh response {request_id} on link {} was refused: it is {len} bytes and the response cap is {max} bytes",
                                 link_id.to_hex_string()
                             );
                             drop_unsent(settlement);
