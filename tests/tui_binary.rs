@@ -50,12 +50,13 @@ fn fresh_config_dir(scenario: &str) -> PathBuf {
 /// A dry-run config that never asks to save a session, so every exit path
 /// is prompt-free. Paths land in single-quoted YAML scalars.
 fn write_dry_run_config(dir: &Path) {
-    write_config(dir, Some("save_session: false\n"));
+    write_config(dir, "save_session: false\n");
 }
 
-/// The same config with `save_session` left to the caller: `None` leaves
-/// it unset, so a dirty session asks "Save session?" on `.exit session`.
-fn write_config(dir: &Path, save_session: Option<&str>) {
+/// The same config with `extra` top-level YAML appended by the caller;
+/// with `save_session` left unset a dirty session asks "Save session?"
+/// on `.exit session`.
+fn write_config(dir: &Path, extra: &str) {
     let vault_pass = dir.join("vault-pass");
     fs::write(&vault_pass, "test-password\n").unwrap();
     fs::write(
@@ -74,11 +75,10 @@ fn write_config(dir: &Path, save_session: Option<&str>) {
              \x20     - name: dry-model\n\
              \x20       max_input_tokens: 100000\n\
              \x20       supports_function_calling: true\n\
-             {save_session}\
+             {extra}\
              workspace_instructions: false\n\
              memory: false\n",
             vault_pass = vault_pass.display(),
-            save_session = save_session.unwrap_or(""),
         ),
     )
     .unwrap();
@@ -894,7 +894,7 @@ fn a_typed_prompt_gets_a_dry_run_reply_in_the_transcript() {
 fn exit_session_shows_the_save_modal_and_saves_on_y() {
     let dir = fresh_config_dir("exit-session");
     let _guard = TempDirGuard(dir.clone());
-    write_config(&dir, None);
+    write_config(&dir, "");
     let mut pty = spawn_tui(&dir, &[]);
 
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
@@ -1049,7 +1049,7 @@ fn without_a_tty_on_stdout_the_tui_refuses_to_start() {
 fn signal_during_the_save_modal(scenario: &str, signal: libc::c_int) {
     let dir = fresh_config_dir(scenario);
     let _guard = TempDirGuard(dir.clone());
-    write_config(&dir, None);
+    write_config(&dir, "");
     let mut pty = spawn_tui(&dir, &[]);
 
     let transcript = pty.wait_for("no session", PTY_DEADLINE).unwrap();
@@ -1285,7 +1285,7 @@ fn an_empty_enter_starts_no_turn_and_dot_exit_leaves_like_ctrl_d() {
 fn ctrl_d_on_a_dirty_session_asks_to_save_and_y_writes_it_before_leaving() {
     let dir = fresh_config_dir("ctrl-d-dirty");
     let _guard = TempDirGuard(dir.clone());
-    write_config(&dir, None);
+    write_config(&dir, "");
     let mut pty = spawn_tui(&dir, &[]);
 
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
@@ -1318,7 +1318,7 @@ fn ctrl_d_on_a_dirty_session_asks_to_save_and_y_writes_it_before_leaving() {
 fn declining_the_save_modal_closes_the_session_without_a_file() {
     let dir = fresh_config_dir("decline-save");
     let _guard = TempDirGuard(dir.clone());
-    write_config(&dir, None);
+    write_config(&dir, "");
     let mut pty = spawn_tui(&dir, &[]);
 
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
@@ -1574,6 +1574,75 @@ fn wait_for_file(pty: &mut Pty, path: &Path, what: &str) {
     }
 }
 
+/// A document loader (`$1` in, `$2` out) that marks its start next to the
+/// input, ignores SIGTERM and SIGINT, and sleeps well past the exit
+/// deadline. A loader runs under a plain blocking `status()` with no
+/// abort check, so this is a turn nothing can stop; a tool would not do,
+/// because the runner SIGKILLs an aborted tool and no trap survives that.
+const STUBBORN_LOADER: &str = "#!/usr/bin/env bash\n\
+    trap '' TERM INT\n\
+    : > \"$1.started\"\n\
+    sleep 30\n\
+    cp \"$1\" \"$2\"\n";
+
+/// A turn that does not stop when told to: the UI waits out
+/// `EXIT_CANCEL_WAIT` and then ends the process without it, still with
+/// the tty restored, the alternate screen left and a notice saying what
+/// was left behind. The exit is bounded: the wrapper's report lands
+/// within ten seconds of the kill.
+/// `sigterm_during_a_running_tool_still_leaves_the_tty_cooked` is the
+/// cooperating twin.
+#[test]
+#[serial]
+fn sigterm_during_a_turn_that_ignores_the_abort_leaves_it_behind_in_bounded_time() {
+    let dir = fresh_config_dir("sigterm-stubborn-turn");
+    let _guard = TempDirGuard(dir.clone());
+    let loader = dir.join("stubborn-loader.sh");
+    fs::write(&loader, STUBBORN_LOADER).unwrap();
+    let document = dir.join("doc.stub");
+    fs::write(&document, "stub document\n").unwrap();
+    let marker = dir.join("doc.stub.started");
+    write_config(
+        &dir,
+        &format!(
+            "save_session: false\n\
+             document_loaders:\n\
+             \x20 stub: 'bash {} $1 $2'\n",
+            loader.display()
+        ),
+    );
+    let mut pty = spawn_tui(&dir, &[]);
+
+    let transcript = pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let pid = child_pid(&transcript);
+    pty.send(format!(".file {}\r", document.display()).as_bytes())
+        .unwrap();
+    wait_for_file(&mut pty, &marker, "the stubborn loader's start marker");
+    let signalled_at = pty.raw().len();
+    let started = std::time::Instant::now();
+    // SAFETY: kill takes a pid and a signal number and touches no memory.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    let took = started.elapsed();
+
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+    assert!(
+        find(pty.raw(), LEAVE_ALT, signalled_at.saturating_sub(16)).is_some(),
+        "SIGTERM during the stubborn turn never left the alternate screen:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("did not stop within"),
+        "no notice said the turn was left behind:\n{transcript}"
+    );
+    let exit_line = find(pty.raw(), b"exit=", signalled_at).expect("the wrapper reported the exit");
+    assert_cursor_shown_before(pty.raw(), exit_line, "the exit report");
+    assert!(
+        took < Duration::from_secs(10),
+        "the exit was not bounded by the deadline: {took:?}"
+    );
+}
+
 /// Waits until `marker` is on screen with its surrounding whitespace
 /// squeezed out (a rendered markdown cell may wrap it), returning the
 /// transcript.
@@ -1704,7 +1773,9 @@ fn typing_while_a_tool_sleeps_reaches_the_composer_and_submits_afterwards() {
 /// cooked and the exit is orderly. The abort kills the tool, so the exit
 /// comes well inside `EXIT_CANCEL_WAIT` (5 s) rather than waiting out the
 /// tool's own eight-second give-up; a turn that did miss that deadline
-/// would be left behind and the process would still exit.
+/// would be left behind and the process would still exit, which
+/// `sigterm_during_a_turn_that_ignores_the_abort_leaves_it_behind_in_bounded_time`
+/// pins.
 #[test]
 #[serial]
 fn sigterm_during_a_running_tool_still_leaves_the_tty_cooked() {
