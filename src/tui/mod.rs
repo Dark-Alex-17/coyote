@@ -1976,54 +1976,83 @@ mod tests {
         });
     }
 
-    /// A tool sleeping on the work task never stalls the composer: keys
-    /// and a resize are handled and drawn while the tool is still running.
+    /// A tool sleeping on the work task never stalls the composer, even on
+    /// a runtime with a single worker: the frame timer fires, and the keys
+    /// and a resize handled meanwhile are drawn, while the tool is still
+    /// running. The tool goes through `spawn_work` like a real turn; had
+    /// it sat on the lone worker, the time driver would wait out the whole
+    /// sleep and the frame with it.
     #[cfg(unix)]
-    #[test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
-    fn the_composer_stays_responsive_while_a_tool_sleeps() {
-        run_async(async {
-            use crate::function::{ToolIo, run_llm_function};
-            use std::collections::HashMap;
-            use std::fs;
-            use std::os::unix::fs::PermissionsExt;
+    async fn the_composer_stays_responsive_while_a_tool_sleeps() {
+        use crate::function::{ToolIo, run_llm_function};
+        use std::collections::HashMap;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
 
-            let _guard = TestConfigDirGuard::new("tui-sleep");
-            let bin = crate::config::paths::functions_bin_dir();
-            fs::create_dir_all(&bin).unwrap();
-            let tool = bin.join("sleep_x7x");
-            fs::write(&tool, "#!/usr/bin/env bash\nsleep 2\n").unwrap();
-            fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        const SLEEP: Duration = Duration::from_secs(2);
+        let _guard = TestConfigDirGuard::new("tui-sleep");
+        let bin = crate::config::paths::functions_bin_dir();
+        fs::create_dir_all(&bin).unwrap();
+        let tool = bin.join("sleep_x7x");
+        fs::write(
+            &tool,
+            format!("#!/usr/bin/env bash\nsleep {}\n", SLEEP.as_secs()),
+        )
+        .unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
 
-            let (tx, _rx) = unbounded_channel();
-            let mut harness = Harness::standalone(80, 24);
-            harness.app.begin_turn("run the tool", false);
-            let started = Instant::now();
-            let handle = tokio::task::spawn_blocking(move || {
-                run_llm_function(
-                    "sleep_x7x".to_string(),
-                    vec![],
-                    HashMap::from([("TERM".to_string(), "dumb".to_string())]),
-                    None,
-                    None,
-                    ToolIo::new(Arc::new(TuiSink::new(tx)), None, 0),
-                    None,
-                )
-            });
-
-            harness.type_text("hello");
-            harness.draw();
-            harness.resize(60, 20);
-            let rendered = harness.draw();
-            let typed_at = started.elapsed();
-            assert!(!handle.is_finished(), "the tool finished in {typed_at:?}");
-            assert!(typed_at < Duration::from_secs(2), "{typed_at:?}");
-            assert_eq!(harness.app.composer_text(), "hello");
-            insta::assert_snapshot!("sleeping_tool_composer_responsive", rendered);
-
-            handle.await.unwrap().unwrap();
-            assert!(started.elapsed() >= Duration::from_secs(2));
+        // The frame timer is what is under test, so the app runs on the
+        // real clock rather than the harness's manual one.
+        let footer = FooterInfo {
+            model: "openai:test-model".to_string(),
+            ..FooterInfo::default()
+        };
+        let mut app = App::new(
+            Arc::new(SystemClock),
+            plain_config(),
+            Arc::new(PromptMemory::default()),
+            footer,
+        )
+        .unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let (tx, _rx) = unbounded_channel();
+        app.begin_turn("run the tool", false);
+        let started = Instant::now();
+        let handle = spawn_work(async move {
+            run_llm_function(
+                "sleep_x7x".to_string(),
+                vec![],
+                HashMap::from([("TERM".to_string(), "dumb".to_string())]),
+                None,
+                None,
+                ToolIo::new(Arc::new(TuiSink::new(tx)), None, 0),
+                None,
+            )
         });
+
+        for c in "hello".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        terminal.backend_mut().resize(60, 20);
+        app.handle_input(TermInput::Resize);
+        app.schedule_frame();
+        app.frames.next_frame().await;
+        let frame_at = started.elapsed();
+        assert!(
+            frame_at < SLEEP / 4,
+            "the frame waited {frame_at:?} on the sleeping tool"
+        );
+        assert!(!handle.is_finished(), "the tool finished in {frame_at:?}");
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        app.frames.frame_drawn();
+        let rendered = terminal.backend().to_string();
+        assert_eq!(app.composer_text(), "hello");
+        insta::assert_snapshot!("sleeping_tool_composer_responsive_60x20", rendered);
+
+        handle.await.unwrap().unwrap();
+        assert!(started.elapsed() >= SLEEP);
     }
 
     #[test]
