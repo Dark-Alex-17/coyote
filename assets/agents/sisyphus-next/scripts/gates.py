@@ -17,8 +17,8 @@ import time
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _lib import (  # noqa: E402
-    CI_FLAKE_RERUNS, CI_POLL_FAILS, CI_POLL_SLEEP, CI_WALL_SECS, CLARIFY_MAX, DELEGATED_RE, GH_CALL_SECS,
-    OWNER_POLL_MAX, OWNER_POLL_MINUTES, OWNER_REMOTE_INPUT, OWNER_WAIT_MINUTES, PROBE_HOUSE_NOTE,
+    CI_FLAKE_RERUNS, CI_LOG_RUNS_MAX, CI_POLL_FAILS, CI_POLL_SLEEP, CI_WALL_SECS, CLARIFY_MAX, DELEGATED_RE,
+    GH_CALL_SECS, OWNER_POLL_MAX, OWNER_POLL_MINUTES, OWNER_REMOTE_INPUT, OWNER_WAIT_MINUTES, PROBE_HOUSE_NOTE,
     QUALITY_RE, REASK_MAX, RERUN_ONCE, RESOLVE_DEADLINE_SECS, RESUME_RE, REVIEW_CI_POLL_BUDGET,
     REVIEW_CI_POLL_CEILING, REVIEW_MAX_POLLS, REVIEW_MAX_ROUNDS, REVIEW_POLL_SLEEP, REVIEW_WALL_SECS,
     STRIKE_LIMIT, SUBTASK_MAX, added_lines_since,
@@ -676,7 +676,8 @@ def apply_answer(state):
         a = _answered(state, {"rerun": ["re-run", "rerun", "keep waiting", "wait"], "fix": ["resume", "coder", "fix"],
                               "leave": ["leave", "draft", "report"]}, "leave")
         if a == "rerun":
-            u.update({"ci_polls": 0, "ci_poll_fails": 0, "ci_started_at": int(time.time())})
+            u.update({"ci_polls": 0, "ci_poll_fails": 0, "ci_started_at": int(time.time()), "ci_status": "",
+                      "ci_failing": []})
             u["_next"] = "ci_poll"
         elif a == "fix":
             u["fix_source"] = "ci"
@@ -691,8 +692,11 @@ def apply_answer(state):
                 f"PR left in draft with CI {state.get('ci_status') or 'unresolved'}: {tail(state.get('ci_diagnosis', ''), 300)}"]
             u["_next"] = "final_report"
     elif kind == "ci_poll_cap":
-        u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
-            f"Review watch stopped: the run's CI polls reached REVIEW_CI_POLL_CEILING ({REVIEW_CI_POLL_CEILING})"]
+        if _watch_started(state):
+            stopped = f"Review watch stopped: the run's CI polls reached REVIEW_CI_POLL_CEILING ({REVIEW_CI_POLL_CEILING})"
+        else:
+            stopped = f"CI watch stopped: the run's CI polls reached the ceiling ({REVIEW_CI_POLL_CEILING})"
+        u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [stopped]
         u["_next"] = "final_report"
     elif kind == "pr_review_push_unconfirmed":
         if _answered(state, {"retry": ["retry"]}, "stop") == "retry":
@@ -1588,7 +1592,8 @@ def ci_gate(state):
         u["_next"] = "pr_review_resolve"
         return u
     if task.get("kind") == "push_fix":
-        u.update({"ci_polls": 0, "ci_poll_fails": 0, "ci_started_at": int(time.time())})
+        u.update({"ci_polls": 0, "ci_poll_fails": 0, "ci_started_at": int(time.time()), "ci_status": "",
+                  "ci_failing": []})
         u["_next"] = "ci_poll"
         return u
     if ret == "run_coder":
@@ -1601,7 +1606,8 @@ def ci_gate(state):
     owns = task.get("open_pr") and not truthy(state.get("delegated"))
     u["ci_owner"] = bool(owns)
     if owns and re.search(r"github\.com/[^\s]+/pull/\d+|#\d+", state.get("git_report") or ""):
-        u.update({"ci_polls": 0, "ci_poll_fails": 0, "ci_started_at": int(time.time())})
+        u.update({"ci_polls": 0, "ci_poll_fails": 0, "ci_started_at": int(time.time()), "ci_status": "",
+                  "ci_failing": []})
         if _review_mode(state) and not (state.get("pr_ref") or "").strip():
             u["pr_ref"] = _pr_ref(state)
         u["_next"] = "ci_poll"
@@ -1690,7 +1696,8 @@ def pr_review_resolve(state):
     ledger(state, u, line)
     u["pr_review_addressed"] = list(as_list(state.get("pr_review_addressed"))) + pending
     u["pr_review_pending"] = []
-    u.update({"ci_polls": 0, "ci_poll_fails": 0, "ci_started_at": int(time.time())})
+    u.update({"ci_polls": 0, "ci_poll_fails": 0, "ci_started_at": int(time.time()), "ci_status": "",
+              "ci_failing": []})
     u["_next"] = "ci_poll"
     return u
 
@@ -1733,7 +1740,7 @@ def _pr_ref(state):
 
 def ci_poll(state):
     u = {}
-    if _review_mode(state):
+    if _watch_started(state):
         u["ci_polls_run"] = as_int(state.get("ci_polls_run")) + 1
         if u["ci_polls_run"] >= REVIEW_CI_POLL_CEILING:
             u["ci_status"] = "poll_cap"
@@ -1790,8 +1797,18 @@ def ci_poll(state):
 
 def ci_route(state):
     u = {}
+    crashed = _review_mode(state) and bool(state.get("last_script_error"))
     note_script_error(state, u, "ci_poll")
     status = state.get("ci_status") or "poll_error"
+    if crashed:
+        # A killed poll leaves the previous visit's status behind, so this visit counts as one failed read.
+        fails = as_int(state.get("ci_poll_fails")) + 1
+        u["ci_poll_fails"] = fails
+        ledger(state, u, f"review-watch: PR #{_pr_ref(state)} CI read failed (poll node error); retry")
+        if fails < CI_POLL_FAILS:
+            u["_next"] = "ci_poll"
+            return u
+        status = "poll_error"
     if status == "green":
         if _review_mode(state) and truthy(state.get("flip_ready")):
             ledger(state, u, "ci: green -> back to the review watch")
@@ -1803,25 +1820,22 @@ def ci_route(state):
         u["_next"] = "git_ops"
     elif status == "red":
         root = state.get("git_root") or state.get("project_dir") or "."
-        pack = []
+        pack, fetched = [], []
         for name, link in as_list(state.get("ci_failing")):
             pack.append(f"### {name}\n{link}")
-            if m := re.search(r"/actions/runs/(\d+)", link or ""):
-                cmd = os.environ.get("SISYPHUS_GH_RUN_LOG_CMD")
-                try:
-                    if cmd:
-                        # Operator-environment test seam run through the shell; it carries the same trust as the process environment.
-                        p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=GH_CALL_SECS,
-                                           env={**os.environ, "SISYPHUS_RUN_ID": m.group(1)})
-                    else:
-                        p = subprocess.run(["gh", "run", "view", m.group(1), "--log-failed"], cwd=root,
-                                           capture_output=True, text=True, timeout=GH_CALL_SECS)
-                    pack.append(tail(p.stdout or p.stderr, 4000))
-                except Exception as e:  # noqa: BLE001
-                    pack.append(f"(log unavailable: {e})")
+            if not (m := re.search(r"/actions/runs/(\d+)", link or "")):
+                continue
+            run_id = m.group(1)
+            if run_id in fetched:
+                pack.append(f"(failed log of run {run_id} is above)")
+            elif len(fetched) >= CI_LOG_RUNS_MAX:
+                pack.append("(log not fetched: CI_LOG_RUNS_MAX reached)")
+            else:
+                fetched.append(run_id)
+                pack.append(_failed_run_log(root, run_id))
         u["ci_evidence"] = tail("\n".join(pack), 12000)
         u["_next"] = "ci_diagnose"
-    elif status == "poll_cap" and _review_mode(state):
+    elif status == "poll_cap" and _watch_started(state):
         polls_run = as_int(state.get("ci_polls_run"))
         ledger(state, u, f"review-watch: PR #{_pr_ref(state)} stop: ci_poll_cap")
         return raise_escalation(state, u, escalation(
@@ -1842,6 +1856,21 @@ def ci_route(state):
     return u
 
 
+def _failed_run_log(root, run_id):
+    cmd = os.environ.get("SISYPHUS_GH_RUN_LOG_CMD")
+    try:
+        if cmd:
+            # Operator-environment test seam run through the shell; it carries the same trust as the process environment.
+            p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=GH_CALL_SECS,
+                               env={**os.environ, "SISYPHUS_RUN_ID": run_id})
+        else:
+            p = subprocess.run(["gh", "run", "view", run_id, "--log-failed"], cwd=root,
+                               capture_output=True, text=True, timeout=GH_CALL_SECS)
+        return tail(p.stdout or p.stderr, 4000)
+    except Exception as e:  # noqa: BLE001
+        return f"(log unavailable: {e})"
+
+
 def ci_apply(state):
     u = {}
     harvest_anomalies(state, u, "ci_diagnose")
@@ -1856,19 +1885,23 @@ def ci_apply(state):
             ledger(state, u, f"ci: flake re-run budget exhausted for {exhausted}; a third red is real by definition")
         else:
             root = state.get("git_root") or state.get("project_dir") or "."
+            run_ids = []
             for name, link in as_list(state.get("ci_failing")):
                 reruns[name] = as_int(reruns.get(name)) + 1
-                if m := re.search(r"/actions/runs/(\d+)", link or ""):
-                    if cmd := os.environ.get("SISYPHUS_GH_RERUN_CMD"):
-                        # Operator-environment test seam run through the shell; it carries the same trust as the process environment.
-                        subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=GH_CALL_SECS,
-                                       env={**os.environ, "SISYPHUS_RUN_ID": m.group(1)})
-                    else:
-                        subprocess.run(["gh", "run", "rerun", m.group(1), "--failed"], cwd=root, capture_output=True,
-                                       text=True, timeout=GH_CALL_SECS)
+                if (m := re.search(r"/actions/runs/(\d+)", link or "")) and m.group(1) not in run_ids:
+                    run_ids.append(m.group(1))
                 ledger(state, u, f"flake-rerun: {name} (re-run {reruns[name]}/{CI_FLAKE_RERUNS})")
+            for run_id in run_ids[:CI_LOG_RUNS_MAX]:
+                if cmd := os.environ.get("SISYPHUS_GH_RERUN_CMD"):
+                    # Operator-environment test seam run through the shell; it carries the same trust as the process environment.
+                    subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=GH_CALL_SECS,
+                                   env={**os.environ, "SISYPHUS_RUN_ID": run_id})
+                else:
+                    subprocess.run(["gh", "run", "rerun", run_id, "--failed"], cwd=root, capture_output=True,
+                                   text=True, timeout=GH_CALL_SECS)
             u["ci_reruns"] = reruns
-            u.update({"ci_polls": 0, "ci_poll_fails": 0, "ci_started_at": int(time.time())})
+            u.update({"ci_polls": 0, "ci_poll_fails": 0, "ci_started_at": int(time.time()), "ci_status": "",
+                      "ci_failing": []})
             u["_next"] = "ci_poll"
             return u
     if verdict == "real":

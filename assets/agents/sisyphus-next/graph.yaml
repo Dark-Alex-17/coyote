@@ -1694,6 +1694,8 @@ nodes:
     type: script
     description: green -> flip ready via git_ops; red -> diagnose; exhausted -> escalate with the evidence pack.
     script: scripts/ci_route.py
+    # CI_LOG_RUNS_MAX (3) x GH_CALL_SECS (90) + 30 margin
+    timeout: 300
     fallback: final_report
 
   ci_diagnose:
@@ -1743,7 +1745,8 @@ nodes:
     type: script
     description: The enum as edges with A6 keying (flake re-runs per check-name per PR, fix strikes B5).
     script: scripts/ci_apply.py
-    timeout: 120
+    # CI_LOG_RUNS_MAX (3) x GH_CALL_SECS (90) + 30 margin
+    timeout: 300
     fallback: final_report
 
   pr_review_poll:

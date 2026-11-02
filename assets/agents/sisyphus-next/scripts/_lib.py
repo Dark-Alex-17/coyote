@@ -32,6 +32,7 @@ CI_POLL_SLEEP = 60        # pr-watch/scripts/poll_pr.py SLEEP_SECS
 CI_POLL_FAILS = 3         # pr-watch/scripts/poll_pr.py MAX_CONSECUTIVE_FAILS
 CI_WALL_SECS = 14400      # coder/graph.yaml settings.timeout (hardware-bound wall clock)
 GH_CALL_SECS = 90         # one gh subprocess call; node timeouts budget their sleep plus this per call
+CI_LOG_RUNS_MAX = 3       # distinct CI runs whose failed log one ci_route visit fetches, sized with its node timeout
 REVIEW_POLL_SLEEP = 600   # review comments arrive on a human timescale, so the watch reads every ten minutes
 REVIEW_MAX_POLLS = 80     # per run; stays below settings.max_loop_iterations (100), which caps visits per node
 REVIEW_WALL_SECS = REVIEW_MAX_POLLS * REVIEW_POLL_SLEEP  # the poll budget expressed as wall clock
