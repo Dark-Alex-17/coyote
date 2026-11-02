@@ -3266,7 +3266,9 @@ async fn attach_probed_local(
 /// retrying` with a fixed reason, the client being the one that saw the socket close.
 /// `Connecting` leaves the row alone: the client sends it right after every
 /// `Disconnected`, before a redial has landed, and the drop stays the row's until a
-/// stream is back; the attach itself already put the row at `connecting`. No idle line
+/// stream is back; the attach itself already put the row at `connecting`.
+/// `DisconnectedWithReason` is read as `Disconnected`, since the client is not opted into
+/// disconnect reasons, and `DialFailed` leaves the row alone like `Connecting`. No idle line
 /// and no announce for any of it: the client re-announces over a restored socket itself.
 /// `None` is the end of the stream, which the detach at stop brings, and the receiver is
 /// let go.
@@ -11382,6 +11384,55 @@ mod tests {
         slot.stop().await.unwrap();
     }
 
+    /// The current contract for a destination whose description is held but whose path
+    /// has expired: resolving answers at once with the description and asks nothing,
+    /// and a request to it fails at once as `LinkFailed` naming no known path rather
+    /// than waiting out a deadline. The node's transport sends no path request of its
+    /// own on the way to the link.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_destination_whose_path_expired_resolves_at_once_and_its_request_fails_fast() {
+        let stub = PeerStub::listen("node-resolve-stale-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let started = started_runtime_on("node-resolve-stale", stub.port()).await;
+        let runtime = started.runtime.clone();
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        stub.wait_to_be_filed(&runtime.peers(), &to).await;
+        let desc = runtime.resolve_destination(&to).await.unwrap();
+        let transport = runtime.transport_handle().await.unwrap();
+        assert!(
+            transport.expire_path(&desc.address_hash).await,
+            "the announce left a path to expire"
+        );
+
+        let asked = Instant::now();
+        let resolved = runtime.resolve_destination(&to).await;
+        assert!(
+            asked.elapsed() < Duration::from_secs(1),
+            "a held description is answered at once: {:?}",
+            asked.elapsed()
+        );
+        assert_eq!(resolved.unwrap().address_hash, desc.address_hash);
+
+        let asked = Instant::now();
+        let result = runtime
+            .request(&desc, "/echo", rmpv::Value::Nil, RequestOptions::default())
+            .await;
+        assert!(
+            asked.elapsed() < Duration::from_secs(1),
+            "the request fails without waiting: {:?}",
+            asked.elapsed()
+        );
+        assert!(
+            matches!(&result, Err(RequestError::LinkFailed(reason)) if reason.contains("no known path")),
+            "{result:?}"
+        );
+
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        slot.stop().await.unwrap();
+    }
+
     /// A reference the send never carried is not left lent: the one-off grant written
     /// before the send is taken back when the send fails, and the error is the send's.
     #[cfg(unix)]
@@ -15501,6 +15552,65 @@ mod tests {
             1,
             "a stop with no node interrupts nothing"
         );
+        started.relay_handle.abort();
+    }
+
+    /// The reasoned events a `local` client may send fold into the row as their plain
+    /// counterparts: `DialFailed` leaves a connected row alone, like `Connecting`, and
+    /// `DisconnectedWithReason` is the fixed drop row `Disconnected` gives. No watcher
+    /// runs, since the slot is never installed, so the started node's one row stands in
+    /// for the `local` one.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_local_clients_reasoned_events_fold_like_their_plain_counterparts() {
+        use rns_transport::transport::{DialFailureKind, DisconnectReason};
+
+        let started = started_runtime("node-local-reasoned-events").await;
+        let runtime = &started.runtime;
+        let mut watches = vec![Watch::Local {
+            index: 0,
+            label: "local rnsd at 127.0.0.1:37428".to_string(),
+            endpoint: LocalEndpoint::Tcp("127.0.0.1:37428".parse().unwrap()),
+            attached: true,
+            events: None,
+        }];
+        let row = |runtime: &MeshRuntime| runtime.interface_states()[0].state.clone();
+        runtime.mark_interface_state(0, InterfaceState::Connecting { reason: None });
+
+        follow_local_event(
+            runtime,
+            &mut watches,
+            0,
+            Some(SharedInstanceEvent::Connected),
+        );
+        assert_eq!(row(runtime), InterfaceState::Connected);
+
+        follow_local_event(
+            runtime,
+            &mut watches,
+            0,
+            Some(SharedInstanceEvent::DialFailed {
+                reason: DialFailureKind::Refused,
+            }),
+        );
+        assert_eq!(row(runtime), InterfaceState::Connected);
+
+        follow_local_event(
+            runtime,
+            &mut watches,
+            0,
+            Some(SharedInstanceEvent::DisconnectedWithReason {
+                reason: DisconnectReason::PeerClosed,
+            }),
+        );
+        assert_eq!(
+            row(runtime),
+            InterfaceState::Disconnected {
+                reason: LOCAL_DROP_REASON.to_string(),
+            }
+        );
+
+        runtime.shutdown().await.unwrap();
         started.relay_handle.abort();
     }
 
