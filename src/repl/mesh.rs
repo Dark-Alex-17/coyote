@@ -6231,7 +6231,7 @@ fn interface_warnings(states: &[InterfaceStatus]) -> Vec<String> {
                     "WARNING: {label} is not reachable yet: {reason}; start the local rnsd"
                 ),
                 InterfaceState::Connecting { reason: None } => format!(
-                    "WARNING: {label} answered but has not finished connecting; mesh traffic through it waits until it does"
+                    "WARNING: {label} has not finished connecting; mesh traffic through it waits until it does"
                 ),
                 InterfaceState::Disconnected { reason } => format!(
                     "WARNING: {label} dropped the connection: {reason}; it is being redialed"
@@ -8274,10 +8274,10 @@ mod tests {
         );
     }
 
-    /// The `local` rows cover both producers of `Connecting`: the probe's reason while
-    /// nothing listens, and no reason once rnsd answered and the attached client is still
-    /// dialing (which must not tell the user to start rnsd); `Disconnected` carries the
-    /// fixed reason the client's drop sets.
+    /// The `local` rows cover both shapes of `Connecting`: the client's last dial failure
+    /// while nothing listens, and no reason while the attached client has neither
+    /// connected nor failed a dial (which must not tell the user to start rnsd);
+    /// `Disconnected` carries the sentence for the client's drop.
     #[test]
     fn interface_warnings_name_the_tail_for_lan_a_remote_relay_and_a_loopback_relay() {
         let states = [
@@ -8319,7 +8319,7 @@ mod tests {
                 kind: "local",
                 endpoint: Some("127.0.0.1:37428".into()),
                 state: InterfaceState::Connecting {
-                    reason: Some("tcp connect failed endpoint=127.0.0.1:37428".into()),
+                    reason: Some("nothing is listening at 127.0.0.1:37428".into()),
                 },
             },
             InterfaceStatus {
@@ -8344,8 +8344,8 @@ mod tests {
                 "WARNING: lan is unreachable (address in use); peers on this link-local segment are out of reach.".to_string(),
                 "WARNING: private relay.example:4965 is unreachable (tcp connect failed endpoint=relay.example:4965); peers behind that relay are out of reach.".to_string(),
                 "WARNING: private 127.0.0.1:4242 is unreachable (tcp connect failed endpoint=127.0.0.1:4242); sessions on this machine cannot reach each other until a local Reticulum daemon (rnsd) is listening there.".to_string(),
-                "WARNING: local rnsd at 127.0.0.1:37428 is not reachable yet: tcp connect failed endpoint=127.0.0.1:37428; start the local rnsd".to_string(),
-                "WARNING: local rnsd at @rns/default answered but has not finished connecting; mesh traffic through it waits until it does".to_string(),
+                "WARNING: local rnsd at 127.0.0.1:37428 is not reachable yet: nothing is listening at 127.0.0.1:37428; start the local rnsd".to_string(),
+                "WARNING: local rnsd at @rns/default has not finished connecting; mesh traffic through it waits until it does".to_string(),
                 "WARNING: local rnsd at @rns/default dropped the connection: rnsd closed the socket; it is being redialed".to_string(),
             ]
         );
@@ -17062,8 +17062,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             }
 
             /// Stands in for rnsd's shared-instance listener at `endpoint` until the returned
-            /// task is aborted: every connection is accepted and drained, which satisfies the
-            /// node's probe and the shared-instance client it attaches alike. Binding the TCP
+            /// task is aborted: every connection is accepted and drained. Binding the TCP
             /// shape fresh (reuse-address on) is what lets the stub come back on the same port
             /// after it was dropped, the way a restarted rnsd does; the abort closes the
             /// accepted streams with the listener, the way a stopped one does.
@@ -17108,7 +17107,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             }
 
             /// Polls `.mesh info` until the `interfaces[index]` row reads `want`, within the
-            /// connect-later budget; the probe behind a `local` row ticks once a second.
+            /// connect-later budget; the client behind a `local` row redials every 2 s.
             #[cfg(unix)]
             async fn wait_for_info_row(
                 ctx: &mut RequestContext,
@@ -17134,12 +17133,12 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
 
             /// The operator sees a `local` rnsd's whole story through the REPL. `.mesh on`
             /// beside a working relay warns that the local rnsd is not reachable yet (with
-            /// the probe's reason and the start-the-daemon tail) and `.mesh info` lists it as
-            /// `connecting, retrying`; when something answers at the endpoint the transport is
-            /// attached and its client's `Connected` makes the row `connected` and the kind
-            /// join the node's interfaces with no idle line (the local rnsd prints none, only
-            /// the TCP kinds do); when it goes away again the client's `Disconnected` makes
-            /// the row `lost, retrying` with the fixed reason and the kind leaves; and when it
+            /// the client's dial failure and the start-the-daemon tail) and `.mesh info` lists
+            /// it as `connecting, retrying`; when something answers at the endpoint the
+            /// client's `Connected` makes the row `connected` and the kind join the node's
+            /// interfaces with no idle line (the local rnsd prints none, only the TCP kinds
+            /// do); when it goes away again the client's drop makes the row `lost, retrying`
+            /// with the orderly close's sentence and the kind leaves; and when it
             /// is back the row is `connected` again, still with no idle line and no second
             /// WARNING. `.mesh off` then detaches cleanly.
             #[cfg(unix)]
@@ -17272,82 +17271,51 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 });
             }
 
-            /// Stands in for an rnsd that answers the probe and nothing after it: one
-            /// connection is accepted, then the listener closes with it, so the attached
-            /// client dials into a refusal. Awaiting the task proves the port is free again.
-            #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-            fn accept_once_then_close(
-                listener: tokio::net::TcpListener,
-            ) -> tokio::task::JoinHandle<()> {
-                tokio::spawn(async move {
-                    let (_probe, _) = listener.accept().await.unwrap();
-                })
-            }
-
-            /// The REPL surface of a `local` rnsd that answered the probe but whose client
-            /// had not connected when the start wait ran out, beside a working relay: the
-            /// node comes up, `.mesh on` warns with the bare-connecting tail (`not connected
-            /// yet`, then the start-the-daemon hint), the summary lists only the relay, and
-            /// `.mesh info` carries the row as a bare `connecting` with no reason and no
-            /// `retrying`. When a listener is back on the endpoint the client's redial lands
-            /// and the row is `connected`, told at info once, with no second WARNING and no
-            /// idle line. The kernel can complete the client's first dial before the stub's
-            /// listener closes (the probe-alone test in `mesh::node` describes it), in which
-            /// case the node came up `connected` instead; that start is turned off and the
-            /// lever re-armed on a fresh port, a bounded number of times.
+            /// The REPL surface of a `local` rnsd whose client had not connected when the
+            /// start wait ran out, beside a working relay: the node comes up, `.mesh on`
+            /// warns with the client's dial failure and the start-the-daemon tail, the
+            /// summary lists only the relay, and `.mesh info` carries the row as
+            /// `connecting, retrying` with that reason. When a listener is on the endpoint
+            /// the client's redial lands and the row is `connected`, told at info once, with
+            /// no second WARNING and no idle line. Written for the TCP shape, whose refused
+            /// dial has one exact sentence, so it runs where that shape is the `local`
+            /// endpoint.
             #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
             #[test]
             #[serial]
-            fn mesh_on_beside_a_relay_warns_and_lists_a_dialing_local_rnsd_as_bare_connecting() {
+            fn mesh_on_beside_a_relay_warns_and_lists_a_dialing_local_rnsd_with_its_dial_reason() {
                 use crate::testing::{info_snapshot, install_log_collector};
 
-                let guard = TestConfigDirGuard::new("repl-mesh-local-dialing-bare");
+                let guard = TestConfigDirGuard::new("repl-mesh-local-dialing-reason");
                 let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
-                let _script = prompt_script::install(&[true, true, true, true, true, true]);
+                let _script = prompt_script::install(&[true]);
                 let _capture = capture::install();
                 install_log_collector();
                 run_async(async {
                     let (addr, relay_handle, _) = loopback_relay().await;
                     let relay_label = format!("private 127.0.0.1:{}", addr.port());
                     let idle = Arc::new(Recording::default());
-                    let mut armed = None;
-                    for _ in 0..3 {
-                        let (port, socket) = held_port().await;
-                        let (entry, endpoint) = absent_local_entry(port);
-                        let stub = accept_once_then_close(socket.listen(16).unwrap());
-                        let mut ctx = ctx_with(
-                            MeshConfig {
-                                interfaces: vec![
-                                    MeshInterface::Private {
-                                        host: "127.0.0.1".to_string(),
-                                        port: addr.port(),
-                                    },
-                                    entry,
-                                ],
-                                ..MeshConfig::default()
-                            },
-                            true,
-                        );
-                        ctx.session = Some(Session::default());
-                        ctx.app.mesh.set_idle(idle.clone());
-                        let stderr_before = stderr_lines().len();
-                        let stdout_before = stdout_lines().len();
-                        run(&mut ctx, ".mesh on").await.unwrap();
-                        let runtime = ctx.app.mesh.get().unwrap();
-                        if runtime.interface_states()[1].state
-                            == (InterfaceState::Connecting { reason: None })
-                        {
-                            armed = Some((ctx, endpoint, stub, stderr_before, stdout_before));
-                            break;
-                        }
-                        // The dial landed in the accept queue before the close: not the
-                        // shape under test.
-                        run(&mut ctx, ".mesh off --yes").await.unwrap();
-                        stub.await.unwrap();
-                    }
-                    let (mut ctx, endpoint, stub, stderr_before, stdout_before) =
-                        armed.expect("the client's first dial kept landing in the accept queue");
+                    let (entry, endpoint) = absent_local_entry(closed_port().await);
+                    let mut ctx = ctx_with(
+                        MeshConfig {
+                            interfaces: vec![
+                                MeshInterface::Private {
+                                    host: "127.0.0.1".to_string(),
+                                    port: addr.port(),
+                                },
+                                entry,
+                            ],
+                            ..MeshConfig::default()
+                        },
+                        true,
+                    );
+                    ctx.session = Some(Session::default());
+                    ctx.app.mesh.set_idle(idle.clone());
+                    let stderr_before = stderr_lines().len();
+                    let stdout_before = stdout_lines().len();
+                    run(&mut ctx, ".mesh on").await.unwrap();
                     let label = format!("local rnsd at {endpoint}");
+                    let reason = format!("nothing is listening at {endpoint}");
                     let runtime = ctx.app.mesh.get().unwrap();
 
                     let warnings_now: Vec<String> = stderr_lines()[stderr_before..]
@@ -17358,7 +17326,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     assert_eq!(
                         warnings_now,
                         vec![format!(
-                            "WARNING: {label} answered but has not finished connecting; mesh traffic through it waits until it does"
+                            "WARNING: {label} is not reachable yet: {reason}; start the local rnsd"
                         )],
                         "{:?}",
                         stderr_lines()
@@ -17373,8 +17341,8 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     let info = out_of(&mut ctx, ".mesh info").await.unwrap();
                     assert_eq!(
                         info_row(&info, "interfaces[1]"),
-                        format!("{label}  connecting"),
-                        "a bare connecting carries no reason and no retrying\n{info}"
+                        format!("{label}  connecting, retrying: {reason}"),
+                        "{info}"
                     );
                     assert_eq!(
                         info_row(&info, "interfaces[0]"),
@@ -17389,8 +17357,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         info_snapshot()
                     );
 
-                    // A listener is back where rnsd listens: the redial lands.
-                    stub.await.unwrap();
+                    // A listener is up where rnsd listens: the redial lands.
                     let daemon = serve_as_daemon_at(&endpoint, None).await;
                     wait_for_info_row(
                         &mut ctx,
@@ -17435,7 +17402,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             }
 
             /// Two `local` entries are refused by `.mesh on` itself, before the preview and
-            /// before anything is probed or attached: a relay that WOULD have carried the
+            /// before anything is dialed or attached: a relay that WOULD have carried the
             /// node sits beside them, so a start that merely ignored the rule would come up
             /// degraded with two `connecting, retrying` rows; instead the command bails with
             /// the one-client-per-process sentence, the node stays off, no WARNING and no

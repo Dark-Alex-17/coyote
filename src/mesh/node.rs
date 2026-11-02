@@ -70,7 +70,6 @@ use crate::supervisor::notification::{SystemNotification, mesh_notification};
 
 use anyhow::{Context, Result, anyhow, bail};
 use arc_swap::ArcSwapOption;
-use futures_util::future::select_all;
 use parking_lot::RwLock;
 use rns_transport::destination::DestinationDesc;
 use rns_transport::destination::request::RequestAllow;
@@ -84,12 +83,12 @@ use rns_transport::iface::auto_runtime::{
     AutoDiscoveryRuntime, AutoInterfaceTransportRuntime, AutoRuntimePlan,
 };
 #[cfg(unix)]
-use rns_transport::iface::local::{LocalUnixEndpoint, preflight_unix_connect};
+use rns_transport::iface::local::LocalUnixEndpoint;
 use rns_transport::iface::tcp_client::{TcpClient, TcpRuntimeStatusHandle};
 use rns_transport::iface::{IfaceRole, InterfaceMode};
 use rns_transport::transport::{
-    AnnounceEvent, SharedInstanceEndpoint, SharedInstanceEvent, SharedInstanceOptions, Transport,
-    TransportConfig,
+    AnnounceEvent, DialFailureKind, DisconnectReason, InterfaceEvent, InterfaceEventKind,
+    SharedInstanceEndpoint, SharedInstanceEvent, SharedInstanceOptions, Transport, TransportConfig,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -120,22 +119,12 @@ const POST_STOP_GRACE: Duration = Duration::from_secs(2);
 pub(crate) const REKEY_GRACE: Duration = Duration::from_secs(5);
 /// Poll interval while waiting for a TCP relay to report itself connected.
 const CONNECT_POLL: Duration = Duration::from_millis(50);
-/// How often the interface watcher probes a `local` rnsd it has not attached yet and polls
-/// a TCP client that has not connected yet, for the node's lifetime.
-const CONNECT_WATCH_TICK: Duration = Duration::from_secs(1);
-/// Depth of each channel the TCP clients report their reconnects and disconnects on. The
-/// client drops an event when the channel is full, which is as far as the watcher's
-/// best-effort lines go.
-const TCP_EVENT_CAPACITY: usize = 16;
 /// Depth of the channel a `local` rnsd's shared-instance client reports its connection
-/// state on; the client drops an event when it is full, the same as the TCP clients.
+/// state on; the client drops an event when it is full.
 const LOCAL_EVENT_CAPACITY: usize = 16;
 /// How long the shared-instance client waits before redialing rnsd after a drop; the row
 /// reads `lost, retrying` until a redial lands.
 const LOCAL_RECONNECT_WAIT: Duration = Duration::from_secs(2);
-/// The reason a `local` row carries on the client's `Disconnected`: the client is the one
-/// that saw the socket close, and the event says nothing more.
-const LOCAL_DROP_REASON: &str = "rnsd closed the socket";
 /// Depth of the host channel a LAN interface feeds the transport through.
 const LAN_CHANNEL_CAPACITY: usize = 128;
 /// How often the peer table is written back if it changed; `stop` writes it regardless.
@@ -347,10 +336,10 @@ impl fmt::Display for LocalEndpoint {
 
 /// What one configured interface is doing. `retrying` means it is tried again without
 /// the user: a TCP client the transport keeps reconnecting, or a `local` rnsd endpoint
-/// the node keeps probing until it attaches and the transport then keeps redialing.
+/// the shared-instance client keeps redialing.
 /// `Unreachable` without it is a `lan` bind that failed and will not be tried again.
-/// `Connecting` is a `local` rnsd not connected yet: with the last probe's reason while
-/// nothing listens, without one once the transport is attached and dialing;
+/// `Connecting` is a `local` rnsd not connected yet: with the sentence for the client's
+/// last dial failure, without one while no dial has failed;
 /// `Disconnected` one that dropped the socket after the node attached, which the
 /// transport is redialing. An attached rnsd's row follows the shared-instance client's
 /// state events.
@@ -458,21 +447,23 @@ enum JoinedInterface {
 
 enum Joined {
     Connected(JoinedInterface),
-    /// A `local` rnsd the probe reached, the transport attached to and whose client
-    /// reported its first `Connected` within the start wait; `events` is where that
-    /// client reports its connection state from here on.
+    /// A `local` rnsd the transport attached to and whose client reported its first
+    /// `Connected` within the start wait; `events` is where that client reports its
+    /// connection state from here on.
     Attached {
         label: String,
         endpoint: LocalEndpoint,
         events: mpsc::Receiver<SharedInstanceEvent>,
     },
     /// `Attached`, but the client had not connected when the start wait ran out: it
-    /// keeps dialing, the row starts at a bare `connecting` and the watcher moves it on
-    /// the client's first `Connected`.
+    /// keeps dialing, the row starts at `connecting` with `dial_failure`, the sentence for
+    /// the last dial that failed (`None` when none had), and the watcher moves it on the
+    /// client's first `Connected`.
     Dialing {
         label: String,
         endpoint: LocalEndpoint,
         events: mpsc::Receiver<SharedInstanceEvent>,
+        dial_failure: Option<String>,
         reason: String,
         message: String,
     },
@@ -482,8 +473,8 @@ enum Joined {
         reason: String,
         message: String,
     },
-    /// A `local` rnsd the probe or the attach did not reach; nothing is attached and the
-    /// interface watcher probes it again every tick.
+    /// A `local` rnsd the transport could not attach to; nothing is attached, so nothing
+    /// retries it and the row keeps the attach's reason.
     NotReached {
         endpoint: LocalEndpoint,
         reason: String,
@@ -496,9 +487,9 @@ enum Joined {
     },
 }
 
-/// An interface the watcher follows for the node's lifetime: a TCP client whose stream
-/// events it listens for, or the local rnsd whose shared-instance client reports its
-/// connection state once attached.
+/// An interface the watcher follows for the node's lifetime: a TCP client whose events it
+/// reads off the transport's interface events, or the local rnsd whose shared-instance
+/// client reports its connection state.
 pub(crate) enum WatchedInterface {
     Tcp {
         /// Position in `interface_states`.
@@ -517,8 +508,8 @@ pub(crate) enum WatchedInterface {
         label: String,
         endpoint: LocalEndpoint,
         /// The state events of a shared-instance client attached when `start` returned;
-        /// `None` once the watcher has taken them, and for an rnsd that was not reached
-        /// at start, which the watcher attaches on the first probe that answers.
+        /// `None` once the watcher has taken them, and for an rnsd the transport could
+        /// not attach to.
         events: parking_lot::Mutex<Option<mpsc::Receiver<SharedInstanceEvent>>>,
     },
 }
@@ -544,34 +535,6 @@ impl WatchedInterface {
             }),
         }
     }
-}
-
-/// The sending ends every TCP client reports its stream edges on, keyed by interface
-/// address; one pair serves every client of a node.
-struct TcpEventSenders {
-    reconnect: mpsc::Sender<AddressHash>,
-    disconnect: mpsc::Sender<AddressHash>,
-}
-
-/// The receiving ends of `TcpEventSenders`; the interface watcher takes them once.
-struct TcpEventReceivers {
-    reconnect: mpsc::Receiver<AddressHash>,
-    disconnect: mpsc::Receiver<AddressHash>,
-}
-
-fn tcp_event_channels() -> (TcpEventSenders, TcpEventReceivers) {
-    let (reconnect_tx, reconnect_rx) = mpsc::channel(TCP_EVENT_CAPACITY);
-    let (disconnect_tx, disconnect_rx) = mpsc::channel(TCP_EVENT_CAPACITY);
-    (
-        TcpEventSenders {
-            reconnect: reconnect_tx,
-            disconnect: disconnect_tx,
-        },
-        TcpEventReceivers {
-            reconnect: reconnect_rx,
-            disconnect: disconnect_rx,
-        },
-    )
 }
 
 struct DestinationState {
@@ -604,8 +567,6 @@ pub(crate) struct MeshRuntime {
     about: Option<String>,
     peer_limits: PeerLimitConfig,
     request_timeouts: RequestTimeouts,
-    /// Bounds each probe of a `local` rnsd; `NodeOptions::connect_timeout`.
-    connect_timeout: Duration,
     inline_max_bytes: u64,
     /// The directory `mesh.fetch.inbox_dir` resolved to at node start; `None` stages
     /// under the cache dir.
@@ -623,9 +584,9 @@ pub(crate) struct MeshRuntime {
     /// Every TCP client and `local` rnsd from the config, connected or not, in config
     /// order.
     watched_interfaces: Vec<WatchedInterface>,
-    /// Where the TCP clients report their reconnects and disconnects; `None` once the
-    /// interface watcher has taken them.
-    tcp_events: parking_lot::Mutex<Option<TcpEventReceivers>>,
+    /// The transport's interface events, subscribed before any interface joined; `None`
+    /// once the interface watcher has taken them.
+    interface_events: parking_lot::Mutex<Option<broadcast::Receiver<InterfaceEvent>>>,
     hooks: MeshHooks,
     /// `None` once `shutdown` has released this owner. `shutdown` stops the transport
     /// explicitly, which cancels its tasks; the clones requests hold only keep the memory
@@ -739,13 +700,13 @@ impl MeshRuntime {
         ));
         // Every stream is subscribed before an interface is joined so nothing is missed.
         let announces = transport.recv_announces().await;
-        let (tcp_event_senders, tcp_event_receivers) = tcp_event_channels();
+        let interface_events = transport.interface_events();
         let mut joined = Vec::with_capacity(plans.len());
         let mut states = Vec::with_capacity(plans.len());
         let mut watched = Vec::new();
         let mut failures = Vec::new();
         for (index, plan) in plans.iter().enumerate() {
-            match join_interface(&transport, plan, &options, &tcp_event_senders).await {
+            match join_interface(&transport, plan, &options, plans.len() == 1).await {
                 Joined::Connected(iface) => {
                     watched.extend(WatchedInterface::of(index, &iface, true));
                     joined.push(iface);
@@ -770,6 +731,7 @@ impl MeshRuntime {
                     label,
                     endpoint,
                     events,
+                    dial_failure,
                     message,
                     ..
                 } => {
@@ -780,7 +742,9 @@ impl MeshRuntime {
                         events: parking_lot::Mutex::new(Some(events)),
                     });
                     joined.push(JoinedInterface::Local { label });
-                    states.push(plan.status(InterfaceState::Connecting { reason: None }));
+                    states.push(plan.status(InterfaceState::Connecting {
+                        reason: dial_failure,
+                    }));
                     failures.push(message);
                 }
                 Joined::Pending {
@@ -908,7 +872,6 @@ impl MeshRuntime {
             about: config.about.clone(),
             peer_limits: PeerLimitConfig::from(config),
             request_timeouts: RequestTimeouts::from(config),
-            connect_timeout: options.connect_timeout,
             inline_max_bytes: config.fetch.inline_max_bytes,
             inbox_dir,
             cache_dir: paths.cache_dir,
@@ -918,7 +881,7 @@ impl MeshRuntime {
             memory: PeerMemory::default(),
             interface_states: RwLock::new(states),
             watched_interfaces: watched,
-            tcp_events: parking_lot::Mutex::new(Some(tcp_event_receivers)),
+            interface_events: parking_lot::Mutex::new(Some(interface_events)),
             hooks: options.hooks,
             transport: Mutex::new(Some(transport.clone())),
             interfaces: Mutex::new(joined),
@@ -2052,26 +2015,21 @@ async fn drain_request_handlers(handler: &LibraryHandler, deadline: tokio::time:
     }
 }
 
+/// `alone` is set when `plan` is the only configured interface, so a failure to join it
+/// refuses the start.
 async fn join_interface(
     transport: &Transport,
     plan: &InterfacePlan,
     options: &NodeOptions,
-    tcp_events: &TcpEventSenders,
+    alone: bool,
 ) -> Joined {
     let joined = match plan {
         InterfacePlan::Lan => join_lan(transport).await,
         InterfacePlan::Local { endpoint } => {
-            join_local(transport, endpoint, options.connect_timeout).await
+            join_local(transport, endpoint, options.connect_timeout, alone).await
         }
         InterfacePlan::Tcp { kind, endpoint } => {
-            join_tcp(
-                transport,
-                kind,
-                endpoint,
-                options.connect_timeout,
-                tcp_events,
-            )
-            .await
+            join_tcp(transport, kind, endpoint, options.connect_timeout).await
         }
     };
     match &joined {
@@ -2087,7 +2045,7 @@ async fn join_interface(
             plan.label()
         ),
         Joined::NotReached { reason, .. } => warn!(
-            "Mesh interface {} is not reachable yet and keeps being probed: {reason}",
+            "Mesh interface {} could not be attached and is not retried: {reason}",
             plan.label()
         ),
         Joined::Failed { reason, .. } => {
@@ -2154,18 +2112,21 @@ fn lan_bind_failure_message(err: &dyn fmt::Display) -> String {
     )
 }
 
-/// Probes rnsd's shared-instance listener at `endpoint`, attaches the transport to it as
-/// a shared-instance client, and waits up to `connect_timeout` for that client's first
-/// `Connected`. The probe only shows that something accepts a connect there, and the
+/// Attaches the transport to rnsd's shared instance at `endpoint` as a shared-instance
+/// client and waits up to `connect_timeout` for that client's first `Connected`. The
 /// attach returns once the client task is spawned, not once it has a stream, so the
 /// client's own event is what decides `Connected` at start; a client still dialing when
 /// the wait runs out stays attached, with its events left on the receiver for the
-/// watcher. From there the client's state events drive the row, and the transport owns
-/// reconnecting and re-announcing.
+/// watcher, and the last dial failure it reported during the wait is the reason the row
+/// and the refusal carry. From there the client's state events drive the row, and the
+/// transport owns redialing and re-announcing. When the rnsd is the only interface
+/// (`alone`), the first dial failure ends the wait: the start is refused on it, as
+/// quickly as the failed dial, rather than after the whole `connect_timeout`.
 async fn join_local(
     transport: &Transport,
     endpoint: &LocalEndpoint,
     connect_timeout: Duration,
+    alone: bool,
 ) -> Joined {
     let not_reachable = |reason: &str| {
         format!(
@@ -2177,78 +2138,47 @@ async fn join_local(
         message: not_reachable(&reason),
         reason,
     };
-    if let Err(reason) = probe_local(endpoint, connect_timeout).await {
-        return not_reached(reason);
-    }
     let mut events = match attach_local(transport, endpoint).await {
         Ok(events) => events,
         Err(reason) => return not_reached(reason),
     };
-    match await_local_connected(&mut events, connect_timeout).await {
-        Ok(None) => Joined::Attached {
-            label: local_label(endpoint),
-            endpoint: endpoint.clone(),
-            events,
-        },
-        Ok(Some(reason)) => Joined::Dialing {
-            label: local_label(endpoint),
-            endpoint: endpoint.clone(),
-            events,
-            message: not_reachable(&reason),
-            reason,
-        },
-        Err(reason) => not_reached(reason),
-    }
-}
-
-/// Reads a freshly attached shared-instance client's events until its first `Connected`
-/// or `connect_timeout`, whichever comes first: `Ok(None)` once connected, `Ok(Some(reason))`
-/// when it was still dialing at the deadline. A stream that ends before either is a
-/// client that is gone, which is `Err`.
-async fn await_local_connected(
-    events: &mut mpsc::Receiver<SharedInstanceEvent>,
-    connect_timeout: Duration,
-) -> Result<Option<String>, String> {
     let deadline = tokio::time::Instant::now() + connect_timeout;
-    loop {
+    let mut dial_failure = None;
+    let reason = loop {
         match timeout_at(deadline, events.recv()).await {
-            Ok(Some(SharedInstanceEvent::Connected)) => return Ok(None),
+            Ok(Some(SharedInstanceEvent::Connected)) => {
+                return Joined::Attached {
+                    label: local_label(endpoint),
+                    endpoint: endpoint.clone(),
+                    events,
+                };
+            }
+            Ok(Some(SharedInstanceEvent::DialFailed { reason })) => {
+                let sentence = dial_failure_sentence(reason, endpoint);
+                dial_failure = Some(sentence.clone());
+                if alone {
+                    break sentence;
+                }
+            }
             Ok(Some(_)) => {}
-            Ok(None) => return Err("the shared-instance client stopped reporting".to_string()),
+            Ok(None) => {
+                return not_reached("the shared-instance client stopped reporting".to_string());
+            }
             Err(_) => {
-                return Ok(Some(format!(
-                    "rnsd accepted the probe but the client did not connect within {connect_timeout:?}"
-                )));
+                break dial_failure.clone().unwrap_or_else(|| {
+                    format!("the client did not connect within {connect_timeout:?}")
+                });
             }
-        }
-    }
-}
-
-/// Whether rnsd's shared-instance listener answers at `endpoint`: one connect, dropped as
-/// soon as it is accepted, bounded by `connect_timeout`. It gates the attach: a client
-/// attached while nothing listens would dial forever with nothing to report, so the
-/// transport is attached only once something answers, and the row follows the client's
-/// events after that.
-async fn probe_local(endpoint: &LocalEndpoint, connect_timeout: Duration) -> Result<(), String> {
-    let connect = async {
-        match endpoint {
-            LocalEndpoint::Tcp(addr) => tokio::net::TcpStream::connect(addr)
-                .await
-                .map(drop)
-                .map_err(|err| format!("could not connect to {addr}: {err}")),
-            #[cfg(unix)]
-            LocalEndpoint::Abstract(value) => {
-                preflight_unix_connect(&LocalUnixEndpoint::from_config_value(value)).await
-            }
-            #[cfg(not(unix))]
-            LocalEndpoint::Abstract(value) => Err(format!(
-                "{value} is an abstract socket, which only Linux and Android have"
-            )),
         }
     };
-    timeout(connect_timeout, connect)
-        .await
-        .unwrap_or_else(|_| Err(format!("connect to {endpoint} timed out")))
+    Joined::Dialing {
+        label: local_label(endpoint),
+        endpoint: endpoint.clone(),
+        events,
+        dial_failure,
+        message: not_reachable(&reason),
+        reason,
+    }
 }
 
 /// Attaches the transport to rnsd's shared instance at `endpoint` and returns the stream
@@ -2273,6 +2203,7 @@ async fn attach_local(
     let (events, receiver) = mpsc::channel(LOCAL_EVENT_CAPACITY);
     let options = SharedInstanceOptions::default()
         .with_reconnect_wait(LOCAL_RECONNECT_WAIT)
+        .with_disconnect_reasons(true)
         .with_state_events(events);
     transport
         .attach_shared_instance(shared, options)
@@ -2281,21 +2212,38 @@ async fn attach_local(
         .map_err(|err| redact_hashes(&format!("attach to the shared instance failed: {err}")))
 }
 
-/// Joins a TCP relay. The client reports every connect after its first on
-/// `events.reconnect` and every drop of an established stream on `events.disconnect`;
-/// the first connect is what the bounded wait below reads off `status`, as the client
-/// sends no event for it.
+/// The row's reason for a `local` rnsd whose established stream ended with `reason`.
+fn disconnect_sentence(reason: DisconnectReason) -> String {
+    match reason {
+        DisconnectReason::PeerClosed => "rnsd closed the socket".to_string(),
+        DisconnectReason::Reset => "the connection was reset".to_string(),
+        DisconnectReason::Timeout => "the connection timed out".to_string(),
+        DisconnectReason::Io(kind) => kind.to_string(),
+        _ => "the connection ended".to_string(),
+    }
+}
+
+/// The row's reason for a `local` rnsd whose last dial to `endpoint` failed with `kind`.
+fn dial_failure_sentence(kind: DialFailureKind, endpoint: &LocalEndpoint) -> String {
+    match kind {
+        DialFailureKind::Refused => format!("nothing is listening at {endpoint}"),
+        DialFailureKind::NotFound => format!("no rnsd socket at {endpoint}"),
+        DialFailureKind::Timeout => "rnsd did not answer".to_string(),
+        DialFailureKind::Io(kind) => kind.to_string(),
+        _ => "the dial failed".to_string(),
+    }
+}
+
+/// Joins a TCP relay. The first connect is what the bounded wait below reads off
+/// `status`; from there the client's events on the transport's interface events drive
+/// the row.
 async fn join_tcp(
     transport: &Transport,
     kind: &'static str,
     endpoint: &str,
     connect_timeout: Duration,
-    events: &TcpEventSenders,
 ) -> Joined {
-    let client = TcpClient::new(endpoint)
-        .with_connect_timeout(connect_timeout)
-        .with_disconnect_events(events.disconnect.clone())
-        .with_reconnect_events(events.reconnect.clone());
+    let client = TcpClient::new(endpoint).with_connect_timeout(connect_timeout);
     let status = client.runtime_status_handle();
     let context = transport.iface_manager().lock().await.new_context(client);
     let hash = *context.channel.address();
@@ -2834,79 +2782,43 @@ enum Transition {
     Reconnect,
 }
 
-/// What a TCP client sent on its event channels, or what an attached `local` rnsd's
-/// client reported on its; `None` there is the end of that client's stream.
-enum WatchEvent {
-    Reconnect(AddressHash),
-    Disconnect(AddressHash),
-    Local(usize, Option<SharedInstanceEvent>),
+/// The next event on the transport's interface events, or `Err(n)` once the watcher fell
+/// `n` events behind and they are gone. Never resolves once the stream is closed, so the
+/// watcher's `select!` keeps serving the `local` arm.
+async fn next_interface_event(
+    events: &mut broadcast::Receiver<InterfaceEvent>,
+) -> Result<InterfaceEvent, u64> {
+    match events.recv().await {
+        Ok(event) => Ok(event),
+        Err(broadcast::error::RecvError::Lagged(missed)) => Err(missed),
+        Err(broadcast::error::RecvError::Closed) => std::future::pending().await,
+    }
 }
 
-/// The next event on `events`, or never once every client holding a sender is gone, so
-/// the watcher's `select!` keeps ticking for the `local` arm.
-async fn next_tcp_event(events: &mut mpsc::Receiver<AddressHash>) -> AddressHash {
-    match events.recv().await {
-        Some(hash) => hash,
+/// The next state event of the attached `local` rnsd's client, `None` once its stream has
+/// ended. Never resolves while no stream is open.
+async fn next_shared_instance_event(local: &mut Option<LocalWatch>) -> Option<SharedInstanceEvent> {
+    match local {
+        Some(local) => local.events.recv().await,
         None => std::future::pending().await,
     }
 }
 
-/// The next state event from any attached `local` rnsd's client, with its row, or `None`
-/// for the row whose stream has ended. Never resolves while no stream is open, so the
-/// watcher's `select!` keeps ticking.
-async fn next_local_event(watches: &mut [Watch]) -> (usize, Option<SharedInstanceEvent>) {
-    let streams: Vec<_> = watches
-        .iter_mut()
-        .filter_map(|watch| match watch {
-            Watch::Local {
-                index,
-                events: Some(events),
-                ..
-            } => {
-                let index = *index;
-                Some(Box::pin(async move { (index, events.recv().await) }))
-            }
-            _ => None,
-        })
-        .collect();
-    if streams.is_empty() {
-        return std::future::pending().await;
-    }
-    select_all(streams).await.0
+/// The watcher's own copy of one TCP client, with what it keeps between events.
+struct TcpWatch {
+    index: usize,
+    label: String,
+    hash: AddressHash,
+    status: TcpRuntimeStatusHandle,
+    /// Whether the client's stream is up, as far as the watcher has heard.
+    connected: bool,
+    /// Whether the client has connected since start, or was connected at start; its
+    /// next connect is then a reconnect rather than its first.
+    has_connected: bool,
 }
 
-/// The watcher's own copy of one watched interface, with what it keeps between ticks.
-enum Watch {
-    Tcp {
-        index: usize,
-        label: String,
-        hash: AddressHash,
-        status: TcpRuntimeStatusHandle,
-        /// Whether the client has connected since start. Until it has, the tick polls
-        /// `status` for its first `connected`; after that its events are what count.
-        connected: bool,
-        /// When the tick read the first `connected`. The client marks its status
-        /// connected before it queues the reconnect event for that same stream, so an
-        /// event that lands within one tick of the switch describes the connect the
-        /// switch already announced and is folded into it.
-        switched_at: Option<Instant>,
-    },
-    Local {
-        index: usize,
-        label: String,
-        endpoint: LocalEndpoint,
-        /// Whether the transport holds a shared-instance client for this rnsd. Until it
-        /// does, the tick probes the endpoint and attaches on the first answer; after
-        /// that its events are what count.
-        attached: bool,
-        /// The client's state events; `None` before the attach and once the stream has
-        /// ended.
-        events: Option<mpsc::Receiver<SharedInstanceEvent>>,
-    },
-}
-
-impl Watch {
-    fn of(watched: &WatchedInterface) -> Self {
+impl TcpWatch {
+    fn of(watched: &WatchedInterface) -> Option<Self> {
         match watched {
             WatchedInterface::Tcp {
                 index,
@@ -2914,207 +2826,192 @@ impl Watch {
                 hash,
                 status,
                 connected_at_start,
-            } => Self::Tcp {
+            } => Some(Self {
                 index: *index,
                 label: label.clone(),
                 hash: *hash,
                 status: status.clone(),
                 connected: *connected_at_start,
-                switched_at: None,
-            },
-            WatchedInterface::Local {
-                index,
-                label,
-                endpoint,
-                events,
-            } => {
-                // The start receiver is taken one-shot, the way `watch_interfaces` takes
-                // `tcp_events`: the first watcher is its only reader.
-                let events = events.lock().take();
-                Self::Local {
-                    index: *index,
-                    label: label.clone(),
-                    endpoint: endpoint.clone(),
-                    attached: events.is_some(),
-                    events,
-                }
-            }
+                has_connected: *connected_at_start,
+            }),
+            WatchedInterface::Local { .. } => None,
         }
     }
 
-    /// Whether the TCP client at `hash` switched from the poll to its events less than
-    /// `within` before `now`: a reconnect event arriving in that window is the first
-    /// connect the switch already announced, not a second one.
-    fn switched_within(
-        watches: &[Self],
-        hash: AddressHash,
-        within: Duration,
-        now: Instant,
-    ) -> bool {
-        watches.iter().any(|watch| match watch {
-            Self::Tcp {
-                hash: at,
-                switched_at: Some(switched),
-                ..
-            } => *at == hash && now.saturating_duration_since(*switched) < within,
-            _ => false,
-        })
+    /// Records a connect and returns what it is to the user; `None` for a client already
+    /// marked connected, such as one whose connect at start the stream still held.
+    fn connect(&mut self) -> Option<Transition> {
+        if self.connected {
+            return None;
+        }
+        self.connected = true;
+        if std::mem::replace(&mut self.has_connected, true) {
+            Some(Transition::Reconnect)
+        } else {
+            Some(Transition::FirstConnect)
+        }
     }
+}
 
-    /// The row and label of the TCP client at `hash` once it has connected; `None` for a
-    /// hash the watcher does not know or a client still waiting on its first connect.
-    fn connected_tcp(watches: &[Self], hash: AddressHash) -> Option<(usize, &str)> {
-        watches.iter().find_map(|watch| match watch {
-            Self::Tcp {
-                index,
-                label,
-                hash: at,
-                connected: true,
-                ..
-            } if *at == hash => Some((*index, label.as_str())),
-            _ => None,
-        })
-    }
+/// The watcher's own copy of the attached `local` rnsd. A transport attaches at most one
+/// shared instance, so the watcher holds at most one of these.
+struct LocalWatch {
+    index: usize,
+    label: String,
+    endpoint: LocalEndpoint,
+    events: mpsc::Receiver<SharedInstanceEvent>,
+    /// The dial failure last logged for the row, so a client redialing into the same
+    /// failure logs it once; cleared on `Connected`.
+    logged_dial_failure: Option<String>,
+}
 
-    fn tcp_label(watches: &[Self], hash: AddressHash) -> Option<&str> {
-        watches.iter().find_map(|watch| match watch {
-            Self::Tcp {
-                label, hash: at, ..
-            } if *at == hash => Some(label.as_str()),
-            _ => None,
+impl LocalWatch {
+    /// `None` for a TCP client and for an rnsd the transport could not attach to.
+    fn of(watched: &WatchedInterface) -> Option<Self> {
+        let WatchedInterface::Local {
+            index,
+            label,
+            endpoint,
+            events,
+        } = watched
+        else {
+            return None;
+        };
+        // The start receiver is taken one-shot, the way `watch_interfaces` takes the
+        // interface events: the first watcher is its only reader.
+        let events = events.lock().take()?;
+        Some(Self {
+            index: *index,
+            label: label.clone(),
+            endpoint: endpoint.clone(),
+            events,
+            logged_dial_failure: None,
         })
     }
 }
 
-/// Follows every TCP client and `local` rnsd for the node's lifetime through the events
-/// their clients send. A TCP client that was unreachable at start sends no event for its
-/// first connect, so the tick polls its status until it reads `connected`; then it is
-/// recorded on the node, told to the user and announced over, so the line never waits on
-/// the announce. That announce skips the floor, as the peers behind that relay have
-/// never heard this destination. From then on, and from the start for a client that
-/// connected at start, each reconnect event gets an announce through `announce_now`: the
-/// relay forgot every path it held through the closed socket, and the heartbeat is up to
-/// an hour away. That announce honours and resets the floor, so a relay that flaps cannot
-/// make this node announce more often than once per `REANNOUNCE_FLOOR_SECS`; the first
-/// connect of a relay that was down at start is the one announce without it. A reconnect
-/// event queued before the poll read the first `connected` is dropped at the switch, once
-/// per tick for every client switching on it, so a connect, drop and return inside one
-/// tick does not announce twice. A disconnect event is only logged: the client redials
-/// on its own. A `local` rnsd that was not reached at start is probed once a tick until
-/// something answers and the transport is attached to it; from there, as from the start
-/// for one attached at start, its shared-instance client's state events drive the row,
-/// see `follow_local_event`. That client re-announces and redials by itself, so no line
-/// is printed and no announce sent for an rnsd. The watcher holds no peer-controlled
-/// state: a fixed list from the node's own config, one flag per client and one per rnsd.
-/// Ends when the node or its slot is gone.
+/// Folds one interface event into the TCP client it belongs to and returns the
+/// transition to tell, if any. An event of any other interface is not the watcher's to
+/// read here: the shared-instance client publishes on the same stream.
+fn follow_tcp_event(
+    watches: &mut [TcpWatch],
+    hash: AddressHash,
+    kind: InterfaceEventKind,
+) -> Option<(AddressHash, Transition)> {
+    let watch = watches.iter_mut().find(|watch| watch.hash == hash)?;
+    match kind {
+        InterfaceEventKind::Connected => watch.connect().map(|transition| (hash, transition)),
+        InterfaceEventKind::Disconnected { reason } => {
+            watch.connected = false;
+            debug!(
+                "Mesh interface {} dropped its connection ({reason:?}); the client is redialing it",
+                watch.label
+            );
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Catches the TCP clients up after the watcher fell `missed` interface events behind,
+/// from each client's status: a client whose stream is up and is not marked connected
+/// gets the transition its missed `Connected` would have brought, and one marked
+/// connected whose stream is down is unmarked, so its next `Connected` counts as a
+/// reconnect.
+fn reconcile_tcp_after_lag(
+    watches: &mut [TcpWatch],
+    missed: u64,
+) -> Vec<(AddressHash, Transition)> {
+    warn!(
+        "Mesh interface watcher fell behind and missed {missed} interface event(s); re-reading every relay's state"
+    );
+    watches
+        .iter_mut()
+        .filter_map(|watch| {
+            if watch.status.to_json()["stream_state"].as_str() == Some("connected") {
+                watch.connect().map(|transition| (watch.hash, transition))
+            } else {
+                watch.connected = false;
+                None
+            }
+        })
+        .collect()
+}
+
+/// Follows every TCP client and the `local` rnsd for the node's lifetime through the
+/// events their clients send. The first `Connected` on the transport's interface events
+/// of a TCP client that was unreachable at start is recorded on the node, told to the
+/// user and announced over, so the line never waits on the announce. That announce skips
+/// the floor, as the peers behind that relay have never heard this destination. Each
+/// `Connected` after a drop, for a client that connected at start as for one that
+/// connected later, gets an announce through `announce_now`: the relay forgot every path
+/// it held through the closed socket, and the heartbeat is up to an hour away. That
+/// announce honours and resets the floor, so a relay that flaps cannot make this node
+/// announce more often than once per `REANNOUNCE_FLOOR_SECS`; the first connect of a
+/// relay that was down at start is the one announce without it. A `Connected` for a
+/// client already marked connected, such as the connect at start the stream still held
+/// when the watcher began, tells nothing. A drop is only logged: the client redials on
+/// its own. A watcher that fell behind the stream reads each client's status instead,
+/// see `reconcile_tcp_after_lag`. The `local` rnsd's shared-instance client's state
+/// events drive its row, see `follow_local_event`. That client re-announces and redials
+/// by itself, so no line is printed and no announce sent for an rnsd. The watcher holds
+/// no peer-controlled state: a fixed list from the node's own config, two flags per
+/// client and one dial failure for the rnsd. Ends when the node or its slot is gone.
 async fn watch_interfaces(
     slot: Weak<MeshSlot>,
     runtime: Weak<MeshRuntime>,
     cancel: CancellationToken,
 ) {
-    let Some((mut watches, events)) = runtime.upgrade().map(|runtime| {
-        let watches = runtime
-            .watched_interfaces()
-            .iter()
-            .map(Watch::of)
-            .collect::<Vec<_>>();
-        (watches, runtime.tcp_events.lock().take())
+    let Some((mut watches, mut local, events)) = runtime.upgrade().map(|runtime| {
+        let watched = runtime.watched_interfaces();
+        (
+            watched.iter().filter_map(TcpWatch::of).collect::<Vec<_>>(),
+            watched.iter().find_map(LocalWatch::of),
+            runtime.interface_events.lock().take(),
+        )
     }) else {
         return;
     };
     let Some(mut events) = events else {
         return;
     };
-    let mut ticks = interval(CONNECT_WATCH_TICK);
-    // A stalled runtime must not replay the missed ticks as a burst of probes.
-    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        let event = tokio::select! {
+        let mut transitions = Vec::new();
+        tokio::select! {
             () = cancel.cancelled() => return,
-            _ = ticks.tick() => None,
-            hash = next_tcp_event(&mut events.reconnect) => Some(WatchEvent::Reconnect(hash)),
-            hash = next_tcp_event(&mut events.disconnect) => Some(WatchEvent::Disconnect(hash)),
-            (index, event) = next_local_event(&mut watches) => Some(WatchEvent::Local(index, event)),
-        };
+            received = next_interface_event(&mut events) => match received {
+                Ok(event) => {
+                    transitions.extend(follow_tcp_event(&mut watches, event.iface(), event.kind()));
+                }
+                Err(missed) => transitions = reconcile_tcp_after_lag(&mut watches, missed),
+            },
+            // The `local` row reads its client's own state stream, not the interface
+            // events: the shared-instance client exposes no state to re-read, so an event
+            // lost to a broadcast `Lagged` could not be caught up.
+            event = next_shared_instance_event(&mut local) => {
+                let Some(runtime) = runtime.upgrade() else {
+                    return;
+                };
+                follow_local_event(&runtime, &mut local, event);
+            }
+        }
+        if transitions.is_empty() {
+            continue;
+        }
         let (Some(slot), Some(runtime)) = (slot.upgrade(), runtime.upgrade()) else {
             return;
         };
         // A TCP row only ever moves to `Connected` here; `Disconnected` and `Connecting`
         // are the local arm's, and the remedies worded for them assume that.
-        let mut transitions = Vec::new();
-        match event {
-            None => {
-                let mut switching = Vec::new();
-                for watch in &mut watches {
-                    match watch {
-                        Watch::Local {
-                            index,
-                            label,
-                            endpoint,
-                            attached,
-                            events,
-                        } => {
-                            if *attached {
-                                continue;
-                            }
-                            let probe = tokio::select! {
-                                () = cancel.cancelled() => return,
-                                outcome = probe_local(endpoint, runtime.connect_timeout) => outcome,
-                            };
-                            attach_probed_local(
-                                &runtime, *index, label, endpoint, attached, events, probe,
-                            )
-                            .await;
-                        }
-                        Watch::Tcp {
-                            hash,
-                            status,
-                            connected,
-                            switched_at,
-                            ..
-                        } => {
-                            if *connected
-                                || status.to_json()["stream_state"].as_str() != Some("connected")
-                            {
-                                continue;
-                            }
-                            *connected = true;
-                            *switched_at = Some(Instant::now());
-                            switching.push(*hash);
-                        }
-                    }
-                }
-                if !switching.is_empty() {
-                    drain_switching_reconnects(&switching, &mut events.reconnect, &mut transitions);
-                }
-            }
-            Some(WatchEvent::Reconnect(hash)) => {
-                if Watch::switched_within(&watches, hash, CONNECT_WATCH_TICK, Instant::now()) {
-                    debug!(
-                        "Mesh interface {} reported the connect its switch already announced",
-                        short(&hash.to_hex_string())
-                    );
-                } else {
-                    transitions.push((hash, Transition::Reconnect));
-                }
-            }
-            Some(WatchEvent::Disconnect(hash)) => {
-                if let Some(label) = Watch::tcp_label(&watches, hash) {
-                    debug!(
-                        "Mesh interface {label} dropped its connection; the client is redialing it"
-                    );
-                }
-            }
-            Some(WatchEvent::Local(index, event)) => {
-                follow_local_event(&runtime, &mut watches, index, event);
-            }
-        }
         for (hash, transition) in transitions {
-            let Some((index, label)) = Watch::connected_tcp(&watches, hash) else {
+            let Some(TcpWatch { index, label, .. }) =
+                watches.iter().find(|watch| watch.hash == hash)
+            else {
                 continue;
             };
+            let index = *index;
             // Awaiting an announce here can hold back another client's line by up to
-            // `REKEY_GRACE`; accepted, as its event waits in the channel.
+            // `REKEY_GRACE`; accepted, as its event waits in the stream.
             match transition {
                 Transition::FirstConnect => {
                     let Some(label) = runtime.mark_interface_connected(index) else {
@@ -3179,138 +3076,87 @@ async fn watch_interfaces(
     }
 }
 
-/// Moves the clients in `switching`, which read `connected` for the first time on this
-/// tick, onto their events: each first connect is reported, then the reconnects already
-/// queued are taken once for all of them, dropping those of the switching clients, which
-/// a connect, drop and return inside one tick left behind, and keeping every other
-/// client's in order. One drain for the whole tick, because a drain per client would
-/// forward a reconnect of a client that switches later in the same tick, and that
-/// client would announce twice.
-fn drain_switching_reconnects(
-    switching: &[AddressHash],
-    reconnects: &mut mpsc::Receiver<AddressHash>,
-    transitions: &mut Vec<(AddressHash, Transition)>,
-) {
-    transitions.extend(
-        switching
-            .iter()
-            .map(|hash| (*hash, Transition::FirstConnect)),
-    );
-    while let Ok(queued) = reconnects.try_recv() {
-        if !switching.contains(&queued) {
-            transitions.push((queued, Transition::Reconnect));
-        }
-    }
-}
-
-/// Folds one probe of a `local` rnsd the transport is not attached to into its row: a
-/// probe that answers is followed by the attach, after which the row reads `connecting`
-/// until the client's first `Connected` and its events are what the watcher follows; a
-/// probe that does not keeps the row `Connecting` with its reason.
-async fn attach_probed_local(
-    runtime: &MeshRuntime,
-    index: usize,
-    label: &str,
-    endpoint: &LocalEndpoint,
-    attached: &mut bool,
-    events: &mut Option<mpsc::Receiver<SharedInstanceEvent>>,
-    probe: Result<(), String>,
-) {
-    match probe {
-        Ok(()) => {
-            let Some(transport) = runtime.transport_handle().await else {
-                return;
-            };
-            match attach_local(&transport, endpoint).await {
-                Ok(receiver) => {
-                    *attached = true;
-                    *events = Some(receiver);
-                    runtime
-                        .interfaces
-                        .lock()
-                        .await
-                        .push(JoinedInterface::Local {
-                            label: label.to_string(),
-                        });
-                    let state = InterfaceState::Connecting { reason: None };
-                    if runtime.mark_interface_state(index, state).is_some() {
-                        debug!("Mesh interface {label} is attached and dialing rnsd");
-                    }
-                }
-                Err(reason) => {
-                    let state = InterfaceState::Connecting {
-                        reason: Some(reason.clone()),
-                    };
-                    if runtime.mark_interface_state(index, state).is_some() {
-                        warn!(
-                            "Mesh interface {label} could not attach to rnsd and keeps being probed: {reason}"
-                        );
-                    }
-                }
-            }
-        }
-        Err(reason) => {
-            let state = InterfaceState::Connecting {
-                reason: Some(reason.clone()),
-            };
-            if runtime.mark_interface_state(index, state).is_some() {
-                debug!("Mesh interface {label} is not reachable yet: {reason}");
-            }
-        }
-    }
-}
-
-/// Folds one state event of an attached `local` rnsd's client into its row. `Connected`
+/// Folds one state event of the attached `local` rnsd's client into its row. `Connected`
 /// is the row's `connected`, logged at info when it moved the row (a client that
-/// connected during start had its `Connected` read there). `Disconnected` is `lost,
-/// retrying` with a fixed reason, the client being the one that saw the socket close.
-/// `Connecting` leaves the row alone: the client sends it right after every
-/// `Disconnected`, before a redial has landed, and the drop stays the row's until a
-/// stream is back; the attach itself already put the row at `connecting`.
-/// `DisconnectedWithReason` is read as `Disconnected`, since the client is not opted into
-/// disconnect reasons, and `DialFailed` leaves the row alone like `Connecting`. No idle line
-/// and no announce for any of it: the client re-announces over a restored socket itself.
-/// `None` is the end of the stream, which the detach at stop brings, and the receiver is
-/// let go.
+/// connected during start had its `Connected` read there). A drop is `lost, retrying`
+/// with the sentence for the client's reason; a plain `Disconnected`, which the attach
+/// does not ask for, reads as an orderly close. `Connecting` leaves the row alone: the
+/// client sends it right after every drop, before a redial has landed, and the drop stays
+/// the row's until a stream is back. A `DialFailed` puts its sentence on a row that is
+/// still `connecting` and leaves a lost or connected row alone; it is logged at debug
+/// only when its sentence differs from the last one logged since the last `Connected`,
+/// as the client redials every `LOCAL_RECONNECT_WAIT`. No idle line and no announce for
+/// any of it: the client re-announces over a restored socket itself. `None` is the end
+/// of the stream, which the detach at stop brings, and the receiver is let go.
 fn follow_local_event(
     runtime: &MeshRuntime,
-    watches: &mut [Watch],
-    index: usize,
+    local: &mut Option<LocalWatch>,
     event: Option<SharedInstanceEvent>,
 ) {
-    let Some(Watch::Local { label, events, .. }) = watches
-        .iter_mut()
-        .find(|watch| matches!(watch, Watch::Local { index: at, .. } if *at == index))
-    else {
+    let Some(watch) = local.as_mut() else {
         return;
     };
-    match event {
-        None => {
-            *events = None;
-            debug!("Mesh interface {label} stopped reporting; its client is detached");
+    let Some(event) = event else {
+        debug!(
+            "Mesh interface {} stopped reporting; its client is detached",
+            watch.label
+        );
+        *local = None;
+        return;
+    };
+    let LocalWatch {
+        index,
+        label,
+        endpoint,
+        logged_dial_failure,
+        ..
+    } = watch;
+    let index = *index;
+    let lose = |reason: DisconnectReason| {
+        let state = InterfaceState::Disconnected {
+            reason: disconnect_sentence(reason),
+        };
+        if runtime.mark_interface_state(index, state).is_some() {
+            warn!("Mesh interface {label} lost rnsd; the transport is redialing it");
         }
-        Some(SharedInstanceEvent::Connected) => {
+    };
+    match event {
+        SharedInstanceEvent::Connected => {
+            *logged_dial_failure = None;
             if runtime.mark_interface_connected(index).is_some() {
                 info!("Mesh interface {label} connected");
             } else {
                 debug!("Mesh interface {label} reported its connection to rnsd");
             }
         }
-        Some(
-            SharedInstanceEvent::Disconnected | SharedInstanceEvent::DisconnectedWithReason { .. },
-        ) => {
-            let state = InterfaceState::Disconnected {
-                reason: LOCAL_DROP_REASON.to_string(),
-            };
-            if runtime.mark_interface_state(index, state).is_some() {
-                warn!("Mesh interface {label} lost rnsd; the transport is redialing it");
+        SharedInstanceEvent::DisconnectedWithReason { reason } => lose(reason),
+        SharedInstanceEvent::Disconnected => lose(DisconnectReason::PeerClosed),
+        SharedInstanceEvent::Connecting => {}
+        SharedInstanceEvent::DialFailed { reason } => {
+            let sentence = dial_failure_sentence(reason, endpoint);
+            let connecting = matches!(
+                runtime
+                    .interface_states
+                    .read()
+                    .get(index)
+                    .map(|status| &status.state),
+                Some(InterfaceState::Connecting { .. })
+            );
+            if connecting {
+                runtime.mark_interface_state(
+                    index,
+                    InterfaceState::Connecting {
+                        reason: Some(sentence.clone()),
+                    },
+                );
+            }
+            if logged_dial_failure.as_deref() != Some(sentence.as_str()) {
+                debug!("Mesh interface {label} could not dial rnsd: {sentence}");
+                *logged_dial_failure = Some(sentence);
             }
         }
-        Some(SharedInstanceEvent::Connecting | SharedInstanceEvent::DialFailed { .. }) => {
-            debug!("Mesh interface {label} is dialing rnsd");
-        }
         // Guard for future variants.
-        Some(other) => debug!("Mesh interface {label} reported {other:?}"),
+        other => debug!("Mesh interface {label} reported {other:?}"),
     }
 }
 
@@ -3660,9 +3506,9 @@ impl MeshSlot {
     /// cached but not surfaced, and not marked as surfaced either, so a repeat from that
     /// identity still earns its one line. The caller refreshes the session's tool catalog
     /// once this returns, since the `mesh__*` tools are declared only while a node is on.
-    /// The interface watcher is spawned here, so this must run inside a tokio runtime; a
-    /// connect that landed between `MeshRuntime::start` and this call is seen on the
-    /// watcher's first tick, and a reconnect event sent in that gap waits in its channel.
+    /// The interface watcher is spawned here, so this must run inside a tokio runtime; an
+    /// interface event sent between `MeshRuntime::start` and this call waits in the
+    /// stream `start` subscribed, and the watcher reads it first.
     pub(crate) fn install(self: &Arc<Self>, runtime: Arc<MeshRuntime>) -> Result<()> {
         if self.get().is_some() {
             bail!(MESH_ALREADY_ON);
@@ -5460,9 +5306,14 @@ mod tests {
     const POLL: Duration = Duration::from_millis(100);
     #[cfg(unix)]
     const INTEROP_TIMEOUT: Duration = Duration::from_secs(15);
-    /// Covers the transport's fixed 5 s reconnect sleep plus one connect and one watcher tick.
+    /// Covers the transport's fixed 5 s reconnect sleep plus one connect and the watcher's
+    /// handling of it.
     #[cfg(unix)]
     const CONNECT_LATER_TIMEOUT: Duration = Duration::from_secs(12);
+    /// How long a test leaves the interface watcher to act on events already sent, before
+    /// it checks that nothing more happened.
+    #[cfg(unix)]
+    const WATCH_SETTLE: Duration = Duration::from_secs(1);
 
     /// Unset timers leave every path's deadlines as they are; set ones apply only where
     /// they are the longer, so a configured value can never shorten a deadline: the one
@@ -12127,7 +11978,7 @@ mod tests {
         sink_handle.abort();
     }
 
-    /// A `local` entry nothing answers at start: where the probe dials an abstract
+    /// A `local` entry nothing answers at start: where the client dials an abstract
     /// socket, one under a name no rnsd uses; elsewhere the loopback `port`, which the
     /// caller holds closed.
     #[cfg(unix)]
@@ -12147,9 +11998,9 @@ mod tests {
     }
 
     /// Stands in for rnsd's shared-instance listener at `endpoint`: every connection is
-    /// accepted and drained, which satisfies the probe and the attached client alike.
-    /// `socket` is the held port the TCP shape listens on. The listener and every stream
-    /// it accepted close with the returned task, so the attached client sees the drop.
+    /// accepted and drained. `socket` is the held port the TCP shape listens on. The
+    /// listener and every stream it accepted close with the returned task, so the
+    /// attached client sees the drop.
     #[cfg(unix)]
     async fn serve_local_stub(
         endpoint: &LocalEndpoint,
@@ -12166,9 +12017,10 @@ mod tests {
         }
     }
 
-    /// Serves the stub at `endpoint` again after the listener that was there went away
-    /// (an aborted `serve_local_stub`, or `accept_once_then_close` done with the probe),
-    /// the way a restarted rnsd listens where the old one did.
+    /// Serves the stub at `endpoint` where nothing holds the port: a closed one, or one
+    /// whose listener went away (an aborted `serve_local_stub`, or
+    /// `accept_once_then_close` done with its one connection), the way a restarted rnsd
+    /// listens where the old one did.
     #[cfg(unix)]
     async fn restart_local_stub(endpoint: &LocalEndpoint) -> JoinHandle<()> {
         match endpoint {
@@ -12201,11 +12053,10 @@ mod tests {
         }
     }
 
-    /// Stands in for an rnsd that answers the probe and nothing after it: the task
-    /// accepts one connection and ends, closing the listener and the probe's stream
-    /// together, so every later dial to the port is refused, which is the attached
-    /// client dialing into a refusal. Awaiting the task proves the port is free for
-    /// `restart_local_stub`.
+    /// Stands in for an rnsd that takes one connection and nothing after it: the task
+    /// accepts one connection and ends, closing the listener and that stream together,
+    /// so every later dial to the port is refused. Awaiting the task proves the port is
+    /// free for `restart_local_stub`.
     #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
     fn accept_once_then_close(listener: tokio::net::TcpListener) -> JoinHandle<()> {
         tokio::spawn(async move {
@@ -12256,12 +12107,22 @@ mod tests {
         }
     }
 
-    /// A `local`-only config with no rnsd bails on the probe's reason with one next step
-    /// (its own), not the relay hint stacked on it, and nothing stays attached.
+    /// Whether `reason` is the dial failure of a `local` client with nothing listening at
+    /// `endpoint`. A loopback port reads as refused; an unbound abstract name reads as
+    /// refused from the Linux kernel, and as a missing socket is accepted too there.
+    #[cfg(unix)]
+    fn names_nothing_listening(reason: &str, endpoint: &LocalEndpoint) -> bool {
+        reason == dial_failure_sentence(DialFailureKind::Refused, endpoint)
+            || (matches!(endpoint, LocalEndpoint::Abstract(_))
+                && reason == dial_failure_sentence(DialFailureKind::NotFound, endpoint))
+    }
+
+    /// A `local`-only config with no rnsd bails on the client's dial failure with one next
+    /// step (its own), not the relay hint stacked on it, and nothing stays attached.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn start_fails_with_one_next_step_when_the_local_rnsd_is_not_listening() {
-        let (port, _held) = held_port().await;
+        let port = closed_port().await;
         let endpoint = local_endpoint(port);
         let tmp = TempDir::new("node-local-absent");
         let mut session = Session::default();
@@ -12282,12 +12143,14 @@ mod tests {
         .expect("a local rnsd that is not listening must be refused")
         .to_string();
 
-        assert!(
-            err.starts_with(&format!(
+        let reason = err
+            .strip_prefix(&format!(
                 "Local rnsd at {endpoint} (type: local) is not reachable: "
-            )),
-            "{err}"
-        );
+            ))
+            .and_then(|rest| rest.split_once(". The node cannot join"))
+            .map(|(reason, _)| reason)
+            .unwrap_or_else(|| panic!("{err}"));
+        assert!(names_nothing_listening(reason, &endpoint), "{err}");
         assert!(err.ends_with("start rnsd or fix mesh.interfaces."), "{err}");
         assert!(!err.contains("Nothing is listening on"), "{err}");
         let metrics = tokio::runtime::Handle::current().metrics();
@@ -12297,21 +12160,21 @@ mod tests {
         .await;
     }
 
-    /// The `local` row follows the shared-instance client's events once it is attached:
-    /// `connecting` with the probe's reason until a listener answers, `connected` on the
-    /// client's `Connected` (and the kind joins `interface_kinds`), `lost, retrying` with
-    /// the fixed reason on its `Disconnected` when the listener goes away again, and it
-    /// stays there while the client's redials are refused, with no idle line for any of
-    /// it. When the listener is back on the same port the client's redial lands and the
-    /// row is `connected` again, each connect told at info exactly once; `stop` detaches
-    /// the shared-instance client.
+    /// The `local` row follows the shared-instance client's events: `connecting` with the
+    /// client's dial failure until a listener answers, `connected` on the client's
+    /// `Connected` (and the kind joins `interface_kinds`), `lost, retrying` with the
+    /// orderly close's sentence when the listener goes away again, and it stays there
+    /// while the client's redials are refused, with no idle line for any of it. When the
+    /// listener is back on the same port the client's redial lands and the row is
+    /// `connected` again, each connect told at info exactly once; `stop` detaches the
+    /// shared-instance client.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_local_row_follows_the_events_from_connecting_to_connected_to_lost() {
         use crate::testing::info_snapshot;
 
         install_log_collector();
-        let (port, socket) = held_port().await;
+        let port = closed_port().await;
         let endpoint = local_endpoint(port);
         let label = format!("local rnsd at {endpoint}");
         let connected_line = format!("Mesh interface {label} connected");
@@ -12345,7 +12208,7 @@ mod tests {
         let states = states_of(&runtime);
         assert_eq!(states[1].0, label);
         assert!(
-            matches!(&states[1].1, InterfaceState::Connecting { reason: Some(reason) } if !reason.is_empty()),
+            matches!(&states[1].1, InterfaceState::Connecting { reason: Some(reason) } if names_nothing_listening(reason, &endpoint)),
             "{states:?}"
         );
         assert_eq!(runtime.interface_kinds(), vec!["private"]);
@@ -12354,7 +12217,7 @@ mod tests {
         slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
         slot.install(runtime.clone()).unwrap();
 
-        let stub = serve_local_stub(&endpoint, socket).await;
+        let stub = restart_local_stub(&endpoint).await;
         wait_for_state(&runtime, 1, "the local row to connect", |state| {
             *state == InterfaceState::Connected
         })
@@ -12364,27 +12227,22 @@ mod tests {
             runtime.interfaces(),
             vec![private_label(relay.port()), label.clone()]
         );
-        sleep(CONNECT_WATCH_TICK * 2).await;
+        sleep(WATCH_SETTLE * 2).await;
         assert_eq!(connects_told(), 1, "{:?}", info_snapshot());
 
         stub.abort();
+        let lost = InterfaceState::Disconnected {
+            reason: "rnsd closed the socket".to_string(),
+        };
         wait_for_state(&runtime, 1, "the local row to report the drop", |state| {
-            *state
-                == InterfaceState::Disconnected {
-                    reason: LOCAL_DROP_REASON.to_string(),
-                }
+            *state == lost
         })
         .await;
         assert_eq!(runtime.interface_kinds(), vec!["private"]);
-        // The client's `Connecting` follows its `Disconnected` at once; the row keeps the
-        // drop through it and through the redials the held port refuses.
-        sleep(LOCAL_RECONNECT_WAIT + CONNECT_WATCH_TICK).await;
-        assert_eq!(
-            states_of(&runtime)[1].1,
-            InterfaceState::Disconnected {
-                reason: LOCAL_DROP_REASON.to_string(),
-            }
-        );
+        // The client's `Connecting` follows the drop at once; the row keeps the drop
+        // through it and through the redials the held port refuses.
+        sleep(LOCAL_RECONNECT_WAIT + WATCH_SETTLE).await;
+        assert_eq!(states_of(&runtime)[1].1, lost);
 
         // rnsd is back where it was: the client's next redial lands, the row moves from
         // the drop to `connected` and that move is the second connect told.
@@ -12394,7 +12252,7 @@ mod tests {
         })
         .await;
         assert_eq!(runtime.interface_kinds(), vec!["private", "local"]);
-        sleep(CONNECT_WATCH_TICK * 2).await;
+        sleep(WATCH_SETTLE * 2).await;
         assert_eq!(connects_told(), 2, "{:?}", info_snapshot());
         assert!(
             notifier.0.lock().is_empty(),
@@ -12451,7 +12309,7 @@ mod tests {
         let transport = runtime.transport_handle().await.unwrap();
         assert!(
             transport.shared_instance().is_some(),
-            "the transport is attached to the shared instance once the probe answered"
+            "the transport is attached to the shared instance"
         );
 
         let slot = Arc::new(MeshSlot::default());
@@ -12462,10 +12320,10 @@ mod tests {
         let envs = one_fire(&hooks, HookEvent::MeshStarted);
         assert_eq!(env_value(&envs, "COYOTE_MESH_INTERFACES"), Some("local"));
 
-        // A few ticks later the row is still `connected`, nothing was said, and the
-        // watcher, which only tells a connect that moved the row, has not repeated the
-        // one start told.
-        sleep(CONNECT_WATCH_TICK * 2).await;
+        // A while later the row is still `connected`, nothing was said, and the watcher,
+        // which only tells a connect that moved the row, has not repeated the one start
+        // told.
+        sleep(WATCH_SETTLE * 2).await;
         assert_eq!(states_of(&runtime)[0].1, InterfaceState::Connected);
         assert!(
             notifier.0.lock().is_empty(),
@@ -12488,27 +12346,22 @@ mod tests {
         stub.abort();
     }
 
-    /// The first real producer of a bare `connecting`: an rnsd that was not reached at
-    /// start answers the probe, the transport is attached, and while its client's dials
-    /// are still refused the row reads `Connecting` WITHOUT a reason (the probe's reason
-    /// left with the probe; the client has established nothing to report), the kind has
-    /// not joined, nothing is told at info and no idle line is printed. Once rnsd takes
-    /// the client's redial the row is `connected`, told at info exactly once. The lever
-    /// is a listener that takes the probe's connection and closes, so the attached
-    /// client dials into a refusal; it is written for the TCP shape, so the test runs
-    /// where that shape is the `local` endpoint (Linux and Android dial an abstract
-    /// socket there).
-    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    /// While the attached client's redials are refused, the row keeps `connecting` with
+    /// the dial failure's sentence, the kind has not joined, nothing is told at info, no
+    /// idle line is printed, and the watcher logs the repeated failure once rather than
+    /// on every redial. Once rnsd takes the client's redial the row is `connected`, told
+    /// at info exactly once.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_local_row_reads_connecting_without_a_reason_while_the_attached_client_dials() {
-        use crate::testing::info_snapshot;
+    async fn a_local_row_keeps_its_dial_reason_while_the_attached_client_redials() {
+        use crate::testing::{debug_snapshot, info_snapshot};
 
         install_log_collector();
-        let (port, socket) = held_port().await;
+        let port = closed_port().await;
         let endpoint = local_endpoint(port);
         let label = format!("local rnsd at {endpoint}");
         let (relay, relay_handle, _) = loopback_relay().await;
-        let tmp = TempDir::new("node-local-connecting-bare");
+        let tmp = TempDir::new("node-local-dial-reason");
         let mut session = Session::default();
         let runtime = MeshRuntime::start(
             &MeshConfig {
@@ -12528,47 +12381,45 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(
-            matches!(
-                states_of(&runtime)[1].1,
-                InterfaceState::Connecting { reason: Some(_) }
-            ),
-            "{:?}",
-            states_of(&runtime)
-        );
+        let InterfaceState::Connecting {
+            reason: Some(reason),
+        } = states_of(&runtime)[1].1.clone()
+        else {
+            panic!("{:?}", states_of(&runtime));
+        };
+        assert!(names_nothing_listening(&reason, &endpoint), "{reason}");
+        let dial_line = format!("Mesh interface {label} could not dial rnsd: {reason}");
         let slot = Arc::new(MeshSlot::default());
         let notifier = Arc::new(RecordingSink::default());
         slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
         slot.install(runtime.clone()).unwrap();
 
-        // rnsd comes up but takes only the probe.
-        let stub = accept_once_then_close(socket.listen(16).unwrap());
-        wait_for_state(
-            &runtime,
-            1,
-            "the local row to read connecting without a reason",
-            |state| *state == InterfaceState::Connecting { reason: None },
-        )
-        .await;
-        assert_eq!(
-            InterfaceState::Connecting { reason: None }.to_string(),
-            "connecting"
-        );
         let transport = runtime.transport_handle().await.unwrap();
         assert!(
             transport.shared_instance().is_some(),
             "the transport is attached while its client dials"
         );
-        // The client redials into a refusal for a redial wait and more; the row holds the
-        // bare `connecting`, the kind stays out and nothing is told.
+        // The client redials into a refusal for two redial waits; the row holds the
+        // reason, the kind stays out, nothing is told and the failure is logged once.
         sleep(LOCAL_RECONNECT_WAIT * 2).await;
         assert_eq!(
             states_of(&runtime)[1].1,
-            InterfaceState::Connecting { reason: None },
+            InterfaceState::Connecting {
+                reason: Some(reason.clone()),
+            },
             "{:?}",
             states_of(&runtime)
         );
         assert_eq!(runtime.interface_kinds(), vec!["private"]);
+        assert_eq!(
+            debug_snapshot()
+                .iter()
+                .filter(|line| *line == &dial_line)
+                .count(),
+            1,
+            "a repeated dial failure is logged once: {:?}",
+            debug_snapshot()
+        );
         let connected_line = format!("Mesh interface {label} connected");
         assert!(
             !info_snapshot().iter().any(|line| line == &connected_line),
@@ -12578,14 +12429,13 @@ mod tests {
 
         // rnsd starts taking connections: the client's next redial lands and the row
         // moves once.
-        stub.await.unwrap();
         let daemon = restart_local_stub(&endpoint).await;
         wait_for_state(&runtime, 1, "the local row to connect", |state| {
             *state == InterfaceState::Connected
         })
         .await;
         assert_eq!(runtime.interface_kinds(), vec!["private", "local"]);
-        sleep(CONNECT_WATCH_TICK * 2).await;
+        sleep(WATCH_SETTLE * 2).await;
         assert_eq!(
             info_snapshot()
                 .iter()
@@ -12607,27 +12457,34 @@ mod tests {
         relay_handle.abort();
     }
 
-    /// The probe is not what decides `connected` at start. A listener that takes the
-    /// probe's connection and closes leaves the attached client dialing into a refusal
-    /// (the same lever as the bare-`connecting` test, and the same gate). A `local`-only
-    /// config is refused the way no rnsd is, with the probe's shape of message and the
-    /// loopback hint, and nothing stays attached. Next to a relay the node starts, the
-    /// row reads a bare `connecting` with the kind out and no connect told, and the
-    /// watcher moves it to `connected`, told once, when a listener is back on the port
-    /// and the client's redial lands.
+    /// An rnsd that takes the client's connection and closes it at once: the client's
+    /// `Connected` arrives within the start wait, so a `local`-only config starts with the
+    /// row `connected`, told once, and the drop that follows is the watcher's to read,
+    /// which moves the row to `lost, retrying` with the kind out and no idle line. The
+    /// row keeps the drop until a listener is back on the port and the client's redial
+    /// lands, which is the second connect told. The lever is written for the TCP shape,
+    /// so the test runs where that shape is the `local` endpoint (Linux and Android dial
+    /// an abstract socket there).
     #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_local_row_is_not_connected_at_start_on_the_probe_alone() {
+    async fn a_local_rnsd_that_drops_the_client_at_once_starts_connected_then_reads_lost() {
         use crate::testing::info_snapshot;
 
         install_log_collector();
         let (port, socket) = held_port().await;
         let endpoint = local_endpoint(port);
+        let label = format!("local rnsd at {endpoint}");
+        let connected_line = format!("Mesh interface {label} connected");
+        let connects_told = || {
+            info_snapshot()
+                .iter()
+                .filter(|line| *line == &connected_line)
+                .count()
+        };
         let stub = accept_once_then_close(socket.listen(16).unwrap());
-        let tmp = TempDir::new("node-local-probe-only");
+        let tmp = TempDir::new("node-local-drop-at-once");
         let mut session = Session::default();
-
-        let err = MeshRuntime::start(
+        let runtime = MeshRuntime::start(
             &MeshConfig {
                 interfaces: vec![local_entry(port)],
                 ..MeshConfig::default()
@@ -12638,39 +12495,60 @@ mod tests {
             short_connect(),
         )
         .await
-        .err()
-        .expect("a local rnsd whose client has not connected must be refused")
-        .to_string();
-        assert!(
-            err.starts_with(&format!(
-                "Local rnsd at {endpoint} (type: local) is not reachable: rnsd accepted the probe but the client did not connect within "
-            )),
-            "{err}"
+        .unwrap();
+        assert_eq!(
+            states_of(&runtime),
+            vec![(label.clone(), InterfaceState::Connected)]
         );
-        assert!(
-            err.ends_with("start rnsd or fix mesh.interfaces."),
-            "one next step, not the relay hint stacked on it: {err}"
-        );
+        assert_eq!(connects_told(), 1, "{:?}", info_snapshot());
         stub.await.unwrap();
-        let metrics = tokio::runtime::Handle::current().metrics();
-        wait_until("the transport's tasks to exit", || {
-            metrics.num_alive_tasks() == 0
+        let slot = Arc::new(MeshSlot::default());
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        slot.install(runtime.clone()).unwrap();
+
+        wait_for_state(&runtime, 0, "the local row to report the drop", |state| {
+            matches!(state, InterfaceState::Disconnected { .. })
         })
         .await;
+        assert!(runtime.interface_kinds().is_empty());
 
-        let (port, socket) = held_port().await;
+        let daemon = restart_local_stub(&endpoint).await;
+        wait_for_state(&runtime, 0, "the local row to reconnect", |state| {
+            *state == InterfaceState::Connected
+        })
+        .await;
+        assert_eq!(runtime.interface_kinds(), vec!["local"]);
+        sleep(WATCH_SETTLE * 2).await;
+        assert_eq!(connects_told(), 2, "{:?}", info_snapshot());
+        assert!(
+            notifier.0.lock().is_empty(),
+            "a local row prints no idle line: {:?}",
+            notifier.0.lock()
+        );
+
+        let transport = runtime.transport_handle().await.unwrap();
+        assert!(slot.stop().await.unwrap());
+        assert!(transport.shared_instance().is_none());
+        daemon.abort();
+    }
+
+    /// Starts a node whose `local` entry is a closed port, next to a relay, and returns it
+    /// with its local row at `connecting` with the refused dial's reason.
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    async fn start_beside_a_relay_with_a_dialing_local(
+        tmp: &TempDir,
+        relay_port: u16,
+    ) -> (Arc<MeshRuntime>, LocalEndpoint) {
+        let port = closed_port().await;
         let endpoint = local_endpoint(port);
-        let label = format!("local rnsd at {endpoint}");
-        let stub = accept_once_then_close(socket.listen(16).unwrap());
-        let tmp = TempDir::new("node-local-probe-only-relay");
         let mut session = Session::default();
-        let (relay, relay_handle, _) = loopback_relay().await;
         let runtime = MeshRuntime::start(
             &MeshConfig {
                 interfaces: vec![
                     MeshInterface::Private {
                         host: "127.0.0.1".to_string(),
-                        port: relay.port(),
+                        port: relay_port,
                     },
                     local_entry(port),
                 ],
@@ -12678,107 +12556,22 @@ mod tests {
             },
             true,
             &mut session,
-            mesh_paths(&tmp),
+            mesh_paths(tmp),
             short_connect(),
         )
         .await
         .unwrap();
-        let states = states_of(&runtime);
-        assert_eq!(states[1].0, label);
         assert_eq!(
-            states[1].1,
-            InterfaceState::Connecting { reason: None },
-            "{states:?}"
-        );
-        assert_eq!(runtime.interface_kinds(), vec!["private"]);
-        let connected_line = format!("Mesh interface {label} connected");
-        assert!(
-            !info_snapshot().iter().any(|line| line == &connected_line),
-            "nothing is connected on the probe alone: {:?}",
-            info_snapshot()
-        );
-        let transport = runtime.transport_handle().await.unwrap();
-        assert!(
-            transport.shared_instance().is_some(),
-            "the transport stays attached while its client dials"
-        );
-        let slot = Arc::new(MeshSlot::default());
-        slot.install(runtime.clone()).unwrap();
-
-        stub.await.unwrap();
-        let daemon = restart_local_stub(&endpoint).await;
-        wait_for_state(&runtime, 1, "the local row to connect", |state| {
-            *state == InterfaceState::Connected
-        })
-        .await;
-        assert_eq!(runtime.interface_kinds(), vec!["private", "local"]);
-        sleep(CONNECT_WATCH_TICK * 2).await;
-        assert_eq!(
-            info_snapshot()
-                .iter()
-                .filter(|line| *line == &connected_line)
-                .count(),
-            1,
-            "the connect is told once: {:?}",
-            info_snapshot()
-        );
-
-        assert!(slot.stop().await.unwrap());
-        assert!(transport.shared_instance().is_none());
-        daemon.abort();
-        relay_handle.abort();
-    }
-
-    /// Starts a node whose `local` entry answers the probe and nothing after it, next to
-    /// a relay, and returns it once its local row reads a bare `connecting`. The lever is
-    /// a listener that takes the probe's connection and closes; the kernel can complete
-    /// the attached client's first dial in the accept queue before that close lands, in
-    /// which case the client saw a stream and its drop and the row reads `lost,
-    /// retrying` instead, so a start that came up any other way is stopped and the lever
-    /// is re-armed on a fresh port, a bounded number of times.
-    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-    async fn start_beside_a_relay_with_a_dialing_local(
-        tmp: &TempDir,
-        relay_port: u16,
-    ) -> (Arc<MeshRuntime>, LocalEndpoint, JoinHandle<()>) {
-        let mut seen = Vec::new();
-        for _ in 0..3 {
-            let (port, socket) = held_port().await;
-            let endpoint = local_endpoint(port);
-            let stub = accept_once_then_close(socket.listen(16).unwrap());
-            let mut session = Session::default();
-            let runtime = MeshRuntime::start(
-                &MeshConfig {
-                    interfaces: vec![
-                        MeshInterface::Private {
-                            host: "127.0.0.1".to_string(),
-                            port: relay_port,
-                        },
-                        local_entry(port),
-                    ],
-                    ..MeshConfig::default()
-                },
-                true,
-                &mut session,
-                mesh_paths(tmp),
-                short_connect(),
-            )
-            .await
-            .unwrap();
-            if states_of(&runtime)[1].1 == (InterfaceState::Connecting { reason: None }) {
-                return (runtime, endpoint, stub);
+            states_of(&runtime)[1].1,
+            InterfaceState::Connecting {
+                reason: Some(dial_failure_sentence(DialFailureKind::Refused, &endpoint)),
             }
-            seen.push(states_of(&runtime)[1].1.clone());
-            runtime.shutdown().await.unwrap();
-            stub.abort();
-        }
-        panic!(
-            "no start left the local row at a bare connecting (a dial that lands in the accept queue before the close reads lost, retrying): {seen:?}"
         );
+        (runtime, endpoint)
     }
 
-    /// A `local` row that is still a bare `connecting` when the operator turns the mesh
-    /// off: `stop` detaches the shared-instance client while it is dialing, nothing hangs
+    /// A `local` row that is still `connecting` when the operator turns the mesh off:
+    /// `stop` detaches the shared-instance client while it is dialing, nothing hangs
     /// on the start wait's leftover receiver, the client does not keep dialing the
     /// endpoint after the detach (an rnsd that comes up afterwards hears nothing), no
     /// connect is ever told, and the same config dir starts again at once against that
@@ -12791,7 +12584,7 @@ mod tests {
         install_log_collector();
         let (relay, relay_handle, _) = loopback_relay().await;
         let tmp = TempDir::new("node-local-dialing-stop");
-        let (runtime, endpoint, stub) =
+        let (runtime, endpoint) =
             start_beside_a_relay_with_a_dialing_local(&tmp, relay.port()).await;
         let label = format!("local rnsd at {endpoint}");
         let connected_line = format!("Mesh interface {label} connected");
@@ -12811,7 +12604,6 @@ mod tests {
             transport.shared_instance().is_none(),
             "the dialing client is detached with the node"
         );
-        stub.await.unwrap();
 
         // rnsd comes up after the stop: the detached client is gone and dials nothing.
         let LocalEndpoint::Tcp(addr) = &endpoint else {
@@ -12865,64 +12657,52 @@ mod tests {
         relay_handle.abort();
     }
 
-    /// The start-abort gate on a `local`-only config waits for the client's first
-    /// `Connected` no longer than `connect_timeout`: a stand-in that takes the probe and
-    /// refuses the dial makes `start` bail within a small multiple of that timeout, not
-    /// hang on the client's redials, and the reason names the configured wait as the
-    /// operator spelled it. The kernel race the probe-alone test describes is handled the
-    /// same way: a start that came up `connected` is stopped and the lever re-armed.
-    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    /// On a `local`-only config the start is refused on the client's first dial failure,
+    /// not after the whole `connect_timeout`: with a timeout far longer than any refused
+    /// dial takes, `start` still bails within a few seconds, and the reason is the dial
+    /// failure the client reported.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_local_only_bail_on_a_dialing_client_is_bounded_by_connect_timeout() {
+    async fn a_local_only_start_is_refused_on_the_first_dial_failure_not_the_timeout() {
         use crate::testing::info_snapshot;
 
         install_log_collector();
-        let connect_timeout = short_connect().connect_timeout;
+        let connect_timeout = Duration::from_secs(60);
         let tmp = TempDir::new("node-local-dialing-bound");
-        let mut outcome = None;
-        for _ in 0..3 {
-            let (port, socket) = held_port().await;
-            let endpoint = local_endpoint(port);
-            let stub = accept_once_then_close(socket.listen(16).unwrap());
-            let mut session = Session::default();
-            let started_at = tokio::time::Instant::now();
-            let result = MeshRuntime::start(
-                &MeshConfig {
-                    interfaces: vec![local_entry(port)],
-                    ..MeshConfig::default()
-                },
-                true,
-                &mut session,
-                mesh_paths(&tmp),
-                short_connect(),
-            )
-            .await;
-            let elapsed = started_at.elapsed();
-            stub.await.unwrap();
-            match result {
-                Err(err) => {
-                    outcome = Some((endpoint, err.to_string(), elapsed));
-                    break;
-                }
-                Ok(runtime) => runtime.shutdown().await.unwrap(),
-            }
-        }
-        let (endpoint, err, elapsed) =
-            outcome.expect("the client's first dial kept landing in the accept queue");
+        let port = closed_port().await;
+        let endpoint = local_endpoint(port);
+        let mut session = Session::default();
+        let started_at = tokio::time::Instant::now();
+        let err = MeshRuntime::start(
+            &MeshConfig {
+                interfaces: vec![local_entry(port)],
+                ..MeshConfig::default()
+            },
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            NodeOptions {
+                connect_timeout,
+                ..NodeOptions::default()
+            },
+        )
+        .await
+        .err()
+        .expect("a local rnsd that refuses every dial must be refused")
+        .to_string();
+        let elapsed = started_at.elapsed();
         assert!(
-            elapsed < connect_timeout * 6,
-            "the start wait is bounded by connect_timeout ({connect_timeout:?}), took {elapsed:?}"
+            elapsed < Duration::from_secs(10),
+            "the refusal waits for the first dial failure, not connect_timeout ({connect_timeout:?}); took {elapsed:?}"
         );
-        assert!(
-            err.contains(&format!("did not connect within {connect_timeout:?}.")),
-            "the reason names the configured wait: {err}"
-        );
-        assert!(
-            err.starts_with(&format!(
+        let reason = err
+            .strip_prefix(&format!(
                 "Local rnsd at {endpoint} (type: local) is not reachable: "
-            )),
-            "{err}"
-        );
+            ))
+            .and_then(|rest| rest.split_once(". The node cannot join"))
+            .map(|(reason, _)| reason)
+            .unwrap_or_else(|| panic!("{err}"));
+        assert!(names_nothing_listening(reason, &endpoint), "{err}");
         let label = format!("local rnsd at {endpoint}");
         assert!(
             !info_snapshot()
@@ -13672,9 +13452,9 @@ mod tests {
         silent.relay_handle.abort();
     }
 
-    /// One connect announce per pending interface: the first `connected` the poll reads
-    /// takes the client off the poll, and a connection that holds sends no event, so the
-    /// later ticks announce nothing.
+    /// One connect announce per pending interface: the client's first `Connected` is its
+    /// one first connect, and a connection that holds sends no further event, so nothing
+    /// is announced later.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_second_connected_poll_never_reannounces() {
@@ -13708,12 +13488,12 @@ mod tests {
         })
         .await;
 
-        sleep(CONNECT_WATCH_TICK * 3).await;
+        sleep(WATCH_SETTLE * 3).await;
         assert!(all_connected(&runtime));
         assert_eq!(
             announces_since(before, &hash8),
             1,
-            "later ticks announce nothing"
+            "a connection that holds announces nothing more"
         );
         assert!(
             runtime.mark_interface_connected(1).is_none(),
@@ -13730,89 +13510,131 @@ mod tests {
         .await;
     }
 
-    /// The switch from the connect poll to the events: the switching clients' own queued
-    /// reconnects go, since their first connects are about to be announced, while another
-    /// client's stay in order behind every first connect; two clients switching on one
-    /// tick are drained together, so neither forwards the other's reconnect.
-    #[test]
-    fn the_switch_to_events_drops_only_the_switching_clients_queued_reconnects() {
-        let switching = AddressHash::new_from_rand(OsRng);
-        let other = AddressHash::new_from_rand(OsRng);
-        let (tx, mut rx) = mpsc::channel(TCP_EVENT_CAPACITY);
-        for hash in [switching, other, switching, other] {
-            tx.try_send(hash).unwrap();
-        }
-
-        let mut transitions = Vec::new();
-        drain_switching_reconnects(&[switching], &mut rx, &mut transitions);
-
-        assert_eq!(
-            transitions,
-            vec![
-                (switching, Transition::FirstConnect),
-                (other, Transition::Reconnect),
-                (other, Transition::Reconnect),
-            ]
-        );
-        assert!(rx.try_recv().is_err(), "the queue is drained at the switch");
-
-        let second = AddressHash::new_from_rand(OsRng);
-        for hash in [switching, second, other, switching, second] {
-            tx.try_send(hash).unwrap();
-        }
-
-        let mut transitions = Vec::new();
-        drain_switching_reconnects(&[switching, second], &mut rx, &mut transitions);
-
-        assert_eq!(
-            transitions,
-            vec![
-                (switching, Transition::FirstConnect),
-                (second, Transition::FirstConnect),
-                (other, Transition::Reconnect),
-            ]
-        );
-        assert!(rx.try_recv().is_err(), "the queue is drained at the switch");
-    }
-
-    #[test]
-    fn a_reconnect_within_one_tick_of_the_switch_is_the_connect_the_switch_announced() {
-        let hash = AddressHash::new_from_rand(OsRng);
-        let other = AddressHash::new_from_rand(OsRng);
-        let switched = Instant::now();
-        let watch = |switched_at| Watch::Tcp {
+    /// The watcher's copy of a TCP client at `hash` whose status reads as never connected.
+    fn tcp_watch(hash: AddressHash, connected_at_start: bool) -> TcpWatch {
+        TcpWatch::of(&WatchedInterface::Tcp {
             index: 0,
             label: "relay".into(),
             hash,
             status: TcpClient::new("127.0.0.1:1").runtime_status_handle(),
-            connected: true,
-            switched_at,
+            connected_at_start,
+        })
+        .unwrap()
+    }
+
+    /// A client connected at start reads the `Connected` the stream held from the start
+    /// as nothing, and its next connect after a drop as a reconnect. A client pending at
+    /// start tells one first connect on its first `Connected`, nothing on a repeat, and a
+    /// reconnect on a connect after a drop. Dial events, and every event of an interface
+    /// that is not a TCP client (the shared-instance client publishes on the same stream),
+    /// tell nothing.
+    #[test]
+    fn tcp_events_tell_one_first_connect_then_a_reconnect_after_each_drop() {
+        let up = AddressHash::new_from_rand(OsRng);
+        let pending = AddressHash::new_from_rand(OsRng);
+        let other = AddressHash::new_from_rand(OsRng);
+        let mut watches = [tcp_watch(up, true), tcp_watch(pending, false)];
+        let connected = InterfaceEventKind::Connected;
+        let dropped = InterfaceEventKind::Disconnected {
+            reason: DisconnectReason::PeerClosed,
         };
-        let fresh = [watch(Some(switched))];
-        assert!(Watch::switched_within(
-            &fresh,
-            hash,
-            CONNECT_WATCH_TICK,
-            switched + CONNECT_WATCH_TICK / 2
-        ));
-        assert!(
-            !Watch::switched_within(&fresh, other, CONNECT_WATCH_TICK, switched),
-            "another client's event is its own"
+
+        assert_eq!(
+            follow_tcp_event(&mut watches, up, InterfaceEventKind::Connecting),
+            None
         );
-        assert!(
-            !Watch::switched_within(
-                &fresh,
-                hash,
-                CONNECT_WATCH_TICK,
-                switched + CONNECT_WATCH_TICK
+        assert_eq!(
+            follow_tcp_event(&mut watches, up, connected),
+            None,
+            "the connect at start the stream still held"
+        );
+        assert_eq!(follow_tcp_event(&mut watches, up, dropped), None);
+        assert_eq!(
+            follow_tcp_event(&mut watches, up, connected),
+            Some((up, Transition::Reconnect))
+        );
+
+        assert_eq!(
+            follow_tcp_event(
+                &mut watches,
+                pending,
+                InterfaceEventKind::DialFailed {
+                    reason: DialFailureKind::Refused,
+                },
             ),
-            "a tick later the event is a real reconnect"
+            None
         );
-        let never = [watch(None)];
-        assert!(
-            !Watch::switched_within(&never, hash, CONNECT_WATCH_TICK, switched),
-            "a client connected at start never switched"
+        assert_eq!(
+            follow_tcp_event(&mut watches, pending, connected),
+            Some((pending, Transition::FirstConnect))
         );
+        assert_eq!(follow_tcp_event(&mut watches, pending, connected), None);
+        assert_eq!(follow_tcp_event(&mut watches, pending, dropped), None);
+        assert_eq!(
+            follow_tcp_event(&mut watches, pending, connected),
+            Some((pending, Transition::Reconnect))
+        );
+
+        assert_eq!(follow_tcp_event(&mut watches, other, connected), None);
+        assert_eq!(follow_tcp_event(&mut watches, other, dropped), None);
+    }
+
+    /// After the watcher fell behind, each client's status decides: a client whose stream
+    /// is up and is not marked connected gets a first connect if it never connected and a
+    /// reconnect if it had, one already marked connected gets nothing, and one marked
+    /// connected whose stream is down is unmarked, so its next `Connected` is a reconnect.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lagged_watcher_reconciles_each_tcp_client_from_its_status() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let transport = Transport::new(TransportConfig::new(
+            SCOPE_APP_NAME,
+            &TransportIdentity::new_from_rand(OsRng),
+            false,
+        ));
+        let client = TcpClient::new(addr.to_string());
+        let up = client.runtime_status_handle();
+        let context = transport.iface_manager().lock().await.new_context(client);
+        let handle = tokio::spawn(TcpClient::spawn(context));
+        let (_stream, _) = listener.accept().await.unwrap();
+        wait_until("the client to connect", || {
+            up.to_json()["stream_state"].as_str() == Some("connected")
+        })
+        .await;
+        let watch = |status: &TcpRuntimeStatusHandle, connected, has_connected| TcpWatch {
+            index: 0,
+            label: "relay".into(),
+            hash: AddressHash::new_from_rand(OsRng),
+            status: status.clone(),
+            connected,
+            has_connected,
+        };
+        let down = TcpClient::new("127.0.0.1:1").runtime_status_handle();
+        let mut watches = [
+            watch(&up, false, false),
+            watch(&up, false, true),
+            watch(&up, true, true),
+            watch(&down, true, true),
+        ];
+        let hashes: Vec<_> = watches.iter().map(|watch| watch.hash).collect();
+
+        let transitions = reconcile_tcp_after_lag(&mut watches, 7);
+
+        assert_eq!(
+            transitions,
+            vec![
+                (hashes[0], Transition::FirstConnect),
+                (hashes[1], Transition::Reconnect),
+            ]
+        );
+        assert!(watches[..3].iter().all(|watch| watch.connected));
+        assert!(!watches[3].connected);
+        assert_eq!(
+            follow_tcp_event(&mut watches, hashes[3], InterfaceEventKind::Connected),
+            Some((hashes[3], Transition::Reconnect))
+        );
+        handle.abort();
     }
 
     /// A node on a `TransportRelay`, installed in its own slot with a recording notifier.
@@ -13880,7 +13702,7 @@ mod tests {
 
     /// The relay goes away and comes back on the same port: each node's client reconnects
     /// on its own, each node announces again (the relay forgot every path it held), the
-    /// relay hears both, and later ticks announce nothing more.
+    /// relay hears both, and nothing more is announced after that.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn both_nodes_reannounce_when_the_relay_restarts_on_the_same_port() {
@@ -13899,7 +13721,7 @@ mod tests {
         wait_for_mesh_line(&a.notifier, &line).await;
         wait_for_mesh_line(&b.notifier, &line).await;
 
-        sleep(CONNECT_WATCH_TICK * 3).await;
+        sleep(WATCH_SETTLE * 3).await;
         assert_eq!(
             announces_since(before, a.hash8()),
             1,
@@ -13952,7 +13774,7 @@ mod tests {
             .await;
         }
 
-        sleep(CONNECT_WATCH_TICK * 3).await;
+        sleep(WATCH_SETTLE * 3).await;
         assert_eq!(
             announces_since(before, a.hash8()),
             0,
@@ -14011,7 +13833,7 @@ mod tests {
         let before = debug_snapshot().len();
 
         relay.stop().await;
-        sleep(CONNECT_WATCH_TICK * 3).await;
+        sleep(WATCH_SETTLE * 3).await;
         for node in [&a, &b] {
             assert!(
                 all_connected(&node.runtime),
@@ -14073,7 +13895,7 @@ mod tests {
             );
         }
 
-        sleep(CONNECT_WATCH_TICK * 3).await;
+        sleep(WATCH_SETTLE * 3).await;
         assert_eq!(
             announces_since(before, a.hash8()),
             1,
@@ -14127,13 +13949,13 @@ mod tests {
         let before = debug_snapshot().len();
         // Let the client fail a few attempts first: attempts that fail before the first
         // connect send no event.
-        sleep(CONNECT_WATCH_TICK * 2).await;
+        sleep(WATCH_SETTLE * 2).await;
         assert_eq!(announces_since(before, &hash8), 0);
 
         let (relay_b, mut heard) = TransportRelay::start_on_subscribed(late_port).await;
         wait_for_mesh_line(&notifier, &format!("{late_label} connected")).await;
         TransportRelay::heard_from(&mut heard, &hash).await;
-        sleep(CONNECT_WATCH_TICK * 3).await;
+        sleep(WATCH_SETTLE * 3).await;
         assert_eq!(
             announces_since(before, &hash8),
             1,
@@ -14148,7 +13970,7 @@ mod tests {
         let (relay_b, mut heard) = TransportRelay::start_on_subscribed(late_port).await;
         wait_for_mesh_line(&notifier, &format!("{late_label} reconnected; announced")).await;
         TransportRelay::heard_from(&mut heard, &hash).await;
-        sleep(CONNECT_WATCH_TICK * 3).await;
+        sleep(WATCH_SETTLE * 3).await;
         assert_eq!(
             announces_since(before, &hash8),
             2,
@@ -14207,7 +14029,7 @@ mod tests {
         relay.stop().await;
         let relay = TransportRelay::start_on(port).await;
         // Wait for the client itself to report the drop and the return, then give the
-        // watcher a few ticks on the restored connection.
+        // watcher a while on the restored connection.
         let WatchedInterface::Tcp { status, .. } = &runtime.watched_interfaces()[0] else {
             panic!("the relay is a TCP client");
         };
@@ -14220,7 +14042,7 @@ mod tests {
                 && json["stream_state"].as_str() == Some("connected")
         })
         .await;
-        sleep(CONNECT_WATCH_TICK * 3).await;
+        sleep(WATCH_SETTLE * 3).await;
 
         assert_eq!(announces_since(before, &hash8), 0);
         assert!(runtime.destination.lock().await.last_announce.is_none());
@@ -14300,7 +14122,7 @@ mod tests {
                 && json["stream_state"].as_str() != Some("connected")
         })
         .await;
-        sleep(CONNECT_WATCH_TICK * 2).await;
+        sleep(WATCH_SETTLE * 2).await;
         assert_eq!(
             states_of(&runtime)[0].1,
             InterfaceState::Connected,
@@ -14313,13 +14135,13 @@ mod tests {
             "nothing is said about a drop: {:?}",
             mesh_lines(&notifier)
         );
-        let dropped =
-            format!("Mesh interface {label} dropped its connection; the client is redialing it");
+        let dropped = format!("Mesh interface {label} dropped its connection (");
         assert!(
             debug_snapshot()
                 .into_iter()
                 .skip(before_drop)
-                .any(|line| line == dropped),
+                .any(|line| line.starts_with(&dropped)
+                    && line.ends_with("); the client is redialing it")),
             "the drop is logged once the client reports it: {:?}",
             debug_snapshot()
                 .into_iter()
@@ -14388,7 +14210,7 @@ mod tests {
         let (late_relay, mut heard) = TransportRelay::start_on_subscribed(late_port).await;
         wait_for_mesh_line(&notifier, &format!("{late_label} connected")).await;
         TransportRelay::heard_from(&mut heard, &hash).await;
-        sleep(CONNECT_WATCH_TICK * 2).await;
+        sleep(WATCH_SETTLE * 2).await;
         assert_eq!(announces_since(before, short(&hash)), 1);
         assert!(all_connected(&runtime));
 
@@ -14401,8 +14223,8 @@ mod tests {
         .await;
     }
 
-    /// Two relays that were down at start come up together, so their clients read
-    /// `connected` on the same watcher tick: each is told once, each first connect
+    /// Two relays that were down at start come up together, so their clients' first
+    /// `Connected` events land back to back: each is told once, each first connect
     /// announces once without the floor, and no `reconnected` line is printed for either,
     /// since a first connect is not a reconnect. Both rows then follow their events: a
     /// restart of one of them is reported for that relay alone, announced once more past
@@ -14439,18 +14261,18 @@ mod tests {
         slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
         slot.install(runtime.clone()).unwrap();
         let before = debug_snapshot().len();
-        sleep(CONNECT_WATCH_TICK * 2).await;
+        sleep(WATCH_SETTLE * 2).await;
         assert_eq!(announces_since(before, &hash8), 0);
 
         // Both relays listen long before the clients' next redial, which they took at the
-        // same moment, so both first connects land within one tick.
+        // same moment, so both first connects land together.
         let (relay_a, mut heard_a) = TransportRelay::start_on_subscribed(late_a).await;
         let (relay_b, mut heard_b) = TransportRelay::start_on_subscribed(late_b).await;
         wait_for_mesh_line(&notifier, &format!("{label_a} connected")).await;
         wait_for_mesh_line(&notifier, &format!("{label_b} connected")).await;
         TransportRelay::heard_from(&mut heard_a, &hash).await;
         TransportRelay::heard_from(&mut heard_b, &hash).await;
-        sleep(CONNECT_WATCH_TICK * 3).await;
+        sleep(WATCH_SETTLE * 3).await;
         let lines = mesh_lines(&notifier);
         for label in [&label_a, &label_b] {
             assert_eq!(
@@ -14480,7 +14302,7 @@ mod tests {
         let (relay_b, mut heard_b) = TransportRelay::start_on_subscribed(late_b).await;
         wait_for_mesh_line(&notifier, &format!("{label_b} reconnected; announced")).await;
         TransportRelay::heard_from(&mut heard_b, &hash).await;
-        sleep(CONNECT_WATCH_TICK * 3).await;
+        sleep(WATCH_SETTLE * 3).await;
         let lines = mesh_lines(&notifier);
         assert_eq!(
             lines
@@ -14552,7 +14374,7 @@ mod tests {
         let listener = socket.listen(16).unwrap();
         let (sink_handle, _) = serve_as_sink(listener).await;
         wait_for_mesh_line(&notifier, &format!("{held_label} connected")).await;
-        sleep(CONNECT_WATCH_TICK * 2).await;
+        sleep(WATCH_SETTLE * 2).await;
 
         assert_eq!(announces_since(before, &hash8), 0);
         assert!(runtime.destination.lock().await.last_announce.is_none());
@@ -15555,63 +15377,120 @@ mod tests {
         started.relay_handle.abort();
     }
 
-    /// The reasoned events a `local` client may send fold into the row as their plain
-    /// counterparts: `DialFailed` leaves a connected row alone, like `Connecting`, and
-    /// `DisconnectedWithReason` is the fixed drop row `Disconnected` gives. No watcher
-    /// runs, since the slot is never installed, so the started node's one row stands in
-    /// for the `local` one.
+    /// A `local` client's events fold into the row with the renderers' sentences: a
+    /// `DialFailed` puts its reason on a `connecting` row and leaves a connected or lost
+    /// row alone, a drop is `lost, retrying` with its reason's sentence and a plain
+    /// `Disconnected` reads as the orderly close, `Connecting` never moves a lost row, and
+    /// the end of the stream lets the client go. No watcher runs, since the slot is never
+    /// installed, so the started node's one row stands in for the `local` one.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_local_clients_reasoned_events_fold_like_their_plain_counterparts() {
-        use rns_transport::transport::{DialFailureKind, DisconnectReason};
-
         let started = started_runtime("node-local-reasoned-events").await;
         let runtime = &started.runtime;
-        let mut watches = vec![Watch::Local {
+        let (_sender, events) = mpsc::channel(1);
+        let mut local = Some(LocalWatch {
             index: 0,
             label: "local rnsd at 127.0.0.1:37428".to_string(),
             endpoint: LocalEndpoint::Tcp("127.0.0.1:37428".parse().unwrap()),
-            attached: true,
-            events: None,
-        }];
+            events,
+            logged_dial_failure: None,
+        });
         let row = |runtime: &MeshRuntime| runtime.interface_states()[0].state.clone();
-        runtime.mark_interface_state(0, InterfaceState::Connecting { reason: None });
-
-        follow_local_event(
-            runtime,
-            &mut watches,
-            0,
-            Some(SharedInstanceEvent::Connected),
-        );
-        assert_eq!(row(runtime), InterfaceState::Connected);
-
-        follow_local_event(
-            runtime,
-            &mut watches,
-            0,
+        let refused = || {
             Some(SharedInstanceEvent::DialFailed {
                 reason: DialFailureKind::Refused,
-            }),
-        );
-        assert_eq!(row(runtime), InterfaceState::Connected);
+            })
+        };
+        let lost = |reason: &str| InterfaceState::Disconnected {
+            reason: reason.to_string(),
+        };
+        runtime.mark_interface_state(0, InterfaceState::Connecting { reason: None });
 
-        follow_local_event(
-            runtime,
-            &mut watches,
-            0,
-            Some(SharedInstanceEvent::DisconnectedWithReason {
-                reason: DisconnectReason::PeerClosed,
-            }),
-        );
+        follow_local_event(runtime, &mut local, refused());
         assert_eq!(
             row(runtime),
-            InterfaceState::Disconnected {
-                reason: LOCAL_DROP_REASON.to_string(),
+            InterfaceState::Connecting {
+                reason: Some("nothing is listening at 127.0.0.1:37428".to_string()),
             }
         );
 
+        follow_local_event(runtime, &mut local, Some(SharedInstanceEvent::Connected));
+        assert_eq!(row(runtime), InterfaceState::Connected);
+
+        follow_local_event(runtime, &mut local, refused());
+        assert_eq!(row(runtime), InterfaceState::Connected);
+
+        follow_local_event(
+            runtime,
+            &mut local,
+            Some(SharedInstanceEvent::DisconnectedWithReason {
+                reason: DisconnectReason::Reset,
+            }),
+        );
+        assert_eq!(row(runtime), lost("the connection was reset"));
+
+        follow_local_event(runtime, &mut local, Some(SharedInstanceEvent::Connecting));
+        assert_eq!(row(runtime), lost("the connection was reset"));
+        follow_local_event(runtime, &mut local, refused());
+        assert_eq!(row(runtime), lost("the connection was reset"));
+
+        follow_local_event(runtime, &mut local, Some(SharedInstanceEvent::Connected));
+        follow_local_event(runtime, &mut local, Some(SharedInstanceEvent::Disconnected));
+        assert_eq!(row(runtime), lost("rnsd closed the socket"));
+
+        follow_local_event(runtime, &mut local, None);
+        assert!(local.is_none());
+
         runtime.shutdown().await.unwrap();
         started.relay_handle.abort();
+    }
+
+    #[test]
+    fn disconnect_sentence_names_each_reason() {
+        assert_eq!(
+            disconnect_sentence(DisconnectReason::PeerClosed),
+            "rnsd closed the socket"
+        );
+        assert_eq!(
+            disconnect_sentence(DisconnectReason::Reset),
+            "the connection was reset"
+        );
+        assert_eq!(
+            disconnect_sentence(DisconnectReason::Timeout),
+            "the connection timed out"
+        );
+        assert_eq!(
+            disconnect_sentence(DisconnectReason::Io(std::io::ErrorKind::BrokenPipe)),
+            "broken pipe"
+        );
+    }
+
+    #[test]
+    fn dial_failure_sentence_names_each_kind() {
+        let endpoint = LocalEndpoint::Tcp("127.0.0.1:37428".parse().unwrap());
+        assert_eq!(
+            dial_failure_sentence(DialFailureKind::Refused, &endpoint),
+            "nothing is listening at 127.0.0.1:37428"
+        );
+        assert_eq!(
+            dial_failure_sentence(
+                DialFailureKind::NotFound,
+                &LocalEndpoint::Abstract("@rns/default".to_string())
+            ),
+            "no rnsd socket at @rns/default"
+        );
+        assert_eq!(
+            dial_failure_sentence(DialFailureKind::Timeout, &endpoint),
+            "rnsd did not answer"
+        );
+        assert_eq!(
+            dial_failure_sentence(
+                DialFailureKind::Io(std::io::ErrorKind::PermissionDenied),
+                &endpoint
+            ),
+            "permission denied"
+        );
     }
 
     #[cfg(unix)]

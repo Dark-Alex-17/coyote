@@ -1860,8 +1860,8 @@ async fn a_propagation_node_demanding_a_raised_stamp_cost_still_takes_our_messag
     drop(reference);
 }
 
-/// What a `local` row's `Disconnected` carries once rnsd drops the socket. `node.rs` owns
-/// the literal; a drift there fails this suite rather than passing it quietly.
+/// What a `local` row's `Disconnected` carries once rnsd drops the socket. `node.rs` renders
+/// it from the client's `PeerClosed` reason; a drift there fails this suite rather than passing it quietly.
 const RNSD_DROP_REASON: &str = "rnsd closed the socket";
 /// How long after SIGTERM both `local` rows must read lost: the client sees the socket
 /// close as soon as rnsd detaches its interfaces.
