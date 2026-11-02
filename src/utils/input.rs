@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use std::io::{Write, stdout};
@@ -7,10 +7,9 @@ use std::io::{Write, stdout};
 /// Returns the character if it's one of the valid options, or the default if Enter is pressed
 pub fn read_single_key(valid_chars: &[char], default: char, prompt: &str) -> Result<char> {
     if crate::tui::active() {
-        return Err(anyhow::anyhow!(
-            "Keyboard prompts are not available in the TUI; unanswered: {}",
-            prompt.trim()
-        ));
+        let question = crate::tui::plain_text(prompt);
+        let question = question.lines().next().unwrap_or_default().trim();
+        bail!("Keyboard prompts are not available in the TUI yet; unanswered: {question}"); // TASK-315
     }
     print!("{prompt}");
     stdout().flush()?;

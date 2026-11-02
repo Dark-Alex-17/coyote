@@ -30,6 +30,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use ratatui_textarea::TextArea;
 use redirect::FdRedirect;
+pub(crate) use render::plain_text;
 use render::{RenderCache, Renderer};
 use sink::{TuiPrompter, TuiSink, UiMsg, unattended_answer};
 use std::collections::VecDeque;
@@ -3290,13 +3291,20 @@ mod tests {
         let _tui_on = crate::testing::AtomicFlagGuard::set(&TUI_ACTIVE, true);
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(crate::utils::read_single_key(&['y', 'n'], 'n', "ask? "));
+            let _ = tx.send(crate::utils::read_single_key(
+                &['y', 'n'],
+                'n',
+                "\x1b[33mWARNING:\x1b[0m risky\nContinue? [y/N] ",
+            ));
         });
         let answer = rx
             .recv_timeout(Duration::from_secs(2))
             .expect("the gate must answer without reading stdin");
         let err = answer.unwrap_err().to_string();
-        assert!(err.contains("not available in the TUI"), "{err}");
+        assert_eq!(
+            err,
+            "Keyboard prompts are not available in the TUI yet; unanswered: WARNING: risky"
+        );
     }
 
     /// `.edit` on a file is refused the same way: no editor is spawned
@@ -3393,6 +3401,10 @@ mod tests {
             (
                 "src/utils/command.rs",
                 "bail!(\"Editing files is not available in the TUI yet\")",
+            ),
+            (
+                "src/utils/input.rs",
+                "bail!(\"Keyboard prompts are not available in the TUI yet; unanswered: {question}\")",
             ),
             (
                 "src/tui/mod.rs",
