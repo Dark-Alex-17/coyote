@@ -94,7 +94,20 @@ fn is_hint_name(rest: &str) -> bool {
     let len = rest
         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
         .unwrap_or(rest.len());
-    len > 0 && BUILTIN_NAMES.contains(&&rest[..len])
+    len > 0 && BUILTIN_NAMES.contains(&&rest[..len]) && !continues_as_path(&rest[len..])
+}
+
+/// A builtin name followed by `/` or by `.` and more name characters is a dotfile path
+/// such as `.vault/key` or `.mcp.json`, not a command hint.
+fn continues_as_path(tail: &str) -> bool {
+    let mut chars = tail.chars();
+    match chars.next() {
+        Some('/') => true,
+        Some('.') => chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '*' | '_' | '-')),
+        _ => false,
+    }
 }
 
 /// The prefix a running session renders hints in. Clones share one value, so a store
@@ -365,6 +378,56 @@ mod tests {
             "a .yaml file",
         ] {
             assert_eq!(slash.render_hints(text), text, "{text}");
+        }
+    }
+
+    mod path_shaped_tails {
+        use super::*;
+
+        const PATHS: [&str; 6] = [
+            "allow `.vault/key`",
+            "deny .vault/** for everyone",
+            "wrote .session/notes.md",
+            "read .info.md and .rag_v2",
+            "under (.agent/tools)",
+            "\".file.tar-gz\"",
+        ];
+
+        #[test]
+        fn dotfile_paths_named_like_builtins_survive_every_prefix() {
+            for prefix in [
+                CommandPrefix::Dot,
+                CommandPrefix::Slash,
+                CommandPrefix::Both,
+            ] {
+                for text in PATHS {
+                    assert_eq!(prefix.render_hints(text), text, "{prefix}: {text}");
+                }
+            }
+        }
+
+        #[test]
+        fn hints_at_sentence_end_and_before_punctuation_still_render() {
+            let cases = [
+                ("run .help.", "run /help."),
+                ("run .help, then .info.", "run /help, then /info."),
+                ("try `.vault`.", "try `/vault`."),
+                ("(.session)", "(/session)"),
+                ("use .rag; then .exit rag", "use /rag; then /exit rag"),
+            ];
+            for (text, slashed) in cases {
+                assert_eq!(CommandPrefix::Slash.render_hints(text), slashed, "{text}");
+                assert_eq!(CommandPrefix::Dot.render_hints(text), text, "{text}");
+                assert_eq!(CommandPrefix::Both.render_hints(text), text, "{text}");
+            }
+        }
+
+        #[test]
+        fn a_hint_and_a_path_on_one_line_render_only_the_hint() {
+            assert_eq!(
+                CommandPrefix::Slash.render_hints("`.vault/key` is denied; run `.vault list`"),
+                "`.vault/key` is denied; run `/vault list`"
+            );
         }
     }
 }
