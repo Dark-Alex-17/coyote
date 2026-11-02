@@ -71,6 +71,10 @@ git("add", ".")
 git("commit", "-q", "-m", "init")
 BASE = subprocess.run(["git", "-C", REPO, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
 
+# The fixtures set every seam before reading it, so a surviving caller seam shows up only here.
+check("env: no caller SISYPHUS_GH_* seam or poll sleep survives the scrub",
+      not [k for k in os.environ if k.startswith("SISYPHUS_GH_") or k in ("SISYPHUS_CI_SLEEP", "SISYPHUS_REVIEW_SLEEP")])
+
 
 def base_state(**over):
     s = {"project_dir": REPO, "git_root": REPO, "base_sha": BASE, "head_sha": BASE, "run_id": "x",

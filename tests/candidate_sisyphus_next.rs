@@ -21,6 +21,8 @@
 //! with `GIT_CONFIG_NOSYSTEM=1` and `GIT_CONFIG_GLOBAL` set to the null device,
 //! so neither the caller's agent variables nor its repository, its injected
 //! git config or any system or user git config reach a fixture.
+//! The batteries also drop every `SISYPHUS_GH_*` seam plus `SISYPHUS_CI_SLEEP`
+//! and `SISYPHUS_REVIEW_SLEEP`, so a caller's seams cannot replace theirs.
 //!
 //! Every real-binary run starts from a scratch config dir whose `mcp.json`
 //! defines no server (`{"mcpServers": {}}`), checked before each spawn, so no
@@ -49,7 +51,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "sisyphus-next";
 const CANDIDATE_NAMES: [&str; 2] = ["sisyphus-next", "architect-next"];
-const SMOKE_FLOOR: usize = 251;
+const SMOKE_FLOOR: usize = 321;
 
 fn agents_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents")
@@ -128,6 +130,21 @@ fn path_with(yq_dir: &Path) -> OsString {
 fn without_agent_vars(cmd: &mut Command) {
     for (key, _) in std::env::vars_os() {
         if key.to_string_lossy().starts_with("LLM_AGENT_VAR_") {
+            cmd.env_remove(key);
+        }
+    }
+}
+
+/// The gates run `SISYPHUS_GH_*` commands in place of `gh` and read the CI
+/// and review poll sleeps from the environment, so a developer's own seams
+/// would replace the batteries' fixtures.
+fn without_sisyphus_seams(cmd: &mut Command) {
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        let seam = name.starts_with("SISYPHUS_GH_")
+            || name == "SISYPHUS_CI_SLEEP"
+            || name == "SISYPHUS_REVIEW_SLEEP";
+        if seam {
             cmd.env_remove(key);
         }
     }
@@ -236,7 +253,8 @@ fn without_git_repo_vars(cmd: &mut Command) {
 }
 
 /// A command that runs inside the candidate dir with every path-bearing
-/// variable pointed at the scratch dir and no agent variables inherited.
+/// variable pointed at the scratch dir and no agent variables or gate seams
+/// inherited.
 fn battery(program: &Path, scratch: &TempDirGuard) -> Command {
     let mut cmd = Command::new(program);
     cmd.current_dir(candidate_dir())
@@ -249,6 +267,7 @@ fn battery(program: &Path, scratch: &TempDirGuard) -> Command {
         .env_remove("GRAPH_STATE")
         .env_remove("GRAPH_STATE_FILE");
     without_agent_vars(&mut cmd);
+    without_sisyphus_seams(&mut cmd);
     without_git_repo_vars(&mut cmd);
     cmd.env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null");
@@ -422,6 +441,29 @@ fn smoke_battery_ignores_a_user_config_swapped_in_through_the_environment() {
     assert_no_bytecode_under_candidate();
 }
 
+/// Gate seams set after the wrapper's own scrub: failing review, checks and
+/// resolve commands and a review poll sleep. The battery's fixtures set every
+/// seam before reading it, so its env row is what would fail if smoke_test.py
+/// kept one of them.
+#[test]
+fn smoke_battery_drops_seams_injected_through_the_environment() {
+    let Some(python) = python3() else { return };
+    let scratch = scratch_dir("smoke-seams");
+    let output = battery(&python, &scratch)
+        .env("SISYPHUS_GH_REVIEWS_CMD", "exit 7")
+        .env("SISYPHUS_GH_CHECKS_CMD", "exit 7")
+        .env("SISYPHUS_GH_RESOLVE_CMD", "exit 7")
+        .env("SISYPHUS_REVIEW_SLEEP", "5")
+        .arg("scripts/smoke_test.py")
+        .output()
+        .unwrap();
+    let report = transcript(&output);
+    assert!(output.status.success(), "{report}");
+    let (passed, total) = smoke_summary(&String::from_utf8_lossy(&output.stdout));
+    assert_eq!(passed, total, "{report}");
+    assert_no_bytecode_under_candidate();
+}
+
 #[test]
 fn readme_hygiene_row_lists_the_scrubbed_git_variables() {
     let readme = fs::read_to_string(candidate_dir().join("README.md")).unwrap();
@@ -463,6 +505,22 @@ fn readme_hygiene_row_states_the_wrapper_run_isolation() {
                     cache dirs";
     assert!(row.contains(sentence), "missing {sentence:?} in: {row}");
     assert!(row.contains("`tests/candidate_sisyphus_next.rs`"), "{row}");
+}
+
+/// The hygiene row names the seam scrub that smoke_test.py and `battery()`
+/// both apply.
+#[test]
+fn readme_hygiene_row_states_the_seam_scrub() {
+    let readme = fs::read_to_string(candidate_dir().join("README.md")).unwrap();
+    let row = readme
+        .lines()
+        .find(|l| l.starts_with("| battery env hygiene |"))
+        .expect("README has a battery env hygiene row");
+    let sentence = "The battery also drops every variable starting with `SISYPHUS_GH_` plus \
+                    `SISYPHUS_CI_SLEEP` and `SISYPHUS_REVIEW_SLEEP` at start, so a caller's \
+                    seams cannot replace its fixtures, and the wrapper's `battery()` removes \
+                    the same names";
+    assert!(row.contains(sentence), "missing {sentence:?} in: {row}");
 }
 
 /// Hunks in `diff -u old new`, or `None` when the files are identical. A file
@@ -588,6 +646,8 @@ fn session_block_check_passes_under_mikefarah_yq() {
             .any(|l| l.starts_with("ok variables mirror sisyphus")),
         "{report}"
     );
+    let graph_only = "ok variables mirror sisyphus (names + defaults; graph-only: pr_tracking)";
+    assert!(stdout.lines().any(|l| l == graph_only), "{report}");
 }
 
 /// The engine forwards a script-node crash only along `fallback:`, so the
@@ -1032,6 +1092,41 @@ fn build_lock_is_declared_at_the_prose_twins_position() {
     assert!(
         description.contains(constraint),
         "candidate description lacks the constraint sentence"
+    );
+}
+
+/// `pr_tracking` is the candidate's one graph-only variable: declared last
+/// with default `ci`, described with both values and the parent that never
+/// passes `review` down, absent from the prose twin, and named in the
+/// session check's exclusion list.
+#[test]
+fn pr_tracking_is_a_graph_only_variable_declared_last_with_default_ci() {
+    let candidate = variable_list(&candidate_dir().join("graph.yaml"));
+    let last = candidate.last().expect("the candidate declares variables");
+    assert_eq!(
+        last["name"].as_str(),
+        Some("pr_tracking"),
+        "{:?}",
+        names_of(&candidate)
+    );
+    assert_eq!(last["default"].as_str(), Some("ci"), "pr_tracking default");
+    let description = last["description"].as_str().unwrap();
+    for word in ["'ci'", "'review'", "architect-next"] {
+        assert!(
+            description.contains(word),
+            "missing {word:?} in: {description}"
+        );
+    }
+    let prose = variable_list(&agents_dir().join("sisyphus/config.yaml"));
+    assert!(
+        !names_of(&prose).contains(&"pr_tracking"),
+        "the prose sisyphus declares pr_tracking: {:?}",
+        names_of(&prose)
+    );
+    let check = fs::read_to_string(candidate_dir().join("scripts/check_session_block.sh")).unwrap();
+    assert!(
+        check.lines().any(|l| l == "GRAPH_ONLY_VARS='pr_tracking'"),
+        "check_session_block.sh does not list pr_tracking as graph-only"
     );
 }
 
@@ -2338,7 +2433,8 @@ const FROZEN_GRAPH_BOUNDS: &[(&str, i64)] = &[
 ];
 
 /// Every integer field of every node in the staging baseline (`timeout`,
-/// `max_attempts`, `max_iterations`); a node absent here declares none.
+/// `max_attempts`, `max_iterations`) plus the review-watch nodes; a node
+/// absent here declares none.
 const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("architecture_review", "max_attempts", 1),
     ("architecture_review", "timeout", 3600),
@@ -2379,6 +2475,9 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("oracle_strikeout", "timeout", 1800),
     ("plan_research", "timeout", 300),
     ("plan_subtasks", "timeout", 600),
+    ("pr_review_apply", "timeout", 120),
+    ("pr_review_poll", "timeout", 120),
+    ("pr_review_triage", "timeout", 600),
     ("research_answer", "max_iterations", 45),
     ("research_answer", "timeout", 3600),
     ("run_coder", "max_attempts", 1),
@@ -2404,6 +2503,7 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
     "ci_fix_strikes",
     "ci_poll_fails",
     "ci_polls",
+    "ci_polls_run",
     "ci_started_at",
     "clarify_rounds",
     "debris_reruns",
@@ -2414,6 +2514,11 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
     "obs_rounds",
     "oracle_retries",
     "owner_polls",
+    "pr_review_poll_fails",
+    "pr_review_polls",
+    "pr_review_rounds",
+    "pr_review_started_at",
+    "pr_review_watch_polls",
     "reask_rounds",
     "rejected_rounds",
     "review_rounds",
@@ -2423,7 +2528,8 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
 ];
 
 /// The bound constants in `scripts/_lib.py` the gates route on (the
-/// re-run-once family covers `debris_reruns`), as written in the baseline.
+/// re-run-once family covers `debris_reruns`), as written in the baseline,
+/// plus the review-watch bounds.
 const FROZEN_SCRIPT_BOUNDS: &[(&str, &str)] = &[
     ("CI_FLAKE_RERUNS", "2"),
     ("CI_POLL_FAILS", "3"),
@@ -2435,6 +2541,11 @@ const FROZEN_SCRIPT_BOUNDS: &[(&str, &str)] = &[
     ("OWNER_WAIT_MINUTES", "30"),
     ("REASK_MAX", "STRIKE_LIMIT"),
     ("RERUN_ONCE", "1"),
+    ("REVIEW_CI_POLL_BUDGET", "60"),
+    ("REVIEW_MAX_POLLS", "80"),
+    ("REVIEW_MAX_ROUNDS", "STRIKE_LIMIT"),
+    ("REVIEW_POLL_SLEEP", "600"),
+    ("REVIEW_WALL_SECS", "REVIEW_MAX_POLLS * REVIEW_POLL_SLEEP"),
     ("STRIKE_LIMIT", "3"),
     ("SUBTASK_MAX", "3"),
     ("TAIL_CHARS", "6000"),
@@ -2552,6 +2663,46 @@ fn graph_and_gate_budgets_equal_the_frozen_baseline() {
     );
 }
 
+/// The integer value of a `_lib.py` constant whose right-hand side is an
+/// integer literal or the name of another such constant.
+fn lib_constant(lib: &str, name: &str) -> i64 {
+    let prefix = format!("{name} = ");
+    let value = lib
+        .lines()
+        .find_map(|l| l.strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("_lib.py assigns no {name}"))
+        .split('#')
+        .next()
+        .unwrap()
+        .trim();
+    value.parse().unwrap_or_else(|_| lib_constant(lib, value))
+}
+
+/// The engine caps the visits to each node at `settings.max_loop_iterations`,
+/// so the review watch has to reach its own caps first: the review poll
+/// budget with the round cap and one visit to spare, and the run-wide CI poll
+/// budget past which no fix round starts.
+#[test]
+fn review_watch_caps_stay_below_the_per_node_visit_cap() {
+    let lib = fs::read_to_string(candidate_dir().join("scripts/_lib.py")).unwrap();
+    let polls = lib_constant(&lib, "REVIEW_MAX_POLLS");
+    let rounds = lib_constant(&lib, "REVIEW_MAX_ROUNDS");
+    let ci_budget = lib_constant(&lib, "REVIEW_CI_POLL_BUDGET");
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let shipped: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let cap = shipped["settings"]["max_loop_iterations"]
+        .as_i64()
+        .expect("settings.max_loop_iterations is an integer");
+    assert!(
+        polls + rounds + 1 < cap,
+        "REVIEW_MAX_POLLS {polls} + REVIEW_MAX_ROUNDS {rounds} + 1 reaches the cap {cap}"
+    );
+    assert!(
+        ci_budget < cap,
+        "REVIEW_CI_POLL_BUDGET {ci_budget} reaches the cap {cap}"
+    );
+}
+
 /// How each llm node's output schema carries the `anomalies` channel in the
 /// staging baseline: `Plain` and `Described` are the two property shapes,
 /// `NoSchema` is a node with no `output_schema` at all.
@@ -2575,6 +2726,7 @@ const FROZEN_LLM_ANOMALIES: &[(&str, AnomaliesChannel)] = &[
     ("observability_pass", AnomaliesChannel::Plain),
     ("plan_research", AnomaliesChannel::Plain),
     ("plan_subtasks", AnomaliesChannel::Plain),
+    ("pr_review_triage", AnomaliesChannel::Plain),
     ("research_answer", AnomaliesChannel::NoSchema),
     ("send_breach_notice", AnomaliesChannel::NoSchema),
     ("summarize_run", AnomaliesChannel::NoSchema),
@@ -3227,9 +3379,63 @@ fn readme_ci_budget_row_separates_per_watch_from_per_run_counters() {
     for sentence in [
         "Per-watch budgets are `ci_polls`, `ci_poll_fails` and `ci_started_at`: they reset every time a watch starts (`ci_gate`, the owner's re-run answer, a flake re-run).",
         "Per-run budgets are `ci_reruns` (per check, `CI_FLAKE_RERUNS`) and `ci_fix_strikes` (`STRIKE_LIMIT`).",
+        "With `pr_tracking` set to `review`, the review watch adds the per-watch budgets `pr_review_watch_polls` and `pr_review_poll_fails`, reset at each watch start, and the per-run budgets `pr_review_polls` (`REVIEW_MAX_POLLS`), `pr_review_started_at` (`REVIEW_WALL_SECS`), `pr_review_rounds` (`REVIEW_MAX_ROUNDS`) and `ci_polls_run` (`REVIEW_CI_POLL_BUDGET`).",
+        "`ci_fix_strikes` stays per run across review rounds",
     ] {
         assert!(row.contains(sentence), "missing {sentence:?} in {row}");
     }
+}
+
+/// The review-watch row names every stop status, every escalation kind, the
+/// seams, each `REVIEW_*` bound exactly as the frozen bounds record it, and
+/// the rule that keeps a delegated run and a parent's task sisyphus out of
+/// the watch.
+#[test]
+fn readme_pr_tracking_row_names_the_loop_stops_and_parent_rule() {
+    let readme = fs::read_to_string(candidate_dir().join("README.md")).unwrap();
+    let section = readme
+        .split("\n## ")
+        .find(|s| s.starts_with("Landed-upstream adjustments"))
+        .expect("README has a Landed-upstream adjustments section");
+    let row = section
+        .lines()
+        .find(|l| l.starts_with("| pr_tracking review watch |"))
+        .unwrap_or_else(|| panic!("missing pr_tracking review watch row:\n{section}"));
+    let names = [
+        "approved",
+        "closed",
+        "merged",
+        "wall_cap",
+        "round_cap",
+        "owner_judgment",
+        "poll_error",
+        "pr_review_closed",
+        "pr_review_exhausted",
+        "pr_review_round_cap",
+        "pr_review_owner_judgment",
+        "ci_exhausted",
+        "ci_infra",
+        "SISYPHUS_GH_REVIEWS_CMD",
+        "SISYPHUS_GH_RESOLVE_CMD",
+        "SISYPHUS_REVIEW_SLEEP",
+    ];
+    for name in names {
+        assert!(
+            row.contains(&format!("`{name}`")),
+            "{name} missing from: {row}"
+        );
+    }
+    for (name, value) in FROZEN_SCRIPT_BOUNDS
+        .iter()
+        .filter(|(n, _)| n.starts_with("REVIEW_"))
+    {
+        let bound = format!("`{name} = {value}`");
+        assert!(row.contains(&bound), "missing {bound} in: {row}");
+    }
+    let parent = "a delegated run never starts the watch";
+    assert!(row.contains(parent), "missing {parent:?} in: {row}");
+    let architect = "architect-next does not pass `pr_tracking=review` to its task sisyphus";
+    assert!(row.contains(architect), "missing {architect:?} in: {row}");
 }
 
 /// Every entry shim dispatches `run("<its own stem>")`, that name is a key of
