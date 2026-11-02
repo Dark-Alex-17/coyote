@@ -4893,3 +4893,132 @@ fn the_local_row_reports_rnsd_going_away_and_coming_back_through_the_real_binary
     assert_eq!(probe.marker_count("MESH_STOPPED"), 1, "one stop at exit");
     rnsd.stop();
 }
+
+/// Ruling 123a through the real binary: a `local`-only `.mesh on` with nothing at the
+/// endpoint is refused on the client's FIRST failed dial, not after the whole start
+/// wait. The bound is generous against the ~1 s a refused dial takes and still well
+/// under the 5 s wait a refusal that sat out the timeout would show.
+#[test]
+fn a_local_only_refusal_arrives_on_the_first_failed_dial_not_after_the_start_wait() {
+    let rnsd = LocalRnsd::absent();
+    let endpoint = rnsd.endpoint();
+    let probe = Probe::new("local-only-refusal-latency", false, &[])
+        .with_local_interface(rnsd.port(), rnsd.instance());
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    wait_for(&mut session, SESSION_PROMPT);
+
+    let started = Instant::now();
+    let refused = command_text(
+        &mut session,
+        ".mesh on --yes",
+        "start rnsd or fix mesh.interfaces.",
+        SESSION_PROMPT,
+    );
+    let took = started.elapsed();
+    assert!(
+        refused.contains(&format!(
+            "Error: Local rnsd at {endpoint} (type: local) is not reachable: "
+        )),
+        "{refused:?}"
+    );
+    assert!(
+        took < Duration::from_secs(4),
+        "a local-only start is refused on the first failed dial; took {took:?}: {refused:?}"
+    );
+    assert_eq!(probe.marker_count("MESH_STARTED"), 0, "nothing was started");
+    let status = exit_clean(&mut session);
+    assert!(
+        matches!(status, WaitStatus::Exited(_, 0)),
+        ".exit: expected a clean exit, got {status:?}"
+    );
+}
+
+/// Rulings 123/124 through the real binary: a `local` entry nothing answers at, beside a
+/// relay that connects, does not refuse the start. `.mesh on` joins through the relay
+/// and warns that the local rnsd is not reachable yet, with the client's dial failure
+/// rendered as Coyote's sentence and the start-the-daemon tail; `.mesh info` lists the
+/// local row as `connecting, retrying: <that sentence>` and keeps it there while the
+/// client redials. Once a listener is up at the endpoint the background redial lands
+/// and the row reads `connected` with no second WARNING. The exact refused-dial
+/// sentence is the TCP shape's, so it is checked where that shape is the endpoint.
+#[test]
+fn a_local_entry_beside_a_relay_starts_dialing_and_flips_to_connected_when_rnsd_listens() {
+    let relay = SilentRelay::start();
+    let mut rnsd = LocalRnsd::absent();
+    let endpoint = rnsd.endpoint();
+    let label = format!("local rnsd at {endpoint}");
+    let probe = Probe::new("local-beside-relay", false, &[relay.port])
+        .with_local_interface(rnsd.port(), rnsd.instance());
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    wait_for(&mut session, SESSION_PROMPT);
+
+    let joined = command_prints(
+        &mut session,
+        ".mesh on --yes",
+        MESH_ON_SUMMARY,
+        SESSION_PROMPT,
+    );
+    probe.wait_for_marker("MESH_STARTED");
+    let warning_prefix = format!("WARNING: {label} is not reachable yet: ");
+    let warnings: Vec<&str> = joined
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("WARNING"))
+        .collect();
+    assert_eq!(
+        warnings.len(),
+        1,
+        "one WARNING, for the local entry: {joined:?}"
+    );
+    assert!(
+        warnings[0].starts_with(&warning_prefix) && warnings[0].ends_with("; start the local rnsd"),
+        "{joined:?}"
+    );
+    let connecting_prefix = format!("{label}  connecting, retrying: ");
+    if cfg!(not(any(target_os = "linux", target_os = "android"))) {
+        let reason = format!("nothing is listening at {endpoint}");
+        assert_eq!(
+            warnings[0],
+            format!("{warning_prefix}{reason}; start the local rnsd"),
+            "{joined:?}"
+        );
+    }
+
+    // Two reads a redial apart: the row holds the dial failure while nothing listens.
+    for read in ["first", "after a redial"] {
+        let info = command_text(&mut session, ".mesh info", "└", SESSION_PROMPT);
+        let table = boxed_table(&format!(".mesh info ({read})"), &info);
+        let row = table.value("interfaces[0]");
+        assert!(row.starts_with(&connecting_prefix), "{read}: {info}");
+        if cfg!(not(any(target_os = "linux", target_os = "android"))) {
+            assert_eq!(
+                row,
+                format!("{connecting_prefix}nothing is listening at {endpoint}"),
+                "{info}"
+            );
+        }
+        thread::sleep(Duration::from_secs(3));
+    }
+
+    // rnsd (stood in for) comes up: the client's background redial lands.
+    rnsd.listen();
+    let info = wait_for_local_row(
+        &mut session,
+        &format!("{label}  connected"),
+        Duration::from_secs(15),
+        "the local row to flip to connected once rnsd listens",
+    );
+    assert!(!info.contains("WARNING"), "no second WARNING: {info}");
+
+    let status = exit_clean(&mut session);
+    probe.wait_for_marker("MESH_STOPPED");
+    assert!(
+        matches!(status, WaitStatus::Exited(_, 0)),
+        ".exit: expected a clean exit, got {status:?}"
+    );
+    assert_eq!(probe.marker_count("MESH_STARTED"), 1, "one join");
+}
