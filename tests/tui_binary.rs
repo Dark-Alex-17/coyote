@@ -1570,36 +1570,47 @@ fn a_cold_start_with_no_cache_dir_comes_up_and_leaves_clean() {
     );
 }
 
-/// Neither side of the pty leaks into the child: it sees exactly the
-/// descriptors a child spawned without a pty sees (its three standard
-/// streams, `ls`'s own handle on the directory it lists, and whatever
-/// the test runner itself was started with). On a tty `ls` prints its
-/// entries in columns, so the list is read word by word.
+/// Nothing the test runner holds leaks into the child, neither side of
+/// the pty nor an ordinary file opened without close-on-exec: it sees
+/// only its three standard streams and, on the lowest free number, `ls`'s
+/// own handle on the directory it lists. On a tty `ls` prints its entries
+/// in columns, so the list is read word by word.
 #[test]
 #[serial]
 fn the_child_inherits_no_pty_descriptor() {
+    use std::os::fd::AsRawFd;
+
     fn listed_fds(text: &str) -> std::collections::BTreeSet<u32> {
         text.split_whitespace()
             .take_while(|word| *word != "fd-list-done")
             .map(|word| word.parse().unwrap())
             .collect()
     }
-    let script = "ls /dev/fd; echo fd-list-done";
-    let plain = Command::new("sh").arg("-c").arg(script).output().unwrap();
-    let baseline = listed_fds(&String::from_utf8_lossy(&plain.stdout));
-    assert!(baseline.contains(&0), "{baseline:?}");
+    let dir = fresh_config_dir("fd-leak");
+    let _guard = TempDirGuard(dir.clone());
+    let scratch = fs::File::create(dir.join("scratch")).unwrap();
+    // SAFETY: fcntl with F_SETFD takes no pointers; the result is checked.
+    assert_ne!(
+        unsafe { libc::fcntl(scratch.as_raw_fd(), libc::F_SETFD, 0) },
+        -1
+    );
+    let scratch_fd = u32::try_from(scratch.as_raw_fd()).unwrap();
 
     let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(script);
+    cmd.arg("-c").arg("ls /dev/fd; echo fd-list-done");
     let mut pty = Pty::spawn(cmd).unwrap();
     let transcript = pty
         .wait_for("fd-list-done", Duration::from_secs(10))
         .unwrap();
     let on_pty = listed_fds(&transcript);
-    let leaked: Vec<&u32> = on_pty.difference(&baseline).collect();
     assert!(
-        leaked.is_empty(),
-        "fds {leaked:?} leaked into the pty child (baseline {baseline:?}):\n{transcript}"
+        !on_pty.contains(&scratch_fd),
+        "the parent's scratch file (fd {scratch_fd}) reached the pty child:\n{transcript}"
+    );
+    assert_eq!(
+        on_pty,
+        (0..=3).collect(),
+        "the pty child sees more than its standard streams and ls's own directory fd:\n{transcript}"
     );
 }
 

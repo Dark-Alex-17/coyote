@@ -42,7 +42,6 @@ impl Pty {
         use std::os::unix::process::CommandExt;
 
         let (master, slave) = open_pair(40, 100)?;
-        let master_fd = master.as_raw_fd();
         let slave_fd = slave.as_raw_fd();
         // SAFETY: the hook calls only async-signal-safe libc functions on
         // descriptors that stay open in the parent until after spawn returns.
@@ -62,7 +61,20 @@ impl Pty {
                         return Err(std::io::Error::last_os_error());
                     }
                 }
-                libc::close(master_fd);
+                // Everything else the test runner holds goes too, whether
+                // or not it carries close-on-exec: a child must never
+                // inherit a lock file or a sibling test's pipe.
+                let open_max = libc::sysconf(libc::_SC_OPEN_MAX);
+                let limit = if open_max > 0 {
+                    open_max.min(1024) as i32
+                } else {
+                    1024
+                };
+                for fd in 3..limit {
+                    if fd != slave_fd {
+                        libc::close(fd);
+                    }
+                }
                 libc::close(slave_fd);
                 Ok(())
             });
@@ -256,11 +268,20 @@ impl Drop for Pty {
         use std::os::fd::AsRawFd;
 
         let _ = self.child.kill();
+        let child_pgrp = self.child.id() as i32;
+        // Under the job-control wrapper the binary runs in its own
+        // foreground group, which the wrapper's death would orphan.
+        // SAFETY: tcgetpgrp reads one int from the tty behind an open fd.
+        let foreground = unsafe { libc::tcgetpgrp(self.master.as_raw_fd()) };
+        if foreground > 1 && foreground != child_pgrp {
+            // SAFETY: kill takes a pid and a signal number and touches no memory.
+            unsafe { libc::kill(-foreground, libc::SIGKILL) };
+        }
         // The child is a session leader (setsid in pre_exec), so its pid
         // names the process group; a coyote grandchild under a shell
         // wrapper goes with it instead of being orphaned.
         // SAFETY: kill takes a pid and a signal number and touches no memory.
-        unsafe { libc::kill(-(self.child.id() as i32), libc::SIGKILL) };
+        unsafe { libc::kill(-child_pgrp, libc::SIGKILL) };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut buf = [0u8; 4096];
         let mut draining = true;
