@@ -923,9 +923,9 @@
   - name: gemma-4-26b-a4b-it
     type: chat
     max_input_tokens: 262144
-    input_price: 0.0675
-    output_price: 0.225
-    cache_read_price: 0.0375
+    input_price: 0.02
+    output_price: 0.06
+    cache_read_price: 0.01
     max_output_tokens: 32768
     supports_vision: true
     supports_function_calling: true
@@ -8483,10 +8483,10 @@
   - name: google/gemma-4-26b-a4b-it
     type: chat
     max_input_tokens: 262144
-    input_price: 0.0675
-    output_price: 0.225
-    cache_read_price: 0.0375
-    max_output_tokens: 235929
+    input_price: 0.02
+    output_price: 0.06
+    cache_read_price: 0.01
+    max_output_tokens: 32768
     supports_vision: true
     supports_function_calling: true
   - name: google/gemma-4-26b-a4b-it:free
@@ -8841,9 +8841,9 @@
   - name: minimax/minimax-m3.1-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.15
-    output_price: 0.6
-    cache_read_price: 0.015
+    input_price: 0.075
+    output_price: 0.3
+    cache_read_price: 0.0075
     max_output_tokens: 524288
     supports_vision: true
     supports_function_calling: true
@@ -10204,8 +10204,9 @@
   - name: openai/gpt-oss-120b
     type: chat
     max_input_tokens: 131072
-    input_price: 0.017
-    output_price: 0.065
+    input_price: 0.15
+    output_price: 0.6
+    cache_read_price: 0.075
     max_output_tokens: 65536
     supports_function_calling: true
   - name: openai/gpt-oss-120b:batch
@@ -10482,8 +10483,8 @@
   - name: qwen/qwen3-coder-30b-a3b-instruct
     type: chat
     max_input_tokens: 262144
-    input_price: 0.07
-    output_price: 0.28
+    input_price: 0.15
+    output_price: 0.6
     max_output_tokens: 235929
     supports_function_calling: true
   - name: qwen/qwen3-coder-flash
@@ -11350,7 +11351,7 @@
   - name: ~deepseek/deepseek-v4-flash-latest
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.0434
+    input_price: 0.059
     output_price: 0.3
     cache_read_price: 0.035
     max_output_tokens: 943718
