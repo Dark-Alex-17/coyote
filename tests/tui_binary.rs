@@ -1527,23 +1527,6 @@ fn write_tool(dir: &Path, file: &str, body: &str) {
     fs::write(tools.join(file), body).unwrap();
 }
 
-/// A tool that asks the user through the prompt channel and reports what
-/// it got.
-const CONFIRM_TOOL: &str = "#!/usr/bin/env bash\n\
-    \n\
-    # @describe Ask the user before continuing.\n\
-    \n\
-    # @env LLM_OUTPUT=/dev/stdout The output path\n\
-    \n\
-    # shellcheck disable=SC1090\n\
-    source \"$LLM_PROMPT_UTILS_FILE\"\n\
-    \n\
-    main() {\n\
-    \x20   local v\n\
-    \x20   v=\"$(confirm \"Proceed with the probe? k7m-q\")\"\n\
-    \x20   echo \"fixture confirm: ${v:-cancelled} k7m-r\" >> \"$LLM_OUTPUT\"\n\
-    }\n";
-
 /// A tool that marks its start at `<marker>-started`, then waits (at most
 /// eight seconds) for `<marker>-release` to appear before finishing.
 const SLEEP_TOOL: &str = "#!/usr/bin/env bash\n\
@@ -1668,32 +1651,39 @@ fn wait_for_squeezed(pty: &mut Pty, marker: &str, what: &str) -> String {
 
 /// `TuiPrompter` renders a tool's `Confirm` request as the modal and
 /// answers it: a tool asking through the prompt channel on a real tty
-/// shows its question in the UI, `y` lets the tool finish, the model's
-/// follow-up reply lands in the transcript, and no raw protocol line
-/// reaches the screen.
+/// shows its question in the UI, `y` reaches the tool as a `1` and lets
+/// it finish, the model's follow-up reply lands in the transcript, and no
+/// raw protocol line reaches the screen.
 #[test]
 #[serial]
 fn a_tools_confirm_request_is_the_modal_and_y_lets_the_tool_finish() {
     let dir = fresh_config_dir("tool-confirm");
     let _guard = TempDirGuard(dir.clone());
+    let out = dir.join("confirm-answer");
     let fake = FakeLlm::start(vec![
         Reply::ToolCall {
-            name: "fixture_confirm".to_string(),
-            arguments: "{}".to_string(),
+            name: "fixture_confirm_rec".to_string(),
+            arguments: format!("{{\"out\": \"{}\"}}", out.display()),
         },
         Reply::Text("fixture done z2v".to_string()),
     ]);
     write_fake_llm_config(&dir, &fake);
-    write_tool(&dir, "fixture_confirm.sh", CONFIRM_TOOL);
+    write_tool(&dir, "fixture_confirm_rec.sh", RECORDING_CONFIRM_TOOL);
     let mut pty = spawn_tui(&dir, &[]);
 
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
     pty.send(b"call the confirm tool\r").unwrap();
-    pty.wait_for("k7m-q", PTY_DEADLINE)
+    pty.wait_for("q9d-q", PTY_DEADLINE)
         .expect("the tool's confirm question never reached the screen");
     pty.read_for(HOTKEY_GAP);
     pty.send(b"y").unwrap();
+    wait_for_file(&mut pty, &out, "the tool's recorded answer");
     let transcript = wait_for_squeezed(&mut pty, "fixture done z2v", "the reply after the tool");
+    assert_eq!(
+        fs::read_to_string(&out).unwrap().trim(),
+        "1",
+        "`y` on the confirm modal did not reach the tool as a yes:\n{transcript}"
+    );
     assert!(
         !transcript.contains("coyote_prompt"),
         "a raw prompt-protocol line reached the screen:\n{transcript}"
@@ -2412,10 +2402,14 @@ fn a_terminal_answering_the_keyboard_probe_gets_flags_pushed_and_releases_are_ig
     pty.read_for(Duration::from_millis(300));
     // Submitting shows the composer's exact contents twice: the prompt echo
     // and the dry-run reply, both painted whole rather than cell by cell.
+    // Counted from the submit on, so the composer's own paints of the
+    // typed text before Enter do not stand in for them.
+    let submitted_at = pty.raw().len();
     pty.send(b"\r").unwrap();
     let deadline = std::time::Instant::now() + PTY_DEADLINE;
     let text = loop {
-        let text = pty.read_for(Duration::from_millis(200));
+        pty.read_for(Duration::from_millis(200));
+        let text = strip_ansi(&String::from_utf8_lossy(&pty.raw()[submitted_at..]));
         let squeezed: String = text.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(
             !squeezed.contains("qz7k"),

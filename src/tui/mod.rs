@@ -2734,9 +2734,9 @@ mod tests {
 
     /// Every direct keyboard read outside this module: crossterm's
     /// `read`/`poll`, `read_single_key`, `edit_file` (which hands the tty
-    /// to `$EDITOR`), `run_command` (a child on the inherited tty), and
-    /// inquire's prompt builders (nothing else under `src/` constructs a
-    /// `Text`, `Select` or the like).
+    /// to `$EDITOR`), `run_command` and `wait_for_status` (a child on the
+    /// inherited tty), and inquire's prompt builders (nothing else under
+    /// `src/` constructs a `Text`, `Select` or the like).
     fn keyboard_readers() -> Vec<KeyboardReader> {
         fn at_word_start(line: &str, at: usize) -> bool {
             line[..at]
@@ -2744,12 +2744,13 @@ mod tests {
                 .next_back()
                 .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
         }
-        const NEEDLES: [&str; 10] = [
+        const NEEDLES: [&str; 11] = [
             "event::read(",
             "event::poll(",
             "read_single_key(",
             "edit_file(",
             "run_command(",
+            "wait_for_status(",
             "Confirm::new(",
             "Select::new(",
             "MultiSelect::new(",
@@ -3010,6 +3011,9 @@ mod tests {
                 .iter()
                 .any(|r| r.file == "src/utils/command.rs" && r.function == "edit_file" && r.gated)
         );
+        assert!(readers.iter().any(|r| r.file == "src/utils/command.rs"
+            && r.function == "run_loader_command"
+            && r.gated));
     }
 
     /// The two stdin readers outside this module stand down while the UI
@@ -3073,6 +3077,26 @@ mod tests {
             err.to_string().contains("not available in the TUI"),
             "{err}"
         );
+    }
+
+    /// A document loader that writes to its output file still runs under
+    /// the TUI, with stdin at EOF instead of the raw tty: the `-` here
+    /// reads stdin and adds nothing.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn a_file_writing_loader_still_runs_under_the_tui() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&TUI_ACTIVE, true);
+        let source = crate::utils::temp_file("-loader-source-", ".txt");
+        std::fs::write(&source, "loaded under the tui x7x\n").unwrap();
+        let loaded = crate::utils::run_loader_command(
+            source.to_str().unwrap(),
+            "txt",
+            "sh -c \"cat $1 - > $2\"",
+        )
+        .unwrap();
+        std::fs::remove_file(&source).unwrap();
+        assert_eq!(loaded, "loaded under the tui x7x\n");
     }
 
     /// A task id in the source names the owner of a debt marker and

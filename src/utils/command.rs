@@ -7,7 +7,7 @@ use std::{
     fs::OpenOptions,
     io::{self, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -89,17 +89,19 @@ pub fn run_command<T: AsRef<OsStr>>(
     if crate::tui::active() {
         bail!("Shell passthrough is not available in the TUI yet");
     }
-    wait_for_status(cmd, args, envs)
+    wait_for_status(cmd, args, envs, Stdio::inherit())
 }
 
 fn wait_for_status<T: AsRef<OsStr>>(
     cmd: &str,
     args: &[T],
     envs: Option<HashMap<String, String>>,
+    stdin: Stdio,
 ) -> Result<i32> {
     let status = Command::new(cmd)
         .args(args.iter())
         .envs(envs.unwrap_or_default())
+        .stdin(stdin)
         .status()?;
     Ok(status.code().unwrap_or_default())
 }
@@ -169,9 +171,15 @@ pub fn run_loader_command(path: &str, extension: &str, loader_command: &str) -> 
         }
         Ok(stdout)
     } else {
-        // A loader writes to its output file and reads nothing from the
-        // keyboard, so it stays usable under the TUI.
-        let status = wait_for_status(cmd, args, None).with_context(|| {
+        // A loader writes to its output file and needs nothing from the
+        // keyboard, so under the TUI it runs with stdin closed rather than
+        // inheriting the raw tty the event stream is reading.
+        let stdin = if crate::tui::active() {
+            Stdio::null()
+        } else {
+            Stdio::inherit()
+        };
+        let status = wait_for_status(cmd, args, None, stdin).with_context(|| {
             format!("Unable to run `{cmd_eval}`, Perhaps '{cmd}' is not installed?")
         })?;
         if status != 0 {

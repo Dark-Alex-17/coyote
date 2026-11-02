@@ -24,8 +24,9 @@ pub(crate) struct KeyContext {
     pub(crate) composer_empty: bool,
     pub(crate) modal: Option<ModalKind>,
     /// Whether a second has passed since the last composer keystroke: the
-    /// condition for a bare hotkey to count as an answer, and for Enter to
-    /// answer a tool's question (a user's own question takes it at once).
+    /// condition for a bare hotkey or Enter to count as an answer to a
+    /// confirm, so a modal that appears mid-sentence cannot be answered by
+    /// the keystroke already in flight.
     pub(crate) idle_ok: bool,
 }
 
@@ -56,7 +57,7 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match ctx.modal {
         Some(ModalKind::Confirm { default, tool }) => match key.code {
-            KeyCode::Enter if tool && !ctx.idle_ok => Action::Nothing,
+            KeyCode::Enter if !ctx.idle_ok => Action::Nothing,
             KeyCode::Enter => Action::Answer(PromptAnswer::Confirmed(default)),
             KeyCode::Esc => Action::Answer(PromptAnswer::Cancelled),
             KeyCode::Char('c') if ctrl => Action::Answer(PromptAnswer::Cancelled),
@@ -241,11 +242,7 @@ mod tests {
                 no_tool,
                 Action::Answer(PromptAnswer::Confirmed(true)),
             ),
-            (
-                plain(KeyCode::Enter),
-                no_tool_busy_typing,
-                Action::Answer(PromptAnswer::Confirmed(true)),
-            ),
+            (plain(KeyCode::Enter), no_tool_busy_typing, Action::Nothing),
             (
                 plain(KeyCode::Esc),
                 busy_typing,
