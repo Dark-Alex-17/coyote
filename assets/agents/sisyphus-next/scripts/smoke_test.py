@@ -860,6 +860,20 @@ check("pr_tracking review: the review_update text names the Update comment and e
       and "a test already covers it" in _t["text"])
 check("pr_tracking review: the review_update text drops the Review round sentence and asks for the own marker",
       "## Review round" not in _t["text"] and f"End that comment with this exact line: {gates.OWN_MARKER}" in _t["text"])
+_blocked = gates.triage_route(rs(**{**_round, "gauntlet_blockers": ["adversary: DIVERGES - criterion 2 unmet"]}))
+check("pr_tracking review: a gauntlet block in a review fix round overwrites fix_source but leaves pending alone",
+      _blocked["_next"] == "compose_fix" and _blocked["fix_source"] == "review" and "pr_review_pending" not in _blocked)
+for _src in ("review", "strikeout", "coder_failed"):
+    u = gates.pr_gate(rs(git_actions={"commit": True, "push": True, "open_pr": True}, fix_source=_src,
+                         pr_review_pending=_round["pr_review_pending"]))
+    check(f"pr_tracking review: pr_gate after a review round with fix_source {_src} still sends the review_update task",
+          u["_next"] == "git_ops" and u["git_task"]["kind"] == "review_update")
+u = gates.apply_answer(rs(escalation=escalation("review_exhausted", "q", []), last_answer="Accept the findings unresolved and proceed",
+                          fix_source="review", pr_review_pending=_round["pr_review_pending"]))
+check("pr_tracking review: review_exhausted accept in a review round -> observability_gate with pending intact",
+      u["_next"] == "observability_gate" and "pr_review_pending" not in u
+      and gates.pr_gate(rs(**{**u, "git_actions": {"commit": True, "push": True, "open_pr": True},
+                              "pr_review_pending": _round["pr_review_pending"]}))["git_task"]["kind"] == "review_update")
 u = gates.ci_gate(rs(git_task=_t, pr_review_pending=_round["pr_review_pending"], pr_review_rounds=1))
 check("pr_tracking review: ci_gate review_update -> pr_review_resolve, nothing resolved there",
       u["_next"] == "pr_review_resolve" and "pr_review_pending" not in u and "decisions" not in u)
@@ -1397,6 +1411,8 @@ _watch_stops = [
      gates.pr_review_route(rs(pr_review_status="wall_cap", pr_review_polls=REVIEW_MAX_POLLS + 1))),
     ("pr_review_round_cap", "pr_review_round_cap",
      gates.pr_review_route(rs(pr_review_status="comments", pr_review_items=_items, pr_review_rounds=REVIEW_MAX_ROUNDS))),
+    ("pr_review_truncated", "pr_review_truncated",
+     gates.pr_review_route(rs(pr_review_status="truncated", pr_review_truncated=["reviewThreads"]))),
     ("ci_poll_cap", "ci_poll_cap", gates.ci_route(rs(ci_status="poll_cap", ci_polls_run=_lib.REVIEW_CI_POLL_CEILING))),
     ("pr_review_push_unconfirmed", "pr_review_push_unconfirmed", gates.pr_review_resolve(rs(pr_review_pending=[]))),
     ("ci_exhausted from ci_route", "ci_exhausted", gates.ci_route(rs(ci_status="timeout"))),
@@ -1436,6 +1452,26 @@ check("pr_tracking review: a stranger's APPROVED after a trusted CHANGES_REQUEST
 review_doc(reviews=[{"id": "r1", "state": "APPROVED", "author": "rev", "association": "COLLABORATOR", "body": ""}])
 check("pr_tracking review: a trusted APPROVED review with no reviewDecision approves",
       gates.pr_review_poll(rs())["pr_review_status"] == "approved")
+for _decision in ("REVIEW_REQUIRED", "CHANGES_REQUESTED"):
+    review_doc(decision=_decision, reviews=[{"id": "r1", "state": "APPROVED", "author": "rev", "body": ""}])
+    check(f"pr_tracking review: reviewDecision {_decision} with a trusted APPROVED review does not approve",
+          gates.pr_review_poll(rs())["pr_review_status"] == "pending")
+review_doc(reviews=[{"id": "r1", "state": "CHANGES_REQUESTED", "author": "ann", "body": "x"},
+                    {"id": "r2", "state": "APPROVED", "author": "ann", "body": ""}])
+check("pr_tracking review: one author's CHANGES_REQUESTED then APPROVED, no reviewDecision, approves",
+      gates.pr_review_poll(rs(pr_review_seen=["r1"]))["pr_review_status"] == "approved")
+review_doc(reviews=[{"id": "r1", "state": "APPROVED", "author": "ann", "body": ""},
+                    {"id": "r2", "state": "CHANGES_REQUESTED", "author": "ben", "body": "x"}])
+check("pr_tracking review: author A APPROVED and author B CHANGES_REQUESTED, no reviewDecision, does not approve",
+      gates.pr_review_poll(rs(pr_review_seen=["r2"]))["pr_review_status"] == "pending")
+review_doc(reviews=[{"id": "r1", "state": "APPROVED", "author": "ann", "body": ""},
+                    {"id": "r2", "state": "CHANGES_REQUESTED", "author": "ann", "body": "x"}])
+check("pr_tracking review: one author's APPROVED then CHANGES_REQUESTED, no reviewDecision, does not approve",
+      gates.pr_review_poll(rs(pr_review_seen=["r2"]))["pr_review_status"] == "pending")
+review_doc(reviews=[{"id": "r1", "state": "CHANGES_REQUESTED", "author": "ben", "body": "x"},
+                    {"id": "r2", "state": "APPROVED", "author": "ann", "body": ""}])
+check("pr_tracking review: an older CHANGES_REQUESTED from another author still blocks a later APPROVED",
+      gates.pr_review_poll(rs(pr_review_seen=["r1"]))["pr_review_status"] == "pending")
 review_doc(threads=[thread("t8", [("c8", "rename this")], outdated=True)])
 u = gates.pr_review_poll(rs())
 check("pr_tracking review: an outdated unresolved thread with fresh comments is an item, marked outdated",
@@ -1557,13 +1593,58 @@ _norm = {"state": "OPEN", "reviewDecision": "", "headRefOid": "abc",
          "reviews": [{"id": "r1", "state": "COMMENTED", "author": "al", "association": "MEMBER", "body": "b"}],
          "comments": [{"id": "k1", "author": "bo", "association": "NONE", "body": "hi"}],
          "reviewThreads": [{"id": "t1", "isResolved": False, "isOutdated": False, "path": "a.py", "line": 3,
-                            "comments": [{"id": "c1", "author": "al", "association": "OWNER", "body": "x", "url": "u"}]}]}
+                            "comments": [{"id": "c1", "author": "al", "association": "OWNER", "body": "x", "url": "u"}]}],
+         "truncated": []}
 check("pr_tracking review: _normalize_pr_review on a raw GraphQL response equals the normalized doc",
       gates._normalize_pr_review(_raw) == _norm and gates._normalize_pr_review(_norm) == _norm)
 check("pr_tracking review: PR_REVIEW_QUERY asks for authorAssociation on reviews, comments and thread comments",
       gates.PR_REVIEW_QUERY.count("authorAssociation") == 3)
 check("pr_tracking review: _normalize_pr_review rejects a response naming no PR",
       gates._normalize_pr_review({"errors": [{"message": "x"}]}) is None and gates._normalize_pr_review({"data": {}}) is None)
+check("pr_tracking review: PR_REVIEW_QUERY reads the last nodes of all four connections with their totalCount",
+      all(f"{conn}{{totalCount nodes{{" in gates.PR_REVIEW_QUERY
+          for conn in ("reviews(last:50)", "comments(last:50)", "reviewThreads(last:100)"))
+      and gates.PR_REVIEW_QUERY.count("comments(last:50){totalCount nodes{") == 2
+      and "first:" not in gates.PR_REVIEW_QUERY and gates.PR_REVIEW_QUERY.count("totalCount") == 4)
+
+
+def raw_review(threads_total=1, comments_total=1):
+    pr = json.loads(json.dumps(_raw["data"]["repository"]["pullRequest"]))
+    pr["reviews"]["totalCount"] = 1
+    pr["comments"]["totalCount"] = 1
+    pr["reviewThreads"]["totalCount"] = threads_total
+    pr["reviewThreads"]["nodes"][0]["comments"]["totalCount"] = comments_total
+    raw = {"data": {"repository": {"pullRequest": pr}}}
+    with open(_REVIEW_DOC, "w") as fh:
+        json.dump(raw, fh)
+    os.environ["SISYPHUS_GH_REVIEWS_CMD"] = f"cat '{_REVIEW_DOC}'"
+    return raw
+
+
+raw_review(threads_total=101)
+u = gates.pr_review_poll(rs())
+check("pr_tracking review: a read with more review threads than returned -> truncated, straight to the route",
+      u["pr_review_status"] == "truncated" and u["pr_review_truncated"] == ["reviewThreads"] and u["_next"] == "pr_review_route"
+      and "pr_review_items" not in u)
+u = gates.pr_review_route(rs(**u))
+check("pr_tracking review: route truncated -> named stop, ledgered, hard-trigger pr_review_truncated",
+      "review-watch: PR #7 stop: truncated (reviewThreads)" in u["decisions"]
+      and u["escalation"]["kind"] == "pr_review_truncated" and u["escalation"]["hard_trigger"] is True
+      and "reviewThreads" in u["escalation"]["question"]
+      and [(o["text"], o["recommended"]) for o in u["escalation"]["options"]] == [("Stop watching and report", True)])
+check("pr_tracking review: a thread with more comments than returned is truncated by thread index",
+      gates._normalize_pr_review(raw_review(comments_total=51))["truncated"] == ["reviewThreads[0].comments"]
+      and gates.pr_review_poll(rs())["pr_review_truncated"] == ["reviewThreads[0].comments"])
+raw_review()
+u = gates.pr_review_poll(rs())
+check("pr_tracking review: full counts on every connection -> not truncated",
+      gates._normalize_pr_review(raw_review())["truncated"] == [] and u["pr_review_status"] != "truncated"
+      and "pr_review_truncated" not in u)
+u = aa("pr_review_truncated", "Stop watching and report", pr_ref="7", pr_review_truncated=["reviews", "reviewThreads[0].comments"])
+check("pr_tracking review: apply_answer truncated -> final_report with a follow-up naming the truncation",
+      u["_next"] == "final_report"
+      and u["follow_ups"] == ["PR review watch stopped: the review read of PR #7 was truncated "
+                              "(reviews, reviewThreads[0].comments); read the review items on GitHub"])
 check("pr_tracking review: bounds stay under max_loop_iterations 100",
       REVIEW_MAX_POLLS + REVIEW_MAX_ROUNDS + 1 < 100 and REVIEW_CI_POLL_BUDGET < _lib.REVIEW_CI_POLL_CEILING < 100)
 
