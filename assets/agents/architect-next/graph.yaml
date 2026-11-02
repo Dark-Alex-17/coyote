@@ -77,11 +77,15 @@ variables:
   - name: task_granularity
     description: "Task sizing for the plan: 'standard' (default, ~1 engineer-day tasks - today's behavior, unchanged) or 'micro' (tasks sized to one file/seam with exact signatures and EXECUTABLE acceptance criteria, grouped into plan-section batches; per task only coder verify + the adversary criteria check run, the full review gauntlet runs once per batch; designed for small/local implementer models and for runs where per-task blast radius must be minimal)"
     default: 'standard'
+  - name: pr_tracking
+    description: "'ci' (default) watches the PR's CI until green, flips it ready and finishes, exactly as before; 'review' then keeps watching the PR for review activity: approval stops the watch, new comments become fix rounds through the CI fix path (push, re-watch CI, watch again), and closed/merged, the review round or wall-clock cap, CI exhausted, or a comment needing owner judgment stop it with the reason sent to the owner"
+    default: 'ci'
 
 settings:
   # Engine backstop only: every cycle carries its own named bound in a script. It counts visits per node per RUN, so for an
   # orchestration it is a defect detector, not a budget. ci_poll alone may revisit itself CI_MAX_ROUNDS (240) times per PR
-  # before it routes ci_status=timeout; 1000 covers four group PRs each watched to that wall cap and stays finite.
+  # before it routes ci_status=timeout, and review_poll REVIEW_MAX_POLLS (144) times per PR before it routes
+  # review_status=wall_cap; 1000 covers four group PRs each watched to the larger cap and stays finite.
   max_loop_iterations: 1000
   log_state_snapshots: true
   validate_before_run: true
@@ -340,6 +344,18 @@ initial_state:
   ci_owning_task: ''
   ci_reruns: {}
   ci_fix_strikes: {}
+  review_polls: 0
+  review_rounds: 0
+  review_poll_fails: 0
+  review_started_at: 0
+  review_fix_rounds: 0
+  review_status: ''
+  review_items: []
+  review_seen: []
+  review_watching: false
+  review_after: ''
+  review_outcomes: {}
+  review_triage_items: []
   validate_note: ''
   followup_tasks: []
   external_feedback: []
@@ -1929,7 +1945,7 @@ nodes:
   ci_route:
     id: ci_route
     type: script
-    description: green -> flip; red -> evidence pack; exhausted -> owner with the evidence.
+    description: green -> flip (or back to the review watch); red -> evidence pack; exhausted -> owner with the evidence.
     script: scripts/ci_route.py
     fallback: end_failure
 
@@ -2006,6 +2022,85 @@ nodes:
     type: script
     description: gh pr ready ONLY on green; every still-draft PR reported with its blocker; upstream groups -> next group.
     script: scripts/flip_ready.py
+    timeout: 300
+    fallback: end_failure
+
+  review_poll:
+    id: review_poll
+    type: script
+    description: pr_tracking=review only. Bounded self-loop over the PR's reviews, comments and threads; the review watch bound is the polls cap + wall clock owned here.
+    script: scripts/review_poll.py
+    timeout: 900
+    fallback: review_route
+
+  review_route:
+    id: review_route
+    type: script
+    description: approved / merged -> end the watch and continue; closed -> finish; new items -> triage; wall cap / poll errors -> owner.
+    script: scripts/review_route.py
+    fallback: end_failure
+
+  review_triage:
+    id: review_triage
+    type: llm
+    description: Classify each new review item as fix / owner / none; owner defaults UP when unsure.
+    instructions: |
+      Triage new review activity on a PR this run authored. For each item in the
+      list, return one entry with its id and an action:
+      - fix: an actionable code change within the PR's scope. Write fix_item as
+        one concrete instruction that quotes the comment.
+      - owner: disputes the scope or the design direction, needs a product or
+        owner decision, or is ambiguous. When unsure, choose owner.
+      - none: praise, an acknowledgement, or a point already answered. Say why
+        in reason.
+      Every item gets exactly one entry; never invent ids.
+    prompt: |
+      ## PR
+      {{pr_url}}
+
+      ## New review items (id, kind, author, path, body)
+      {{review_items}}
+
+      ## Tasks (id, title, declared files)
+      {{tasks}}
+    tools: []
+    timeout: 600
+    output_schema:
+      type: object
+      properties:
+        review_triage_items:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              action:
+                type: string
+                enum: [fix, owner, none]
+              fix_item: { type: string }
+              reason: { type: string }
+        anomalies:
+          type: array
+          items: { type: string }
+      required: [review_triage_items]
+    state_updates:
+      last_node_output: '{{output}}'
+    fallback: review_apply
+    next: review_apply
+
+  review_apply:
+    id: review_apply
+    type: script
+    description: Triage as edges - owner items -> owner; fix items -> the CI fix path (review fix rounds per PR bounded); none -> keep watching.
+    script: scripts/review_apply.py
+    timeout: 120
+    fallback: end_failure
+
+  review_update:
+    id: review_update
+    type: script
+    description: After a review fix round - resolve the addressed threads, post the Update comment mapping items to the head SHA, re-watch CI.
+    script: scripts/review_update.py
     timeout: 300
     fallback: end_failure
 

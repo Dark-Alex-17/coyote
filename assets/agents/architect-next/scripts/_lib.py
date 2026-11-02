@@ -37,6 +37,11 @@ CI_POLL_SLEEP = 60        # pr-watch/scripts/poll_pr.py SLEEP_SECS
 CI_POLL_FAILS = 3         # pr-watch/scripts/poll_pr.py MAX_CONSECUTIVE_FAILS
 CI_WALL_SECS = 14400      # coder/graph.yaml settings.timeout (hardware-bound wall clock)
 CI_MAX_ROUNDS = CI_WALL_SECS // CI_POLL_SLEEP  # A6 rounds cap, derived (240)
+REVIEW_POLL_SLEEP = 600   # review watch: one poll every 10 minutes
+REVIEW_WALL_SECS = 86400  # review watch: one day without approval escalates
+REVIEW_MAX_POLLS = REVIEW_WALL_SECS // REVIEW_POLL_SLEEP  # review polls cap, derived (144)
+REVIEW_MAX_ROUNDS = STRIKE_LIMIT  # review fix rounds per PR
+PR_TRACKING_ENUM = ("ci", "review")
 VERIFY_CMD_SECS = 900     # gauntlet: each verification command <= 15 min
 VERIFY_SET_SECS = 3300    # gauntlet: the whole set <= 55 min
 TAIL_CHARS = 6000         # trim_output class: evidence tails handed to llm nodes

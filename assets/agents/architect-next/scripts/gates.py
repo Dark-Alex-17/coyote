@@ -22,7 +22,8 @@ from _lib import (  # noqa: E402
     CI_WALL_SECS, CODE_VAR, CONFLICT_CYCLES_MAX, CONVENTIONS_LINE, CORE_TOOLS_REL, DESIGN_ROUNDS_MAX,
     GATE1_HOUSE_LINE, IDIOM_LINE, IS_UPSTREAM, LOG_EVENT_LINE, MODE_ENUMS, MULTI_IS_GROUPS,
     NO_COMMIT_MAIN_LINE, OWNER_POLL_MAX, OWNER_POLL_MINUTES, OWNER_REMOTE_INPUT, OWNER_WAIT_MINUTES,
-    PLANNING_VAR, PR_URL_RE, PROBE_HOUSE_NOTE, REPO_HINT, RERUN_ONCE, RESUME_RE, SHA_RE, SIBLING_HINT,
+    PLANNING_VAR, PR_TRACKING_ENUM, PR_URL_RE, PROBE_HOUSE_NOTE, REPO_HINT, RERUN_ONCE, RESUME_RE,
+    REVIEW_MAX_POLLS, REVIEW_MAX_ROUNDS, REVIEW_POLL_SLEEP, REVIEW_WALL_SECS, SHA_RE, SIBLING_HINT,
     SISYPHUS_RUN_RE, STACK_LINKING, STORE_LABEL, STORE_TOOL_PREFIX, STRIKE_LIMIT, TASKSTORE, TASK_ID_RE,
     TEST_FILE_RE, VERIFY_CMD_SECS, VERIFY_SET_SECS, WAVE_CAP,
     append_artifact, as_dict, as_int, as_list, commit_planning, context_pack, core_tool, emit,
@@ -73,10 +74,15 @@ def intake(state):
     u = _normalize_paths(state)
     mv = mode(state)
     bad = {k: v for k, v in mv.items() if v not in MODE_ENUMS[k]}
+    tracking = str(var(state, "pr_tracking", "ci")).strip()
+    if tracking not in PR_TRACKING_ENUM:
+        bad["pr_tracking"] = tracking
     u["mode_vector"] = mv
     u["mode_line"] = (f"pr_strategy={mv['pr_strategy']} parallel_tasks={mv['parallel_tasks']} "
                       f"task_granularity={mv['task_granularity']} autonomy={mv['autonomy']} "
                       f"escalation_policy={mv['escalation_policy']}")
+    if tracking == "review":
+        u["mode_line"] += " pr_tracking=review"
     u["brief"] = brief
     u["sizing_rule"] = (
         "each task is micro-sized: one file or one tight seam (hard cap 3 files including tests; the compile-atomicity "
@@ -158,7 +164,7 @@ def intake(state):
             snapshot(state, u, "intake")
             return raise_escalation(state, u, escalation(
                 "mode_invalid", f"Unknown mode value(s): {bad}. Which value should apply?",
-                [option(f"{k} = {MODE_ENUMS[k][0]}", recommended=True, evidence="the documented default") for k in bad]
+                [option(f"{k} = {MODE_ENUMS.get(k, PR_TRACKING_ENUM)[0]}", recommended=True, evidence="the documented default") for k in bad]
                 + [option("Abort the run")], tier3_ok=False))
         if not u["design_doc_path"] or not os.path.isfile(u["design_doc_path"]):
             snapshot(state, u, "intake")
@@ -1464,6 +1470,8 @@ def fix_done(state):
     elif ret == "ci":
         u.update({"ci_polls": 0, "ci_poll_fails": 0})
         u["_next"] = "ci_poll"
+    elif ret == "review":
+        u["_next"] = "review_update"
     else:
         u["_next"] = "select_tasks"
     return u
@@ -2209,7 +2217,7 @@ def apply_answer(state):
         u["failure_reason"] = f"aborted at the user's request ({kind}): {answer}"
         u["_next"] = "end_aborted"
     elif kind == "mode_invalid":
-        for k in MODE_ENUMS:
+        for k in (*MODE_ENUMS, "pr_tracking"):
             if m := re.search(rf"{k}\s*=\s*([\w-]+)", answer):
                 u[k] = m.group(1)
         u["_next"] = "orient_read" if state.get("design_doc_path") else "intake"
@@ -2505,9 +2513,36 @@ def apply_answer(state):
             u["fix_request"] = {"task": state.get("ci_owning_task") or (tasks[-1]["id"] if tasks else ""), "source": "ci", "return_to": "ci",
                                 "items": [f"CI failure (user-directed fix round): {tail(state.get('ci_diagnosis', ''), 300)}"], "note": tail(state.get("ci_evidence", ""), 4000)}
             u["_next"] = "fix_round"
+        elif truthy(state.get("review_watching")):
+            status = f"{kind} (CI {state.get('ci_status') or 'unresolved'})"
+            u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"PR #{state.get('pr_number')} review watch stopped: {status}: {tail(state.get('ci_diagnosis', ''), 300)}"]
+            _review_event(state, u, f"stop: {status}")
+            _close_review_watch(state, u, kind)
+            _after_flip(state, u)
         else:
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"PR #{state.get('pr_number')} left in draft with CI {state.get('ci_status') or 'unresolved'}: {tail(state.get('ci_diagnosis', ''), 300)}"]
             u["_next"] = "finish_plan"
+    elif kind in ("review_exhausted", "review_round_cap", "review_owner_judgment"):
+        a = _answered(state, {"stop": ["stop"], "skip": ["skip"], "keep": ["keep watching", "keep", "re-arm"],
+                              "more": ["one more", "resume", "address", "fix round"]}, "stop")
+        if a == "keep" and kind == "review_exhausted":
+            u.update({"review_polls": 0, "review_rounds": 0, "review_poll_fails": 0, "review_started_at": int(time.time()), "review_status": ""})
+            u["_next"] = "review_poll"
+        elif a == "more" and kind == "review_round_cap":
+            u["review_fix_rounds"] = REVIEW_MAX_ROUNDS - 1
+            u["_next"] = "review_apply"
+        elif a == "more" and kind == "review_owner_judgment":
+            _review_fix(state, u, [i for i in _triaged(state) if i["action"] in ("fix", "owner")])
+        elif a == "skip" and kind == "review_owner_judgment":
+            u["review_seen"] = list(as_list(state.get("review_seen"))) + as_list(as_dict(esc.get("data")).get("items"))
+            u.update({"review_items": [], "review_triage_items": [], "review_status": ""})
+            u["_next"] = "review_poll"
+        else:
+            status = state.get("review_status") or kind
+            u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"PR #{state.get('pr_number')} review watch stopped: {status}"]
+            _review_event(state, u, f"stopped by the owner: {status}")
+            _close_review_watch(state, u, status)
+            _after_flip(state, u)
     elif kind == "pr_body_notes":
         u["_next"] = "open_pr"
     else:
@@ -2801,9 +2836,10 @@ def open_pr(state):
     if state.get("pr_number"):
         u["_next"] = "pr_round_comments"
         return u
-    # ARCHITECT_GH_{COMMENT,CREATE,CHECKS,LOG,READY}_CMD are test and operator seams: when set, the gate runs the
-    # value through `bash -c` (the checks one through `/bin/sh -c`) instead of the `gh` call, and a set checks seam
-    # also skips `gh run rerun`. Both batteries and the Rust wrapper strip inherited ones.
+    # ARCHITECT_GH_{COMMENT,CREATE,CHECKS,LOG,READY,REVIEWS,RESOLVE}_CMD are test and operator seams: when set, the
+    # gate runs the value through `bash -c` (the checks and reviews ones through `/bin/sh -c`; the resolve one gets the
+    # review thread id as $1) instead of the `gh` call, and a set checks seam also skips `gh run rerun`. Both batteries
+    # and the Rust wrapper strip inherited ones.
     cmd = os.environ.get("ARCHITECT_GH_CREATE_CMD")
     if cmd:
         rc, out = sh(["bash", "-c", cmd], timeout=120)
@@ -2891,7 +2927,7 @@ def ci_route(state):
     status = state.get("ci_status") or "poll_error"
     if status == "green":
         ledger(state, u, f"ci: PR #{state.get('pr_number')} green")
-        u["_next"] = "flip_ready"
+        u["_next"] = "review_poll" if truthy(state.get("review_watching")) else "flip_ready"
     elif status == "red":
         u["_next"] = "ci_evidence"
     else:
@@ -3027,13 +3063,258 @@ def flip_ready(state):
     if drafts:
         u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"PR still in draft (checks never went green or verification unfinished): {d}" for d in drafts]
         ledger(state, u, f"pr: {len(drafts)} task PR(s) still in draft - reported, never silently")
-    if MULTI_IS_GROUPS and not is_single(state) and state.get("closeout_scope") == "group":
+    if _review_mode(state) and state.get("pr_number") and not truthy(state.get("review_watching")):
+        # The group reset clears pr_number, so it waits until the review watch ends.
+        u.update({"review_watching": True, "review_after": "select_tasks" if _group_closes(state) else "finish_plan",
+                  "review_started_at": int(time.time()), "review_polls": 0, "review_rounds": 0, "review_poll_fails": 0,
+                  "review_fix_rounds": 0, "review_seen": [], "review_status": ""})
+        _review_event(state, u, "watching reviews")
+        u["_next"] = "review_poll"
+        return u
+    return _after_flip(state, u)
+
+
+def _group_closes(state):
+    return MULTI_IS_GROUPS and not is_single(state) and state.get("closeout_scope") == "group"
+
+
+def _after_flip(state, u):
+    if _group_closes(state):
         u["closeout_done_for"] = state.get("closeout_unit")
         u.update({"pr_number": "", "pr_url": "", "integration_checked": False, "integration_amended": False})
         ledger(state, u, f"group: {state.get('closeout_unit')} closed out; next group")
         u["_next"] = "select_tasks"
         return u
     u["_next"] = "finish_plan"
+    return u
+
+
+def _review_mode(state):
+    return str(var(state, "pr_tracking", "ci")).strip() == "review"
+
+
+def _review_event(state, u, event):
+    line = f"review-watch: PR #{state.get('pr_number')} {event}"
+    ledger(state, u, line)
+    _slack_ping(state, line)
+
+
+def _close_review_watch(state, u, status):
+    outcomes = dict(as_dict(state.get("review_outcomes")))
+    outcomes[str(state.get("pr_number") or "")] = status
+    u.update({"review_outcomes": outcomes, "review_watching": False, "review_status": status})
+
+
+REVIEW_QUERY = (
+    "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { "
+    "state reviewDecision headRefOid reviews(last: 100) { nodes { id state body author { login } commit { oid } } } "
+    "comments(last: 100) { nodes { id body author { login } } } "
+    "reviewThreads(first: 100) { nodes { id isResolved path comments(first: 20) { nodes { id body author { login } } } } } } } }")
+REPLY_MUTATION = ("mutation($thread: ID!, $body: String!) { addPullRequestReviewThreadReply(input: "
+                  "{pullRequestReviewThreadId: $thread, body: $body}) { comment { id } } }")
+RESOLVE_MUTATION = "mutation($thread: ID!) { resolveReviewThread(input: {threadId: $thread}) { thread { id isResolved } } }"
+OWN_COMMENT_PREFIXES = ("## Update @", "## Review round", "## Batch review round")
+
+
+def _nodes(obj, key):
+    return [n for n in as_list(as_dict(as_dict(obj).get(key)).get("nodes")) if isinstance(n, dict)]
+
+
+def _login(obj):
+    return as_dict(obj.get("author")).get("login") or ""
+
+
+def _review_read(state):
+    """The PR's review state as the bare pullRequest object, or None when the read failed."""
+    cmd = os.environ.get("ARCHITECT_GH_REVIEWS_CMD")
+    try:
+        if cmd:
+            p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=90)
+        else:
+            p = subprocess.run(["gh", "api", "graphql", "-f", f"query={REVIEW_QUERY}", "-F", "owner={owner}", "-F", "name={repo}",
+                                "-F", f"number={state.get('pr_number')}"], cwd=state.get("code_repo_path", ""),
+                               capture_output=True, text=True, timeout=90)
+        data = json.loads(p.stdout) if p.returncode == 0 and p.stdout.strip() else None
+    except Exception:  # noqa: BLE001
+        data = None
+    if not isinstance(data, dict):
+        return None
+    wrapped = as_dict(as_dict(as_dict(data.get("data")).get("repository")).get("pullRequest"))
+    pr = wrapped or data
+    return pr if pr.get("state") else None
+
+
+def _review_items(pr, seen):
+    items = []
+    for t in _nodes(pr, "reviewThreads"):
+        if t.get("isResolved"):
+            continue
+        cs = _nodes(t, "comments")
+        # Keyed by the newest reviewer comment, so a reply on a thread already handled surfaces again;
+        # the watch's own "Addressed in" reply does not.
+        latest = next((c.get("id") for c in reversed(cs) if not (c.get("body") or "").startswith("Addressed in ")), "")
+        items.append({"id": f"thread:{t.get('id')}:{latest}", "kind": "thread", "author": _login(cs[0]) if cs else "",
+                      "body": "\n\n".join(c.get("body") or "" for c in cs), "path": t.get("path") or "", "thread_id": t.get("id") or ""})
+    for r in _nodes(pr, "reviews"):
+        if r.get("state") in ("CHANGES_REQUESTED", "COMMENTED") and (r.get("body") or "").strip():
+            items.append({"id": f"review:{r.get('id')}", "kind": "review", "author": _login(r), "body": r["body"], "path": "", "thread_id": ""})
+    for c in _nodes(pr, "comments"):
+        items.append({"id": f"comment:{c.get('id')}", "kind": "comment", "author": _login(c), "body": c.get("body") or "", "path": "", "thread_id": ""})
+    return [i for i in items if i["id"] not in seen and not i["body"].lstrip().startswith(OWN_COMMENT_PREFIXES)]
+
+
+def review_poll(state):
+    u = {}
+    polls = as_int(state.get("review_polls"))
+    rounds = as_int(state.get("review_rounds"))
+    started = as_int(state.get("review_started_at")) or int(time.time())
+    if polls > 0:
+        time.sleep(int(os.environ.get("ARCHITECT_REVIEW_SLEEP", REVIEW_POLL_SLEEP)))
+    u["review_polls"] = polls + 1
+    u["review_rounds"] = rounds + 1
+    if time.time() - started > REVIEW_WALL_SECS or rounds + 1 > REVIEW_MAX_POLLS:
+        u["review_status"] = "wall_cap"
+        u["_next"] = "review_route"
+        return u
+    pr = _review_read(state)
+    if pr is None:
+        fails = as_int(state.get("review_poll_fails")) + 1
+        u["review_poll_fails"] = fails
+        u["review_status"] = "poll_error" if fails >= CI_POLL_FAILS else "pending"
+        u["_next"] = "review_route" if fails >= CI_POLL_FAILS else "review_poll"
+        return u
+    u["review_poll_fails"] = 0
+    head = pr.get("headRefOid") or ""
+    approved = pr.get("reviewDecision") == "APPROVED" or any(
+        r.get("state") == "APPROVED" and head and as_dict(r.get("commit")).get("oid") == head for r in _nodes(pr, "reviews"))
+    items = _review_items(pr, set(as_list(state.get("review_seen"))))
+    if pr["state"] == "MERGED":
+        u.update({"review_status": "merged", "_next": "review_route"})
+    elif pr["state"] == "CLOSED":
+        u.update({"review_status": "closed", "_next": "review_route"})
+    elif approved:
+        u.update({"review_status": "approved", "_next": "review_route"})
+    elif items:
+        u.update({"review_status": "comments", "review_items": items, "_next": "review_route"})
+    else:
+        u.update({"review_status": "pending", "_next": "review_poll"})
+    return u
+
+
+def review_route(state):
+    u = {}
+    note_script_error(state, u, "review_poll")
+    status = state.get("review_status") or "poll_error"
+    pr = state.get("pr_number")
+    if status in ("approved", "merged"):
+        _review_event(state, u, "approved" if status == "approved" else "merged externally")
+        _close_review_watch(state, u, status)
+        return _after_flip(state, u)
+    if status == "closed":
+        _review_event(state, u, "closed externally")
+        _close_review_watch(state, u, status)
+        u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"PR #{pr} was closed externally during the review watch; no further work started on top of it"]
+        u["_next"] = "finish_plan"
+        return u
+    if status == "comments":
+        u["_next"] = "review_triage"
+        return u
+    _review_event(state, u, f"stop: {status}")
+    return raise_escalation(state, u, escalation(
+        "review_exhausted", f"The review watch on PR #{pr} ended without an approval ({status}: polls {state.get('review_rounds')}, "
+                            f"wall {REVIEW_WALL_SECS}s). Keep watching, or stop watching and report?",
+        [option("Keep watching (re-arm the review watch)"),
+         option("Stop watching and report", recommended=True, evidence="the PR stays open and ready; the report names the stop reason")]))
+
+
+def _triaged(state):
+    """Each pending review item merged with its triage verdict; an item the triage skipped counts as `owner`."""
+    verdicts = {str(as_dict(t).get("id")): as_dict(t) for t in as_list(state.get("review_triage_items"))}
+    out = []
+    for it in as_list(state.get("review_items")):
+        it = as_dict(it)
+        v = verdicts.get(str(it.get("id")), {})
+        action = v.get("action") if v.get("action") in ("fix", "owner", "none") else "owner"
+        out.append({**it, "action": action, "fix_item": v.get("fix_item") or "", "reason": v.get("reason") or ""})
+    return out
+
+
+def _review_fix(state, u, items):
+    n = as_int(state.get("review_fix_rounds")) + 1
+    u["review_fix_rounds"] = n
+    owner = _owning_task(state, " ".join(f"{i.get('path', '')} {i.get('body', '')}" for i in items))
+    bodies = "\n\n".join(f"### {i['id']} ({i.get('author') or 'unknown'}{', ' + i['path'] if i.get('path') else ''})\n{i.get('body', '')}" for i in items)
+    u["fix_request"] = {"task": owner, "source": "review", "return_to": "review",
+                        "items": [f"{i['id']}: {i.get('fix_item') or tail(i.get('body', ''), 400)}" for i in items],
+                        "note": tail(bodies, 4000) + "\nPush the fix; the watch posts the Update comment and resolves the threads."}
+    _review_event(state, u, f"{len(items)} new item(s) -> fix round {n}/{REVIEW_MAX_ROUNDS}")
+    u["_next"] = "fix_round"
+    return u
+
+
+def review_apply(state):
+    u = {}
+    harvest_anomalies(state, u, "review_triage")
+    note_script_error(state, u, "review_triage")
+    pr = state.get("pr_number")
+    items = _triaged(state)
+    owner = [i for i in items if i["action"] == "owner"]
+    fixes = [i for i in items if i["action"] == "fix"]
+    if owner:
+        quoted = "\n".join(f"- {i['id']} ({i.get('author') or 'unknown'}): {tail(i.get('body', ''), 300)}" for i in owner)
+        u["review_status"] = "owner_judgment"
+        _review_event(state, u, "stop: owner_judgment")
+        return raise_escalation(state, u, escalation(
+            "review_owner_judgment", f"Review comment(s) on PR #{pr} need an owner decision:\n{quoted}\n"
+                                     "Address them as a fix round, skip them and keep watching, or stop watching?",
+            [option("Address it as a fix round"), option("Skip it and keep watching"), option("Stop watching and report")],
+            hard_trigger=True, data={"items": [i["id"] for i in owner]}))
+    if not fixes:
+        u["review_seen"] = list(as_list(state.get("review_seen"))) + [i["id"] for i in items]
+        u.update({"review_items": [], "review_triage_items": [], "review_status": "pending"})
+        _review_event(state, u, f"{len(items)} item(s) need no change")
+        u["_next"] = "review_poll"
+        return u
+    if as_int(state.get("review_fix_rounds")) >= REVIEW_MAX_ROUNDS:
+        u["review_status"] = "round_cap"
+        _review_event(state, u, "stop: round_cap")
+        return raise_escalation(state, u, escalation(
+            "review_round_cap", f"PR #{pr} drew new review comments after {REVIEW_MAX_ROUNDS} review fix rounds without an approval. How to proceed?",
+            [option("Resume with one more fix round"), option("Stop watching and report", recommended=True)],
+            evidence=tail("\n".join(f"- {i['id']}: {i['fix_item']}" for i in fixes), 1500)))
+    return _review_fix(state, u, fixes)
+
+
+def _resolve_thread(state, thread_id, sha):
+    cmd = os.environ.get("ARCHITECT_GH_RESOLVE_CMD")
+    if cmd:
+        return sh(["bash", "-c", cmd, "_", thread_id], timeout=60)[0] == 0
+    code = state.get("code_repo_path", "")
+    replied = sh(["gh", "api", "graphql", "-f", f"query={REPLY_MUTATION}", "-f", f"thread={thread_id}", "-f", f"body=Addressed in {sha}"],
+                 cwd=code, timeout=60)[0] == 0
+    resolved = sh(["gh", "api", "graphql", "-f", f"query={RESOLVE_MUTATION}", "-f", f"thread={thread_id}"], cwd=code, timeout=60)[0] == 0
+    return replied and resolved
+
+
+def review_update(state):
+    u = {}
+    pr = state.get("pr_number")
+    sha = git_out(state.get("code_repo_path", ""), "rev-parse", "HEAD")
+    items = _triaged(state)
+    lines = [f"## Update @ {sha}", ""]
+    for i in [i for i in items if i["action"] != "none"]:
+        ok = _resolve_thread(state, i["thread_id"], sha) if i.get("thread_id") else True
+        _review_event(state, u, f"addressed {i['id']} -> {sha}" + ("" if ok else " (thread resolve FAILED)"))
+        lines.append(f"- {i['id']}: {sha}")
+    skipped = [i for i in items if i["action"] == "none"]
+    if skipped:
+        lines += ["", "Not addressed:"] + [f"- {i['id']}: {i['reason'] or 'no change needed'}" for i in skipped]
+    ok, out = _pr_comment(state, pr, "\n".join(lines))
+    ledger(state, u, f"pr-comment: PR #{pr} update @ {sha}: {'posted' if ok else 'FAILED ' + tail(out, 120)}")
+    u["review_seen"] = list(as_list(state.get("review_seen"))) + [i["id"] for i in items]
+    u.update({"review_items": [], "review_triage_items": [], "review_polls": 0, "review_status": "",
+              "ci_polls": 0, "ci_poll_fails": 0, "ci_started_at": int(time.time())})
+    u["_next"] = "ci_poll"
     return u
 
 
@@ -3105,6 +3386,8 @@ def final_report(state):
     L += [""]
     if state.get("pr_url"):
         L += [f"## PR", f"{state.get('pr_url')} (draft -> {'ready' if truthy(state.get('flipped_ready')) else 'still draft'}; CI {state.get('ci_status') or 'not watched'})", ""]
+    if _review_mode(state):
+        L += ["## Review watch"] + ([f"- PR #{n}: {s}" for n, s in as_dict(state.get("review_outcomes")).items()] or ["- none"]) + [""]
     if STACK_LINKING and not is_single(state):
         L += ["## Stacks (bottom -> top; merge bottom-up: merging the bottom PR auto-rebases the remaining branches and retargets the next PR to main; no layer merges until every PR below it also passes main's protections)"]
         L += [f"- {d}" for d in as_list(state.get("decisions")) if str(d).startswith("stack:")] or ["- none linked"]
@@ -3199,7 +3482,8 @@ GATES = {
     "phase_f_gate": phase_f_gate, "integration_check": integration_check, "integrate_route": integrate_route,
     "hygiene_create": hygiene_create, "stack_gate_final": stack_gate_final, "pr_body": pr_body, "open_pr": open_pr,
     "pr_round_comments": pr_round_comments, "ci_poll": ci_poll, "ci_route": ci_route, "ci_evidence": ci_evidence, "ci_apply": ci_apply,
-    "flip_ready": flip_ready, "finish_plan": finish_plan, "final_report": final_report, "whetstone_gate": whetstone_gate,
+    "flip_ready": flip_ready, "review_poll": review_poll, "review_route": review_route, "review_apply": review_apply,
+    "review_update": review_update, "finish_plan": finish_plan, "final_report": final_report, "whetstone_gate": whetstone_gate,
     "group_closeout": group_closeout,
 }
 
