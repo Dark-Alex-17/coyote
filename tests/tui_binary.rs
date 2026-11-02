@@ -763,6 +763,41 @@ fn a_ctrl_c_meant_for_the_editor_does_not_end_the_session() {
     assert_tty_restored(&transcript);
 }
 
+/// A `kill -TERM` delivered while the editor has the terminal is for
+/// coyote, not the editor, and is not forgotten with the editor's Ctrl+C:
+/// once the editor returns the UI quits on it, orderly, with the tty
+/// cooked.
+#[test]
+#[serial]
+fn a_sigterm_during_the_editor_quits_once_the_editor_returns() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = fresh_config_dir("editor-sigterm");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let editor = dir.join("line-editor.sh");
+    fs::write(&editor, "#!/bin/sh\nIFS= read -r x </dev/tty\n: > \"$1\"\n").unwrap();
+    fs::set_permissions(&editor, fs::Permissions::from_mode(0o755)).unwrap();
+    let editor = editor.to_str().unwrap();
+    let mut pty = spawn_tui(&dir, &[("EDITOR", editor), ("VISUAL", editor)]);
+
+    let transcript = pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let pid = child_pid(&transcript);
+    let before = pty.raw().len();
+    pty.send(b"\x0f").unwrap();
+    pty.wait_for_raw(LEAVE_ALT, before, PTY_DEADLINE)
+        .expect("Ctrl-O did not release the terminal for the editor");
+    pty.read_for(Duration::from_millis(300));
+    // SAFETY: kill takes a pid and a signal number and touches no memory.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b"\r").unwrap();
+
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
 /// The dry-run model echoes the role prompt plus the user's text, so a
 /// markdown prompt comes back rendered: `**zebra**` loses its asterisks and
 /// the inline code its backticks. Ratatui's diffing paints words with

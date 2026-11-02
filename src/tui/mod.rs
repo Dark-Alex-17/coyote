@@ -1069,15 +1069,15 @@ impl Termination {
         }
     }
 
-    /// Forgets a signal that landed while the terminal was released. The
+    /// Forgets a SIGINT that landed while the terminal was released. The
     /// editor and coyote share the foreground process group, so a Ctrl+C
     /// meant for the editor also reaches coyote, where it would otherwise
-    /// sit latched and end the session at the next select.
+    /// sit latched and end the session at the next select. SIGTERM and
+    /// SIGHUP are addressed to coyote itself and stay latched, so a kill
+    /// or a lost terminal during the shell-out still quits afterwards.
     fn discard_pending(&mut self) {
         use futures_util::FutureExt;
-        for signal in [&mut self.term, &mut self.hup, &mut self.int] {
-            while signal.recv().now_or_never().flatten().is_some() {}
-        }
+        while self.int.recv().now_or_never().flatten().is_some() {}
     }
 }
 
@@ -2141,6 +2141,25 @@ mod tests {
         let started = tokio::time::Instant::now();
         assert!(join_unattended(handle, &mut rx, deadline).await.is_none());
         assert!(started.elapsed() >= deadline);
+    }
+
+    /// A SIGTERM latched while the terminal was released survives the
+    /// discard that follows a shell-out, which is for the editor's Ctrl+C
+    /// only, and still ends the loop at the next select. The handler is
+    /// armed before the raise, so the signal cannot reach the default
+    /// disposition.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn discard_pending_keeps_a_latched_sigterm() {
+        let mut termination = Termination::arm().unwrap();
+        // SAFETY: raise takes a signal number and no pointers.
+        unsafe { libc::raise(libc::SIGTERM) };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        termination.discard_pending();
+        tokio::time::timeout(Duration::from_secs(2), termination.recv())
+            .await
+            .expect("the SIGTERM was discarded along with the editor's Ctrl+C");
     }
 
     /// One worker, and the work task blocks its thread for longer than the
