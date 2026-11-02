@@ -1,6 +1,7 @@
 //! Pins the README's mesh section, the constants the code uses and the source-comment
-//! hygiene rules to the code, plus the envoy session-key and fetch response-bound vectors.
-//! The scanners are line-oriented and std-only.
+//! hygiene rules to the code, plus the envoy session-key and fetch response-bound vectors
+//! and the rule that mesh text is printed only through its sinks. The scanners are
+//! line-oriented and std-only.
 
 use std::path::{Path, PathBuf};
 
@@ -922,6 +923,143 @@ mod tests {
     fn is_a_plain_comment(line: &str) -> bool {
         let rest = line.trim_start().strip_prefix("//");
         rest.is_some_and(|rest| !rest.starts_with('/') && !rest.starts_with('!'))
+    }
+
+    mod mesh_text_sinks {
+        use super::*;
+        use std::collections::BTreeMap;
+
+        /// The free functions in `src/repl/mesh.rs` that put mesh text on the terminal.
+        const SINKS: [&str; 3] = ["out_text", "err_text", "out_path_text"];
+
+        /// Sinks that print byte for byte, each with the reason it must not render hints.
+        const UNRENDERED_SINKS: [(&str, &str); 1] = [(
+            "out_path_text",
+            "prints paths and share patterns, and `.vault/key` would become `/vault/key`",
+        )];
+
+        const PRINT_MACROS: [&str; 4] = ["println!", "eprintln!", "print!", "eprint!"];
+
+        fn prints_directly(code: &str) -> bool {
+            PRINT_MACROS.iter().any(|needle| {
+                code.match_indices(needle)
+                    .any(|(at, _)| is_word_boundary(code.as_bytes()[..at].last()))
+            })
+        }
+
+        /// The name of the free function `line` opens, if it opens one at column zero.
+        fn top_level_fn_name(line: &str) -> Option<&str> {
+            let rest = line
+                .trim_start_matches("pub(crate) ")
+                .trim_start_matches("pub ")
+                .trim_start_matches("async ")
+                .strip_prefix("fn ")?;
+            rest.split(['(', '<']).next()
+        }
+
+        /// Every direct print outside a sink, and every sink that prints without
+        /// `render_hints` and is not an unrendered sink; plus the sinks `source` defines.
+        fn scan(path: &str, source: &str) -> (Vec<String>, Vec<String>) {
+            let mut hits = Vec::new();
+            let mut rendered: BTreeMap<&str, bool> = BTreeMap::new();
+            let mut item: Option<&str> = None;
+            for (index, line) in lines_outside_test_modules(source).into_iter().enumerate() {
+                if line.starts_with('}') {
+                    item = None;
+                } else if !line.is_empty() && !line.starts_with([' ', '#', '/', ')']) {
+                    item = top_level_fn_name(line).filter(|name| SINKS.contains(name));
+                    if let Some(name) = item {
+                        rendered.entry(name).or_insert(false);
+                    }
+                }
+                let code = line.trim_start();
+                if code.starts_with("///") || code.starts_with("//!") {
+                    continue;
+                }
+                match item {
+                    Some(name) if code.contains("render_hints") => {
+                        rendered.insert(name, true);
+                    }
+                    Some(_) => {}
+                    None if prints_directly(code) => {
+                        hits.push(format!("{path}:{}: {code}", index + 1));
+                    }
+                    None => {}
+                }
+            }
+            for (name, rendered) in &rendered {
+                let unrendered = UNRENDERED_SINKS.iter().any(|(sink, _)| sink == name);
+                if !rendered && !unrendered {
+                    hits.push(format!("{path}: `{name}` prints without render_hints"));
+                }
+            }
+            (hits, rendered.into_keys().map(str::to_string).collect())
+        }
+
+        #[test]
+        fn sink_scanner_trips_each_shape_and_spares_the_sinks() {
+            for (red, expected) in [
+                ("fn show() {\n    println!(\"x\");\n}\n", 1),
+                ("fn show() {\n    eprint!(\"x\");\n}\n", 1),
+                ("fn show() {\n    let _ = 1; print!(\"x\");\n}\n", 1),
+                (
+                    "pub(crate) fn err_text(text: &str) {\n    eprintln!(\"{text}\");\n}\n",
+                    1,
+                ),
+                (
+                    "impl Node {\n    fn out_text(&self) {\n        println!(\"x\");\n    }\n}\n",
+                    1,
+                ),
+                (
+                    "fn out_text(text: &str) {\n    println!(\"{text}\");\n}\nfn after() {\n    println!(\"y\");\n}\n",
+                    2,
+                ),
+            ] {
+                let (hits, _) = scan("src/fixture.rs", red);
+                assert_eq!(hits.len(), expected, "{red:?}: {hits:?}");
+            }
+            for green in [
+                "pub(crate) fn out_text(text: &str) {\n    println!(\"{}\", live_prefix().render_hints(text));\n}\n",
+                "pub(crate) fn out_path_text(text: &str) {\n    println!(\"{text}\");\n}\n",
+                "/// `println!` is not called here\nfn quiet() {}\n",
+                "fn quiet() {\n    // println! would skip the sink\n}\n",
+                "#[cfg(test)]\nmod tests {\n    fn noisy() {\n        println!(\"x\");\n    }\n}\n",
+                "fn quiet(out: &mut String) {\n    let _ = writeln!(out, \"x\");\n}\n",
+            ] {
+                let (hits, _) = scan("src/fixture.rs", green);
+                assert!(hits.is_empty(), "{green:?}: {hits:?}");
+            }
+        }
+
+        /// Mesh text reaches the terminal only through the sinks, so every line follows
+        /// the configured command prefix and paths are printed as they are. The
+        /// conformance and fuzz harnesses print reports, not mesh text.
+        #[test]
+        fn mesh_text_is_printed_only_through_the_sinks() {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+            let mut files = rust_files_under(root, "src/mesh").unwrap();
+            files.retain(|(path, _)| {
+                !path.starts_with("src/mesh/conformance/") && !path.starts_with("src/mesh/fuzz/")
+            });
+            let repl = "src/repl/mesh.rs";
+            files.push((
+                repl.to_string(),
+                std::fs::read_to_string(root.join(repl)).unwrap(),
+            ));
+            let mut hits = Vec::new();
+            for (path, source) in &files {
+                let (found, sinks) = scan(path, source);
+                hits.extend(found);
+                if path == repl {
+                    assert_eq!(sinks, ["err_text", "out_path_text", "out_text"]);
+                }
+            }
+            assert!(
+                hits.is_empty(),
+                "print mesh text through out_text or err_text, or out_path_text for a path:\n{}",
+                hits.join("\n")
+            );
+        }
     }
 
     /// The workspace config directory's name reaches the code through
