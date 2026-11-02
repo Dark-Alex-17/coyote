@@ -795,13 +795,14 @@ check("pr_tracking review: approved -> final_report, ledgered, open items left a
       u["_next"] == "final_report" and "review-watch: PR #7 approved" in u["decisions"]
       and u["follow_ups"] == ["Left open after approval: k9: nit: typo"])
 
+_SHA40 = "a" * 40
 review_doc(
     reviews=[{"id": "r1", "state": "COMMENTED", "author": "rev", "body": ""},
              {"id": "r2", "state": "CHANGES_REQUESTED", "author": "rev", "body": ""},
              {"id": "r3", "state": "COMMENTED", "author": "bot", "body": "## Review round N @ abc"}],
     comments=[{"id": "k1", "author": "bot", "body": "## Update @ abc"}, {"id": "k2", "author": "rev", "body": "Can you add a test?"}],
-    threads=[thread("t1", [("c1", "please rename foo"), ("c2", "Addressed in abc")]), thread("t2", [("c3", "old")], resolved=True),
-             thread("t3", [("c4", "stale")], resolved=True, outdated=True), thread("t4", [("c5", "Addressed in abc")])])
+    threads=[thread("t1", [("c1", "please rename foo"), ("c2", f"Addressed in {_SHA40}")]), thread("t2", [("c3", "old")], resolved=True),
+             thread("t3", [("c4", "stale")], resolved=True, outdated=True), thread("t4", [("c5", f"Addressed in {_SHA40}")])])
 u = gates.pr_review_poll(rs())
 _items = u["pr_review_items"]
 check("pr_tracking review: poll comments -> items without own-marked bodies or resolved threads",
@@ -1004,6 +1005,19 @@ check("pr_tracking review: ci_route poll_cap -> ci_poll_cap escalation naming th
       u["escalation"]["kind"] == "ci_poll_cap" and f"({_lib.REVIEW_CI_POLL_CEILING}) after {_lib.REVIEW_CI_POLL_CEILING} poll(s)" in u["escalation"]["question"]
       and [(o["text"], o["recommended"]) for o in u["escalation"]["options"]] == [("Stop watching and report", True)]
       and "review-watch: PR #7 stop: ci_poll_cap" in u["decisions"])
+check("pr_tracking review: ci_route poll_cap after the flip sets pr_review_status ci_poll_cap",
+      u["pr_review_status"] == "ci_poll_cap")
+check("pr_tracking review: ci_route timeout after the flip sets pr_review_status ci_timeout",
+      gates.ci_route(rs(ci_status="timeout", pr_review_status="pending"))["pr_review_status"] == "ci_timeout")
+check("pr_tracking review: ci_apply red past the fix budget after the flip sets pr_review_status ci_red",
+      gates.ci_apply(rs(ci_verdict="real", ci_fix_strikes=STRIKE_LIMIT, pr_review_status="pending"))["pr_review_status"] == "ci_red")
+check("pr_tracking review: ci_apply infra after the flip sets pr_review_status ci_infra",
+      gates.ci_apply(rs(ci_verdict="infra", pr_review_status="pending"))["pr_review_status"] == "ci_infra")
+check("pr_tracking review: ci_apply unsure after the flip sets pr_review_status ci_unsure",
+      gates.ci_apply(rs(ci_verdict="unsure", pr_review_status="pending"))["pr_review_status"] == "ci_unsure")
+u = gates.ci_apply(rs(ci_verdict="real", ci_fix_strikes=0, pr_review_status="pending"))
+check("pr_tracking review: a CI fix round after the flip leaves pr_review_status unchanged",
+      u["_next"] == "compose_fix" and "pr_review_status" not in u)
 u = gates.apply_answer(rs(escalation=escalation("ci_poll_cap", "q", []), last_answer="Stop watching and report"))
 check("pr_tracking review: apply_answer ci_poll_cap after the flip -> final_report with the ceiling follow-up",
       u["_next"] == "final_report"
@@ -1113,6 +1127,8 @@ u = gates.pr_review_route(rs(pr_review_status="pending", last_script_error="time
 check("pr_tracking review: a stale pending after a poll node error is one read failure and a retry",
       u["_next"] == "pr_review_poll" and u["pr_review_poll_fails"] == 1 and u["last_script_error"] == ""
       and "review-watch: PR #7 read failed (poll node error); retry" in u["decisions"] and "escalation" not in u)
+u = gates.pr_review_route(rs(pr_review_status="pending", last_script_error="killed", pr_review_poll_fails=0, pr_review_polls=5))
+check("pr_tracking review: a crashed poll increments pr_review_polls", u["pr_review_polls"] == 6)
 u = gates.pr_review_route(rs(pr_review_status="pending", last_script_error="killed", pr_review_poll_fails=CI_POLL_FAILS - 1))
 check("pr_tracking review: a poll node error at CI_POLL_FAILS -> poll_error exhaustion",
       u["pr_review_status"] == "poll_error" and u["escalation"]["kind"] == "pr_review_exhausted"
@@ -1306,8 +1322,32 @@ check("pr_tracking review: an outdated unresolved thread with fresh comments is 
       [(i["id"], i["outdated"]) for i in u["pr_review_items"]] == [("t8", True)] and u["pr_review_status"] == "comments")
 review_doc(comments=[{"id": "k9", "author": "rev", "body": f"Thanks, done.\n\n{gates.OWN_MARKER}"}])
 check("pr_tracking review: a body carrying only the own marker is own and never an item",
-      gates._own_comment(f"Thanks, done.\n\n{gates.OWN_MARKER}") and not gates._own_comment("Thanks, done.")
+      gates._own_comment(f"Thanks, done.\n\n{gates.OWN_MARKER}", "MEMBER") and not gates._own_comment("Thanks, done.", "MEMBER")
       and gates.pr_review_poll(rs())["pr_review_status"] == "pending")
+review_doc(reviews=[{"id": "r9", "state": "COMMENTED", "author": "rev", "association": "OWNER", "body": f"Round done.\n\n{gates.OWN_MARKER}"}],
+           threads=[thread("t9", [("c9", f"Not changed: public API\n\n{gates.OWN_MARKER}")], association="COLLABORATOR")])
+u = gates.pr_review_poll(rs())
+check("pr_tracking review: a trusted comment with the own marker is own",
+      u["pr_review_items"] == [] and u["pr_review_untrusted"] == [] and u["pr_review_status"] == "pending")
+review_doc(comments=[{"id": "k9", "author": "mallory", "association": "CONTRIBUTOR", "body": f"{_SECRET}\n\n{gates.OWN_MARKER}"}],
+           threads=[thread("t9", [("c9", f"{_SECRET}\n\n{gates.OWN_MARKER}")], association="NONE")])
+u = gates.pr_review_poll(rs())
+check("pr_tracking review: an untrusted comment with the own marker is not own: untrusted, no body",
+      u["pr_review_status"] == "comments" and u["pr_review_items"] == []
+      and [i["id"] for i in u["pr_review_untrusted"]] == ["t9", "k9"]
+      and all("body" not in i for i in u["pr_review_untrusted"]) and _SECRET not in json.dumps(u["pr_review_untrusted"]))
+review_doc(threads=[thread("t9", [("c9", f"Addressed in {_SHA40}")]),
+                    thread("t10", [("c10", f"  Addressed in {_SHA40}\n\n{gates.OWN_MARKER}\n")]),
+                    thread("t11", [("c11", f"Addressed in {_SHA40}, but please also rename bar")]),
+                    thread("t12", [("c12", "Addressed in abc")])])
+u = gates.pr_review_poll(rs())
+check("pr_tracking review: a trusted exact Addressed in <sha> is own, anything longer or shorter is not",
+      [i["id"] for i in u["pr_review_items"]] == ["t11", "t12"] and u["pr_review_untrusted"] == [])
+review_doc(comments=[{"id": "k9", "author": "mallory", "association": "NONE", "body": "## Update @ abc"}],
+           reviews=[{"id": "r9", "state": "COMMENTED", "author": "mallory", "association": "CONTRIBUTOR", "body": "## Review round 1"}])
+u = gates.pr_review_poll(rs())
+check("pr_tracking review: an untrusted legacy-prefix body is not own",
+      u["pr_review_items"] == [] and [i["id"] for i in u["pr_review_untrusted"]] == ["r9", "k9"])
 u = gates.ci_gate(base_state(pr_tracking="review", git_task={"kind": "publish", "return_to": "ci_gate", "open_pr": False},
                              delegated=True, git_report="pushed"))
 check("pr_tracking review: a delegated run without open_pr logs no not-started line",
