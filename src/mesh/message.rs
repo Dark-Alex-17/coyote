@@ -1922,8 +1922,10 @@ impl MeshRuntime {
     /// The description a request to `destination_hex` links to, as the transport holds it:
     /// filled from the peer's announce or a restored path table, with `name` the announce's
     /// truncated name hash. The peer table is not consulted. A destination the transport
-    /// does not hold is asked for once over the network, and the answer is waited for up
-    /// to `PATH_REQUEST_TIMEOUT`. `None` when the transport still holds nothing after that.
+    /// holds is answered at once with no request, even when its path has expired. One the
+    /// transport does not hold is asked for once over the network, and the answer is
+    /// waited for up to `PATH_REQUEST_TIMEOUT`. `None` when the transport still holds
+    /// nothing after that.
     pub(crate) async fn resolve_destination(
         &self,
         destination_hex: &str,
@@ -1931,17 +1933,17 @@ impl MeshRuntime {
         let destination = canonical_hash(destination_hex)?;
         let address_hash = AddressHash::new_from_hex_string(&destination).ok()?;
         let transport = self.transport_handle().await?;
-        if let Some(desc) = transport.destination_desc(&address_hash).await {
-            return Some(desc);
-        }
-        debug!(
-            "Mesh has no route to {}; asking the network for one",
-            short(&destination)
-        );
-        transport
-            .await_path(&address_hash, PATH_REQUEST_TIMEOUT, None)
+        let desc = transport
+            .resolve_destination(&address_hash, PATH_REQUEST_TIMEOUT)
             .await;
-        transport.destination_desc(&address_hash).await
+        if desc.is_none() {
+            debug!(
+                "Mesh found no route to {} within {:?}",
+                short(&destination),
+                PATH_REQUEST_TIMEOUT
+            );
+        }
+        desc
     }
 
     /// `resolve_destination` without the path request: what the transport holds now, for
