@@ -728,6 +728,12 @@ def apply_answer(state):
         u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
             f"PR review watch stopped at the round cap; open items: {', '.join(refs) or 'none'}"]
         u["_next"] = "final_report"
+    elif kind == "pr_review_truncated":
+        what = ", ".join(str(t) for t in as_list(state.get("pr_review_truncated"))) or "unknown"
+        u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
+            f"PR review watch stopped: the review read of PR #{_pr_ref(state)} was truncated ({what}); "
+            "read the review items on GitHub"]
+        u["_next"] = "final_report"
     elif kind == "pr_review_owner_judgment" and as_list(as_dict(esc.get("data")).get("untrusted")):
         untrusted = [i for i in as_list(as_dict(esc.get("data")).get("untrusted")) if isinstance(i, dict)]
         if _answered(state, {"skip": ["skip"]}, "stop") == "skip":
@@ -2036,10 +2042,10 @@ def ci_apply(state):
 PR_REVIEW_QUERY = (
     "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){"
     "state reviewDecision headRefOid "
-    "reviews(last:50){nodes{id state body authorAssociation author{login}}} "
-    "comments(last:50){nodes{id body authorAssociation author{login}}} "
-    "reviewThreads(first:100){nodes{id isResolved isOutdated path line "
-    "comments(first:50){nodes{id body url authorAssociation author{login}}}}}}}}"
+    "reviews(last:50){totalCount nodes{id state body authorAssociation author{login}}} "
+    "comments(last:50){totalCount nodes{id body authorAssociation author{login}}} "
+    "reviewThreads(last:100){totalCount nodes{id isResolved isOutdated path line "
+    "comments(last:50){totalCount nodes{id body url authorAssociation author{login}}}}}}}}"
 )
 # Own comments are recognised by body (the marker, a legacy prefix, or a bare thread reply), not author: the bot
 # and the owner can share one gh login. The body alone proves nothing, so only a trusted account's comment counts.
@@ -2068,6 +2074,11 @@ def _association(node):
     return str(node.get("authorAssociation") or node.get("association") or "").upper()
 
 
+def _truncated(conn):
+    """A connection whose totalCount exceeds the nodes returned; a plain list (a normalized doc) never is."""
+    return isinstance(conn, dict) and as_int(conn.get("totalCount")) > len(_nodes(conn))
+
+
 def _normalize_pr_review(raw):
     """The raw GraphQL response or an already-normalized doc -> the normalized doc; None when it names no PR."""
     if not isinstance(raw, dict):
@@ -2075,6 +2086,9 @@ def _normalize_pr_review(raw):
     pr = as_dict(as_dict(as_dict(raw.get("data")).get("repository")).get("pullRequest")) if "data" in raw else raw
     if not pr.get("state"):
         return None
+    threads = _nodes(pr.get("reviewThreads"))
+    truncated = [k for k in ("reviews", "comments", "reviewThreads") if _truncated(pr.get(k))] + [
+        f"reviewThreads[{i}].comments" for i, t in enumerate(threads) if _truncated(t.get("comments"))]
     return {
         "state": str(pr.get("state") or "").upper(),
         "reviewDecision": str(pr.get("reviewDecision") or "").upper(),
@@ -2088,7 +2102,8 @@ def _normalize_pr_review(raw):
                            "comments": [{"id": str(c.get("id") or ""), "author": _login(c), "association": _association(c),
                                          "body": str(c.get("body") or ""), "url": str(c.get("url") or "")}
                                         for c in _nodes(t.get("comments"))]}
-                          for t in _nodes(pr.get("reviewThreads"))],
+                          for t in threads],
+        "truncated": truncated,
     }
 
 
@@ -2204,9 +2219,15 @@ def _pr_review_status(doc, items, trusted=_association_trusted):
     if state == "CLOSED":
         return "closed"
     decision = doc.get("reviewDecision") or ""
-    verdicts = [r.get("state") for r in doc.get("reviews") or []
-                if r.get("state") in ("APPROVED", "CHANGES_REQUESTED") and trusted(r)]
-    if decision == "APPROVED" or (not decision and verdicts and verdicts[-1] == "APPROVED"):
+    if decision:
+        approved = decision == "APPROVED"
+    else:
+        latest = {}
+        for r in doc.get("reviews") or []:
+            if r.get("state") in ("APPROVED", "CHANGES_REQUESTED") and trusted(r):
+                latest[r.get("author")] = r.get("state")
+        approved = "APPROVED" in latest.values() and "CHANGES_REQUESTED" not in latest.values()
+    if approved:
         return "approved"
     return "comments" if items else "pending"
 
@@ -2253,6 +2274,11 @@ def pr_review_poll(state):
             u["_next"] = "pr_review_poll"
         return u
     u["pr_review_poll_fails"] = 0
+    if doc.get("truncated"):
+        u["pr_review_truncated"] = doc["truncated"]
+        u["pr_review_status"] = "truncated"
+        u["_next"] = "pr_review_route"
+        return u
 
     def trusted(c):
         return _author_trusted(state, u, c.get("author"), c.get("association"))
@@ -2318,6 +2344,15 @@ def pr_review_route(state):
                                    f"watch stops: {cap}. How to proceed?",
             [option("Stop watching and report", recommended=True, evidence=cap)],
             evidence=tail("\n\n".join(f"{_item_ref(i)}: {i.get('body', '')}" for i in items), 2500),
+            hard_trigger=True))
+    if status == "truncated":
+        what = ", ".join(str(t) for t in as_list(state.get("pr_review_truncated"))) or "unknown"
+        ledger(state, u, f"review-watch: PR #{pr} stop: truncated ({what})")
+        return raise_escalation(state, u, escalation(
+            "pr_review_truncated", f"Review watch on PR #{pr} stopped: the review read was truncated ({what}), so "
+                                   "review items could be missed. How to proceed?",
+            [option("Stop watching and report", recommended=True,
+                    evidence=f"GitHub returned fewer items than it counts for {what}")],
             hard_trigger=True))
     if status != "wall_cap":
         status = "poll_error"
