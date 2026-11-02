@@ -8,6 +8,13 @@ pub(crate) use other::FdRedirect;
 #[cfg(unix)]
 pub(crate) use unix::FdRedirect;
 
+use std::time::Duration;
+
+/// Longest `finish` waits for the drain thread to catch up.
+pub(crate) const SETTLE_LIMIT: Duration = Duration::from_millis(50);
+/// Gap without new bytes after which the pipe counts as quiescent.
+pub(crate) const QUIET_GAP: Duration = Duration::from_millis(10);
+
 /// Command output stays on the console until the Windows twin lands.
 #[cfg(not(unix))]
 mod other {
@@ -28,15 +35,12 @@ mod other {
 
 #[cfg(unix)]
 mod unix {
+    use super::{QUIET_GAP, SETTLE_LIMIT};
     use std::io::{self, Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::sync::{Arc, Condvar, Mutex};
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
-    /// Longest `finish` waits for the drain thread to catch up.
-    const SETTLE_LIMIT: Duration = Duration::from_millis(50);
-    /// Gap without new bytes after which the pipe counts as quiescent.
-    const QUIET_GAP: Duration = Duration::from_millis(10);
     /// Most of a command's output kept for its cell; a runaway writer is
     /// cut here and the tail is counted rather than stored.
     const CAPTURE_LIMIT: usize = 1024 * 1024;
@@ -278,6 +282,7 @@ mod unix {
         use std::fs::File;
         use std::process::Command;
         use std::sync::mpsc;
+        use std::time::Duration;
 
         fn write_fd2(bytes: &[u8]) {
             // SAFETY: `bytes` is a valid buffer of the given length.

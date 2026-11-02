@@ -100,7 +100,7 @@ fn serve(listener: TcpListener, replies: &[Reply], served: &AtomicUsize, stop: &
                 let reply = replies.get(n).unwrap_or(&fallback);
                 match (reply, body["stream"] == Value::Bool(true)) {
                     (Reply::Streamed(chunks), true) => {
-                        paced_sse_response(&mut stream, chunks);
+                        paced_sse_response(&mut stream, chunks, stop);
                         let _ = stream.shutdown(Shutdown::Both);
                         continue;
                     }
@@ -224,8 +224,10 @@ fn sse_response(reply: &Reply) -> Vec<u8> {
 
 /// Writes the chunks of a [`Reply::Streamed`] one SSE frame at a time on
 /// a close-delimited response (no Content-Length), flushing after each so
-/// the client sees every delta as soon as it is written.
-fn paced_sse_response(stream: &mut TcpStream, chunks: &[Chunk]) {
+/// the client sees every delta as soon as it is written. A `WaitFor`
+/// gives up when the server is told to stop, so a test that ends before
+/// the file appears does not hold the drop up.
+fn paced_sse_response(stream: &mut TcpStream, chunks: &[Chunk], stop: &AtomicBool) {
     let head = "HTTP/1.1 200 OK\r\n\
          Content-Type: text/event-stream\r\n\
          Connection: close\r\n\
@@ -240,7 +242,10 @@ fn paced_sse_response(stream: &mut TcpStream, chunks: &[Chunk]) {
             Chunk::Reasoning(text) => json!({"reasoning_content": text}),
             Chunk::WaitFor(path) => {
                 let deadline = std::time::Instant::now() + Duration::from_secs(8);
-                while !path.exists() && std::time::Instant::now() < deadline {
+                while !path.exists()
+                    && !stop.load(Ordering::SeqCst)
+                    && std::time::Instant::now() < deadline
+                {
                     thread::sleep(Duration::from_millis(50));
                 }
                 continue;

@@ -647,6 +647,7 @@ fn resuming_after_ctrl_z_repaints_the_screen() {
     pty.send(b"\x04").unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
 }
 
 /// With an editor that returns at once, Ctrl-O must release the terminal
@@ -964,6 +965,7 @@ fn no_color_paints_no_colour_but_keeps_bold_or_underline() {
     pty.send(b"\x04").unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
 
     let sgrs = sgr_params(pty.raw());
     let coloured: Vec<_> = sgrs.iter().filter(|p| is_colour_sgr(p)).collect();
@@ -992,6 +994,7 @@ fn without_colorterm_no_rgb_colour_reaches_the_terminal() {
     pty.send(b"\x04").unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
 
     let sgrs = sgr_params(pty.raw());
     let rgb: Vec<_> = sgrs.iter().filter(|p| is_rgb_sgr(p)).collect();
@@ -1323,7 +1326,8 @@ fn declining_the_save_modal_closes_the_session_without_a_file() {
 
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
     open_and_dirty_a_session(&mut pty);
-    let files_before = walk(&dir).len();
+    let sessions = dir.join("sessions");
+    let files_before = walk(&sessions).len();
     pty.send(b".exit session\r").unwrap();
     pty.wait_for("Save session?", PTY_DEADLINE).unwrap();
     pty.read_for(HOTKEY_GAP);
@@ -1345,7 +1349,7 @@ fn declining_the_save_modal_closes_the_session_without_a_file() {
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
     assert_tty_restored(&transcript);
-    let files_after = walk(&dir);
+    let files_after = walk(&sessions);
     assert_eq!(
         files_after.len(),
         files_before,

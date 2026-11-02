@@ -27,6 +27,9 @@
 # one prompt at a time: never run two helpers concurrently (background
 # subshells) in the same tool, or they will swallow each other's replies.
 #
+# COYOTE_UI is "repl" or "tui" when a human can answer and "headless" when
+# nobody can; tools may branch on it before asking.
+#
 # - guard_operation   Prompt for permission to run an operation
 # - guard_path        Prompt for permission to perform path operations
 # - patch_file        Patch a file

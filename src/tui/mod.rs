@@ -1330,13 +1330,7 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
             exit_leaving_the_task_behind(&mut screen, unfinished)
         }
         Leave::Lost(err, mut late) => {
-            // The drain thread may still be forwarding what the pipe held
-            // when the guard went down.
-            while let Ok(msg) = rx.try_recv() {
-                if let UiMsg::Notice { text, .. } = msg {
-                    late.push(text);
-                }
-            }
+            settle_late_notices(&mut rx, &mut late).await;
             for text in late {
                 eprintln!("{}", render::plain_text(&text));
             }
@@ -1345,6 +1339,32 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
     };
     crate::hooks::drain_pending(EXIT_HOOK_DRAIN_TIMEOUT).await;
     result.map(|_| ())
+}
+
+/// Collects the notices a lost turn's capture is still forwarding. The
+/// drain thread hands the pipe's contents over after the guard went
+/// down, so the queue gets the same bounded quiet-gap settle a finished
+/// turn's capture gets before it is read.
+async fn settle_late_notices(rx: &mut UnboundedReceiver<UiMsg>, late: &mut Vec<String>) {
+    let started = Instant::now();
+    let mut last = started;
+    loop {
+        let now = Instant::now();
+        if now.duration_since(last) >= redirect::QUIET_GAP
+            || now.duration_since(started) >= redirect::SETTLE_LIMIT
+        {
+            return;
+        }
+        let wait = (last + redirect::QUIET_GAP).min(started + redirect::SETTLE_LIMIT) - now;
+        match tokio::time::timeout(wait, rx.recv()).await {
+            Ok(Some(UiMsg::Notice { text, .. })) => {
+                late.push(text);
+                last = Instant::now();
+            }
+            Ok(Some(_)) => last = Instant::now(),
+            Ok(None) | Err(_) => return,
+        }
+    }
 }
 
 async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
