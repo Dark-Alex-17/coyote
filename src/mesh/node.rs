@@ -3284,7 +3284,9 @@ fn follow_local_event(
                 debug!("Mesh interface {label} reported its connection to rnsd");
             }
         }
-        Some(SharedInstanceEvent::Disconnected) => {
+        Some(
+            SharedInstanceEvent::Disconnected | SharedInstanceEvent::DisconnectedWithReason { .. },
+        ) => {
             let state = InterfaceState::Disconnected {
                 reason: LOCAL_DROP_REASON.to_string(),
             };
@@ -3292,7 +3294,7 @@ fn follow_local_event(
                 warn!("Mesh interface {label} lost rnsd; the transport is redialing it");
             }
         }
-        Some(SharedInstanceEvent::Connecting) => {
+        Some(SharedInstanceEvent::Connecting | SharedInstanceEvent::DialFailed { .. }) => {
             debug!("Mesh interface {label} is dialing rnsd");
         }
         // Guard for future variants.

@@ -1841,10 +1841,11 @@ pub(crate) mod network {
     /// Whether the library has refused a request advertisement on `link_id` one byte over
     /// the destination's cap. The advertisement's hash sits between the link and the
     /// sizes, and the transfer size depends on compression, so only the data size and the
-    /// limit are matched.
+    /// limit are matched. The library warns on a link's first refusal and counts it after
+    /// the limit as `rejected=1`.
     pub(crate) fn library_refused_oversize_request(link_id: LinkId) -> bool {
         let sizes = format!("data_size={} transfer_size=", MAX_REQUEST_PAYLOAD_BYTES + 1);
-        let limit = format!(" limit={MAX_REQUEST_PAYLOAD_BYTES}");
+        let limit = format!(" limit={MAX_REQUEST_PAYLOAD_BYTES} rejected=1");
         library_request_refusal_on(link_id)
             .is_some_and(|line| line.contains(&sizes) && line.ends_with(&limit))
     }
