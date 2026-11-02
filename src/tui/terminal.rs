@@ -29,7 +29,7 @@ pub(crate) type TtyWriter = std::fs::File;
 pub(crate) type TtyWriter = io::Stdout;
 
 /// Raw fd of the dup'd stdout the panic hook restores through; -1 until
-/// `Screen::enter` has run.
+/// `Screen::enter` has run, and again once the `Screen` is gone.
 #[cfg(unix)]
 static PANIC_FD: AtomicI32 = AtomicI32::new(-1);
 /// Whether the keyboard enhancement flags are currently pushed, so the
@@ -166,16 +166,20 @@ fn restore_from_static() {
     {
         use std::mem::ManuallyDrop;
         use std::os::fd::FromRawFd;
-        // Taken, not read: the slot has a single taker, so a second panic
-        // (or a `Screen` tearing down after this swap) finds it empty.
-        let fd = PANIC_FD.swap(-1, Ordering::SeqCst);
+        // Read, not taken: the fd stays armed for the next panic, since a
+        // background task's panic is caught as a join error and the UI
+        // re-enters the screen afterwards. `leave` itself is single-taker
+        // through SCREEN_ENTERED, so two hooks cannot both write.
+        let fd = PANIC_FD.load(Ordering::SeqCst);
         if fd < 0 {
             return;
         }
-        // SAFETY: the fd was dup'd by `open_tty_writer` and is open while
-        // PANIC_FD holds it: `Screen` takes it out of PANIC_FD before the
-        // writer that owns the fd is dropped. ManuallyDrop keeps this handle
-        // from closing it.
+        // SAFETY: the fd was dup'd by `open_tty_writer`; `Screen` clears
+        // PANIC_FD before the writer that owns the fd drops, so this write
+        // normally lands on an open descriptor. A hook racing `Screen::drop`
+        // on another thread can still find it closed and get EBADF, which
+        // is ignored like every other error here. ManuallyDrop keeps this
+        // handle from closing the fd.
         let mut writer = ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
         let _ = leave(&mut *writer);
     }
@@ -272,6 +276,8 @@ fn reenter_if_left<W: Write>(
 pub(crate) struct Screen {
     terminal: Terminal<CrosstermBackend<TtyWriter>>,
     enhancement: bool,
+    #[cfg(unix)]
+    fd: i32,
 }
 
 impl Screen {
@@ -297,11 +303,23 @@ impl Screen {
         Ok(Self {
             terminal,
             enhancement,
+            #[cfg(unix)]
+            fd,
         })
     }
 
+    /// Points the panic hook at this screen's descriptor again. Called
+    /// after every re-enter so the hook's view never depends on which
+    /// path last took the terminal.
+    fn arm_panic_hook(&self) {
+        #[cfg(unix)]
+        PANIC_FD.store(self.fd, Ordering::SeqCst);
+    }
+
     pub(crate) fn draw(&mut self, render: impl FnOnce(&mut ratatui::Frame)) -> io::Result<()> {
-        reenter_if_left(&mut self.terminal, enter_sequence(self.enhancement))?;
+        if reenter_if_left(&mut self.terminal, enter_sequence(self.enhancement))? {
+            self.arm_panic_hook();
+        }
         draw_frame(&mut self.terminal, render)
     }
 
@@ -330,6 +348,7 @@ impl Screen {
         self.leave()?;
         let value = f();
         enter(self.terminal.backend_mut(), self.enhancement)?;
+        self.arm_panic_hook();
         disable_raw_mode()?;
         enable_raw_mode()?;
         repaint_from_scratch(&mut self.terminal)?;
@@ -340,7 +359,8 @@ impl Screen {
 /// An early `?` or an unwind between `enter` and the explicit `leave` in
 /// the run loop still restores the terminal; after that `leave` this is a
 /// no-op. The hook's descriptor is forgotten here, ahead of the writer
-/// closing it.
+/// closing it; a hook already past its `load` on another thread writes to
+/// the closed fd and ignores the EBADF.
 impl Drop for Screen {
     fn drop(&mut self) {
         let _ = self.leave();
@@ -587,5 +607,53 @@ mod tests {
         install_panic_hook();
         assert!(PANIC_HOOK.is_completed());
         assert!(!install_panic_hook());
+    }
+
+    /// A panic restores the terminal, the UI re-enters it, and a second
+    /// panic restores it again: the hook's descriptor survives the first
+    /// restore.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn the_panic_hook_restores_again_after_a_reenter() {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+
+        // Every leave step flushes before the hook returns and the alternate
+        // screen is the last one written, so reading up to it cannot block.
+        fn read_through_leave_alt(reader: &mut io::PipeReader) -> Vec<u8> {
+            let mut out = Vec::new();
+            let mut chunk = [0u8; 256];
+            while !out.ends_with(b"\x1b[?1049l") {
+                let n = reader.read(&mut chunk).unwrap();
+                assert_ne!(n, 0, "the pipe closed before the leave sequence: {out:?}");
+                out.extend_from_slice(&chunk[..n]);
+            }
+            out
+        }
+
+        let (mut reader, writer) = io::pipe().unwrap();
+        PANIC_FD.store(writer.as_raw_fd(), Ordering::SeqCst);
+        ENHANCEMENT_PUSHED.store(false, Ordering::SeqCst);
+
+        SCREEN_ENTERED.store(true, Ordering::SeqCst);
+        restore_from_static();
+        let first = read_through_leave_alt(&mut reader);
+        assert_eq!(count(&first, b"\x1b[?1049l"), 1, "{first:?}");
+        assert!(!SCREEN_ENTERED.load(Ordering::SeqCst));
+        assert_eq!(
+            PANIC_FD.load(Ordering::SeqCst),
+            writer.as_raw_fd(),
+            "the first restore disarmed the hook"
+        );
+
+        // The UI re-entering the screen, as `reenter_if_left` does.
+        SCREEN_ENTERED.store(true, Ordering::SeqCst);
+        restore_from_static();
+        let second = read_through_leave_alt(&mut reader);
+        assert_eq!(count(&second, b"\x1b[?1049l"), 1, "{second:?}");
+        assert!(!SCREEN_ENTERED.load(Ordering::SeqCst));
+
+        PANIC_FD.store(-1, Ordering::SeqCst);
     }
 }
