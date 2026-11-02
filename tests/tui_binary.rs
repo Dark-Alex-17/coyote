@@ -1738,6 +1738,11 @@ fn typing_while_a_tool_sleeps_reaches_the_composer_and_submits_afterwards() {
     let typed_at = pty.raw().len();
     let typed = std::time::Instant::now();
     pty.send(b"typeahead-q9z").unwrap();
+    // Keystrokes that straddle a frame boundary are painted as two cell
+    // runs with a cursor move between them, so the stripped transcript need
+    // not hold the marker contiguously. Ctrl+L repaints the whole screen in
+    // one frame, which also proves a key is handled while the tool sleeps.
+    pty.send(b"\x0c").unwrap();
     pty.wait_for_after("typeahead-q9z", typed_at, PTY_DEADLINE)
         .expect("text typed while the tool slept was not drawn in the composer");
     let drawn_after = typed.elapsed();
