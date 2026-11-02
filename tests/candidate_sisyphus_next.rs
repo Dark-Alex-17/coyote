@@ -51,7 +51,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "sisyphus-next";
 const CANDIDATE_NAMES: [&str; 2] = ["sisyphus-next", "architect-next"];
-const SMOKE_FLOOR: usize = 375;
+const SMOKE_FLOOR: usize = 392;
 
 fn agents_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents")
@@ -2490,9 +2490,10 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("build_gauntlet_prompt", "timeout", 60),
     ("check_inbox_final", "timeout", 300),
     ("check_inbox_pre", "timeout", 300),
-    ("ci_apply", "timeout", 120),
+    ("ci_apply", "timeout", 300),
     ("ci_diagnose", "timeout", 600),
     ("ci_poll", "timeout", 180),
+    ("ci_route", "timeout", 300),
     ("compose_brief", "timeout", 600),
     ("consult_navigator", "max_attempts", 1),
     ("consult_navigator", "timeout", 1800),
@@ -2577,6 +2578,7 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
 /// plus the review-watch bounds.
 const FROZEN_SCRIPT_BOUNDS: &[(&str, &str)] = &[
     ("CI_FLAKE_RERUNS", "2"),
+    ("CI_LOG_RUNS_MAX", "3"),
     ("CI_POLL_FAILS", "3"),
     ("CI_POLL_SLEEP", "60"),
     ("CI_WALL_SECS", "14400"),
@@ -2763,9 +2765,10 @@ fn review_watch_caps_stay_below_the_per_node_visit_cap() {
 }
 
 /// A poll node sleeps and then makes one gh call bounded by `GH_CALL_SECS`,
-/// and `pr_review_resolve` starts no call past `RESOLVE_DEADLINE_SECS`, so
-/// each node timeout has to exceed that worst case or the engine kills the
-/// node mid-call.
+/// `pr_review_resolve` starts no call past `RESOLVE_DEADLINE_SECS`, and
+/// `ci_route` and `ci_apply` make one gh call per distinct CI run, up to
+/// `CI_LOG_RUNS_MAX`, so each node timeout has to exceed that worst case or
+/// the engine kills the node mid-call.
 #[test]
 fn poll_node_timeouts_cover_the_sleep_and_one_gh_call() {
     let lib = fs::read_to_string(candidate_dir().join("scripts/_lib.py")).unwrap();
@@ -2787,6 +2790,14 @@ fn poll_node_timeouts_cover_the_sleep_and_one_gh_call() {
         assert!(
             limit > secs + gh_call,
             "{node} timeout {limit} does not exceed {wait} {secs} + GH_CALL_SECS {gh_call}"
+        );
+    }
+    let runs = lib_constant(&lib, "CI_LOG_RUNS_MAX");
+    for node in ["ci_route", "ci_apply"] {
+        let limit = timeout(node);
+        assert!(
+            limit > runs * gh_call,
+            "{node} timeout {limit} does not exceed CI_LOG_RUNS_MAX {runs} * GH_CALL_SECS {gh_call}"
         );
     }
 }
