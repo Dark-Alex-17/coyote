@@ -2536,10 +2536,10 @@ def apply_answer(state):
             u["_next"] = "finish_plan"
         else:
             _leave_in_draft(state, u)
-    elif kind in ("review_exhausted", "review_round_cap", "review_owner_judgment"):
+    elif kind in ("review_exhausted", "review_read_truncated", "review_round_cap", "review_owner_judgment"):
         a = _answered(state, {"stop": ["stop"], "skip": ["skip"], "keep": ["keep watching", "keep", "re-arm"],
                               "more": ["one more", "resume", "address", "fix round"]}, "stop")
-        if a == "keep" and kind == "review_exhausted":
+        if a == "keep" and kind in ("review_exhausted", "review_read_truncated"):
             u.update({"review_polls": 0, "review_rounds": 0, "review_poll_fails": 0, "review_started_at": int(time.time()), "review_status": ""})
             u["_next"] = "review_poll"
         elif a == "more" and kind == "review_round_cap":
@@ -3189,11 +3189,15 @@ def _close_review_watch(state, u, status):
     u.update({"review_outcomes": outcomes, "review_watching": False, "review_status": status})
 
 
+REVIEW_PAGE = 100
+THREAD_COMMENTS_PAGE = 50
+_COMMENT_NODES = "nodes { id body authorAssociation author { login } }"
 REVIEW_QUERY = (
     "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { "
-    "state reviewDecision headRefOid reviews(last: 100) { nodes { id state body authorAssociation author { login } commit { oid } } } "
-    "comments(last: 100) { nodes { id body authorAssociation author { login } } } "
-    "reviewThreads(first: 100) { nodes { id isResolved isOutdated path comments(first: 20) { nodes { id body authorAssociation author { login } } } } } } } }")
+    f"state reviewDecision headRefOid reviews(last: {REVIEW_PAGE}) {{ totalCount nodes {{ id state body authorAssociation author {{ login }} commit {{ oid }} }} }} "
+    f"comments(last: {REVIEW_PAGE}) {{ totalCount {_COMMENT_NODES} }} "
+    f"reviewThreads(last: {REVIEW_PAGE}) {{ totalCount pageInfo {{ hasPreviousPage }} nodes {{ id isResolved isOutdated path "
+    f"rootComment: comments(first: 1) {{ {_COMMENT_NODES} }} comments(last: {THREAD_COMMENTS_PAGE}) {{ totalCount {_COMMENT_NODES} }} }} }} }} }} }}")
 REPLY_MUTATION = ("mutation($thread: ID!, $body: String!) { addPullRequestReviewThreadReply(input: "
                   "{pullRequestReviewThreadId: $thread, body: $body}) { comment { id } } }")
 RESOLVE_MUTATION = "mutation($thread: ID!) { resolveReviewThread(input: {threadId: $thread}) { thread { id isResolved } } }"
@@ -3251,7 +3255,7 @@ def _review_items(pr, seen):
     """New review items as (trusted, untrusted); an untrusted item is built without its body, so the text stays on the PR."""
     found = []
     for t in _nodes(pr, "reviewThreads"):
-        cs = _nodes(t, "comments")
+        cs = _thread_comments(t)
         # A resolved thread is only read again when someone answered after the watch's own reply.
         if t.get("isResolved") and not (cs and not _own_comment(cs[-1]) and any(_own_comment(c) for c in cs[:-1])):
             continue
@@ -3282,6 +3286,39 @@ def _review_items(pr, seen):
     return trusted, untrusted
 
 
+def _thread_comments(t):
+    """The thread root followed by the newest comments; a long thread loses only its middle."""
+    cs = _nodes(t, "comments")
+    root = _nodes(t, "rootComment")[:1]
+    return root + cs if root and root[0].get("id") not in {c.get("id") for c in cs} else cs
+
+
+def _approved(pr):
+    """GitHub's reviewDecision when it has one; without it, each author's latest verdict decides."""
+    decision = pr.get("reviewDecision")
+    if decision:
+        return decision == "APPROVED"
+    head = pr.get("headRefOid") or ""
+    latest = {}
+    for r in _nodes(pr, "reviews"):
+        if r.get("state") in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
+            latest[_login(r)] = r
+    verdicts = list(latest.values())
+    return not any(r["state"] == "CHANGES_REQUESTED" for r in verdicts) and any(
+        r["state"] == "APPROVED" and head and as_dict(r.get("commit")).get("oid") == head and _trusted(r) for r in verdicts)
+
+
+def _overflowed(pr):
+    """Each review list the read did not fetch in full, as {list, total}; a long thread never counts, its root and newest comments suffice."""
+    out = []
+    for key in ("reviewThreads", "reviews", "comments"):
+        conn = as_dict(pr.get(key))
+        total = as_int(conn.get("totalCount"))
+        if total > REVIEW_PAGE or as_dict(conn.get("pageInfo")).get("hasPreviousPage"):
+            out.append({"list": key, "total": total})
+    return out
+
+
 def review_poll(state):
     u = {}
     polls = as_int(state.get("review_polls"))
@@ -3308,15 +3345,15 @@ def review_poll(state):
         u["_next"] = "review_route" if fails >= CI_POLL_FAILS else "review_poll"
         return u
     u["review_poll_fails"] = 0
-    head = pr.get("headRefOid") or ""
-    approved = pr.get("reviewDecision") == "APPROVED" or any(
-        r.get("state") == "APPROVED" and head and as_dict(r.get("commit")).get("oid") == head and _trusted(r) for r in _nodes(pr, "reviews"))
     items, untrusted = _review_items(pr, set(as_list(state.get("review_seen"))))
+    overflow = _overflowed(pr)
     if pr["state"] == "MERGED":
         u.update({"review_status": "merged", "_next": "review_route"})
     elif pr["state"] == "CLOSED":
         u.update({"review_status": "closed", "_next": "review_route"})
-    elif approved:
+    elif overflow:
+        u.update({"review_status": "truncated", "review_items": overflow, "_next": "review_route"})
+    elif _approved(pr):
         u.update({"review_status": "approved", "_next": "review_route"})
     elif items or untrusted:
         u.update({"review_status": "comments", "review_items": items, "review_untrusted": untrusted, "_next": "review_route"})
@@ -3363,6 +3400,15 @@ def review_route(state):
                                      "The watch did not read the body: read it on the PR. Skip it and keep watching, or stop watching?",
             [option("Skip it and keep watching"), option("Stop watching and report", recommended=True)],
             hard_trigger=True, data={"items": [i["id"] for i in untrusted], "untrusted": True}))
+    if status == "truncated":
+        _review_event(state, u, "stop: read_truncated")
+        listed = ", ".join(f"{i.get('list')} has {i.get('total') or f'more than {REVIEW_PAGE}'}"
+                           for i in (as_dict(x) for x in as_list(state.get("review_items"))))
+        return raise_escalation(state, u, escalation(
+            "review_read_truncated", f"The review read on PR #{pr} holds more than the {REVIEW_PAGE} items it fetches per list ({listed}), "
+                                     "so the watch cannot see every review item. Keep watching, or stop watching and report?",
+            [option("Keep watching (re-arm the review watch)"),
+             option("Stop watching and report", recommended=True, evidence="the PR stays open and ready; read the full review on the PR")]))
     _review_event(state, u, f"stop: {status}")
     if status == "visit_cap":
         return raise_escalation(state, u, escalation(

@@ -1862,6 +1862,80 @@ finally:
         else:
             os.environ[_k] = _v
 
+# ---------------------------------------------------------------- approval: reviewDecision first, else each author's latest verdict
+def verdict(rid, state, login, oid="h2"):
+    return {"id": rid, "state": state, "body": "", "authorAssociation": "MEMBER", "author": {"login": login}, "commit": {"oid": oid}}
+
+
+HEAD_OK = verdict("R50", "APPROVED", "bob")
+try:
+    for decision, given, want, label in (
+            ("CHANGES_REQUESTED", [HEAD_OK], False, "reviewDecision CHANGES_REQUESTED + a trusted approval on head -> not approved"),
+            ("REVIEW_REQUIRED", [HEAD_OK], False, "reviewDecision REVIEW_REQUIRED + a trusted approval on head -> not approved"),
+            ("", [HEAD_OK, verdict("R51", "CHANGES_REQUESTED", "bob")], False, "empty decision, an author approves then requests changes -> not approved"),
+            ("", [verdict("R51", "CHANGES_REQUESTED", "bob", oid="h1"), HEAD_OK], True, "empty decision, an author requests changes then approves on head -> approved"),
+            ("", [HEAD_OK, verdict("R52", "CHANGES_REQUESTED", "carol")], False, "empty decision, one author approves on head, another's latest requests changes -> not approved"),
+            ("", [HEAD_OK, verdict("R53", "COMMENTED", "bob")], True, "empty decision, an author approves then comments -> still approved"),
+            ("APPROVED", [], True, "reviewDecision APPROVED -> approved")):
+        reviews(decision=decision, reviews_=given)
+        u = gates.review_poll(base_state(**WATCH))
+        check(f"approval: {label}", u.get("review_status") == ("approved" if want else "pending"), u.get("review_status"))
+finally:
+    for _k, _v in _watch_saved.items():
+        if _v is None:
+            os.environ.pop(_k, None)
+        else:
+            os.environ[_k] = _v
+
+# ---------------------------------------------------------------- truncation: a review read that overflows a page stops the watch
+def paged(decision="", **lists):
+    pr = {"state": "OPEN", "reviewDecision": decision, "headRefOid": "h2", **{k: {"nodes": []} for k in ("reviews", "comments", "reviewThreads")}, **lists}
+    os.environ["ARCHITECT_GH_REVIEWS_CMD"] = "echo '" + json.dumps({"data": {"repository": {"pullRequest": pr}}}) + "'"
+
+
+try:
+    LONG_ROOT = by("C60", "MEMBER", body="the root ask", login="bob")
+    LONG_REPLIES = [by(f"C{n}", "MEMBER", body=f"reply {n}", login="carol") for n in range(61, 120)]
+    LONG_THREAD = {**thread("TH60", *LONG_REPLIES[-gates.THREAD_COMMENTS_PAGE:]), "rootComment": {"nodes": [LONG_ROOT]}}
+    LONG_THREAD["comments"]["totalCount"] = 1 + len(LONG_REPLIES)
+    paged(reviewThreads={"totalCount": 1, "nodes": [LONG_THREAD]})
+    u = gates.review_poll(base_state(**WATCH, review_seen=["thread:TH60:C118"]))
+    got = u.get("review_items", [{}])[0]
+    check("truncation: a 60-comment thread read as root + last 50 with a new newest reply -> an item keyed on that reply, root body and author kept",
+          u.get("review_status") == "comments" and got.get("id") == "thread:TH60:C119" and got.get("body", "").startswith("the root ask\n\n")
+          and got.get("author") == "bob", u)
+    paged(reviewThreads={"totalCount": 101, "nodes": []})
+    u = gates.review_poll(base_state(**WATCH))
+    check("truncation: reviewThreads totalCount 101 -> truncated -> review_route", u.get("review_status") == "truncated" and u.get("_next") == "review_route", u)
+    RT = gates.review_route(base_state(**WATCH, **u))
+    esc = RT.get("escalation", {})
+    check("truncation: review_route truncated -> review_read_truncated naming the list and count, keep or stop (recommended), stop ledgered",
+          esc.get("kind") == "review_read_truncated" and "reviewThreads has 101" in esc.get("question", "")
+          and [(o["text"], o["recommended"]) for o in esc.get("options", [])] == [("Keep watching (re-arm the review watch)", False), ("Stop watching and report", True)]
+          and ledgered(RT, "review-watch: PR #99 stop: read_truncated"), RT)
+    paged(decision="APPROVED", comments={"totalCount": 150, "nodes": []})
+    check("truncation: comments totalCount 150 -> truncated, even over an approval", gates.review_poll(base_state(**WATCH)).get("review_status") == "truncated")
+    paged(reviewThreads={"pageInfo": {"hasPreviousPage": True}, "nodes": []})
+    check("truncation: reviewThreads with a previous page -> truncated", gates.review_poll(base_state(**WATCH)).get("review_status") == "truncated")
+    paged(decision="APPROVED", **{k: {"totalCount": gates.REVIEW_PAGE, "nodes": []} for k in ("reviews", "comments", "reviewThreads")})
+    check("truncation: every list at totalCount exactly 100 -> not truncated", gates.review_poll(base_state(**WATCH)).get("review_status") == "approved")
+    check("truncation: REVIEW_QUERY reads the last 100 of each list, the last 50 thread comments plus the root, with totalCount",
+          all(s in gates.REVIEW_QUERY for s in ("reviewThreads(last: 100)", "comments(last: 50)", "rootComment: comments(first: 1)", "totalCount", "hasPreviousPage")))
+    u = AA("review_read_truncated", "Keep watching (re-arm the review watch)", **WATCH, review_polls=9, review_rounds=5, review_poll_fails=2, review_started_at=1,
+           review_status="truncated")
+    check("truncation: apply_answer review_read_truncated keep -> review_poll with the counters and wall clock re-armed",
+          u.get("_next") == "review_poll" and u.get("review_polls") == u.get("review_rounds") == u.get("review_poll_fails") == 0 and u.get("review_started_at", 0) > 1, u)
+    u = AA("review_read_truncated", "Stop watching and report", **WATCH, review_status="truncated")
+    check("truncation: apply_answer review_read_truncated stop -> finish_plan + follow-up, outcome truncated, watch closed",
+          u.get("_next") == "finish_plan" and u.get("review_outcomes") == {"99": "truncated"} and u.get("review_watching") is False
+          and any("PR #99 review watch stopped: truncated" in f for f in u.get("follow_ups", [])), u)
+finally:
+    for _k, _v in _watch_saved.items():
+        if _v is None:
+            os.environ.pop(_k, None)
+        else:
+            os.environ[_k] = _v
+
 # ---------------------------------------------------------------- watch stops: every stop goes through an escalation
 STOP_ESC = {}
 for status, opt in (("closed", "Stop watching and report"), ("merged", "Stop watching and continue")):
@@ -1904,7 +1978,7 @@ STOPS = list(stop_functions(GATES_AST))
 STOP_KINDS = set().union(*(k for _, _, k in STOPS))
 check("watch stops: every gates.py function with a 'stop: ' event raises an escalation, and apply_answer handles each kind they raise",
       {"review_route", "review_apply", "review_update"} <= {n for n, _, _ in STOPS} and all(esc for _, esc, _ in STOPS)
-      and "review_external_close" in STOP_KINDS and STOP_KINDS <= HANDLED,
+      and {"review_external_close", "review_read_truncated"} <= STOP_KINDS and STOP_KINDS <= HANDLED,
       ([n for n, esc, _ in STOPS if not esc], sorted(STOP_KINDS - HANDLED)))
 
 # ---------------------------------------------------------------- rollup scope: --plan always, --tasks for a PR group only
