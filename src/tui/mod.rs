@@ -2859,7 +2859,8 @@ mod tests {
                     continue;
                 }
                 readers.push(KeyboardReader {
-                    gated: body.contains("crate::tui::active()"),
+                    gated: body.contains("crate::tui::active()")
+                        || body.contains("ensure_editor_available()"),
                     file,
                     function,
                 });
@@ -2869,8 +2870,9 @@ mod tests {
     }
 
     /// Every direct keyboard reader outside this module either checks the
-    /// TUI flag or is listed here with the reason it stays REPL-only, so a
-    /// new reader cannot appear without a decision about the TUI.
+    /// TUI flag (itself, or through `ensure_editor_available`) or is listed
+    /// here with the reason it stays REPL-only, so a new reader cannot
+    /// appear without a decision about the TUI.
     #[test]
     fn every_direct_keyboard_reader_is_gated_or_accounted_for() {
         const DIRECT_TTY: &str =
@@ -2961,16 +2963,6 @@ mod tests {
             (
                 "src/config/request_context.rs",
                 "upsert_role",
-                VIA_EDIT_GATE,
-            ),
-            (
-                "src/config/request_context.rs",
-                "upsert_skill",
-                VIA_EDIT_GATE,
-            ),
-            (
-                "src/config/request_context.rs",
-                "edit_rag_docs",
                 VIA_EDIT_GATE,
             ),
             (

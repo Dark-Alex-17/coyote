@@ -57,8 +57,8 @@ use crate::turn::{StdoutSink, UiSink};
 use crate::utils::process::ProcessStamp;
 use crate::utils::{
     AbortSignal, UserInterrupt, abortable_run_with_spinner, create_abort_signal, edit_file,
-    estimate_token_length, fuzzy_filter, get_env_name, list_file_names, now, render_prompt,
-    temp_file,
+    ensure_editor_available, estimate_token_length, fuzzy_filter, get_env_name, list_file_names,
+    now, render_prompt, temp_file,
 };
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use serde::Serialize;
@@ -6877,6 +6877,7 @@ impl RequestContext {
 
     pub fn upsert_skill(&self, app: &AppConfig, name: &str) -> Result<()> {
         paths::validate_skill_name(name)?;
+        ensure_editor_available()?;
         let path = paths::skill_file(name);
         ensure_parent_exists(&path)?;
         let is_new = !path.exists();
@@ -7441,6 +7442,7 @@ impl RequestContext {
         }
 
         let document_paths = rag.document_paths();
+        ensure_editor_available()?;
         let temp_file = temp_file(&format!("-rag-{}", rag.name()), ".txt");
         tokio::fs::write(&temp_file, &document_paths.join("\n"))
             .await
@@ -11747,6 +11749,31 @@ mod tests {
         assert_eq!(root.interrupt_policy(), UserInterrupt::Owned);
         let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
         assert_eq!(root.interrupt_policy(), UserInterrupt::NotOwned);
+    }
+
+    /// `.skill <name>` under the full-screen UI is refused before the
+    /// scaffold is written: no editor can open it there, and a refusal
+    /// that left the file behind would turn the next `.skill` into an
+    /// edit of an empty template.
+    #[test]
+    #[serial]
+    fn upsert_skill_under_the_tui_refuses_before_scaffolding_the_file() {
+        let _guard = TestConfigDirGuard::new();
+        let ctx = create_test_ctx();
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let err = ctx
+            .upsert_skill(&ctx.app.config, "tui-refused-skill")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not available in the TUI"),
+            "{err}"
+        );
+        let path = paths::skill_file("tui-refused-skill");
+        assert!(
+            !path.exists(),
+            "the refusal left a scaffold at {}",
+            path.display()
+        );
     }
 
     /// A seeded child hands out the very signal `agent__cancel` sets; the
