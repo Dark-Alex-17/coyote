@@ -2102,12 +2102,12 @@ mod tests {
         ));
     }
 
-    /// With nobody left to answer, coyote's own yes/no question takes its
-    /// default, a tool's is refused whatever default the tool supplied,
-    /// and anything else is cancelled, whether the prompter is already
-    /// marked unattended or the question was queued when the UI gave up.
+    /// With nobody left to answer, every yes/no question is refused
+    /// whatever default the asker supplied, coyote's own included, and
+    /// anything else is cancelled, whether the prompter is already marked
+    /// unattended or the question was queued when the UI gave up.
     #[test]
-    fn unattended_prompts_take_the_confirm_default_and_cancel_the_rest() {
+    fn unattended_prompts_refuse_every_confirm_and_cancel_the_rest() {
         let (tx, _rx) = unbounded_channel();
         let prompter = TuiPrompter::new(tx, Arc::new(AtomicBool::new(true)));
         let save = PromptRequest {
@@ -2124,7 +2124,7 @@ mod tests {
         };
         assert_eq!(
             prompter.prompt(opt_in).unwrap(),
-            PromptAnswer::Confirmed(true)
+            PromptAnswer::Confirmed(false)
         );
         assert_eq!(
             prompter.prompt(confirm_request(Some("fs_write"))).unwrap(),
@@ -2182,7 +2182,7 @@ mod tests {
         };
         assert!(started.elapsed() < EXIT_CANCEL_WAIT);
         assert_eq!(early_answer.unwrap(), PromptAnswer::Confirmed(false));
-        assert_eq!(late_answer.unwrap(), PromptAnswer::Confirmed(true));
+        assert_eq!(late_answer.unwrap(), PromptAnswer::Confirmed(false));
     }
 
     /// A work task that never finishes is given up on at the deadline:

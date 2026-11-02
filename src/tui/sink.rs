@@ -173,22 +173,16 @@ impl EventSink for TuiSink {
     }
 }
 
-/// What a question gets when nobody is left to answer it. A yes/no
-/// question from coyote itself takes its default (no, when it has none)
-/// so a teardown with a dirty session still completes, the way the REPL's
-/// default signal disposition would have dropped it. A tool's yes/no
-/// question is always answered no: the tool chose the default, and an
-/// absent human does not grant it. Every other kind is cancelled.
+/// What a question gets when nobody is left to answer it. Every yes/no
+/// question is answered no, whatever default the asker supplied: a
+/// tool's default is the tool's choice, not the human's, and even
+/// coyote's own opt-in confirms must not be granted by an absence. The
+/// save-on-exit question defaults to no anyway, so a teardown with a
+/// dirty session still completes, the way the REPL's default signal
+/// disposition would have dropped it. Every other kind is cancelled.
 pub(crate) fn unattended_answer(req: &PromptRequest) -> PromptAnswer {
     match req.action {
-        PromptAction::Confirm => PromptAnswer::Confirmed(
-            req.tool.is_none()
-                && req
-                    .default
-                    .as_ref()
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-        ),
+        PromptAction::Confirm => PromptAnswer::Confirmed(false),
         _ => PromptAnswer::Cancelled,
     }
 }
