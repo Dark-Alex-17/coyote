@@ -1896,6 +1896,7 @@ def ci_route(state):
         u["_next"] = "ci_diagnose"
     elif status == "poll_cap" and _watch_started(state):
         polls_run = as_int(state.get("ci_polls_run"))
+        u["pr_review_status"] = "ci_poll_cap"
         ledger(state, u, f"review-watch: PR #{_pr_ref(state)} stop: ci_poll_cap")
         return raise_escalation(state, u, escalation(
             "ci_poll_cap", f"Review watch stopped: the run's CI polls reached REVIEW_CI_POLL_CEILING "
@@ -1903,6 +1904,7 @@ def ci_route(state):
             [option("Stop watching and report", recommended=True,
                     evidence=f"{polls_run} CI poll(s) this run; the ceiling sits below the per-node visit cap")]))
     elif _watch_started(state):
+        u["pr_review_status"] = f"ci_{status}"
         ledger(state, u, f"review-watch: PR #{_pr_ref(state)} stop: ci_{status}")
         return raise_escalation(state, u, escalation(
             "ci_exhausted", f"Review watch stopped: CI watch ended without a verdict ({status}). Keep waiting, or stop watching?",
@@ -1968,6 +1970,7 @@ def ci_apply(state):
         u["ci_fix_strikes"] = strikes
         if strikes > STRIKE_LIMIT:
             if _watch_started(state):
+                u["pr_review_status"] = "ci_red"
                 ledger(state, u, f"review-watch: PR #{_pr_ref(state)} stop: ci_red")
                 return raise_escalation(state, u, escalation(
                     "ci_exhausted", f"Review watch stopped: CI still red after {STRIKE_LIMIT} fix rounds. How to proceed?",
@@ -1982,6 +1985,7 @@ def ci_apply(state):
         return u
     if verdict == "infra":
         if _watch_started(state):
+            u["pr_review_status"] = "ci_infra"
             ledger(state, u, f"review-watch: PR #{_pr_ref(state)} stop: ci_infra")
             return raise_escalation(state, u, escalation(
                 "ci_infra", "Review watch stopped: CI failed for an external cause (runner lost / timeout / 429 / "
@@ -1993,6 +1997,7 @@ def ci_apply(state):
             [option("Keep waiting (re-run the watch)", recommended=True, evidence=tail(state.get("ci_diagnosis", ""), 300)),
              option("Leave the PR in draft and report")]))
     if _watch_started(state):
+        u["pr_review_status"] = "ci_unsure"
         ledger(state, u, f"review-watch: PR #{_pr_ref(state)} stop: ci_unsure")
         return raise_escalation(state, u, escalation(
             "ci_unsure", "Review watch stopped: CI diagnosis is unsure (unsure defaults up, never to a re-run). How to proceed?",
@@ -2014,10 +2019,12 @@ PR_REVIEW_QUERY = (
     "reviewThreads(first:100){nodes{id isResolved isOutdated path line "
     "comments(first:50){nodes{id body url authorAssociation author{login}}}}}}}}"
 )
-# Own comments are recognised by body (the marker, or a prefix as the fallback), not author: the bot and the
-# owner can share one gh login.
+# Own comments are recognised by body (the marker, a legacy prefix, or a bare thread reply), not author: the bot
+# and the owner can share one gh login. The body alone proves nothing, so only a trusted account's comment counts.
 OWN_MARKER = "<!-- sisyphus-next:own -->"
-OWN_COMMENT_PREFIXES = ("## Update @", "## Review round", "Addressed in ")
+OWN_COMMENT_PREFIXES = ("## Update @", "## Review round")
+# A marked reply already matches on the marker, so only the bare form needs its own pattern.
+OWN_ADDRESSED_RE = re.compile(r"Addressed in [0-9a-f]{40}")
 # Only these accounts may steer the coder; anyone else's comment goes to the owner with its body withheld.
 TRUSTED_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR")
 
@@ -2061,8 +2068,10 @@ def _normalize_pr_review(raw):
     }
 
 
-def _own_comment(body):
-    return OWN_MARKER in (body or "") or (body or "").lstrip().startswith(OWN_COMMENT_PREFIXES)
+def _own_comment(body, association):
+    body = (body or "").strip()
+    return association in TRUSTED_ASSOCIATIONS and (
+        OWN_MARKER in body or body.startswith(OWN_COMMENT_PREFIXES) or bool(OWN_ADDRESSED_RE.fullmatch(body)))
 
 
 def _pr_review_items(doc, seen):
@@ -2072,7 +2081,8 @@ def _pr_review_items(doc, seen):
     for t in doc.get("reviewThreads") or []:
         if t.get("isResolved"):
             continue
-        fresh = [c for c in t.get("comments") or [] if c.get("id") not in seen and not _own_comment(c.get("body"))]
+        fresh = [c for c in t.get("comments") or []
+                 if c.get("id") not in seen and not _own_comment(c.get("body"), c.get("association"))]
         if fresh:
             strangers = [c for c in fresh if c.get("association") not in TRUSTED_ASSOCIATIONS]
             found.append(({"id": t.get("id"), "kind": "thread", "path": t.get("path", ""), "line": t.get("line"),
@@ -2082,7 +2092,7 @@ def _pr_review_items(doc, seen):
                           strangers[0] if strangers else None))
     for r in doc.get("reviews") or []:
         body = (r.get("body") or "").strip()
-        if r.get("id") in seen or _own_comment(body):
+        if r.get("id") in seen or _own_comment(body, r.get("association")):
             continue
         if r.get("state") == "CHANGES_REQUESTED":
             body = body or "Changes requested (see the review threads)"
@@ -2093,7 +2103,7 @@ def _pr_review_items(doc, seen):
                       None if r.get("association") in TRUSTED_ASSOCIATIONS else r))
     for c in doc.get("comments") or []:
         body = (c.get("body") or "").strip()
-        if c.get("id") in seen or not body or _own_comment(body):
+        if c.get("id") in seen or not body or _own_comment(body, c.get("association")):
             continue
         found.append(({"id": c.get("id"), "kind": "comment", "path": "", "line": None, "author": c.get("author", ""),
                        "body": body, "url": "", "seen_ids": [c.get("id")]},
@@ -2179,6 +2189,7 @@ def pr_review_route(state):
         # A killed poll leaves the previous visit's status behind, so this visit counts as one failed read.
         fails = as_int(state.get("pr_review_poll_fails")) + 1
         u["pr_review_poll_fails"] = fails
+        u["pr_review_polls"] = as_int(state.get("pr_review_polls")) + 1
         ledger(state, u, f"review-watch: PR #{pr} read failed (poll node error); retry")
         if fails < CI_POLL_FAILS:
             u["_next"] = "pr_review_poll"
