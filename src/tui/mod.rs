@@ -1313,10 +1313,15 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
         FooterInfo::from_ctx(&ctx),
     )?;
 
-    // Armed first: a signal landing between the screen entering and the
-    // loop's first select must reach the loop, not the default handler.
-    let termination = Termination::arm()?;
     let mut screen = Screen::enter()?;
+    // Armed only once the terminal is ours. Entering blocks on the
+    // keyboard-enhancement probe, which spins on a tty whose master has
+    // gone away; with the streams armed earlier the SIGHUP for that
+    // hang-up would sit latched in tokio with nothing polling it, and the
+    // process would be left at full CPU. Under the default disposition it
+    // dies the ordinary way, and `Screen`'s Drop still restores the
+    // terminal if arming fails.
+    let termination = Termination::arm()?;
     if std::env::var(PANIC_AT_START_ENV).as_deref() == Ok("1") {
         panic!("{PANIC_AT_START_ENV} requested a panic after entering the alternate screen");
     }
@@ -3356,15 +3361,20 @@ mod tests {
         }
     }
 
-    /// The signal handlers are armed before the terminal changes modes,
-    /// and the keyboard-enhancement probe reads the tty, so the screen is
-    /// entered before the event stream takes stdin.
+    /// The keyboard-enhancement probe inside `Screen::enter` reads the tty
+    /// and blocks, so the screen is entered before the signal streams are
+    /// armed (a hang-up during the probe must still kill the process) and
+    /// before the event stream takes stdin.
     #[test]
-    fn run_arms_signals_enters_the_screen_then_starts_the_event_stream() {
+    fn run_enters_the_screen_then_arms_signals_and_starts_the_event_stream() {
         let run = fn_body(include_str!("mod.rs"), "pub async fn run(");
         let arm = run.find("Termination::arm()").unwrap();
         let enter = run.find("Screen::enter()").unwrap();
         let stream = run.find("EventStream::new()").unwrap();
-        assert!(arm < enter && enter < stream);
+        assert!(enter < arm, "signals armed before the screen was entered");
+        assert!(
+            enter < stream,
+            "the event stream took stdin before the probe"
+        );
     }
 }

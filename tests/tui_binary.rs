@@ -530,6 +530,45 @@ fn sighup_leaves_the_tty_cooked() {
     );
 }
 
+/// A hang-up while the keyboard-enhancement probe is still waiting on
+/// the terminal (the first two seconds, before the footer) must kill the
+/// process the ordinary way. The signal streams are armed only after the
+/// screen is entered, so nothing latches the signal while the probe
+/// blocks; otherwise the process would spin on the dead tty forever.
+/// The tty flags are not checked here: crossterm's probe switches raw
+/// mode on for its own duration, and a process that dies inside it
+/// leaves the line discipline as the probe had it.
+#[test]
+#[serial]
+fn sighup_during_the_startup_probe_kills_the_process() {
+    let dir = fresh_config_dir("sighup-probe");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    let transcript = pty.wait_for("cpid=", PTY_DEADLINE).unwrap();
+    let pid = child_pid(&transcript);
+    // The probe opens with its query and then waits two seconds for a
+    // reply nobody here sends.
+    pty.wait_for_raw(b"\x1b[?u\x1b[c", 0, PTY_DEADLINE).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    // SAFETY: kill takes a pid and a signal number and touches no memory.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGHUP) }, 0);
+    let transcript = pty
+        .wait_for("tty-probe-done", Duration::from_secs(5))
+        .unwrap();
+
+    let code = exit_code(&transcript);
+    assert!(
+        code == 129 || code == 1,
+        "expected the hang-up to end the process, got exit={code}:\n{transcript}"
+    );
+    assert!(
+        !transcript.contains("no session"),
+        "the footer was already up, so the hang-up missed the probe:\n{transcript}"
+    );
+}
+
 /// Drives Ctrl-Z under the job-control wrapper up to the point where the
 /// shell has the terminal back, and checks what the shell sees: the
 /// alternate screen and bracketed paste gone before the shell spoke, and
