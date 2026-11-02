@@ -612,9 +612,12 @@ fn sighup_during_the_startup_probe_kills_the_process() {
         .wait_for("tty-probe-done", Duration::from_secs(5))
         .unwrap();
 
+    // The signal streams are armed only after the probe, so the kernel's
+    // default disposition ends the process: 128 + SIGHUP, never an error
+    // return from `run`.
     let code = exit_code(&transcript);
-    assert!(
-        code == 129 || code == 1,
+    assert_eq!(
+        code, 129,
         "expected the hang-up to end the process, got exit={code}:\n{transcript}"
     );
     assert!(
