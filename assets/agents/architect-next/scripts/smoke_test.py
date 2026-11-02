@@ -31,6 +31,7 @@ os.environ["ARCHITECT_RUNS_ROOT"] = os.path.join(TMP, "runs")
 os.environ["HOME"] = os.path.join(TMP, "home")  # no real away file / rulings file
 os.makedirs(os.environ["HOME"], exist_ok=True)
 os.environ["ARCHITECT_CI_SLEEP"] = "0"
+os.environ["ARCHITECT_REVIEW_SLEEP"] = "0"
 for _k in [k for k in os.environ if k.startswith("LLM_AGENT_VAR_")]:
     # the battery must not inherit the agent variables of whoever runs it
     os.environ.pop(_k)
@@ -56,7 +57,8 @@ os.environ.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
 import gates  # noqa: E402
 import _lib  # noqa: E402
 from _lib import (AMEND_CYCLES_MAX, CI_FLAKE_RERUNS, CI_MAX_ROUNDS, CI_POLL_FAILS, CONFLICT_CYCLES_MAX, CORE_TOOLS_REL,  # noqa: E402
-                  DESIGN_ROUNDS_MAX, FORK, MULTI_IS_GROUPS, RERUN_ONCE, STRIKE_LIMIT, WAVE_CAP, escalation, option, read_file)
+                  DESIGN_ROUNDS_MAX, FORK, MULTI_IS_GROUPS, RERUN_ONCE, REVIEW_MAX_POLLS, REVIEW_MAX_ROUNDS, STRIKE_LIMIT, WAVE_CAP,
+                  escalation, option, read_file)
 
 RESULTS = []
 
@@ -1130,6 +1132,226 @@ check("final_report: grep-complete rollups (collect_ledger_lines), batch groupin
 check("whetstone_gate: feedback -> run_whetstone", gates.whetstone_gate(base_state(external_feedback=["human said x"]))["_next"] == "run_whetstone")
 check("whetstone_gate: none -> summarize_run (noted)", gates.whetstone_gate(base_state())["_next"] == "summarize_run")
 check("group_closeout -> phase_f_gate", gates.group_closeout(base_state(closeout_unit="g1"))["_next"] == "phase_f_gate")
+
+# ---------------------------------------------------------------- pr_tracking review watch
+_review_saved = {k: os.environ.get(k) for k in ("ARCHITECT_GH_REVIEWS_CMD", "ARCHITECT_GH_RESOLVE_CMD", "ARCHITECT_GH_COMMENT_CMD", "ARCHITECT_GH_READY_CMD")}
+REVIEW_CALLS = os.path.join(TMP, "review-calls.txt")
+
+
+def reviews(pr_state="OPEN", decision="", head="h2", reviews_=(), comments=(), threads=(), wrap=True):
+    pr = {"state": pr_state, "reviewDecision": decision, "headRefOid": head, "reviews": {"nodes": list(reviews_)},
+          "comments": {"nodes": list(comments)}, "reviewThreads": {"nodes": list(threads)}}
+    os.environ["ARCHITECT_GH_REVIEWS_CMD"] = "echo '" + json.dumps({"data": {"repository": {"pullRequest": pr}}} if wrap else pr) + "'"
+
+
+def review_keys(u):
+    return sorted(k for k in u if k.startswith("review_"))
+
+
+def ledgered(u, line):
+    return any(line in d for d in u.get("decisions", []))
+
+
+RW = dict(pr_number="99", pr_tracking="review", tasks=ts_f, plan_path=PROMOTED)
+WATCH = dict(RW, review_watching=True, review_after="finish_plan")
+GROUP = dict(pr_strategy="multi", closeout_scope="group", closeout_unit="g1")
+
+os.environ["ARCHITECT_GH_READY_CMD"] = "true"
+for tracking in ("", "ci"):
+    label = tracking or "unset"
+    u = gates.flip_ready(base_state(pr_number="99", tasks=ts_f, pr_tracking=tracking))
+    check(f"review watch: pr_tracking {label} - flip_ready single -> finish_plan, no review_* keys",
+          u["flipped_ready"] and u["_next"] == "finish_plan" and not review_keys(u), review_keys(u))
+    if MULTI_IS_GROUPS:
+        u = gates.flip_ready(base_state(pr_number="99", tasks=ts_f, pr_tracking=tracking, **GROUP))
+        check(f"review watch: pr_tracking {label} - flip_ready group close-out -> select_tasks, no review_* keys",
+              u["_next"] == "select_tasks" and u["closeout_done_for"] == "g1" and u["pr_number"] == "" and not review_keys(u), review_keys(u))
+check("review watch: ci_route green with no watch running -> flip_ready", gates.ci_route(base_state(**RW, ci_status="green"))["_next"] == "flip_ready")
+st_ci = gates.intake({"initial_prompt": f"go {DESIGN}", **STORE.variables(DESIGN, TMP, pr_strategy="single", pr_tracking="ci")})
+st_rv = gates.intake({"initial_prompt": f"go {DESIGN}", **STORE.variables(DESIGN, TMP, pr_strategy="single", pr_tracking="review")})
+check("review watch: intake mode_line - ci carries no pr_tracking, review appends ' pr_tracking=review'",
+      "pr_tracking" not in st_ci["mode_line"] and st_rv["mode_line"] == st_ci["mode_line"] + " pr_tracking=review" and st_ci["_next"] == st_rv["_next"] == "orient_read",
+      (st_ci["mode_line"], st_rv["mode_line"]))
+st_bad = gates.intake({"initial_prompt": f"go {DESIGN}", **STORE.variables(DESIGN, TMP, pr_strategy="single", pr_tracking="sometimes")})
+check("review watch: intake unknown pr_tracking -> mode_invalid with option 'pr_tracking = ci'",
+      st_bad["_next"] == "escalate_gate" and st_bad["escalation"]["kind"] == "mode_invalid" and any(o["text"] == "pr_tracking = ci" for o in st_bad["escalation"]["options"]))
+u = AA("mode_invalid", "pr_tracking = review", design_doc_path="")
+check("review watch: apply_answer mode_invalid parses 'pr_tracking = review'", u.get("pr_tracking") == "review" and u["_next"] == "intake")
+
+u = gates.flip_ready(base_state(**RW))
+check("review watch: flip_ready single in review mode -> review_poll, watch armed, continuation finish_plan, ledgered",
+      u["flipped_ready"] and u["_next"] == "review_poll" and u["review_watching"] is True and u["review_after"] == "finish_plan"
+      and u["review_fix_rounds"] == 0 and u["review_seen"] == [] and ledgered(u, "review-watch: PR #99 watching reviews"))
+if MULTI_IS_GROUPS:
+    u = gates.flip_ready(base_state(**RW, **GROUP))
+    check("review watch: flip_ready group close-out in review mode -> review_poll, continuation select_tasks, group reset deferred (pr_number kept)",
+          u["_next"] == "review_poll" and u["review_after"] == "select_tasks" and "pr_number" not in u and "closeout_done_for" not in u)
+
+reviews(decision="APPROVED")
+u = gates.review_poll(base_state(**WATCH, review_polls=0))
+check("review watch: review_poll reviewDecision APPROVED -> approved -> review_route", u["review_status"] == "approved" and u["_next"] == "review_route" and u["review_polls"] == 1)
+reviews(reviews_=[{"id": "R1", "state": "APPROVED", "body": "", "author": {"login": "bob"}, "commit": {"oid": "h2"}}], wrap=False)
+check("review watch: review_poll APPROVED review on headRefOid with no reviewDecision (bare pullRequest JSON) -> approved",
+      gates.review_poll(base_state(**WATCH))["review_status"] == "approved")
+reviews(reviews_=[{"id": "R1", "state": "APPROVED", "body": "", "author": {"login": "bob"}, "commit": {"oid": "h1"}}])
+u = gates.review_poll(base_state(**WATCH))
+check("review watch: review_poll APPROVED review on an older commit is not an approval -> pending, poll again", u["review_status"] == "pending" and u["_next"] == "review_poll")
+u = gates.review_route(base_state(**WATCH, review_status="approved"))
+check("review watch: review_route approved -> finish_plan, outcome recorded, watch closed, ledgered",
+      u["_next"] == "finish_plan" and u["review_outcomes"] == {"99": "approved"} and u["review_watching"] is False and "review-watch: PR #99 approved" in u["decisions"])
+if MULTI_IS_GROUPS:
+    u = gates.review_route(base_state(**WATCH, **GROUP, review_status="approved"))
+    check("review watch: review_route approved in group mode -> the deferred group reset runs now -> select_tasks",
+          u["_next"] == "select_tasks" and u["closeout_done_for"] == "g1" and u["pr_number"] == "" and u["review_watching"] is False)
+
+THREAD = {"id": "TH1", "isResolved": False, "path": "src/a.go", "comments": {"nodes": [{"id": "C1", "body": "rename this var", "author": {"login": "bob"}}]}}
+RESOLVED = {"id": "TH2", "isResolved": True, "path": "src/b.go", "comments": {"nodes": [{"id": "C2", "body": "old note", "author": {"login": "bob"}}]}}
+CHANGES = {"id": "R2", "state": "CHANGES_REQUESTED", "body": "add a test for the empty widget", "author": {"login": "bob"}, "commit": {"oid": "h2"}}
+ISSUE = {"id": "I1", "body": "please update the docs", "author": {"login": "carol"}}
+OWN = [{"id": "I2", "body": "## Update @ abc", "author": {"login": "me"}}, {"id": "I3", "body": "## Review round 1 @ h", "author": {"login": "me"}}]
+reviews(reviews_=[CHANGES], comments=[ISSUE, *OWN], threads=[THREAD, RESOLVED])
+u = gates.review_poll(base_state(**WATCH))
+ITEMS = u.get("review_items", [])
+rids = [i["id"] for i in ITEMS]
+check("review watch: review_poll unresolved thread + CHANGES_REQUESTED body + issue comment -> comments with three items",
+      u["review_status"] == "comments" and u["_next"] == "review_route" and len(rids) == 3 and rids[0].startswith("thread:TH1")
+      and ITEMS[0]["thread_id"] == "TH1" and rids[1:] == ["review:R2", "comment:I1"], rids)
+check("review watch: review_poll skips the watch's own Update / Review round comments and resolved threads",
+      not any(x in i for i in rids for x in ("I2", "I3", "TH2")), rids)
+u = gates.review_poll(base_state(**WATCH, review_seen=rids))
+check("review watch: review_poll items already in review_seen are not new -> pending", u["review_status"] == "pending" and u["_next"] == "review_poll")
+check("review watch: review_route comments -> review_triage", gates.review_route(base_state(**WATCH, review_status="comments", review_items=ITEMS))["_next"] == "review_triage")
+FIX_ALL = [{"id": i, "action": "fix", "fix_item": f"do {i}", "reason": ""} for i in rids]
+TRIAGED = dict(WATCH, review_items=ITEMS)
+u = gates.review_apply(base_state(**TRIAGED, review_triage_items=FIX_ALL, review_fix_rounds=0))
+fr = u.get("fix_request", {})
+check("review watch: review_apply all fix -> fix_round with source review / return_to review, round 1 ledgered",
+      u["_next"] == "fix_round" and fr.get("source") == "review" and fr.get("return_to") == "review" and u["review_fix_rounds"] == 1 and fr.get("task") == T1
+      and len(fr["items"]) == 3 and fr["items"][0] == f"{rids[0]}: do {rids[0]}" and ledgered(u, f"3 new item(s) -> fix round 1/{REVIEW_MAX_ROUNDS}"), fr)
+u = gates.fix_round(base_state(fix_request=fr))
+check("review watch: fix_round -> compose_delegation with fix_source review", u["_next"] == "compose_delegation" and u["fix_source"] == "review" and u["fix_return_to"] == "review")
+check("review watch: fix_done return_to review -> review_update",
+      gates.fix_done(base_state(**WATCH, current_task=T1, fix_source="review", fix_return_to="review"))["_next"] == "review_update")
+os.environ["ARCHITECT_GH_RESOLVE_CMD"] = f"echo \"resolve $1\" >> {REVIEW_CALLS}"
+os.environ["ARCHITECT_GH_COMMENT_CMD"] = f"echo comment >> {REVIEW_CALLS}"
+_real_pr_comment, posted = gates._pr_comment, []
+gates._pr_comment = lambda s, n, b: (posted.append(b), _real_pr_comment(s, n, b))[1]
+try:
+    u = gates.review_update(base_state(**TRIAGED, review_triage_items=FIX_ALL, ci_rounds=5, ci_polls=7, ci_poll_fails=2))
+    u_none = gates.review_update(base_state(**TRIAGED, review_triage_items=FIX_ALL[:2] + [dict(FIX_ALL[2], action="none", reason="docs are out of scope")]))
+finally:
+    gates._pr_comment = _real_pr_comment
+calls = read_file(REVIEW_CALLS).splitlines() if os.path.isfile(REVIEW_CALLS) else []
+head = git(CODE, "rev-parse", "HEAD")
+check("review watch: review_update -> thread resolved, Update comment posted, every item seen, CI watch re-armed (rounds kept) -> ci_poll",
+      u["_next"] == "ci_poll" and calls[:2] == ["resolve TH1", "comment"] and u["review_seen"] == rids and u["ci_polls"] == 0 and u["ci_poll_fails"] == 0
+      and "ci_rounds" not in u and u["review_items"] == [] and ledgered(u, f"update @ {head}: posted") and ledgered(u, f"review-watch: PR #99 addressed {rids[0]} -> {head}"), calls)
+check("review watch: review_update Update comment maps each item to the head SHA and names the items left unaddressed",
+      len(posted) == 2 and posted[0].startswith(f"## Update @ {head}\n") and all(f"- {i}: {head}" in posted[0] for i in rids)
+      and f"Not addressed:\n- {rids[2]}: docs are out of scope" in posted[1] and f"- {rids[2]}: {head}" not in posted[1], posted)
+check("review watch: ci_route green while watching -> review_poll (no second flip)", gates.ci_route(base_state(**WATCH, ci_status="green"))["_next"] == "review_poll")
+
+u = gates.review_apply(base_state(**TRIAGED, review_triage_items=[dict(t, action="none", reason="praise") for t in FIX_ALL]))
+check("review watch: review_apply all none -> review_poll, ids seen, no fix round", u["_next"] == "review_poll" and u["review_seen"] == rids and "fix_request" not in u)
+u = gates.review_apply(base_state(**TRIAGED, review_triage_items=FIX_ALL[:2]))
+check("review watch: review_apply triage missing an item -> owner -> review_owner_judgment",
+      u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "review_owner_judgment" and u["escalation"]["data"]["items"] == [rids[2]])
+
+u = gates.ci_apply(base_state(**WATCH, ci_verdict="real", failing_checks=["test"], ci_failing=[("test", "l")], ci_fix_strikes={"99": {"test": STRIKE_LIMIT}}))
+check("review watch: CI red past the fix budget while watching -> ci_exhausted (hard trigger)", u["escalation"]["kind"] == "ci_exhausted" and u["escalation"]["hard_trigger"])
+u = AA("ci_exhausted", "Leave the PR in draft and report", **WATCH, ci_status="red")
+check("review watch: apply_answer ci_exhausted leave while watching -> finish_plan, outcome recorded, watch closed, follow-up",
+      u["_next"] == "finish_plan" and u["review_outcomes"] == {"99": "ci_exhausted"} and u["review_watching"] is False
+      and any("review watch stopped: ci_exhausted" in f for f in u["follow_ups"]) and ledgered(u, "review-watch: PR #99 stop: ci_exhausted"))
+if MULTI_IS_GROUPS:
+    u = AA("ci_exhausted", "Leave the PR in draft and report", **WATCH, **GROUP, ci_status="red")
+    check("review watch: apply_answer ci_exhausted leave while watching in group mode -> finish_plan, never the next group",
+          u["_next"] == "finish_plan" and "closeout_done_for" not in u and "pr_number" not in u)
+check("review watch: CI infra failure while watching -> ci_infra", gates.ci_apply(base_state(**WATCH, ci_verdict="infra", failing_checks=["test"]))["escalation"]["kind"] == "ci_infra")
+
+reviews(pr_state="MERGED", decision="APPROVED")
+check("review watch: review_poll state MERGED -> merged (wins over an approval)", gates.review_poll(base_state(**WATCH))["review_status"] == "merged")
+u = gates.review_route(base_state(**WATCH, review_status="merged"))
+check("review watch: review_route merged -> continuation finish_plan, outcome merged, 'merged externally' ledgered",
+      u["_next"] == "finish_plan" and u["review_outcomes"] == {"99": "merged"} and ledgered(u, "review-watch: PR #99 merged externally"))
+reviews(pr_state="CLOSED", comments=[ISSUE])
+check("review watch: review_poll state CLOSED -> closed (wins over new comments)", gates.review_poll(base_state(**WATCH))["review_status"] == "closed")
+u = gates.review_route(base_state(**WATCH, review_status="closed"))
+check("review watch: review_route closed -> finish_plan + follow-up, 'closed externally' ledgered",
+      u["_next"] == "finish_plan" and u["review_outcomes"] == {"99": "closed"} and u["review_watching"] is False
+      and any("closed externally" in f for f in u["follow_ups"]) and ledgered(u, "review-watch: PR #99 closed externally"))
+if MULTI_IS_GROUPS:
+    u = gates.review_route(base_state(**WATCH, **GROUP, review_status="closed"))
+    check("review watch: review_route closed in group mode -> finish_plan, never the next group", u["_next"] == "finish_plan" and "closeout_done_for" not in u)
+
+u = gates.review_apply(base_state(**TRIAGED, review_triage_items=FIX_ALL, review_fix_rounds=REVIEW_MAX_ROUNDS))
+check("review watch: review_apply at the review round cap -> review_round_cap",
+      u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "review_round_cap" and u["review_status"] == "round_cap" and "fix_request" not in u)
+u = gates.review_apply(base_state(**TRIAGED, review_triage_items=FIX_ALL, review_fix_rounds=REVIEW_MAX_ROUNDS - 1))
+check("review watch: review_apply one below the review round cap -> fix_round", u["_next"] == "fix_round" and u["review_fix_rounds"] == REVIEW_MAX_ROUNDS)
+reviews()
+u = gates.review_poll(base_state(**WATCH, review_polls=1, review_rounds=REVIEW_MAX_POLLS))
+check("review watch: review_poll past the poll cap -> wall_cap -> review_route", u["review_status"] == "wall_cap" and u["_next"] == "review_route")
+u = gates.review_poll(base_state(**WATCH, review_polls=1, review_rounds=REVIEW_MAX_POLLS - 1))
+check("review watch: review_poll on the last allowed poll -> pending, poll again", u["review_status"] == "pending" and u["_next"] == "review_poll")
+check("review watch: review_poll past the wall clock -> wall_cap", gates.review_poll(base_state(**WATCH, review_polls=1, review_started_at=1))["review_status"] == "wall_cap")
+u = gates.review_route(base_state(**WATCH, review_status="wall_cap"))
+check("review watch: review_route wall_cap -> review_exhausted, stop ledgered", u["escalation"]["kind"] == "review_exhausted" and ledgered(u, "review-watch: PR #99 stop: wall_cap"))
+os.environ["ARCHITECT_GH_REVIEWS_CMD"] = "false"
+u = gates.review_poll(base_state(**WATCH, review_poll_fails=0))
+os.environ["ARCHITECT_GH_REVIEWS_CMD"] = "echo not-json"
+u2 = gates.review_poll(base_state(**WATCH, review_poll_fails=1))
+check("review watch: review_poll read error or unparseable JSON below the cap -> poll again",
+      u["_next"] == u2["_next"] == "review_poll" and u["review_poll_fails"] == 1 and u2["review_poll_fails"] == 2)
+u = gates.review_poll(base_state(**WATCH, review_poll_fails=CI_POLL_FAILS - 1))
+check("review watch: review_poll consecutive read errors at the cap -> poll_error -> review_route", u["review_status"] == "poll_error" and u["_next"] == "review_route")
+check("review watch: review_route poll_error -> review_exhausted", gates.review_route(base_state(**WATCH, review_status="poll_error"))["escalation"]["kind"] == "review_exhausted")
+
+OWNER_ONE = [FIX_ALL[0], dict(FIX_ALL[1], action="owner", reason="disputes scope"), FIX_ALL[2]]
+u = gates.review_apply(base_state(**TRIAGED, review_triage_items=OWNER_ONE))
+check("review watch: review_apply one owner item -> review_owner_judgment (hard trigger) quoting it",
+      u["escalation"]["kind"] == "review_owner_judgment" and u["escalation"]["hard_trigger"] and u["review_status"] == "owner_judgment"
+      and u["escalation"]["data"]["items"] == [rids[1]] and "add a test for the empty widget" in u["escalation"]["question"] and "fix_request" not in u)
+
+u = AA("review_exhausted", "Keep watching (re-arm the review watch)", **WATCH, review_polls=9, review_rounds=REVIEW_MAX_POLLS, review_poll_fails=2, review_started_at=1, review_status="wall_cap")
+check("review watch: apply_answer review_exhausted keep -> review_poll with the counters and wall clock re-armed",
+      u["_next"] == "review_poll" and u["review_polls"] == u["review_rounds"] == u["review_poll_fails"] == 0 and u["review_started_at"] > 1)
+u = AA("review_exhausted", "Stop watching and report", **WATCH, review_status="wall_cap")
+check("review watch: apply_answer review_exhausted stop -> continuation finish_plan + follow-up, outcome wall_cap",
+      u["_next"] == "finish_plan" and u["review_outcomes"] == {"99": "wall_cap"} and u["review_watching"] is False
+      and any("PR #99 review watch stopped: wall_cap" in f for f in u["follow_ups"]))
+if MULTI_IS_GROUPS:
+    u = AA("review_exhausted", "Stop watching and report", **WATCH, **GROUP, review_status="wall_cap")
+    check("review watch: apply_answer review_exhausted stop in group mode -> the next group starts", u["_next"] == "select_tasks" and u["closeout_done_for"] == "g1")
+u = AA("review_round_cap", "Resume with one more fix round", **TRIAGED, review_triage_items=FIX_ALL, review_fix_rounds=REVIEW_MAX_ROUNDS)
+check("review watch: apply_answer review_round_cap one more -> review_apply one below the cap", u["_next"] == "review_apply" and u["review_fix_rounds"] == REVIEW_MAX_ROUNDS - 1)
+u = AA("review_round_cap", "Stop watching and report", **WATCH, review_status="round_cap")
+check("review watch: apply_answer review_round_cap stop -> finish_plan, outcome round_cap", u["_next"] == "finish_plan" and u["review_outcomes"] == {"99": "round_cap"})
+OJ = escalation("review_owner_judgment", "q", [], data={"items": [rids[1]]})
+u = AA("review_owner_judgment", "Address it as a fix round", esc=OJ, **TRIAGED, review_triage_items=OWNER_ONE)
+check("review watch: apply_answer review_owner_judgment address -> fix_round with the owner item as a fix item",
+      u["_next"] == "fix_round" and u["fix_request"]["source"] == "review" and len(u["fix_request"]["items"]) == 3 and u["review_fix_rounds"] == 1)
+u = AA("review_owner_judgment", "Skip it and keep watching", esc=OJ, **TRIAGED, review_triage_items=OWNER_ONE, review_seen=["x"])
+check("review watch: apply_answer review_owner_judgment skip -> review_poll with the owner item seen", u["_next"] == "review_poll" and u["review_seen"] == ["x", rids[1]])
+u = AA("review_owner_judgment", "Stop watching and report", esc=OJ, **TRIAGED, review_triage_items=OWNER_ONE, review_status="owner_judgment")
+check("review watch: apply_answer review_owner_judgment stop -> finish_plan, outcome owner_judgment",
+      u["_next"] == "finish_plan" and u["review_outcomes"] == {"99": "owner_judgment"} and u["review_watching"] is False)
+
+r = gates.final_report(base_state(**RW, pr_url="https://github.com/o/r/pull/99", review_outcomes={"99": "approved"}))["report"]
+check("review watch: final_report in review mode lists each PR's watch outcome", "## Review watch\n- PR #99: approved\n" in r)
+r = gates.final_report(base_state(plan_path=PROMOTED, tasks=ts_f, pr_url="https://github.com/o/r/pull/99", review_outcomes={"99": "approved"}))["report"]
+check("review watch: final_report in ci mode has no Review watch section", "## Review watch" not in r)
+
+reviews(decision="APPROVED")
+p = subprocess.run([sys.executable, os.path.join(HERE, "review_poll.py")], capture_output=True, text=True,
+                   env={**os.environ, "GRAPH_STATE": json.dumps(base_state(**WATCH))})
+check("review watch: entry script review_poll.py through GRAPH_STATE -> JSON with _next",
+      p.returncode == 0 and json.loads(p.stdout.strip().splitlines()[-1])["_next"] == "review_route", p.stderr[-300:])
+for _k, _v in _review_saved.items():
+    if _v is None:
+        os.environ.pop(_k, None)
+    else:
+        os.environ[_k] = _v
 
 # ---------------------------------------------------------------- rollup scope: --plan always, --tasks for a PR group only
 # A recording tools.sh (ARCHITECT_CORE_TOOLS) logs the --tasks / --plan each core call receives.
