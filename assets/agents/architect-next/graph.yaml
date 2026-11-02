@@ -2017,7 +2017,7 @@ nodes:
     type: script
     description: The enum as edges with A6 keying (flake re-runs B19 and fix strikes B18 per check-name per PR - a fix push never re-arms a budget).
     script: scripts/ci_apply.py
-    timeout: 120
+    timeout: 300
     fallback: end_failure
 
   flip_ready:
@@ -2108,7 +2108,7 @@ nodes:
     type: script
     description: After a review fix round - resolve the addressed threads, post the Update comment mapping items to the head SHA, re-watch CI.
     script: scripts/review_update.py
-    timeout: 900
+    timeout: 1020
     fallback: end_failure
 
   finish_plan:

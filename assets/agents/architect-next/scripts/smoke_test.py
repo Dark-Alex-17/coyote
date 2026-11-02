@@ -13,8 +13,10 @@ GRAPH_STATE env pattern through the real entry scripts (subprocess).
 Usage: smoke_test.py   (exit 1 on any failure; prints one line per check)
 """
 
+import ast
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -57,7 +59,7 @@ os.environ.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
 import gates  # noqa: E402
 import _lib  # noqa: E402
 from _lib import (AMEND_CYCLES_MAX, CI_FLAKE_RERUNS, CI_MAX_ROUNDS, CI_POLL_FAILS, CI_POLL_SLEEP, CI_WALL_SECS, CONFLICT_CYCLES_MAX,  # noqa: E402
-                  CORE_TOOLS_REL, DESIGN_ROUNDS_MAX, FORK, GH_POLL_TIMEOUT, MULTI_IS_GROUPS, POLL_VISIT_BUDGET, RERUN_ONCE,
+                  CORE_TOOLS_REL, DESIGN_ROUNDS_MAX, FORK, GH_CALL_SECS, MULTI_IS_GROUPS, POLL_VISIT_BUDGET, RERUN_ONCE,
                   REVIEW_MAX_POLLS, REVIEW_MAX_ROUNDS, REVIEW_POLL_SLEEP, REVIEW_UPDATE_BUDGET, STRIKE_LIMIT, WAVE_CAP,
                   escalation, option, read_file)
 
@@ -1135,7 +1137,8 @@ check("whetstone_gate: none -> summarize_run (noted)", gates.whetstone_gate(base
 check("group_closeout -> phase_f_gate", gates.group_closeout(base_state(closeout_unit="g1"))["_next"] == "phase_f_gate")
 
 # ---------------------------------------------------------------- pr_tracking review watch
-_review_saved = {k: os.environ.get(k) for k in ("ARCHITECT_GH_REVIEWS_CMD", "ARCHITECT_GH_RESOLVE_CMD", "ARCHITECT_GH_COMMENT_CMD", "ARCHITECT_GH_READY_CMD")}
+_review_saved = {k: os.environ.get(k) for k in ("ARCHITECT_GH_REVIEWS_CMD", "ARCHITECT_GH_RESOLVE_CMD", "ARCHITECT_GH_COMMENT_CMD", "ARCHITECT_GH_READY_CMD",
+                                                "ARCHITECT_GH_HEAD_CMD")}
 REVIEW_CALLS = os.path.join(TMP, "review-calls.txt")
 
 
@@ -1244,7 +1247,7 @@ check("review watch: fix_done return_to review -> review_update",
 os.environ["ARCHITECT_GH_RESOLVE_CMD"] = f"echo \"resolve $1\" >> {REVIEW_CALLS}"
 os.environ["ARCHITECT_GH_COMMENT_CMD"] = f"echo comment >> {REVIEW_CALLS}"
 head = git(CODE, "rev-parse", "HEAD")
-reviews(head=head)
+os.environ["ARCHITECT_GH_HEAD_CMD"] = f"echo {head}"
 _real_pr_comment, posted = gates._pr_comment, []
 gates._pr_comment = lambda s, n, b: (posted.append(b), _real_pr_comment(s, n, b))[1]
 try:
@@ -1361,16 +1364,17 @@ check("review watch: entry script review_poll.py through GRAPH_STATE -> JSON wit
 # ---------------------------------------------------------------- watch hardening: node timeouts, stale statuses, visit budget, push check
 GRAPH = json.loads(subprocess.run(["yq", "-o=json", ".", os.path.join(HERE, "..", "graph.yaml")], capture_output=True, text=True).stdout)
 NODES, SEEDS = GRAPH["nodes"], GRAPH["initial_state"]
-check("watch: ci_poll / review_poll node timeouts cover the sleep plus one gh read; review_update covers its thread budget plus the comment",
-      NODES["ci_poll"]["timeout"] > CI_POLL_SLEEP + GH_POLL_TIMEOUT and NODES["review_poll"]["timeout"] > REVIEW_POLL_SLEEP + GH_POLL_TIMEOUT
-      and NODES["review_update"]["timeout"] >= REVIEW_UPDATE_BUDGET + 240,
+check("watch: ci_poll / review_poll node timeouts cover the sleep plus one gh read; review_update covers its thread budget plus the "
+      "in-flight thread, the head check and the comment",
+      NODES["ci_poll"]["timeout"] > CI_POLL_SLEEP + GH_CALL_SECS and NODES["review_poll"]["timeout"] > REVIEW_POLL_SLEEP + GH_CALL_SECS
+      and NODES["review_update"]["timeout"] >= REVIEW_UPDATE_BUDGET + 4 * GH_CALL_SECS + 60,
       {k: NODES[k].get("timeout") for k in ("ci_poll", "review_poll", "review_update")})
 check("watch: review_route has a timeout above the slack_ping subprocess bound (60s)", NODES["review_route"].get("timeout", 0) > 60, NODES["review_route"].get("timeout"))
 check("watch: ci_polls_run and review_polls_run seeded at 0", SEEDS.get("ci_polls_run") == 0 and SEEDS.get("review_polls_run") == 0)
 
-_real_run, _real_gh_timeout, gh_timeouts = subprocess.run, gates.GH_POLL_TIMEOUT, []
+_real_run, _real_gh_timeout, gh_timeouts = subprocess.run, gates.GH_CALL_SECS, []
 subprocess.run = lambda *a, **kw: (gh_timeouts.append(kw.get("timeout")), _real_run(*a, **kw))[1]
-gates.GH_POLL_TIMEOUT = 77
+gates.GH_CALL_SECS = 77
 try:
     checks(("build", "pass"))
     gates.ci_poll(base_state(pr_number="99"))
@@ -1378,8 +1382,8 @@ try:
     reviews()
     gates.review_poll(base_state(**WATCH))
 finally:
-    subprocess.run, gates.GH_POLL_TIMEOUT = _real_run, _real_gh_timeout
-check("watch: ci_poll and review_poll bound the gh read by GH_POLL_TIMEOUT", ci_timeouts == [77] and gh_timeouts == [77], (ci_timeouts, gh_timeouts))
+    subprocess.run, gates.GH_CALL_SECS = _real_run, _real_gh_timeout
+check("watch: ci_poll and review_poll bound the gh read by GH_CALL_SECS", ci_timeouts == [77] and gh_timeouts == [77], (ci_timeouts, gh_timeouts))
 
 u = gates.ci_route(base_state(pr_number="99", ci_status="pending", ci_poll_fails=0))
 u2 = gates.ci_route(base_state(pr_number="99", ci_status="", ci_poll_fails=1))
@@ -1436,7 +1440,8 @@ if MULTI_IS_GROUPS:
 _real_pr_comment, posted = gates._pr_comment, []
 gates._pr_comment = lambda s, n, b: (posted.append(b), _real_pr_comment(s, n, b))[1]
 try:
-    for label, setup in (("a head mismatch", lambda: reviews(head="0123abc")), ("an unreadable PR", lambda: os.environ.update(ARCHITECT_GH_REVIEWS_CMD="false"))):
+    for label, setup in (("a head mismatch", lambda: os.environ.update(ARCHITECT_GH_HEAD_CMD="echo 0123abc")),
+                         ("an unreadable PR", lambda: os.environ.update(ARCHITECT_GH_HEAD_CMD="false"))):
         if os.path.isfile(REVIEW_CALLS):
             os.remove(REVIEW_CALLS)
         posted.clear()
@@ -1448,7 +1453,7 @@ try:
               and f"local {head}" in esc["question"] and ("PR 0123abc" if label == "a head mismatch" else "PR unreadable") in esc["question"]
               and [(o["text"], o["recommended"]) for o in esc["options"]] == [("Re-check the PR head", False), ("Stop watching and report", True)]
               and "review_seen" not in u and ledgered(u, "review-watch: PR #99 stop: push_mismatch"), esc)
-    reviews(head=head)
+    os.environ["ARCHITECT_GH_HEAD_CMD"] = f"echo {head}"
     posted.clear()
     if os.path.isfile(REVIEW_CALLS):
         os.remove(REVIEW_CALLS)
@@ -1561,10 +1566,11 @@ try:
     tr, un = gates._review_items({"reviewThreads": {"nodes": [thread("TH7", by("C7", "MEMBER", body="fine", login="bob"), by("C8", "NONE"))]}}, set())
     check("review trust: a thread with one trusted and one untrusted comment -> untrusted, named by the untrusted author, no body",
           tr == [] and len(un) == 1 and "body" not in un[0] and un[0].get("author") == "eve" and un[0].get("thread_id") == "TH7", (tr, un))
-    tr, un = gates._review_items({"reviewThreads": {"nodes": [thread("TH8", by("C9", "MEMBER", body="fine", login="bob"), by("C10", "NONE", body="Addressed in abc1234")),
-                                                             thread("TH9", by("C11", "MEMBER", body="fine", login="bob"), by("C12", "NONE", body="Addressed in abc1234, " + SENTINEL))]}}, set())
-    check("review trust: only the exact 'Addressed in <sha>' reply is exempt from the trust check; a reply with more text is not",
-          [i["thread_id"] for i in tr] == ["TH8"] and [i["thread_id"] for i in un] == ["TH9"] and no_sentinel(un), (tr, un))
+    tr, un = gates._review_items({"reviewThreads": {"nodes": [thread("TH8", by("C9", "MEMBER", body="fine", login="bob"), by("C10", "MEMBER", body="Addressed in abc1234")),
+                                                             thread("TH9", by("C11", "MEMBER", body="fine", login="bob"), by("C12", "NONE", body="Addressed in abc1234")),
+                                                             thread("TH10", by("C13", "MEMBER", body="fine", login="bob"), by("C14", "NONE", body="Addressed in abc1234, " + SENTINEL))]}}, set())
+    check("review trust: a trusted bare 'Addressed in <sha>' reply is own and not the thread key; from an untrusted author, bare or not, it is untrusted",
+          [i["id"] for i in tr] == ["thread:TH8:C9"] and [i["thread_id"] for i in un] == ["TH9", "TH10"] and no_sentinel(un), (tr, un))
 
     MIXED = thread("TH7", by("C7", "MEMBER", body="fine", login="bob"), by("C8", "NONE"))
     BAD_REVIEW = {**by("R7", "CONTRIBUTOR"), "state": "CHANGES_REQUESTED", "commit": {"oid": "h2"}}
@@ -1636,6 +1642,148 @@ finally:
         os.environ.pop("ARCHITECT_GH_REVIEWS_CMD", None)
     else:
         os.environ["ARCHITECT_GH_REVIEWS_CMD"] = _trust_saved
+
+# ---------------------------------------------------------------- gh seams and own marker
+SEAM_ENV = ("ARCHITECT_GH_HEAD_CMD", "ARCHITECT_GH_RERUN_CMD", "ARCHITECT_GH_VIEW_CMD", "ARCHITECT_GH_CHECKS_CMD", "ARCHITECT_GH_COMMENT_CMD",
+            "ARCHITECT_GH_RESOLVE_CMD", "ARCHITECT_GH_READY_CMD", "PATH")
+_seam_saved = {k: os.environ.get(k) for k in SEAM_ENV}
+SEAM_CALLS = os.path.join(TMP, "seam-calls.txt")
+COMMENT_BODY = os.path.join(TMP, "comment-body.txt")
+REPLY_BODY = os.path.join(TMP, "reply-body.txt")
+# a gh on PATH that only records its args, so a test can tell whether the real gh path ran
+write(os.path.join(TMP, "fakebin", "gh"), f"#!/bin/sh\nprintf 'gh %s\\n' \"$*\" >> {SEAM_CALLS}\n", exe=True)
+
+
+def seam_calls():
+    calls_ = read_file(SEAM_CALLS).splitlines() if os.path.isfile(SEAM_CALLS) else []
+    if os.path.isfile(SEAM_CALLS):
+        os.remove(SEAM_CALLS)
+    return calls_
+
+
+def argv_head(call):
+    first = call.args[0] if call.args else None
+    return [e.value for e in first.elts[:2] if isinstance(e, ast.Constant)] if isinstance(first, ast.List) else []
+
+
+def gh_call_nodes(tree):
+    """Every call that runs gh or a seam: a ["gh", ...] or ["bash", "-c", ...] argv, or a shell=True run."""
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Call) and (argv_head(n)[:1] == ["gh"] or argv_head(n) == ["bash", "-c"]
+                                        or any(k.arg == "shell" and getattr(k.value, "value", None) is True for k in n.keywords)):
+            yield n
+
+
+GATES_SRC = read_file(os.path.join(HERE, "gates.py"))
+GATES_AST = ast.parse(GATES_SRC)
+try:
+    os.environ["PATH"] = os.path.join(TMP, "fakebin") + os.pathsep + _seam_saved["PATH"]
+    seam_calls()
+    os.environ["ARCHITECT_GH_HEAD_CMD"] = f"printf 'head %s\\n' \"$1\" >> {SEAM_CALLS}; echo abc1234"
+    got = gates._pr_head(base_state(pr_number="99"))
+    calls = seam_calls()
+    check("gh seams: ARCHITECT_GH_HEAD_CMD set -> the head check runs it with the PR number and reads the SHA it prints",
+          got == "abc1234" and calls == ["head 99"], (got, calls))
+    os.environ["ARCHITECT_GH_HEAD_CMD"] = "false"
+    got = gates._pr_head(base_state(pr_number="99"))
+    calls = seam_calls()
+    check("gh seams: a failing head seam -> empty head", got == "", (got, calls))
+
+    FLAKE = dict(pr_number="99", ci_verdict="flake", failing_checks=["test"], ci_failing=[("test", "https://github.com/o/r/actions/runs/7")], ci_reruns={})
+    os.environ["ARCHITECT_GH_RERUN_CMD"] = f"printf 'rerun %s\\n' \"$1\" >> {SEAM_CALLS}"
+    os.environ["ARCHITECT_GH_CHECKS_CMD"] = "true"
+    u = gates.ci_apply(base_state(**FLAKE))
+    calls = seam_calls()
+    check("gh seams: ARCHITECT_GH_RERUN_CMD set -> ci_apply re-runs through it with the run id, even with the checks seam set",
+          u.get("_next") == "ci_poll" and calls == ["rerun 7"], calls)
+    os.environ.pop("ARCHITECT_GH_RERUN_CMD")
+    u = gates.ci_apply(base_state(**FLAKE))
+    calls = seam_calls()
+    check("gh seams: checks seam set and no rerun seam -> no re-run at all (neither the seam nor gh)", u.get("_next") == "ci_poll" and calls == [], calls)
+    os.environ.pop("ARCHITECT_GH_CHECKS_CMD")
+    gates.ci_apply(base_state(**FLAKE))
+    calls = seam_calls()
+    check("gh seams: no rerun or checks seam -> gh run rerun <id> --failed", calls == ["gh run rerun 7 --failed"], calls)
+
+    os.environ["ARCHITECT_GH_VIEW_CMD"] = f"printf 'view %s %s\\n' \"$1\" \"$2\" >> {SEAM_CALLS}; echo MERGED"
+    merged = gates._pr_merged(base_state(), "feat/x")
+    calls = seam_calls()
+    check("gh seams: ARCHITECT_GH_VIEW_CMD set -> _pr_merged views the branch's state through it", merged and calls == ["view feat/x state"], calls)
+    os.environ["ARCHITECT_GH_VIEW_CMD"] = f"printf 'view %s %s\\n' \"$1\" \"$2\" >> {SEAM_CALLS}; echo true"
+    os.environ["ARCHITECT_GH_READY_CMD"] = "true"
+    _real_groups = gates.MULTI_IS_GROUPS
+    gates.MULTI_IS_GROUPS = False
+    try:
+        u = gates.flip_ready(base_state(pr_strategy="multi", tasks=[{"id": "TX", "status": "complete", "pr_number": "5"}]))
+    finally:
+        gates.MULTI_IS_GROUPS = _real_groups
+    calls = seam_calls()
+    check("gh seams: ARCHITECT_GH_VIEW_CMD set -> flip_ready reads a task PR's isDraft through it and reports the draft",
+          calls == ["view 5 isDraft"] and any("TX PR #5" in f for f in u.get("follow_ups", [])), (calls, u.get("follow_ups")))
+
+    covered, outside = set(), []
+    for fn in (n for n in ast.walk(GATES_AST) if isinstance(n, ast.FunctionDef)):
+        reads_seam = re.search(r'os\.environ\.get\("ARCHITECT_GH_[A-Z]+_CMD"\)', ast.get_source_segment(GATES_SRC, fn))
+        for c in gh_call_nodes(fn):
+            if argv_head(c)[:1] != ["gh"]:
+                continue
+            if reads_seam:
+                covered.add(c.lineno)
+            else:
+                outside.append(f"{fn.name}:{c.lineno}")
+    gh_lines = [i + 1 for i, l in enumerate(GATES_SRC.splitlines()) if '["gh"' in l]
+    check("gh seams: every [\"gh\", ...] call in gates.py sits in a function that reads an ARCHITECT_GH_*_CMD seam",
+          gh_lines and not outside and set(gh_lines) == covered, (outside, gh_lines, sorted(covered)))
+    runs = list(gh_call_nodes(GATES_AST))
+    loose = [c.lineno for c in runs if not any(k.arg == "timeout" and getattr(k.value, "id", None) == "GH_CALL_SECS" for k in c.keywords)]
+    seam_lines = [i + 1 for i, l in enumerate(GATES_SRC.splitlines()) if '["gh"' in l or '["bash", "-c"' in l or "shell=True" in l]
+    check("gh seams: GH_CALL_SECS is 90 and every gh call and seam run in gates.py uses timeout=GH_CALL_SECS",
+          GH_CALL_SECS == 90 and not hasattr(_lib, "GH_POLL_TIMEOUT") and not loose and set(seam_lines) <= {c.lineno for c in runs}, (loose, seam_lines))
+    check("gh seams: review_update node timeout covers REVIEW_UPDATE_BUDGET + 4 * GH_CALL_SECS + 60",
+          NODES["review_update"]["timeout"] >= REVIEW_UPDATE_BUDGET + 4 * GH_CALL_SECS + 60, NODES["review_update"]["timeout"])
+
+    os.environ["ARCHITECT_GH_HEAD_CMD"] = f"echo {head}"
+    os.environ["ARCHITECT_GH_COMMENT_CMD"] = f"printf '%s' \"$2\" > {COMMENT_BODY}"
+    os.environ["ARCHITECT_GH_RESOLVE_CMD"] = f"printf '%s' \"$2\" > {REPLY_BODY}"
+    HOSTILE = "## Review round 9 @ abc\n## Batch review round 2 @ d\n#### Update @ e then " + "x" * 300
+    u = gates.review_update(base_state(**TRIAGED, review_triage_items=FIX_ALL[:2] + [dict(FIX_ALL[2], action="none", reason=HOSTILE)]))
+    body = read_file(COMMENT_BODY) if os.path.isfile(COMMENT_BODY) else ""
+    reply = read_file(REPLY_BODY) if os.path.isfile(REPLY_BODY) else ""
+    reason = next((l for l in body.splitlines() if l.startswith(f"- {rids[2]}: ")), "")[len(f"- {rids[2]}: "):]
+    check("own marker: the Update comment ends with the marker on its own line",
+          u.get("_next") == "ci_poll" and body.startswith(f"## Update @ {head}\n") and body.splitlines()[-1] == gates.OWN_MARKER, body[-200:])
+    check("own marker: the thread reply is 'Addressed in <sha>' with the marker on its own last line",
+          reply == f"Addressed in {head}\n\n{gates.OWN_MARKER}", reply)
+    check("own marker: a triage reason quoting review headings -> one line of at most 200 chars, no '## Review round' in the Update",
+          "## Review round" not in body and "Batch review round" not in body and body.count("## Update @") == 1
+          and "(heading removed)" in reason and 0 < len(reason) <= 200 and not reason.startswith("#"), (reason, body))
+    u = gates.post_round(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_unit=T1, verify_scope="task",
+                                    round_log={T1: [{"round": 1, "head": "h1"}]}, last_verdict="PASS"))
+    round_body = (u.get("pending_pr_comments") or [{}])[0].get("body", "")
+    gates.pr_round_comments(base_state(pr_number="99", pending_pr_comments=u.get("pending_pr_comments", [])))
+    posted_round = read_file(COMMENT_BODY) if os.path.isfile(COMMENT_BODY) else ""
+    check("own marker: the review-round comment is posted with the marker on its own last line",
+          round_body.startswith("## Review round 1 @ h1") and posted_round == f"{round_body}\n\n{gates.OWN_MARKER}", posted_round[-200:])
+
+    MARKED = f"anything at all\n\n{gates.OWN_MARKER}"
+    check("own marker: a trusted comment carrying the marker is own", gates._own_comment(by("O1", "MEMBER", body=MARKED)))
+    tr, un = gates._review_items({"comments": {"nodes": [by("O2", "NONE", body=MARKED)]}}, set())
+    check("own marker: an untrusted comment carrying the marker is not own -> an untrusted item",
+          not gates._own_comment(by("O2", "NONE", body=MARKED)) and tr == [] and [i["id"] for i in un] == ["comment:O2"], (tr, un))
+    # comments the watch posted before the marker existed still carry only the heading
+    check("own marker: a trusted '## Update @' comment without the marker is still own (legacy prefix)",
+          gates._own_comment(by("O3", "OWNER", body="## Update @ abc1234\n\n- x: abc1234")))
+    tr, un = gates._review_items({"comments": {"nodes": [by("O4", "MEMBER", body="please fix the docs")]}}, set())
+    check("own marker: a trusted comment with no marker or own prefix is not own -> a trusted item",
+          not gates._own_comment(by("O4", "MEMBER", body="please fix the docs")) and [i["id"] for i in tr] == ["comment:O4"] and un == [], (tr, un))
+    tr, un = gates._review_items({"reviewThreads": {"nodes": [thread("TH20", by("C20", "MEMBER", body="fine", login="bob"), by("C21", "MEMBER", body=reply or MARKED))]}}, set())
+    check("own marker: the thread key skips a marked own reply and keys on the newest reviewer comment", [i["id"] for i in tr] == ["thread:TH20:C20"] and un == [], (tr, un))
+finally:
+    for _k, _v in _seam_saved.items():
+        if _v is None:
+            os.environ.pop(_k, None)
+        else:
+            os.environ[_k] = _v
 
 # ---------------------------------------------------------------- rollup scope: --plan always, --tasks for a PR group only
 # A recording tools.sh (ARCHITECT_CORE_TOOLS) logs the --tasks / --plan each core call receives.

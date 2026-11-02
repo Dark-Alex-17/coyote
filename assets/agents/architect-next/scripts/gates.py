@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _lib import (  # noqa: E402
     AMEND_CYCLES_MAX, ARCHIVIST_AVAILABLE, CI_FLAKE_RERUNS, CI_MAX_ROUNDS, CI_POLL_FAILS, CI_POLL_SLEEP,
     CI_WALL_SECS, CODE_VAR, CONFLICT_CYCLES_MAX, CONVENTIONS_LINE, CORE_TOOLS_REL, DESIGN_ROUNDS_MAX,
-    GATE1_HOUSE_LINE, GH_POLL_TIMEOUT, IDIOM_LINE, IS_UPSTREAM, LOG_EVENT_LINE, MODE_ENUMS, MULTI_IS_GROUPS,
+    GATE1_HOUSE_LINE, GH_CALL_SECS, IDIOM_LINE, IS_UPSTREAM, LOG_EVENT_LINE, MODE_ENUMS, MULTI_IS_GROUPS,
     NO_COMMIT_MAIN_LINE, OWNER_POLL_MAX, OWNER_POLL_MINUTES, OWNER_REMOTE_INPUT, OWNER_WAIT_MINUTES,
     PLANNING_VAR, POLL_VISIT_BUDGET, PR_TRACKING_ENUM, PR_URL_RE, PROBE_HOUSE_NOTE, REPO_HINT, RERUN_ONCE, RESUME_RE,
     REVIEW_MAX_POLLS, REVIEW_MAX_ROUNDS, REVIEW_POLL_SLEEP, REVIEW_UPDATE_BUDGET, REVIEW_WALL_SECS, SHA_RE, SIBLING_HINT,
@@ -711,9 +711,15 @@ def branch_setup(state):
 
 
 def _pr_merged(state, branch):
-    code = state.get("code_repo_path", "")
-    rc, out = sh(["gh", "pr", "view", branch, "--json", "state", "--jq", ".state"], cwd=code, timeout=60)
+    rc, out = _pr_view(state, branch, "state")
     return rc == 0 and out.strip().upper() == "MERGED"
+
+
+def _pr_view(state, target, field):
+    cmd = os.environ.get("ARCHITECT_GH_VIEW_CMD")
+    if cmd:
+        return sh(["bash", "-c", cmd, "_", str(target), field], timeout=GH_CALL_SECS)
+    return sh(["gh", "pr", "view", str(target), "--json", field, "--jq", f".{field}"], cwd=state.get("code_repo_path", ""), timeout=GH_CALL_SECS)
 
 
 def _blockers_done(task, tasks):
@@ -1415,10 +1421,11 @@ def _pr_comment(state, pr_number, body):
     code = state.get("code_repo_path", "")
     if not pr_number:
         return False, "no PR"
+    body = f"{body}\n\n{OWN_MARKER}"
     cmd = os.environ.get("ARCHITECT_GH_COMMENT_CMD")
     if cmd:
-        return sh(["bash", "-c", cmd], timeout=60)[0] == 0, "stub"
-    rc, out = sh(["gh", "pr", "comment", str(pr_number), "--body", body], cwd=code, timeout=120)
+        return sh(["bash", "-c", cmd, "_", str(pr_number), body], timeout=GH_CALL_SECS)[0] == 0, "stub"
+    rc, out = sh(["gh", "pr", "comment", str(pr_number), "--body", body], cwd=code, timeout=GH_CALL_SECS)
     return rc == 0, out
 
 
@@ -2857,15 +2864,16 @@ def open_pr(state):
     if state.get("pr_number"):
         u["_next"] = "pr_round_comments"
         return u
-    # ARCHITECT_GH_{COMMENT,CREATE,CHECKS,LOG,READY,REVIEWS,RESOLVE}_CMD are test and operator seams: when set, the
-    # gate runs the value through `bash -c` (the checks and reviews ones through `/bin/sh -c`; the resolve one gets the
-    # review thread id as $1) instead of the `gh` call, and a set checks seam also skips `gh run rerun`. Both batteries
-    # and the Rust wrapper strip inherited ones.
+    # ARCHITECT_GH_{COMMENT,CREATE,CHECKS,HEAD,LOG,READY,RERUN,REVIEWS,RESOLVE,VIEW}_CMD are test and operator seams:
+    # when set, the gate runs the value through `bash -c` (the checks and reviews ones through `/bin/sh -c`) instead of
+    # the `gh` call. Positional args: comment gets the PR number and body, head the PR number, rerun the run id,
+    # resolve the review thread id and reply body, view the PR or branch and the JSON field. With no rerun seam, a set
+    # checks seam skips `gh run rerun`. Both batteries and the Rust wrapper strip inherited ones.
     cmd = os.environ.get("ARCHITECT_GH_CREATE_CMD")
     if cmd:
-        rc, out = sh(["bash", "-c", cmd], timeout=120)
+        rc, out = sh(["bash", "-c", cmd], timeout=GH_CALL_SECS)
     else:
-        rc, out = sh(["gh", "pr", "create", "--draft", "--base", base, "--head", branch, "--title", title, "--body-file", state.get("pr_body_path", "")], cwd=code, timeout=180)
+        rc, out = sh(["gh", "pr", "create", "--draft", "--base", base, "--head", branch, "--title", title, "--body-file", state.get("pr_body_path", "")], cwd=code, timeout=GH_CALL_SECS)
     m = PR_URL_RE.search(out or "")
     if rc != 0 or not m:
         ledger(state, u, f"pr: gh pr create failed: {tail(out, 300)}")
@@ -2920,10 +2928,10 @@ def ci_poll(state):
     cmd = os.environ.get("ARCHITECT_GH_CHECKS_CMD")
     try:
         if cmd:
-            p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=GH_POLL_TIMEOUT)
+            p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=GH_CALL_SECS)
         else:
             p = subprocess.run(["gh", "pr", "checks", str(state.get("pr_number")), "--json", "name,state,bucket,link"], cwd=code,
-                               capture_output=True, text=True, timeout=GH_POLL_TIMEOUT)
+                               capture_output=True, text=True, timeout=GH_CALL_SECS)
         data = json.loads(p.stdout) if p.returncode == 0 and p.stdout.strip() else None
     except Exception:  # noqa: BLE001
         data = None
@@ -3006,7 +3014,7 @@ def ci_evidence(state):
         log = ""
         if m := re.search(r"/actions/runs/(\d+)", link or ""):
             cmd = os.environ.get("ARCHITECT_GH_LOG_CMD")
-            rc, log = sh(["bash", "-c", cmd], timeout=60) if cmd else sh(["gh", "run", "view", m.group(1), "--log-failed"], cwd=code, timeout=120)
+            rc, log = sh(["bash", "-c", cmd], timeout=GH_CALL_SECS) if cmd else sh(["gh", "run", "view", m.group(1), "--log-failed"], cwd=code, timeout=GH_CALL_SECS)
         trimmed = tail(log, 4000)
         pack.append(trimmed or "(log unavailable)")
         sigs += [f"[{name}] {l.strip()[:200]}" for l in log.splitlines() if SIGNATURE_RE.match(l)][:15]
@@ -3055,11 +3063,14 @@ def ci_apply(state):
             ledger(state, u, f"ci: flake re-run budget exhausted for {exhausted} on PR #{pr}; a third red is real by definition")
         else:
             code = state.get("code_repo_path", "")
+            rerun = os.environ.get("ARCHITECT_GH_RERUN_CMD")
             for name, link in as_list(state.get("ci_failing")):
                 pr_reruns[name] = as_int(pr_reruns.get(name)) + 1
                 if m := re.search(r"/actions/runs/(\d+)", link or ""):
-                    if not os.environ.get("ARCHITECT_GH_CHECKS_CMD"):
-                        sh(["gh", "run", "rerun", m.group(1), "--failed"], cwd=code, timeout=60)
+                    if rerun:
+                        sh(["bash", "-c", rerun, "_", m.group(1)], timeout=GH_CALL_SECS)
+                    elif not os.environ.get("ARCHITECT_GH_CHECKS_CMD"):
+                        sh(["gh", "run", "rerun", m.group(1), "--failed"], cwd=code, timeout=GH_CALL_SECS)
                 ledger(state, u, f"flake-rerun: PR #{pr} {name} (re-run {pr_reruns[name]}/{CI_FLAKE_RERUNS})")
             reruns[pr] = pr_reruns
             u["ci_reruns"] = reruns
@@ -3114,13 +3125,13 @@ def flip_ready(state):
         pr = state.get("pr_number")
         if pr:
             cmd = os.environ.get("ARCHITECT_GH_READY_CMD")
-            rc, out = sh(["bash", "-c", cmd], timeout=60) if cmd else sh(["gh", "pr", "ready", str(pr)], cwd=code, timeout=60)
+            rc, out = sh(["bash", "-c", cmd], timeout=GH_CALL_SECS) if cmd else sh(["gh", "pr", "ready", str(pr)], cwd=code, timeout=GH_CALL_SECS)
             u["flipped_ready"] = rc == 0
             ledger(state, u, f"pr: #{pr} {'flipped to ready' if rc == 0 else 'flip FAILED: ' + tail(out, 200)}")
     drafts = []
     for t in tasks:
         if t.get("pr_number") and not (is_single(state) or MULTI_IS_GROUPS):
-            rc, out = sh(["gh", "pr", "view", str(t["pr_number"]), "--json", "isDraft", "--jq", ".isDraft"], cwd=code, timeout=60)
+            rc, out = _pr_view(state, t["pr_number"], "isDraft")
             if rc == 0 and out.strip() == "true":
                 drafts.append(f"{t['id']} PR #{t['pr_number']}")
     if drafts:
@@ -3178,8 +3189,11 @@ REPLY_MUTATION = ("mutation($thread: ID!, $body: String!) { addPullRequestReview
 RESOLVE_MUTATION = "mutation($thread: ID!) { resolveReviewThread(input: {threadId: $thread}) { thread { id isResolved } } }"
 OWN_COMMENT_PREFIXES = ("## Update @", "## Review round", "## Batch review round")
 TRUSTED_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR")
-# Only the exact reply the watch posts is exempt from the trust check: any other text in a thread reaches the triage prompt.
 OWN_REPLY_RE = re.compile(r"Addressed in [0-9a-f]{7,40}")
+# Every comment and reply the gates post ends with this; the prefixes and the reply pattern above only recognise
+# comments posted before it existed.
+OWN_MARKER = "<!-- architect-next:own -->"
+REVIEW_HEADING_RE = re.compile(r"#+\s*(?:Batch review round|Review round|Update @)")
 
 
 def _nodes(obj, key):
@@ -3198,16 +3212,21 @@ def _first_untrusted(objs):
     return next((o for o in objs if not _trusted(o)), None)
 
 
+def _own_comment(c):
+    body = c.get("body") or ""
+    return _trusted(c) and (OWN_MARKER in body or body.lstrip().startswith(OWN_COMMENT_PREFIXES) or bool(OWN_REPLY_RE.fullmatch(body.strip())))
+
+
 def _review_read(state):
     """The PR's review state as the bare pullRequest object, or None when the read failed."""
     cmd = os.environ.get("ARCHITECT_GH_REVIEWS_CMD")
     try:
         if cmd:
-            p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=GH_POLL_TIMEOUT)
+            p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=GH_CALL_SECS)
         else:
             p = subprocess.run(["gh", "api", "graphql", "-f", f"query={REVIEW_QUERY}", "-F", "owner={owner}", "-F", "name={repo}",
                                 "-F", f"number={state.get('pr_number')}"], cwd=state.get("code_repo_path", ""),
-                               capture_output=True, text=True, timeout=GH_POLL_TIMEOUT)
+                               capture_output=True, text=True, timeout=GH_CALL_SECS)
         data = json.loads(p.stdout) if p.returncode == 0 and p.stdout.strip() else None
     except Exception:  # noqa: BLE001
         data = None
@@ -3226,19 +3245,22 @@ def _review_items(pr, seen):
             continue
         cs = _nodes(t, "comments")
         # Keyed by the newest reviewer comment, so a reply on a thread already handled surfaces again;
-        # the watch's own "Addressed in" reply does not.
-        latest = next((c.get("id") for c in reversed(cs) if not (c.get("body") or "").startswith("Addressed in ")), "")
-        bad = _first_untrusted(c for c in cs if not OWN_REPLY_RE.fullmatch((c.get("body") or "").strip()))
-        found.append((bad, {"id": f"thread:{t.get('id')}:{latest}", "kind": "thread", "author": _login(cs[0]) if cs else "",
-                            "body": "\n\n".join(c.get("body") or "" for c in cs), "path": t.get("path") or "", "thread_id": t.get("id") or ""}))
+        # the watch's own reply does not.
+        latest = next((c.get("id") for c in reversed(cs) if not _own_comment(c)), "")
+        bad = _first_untrusted(c for c in cs if not _own_comment(c))
+        found.append((bad, bool(cs) and _own_comment(cs[0]), {
+            "id": f"thread:{t.get('id')}:{latest}", "kind": "thread", "author": _login(cs[0]) if cs else "",
+            "body": "\n\n".join(c.get("body") or "" for c in cs), "path": t.get("path") or "", "thread_id": t.get("id") or ""}))
     for r in _nodes(pr, "reviews"):
         if r.get("state") in ("CHANGES_REQUESTED", "COMMENTED") and (r.get("body") or "").strip():
-            found.append((_first_untrusted([r]), {"id": f"review:{r.get('id')}", "kind": "review", "author": _login(r), "body": r["body"], "path": "", "thread_id": ""}))
+            found.append((_first_untrusted([r]), _own_comment(r),
+                          {"id": f"review:{r.get('id')}", "kind": "review", "author": _login(r), "body": r["body"], "path": "", "thread_id": ""}))
     for c in _nodes(pr, "comments"):
-        found.append((_first_untrusted([c]), {"id": f"comment:{c.get('id')}", "kind": "comment", "author": _login(c), "body": c.get("body") or "", "path": "", "thread_id": ""}))
+        found.append((_first_untrusted([c]), _own_comment(c),
+                      {"id": f"comment:{c.get('id')}", "kind": "comment", "author": _login(c), "body": c.get("body") or "", "path": "", "thread_id": ""}))
     trusted, untrusted = [], []
-    for bad, i in found:
-        if i["id"] in seen or i["body"].lstrip().startswith(OWN_COMMENT_PREFIXES):
+    for bad, own, i in found:
+        if i["id"] in seen or own:
             continue
         if bad is None:
             trusted.append(i)
@@ -3411,14 +3433,31 @@ def review_apply(state):
 
 
 def _resolve_thread(state, thread_id, sha):
+    body = f"Addressed in {sha}\n\n{OWN_MARKER}"
     cmd = os.environ.get("ARCHITECT_GH_RESOLVE_CMD")
     if cmd:
-        return sh(["bash", "-c", cmd, "_", thread_id], timeout=60)[0] == 0
+        return sh(["bash", "-c", cmd, "_", thread_id, body], timeout=GH_CALL_SECS)[0] == 0
     code = state.get("code_repo_path", "")
-    replied = sh(["gh", "api", "graphql", "-f", f"query={REPLY_MUTATION}", "-f", f"thread={thread_id}", "-f", f"body=Addressed in {sha}"],
-                 cwd=code, timeout=60)[0] == 0
-    resolved = sh(["gh", "api", "graphql", "-f", f"query={RESOLVE_MUTATION}", "-f", f"thread={thread_id}"], cwd=code, timeout=60)[0] == 0
+    replied = sh(["gh", "api", "graphql", "-f", f"query={REPLY_MUTATION}", "-f", f"thread={thread_id}", "-f", f"body={body}"],
+                 cwd=code, timeout=GH_CALL_SECS)[0] == 0
+    resolved = sh(["gh", "api", "graphql", "-f", f"query={RESOLVE_MUTATION}", "-f", f"thread={thread_id}"], cwd=code, timeout=GH_CALL_SECS)[0] == 0
     return replied and resolved
+
+
+def _pr_head(state):
+    pr = str(state.get("pr_number") or "")
+    cmd = os.environ.get("ARCHITECT_GH_HEAD_CMD")
+    if cmd:
+        rc, out = sh(["bash", "-c", cmd, "_", pr], timeout=GH_CALL_SECS)
+    else:
+        rc, out = sh(["gh", "pr", "view", pr, "--json", "headRefOid", "--jq", ".headRefOid"], cwd=state.get("code_repo_path", ""), timeout=GH_CALL_SECS)
+    return out.strip() if rc == 0 else ""
+
+
+def _update_reason(text):
+    """A triage reason as one line that cannot pass for one of the watch's own headings."""
+    line = REVIEW_HEADING_RE.sub("(heading removed)", " ".join((text or "").split())).lstrip("#").strip()
+    return line[:200]
 
 
 def review_update(state):
@@ -3426,7 +3465,7 @@ def review_update(state):
     started = time.time()
     pr = state.get("pr_number")
     sha = git_out(state.get("code_repo_path", ""), "rev-parse", "HEAD")
-    oid = as_dict(_review_read(state)).get("headRefOid") or ""
+    oid = _pr_head(state)
     if not sha or oid != sha:
         _review_event(state, u, "stop: push_mismatch")
         return raise_escalation(state, u, escalation(
@@ -3446,7 +3485,7 @@ def review_update(state):
         lines.append(f"- {i['id']}: {sha}")
     skipped = [i for i in items if i["action"] == "none"]
     if skipped:
-        lines += ["", "Not addressed:"] + [f"- {i['id']}: {i['reason'] or 'no change needed'}" for i in skipped]
+        lines += ["", "Not addressed:"] + [f"- {i['id']}: {_update_reason(i['reason']) or 'no change needed'}" for i in skipped]
     if late:
         lines += ["", "Not resolved (time budget):"] + [f"- {i}" for i in late]
     ok, out = _pr_comment(state, pr, "\n".join(lines))
