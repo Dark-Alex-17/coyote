@@ -20,10 +20,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _lib import (  # noqa: E402
     AMEND_CYCLES_MAX, ARCHIVIST_AVAILABLE, CI_FLAKE_RERUNS, CI_MAX_ROUNDS, CI_POLL_FAILS, CI_POLL_SLEEP,
     CI_WALL_SECS, CODE_VAR, CONFLICT_CYCLES_MAX, CONVENTIONS_LINE, CORE_TOOLS_REL, DESIGN_ROUNDS_MAX,
-    GATE1_HOUSE_LINE, IDIOM_LINE, IS_UPSTREAM, LOG_EVENT_LINE, MODE_ENUMS, MULTI_IS_GROUPS,
+    GATE1_HOUSE_LINE, GH_POLL_TIMEOUT, IDIOM_LINE, IS_UPSTREAM, LOG_EVENT_LINE, MODE_ENUMS, MULTI_IS_GROUPS,
     NO_COMMIT_MAIN_LINE, OWNER_POLL_MAX, OWNER_POLL_MINUTES, OWNER_REMOTE_INPUT, OWNER_WAIT_MINUTES,
-    PLANNING_VAR, PR_TRACKING_ENUM, PR_URL_RE, PROBE_HOUSE_NOTE, REPO_HINT, RERUN_ONCE, RESUME_RE,
-    REVIEW_MAX_POLLS, REVIEW_MAX_ROUNDS, REVIEW_POLL_SLEEP, REVIEW_WALL_SECS, SHA_RE, SIBLING_HINT,
+    PLANNING_VAR, POLL_VISIT_BUDGET, PR_TRACKING_ENUM, PR_URL_RE, PROBE_HOUSE_NOTE, REPO_HINT, RERUN_ONCE, RESUME_RE,
+    REVIEW_MAX_POLLS, REVIEW_MAX_ROUNDS, REVIEW_POLL_SLEEP, REVIEW_UPDATE_BUDGET, REVIEW_WALL_SECS, SHA_RE, SIBLING_HINT,
     SISYPHUS_RUN_RE, STACK_LINKING, STORE_LABEL, STORE_TOOL_PREFIX, STRIKE_LIMIT, TASKSTORE, TASK_ID_RE,
     TEST_FILE_RE, VERIFY_CMD_SECS, VERIFY_SET_SECS, WAVE_CAP,
     append_artifact, as_dict, as_int, as_list, commit_planning, context_pack, core_tool, emit,
@@ -940,6 +940,9 @@ def _delegation_text(state, task, kind, fix_items=(), fix_note="", project_dir=N
           "- Do NOT suppress errors or delete failing tests."]
     if single:
         L += ["- Do NOT open a PR. Do NOT create or switch branches. Do NOT merge or rebase onto main."]
+    if kind == "fix" and truthy(state.get("review_watching")):
+        L += ["- The PR is already open and ready for review: push your commits only - never open, re-publish, retitle, edit or convert "
+              "the PR to draft (no `gh pr create`, `gh pr ready`, `gh pr edit`)."]
     if NO_COMMIT_MAIN_LINE:
         L += [NO_COMMIT_MAIN_LINE]
     L += ["- Do NOT diverge from the task's stated scope; if the plan is wrong, STOP and report back.",
@@ -2201,6 +2204,11 @@ def _answered(state, choices, default=None):
     return default
 
 
+def _leave_in_draft(state, u):
+    u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"PR #{state.get('pr_number')} left in draft with CI {state.get('ci_status') or 'unresolved'}: {tail(state.get('ci_diagnosis', ''), 300)}"]
+    u["_next"] = "finish_plan"
+
+
 def apply_answer(state):
     u = {}
     esc = as_dict(state.get("escalation"))
@@ -2520,8 +2528,7 @@ def apply_answer(state):
             _close_review_watch(state, u, kind)
             u["_next"] = "finish_plan"
         else:
-            u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"PR #{state.get('pr_number')} left in draft with CI {state.get('ci_status') or 'unresolved'}: {tail(state.get('ci_diagnosis', ''), 300)}"]
-            u["_next"] = "finish_plan"
+            _leave_in_draft(state, u)
     elif kind in ("review_exhausted", "review_round_cap", "review_owner_judgment"):
         a = _answered(state, {"stop": ["stop"], "skip": ["skip"], "keep": ["keep watching", "keep", "re-arm"],
                               "more": ["one more", "resume", "address", "fix round"]}, "stop")
@@ -2543,6 +2550,16 @@ def apply_answer(state):
             _review_event(state, u, f"stopped by the owner: {status}")
             _close_review_watch(state, u, status)
             _after_flip(state, u)
+    elif kind in ("watch_visit_cap", "review_push_mismatch"):
+        if kind == "review_push_mismatch" and _answered(state, {"recheck": ["re-check", "recheck"]}) == "recheck":
+            u["_next"] = "review_update"
+        elif truthy(state.get("review_watching")):
+            u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"PR #{state.get('pr_number')} review watch stopped: {kind}"]
+            _review_event(state, u, f"stopped by the owner: {kind}")
+            _close_review_watch(state, u, kind)
+            u["_next"] = "finish_plan"
+        else:
+            _leave_in_draft(state, u)
     elif kind == "pr_body_notes":
         u["_next"] = "open_pr"
     else:
@@ -2882,6 +2899,11 @@ def ci_poll(state):
     polls = as_int(state.get("ci_polls"))
     rounds = as_int(state.get("ci_rounds"))
     started = as_int(state.get("ci_started_at")) or int(time.time())
+    runs = as_int(state.get("ci_polls_run"))
+    u["ci_polls_run"] = runs + 1
+    if runs >= POLL_VISIT_BUDGET:
+        u.update({"ci_status": "visit_cap", "_next": "ci_route"})
+        return u
     if polls > 0:
         time.sleep(int(os.environ.get("ARCHITECT_CI_SLEEP", CI_POLL_SLEEP)))
     u["ci_polls"] = polls + 1
@@ -2894,10 +2916,10 @@ def ci_poll(state):
     cmd = os.environ.get("ARCHITECT_GH_CHECKS_CMD")
     try:
         if cmd:
-            p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=90)
+            p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=GH_POLL_TIMEOUT)
         else:
             p = subprocess.run(["gh", "pr", "checks", str(state.get("pr_number")), "--json", "name,state,bucket,link"], cwd=code,
-                               capture_output=True, text=True, timeout=90)
+                               capture_output=True, text=True, timeout=GH_POLL_TIMEOUT)
         data = json.loads(p.stdout) if p.returncode == 0 and p.stdout.strip() else None
     except Exception:  # noqa: BLE001
         data = None
@@ -2923,16 +2945,41 @@ def ci_poll(state):
 
 def ci_route(state):
     u = {}
+    failed_poll = "ci_poll" in (state.get("last_script_error") or "")
     note_script_error(state, u, "ci_poll")
-    status = state.get("ci_status") or "poll_error"
+    status = state.get("ci_status") or ""
+    pr = state.get("pr_number")
+    watching = truthy(state.get("review_watching"))
+    if failed_poll or status in ("pending", ""):
+        fails = as_int(state.get("ci_poll_fails")) + 1
+        u["ci_poll_fails"] = fails
+        ledger(state, u, f"fallback: ci_poll left no fresh status ({status or 'none'}); counted as a read failure ({fails}/{CI_POLL_FAILS})")
+        if fails < CI_POLL_FAILS:
+            u.update({"ci_status": "pending", "_next": "ci_poll"})
+            return u
+        status = u["ci_status"] = "poll_error"
     if status == "green":
-        ledger(state, u, f"ci: PR #{state.get('pr_number')} green")
-        u["_next"] = "review_poll" if truthy(state.get("review_watching")) else "flip_ready"
+        ledger(state, u, f"ci: PR #{pr} green")
+        u["_next"] = "review_poll" if watching else "flip_ready"
     elif status == "red":
         u["_next"] = "ci_evidence"
+    elif status == "visit_cap":
+        if watching:
+            ledger(state, u, f"review-watch: PR #{pr} stop: watch_visit_cap")
+        return raise_escalation(state, u, escalation(
+            "watch_visit_cap", f"The CI watch on PR #{pr} used its run-wide budget of {POLL_VISIT_BUDGET} polls. Stop watching and report.",
+            [option("Stop watching and report", recommended=True)]))
+    elif watching:
+        ledger(state, u, f"review-watch: PR #{pr} stop: ci_exhausted")
+        return raise_escalation(state, u, escalation(
+            "ci_exhausted", f"The CI watch during the review watch on PR #{pr} ended without a verdict ({status}: rounds {state.get('ci_rounds')}, "
+                            f"wall {CI_WALL_SECS}s). Keep waiting, or stop watching and report?",
+            [option("Keep waiting (re-run the watch)"), option("Stop watching and report", recommended=True,
+                                                                 evidence="the PR stays open and ready; the report names the stop reason")],
+            evidence=tail(state.get("ci_evidence", ""), 1500)))
     else:
         return raise_escalation(state, u, escalation(
-            "ci_exhausted", f"The CI watch on PR #{state.get('pr_number')} ended without a verdict ({status}: rounds {state.get('ci_rounds')}, "
+            "ci_exhausted", f"The CI watch on PR #{pr} ended without a verdict ({status}: rounds {state.get('ci_rounds')}, "
                             f"wall {CI_WALL_SECS}s). Keep waiting, or leave the PR in draft and report?",
             [option("Keep waiting (re-run the watch)"), option("Leave the PR in draft and report", recommended=True,
                                                                  evidence="a draft with a named blocker beats a ready PR on red/pending")],
@@ -2992,6 +3039,11 @@ def ci_apply(state):
     strikes = dict(as_dict(state.get("ci_fix_strikes")))
     pr_reruns = dict(as_dict(reruns.get(pr)))
     pr_strikes = dict(as_dict(strikes.get(pr)))
+    watching = truthy(state.get("review_watching"))
+    if watching:
+        during, leave = f" during the review watch on PR #{pr}", "Stop watching and report"
+    else:
+        during, leave = "", "Leave the PR in draft and report"
     if verdict == "flake":
         exhausted = [c for c in checks if as_int(pr_reruns.get(c)) >= CI_FLAKE_RERUNS]
         if exhausted:
@@ -3021,9 +3073,11 @@ def ci_apply(state):
         strikes[pr] = pr_strikes
         u["ci_fix_strikes"] = strikes
         if over:
+            if watching:
+                ledger(state, u, f"review-watch: PR #{pr} stop: ci_exhausted")
             return raise_escalation(state, u, escalation(
-                "ci_exhausted", f"CI still red on {over} after {STRIKE_LIMIT} fix rounds (per check-name per PR #{pr}). How to proceed?",
-                [option("Resume with one more coder fix round"), option("Leave the PR in draft and report", recommended=True)],
+                "ci_exhausted", f"CI still red on {over}{during} after {STRIKE_LIMIT} fix rounds (per check-name per PR #{pr}). How to proceed?",
+                [option("Resume with one more coder fix round"), option(leave, recommended=True)],
                 evidence=tail(state.get("ci_evidence", ""), 2000), hard_trigger=True))
         u["fix_request"] = {"task": owner, "source": "ci", "return_to": "ci",
                             "items": [f"CI failure on PR #{pr} ({', '.join(checks)}): " + tail(state.get("ci_diagnosis", ""), 400)],
@@ -3033,13 +3087,18 @@ def ci_apply(state):
         u["_next"] = "fix_round"
         return u
     if verdict == "infra":
+        if watching:
+            ledger(state, u, f"review-watch: PR #{pr} stop: ci_infra")
         return raise_escalation(state, u, escalation(
-            "ci_infra", "CI failed for infrastructure reasons (runner lost / timeout / 429 / cancelled). Wait and re-watch, or leave in draft?",
+            "ci_infra", f"CI failed{during} for infrastructure reasons (runner lost / timeout / 429 / cancelled). "
+                        + ("Wait and re-watch, or stop watching and report?" if watching else "Wait and re-watch, or leave in draft?"),
             [option("Keep waiting (re-run the watch)", recommended=True, evidence=tail(state.get("ci_diagnosis", ""), 300)),
-             option("Leave the PR in draft and report")]))
+             option(leave)]))
+    if watching:
+        ledger(state, u, f"review-watch: PR #{pr} stop: ci_unsure")
     return raise_escalation(state, u, escalation(
-        "ci_unsure", "CI diagnosis is unsure (unsure defaults up, never to a re-run). How to proceed?",
-        [option("Re-run the failing checks once"), option("Resume with a coder fix round"), option("Leave the PR in draft and report", recommended=True)],
+        "ci_unsure", f"CI diagnosis{during} is unsure (unsure defaults up, never to a re-run). How to proceed?",
+        [option("Re-run the failing checks once"), option("Resume with a coder fix round"), option(leave, recommended=True)],
         evidence=tail(state.get("ci_evidence", ""), 2000)))
 
 
@@ -3129,11 +3188,11 @@ def _review_read(state):
     cmd = os.environ.get("ARCHITECT_GH_REVIEWS_CMD")
     try:
         if cmd:
-            p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=90)
+            p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=GH_POLL_TIMEOUT)
         else:
             p = subprocess.run(["gh", "api", "graphql", "-f", f"query={REVIEW_QUERY}", "-F", "owner={owner}", "-F", "name={repo}",
                                 "-F", f"number={state.get('pr_number')}"], cwd=state.get("code_repo_path", ""),
-                               capture_output=True, text=True, timeout=90)
+                               capture_output=True, text=True, timeout=GH_POLL_TIMEOUT)
         data = json.loads(p.stdout) if p.returncode == 0 and p.stdout.strip() else None
     except Exception:  # noqa: BLE001
         data = None
@@ -3168,6 +3227,11 @@ def review_poll(state):
     polls = as_int(state.get("review_polls"))
     rounds = as_int(state.get("review_rounds"))
     started = as_int(state.get("review_started_at")) or int(time.time())
+    runs = as_int(state.get("review_polls_run"))
+    u["review_polls_run"] = runs + 1
+    if runs >= POLL_VISIT_BUDGET:
+        u.update({"review_status": "visit_cap", "_next": "review_route"})
+        return u
     if polls > 0:
         time.sleep(int(os.environ.get("ARCHITECT_REVIEW_SLEEP", REVIEW_POLL_SLEEP)))
     u["review_polls"] = polls + 1
@@ -3203,9 +3267,18 @@ def review_poll(state):
 
 def review_route(state):
     u = {}
+    failed_poll = "review_poll" in (state.get("last_script_error") or "")
     note_script_error(state, u, "review_poll")
-    status = state.get("review_status") or "poll_error"
+    status = state.get("review_status") or ""
     pr = state.get("pr_number")
+    if failed_poll or status in ("pending", ""):
+        fails = as_int(state.get("review_poll_fails")) + 1
+        u["review_poll_fails"] = fails
+        ledger(state, u, f"fallback: review_poll left no fresh status ({status or 'none'}); counted as a read failure ({fails}/{CI_POLL_FAILS})")
+        if fails < CI_POLL_FAILS:
+            u.update({"review_status": "pending", "_next": "review_poll"})
+            return u
+        status = u["review_status"] = "poll_error"
     if status in ("approved", "merged"):
         _review_event(state, u, "approved" if status == "approved" else "merged externally")
         _close_review_watch(state, u, status)
@@ -3220,6 +3293,10 @@ def review_route(state):
         u["_next"] = "review_triage"
         return u
     _review_event(state, u, f"stop: {status}")
+    if status == "visit_cap":
+        return raise_escalation(state, u, escalation(
+            "watch_visit_cap", f"The review watch on PR #{pr} used its run-wide budget of {POLL_VISIT_BUDGET} polls. Stop watching and report.",
+            [option("Stop watching and report", recommended=True)]))
     return raise_escalation(state, u, escalation(
         "review_exhausted", f"The review watch on PR #{pr} ended without an approval ({status}: polls {state.get('review_rounds')}, "
                             f"wall {REVIEW_WALL_SECS}s). Keep watching, or stop watching and report?",
@@ -3243,6 +3320,9 @@ def _review_fix(state, u, items):
     n = as_int(state.get("review_fix_rounds")) + 1
     u["review_fix_rounds"] = n
     owner = _owning_task(state, " ".join(f"{i.get('path', '')} {i.get('body', '')}" for i in items))
+    rounds = dict(as_dict(state.get("task_rounds")))
+    rounds[owner] = {**as_dict(rounds.get(owner)), "conformance_rounds": 0, "debris_reruns": 0}
+    u["task_rounds"] = rounds
     bodies = "\n\n".join(f"### {i['id']} ({i.get('author') or 'unknown'}{', ' + i['path'] if i.get('path') else ''})\n{i.get('body', '')}" for i in items)
     u["fix_request"] = {"task": owner, "source": "review", "return_to": "review",
                         "items": [f"{i['id']}: {i.get('fix_item') or tail(i.get('body', ''), 400)}" for i in items],
@@ -3298,22 +3378,37 @@ def _resolve_thread(state, thread_id, sha):
 
 def review_update(state):
     u = {}
+    started = time.time()
     pr = state.get("pr_number")
     sha = git_out(state.get("code_repo_path", ""), "rev-parse", "HEAD")
+    oid = as_dict(_review_read(state)).get("headRefOid") or ""
+    if not sha or oid != sha:
+        _review_event(state, u, "stop: push_mismatch")
+        return raise_escalation(state, u, escalation(
+            "review_push_mismatch", f"The fix for PR #{pr} is not on the PR head (local {sha or 'unknown'}, PR {oid or 'unreadable'}): "
+                                    "the push may have failed.",
+            [option("Re-check the PR head"), option("Stop watching and report", recommended=True)]))
     items = _triaged(state)
     lines = [f"## Update @ {sha}", ""]
+    late = []
     for i in [i for i in items if i["action"] != "none"]:
+        if i.get("thread_id") and time.time() - started > REVIEW_UPDATE_BUDGET:
+            late.append(i["id"])
+            ledger(state, u, f"review-watch: PR #{pr} not resolved (time budget) {i['id']}")
+            continue
         ok = _resolve_thread(state, i["thread_id"], sha) if i.get("thread_id") else True
         _review_event(state, u, f"addressed {i['id']} -> {sha}" + ("" if ok else " (thread resolve FAILED)"))
         lines.append(f"- {i['id']}: {sha}")
     skipped = [i for i in items if i["action"] == "none"]
     if skipped:
         lines += ["", "Not addressed:"] + [f"- {i['id']}: {i['reason'] or 'no change needed'}" for i in skipped]
+    if late:
+        lines += ["", "Not resolved (time budget):"] + [f"- {i}" for i in late]
     ok, out = _pr_comment(state, pr, "\n".join(lines))
     ledger(state, u, f"pr-comment: PR #{pr} update @ {sha}: {'posted' if ok else 'FAILED ' + tail(out, 120)}")
-    u["review_seen"] = list(as_list(state.get("review_seen"))) + [i["id"] for i in items]
+    u["review_seen"] = list(as_list(state.get("review_seen"))) + [i["id"] for i in items if i["id"] not in late]
     u.update({"review_items": [], "review_triage_items": [], "review_polls": 0, "review_status": "",
-              "ci_polls": 0, "ci_poll_fails": 0, "ci_started_at": int(time.time())})
+              "ci_polls": 0, "ci_poll_fails": 0, "ci_status": "", "ci_started_at": int(time.time())})
     u["_next"] = "ci_poll"
     return u
 

@@ -344,6 +344,8 @@ initial_state:
   ci_owning_task: ''
   ci_reruns: {}
   ci_fix_strikes: {}
+  ci_polls_run: 0
+  review_polls_run: 0
   review_polls: 0
   review_rounds: 0
   review_poll_fails: 0
@@ -1939,7 +1941,7 @@ nodes:
     type: script
     description: Bounded self-loop over gh pr checks (pr-watch poll precedent); A6 total-watch bound = rounds cap + wall clock owned here (B20).
     script: scripts/ci_poll.py
-    timeout: 120
+    timeout: 180
     fallback: ci_route
 
   ci_route:
@@ -2038,6 +2040,7 @@ nodes:
     type: script
     description: approved / merged -> end the watch and continue; closed -> finish; new items -> triage; wall cap / poll errors -> owner.
     script: scripts/review_route.py
+    timeout: 120
     fallback: end_failure
 
   review_triage:
@@ -2101,7 +2104,7 @@ nodes:
     type: script
     description: After a review fix round - resolve the addressed threads, post the Update comment mapping items to the head SHA, re-watch CI.
     script: scripts/review_update.py
-    timeout: 300
+    timeout: 900
     fallback: end_failure
 
   finish_plan:
