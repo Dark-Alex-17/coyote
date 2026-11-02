@@ -42,6 +42,8 @@ BOUNDED = {
     "parse_answer": "B14 reask_rounds<=3",
     "ci_poll": "B15 wall clock + poll fails<=3",
     "ci_apply": "B15 flake reruns<=2 per check + fix strikes<=3",
+    "pr_review_poll": "B16 REVIEW_MAX_POLLS per run + REVIEW_WALL_SECS + poll fails<=3",
+    "pr_review_route": "B16 REVIEW_MAX_ROUNDS fix rounds + REVIEW_CI_POLL_BUDGET",
     "merge_oracle": "oracle_retries<=1 (via apply_answer)",
     "scope_check": "scope_confirmed once / breach -> escalation",
 }

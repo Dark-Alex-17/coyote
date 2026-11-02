@@ -29,10 +29,14 @@ for v in $(yq '.variables[].name' "$G"); do
   [[ "$(yq ".initial_state | has(\"$v\")" "$G")" == "false" ]] && say ok "variable not shadowed: $v" || say FAIL "variable shadowed by initial_state: $v"
 done
 # variables mirror the prose sisyphus: names + defaults exactly
+# Graph-only variables are declared by the graph and absent from the prose twin.
+GRAPH_ONLY_VARS='pr_tracking'
+skip=""
+for v in $GRAPH_ONLY_VARS; do skip+=" | select(.name != \"$v\")"; done
 CORE="$(dirname "$0")/../../sisyphus/config.yaml"
 if [[ -f "$CORE" ]]; then
-  a=$(yq -o=json '[.variables[] | {"name": .name, "default": .default}]' "$G"); b=$(yq -o=json '[.variables[] | {"name": .name, "default": .default}]' "$CORE")
-  [[ "$a" == "$b" ]] && say ok "variables mirror $(basename "$(dirname "$CORE")") (names + defaults)" || say FAIL "variable mirror drift vs $CORE"
+  a=$(yq -o=json "[.variables[]$skip | {\"name\": .name, \"default\": .default}]" "$G"); b=$(yq -o=json '[.variables[] | {"name": .name, "default": .default}]' "$CORE")
+  [[ "$a" == "$b" ]] && say ok "variables mirror $(basename "$(dirname "$CORE")") (names + defaults; graph-only: ${GRAPH_ONLY_VARS// /, })" || say FAIL "variable mirror drift vs $CORE"
 else
   say FAIL "no prose sisyphus config.yaml found to mirror against"
 fi

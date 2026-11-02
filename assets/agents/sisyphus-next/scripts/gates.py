@@ -19,7 +19,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _lib import (  # noqa: E402
     CI_FLAKE_RERUNS, CI_POLL_FAILS, CI_POLL_SLEEP, CI_WALL_SECS, CLARIFY_MAX, DELEGATED_RE,
     OWNER_POLL_MAX, OWNER_POLL_MINUTES, OWNER_REMOTE_INPUT, OWNER_WAIT_MINUTES, PROBE_HOUSE_NOTE,
-    QUALITY_RE, REASK_MAX, RERUN_ONCE, RESUME_RE, STRIKE_LIMIT, SUBTASK_MAX, added_lines_since,
+    QUALITY_RE, REASK_MAX, RERUN_ONCE, RESUME_RE, REVIEW_CI_POLL_BUDGET, REVIEW_MAX_POLLS, REVIEW_MAX_ROUNDS,
+    REVIEW_POLL_SLEEP, REVIEW_WALL_SECS, STRIKE_LIMIT, SUBTASK_MAX, added_lines_since,
     append_artifact, as_dict, as_int, as_list, changed_files_since, emit, ensure_run_dir,
     escalation, git, git_out, harvest_anomalies, ledger, load_state, match_option,
     note_script_error, now_iso, option, raise_escalation, read_artifact, run_dir_for, snapshot,
@@ -683,6 +684,51 @@ def apply_answer(state):
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
                 f"PR left in draft with CI {state.get('ci_status') or 'unresolved'}: {tail(state.get('ci_diagnosis', ''), 300)}"]
             u["_next"] = "final_report"
+    elif kind == "pr_review_closed":
+        if _answered(state, {"keep": ["keep"]}, "stop") == "keep":
+            u.update({"pr_review_watch_polls": 0, "pr_review_poll_fails": 0})
+            u["_next"] = "pr_review_poll"
+        else:
+            u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
+                f"PR review watch stopped: PR {state.get('pr_review_status') or 'closed'} externally"]
+            u["_next"] = "final_report"
+    elif kind == "pr_review_exhausted":
+        if _answered(state, {"retry": ["retry"]}, "stop") == "retry":
+            u.update({"pr_review_watch_polls": 0, "pr_review_poll_fails": 0})
+            u["_next"] = "pr_review_poll"
+        else:
+            u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
+                f"PR review watch stopped ({state.get('pr_review_status') or 'poll_error'})"]
+            u["_next"] = "final_report"
+    elif kind == "pr_review_round_cap":
+        refs = [_item_ref(i) for i in as_list(state.get("pr_review_items")) if isinstance(i, dict)]
+        u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
+            f"PR review watch stopped at the round cap; open items: {', '.join(refs) or 'none'}"]
+        u["_next"] = "final_report"
+    elif kind == "pr_review_owner_judgment":
+        data = as_dict(esc.get("data"))
+        queue = [q for q in as_list(state.get("pr_review_queue")) if isinstance(q, dict)]
+        judged = [j for j in as_list(data.get("judgment")) if isinstance(j, dict)]
+        noaction = [n for n in as_list(data.get("noaction")) if isinstance(n, dict)]
+        a = _answered(state, {"stop": ["stop"], "skip": ["skip"], "fix": ["fix"]}, "stop")
+        skipped = [{"id": j.get("id"), "kind": j.get("kind"), "url": j.get("url"),
+                    "reason": "skipped at the owner's say-so"} for j in judged]
+        if a == "fix":
+            asked = [{"id": j.get("id"), "kind": j.get("kind"), "url": j.get("url"),
+                      "text": j.get("body") or j.get("question") or ""} for j in judged]
+            _start_review_round(state, u, queue + asked, noaction)
+        elif a == "skip" and queue:
+            _start_review_round(state, u, queue, noaction + skipped)
+        elif a == "skip":
+            u["pr_review_addressed"] = list(as_list(state.get("pr_review_addressed"))) + [
+                {**n, "action": "skip"} for n in noaction + skipped]
+            u["_next"] = "pr_review_poll"
+        else:
+            open_items = [f"{_item_ref(j)}: {j.get('question', '')}" for j in judged] + \
+                         [f"{_item_ref(q)}: {q.get('text', '')}" for q in queue]
+            u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
+                "PR review watch stopped at the owner's say-so; open review items: " + "; ".join(open_items)]
+            u["_next"] = "final_report"
     else:
         ledger(state, u, f"apply_answer: unknown escalation kind {kind!r}; continuing to the report")
         u["_next"] = "final_report"
@@ -909,6 +955,10 @@ def compose_fix(state):
         lines += ["CI is red on the PR. Fix the failure below (evidence pack verbatim):", state.get("ci_evidence") or ""]
         if (state.get("ci_diagnosis") or "").strip():
             lines += ["", "Diagnosis:", state["ci_diagnosis"]]
+    elif src == "pr_review":
+        lines += ["Address these PR review comments (verbatim reviewer requests on the open PR; each line is "
+                  "<url or id>: <request>):"]
+        lines += [f"- {item}" for item in as_list(state.get("fix_items"))]
     elif src == "resume":
         lines += ["Resume request from the orchestrator (address every item):", state.get("brief") or ""]
     else:
@@ -1431,6 +1481,13 @@ def pr_gate(state):
         u["_next"] = "final_report"
         return u
     u["report"] = _assemble_report(state, u, pre_publish=True)
+    pending = [p for p in as_list(state.get("pr_review_pending")) if isinstance(p, dict)]
+    if _review_mode(state) and truthy(state.get("ci_owner")) and pending:
+        u["git_task"] = {"kind": "review_update", "return_to": "ci_gate", "commit": True, "push": True,
+                         "open_pr": False, "draft": False, "flip_ready": False,
+                         "text": _review_update_text(state, pending)}
+        u["_next"] = "git_ops"
+        return u
     task = {"kind": "publish", "return_to": "ci_gate",
             "commit": truthy(actions.get("commit")) or truthy(actions.get("push")) or truthy(actions.get("open_pr")),
             "push": truthy(actions.get("push")) or truthy(actions.get("open_pr")),
@@ -1443,6 +1500,20 @@ def pr_gate(state):
     u["git_task"] = task
     u["_next"] = "check_inbox_final" if truthy(state.get("parallel_mode")) else "git_ops"
     return u
+
+
+def _review_update_text(state, pending):
+    fixed = [f"- {_item_ref(p)}: {p.get('text', '')}" for p in pending if p.get("action") == "fix"]
+    skipped = [f"- {_item_ref(p)}: {p.get('reason', '')}" for p in pending if p.get("action") != "fix"]
+    lines = [f"Commit the review fixes and push the CURRENT branch (the PR head of PR #{_pr_ref(state)}). "
+             "Do NOT open a PR and do NOT change draft state. Post ONE new top-level PR comment titled "
+             "'## Update @ <full head SHA>' mapping each addressed item below (url) to the commit that addresses it, "
+             "one line each, plus each item deliberately NOT addressed and why. "
+             "Then post one '## Review round N @ <sha>' comment per round listed.",
+             "", "Addressed review items:"] + (fixed or ["- none"])
+    if skipped:
+        lines += ["", "Deliberately not addressed (reason):"] + skipped
+    return "\n".join(lines)
 
 
 def ci_gate(state):
@@ -1462,8 +1533,12 @@ def ci_gate(state):
     task = as_dict(state.get("git_task"))
     ret = task.get("return_to") or "final_report"
     if task.get("kind") == "flip_ready":
+        if _review_mode(state) and truthy(state.get("ci_owner")):
+            return _start_review_watch(state, u)
         u["_next"] = "final_report"
         return u
+    if task.get("kind") == "review_update":
+        return _review_update_pushed(state, u)
     if ret == "run_coder":
         u["git_task"] = {}
         u["_next"] = "run_coder"
@@ -1475,15 +1550,86 @@ def ci_gate(state):
     u["ci_owner"] = bool(owns)
     if owns and re.search(r"github\.com/[^\s]+/pull/\d+|#\d+", state.get("git_report") or ""):
         u.update({"ci_polls": 0, "ci_poll_fails": 0, "ci_started_at": int(time.time())})
+        if _review_mode(state) and not (state.get("pr_ref") or "").strip():
+            u["pr_ref"] = _pr_ref(state)
         u["_next"] = "ci_poll"
     else:
         if task.get("open_pr") and not owns:
             ledger(state, u, "ci: PR lifecycle owned by the parent orchestrator; left in draft")
+        if _review_mode(state) and truthy(state.get("delegated")):
+            ledger(state, u, "review-watch: not started: PR lifecycle owned by the parent orchestrator")
         u["_next"] = "final_report"
     return u
 
 
+def _review_mode(state):
+    return str(var(state, "pr_tracking", "ci")).strip().lower() == "review"
+
+
+def _item_ref(item):
+    return item.get("url") or item.get("id") or ""
+
+
+def _start_review_watch(state, u):
+    if not as_int(state.get("pr_review_started_at")):
+        u["pr_review_started_at"] = int(time.time())
+    u.update({"pr_review_watch_polls": 0, "pr_review_poll_fails": 0, "pr_review_status": "pending"})
+    ledger(state, u, f"review-watch: PR #{_pr_ref(state)} watching")
+    u["_next"] = "pr_review_poll"
+    return u
+
+
+def _review_update_pushed(state, u):
+    root = state.get("git_root") or state.get("project_dir") or "."
+    head = git_out(root, "rev-parse", "HEAD", default=state.get("head_sha", ""))
+    pending = [p for p in as_list(state.get("pr_review_pending")) if isinstance(p, dict)]
+    resolved, failed = 0, []
+    for p in pending:
+        if p.get("kind") == "thread" and p.get("action") == "fix":
+            if _resolve_thread(state, str(p.get("id") or ""), f"Addressed in {head}"):
+                resolved += 1
+            else:
+                failed.append(str(p.get("id") or ""))
+    line = (f"review-watch: PR #{_pr_ref(state)} fix round {as_int(state.get('pr_review_rounds'))} pushed @ {head}; "
+            f"{resolved} thread(s) resolved")
+    if failed:
+        line += f" ({len(failed)} failed: {', '.join(failed)})"
+    ledger(state, u, line)
+    u["pr_review_addressed"] = list(as_list(state.get("pr_review_addressed"))) + pending
+    u["pr_review_pending"] = []
+    u.update({"ci_polls": 0, "ci_poll_fails": 0, "ci_started_at": int(time.time())})
+    u["_next"] = "ci_poll"
+    return u
+
+
+REPLY_MUTATION = ("mutation($id:ID!,$body:String!){addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$id,"
+                  "body:$body}){comment{id}}}")
+RESOLVE_MUTATION = "mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{isResolved}}}"
+
+
+def _resolve_thread(state, thread_id, body):
+    root = state.get("git_root") or state.get("project_dir") or "."
+    cmd = os.environ.get("SISYPHUS_GH_RESOLVE_CMD")
+    try:
+        if cmd:
+            # Operator-environment test seam run through the shell; it carries the same trust as the process environment.
+            p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=90,
+                               env={**os.environ, "SISYPHUS_THREAD_ID": thread_id, "SISYPHUS_REPLY_BODY": body})
+            return p.returncode == 0
+        p = subprocess.run(["gh", "api", "graphql", "-f", f"query={REPLY_MUTATION}", "-f", f"id={thread_id}",
+                            "-f", f"body={body}"], cwd=root, capture_output=True, text=True, timeout=90)
+        if p.returncode != 0:
+            return False
+        p = subprocess.run(["gh", "api", "graphql", "-f", f"query={RESOLVE_MUTATION}", "-f", f"id={thread_id}"],
+                           cwd=root, capture_output=True, text=True, timeout=90)
+        return p.returncode == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _pr_ref(state):
+    if ref := str(state.get("pr_ref") or "").strip():
+        return ref
     rep = state.get("git_report") or ""
     if m := re.search(r"https://github\.com/[^\s)]+/pull/(\d+)", rep):
         return m.group(1)
@@ -1494,6 +1640,8 @@ def _pr_ref(state):
 
 def ci_poll(state):
     u = {}
+    if _review_mode(state):
+        u["ci_polls_run"] = as_int(state.get("ci_polls_run")) + 1
     polls = as_int(state.get("ci_polls"))
     started = as_int(state.get("ci_started_at")) or int(time.time())
     if polls > 0:
@@ -1548,6 +1696,9 @@ def ci_route(state):
     note_script_error(state, u, "ci_poll")
     status = state.get("ci_status") or "poll_error"
     if status == "green":
+        if _review_mode(state) and truthy(state.get("flip_ready")):
+            ledger(state, u, "ci: green -> back to the review watch")
+            return _start_review_watch(state, u)
         u["git_task"] = {"kind": "flip_ready", "return_to": "final_report", "flip_ready": True,
                          "text": "CI is green and the verification loop is complete: flip the PR to ready (gh pr ready)."}
         u["flip_ready"] = True
@@ -1602,6 +1753,12 @@ def ci_apply(state):
         strikes = as_int(state.get("ci_fix_strikes")) + 1
         u["ci_fix_strikes"] = strikes
         if strikes > STRIKE_LIMIT:
+            if _review_mode(state):
+                ledger(state, u, f"review-watch: PR #{_pr_ref(state)} stop: ci_red")
+                return raise_escalation(state, u, escalation(
+                    "ci_exhausted", f"Review watch stopped: CI still red after {STRIKE_LIMIT} fix rounds. How to proceed?",
+                    [option("Resume with one more coder fix round"), option("Stop watching and report", recommended=True)],
+                    evidence=tail(state.get("ci_evidence", ""), 2000)))
             return raise_escalation(state, u, escalation(
                 "ci_exhausted", f"CI still red after {STRIKE_LIMIT} fix rounds. How to proceed?",
                 [option("Resume with one more coder fix round"), option("Leave the PR in draft and report", recommended=True)],
@@ -1610,6 +1767,13 @@ def ci_apply(state):
         u["_next"] = "compose_fix"
         return u
     if verdict == "infra":
+        if _review_mode(state):
+            ledger(state, u, f"review-watch: PR #{_pr_ref(state)} stop: ci_infra")
+            return raise_escalation(state, u, escalation(
+                "ci_infra", "Review watch stopped: CI failed for an external cause (runner lost / timeout / 429 / "
+                            "cancelled). Wait and re-watch, or stop watching?",
+                [option("Keep waiting (re-run the watch)", recommended=True, evidence=tail(state.get("ci_diagnosis", ""), 300)),
+                 option("Stop watching and report")]))
         return raise_escalation(state, u, escalation(
             "ci_infra", "CI failed for infrastructure reasons (runner lost / timeout / 429 / cancelled). Wait and re-watch, or leave in draft?",
             [option("Keep waiting (re-run the watch)", recommended=True, evidence=tail(state.get("ci_diagnosis", ""), 300)),
@@ -1619,6 +1783,275 @@ def ci_apply(state):
         [option("Re-run the failing checks once"), option("Resume with a coder fix round"),
          option("Leave the PR in draft and report", recommended=True)],
         evidence=tail(state.get("ci_evidence", ""), 2000)))
+
+
+PR_REVIEW_QUERY = (
+    "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){"
+    "state reviewDecision headRefOid "
+    "reviews(last:50){nodes{id state body author{login}}} "
+    "comments(last:50){nodes{id body author{login}}} "
+    "reviewThreads(first:100){nodes{id isResolved isOutdated path line "
+    "comments(first:50){nodes{id body url author{login}}}}}}}}"
+)
+# Own comments are recognised by body prefix, not author: the bot and the owner can share one gh login.
+OWN_COMMENT_PREFIXES = ("## Update @", "## Review round", "Addressed in ")
+
+
+def _nodes(v):
+    if isinstance(v, dict):
+        v = v.get("nodes")
+    return [n for n in v if isinstance(n, dict)] if isinstance(v, list) else []
+
+
+def _login(node):
+    a = node.get("author")
+    return str(a.get("login") or "") if isinstance(a, dict) else str(a or "")
+
+
+def _normalize_pr_review(raw):
+    """The raw GraphQL response or an already-normalized doc -> the normalized doc; None when it names no PR."""
+    if not isinstance(raw, dict):
+        return None
+    pr = as_dict(as_dict(as_dict(raw.get("data")).get("repository")).get("pullRequest")) if "data" in raw else raw
+    if not pr.get("state"):
+        return None
+    return {
+        "state": str(pr.get("state") or "").upper(),
+        "reviewDecision": str(pr.get("reviewDecision") or "").upper(),
+        "headRefOid": str(pr.get("headRefOid") or ""),
+        "reviews": [{"id": str(r.get("id") or ""), "state": str(r.get("state") or "").upper(), "author": _login(r),
+                     "body": str(r.get("body") or "")} for r in _nodes(pr.get("reviews"))],
+        "comments": [{"id": str(c.get("id") or ""), "author": _login(c), "body": str(c.get("body") or "")}
+                     for c in _nodes(pr.get("comments"))],
+        "reviewThreads": [{"id": str(t.get("id") or ""), "isResolved": bool(t.get("isResolved")),
+                           "isOutdated": bool(t.get("isOutdated")), "path": str(t.get("path") or ""), "line": t.get("line"),
+                           "comments": [{"id": str(c.get("id") or ""), "author": _login(c), "body": str(c.get("body") or ""),
+                                         "url": str(c.get("url") or "")} for c in _nodes(t.get("comments"))]}
+                          for t in _nodes(pr.get("reviewThreads"))],
+    }
+
+
+def _own_comment(body):
+    return (body or "").lstrip().startswith(OWN_COMMENT_PREFIXES)
+
+
+def _pr_review_items(doc, seen):
+    seen = {str(s) for s in seen}
+    items = []
+    for t in doc.get("reviewThreads") or []:
+        if t.get("isResolved") or t.get("isOutdated"):
+            continue
+        fresh = [c for c in t.get("comments") or [] if c.get("id") not in seen and not _own_comment(c.get("body"))]
+        if fresh:
+            items.append({"id": t.get("id"), "kind": "thread", "path": t.get("path", ""), "line": t.get("line"),
+                          "author": fresh[0].get("author", ""), "body": "\n\n".join(c.get("body", "") for c in fresh),
+                          "url": fresh[0].get("url", ""), "seen_ids": [c.get("id") for c in t.get("comments") or []]})
+    for r in doc.get("reviews") or []:
+        body = (r.get("body") or "").strip()
+        if r.get("id") in seen or _own_comment(body):
+            continue
+        if r.get("state") == "CHANGES_REQUESTED":
+            body = body or "Changes requested (see the review threads)"
+        elif r.get("state") != "COMMENTED" or not body:
+            continue
+        items.append({"id": r.get("id"), "kind": "review", "path": "", "line": None, "author": r.get("author", ""),
+                      "body": body, "url": "", "seen_ids": [r.get("id")]})
+    for c in doc.get("comments") or []:
+        body = (c.get("body") or "").strip()
+        if c.get("id") in seen or not body or _own_comment(body):
+            continue
+        items.append({"id": c.get("id"), "kind": "comment", "path": "", "line": None, "author": c.get("author", ""),
+                      "body": body, "url": "", "seen_ids": [c.get("id")]})
+    return items
+
+
+def _pr_review_status(doc, items):
+    state = doc.get("state")
+    if state == "MERGED":
+        return "merged"
+    if state == "CLOSED":
+        return "closed"
+    decision = doc.get("reviewDecision") or ""
+    verdicts = [r.get("state") for r in doc.get("reviews") or [] if r.get("state") in ("APPROVED", "CHANGES_REQUESTED")]
+    if decision == "APPROVED" or (not decision and verdicts and verdicts[-1] == "APPROVED"):
+        return "approved"
+    return "comments" if items else "pending"
+
+
+def _read_pr_review(state):
+    root = state.get("git_root") or state.get("project_dir") or "."
+    cmd = os.environ.get("SISYPHUS_GH_REVIEWS_CMD")
+    try:
+        if cmd:
+            # Operator-environment test seam run through the shell; it carries the same trust as the process environment.
+            p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=90)
+        else:
+            p = subprocess.run(["gh", "api", "graphql", "-F", "owner={owner}", "-F", "name={repo}",
+                                "-F", f"number={_pr_ref(state)}", "-f", f"query={PR_REVIEW_QUERY}"],
+                               cwd=root, capture_output=True, text=True, timeout=90)
+        if p.returncode != 0 or not p.stdout.strip():
+            return None
+        return _normalize_pr_review(json.loads(p.stdout))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def pr_review_poll(state):
+    u = {}
+    watch = as_int(state.get("pr_review_watch_polls"))
+    if watch > 0:
+        time.sleep(int(os.environ.get("SISYPHUS_REVIEW_SLEEP", REVIEW_POLL_SLEEP)))
+    polls = as_int(state.get("pr_review_polls")) + 1
+    u["pr_review_polls"] = polls
+    u["pr_review_watch_polls"] = watch + 1
+    started = as_int(state.get("pr_review_started_at")) or int(time.time())
+    if polls > REVIEW_MAX_POLLS or time.time() - started > REVIEW_WALL_SECS:
+        u["pr_review_status"] = "wall_cap"
+        u["_next"] = "pr_review_route"
+        return u
+    doc = _read_pr_review(state)
+    if doc is None:
+        fails = as_int(state.get("pr_review_poll_fails")) + 1
+        u["pr_review_poll_fails"] = fails
+        if fails >= CI_POLL_FAILS:
+            u["pr_review_status"] = "poll_error"
+            u["_next"] = "pr_review_route"
+        else:
+            u["_next"] = "pr_review_poll"
+        return u
+    u["pr_review_poll_fails"] = 0
+    items = _pr_review_items(doc, as_list(state.get("pr_review_seen")))
+    u["pr_review_items"] = items
+    u["pr_review_status"] = _pr_review_status(doc, items)
+    u["_next"] = "pr_review_poll" if u["pr_review_status"] == "pending" else "pr_review_route"
+    return u
+
+
+def pr_review_route(state):
+    u = {}
+    note_script_error(state, u, "pr_review_poll")
+    status = state.get("pr_review_status") or "poll_error"
+    pr = _pr_ref(state)
+    items = [i for i in as_list(state.get("pr_review_items")) if isinstance(i, dict)]
+    if status == "approved":
+        ledger(state, u, f"review-watch: PR #{pr} approved")
+        if items:
+            u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
+                f"Left open after approval: {_item_ref(i)}: {(i.get('body') or '')[:200]}" for i in items]
+        u["_next"] = "final_report"
+        return u
+    if status in ("merged", "closed"):
+        ledger(state, u, f"review-watch: PR #{pr} {status} externally")
+        return raise_escalation(state, u, escalation(
+            "pr_review_closed", f"PR #{pr} was {status} externally while the review watch ran. How to proceed?",
+            [option("Stop watching and report", recommended=True, evidence=f"the PR is {status}; there is nothing left to watch"),
+             option("Keep watching (the PR was reopened)")]))
+    if status == "comments":
+        rounds = as_int(state.get("pr_review_rounds"))
+        ci_polls_run = as_int(state.get("ci_polls_run"))
+        cap = ""
+        if rounds >= REVIEW_MAX_ROUNDS:
+            cap = f"{rounds} review fix round(s) already ran (cap {REVIEW_MAX_ROUNDS})"
+        elif ci_polls_run >= REVIEW_CI_POLL_BUDGET:
+            cap = f"the CI watches already used {ci_polls_run} poll(s) (budget {REVIEW_CI_POLL_BUDGET})"
+        if not cap:
+            u["_next"] = "pr_review_triage"
+            return u
+        u["pr_review_status"] = "round_cap"
+        ledger(state, u, f"review-watch: PR #{pr} stop: round_cap")
+        return raise_escalation(state, u, escalation(
+            "pr_review_round_cap", f"PR #{pr} has {len(items)} new review item(s), but the review watch stops: {cap}. "
+                                   "How to proceed?",
+            [option("Stop watching and report", recommended=True, evidence=cap)],
+            evidence=tail("\n\n".join(f"{_item_ref(i)}: {i.get('body', '')}" for i in items), 2500)))
+    if status != "wall_cap":
+        status = "poll_error"
+        u["pr_review_status"] = status
+    if status == "wall_cap":
+        reason = (f"the watch budget is spent ({as_int(state.get('pr_review_polls'))} poll(s), cap {REVIEW_MAX_POLLS}; "
+                  f"wall clock cap {REVIEW_WALL_SECS}s)")
+    else:
+        reason = f"{as_int(state.get('pr_review_poll_fails'))} consecutive review reads failed (limit {CI_POLL_FAILS})"
+    ledger(state, u, f"review-watch: PR #{pr} stop: {status}")
+    opts = [option("Stop watching and report", recommended=True, evidence=reason)]
+    if status == "poll_error":
+        opts.append(option("Retry the review watch"))
+    return raise_escalation(state, u, escalation(
+        "pr_review_exhausted", f"Review watch on PR #{pr} stopped: {reason}. How to proceed?", opts))
+
+
+def _triaged(state, u, items, entries, field):
+    """Triage entries mapped back to their items by id; unknown ids are ledgered and dropped."""
+    out = []
+    for e in entries:
+        item = items.get(str(e.get("id") or ""))
+        if item is None:
+            ledger(state, u, f"review-watch: PR #{_pr_ref(state)} triage named unknown item {e.get('id')!r}; dropped")
+            continue
+        out.append({"id": item.get("id"), "kind": item.get("kind"), "url": item.get("url", ""),
+                    "body": item.get("body", ""), field: str(e.get(field) or "")})
+    return out
+
+
+def _start_review_round(state, u, fixes, noaction):
+    rounds = as_int(state.get("pr_review_rounds")) + 1
+    u["pr_review_rounds"] = rounds
+    u["fix_source"] = "pr_review"
+    u["fix_items"] = [f"{_item_ref(f)}: {f.get('text', '')}" for f in fixes]
+    u["pr_review_pending"] = (
+        [{"id": f.get("id"), "kind": f.get("kind"), "url": f.get("url", ""), "text": f.get("text", ""), "action": "fix"}
+         for f in fixes]
+        + [{"id": n.get("id"), "kind": n.get("kind"), "url": n.get("url", ""), "reason": n.get("reason", ""),
+            "action": "skip"} for n in noaction])
+    u["pr_review_queue"] = []
+    ledger(state, u, f"review-watch: PR #{_pr_ref(state)} {len(fixes)} new item(s) -> fix round {rounds}/{REVIEW_MAX_ROUNDS}")
+    u["_next"] = "compose_fix"
+    return u
+
+
+def pr_review_apply(state):
+    # The engine merges nothing when the triage node fails, so the lists are always reset here.
+    u = {"pr_review_fix": [], "pr_review_judgment": [], "pr_review_noaction": []}
+    harvest_anomalies(state, u, "pr_review_triage")
+    note_script_error(state, u, "pr_review_triage")
+    pr = _pr_ref(state)
+    items = {str(i.get("id")): i for i in as_list(state.get("pr_review_items")) if isinstance(i, dict) and i.get("id")}
+    fixes = _triaged(state, u, items, [e for e in as_list(state.get("pr_review_fix")) if isinstance(e, dict)], "text")
+    judged = _triaged(state, u, items, [e for e in as_list(state.get("pr_review_judgment")) if isinstance(e, dict)],
+                      "question")
+    noaction = _triaged(state, u, items, [e for e in as_list(state.get("pr_review_noaction")) if isinstance(e, dict)],
+                        "reason")
+    classified = {e["id"] for e in fixes + judged + noaction}
+    unclassified = [i for i in items.values() if i.get("id") not in classified]
+    if unclassified:
+        ledger(state, u, f"review-watch: PR #{pr} triage left {len(unclassified)} item(s) unclassified; owner judgment")
+        judged += [{"id": i.get("id"), "kind": i.get("kind"), "url": i.get("url", ""), "body": i.get("body", ""),
+                    "question": f"Triage did not classify this comment; how should it be handled? {tail(i.get('body', ''), 300)}"}
+                   for i in unclassified]
+    seen = list(as_list(state.get("pr_review_seen")))
+    for i in items.values():
+        for sid in [i.get("id")] + as_list(i.get("seen_ids")):
+            if sid and sid not in seen:
+                seen.append(sid)
+    u["pr_review_seen"] = seen
+    if judged:
+        u["pr_review_queue"] = fixes
+        listed = "\n".join(f"- {j['question']} ({_item_ref(j)})" for j in judged)
+        return raise_escalation(state, u, escalation(
+            "pr_review_owner_judgment", f"PR review comment(s) need owner judgment:\n{listed}",
+            [option("Fix them as the reviewer asks"), option("Skip them and keep watching"),
+             option("Stop watching and report")],
+            evidence=tail("\n\n".join(f"{_item_ref(j)}: {j.get('body', '')}" for j in judged), 2500),
+            hard_trigger=True, data={"judgment": judged, "noaction": noaction}))
+    if fixes:
+        return _start_review_round(state, u, fixes, noaction)
+    ledger(state, u, f"review-watch: PR #{pr} {len(noaction)} item(s) need no change")
+    u["pr_review_addressed"] = list(as_list(state.get("pr_review_addressed"))) + [
+        {"id": n.get("id"), "kind": n.get("kind"), "url": n.get("url", ""), "reason": n.get("reason", ""), "action": "skip"}
+        for n in noaction]
+    u.update({"pr_review_watch_polls": 0, "pr_review_poll_fails": 0})
+    u["_next"] = "pr_review_poll"
+    return u
 
 
 def _assemble_report(state, u, pre_publish=False):
@@ -1656,6 +2089,10 @@ def _assemble_report(state, u, pre_publish=False):
                              + (" [" + "; ".join(f"{k}: {v}" for k, v in details.items()) + "]" if details else ""))
     if g("ci_status"):
         lines.append(f"- CI: {g('ci_status')}" + (" (flipped to ready)" if truthy(g("flip_ready", False)) else ""))
+    review = _review_mode(state)
+    if review:
+        lines.append(f"- PR review watch: {g('pr_review_status') or 'not started'} after "
+                     f"{as_int(g('pr_review_rounds', 0))} fix round(s)")
     lines.append("")
     digest = as_list(g("autonomous_digest", []))
     if digest:
@@ -1668,6 +2105,10 @@ def _assemble_report(state, u, pre_publish=False):
     rej = as_list(g("rejected_findings", []))
     if rej:
         lines += ["## Review decisions"] + [f"- {r}" for r in rej] + [""]
+    addressed = [a for a in as_list(g("pr_review_addressed", [])) if isinstance(a, dict)] if review else []
+    if addressed:
+        lines += ["## PR review feedback addressed"] + [
+            f"- {a.get('action', '')}: {_item_ref(a)}: {a.get('text') or a.get('reason') or ''}" for a in addressed] + [""]
     debt = as_list(g("debt_left_behind", []))
     lines += ["Debt left behind:"] + ([f"- {d}" for d in debt] or ["- none"]) + [""]
     ex = as_list(g("debris_exemptions", []))
@@ -1731,6 +2172,7 @@ GATES = {
     "triage_route": triage_route, "observability_gate": observability_gate,
     "observability_route": observability_route, "whetstone_gate": whetstone_gate, "pr_gate": pr_gate,
     "ci_gate": ci_gate, "ci_poll": ci_poll, "ci_route": ci_route, "ci_apply": ci_apply,
+    "pr_review_poll": pr_review_poll, "pr_review_route": pr_review_route, "pr_review_apply": pr_review_apply,
     "final_report": final_report,
 }
 
