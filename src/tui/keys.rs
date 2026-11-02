@@ -29,6 +29,11 @@ pub(crate) struct KeyContext {
     /// confirm, so a modal that appears mid-sentence cannot be answered by
     /// the keystroke already in flight.
     pub(crate) idle_ok: bool,
+    /// Whether the whole question is on screen. A question taller than
+    /// its pane is clipped with a marker, and nothing clipped may be
+    /// approved: only Esc and Ctrl+C answer until the terminal is tall
+    /// enough to show all of it.
+    pub(crate) question_fully_shown: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,20 +62,19 @@ pub(crate) enum Action {
 pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match ctx.modal {
-        Some(ModalKind::Confirm { default, tool }) => match lowercase(key.code) {
-            KeyCode::Enter if !ctx.idle_ok => Action::Nothing,
-            KeyCode::Enter => Action::Answer(PromptAnswer::Confirmed(default)),
-            KeyCode::Esc => Action::Answer(PromptAnswer::Cancelled),
-            KeyCode::Char('c') if ctrl => Action::Answer(PromptAnswer::Cancelled),
-            KeyCode::Char('y') if ctx.idle_ok && !ctrl => {
-                Action::Answer(PromptAnswer::Confirmed(true))
+        Some(ModalKind::Confirm { default, tool }) => {
+            let answerable = ctx.idle_ok && ctx.question_fully_shown;
+            match lowercase(key.code) {
+                KeyCode::Esc => Action::Answer(PromptAnswer::Cancelled),
+                KeyCode::Char('c') if ctrl => Action::Answer(PromptAnswer::Cancelled),
+                _ if !answerable => Action::Nothing,
+                KeyCode::Enter => Action::Answer(PromptAnswer::Confirmed(default)),
+                KeyCode::Char('y') if !ctrl => Action::Answer(PromptAnswer::Confirmed(true)),
+                KeyCode::Char('n') if !ctrl => Action::Answer(PromptAnswer::Confirmed(false)),
+                KeyCode::Char('a') if !ctrl && tool => Action::AnswerYesForSession,
+                _ => Action::Nothing,
             }
-            KeyCode::Char('n') if ctx.idle_ok && !ctrl => {
-                Action::Answer(PromptAnswer::Confirmed(false))
-            }
-            KeyCode::Char('a') if ctx.idle_ok && !ctrl && tool => Action::AnswerYesForSession,
-            _ => Action::Nothing,
-        },
+        }
         Some(ModalKind::Input) => match key.code {
             KeyCode::Enter if key.modifiers.is_empty() => Action::SubmitModalInput,
             KeyCode::Esc => Action::Answer(PromptAnswer::Cancelled),
@@ -139,6 +143,7 @@ mod tests {
         composer_empty: true,
         modal: None,
         idle_ok: true,
+        question_fully_shown: true,
     };
 
     #[test]
@@ -222,6 +227,10 @@ mod tests {
             idle_ok: false,
             ..no_tool
         };
+        let clipped = KeyContext {
+            question_fully_shown: false,
+            ..modal
+        };
         let cases = [
             (
                 plain(KeyCode::Char('y')),
@@ -272,6 +281,16 @@ mod tests {
                 busy_typing,
                 Action::Answer(PromptAnswer::Cancelled),
             ),
+            (plain(KeyCode::Char('y')), clipped, Action::Nothing),
+            (plain(KeyCode::Char('n')), clipped, Action::Nothing),
+            (plain(KeyCode::Char('a')), clipped, Action::Nothing),
+            (plain(KeyCode::Enter), clipped, Action::Nothing),
+            (
+                plain(KeyCode::Esc),
+                clipped,
+                Action::Answer(PromptAnswer::Cancelled),
+            ),
+            (ctrl('c'), clipped, Action::Answer(PromptAnswer::Cancelled)),
             (ctrl('c'), modal, Action::Answer(PromptAnswer::Cancelled)),
             (plain(KeyCode::Char('x')), modal, Action::Nothing),
         ];

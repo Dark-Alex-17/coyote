@@ -61,8 +61,11 @@ const HOTKEY_IDLE: Duration = Duration::from_secs(1);
 const TOOL_OUTPUT_TAIL: usize = 20;
 const COMPOSER_MIN_ROWS: u16 = 3;
 const COMPOSER_MAX_ROWS: u16 = 8;
-/// Rows a wrapped question may take above the modal's field and hint.
-const MODAL_QUESTION_MAX_ROWS: u16 = 8;
+/// Transcript rows a modal's question may not take from the frame, so the
+/// narration being approved stays in view above it. A question that still
+/// does not fit is clipped with a marker and cannot be approved until the
+/// terminal is tall enough.
+const TRANSCRIPT_MIN_ROWS: u16 = 4;
 const INPUT_HINT: &str = "Enter = answer  Esc = cancel";
 const COMPOSER_PLACEHOLDER: &str = "Type a prompt or a .command; Enter sends";
 /// How long the status row waits between two ticks of its elapsed time.
@@ -438,21 +441,56 @@ impl PendingPrompt {
         }
     }
 
-    /// The question wrapped to `width`, every line of it: what the user
-    /// approves is read from here, so none of it may be clipped away.
-    fn question_lines(&self, width: u16) -> Vec<Line<'static>> {
-        render::plain_lines(
-            &self.req.question,
-            width,
-            Style::new().add_modifier(Modifier::BOLD),
-        )
+    fn hint(&self) -> String {
+        match self.kind() {
+            ModalKind::Input => INPUT_HINT.to_string(),
+            ModalKind::Confirm { default, tool } => confirm_hint(default, tool),
+        }
     }
 
-    fn question_rows(&self, width: u16) -> u16 {
-        u16::try_from(self.question_lines(width).len())
-            .unwrap_or(MODAL_QUESTION_MAX_ROWS)
-            .clamp(1, MODAL_QUESTION_MAX_ROWS)
+    fn hint_lines(&self, width: u16) -> Vec<Line<'static>> {
+        render::plain_lines(&self.hint(), width, DIM)
     }
+
+    /// The question wrapped to `width`, every line of it: what the user
+    /// approves is read from here, so none of it may be clipped away.
+    /// Blank lines are dropped so a run of newlines cannot push the rest
+    /// of the question past the pane.
+    fn question_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let question = self
+            .req
+            .question
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        render::plain_lines(&question, width, Style::new().add_modifier(Modifier::BOLD))
+    }
+
+    /// Rows the question may take on a frame `height` tall: the status
+    /// row, the footer, the modal's middle row and its hint are fixed, and
+    /// `TRANSCRIPT_MIN_ROWS` stay with the transcript.
+    fn question_cap(&self, width: u16, height: u16) -> u16 {
+        let fixed = 3 + TRANSCRIPT_MIN_ROWS + row_count(self.hint_lines(width).len());
+        height.saturating_sub(fixed).max(1)
+    }
+
+    fn question_rows(&self, width: u16, height: u16) -> u16 {
+        row_count(self.question_lines(width).len()).clamp(1, self.question_cap(width, height))
+    }
+
+    fn question_fully_shown(&self, width: u16, height: u16) -> bool {
+        row_count(self.question_lines(width).len()) <= self.question_cap(width, height)
+    }
+
+    /// Rows of the whole modal: question, field or tool row, hint.
+    fn rows(&self, width: u16, height: u16) -> u16 {
+        self.question_rows(width, height) + 1 + row_count(self.hint_lines(width).len())
+    }
+}
+
+fn row_count(lines: usize) -> u16 {
+    u16::try_from(lines).unwrap_or(u16::MAX)
 }
 
 /// Something the loop, not the app, has to do.
@@ -493,6 +531,9 @@ pub(crate) struct App {
     footer: FooterInfo,
     usage: String,
     last_keystroke: Option<Instant>,
+    /// The area of the last frame drawn; what a modal's question cap and
+    /// its clipped state are judged against between frames.
+    frame_area: Option<Rect>,
     clock: Arc<dyn Clock>,
     frames: FrameScheduler,
     renderer: Renderer,
@@ -517,6 +558,7 @@ impl App {
             footer,
             usage: String::new(),
             last_keystroke: None,
+            frame_area: None,
             frames: FrameScheduler::new(Arc::clone(&clock)),
             clock,
             renderer,
@@ -626,11 +668,16 @@ impl App {
         let idle_ok = self
             .last_keystroke
             .is_none_or(|at| self.clock.now().duration_since(at) >= HOTKEY_IDLE);
+        let question_fully_shown = match (self.prompts.front(), self.frame_area) {
+            (Some(prompt), Some(area)) => prompt.question_fully_shown(area.width, area.height),
+            _ => true,
+        };
         KeyContext {
             turn_running: self.turn.is_some() || self.exiting,
             composer_empty: self.composer.is_empty(),
             modal: self.prompts.front().map(PendingPrompt::kind),
             idle_ok,
+            question_fully_shown,
         }
     }
 
@@ -910,9 +957,9 @@ impl App {
         }
     }
 
-    fn bottom_pane_rows(&self, width: u16) -> u16 {
+    fn bottom_pane_rows(&self, area: Rect) -> u16 {
         match self.prompts.front() {
-            Some(prompt) => prompt.question_rows(width) + 2,
+            Some(prompt) => prompt.rows(area.width, area.height),
             None => u16::try_from(self.composer.lines().len())
                 .unwrap_or(COMPOSER_MAX_ROWS)
                 .clamp(COMPOSER_MIN_ROWS, COMPOSER_MAX_ROWS),
@@ -922,10 +969,11 @@ impl App {
     /// One frame from state; `frame.area()` is the only size consulted.
     pub(crate) fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
+        self.frame_area = Some(area);
         let [transcript, status, bottom, footer] = Layout::vertical([
             Constraint::Min(0),
             Constraint::Length(1),
-            Constraint::Length(self.bottom_pane_rows(area.width)),
+            Constraint::Length(self.bottom_pane_rows(area)),
             Constraint::Length(1),
         ])
         .areas(area);
@@ -1017,7 +1065,9 @@ impl Widget for FooterBar {
     }
 }
 
-/// A prompt drawn where the composer was: question, origin, hint.
+/// A prompt drawn where the composer was: question, origin, hint. A
+/// question taller than its rows is cut with a marker counting the hidden
+/// lines; the cap grows with the terminal, so enlarging it shows them.
 struct PromptModal<'a>(&'a PendingPrompt);
 
 impl Widget for PromptModal<'_> {
@@ -1026,14 +1076,26 @@ impl Widget for PromptModal<'_> {
         if area.is_empty() {
             return;
         }
+        let hint_lines = self.0.hint_lines(area.width);
         let [question, middle, hint] = Layout::vertical([
             Constraint::Min(1),
             Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(row_count(hint_lines.len())),
         ])
         .areas(area);
         let req = &self.0.req;
-        Paragraph::new(self.0.question_lines(area.width)).render(question, buf);
+        let mut lines = self.0.question_lines(area.width);
+        let visible = usize::from(question.height);
+        if lines.len() > visible && visible > 0 {
+            let kept = visible - 1;
+            let hidden = lines.len() - kept;
+            lines.truncate(kept);
+            lines.push(Line::from(Span::styled(
+                format!("(+{hidden} more lines; enlarge the terminal)"),
+                DIM,
+            )));
+        }
+        Paragraph::new(lines).render(question, buf);
         match &self.0.field {
             Some(field) => field.render(middle, buf),
             None => {
@@ -1043,11 +1105,7 @@ impl Widget for PromptModal<'_> {
                 }
             }
         }
-        let hint_text = match self.0.kind() {
-            ModalKind::Input => INPUT_HINT.to_string(),
-            ModalKind::Confirm { default, tool } => confirm_hint(default, tool),
-        };
-        Paragraph::new(Line::from(Span::styled(hint_text, DIM))).render(hint, buf);
+        Paragraph::new(hint_lines).render(hint, buf);
     }
 }
 
@@ -2489,21 +2547,108 @@ mod tests {
 
         let rendered = harness.draw();
         insta::assert_snapshot!("wrapped_narration_and_question_40x20", rendered.clone());
-        let squeezed: String = rendered
-            .chars()
-            .filter(|c| !c.is_whitespace() && *c != '"')
-            .collect();
-        for text in [narration.as_str(), question] {
-            let wanted: String = text
-                .chars()
-                .filter(|c| !c.is_whitespace() && *c != '"')
-                .collect();
+        let shown = squeezed(&rendered);
+        let hint = confirm_hint(true, true);
+        for text in [narration.as_str(), question, hint.as_str()] {
             assert!(
-                squeezed.contains(&wanted),
+                shown.contains(&squeezed(text)),
                 "not every character of {text:?} is on the screen:\n{rendered}"
             );
         }
         harness.app.answer_front(PromptAnswer::Cancelled);
+    }
+
+    /// The buffer dump with its row quotes and all whitespace removed, so
+    /// text wrapped over several rows can be matched as one run.
+    fn squeezed(text: &str) -> String {
+        text.chars()
+            .filter(|c| !c.is_whitespace() && *c != '"')
+            .collect()
+    }
+
+    /// A question taller than the rows a 20-line frame can spare is cut
+    /// with a marker counting the hidden lines, and no hotkey approves it
+    /// until the terminal has grown enough to show the whole thing.
+    #[test]
+    fn a_clipped_question_shows_a_marker_and_cannot_be_approved() {
+        let mut harness = Harness::standalone(40, 20);
+        harness.app.begin_turn("clean up", false);
+        let question = (1..=12)
+            .map(|n| format!("line {n} of the question"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let req = PromptRequest {
+            tool: Some("fs_rm".to_string()),
+            ..PromptRequest::new(PromptAction::Confirm, &question, Origin::detached())
+        };
+        let asker = ask_on_a_thread(&mut harness, req);
+
+        let rendered = harness.draw();
+        insta::assert_snapshot!("clipped_question_marker_40x20", rendered.clone());
+        assert!(
+            rendered.contains("(+2 more lines; enlarge the terminal)"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("line 11 of"), "{rendered}");
+        harness.clock.advance(HOTKEY_IDLE);
+        for key in [KeyCode::Char('y'), KeyCode::Char('a'), KeyCode::Enter] {
+            assert_eq!(harness.press(key), None);
+            assert_eq!(
+                harness.app.prompts.len(),
+                1,
+                "{key:?} answered a clipped question"
+            );
+        }
+        assert!(!asker.is_finished());
+
+        harness.resize(40, 24);
+        let rendered = harness.draw();
+        assert!(!rendered.contains("more lines"), "{rendered}");
+        assert!(
+            squeezed(&rendered).contains(&squeezed(&question)),
+            "{rendered}"
+        );
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Char('y')), None);
+        assert_eq!(
+            asker.join().unwrap().unwrap(),
+            PromptAnswer::Confirmed(true)
+        );
+    }
+
+    /// A tool-controlled path in the question is shown whole: on 40 columns
+    /// a 300-character path wraps over several rows and every character of
+    /// it is on screen before `y` can approve it.
+    #[test]
+    fn a_long_path_in_the_confirm_question_is_shown_whole() {
+        let mut harness = Harness::standalone(40, 20);
+        harness.app.begin_turn("remove it", false);
+        let path = format!(
+            "/tmp/{}/{}/{}",
+            "a".repeat(100),
+            "b".repeat(100),
+            "c".repeat(93)
+        );
+        assert_eq!(path.len(), 300);
+        let question = format!("Remove '{path}'?");
+        let req = PromptRequest {
+            tool: Some("fs_rm".to_string()),
+            ..PromptRequest::new(PromptAction::Confirm, &question, Origin::detached())
+        };
+        let asker = ask_on_a_thread(&mut harness, req);
+
+        let rendered = harness.draw();
+        insta::assert_snapshot!("long_path_confirm_40x20", rendered.clone());
+        assert!(
+            squeezed(&rendered).contains(&squeezed(&question)),
+            "{rendered}"
+        );
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Char('y')), None);
+        assert_eq!(
+            asker.join().unwrap().unwrap(),
+            PromptAnswer::Confirmed(true)
+        );
     }
 
     #[test]

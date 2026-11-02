@@ -1,0 +1,24 @@
+---
+source: src/tui/mod.rs
+expression: rendered.clone()
+---
+"> clean up                              "
+"                                        "
+"                                        "
+"                                        "
+"Working . 0s                            "
+"line 1 of the question                  "
+"line 2 of the question                  "
+"line 3 of the question                  "
+"line 4 of the question                  "
+"line 5 of the question                  "
+"line 6 of the question                  "
+"line 7 of the question                  "
+"line 8 of the question                  "
+"line 9 of the question                  "
+"line 10 of the question                 "
+"(+2 more lines; enlarge the terminal)   "
+"tool: fs_rm                             "
+"y = yes  n = no  a = yes for this       "
+"session  Enter = yes  Esc = cancel      "
+"openai:test-model . no session . agents "

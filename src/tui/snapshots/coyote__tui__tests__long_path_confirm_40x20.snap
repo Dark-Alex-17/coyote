@@ -1,0 +1,24 @@
+---
+source: src/tui/mod.rs
+expression: rendered.clone()
+---
+"> remove it                             "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"Working . 0s                            "
+"Remove '/tmp/                           "
+"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+"aaaaaaaaaaaaaaaaaaaa/                   "
+"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+"bbbbbbbbbbbbbbbbbbbb/                   "
+"cccccccccccccccccccccccccccccccccccccccc"
+"cccccccccccccccccccccccccccccccccccccccc"
+"ccccccccccccc'?                         "
+"tool: fs_rm                             "
+"y = yes  n = no  a = yes for this       "
+"session  Enter = yes  Esc = cancel      "
+"openai:test-model . no session . agents "
