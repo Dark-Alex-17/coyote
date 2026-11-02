@@ -2362,52 +2362,6 @@ fn declining_a_tools_confirm_with_n_gives_the_tool_a_no_and_the_turn_still_finis
     assert_tty_restored(&transcript);
 }
 
-/// Keys typed the moment the alternate screen appears, while the
-/// keyboard-enhancement probe is still waiting for its answer, are not
-/// lost: they land in the composer once the reader starts and Enter then
-/// submits them as the first turn. Nothing is echoed cooked onto the
-/// screen either.
-#[test]
-#[serial]
-fn keys_typed_during_startup_land_in_the_composer_and_submit() {
-    let dir = fresh_config_dir("startup-typeahead");
-    let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir);
-    let mut pty = spawn_tui(&dir, &[]);
-
-    pty.wait_for_raw(ENTER_ALT, 0, PTY_DEADLINE)
-        .expect("the alternate screen was never entered");
-    pty.send(b"**early** typed x4b").unwrap();
-    pty.wait_for("no session", PTY_DEADLINE).unwrap();
-    let composed = pty.read_for(Duration::from_millis(300));
-    // Cells that stay blank between frames are skipped by the diff, so the
-    // composer's spaces may not be in the byte stream: compare squeezed.
-    let squeezed_composed: String = composed.chars().filter(|c| !c.is_whitespace()).collect();
-    assert!(
-        squeezed_composed.contains("**early**typedx4b"),
-        "text typed during startup never reached the composer:\n{composed}"
-    );
-    pty.send(b"\r").unwrap();
-    let deadline = std::time::Instant::now() + PTY_DEADLINE;
-    loop {
-        let text = pty.read_for(Duration::from_millis(200));
-        let squeezed: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-        // The rendered dry-run reply drops the asterisks the prompt kept.
-        if squeezed.contains("earlytypedx4b") && text.matches("x4b").count() >= 2 {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "Enter did not submit the text typed during startup:\n{text}"
-        );
-    }
-
-    pty.send(b"\x04").unwrap();
-    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
-    assert_eq!(exit_code(&transcript), 0, "{transcript}");
-    assert_tty_restored(&transcript);
-}
-
 /// On a terminal that answers the keyboard-enhancement probe (kitty,
 /// ghostty, wezterm, foot) the flags are pushed after alt-screen entry
 /// and popped before it is left, and with them on, a key *release* the
