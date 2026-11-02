@@ -777,11 +777,11 @@ impl App {
                 self.cells.push(Cell::notice(
                     NoticeKind::ToolWarning,
                     format!(
-                        "Prompt kind {} is not supported in the TUI yet",
+                        "Prompt kind {} is not available in the TUI yet",
                         req.action.name()
                     ),
                 ));
-                let _ = reply.send(PromptAnswer::Cancelled);
+                let _ = reply.send(PromptAnswer::Cancelled); // TASK-315
                 return;
             }
         };
@@ -3161,6 +3161,18 @@ mod tests {
             (
                 "src/function/prompt_channel.rs",
                 "bail!(\"Prompt reply channel is not implemented on this platform\")",
+            ),
+            (
+                "src/utils/command.rs",
+                "bail!(\"Shell passthrough is not available in the TUI yet\")",
+            ),
+            (
+                "src/utils/command.rs",
+                "bail!(\"Editing files is not available in the TUI yet\")",
+            ),
+            (
+                "src/tui/mod.rs",
+                "let _ = reply.send(PromptAnswer::Cancelled);",
             ),
             (
                 "tests/tui_binary.rs",

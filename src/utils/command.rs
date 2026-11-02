@@ -87,7 +87,7 @@ pub fn run_command<T: AsRef<OsStr>>(
     envs: Option<HashMap<String, String>>,
 ) -> Result<i32> {
     if crate::tui::active() {
-        bail!("Shell passthrough is not available in the TUI yet");
+        bail!("Shell passthrough is not available in the TUI yet"); // TASK-315
     }
     wait_for_status(cmd, args, envs, Stdio::inherit())
 }
@@ -193,7 +193,7 @@ pub fn run_loader_command(path: &str, extension: &str, loader_command: &str) -> 
 
 pub fn edit_file(editor: &str, path: &Path) -> Result<()> {
     if crate::tui::active() {
-        bail!("Editing files is not available in the TUI yet");
+        bail!("Editing files is not available in the TUI yet"); // TASK-315
     }
     let mut child = Command::new(editor).arg(path).spawn()?;
     child.wait()?;
