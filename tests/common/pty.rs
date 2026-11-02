@@ -61,9 +61,12 @@ impl Pty {
                         return Err(std::io::Error::last_os_error());
                     }
                 }
-                // Everything else the test runner holds goes too, whether
-                // or not it carries close-on-exec: a child must never
-                // inherit a lock file or a sibling test's pipe.
+                // Everything else the test runner holds without
+                // close-on-exec goes too: a child must never inherit a
+                // lock file or a sibling test's pipe. Descriptors that
+                // carry the flag are left alone: exec drops them anyway,
+                // and one of them is std's exec-status pipe, which the
+                // parent needs to learn that execvp failed.
                 let open_max = libc::sysconf(libc::_SC_OPEN_MAX);
                 let limit = if open_max > 0 {
                     open_max.min(1024) as i32
@@ -71,7 +74,11 @@ impl Pty {
                     1024
                 };
                 for fd in 3..limit {
-                    if fd != slave_fd {
+                    if fd == slave_fd {
+                        continue;
+                    }
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    if flags != -1 && flags & libc::FD_CLOEXEC == 0 {
                         libc::close(fd);
                     }
                 }
