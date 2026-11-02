@@ -5015,3 +5015,71 @@ fn a_local_entry_beside_a_relay_starts_dialing_and_flips_to_connected_when_rnsd_
     );
     assert_eq!(probe.marker_count("MESH_STARTED"), 1, "one join");
 }
+
+/// While a `local` entry beside a relay keeps failing its
+/// dial with the same reason, Coyote's own log names that reason once, not once per 2 s
+/// redial. Two log reads ~8 s apart (four redials) must show no new Coyote line naming
+/// the endpoint. The transport library's own per-dial `couldn't connect` warning is not
+/// Coyote's line and is left out of the count.
+#[test]
+fn a_dialing_local_entry_logs_its_unchanged_dial_failure_once_not_every_redial() {
+    let relay = SilentRelay::start();
+    let rnsd = LocalRnsd::absent();
+    let endpoint = rnsd.endpoint();
+    let probe = Probe::new("local-dial-log-cadence", false, &[relay.port])
+        .with_local_interface(rnsd.port(), rnsd.instance());
+    let log_path = probe.temp_root.join("probe-coyote.log");
+    let mut command = probe.command();
+    command
+        .env("COYOTE_LOG_PATH", &log_path)
+        .env("COYOTE_LOG_LEVEL", "debug")
+        .args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    wait_for(&mut session, SESSION_PROMPT);
+    command_prints(
+        &mut session,
+        ".mesh on --yes",
+        MESH_ON_SUMMARY,
+        SESSION_PROMPT,
+    );
+    probe.wait_for_marker("MESH_STARTED");
+
+    let naming = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter(|line| line.contains(&endpoint) && !line.contains("rns-transport"))
+            .map(str::to_string)
+            .collect()
+    };
+    // Let the first failed dial land and be logged.
+    thread::sleep(Duration::from_secs(3));
+    let before = naming(&fs::read_to_string(&log_path).unwrap_or_default());
+    thread::sleep(Duration::from_secs(8));
+    let after = naming(&fs::read_to_string(&log_path).unwrap_or_default());
+    assert!(
+        !before.is_empty(),
+        "the debug log names the dialing local entry at least once (else the count is vacuous)"
+    );
+    let info = command_text(&mut session, ".mesh info", "└", SESSION_PROMPT);
+    assert_eq!(
+        boxed_table(".mesh info", &info).value("interfaces[0]"),
+        format!(
+            "local rnsd at {endpoint}  connecting, retrying: nothing is listening at {endpoint}"
+        ),
+        "{info}"
+    );
+    assert_eq!(
+        after.len(),
+        before.len(),
+        "an unchanged dial failure is not re-logged every redial; new lines: {:#?}",
+        &after[before.len().min(after.len())..]
+    );
+    assert!(
+        after.len() <= 3,
+        "the dial failure is logged once, not per redial: {after:#?}"
+    );
+    let status = exit_clean(&mut session);
+    assert!(
+        matches!(status, WaitStatus::Exited(_, 0)),
+        ".exit: expected a clean exit, got {status:?}"
+    );
+}
