@@ -51,7 +51,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "sisyphus-next";
 const CANDIDATE_NAMES: [&str; 2] = ["sisyphus-next", "architect-next"];
-const SMOKE_FLOOR: usize = 321;
+const SMOKE_FLOOR: usize = 375;
 
 fn agents_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents")
@@ -135,19 +135,57 @@ fn without_agent_vars(cmd: &mut Command) {
     }
 }
 
-/// The gates run `SISYPHUS_GH_*` commands in place of `gh` and read the CI
-/// and review poll sleeps from the environment, so a developer's own seams
-/// would replace the batteries' fixtures.
+const SISYPHUS_SEAMS: &[&str] = &[
+    "SISYPHUS_CI_SLEEP",
+    "SISYPHUS_REVIEW_SLEEP",
+    "SISYPHUS_ASK_OWNER_BIN",
+    "SISYPHUS_SLACK_PING_BIN",
+];
+
+/// The gates run `SISYPHUS_GH_*` commands in place of `gh`, read the CI and
+/// review poll sleeps from the environment and run the owner-question and
+/// Slack-ping binaries named by `SISYPHUS_ASK_OWNER_BIN` and
+/// `SISYPHUS_SLACK_PING_BIN`, so a developer's own seams would replace the
+/// batteries' fixtures.
 fn without_sisyphus_seams(cmd: &mut Command) {
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        let seam = name.starts_with("SISYPHUS_GH_")
-            || name == "SISYPHUS_CI_SLEEP"
-            || name == "SISYPHUS_REVIEW_SLEEP";
-        if seam {
-            cmd.env_remove(key);
+    without_sisyphus_seams_from(cmd, std::env::vars_os().map(|(key, _)| key));
+}
+
+fn without_sisyphus_seams_from(cmd: &mut Command, names: impl IntoIterator<Item = OsString>) {
+    for name in names {
+        let text = name.to_string_lossy();
+        if text.starts_with("SISYPHUS_GH_") || SISYPHUS_SEAMS.contains(&text.as_ref()) {
+            cmd.env_remove(name);
         }
     }
+}
+
+#[test]
+fn sisyphus_seam_scrub_removes_every_seam_and_keeps_the_rest() {
+    let seams = [
+        "SISYPHUS_GH_X",
+        "SISYPHUS_CI_SLEEP",
+        "SISYPHUS_REVIEW_SLEEP",
+        "SISYPHUS_ASK_OWNER_BIN",
+        "SISYPHUS_SLACK_PING_BIN",
+    ];
+    let names = seams
+        .iter()
+        .chain(&["SISYPHUS_FAKE_KEEP"])
+        .map(OsString::from);
+    let mut cmd = Command::new("true");
+    without_sisyphus_seams_from(&mut cmd, names);
+    let envs: BTreeMap<OsString, Option<OsString>> = cmd
+        .get_envs()
+        .map(|(k, v)| (k.to_os_string(), v.map(OsStr::to_os_string)))
+        .collect();
+    for seam in seams {
+        assert_eq!(envs.get(OsStr::new(seam)), Some(&None), "{seam}: {envs:?}");
+    }
+    assert!(
+        !envs.contains_key(OsStr::new("SISYPHUS_FAKE_KEEP")),
+        "{envs:?}"
+    );
 }
 
 /// Inherited overrides such as `COYOTE_WORKSPACE_CONFIG_DIR`, `COYOTE_PROVIDER`
@@ -508,7 +546,7 @@ fn readme_hygiene_row_states_the_wrapper_run_isolation() {
 }
 
 /// The hygiene row names the seam scrub that smoke_test.py and `battery()`
-/// both apply.
+/// both apply, the owner-question and Slack-ping binary overrides included.
 #[test]
 fn readme_hygiene_row_states_the_seam_scrub() {
     let readme = fs::read_to_string(candidate_dir().join("README.md")).unwrap();
@@ -521,6 +559,12 @@ fn readme_hygiene_row_states_the_seam_scrub() {
                     seams cannot replace its fixtures, and the wrapper's `battery()` removes \
                     the same names";
     assert!(row.contains(sentence), "missing {sentence:?} in: {row}");
+    for name in ["SISYPHUS_ASK_OWNER_BIN", "SISYPHUS_SLACK_PING_BIN"] {
+        assert!(
+            row.contains(&format!("`{name}`")),
+            "{name} missing from: {row}"
+        );
+    }
 }
 
 /// Hunks in `diff -u old new`, or `None` when the files are identical. A file
@@ -2448,7 +2492,7 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("check_inbox_pre", "timeout", 300),
     ("ci_apply", "timeout", 120),
     ("ci_diagnose", "timeout", 600),
-    ("ci_poll", "timeout", 120),
+    ("ci_poll", "timeout", 180),
     ("compose_brief", "timeout", 600),
     ("consult_navigator", "max_attempts", 1),
     ("consult_navigator", "timeout", 1800),
@@ -2476,7 +2520,8 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("plan_research", "timeout", 300),
     ("plan_subtasks", "timeout", 600),
     ("pr_review_apply", "timeout", 120),
-    ("pr_review_poll", "timeout", 120),
+    ("pr_review_poll", "timeout", 750),
+    ("pr_review_resolve", "timeout", 600),
     ("pr_review_triage", "timeout", 600),
     ("research_answer", "max_iterations", 45),
     ("research_answer", "timeout", 3600),
@@ -2536,12 +2581,15 @@ const FROZEN_SCRIPT_BOUNDS: &[(&str, &str)] = &[
     ("CI_POLL_SLEEP", "60"),
     ("CI_WALL_SECS", "14400"),
     ("CLARIFY_MAX", "STRIKE_LIMIT"),
+    ("GH_CALL_SECS", "90"),
     ("OWNER_POLL_MAX", "2"),
     ("OWNER_POLL_MINUTES", "25"),
     ("OWNER_WAIT_MINUTES", "30"),
     ("REASK_MAX", "STRIKE_LIMIT"),
     ("RERUN_ONCE", "1"),
+    ("RESOLVE_DEADLINE_SECS", "480"),
     ("REVIEW_CI_POLL_BUDGET", "60"),
+    ("REVIEW_CI_POLL_CEILING", "90"),
     ("REVIEW_MAX_POLLS", "80"),
     ("REVIEW_MAX_ROUNDS", "STRIKE_LIMIT"),
     ("REVIEW_POLL_SLEEP", "600"),
@@ -2679,15 +2727,18 @@ fn lib_constant(lib: &str, name: &str) -> i64 {
 }
 
 /// The engine caps the visits to each node at `settings.max_loop_iterations`,
-/// so the review watch has to reach its own caps first: the review poll
-/// budget with the round cap and one visit to spare, and the run-wide CI poll
-/// budget past which no fix round starts.
+/// so review mode has to reach its own caps first: the review poll budget
+/// with the round cap and one visit to spare on `pr_review_poll`, and on
+/// `ci_poll` the run-wide CI poll ceiling, with the budget past which no fix
+/// round starts below that ceiling. Only these review-mode bounds are
+/// checked; ci mode puts no run-wide cap on `ci_poll`.
 #[test]
 fn review_watch_caps_stay_below_the_per_node_visit_cap() {
     let lib = fs::read_to_string(candidate_dir().join("scripts/_lib.py")).unwrap();
     let polls = lib_constant(&lib, "REVIEW_MAX_POLLS");
     let rounds = lib_constant(&lib, "REVIEW_MAX_ROUNDS");
     let ci_budget = lib_constant(&lib, "REVIEW_CI_POLL_BUDGET");
+    let ci_ceiling = lib_constant(&lib, "REVIEW_CI_POLL_CEILING");
     let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
     let shipped: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
     let cap = shipped["settings"]["max_loop_iterations"]
@@ -2701,6 +2752,43 @@ fn review_watch_caps_stay_below_the_per_node_visit_cap() {
         ci_budget < cap,
         "REVIEW_CI_POLL_BUDGET {ci_budget} reaches the cap {cap}"
     );
+    assert!(
+        ci_ceiling < cap,
+        "REVIEW_CI_POLL_CEILING {ci_ceiling} reaches the cap {cap}"
+    );
+    assert!(
+        ci_budget < ci_ceiling,
+        "REVIEW_CI_POLL_BUDGET {ci_budget} is not below REVIEW_CI_POLL_CEILING {ci_ceiling}"
+    );
+}
+
+/// A poll node sleeps and then makes one gh call bounded by `GH_CALL_SECS`,
+/// and `pr_review_resolve` starts no call past `RESOLVE_DEADLINE_SECS`, so
+/// each node timeout has to exceed that worst case or the engine kills the
+/// node mid-call.
+#[test]
+fn poll_node_timeouts_cover_the_sleep_and_one_gh_call() {
+    let lib = fs::read_to_string(candidate_dir().join("scripts/_lib.py")).unwrap();
+    let gh_call = lib_constant(&lib, "GH_CALL_SECS");
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let shipped: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let timeout = |node: &str| {
+        shipped["nodes"][node]["timeout"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("{node} has an integer timeout"))
+    };
+    for (node, wait) in [
+        ("ci_poll", "CI_POLL_SLEEP"),
+        ("pr_review_poll", "REVIEW_POLL_SLEEP"),
+        ("pr_review_resolve", "RESOLVE_DEADLINE_SECS"),
+    ] {
+        let secs = lib_constant(&lib, wait);
+        let limit = timeout(node);
+        assert!(
+            limit > secs + gh_call,
+            "{node} timeout {limit} does not exceed {wait} {secs} + GH_CALL_SECS {gh_call}"
+        );
+    }
 }
 
 /// How each llm node's output schema carries the `anomalies` channel in the
@@ -3387,9 +3475,11 @@ fn readme_ci_budget_row_separates_per_watch_from_per_run_counters() {
 }
 
 /// The review-watch row names every stop status, every escalation kind, the
-/// seams, each `REVIEW_*` bound exactly as the frozen bounds record it, and
-/// the rule that keeps a delegated run and a parent's task sisyphus out of
-/// the watch.
+/// seams, each `REVIEW_*` bound exactly as the frozen bounds record it, the
+/// trust boundary on commenters, the rule that keeps a delegated run and a
+/// parent's task sisyphus out of the watch, and the engine facts that make
+/// the watch an in-graph loop; those engine facts are checked against the
+/// source files the row cites.
 #[test]
 fn readme_pr_tracking_row_names_the_loop_stops_and_parent_rule() {
     let readme = fs::read_to_string(candidate_dir().join("README.md")).unwrap();
@@ -3415,8 +3505,13 @@ fn readme_pr_tracking_row_names_the_loop_stops_and_parent_rule() {
         "pr_review_owner_judgment",
         "ci_exhausted",
         "ci_infra",
+        "ci_poll_cap",
+        "pr_review_push_unconfirmed",
         "SISYPHUS_GH_REVIEWS_CMD",
         "SISYPHUS_GH_RESOLVE_CMD",
+        "SISYPHUS_GH_HEAD_CMD",
+        "SISYPHUS_GH_RUN_LOG_CMD",
+        "SISYPHUS_GH_RERUN_CMD",
         "SISYPHUS_REVIEW_SLEEP",
     ];
     for name in names {
@@ -3436,6 +3531,30 @@ fn readme_pr_tracking_row_names_the_loop_stops_and_parent_rule() {
     assert!(row.contains(parent), "missing {parent:?} in: {row}");
     let architect = "architect-next does not pass `pr_tracking=review` to its task sisyphus";
     assert!(row.contains(architect), "missing {architect:?} in: {row}");
+    let trust = "Only comments from OWNER/MEMBER/COLLABORATOR accounts (`authorAssociation`) \
+                 reach triage and the coder; every other account's comments are ledgered and \
+                 escalated to the owner as `pr_review_owner_judgment` with their bodies \
+                 withheld, answerable only with skip or stop, and this is enforced in \
+                 `gates.py`, not by the prompt.";
+    assert!(row.contains(trust), "missing {trust:?} in: {row}");
+    let stranger = "A stranger's approval never ends the watch";
+    assert!(row.contains(stranger), "missing {stranger:?} in: {row}");
+    let design = "a graph node cannot keep a background child past the node: \
+                  `src/graph/llm.rs` reaps node-local jobs (`reap_jobs`) on every llm node \
+                  exit, and the unreclaimed-task guardrail in `src/function/agents.rs` cancels \
+                  the spawned agents a turn leaves behind";
+    assert!(row.contains(design), "missing {design:?} in: {row}");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let llm = fs::read_to_string(root.join("src/graph/llm.rs")).unwrap();
+    assert!(
+        llm.contains("reap_jobs("),
+        "src/graph/llm.rs no longer calls reap_jobs"
+    );
+    let agents = fs::read_to_string(root.join("src/function/agents.rs")).unwrap();
+    assert!(
+        agents.contains("unreclaimed"),
+        "src/function/agents.rs no longer carries the unreclaimed-task guardrail"
+    );
 }
 
 /// Every entry shim dispatches `run("<its own stem>")`, that name is a key of
