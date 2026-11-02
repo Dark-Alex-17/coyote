@@ -4166,6 +4166,7 @@ impl RequestContext {
     }
 
     pub fn edit_session(&mut self, app: &AppConfig) -> Result<()> {
+        ensure_editor_available()?;
         let (name, scope) = match &self.session {
             Some(session) => (session.name().to_string(), session.scope()),
             None => bail!("No session"),
@@ -4192,6 +4193,7 @@ impl RequestContext {
     }
 
     pub fn edit_agent_config(&self, app: &AppConfig) -> Result<()> {
+        ensure_editor_available()?;
         let agent_name = match &self.agent {
             Some(agent) => agent.name(),
             None => bail!("No agent"),
@@ -4230,6 +4232,7 @@ impl RequestContext {
         if self.macro_flag {
             bail!("No macro");
         }
+        ensure_editor_available()?;
         let ans = Confirm::new("Create a new macro?")
             .with_default(true)
             .prompt()?;
@@ -6866,6 +6869,7 @@ impl RequestContext {
     }
 
     fn upsert_role(&self, app: &AppConfig, name: &str) -> Result<()> {
+        ensure_editor_available()?;
         let role_path = paths::role_file(name);
         ensure_parent_exists(&role_path)?;
         let editor = app.editor()?;
@@ -11775,6 +11779,123 @@ mod tests {
             "the refusal left a scaffold at {}",
             path.display()
         );
+    }
+
+    fn assert_refused_under_the_tui(err: anyhow::Error) {
+        assert!(
+            err.to_string().contains("not available in the TUI"),
+            "{err}"
+        );
+    }
+
+    /// `.edit session` saves the session before opening it; under the
+    /// full-screen UI the refusal comes first, so the file is never
+    /// written.
+    #[test]
+    #[serial]
+    fn edit_session_under_the_tui_refuses_before_saving_the_session() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let mut session = Session::default();
+        session.set_name("tui-refused-session".into());
+        let path = ctx.session_file_for(session.name(), session.scope());
+        ctx.session = Some(session);
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let app = ctx.app.config.clone();
+        assert_refused_under_the_tui(ctx.edit_session(&app).unwrap_err());
+        assert!(
+            !path.exists(),
+            "the refusal saved the session to {}",
+            path.display()
+        );
+    }
+
+    /// `.edit agent-config` writes a stub config when the agent has none;
+    /// a stub left behind by a refusal would redirect every later edit of
+    /// a graph-only agent to it.
+    #[test]
+    #[serial]
+    fn edit_agent_config_under_the_tui_refuses_before_writing_the_stub() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        ctx.agent = Some(Agent::test_new(AgentConfig {
+            name: "tui-refused-agent".to_string(),
+            ..AgentConfig::default()
+        }));
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let app = ctx.app.config.clone();
+        assert_refused_under_the_tui(ctx.edit_agent_config(&app).unwrap_err());
+        let path = paths::agent_config_file("tui-refused-agent");
+        assert!(
+            !path.exists(),
+            "the refusal left a stub config at {}",
+            path.display()
+        );
+    }
+
+    /// `.edit rag-docs` hands the document list to the editor through a
+    /// temp file; the refusal comes before that file is created.
+    #[test]
+    #[serial]
+    fn edit_rag_docs_under_the_tui_refuses_before_writing_the_temp_file() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let name = "tui-refused-kb";
+        let rag_path = ctx.rag_file(name);
+        ensure_parent_exists(&rag_path).unwrap();
+        write(
+            &rag_path,
+            "driver: yaml\nembedding_model: test-seeded:test-embedder\nchunk_size: 512\nchunk_overlap: 64\ntop_k: 5\n",
+        )
+        .unwrap();
+        ctx.rag = Some(Arc::new(run_async(async {
+            Rag::load(&AppConfig::default(), name, &rag_path)
+                .await
+                .unwrap()
+        })));
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let err = run_async(ctx.edit_rag_docs(utils::create_abort_signal())).unwrap_err();
+        assert_refused_under_the_tui(err);
+        let needle = format!("-rag-{name}");
+        let leftovers: Vec<PathBuf> = read_dir(env::temp_dir())
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.to_string_lossy().contains(&needle))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the refusal left the editor's temp file behind: {leftovers:?}"
+        );
+    }
+
+    /// `.role new` and `.macro new` create their parent directory before
+    /// the editor opens; the refusal leaves neither the directory nor the
+    /// file behind.
+    #[test]
+    #[serial]
+    fn upsert_role_and_new_macro_under_the_tui_refuse_before_creating_anything() {
+        let _guard = TestConfigDirGuard::new();
+        let ctx = create_test_ctx();
+        let role_path = paths::role_file("tui-refused-role");
+        let macro_path = paths::macro_file("tui-refused-macro");
+        for path in [&role_path, &macro_path] {
+            assert!(
+                !path.parent().unwrap().exists(),
+                "{} exists before the refusal",
+                path.parent().unwrap().display()
+            );
+        }
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let app = ctx.app.config.clone();
+        assert_refused_under_the_tui(ctx.upsert_role(&app, "tui-refused-role").unwrap_err());
+        assert_refused_under_the_tui(ctx.new_macro(&app, "tui-refused-macro").unwrap_err());
+        for path in [&role_path, &macro_path] {
+            assert!(
+                !path.exists() && !path.parent().unwrap().exists(),
+                "the refusal created {} or its directory",
+                path.display()
+            );
+        }
     }
 
     /// A seeded child hands out the very signal `agent__cancel` sets; the

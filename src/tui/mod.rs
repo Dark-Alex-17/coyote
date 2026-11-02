@@ -3017,24 +3017,8 @@ mod tests {
                 "edit_mcp_config",
                 VIA_EDIT_GATE,
             ),
-            (
-                "src/config/request_context.rs",
-                "edit_session",
-                VIA_EDIT_GATE,
-            ),
-            (
-                "src/config/request_context.rs",
-                "edit_agent_config",
-                VIA_EDIT_GATE,
-            ),
             ("src/config/request_context.rs", "new_role", DIRECT_TTY),
             ("src/config/request_context.rs", "save_role", DIRECT_TTY),
-            ("src/config/request_context.rs", "new_macro", DIRECT_TTY),
-            (
-                "src/config/request_context.rs",
-                "upsert_role",
-                VIA_EDIT_GATE,
-            ),
             (
                 "src/config/request_context.rs",
                 "use_session_recording_rebuild",
