@@ -10,9 +10,10 @@ pub(crate) use unix::FdRedirect;
 
 use std::time::Duration;
 
-/// Longest `finish` waits for the drain thread to catch up.
+/// Longest `finish` waits for the drain thread to reach EOF or go quiet.
 pub(crate) const SETTLE_LIMIT: Duration = Duration::from_millis(50);
-/// Gap without new bytes after which the pipe counts as quiescent.
+/// Gap without new bytes, once the drain thread has read since the write
+/// end closed, after which the pipe counts as quiescent.
 pub(crate) const QUIET_GAP: Duration = Duration::from_millis(10);
 
 /// Command output stays on the console until the Windows twin lands.
@@ -39,7 +40,7 @@ mod unix {
     use std::io::{self, Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::sync::{Arc, Condvar, Mutex};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     /// Most of a command's output kept for its cell; a runaway writer is
     /// cut here and the tail is counted rather than stored.
@@ -85,10 +86,10 @@ mod unix {
     /// not released onto whichever fd is current afterwards. The drain
     /// thread is never joined: a child the command spawned (an MCP server
     /// whose stderr is inherited) can hold the write end for the whole
-    /// session, so `finish` waits only for quiescence, snapshots what has
-    /// arrived, and leaves the thread to forward anything later. A guard
-    /// dropped without `finish` (the turn's future was cancelled or
-    /// panicked) still puts the fds back and hands what the pipe holds to
+    /// session, so `finish` waits for EOF only up to a bound, snapshots
+    /// what has arrived, and leaves the thread to forward anything later.
+    /// A guard dropped without `finish` (the turn's future was cancelled
+    /// or panicked) still puts the fds back and hands what the pipe holds to
     /// the late-output callback, so a panic message printed into the pipe
     /// is not lost with the cell it would have gone to.
     pub(crate) struct FdRedirect {
@@ -151,9 +152,12 @@ mod unix {
         let _ = io::stderr().flush();
     }
 
-    fn drain(read_end: OwnedFd, shared: Arc<Shared>) {
+    fn drain(read_end: OwnedFd, shared: Arc<Shared>, first_read_delay: Option<Duration>) {
         let mut reader = std::fs::File::from(read_end);
         let mut chunk = [0u8; 4096];
+        if let Some(delay) = first_read_delay {
+            std::thread::sleep(delay);
+        }
         loop {
             let n = match reader.read(&mut chunk) {
                 Ok(0) => break,
@@ -185,6 +189,23 @@ mod unix {
         /// arrives after `finish` from a writer still holding the pipe, and
         /// everything buffered when the guard is dropped unfinished.
         pub(crate) fn begin(late: impl Fn(String) + Send + Sync + 'static) -> io::Result<Self> {
+            Self::begin_with(late, None)
+        }
+
+        /// `begin` with a drain thread that sleeps before its first read,
+        /// standing in for a scheduler that has not run it yet.
+        #[cfg(test)]
+        fn begin_with_slow_drain(
+            late: impl Fn(String) + Send + Sync + 'static,
+            first_read_delay: Duration,
+        ) -> io::Result<Self> {
+            Self::begin_with(late, Some(first_read_delay))
+        }
+
+        fn begin_with(
+            late: impl Fn(String) + Send + Sync + 'static,
+            first_read_delay: Option<Duration>,
+        ) -> io::Result<Self> {
             flush_std_streams();
             let (read_end, write_end) = pipe()?;
             let saved = SavedFds::save()?;
@@ -207,7 +228,7 @@ mod unix {
             let thread_shared = Arc::clone(&shared);
             if let Err(err) = std::thread::Builder::new()
                 .name("tui-fd-drain".into())
-                .spawn(move || drain(read_end, thread_shared))
+                .spawn(move || drain(read_end, thread_shared, first_read_delay))
             {
                 saved.restore();
                 return Err(err);
@@ -220,25 +241,30 @@ mod unix {
         }
 
         /// Puts fds 1 and 2 back and returns what the pipe received so far.
+        /// The write end is closed first, so the drain thread reaches EOF
+        /// as soon as it runs unless a child still holds the pipe; the
+        /// quiet-gap rule only applies once it has read since then, so a
+        /// thread the scheduler has not run yet is waited for, not given
+        /// up on.
         pub(crate) fn finish(mut self) -> String {
             self.restore_fds();
             let shared = Arc::clone(&self.shared);
 
             let started = Instant::now();
+            let limit = started + SETTLE_LIMIT;
             let mut drained = shared.drained.lock().unwrap_or_else(|p| p.into_inner());
             loop {
                 let now = Instant::now();
-                let quiet_since = drained.last_read.map_or(started, |t| t.max(started));
-                if drained.eof
-                    || now.duration_since(quiet_since) >= QUIET_GAP
-                    || now.duration_since(started) >= SETTLE_LIMIT
-                {
+                let deadline = match drained.last_read.filter(|read| *read >= started) {
+                    Some(read) => (read + QUIET_GAP).min(limit),
+                    None => limit,
+                };
+                if drained.eof || now >= deadline {
                     break;
                 }
-                let wait = (quiet_since + QUIET_GAP).min(started + SETTLE_LIMIT) - now;
                 drained = shared
                     .changed
-                    .wait_timeout(drained, wait)
+                    .wait_timeout(drained, deadline - now)
                     .unwrap_or_else(|p| p.into_inner())
                     .0;
             }
@@ -282,7 +308,6 @@ mod unix {
         use std::fs::File;
         use std::process::Command;
         use std::sync::mpsc;
-        use std::time::Duration;
 
         fn write_fd2(bytes: &[u8]) {
             // SAFETY: `bytes` is a valid buffer of the given length.
@@ -344,6 +369,28 @@ mod unix {
             release_harness_output(saved, reader, "");
             assert!(elapsed < Duration::from_secs(2), "finish took {elapsed:?}");
             assert_eq!(captured.trim(), "before-r2x");
+        }
+
+        /// A drain thread the scheduler has not run yet is waited for:
+        /// output written before `finish` lands in the cell even when the
+        /// first read comes after the quiet gap would have expired.
+        #[test]
+        #[serial]
+        fn finish_waits_for_a_drain_thread_that_has_not_read_yet() {
+            let (saved, reader) = capture_stdout();
+            let (tx, rx) = mpsc::channel();
+            let guard = FdRedirect::begin_with_slow_drain(
+                move |text| {
+                    let _ = tx.send(text);
+                },
+                QUIET_GAP * 3,
+            )
+            .unwrap();
+            write_fd1(b"slow-drain-r6x\n");
+            let captured = guard.finish();
+            release_harness_output(saved, reader, "");
+            assert_eq!(captured.trim(), "slow-drain-r6x");
+            assert!(rx.try_recv().is_err(), "the output went out as late output");
         }
 
         /// Bytes a lingering writer sends after `finish` reach the late

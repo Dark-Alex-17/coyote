@@ -200,11 +200,14 @@ fn child_pid(transcript: &str) -> i32 {
 
 /// Also the one place a REPL command's `print!` output is seen through the
 /// fd capture: in-process tests never see it, because libtest diverts
-/// `print!` before it reaches fd 1. `.info` is taller than the screen, so
-/// the marker is its last row. The table is a `Command` cell inside the
-/// alternate screen, so once the screen is left nothing of it may reach
-/// the terminal the shell gets back: the only bytes after the leave are
-/// the wrapper's own report.
+/// `print!` before it reaches fd 1. The screen is made tall enough for the
+/// whole table so its rows can be placed: the first one is painted
+/// directly under `> .info`, which is where the Command cell puts it; a
+/// capture that gave up before the drain thread ran would instead leave
+/// the cell empty and show the table a blank row lower, as a notice. The
+/// table is a `Command` cell inside the alternate screen, so once the
+/// screen is left nothing of it may reach the terminal the shell gets
+/// back: the only bytes after the leave are the wrapper's own report.
 #[test]
 #[serial]
 fn a_command_prints_into_the_transcript_and_ctrl_d_leaves_the_tty_cooked() {
@@ -214,10 +217,30 @@ fn a_command_prints_into_the_transcript_and_ctrl_d_leaves_the_tty_cooked() {
     let mut pty = spawn_tui(&dir, &[]);
 
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.resize(80, 100).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let info_at = pty.raw().len();
     pty.send(b".info\r").unwrap();
-    pty.wait_for("log_path", PTY_DEADLINE).unwrap();
+    pty.wait_for_after("log_path", info_at, PTY_DEADLINE)
+        .unwrap();
     // Let the capture settle so a late forward would have happened.
     pty.read_for(Duration::from_millis(500));
+    let header_rows = painted_at(pty.raw(), b"> .info", info_at);
+    let &(header_row, 1) = header_rows.first().unwrap_or_else(|| {
+        panic!(
+            "`> .info` was never painted at a column-one cursor position:\n{}",
+            strip_ansi(&String::from_utf8_lossy(&pty.raw()[info_at..]))
+        )
+    }) else {
+        panic!("`> .info` was painted mid-row: {header_rows:?}");
+    };
+    let first_rows = painted_at(pty.raw(), b"model", info_at);
+    assert!(
+        first_rows.contains(&(header_row + 1, 1)),
+        "the table's first row was not painted directly under `> .info` (row \
+         {header_row}); `model` was painted at {first_rows:?}:\n{}",
+        strip_ansi(&String::from_utf8_lossy(&pty.raw()[info_at..]))
+    );
     pty.send(b"\x04").unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
 
@@ -350,6 +373,37 @@ fn count(haystack: &[u8], needle: &[u8]) -> usize {
         .windows(needle.len())
         .filter(|w| *w == needle)
         .count()
+}
+
+/// The 1-based (row, col) of the cursor-position sequence (`CSI r;c H`)
+/// that placed each occurrence of `needle` from `from` on: the painter
+/// positions the cursor before the first changed cell of a row, so this
+/// is the screen row a piece of text was drawn on.
+fn painted_at(haystack: &[u8], needle: &[u8], from: usize) -> Vec<(u16, u16)> {
+    let mut positions = Vec::new();
+    let mut at = from;
+    while let Some(hit) = find(haystack, needle, at) {
+        let mut end = hit;
+        while let Some(start) = rfind(&haystack[..end], b"\x1b[") {
+            let params: Vec<u8> = haystack[start + 2..hit]
+                .iter()
+                .copied()
+                .take_while(|b| b.is_ascii_digit() || *b == b';')
+                .collect();
+            if haystack.get(start + 2 + params.len()) == Some(&b'H')
+                && let Some((row, col)) = std::str::from_utf8(&params)
+                    .ok()
+                    .and_then(|p| p.split_once(';'))
+                && let (Ok(row), Ok(col)) = (row.parse(), col.parse())
+            {
+                positions.push((row, col));
+                break;
+            }
+            end = start;
+        }
+        at = hit + 1;
+    }
+    positions
 }
 
 /// The UI hides the cursor on every frame and never positions one, so
