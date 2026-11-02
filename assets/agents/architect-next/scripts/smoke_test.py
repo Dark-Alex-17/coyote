@@ -1203,6 +1203,12 @@ if MULTI_IS_GROUPS:
     u = gates.review_route(base_state(**WATCH, **GROUP, review_status="approved"))
     check("review watch: review_route approved in group mode -> the deferred group reset runs now -> select_tasks",
           u["_next"] == "select_tasks" and u["closeout_done_for"] == "g1" and u["pr_number"] == "" and u["review_watching"] is False)
+    g2 = base_state(**{**WATCH, **GROUP, "review_seen": ["comment:I9"], "review_fix_rounds": 2, **u})
+    g2.update(pr_number="100", closeout_unit="g2")
+    u2 = gates.flip_ready(g2)
+    check("review watch: group mode watches each PR - the next group's flip_ready arms a fresh watch, earlier outcomes kept",
+          u2["_next"] == "review_poll" and u2["review_watching"] is True and u2["review_seen"] == [] and u2["review_fix_rounds"] == 0
+          and "review_outcomes" not in u2 and g2["review_outcomes"] == {"99": "approved"} and ledgered(u2, "review-watch: PR #100 watching reviews"), u2)
 
 THREAD = {"id": "TH1", "isResolved": False, "path": "src/a.go", "comments": {"nodes": [{"id": "C1", "body": "rename this var", "author": {"login": "bob"}}]}}
 RESOLVED = {"id": "TH2", "isResolved": True, "path": "src/b.go", "comments": {"nodes": [{"id": "C2", "body": "old note", "author": {"login": "bob"}}]}}
