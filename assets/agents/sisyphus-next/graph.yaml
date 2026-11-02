@@ -282,6 +282,7 @@ initial_state:
   pr_review_pending: []
   pr_review_reply_pending: []
   pr_review_addressed: []
+  pr_review_perms: {}
   # --- report ---
   report: ''
   summary: ''

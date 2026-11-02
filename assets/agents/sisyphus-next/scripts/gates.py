@@ -2047,8 +2047,10 @@ OWN_MARKER = "<!-- sisyphus-next:own -->"
 OWN_COMMENT_PREFIXES = ("## Update @", "## Review round")
 # A marked reply already matches on the marker, so only the bare form needs its own pattern.
 OWN_ADDRESSED_RE = re.compile(r"Addressed in [0-9a-f]{40}")
-# Only these accounts may steer the coder; anyone else's comment goes to the owner with its body withheld.
+# Only these accounts may steer the coder; anyone else's comment goes to the owner with its body withheld. In the
+# review watch the association is only a pre-filter: besides OWNER, the account also needs write access to the repo.
 TRUSTED_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR")
+TRUSTED_PERMISSIONS = ("admin", "maintain", "write")
 
 
 def _nodes(v):
@@ -2090,15 +2092,60 @@ def _normalize_pr_review(raw):
     }
 
 
-def _own_comment(body, association):
+def _association_trusted(c):
+    return c.get("association") in TRUSTED_ASSOCIATIONS
+
+
+def _read_permission(state, login):
+    """The login's repo permission word, or "" when the read fails or names none."""
+    root = state.get("git_root") or state.get("project_dir") or "."
+    cmd = os.environ.get("SISYPHUS_GH_PERM_CMD")
+    try:
+        if cmd:
+            # Operator-environment test seam run through the shell; it carries the same trust as the process environment.
+            p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=GH_CALL_SECS,
+                               env={**os.environ, "SISYPHUS_LOGIN": login})
+        else:
+            p = subprocess.run(["gh", "api", f"repos/{{owner}}/{{repo}}/collaborators/{login}/permission",
+                                "--jq", ".permission"], cwd=root, capture_output=True, text=True, timeout=GH_CALL_SECS)
+        if p.returncode != 0:
+            return ""
+        word = p.stdout.strip()
+        if word.startswith("{"):
+            doc = json.loads(word)
+            word = str(doc.get("permission") or doc.get("role_name") or "")
+        word = word.strip().lower()
+        return word if re.fullmatch(r"[a-z_]+", word) else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _author_trusted(state, u, login, association):
+    """OWNER, or a trusted association whose repo permission is write or above; read once per login per run."""
+    if association == "OWNER":
+        return True
+    if association not in TRUSTED_ASSOCIATIONS:
+        return False
+    perms = u.setdefault("pr_review_perms", dict(as_dict(state.get("pr_review_perms"))))
+    if login not in perms:
+        word = _read_permission(state, login)
+        perms[login] = word in TRUSTED_PERMISSIONS
+        ledger(state, u, f"review-watch: PR #{_pr_ref(state)} {login} permission {word or 'unreadable'}")
+    return perms[login]
+
+
+def _own_comment(body, association, trusted=None):
+    """`trusted`, when given, is a zero-argument check on the author that must also pass."""
     body = (body or "").strip()
     return association in TRUSTED_ASSOCIATIONS and (
-        OWN_MARKER in body or body.startswith(OWN_COMMENT_PREFIXES) or bool(OWN_ADDRESSED_RE.fullmatch(body)))
+        OWN_MARKER in body or body.startswith(OWN_COMMENT_PREFIXES) or bool(OWN_ADDRESSED_RE.fullmatch(body))) and (
+        trusted is None or trusted())
 
 
-def _pr_review_items(doc, seen):
+def _pr_review_items(doc, seen, trusted=_association_trusted):
     """New review items as (trusted, untrusted); an untrusted item names its author but carries no body.
 
+    `trusted` decides each comment's and review's author, so threads, reviews and comments share one verdict.
     A thread with fresh comments from both trusted and untrusted authors yields both: the trusted item carries only
     the trusted comments, and the untrusted entry, id `<thread id>#untrusted`, carries only the strangers' ids.
     """
@@ -2108,8 +2155,8 @@ def _pr_review_items(doc, seen):
         if t.get("isResolved"):
             continue
         fresh = [c for c in t.get("comments") or []
-                 if c.get("id") not in seen and not _own_comment(c.get("body"), c.get("association"))]
-        strangers = [c for c in fresh if c.get("association") not in TRUSTED_ASSOCIATIONS]
+                 if c.get("id") not in seen and not _own_comment(c.get("body"), c.get("association"), lambda: trusted(c))]
+        strangers = [c for c in fresh if not trusted(c)]
         stranger_ids = [c.get("id") for c in strangers]
         vouched = [c for c in fresh if c.get("id") not in stranger_ids]
         thread = {"id": t.get("id"), "kind": "thread", "path": t.get("path", ""), "line": t.get("line")}
@@ -2126,7 +2173,7 @@ def _pr_review_items(doc, seen):
             found.append((entry, strangers[0]))
     for r in doc.get("reviews") or []:
         body = (r.get("body") or "").strip()
-        if r.get("id") in seen or _own_comment(body, r.get("association")):
+        if r.get("id") in seen or _own_comment(body, r.get("association"), lambda: trusted(r)):
             continue
         if r.get("state") == "CHANGES_REQUESTED":
             body = body or "Changes requested (see the review threads)"
@@ -2134,23 +2181,23 @@ def _pr_review_items(doc, seen):
             continue
         found.append(({"id": r.get("id"), "kind": "review", "path": "", "line": None, "author": r.get("author", ""),
                        "body": body, "url": "", "seen_ids": [r.get("id")]},
-                      None if r.get("association") in TRUSTED_ASSOCIATIONS else r))
+                      None if trusted(r) else r))
     for c in doc.get("comments") or []:
         body = (c.get("body") or "").strip()
-        if c.get("id") in seen or not body or _own_comment(body, c.get("association")):
+        if c.get("id") in seen or not body or _own_comment(body, c.get("association"), lambda: trusted(c)):
             continue
         found.append(({"id": c.get("id"), "kind": "comment", "path": "", "line": None, "author": c.get("author", ""),
                        "body": body, "url": "", "seen_ids": [c.get("id")]},
-                      None if c.get("association") in TRUSTED_ASSOCIATIONS else c))
-    trusted = [i for i, stranger in found if stranger is None]
+                      None if trusted(c) else c))
+    vouched_items = [i for i, stranger in found if stranger is None]
     untrusted = [{"id": i["id"], "kind": i["kind"], "url": stranger.get("url") or i["url"], "path": i["path"],
                   "line": i["line"], "author": stranger.get("author", ""), "association": stranger.get("association", ""),
                   "seen_ids": i["seen_ids"], **({"thread_id": i["thread_id"]} if "thread_id" in i else {})}
                  for i, stranger in found if stranger is not None]
-    return trusted, untrusted
+    return vouched_items, untrusted
 
 
-def _pr_review_status(doc, items):
+def _pr_review_status(doc, items, trusted=_association_trusted):
     state = doc.get("state")
     if state == "MERGED":
         return "merged"
@@ -2158,7 +2205,7 @@ def _pr_review_status(doc, items):
         return "closed"
     decision = doc.get("reviewDecision") or ""
     verdicts = [r.get("state") for r in doc.get("reviews") or []
-                if r.get("state") in ("APPROVED", "CHANGES_REQUESTED") and r.get("association") in TRUSTED_ASSOCIATIONS]
+                if r.get("state") in ("APPROVED", "CHANGES_REQUESTED") and trusted(r)]
     if decision == "APPROVED" or (not decision and verdicts and verdicts[-1] == "APPROVED"):
         return "approved"
     return "comments" if items else "pending"
@@ -2206,10 +2253,14 @@ def pr_review_poll(state):
             u["_next"] = "pr_review_poll"
         return u
     u["pr_review_poll_fails"] = 0
-    items, untrusted = _pr_review_items(doc, as_list(state.get("pr_review_seen")))
+
+    def trusted(c):
+        return _author_trusted(state, u, c.get("author"), c.get("association"))
+
+    items, untrusted = _pr_review_items(doc, as_list(state.get("pr_review_seen")), trusted)
     u["pr_review_items"] = items
     u["pr_review_untrusted"] = untrusted
-    u["pr_review_status"] = _pr_review_status(doc, items + untrusted)
+    u["pr_review_status"] = _pr_review_status(doc, items + untrusted, trusted)
     u["_next"] = "pr_review_poll" if u["pr_review_status"] == "pending" else "pr_review_route"
     return u
 
@@ -2296,7 +2347,7 @@ def _untrusted_judgment(state, u, untrusted):
     listed = "\n".join(f"- {_item_ref(i)} by {i.get('author', '')} ({i.get('association', '')})" for i in untrusted)
     return raise_escalation(state, u, escalation(
         "pr_review_owner_judgment",
-        "PR review comment(s) from accounts outside OWNER/MEMBER/COLLABORATOR need owner judgment "
+        "PR review comment(s) from accounts outside OWNER/MEMBER/COLLABORATOR or without write access need owner judgment "
         f"(bodies withheld; read them on GitHub):\n{listed}",
         [option("Skip them and keep watching"), option("Stop watching and report")],
         hard_trigger=True, data={"untrusted": untrusted}))
