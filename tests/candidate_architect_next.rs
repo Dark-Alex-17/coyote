@@ -47,7 +47,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "architect-next";
-const SMOKE_FLOOR: usize = 365;
+const SMOKE_FLOOR: usize = 423;
 const MATRIX_FLOOR: usize = 53;
 const _: () = assert!(MATRIX_FLOOR >= 53, "the matrix floor never drops below 53");
 
@@ -1011,6 +1011,17 @@ fn names_of(vars: &[serde_yaml::Value]) -> Vec<&str> {
     vars.iter().map(|v| v["name"].as_str().unwrap()).collect()
 }
 
+/// Candidate variables the prose twin has no counterpart for. Every mirror
+/// check compares the candidate's list less these against the twin's.
+const GRAPH_ONLY_VARIABLES: &[&str] = &["pr_tracking"];
+
+fn mirrored(vars: &[serde_yaml::Value]) -> Vec<serde_yaml::Value> {
+    vars.iter()
+        .filter(|v| !GRAPH_ONLY_VARIABLES.contains(&v["name"].as_str().unwrap()))
+        .cloned()
+        .collect()
+}
+
 fn description_of<'a>(vars: &'a [serde_yaml::Value], name: &str) -> &'a str {
     vars.iter()
         .find(|v| v["name"].as_str() == Some(name))
@@ -1050,13 +1061,14 @@ fn build_lock_is_declared_at_the_prose_twins_position() {
     );
 }
 
-/// The candidate declares the prose twin's variables in the same order, name
-/// for name and `default` for `default`, with a missing default counted as
-/// null on both sides. `check_session_block.sh` runs the same comparison but
-/// needs the mikefarah `yq`; this one runs without it.
+/// The candidate, less its graph-only variables, declares the prose twin's
+/// variables in the same order, name for name and `default` for `default`,
+/// with a missing default counted as null on both sides.
+/// `check_session_block.sh` runs the same comparison but needs the mikefarah
+/// `yq`; this one runs without it.
 #[test]
 fn variables_mirror_the_prose_twin_name_for_name_and_default_for_default() {
-    let candidate = variable_list(&candidate_dir().join("graph.yaml"));
+    let candidate = mirrored(&variable_list(&candidate_dir().join("graph.yaml")));
     let prose = variable_list(&agents_dir().join("architect/config.yaml"));
     assert_eq!(
         names_of(&candidate),
@@ -1078,6 +1090,44 @@ fn variables_mirror_the_prose_twin_name_for_name_and_default_for_default() {
             "{name}: the default drifted from the prose twin's"
         );
     }
+}
+
+/// `pr_tracking` is declared in the graph with default `ci`, it is the only
+/// candidate variable the prose twin lacks, and `check_session_block.sh`
+/// exempts exactly the same set from its mirror.
+#[test]
+fn pr_tracking_is_the_only_graph_only_variable() {
+    let candidate = variable_list(&candidate_dir().join("graph.yaml"));
+    let prose = variable_list(&agents_dir().join("architect/config.yaml"));
+    let twin = names_of(&prose);
+    let extra: Vec<&str> = names_of(&candidate)
+        .into_iter()
+        .filter(|n| !twin.contains(n))
+        .collect();
+    assert_eq!(
+        extra, GRAPH_ONLY_VARIABLES,
+        "the candidate's variables beyond the prose twin's"
+    );
+    let tracking = candidate
+        .iter()
+        .find(|v| v["name"].as_str() == Some("pr_tracking"))
+        .expect("graph.yaml declares no pr_tracking variable");
+    assert_eq!(
+        tracking["default"].as_str(),
+        Some("ci"),
+        "pr_tracking default"
+    );
+
+    let quoted: Vec<String> = GRAPH_ONLY_VARIABLES
+        .iter()
+        .map(|n| format!("\"{n}\""))
+        .collect();
+    let line = format!("GRAPH_ONLY='[{}]'", quoted.join(", "));
+    let check = fs::read_to_string(candidate_dir().join("scripts/check_session_block.sh")).unwrap();
+    assert!(
+        check.lines().any(|l| l == line),
+        "check_session_block.sh must exempt exactly {GRAPH_ONLY_VARIABLES:?} via `{line}`"
+    );
 }
 
 /// Lines the toolchain pattern matches without naming a toolchain command,
@@ -2136,10 +2186,10 @@ fn readme_toolchain_census_matches_the_live_grep() {
     );
     assert_eq!(
         gates_lines,
-        vec![41, 2628, 2637],
+        vec![42, 2663, 2672],
         "the gates.py toolchain hits moved; update the README census and its prose"
     );
-    for line in [2628, 2637] {
+    for line in [2663, 2672] {
         assert!(
             text.contains(&format!("`gates.py:{line}`")) || text.contains(&format!("`:{line}`")),
             "the README prose must cite gates.py:{line}"
@@ -2514,9 +2564,9 @@ fn info_by_name_lists_the_graph_and_seats_a_build_lock_override() {
 }
 
 /// The variables block the binary renders for `coyote -a architect-next
-/// --info` is exactly the prose twin's variable list, name for name and in
-/// order (`build_lock` included), so a consumer sees no variable the twin
-/// lacks and misses none it has.
+/// --info`, less the graph-only variables, is exactly the prose twin's
+/// variable list, name for name and in order (`build_lock` included), so a
+/// consumer sees no other variable the twin lacks and misses none it has.
 #[test]
 fn info_by_name_lists_exactly_the_prose_twins_variables_in_order() {
     let scratch = scratch_dir("info-vars");
@@ -2525,6 +2575,7 @@ fn info_by_name_lists_exactly_the_prose_twins_variables_in_order() {
     let listed: Vec<&str> = info_variables(&stdout)
         .into_iter()
         .map(|l| l.split_once(':').map_or(l, |(name, _)| name))
+        .filter(|name| !GRAPH_ONLY_VARIABLES.contains(name))
         .collect();
     let prose = variable_list(&agents_dir().join("architect/config.yaml"));
     let twin = names_of(&prose);
@@ -3815,7 +3866,8 @@ const FROZEN_GRAPH_BOUNDS: &[(&str, i64)] = &[
 
 /// Every integer field of every node in the shipped baseline (`timeout`,
 /// `max_attempts`, `max_iterations`, `max_concurrency`), the staging values
-/// plus the frozen budgets row; a node absent here declares none.
+/// plus the frozen budgets row and the review watch nodes; a node absent here
+/// declares none.
 const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("amend_plan", "max_iterations", 20),
     ("amend_plan", "timeout", 1800),
@@ -3882,6 +3934,10 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("promote_tasks", "max_iterations", 45),
     ("promote_tasks", "timeout", 3600),
     ("promote_verify", "timeout", 600),
+    ("review_apply", "timeout", 120),
+    ("review_poll", "timeout", 900),
+    ("review_triage", "timeout", 600),
+    ("review_update", "timeout", 300),
     ("run_adversary", "max_attempts", 1),
     ("run_adversary", "timeout", 7200),
     ("run_gauntlet", "max_attempts", 1),
@@ -3924,6 +3980,11 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
     "owner_polls",
     "promote_retries",
     "reask_rounds",
+    "review_fix_rounds",
+    "review_poll_fails",
+    "review_polls",
+    "review_rounds",
+    "review_started_at",
     "wave_fix_rounds",
     "wave_index",
 ];
@@ -3944,6 +4005,15 @@ const FROZEN_SCRIPT_BOUNDS: &[(&str, &str, &str, i64)] = &[
     ("OWNER_POLL_MINUTES", "", "25", 25),
     ("OWNER_WAIT_MINUTES", "", "30", 30),
     ("RERUN_ONCE", "", "1", 1),
+    (
+        "REVIEW_MAX_POLLS",
+        "",
+        "REVIEW_WALL_SECS // REVIEW_POLL_SLEEP",
+        144,
+    ),
+    ("REVIEW_MAX_ROUNDS", "", "STRIKE_LIMIT", 3),
+    ("REVIEW_POLL_SLEEP", "", "600", 600),
+    ("REVIEW_WALL_SECS", "", "86400", 86400),
     ("STRIKE_LIMIT", "", "3", 3),
     ("TAIL_CHARS", "", "6000", 6000),
     ("VERIFY_CMD_SECS", "", "900", 900),
@@ -4075,12 +4145,14 @@ fn graph_and_gate_budgets_equal_the_frozen_baseline() {
     );
 }
 
-/// The engine's per-node visit cap outlasts one full CI watch: `ci_poll`
-/// revisits itself up to `CI_MAX_ROUNDS` times before it routes the timeout,
-/// so a cap at or below that value ends the watch as an engine error. The
-/// cap covers four group PRs, each watched to that wall cap.
+/// The engine's per-node visit cap outlasts every poll loop `_lib` bounds:
+/// `ci_poll` revisits itself up to `CI_MAX_ROUNDS` times and `review_poll` up
+/// to `REVIEW_MAX_POLLS` times per PR before each routes its timeout, so a
+/// cap at or below either value ends the watch as an engine error. The cap
+/// covers four group PRs, each watched to both wall caps, and also stays
+/// above the review fix-round bound `REVIEW_MAX_ROUNDS`.
 #[test]
-fn loop_cap_exceeds_the_ci_poll_rounds_lib_computes() {
+fn loop_cap_exceeds_the_ci_and_review_poll_rounds_lib_computes() {
     let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
     let shipped: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
     let cap = shipped["settings"]["max_loop_iterations"]
@@ -4090,25 +4162,39 @@ fn loop_cap_exceeds_the_ci_poll_rounds_lib_computes() {
     let Some(python) = python3() else {
         return;
     };
-    let scratch = scratch_dir("lib-ci-rounds");
+    let scratch = scratch_dir("lib-poll-rounds");
     let mut cmd = battery(&python, &scratch);
     cmd.current_dir(candidate_dir().join("scripts")).args([
         "-c",
-        "import json, _lib\nprint(json.dumps({\"CI_MAX_ROUNDS\": _lib.CI_MAX_ROUNDS}))\n",
+        "import json, _lib\nprint(json.dumps({k: getattr(_lib, k) for k in \
+         (\"CI_MAX_ROUNDS\", \"REVIEW_MAX_POLLS\", \"REVIEW_MAX_ROUNDS\")}))\n",
     ]);
-    let out = output_with_timeout(&mut cmd, GATE_LIMIT, "_lib CI_MAX_ROUNDS");
+    let out = output_with_timeout(&mut cmd, GATE_LIMIT, "_lib poll bounds");
     assert_no_bytecode_under_candidate();
-    let values = parse_json_stdout("_lib CI_MAX_ROUNDS", &out);
-    let rounds = values["CI_MAX_ROUNDS"].as_i64().unwrap();
+    let values = parse_json_stdout("_lib poll bounds", &out);
+    let bound = |name: &str| values[name].as_i64().unwrap();
+    let rounds = bound("CI_MAX_ROUNDS");
     assert!(
         cap >= 4 * rounds,
         "settings.max_loop_iterations {cap} does not cover four group PRs of CI_MAX_ROUNDS {rounds} polls each"
     );
+    let polls = bound("REVIEW_MAX_POLLS");
+    assert!(
+        cap >= 4 * polls,
+        "settings.max_loop_iterations {cap} does not cover four group PRs of REVIEW_MAX_POLLS {polls} polls each"
+    );
+    for name in ["REVIEW_MAX_POLLS", "REVIEW_MAX_ROUNDS"] {
+        assert!(
+            bound(name) < cap,
+            "{name} {} is not below settings.max_loop_iterations {cap}",
+            bound(name)
+        );
+    }
 }
 
 /// How each llm node's output schema carries the `anomalies` channel in the
-/// staging baseline: `Plain` is the optional string-array property,
-/// `NoSchema` is a node with no `output_schema` at all.
+/// staging baseline plus `review_triage`: `Plain` is the optional
+/// string-array property, `NoSchema` is a node with no `output_schema` at all.
 #[derive(Clone, Copy, Debug)]
 enum AnomaliesChannel {
     Plain,
@@ -4128,6 +4214,7 @@ const FROZEN_LLM_ANOMALIES: &[(&str, AnomaliesChannel)] = &[
     ("pr_body_fix", AnomaliesChannel::NoSchema),
     ("pr_summary", AnomaliesChannel::Plain),
     ("promote_tasks", AnomaliesChannel::NoSchema),
+    ("review_triage", AnomaliesChannel::Plain),
     ("summarize_run", AnomaliesChannel::NoSchema),
     ("task_done", AnomaliesChannel::NoSchema),
 ];
@@ -4788,9 +4875,11 @@ fn census_files(root: &Path) -> BTreeSet<String> {
 
 /// The README's recorded census is a live `diff -u` against the staging
 /// tree: the same set of differing files, each with the hunk count it
-/// states, and no file on one side only. The staging tree lives outside this
-/// repo, so the check runs only when `ARCHITECT_NEXT_STAGING_DIR` is set, and
-/// fails when that value is not a directory.
+/// states. A file only the candidate has is diffed against `/dev/null`, so it
+/// must be listed too; a staging file the candidate lacks fails. The staging
+/// tree lives outside this repo, so the check runs only when
+/// `ARCHITECT_NEXT_STAGING_DIR` is set, and fails when that value is not a
+/// directory.
 #[test]
 fn readme_census_matches_a_live_diff_against_the_staging_tree() {
     let staging = std::env::var_os("ARCHITECT_NEXT_STAGING_DIR").filter(|v| !v.is_empty());
@@ -4805,19 +4894,23 @@ fn readme_census_matches_a_live_diff_against_the_staging_tree() {
     );
     let ours = census_files(&candidate_dir());
     let theirs = census_files(&staging);
-    let only_ours: Vec<&String> = ours.difference(&theirs).collect();
     let only_staging: Vec<&String> = theirs.difference(&ours).collect();
     assert!(
-        only_ours.is_empty() && only_staging.is_empty(),
-        "files on one side only: candidate {only_ours:?}, staging {only_staging:?}"
+        only_staging.is_empty(),
+        "staging files the candidate lacks: {only_staging:?}"
     );
 
     let mut live = BTreeMap::new();
     for rel in &ours {
+        let base = if theirs.contains(rel) {
+            staging.join(rel)
+        } else {
+            PathBuf::from("/dev/null")
+        };
         let out = output_with_timeout(
             Command::new("diff")
                 .arg("-u")
-                .arg(staging.join(rel))
+                .arg(base)
                 .arg(candidate_dir().join(rel)),
             GATE_LIMIT,
             "diff -u",

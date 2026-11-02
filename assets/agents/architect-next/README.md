@@ -28,7 +28,8 @@ not in this repo).
   state.json, tasks.json, research.md, reports/, rounds/, decisions ledger, anomalies and
   report. A prompt containing `Architect run id: <id>` re-enters that run.
 
-Variables mirror `architect` (names and defaults identical). The session block routes
+Variables mirror `architect` (names and defaults identical), except the graph-only
+`pr_tracking` (the `pr_tracking` review watch row). The session block routes
 work to the graph and conversation to the `engineer` chat lane (`chat_agent_for: architect`).
 
 ## Landed-upstream adjustments
@@ -51,51 +52,63 @@ below. Later landings add their own rows.
 | engine facts | this README | agent-node resume: not available by decision (2026-10-28); E1 stays as the artifact contract; G6 escalation_timeout open |
 | battery env hygiene | `scripts/smoke_test.py`, `scripts/mode_matrix.py`, `tests/candidate_architect_next.rs` | both batteries drop every `LLM_AGENT_VAR_*` variable at start so they cannot inherit the agent variables of the process running them (`_lib.var` reads the mode variables through them), drop `ARCHITECT_CORE_TOOLS`, `ARCHITECT_ASK_OWNER_BIN`, `ARCHITECT_SLACK_PING_BIN` and every `ARCHITECT_GH_*_CMD` so a caller's tool overrides cannot replace the gates' own `tools.sh`, `ask_owner`, `slack_ping` and `gh` calls, and drop `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY` and `GIT_COMMON_DIR` the same way, so a run from a git hook (which exports them) commits in the scratch repositories, not the caller's; the smoke battery's recording `tools.sh` restores any prior `ARCHITECT_CORE_TOOLS` when its call returns. Both also drop `GIT_CONFIG_PARAMETERS` and every inherited `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_*` and `GIT_CONFIG_VALUE_*`, so a caller's command-line git config cannot reach the scratch repositories, then set `GIT_CONFIG_COUNT=1`, `GIT_CONFIG_KEY_0=user.useConfigOnly` and `GIT_CONFIG_VALUE_0=true`, and set `GIT_CONFIG_NOSYSTEM=1` and `GIT_CONFIG_GLOBAL=/dev/null` so a direct run ignores the system and user git config (signing, hooks) as well. After those drops both set a fixed `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME` and `GIT_COMMITTER_EMAIL`, which every gate and each battery's own git helper inherits: the scratch `HOME` holds no git identity, and git refuses to guess one when `user.useConfigOnly` is set or when the host name has no dot (it cannot build an email), so without the fixed identity every gate commit would fail on such a host; setting `user.useConfigOnly` makes every host behave that way. The Rust wrapper strips the repository variables from every git, script and binary command it starts and the agent variables and tool overrides from every script and binary command; it builds its scratch repository and runs the review-gauntlet scripts with `GIT_CONFIG_NOSYSTEM=1` and `GIT_CONFIG_GLOBAL=/dev/null`, so no system or user git config (signing, hooks) applies, and runs the batteries with the same `GIT_CONFIG_*` drop and `user.useConfigOnly` setting. Every binary command it starts drops every inherited `COYOTE_*` variable (`COYOTE_PROVIDER`, `COYOTE_PLATFORM`, `COYOTE_WORKSPACE_CONFIG_DIR`, `COYOTE_CONFIG_FILE` and the rest) before it sets its own `COYOTE_CONFIG_DIR` and `COYOTE_CACHE_DIR`. Every scratch config dir it starts the binary from holds an `mcp.json` that defines no server: the bundled one launches `engineer`'s `ddg-search` through `uvx`, which CI hosts lack, and the engine never installs over an existing file |
 | ledger rollup scope | `scripts/gates.py` `hygiene_create` / `_group_members` / `_skip_empty_group` / `group_closeout` / `pr_body` / `_collect` / `_completed_tasks_dir`, `scripts/smoke_test.py` | every `collect_ledger_lines` call passes `--plan`: the prose `architect/tools.sh` declares it required and hands it to `plan_tasks.py`, which exits `plan not found` without it, so staging's calls always fell back to `(collect_ledger_lines unavailable: ...)`. In multi-PR mode the group-scoped calls (`hygiene_create`'s starting ledger and `pr_body`'s `assemble_pr_body`) also pass `--tasks <group members>`, as the prose architect does, where the members are the closing group's complete tasks (a skipped, failed or parked member is not in the completed task store, so naming it would only cost a body fix round); the run report (`_collect`) passes no `--tasks` and stays run-scoped, because it covers every PR group. A group with no complete task makes no group-scoped call, since an empty `--tasks` would widen it to the whole plan: `group_closeout` skips that group's PR with a ledger line and a follow-up naming the group, then moves to the next group (or finishes the plan at run scope); `pr_body` skips an empty group the same way and `hygiene_create` skips its hygiene chore. Under the dirstate task store all three read the `completed` task dir, where complete tasks live. The smoke battery records each call's arguments and runs the real `tools.sh` over a scratch plan and task log |
-| frozen budgets | `graph.yaml` `settings.max_loop_iterations` and `batch_gauntlet_build`, `tests/candidate_architect_next.rs` | the engine counts `max_loop_iterations` per node per run and never resets it, and `ci_poll` revisits itself up to `CI_MAX_ROUNDS` (240) times per PR before it routes `ci_status=timeout`, so staging's cap of 100 ended a long CI watch as an engine error; the cap is now 1000, still a finite defect detector, which covers four group PRs each watched to the 240-poll wall cap, and the wrapper pins it at four times or more the `CI_MAX_ROUNDS` that `_lib.py` computes. `batch_gauntlet_build` declared no `timeout:`; it only sets the batch verify scope and routes to `verify_gate`, so it now carries `verify_gate`'s `timeout: 60` |
-| gh command seams | `scripts/gates.py` | `ARCHITECT_GH_COMMENT_CMD`, `ARCHITECT_GH_CREATE_CMD`, `ARCHITECT_GH_CHECKS_CMD`, `ARCHITECT_GH_LOG_CMD` and `ARCHITECT_GH_READY_CMD` replace the gates' `gh pr comment`, `gh pr create`, `gh pr checks`, `gh run view --log-failed` and `gh pr ready` calls; a set checks seam also skips `gh run rerun`. Each runs its value from the operator's own environment through `bash -c` (the checks seam through `/bin/sh -c`). They are test and operator seams, documented rather than gated: both batteries and the Rust wrapper drop any inherited value before they set their own |
+| frozen budgets | `graph.yaml` `settings.max_loop_iterations` and `batch_gauntlet_build`, `tests/candidate_architect_next.rs` | the engine counts `max_loop_iterations` per node per run and never resets it, and `ci_poll` revisits itself up to `CI_MAX_ROUNDS` (240) times per PR before it routes `ci_status=timeout`, so staging's cap of 100 ended a long CI watch as an engine error; the cap is now 1000, still a finite defect detector, which covers four group PRs each watched to the 240-poll wall cap, and the wrapper pins it at four times or more the `CI_MAX_ROUNDS` that `_lib.py` computes. `batch_gauntlet_build` declared no `timeout:`; it only sets the batch verify scope and routes to `verify_gate`, so it now carries `verify_gate`'s `timeout: 60`. `review_poll` revisits itself up to `REVIEW_MAX_POLLS` (144) times per PR, so 1000 also covers four group PRs each watched to the review wall cap, and the pin now checks both, plus `REVIEW_MAX_POLLS` and `REVIEW_MAX_ROUNDS` staying below the cap |
+| gh command seams | `scripts/gates.py` | `ARCHITECT_GH_COMMENT_CMD`, `ARCHITECT_GH_CREATE_CMD`, `ARCHITECT_GH_CHECKS_CMD`, `ARCHITECT_GH_LOG_CMD`, `ARCHITECT_GH_READY_CMD`, `ARCHITECT_GH_REVIEWS_CMD` and `ARCHITECT_GH_RESOLVE_CMD` replace the gates' `gh pr comment`, `gh pr create`, `gh pr checks`, `gh run view --log-failed` and `gh pr ready` calls, the `gh api graphql` review read and the `gh api graphql` thread reply and resolve mutations; a set checks seam also skips `gh run rerun`. Each runs its value from the operator's own environment through `bash -c` (the checks and reviews seams through `/bin/sh -c`; the resolve seam gets the review thread id as `$1`). They are test and operator seams, documented rather than gated: both batteries and the Rust wrapper drop any inherited value before they set their own |
+| `pr_tracking` review watch | `graph.yaml` `variables:` / `initial_state` / `review_poll`, `review_route`, `review_triage`, `review_apply`, `review_update` and the `ci_route` description; `scripts/_lib.py`; `scripts/gates.py` `intake` / `apply_answer` / `fix_done` / `ci_route` / `flip_ready` / `review_poll` / `review_route` / `review_apply` / `review_update` / `final_report`; the new `scripts/review_poll.py`, `review_route.py`, `review_apply.py` and `review_update.py` entry shims; `scripts/audit_graph.py` bound labels; `scripts/check_session_block.sh`; `scripts/smoke_test.py`; `tests/candidate_architect_next.rs` | a new variable `pr_tracking`, default `ci`. `ci` is today's routing unchanged: the green PR is flipped ready and the plan finishes (or the next group starts), `mode_line` carries no `pr_tracking`, and the mode matrix still walks 53/53 without it; an unknown value is a `mode_invalid` escalation. `review` keeps watching the PR after the flip: `flip_ready` arms the watch and routes to `review_poll`, a bounded self-loop (one read every `REVIEW_POLL_SLEEP`, 600s) over the PR's state, approval, reviews, issue comments and unresolved threads that skips the watch's own `## Update @` and `## Review round` comments and every item already seen; `review_route` sends new items to the `review_triage` llm node, which marks each as fix, owner or none (owner when unsure; an item it leaves out counts as owner); `review_apply` turns the fix items into a fix round on the existing fix path (`fix_round`, the delegate, `fix_done`), and `fix_done` returns to `review_update`, which replies `Addressed in <sha>` on each addressed thread and resolves it, posts a `## Update @ <sha>` comment mapping each item to the head SHA and naming the items left unaddressed, then re-watches CI through `ci_poll`; `ci_route` green while the watch runs goes back to `review_poll` instead of flipping again. Stop conditions: approved (GitHub reports the PR approved, or an APPROVED review sits on the head commit) stops the watch, reports the outcome and continues; comments get a fix round, a push, a CI re-watch and then the watch again; CI red with the fix budget spent, or a CI infra failure, raises the existing `ci_exhausted` or `ci_infra` escalation, and leaving the PR there finishes the plan, never the next group; a PR closed externally stops the watch with a follow-up and finishes the plan, a PR merged externally stops it and continues; the review round cap (`REVIEW_MAX_ROUNDS`, 3 fix rounds per PR, `review_round_cap`) and the wall-clock and poll caps (`REVIEW_WALL_SECS` 86400s, `REVIEW_MAX_POLLS` 144, or `CI_POLL_FAILS` consecutive read errors, `review_exhausted`) escalate; a comment that needs the owner's judgment escalates as a hard trigger (`review_owner_judgment`). Every event is a ledger line `review-watch: PR #<n> ...` and a `slack_ping`, and the run report gains a `## Review watch` section with each PR's outcome. In group mode each group PR is watched and the next group starts only after that watch ends: stacking would let the next group start earlier, but a review fix pushed to group N would then need a restack of group N+1. `ci_rounds` stays cumulative per PR across review fix rounds, while the CI poll counters and wall clock are re-armed for each re-watch. The watch is an in-graph poll self-loop because a graph node cannot leave a background child running past its own exit: llm nodes reap their jobs and the pending-agent guardrail cancels spawned agents. `pr_tracking` is graph-only (the prose `architect/config.yaml` has no such variable), so `scripts/check_session_block.sh` and the Rust mirror checks compare the candidate's variables less the declared graph-only set (`pr_tracking`) against the prose twin, and a separate pin holds that `pr_tracking` is declared with default `ci` and is the only graph-only variable |
 
 Recorded census against the staging tree (files that differ; hunks per file as counted by
-`diff -u <staging file> <file> | grep -c '^@@'`):
+`diff -u <staging file> <file> | grep -c '^@@'`, with `/dev/null` standing in for a staging
+file that does not exist):
 
 ```
-graph.yaml                6 hunks   (description provenance; letter-digit labels dropped from the description's cutover sentence; project_dir em dash; pr_strategy em dash + build_lock + task_granularity em dash + max_loop_iterations 1000 with its CI_MAX_ROUNDS comment; the initial_state.skipped_group_indexes: [] seed; batch_gauntlet_build timeout: 60)
-scripts/_lib.py           3 hunks   (RESUME_RE takes the -<n> suffix of a claimed run id; new cache_dir, runs_root docstring and base path, new_run_id claims its run dir with os.mkdir; core_tool drops inherited argc_* variables)
-scripts/smoke_test.py    11 hunks   (import types; LLM_AGENT_VAR_*, GIT_* repository-variable, ARCHITECT_CORE_TOOLS / ARCHITECT_ASK_OWNER_BIN / ARCHITECT_SLACK_PING_BIN / ARCHITECT_GH_*_CMD and GIT_CONFIG_* drop, user.useConfigOnly, no system or user git config, one fixed git identity + import _lib; the git helper's own GIT_ENV retired; utils.sh source + the real-copy pin; run dir resolution checks, the battery-env-restored check, the run-id claim and RESUME_RE rows; the empty-group stack rows (branch_setup stacks past a skipped group); gauntlet_reply / verdict_state fixtures in the real table shape, lanes_with_findings, composer settled-lanes, attention, in-repo planning-store, relpath ValueError, literal-pathspec, untracked-file, two-dot store, prior-round-only and dirty-tree rows, GPASS / GPROBE / GBLOCK; the adversary-lane verdict rows, the adversary probe rows (a quoted probe PASS or INCONCLUSIVE starts no probe round), GINC / GDEB; the parser rows: prose-quoted, trailing-text, indented, first match, whole status cells, first table only, USAGE_PROBE last match, probe detail cell, injected header overrides, sentinel only in a lane report, debris scope, forged Blockers headings, a plan-root quote in a lane report leaving a PASS on post_round / conforms and an incomplete-only BLOCKED on its re-run; the wave_route header rows; the rollup-scope rows, the argc_* scrub row with argc_dir checked as dir=unset, the skipped-member and group-scoped fallback rows, the dirstate completed-dir row, the real collect_ledger_lines rows and the empty-group rows, including the skipped-group record and PR state reset)
+graph.yaml                9 hunks   (description provenance; letter-digit labels dropped from the description's cutover sentence; project_dir em dash; pr_strategy em dash + build_lock + task_granularity em dash + the pr_tracking variable + max_loop_iterations 1000 with its CI_MAX_ROUNDS and REVIEW_MAX_POLLS comment; the initial_state.skipped_group_indexes: [] seed; the review watch initial_state seeds; batch_gauntlet_build timeout: 60; the ci_route description names the review watch; the review_poll, review_route, review_triage, review_apply and review_update nodes)
+scripts/_lib.py           4 hunks   (the REVIEW_POLL_SLEEP / REVIEW_WALL_SECS / REVIEW_MAX_POLLS / REVIEW_MAX_ROUNDS bounds and PR_TRACKING_ENUM; RESUME_RE takes the -<n> suffix of a claimed run id; new cache_dir, runs_root docstring and base path, new_run_id claims its run dir with os.mkdir; core_tool drops inherited argc_* variables)
+scripts/smoke_test.py    11 hunks   (import types; ARCHITECT_REVIEW_SLEEP=0; LLM_AGENT_VAR_*, GIT_* repository-variable, ARCHITECT_CORE_TOOLS / ARCHITECT_ASK_OWNER_BIN / ARCHITECT_SLACK_PING_BIN / ARCHITECT_GH_*_CMD and GIT_CONFIG_* drop, user.useConfigOnly, no system or user git config, one fixed git identity + import _lib with REVIEW_MAX_POLLS / REVIEW_MAX_ROUNDS; the git helper's own GIT_ENV retired; utils.sh source + the real-copy pin; run dir resolution checks, the battery-env-restored check, the run-id claim and RESUME_RE rows; the empty-group stack rows (branch_setup stacks past a skipped group); gauntlet_reply / verdict_state fixtures in the real table shape, lanes_with_findings, composer settled-lanes, attention, in-repo planning-store, relpath ValueError, literal-pathspec, untracked-file, two-dot store, prior-round-only and dirty-tree rows, GPASS / GPROBE / GBLOCK; the adversary-lane verdict rows, the adversary probe rows (a quoted probe PASS or INCONCLUSIVE starts no probe round), GINC / GDEB; the parser rows: prose-quoted, trailing-text, indented, first match, whole status cells, first table only, USAGE_PROBE last match, probe detail cell, injected header overrides, sentinel only in a lane report, debris scope, forged Blockers headings, a plan-root quote in a lane report leaving a PASS on post_round / conforms and an incomplete-only BLOCKED on its re-run; the wave_route header rows; the pr_tracking review watch rows; the rollup-scope rows, the argc_* scrub row with argc_dir checked as dir=unset, the skipped-member and group-scoped fallback rows, the dirstate completed-dir row, the real collect_ledger_lines rows and the empty-group rows, including the skipped-group record and PR state reset)
 scripts/mode_matrix.py    9 hunks   (LLM_AGENT_VAR_*, GIT_* repository-variable, ARCHITECT_CORE_TOOLS / ARCHITECT_ASK_OWNER_BIN / ARCHITECT_SLACK_PING_BIN / ARCHITECT_GH_*_CMD and GIT_CONFIG_* drop, user.useConfigOnly, no system or user git config, one fixed git identity; the git helper's own GIT_ENV retired; the yq guard in load_graph; canned gauntlet reply in the real table shape; main imports only CORE_TOOLS_REL; main removes the scratch HOME in a finally around walk_combinations; utils.sh source, fails loud instead of stubbing, confirmation line; the `if True` dropped; the old end-of-walk cleanup and summary moved into main)
 scripts/_fixture.py       1 hunk    (the GIT_ENV identity overlay removed; the git helper inherits the battery environment and its one fixed git identity)
 scripts/marker_map.json  25 hunks   (62 regions: two new, line numbers shifted, four first-lines reworded upstream)
-scripts/gates.py         17 hunks   (GREEN tuple retired; branch_setup walks the stack base back past skipped groups; verify_gate: dirty-tree guard + whole-cell GREEN settling; one hunk for _code_tree_dirty, _gauntlet_header, _gauntlet_section, _GAUNTLET_VERDICT_RE / _has_verdict, _lane_rows, _lane_cells, _probe_verdict and the header-only _parse_gauntlet with its adversary-lane flag, the adversary-lane probe guard and single Blockers reader; route_verdict: lane flag, header pre-check, probe verdict behind the adversary-lane probe guard, lanes_with_findings; the probe adopt and INCONCLUSIVE checks, 2 hunks; _lane_table; dead hygiene_pending_for_chain guard in stack_gate removed; wave_route header pre-check; hygiene_create skips an empty group's chore; hygiene_create collect_ledger_lines --plan / --tasks over the completed tasks dir; _completed_tasks_dir, _group_members and _skip_empty_group, which records the skipped group index and resets the per-group PR state; pr_body: empty-group skip, --tasks, the completed tasks dir and the group-scoped fallback list; the gh command seams comment in open_pr; _collect --plan over the completed tasks dir; group_closeout skips an empty group)
-README.md                 2 hunks   (design-record aside in the status paragraph; run-state bullet, this section and the Verify section)
+scripts/gates.py         27 hunks   (the PR_TRACKING_ENUM / REVIEW_* import; GREEN tuple retired; intake's pr_tracking check and mode_line suffix; the mode_invalid option default for pr_tracking; branch_setup walks the stack base back past skipped groups; verify_gate: dirty-tree guard + whole-cell GREEN settling; one hunk for _code_tree_dirty, _gauntlet_header, _gauntlet_section, _GAUNTLET_VERDICT_RE / _has_verdict, _lane_rows, _lane_cells, _probe_verdict and the header-only _parse_gauntlet with its adversary-lane flag, the adversary-lane probe guard and single Blockers reader; route_verdict: lane flag, header pre-check, probe verdict behind the adversary-lane probe guard, lanes_with_findings; the probe adopt and INCONCLUSIVE checks, 2 hunks; _lane_table; fix_done returns a review fix round to review_update; dead hygiene_pending_for_chain guard in stack_gate removed; wave_route header pre-check; apply_answer parses pr_tracking from a mode_invalid answer; apply_answer ends the review watch when a watched PR is left red and answers the review_exhausted / review_round_cap / review_owner_judgment escalations; hygiene_create skips an empty group's chore; hygiene_create collect_ledger_lines --plan / --tasks over the completed tasks dir; _completed_tasks_dir, _group_members and _skip_empty_group, which records the skipped group index and resets the per-group PR state; pr_body: empty-group skip, --tasks, the completed tasks dir and the group-scoped fallback list; the gh command seams comment in open_pr, now naming the reviews and resolve seams; ci_route green goes back to review_poll while the watch runs; flip_ready arms the watch, with _after_flip, the review_poll / review_route / review_apply / review_update gates and their helpers; _collect --plan over the completed tasks dir; final_report's Review watch section; group_closeout skips an empty group; the review_* GATES entries)
+scripts/audit_graph.py    1 hunk    (the review_poll and review_apply bound labels)
+scripts/check_session_block.sh  1 hunk    (the variable mirror leaves out the graph-only pr_tracking)
+scripts/review_poll.py    1 hunk    (new entry shim for the review_poll node)
+scripts/review_route.py   1 hunk    (new entry shim for the review_route node)
+scripts/review_apply.py   1 hunk    (new entry shim for the review_apply node)
+scripts/review_update.py  1 hunk    (new entry shim for the review_update node)
+README.md                 2 hunks   (design-record aside in the status paragraph; run-state bullet, the variables-mirror sentence, this section and the Verify section)
 ```
 
-Every other file is byte-identical to staging. The graph's node set and prompts are unchanged,
-and so is every loop bound and node timeout in `graph.yaml`, `scripts/_lib.py` and
-`scripts/gates.py` except two in `graph.yaml`: `settings.max_loop_iterations` is 1000 (staging
-100) and `batch_gauntlet_build` carries `timeout: 60` (staging none), as the frozen budgets row
-records.
+Every other file is byte-identical to staging. The graph adds the five review watch nodes
+(`review_poll` with `timeout: 900`, `review_triage` with 600, `review_apply` with 120,
+`review_update` with 300, and `review_route` with none) and `scripts/_lib.py` the four review
+bounds (`REVIEW_POLL_SLEEP` 600, `REVIEW_WALL_SECS` 86400, `REVIEW_MAX_POLLS` 144,
+`REVIEW_MAX_ROUNDS` 3), as the `pr_tracking` review watch row records. Every staging node's
+prompt is unchanged, and so is every staging loop bound and node timeout in `graph.yaml`,
+`scripts/_lib.py` and `scripts/gates.py` except two in `graph.yaml`:
+`settings.max_loop_iterations` is 1000 (staging 100) and `batch_gauntlet_build` carries
+`timeout: 60` (staging none), as the frozen budgets row records.
 
 Toolchain census (the gates must stay project-agnostic; verification commands come
 from the brief, never from a hard-coded toolchain):
 
 ```
 $ grep -nE '\b(cargo|npm|pnpm|yarn|go (test|build)|pytest|mvn|gradle|make)\b' scripts/*.py
-scripts/_lib.py:561:    r"`[^`]+`|\b(go|cargo|npm|pnpm|yarn|make|pytest|python3?|bash|sh|grep|rg|curl|task|just|mvn|gradle|dotnet|bun)\b\s",
-scripts/gates.py:41:    r"yarn\.lock$|pnpm-lock\.yaml$|Cargo\.(toml|lock)$|requirements.*\.txt$|poetry\.lock$",
-scripts/gates.py:2628:        "file:line, at most 25 per run so iterate); identifiers that only make sense with the plan open; ...
-scripts/gates.py:2637:        "failing test to make it pass; you still do NOT edit the plan or task files -- report instead.\n\n"
+scripts/_lib.py:566:    r"`[^`]+`|\b(go|cargo|npm|pnpm|yarn|make|pytest|python3?|bash|sh|grep|rg|curl|task|just|mvn|gradle|dotnet|bun)\b\s",
+scripts/gates.py:42:    r"yarn\.lock$|pnpm-lock\.yaml$|Cargo\.(toml|lock)$|requirements.*\.txt$|poetry\.lock$",
+scripts/gates.py:2663:        "file:line, at most 25 per run so iterate); identifiers that only make sense with the plan open; ...
+scripts/gates.py:2672:        "failing test to make it pass; you still do NOT edit the plan or task files -- report instead.\n\n"
 scripts/mode_matrix.py:176:`make run`
 scripts/mode_matrix.py:273:            ... "local_run_recipe": "`make run`",
-scripts/smoke_test.py:100:CODE_BASE = make_repo(CODE, {..., "CLAUDE.md": "Run `go test ./...` before committing.\n", ...
-scripts/smoke_test.py:159:`make run`
-scripts/smoke_test.py:498:u = gates.verify_gate(base_state(..., local_run_recipe="make run"))
-scripts/smoke_test.py:870:   ... "acceptance_criteria": ["`go test ./...`"], ...
-scripts/smoke_test.py:985:u = AA("probe_gap", "Supply the recipe: make run", ...)
+scripts/smoke_test.py:102:CODE_BASE = make_repo(CODE, {..., "CLAUDE.md": "Run `go test ./...` before committing.\n", ...
+scripts/smoke_test.py:161:`make run`
+scripts/smoke_test.py:500:u = gates.verify_gate(base_state(..., local_run_recipe="make run"))
+scripts/smoke_test.py:872:   ... "acceptance_criteria": ["`go test ./...`"], ...
+scripts/smoke_test.py:987:u = AA("probe_gap", "Supply the recipe: make run", ...)
 ```
 
-None of these runs a toolchain: `_lib.py:561` is the alternation of the executable-criterion
+None of these runs a toolchain: `_lib.py:566` is the alternation of the executable-criterion
 classifier (`EXECUTABLE_RE` recognises a command-shaped acceptance criterion; it hardcodes no
-command), `gates.py:41` is the dependency-manifest regex (the hits are `yarn`/`pnpm` inside
-lockfile names), `gates.py:2628` and `:2637` are the English verb `make` in prompt prose, and
+command), `gates.py:42` is the dependency-manifest regex (the hits are `yarn`/`pnpm` inside
+lockfile names), `gates.py:2663` and `:2672` are the English verb `make` in prompt prose, and
 the `mode_matrix.py` and `smoke_test.py` lines are battery fixtures. The wrapper test
 `no_gate_names_a_toolchain_command` keeps it that way with a `make`-less variant of the
 pattern: it matches `\b(cargo|rustc|npm|pnpm|yarn|pytest|mvn|gradle|just)\b|\bgo (test|build|run)\b`
@@ -191,9 +204,12 @@ The wrapper's live test groups:
   keeping its own git identity overlay;
 - run dir: run-dir precedence from a fresh process, and an empty `ARCHITECT_RUNS_ROOT`
   falling back to the cache-dir tier;
-- graph and gates: `build_lock` position, the variable mirror (the candidate's variables
-  match the prose `architect/config.yaml` name for name and default for default, without
-  `yq`), the marker-map triples (every `(ordinal, condition, first)` of `marker_map.json`
+- graph and gates: `build_lock` position, the variable mirror (the candidate's variables,
+  less the graph-only `pr_tracking`, match the prose `architect/config.yaml` name for name
+  and default for default, without `yq`), the graph-only pin (`pr_tracking` is declared with
+  default `ci`, is the only variable the prose twin lacks, and is the set
+  `check_session_block.sh` leaves out of its mirror), the marker-map triples (every
+  `(ordinal, condition, first)` of `marker_map.json`
   against the prose `architect/instructions.md`, the check the matrix makes, without `yq`),
   the description pins (`description_names_no_file_outside_the_repo`, and no
   letter-digit label in the description), toolchain census, ASCII sweep, and the shim pin
@@ -206,8 +222,10 @@ The wrapper's live test groups:
   `verify_gate` and narrowed through the gauntlet's real `signals.py` and `build_items.py`;
   the no-settled-lanes round; the parser rows; the planning-store dirty-tree rows;
 - budgets and channels: graph, node, `initial_state` and `_lib.py` bounds against the shipped
-  baseline (the staging values plus the frozen budgets row), the loop cap at four times or
-  more the `CI_MAX_ROUNDS` that `_lib.py` computes, the `anomalies` property on every llm node, and no
+  baseline (the staging values plus the frozen budgets row and the review watch nodes, seeds
+  and bounds), the loop cap at four times or more both the `CI_MAX_ROUNDS` and the
+  `REVIEW_MAX_POLLS` that `_lib.py` computes, with `REVIEW_MAX_POLLS` and `REVIEW_MAX_ROUNDS`
+  below it, the `anomalies` property on every llm node (`review_triage` included), and no
   `inputs: build_lock` anywhere; the real `tools.sh` `collect_ledger_lines` rollup; both
   batteries drop the same variables as the wrapper;
 - wrapper hygiene: every binary runner drops the inherited `COYOTE_*` variables before its
@@ -220,8 +238,9 @@ The wrapper's live test groups:
   the `build_lock` and E9 rows, `pr_body` passing `--tasks`, the dead-guard census row, the
   grammar subsection, V1, engine-facts, env hygiene, ledger and gh command seams rows, the
   battery figures against the wrapper floors, and the recorded staging census against a live
-  `diff -u` when `ARCHITECT_NEXT_STAGING_DIR` names the staging tree (without it the test
-  prints a skip line and checks nothing; set to a path that is not a directory, it fails);
+  `diff -u` when `ARCHITECT_NEXT_STAGING_DIR` names the staging tree (a file staging lacks is
+  diffed against `/dev/null`; without the variable the test prints a skip line and checks
+  nothing; set to a path that is not a directory, it fails);
 - real-binary dry runs: four by name (from a seeded config dir; from an empty config dir that
   installs the candidate; re-entry by run id in the prompt; an unknown run id in the prompt
   starts a fresh run), the XDG-tier dry run (only `XDG_CACHE_HOME` set, the run lands under
@@ -232,7 +251,7 @@ The wrapper's live test groups:
 - real-binary `--info`: by name it lists the graph with no error, renders `build_lock` with
   its empty default between `pr_strategy` and `task_granularity`, seats an
   `--agent-variable build_lock` override over that default, and renders exactly the prose
-  twin's variable list in order.
+  twin's variable list in order once the graph-only `pr_tracking` is left out.
 
 The mode-matrix run is the one ignored test.
 
@@ -249,8 +268,8 @@ when `ARCHITECT_NEXT_REQUIRE_YQ` is set to a non-empty value. The sweep that
 keeps every bundled agent from naming this candidate lives in
 `tests/candidate_sisyphus_next.rs` and covers both candidate names.
 
-Measured 2026-10-30 after the adjustments above, from a fresh scratch dir: audit
-`PROBLEMS: none`; smoke `365/365 checks passed`; mode matrix `53/53 checks passed`
-(`62 live regions == 62 mapped`) in 3m06s wall clock; session check last line
+Measured 2026-11-02 after the adjustments above, from a fresh scratch dir: audit
+`PROBLEMS: none`; smoke `423/423 checks passed`; mode matrix `53/53 checks passed`
+(`62 live regions == 62 mapped`) in 3m27s wall clock; session check last line
 `ok node ids / script paths consistent` (mikefarah yq v4.53.3); no unset-variable failure
 from `architect/tools.sh` under the real `utils.sh`.

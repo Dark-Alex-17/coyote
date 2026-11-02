@@ -28,10 +28,11 @@ dups=$(yq '.session.expose | length' "$G"); uniq_=$(yq '.session.expose | unique
 for v in $(yq '.variables[].name' "$G"); do
   [[ "$(yq ".initial_state | has(\"$v\")" "$G")" == "false" ]] && say ok "variable not shadowed: $v" || say FAIL "variable shadowed by initial_state: $v"
 done
-# variables mirror the prose architect: names + defaults exactly
+# variables mirror the prose architect: names + defaults exactly, less the graph-only ones the prose twin never declares
 CORE="$(dirname "$0")/../../architect/config.yaml"
+GRAPH_ONLY='["pr_tracking"]'
 if [[ -f "$CORE" ]]; then
-  a=$(yq -o=json '[.variables[] | {"name": .name, "default": .default}]' "$G"); b=$(yq -o=json '[.variables[] | {"name": .name, "default": .default}]' "$CORE")
+  a=$(yq -o=json "[.variables[] | select(([.name] - $GRAPH_ONLY) | length > 0) | {\"name\": .name, \"default\": .default}]" "$G"); b=$(yq -o=json '[.variables[] | {"name": .name, "default": .default}]' "$CORE")
   [[ "$a" == "$b" ]] && say ok "variables mirror $(basename "$(dirname "$CORE")") (names + defaults)" || say FAIL "variable mirror drift vs $CORE"
 else
   say FAIL "no prose architect config.yaml found to mirror against"
