@@ -359,7 +359,6 @@ initial_state:
   review_permissions: {}
   review_seen: []
   review_watching: false
-  review_after: ''
   review_outcomes: {}
   review_triage_items: []
   validate_note: ''

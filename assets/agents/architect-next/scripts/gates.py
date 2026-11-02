@@ -2552,6 +2552,13 @@ def apply_answer(state):
         elif a == "more" and kind == "review_round_cap":
             u["review_fix_rounds"] = REVIEW_MAX_ROUNDS - 1
             u["_next"] = "review_apply"
+        elif a == "more" and kind == "review_owner_judgment" and as_dict(esc.get("data")).get("untrusted"):
+            ledger(state, u, f"review-watch: PR #{state.get('pr_number')} refused: untrusted items cannot become a fix round")
+            refusal = "Addressing is not available for untrusted items."
+            question = esc.get("question") or ""
+            raise_escalation(state, u, escalation(
+                kind, question if question.startswith(refusal) else f"{refusal} {question}", as_list(esc.get("options")),
+                evidence=esc.get("evidence") or "", hard_trigger=True, data=as_dict(esc.get("data"))))
         elif a == "more" and kind == "review_owner_judgment":
             _review_fix(state, u, [i for i in _triaged(state) if i["action"] in ("fix", "owner")])
         elif a == "skip" and kind == "review_owner_judgment" and as_dict(esc.get("data")).get("untrusted"):
@@ -3159,8 +3166,7 @@ def flip_ready(state):
         ledger(state, u, f"pr: {len(drafts)} task PR(s) still in draft - reported, never silently")
     if _review_mode(state) and state.get("pr_number") and not truthy(state.get("review_watching")):
         # The group reset clears pr_number, so it waits until the review watch ends.
-        u.update({"review_watching": True, "review_after": "select_tasks" if _group_closes(state) else "finish_plan",
-                  "review_started_at": int(time.time()), "review_polls": 0, "review_rounds": 0, "review_poll_fails": 0,
+        u.update({"review_watching": True, "review_started_at": int(time.time()), "review_polls": 0, "review_rounds": 0, "review_poll_fails": 0,
                   "review_fix_rounds": 0, "review_seen": [], "review_status": ""})
         _review_event(state, u, "watching reviews")
         u["_next"] = "review_poll"
@@ -3187,10 +3193,11 @@ def _review_mode(state):
     return str(var(state, "pr_tracking", "ci")).strip() == "review"
 
 
-def _review_event(state, u, event):
+def _review_event(state, u, event, ping=True):
     line = f"review-watch: PR #{state.get('pr_number')} {event}"
     ledger(state, u, line)
-    _slack_ping(state, line)
+    if ping:
+        _slack_ping(state, line)
 
 
 def _close_review_watch(state, u, status):
@@ -3309,14 +3316,21 @@ def _review_items(state, u, pr, seen):
         # A resolved thread is only read again when someone answered after the watch's own reply.
         if t.get("isResolved") and not (cs and not own(cs[-1]) and any(own(c) for c in cs[:-1])):
             continue
-        # Keyed by the newest reviewer comment, so a reply on a thread already handled surfaces again;
-        # the watch's own reply does not.
-        latest = next((c.get("id") for c in reversed(cs) if not own(c)), "")
-        bad = _first_untrusted(state, u, (c for c in cs if not own(c)))
-        found.append((bad, bool(cs) and own(cs[0]), {
-            "id": f"thread:{t.get('id')}:{latest}", "kind": "thread", "author": _login(cs[0]) if cs else "",
-            "body": "\n\n".join(c.get("body") or "" for c in cs), "path": t.get("path") or "", "thread_id": t.get("id") or "",
-            "outdated": bool(t.get("isOutdated"))}))
+        reviewers = [c for c in cs if not own(c)]
+        strays = [c for c in reviewers if not _trusted(state, u, c)]
+        vouched = [c for c in reviewers if c not in strays]
+        # Keyed by the newest trusted reviewer comment, or the newest reviewer comment when none is trusted, so a
+        # reply on a thread already handled surfaces again; the watch's own reply and a stray untrusted one do not.
+        latest = (vouched or reviewers or [{}])[-1].get("id") or ""
+        is_own = bool(cs) and own(cs[0])
+        where = {"kind": "thread", "path": t.get("path") or "", "thread_id": t.get("id") or "", "outdated": bool(t.get("isOutdated"))}
+        # A trusted thread keeps its trusted text; each stray untrusted comment is omitted from it and reported on its own.
+        body = "\n\n".join(f"(comment {c.get('id')} by {_login(c)}, not a trusted reviewer: omitted)" if c in strays else c.get("body") or ""
+                           for c in cs)
+        found.append((strays[0] if strays and not vouched else None, is_own, {
+            "id": f"thread:{t.get('id')}:{latest}", "author": _login(cs[0]) if cs else "", "body": body, **where}))
+        if vouched:
+            found += [(c, is_own, {"id": f"threadcomment:{c.get('id')}", **where}) for c in strays]
     for r in _nodes(pr, "reviews"):
         if r.get("state") in ("CHANGES_REQUESTED", "COMMENTED") and (r.get("body") or "").strip():
             found.append((_first_untrusted(state, u, [r]), own(r),
@@ -3447,8 +3461,8 @@ def review_route(state):
         if not untrusted:
             u["_next"] = "review_triage"
             return u
-        for i in untrusted:
-            _review_event(state, u, f"untrusted {i['id']} by {i['author']} ({i['association'] or 'NONE'}) -> owner judgment")
+        _review_event(state, u, "untrusted " + ", ".join(f"{i['id']} by {i['author']} ({i['association'] or 'NONE'})" for i in untrusted)
+                      + " -> owner judgment")
         u["review_status"] = "owner_judgment"
         listed = "\n".join(f"- {i['id']} by {i['author'] or 'unknown'} ({i['association'] or 'NONE'})" for i in untrusted)
         return raise_escalation(state, u, escalation(
@@ -3490,9 +3504,17 @@ def _triaged(state):
     return out
 
 
+def _untrusted_ids(state):
+    return {as_dict(i).get("id") for i in as_list(state.get("review_untrusted"))}
+
+
+def _trusted_with_body(state, items):
+    untrusted = _untrusted_ids(state)
+    return [i for i in items if "body" in i and i.get("id") not in untrusted]
+
+
 def _review_fix(state, u, items):
-    untrusted = {as_dict(i).get("id") for i in as_list(state.get("review_untrusted"))}
-    items = [i for i in items if "body" in i and i.get("id") not in untrusted]
+    items = _trusted_with_body(state, items)
     if not items:
         _review_event(state, u, "no trusted item to fix")
         u["_next"] = "review_poll"
@@ -3588,29 +3610,34 @@ def review_update(state):
                                     "the push may have failed.",
             [option("Re-check the PR head"), option("Stop watching and report", recommended=True)]))
     items = _triaged(state)
+    usable = _trusted_with_body(state, items)
+    untrusted = _untrusted_ids(state)
     lines = [f"## Update @ {sha}", ""]
     late = []
+    addressed = 0
     feedback = list(as_list(state.get("external_feedback")))
-    for i in [i for i in items if i["action"] != "none"]:
+    for i in [i for i in usable if i["action"] != "none"]:
         if i.get("thread_id") and time.time() - started > REVIEW_UPDATE_BUDGET:
             late.append(i["id"])
             ledger(state, u, f"review-watch: PR #{pr} not resolved (time budget) {i['id']}")
             continue
         ok = _resolve_thread(state, i["thread_id"], sha) if i.get("thread_id") else True
-        _review_event(state, u, f"addressed {i['id']} -> {sha}" + ("" if ok else " (thread resolve FAILED)"))
+        _review_event(state, u, f"addressed {i['id']} -> {sha}" + ("" if ok else " (thread resolve FAILED)"), ping=False)
+        addressed += 1
         lines.append(f"- {i['id']}: {sha}")
         prefix = f"PR #{pr} {i['id']} ("
-        if "body" in i and not any(isinstance(f, str) and f.startswith(prefix) for f in feedback):
-            feedback.append(f"{prefix}{i.get('author') or 'unknown'}): " + tail(i["body"], 600))
+        if not any(isinstance(f, str) and f.startswith(prefix) for f in feedback):
+            feedback.append(f"{prefix}{i.get('author') or 'unknown'}): <untrusted-review-data>\n{tail(i['body'], 600)}\n</untrusted-review-data>")
+    _review_event(state, u, f"addressed {addressed} item(s) @ {sha}")
     u["external_feedback"] = feedback
-    skipped = [i for i in items if i["action"] == "none"]
+    skipped = [i for i in usable if i["action"] == "none"]
     if skipped:
         lines += ["", "Not addressed:"] + [f"- {i['id']}: {_update_reason(i['reason']) or 'no change needed'}" for i in skipped]
     if late:
         lines += ["", "Not resolved (time budget):"] + [f"- {i}" for i in late]
     ok, out = _pr_comment(state, pr, "\n".join(lines))
     ledger(state, u, f"pr-comment: PR #{pr} update @ {sha}: {'posted' if ok else 'FAILED ' + tail(out, 120)}")
-    u["review_seen"] = list(as_list(state.get("review_seen"))) + [i["id"] for i in items if i["id"] not in late]
+    u["review_seen"] = list(as_list(state.get("review_seen"))) + [i["id"] for i in items if i["id"] not in late and i["id"] not in untrusted]
     u.update({"review_items": [], "review_triage_items": [], "review_polls": 0, "review_status": "",
               "ci_polls": 0, "ci_poll_fails": 0, "ci_status": "", "ci_started_at": int(time.time())})
     u["_next"] = "ci_poll"
