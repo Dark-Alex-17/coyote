@@ -23,7 +23,8 @@ pub(crate) struct KeyContext {
     pub(crate) turn_running: bool,
     pub(crate) composer_empty: bool,
     pub(crate) modal: Option<ModalKind>,
-    /// Whether a second has passed since the last composer keystroke: the
+    /// Whether a second has passed since the last key pressed outside a
+    /// modal (accepted or ignored) or since the previous answer: the
     /// condition for a bare hotkey or Enter to count as an answer to a
     /// confirm, so a modal that appears mid-sentence cannot be answered by
     /// the keystroke already in flight.

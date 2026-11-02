@@ -629,12 +629,17 @@ impl App {
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> Option<Command> {
         let action = keys::map_key(key, &self.key_context());
+        // Every key pressed while no question is up re-arms the idle gate,
+        // the ignored ones included: an Enter tapped during a turn is a
+        // keystroke the user is still making when the confirm appears.
+        // Hotkeys answering a modal do not count; `answer_front` re-arms
+        // for the next queued question instead.
+        if self.prompts.is_empty() {
+            self.last_keystroke = Some(self.clock.now());
+        }
         let command = match action {
             Action::Submit => {
                 let text = self.composer_text();
-                // Enter is a keystroke too: a confirm raised by the turn
-                // just submitted must not be answered by a repeated Enter.
-                self.last_keystroke = Some(self.clock.now());
                 if text.trim().is_empty() {
                     None
                 } else {
@@ -646,7 +651,6 @@ impl App {
                 }
             }
             Action::InsertNewline => {
-                self.last_keystroke = Some(self.clock.now());
                 self.composer.insert_newline();
                 None
             }
@@ -690,7 +694,6 @@ impl App {
                 None
             }
             Action::ComposerInput(key) => {
-                self.last_keystroke = Some(self.clock.now());
                 self.composer.input(key);
                 None
             }
@@ -2137,6 +2140,36 @@ mod tests {
         assert_eq!(harness.press(KeyCode::Enter), None);
         assert_eq!(harness.app.prompts.len(), 1);
         assert!(!asker.is_finished());
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert_eq!(
+            asker.join().unwrap().unwrap(),
+            PromptAnswer::Confirmed(true)
+        );
+    }
+
+    /// Enter tapped while the turn runs maps to nothing, but it is still
+    /// a keystroke for the idle gate: a confirm appearing right after one
+    /// is not answered by the next tap of the same key.
+    #[test]
+    fn enter_ignored_during_a_turn_still_arms_the_idle_gate_for_a_fresh_confirm() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.type_text("call the tool");
+        harness.clock.advance(HOTKEY_IDLE);
+        assert!(matches!(
+            harness.press(KeyCode::Enter),
+            Some(Command::Submit(_))
+        ));
+        harness.app.begin_turn("call the tool", false);
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Enter), None);
+
+        harness.clock.advance(Duration::from_millis(200));
+        let asker = ask_on_a_thread(&mut harness, confirm_request(None));
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert_eq!(harness.app.prompts.len(), 1);
+        assert!(!asker.is_finished());
+
         harness.clock.advance(HOTKEY_IDLE);
         assert_eq!(harness.press(KeyCode::Enter), None);
         assert_eq!(
