@@ -1067,7 +1067,8 @@ impl RequestContext {
     }
 
     /// What kind of surface answers this run's prompts, exported to tools as
-    /// `COYOTE_UI`. Mirrors the branch `default_prompter` seats from.
+    /// `COYOTE_UI`: headless when no human is present, the full-screen UI
+    /// while it owns the terminal, the REPL otherwise.
     pub(crate) fn ui_kind(&self) -> UiKind {
         if !human_present() {
             UiKind::Headless

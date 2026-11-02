@@ -57,7 +57,7 @@ pub(crate) enum Action {
 pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match ctx.modal {
-        Some(ModalKind::Confirm { default, tool }) => match key.code {
+        Some(ModalKind::Confirm { default, tool }) => match lowercase(key.code) {
             KeyCode::Enter if !ctx.idle_ok => Action::Nothing,
             KeyCode::Enter => Action::Answer(PromptAnswer::Confirmed(default)),
             KeyCode::Esc => Action::Answer(PromptAnswer::Cancelled),
@@ -107,6 +107,14 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             KeyCode::Enter => Action::Submit,
             _ => Action::ComposerInput(key),
         },
+    }
+}
+
+/// A hotkey answers the same with Shift or caps lock held.
+fn lowercase(code: KeyCode) -> KeyCode {
+    match code {
+        KeyCode::Char(c) => KeyCode::Char(c.to_ascii_lowercase()),
+        other => other,
     }
 }
 
@@ -224,6 +232,21 @@ mod tests {
                 plain(KeyCode::Char('n')),
                 modal,
                 Action::Answer(PromptAnswer::Confirmed(false)),
+            ),
+            (
+                press(KeyCode::Char('Y'), KeyModifiers::SHIFT),
+                modal,
+                Action::Answer(PromptAnswer::Confirmed(true)),
+            ),
+            (
+                press(KeyCode::Char('N'), KeyModifiers::SHIFT),
+                modal,
+                Action::Answer(PromptAnswer::Confirmed(false)),
+            ),
+            (
+                press(KeyCode::Char('A'), KeyModifiers::SHIFT),
+                modal,
+                Action::AnswerYesForSession,
             ),
             (
                 plain(KeyCode::Char('a')),

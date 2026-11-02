@@ -243,7 +243,19 @@ fn a_command_prints_into_the_transcript_and_ctrl_d_leaves_the_tty_cooked() {
 #[test]
 #[serial]
 fn sigterm_leaves_the_tty_cooked() {
-    let dir = fresh_config_dir("sigterm");
+    signal_leaves_the_tty_cooked("sigterm", libc::SIGTERM);
+}
+
+/// Raw mode turns Ctrl+C into a key, so a SIGINT that does arrive is a
+/// `kill -INT` from outside and gets the same orderly quit as SIGTERM.
+#[test]
+#[serial]
+fn sigint_leaves_the_tty_cooked() {
+    signal_leaves_the_tty_cooked("sigint", libc::SIGINT);
+}
+
+fn signal_leaves_the_tty_cooked(scenario: &str, signal: libc::c_int) {
+    let dir = fresh_config_dir(scenario);
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config(&dir);
     let mut pty = spawn_tui(&dir, &[]);
@@ -251,14 +263,14 @@ fn sigterm_leaves_the_tty_cooked() {
     let transcript = pty.wait_for("no session", PTY_DEADLINE).unwrap();
     let pid = child_pid(&transcript);
     // SAFETY: kill takes a pid and a signal number and touches no memory.
-    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    assert_eq!(unsafe { libc::kill(pid, signal) }, 0);
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
 
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
     assert_tty_restored(&transcript);
     assert!(
         find(pty.raw(), LEAVE_ALT, 0).is_some(),
-        "SIGTERM never left the alternate screen:\n{transcript}"
+        "signal {signal} never left the alternate screen:\n{transcript}"
     );
 }
 
@@ -890,11 +902,16 @@ fn a_sigterm_during_the_editor_quits_once_the_editor_returns() {
     // SAFETY: kill takes a pid and a signal number and touches no memory.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
     pty.read_for(Duration::from_millis(300));
+    let released_at = pty.raw().len();
     pty.send(b"\r").unwrap();
 
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
     assert_tty_restored(&transcript);
+    assert!(
+        !strip_ansi(&String::from_utf8_lossy(&pty.raw()[..released_at])).contains("exit="),
+        "the UI quit while the editor still had the terminal:\n{transcript}"
+    );
 }
 
 /// The dry-run model echoes the role prompt plus the user's text, so a
@@ -1263,22 +1280,17 @@ fn ctrl_d_under_an_agent_fires_the_completed_hook_before_exit() {
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
     assert_tty_restored(&transcript);
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let fired = fs::read_to_string(&marker)
-            .unwrap_or_default()
-            .lines()
-            .filter(|line| *line == "COMPLETED")
-            .count();
-        if fired == 1 {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline && fired == 0,
-            "agent.completed fired {fired} times after Ctrl+D (expected once):\n{transcript}"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    // The hook is drained before the process exits, so the marker is
+    // complete by the time the wrapper has reported.
+    let fired = fs::read_to_string(&marker)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| *line == "COMPLETED")
+        .count();
+    assert_eq!(
+        fired, 1,
+        "agent.completed fired {fired} times after Ctrl+D (expected once):\n{transcript}"
+    );
 }
 
 /// Dirties a temp session the way the save-modal cases do: a dry-run turn
@@ -2589,6 +2601,7 @@ fn a_reply_with_a_link_shows_its_text_and_leaks_no_osc_8() {
     let mut pty = spawn_tui(&dir, &[]);
 
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let submitted_at = pty.raw().len();
     pty.send(b"link please\r").unwrap();
     let transcript = wait_for_squeezed(&mut pty, "the fixture page r2x", "the link's text");
     assert_eq!(fake.served(), 1, "{transcript}");
@@ -2607,10 +2620,16 @@ fn a_reply_with_a_link_shows_its_text_and_leaks_no_osc_8() {
         !visible.contains("]8;;"),
         "an OSC 8 fragment was painted as text:\n{visible}"
     );
-    assert!(
-        !visible.contains('\x1b'),
-        "a raw escape byte survived into the visible transcript:\n{visible:?}"
-    );
+    // Past the startup colour queries the UI writes no operating-system
+    // commands of its own, so any `ESC ]` after the submit came through
+    // from the reply.
+    if let Some(at) = find(raw, b"\x1b]", submitted_at) {
+        let context = &raw[at.saturating_sub(40)..(at + 80).min(raw.len())];
+        panic!(
+            "an OSC introducer reached the tty at {at}: {:?}",
+            String::from_utf8_lossy(context)
+        );
+    }
 
     // The UI is still live afterwards.
     pty.send(b".info\r").unwrap();

@@ -8,7 +8,8 @@ pub(crate) enum UiKind {
 }
 
 impl UiKind {
-    /// The environment variable every tool process receives.
+    /// The environment variable every tool process receives; `main` also
+    /// reads it at startup, where `tui` selects the full-screen UI.
     pub(crate) const ENV: &'static str = "COYOTE_UI";
 
     pub(crate) fn as_str(self) -> &'static str {

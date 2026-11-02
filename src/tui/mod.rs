@@ -64,6 +64,7 @@ const COMPOSER_MAX_ROWS: u16 = 8;
 /// Rows a wrapped question may take above the modal's field and hint.
 const MODAL_QUESTION_MAX_ROWS: u16 = 8;
 const INPUT_HINT: &str = "Enter = answer  Esc = cancel";
+const COMPOSER_PLACEHOLDER: &str = "Type a prompt or a .command; Enter sends";
 /// How long the status row waits between two ticks of its elapsed time.
 const STATUS_TICK: Duration = Duration::from_secs(1);
 /// How long `flush_typeahead` waits for one more queued event, and how
@@ -471,6 +472,15 @@ fn new_textarea() -> TextArea<'static> {
     textarea
 }
 
+/// An empty composer with its placeholder; the modal's input field is a
+/// bare `new_textarea`.
+fn new_composer() -> TextArea<'static> {
+    let mut composer = new_textarea();
+    composer.set_placeholder_text(COMPOSER_PLACEHOLDER);
+    composer.set_placeholder_style(DIM);
+    composer
+}
+
 /// Everything drawn, and the rules for changing it.
 pub(crate) struct App {
     cells: Vec<Cell>,
@@ -498,12 +508,9 @@ impl App {
         footer: FooterInfo,
     ) -> Result<Self> {
         let renderer = Renderer::new(config.render_options()?)?;
-        let mut composer = new_textarea();
-        composer.set_placeholder_text("Type a prompt or a .command; Enter sends");
-        composer.set_placeholder_style(DIM);
         Ok(Self {
             cells: Vec::new(),
-            composer,
+            composer: new_composer(),
             prompts: VecDeque::new(),
             turn: None,
             exiting: false,
@@ -529,7 +536,7 @@ impl App {
     pub(crate) fn set_composer_text(&mut self, text: &str) {
         let mut composer = TextArea::new(text.split('\n').map(str::to_string).collect());
         composer.set_cursor_line_style(Style::new());
-        composer.set_placeholder_text(self.composer.placeholder_text().to_string());
+        composer.set_placeholder_text(COMPOSER_PLACEHOLDER);
         composer.set_placeholder_style(DIM);
         composer.move_cursor(ratatui_textarea::CursorMove::Bottom);
         composer.move_cursor(ratatui_textarea::CursorMove::End);
@@ -663,10 +670,7 @@ impl App {
                 if text.trim().is_empty() {
                     None
                 } else {
-                    self.composer = new_textarea();
-                    self.composer
-                        .set_placeholder_text("Type a prompt or a .command; Enter sends");
-                    self.composer.set_placeholder_style(DIM);
+                    self.composer = new_composer();
                     Some(Command::Submit(text.trim().to_string()))
                 }
             }
@@ -2071,7 +2075,11 @@ mod tests {
         app.frames.frame_drawn();
         let rendered = terminal.backend().to_string();
         assert_eq!(app.composer_text(), "hello");
-        insta::assert_snapshot!("sleeping_tool_composer_responsive_60x20", rendered);
+        // The app runs on the real clock here, so the elapsed seconds in
+        // the status row depend on the host's speed.
+        insta::with_settings!({ filters => vec![(r"Working \. \d+s", "Working . [N]s")] }, {
+            insta::assert_snapshot!("sleeping_tool_composer_responsive_60x20", rendered);
+        });
 
         handle.await.unwrap().unwrap();
         assert!(started.elapsed() >= SLEEP);
