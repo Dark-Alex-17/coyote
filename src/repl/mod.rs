@@ -2113,9 +2113,11 @@ pub(crate) fn unfence(line: &str) -> &str {
 }
 
 /// Whether a submitted line, fence stripped, is a command rather than a
-/// message for the model.
+/// message for the model: a `.command` or a `!shell` passthrough, the two
+/// arms the dispatcher below handles itself.
 pub(crate) fn is_command(line: &str, prefix: CommandPrefix) -> bool {
-    parse_command(unfence(line), prefix).is_some()
+    let line = unfence(line);
+    parse_command(line, prefix).is_some() || try_extract_shell_command(line).is_some()
 }
 
 fn try_extract_shell_command(line: &str) -> Option<&str> {
@@ -8441,8 +8443,11 @@ local_hello() {\n\
         assert_eq!(unfence("::: unterminated"), "::: unterminated");
         assert!(is_command("::: .info :::", CommandPrefix::Dot));
         assert!(is_command(".info", CommandPrefix::Dot));
+        assert!(is_command("!ls", CommandPrefix::Dot));
+        assert!(is_command("::: !ls :::", CommandPrefix::Dot));
         assert!(!is_command("::: plain chat :::", CommandPrefix::Dot));
         assert!(!is_command("::: .info :::", CommandPrefix::Slash));
+        assert!(!is_command("ls!", CommandPrefix::Dot));
     }
 
     #[test]
