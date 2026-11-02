@@ -23728,6 +23728,7 @@ mod tests {
                             "pr_gate",
                             "pr_review_apply",
                             "pr_review_poll",
+                            "pr_review_resolve",
                             "pr_review_route",
                             "pr_review_triage",
                             "record_subtasks",
