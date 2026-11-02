@@ -2531,7 +2531,7 @@ def apply_answer(state):
         elif truthy(state.get("review_watching")):
             status = f"{kind} (CI {state.get('ci_status') or 'unresolved'})"
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"PR #{state.get('pr_number')} review watch stopped: {status}: {tail(state.get('ci_diagnosis', ''), 300)}"]
-            _review_event(state, u, f"stop: {status}")
+            _review_event(state, u, f"stopped by the owner: {status}")
             _close_review_watch(state, u, kind)
             u["_next"] = "finish_plan"
         else:
@@ -2571,6 +2571,16 @@ def apply_answer(state):
             u["_next"] = "finish_plan"
         else:
             _leave_in_draft(state, u)
+    elif kind == "review_external_close":
+        status = "merged" if as_dict(esc.get("data")).get("status") == "merged" else "closed"
+        _review_event(state, u, f"stopped by the owner: {status} externally")
+        _close_review_watch(state, u, status)
+        if status == "merged":
+            _after_flip(state, u)
+        else:
+            u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
+                f"PR #{state.get('pr_number')} was closed externally during the review watch; no further work started on top of it"]
+            u["_next"] = "finish_plan"
     elif kind == "pr_body_notes":
         u["_next"] = "open_pr"
     else:
@@ -3183,7 +3193,7 @@ REVIEW_QUERY = (
     "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { "
     "state reviewDecision headRefOid reviews(last: 100) { nodes { id state body authorAssociation author { login } commit { oid } } } "
     "comments(last: 100) { nodes { id body authorAssociation author { login } } } "
-    "reviewThreads(first: 100) { nodes { id isResolved path comments(first: 20) { nodes { id body authorAssociation author { login } } } } } } } }")
+    "reviewThreads(first: 100) { nodes { id isResolved isOutdated path comments(first: 20) { nodes { id body authorAssociation author { login } } } } } } } }")
 REPLY_MUTATION = ("mutation($thread: ID!, $body: String!) { addPullRequestReviewThreadReply(input: "
                   "{pullRequestReviewThreadId: $thread, body: $body}) { comment { id } } }")
 RESOLVE_MUTATION = "mutation($thread: ID!) { resolveReviewThread(input: {threadId: $thread}) { thread { id isResolved } } }"
@@ -3241,16 +3251,18 @@ def _review_items(pr, seen):
     """New review items as (trusted, untrusted); an untrusted item is built without its body, so the text stays on the PR."""
     found = []
     for t in _nodes(pr, "reviewThreads"):
-        if t.get("isResolved"):
-            continue
         cs = _nodes(t, "comments")
+        # A resolved thread is only read again when someone answered after the watch's own reply.
+        if t.get("isResolved") and not (cs and not _own_comment(cs[-1]) and any(_own_comment(c) for c in cs[:-1])):
+            continue
         # Keyed by the newest reviewer comment, so a reply on a thread already handled surfaces again;
         # the watch's own reply does not.
         latest = next((c.get("id") for c in reversed(cs) if not _own_comment(c)), "")
         bad = _first_untrusted(c for c in cs if not _own_comment(c))
         found.append((bad, bool(cs) and _own_comment(cs[0]), {
             "id": f"thread:{t.get('id')}:{latest}", "kind": "thread", "author": _login(cs[0]) if cs else "",
-            "body": "\n\n".join(c.get("body") or "" for c in cs), "path": t.get("path") or "", "thread_id": t.get("id") or ""}))
+            "body": "\n\n".join(c.get("body") or "" for c in cs), "path": t.get("path") or "", "thread_id": t.get("id") or "",
+            "outdated": bool(t.get("isOutdated"))}))
     for r in _nodes(pr, "reviews"):
         if r.get("state") in ("CHANGES_REQUESTED", "COMMENTED") and (r.get("body") or "").strip():
             found.append((_first_untrusted([r]), _own_comment(r),
@@ -3266,7 +3278,7 @@ def _review_items(pr, seen):
             trusted.append(i)
         else:
             untrusted.append({"id": i["id"], "kind": i["kind"], "author": _login(bad), "association": bad.get("authorAssociation") or "",
-                              "path": i["path"], "thread_id": i["thread_id"]})
+                              "path": i["path"], "thread_id": i["thread_id"], **({"outdated": i["outdated"]} if "outdated" in i else {})})
     return trusted, untrusted
 
 
@@ -3327,16 +3339,16 @@ def review_route(state):
             u.update({"review_status": "pending", "_next": "review_poll"})
             return u
         status = u["review_status"] = "poll_error"
-    if status in ("approved", "merged"):
-        _review_event(state, u, "approved" if status == "approved" else "merged externally")
+    if status == "approved":
+        _review_event(state, u, "approved")
         _close_review_watch(state, u, status)
         return _after_flip(state, u)
-    if status == "closed":
-        _review_event(state, u, "closed externally")
-        _close_review_watch(state, u, status)
-        u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"PR #{pr} was closed externally during the review watch; no further work started on top of it"]
-        u["_next"] = "finish_plan"
-        return u
+    if status in ("closed", "merged"):
+        _review_event(state, u, f"stop: {status} externally")
+        then = "report" if status == "closed" else "continue"
+        return raise_escalation(state, u, escalation(
+            "review_external_close", f"PR #{pr} was {status} externally during the review watch. Stop watching and {then}.",
+            [option(f"Stop watching and {then}", recommended=True)], data={"status": status}))
     if status == "comments":
         untrusted = [as_dict(i) for i in as_list(state.get("review_untrusted"))]
         if not untrusted:
@@ -3475,6 +3487,7 @@ def review_update(state):
     items = _triaged(state)
     lines = [f"## Update @ {sha}", ""]
     late = []
+    feedback = list(as_list(state.get("external_feedback")))
     for i in [i for i in items if i["action"] != "none"]:
         if i.get("thread_id") and time.time() - started > REVIEW_UPDATE_BUDGET:
             late.append(i["id"])
@@ -3483,6 +3496,10 @@ def review_update(state):
         ok = _resolve_thread(state, i["thread_id"], sha) if i.get("thread_id") else True
         _review_event(state, u, f"addressed {i['id']} -> {sha}" + ("" if ok else " (thread resolve FAILED)"))
         lines.append(f"- {i['id']}: {sha}")
+        prefix = f"PR #{pr} {i['id']} ("
+        if "body" in i and not any(isinstance(f, str) and f.startswith(prefix) for f in feedback):
+            feedback.append(f"{prefix}{i.get('author') or 'unknown'}): " + tail(i["body"], 600))
+    u["external_feedback"] = feedback
     skipped = [i for i in items if i["action"] == "none"]
     if skipped:
         lines += ["", "Not addressed:"] + [f"- {i['id']}: {_update_reason(i['reason']) or 'no change needed'}" for i in skipped]

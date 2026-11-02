@@ -1275,7 +1275,7 @@ check("review watch: CI red past the fix budget while watching -> ci_exhausted (
 u = AA("ci_exhausted", "Leave the PR in draft and report", **WATCH, ci_status="red")
 check("review watch: apply_answer ci_exhausted leave while watching -> finish_plan, outcome recorded, watch closed, follow-up",
       u["_next"] == "finish_plan" and u["review_outcomes"] == {"99": "ci_exhausted"} and u["review_watching"] is False
-      and any("review watch stopped: ci_exhausted" in f for f in u["follow_ups"]) and ledgered(u, "review-watch: PR #99 stop: ci_exhausted"))
+      and any("review watch stopped: ci_exhausted" in f for f in u["follow_ups"]) and ledgered(u, "review-watch: PR #99 stopped by the owner: ci_exhausted"))
 if MULTI_IS_GROUPS:
     u = AA("ci_exhausted", "Leave the PR in draft and report", **WATCH, **GROUP, ci_status="red")
     check("review watch: apply_answer ci_exhausted leave while watching in group mode -> finish_plan, never the next group",
@@ -1285,17 +1285,21 @@ check("review watch: CI infra failure while watching -> ci_infra", gates.ci_appl
 reviews(pr_state="MERGED", decision="APPROVED")
 check("review watch: review_poll state MERGED -> merged (wins over an approval)", gates.review_poll(base_state(**WATCH))["review_status"] == "merged")
 u = gates.review_route(base_state(**WATCH, review_status="merged"))
-check("review watch: review_route merged -> continuation finish_plan, outcome merged, 'merged externally' ledgered",
-      u["_next"] == "finish_plan" and u["review_outcomes"] == {"99": "merged"} and ledgered(u, "review-watch: PR #99 merged externally"))
+u = AA("review_external_close", "Stop watching and continue", esc=u.get("escalation"), **WATCH, review_status="merged")
+check("review watch: review_route merged, owner answers -> continuation finish_plan, outcome merged, 'merged externally' ledgered",
+      u.get("_next") == "finish_plan" and u.get("review_outcomes") == {"99": "merged"} and ledgered(u, "review-watch: PR #99 stopped by the owner: merged externally"), u)
 reviews(pr_state="CLOSED", comments=[ISSUE])
 check("review watch: review_poll state CLOSED -> closed (wins over new comments)", gates.review_poll(base_state(**WATCH))["review_status"] == "closed")
 u = gates.review_route(base_state(**WATCH, review_status="closed"))
-check("review watch: review_route closed -> finish_plan + follow-up, 'closed externally' ledgered",
-      u["_next"] == "finish_plan" and u["review_outcomes"] == {"99": "closed"} and u["review_watching"] is False
-      and any("closed externally" in f for f in u["follow_ups"]) and ledgered(u, "review-watch: PR #99 closed externally"))
+CLOSED_ESC = u.get("escalation")
+u = AA("review_external_close", "Stop watching and report", esc=CLOSED_ESC, **WATCH, review_status="closed")
+check("review watch: review_route closed, owner answers -> finish_plan + follow-up, 'closed externally' ledgered",
+      u.get("_next") == "finish_plan" and u.get("review_outcomes") == {"99": "closed"} and u.get("review_watching") is False
+      and any("closed externally" in f for f in u.get("follow_ups", [])) and ledgered(u, "review-watch: PR #99 stopped by the owner: closed externally"), u)
 if MULTI_IS_GROUPS:
-    u = gates.review_route(base_state(**WATCH, **GROUP, review_status="closed"))
-    check("review watch: review_route closed in group mode -> finish_plan, never the next group", u["_next"] == "finish_plan" and "closeout_done_for" not in u)
+    u = AA("review_external_close", "Stop watching and report", esc=CLOSED_ESC, **WATCH, **GROUP, review_status="closed")
+    check("review watch: review_route closed in group mode, owner answers -> finish_plan, never the next group",
+          u.get("_next") == "finish_plan" and "closeout_done_for" not in u, u)
 
 u = gates.review_apply(base_state(**TRIAGED, review_triage_items=FIX_ALL, review_fix_rounds=REVIEW_MAX_ROUNDS))
 check("review watch: review_apply at the review round cap -> review_round_cap",
@@ -1784,6 +1788,124 @@ finally:
             os.environ.pop(_k, None)
         else:
             os.environ[_k] = _v
+
+# ---------------------------------------------------------------- watch threads: outdated threads, fresh replies on resolved threads
+WATCH_ENV = ("ARCHITECT_GH_REVIEWS_CMD", "ARCHITECT_GH_HEAD_CMD", "ARCHITECT_GH_COMMENT_CMD", "ARCHITECT_GH_RESOLVE_CMD")
+_watch_saved = {k: os.environ.get(k) for k in WATCH_ENV}
+# one line: the reviews() stub echoes its JSON, and sh's echo would turn an escaped newline into a real one
+OWN_REPLY = f"Addressed in abc1234 {gates.OWN_MARKER}"
+
+
+def resolved(tid, *cs):
+    return {**thread(tid, *cs), "isResolved": True}
+
+
+try:
+    check("watch threads: REVIEW_QUERY asks for isOutdated on review threads", "isResolved isOutdated path" in gates.REVIEW_QUERY)
+    tr, un = gates._review_items({"reviewThreads": {"nodes": [{**thread("TH30", by("C30", "MEMBER", body="still wrong", login="bob")), "isOutdated": True},
+                                                             thread("TH31", by("C31", "MEMBER", body="and here", login="bob"))]}}, set())
+    check("watch threads: an unresolved outdated thread -> an item with outdated True; a current one -> outdated False",
+          [(i["id"], i.get("outdated")) for i in tr] == [("thread:TH30:C30", True), ("thread:TH31:C31", False)] and un == [], (tr, un))
+    FRESH = resolved("TH32", by("C32", "MEMBER", body="rename this", login="bob"), by("C33", "MEMBER", body=OWN_REPLY),
+                     by("C34", "MEMBER", body="the rename missed a caller", login="bob"))
+    tr, un = gates._review_items({"reviewThreads": {"nodes": [FRESH]}}, {"thread:TH32:C32"})
+    check("watch threads: a resolved thread with an own reply then a newer trusted comment -> surfaces under the new key with its body",
+          [i["id"] for i in tr] == ["thread:TH32:C34"] and "the rename missed a caller" in tr[0].get("body", "") and tr[0].get("outdated") is False and un == [],
+          (tr, un))
+    tr, un = gates._review_items({"reviewThreads": {"nodes": [
+        resolved("TH33", by("C35", "MEMBER", body="rename this", login="bob"), by("C36", "MEMBER", body=OWN_REPLY)),
+        resolved("TH34", by("C37", "MEMBER", body="rename this", login="bob"), by("C38", "MEMBER", body="never mind", login="bob"))]}}, set())
+    check("watch threads: a resolved thread whose newest comment is own, or with no own comment at all -> skipped", tr == [] and un == [], (tr, un))
+    tr, un = gates._review_items({"reviewThreads": {"nodes": [{**resolved("TH35", by("C39", "MEMBER", body="rename this", login="bob"),
+                                                                          by("C40", "MEMBER", body=OWN_REPLY), by("C41", "NONE")), "isOutdated": True}]}}, set())
+    check("watch threads: a resolved thread with an own reply then an untrusted newer comment -> an untrusted item with outdated and no body",
+          tr == [] and [i["id"] for i in un] == ["thread:TH35:C41"] and sorted(un[0]) == sorted(UNTRUSTED_KEYS + ["outdated"])
+          and un[0].get("outdated") is True and no_sentinel(un), (tr, un))
+    reviews(threads=[FRESH])
+    u = gates.review_poll(base_state(**WATCH, review_seen=["thread:TH32:C32"]))
+    check("watch threads: review_poll on a reviewer reply after the watch resolved the thread -> comments",
+          u.get("review_status") == "comments" and [i["id"] for i in u.get("review_items", [])] == ["thread:TH32:C34"], u)
+finally:
+    for _k, _v in _watch_saved.items():
+        if _v is None:
+            os.environ.pop(_k, None)
+        else:
+            os.environ[_k] = _v
+
+# ---------------------------------------------------------------- watch whetstone: addressed trusted review items feed whetstone
+try:
+    os.environ["ARCHITECT_GH_HEAD_CMD"] = f"echo {head}"
+    os.environ["ARCHITECT_GH_COMMENT_CMD"] = "true"
+    os.environ["ARCHITECT_GH_RESOLVE_CMD"] = "true"
+    LONG = "x" * 700 + " the tail of the long comment"
+    FEED = [{"id": "thread:TH40:C40", "kind": "thread", "author": "bob", "body": LONG, "path": "src/a.go", "thread_id": "TH40"},
+            {"id": "comment:I40", "kind": "comment", "author": "carol", "body": "fix the docs", "path": "", "thread_id": ""},
+            {"id": "comment:I41", "kind": "comment", "author": "dave", "body": "nice work", "path": "", "thread_id": ""},
+            {"id": "thread:TH41:C42", "kind": "thread", "author": "eve", "association": "NONE", "path": "src/b.go", "thread_id": "TH41"}]
+    FEED_TRIAGE = [{"id": "thread:TH40:C40", "action": "fix"}, {"id": "comment:I40", "action": "owner"},
+                   {"id": "comment:I41", "action": "none", "reason": "praise"}, {"id": "thread:TH41:C42", "action": "fix"}]
+    EARLIER = ["human said x", "PR #99 comment:I40 (carol): fix the docs"]
+    u = gates.review_update(base_state(**WATCH, review_items=FEED, review_triage_items=FEED_TRIAGE, external_feedback=EARLIER))
+    check("watch whetstone: review_update feeds each addressed trusted item (id, author, body tail), never a none item, an item without a body or a duplicate",
+          u.get("_next") == "ci_poll" and u.get("external_feedback") == EARLIER + ["PR #99 thread:TH40:C40 (bob): " + gates.tail(LONG, 600)],
+          u.get("external_feedback"))
+    check("watch whetstone: whetstone_gate after a fed review_update -> run_whetstone",
+          gates.whetstone_gate(base_state(external_feedback=u.get("external_feedback", [])))["_next"] == "run_whetstone")
+    u = gates.review_update(base_state(**WATCH, review_items=FEED[2:3], review_triage_items=FEED_TRIAGE[2:3]))
+    check("watch whetstone: a review_update that addressed nothing leaves external_feedback empty -> whetstone skipped",
+          u.get("external_feedback") == [] and gates.whetstone_gate(base_state(external_feedback=u.get("external_feedback")))["_next"] == "summarize_run",
+          u.get("external_feedback"))
+finally:
+    for _k, _v in _watch_saved.items():
+        if _v is None:
+            os.environ.pop(_k, None)
+        else:
+            os.environ[_k] = _v
+
+# ---------------------------------------------------------------- watch stops: every stop goes through an escalation
+STOP_ESC = {}
+for status, opt in (("closed", "Stop watching and report"), ("merged", "Stop watching and continue")):
+    u = gates.review_route(base_state(**WATCH, review_status=status))
+    STOP_ESC[status] = esc = u.get("escalation", {})
+    check(f"watch stops: review_route {status} -> review_external_close with the single option '{opt}', stop ledgered, watch still open",
+          u.get("_next") == "escalate_gate" and esc.get("kind") == "review_external_close" and esc.get("data") == {"status": status}
+          and [(o["text"], o["recommended"]) for o in esc.get("options", [])] == [(opt, True)] and ledgered(u, f"review-watch: PR #99 stop: {status} externally")
+          and "review_watching" not in u and "review_outcomes" not in u and "follow_ups" not in u, u)
+u = AA("review_external_close", "Stop watching and report", esc=STOP_ESC["closed"], **WATCH, review_status="closed")
+check("watch stops: apply_answer review_external_close closed -> finish_plan, closed-externally follow-up, outcome closed, watch closed",
+      u.get("_next") == "finish_plan" and u.get("review_outcomes") == {"99": "closed"} and u.get("review_watching") is False
+      and any("PR #99 was closed externally" in f for f in u.get("follow_ups", [])), u)
+u = AA("review_external_close", "Stop watching and continue", esc=STOP_ESC["merged"], **WATCH, review_status="merged")
+check("watch stops: apply_answer review_external_close merged single -> finish_plan, outcome merged, no follow-up",
+      u.get("_next") == "finish_plan" and u.get("review_outcomes") == {"99": "merged"} and u.get("review_watching") is False and "follow_ups" not in u, u)
+_real_groups = gates.MULTI_IS_GROUPS
+gates.MULTI_IS_GROUPS = True
+try:
+    u = AA("review_external_close", "Stop watching and continue", esc=STOP_ESC["merged"], **WATCH, **GROUP, review_status="merged")
+finally:
+    gates.MULTI_IS_GROUPS = _real_groups
+check("watch stops: apply_answer review_external_close merged in a group close-out -> select_tasks with the group reset",
+      u.get("_next") == "select_tasks" and u.get("closeout_done_for") == "g1" and u.get("pr_number") == "" and u.get("review_outcomes") == {"99": "merged"}, u)
+
+
+def stop_functions(tree):
+    """Top-level functions with a 'stop: ' string, and the escalation kinds each one raises."""
+    for fn in (n for n in tree.body if isinstance(n, ast.FunctionDef)):
+        if any(isinstance(n, ast.Constant) and isinstance(n.value, str) and "stop: " in n.value for n in ast.walk(fn)):
+            calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
+            yield fn.name, any(c.func.id == "raise_escalation" for c in calls), \
+                {c.args[0].value for c in calls if c.func.id == "escalation" and c.args and isinstance(c.args[0], ast.Constant)}
+
+
+ANSWER_FN = next(n for n in GATES_AST.body if isinstance(n, ast.FunctionDef) and n.name == "apply_answer")
+HANDLED = {e.value for n in ast.walk(ANSWER_FN) if isinstance(n, ast.Compare) and isinstance(n.left, ast.Name) and n.left.id == "kind"
+           for c in n.comparators for e in (c.elts if isinstance(c, ast.Tuple) else [c]) if isinstance(e, ast.Constant)}
+STOPS = list(stop_functions(GATES_AST))
+STOP_KINDS = set().union(*(k for _, _, k in STOPS))
+check("watch stops: every gates.py function with a 'stop: ' event raises an escalation, and apply_answer handles each kind they raise",
+      {"review_route", "review_apply", "review_update"} <= {n for n, _, _ in STOPS} and all(esc for _, esc, _ in STOPS)
+      and "review_external_close" in STOP_KINDS and STOP_KINDS <= HANDLED,
+      ([n for n, esc, _ in STOPS if not esc], sorted(STOP_KINDS - HANDLED)))
 
 # ---------------------------------------------------------------- rollup scope: --plan always, --tasks for a PR group only
 # A recording tools.sh (ARCHITECT_CORE_TOOLS) logs the --tasks / --plan each core call receives.
