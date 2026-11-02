@@ -51,7 +51,9 @@
 // off for its read when stty can reach that terminal.
 //
 // COYOTE_UI is "repl" or "tui" when a human can answer and "headless" when
-// nobody can; tools may branch on it before asking.
+// nobody can; tools may branch on it before asking. Under "tui" only the
+// channel-backed path is safe: the /dev/tty fallback draws straight over the
+// full-screen UI.
 
 import * as fs from "node:fs";
 import * as path from "node:path";

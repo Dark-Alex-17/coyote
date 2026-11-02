@@ -565,23 +565,7 @@ fn enter_and_leave_sequences_mirror_around_the_alternate_screen() {
 #[test]
 #[serial]
 fn sighup_leaves_the_tty_cooked() {
-    let dir = fresh_config_dir("sighup");
-    let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir);
-    let mut pty = spawn_tui(&dir, &[]);
-
-    let transcript = pty.wait_for("no session", PTY_DEADLINE).unwrap();
-    let pid = child_pid(&transcript);
-    // SAFETY: kill takes a pid and a signal number and touches no memory.
-    assert_eq!(unsafe { libc::kill(pid, libc::SIGHUP) }, 0);
-    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
-
-    assert_eq!(exit_code(&transcript), 0, "{transcript}");
-    assert_tty_restored(&transcript);
-    assert!(
-        rfind(pty.raw(), LEAVE_ALT).is_some(),
-        "SIGHUP exit never left the alternate screen"
-    );
+    signal_leaves_the_tty_cooked("sighup", libc::SIGHUP);
 }
 
 /// A hang-up while the keyboard-enhancement probe is still waiting on

@@ -174,6 +174,7 @@ pub(crate) fn install_panic_hook() -> bool {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             restore_from_static();
+            echo_panic_past_capture(info);
             previous(info);
         }));
         installed = true;
@@ -181,29 +182,33 @@ pub(crate) fn install_panic_hook() -> bool {
     installed
 }
 
-/// Writes the leave sequence through the descriptor `enter` recorded. Runs
-/// on the panic path, so every error is ignored: there is nothing left to
-/// report it to.
-fn restore_from_static() {
-    #[cfg(unix)]
-    {
-        use std::mem::ManuallyDrop;
-        use std::os::fd::FromRawFd;
-        // Read, not taken: the fd stays armed for the next panic, since a
-        // background task's panic is caught as a join error and the UI
-        // re-enters the screen afterwards. `leave` itself is single-taker
-        // through SCREEN_ENTERED, so two hooks cannot both write.
-        let fd = PANIC_FD.load(Ordering::SeqCst);
-        if fd < 0 {
-            return;
-        }
+/// The terminal behind the descriptor `enter` recorded, or None before
+/// `Screen::enter` and after the `Screen` is gone.
+#[cfg(unix)]
+fn static_tty() -> Option<std::mem::ManuallyDrop<std::fs::File>> {
+    use std::os::fd::FromRawFd;
+    // Read, not taken: the fd stays armed for the next panic, since a
+    // background task's panic is caught as a join error and the UI
+    // re-enters the screen afterwards. `leave` itself is single-taker
+    // through SCREEN_ENTERED, so two hooks cannot both write.
+    let fd = PANIC_FD.load(Ordering::SeqCst);
+    (fd >= 0).then(|| {
         // SAFETY: the fd was dup'd by `open_tty_writer`; `Screen` clears
         // PANIC_FD before the writer that owns the fd drops, so this write
         // normally lands on an open descriptor. A hook racing `Screen::drop`
         // on another thread can still find it closed and get EBADF, which
         // is ignored like every other error here. ManuallyDrop keeps this
         // handle from closing the fd.
-        let mut writer = ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
+        std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) })
+    })
+}
+
+/// Writes the leave sequence through the descriptor `enter` recorded. Runs
+/// on the panic path, so every error is ignored: there is nothing left to
+/// report it to.
+fn restore_from_static() {
+    #[cfg(unix)]
+    if let Some(mut writer) = static_tty() {
         let _ = leave(&mut *writer);
     }
     #[cfg(not(unix))]
@@ -211,6 +216,24 @@ fn restore_from_static() {
         let _ = leave(&mut io::stdout());
     }
 }
+
+/// The hook after this one prints to fd 2, which during a command turn is
+/// the capture pipe. A panic on a work thread is caught as a join error
+/// and its text comes back through the late-output path; the driver's own
+/// panic ends the process with the text still in the pipe, so it is
+/// written to the terminal here as well, after `leave` has cooked it.
+#[cfg(unix)]
+fn echo_panic_past_capture(info: &std::panic::PanicHookInfo<'_>) {
+    if super::redirect::fds_captured()
+        && std::thread::current().name() == Some("main")
+        && let Some(mut tty) = static_tty()
+    {
+        let _ = writeln!(tty, "thread 'main' {info}");
+    }
+}
+
+#[cfg(not(unix))]
+fn echo_panic_past_capture(_: &std::panic::PanicHookInfo<'_>) {}
 
 /// Switches the terminal into the UI's modes.
 pub(crate) fn enter(writer: &mut impl Write, enhancement: bool) -> io::Result<()> {

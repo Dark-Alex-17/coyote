@@ -28,7 +28,9 @@
 # subshells) in the same tool, or they will swallow each other's replies.
 #
 # COYOTE_UI is "repl" or "tui" when a human can answer and "headless" when
-# nobody can; tools may branch on it before asking.
+# nobody can; tools may branch on it before asking. Under "tui" only the
+# channel-backed helpers are safe: range, editor and any /dev/tty fallback
+# draw straight over the full-screen UI.
 #
 # - guard_operation   Prompt for permission to run an operation
 # - guard_path        Prompt for permission to perform path operations

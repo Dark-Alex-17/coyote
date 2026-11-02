@@ -43,8 +43,10 @@ impl Pty {
 
         let (master, slave) = open_pair(40, 100)?;
         let slave_fd = slave.as_raw_fd();
-        // SAFETY: the hook calls only async-signal-safe libc functions on
-        // descriptors that stay open in the parent until after spawn returns.
+        // SAFETY: the hook calls only libc functions that are plain
+        // syscalls (getrlimit included, which sysconf is not on every
+        // libc) on descriptors that stay open in the parent until after
+        // spawn returns.
         unsafe {
             cmd.pre_exec(move || {
                 if libc::setsid() == -1 {
@@ -67,11 +69,13 @@ impl Pty {
                 // carry the flag are left alone: exec drops them anyway,
                 // and one of them is std's exec-status pipe, which the
                 // parent needs to learn that execvp failed.
-                let open_max = libc::sysconf(libc::_SC_OPEN_MAX);
-                let limit = if open_max > 0 {
-                    open_max.min(1024) as i32
-                } else {
-                    1024
+                let mut nofile = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                let limit = match libc::getrlimit(libc::RLIMIT_NOFILE, &mut nofile) {
+                    0 if nofile.rlim_cur != libc::RLIM_INFINITY => nofile.rlim_cur.min(1024) as i32,
+                    _ => 1024,
                 };
                 for fd in 3..limit {
                     if fd == slave_fd {
@@ -277,10 +281,17 @@ impl Drop for Pty {
         let _ = self.child.kill();
         let child_pgrp = self.child.id() as i32;
         // Under the job-control wrapper the binary runs in its own
-        // foreground group, which the wrapper's death would orphan.
-        // SAFETY: tcgetpgrp reads one int from the tty behind an open fd.
+        // foreground group, which the wrapper's death would orphan. The
+        // group is only killed while it still belongs to the child's
+        // session (the child is its leader, so the session id is its
+        // pid): a stale id may already name an unrelated process group.
+        // SAFETY: tcgetpgrp reads one int from the tty behind an open fd;
+        // getsid takes a pid and touches no memory.
         let foreground = unsafe { libc::tcgetpgrp(self.master.as_raw_fd()) };
-        if foreground > 1 && foreground != child_pgrp {
+        if foreground > 1
+            && foreground != child_pgrp
+            && unsafe { libc::getsid(foreground) } == child_pgrp
+        {
             // SAFETY: kill takes a pid and a signal number and touches no memory.
             unsafe { libc::kill(-foreground, libc::SIGKILL) };
         }

@@ -41,7 +41,6 @@ ratatui = { version = "0.30", default-features = false, features = [
   "crossterm_0_29",
   "layout-cache",
   "underline-color",
-  "scrolling-regions",
 ] }
 ansi-to-tui = "8"
 ratatui-textarea = { version = "0.9", default-features = false, features = [

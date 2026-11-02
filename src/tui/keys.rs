@@ -76,9 +76,12 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             }
         }
         Some(ModalKind::Input) => match key.code {
-            KeyCode::Enter if key.modifiers.is_empty() => Action::SubmitModalInput,
             KeyCode::Esc => Action::Answer(PromptAnswer::Cancelled),
             KeyCode::Char('c') if ctrl => Action::Answer(PromptAnswer::Cancelled),
+            // The field is one line, so the composer's newline chords have
+            // nothing to insert: Enter submits however it is held.
+            KeyCode::Enter => Action::SubmitModalInput,
+            KeyCode::Char('j') if ctrl => Action::Nothing,
             _ => Action::ModalInput(key),
         },
         None => match key.code {
@@ -310,6 +313,21 @@ mod tests {
         assert_eq!(
             map_key(plain(KeyCode::Enter), &modal),
             Action::SubmitModalInput
+        );
+        for modifiers in [
+            KeyModifiers::SHIFT,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL,
+        ] {
+            assert_eq!(
+                map_key(press(KeyCode::Enter, modifiers), &modal),
+                Action::SubmitModalInput,
+                "{modifiers:?}"
+            );
+        }
+        assert_eq!(
+            map_key(press(KeyCode::Char('j'), KeyModifiers::CONTROL), &modal),
+            Action::Nothing
         );
         assert_eq!(
             map_key(plain(KeyCode::Esc), &modal),

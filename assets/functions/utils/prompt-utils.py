@@ -33,7 +33,9 @@
 # concurrently in the same tool, or they will swallow each other's replies.
 #
 # COYOTE_UI is "repl" or "tui" when a human can answer and "headless" when
-# nobody can; tools may branch on it before asking.
+# nobody can; tools may branch on it before asking. Under "tui" only the
+# channel-backed path is safe: the /dev/tty fallback draws straight over the
+# full-screen UI.
 
 import getpass
 import io

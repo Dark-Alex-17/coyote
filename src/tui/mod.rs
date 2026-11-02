@@ -60,6 +60,9 @@ const PANIC_AT_START_ENV: &str = "COYOTE_TUI_PANIC_AT_START";
 /// confirms a prompt that appeared under it.
 const HOTKEY_IDLE: Duration = Duration::from_secs(1);
 const TOOL_OUTPUT_TAIL: usize = 20;
+/// Most text one cell of late command output holds; a leftover child that
+/// keeps writing sees its oldest lines dropped rather than the transcript grow.
+const LATE_OUTPUT_LIMIT: usize = 64 * 1024;
 const COMPOSER_MIN_ROWS: u16 = 3;
 const COMPOSER_MAX_ROWS: u16 = 8;
 /// Transcript rows a modal's question may not take from the frame, so the
@@ -687,10 +690,19 @@ impl App {
             TermInput::Key(key) => self.handle_key(key),
             TermInput::Paste(text) => {
                 self.last_keystroke = Some(self.clock.now());
-                match self.prompts.front_mut().and_then(|p| p.field.as_mut()) {
-                    Some(field) => field.insert_str(text.replace('\n', " ")),
-                    None => self.composer.insert_str(text),
-                };
+                match self.prompts.front_mut() {
+                    // A confirm has no field, and the composer is hidden
+                    // under the modal: a paste there would land where the
+                    // user cannot see it.
+                    Some(prompt) => {
+                        if let Some(field) = prompt.field.as_mut() {
+                            field.insert_str(text.replace('\n', " "));
+                        }
+                    }
+                    None => {
+                        self.composer.insert_str(text);
+                    }
+                }
                 self.schedule_frame();
                 None
             }
@@ -810,7 +822,7 @@ impl App {
                 }
                 _ => self.cells.push(Cell::assistant(text, true)),
             },
-            UiMsg::Notice { kind, text } => self.cells.push(Cell::notice(kind, text)),
+            UiMsg::Notice { kind, text } => self.push_notice(kind, text),
             UiMsg::ToolNarration { call_id, line } => self.cells.push(Cell::Text {
                 call_id: Some(call_id),
                 lines: vec![line],
@@ -863,7 +875,42 @@ impl App {
         self.prompts.push_back(PendingPrompt { req, reply, field });
     }
 
+    /// Late command output arrives one pipe read at a time; consecutive
+    /// chunks join the trailing Routing cell instead of each taking a
+    /// cell of their own, and the cell keeps only its newest text.
+    fn push_notice(&mut self, kind: NoticeKind, mut text: String) {
+        if kind != NoticeKind::Routing {
+            self.cells.push(Cell::notice(kind, text));
+            return;
+        }
+        text.truncate(text.trim_end_matches('\n').len());
+        if let Some(Cell::Notice {
+            kind: NoticeKind::Routing,
+            text: tail,
+            cache,
+        }) = self.cells.last_mut()
+        {
+            if !tail.is_empty() && !text.is_empty() {
+                tail.push('\n');
+            }
+            tail.push_str(&text);
+            if tail.len() > LATE_OUTPUT_LIMIT {
+                let cut = tail.len() - LATE_OUTPUT_LIMIT;
+                let cut = (cut..=tail.len())
+                    .find(|at| tail.is_char_boundary(*at))
+                    .unwrap_or(tail.len());
+                tail.drain(..cut);
+            }
+            *cache = LineCache::default();
+            return;
+        }
+        self.cells.push(Cell::notice(kind, text));
+    }
+
     fn append_tool_output(&mut self, call_id: Option<String>, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
         let text = String::from_utf8_lossy(bytes);
         let first_cell = self
             .turn
@@ -888,8 +935,9 @@ impl App {
         else {
             return;
         };
-        for (i, piece) in text.split('\n').enumerate() {
-            let last_is_open = i == text.split('\n').count() - 1;
+        let pieces: Vec<&str> = text.split('\n').collect();
+        for (i, piece) in pieces.iter().enumerate() {
+            let last_is_open = i == pieces.len() - 1;
             if i == 0 && *open_line {
                 if let Some(last) = lines.last_mut() {
                     last.push_str(piece);
@@ -2235,6 +2283,23 @@ mod tests {
         );
     }
 
+    /// A paste while a confirm is up has nowhere visible to go: the modal
+    /// has no field and the composer is hidden under it.
+    #[test]
+    fn a_paste_under_a_confirm_is_dropped() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.type_text("draft");
+        let asker = ask_on_a_thread(&mut harness, confirm_request(None));
+        harness
+            .app
+            .handle_input(TermInput::Paste("pasted-p3x".to_string()));
+        assert_eq!(harness.app.composer_text(), "draft");
+        assert_eq!(harness.app.prompts.len(), 1);
+        harness.clock.advance(HOTKEY_IDLE);
+        harness.press(KeyCode::Esc);
+        assert_eq!(asker.join().unwrap().unwrap(), PromptAnswer::Cancelled);
+    }
+
     /// Enter tapped while the turn runs maps to nothing, but it is still
     /// a keystroke for the idle gate: a confirm appearing right after one
     /// is not answered by the next tap of the same key.
@@ -2491,6 +2556,32 @@ mod tests {
         assert_eq!(late.len(), 1, "{late:?}");
         assert!(late[0].contains("boom-r7x"), "{late:?}");
         assert!(late[0].contains("panicked"), "{late:?}");
+    }
+
+    /// A leftover writer's chunks fold into one cell that keeps its
+    /// newest text, so a chatty child cannot grow the transcript by a
+    /// cell per write.
+    #[test]
+    fn late_output_chunks_share_one_bounded_cell() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("explain", false);
+        let (tx, mut rx) = unbounded_channel();
+        let late = late_output(tx);
+        late("first-k1q\n".to_string());
+        late("second-k1q\n".to_string());
+        while let Ok(msg) = rx.try_recv() {
+            harness.app.handle_msg(msg);
+        }
+        assert_eq!(harness.app.cells.len(), 2);
+        assert_eq!(harness.app.turn_late_output(), ["first-k1q\nsecond-k1q"]);
+
+        late("x".repeat(LATE_OUTPUT_LIMIT));
+        harness.app.handle_msg(rx.try_recv().unwrap());
+        let kept = harness.app.turn_late_output();
+        assert_eq!(harness.app.cells.len(), 2);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].len(), LATE_OUTPUT_LIMIT);
+        assert!(!kept[0].contains("k1q"));
     }
 
     #[test]

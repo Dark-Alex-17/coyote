@@ -4,9 +4,9 @@
 //! transcript cell when the fds are back on the terminal.
 
 #[cfg(not(unix))]
-pub(crate) use other::FdRedirect;
+pub(crate) use other::{FdRedirect, fds_captured};
 #[cfg(unix)]
-pub(crate) use unix::FdRedirect;
+pub(crate) use unix::{FdRedirect, fds_captured};
 
 use std::time::Duration;
 
@@ -32,6 +32,10 @@ mod other {
             String::new() // TASK-316
         }
     }
+
+    pub(crate) fn fds_captured() -> bool {
+        false
+    }
 }
 
 #[cfg(unix)]
@@ -39,12 +43,22 @@ mod unix {
     use super::{QUIET_GAP, SETTLE_LIMIT};
     use std::io::{self, Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Duration, Instant};
 
     /// Most of a command's output kept for its cell; a runaway writer is
     /// cut here and the tail is counted rather than stored.
     const CAPTURE_LIMIT: usize = 1024 * 1024;
+
+    static CAPTURED: AtomicBool = AtomicBool::new(false);
+
+    /// Whether fds 1 and 2 point into a guard's pipe right now. The panic
+    /// hook asks: a message the default hook prints there dies with the
+    /// process.
+    pub(crate) fn fds_captured() -> bool {
+        CAPTURED.load(Ordering::SeqCst)
+    }
 
     struct Drained {
         buf: Vec<u8>,
@@ -113,6 +127,7 @@ mod unix {
 
         fn restore(&self) {
             flush_std_streams();
+            CAPTURED.store(false, Ordering::SeqCst);
             if let Err(err) = dup2(self.stdout.as_raw_fd(), libc::STDOUT_FILENO) {
                 warn!("Failed to restore stdout after a command turn: {err}");
             }
@@ -214,6 +229,7 @@ mod unix {
                 saved.restore();
                 return Err(err);
             }
+            CAPTURED.store(true, Ordering::SeqCst);
             let shared = Arc::new(Shared {
                 drained: Mutex::new(Drained {
                     buf: Vec::new(),
@@ -369,6 +385,22 @@ mod unix {
             release_harness_output(saved, reader, "");
             assert!(elapsed < Duration::from_secs(2), "finish took {elapsed:?}");
             assert_eq!(captured.trim(), "before-r2x");
+        }
+
+        /// The panic hook's view of the capture follows the guard exactly,
+        /// whether it ends through `finish` or a drop.
+        #[test]
+        #[serial]
+        fn the_capture_flag_tracks_the_guard() {
+            let (saved, reader) = capture_stdout();
+            assert!(!fds_captured());
+            let guard = FdRedirect::begin(|_| {}).unwrap();
+            assert!(fds_captured());
+            guard.finish();
+            assert!(!fds_captured());
+            drop(FdRedirect::begin(|_| {}).unwrap());
+            assert!(!fds_captured());
+            release_harness_output(saved, reader, "");
         }
 
         /// A drain thread the scheduler has not run yet is waited for:
