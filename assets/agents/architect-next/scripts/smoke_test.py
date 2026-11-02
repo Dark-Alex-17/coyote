@@ -1383,50 +1383,50 @@ u = gates.ci_route(base_state(pr_number="99", ci_status="pending", ci_poll_fails
 u2 = gates.ci_route(base_state(pr_number="99", ci_status="", ci_poll_fails=1))
 u3 = gates.ci_route(base_state(pr_number="99", ci_status="red", ci_poll_fails=0, last_script_error="script 'ci_poll' failed: timed out"))
 check("watch: ci_route stale pending / empty status or a failed ci_poll -> one read failure, poll again",
-      u["_next"] == u2["_next"] == u3["_next"] == "ci_poll" and u["ci_poll_fails"] == 1 and u2["ci_poll_fails"] == 2 and u3["ci_poll_fails"] == 1
+      u["_next"] == u2["_next"] == u3["_next"] == "ci_poll" and u.get("ci_poll_fails") == 1 and u2.get("ci_poll_fails") == 2 and u3.get("ci_poll_fails") == 1
       and ledgered(u, "counted as a read failure (1/") and ledgered(u3, "fallback: ci_poll: script 'ci_poll' failed"), (u, u3))
 u = gates.ci_route(base_state(pr_number="99", ci_status="pending", ci_poll_fails=CI_POLL_FAILS - 1))
 check("watch: ci_route stale status at the read-failure cap -> poll_error -> ci_exhausted",
-      u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "ci_exhausted" and u["ci_status"] == "poll_error" and "(poll_error:" in u["escalation"]["question"])
+      u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "ci_exhausted" and u.get("ci_status") == "poll_error" and "(poll_error:" in u["escalation"]["question"], u)
 u = gates.review_route(base_state(**WATCH, review_status="pending", review_poll_fails=0))
 u2 = gates.review_route(base_state(**WATCH, review_status="", review_poll_fails=1))
 u3 = gates.review_route(base_state(**WATCH, review_status="comments", review_poll_fails=0, last_script_error="script 'review_poll' failed: timed out"))
 check("watch: review_route stale pending / empty status or a failed review_poll -> one read failure, poll again",
-      u["_next"] == u2["_next"] == u3["_next"] == "review_poll" and u["review_poll_fails"] == 1 and u2["review_poll_fails"] == 2
-      and u3["review_poll_fails"] == 1 and ledgered(u, "counted as a read failure (1/"), (u, u3))
+      u["_next"] == u2["_next"] == u3["_next"] == "review_poll" and u.get("review_poll_fails") == 1 and u2.get("review_poll_fails") == 2
+      and u3.get("review_poll_fails") == 1 and ledgered(u, "counted as a read failure (1/"), (u, u3))
 u = gates.review_route(base_state(**WATCH, review_status="pending", review_poll_fails=CI_POLL_FAILS - 1))
 check("watch: review_route stale status at the read-failure cap -> poll_error -> review_exhausted",
-      u["escalation"]["kind"] == "review_exhausted" and u["review_status"] == "poll_error" and ledgered(u, "review-watch: PR #99 stop: poll_error"))
+      u.get("escalation", {}).get("kind") == "review_exhausted" and u.get("review_status") == "poll_error" and ledgered(u, "review-watch: PR #99 stop: poll_error"))
 
 checks(("build", "pass"))
 u = gates.ci_poll(base_state(pr_number="99", ci_polls_run=POLL_VISIT_BUDGET - 1))
-check("watch: ci_poll one below the run-wide visit budget -> a normal poll", u["ci_status"] == "green" and u["ci_polls_run"] == POLL_VISIT_BUDGET)
+check("watch: ci_poll one below the run-wide visit budget -> a normal poll", u.get("ci_status") == "green" and u.get("ci_polls_run") == POLL_VISIT_BUDGET)
 u = gates.ci_poll(base_state(pr_number="99", ci_polls_run=POLL_VISIT_BUDGET))
-check("watch: ci_poll at the run-wide visit budget -> visit_cap -> ci_route", u["ci_status"] == "visit_cap" and u["_next"] == "ci_route")
+check("watch: ci_poll at the run-wide visit budget -> visit_cap -> ci_route", u.get("ci_status") == "visit_cap" and u["_next"] == "ci_route")
 reviews()
 u = gates.review_poll(base_state(**WATCH, review_polls_run=POLL_VISIT_BUDGET - 1))
-check("watch: review_poll one below the run-wide visit budget -> a normal poll", u["review_status"] == "pending" and u["review_polls_run"] == POLL_VISIT_BUDGET)
+check("watch: review_poll one below the run-wide visit budget -> a normal poll", u.get("review_status") == "pending" and u.get("review_polls_run") == POLL_VISIT_BUDGET)
 u = gates.review_poll(base_state(**WATCH, review_polls_run=POLL_VISIT_BUDGET))
-check("watch: review_poll at the run-wide visit budget -> visit_cap -> review_route", u["review_status"] == "visit_cap" and u["_next"] == "review_route")
+check("watch: review_poll at the run-wide visit budget -> visit_cap -> review_route", u.get("review_status") == "visit_cap" and u["_next"] == "review_route")
 STOP_ONLY = [("Stop watching and report", True)]
 u = gates.ci_route(base_state(pr_number="99", ci_status="visit_cap"))
 check("watch: ci_route visit_cap -> watch_visit_cap with the single option 'Stop watching and report'",
-      u["escalation"]["kind"] == "watch_visit_cap" and [(o["text"], o["recommended"]) for o in u["escalation"]["options"]] == STOP_ONLY
+      u.get("escalation", {}).get("kind") == "watch_visit_cap" and [(o["text"], o["recommended"]) for o in u["escalation"]["options"]] == STOP_ONLY
       and not ledgered(u, "review-watch:"))
 u = gates.ci_route(base_state(**WATCH, ci_status="visit_cap"))
-check("watch: ci_route visit_cap while watching -> watch_visit_cap, stop ledgered", u["escalation"]["kind"] == "watch_visit_cap"
+check("watch: ci_route visit_cap while watching -> watch_visit_cap, stop ledgered", u.get("escalation", {}).get("kind") == "watch_visit_cap"
       and ledgered(u, "review-watch: PR #99 stop: watch_visit_cap"))
 u = gates.review_route(base_state(**WATCH, review_status="visit_cap"))
 check("watch: review_route visit_cap -> watch_visit_cap with the single option 'Stop watching and report', stop ledgered",
-      u["escalation"]["kind"] == "watch_visit_cap" and [(o["text"], o["recommended"]) for o in u["escalation"]["options"]] == STOP_ONLY
+      u.get("escalation", {}).get("kind") == "watch_visit_cap" and [(o["text"], o["recommended"]) for o in u["escalation"]["options"]] == STOP_ONLY
       and ledgered(u, "review-watch: PR #99 stop: visit_cap"))
 u = AA("watch_visit_cap", "Stop watching and report", pr_number="99", ci_status="visit_cap")
 check("watch: apply_answer watch_visit_cap stop in the CI watch -> finish_plan with the left-in-draft follow-up",
-      u["_next"] == "finish_plan" and any("PR #99 left in draft with CI visit_cap" in f for f in u["follow_ups"]) and "review_watching" not in u)
+      u["_next"] == "finish_plan" and any("PR #99 left in draft with CI visit_cap" in f for f in u.get("follow_ups", [])) and "review_watching" not in u)
 u = AA("watch_visit_cap", "Stop watching and report", **WATCH, ci_status="green")
 check("watch: apply_answer watch_visit_cap stop in the review watch -> watch closed + follow-up + finish_plan",
-      u["_next"] == "finish_plan" and u["review_watching"] is False and u["review_outcomes"] == {"99": "watch_visit_cap"}
-      and any("review watch stopped: watch_visit_cap" in f for f in u["follow_ups"]) and not any("left in draft" in f for f in u["follow_ups"]))
+      u["_next"] == "finish_plan" and u.get("review_watching") is False and u.get("review_outcomes") == {"99": "watch_visit_cap"}
+      and any("review watch stopped: watch_visit_cap" in f for f in u.get("follow_ups", [])) and not any("left in draft" in f for f in u.get("follow_ups", [])))
 if MULTI_IS_GROUPS:
     u = AA("watch_visit_cap", "Stop watching and report", **WATCH, **GROUP)
     check("watch: apply_answer watch_visit_cap stop in group mode -> finish_plan, never the next group", u["_next"] == "finish_plan" and "closeout_done_for" not in u)
@@ -1459,20 +1459,20 @@ finally:
     gates._pr_comment = _real_pr_comment
 calls = read_file(REVIEW_CALLS).splitlines() if os.path.isfile(REVIEW_CALLS) else []
 check("watch: review_update past its time budget -> remaining threads left unresolved, listed, ledgered and not seen",
-      u["_next"] == "ci_poll" and not any(c.startswith("resolve") for c in calls) and u["review_seen"] == rids[1:]
+      u["_next"] == "ci_poll" and not any(c.startswith("resolve") for c in calls) and u.get("review_seen") == rids[1:]
       and len(posted) == 1 and f"Not resolved (time budget):\n- {rids[0]}" in posted[0] and f"- {rids[1]}: {head}" in posted[0]
       and ledgered(u, f"review-watch: PR #99 not resolved (time budget) {rids[0]}"), (calls, u.get("review_seen"), posted))
 u = AA("review_push_mismatch", "Re-check the PR head", **TRIAGED, review_triage_items=FIX_ALL)
 check("watch: apply_answer review_push_mismatch re-check -> review_update", u["_next"] == "review_update" and "review_watching" not in u)
 u = AA("review_push_mismatch", "Stop watching and report", **WATCH)
 check("watch: apply_answer review_push_mismatch stop -> watch closed + follow-up + finish_plan",
-      u["_next"] == "finish_plan" and u["review_watching"] is False and u["review_outcomes"] == {"99": "review_push_mismatch"}
-      and any("review watch stopped: review_push_mismatch" in f for f in u["follow_ups"]))
+      u["_next"] == "finish_plan" and u.get("review_watching") is False and u.get("review_outcomes") == {"99": "review_push_mismatch"}
+      and any("review watch stopped: review_push_mismatch" in f for f in u.get("follow_ups", [])))
 
 
 def esc_shape(u):
-    e = u["escalation"]
-    return e["question"], [(o["text"], o["recommended"]) for o in e["options"]]
+    e = u.get("escalation", {})
+    return e.get("question"), [(o["text"], o["recommended"]) for o in e.get("options", [])]
 
 
 LEAVE = "Leave the PR in draft and report"
@@ -1503,10 +1503,10 @@ for kind, over, question, opts in CI_CASES:
         u = gates.ci_apply(base_state(**st, **over))
         want = (question.format(d=d, w=w), [(t.format(l=l), r) for t, r in opts])
         check(f"watch: ci_apply {kind} {'while watching -> review-aware text, stop option, stop ledgered' if watching else 'outside the watch -> text and options unchanged'}",
-              u["escalation"]["kind"] == kind and esc_shape(u) == want and ledgered(u, f"review-watch: PR #99 stop: {kind}") == watching, esc_shape(u))
+              u.get("escalation", {}).get("kind") == kind and esc_shape(u) == want and ledgered(u, f"review-watch: PR #99 stop: {kind}") == watching, esc_shape(u))
 u = AA("ci_unsure", STOP, **WATCH, ci_status="red")
 check("watch: apply_answer ci_unsure 'Stop watching and report' while watching -> finish_plan, watch closed, never the left-in-draft follow-up",
-      u["_next"] == "finish_plan" and u["review_watching"] is False and not any("left in draft" in f for f in u["follow_ups"]))
+      u["_next"] == "finish_plan" and u.get("review_watching") is False and not any("left in draft" in f for f in u.get("follow_ups", [])))
 
 FIX_DELEGATION = dict(plan_path=PROMOTED, tasks=TS1, current_task=T1, run_branch="feat/PLAN-widgets", delegation_kind="fix", fix_items=["review: rename"])
 PUSH_ONLY = "push your commits only - never open, re-publish, retitle, edit or convert the PR to draft"
@@ -1518,7 +1518,7 @@ check("watch: fix delegation while watching carries the push-only MUST NOT line;
 
 u = gates.review_apply(base_state(**TRIAGED, review_triage_items=FIX_ALL, task_rounds={T1: {"conformance_rounds": RERUN_ONCE, "debris_reruns": RERUN_ONCE, "x": 5}, "T9": {"conformance_rounds": 1}}))
 check("watch: a review fix round resets the owning task's conformance_rounds and debris_reruns (fresh gauntlet budget)",
-      u["_next"] == "fix_round" and u["task_rounds"][T1] == {"conformance_rounds": 0, "debris_reruns": 0, "x": 5} and u["task_rounds"]["T9"] == {"conformance_rounds": 1},
+      u["_next"] == "fix_round" and u.get("task_rounds") == {T1: {"conformance_rounds": 0, "debris_reruns": 0, "x": 5}, "T9": {"conformance_rounds": 1}},
       u.get("task_rounds"))
 for _k, _v in _review_saved.items():
     if _v is None:
