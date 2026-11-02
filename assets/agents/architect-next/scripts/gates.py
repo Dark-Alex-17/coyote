@@ -1408,7 +1408,8 @@ def fix_round(state):
     f = as_dict(state.get("fix_request"))
     u.update({"current_task": f.get("task") or state.get("current_task"), "delegation_kind": "fix",
               "fix_items": as_list(f.get("items")), "fix_source": f.get("source", "review"),
-              "fix_return_to": f.get("return_to", "select_tasks"), "fix_note": f.get("note", ""), "fix_request": {}})
+              "fix_return_to": f.get("return_to", "select_tasks"), "fix_origin_return": f.get("return_to", ""),
+              "fix_note": f.get("note", ""), "fix_request": {}})
     u["_next"] = "compose_delegation"
     return u
 
@@ -1452,7 +1453,7 @@ def post_round(state):
         ledger(state, u, f"pr-comment: {task['id']} PR #{task['pr_number']} round {n}: {'posted' if ok else 'FAILED ' + tail(out, 120)}")
     if state.get("fix_source") == "probe_adopt" and state.get("delegation_kind") == "fix":
         u.update({"delegation_kind": "implement", "fix_source": "", "fix_items": []})
-    if task.get("status") == "complete" and state.get("delegation_kind") == "fix":
+    if task.get("status") == "complete" and (state.get("delegation_kind") == "fix" or state.get("fix_origin_return")):
         u["_next"] = "fix_done"
     else:
         u["_next"] = "harvest_report"
@@ -1464,10 +1465,11 @@ def fix_done(state):
     tasks = as_list(state.get("tasks"))
     task = task_by_id(tasks, state.get("current_task")) or {}
     src = state.get("fix_source") or "review"
-    ret = state.get("fix_return_to") or "select_tasks"
+    # A re-review or probe adoption inside an outer fix round rewrites fix_return_to; the origin keeps the watch to return to.
+    ret = state.get("fix_origin_return") or state.get("fix_return_to") or "select_tasks"
     log_event(state, task, f"fix round ({src}) landed; HEAD {task.get('head_sha', '')}; verdict {state.get('last_verdict', '')}")
     ledger(state, u, f"fix-done: {task.get('id')} ({src}) -> {ret}")
-    u.update({"delegation_kind": "implement", "fix_items": [], "fix_source": "", "fix_return_to": ""})
+    u.update({"delegation_kind": "implement", "fix_items": [], "fix_source": "", "fix_return_to": "", "fix_origin_return": ""})
     if ret == "batch":
         if as_list(state.get("pending_fixes")):
             u["_next"] = "select_tasks"
@@ -2386,6 +2388,7 @@ def apply_answer(state):
         else:
             task["status"] = "failed"
             save_tasks(state, u, tasks)
+            u["fix_origin_return"] = ""
             u["failure_reason"] = f"{task.get('id')} failed after Sisyphus recovery; aborted at the user's request"
             u["_next"] = "end_aborted"
     elif kind == "conformance_stuck":
@@ -2429,6 +2432,7 @@ def apply_answer(state):
             u["_next"] = "post_round" if state.get("verify_scope") != "batch" else "batch_close"
         else:
             log_event(state, task, "aborted at the user's request: the review could not be completed") if task else None
+            u["fix_origin_return"] = ""
             u["failure_reason"] = f"aborted: the review of {task.get('id')} could not be completed"
             u["_next"] = "end_aborted"
     elif kind == "design_ask":
@@ -2481,6 +2485,7 @@ def apply_answer(state):
         else:
             task["status"] = "failed"
             save_tasks(state, u, tasks)
+            u["fix_origin_return"] = ""
             u["_next"] = "wave_cleanup"
     elif kind in ("integration_conflict", "integration_red"):
         a = _answered(state, {"stop": ["stop"], "round": ["one more", "cycle", "round"], "abort": ["abort"]}, "stop")
@@ -2494,6 +2499,7 @@ def apply_answer(state):
         elif a == "abort":
             task["status"] = "failed"
             save_tasks(state, u, tasks)
+            u["fix_origin_return"] = ""
             u["_next"] = "wave_cleanup"
         else:
             u["failure_reason"] = f"stopped: {kind} on {task.get('id')}"
@@ -2540,7 +2546,8 @@ def apply_answer(state):
         a = _answered(state, {"stop": ["stop"], "skip": ["skip"], "keep": ["keep watching", "keep", "re-arm"],
                               "more": ["one more", "resume", "address", "fix round"]}, "stop")
         if a == "keep" and kind in ("review_exhausted", "review_read_truncated"):
-            u.update({"review_polls": 0, "review_rounds": 0, "review_poll_fails": 0, "review_started_at": int(time.time()), "review_status": ""})
+            u.update({"review_polls": 0, "review_rounds": 0, "review_poll_fails": 0, "review_started_at": int(time.time()), "review_status": "",
+                      "review_truncated": []})
             u["_next"] = "review_poll"
         elif a == "more" and kind == "review_round_cap":
             u["review_fix_rounds"] = REVIEW_MAX_ROUNDS - 1
@@ -2560,6 +2567,8 @@ def apply_answer(state):
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"PR #{state.get('pr_number')} review watch stopped: {status}"]
             _review_event(state, u, f"stopped by the owner: {status}")
             _close_review_watch(state, u, status)
+            if kind == "review_read_truncated":
+                u.update({"review_truncated": [], "review_status": ""})
             _after_flip(state, u)
     elif kind in ("watch_visit_cap", "review_push_mismatch"):
         if kind == "review_push_mismatch" and _answered(state, {"recheck": ["re-check", "recheck"]}) == "recheck":
@@ -3352,7 +3361,7 @@ def review_poll(state):
     elif pr["state"] == "CLOSED":
         u.update({"review_status": "closed", "_next": "review_route"})
     elif overflow:
-        u.update({"review_status": "truncated", "review_items": overflow, "_next": "review_route"})
+        u.update({"review_status": "truncated", "review_truncated": overflow, "_next": "review_route"})
     elif _approved(pr):
         u.update({"review_status": "approved", "_next": "review_route"})
     elif items or untrusted:
@@ -3403,7 +3412,7 @@ def review_route(state):
     if status == "truncated":
         _review_event(state, u, "stop: read_truncated")
         listed = ", ".join(f"{i.get('list')} has {i.get('total') or f'more than {REVIEW_PAGE}'}"
-                           for i in (as_dict(x) for x in as_list(state.get("review_items"))))
+                           for i in (as_dict(x) for x in as_list(state.get("review_truncated"))))
         return raise_escalation(state, u, escalation(
             "review_read_truncated", f"The review read on PR #{pr} holds more than the {REVIEW_PAGE} items it fetches per list ({listed}), "
                                      "so the watch cannot see every review item. Keep watching, or stop watching and report?",

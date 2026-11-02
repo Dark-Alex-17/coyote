@@ -749,8 +749,9 @@ ts_done = copy.deepcopy(TS1)
 gates.task_by_id(ts_done, T1)["status"] = "complete"
 u = gates.post_round(base_state(plan_path=PROMOTED, tasks=ts_done, current_task=T1, verify_unit=T1, delegation_kind="fix", fix_source="batch", round_log={T1: [{"round": 2, "head": "h2"}]}, last_verdict="PASS"))
 check("post_round: fix round on a closed task -> fix_done", u["_next"] == "fix_done")
-for ret, pend, exp in [("batch", [], "batch_gauntlet_build"), ("batch", [{"task": T2}], "select_tasks"), ("integration", [], "integration_test"), ("integration_check", [], "integration_check"), ("ci", [], "ci_poll"), ("select_tasks", [], "select_tasks")]:
-    u = gates.fix_done(base_state(plan_path=PROMOTED, tasks=ts_done, current_task=T1, fix_source="x", fix_return_to=ret, pending_fixes=pend))
+for ret, pend, exp in [("batch", [], "batch_gauntlet_build"), ("batch", [{"task": T2}], "select_tasks"), ("integration", [], "integration_test"), ("integration_check", [], "integration_check"), ("ci", [], "ci_poll"), ("review", [], "review_update"),
+                       ("verify", [], "select_tasks"), ("post_round", [], "select_tasks"), ("select_tasks", [], "select_tasks")]:
+    u = gates.fix_done(base_state(plan_path=PROMOTED, tasks=ts_done, current_task=T1, fix_source="x", fix_return_to=ret, fix_origin_return="", pending_fixes=pend))
     check(f"fix_done: return_to={ret} pending={bool(pend)} -> {exp}", u["_next"] == exp)
 _n = gates._prior_report(base_state(), T1)[1]
 write(os.path.join(rd, "reports", f"{T1}-r{_n}.md"), REPORT_OK + "rejected-finding: style nit -- src/a.go:4 convention\nrejected-finding: not needed\n")
@@ -1887,6 +1888,54 @@ finally:
         else:
             os.environ[_k] = _v
 
+# ---------------------------------------------------------------- fix origin: an outer CI or review fix round returns to its watch
+def fix_origin_chain(return_to, *verdicts, **over):
+    s = base_state(**dict(WATCH, tasks=copy.deepcopy(ts_f)), current_task=T1, verify_scope="task", verify_unit=T1, verify_lane="gauntlet", **over)
+    s.update(gates.fix_round(dict(s, fix_request={"task": T1, "source": return_to, "return_to": return_to, "items": ["fix it"]})))
+    steps = [dict(s)]
+    for n, text in enumerate(verdicts, 1):
+        s.update(gauntlet_result=text, round_log={T1: [{"round": i, "head": "h"} for i in range(1, n + 1)]})
+        s.update(gates.route_verdict(s))
+        steps.append(dict(s))
+    return s, steps
+
+
+check("fix origin: fix_origin_return seeded empty in initial_state", SEEDS.get("fix_origin_return") == "")
+s, steps = fix_origin_chain("review", GBLOCK, GPASS)
+check("fix origin: fix_round on a review request sets fix_origin_return review",
+      steps[0].get("fix_origin_return") == "review" and steps[0].get("fix_return_to") == "review", steps[0].get("fix_origin_return"))
+check("fix origin: a BLOCKED re-review sets fix_return_to verify and leaves fix_origin_return review",
+      steps[1].get("_next") == "compose_delegation" and steps[1].get("fix_return_to") == "verify" and steps[1].get("fix_origin_return") == "review",
+      {k: steps[1].get(k) for k in ("_next", "fix_return_to", "fix_origin_return")})
+s.update(gates.post_round(s))
+check("fix origin: the PASS after a BLOCKED review fix round -> post_round -> fix_done", s.get("_next") == "fix_done", s.get("_next"))
+u = gates.fix_done(s)
+check("fix origin: fix_done after a BLOCKED review fix round -> review_update, origin cleared",
+      u.get("_next") == "review_update" and u.get("fix_origin_return") == "" and ledgered(u, f"fix-done: {T1} (review) -> review"), u.get("_next"))
+s.update(u)
+s.update(delegation_kind="fix", fix_source="review", fix_return_to="verify")
+s.update(gates.post_round(s))
+check("fix origin: a later ordinary fix (return_to verify, origin cleared) -> post_round -> fix_done -> select_tasks",
+      s.get("_next") == "fix_done" and gates.fix_done(s).get("_next") == "select_tasks", s.get("_next"))
+s, steps = fix_origin_chain("ci", GBLOCK, GPASS, ci_polls=7, ci_poll_fails=2)
+s.update(gates.post_round(s))
+u = gates.fix_done(s) if s.get("_next") == "fix_done" else {}
+check("fix origin: a BLOCKED CI fix round re-reviewed to PASS -> fix_done -> ci_poll with ci_polls and ci_poll_fails reset",
+      steps[1].get("fix_origin_return") == "ci" and u.get("_next") == "ci_poll" and u.get("ci_polls") == u.get("ci_poll_fails") == 0,
+      {k: u.get(k) for k in ("_next", "ci_polls", "ci_poll_fails")})
+s, steps = fix_origin_chain("review", GPROBE)
+check("fix origin: a probe PASS during a review fix round -> adopt round (fix_return_to post_round), origin kept",
+      s.get("_next") == "compose_delegation" and s.get("fix_source") == "probe_adopt" and s.get("fix_return_to") == "post_round"
+      and s.get("fix_origin_return") == "review", {k: s.get(k) for k in ("_next", "fix_source", "fix_return_to", "fix_origin_return")})
+s.update(gates.post_round(s))
+u = gates.fix_done(s) if s.get("_next") == "fix_done" else {}
+check("fix origin: after the adopt round post_round -> fix_done -> review_update", u.get("_next") == "review_update", s.get("_next"))
+u = gates.post_round(base_state(**WATCH, current_task=T1, verify_unit=T1, delegation_kind="implement", fix_origin_return="review",
+                                round_log={T1: [{"round": 1, "head": "h"}]}, last_verdict="PASS"))
+check("fix origin: post_round with delegation_kind already reset to implement and origin review -> fix_done", u.get("_next") == "fix_done", u.get("_next"))
+u = AA("task_failed", "Abort this task and stop", current_task=T1, tasks=tasks_with(), fix_origin_return="review")
+check("fix origin: task_failed abort clears fix_origin_return", u.get("_next") == "end_aborted" and u.get("fix_origin_return") == "", u.get("fix_origin_return"))
+
 # ---------------------------------------------------------------- truncation: a review read that overflows a page stops the watch
 def paged(decision="", **lists):
     pr = {"state": "OPEN", "reviewDecision": decision, "headRefOid": "h2", **{k: {"nodes": []} for k in ("reviews", "comments", "reviewThreads")}, **lists}
@@ -1905,8 +1954,11 @@ try:
           u.get("review_status") == "comments" and got.get("id") == "thread:TH60:C119" and got.get("body", "").startswith("the root ask\n\n")
           and got.get("author") == "bob", u)
     paged(reviewThreads={"totalCount": 101, "nodes": []})
-    u = gates.review_poll(base_state(**WATCH))
-    check("truncation: reviewThreads totalCount 101 -> truncated -> review_route", u.get("review_status") == "truncated" and u.get("_next") == "review_route", u)
+    u = gates.review_poll(base_state(**WATCH, review_items=ITEMS))
+    check("truncation: reviewThreads totalCount 101 -> truncated -> review_route, overflow in review_truncated, review_items untouched",
+          u.get("review_status") == "truncated" and u.get("_next") == "review_route" and u.get("review_truncated", [{}])[0].get("list") == "reviewThreads"
+          and "review_items" not in u, u)
+    check("truncation: review_truncated seeded empty in initial_state", SEEDS.get("review_truncated") == [])
     RT = gates.review_route(base_state(**WATCH, **u))
     esc = RT.get("escalation", {})
     check("truncation: review_route truncated -> review_read_truncated naming the list and count, keep or stop (recommended), stop ledgered",
@@ -1922,13 +1974,15 @@ try:
     check("truncation: REVIEW_QUERY reads the last 100 of each list, the last 50 thread comments plus the root, with totalCount",
           all(s in gates.REVIEW_QUERY for s in ("reviewThreads(last: 100)", "comments(last: 50)", "rootComment: comments(first: 1)", "totalCount", "hasPreviousPage")))
     u = AA("review_read_truncated", "Keep watching (re-arm the review watch)", **WATCH, review_polls=9, review_rounds=5, review_poll_fails=2, review_started_at=1,
-           review_status="truncated")
-    check("truncation: apply_answer review_read_truncated keep -> review_poll with the counters and wall clock re-armed",
-          u.get("_next") == "review_poll" and u.get("review_polls") == u.get("review_rounds") == u.get("review_poll_fails") == 0 and u.get("review_started_at", 0) > 1, u)
-    u = AA("review_read_truncated", "Stop watching and report", **WATCH, review_status="truncated")
-    check("truncation: apply_answer review_read_truncated stop -> finish_plan + follow-up, outcome truncated, watch closed",
+           review_status="truncated", review_truncated=[{"list": "reviewThreads", "total": 101}])
+    check("truncation: apply_answer review_read_truncated keep -> review_poll with the counters and wall clock re-armed, review_truncated and status cleared",
+          u.get("_next") == "review_poll" and u.get("review_polls") == u.get("review_rounds") == u.get("review_poll_fails") == 0 and u.get("review_started_at", 0) > 1
+          and u.get("review_truncated") == [] and u.get("review_status") == "", u)
+    u = AA("review_read_truncated", "Stop watching and report", **WATCH, review_status="truncated", review_truncated=[{"list": "reviewThreads", "total": 101}])
+    check("truncation: apply_answer review_read_truncated stop -> finish_plan + follow-up, outcome truncated, watch closed, review_truncated and status cleared",
           u.get("_next") == "finish_plan" and u.get("review_outcomes") == {"99": "truncated"} and u.get("review_watching") is False
-          and any("PR #99 review watch stopped: truncated" in f for f in u.get("follow_ups", [])), u)
+          and any("PR #99 review watch stopped: truncated" in f for f in u.get("follow_ups", [])) and u.get("review_truncated") == []
+          and u.get("review_status") == "", u)
 finally:
     for _k, _v in _watch_saved.items():
         if _v is None:

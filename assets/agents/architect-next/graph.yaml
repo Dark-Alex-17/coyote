@@ -245,6 +245,7 @@ initial_state:
   fix_items: []
   fix_source: ''
   fix_return_to: ''
+  fix_origin_return: ''
   fix_note: ''
   verify_scope: 'task'
   verify_unit: ''
@@ -353,6 +354,7 @@ initial_state:
   review_fix_rounds: 0
   review_status: ''
   review_items: []
+  review_truncated: []
   review_untrusted: []
   review_seen: []
   review_watching: false
