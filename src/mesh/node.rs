@@ -473,10 +473,10 @@ enum Joined {
         reason: String,
         message: String,
     },
-    /// A `local` rnsd the transport could not attach to; nothing is attached, so nothing
-    /// retries it and the row keeps the attach's reason.
+    /// A `local` rnsd the transport could not attach to, or whose client stopped
+    /// reporting during the start wait; nothing retries it, so the row is `unreachable`
+    /// with that reason for the node's lifetime.
     NotReached {
-        endpoint: LocalEndpoint,
         reason: String,
         message: String,
     },
@@ -485,6 +485,29 @@ enum Joined {
         reason: String,
         message: String,
     },
+}
+
+impl Joined {
+    /// The row an interface starts on: only what something keeps retrying reads as
+    /// retrying.
+    fn start_state(&self) -> InterfaceState {
+        match self {
+            Self::Connected(_) | Self::Attached { .. } => InterfaceState::Connected,
+            Self::Dialing { dial_failure, .. } => InterfaceState::Connecting {
+                reason: dial_failure.clone(),
+            },
+            Self::Pending { reason, .. } => InterfaceState::Unreachable {
+                reason: reason.clone(),
+                retrying: true,
+            },
+            Self::NotReached { reason, .. } | Self::Failed { reason, .. } => {
+                InterfaceState::Unreachable {
+                    reason: reason.clone(),
+                    retrying: false,
+                }
+            }
+        }
+    }
 }
 
 /// An interface the watcher follows for the node's lifetime: a TCP client whose events it
@@ -508,16 +531,14 @@ pub(crate) enum WatchedInterface {
         label: String,
         endpoint: LocalEndpoint,
         /// The state events of a shared-instance client attached when `start` returned;
-        /// `None` once the watcher has taken them, and for an rnsd the transport could
-        /// not attach to.
+        /// `None` once the watcher has taken them.
         events: parking_lot::Mutex<Option<mpsc::Receiver<SharedInstanceEvent>>>,
     },
 }
 
 impl WatchedInterface {
     /// `None` for a LAN interface, which has no client to follow; a `local` rnsd is
-    /// watched from `Joined::Attached`, `Joined::Dialing` or `Joined::NotReached`, never
-    /// from here.
+    /// watched from `Joined::Attached` or `Joined::Dialing`, never from here.
     fn of(index: usize, iface: &JoinedInterface, connected_at_start: bool) -> Option<Self> {
         match iface {
             JoinedInterface::Lan { .. } | JoinedInterface::Local { .. } => None,
@@ -706,11 +727,12 @@ impl MeshRuntime {
         let mut watched = Vec::new();
         let mut failures = Vec::new();
         for (index, plan) in plans.iter().enumerate() {
-            match join_interface(&transport, plan, &options, plans.len() == 1).await {
+            let outcome = join_interface(&transport, plan, &options, plans.len() == 1).await;
+            states.push(plan.status(outcome.start_state()));
+            match outcome {
                 Joined::Connected(iface) => {
                     watched.extend(WatchedInterface::of(index, &iface, true));
                     joined.push(iface);
-                    states.push(plan.status(InterfaceState::Connected));
                 }
                 Joined::Attached {
                     label,
@@ -725,13 +747,11 @@ impl MeshRuntime {
                         events: parking_lot::Mutex::new(Some(events)),
                     });
                     joined.push(JoinedInterface::Local { label });
-                    states.push(plan.status(InterfaceState::Connected));
                 }
                 Joined::Dialing {
                     label,
                     endpoint,
                     events,
-                    dial_failure,
                     message,
                     ..
                 } => {
@@ -742,45 +762,14 @@ impl MeshRuntime {
                         events: parking_lot::Mutex::new(Some(events)),
                     });
                     joined.push(JoinedInterface::Local { label });
-                    states.push(plan.status(InterfaceState::Connecting {
-                        reason: dial_failure,
-                    }));
                     failures.push(message);
                 }
-                Joined::Pending {
-                    iface,
-                    reason,
-                    message,
-                } => {
+                Joined::Pending { iface, message, .. } => {
                     watched.extend(WatchedInterface::of(index, &iface, false));
                     joined.push(iface);
-                    states.push(plan.status(InterfaceState::Unreachable {
-                        reason,
-                        retrying: true,
-                    }));
                     failures.push(message);
                 }
-                Joined::NotReached {
-                    endpoint,
-                    reason,
-                    message,
-                } => {
-                    watched.push(WatchedInterface::Local {
-                        index,
-                        label: plan.label(),
-                        endpoint,
-                        events: parking_lot::Mutex::new(None),
-                    });
-                    states.push(plan.status(InterfaceState::Connecting {
-                        reason: Some(reason),
-                    }));
-                    failures.push(message);
-                }
-                Joined::Failed { reason, message } => {
-                    states.push(plan.status(InterfaceState::Unreachable {
-                        reason,
-                        retrying: false,
-                    }));
+                Joined::NotReached { message, .. } | Joined::Failed { message, .. } => {
                     failures.push(message);
                 }
             }
@@ -2134,7 +2123,6 @@ async fn join_local(
         )
     };
     let not_reached = |reason: String| Joined::NotReached {
-        endpoint: endpoint.clone(),
         message: not_reachable(&reason),
         reason,
     };
@@ -2143,34 +2131,22 @@ async fn join_local(
         Err(reason) => return not_reached(reason),
     };
     let deadline = tokio::time::Instant::now() + connect_timeout;
-    let mut dial_failure = None;
-    let reason = loop {
-        match timeout_at(deadline, events.recv()).await {
-            Ok(Some(SharedInstanceEvent::Connected)) => {
-                return Joined::Attached {
-                    label: local_label(endpoint),
-                    endpoint: endpoint.clone(),
-                    events,
-                };
-            }
-            Ok(Some(SharedInstanceEvent::DialFailed { reason })) => {
-                let sentence = dial_failure_sentence(reason, endpoint);
-                dial_failure = Some(sentence.clone());
-                if alone {
-                    break sentence;
-                }
-            }
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                return not_reached("the shared-instance client stopped reporting".to_string());
-            }
-            Err(_) => {
-                break dial_failure.clone().unwrap_or_else(|| {
-                    format!("the client did not connect within {connect_timeout:?}")
-                });
-            }
+    let dial_failure = match await_local_start(&mut events, deadline, alone, endpoint).await {
+        LocalStart::Connected => {
+            return Joined::Attached {
+                label: local_label(endpoint),
+                endpoint: endpoint.clone(),
+                events,
+            };
+        }
+        LocalStart::NotConnected { dial_failure } => dial_failure,
+        LocalStart::StoppedReporting => {
+            return not_reached("the shared-instance client stopped reporting".to_string());
         }
     };
+    let reason = dial_failure
+        .clone()
+        .unwrap_or_else(|| format!("the client did not connect within {connect_timeout:?}"));
     Joined::Dialing {
         label: local_label(endpoint),
         endpoint: endpoint.clone(),
@@ -2178,6 +2154,45 @@ async fn join_local(
         dial_failure,
         message: not_reachable(&reason),
         reason,
+    }
+}
+
+/// How a `local` client's start wait ended.
+#[derive(Debug, PartialEq, Eq)]
+enum LocalStart {
+    Connected,
+    /// The wait ran out, or the first dial failed while the rnsd is the only interface;
+    /// `dial_failure` is the sentence for the last dial that failed, `None` when none had.
+    NotConnected {
+        dial_failure: Option<String>,
+    },
+    /// The client's state stream ended before it connected.
+    StoppedReporting,
+}
+
+/// Reads a `local` client's state events until its first `Connected` or `deadline`.
+/// When the rnsd is the only interface (`alone`) the first dial failure ends the wait,
+/// since the start is refused either way.
+async fn await_local_start(
+    events: &mut mpsc::Receiver<SharedInstanceEvent>,
+    deadline: tokio::time::Instant,
+    alone: bool,
+    endpoint: &LocalEndpoint,
+) -> LocalStart {
+    let mut dial_failure = None;
+    loop {
+        match timeout_at(deadline, events.recv()).await {
+            Ok(Some(SharedInstanceEvent::Connected)) => return LocalStart::Connected,
+            Ok(Some(SharedInstanceEvent::DialFailed { reason })) => {
+                dial_failure = Some(dial_failure_sentence(reason, endpoint));
+                if alone {
+                    return LocalStart::NotConnected { dial_failure };
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => return LocalStart::StoppedReporting,
+            Err(_) => return LocalStart::NotConnected { dial_failure },
+        }
     }
 }
 
@@ -2866,7 +2881,7 @@ struct LocalWatch {
 }
 
 impl LocalWatch {
-    /// `None` for a TCP client and for an rnsd the transport could not attach to.
+    /// `None` for a TCP client and once the start receiver has been taken.
     fn of(watched: &WatchedInterface) -> Option<Self> {
         let WatchedInterface::Local {
             index,
@@ -11898,6 +11913,36 @@ mod tests {
         assert_eq!(states.len(), 2, "{states:?}");
         assert_eq!(states[0].0, private_label(closed));
         assert!(is_retrying(&states[0].1), "{states:?}");
+        // A relay's reason is the TCP client's own last error, not a `local` sentence.
+        let InterfaceState::Unreachable { reason, .. } = &states[0].1 else {
+            unreachable!()
+        };
+        let Some(WatchedInterface::Tcp { status, .. }) = runtime.watched_interfaces.first() else {
+            panic!("the refused relay is watched first");
+        };
+        assert_eq!(
+            status.to_json()["last_error"].as_str(),
+            Some(reason.as_str())
+        );
+        let endpoint = LocalEndpoint::Tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, closed)));
+        let dial_sentences = [
+            DialFailureKind::Refused,
+            DialFailureKind::NotFound,
+            DialFailureKind::Timeout,
+            DialFailureKind::Io(std::io::ErrorKind::ConnectionRefused),
+        ]
+        .map(|kind| dial_failure_sentence(kind, &endpoint));
+        let drop_sentences = [
+            DisconnectReason::PeerClosed,
+            DisconnectReason::Reset,
+            DisconnectReason::Timeout,
+            DisconnectReason::Io(std::io::ErrorKind::ConnectionRefused),
+        ]
+        .map(disconnect_sentence);
+        assert!(
+            !dial_sentences.contains(reason) && !drop_sentences.contains(reason),
+            "{reason}"
+        );
         assert_eq!(
             states[1],
             (private_label(relay.port), InterfaceState::Connected)
@@ -12531,6 +12576,118 @@ mod tests {
         assert!(slot.stop().await.unwrap());
         assert!(transport.shared_instance().is_none());
         daemon.abort();
+    }
+
+    /// Beside a relay the start wait reads past the client's refused dial: a listener
+    /// that comes up after it, inside `connect_timeout`, takes the client's redial, and
+    /// the row is `connected` when `start` returns.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_local_rnsd_beside_a_relay_that_listens_after_a_refused_dial_starts_connected() {
+        let port = closed_port().await;
+        let endpoint = local_endpoint(port);
+        let label = format!("local rnsd at {endpoint}");
+        let (relay, relay_handle, _) = loopback_relay().await;
+        let tmp = TempDir::new("node-local-listens-during-start");
+        let mut session = Session::default();
+        let started = tokio::time::Instant::now();
+        let (stub_up, late_stub) = tokio::sync::oneshot::channel();
+        {
+            let endpoint = endpoint.clone();
+            tokio::spawn(async move {
+                sleep(LOCAL_RECONNECT_WAIT / 4).await;
+                let _ = stub_up.send(restart_local_stub(&endpoint).await);
+            });
+        }
+
+        let runtime = MeshRuntime::start(
+            &MeshConfig {
+                interfaces: vec![
+                    MeshInterface::Private {
+                        host: "127.0.0.1".to_string(),
+                        port: relay.port(),
+                    },
+                    local_entry(port),
+                ],
+                ..MeshConfig::default()
+            },
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            NodeOptions {
+                connect_timeout: Duration::from_secs(10),
+                ..NodeOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            states_of(&runtime),
+            vec![
+                (private_label(relay.port()), InterfaceState::Connected),
+                (label, InterfaceState::Connected),
+            ]
+        );
+        // The first dial was refused, so the connect that landed was a redial.
+        assert!(
+            started.elapsed() >= LOCAL_RECONNECT_WAIT,
+            "{:?}",
+            started.elapsed()
+        );
+        let stub = late_stub.await.unwrap();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime).unwrap();
+        assert!(slot.stop().await.unwrap());
+        stub.abort();
+        relay_handle.abort();
+    }
+
+    /// The client is attached with reasoned drops: an rnsd that resets the stream reads
+    /// as a reset on the row, not as the orderly close.
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_local_rnsd_that_resets_the_stream_reads_lost_with_the_reset() {
+        let (port, socket) = held_port().await;
+        let listener = socket.listen(16).unwrap();
+        let (reset, reset_now) = tokio::sync::oneshot::channel::<()>();
+        let stub = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = reset_now.await;
+            stream.set_zero_linger().unwrap();
+            drop(stream);
+        });
+        let tmp = TempDir::new("node-local-reset");
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &MeshConfig {
+                interfaces: vec![local_entry(port)],
+                ..MeshConfig::default()
+            },
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(states_of(&runtime)[0].1, InterfaceState::Connected);
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+
+        reset.send(()).unwrap();
+        stub.await.unwrap();
+        wait_for_state(&runtime, 0, "the local row to report the reset", |state| {
+            matches!(state, InterfaceState::Disconnected { .. })
+        })
+        .await;
+
+        let lost = InterfaceState::Disconnected {
+            reason: disconnect_sentence(DisconnectReason::Reset),
+        };
+        assert_eq!(states_of(&runtime)[0].1, lost);
+        assert_ne!(lost.to_string(), "lost, retrying: rnsd closed the socket");
+        assert!(slot.stop().await.unwrap());
     }
 
     /// Starts a node whose `local` entry is a closed port, next to a relay, and returns it
@@ -15491,6 +15648,148 @@ mod tests {
             ),
             "permission denied"
         );
+    }
+
+    fn start_wait_endpoint() -> LocalEndpoint {
+        LocalEndpoint::Tcp("127.0.0.1:37428".parse().unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_local_start_wait_with_only_connecting_runs_to_the_deadline_without_a_reason() {
+        let endpoint = start_wait_endpoint();
+        let (sender, mut events) = mpsc::channel(4);
+        sender.send(SharedInstanceEvent::Connecting).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+
+        let outcome = await_local_start(&mut events, deadline, false, &endpoint).await;
+
+        assert_eq!(outcome, LocalStart::NotConnected { dial_failure: None });
+        assert!(tokio::time::Instant::now() >= deadline);
+        drop(sender);
+    }
+
+    #[tokio::test]
+    async fn a_local_start_wait_beside_other_interfaces_reads_past_a_dial_failure_to_the_deadline()
+    {
+        let endpoint = start_wait_endpoint();
+        let (sender, mut events) = mpsc::channel(4);
+        sender.send(SharedInstanceEvent::Connecting).await.unwrap();
+        sender
+            .send(SharedInstanceEvent::DialFailed {
+                reason: DialFailureKind::Refused,
+            })
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+
+        let outcome = await_local_start(&mut events, deadline, false, &endpoint).await;
+
+        assert_eq!(
+            outcome,
+            LocalStart::NotConnected {
+                dial_failure: Some("nothing is listening at 127.0.0.1:37428".to_string()),
+            }
+        );
+        assert!(tokio::time::Instant::now() >= deadline);
+        drop(sender);
+    }
+
+    #[tokio::test]
+    async fn a_local_start_wait_alone_ends_on_the_first_dial_failure() {
+        let endpoint = start_wait_endpoint();
+        let (sender, mut events) = mpsc::channel(4);
+        sender
+            .send(SharedInstanceEvent::DialFailed {
+                reason: DialFailureKind::NotFound,
+            })
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            await_local_start(&mut events, deadline, true, &endpoint),
+        )
+        .await
+        .expect("the first dial failure ends a lone rnsd's wait");
+
+        assert_eq!(
+            outcome,
+            LocalStart::NotConnected {
+                dial_failure: Some("no rnsd socket at 127.0.0.1:37428".to_string()),
+            }
+        );
+        drop(sender);
+    }
+
+    #[tokio::test]
+    async fn a_local_start_wait_ends_connected_on_the_clients_connected() {
+        let endpoint = start_wait_endpoint();
+        let (sender, mut events) = mpsc::channel(4);
+        for event in [
+            SharedInstanceEvent::Connecting,
+            SharedInstanceEvent::DialFailed {
+                reason: DialFailureKind::Refused,
+            },
+            SharedInstanceEvent::Connected,
+        ] {
+            sender.send(event).await.unwrap();
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+
+        let outcome = await_local_start(&mut events, deadline, false, &endpoint).await;
+
+        assert_eq!(outcome, LocalStart::Connected);
+        drop(sender);
+    }
+
+    #[tokio::test]
+    async fn a_local_start_wait_on_a_closed_stream_reads_stopped_reporting() {
+        let endpoint = start_wait_endpoint();
+        let (sender, mut events) = mpsc::channel(4);
+        sender.send(SharedInstanceEvent::Connecting).await.unwrap();
+        drop(sender);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+
+        let outcome = await_local_start(&mut events, deadline, false, &endpoint).await;
+
+        assert_eq!(outcome, LocalStart::StoppedReporting);
+    }
+
+    /// Attaching a second shared instance is refused by the transport, so nothing is
+    /// left to retry the entry: its row reads `unreachable` with the attach's reason
+    /// and never `retrying`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_local_rnsd_the_transport_cannot_attach_reads_unreachable_and_not_retrying() {
+        let identity = TransportIdentity::new_from_rand(OsRng);
+        let transport = Transport::new(TransportConfig::new(SCOPE_APP_NAME, &identity, false));
+        let first = LocalEndpoint::Tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, 1)));
+        let _held = attach_local(&transport, &first).await.unwrap();
+        let endpoint = LocalEndpoint::Tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, 2)));
+
+        let joined = join_local(&transport, &endpoint, Duration::from_millis(300), false).await;
+
+        let Joined::NotReached { reason, message } = &joined else {
+            panic!("a second attach must not reach: {}", joined.start_state());
+        };
+        assert!(
+            reason.starts_with("attach to the shared instance failed: "),
+            "{reason}"
+        );
+        assert!(
+            message.starts_with("Local rnsd at 127.0.0.1:2 (type: local) is not reachable: "),
+            "{message}"
+        );
+        let state = joined.start_state();
+        assert_eq!(
+            state,
+            InterfaceState::Unreachable {
+                reason: reason.clone(),
+                retrying: false,
+            }
+        );
+        assert!(!state.to_string().contains("retrying"), "{state}");
+        transport.stop().await;
     }
 
     #[cfg(unix)]

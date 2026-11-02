@@ -6218,9 +6218,15 @@ fn interface_warnings(states: &[InterfaceStatus]) -> Vec<String> {
             let label = &status.label;
             Some(match &status.state {
                 InterfaceState::Connected => return None,
-                InterfaceState::Unreachable { reason, .. } if status.is_loopback() => format!(
-                    "WARNING: {label} is unreachable ({reason}); sessions on this machine cannot reach each other until a local Reticulum daemon (rnsd) is listening there."
-                ),
+                // A `local` rnsd is only unreachable when nothing retries it, so the
+                // loopback promise of recovering once rnsd listens would not hold for it.
+                InterfaceState::Unreachable { reason, .. }
+                    if status.is_loopback() && status.kind != "local" =>
+                {
+                    format!(
+                        "WARNING: {label} is unreachable ({reason}); sessions on this machine cannot reach each other until a local Reticulum daemon (rnsd) is listening there."
+                    )
+                }
                 InterfaceState::Unreachable { reason, .. } if status.kind == "lan" => format!(
                     "WARNING: lan is unreachable ({reason}); peers on this link-local segment are out of reach."
                 ),
@@ -8336,6 +8342,15 @@ mod tests {
                     reason: "rnsd closed the socket".into(),
                 },
             },
+            InterfaceStatus {
+                label: "local rnsd at 127.0.0.1:37428".into(),
+                kind: "local",
+                endpoint: Some("127.0.0.1:37428".into()),
+                state: InterfaceState::Unreachable {
+                    reason: "attach to the shared instance failed: InvalidArgument".into(),
+                    retrying: false,
+                },
+            },
         ];
 
         assert_eq!(
@@ -8347,6 +8362,7 @@ mod tests {
                 "WARNING: local rnsd at 127.0.0.1:37428 is not reachable yet: nothing is listening at 127.0.0.1:37428; start the local rnsd".to_string(),
                 "WARNING: local rnsd at @rns/default has not finished connecting; mesh traffic through it waits until it does".to_string(),
                 "WARNING: local rnsd at @rns/default dropped the connection: rnsd closed the socket; it is being redialed".to_string(),
+                "WARNING: local rnsd at 127.0.0.1:37428 is unreachable (attach to the shared instance failed: InvalidArgument); peers behind that relay are out of reach.".to_string(),
             ]
         );
     }
@@ -17046,8 +17062,8 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             }
 
             /// A `local` entry nothing answers at first, as the REPL spells it for one
-            /// platform: the held loopback port where rnsd has no abstract socket, an
-            /// abstract socket under a name no rnsd uses where it has.
+            /// platform: the loopback `port` where rnsd has no abstract socket, an abstract
+            /// socket under a name no rnsd uses where it has.
             #[cfg(unix)]
             fn absent_local_entry(port: u16) -> (MeshInterface, LocalEndpoint) {
                 let entry = MeshInterface::Local {
@@ -17150,8 +17166,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 let _script = prompt_script::install(&[true]);
                 let _capture = capture::install();
                 run_async(async {
-                    let (port, socket) = held_port().await;
-                    let (entry, endpoint) = absent_local_entry(port);
+                    let (entry, endpoint) = absent_local_entry(closed_port().await);
                     let (addr, relay_handle, _) = loopback_relay().await;
                     let mut ctx = ctx_with(
                         MeshConfig {
@@ -17182,7 +17197,13 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     else {
                         panic!("{states:?}");
                     };
-                    assert!(!reason.is_empty(), "{states:?}");
+                    // The port is closed rather than held: macOS lets a dial to a bound
+                    // socket that is not listening time out instead of refusing it.
+                    assert_eq!(
+                        reason,
+                        &format!("nothing is listening at {endpoint}"),
+                        "{states:?}"
+                    );
                     assert_eq!(
                         warnings(),
                         vec![format!(
@@ -17207,7 +17228,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     assert_eq!(runtime.interface_kinds(), vec!["private"]);
 
                     // rnsd (stood in for) starts answering at the endpoint.
-                    let stub = serve_as_daemon_at(&endpoint, Some(socket)).await;
+                    let stub = serve_local_rnsd(&endpoint).await;
                     let info = wait_for_info_row(
                         &mut ctx,
                         1,
@@ -17239,7 +17260,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     assert_eq!(runtime.interface_kinds(), vec!["private"]);
 
                     // ... and comes back on the same endpoint.
-                    let stub = serve_as_daemon_at(&endpoint, None).await;
+                    let stub = serve_local_rnsd(&endpoint).await;
                     wait_for_info_row(
                         &mut ctx,
                         1,
@@ -17358,7 +17379,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     );
 
                     // A listener is up where rnsd listens: the redial lands.
-                    let daemon = serve_as_daemon_at(&endpoint, None).await;
+                    let daemon = serve_local_rnsd(&endpoint).await;
                     wait_for_info_row(
                         &mut ctx,
                         1,
@@ -17458,21 +17479,6 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     }
                     relay_handle.abort();
                 });
-            }
-
-            /// `serve_local_rnsd`, but the first TCP open listens on the socket the test has
-            /// been holding (so nothing else took the port meanwhile); later opens bind fresh.
-            #[cfg(unix)]
-            async fn serve_as_daemon_at(
-                endpoint: &LocalEndpoint,
-                held: Option<tokio::net::TcpSocket>,
-            ) -> tokio::task::JoinHandle<()> {
-                match (endpoint, held) {
-                    (LocalEndpoint::Tcp(_), Some(socket)) => {
-                        serve_as_daemon(socket.listen(16).unwrap()).await
-                    }
-                    (endpoint, _) => serve_local_rnsd(endpoint).await,
-                }
             }
 
             /// While a node is on, the node's rows are the only `interfaces[i]` rows. While
