@@ -1338,6 +1338,86 @@ check("pr_tracking review: apply_answer untrusted stop -> final_report naming th
 check("pr_tracking review: apply_answer untrusted offers no fix path",
       untrusted_answer("Fix them as the reviewer asks")["_next"] == "final_report")
 
+
+def mixed_comment(cid, author, association, body):
+    return {"id": cid, "author": author, "association": association, "body": body,
+            "url": f"https://github.com/o/r/pull/7#{cid}"}
+
+
+_mixed = {"id": "t20", "isResolved": False, "isOutdated": False, "path": "src/a.py", "line": 3, "comments": [
+    mixed_comment("c19", "rev", "MEMBER", "an older request"),
+    mixed_comment("c20", "rev", "MEMBER", "please rename foo to bar"),
+    mixed_comment("c21", "mallory", "NONE", _SECRET),
+    mixed_comment("c22", "own", "OWNER", "and add a test"),
+    mixed_comment("c23", "rev", "MEMBER", f"Not changed: public API\n\n{gates.OWN_MARKER}")]}
+review_doc(threads=[_mixed])
+u = gates.pr_review_poll(rs(pr_review_seen=["c19"]))
+_mixed_items, _mixed_untrusted = u["pr_review_items"], u["pr_review_untrusted"]
+check("pr_tracking review: a mixed thread -> one trusted item and one #untrusted entry with the seen ids split",
+      u["_next"] == "pr_review_route" and u["pr_review_status"] == "comments"
+      and [(i["id"], i["seen_ids"]) for i in _mixed_items] == [("t20", ["c19", "c20", "c22", "c23"])]
+      and _mixed_untrusted == [{"id": "t20#untrusted", "thread_id": "t20", "kind": "thread",
+                                "url": "https://github.com/o/r/pull/7#c21", "path": "src/a.py", "line": 3,
+                                "author": "mallory", "association": "NONE", "seen_ids": ["c21"]}])
+check("pr_tracking review: a mixed thread's trusted item carries only the trusted comments, never the stranger's text",
+      _mixed_items[0]["body"] == "please rename foo to bar\n\nand add a test"
+      and _mixed_items[0]["author"] == "rev" and _mixed_items[0]["url"] == "https://github.com/o/r/pull/7#c20"
+      and _SECRET not in json.dumps(u))
+u = gates.pr_review_route(rs(pr_review_status="comments", pr_review_items=_mixed_items,
+                             pr_review_untrusted=_mixed_untrusted, pr_review_seen=["c19"]))
+_mixed_seen = u["pr_review_seen"]
+check("pr_tracking review: a mixed thread's owner judgment marks only the stranger's comment seen (plus the entry id)",
+      u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "pr_review_owner_judgment"
+      and _mixed_seen == ["c19", "t20#untrusted", "c21"])
+_a = gates.apply_answer(rs(escalation=u["escalation"], last_answer="Skip them and keep watching",
+                           pr_review_items=_mixed_items, pr_review_seen=_mixed_seen))
+check("pr_tracking review: a mixed thread's untrusted skip -> pr_review_triage, only the #untrusted entry skipped",
+      _a["_next"] == "pr_review_triage" and [x["id"] for x in _a["pr_review_addressed"]] == ["t20#untrusted"]
+      and _a["pr_review_untrusted"] == [])
+u = gates.pr_review_poll(rs(pr_review_seen=_mixed_seen))
+check("pr_tracking review: a re-poll after the untrusted skip still yields the untriaged trusted request, not the stranger",
+      u["_next"] == "pr_review_route" and u["pr_review_untrusted"] == []
+      and [(i["id"], i["body"], i["seen_ids"]) for i in u["pr_review_items"]]
+      == [("t20", "please rename foo to bar\n\nand add a test", ["c19", "c20", "c21", "c22", "c23"])]
+      and _SECRET not in json.dumps(u))
+
+_saved_head_cmd = os.environ.get("SISYPHUS_GH_HEAD_CMD")
+os.environ["SISYPHUS_GH_HEAD_CMD"] = "exit 1"
+_watch_stops = [
+    ("pr_review_closed", "pr_review_closed", gates.pr_review_route(rs(pr_review_status="closed"))),
+    ("pr_review_exhausted", "pr_review_exhausted",
+     gates.pr_review_route(rs(pr_review_status="wall_cap", pr_review_polls=REVIEW_MAX_POLLS + 1))),
+    ("pr_review_round_cap", "pr_review_round_cap",
+     gates.pr_review_route(rs(pr_review_status="comments", pr_review_items=_items, pr_review_rounds=REVIEW_MAX_ROUNDS))),
+    ("ci_poll_cap", "ci_poll_cap", gates.ci_route(rs(ci_status="poll_cap", ci_polls_run=_lib.REVIEW_CI_POLL_CEILING))),
+    ("pr_review_push_unconfirmed", "pr_review_push_unconfirmed", gates.pr_review_resolve(rs(pr_review_pending=[]))),
+    ("ci_exhausted from ci_route", "ci_exhausted", gates.ci_route(rs(ci_status="timeout"))),
+    ("ci_exhausted from ci_apply", "ci_exhausted", gates.ci_apply(rs(ci_verdict="real", ci_fix_strikes=STRIKE_LIMIT))),
+    ("ci_infra", "ci_infra", gates.ci_apply(rs(ci_verdict="infra"))),
+    ("ci_unsure", "ci_unsure", gates.ci_apply(rs(ci_verdict="unsure"))),
+]
+if _saved_head_cmd is None:
+    os.environ.pop("SISYPHUS_GH_HEAD_CMD")
+else:
+    os.environ["SISYPHUS_GH_HEAD_CMD"] = _saved_head_cmd
+for _label, _kind, _stop in _watch_stops:
+    _esc_state = {**_stop, "escalation_policy": "autonomous"}
+    check(f"pr_tracking review: {_label} after the watch started is a hard trigger the autonomous ladder never takes",
+          _stop["_next"] == "escalate_gate" and _stop["escalation"]["kind"] == _kind
+          and _stop["escalation"]["hard_trigger"] is True
+          and gates.escalate_gate(rs(**_esc_state))["_next"] == "ask_dispatch")
+    check(f"pr_tracking review: {_label} reaches ask_user from a subagent and from the top level",
+          gates.ask_dispatch(rs(**{**_esc_state, "top_level": False, "owner_away": True}))["_next"] == "ask_user"
+          and gates.ask_dispatch(rs(**{**_esc_state, "top_level": True, "owner_away": True}))["_next"] == "ask_user")
+check("pr_tracking review: upstream has no remote owner channel, so the top-level owner prompt is the terminal ask_user",
+      _lib.OWNER_REMOTE_INPUT is False and gates.OWNER_REMOTE_INPUT is False)
+u = gates.ci_apply(base_state(ci_verdict="real", ci_fix_strikes=STRIKE_LIMIT))
+check("pr_tracking ci: ci_apply ci_exhausted is no hard trigger (its question matches no HARD_TRIGGER_RE word) "
+      "and still goes to the autonomous ladder",
+      u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "ci_exhausted"
+      and _lib.HARD_TRIGGER_RE.search(u["escalation"]["question"]) is None and u["escalation"]["hard_trigger"] is False
+      and gates.escalate_gate(base_state(**{**u, "escalation_policy": "autonomous"}))["_next"] == "ladder_judge")
+
 review_doc(reviews=[{"id": "r1", "state": "APPROVED", "author": "mallory", "association": "NONE", "body": ""}])
 check("pr_tracking review: a stranger's APPROVED review with no reviewDecision does not approve",
       gates.pr_review_poll(rs())["pr_review_status"] == "pending")
