@@ -1306,7 +1306,7 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
                 }
             }
             for text in late {
-                eprintln!("{text}");
+                eprintln!("{}", render::plain_text(&text));
             }
             Err(err.into())
         }
