@@ -1248,10 +1248,10 @@ fn edit_in_editor(editor: &str, text: &str) -> std::io::Result<String> {
     Ok(edited?.trim_end_matches('\n').to_string())
 }
 
-/// Reads and drops whatever the terminal queued while the editor ran,
-/// including events still in flight when it exited. Gives up after
-/// `TYPEAHEAD_LIMIT` events so a stream that never goes quiet cannot hold
-/// the loop.
+/// Reads and drops whatever the terminal queued while it was released
+/// (to an editor or a stopped job), including events still in flight
+/// when control came back. Gives up after `TYPEAHEAD_LIMIT` events so a
+/// stream that never goes quiet cannot hold the loop.
 async fn flush_typeahead<S>(stream: &mut S)
 where
     S: futures_util::Stream<Item = std::io::Result<crossterm::event::Event>> + Unpin,
@@ -1462,6 +1462,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                             if let Err(err) = released {
                                 warn!("Failed to re-enter the alternate screen: {err}");
                             }
+                            flush_typeahead(stream).await;
                             app.schedule_frame();
                         }
                     }

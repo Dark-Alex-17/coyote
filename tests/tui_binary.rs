@@ -628,6 +628,43 @@ fn ctrl_z_hands_the_terminal_to_the_shell_and_fg_takes_it_back() {
     );
 }
 
+/// Keys typed while the job is stopped belong to the shell's turn at the
+/// terminal, not to the composer: whatever is still queued when `fg`
+/// brings the UI back is dropped, the same as typeahead after an editor.
+#[test]
+#[serial]
+fn keys_typed_while_stopped_do_not_reach_the_composer_after_fg() {
+    let dir = fresh_config_dir("ctrl-z-typeahead");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let mut pty = spawn_tui_under(&dir, &[], JOB_CONTROL_WRAPPER, "/dev/tty");
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let before_suspend = pty.raw().len();
+    let stopped_marker = suspend_and_check_handback(&mut pty, before_suspend);
+    // The wrapper sleeps a second before `fg`; these bytes sit in the tty
+    // queue until the UI is back in raw mode.
+    pty.send(b"stopped-typeahead-w2q").unwrap();
+
+    let re_entered = wait_for_re_entry(&mut pty, stopped_marker);
+    assert_repainted_after(&mut pty, re_entered, "fg");
+    pty.read_for(Duration::from_millis(500));
+    let since_re_entry = strip_ansi(&String::from_utf8_lossy(&pty.raw()[re_entered..]));
+    assert!(
+        !since_re_entry.contains("stopped-typeahead-w2q"),
+        "keys typed while the job was stopped landed in the composer after fg:\n{since_re_entry}"
+    );
+
+    pty.send(b".info\r").unwrap();
+    pty.wait_for_after("log_path", re_entered, PTY_DEADLINE)
+        .expect("keys were not handled after resume");
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
 /// After `fg` the UI must repaint its screen on its own, not come back
 /// blank until some later change touches enough cells.
 #[test]
