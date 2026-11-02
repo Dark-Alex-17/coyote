@@ -51,7 +51,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "sisyphus-next";
 const CANDIDATE_NAMES: [&str; 2] = ["sisyphus-next", "architect-next"];
-const SMOKE_FLOOR: usize = 414;
+const SMOKE_FLOOR: usize = 444;
 
 fn agents_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents")
@@ -1375,8 +1375,12 @@ fn smoke_summary_and_exit_code_cover_a_check_recorded_last() {
 
 /// Each guard in gates.py, removed from a scratch copy, turns its smoke row
 /// red: the trust filter (every association the fixtures use counts as
-/// trusted), the remote-head check before resolving, and the post-flip gate
-/// on the CI poll ceiling count.
+/// trusted), the remote-head check before resolving, the post-flip gate on
+/// the CI poll ceiling, the reply before each resolve, the trusted author of
+/// an own comment, the crashed-poll count toward `pr_review_polls`, the
+/// crashed-`ci_poll` read failure in `ci_route`, the `CI_LOG_RUNS_MAX` cap on
+/// flake re-runs, the stale CI status reset after resolving and the seen-id
+/// split of a mixed-author thread.
 #[test]
 fn smoke_rows_go_red_under_the_recorded_sabotages() {
     let Some(python) = python3() else { return };
@@ -1398,10 +1402,61 @@ fn smoke_rows_go_red_under_the_recorded_sabotages() {
         ),
         (
             "ceiling",
-            "    if _watch_started(state):\n        u[\"ci_polls_run\"]",
-            "    if _review_mode(state):\n        u[\"ci_polls_run\"]",
-            "pr_tracking review: ci_poll before the flip counts no ci_polls_run and never \
+            "if _watch_started(state) and u[\"ci_polls_run\"] >= REVIEW_CI_POLL_CEILING:",
+            "if u[\"ci_polls_run\"] >= REVIEW_CI_POLL_CEILING:",
+            "pr_tracking review: ci_poll before the flip counts in ci_polls_run but never \
              poll_caps",
+        ),
+        (
+            "reply-first",
+            "        elif not _reply_thread(state, tid, f\"Addressed in {head}\\n\\n{OWN_MARKER}\"):\n            \
+             reply_failed.append(tid)\n",
+            "",
+            "pr_tracking review: pr_review_resolve replies then resolves a fix thread and only \
+             replies to a skip thread",
+        ),
+        (
+            "own-author",
+            "return association in TRUSTED_ASSOCIATIONS and (",
+            "return True and (",
+            "pr_tracking review: an untrusted comment with the own marker is not own: untrusted, \
+             no body",
+        ),
+        (
+            "crashed-poll",
+            "        u[\"pr_review_polls\"] = as_int(state.get(\"pr_review_polls\")) + 1\n",
+            "        u[\"pr_review_polls\"] = as_int(state.get(\"pr_review_polls\"))\n",
+            "pr_tracking review: a crashed poll increments pr_review_polls",
+        ),
+        (
+            "ci-crash",
+            "    crashed = _review_mode(state) and bool(state.get(\"last_script_error\"))\n",
+            "    crashed = False\n",
+            "pr_tracking review: a stale green after a ci_poll node error is one read failure and \
+             a retry",
+        ),
+        (
+            "rerun-cap",
+            "rerun_ids = run_ids[:CI_LOG_RUNS_MAX]",
+            "rerun_ids = run_ids",
+            "pr_tracking review: ci_apply flake re-runs and charges at most CI_LOG_RUNS_MAX runs \
+             and ledgers the rest",
+        ),
+        (
+            "status-reset",
+            "    u[\"pr_review_pending\"] = []\n    u.update({\"ci_polls\": 0, \"ci_poll_fails\": 0, \
+             \"ci_started_at\": int(time.time()), \"ci_status\": \"\",",
+            "    u[\"pr_review_pending\"] = []\n    u.update({\"ci_polls\": 0, \"ci_poll_fails\": 0, \
+             \"ci_started_at\": int(time.time()), \"ci_status\": state.get(\"ci_status\", \"\"),",
+            "pr_tracking review: pr_review_resolve resets ci_status and ci_failing",
+        ),
+        (
+            "mixed-thread",
+            "entry = {**thread, \"url\": \"\", \"seen_ids\": stranger_ids}",
+            "entry = {**thread, \"url\": \"\", \"seen_ids\": [c.get(\"id\") for c in t.get(\"comments\") \
+             or []]}",
+            "pr_tracking review: a re-poll after the untrusted skip still yields the untriaged \
+             trusted request, not the stranger",
         ),
     ];
     for (label, old, new, row) in sabotages {
@@ -2822,8 +2877,11 @@ fn lib_constant(lib: &str, name: &str) -> i64 {
 /// so review mode has to reach its own caps first: the review poll budget
 /// with the round cap and one visit to spare on `pr_review_poll`, and on
 /// `ci_poll` the run-wide CI poll ceiling, with the budget past which no fix
-/// round starts below that ceiling. Only these review-mode bounds are
-/// checked; ci mode puts no run-wide cap on `ci_poll`.
+/// round starts below that ceiling. The ceiling bounds the `ci_poll` visits
+/// because review mode counts every visit into `ci_polls_run` from the first
+/// poll of the run, and a first post-flip poll that finds the count at the
+/// ceiling caps at once. Only these review-mode bounds are checked; ci mode
+/// puts no run-wide cap on `ci_poll`.
 #[test]
 fn review_watch_caps_stay_below_the_per_node_visit_cap() {
     let lib = fs::read_to_string(candidate_dir().join("scripts/_lib.py")).unwrap();
@@ -2846,7 +2904,8 @@ fn review_watch_caps_stay_below_the_per_node_visit_cap() {
     );
     assert!(
         ci_ceiling < cap,
-        "REVIEW_CI_POLL_CEILING {ci_ceiling} reaches the cap {cap}"
+        "REVIEW_CI_POLL_CEILING {ci_ceiling} reaches the cap {cap}, so ci_poll visits counted \
+         from the first poll could hit the engine cap first"
     );
     assert!(
         ci_budget < ci_ceiling,
@@ -3643,10 +3702,12 @@ fn readme_ci_budget_row_separates_per_watch_from_per_run_counters() {
 
 /// The review-watch row names every stop status, every escalation kind, the
 /// seams, each `REVIEW_*` bound exactly as the frozen bounds record it, the
-/// trust boundary on commenters, the rule that keeps a delegated run and a
+/// trust boundary on commenters, the run-wide CI poll count, the escalation
+/// channel with no remote owner input, the rule that keeps a delegated run and a
 /// parent's task sisyphus out of the watch, and the engine facts that make
 /// the watch an in-graph loop; those engine facts are checked against the
-/// source files the row cites.
+/// source files the row cites. The resolve seam is no longer described as
+/// standing in for the reply call.
 #[test]
 fn readme_pr_tracking_row_names_the_loop_stops_and_parent_rule() {
     let readme = fs::read_to_string(candidate_dir().join("README.md")).unwrap();
@@ -3680,6 +3741,9 @@ fn readme_pr_tracking_row_names_the_loop_stops_and_parent_rule() {
         "SISYPHUS_GH_RUN_LOG_CMD",
         "SISYPHUS_GH_RERUN_CMD",
         "SISYPHUS_REVIEW_SLEEP",
+        "SISYPHUS_GH_REPLY_CMD",
+        "pr_review_reply",
+        "RESOLVE_DEADLINE_SECS = 480",
     ];
     for name in names {
         assert!(
@@ -3706,6 +3770,24 @@ fn readme_pr_tracking_row_names_the_loop_stops_and_parent_rule() {
     assert!(row.contains(trust), "missing {trust:?} in: {row}");
     let stranger = "A stranger's approval never ends the watch";
     assert!(row.contains(stranger), "missing {stranger:?} in: {row}");
+    let stale = "in place of the reply and resolve calls";
+    assert!(!row.contains(stale), "stale {stale:?} in: {row}");
+    let ceiling = "In review mode `ci_polls_run` counts every CI poll of the run, the polls \
+                   before the flip and the crashed polls that `ci_route` counts included; the \
+                   `REVIEW_CI_POLL_CEILING` cap applies only once the watch has started \
+                   (`_watch_started`), and at once on the first poll after the flip if the \
+                   count is already at the ceiling";
+    assert!(row.contains(ceiling), "missing {ceiling:?} in: {row}");
+    let owner = "Upstream `OWNER_REMOTE_INPUT` is False, so `ask_owner_poll` never runs: a \
+                 stop reaches the parent orchestrator through `ask_user` when the run is a \
+                 child, and the owner through the terminal `ask_user` at the top level.";
+    assert!(row.contains(owner), "missing {owner:?} in: {row}");
+    let lib = fs::read_to_string(candidate_dir().join("scripts/_lib.py")).unwrap();
+    assert!(
+        lib.lines()
+            .any(|l| l.starts_with("OWNER_REMOTE_INPUT = False")),
+        "_lib.py no longer sets OWNER_REMOTE_INPUT = False"
+    );
     let design = "a graph node cannot keep a background child past the node: \
                   `src/graph/llm.rs` reaps node-local jobs (`reap_jobs`) on every llm node \
                   exit, and the unreclaimed-task guardrail in `src/function/agents.rs` cancels \
