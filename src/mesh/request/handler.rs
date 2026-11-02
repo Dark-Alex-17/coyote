@@ -162,8 +162,8 @@ impl LibraryHandler {
     /// outcome the library resolves once it has sent it, awaited on a detached task: the
     /// permit covers the handler, not the transfer, and neither it nor `HANDLER_TIMEOUT`
     /// bounds that transfer. A reply over the destination's response cap is refused by
-    /// the library, which warns once and sends nothing; the outcome reads `TooLarge` and
-    /// the settlement is dropped unsent.
+    /// the library, which warns once and sends nothing; for a settled reply the outcome
+    /// reads `TooLarge` and the settlement is dropped unsent.
     async fn reply(
         &self,
         permit: OwnedSemaphorePermit,

@@ -152,8 +152,9 @@ arc-swap = "1.9.2"
 # `Transport::resolve_destination` (the resolved description of an announced
 # destination, held or asked for over the network), `InboundRequest::into_parts` with its
 # `ResponseOutcomeTracker` and `ResponseOutcome` (what became of a response the library
-# sent for a handler), `SingleInputDestination::set_max_response_size` (the responder's
-# cap on what it sends), and `SharedInstanceOptions::with_state_events` with
+# sent for a handler), `SingleInputDestination::set_max_request_size` and
+# `SingleInputDestination::set_max_response_size` (the responder's caps on what it accepts
+# and what it sends), and `SharedInstanceOptions::with_state_events` with
 # `SharedInstanceEvent` (the shared instance client's connection state).
 #
 # `lxmf-wire` still comes from upstream LXMF-rs, so its version no longer matches the

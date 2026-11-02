@@ -54,6 +54,10 @@ pub(crate) const MAX_REQUEST_PAYLOAD_BYTES: usize = 256 * 1024;
 pub(crate) const MAX_FETCH_RESPONSE_BYTES: usize =
     (crate::config::mesh_config::MAX_FETCH_FILE_BYTES as usize) + 4096;
 
+// Every non-fetch reply is bounded by its requester at MAX_REQUEST_PAYLOAD_BYTES, so the
+// responder cap only refuses a reply no requester would accept.
+const _: () = assert!(MAX_REQUEST_PAYLOAD_BYTES < MAX_FETCH_RESPONSE_BYTES);
+
 fn path_name(path_hash: PathHash) -> Option<&'static str> {
     KNOWN_PATHS
         .into_iter()

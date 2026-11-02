@@ -1852,15 +1852,26 @@ pub(crate) fn session_destination_name(instance_id: &str) -> DestinationName {
     DestinationName::new(SCOPE_APP_NAME, &format!("session.{instance_id}"))
 }
 
+/// Arms a session destination with the responder's caps on what it accepts and what it
+/// sends. With `MAX_REQUEST_PAYLOAD_BYTES`, coyote-rns-transport 0.18.0 refuses an oversize
+/// request at the advertisement, before it reaches a handler (a request that travels as a
+/// resource; a packet-form one over the cap is dropped). With `MAX_FETCH_RESPONSE_BYTES`,
+/// the widest bound any requester accepts, a reply no peer could take is refused before it
+/// costs a transfer.
+pub(crate) fn arm_destination_caps(destination: &mut SingleInputDestination) {
+    destination
+        .set_max_request_size(MAX_REQUEST_PAYLOAD_BYTES)
+        .expect("the cap setter is infallible");
+    destination
+        .set_max_response_size(MAX_FETCH_RESPONSE_BYTES)
+        .expect("the cap setter is infallible");
+}
+
 /// Registers the destination for `instance_id`, with `request_handler` serving every known
 /// path on it, and attaches `app_data` to its announces; each transport wait gives up at
 /// `deadline`. A destination registered but left without its announce data is
 /// deregistered again, best effort, and the error says whether that worked. The
-/// destination is armed with `MAX_REQUEST_PAYLOAD_BYTES`:
-/// coyote-rns-transport 0.18.0 refuses an oversize request at the advertisement, before it
-/// reaches a handler (a request that travels as a resource; a packet-form one over the cap
-/// is dropped). It is also armed with `MAX_FETCH_RESPONSE_BYTES`, the widest bound any
-/// requester accepts, so a reply no peer could take is refused before it costs a transfer.
+/// destination's caps come from `arm_destination_caps`.
 async fn register_destination(
     transport: &Transport,
     identity: &TransportIdentity,
@@ -1871,12 +1882,7 @@ async fn register_destination(
 ) -> Result<(Arc<Mutex<SingleInputDestination>>, AddressHash, OriginName)> {
     let name = session_destination_name(instance_id);
     let mut destination = SingleInputDestination::new(identity.clone(), name);
-    destination
-        .set_max_request_size(MAX_REQUEST_PAYLOAD_BYTES)
-        .expect("the cap setter is infallible");
-    destination
-        .set_max_response_size(MAX_FETCH_RESPONSE_BYTES)
-        .expect("the cap setter is infallible");
+    arm_destination_caps(&mut destination);
     let registered = register_request_paths(&mut destination, request_handler)?;
     let hash = destination.desc.address_hash;
     let origin = OriginName::of(&destination.desc.name);

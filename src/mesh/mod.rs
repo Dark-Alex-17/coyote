@@ -373,6 +373,8 @@ pub(crate) mod test_support {
     #[cfg(all(test, unix))]
     pub(crate) use super::node::RecordingEnvoy;
     #[cfg(unix)]
+    use super::node::arm_destination_caps;
+    #[cfg(unix)]
     use super::node::{MeshRuntime, MeshSlot, NodeOptions};
     #[cfg(unix)]
     pub(crate) use super::peers::{PEER_TTL, PeerSighting};
@@ -393,7 +395,7 @@ pub(crate) mod test_support {
     #[cfg(unix)]
     use super::request::{
         Admission, Dispatcher, HANDLER_TIMEOUT, InboundRequest, KNOWN_PATHS, LibraryHandler,
-        LoggingKnockSink, MAX_FETCH_RESPONSE_BYTES, MAX_REQUEST_PAYLOAD_BYTES, RequestHandler,
+        LoggingKnockSink, RequestHandler,
     };
     pub(crate) use super::request::{
         AdmittedRequest, Handler, MESSAGE_PATH, NAME_HASH_LEN, OriginName, PathHash, RefusalCode,
@@ -979,9 +981,8 @@ pub(crate) mod test_support {
         }
 
         /// `listen` with the handler bound by `handler_timeout` instead. The destination is
-        /// armed with `MAX_REQUEST_PAYLOAD_BYTES` and `MAX_FETCH_RESPONSE_BYTES` the way the
-        /// node's is, so the library refuses an oversize request before the handler sees it
-        /// and an oversize reply before it is sent.
+        /// armed by the node's own `arm_destination_caps`, so the library refuses an oversize
+        /// request before the handler sees it and an oversize reply before it is sent.
         pub(crate) async fn listen_with_timeout(
             handler: Arc<dyn RequestHandler>,
             client_mtu: usize,
@@ -1012,12 +1013,7 @@ pub(crate) mod test_support {
             })
             .await;
             let mut destination = SingleInputDestination::new(identity, name);
-            destination
-                .set_max_request_size(MAX_REQUEST_PAYLOAD_BYTES)
-                .unwrap();
-            destination
-                .set_max_response_size(MAX_FETCH_RESPONSE_BYTES)
-                .unwrap();
+            arm_destination_caps(&mut destination);
             for path in paths {
                 destination
                     .register_request_handler(path, adapter.clone(), RequestAllow::All, true)

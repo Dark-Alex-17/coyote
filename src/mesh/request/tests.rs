@@ -1841,8 +1841,8 @@ pub(crate) mod network {
     /// Whether the library has refused a request advertisement on `link_id` one byte over
     /// the destination's cap. The advertisement's hash sits between the link and the
     /// sizes, and the transfer size depends on compression, so only the data size and the
-    /// limit are matched. The library warns on a link's first refusal and counts it after
-    /// the limit as `rejected=1`.
+    /// limit are matched. The library warns on a link's first refusal; that line ends with
+    /// the limit followed by `rejected=1`.
     pub(crate) fn library_refused_oversize_request(link_id: LinkId) -> bool {
         let sizes = format!("data_size={} transfer_size=", MAX_REQUEST_PAYLOAD_BYTES + 1);
         let limit = format!(" limit={MAX_REQUEST_PAYLOAD_BYTES} rejected=1");
@@ -2410,10 +2410,10 @@ pub(crate) mod network {
     }
 
     /// Every way a settled reply can fail to go out ends the same: the settlement is
-    /// dropped unsent and one warn says why, under the request's id. The reply over the
-    /// destination's response cap is refused by the library, which warns itself; every
-    /// other failure reaches the adapter as the response outcome the library resolved,
-    /// and the adapter warns.
+    /// dropped unsent and one warn says why, under the request's id. A reply whose frame
+    /// is one byte over the destination's response cap is refused by the library, which
+    /// warns itself, while one exactly on the cap is sent; every other failure reaches the
+    /// adapter as the response outcome the library resolved, and the adapter warns.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_settled_reply_is_sent_once_delivered_and_dropped_unsent_when_it_cannot_go_out() {
         install_log_collector();
@@ -2529,14 +2529,61 @@ pub(crate) mod network {
         .await;
         assert!(dropped.load(Ordering::SeqCst));
 
-        // A frame no requester would accept is refused by the library under the
-        // destination's response cap before it costs a transfer: one warn, no second
-        // from the adapter, and the settlement dropped unsent.
-        let body = Value::Binary(vec![0x5a; MAX_FETCH_RESPONSE_BYTES + 1]);
-        let (reply, sent, dropped) = settled(body.clone());
+        // The destination's response cap is inclusive and measures the response frame,
+        // request id included: a frame of exactly `MAX_FETCH_RESPONSE_BYTES` goes out and
+        // the settlement reads sent. The library's own request is used so the requester
+        // takes a reply that size on `/echo`.
+        let link = open_link(&requester.transport, &desc, "/echo", link_deadline())
+            .await
+            .unwrap();
+        let link_id = *link.lock().await.id();
+        let entered = handler.entered.load(Ordering::SeqCst);
+        let taking_the_bound = LibraryRequestOptions::default()
+            .with_timeout(FETCH_TRANSFER_REQUEST_TIMEOUT)
+            .with_max_response_size(MAX_FETCH_RESPONSE_BYTES);
+        let receipt = requester
+            .transport
+            .request(
+                &link_id,
+                "/echo",
+                requester.envelope(Value::Nil).into_value(),
+                taking_the_bound,
+            )
+            .await
+            .unwrap();
+        wait_until("the handler to hold the reply", || {
+            handler.entered.load(Ordering::SeqCst) > entered
+        })
+        .await;
+        let (_, request_id) = handler.last.lock().unwrap();
+        let body = compressible_body_framing_to(MAX_FETCH_RESPONSE_BYTES);
+        response_frame_of(request_id, body.clone(), MAX_FETCH_RESPONSE_BYTES);
+        let (reply, sent, dropped) = settled(Value::Binary(body.clone()));
         *handler.reply.lock() = Some(reply);
+        handler.release.notify_one();
+        let response = timeout(FETCH_TRANSFER_REQUEST_TIMEOUT, receipt.response())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            response.value() == Some(&Value::Binary(body)),
+            "a reply on the bound arrives byte for byte"
+        );
+        wait_until("the completed transfer to settle the reply", || {
+            sent.load(Ordering::SeqCst)
+        })
+        .await;
+        assert!(dropped.load(Ordering::SeqCst));
+
+        // A frame one byte over is refused by the library under the same cap before it
+        // costs a transfer: one warn, no second from the adapter, and the settlement
+        // dropped unsent.
         let (in_flight, link_id, request_id) = handler.hold(&requester, &desc).await;
-        let encoded = ResponseFrame::new(request_id, body).encode().len();
+        let body = compressible_body_framing_to(MAX_FETCH_RESPONSE_BYTES + 1);
+        let encoded =
+            response_frame_of(request_id, body.clone(), MAX_FETCH_RESPONSE_BYTES + 1).len();
+        let (reply, sent, dropped) = settled(Value::Binary(body));
+        *handler.reply.lock() = Some(reply);
         handler.release.notify_one();
         let refused = format!(
             "tp: response {request_id} on link {link_id} refused, {encoded}B exceeds the destination response limit {MAX_FETCH_RESPONSE_BYTES}B"
@@ -2706,6 +2753,67 @@ pub(crate) mod network {
         })
         .await;
 
+        requester.stop().await;
+        responder.stop().await;
+    }
+
+    /// The response cap the node arms holds for a plain `Reply::Value` too: a frame one
+    /// byte over `MAX_FETCH_RESPONSE_BYTES` draws exactly one library refusal warn and
+    /// nothing is sent, so the requester times out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_value_reply_over_the_response_cap_is_refused_by_the_library_and_never_sent() {
+        install_log_collector();
+        let recorder = Arc::new(Recorder::default());
+        let body = Value::Binary(compressible_body_framing_to(MAX_FETCH_RESPONSE_BYTES + 1));
+        recorder.queue(Script::Reply(Reply::Value(body.clone())));
+        let (responder, requester, desc) = pair(recorder.clone()).await;
+        let in_flight = {
+            let (transport, identity) = (requester.transport.clone(), requester.identity.clone());
+            let envelope = requester.envelope(Value::Nil);
+            tokio::spawn(async move {
+                link::request(
+                    &transport,
+                    &identity,
+                    &desc,
+                    "/echo",
+                    envelope,
+                    short_options(),
+                )
+                .await
+            })
+        };
+        wait_until("the handler to see the request", || {
+            recorder.seen_count() == 1
+        })
+        .await;
+        let Seen {
+            link_id,
+            request_id,
+            ..
+        } = recorder.last();
+        let encoded = ResponseFrame::new(request_id, body).encode().len();
+        assert_eq!(encoded, MAX_FETCH_RESPONSE_BYTES + 1);
+        let refused = format!(
+            "tp: response {request_id} on link {link_id} refused, {encoded}B exceeds the destination response limit {MAX_FETCH_RESPONSE_BYTES}B"
+        );
+        wait_until("the library to refuse the reply", || {
+            warn_snapshot().iter().any(|message| message == &refused)
+        })
+        .await;
+        assert_eq!(
+            timeout(SHORT_REQUEST_TIMEOUT * 2, in_flight)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err(),
+            timed_out("/echo"),
+            "the requester hears nothing"
+        );
+        let about_this_reply: Vec<String> = warn_snapshot()
+            .into_iter()
+            .filter(|message| message.contains(&request_id.to_string()))
+            .collect();
+        assert_eq!(about_this_reply, vec![refused]);
         requester.stop().await;
         responder.stop().await;
     }
