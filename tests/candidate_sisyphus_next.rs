@@ -51,7 +51,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "sisyphus-next";
 const CANDIDATE_NAMES: [&str; 2] = ["sisyphus-next", "architect-next"];
-const SMOKE_FLOOR: usize = 392;
+const SMOKE_FLOOR: usize = 414;
 
 fn agents_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents")
@@ -164,6 +164,7 @@ fn without_sisyphus_seams_from(cmd: &mut Command, names: impl IntoIterator<Item 
 fn sisyphus_seam_scrub_removes_every_seam_and_keeps_the_rest() {
     let seams = [
         "SISYPHUS_GH_X",
+        "SISYPHUS_GH_REPLY_CMD",
         "SISYPHUS_CI_SLEEP",
         "SISYPHUS_REVIEW_SLEEP",
         "SISYPHUS_ASK_OWNER_BIN",
@@ -420,6 +421,31 @@ fn smoke_git_scrub_lists_equal_the_wrappers() {
         |items: &[&str]| -> BTreeSet<String> { items.iter().map(|s| s.to_string()).collect() };
     assert_eq!(smoke_tuple("GIT_REPO_VARS"), set(GIT_REPO_VARS));
     assert_eq!(smoke_tuple("GIT_CONFIG_PREFIXES"), set(GIT_CONFIG_PREFIXES));
+}
+
+/// smoke_test.py and `battery()` scrub the same named seams, and both drop
+/// the `SISYPHUS_GH_*` commands by prefix rather than by name, so a new gh
+/// seam such as `SISYPHUS_GH_REPLY_CMD` needs no list entry in either.
+#[test]
+fn smoke_scrub_list_matches_the_wrapper_seam_list() {
+    let wrapper: BTreeSet<String> = SISYPHUS_SEAMS.iter().map(|s| s.to_string()).collect();
+    assert_eq!(smoke_tuple("SCRUBBED_SEAMS"), wrapper);
+    let smoke = fs::read_to_string(candidate_dir().join("scripts/smoke_test.py")).unwrap();
+    assert!(
+        smoke.contains("k.startswith(\"SISYPHUS_GH_\")"),
+        "smoke_test.py no longer scrubs SISYPHUS_GH_* by prefix"
+    );
+    let mut cmd = Command::new("true");
+    without_sisyphus_seams_from(&mut cmd, [OsString::from("SISYPHUS_GH_REPLY_CMD")]);
+    let envs: BTreeMap<OsString, Option<OsString>> = cmd
+        .get_envs()
+        .map(|(k, v)| (k.to_os_string(), v.map(OsStr::to_os_string)))
+        .collect();
+    assert_eq!(
+        envs.get(OsStr::new("SISYPHUS_GH_REPLY_CMD")),
+        Some(&None),
+        "{envs:?}"
+    );
 }
 
 /// Config injected through `GIT_CONFIG_COUNT` after the wrapper's own scrub
@@ -1345,6 +1371,69 @@ fn smoke_summary_and_exit_code_cover_a_check_recorded_last() {
         !broken.status.success(),
         "a failure recorded last must fail the battery:\n{report}"
     );
+}
+
+/// Each guard in gates.py, removed from a scratch copy, turns its smoke row
+/// red: the trust filter (every association the fixtures use counts as
+/// trusted), the remote-head check before resolving, and the post-flip gate
+/// on the CI poll ceiling count.
+#[test]
+fn smoke_rows_go_red_under_the_recorded_sabotages() {
+    let Some(python) = python3() else { return };
+    let sabotages = [
+        (
+            "trust",
+            "TRUSTED_ASSOCIATIONS = (\"OWNER\", \"MEMBER\", \"COLLABORATOR\")",
+            "TRUSTED_ASSOCIATIONS = (\"OWNER\", \"MEMBER\", \"COLLABORATOR\", \"CONTRIBUTOR\", \
+             \"FIRST_TIME_CONTRIBUTOR\", \"NONE\")",
+            "pr_tracking review: untrusted thread, review and comment -> pr_review_untrusted \
+             without a body key",
+        ),
+        (
+            "head",
+            "    if not head or remote != head:\n",
+            "    if False:\n",
+            "pr_tracking review: pr_review_resolve on a head mismatch -> push_unconfirmed, \
+             nothing replied or resolved",
+        ),
+        (
+            "ceiling",
+            "    if _watch_started(state):\n        u[\"ci_polls_run\"]",
+            "    if _review_mode(state):\n        u[\"ci_polls_run\"]",
+            "pr_tracking review: ci_poll before the flip counts no ci_polls_run and never \
+             poll_caps",
+        ),
+    ];
+    for (label, old, new, row) in sabotages {
+        let scratch = scratch_dir(&format!("sabotage-{label}"));
+        let copy = scratch_candidate_copy(&scratch);
+        let gates = copy.join("scripts").join("gates.py");
+        let text = fs::read_to_string(&gates).unwrap();
+        assert_eq!(
+            text.matches(old).count(),
+            1,
+            "{label}: {old:?} must occur exactly once in gates.py"
+        );
+        fs::write(&gates, text.replacen(old, new, 1)).unwrap();
+        let output = battery(&python, &scratch)
+            .current_dir(&copy)
+            .arg("scripts/smoke_test.py")
+            .output()
+            .unwrap();
+        let report = transcript(&output);
+        assert!(
+            !output.status.success(),
+            "{label}: the battery passed with the guard removed:\n{report}"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let fail = format!("FAIL {row}");
+        assert!(
+            stdout.lines().any(|l| l
+                .strip_prefix(&fail)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with("  ("))),
+            "{label}: no `{fail}` line:\n{report}"
+        );
+    }
 }
 
 /// The shipped `debt_scan` node lifted verbatim into a two-node graph with
@@ -2522,6 +2611,7 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("plan_subtasks", "timeout", 600),
     ("pr_review_apply", "timeout", 120),
     ("pr_review_poll", "timeout", 750),
+    ("pr_review_reply", "timeout", 600),
     ("pr_review_resolve", "timeout", 600),
     ("pr_review_triage", "timeout", 600),
     ("research_answer", "max_iterations", 45),
@@ -2765,7 +2855,8 @@ fn review_watch_caps_stay_below_the_per_node_visit_cap() {
 }
 
 /// A poll node sleeps and then makes one gh call bounded by `GH_CALL_SECS`,
-/// `pr_review_resolve` starts no call past `RESOLVE_DEADLINE_SECS`, and
+/// `pr_review_resolve` and `pr_review_reply` start no call past
+/// `RESOLVE_DEADLINE_SECS`, and
 /// `ci_route` and `ci_apply` make one gh call per distinct CI run, up to
 /// `CI_LOG_RUNS_MAX`, so each node timeout has to exceed that worst case or
 /// the engine kills the node mid-call.
@@ -2784,6 +2875,7 @@ fn poll_node_timeouts_cover_the_sleep_and_one_gh_call() {
         ("ci_poll", "CI_POLL_SLEEP"),
         ("pr_review_poll", "REVIEW_POLL_SLEEP"),
         ("pr_review_resolve", "RESOLVE_DEADLINE_SECS"),
+        ("pr_review_reply", "RESOLVE_DEADLINE_SECS"),
     ] {
         let secs = lib_constant(&lib, wait);
         let limit = timeout(node);
@@ -2798,6 +2890,70 @@ fn poll_node_timeouts_cover_the_sleep_and_one_gh_call() {
         assert!(
             limit > runs * gh_call,
             "{node} timeout {limit} does not exceed CI_LOG_RUNS_MAX {runs} * GH_CALL_SECS {gh_call}"
+        );
+    }
+}
+
+/// Each `subprocess.run(...)` call in `source` as its 1-based line number and
+/// the call text up to the matching close paren. Parens inside string
+/// literals and comments do not count.
+fn subprocess_run_calls(source: &str) -> Vec<(usize, &str)> {
+    let needle = "subprocess.run(";
+    let mut calls = Vec::new();
+    for (at, _) in source.match_indices(needle) {
+        let (mut depth, mut quote, mut escaped, mut comment) = (0usize, None, false, false);
+        let mut end = None;
+        for (offset, c) in source[at + needle.len() - 1..].char_indices() {
+            if comment {
+                comment = c != '\n';
+            } else if let Some(q) = quote {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == q {
+                    quote = None;
+                }
+            } else if c == '"' || c == '\'' {
+                quote = Some(c);
+            } else if c == '#' {
+                comment = true;
+            } else if c == '(' {
+                depth += 1;
+            } else if c == ')' {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(at + needle.len() + offset);
+                    break;
+                }
+            }
+        }
+        let line = source[..at].matches('\n').count() + 1;
+        let end = end.unwrap_or_else(|| panic!("gates.py:{line}: unbalanced subprocess.run call"));
+        calls.push((line, &source[at..end]));
+    }
+    calls
+}
+
+/// The node timeouts above assume no gh call outlives `GH_CALL_SECS`, so
+/// every `gh` call and every shell-run seam standing in for one has to pass
+/// that timeout.
+#[test]
+fn every_gh_and_seam_run_in_gates_carries_the_gh_call_timeout() {
+    let gates = fs::read_to_string(candidate_dir().join("scripts/gates.py")).unwrap();
+    let gh_calls: Vec<(usize, &str)> = subprocess_run_calls(&gates)
+        .into_iter()
+        .filter(|(_, call)| call.contains("\"gh\"") || call.contains("shell=True"))
+        .collect();
+    assert!(
+        gh_calls.len() >= 10,
+        "the scan found only {} gh or seam calls in gates.py",
+        gh_calls.len()
+    );
+    for (line, call) in gh_calls {
+        assert!(
+            call.contains("timeout=GH_CALL_SECS"),
+            "gates.py:{line}: a gh or seam call without timeout=GH_CALL_SECS: {call}"
         );
     }
 }
