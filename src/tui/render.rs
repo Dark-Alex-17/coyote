@@ -10,6 +10,7 @@ use ansi_to_tui::IntoText;
 use anyhow::Result;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
+use unicode_width::UnicodeWidthChar;
 
 const ESC: char = '\x1b';
 
@@ -135,6 +136,46 @@ pub(crate) fn plain_lines(text: &str, width: u16, style: Style) -> Vec<Line<'sta
 /// so a table keeps its columns and the view clips what does not fit.
 pub(crate) fn preformatted_lines(output: &str) -> Vec<Line<'static>> {
     styled_lines(&sanitize_ansi(output.trim_end_matches(['\n', '\r'])))
+}
+
+/// Breaks every line wider than `width` at the column boundary, span
+/// styles kept, so nothing the view would clip goes unseen. A tool call's
+/// narration is approved on what is shown; a long argument must not hide
+/// its tail past the right edge.
+pub(crate) fn hard_wrap(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
+    let width = usize::from(width.max(1));
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        if line.width() <= width {
+            out.push(line);
+            continue;
+        }
+        let Line { spans, style, .. } = line;
+        let mut row: Vec<Span<'static>> = Vec::new();
+        let mut used = 0;
+        for span in spans {
+            let mut piece = String::new();
+            for c in span.content.chars() {
+                let columns = c.width().unwrap_or(0);
+                if used + columns > width && used > 0 {
+                    if !piece.is_empty() {
+                        row.push(Span::styled(std::mem::take(&mut piece), span.style));
+                    }
+                    out.push(Line::from(std::mem::take(&mut row)).style(style));
+                    used = 0;
+                }
+                piece.push(c);
+                used += columns;
+            }
+            if !piece.is_empty() {
+                row.push(Span::styled(piece, span.style));
+            }
+        }
+        if !row.is_empty() {
+            out.push(Line::from(row).style(style));
+        }
+    }
+    out
 }
 
 /// The first line of already-painted text; the footer's usage readout
@@ -418,6 +459,30 @@ mod tests {
             every_span(&lines).all(|span| !span.content.contains(ESC)),
             "{lines:?}"
         );
+    }
+
+    /// A styled line wider than the view is broken at the column
+    /// boundary with every character kept and each piece in the style of
+    /// the span it came from; lines that fit are left alone.
+    #[test]
+    fn hard_wrap_keeps_every_character_and_each_spans_style() {
+        let bold = Style::new().add_modifier(Modifier::BOLD);
+        let lines = vec![
+            Line::from("fits"),
+            Line::from(vec![Span::raw("abcdefgh"), Span::styled("ijklmnop", bold)]),
+        ];
+        let wrapped = hard_wrap(lines, 6);
+        let rows: Vec<String> = wrapped.iter().map(Line::to_string).collect();
+        assert_eq!(rows, ["fits", "abcdef", "ghijkl", "mnop"]);
+        for line in &wrapped {
+            assert!(line.width() <= 6, "{line:?}");
+        }
+        let styled: String = every_span(&wrapped)
+            .filter(|span| span.style == bold)
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(styled, "ijklmnop");
+        assert_eq!(hard_wrap(vec![Line::from("ab")], 0).len(), 2);
     }
 
     #[test]
