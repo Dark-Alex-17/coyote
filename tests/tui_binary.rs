@@ -313,7 +313,6 @@ const ENTER_ALT: &[u8] = b"\x1b[?1049h";
 const LEAVE_ALT: &[u8] = b"\x1b[?1049l";
 const PASTE_ON: &[u8] = b"\x1b[?2004h";
 const PASTE_OFF: &[u8] = b"\x1b[?2004l";
-const KEYBOARD_POP: &[u8] = b"\x1b[<u";
 
 fn find(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     haystack[from.min(haystack.len())..]
@@ -326,10 +325,18 @@ fn rfind(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).rposition(|w| w == needle)
 }
 
-/// Kitty keyboard push: `ESC [ > <flags> u`.
-fn find_keyboard_push(haystack: &[u8], from: usize) -> Option<usize> {
+fn count(haystack: &[u8], needle: &[u8]) -> usize {
+    haystack
+        .windows(needle.len())
+        .filter(|w| *w == needle)
+        .count()
+}
+
+/// Kitty keyboard push (`ESC [ > <flags> u`) or pop (`ESC [ < <count> u`),
+/// by its introducer byte.
+fn find_keyboard_stack_op(haystack: &[u8], introducer: u8, from: usize) -> Option<usize> {
     let mut at = from;
-    while let Some(start) = find(haystack, b"\x1b[>", at) {
+    while let Some(start) = find(haystack, &[0x1b, b'[', introducer], at) {
         let rest = &haystack[start + 3..];
         let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
         if digits > 0 && rest.get(digits) == Some(&b'u') {
@@ -338,6 +345,20 @@ fn find_keyboard_push(haystack: &[u8], from: usize) -> Option<usize> {
         at = start + 1;
     }
     None
+}
+
+fn find_keyboard_push(haystack: &[u8], from: usize) -> Option<usize> {
+    find_keyboard_stack_op(haystack, b'>', from)
+}
+
+fn rfind_keyboard_pop(haystack: &[u8]) -> Option<usize> {
+    let mut last = None;
+    let mut from = 0;
+    while let Some(at) = find_keyboard_stack_op(haystack, b'<', from) {
+        last = Some(at);
+        from = at + 1;
+    }
+    last
 }
 
 /// Every SGR parameter list (`ESC [ ... m`) in the raw output, split into
@@ -394,11 +415,11 @@ fn is_rgb_sgr(params: &[u16]) -> bool {
         .any(|w| (w[0] == 38 || w[0] == 48 || w[0] == 58) && w[1] == 2)
 }
 
-/// The alternate screen is entered once and left on Ctrl+D; bracketed
-/// paste comes and goes with it; keyboard-enhancement flags, when the
-/// terminal takes them, are pushed after alt-screen entry and popped
-/// before leaving it, and the support probe is sent before the reader
-/// starts.
+/// The alternate screen is entered once and left exactly once on Ctrl+D;
+/// bracketed paste comes on after it and goes off before it is left;
+/// keyboard-enhancement flags, when the terminal takes them, are pushed
+/// after alt-screen entry and popped before leaving it, and the support
+/// probe is sent before the reader starts.
 #[test]
 #[serial]
 fn enter_and_leave_sequences_mirror_around_the_alternate_screen() {
@@ -420,13 +441,19 @@ fn enter_and_leave_sequences_mirror_around_the_alternate_screen() {
         find(raw, ENTER_ALT, enter_alt + 1).is_none(),
         "the alternate screen was entered more than once"
     );
+    assert_eq!(
+        count(raw, LEAVE_ALT),
+        1,
+        "the alternate screen must be left exactly once:\n{transcript}"
+    );
 
     let paste_on = find(raw, PASTE_ON, 0).expect("bracketed paste was never enabled");
     let paste_off = rfind(raw, PASTE_OFF).expect("bracketed paste was never disabled");
     assert!(
-        paste_on < paste_off && paste_off < leave_alt,
-        "bracketed paste must be disabled before the alternate screen is left \
-         (on={paste_on}, off={paste_off}, leave={leave_alt})"
+        enter_alt < paste_on && paste_on < paste_off && paste_off < leave_alt,
+        "bracketed paste must come on inside the alternate screen and go off \
+         before it is left (enter={enter_alt}, on={paste_on}, off={paste_off}, \
+         leave={leave_alt})"
     );
 
     // The keyboard-enhancement probe is answered by nothing on a pty, so
@@ -437,7 +464,7 @@ fn enter_and_leave_sequences_mirror_around_the_alternate_screen() {
         "the keyboard-enhancement support probe (CSI ? u) was never sent"
     );
     if let Some(push) = find_keyboard_push(raw, 0) {
-        let pop = rfind(raw, KEYBOARD_POP).expect("flags pushed but never popped");
+        let pop = rfind_keyboard_pop(raw).expect("flags pushed but never popped");
         assert!(enter_alt < push, "flags pushed before alt-screen entry");
         assert!(push < pop && pop < leave_alt, "flags popped after leaving");
     }
@@ -1058,4 +1085,241 @@ fn ctrl_d_under_an_agent_fires_the_completed_hook_before_exit() {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Dirties a temp session the way the save-modal cases do: a dry-run turn
+/// records nothing, so a session setting is what flips the dirty bit.
+fn open_and_dirty_a_session(pty: &mut Pty) {
+    pty.send(b".session\r").unwrap();
+    pty.wait_for("temp", PTY_DEADLINE).unwrap();
+    pty.send(b".set skills_enabled false\r").unwrap();
+    pty.read_for(Duration::from_millis(800));
+}
+
+/// Hotkeys on a modal only count once typing has been idle for a second
+/// (pinned by the ManualClock unit test); settle before answering.
+const HOTKEY_GAP: Duration = Duration::from_millis(1200);
+
+/// An unknown dot-command is an ordinary command turn that fails: the
+/// REPL's hint lands in the transcript as the error, the UI stays up and
+/// takes the next command, and Ctrl+D still leaves the tty cooked.
+#[test]
+#[serial]
+fn an_unknown_command_shows_the_hint_and_the_ui_keeps_taking_keys() {
+    let dir = fresh_config_dir("unknown-command");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b".nosuchcommand-x7x\r").unwrap();
+    pty.wait_for("Unknown command", PTY_DEADLINE)
+        .expect("no hint was shown for an unknown command");
+    pty.send(b".info\r").unwrap();
+    pty.wait_for("log_path", PTY_DEADLINE)
+        .expect("keys were not handled after the unknown command");
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// An empty Enter starts no turn (no working row, no dry-run echo) and
+/// `.exit` leaves exactly as Ctrl+D does: alternate screen left once,
+/// exit 0, tty cooked.
+#[test]
+#[serial]
+fn an_empty_enter_starts_no_turn_and_dot_exit_leaves_like_ctrl_d() {
+    let dir = fresh_config_dir("empty-enter-dot-exit");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let before = pty.raw().len();
+    pty.send(b"\r").unwrap();
+    pty.read_for(Duration::from_millis(800));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
+    assert!(
+        !since.contains("Working"),
+        "an empty Enter started a turn:\n{since}"
+    );
+
+    pty.send(b".exit\r").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        1,
+        "`.exit` must leave the alternate screen exactly once:\n{transcript}"
+    );
+}
+
+/// Teardown mirrors `Repl::run`: Ctrl+D runs `exit_session()`, which asks
+/// "Save session?" for a dirty session with `save_session` unset. With the
+/// terminal still there the question is the modal, `y` asks for a name,
+/// and the named session is on disk when the process has left.
+#[test]
+#[serial]
+fn ctrl_d_on_a_dirty_session_asks_to_save_and_y_writes_it_before_leaving() {
+    let dir = fresh_config_dir("ctrl-d-dirty");
+    let _guard = TempDirGuard(dir.clone());
+    write_config(&dir, None);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    open_and_dirty_a_session(&mut pty);
+    pty.send(b"\x04").unwrap();
+    pty.wait_for("Save session?", PTY_DEADLINE)
+        .expect("Ctrl+D on a dirty session did not ask to save it");
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"y").unwrap();
+    pty.wait_for("ession name", PTY_DEADLINE).unwrap();
+    pty.send(b"probe-ctrl-d\r").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+    let saved = walk(&dir).into_iter().find(|p| {
+        p.file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("probe-ctrl-d"))
+    });
+    assert!(
+        saved.is_some(),
+        "no probe-ctrl-d session file was written under {dir:?}:\n{transcript}"
+    );
+}
+
+/// `n` on the "Save session?" modal closes the session without asking for
+/// a name or writing a file; the UI is still live afterwards.
+#[test]
+#[serial]
+fn declining_the_save_modal_closes_the_session_without_a_file() {
+    let dir = fresh_config_dir("decline-save");
+    let _guard = TempDirGuard(dir.clone());
+    write_config(&dir, None);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    open_and_dirty_a_session(&mut pty);
+    let files_before = walk(&dir).len();
+    pty.send(b".exit session\r").unwrap();
+    pty.wait_for("Save session?", PTY_DEADLINE).unwrap();
+    pty.read_for(HOTKEY_GAP);
+    let answered_at = pty.raw().len();
+    pty.send(b"n").unwrap();
+    pty.wait_for_after("no session", answered_at, PTY_DEADLINE)
+        .expect("declining the save did not close the session");
+    pty.read_for(Duration::from_millis(500));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[answered_at..]));
+    assert!(
+        !since.contains("ession name"),
+        "`n` still asked for a session name:\n{since}"
+    );
+    pty.send(b".info\r").unwrap();
+    pty.wait_for("log_path", PTY_DEADLINE)
+        .expect("keys were not handled after the modal closed");
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+    let files_after = walk(&dir);
+    assert_eq!(
+        files_after.len(),
+        files_before,
+        "declining the save still wrote something: {files_after:?}"
+    );
+}
+
+/// Bracketed paste is on while the screen is up, so a paste holding a
+/// newline reaches the composer as text and is not submitted as a prompt.
+#[test]
+#[serial]
+fn a_bracketed_paste_with_a_newline_lands_in_the_composer_unsubmitted() {
+    let dir = fresh_config_dir("paste");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let before = pty.raw().len();
+    pty.send(b"\x1b[200~pasted-a1x\rpasted-b2x\x1b[201~")
+        .unwrap();
+    pty.wait_for_after("pasted-b2x", before, PTY_DEADLINE)
+        .expect("the pasted text never reached the composer");
+    pty.read_for(Duration::from_millis(800));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
+    assert!(since.contains("pasted-a1x"), "{since}");
+    assert!(
+        !since.contains("Working"),
+        "a paste containing a newline was submitted as a prompt:\n{since}"
+    );
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// `exit()` is idempotent and the composer is inert once teardown runs: a
+/// second Ctrl+D on its heels changes nothing. One leave, exit 0.
+#[test]
+#[serial]
+fn a_second_ctrl_d_during_teardown_changes_nothing() {
+    let dir = fresh_config_dir("double-ctrl-d");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b"\x04\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        1,
+        "two Ctrl+Ds left the alternate screen more than once:\n{transcript}"
+    );
+}
+
+/// The first run ever: no cache dir, no sessions, no config beyond the
+/// dry-run file. The UI comes up with its chrome, and leaving creates no
+/// stray file next to the tty report.
+#[test]
+#[serial]
+fn a_cold_start_with_no_cache_dir_comes_up_and_leaves_clean() {
+    let dir = fresh_config_dir("cold-start");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    // `fresh_config_dir` pre-creates `sessions`; a first run has neither it
+    // nor the cache dir.
+    fs::remove_dir_all(dir.join("sessions")).unwrap();
+    assert!(!dir.join("cache").exists());
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("Type a prompt", PTY_DEADLINE).unwrap();
+    pty.wait_for("dryrun:dry-model", PTY_DEADLINE).unwrap();
+    pty.send(MARKDOWN_PROMPT).unwrap();
+    wait_for_rendered_reply(&mut pty);
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+    let after = strip_ansi(&String::from_utf8_lossy(
+        &pty.raw()[rfind(pty.raw(), LEAVE_ALT).unwrap()..],
+    ));
+    let report_at = after.find("exit=").unwrap();
+    assert!(
+        after[..report_at].trim().is_empty(),
+        "bytes reached the terminal between the leave and the report: {:?}",
+        after[..report_at].trim()
+    );
 }

@@ -2311,10 +2311,8 @@ mod tests {
         Some(&name[..end])
     }
 
-    /// Every direct keyboard read outside this module: crossterm's
-    /// `read`/`poll`, `read_single_key`, and inquire's prompt builders
-    /// (nothing else under `src/` constructs a `Text`, `Select` or the like).
-    fn keyboard_readers() -> Vec<KeyboardReader> {
+    /// Every `.rs` file under `dir`, sorted.
+    fn rust_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
             for entry in std::fs::read_dir(dir).unwrap().flatten() {
                 let path = entry.path();
@@ -2325,6 +2323,16 @@ mod tests {
                 }
             }
         }
+        let mut files = Vec::new();
+        walk(dir, &mut files);
+        files.sort();
+        files
+    }
+
+    /// Every direct keyboard read outside this module: crossterm's
+    /// `read`/`poll`, `read_single_key`, and inquire's prompt builders
+    /// (nothing else under `src/` constructs a `Text`, `Select` or the like).
+    fn keyboard_readers() -> Vec<KeyboardReader> {
         fn at_word_start(line: &str, at: usize) -> bool {
             line[..at]
                 .chars()
@@ -2343,11 +2351,8 @@ mod tests {
         ];
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let src = root.join("src");
-        let mut files = Vec::new();
-        walk(&src, &mut files);
-        files.sort();
         let mut readers: Vec<KeyboardReader> = Vec::new();
-        for path in files {
+        for path in rust_files(&src) {
             if path.starts_with(src.join("tui")) {
                 continue;
             }
@@ -2569,6 +2574,82 @@ mod tests {
         );
         let utils = include_str!("../utils/mod.rs");
         assert!(fn_body(utils, "pub fn drain_stale_tty_input").contains("crate::tui::active()"));
+    }
+
+    /// A task id in the source names the owner of a debt marker and
+    /// nothing else: every line carrying one is a lint suppression, a
+    /// `todo!`, an ignored test, or the one pre-existing marker below.
+    /// An id quoted as data (inside a string literal or a backtick code
+    /// span, the way the planning-debris lint and its fixtures spell
+    /// theirs) is a needle, not a reference. This task's own id appears
+    /// nowhere. The needles here are spelled in halves so this test's
+    /// source does not match itself.
+    #[test]
+    fn task_ids_mark_only_owned_debt() {
+        fn quoted(line: &str, at: usize) -> bool {
+            let before = &line[..at];
+            let quotes = before
+                .match_indices('"')
+                .filter(|(i, _)| !before[..*i].ends_with('\\'))
+                .count();
+            quotes % 2 == 1 || before.matches('`').count() % 2 == 1
+        }
+        let id_prefix = concat!("TA", "SK-");
+        let own_id = concat!("TA", "SK-", "312");
+        let debt_markers = [
+            "#[allow(",
+            "#![allow(",
+            "#[expect(",
+            "#![expect(",
+            "cfg_attr(",
+            "todo!",
+            "unimplemented!",
+            "#[ignore",
+        ];
+        // Owned by the Windows task: the prompt reply channel's missing twin.
+        let allowlisted: &[(&str, &str)] = &[(
+            "src/function/prompt_channel.rs",
+            "bail!(\"Prompt reply channel is not implemented on this platform\")",
+        )];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut offenders = Vec::new();
+        let mut own = Vec::new();
+        for dir in ["src", "tests"] {
+            for path in rust_files(&root.join(dir)) {
+                let file = path.strip_prefix(root).unwrap().display().to_string();
+                let text = std::fs::read_to_string(&path).unwrap();
+                for (index, line) in text.lines().enumerate() {
+                    if line.contains(own_id) {
+                        own.push(format!("{file}:{}", index + 1));
+                    }
+                    let bare: Vec<usize> = line
+                        .match_indices(id_prefix)
+                        .map(|(at, _)| at)
+                        .filter(|at| !quoted(line, *at))
+                        .collect();
+                    if bare.is_empty() {
+                        continue;
+                    }
+                    let owned = debt_markers.iter().any(|marker| line.contains(marker));
+                    let listed = allowlisted
+                        .iter()
+                        .any(|(f, needle)| *f == file && line.contains(needle));
+                    if !owned && !listed {
+                        offenders.push(format!("{file}:{}: {}", index + 1, line.trim()));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "task ids outside a debt marker:\n{}",
+            offenders.join("\n")
+        );
+        assert!(
+            own.is_empty(),
+            "this task's id left in the source:\n{}",
+            own.join("\n")
+        );
     }
 
     /// The signal handlers are armed before the terminal changes modes,

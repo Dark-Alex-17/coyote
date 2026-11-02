@@ -161,8 +161,9 @@ fn restore_from_static() {
         if fd < 0 {
             return;
         }
-        // SAFETY: the fd was dup'd by `open_tty_writer` and stays open for
-        // the process lifetime; ManuallyDrop keeps this handle from closing it.
+        // SAFETY: the fd was dup'd by `open_tty_writer` and is open while
+        // PANIC_FD holds it: `Screen` clears PANIC_FD before the writer that
+        // owns the fd is dropped. ManuallyDrop keeps this handle from closing it.
         let mut writer = ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
         let _ = leave(&mut *writer);
     }
@@ -175,9 +176,19 @@ fn restore_from_static() {
 /// Switches the terminal into the UI's modes.
 pub(crate) fn enter(writer: &mut impl Write, enhancement: bool) -> io::Result<()> {
     install_panic_hook();
+    enter_steps(writer, enter_sequence(enhancement))
+}
+
+/// Applies `steps` in order. A failing step hands the terminal back through
+/// `leave`, which undoes the full sequence (switching off a mode that never
+/// came on is harmless) and clears the entered flag.
+fn enter_steps(writer: &mut impl Write, steps: Vec<TerminalStep>) -> io::Result<()> {
     SCREEN_ENTERED.store(true, Ordering::SeqCst);
-    for step in enter_sequence(enhancement) {
-        step.apply(writer)?;
+    for step in steps {
+        if let Err(err) = step.apply(writer) {
+            let _ = leave(writer);
+            return Err(err);
+        }
         if step == TerminalStep::KeyboardEnhancement(true) {
             ENHANCEMENT_PUSHED.store(true, Ordering::SeqCst);
         }
@@ -228,6 +239,23 @@ fn repaint_from_scratch<W: Write>(terminal: &mut Terminal<CrosstermBackend<W>>) 
     Ok(())
 }
 
+/// Re-applies the terminal modes and schedules a full repaint when `leave`
+/// ran behind the UI's back: the panic hook restores the terminal for a
+/// panic on a background task too, and that one is caught as a join error
+/// while the loop keeps drawing. Returns whether it had to.
+fn reenter_if_left<W: Write>(
+    terminal: &mut Terminal<CrosstermBackend<W>>,
+    steps: Vec<TerminalStep>,
+) -> io::Result<bool> {
+    if SCREEN_ENTERED.load(Ordering::SeqCst) {
+        return Ok(false);
+    }
+    warn!("The terminal was restored behind the UI; re-entering the screen");
+    enter_steps(terminal.backend_mut(), steps)?;
+    repaint_from_scratch(terminal)?;
+    Ok(true)
+}
+
 /// The alternate screen the UI draws on, with the terminal modes it owns.
 pub(crate) struct Screen {
     terminal: Terminal<CrosstermBackend<TtyWriter>>,
@@ -236,17 +264,24 @@ pub(crate) struct Screen {
 
 impl Screen {
     /// Probes the terminal, enters the alternate screen and builds the
-    /// ratatui terminal over the dup'd stdout.
+    /// ratatui terminal over the dup'd stdout. The terminal is built
+    /// first (it only asks for the size) so a failure after the modes are
+    /// applied cannot leave them on.
     pub(crate) fn enter() -> Result<Self> {
         let enhancement = probe_keyboard_enhancement();
-        let mut writer = open_tty_writer()?;
+        let writer = open_tty_writer()?;
         #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            PANIC_FD.store(writer.as_raw_fd(), Ordering::SeqCst);
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&writer);
+        let mut terminal = Terminal::new(CrosstermBackend::new(writer))?;
+        #[cfg(unix)]
+        PANIC_FD.store(fd, Ordering::SeqCst);
+        if let Err(err) = enter(terminal.backend_mut(), enhancement) {
+            // Cleared before `terminal` drops the writer: the hook must
+            // never write to a closed or reused descriptor.
+            #[cfg(unix)]
+            PANIC_FD.store(-1, Ordering::SeqCst);
+            return Err(err.into());
         }
-        enter(&mut writer, enhancement)?;
-        let terminal = Terminal::new(CrosstermBackend::new(writer))?;
         Ok(Self {
             terminal,
             enhancement,
@@ -254,6 +289,7 @@ impl Screen {
     }
 
     pub(crate) fn draw(&mut self, render: impl FnOnce(&mut ratatui::Frame)) -> io::Result<()> {
+        reenter_if_left(&mut self.terminal, enter_sequence(self.enhancement))?;
         draw_frame(&mut self.terminal, render)
     }
 
@@ -282,10 +318,13 @@ impl Screen {
 
 /// An early `?` or an unwind between `enter` and the explicit `leave` in
 /// the run loop still restores the terminal; after that `leave` this is a
-/// no-op.
+/// no-op. The hook's descriptor is forgotten here, ahead of the writer
+/// closing it.
 impl Drop for Screen {
     fn drop(&mut self) {
         let _ = self.leave();
+        #[cfg(unix)]
+        PANIC_FD.store(-1, Ordering::SeqCst);
     }
 }
 
@@ -295,6 +334,7 @@ mod tests {
     use ratatui::layout::Rect;
     use ratatui::widgets::Paragraph;
     use ratatui::{TerminalOptions, Viewport};
+    use serial_test::serial;
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Default)]
@@ -329,6 +369,48 @@ mod tests {
         .unwrap()
     }
 
+    /// A writer that fails its `n`th write and records the rest.
+    struct FailingWriter {
+        out: Vec<u8>,
+        writes: usize,
+        fail_at: usize,
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            if self.writes == self.fail_at {
+                return Err(io::Error::other("write refused"));
+            }
+            self.out.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The enter steps that only write to the terminal: raw mode is left
+    /// out because it would switch the test runner's own tty.
+    fn writing_enter_steps() -> Vec<TerminalStep> {
+        enter_sequence(false)
+            .into_iter()
+            .filter(|step| !matches!(step, TerminalStep::RawMode(_)))
+            .collect()
+    }
+
+    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    fn count(haystack: &[u8], needle: &[u8]) -> usize {
+        haystack
+            .windows(needle.len())
+            .filter(|w| *w == needle)
+            .count()
+    }
+
     #[test]
     fn leave_sequence_is_the_strict_mirror_of_enter() {
         for enhancement in [false, true] {
@@ -357,12 +439,81 @@ mod tests {
     /// Without an `enter` on record there is nothing to undo, so `leave`
     /// writes no bytes and a second call is just as quiet.
     #[test]
+    #[serial]
     fn leave_without_a_prior_enter_is_a_no_op_twice() {
         SCREEN_ENTERED.store(false, Ordering::SeqCst);
         let mut out = Vec::new();
         leave(&mut out).unwrap();
         leave(&mut out).unwrap();
         assert!(out.is_empty(), "{out:?}");
+    }
+
+    /// A step failing midway hands back what came on before it: the
+    /// alternate screen entered by the first write is left again, the
+    /// flag is down, and nothing is pushed.
+    #[test]
+    #[serial]
+    fn a_failing_enter_step_unwinds_the_steps_already_applied() {
+        SCREEN_ENTERED.store(false, Ordering::SeqCst);
+        ENHANCEMENT_PUSHED.store(false, Ordering::SeqCst);
+        let mut writer = FailingWriter {
+            out: Vec::new(),
+            writes: 0,
+            fail_at: 2,
+        };
+        let err = enter_steps(&mut writer, writing_enter_steps()).unwrap_err();
+        assert_eq!(err.to_string(), "write refused");
+        assert!(!SCREEN_ENTERED.load(Ordering::SeqCst));
+        assert!(!ENHANCEMENT_PUSHED.load(Ordering::SeqCst));
+        let enter_alt = find(&writer.out, b"\x1b[?1049h").expect("the first step was applied");
+        let leave_alt = find(&writer.out, b"\x1b[?1049l").expect("the applied step was undone");
+        assert!(enter_alt < leave_alt, "{:?}", writer.out);
+        assert!(
+            !writer.out.contains(&b'u'),
+            "no enhancement flags were pushed or popped: {:?}",
+            writer.out
+        );
+    }
+
+    /// `leave` undoes an `enter` once: the full mirror on the first call
+    /// (pop, then the modes, then the alternate screen), nothing on the
+    /// second.
+    #[test]
+    #[serial]
+    fn leave_restores_once_and_is_silent_afterwards() {
+        SCREEN_ENTERED.store(true, Ordering::SeqCst);
+        ENHANCEMENT_PUSHED.store(true, Ordering::SeqCst);
+        let mut out = Vec::new();
+        leave(&mut out).unwrap();
+        assert_eq!(count(&out, b"\x1b[?1049l"), 1, "{out:?}");
+        assert_eq!(count(&out, b"\x1b[<1u"), 1, "{out:?}");
+        assert!(find(&out, b"\x1b[<1u") < find(&out, b"\x1b[?1049l"));
+        assert!(!SCREEN_ENTERED.load(Ordering::SeqCst));
+        assert!(!ENHANCEMENT_PUSHED.load(Ordering::SeqCst));
+
+        let mut again = Vec::new();
+        leave(&mut again).unwrap();
+        assert!(again.is_empty(), "{again:?}");
+    }
+
+    /// A frame drawn after something else restored the terminal first
+    /// re-enters it and repaints from scratch; once back, drawing is just
+    /// drawing.
+    #[test]
+    #[serial]
+    fn a_draw_after_a_foreign_leave_reenters_and_repaints_once() {
+        SCREEN_ENTERED.store(false, Ordering::SeqCst);
+        let out = SharedBuf::default();
+        let mut terminal = buffer_terminal(&out);
+        assert!(reenter_if_left(&mut terminal, writing_enter_steps()).unwrap());
+        let bytes = out.take();
+        assert!(bytes.contains("\x1b[?1049h"), "{bytes:?}");
+        assert!(bytes.contains("\x1b[2J"), "{bytes:?}");
+        assert!(SCREEN_ENTERED.load(Ordering::SeqCst));
+
+        assert!(!reenter_if_left(&mut terminal, writing_enter_steps()).unwrap());
+        assert!(out.take().is_empty());
+        SCREEN_ENTERED.store(false, Ordering::SeqCst);
     }
 
     /// The repaint helper never asks the terminal anything: a buffer that

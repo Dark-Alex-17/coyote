@@ -280,6 +280,11 @@ impl Drop for Pty {
         use std::os::fd::AsRawFd;
 
         let _ = self.child.kill();
+        // The child is a session leader (setsid in pre_exec), so its pid
+        // names the process group; a coyote grandchild under a shell
+        // wrapper goes with it instead of being orphaned.
+        // SAFETY: kill takes a pid and a signal number and touches no memory.
+        unsafe { libc::kill(-(self.child.id() as i32), libc::SIGKILL) };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut buf = [0u8; 4096];
         let mut draining = true;
@@ -380,13 +385,16 @@ pub fn strip_ansi(text: &str) -> String {
 #[cfg(all(test, unix))]
 mod tests {
     use super::{Pty, strip_ansi};
+    use serial_test::serial;
     use std::process::Command;
     use std::time::Duration;
 
     #[test]
     fn csi_with_intermediate_bytes_is_dropped_whole() {
-        // Kitty keyboard pop (`ESC [ < u`) and a DEC private mode reset
-        // (`ESC [ ? 2004 l`), both with a space intermediate variant.
+        // Kitty keyboard pop (`ESC [ < 1 u`, also without its count) and a
+        // DEC private mode reset (`ESC [ ? 2004 l`), plus a space
+        // intermediate variant.
+        assert_eq!(strip_ansi("a\x1b[<1ub"), "ab");
         assert_eq!(strip_ansi("a\x1b[<ub"), "ab");
         assert_eq!(strip_ansi("a\x1b[?2004lb"), "ab");
         assert_eq!(strip_ansi("a\x1b[2 qb"), "ab");
@@ -413,6 +421,7 @@ mod tests {
     /// the test runner itself was started with). On a tty `ls` prints its
     /// entries in columns, so the list is read word by word.
     #[test]
+    #[serial]
     fn the_child_inherits_no_pty_descriptor() {
         fn listed_fds(text: &str) -> std::collections::BTreeSet<u32> {
             text.split_whitespace()
