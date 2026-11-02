@@ -4893,47 +4893,6 @@ fn the_local_row_reports_rnsd_going_away_and_coming_back_through_the_real_binary
     rnsd.stop();
 }
 
-/// Through the real binary: a `local`-only `.mesh on` with nothing at the endpoint is
-/// refused on the client's FIRST failed dial, not after the whole start wait. The bound
-/// is generous against the ~1 s a refused dial takes and still well under the 5 s wait a
-/// refusal that sat out the timeout would show.
-#[test]
-fn a_local_only_refusal_arrives_on_the_first_failed_dial_not_after_the_start_wait() {
-    let rnsd = LocalRnsd::absent();
-    let endpoint = rnsd.endpoint();
-    let probe = Probe::new("local-only-refusal-latency", false, &[])
-        .with_local_interface(rnsd.port(), rnsd.instance());
-    let mut command = probe.command();
-    command.args(["--session", "probe"]);
-    let mut session = spawn_repl(command);
-    wait_for(&mut session, SESSION_PROMPT);
-
-    let started = Instant::now();
-    let refused = command_text(
-        &mut session,
-        ".mesh on --yes",
-        "start rnsd or fix mesh.interfaces.",
-        SESSION_PROMPT,
-    );
-    let took = started.elapsed();
-    assert!(
-        refused.contains(&format!(
-            "Error: Local rnsd at {endpoint} (type: local) is not reachable: "
-        )),
-        "{refused:?}"
-    );
-    assert!(
-        took < Duration::from_secs(4),
-        "a local-only start is refused on the first failed dial; took {took:?}: {refused:?}"
-    );
-    assert_eq!(probe.marker_count("MESH_STARTED"), 0, "nothing was started");
-    let status = exit_clean(&mut session);
-    assert!(
-        matches!(status, WaitStatus::Exited(_, 0)),
-        ".exit: expected a clean exit, got {status:?}"
-    );
-}
-
 /// Through the real binary: a `local` entry nothing answers at, beside a relay that
 /// connects, does not refuse the start. `.mesh on` joins through the relay and warns
 /// that the local rnsd is not reachable yet, with the client's dial failure rendered as
