@@ -1142,16 +1142,20 @@ fn answer_unattended(msg: UiMsg) {
     }
 }
 
-/// Waits up to `EXIT_CANCEL_WAIT` for a work task after the UI gave up,
-/// answering every prompt it raises meanwhile so the asker never sits on
-/// the reply until the deadline. `None` when the task did not finish in
-/// time or panicked.
-async fn join_unattended<T>(handle: JoinHandle<T>, rx: &mut UnboundedReceiver<UiMsg>) -> Option<T> {
+/// Waits up to `deadline` for a work task after the UI gave up, answering
+/// every prompt it raises meanwhile so the asker never sits on the reply
+/// until the deadline. `None` when the task did not finish in time or
+/// panicked; a task that ran out of time is still running.
+async fn join_unattended<T>(
+    handle: JoinHandle<T>,
+    rx: &mut UnboundedReceiver<UiMsg>,
+    deadline: Duration,
+) -> Option<T> {
     while let Ok(msg) = rx.try_recv() {
         answer_unattended(msg);
     }
     tokio::pin!(handle);
-    let joined = tokio::time::timeout(EXIT_CANCEL_WAIT, async {
+    let joined = tokio::time::timeout(deadline, async {
         loop {
             tokio::select! {
                 joined = &mut handle => return joined,
@@ -1161,6 +1165,23 @@ async fn join_unattended<T>(handle: JoinHandle<T>, rx: &mut UnboundedReceiver<Ui
     })
     .await;
     joined.ok()?.ok()
+}
+
+/// Ends the process once the UI gave up on a work task that never handed
+/// the context back. The task runs on a blocking-pool thread, which
+/// nothing can cancel, and the `Runtime` dropped at the end of `main`
+/// waits for that thread: the user would be left with a restored, empty
+/// terminal and a process that does not exit until the tool does.
+/// `top_level_agent_finished` cannot run here because the context is
+/// inside the abandoned task. The notice goes through the screen's own
+/// descriptor because the task still has fds 1 and 2 captured. Exits 0,
+/// the orderly-quit code.
+fn exit_leaving_the_task_behind(screen: &mut Screen) -> ! {
+    let _ = screen.print_line(&format!(
+        "The running tool did not stop within {} s; leaving it behind",
+        EXIT_CANCEL_WAIT.as_secs()
+    ));
+    std::process::exit(0)
 }
 
 /// Edits `text` in `editor` (resolved the way the REPL resolves its buffer
@@ -1271,7 +1292,10 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
                 }
                 Err(err) => Err(err.into()),
             },
-            None => Ok(()),
+            None => {
+                crate::hooks::drain_pending(EXIT_HOOK_DRAIN_TIMEOUT).await;
+                exit_leaving_the_task_behind(&mut screen)
+            }
         },
         Leave::Lost(err, mut late) => {
             // The drain thread may still be forwarding what the pipe held
@@ -1324,13 +1348,15 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> (Leave, Option<
                 match task.take() {
                     Some(Task::Turn { handle, .. }) => {
                         abort.set_ctrlc();
-                        if let Some((returned, _)) = join_unattended(handle, rx).await {
+                        if let Some((returned, _)) =
+                            join_unattended(handle, rx, EXIT_CANCEL_WAIT).await
+                        {
                             ctx = Some(returned);
                         }
                     }
                     Some(Task::Exit(handle)) => {
                         if let Some((returned, result, captured)) =
-                            join_unattended(handle, rx).await
+                            join_unattended(handle, rx, EXIT_CANCEL_WAIT).await
                         {
                             return (Leave::Finished(result, captured), Some(returned));
                         }
@@ -2095,10 +2121,26 @@ mod tests {
             (answer, early_answer)
         });
         let started = Instant::now();
-        let (late_answer, early_answer) = join_unattended(handle, &mut rx).await.unwrap();
+        let (late_answer, early_answer) = join_unattended(handle, &mut rx, EXIT_CANCEL_WAIT)
+            .await
+            .unwrap();
         assert!(started.elapsed() < EXIT_CANCEL_WAIT);
         assert_eq!(early_answer.unwrap(), PromptAnswer::Confirmed(false));
         assert_eq!(late_answer.unwrap(), PromptAnswer::Confirmed(true));
+    }
+
+    /// A work task that never finishes is given up on at the deadline:
+    /// the wait ends with `None` rather than following the task. The
+    /// caller then has a task still running and no context, which is the
+    /// case `run` ends the process for.
+    #[tokio::test(start_paused = true)]
+    async fn join_unattended_gives_up_at_the_deadline() {
+        let (_tx, mut rx) = unbounded_channel();
+        let handle = tokio::spawn(std::future::pending::<()>());
+        let deadline = Duration::from_millis(50);
+        let started = tokio::time::Instant::now();
+        assert!(join_unattended(handle, &mut rx, deadline).await.is_none());
+        assert!(started.elapsed() >= deadline);
     }
 
     /// One worker, and the work task blocks its thread for longer than the

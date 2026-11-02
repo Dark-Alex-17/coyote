@@ -1641,8 +1641,10 @@ fn typing_while_a_tool_sleeps_reaches_the_composer_and_submits_afterwards() {
 
 /// SIGTERM while a work task is still running (a tool blocked mid-turn)
 /// still runs the leave path: the alternate screen is left, the tty is
-/// cooked and the exit is orderly. How long that takes is reported, not
-/// pinned: no exit deadline applies while a work task owns the context.
+/// cooked and the exit is orderly. The abort kills the tool, so the exit
+/// comes well inside `EXIT_CANCEL_WAIT` (5 s) rather than waiting out the
+/// tool's own eight-second give-up; a turn that did miss that deadline
+/// would be left behind and the process would still exit.
 #[test]
 #[serial]
 fn sigterm_during_a_running_tool_still_leaves_the_tty_cooked() {
@@ -1681,9 +1683,10 @@ fn sigterm_during_a_running_tool_still_leaves_the_tty_cooked() {
         find(pty.raw(), LEAVE_ALT, signalled_at.saturating_sub(16)).is_some(),
         "SIGTERM during the tool never left the alternate screen:\n{transcript}"
     );
-    // The tool gives up on its own after eight seconds; an exit slower
-    // than that waited the turn out rather than tearing it down.
-    eprintln!("SIGTERM during a running tool: exit took {took:?} (tool runs 8s unreleased)");
+    assert!(
+        took < Duration::from_secs(5),
+        "the exit waited the tool out instead of aborting it: {took:?}"
+    );
 }
 
 /// Two turns in a row: the second prompt gets its own rendered reply and

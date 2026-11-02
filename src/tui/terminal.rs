@@ -301,6 +301,15 @@ impl Screen {
         leave(self.terminal.backend_mut())
     }
 
+    /// Prints a line through the dup'd descriptor, for a message that has
+    /// to reach the terminal while fds 1 and 2 are still captured by a
+    /// turn that never finished. Meant for after `leave`.
+    pub(crate) fn print_line(&mut self, text: &str) -> io::Result<()> {
+        let writer = self.terminal.backend_mut();
+        writeln!(writer, "{text}")?;
+        writer.flush()
+    }
+
     /// Hands the terminal to `f` in its normal modes (a suspended shell, an
     /// editor), then takes it back: re-enters, re-applies raw mode so a
     /// child that changed the termios state leaves no trace, and clears so
