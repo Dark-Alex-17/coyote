@@ -1112,12 +1112,32 @@ enum Leave {
     /// whatever it printed come along.
     Finished(Result<()>, String),
     /// A termination signal or a closed stdin: nobody is left to answer a
-    /// prompt, so the teardown runs after the screen is restored.
-    Abandoned,
+    /// prompt, so the teardown runs after the screen is restored, on the
+    /// context the turn handed back (or never left). Boxed for its size.
+    Abandoned(Box<RequestContext>),
+    /// The same signal or EOF, but the work task did not hand the context
+    /// back within the deadline and is still running.
+    Outlived(Unfinished),
     /// A work task panicked and took the context with it. The late output
     /// the loop already fed to the app comes along: the panic message
     /// arrives that way, and the app is never drawn again.
     Lost(tokio::task::JoinError, Vec<String>),
+}
+
+/// The work task the UI gave up waiting for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unfinished {
+    Turn,
+    Exit,
+}
+
+impl Unfinished {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Turn => "The running turn",
+            Self::Exit => "The session teardown",
+        }
+    }
 }
 
 /// The handles the loop holds between steps. `app`, `screen` and `abort`
@@ -1144,13 +1164,12 @@ fn answer_unattended(msg: UiMsg) {
 
 /// Waits up to `deadline` for a work task after the UI gave up, answering
 /// every prompt it raises meanwhile so the asker never sits on the reply
-/// until the deadline. `None` when the task did not finish in time or
-/// panicked; a task that ran out of time is still running.
+/// until the deadline.
 async fn join_unattended<T>(
     handle: JoinHandle<T>,
     rx: &mut UnboundedReceiver<UiMsg>,
     deadline: Duration,
-) -> Option<T> {
+) -> Join<T> {
     while let Ok(msg) = rx.try_recv() {
         answer_unattended(msg);
     }
@@ -1164,7 +1183,21 @@ async fn join_unattended<T>(
         }
     })
     .await;
-    joined.ok()?.ok()
+    match joined {
+        Ok(Ok(value)) => Join::Finished(value),
+        Ok(Err(err)) => Join::Panicked(err),
+        Err(_) => Join::TimedOut,
+    }
+}
+
+/// How the wait on a work task ended.
+enum Join<T> {
+    Finished(T),
+    /// The task panicked; its message went out through the late-output
+    /// path, as it does for a panic the loop itself observes.
+    Panicked(tokio::task::JoinError),
+    /// The deadline passed with the task still running.
+    TimedOut,
 }
 
 /// Ends the process once the UI gave up on a work task that never handed
@@ -1176,9 +1209,10 @@ async fn join_unattended<T>(
 /// inside the abandoned task. The notice goes through the screen's own
 /// descriptor because the task still has fds 1 and 2 captured. Exits 0,
 /// the orderly-quit code.
-fn exit_leaving_the_task_behind(screen: &mut Screen) -> ! {
+fn exit_leaving_the_task_behind(screen: &mut Screen, unfinished: Unfinished) -> ! {
     let _ = screen.print_line(&format!(
-        "The running tool did not stop within {} s; leaving it behind",
+        "{} did not stop within {} s; leaving it behind",
+        unfinished.describe(),
         EXIT_CANCEL_WAIT.as_secs()
     ));
     std::process::exit(0)
@@ -1268,7 +1302,7 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
         auto_cancel: &auto_cancel,
     };
 
-    let (leave, ctx) = run_loop(&mut shell, ctx).await;
+    let leave = run_loop(&mut shell, ctx).await;
     let mut rx = shell.rx;
     // Whatever ended the loop, no screen is left to ask on: a question
     // raised during the teardown below answers itself.
@@ -1284,19 +1318,17 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
             print!("{}", render::sanitize_ansi(&captured));
             result
         }
-        Leave::Abandoned => match ctx {
-            Some(ctx) => match spawn_exit(ctx, abort.clone()).await {
-                Ok((_, result, captured)) => {
-                    print!("{}", render::sanitize_ansi(&captured));
-                    result
-                }
-                Err(err) => Err(err.into()),
-            },
-            None => {
-                crate::hooks::drain_pending(EXIT_HOOK_DRAIN_TIMEOUT).await;
-                exit_leaving_the_task_behind(&mut screen)
+        Leave::Abandoned(ctx) => match spawn_exit(*ctx, abort.clone()).await {
+            Ok((_, result, captured)) => {
+                print!("{}", render::sanitize_ansi(&captured));
+                result
             }
+            Err(err) => Err(err.into()),
         },
+        Leave::Outlived(unfinished) => {
+            crate::hooks::drain_pending(EXIT_HOOK_DRAIN_TIMEOUT).await;
+            exit_leaving_the_task_behind(&mut screen, unfinished)
+        }
         Leave::Lost(err, mut late) => {
             // The drain thread may still be forwarding what the pipe held
             // when the guard went down.
@@ -1315,7 +1347,7 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
     result.map(|_| ())
 }
 
-async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> (Leave, Option<RequestContext>) {
+async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
     let Shell {
         app,
         screen,
@@ -1345,25 +1377,29 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> (Leave, Option<
                 auto_cancel.store(true, Ordering::SeqCst);
                 app.begin_exit();
                 app.abandon_prompts();
-                match task.take() {
+                return match task.take() {
                     Some(Task::Turn { handle, .. }) => {
                         abort.set_ctrlc();
-                        if let Some((returned, _)) =
-                            join_unattended(handle, rx, EXIT_CANCEL_WAIT).await
-                        {
-                            ctx = Some(returned);
+                        match join_unattended(handle, rx, EXIT_CANCEL_WAIT).await {
+                            Join::Finished((returned, _)) => Leave::Abandoned(Box::new(returned)),
+                            Join::Panicked(err) => Leave::Lost(err, app.turn_late_output()),
+                            Join::TimedOut => Leave::Outlived(Unfinished::Turn),
                         }
                     }
                     Some(Task::Exit(handle)) => {
-                        if let Some((returned, result, captured)) =
-                            join_unattended(handle, rx, EXIT_CANCEL_WAIT).await
-                        {
-                            return (Leave::Finished(result, captured), Some(returned));
+                        match join_unattended(handle, rx, EXIT_CANCEL_WAIT).await {
+                            Join::Finished((_, result, captured)) => {
+                                Leave::Finished(result, captured)
+                            }
+                            Join::Panicked(err) => Leave::Lost(err, Vec::new()),
+                            Join::TimedOut => Leave::Outlived(Unfinished::Exit),
                         }
                     }
-                    None => {}
-                }
-                return (Leave::Abandoned, ctx);
+                    None => Leave::Abandoned(Box::new(
+                        ctx.take()
+                            .expect("the context is in hand while no task runs"),
+                    )),
+                };
             }
             Step::Input(Some(Ok(event))) => {
                 let command = app.handle_input(events::classify(event));
@@ -1463,17 +1499,15 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> (Leave, Option<
                         Err(err) => {
                             let late = app.turn_late_output();
                             app.abandon_prompts();
-                            return (Leave::Lost(err, late), None);
+                            return Leave::Lost(err, late);
                         }
                     }
                 }
                 Done::Exit(joined) => {
                     app.abandon_prompts();
                     return match joined {
-                        Ok((returned, result, captured)) => {
-                            (Leave::Finished(result, captured), Some(returned))
-                        }
-                        Err(err) => (Leave::Lost(err, Vec::new()), None),
+                        Ok((_, result, captured)) => Leave::Finished(result, captured),
+                        Err(err) => Leave::Lost(err, Vec::new()),
                     };
                 }
             },
@@ -2121,16 +2155,18 @@ mod tests {
             (answer, early_answer)
         });
         let started = Instant::now();
-        let (late_answer, early_answer) = join_unattended(handle, &mut rx, EXIT_CANCEL_WAIT)
-            .await
-            .unwrap();
+        let Join::Finished((late_answer, early_answer)) =
+            join_unattended(handle, &mut rx, EXIT_CANCEL_WAIT).await
+        else {
+            panic!("the work task finished well inside the deadline");
+        };
         assert!(started.elapsed() < EXIT_CANCEL_WAIT);
         assert_eq!(early_answer.unwrap(), PromptAnswer::Confirmed(false));
         assert_eq!(late_answer.unwrap(), PromptAnswer::Confirmed(true));
     }
 
     /// A work task that never finishes is given up on at the deadline:
-    /// the wait ends with `None` rather than following the task. The
+    /// the wait reports a timeout rather than following the task. The
     /// caller then has a task still running and no context, which is the
     /// case `run` ends the process for.
     #[tokio::test(start_paused = true)]
@@ -2139,8 +2175,26 @@ mod tests {
         let handle = tokio::spawn(std::future::pending::<()>());
         let deadline = Duration::from_millis(50);
         let started = tokio::time::Instant::now();
-        assert!(join_unattended(handle, &mut rx, deadline).await.is_none());
+        assert!(matches!(
+            join_unattended(handle, &mut rx, deadline).await,
+            Join::TimedOut
+        ));
         assert!(started.elapsed() >= deadline);
+    }
+
+    /// A work task that panics while the UI waits on it is told apart
+    /// from one that ran out of time: the panic comes back as such, with
+    /// its message, instead of being reported as a task left behind.
+    #[tokio::test]
+    async fn join_unattended_reports_a_panicking_task_as_panicked() {
+        let (_tx, mut rx) = unbounded_channel();
+        let handle = tokio::task::spawn_blocking(|| -> () { panic!("boom-j4p") });
+        let Join::Panicked(err) = join_unattended(handle, &mut rx, EXIT_CANCEL_WAIT).await else {
+            panic!("the panic was not reported as one");
+        };
+        assert!(err.is_panic(), "{err}");
+        let payload = err.into_panic();
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"boom-j4p"));
     }
 
     /// A SIGTERM latched while the terminal was released survives the
