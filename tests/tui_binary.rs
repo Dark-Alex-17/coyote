@@ -1279,7 +1279,10 @@ fn any_other_coyote_ui_value_starts_the_plain_repl() {
 /// agent's `agent.completed` hook and `tui::run` awaits
 /// `hooks::drain_pending` before returning, so a Ctrl+D under `--agent`
 /// leaves the hook's marker behind. The hook is an agent-scoped global
-/// hook admitted through `global_hooks: ["*"]`.
+/// hook admitted through `global_hooks: ["*"]`. The drain acknowledges
+/// the hook's spawn, not its exit (hook children deliberately outlive
+/// coyote), so the marker is awaited with a bounded deadline the way
+/// `macro_bracketing` awaits its markers.
 #[test]
 #[serial]
 fn ctrl_d_under_an_agent_fires_the_completed_hook_before_exit() {
@@ -1319,16 +1322,24 @@ fn ctrl_d_under_an_agent_fires_the_completed_hook_before_exit() {
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
     assert_tty_restored(&transcript);
 
-    // The hook is drained before the process exits, so the marker is
-    // complete by the time the wrapper has reported.
-    let fired = fs::read_to_string(&marker)
-        .unwrap_or_default()
-        .lines()
-        .filter(|line| *line == "COMPLETED")
-        .count();
+    let completed = |marker: &Path| {
+        fs::read_to_string(marker)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| *line == "COMPLETED")
+            .count()
+    };
+    let deadline = std::time::Instant::now() + PTY_DEADLINE;
+    let fired = loop {
+        let fired = completed(&marker);
+        if fired > 0 || std::time::Instant::now() >= deadline {
+            break fired;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
     assert_eq!(
         fired, 1,
-        "agent.completed fired {fired} times after Ctrl+D (expected once):\n{transcript}"
+        "agent.completed fired {fired} times within {PTY_DEADLINE:?} of Ctrl+D (expected once):\n{transcript}"
     );
 }
 
