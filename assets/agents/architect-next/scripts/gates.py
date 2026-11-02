@@ -17,10 +17,11 @@ import time
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _lib  # noqa: E402
 from _lib import (  # noqa: E402
     AMEND_CYCLES_MAX, ARCHIVIST_AVAILABLE, CI_FLAKE_RERUNS, CI_MAX_ROUNDS, CI_POLL_FAILS, CI_POLL_SLEEP,
     CI_WALL_SECS, CODE_VAR, CONFLICT_CYCLES_MAX, CONVENTIONS_LINE, CORE_TOOLS_REL, DESIGN_ROUNDS_MAX,
-    GATE1_HOUSE_LINE, GH_CALL_SECS, IDIOM_LINE, IS_UPSTREAM, LOG_EVENT_LINE, MODE_ENUMS, MULTI_IS_GROUPS,
+    GATE1_HOUSE_LINE, GH_CALL_SECS, GH_LOOP_SECS, IDIOM_LINE, IS_UPSTREAM, LOG_EVENT_LINE, MODE_ENUMS, MULTI_IS_GROUPS,
     NO_COMMIT_MAIN_LINE, OWNER_POLL_MAX, OWNER_POLL_MINUTES, OWNER_REMOTE_INPUT, OWNER_WAIT_MINUTES,
     PERM_LOOKUPS_PER_POLL, PLANNING_VAR, POLL_VISIT_BUDGET, PR_TRACKING_ENUM, PR_URL_RE, PROBE_HOUSE_NOTE, REPO_HINT, RERUN_ONCE, RESUME_RE,
     REVIEW_MAX_POLLS, REVIEW_MAX_ROUNDS, REVIEW_POLL_SLEEP, REVIEW_UPDATE_BUDGET, REVIEW_WALL_SECS, SHA_RE, SIBLING_HINT,
@@ -3035,15 +3036,20 @@ def ci_evidence(state):
     """Section 10.12 (1): bounded evidence pack with failure signatures and infra pre-classification."""
     u = {}
     code = state.get("code_repo_path", "")
-    pack, sigs, infra = [], [], []
+    pack, sigs, infra, skipped = [], [], [], []
+    started = _lib._now()
     for name, link in as_list(state.get("ci_failing")):
         pack.append(f"### {name}\n{link}")
-        log = ""
+        log, missing = "", "(log unavailable)"
         if m := re.search(r"/actions/runs/(\d+)", link or ""):
-            cmd = os.environ.get("ARCHITECT_GH_LOG_CMD")
-            rc, log = sh(["bash", "-c", cmd], timeout=GH_CALL_SECS) if cmd else sh(["gh", "run", "view", m.group(1), "--log-failed"], cwd=code, timeout=GH_CALL_SECS)
+            if _lib._now() - started > GH_LOOP_SECS:
+                skipped.append(name)
+                missing = "(log skipped: node time budget)"
+            else:
+                cmd = os.environ.get("ARCHITECT_GH_LOG_CMD")
+                rc, log = sh(["bash", "-c", cmd], timeout=GH_CALL_SECS) if cmd else sh(["gh", "run", "view", m.group(1), "--log-failed"], cwd=code, timeout=GH_CALL_SECS)
         trimmed = tail(log, 4000)
-        pack.append(trimmed or "(log unavailable)")
+        pack.append(trimmed or missing)
         sigs += [f"[{name}] {l.strip()[:200]}" for l in log.splitlines() if SIGNATURE_RE.match(l)][:15]
         if INFRA_RE.search(log or "") or INFRA_RE.search(name):
             infra.append(name)
@@ -3051,6 +3057,8 @@ def ci_evidence(state):
     u["ci_signatures"] = sigs
     u["ci_infra_hint"] = infra
     u["ci_evidence_trimmed"] = any(len(p) > 4000 for p in pack)
+    if skipped:
+        ledger(state, u, f"ci: node time budget ({GH_LOOP_SECS}s) reached; failed-log reads skipped for {skipped}")
     ledger(state, u, f"ci: evidence pack built ({len(sigs)} signature(s); infra hint {infra or 'none'}; trimmed={u['ci_evidence_trimmed']})")
     return u
 
@@ -3069,6 +3077,7 @@ def _owning_task(state, diagnosis):
 
 def ci_apply(state):
     u = {}
+    started = _lib._now()
     harvest_anomalies(state, u, "ci_diagnose")
     note_script_error(state, u, "ci_diagnose")
     verdict = state.get("ci_verdict") or "unsure"
@@ -3091,14 +3100,24 @@ def ci_apply(state):
         else:
             code = state.get("code_repo_path", "")
             rerun = os.environ.get("ARCHITECT_GH_RERUN_CMD")
+            rerun_ids, skipped = set(), {}
             for name, link in as_list(state.get("ci_failing")):
-                pr_reruns[name] = as_int(pr_reruns.get(name)) + 1
                 if m := re.search(r"/actions/runs/(\d+)", link or ""):
-                    if rerun:
-                        sh(["bash", "-c", rerun, "_", m.group(1)], timeout=GH_CALL_SECS)
-                    elif not os.environ.get("ARCHITECT_GH_CHECKS_CMD"):
-                        sh(["gh", "run", "rerun", m.group(1), "--failed"], cwd=code, timeout=GH_CALL_SECS)
+                    run_id = m.group(1)
+                    if run_id in skipped or (run_id not in rerun_ids and _lib._now() - started > GH_LOOP_SECS):
+                        skipped.setdefault(run_id, []).append(name)
+                        continue
+                    if run_id not in rerun_ids:
+                        rerun_ids.add(run_id)
+                        if rerun:
+                            sh(["bash", "-c", rerun, "_", run_id], timeout=GH_CALL_SECS)
+                        elif not os.environ.get("ARCHITECT_GH_CHECKS_CMD"):
+                            sh(["gh", "run", "rerun", run_id, "--failed"], cwd=code, timeout=GH_CALL_SECS)
+                pr_reruns[name] = as_int(pr_reruns.get(name)) + 1
                 ledger(state, u, f"flake-rerun: PR #{pr} {name} (re-run {pr_reruns[name]}/{CI_FLAKE_RERUNS})")
+            if skipped:
+                ledger(state, u, f"ci: node time budget ({GH_LOOP_SECS}s) reached on PR #{pr}; not re-run: "
+                                 + "; ".join(f"run {rid} ({', '.join(names)})" for rid, names in skipped.items()))
             reruns[pr] = pr_reruns
             u["ci_reruns"] = reruns
             u.update({"ci_polls": 0, "ci_poll_fails": 0})
@@ -3146,6 +3165,7 @@ def ci_apply(state):
 
 def flip_ready(state):
     u = {}
+    started = _lib._now()
     code = state.get("code_repo_path", "")
     tasks = as_list(state.get("tasks"))
     if is_single(state) or MULTI_IS_GROUPS:
@@ -3155,15 +3175,24 @@ def flip_ready(state):
             rc, out = sh(["bash", "-c", cmd], timeout=GH_CALL_SECS) if cmd else sh(["gh", "pr", "ready", str(pr)], cwd=code, timeout=GH_CALL_SECS)
             u["flipped_ready"] = rc == 0
             ledger(state, u, f"pr: #{pr} {'flipped to ready' if rc == 0 else 'flip FAILED: ' + tail(out, 200)}")
-    drafts = []
+    drafts, unchecked = [], []
     for t in tasks:
         if t.get("pr_number") and not (is_single(state) or MULTI_IS_GROUPS):
+            if _lib._now() - started > GH_LOOP_SECS:
+                unchecked.append(f"{t['id']} PR #{t['pr_number']}")
+                continue
             rc, out = _pr_view(state, t["pr_number"], "isDraft")
             if rc == 0 and out.strip() == "true":
                 drafts.append(f"{t['id']} PR #{t['pr_number']}")
+    follow_ups = list(as_list(state.get("follow_ups")))
     if drafts:
-        u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"PR still in draft (checks never went green or verification unfinished): {d}" for d in drafts]
+        follow_ups += [f"PR still in draft (checks never went green or verification unfinished): {d}" for d in drafts]
         ledger(state, u, f"pr: {len(drafts)} task PR(s) still in draft - reported, never silently")
+    if unchecked:
+        follow_ups.append(f"PR draft state not checked (node time budget): {', '.join(unchecked)}")
+        ledger(state, u, f"pr: node time budget ({GH_LOOP_SECS}s) reached; draft state not checked for {unchecked}")
+    if drafts or unchecked:
+        u["follow_ups"] = follow_ups
     if _review_mode(state) and state.get("pr_number") and not truthy(state.get("review_watching")):
         # The group reset clears pr_number, so it waits until the review watch ends.
         u.update({"review_watching": True, "review_started_at": int(time.time()), "review_polls": 0, "review_rounds": 0, "review_poll_fails": 0,

@@ -83,10 +83,10 @@ variables:
 
 settings:
   # Engine backstop only: every cycle carries its own named bound in a script. It counts visits per node per RUN, so for an
-  # orchestration it is a defect detector, not a budget. ci_poll alone may revisit itself CI_MAX_ROUNDS (240) times per PR
-  # before it routes ci_status=timeout, and review_poll REVIEW_MAX_POLLS (144) times per PR before it routes
-  # review_status=wall_cap; 1000 covers four group PRs each watched to the larger cap and stays finite.
-  max_loop_iterations: 1000
+  # orchestration it is a defect detector, not a budget. ci_poll may revisit itself up to CI_MAX_ROUNDS (240) times per PR
+  # and review_poll up to REVIEW_MAX_POLLS (144) times per PR; both stop by name once their run-wide visit count reaches
+  # POLL_VISIT_BUDGET (1200, four group PRs watched to the CI cap plus one watch of headroom). The cap sits above that.
+  max_loop_iterations: 1500
   log_state_snapshots: true
   validate_before_run: true
   # Architect runs span hours-to-days (the facade's choice); the delegate and the
@@ -1959,7 +1959,7 @@ nodes:
     type: script
     description: Section 10.12 (1) - failing jobs + log-failed, trimmed; failure signatures; deterministic infra pre-classification.
     script: scripts/ci_evidence.py
-    timeout: 300
+    timeout: 390
     fallback: ci_diagnose
     next: ci_diagnose
 
@@ -2019,7 +2019,7 @@ nodes:
     type: script
     description: The enum as edges with A6 keying (flake re-runs B19 and fix strikes B18 per check-name per PR - a fix push never re-arms a budget).
     script: scripts/ci_apply.py
-    timeout: 300
+    timeout: 390
     fallback: end_failure
 
   flip_ready:
@@ -2027,7 +2027,7 @@ nodes:
     type: script
     description: gh pr ready ONLY on green; every still-draft PR reported with its blocker; upstream groups -> next group.
     script: scripts/flip_ready.py
-    timeout: 300
+    timeout: 390
     fallback: end_failure
 
   review_poll:

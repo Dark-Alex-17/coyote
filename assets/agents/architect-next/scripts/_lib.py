@@ -21,6 +21,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 # ---------------------------------------------------------------- constants
 STRIKE_LIMIT = 3          # 3-strike family (B1, B5, B14, B16, B18, B22)
@@ -36,6 +37,7 @@ CI_FLAKE_RERUNS = 2       # section 10.12 / A6: 2 re-runs per check-name per PR
 CI_POLL_SLEEP = 60        # pr-watch/scripts/poll_pr.py SLEEP_SECS
 CI_POLL_FAILS = 3         # pr-watch/scripts/poll_pr.py MAX_CONSECUTIVE_FAILS
 GH_CALL_SECS = 90         # one gh call or seam run; node timeouts cover the sleep plus this
+GH_LOOP_SECS = 180        # time a gate spends issuing gh calls in a loop before it stops; each such node's timeout covers this plus one GH_CALL_SECS call plus margin
 CI_WALL_SECS = 14400      # coder/graph.yaml settings.timeout (hardware-bound wall clock)
 CI_MAX_ROUNDS = CI_WALL_SECS // CI_POLL_SLEEP  # A6 rounds cap, derived (240)
 REVIEW_POLL_SLEEP = 600   # review watch: one poll every 10 minutes
@@ -44,7 +46,7 @@ REVIEW_MAX_POLLS = REVIEW_WALL_SECS // REVIEW_POLL_SLEEP  # review polls cap, de
 REVIEW_MAX_ROUNDS = STRIKE_LIMIT  # review fix rounds per PR
 REVIEW_UPDATE_BUDGET = 600  # review_update: seconds of thread replies before the rest wait for the next round
 PERM_LOOKUPS_PER_POLL = 2  # review_poll: uncached permission reads per poll, so the sleep plus every gh call fits the node timeout
-POLL_VISIT_BUDGET = 950   # below settings.max_loop_iterations so the watch stops by name before the engine cap
+POLL_VISIT_BUDGET = 4 * CI_MAX_ROUNDS + CI_MAX_ROUNDS  # four group PRs each watched to the CI wall cap, plus one watch of headroom; below settings.max_loop_iterations
 PR_TRACKING_ENUM = ("ci", "review")
 VERIFY_CMD_SECS = 900     # gauntlet: each verification command <= 15 min
 VERIFY_SET_SECS = 3300    # gauntlet: the whole set <= 55 min
@@ -164,6 +166,10 @@ def now_iso():
 
 def today():
     return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
+
+
+# Read as _lib._now() so a test can move the clock for every caller at once.
+_now = time.time
 
 
 def mode(state):

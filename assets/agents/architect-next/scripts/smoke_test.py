@@ -59,7 +59,7 @@ os.environ.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
 import gates  # noqa: E402
 import _lib  # noqa: E402
 from _lib import (AMEND_CYCLES_MAX, CI_FLAKE_RERUNS, CI_MAX_ROUNDS, CI_POLL_FAILS, CI_POLL_SLEEP, CI_WALL_SECS, CONFLICT_CYCLES_MAX,  # noqa: E402
-                  CORE_TOOLS_REL, DESIGN_ROUNDS_MAX, FORK, GH_CALL_SECS, MULTI_IS_GROUPS, POLL_VISIT_BUDGET, RERUN_ONCE,
+                  CORE_TOOLS_REL, DESIGN_ROUNDS_MAX, FORK, GH_CALL_SECS, GH_LOOP_SECS, MULTI_IS_GROUPS, POLL_VISIT_BUDGET, RERUN_ONCE,
                   REVIEW_MAX_POLLS, REVIEW_MAX_ROUNDS, REVIEW_POLL_SLEEP, REVIEW_UPDATE_BUDGET, STRIKE_LIMIT, WAVE_CAP,
                   escalation, option, read_file)
 
@@ -1808,6 +1808,85 @@ try:
     check("own marker: the thread key skips a marked own reply and keys on the newest reviewer comment", [i["id"] for i in tr] == ["thread:TH20:C20"] and un == [], (tr, un))
 finally:
     for _k, _v in _seam_saved.items():
+        if _v is None:
+            os.environ.pop(_k, None)
+        else:
+            os.environ[_k] = _v
+
+# ---------------------------------------------------------------- ci budget: visit budget, re-runs per run id, node-time-bounded gh loops
+check("ci budget: POLL_VISIT_BUDGET covers four CI watches plus headroom and sits below settings.max_loop_iterations (1500)",
+      4 * CI_MAX_ROUNDS + CI_MAX_ROUNDS // 4 <= POLL_VISIT_BUDGET < GRAPH["settings"]["max_loop_iterations"] and GRAPH["settings"]["max_loop_iterations"] == 1500,
+      (POLL_VISIT_BUDGET, GRAPH["settings"].get("max_loop_iterations")))
+LOOP_NODES = ("ci_apply", "ci_evidence", "flip_ready")
+check("ci budget: ci_apply / ci_evidence / flip_ready node timeouts cover GH_LOOP_SECS + 2 * GH_CALL_SECS + 30",
+      all(NODES[k].get("timeout", 0) >= GH_LOOP_SECS + 2 * GH_CALL_SECS + 30 for k in LOOP_NODES), {k: NODES[k].get("timeout") for k in LOOP_NODES})
+
+BUDGET_ENV = ("ARCHITECT_GH_RERUN_CMD", "ARCHITECT_GH_LOG_CMD", "ARCHITECT_GH_VIEW_CMD", "ARCHITECT_GH_READY_CMD", "ARCHITECT_GH_CHECKS_CMD")
+_budget_saved = {k: os.environ.get(k) for k in BUDGET_ENV}
+BUDGET_CALLS = os.path.join(TMP, "budget-calls.txt")
+
+
+def budget_calls():
+    calls_ = read_file(BUDGET_CALLS).splitlines() if os.path.isfile(BUDGET_CALLS) else []
+    if os.path.isfile(BUDGET_CALLS):
+        os.remove(BUDGET_CALLS)
+    return calls_
+
+
+def clock_past_budget():
+    """A clock that reads 0 at the gate's entry and past GH_LOOP_SECS on every later read."""
+    reads = []
+
+    def now():
+        reads.append(1)
+        return 0 if len(reads) == 1 else GH_LOOP_SECS + 1
+    return now
+
+
+def run_link(rid):
+    return f"https://github.com/o/r/actions/runs/{rid}"
+
+
+_real_now, _real_groups = _lib._now, gates.MULTI_IS_GROUPS
+try:
+    budget_calls()
+    os.environ["ARCHITECT_GH_RERUN_CMD"] = f"echo \"$1\" >> {BUDGET_CALLS}"
+    SAME_RUN = dict(pr_number="99", ci_verdict="flake", failing_checks=["test", "lint"], ci_reruns={},
+                    ci_failing=[("test", run_link(7)), ("lint", run_link(7))])
+    u = gates.ci_apply(base_state(**SAME_RUN))
+    calls = budget_calls()
+    counts = u.get("ci_reruns", {}).get("99", {})
+    check("ci budget: two failing checks of one workflow run -> one re-run call, both per-check counters incremented, one ledger line per check",
+          calls == ["7"] and counts == {"test": 1, "lint": 1} and ledgered(u, "flake-rerun: PR #99 test") and ledgered(u, "flake-rerun: PR #99 lint"), (calls, counts))
+    u = gates.ci_apply(base_state(**dict(SAME_RUN, ci_failing=[("test", run_link(7)), ("lint", run_link(8))])))
+    calls = budget_calls()
+    check("ci budget: two failing checks of different runs -> two re-run calls", calls == ["7", "8"] and u.get("ci_reruns", {}).get("99") == {"test": 1, "lint": 1}, calls)
+
+    _lib._now = clock_past_budget()
+    u = gates.ci_apply(base_state(**dict(SAME_RUN, ci_failing=[("test", run_link(7)), ("lint", run_link(8))])))
+    calls = budget_calls()
+    check("ci budget: ci_apply past GH_LOOP_SECS -> no re-run call, counters untouched, the run ids not re-run ledgered",
+          calls == [] and u.get("ci_reruns", {}).get("99") == {} and ledgered(u, "not re-run: run 7 (test); run 8 (lint)"), (calls, u.get("ci_reruns"), u.get("decisions")))
+
+    os.environ["ARCHITECT_GH_LOG_CMD"] = f"echo log >> {BUDGET_CALLS}; echo '--- FAIL: TestWidget'"
+    _lib._now = clock_past_budget()
+    u = gates.ci_evidence(base_state(ci_failing=[("test", run_link(7)), ("lint", run_link(8))]))
+    calls = budget_calls()
+    check("ci budget: ci_evidence past GH_LOOP_SECS -> no log reads, each entry marked skipped, one ledger line naming the checks",
+          calls == [] and u.get("ci_evidence", "").count("(log skipped: node time budget)") == 2
+          and ledgered(u, "failed-log reads skipped for ['test', 'lint']"), (calls, u.get("ci_evidence"), u.get("decisions")))
+
+    os.environ["ARCHITECT_GH_VIEW_CMD"] = f"echo \"view $1\" >> {BUDGET_CALLS}; echo true"
+    os.environ["ARCHITECT_GH_READY_CMD"] = "true"
+    gates.MULTI_IS_GROUPS = False
+    _lib._now = clock_past_budget()
+    u = gates.flip_ready(base_state(pr_strategy="multi", tasks=[{"id": "TX", "status": "complete", "pr_number": "5"}]))
+    calls = budget_calls()
+    check("ci budget: flip_ready past GH_LOOP_SECS -> no isDraft view, the unchecked task PR reported as a follow-up",
+          calls == [] and "PR draft state not checked (node time budget): TX PR #5" in u.get("follow_ups", []), (calls, u.get("follow_ups")))
+finally:
+    _lib._now, gates.MULTI_IS_GROUPS = _real_now, _real_groups
+    for _k, _v in _budget_saved.items():
         if _v is None:
             os.environ.pop(_k, None)
         else:
