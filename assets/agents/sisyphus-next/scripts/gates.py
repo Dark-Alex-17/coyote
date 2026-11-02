@@ -1676,7 +1676,8 @@ def pr_review_resolve(state):
             "pr_review_push_unconfirmed",
             f"PR #{pr}: the review fix push is not confirmed (remote head {remote or 'unreadable'}, local HEAD "
             f"{head or 'unreadable'}), so no review thread was resolved. How to proceed?",
-            [option("Retry the push check"), option("Stop watching and report", recommended=True)]))
+            [option("Retry the push check"), option("Stop watching and report", recommended=True)],
+            hard_trigger=True))
     pending = [p for p in as_list(state.get("pr_review_pending")) if isinstance(p, dict)]
     resolved, replied, reply_failed, resolve_failed, left = 0, 0, [], [], []
     for p in pending:
@@ -1903,13 +1904,15 @@ def ci_route(state):
             "ci_poll_cap", f"Review watch stopped: the run's CI polls reached REVIEW_CI_POLL_CEILING "
                            f"({REVIEW_CI_POLL_CEILING}) after {polls_run} poll(s). How to proceed?",
             [option("Stop watching and report", recommended=True,
-                    evidence=f"{polls_run} CI poll(s) this run; the ceiling sits below the per-node visit cap")]))
+                    evidence=f"{polls_run} CI poll(s) this run; the ceiling sits below the per-node visit cap")],
+            hard_trigger=True))
     elif _watch_started(state):
         u["pr_review_status"] = f"ci_{status}"
         ledger(state, u, f"review-watch: PR #{_pr_ref(state)} stop: ci_{status}")
         return raise_escalation(state, u, escalation(
             "ci_exhausted", f"Review watch stopped: CI watch ended without a verdict ({status}). Keep waiting, or stop watching?",
-            [option("Keep waiting (re-run the watch)"), option("Stop watching and report", recommended=True)]))
+            [option("Keep waiting (re-run the watch)"), option("Stop watching and report", recommended=True)],
+            hard_trigger=True))
     else:
         return raise_escalation(state, u, escalation(
             "ci_exhausted", f"CI watch ended without a verdict ({status}). Keep waiting, or leave the PR in draft and report?",
@@ -1994,7 +1997,7 @@ def ci_apply(state):
                 return raise_escalation(state, u, escalation(
                     "ci_exhausted", f"Review watch stopped: CI still red after {STRIKE_LIMIT} fix rounds. How to proceed?",
                     [option("Resume with one more coder fix round"), option("Stop watching and report", recommended=True)],
-                    evidence=tail(state.get("ci_evidence", ""), 2000)))
+                    evidence=tail(state.get("ci_evidence", ""), 2000), hard_trigger=True))
             return raise_escalation(state, u, escalation(
                 "ci_exhausted", f"CI still red after {STRIKE_LIMIT} fix rounds. How to proceed?",
                 [option("Resume with one more coder fix round"), option("Leave the PR in draft and report", recommended=True)],
@@ -2010,7 +2013,7 @@ def ci_apply(state):
                 "ci_infra", "Review watch stopped: CI failed for an external cause (runner lost / timeout / 429 / "
                             "cancelled). Wait and re-watch, or stop watching?",
                 [option("Keep waiting (re-run the watch)", recommended=True, evidence=tail(state.get("ci_diagnosis", ""), 300)),
-                 option("Stop watching and report")]))
+                 option("Stop watching and report")], hard_trigger=True))
         return raise_escalation(state, u, escalation(
             "ci_infra", "CI failed for infrastructure reasons (runner lost / timeout / 429 / cancelled). Wait and re-watch, or leave in draft?",
             [option("Keep waiting (re-run the watch)", recommended=True, evidence=tail(state.get("ci_diagnosis", ""), 300)),
@@ -2022,7 +2025,7 @@ def ci_apply(state):
             "ci_unsure", "Review watch stopped: CI diagnosis is unsure (unsure defaults up, never to a re-run). How to proceed?",
             [option("Re-run the failing checks once"), option("Resume with a coder fix round"),
              option("Stop watching and report", recommended=True)],
-            evidence=tail(state.get("ci_evidence", ""), 2000)))
+            evidence=tail(state.get("ci_evidence", ""), 2000), hard_trigger=True))
     return raise_escalation(state, u, escalation(
         "ci_unsure", "CI diagnosis is unsure (unsure defaults up, never to a re-run). How to proceed?",
         [option("Re-run the failing checks once"), option("Resume with a coder fix round"),
@@ -2094,7 +2097,11 @@ def _own_comment(body, association):
 
 
 def _pr_review_items(doc, seen):
-    """New review items as (trusted, untrusted); an untrusted item names its author but carries no body."""
+    """New review items as (trusted, untrusted); an untrusted item names its author but carries no body.
+
+    A thread with fresh comments from both trusted and untrusted authors yields both: the trusted item carries only
+    the trusted comments, and the untrusted entry, id `<thread id>#untrusted`, carries only the strangers' ids.
+    """
     seen = {str(s) for s in seen}
     found = []
     for t in doc.get("reviewThreads") or []:
@@ -2102,13 +2109,21 @@ def _pr_review_items(doc, seen):
             continue
         fresh = [c for c in t.get("comments") or []
                  if c.get("id") not in seen and not _own_comment(c.get("body"), c.get("association"))]
-        if fresh:
-            strangers = [c for c in fresh if c.get("association") not in TRUSTED_ASSOCIATIONS]
-            found.append(({"id": t.get("id"), "kind": "thread", "path": t.get("path", ""), "line": t.get("line"),
-                           "author": fresh[0].get("author", ""), "body": "\n\n".join(c.get("body", "") for c in fresh),
-                           "url": fresh[0].get("url", ""), "outdated": bool(t.get("isOutdated")),
-                           "seen_ids": [c.get("id") for c in t.get("comments") or []]},
-                          strangers[0] if strangers else None))
+        strangers = [c for c in fresh if c.get("association") not in TRUSTED_ASSOCIATIONS]
+        stranger_ids = [c.get("id") for c in strangers]
+        vouched = [c for c in fresh if c.get("id") not in stranger_ids]
+        thread = {"id": t.get("id"), "kind": "thread", "path": t.get("path", ""), "line": t.get("line")}
+        if vouched:
+            found.append(({**thread, "author": vouched[0].get("author", ""),
+                           "body": "\n\n".join(c.get("body", "") for c in vouched), "url": vouched[0].get("url", ""),
+                           "outdated": bool(t.get("isOutdated")),
+                           "seen_ids": [c.get("id") for c in t.get("comments") or [] if c.get("id") not in stranger_ids]},
+                          None))
+        if strangers:
+            entry = {**thread, "url": "", "seen_ids": stranger_ids}
+            if vouched:
+                entry.update({"id": f"{t.get('id')}#untrusted", "thread_id": t.get("id")})
+            found.append((entry, strangers[0]))
     for r in doc.get("reviews") or []:
         body = (r.get("body") or "").strip()
         if r.get("id") in seen or _own_comment(body, r.get("association")):
@@ -2130,7 +2145,8 @@ def _pr_review_items(doc, seen):
     trusted = [i for i, stranger in found if stranger is None]
     untrusted = [{"id": i["id"], "kind": i["kind"], "url": stranger.get("url") or i["url"], "path": i["path"],
                   "line": i["line"], "author": stranger.get("author", ""), "association": stranger.get("association", ""),
-                  "seen_ids": i["seen_ids"]} for i, stranger in found if stranger is not None]
+                  "seen_ids": i["seen_ids"], **({"thread_id": i["thread_id"]} if "thread_id" in i else {})}
+                 for i, stranger in found if stranger is not None]
     return trusted, untrusted
 
 
@@ -2230,7 +2246,7 @@ def pr_review_route(state):
         return raise_escalation(state, u, escalation(
             "pr_review_closed", f"PR #{pr} was {status} externally while the review watch ran. How to proceed?",
             [option("Stop watching and report", recommended=True, evidence=f"the PR is {status}; there is nothing left to watch"),
-             option("Keep watching (the PR was reopened)")]))
+             option("Keep watching (the PR was reopened)")], hard_trigger=True))
     if status == "comments":
         rounds = as_int(state.get("pr_review_rounds"))
         ci_polls_run = as_int(state.get("ci_polls_run"))
@@ -2250,7 +2266,8 @@ def pr_review_route(state):
             "pr_review_round_cap", f"PR #{pr} has {len(items) + len(untrusted)} new review item(s), but the review "
                                    f"watch stops: {cap}. How to proceed?",
             [option("Stop watching and report", recommended=True, evidence=cap)],
-            evidence=tail("\n\n".join(f"{_item_ref(i)}: {i.get('body', '')}" for i in items), 2500)))
+            evidence=tail("\n\n".join(f"{_item_ref(i)}: {i.get('body', '')}" for i in items), 2500),
+            hard_trigger=True))
     if status != "wall_cap":
         status = "poll_error"
         u["pr_review_status"] = status
@@ -2265,7 +2282,8 @@ def pr_review_route(state):
     if status == "poll_error":
         opts.append(option("Retry the review watch"))
     return raise_escalation(state, u, escalation(
-        "pr_review_exhausted", f"Review watch on PR #{pr} stopped: {reason}. How to proceed?", opts))
+        "pr_review_exhausted", f"Review watch on PR #{pr} stopped: {reason}. How to proceed?", opts,
+        hard_trigger=True))
 
 
 def _untrusted_judgment(state, u, untrusted):
