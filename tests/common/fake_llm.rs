@@ -1,5 +1,6 @@
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
@@ -8,8 +9,24 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 pub enum Reply {
-    ToolCall { name: String, arguments: String },
+    ToolCall {
+        name: String,
+        arguments: String,
+    },
     Text(String),
+    /// A paced streamed reply: each chunk is one SSE frame, written and
+    /// flushed on its own; a `WaitFor` chunk holds the stream open until
+    /// the named file exists (eight seconds at most), so a test can look
+    /// at the screen between two deltas. A non-streaming request gets the
+    /// text chunks joined into one message.
+    Streamed(Vec<Chunk>),
+}
+
+pub enum Chunk {
+    /// A `delta.content` frame.
+    Text(String),
+    /// Hold the stream until this path exists.
+    WaitFor(PathBuf),
 }
 
 /// An OpenAI chat-completions endpoint that answers the N-th POST with the
@@ -78,10 +95,14 @@ fn serve(listener: TcpListener, replies: &[Reply], served: &AtomicUsize, stop: &
             Ok(body) => {
                 let n = served.fetch_add(1, Ordering::SeqCst);
                 let reply = replies.get(n).unwrap_or(&fallback);
-                if body["stream"] == Value::Bool(true) {
-                    sse_response(reply)
-                } else {
-                    json_response(reply)
+                match (reply, body["stream"] == Value::Bool(true)) {
+                    (Reply::Streamed(chunks), true) => {
+                        paced_sse_response(&mut stream, chunks);
+                        let _ = stream.shutdown(Shutdown::Both);
+                        continue;
+                    }
+                    (_, true) => sse_response(reply),
+                    (_, false) => json_response(reply),
                 }
             }
             Err(err) => {
@@ -141,9 +162,23 @@ fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
+fn joined_text(chunks: &[Chunk]) -> String {
+    chunks
+        .iter()
+        .filter_map(|c| match c {
+            Chunk::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
 fn json_response(reply: &Reply) -> Vec<u8> {
     let (message, finish_reason) = match reply {
         Reply::Text(text) => (json!({"role": "assistant", "content": text}), "stop"),
+        Reply::Streamed(chunks) => (
+            json!({"role": "assistant", "content": joined_text(chunks)}),
+            "stop",
+        ),
         Reply::ToolCall { name, arguments } => (
             json!({
                 "role": "assistant",
@@ -169,6 +204,7 @@ fn json_response(reply: &Reply) -> Vec<u8> {
 fn sse_response(reply: &Reply) -> Vec<u8> {
     let delta = match reply {
         Reply::Text(text) => json!({"content": text}),
+        Reply::Streamed(chunks) => json!({"content": joined_text(chunks)}),
         Reply::ToolCall { name, arguments } => json!({
             "tool_calls": [{
                 "index": 0,
@@ -181,6 +217,42 @@ fn sse_response(reply: &Reply) -> Vec<u8> {
     let frame = json!({"choices": [{"index": 0, "delta": delta}]});
     let payload = format!("data: {frame}\n\ndata: [DONE]\n\n");
     http_response(200, "text/event-stream", payload.as_bytes())
+}
+
+/// Writes the chunks of a [`Reply::Streamed`] one SSE frame at a time on
+/// a close-delimited response (no Content-Length), flushing after each so
+/// the client sees every delta as soon as it is written.
+fn paced_sse_response(stream: &mut TcpStream, chunks: &[Chunk]) {
+    let head = "HTTP/1.1 200 OK\r\n\
+         Content-Type: text/event-stream\r\n\
+         Connection: close\r\n\
+         \r\n";
+    if stream.write_all(head.as_bytes()).is_err() {
+        return;
+    }
+    let _ = stream.flush();
+    for chunk in chunks {
+        let delta = match chunk {
+            Chunk::Text(text) => json!({"content": text}),
+            Chunk::WaitFor(path) => {
+                let deadline = std::time::Instant::now() + Duration::from_secs(8);
+                while !path.exists() && std::time::Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(50));
+                }
+                continue;
+            }
+        };
+        let frame = json!({"choices": [{"index": 0, "delta": delta}]});
+        if stream
+            .write_all(format!("data: {frame}\n\n").as_bytes())
+            .is_err()
+        {
+            return;
+        }
+        let _ = stream.flush();
+    }
+    let _ = stream.write_all(b"data: [DONE]\n\n");
+    let _ = stream.flush();
 }
 
 fn http_response(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {

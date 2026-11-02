@@ -15,7 +15,7 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, fs, iter, process};
 
-use common::fake_llm::{FakeLlm, Reply};
+use common::fake_llm::{Chunk, FakeLlm, Reply};
 use common::pty::{Pty, strip_ansi};
 use serial_test::serial;
 
@@ -1789,4 +1789,98 @@ fn a_tiny_window_does_not_crash_the_ui_and_growing_back_repaints() {
         1,
         "the alternate screen was left more than once (a panic restore?):\n{transcript}"
     );
+}
+
+// ---------------------------------------------------------------------
+// Paced streams: the fake holds the SSE response open between two deltas
+// so the screen can be read while the model is still "talking".
+// ---------------------------------------------------------------------
+
+/// A streamed reply renders progressively: the first delta is on screen
+/// while the stream is still open (the fake has not sent the second delta
+/// yet), and the second delta joins it once released. The whole reply
+/// must not wait for the stream to end before it is painted.
+#[test]
+#[serial]
+fn a_streamed_reply_is_painted_before_the_stream_ends() {
+    let dir = fresh_config_dir("paced-stream");
+    let _guard = TempDirGuard(dir.clone());
+    let release = dir.join("stream-release");
+    let fake = FakeLlm::start(vec![Reply::Streamed(vec![
+        Chunk::Text("first half h4x".to_string()),
+        Chunk::WaitFor(release.clone()),
+        Chunk::Text(" second half j9k".to_string()),
+    ])]);
+    write_fake_llm_config(&dir, &fake);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b"stream something\r").unwrap();
+    let started = std::time::Instant::now();
+    let transcript = wait_for_squeezed(&mut pty, "first half h4x", "the first delta");
+    let squeezed: String = transcript.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "the first delta appeared only after the fake gave up holding the stream"
+    );
+    assert!(
+        !squeezed.contains("secondhalfj9k"),
+        "the second delta was on screen before the fake sent it:\n{transcript}"
+    );
+    // Give a late paint a chance before deciding; the second delta has
+    // not been sent, so it must still be absent.
+    let settled = pty.read_for(Duration::from_millis(600));
+    assert!(
+        !settled
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            .contains("secondhalfj9k"),
+        "the second delta reached the screen before the fake sent it:\n{settled}"
+    );
+
+    fs::write(&release, b"").unwrap();
+    let transcript = wait_for_squeezed(&mut pty, "second half j9k", "the second delta");
+    assert_eq!(fake.served(), 1, "{transcript}");
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// `exit()` is idempotent on the panic path too: the hook restores the
+/// terminal and nothing afterwards (a guard drop, the normal leave path)
+/// leaves the alternate screen or disables bracketed paste a second time.
+#[test]
+#[serial]
+fn a_panic_at_start_leaves_the_alternate_screen_exactly_once() {
+    let dir = fresh_config_dir("panic-once");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let mut pty = spawn_tui(&dir, &[("COYOTE_TUI_PANIC_AT_START", "1")]);
+
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 101, "{transcript}");
+    assert_tty_restored(&transcript);
+    let raw = pty.raw();
+    assert_eq!(
+        count(raw, ENTER_ALT),
+        1,
+        "the alternate screen must be entered exactly once:\n{transcript}"
+    );
+    assert_eq!(
+        count(raw, LEAVE_ALT),
+        1,
+        "the alternate screen must be left exactly once on a panic:\n{transcript}"
+    );
+    assert_eq!(
+        count(raw, PASTE_OFF),
+        1,
+        "bracketed paste must be disabled exactly once on a panic:\n{transcript}"
+    );
+    if let Some(push) = find_keyboard_push(raw, 0) {
+        let pop = rfind_keyboard_pop(raw).expect("flags pushed but never popped on panic");
+        assert!(push < pop, "{transcript}");
+    }
 }
