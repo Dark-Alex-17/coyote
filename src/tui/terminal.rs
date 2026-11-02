@@ -166,13 +166,17 @@ fn restore_from_static() {
     {
         use std::mem::ManuallyDrop;
         use std::os::fd::FromRawFd;
-        let fd = PANIC_FD.load(Ordering::SeqCst);
+        // Taken, not read: a `Screen::enter` failing on another thread
+        // swaps the slot too, so exactly one of the two sees the fd and
+        // the hook never writes through a descriptor about to be closed.
+        let fd = PANIC_FD.swap(-1, Ordering::SeqCst);
         if fd < 0 {
             return;
         }
         // SAFETY: the fd was dup'd by `open_tty_writer` and is open while
-        // PANIC_FD holds it: `Screen` clears PANIC_FD before the writer that
-        // owns the fd is dropped. ManuallyDrop keeps this handle from closing it.
+        // PANIC_FD holds it: `Screen` takes it out of PANIC_FD before the
+        // writer that owns the fd is dropped. ManuallyDrop keeps this handle
+        // from closing it.
         let mut writer = ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
         let _ = leave(&mut *writer);
     }
@@ -285,10 +289,10 @@ impl Screen {
         #[cfg(unix)]
         PANIC_FD.store(fd, Ordering::SeqCst);
         if let Err(err) = enter(terminal.backend_mut(), enhancement) {
-            // Cleared before `terminal` drops the writer: the hook must
+            // Taken back before `terminal` drops the writer: the hook must
             // never write to a closed or reused descriptor.
             #[cfg(unix)]
-            PANIC_FD.store(-1, Ordering::SeqCst);
+            PANIC_FD.swap(-1, Ordering::SeqCst);
             return Err(err.into());
         }
         Ok(Self {
@@ -342,7 +346,7 @@ impl Drop for Screen {
     fn drop(&mut self) {
         let _ = self.leave();
         #[cfg(unix)]
-        PANIC_FD.store(-1, Ordering::SeqCst);
+        PANIC_FD.swap(-1, Ordering::SeqCst);
     }
 }
 

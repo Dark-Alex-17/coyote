@@ -702,6 +702,10 @@ impl App {
             // The asker gave up waiting (its turn was interrupted); the
             // answer has nowhere to go.
             let _ = prompt.reply.send(answer);
+            // The next queued question gets a fresh idle gate: a held or
+            // repeated hotkey must not answer it on the first prompt's
+            // momentum.
+            self.last_keystroke = Some(self.clock.now());
         }
     }
 
@@ -2054,6 +2058,35 @@ mod tests {
             PromptAnswer::Confirmed(true)
         );
         assert_eq!(harness.app.composer_text(), "draft");
+    }
+
+    /// Answering one question re-arms the idle gate for the next queued
+    /// one: a `y` held down or pressed twice answers only the first.
+    #[test]
+    fn a_hotkey_right_after_answering_does_not_answer_the_next_queued_prompt() {
+        let mut harness = Harness::standalone(80, 24);
+        let first = ask_on_a_thread(&mut harness, confirm_request(None));
+        let second = ask_on_a_thread(&mut harness, confirm_request(Some("fs_write")));
+        assert_eq!(harness.app.prompts.len(), 2);
+
+        assert_eq!(harness.press(KeyCode::Char('y')), None);
+        assert_eq!(
+            first.join().unwrap().unwrap(),
+            PromptAnswer::Confirmed(true)
+        );
+        assert_eq!(harness.app.prompts.len(), 1);
+
+        assert_eq!(harness.press(KeyCode::Char('y')), None);
+        assert_eq!(harness.app.prompts.len(), 1);
+        assert!(!second.is_finished());
+
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Char('y')), None);
+        assert_eq!(
+            second.join().unwrap().unwrap(),
+            PromptAnswer::Confirmed(true)
+        );
+        assert!(harness.app.prompts.is_empty());
     }
 
     #[test]
