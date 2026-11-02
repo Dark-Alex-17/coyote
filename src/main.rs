@@ -375,15 +375,6 @@ async fn async_main() -> Result<()> {
     Ok(())
 }
 
-fn update_app_config(ctx: &mut RequestContext, update: impl FnOnce(&mut AppConfig)) {
-    let mut app_config = (*ctx.app.config).clone();
-    update(&mut app_config);
-
-    let mut app_state = (*ctx.app).clone();
-    app_state.config = Arc::new(app_config);
-    ctx.app = Arc::new(app_state);
-}
-
 async fn run(
     mut ctx: RequestContext,
     cli: Cli,
@@ -452,7 +443,7 @@ async fn run(
     }
 
     if cli.dry_run {
-        update_app_config(&mut ctx, |app| app.dry_run = true);
+        ctx.update_app_config(|app| app.dry_run = true);
     }
 
     if let Some(agent) = &cli.agent {
@@ -533,20 +524,20 @@ async fn run(
         ctx.set_model_on_role_like(app.as_ref(), model_id)?;
     }
     if cli.no_stream {
-        update_app_config(&mut ctx, |app| app.stream = false);
+        ctx.update_app_config(|app| app.stream = false);
     }
     if cli.raw_markdown {
-        update_app_config(&mut ctx, |app| app.raw_markdown = true);
+        ctx.update_app_config(|app| app.raw_markdown = true);
     }
     if cli.no_memory {
-        update_app_config(&mut ctx, |app| app.memory = Some(false));
+        ctx.update_app_config(|app| app.memory = Some(false));
     }
     if cli.no_workspace_instructions {
-        update_app_config(&mut ctx, |app| app.workspace_instructions = Some(false));
+        ctx.update_app_config(|app| app.workspace_instructions = Some(false));
     }
     if !cli.workspace_instructions_file.is_empty() {
         let files = cli.workspace_instructions_file.clone();
-        update_app_config(&mut ctx, |app| {
+        ctx.update_app_config(|app| {
             app.workspace_instructions_files = Some(files);
         });
     }

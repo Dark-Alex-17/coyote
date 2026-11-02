@@ -117,3 +117,26 @@ impl AppState {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::CommandPrefix;
+    use crate::testing::TestConfigDirGuard;
+    use crate::utils::create_abort_signal;
+    use serial_test::serial;
+
+    #[tokio::test]
+    #[serial]
+    async fn a_slash_config_starts_with_a_slash_live_prefix() {
+        let _guard = TestConfigDirGuard::new("app-state-live-prefix");
+        let config = Arc::new(AppConfig {
+            command_prefix: CommandPrefix::Slash,
+            ..AppConfig::default()
+        });
+        let app = AppState::init(config, None, false, true, true, create_abort_signal())
+            .await
+            .unwrap();
+        assert_eq!(app.mesh.command_prefix().load(), CommandPrefix::Slash);
+    }
+}

@@ -1485,7 +1485,7 @@ impl RequestContext {
         }
     }
 
-    fn update_app_config(&mut self, update: impl FnOnce(&mut AppConfig)) {
+    pub(crate) fn update_app_config(&mut self, update: impl FnOnce(&mut AppConfig)) {
         let mut app_config = (*self.app.config).clone();
         update(&mut app_config);
 

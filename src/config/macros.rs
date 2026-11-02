@@ -1,7 +1,7 @@
 use crate::config::paths;
 use crate::config::{
-    CommandPrefix, RequestContext, RoleLike, ensure_parent_exists, refresh_mesh_snapshot,
-    sanitize_display_text,
+    CommandPrefix, LivePrefix, RequestContext, RoleLike, ensure_parent_exists,
+    refresh_mesh_snapshot, sanitize_display_text,
 };
 use crate::repl::{command_head, run_repl_command_with_prefix, split_args_text};
 use crate::utils::{AbortSignal, multiline_text};
@@ -67,6 +67,10 @@ pub async fn macro_execute(
     let mut app_state = (*ctx.app).clone();
     app_state.config = Arc::new(app_config);
 
+    let _restore_prefix = LivePrefixRestore {
+        live: ctx.app.mesh.command_prefix().clone(),
+        outer: ctx.command_prefix(),
+    };
     let mut macro_ctx = RequestContext::new(Arc::new(app_state), ctx.working_mode);
     macro_ctx.macro_flag = true;
     macro_ctx.info_flag = ctx.info_flag;
@@ -107,6 +111,20 @@ pub async fn macro_execute(
     .await;
     macro_ctx.top_level_agent_finished(result.as_ref().err(), Some(&abort_signal));
     result
+}
+
+/// An isolated macro shares the outer session's mesh slot, so its own
+/// `.set command_prefix` stores into the outer live prefix while its config is thrown
+/// away. Dropping this puts the outer value back, whether the macro finished or failed.
+struct LivePrefixRestore {
+    live: LivePrefix,
+    outer: CommandPrefix,
+}
+
+impl Drop for LivePrefixRestore {
+    fn drop(&mut self) {
+        self.live.store(self.outer);
+    }
 }
 
 struct MacroModeGuard<'a> {
@@ -1071,6 +1089,47 @@ variables:
             None,
             "an isolated macro's mutations must stay on the fork"
         );
+    }
+
+    mod live_prefix_restore {
+        use super::*;
+
+        fn run_isolated(steps: &str) -> (RequestContext, Result<()>) {
+            write_macro_file(
+                "iso-prefix-macro",
+                &format!("isolated: true\nsteps:\n{steps}"),
+            );
+            let mut ctx = test_ctx();
+            ctx.session = Some(Session::default());
+            let result = run_async(macro_execute(
+                &mut ctx,
+                "iso-prefix-macro",
+                None,
+                create_abort_signal(),
+            ));
+            (ctx, result)
+        }
+
+        #[test]
+        #[serial]
+        fn an_isolated_prefix_change_leaves_the_outer_live_prefix_alone() {
+            let _guard = TestConfigDirGuard::new("macros-tests");
+            let (ctx, result) = run_isolated("  - \".set command_prefix slash\"\n");
+            result.unwrap();
+            assert_eq!(ctx.command_prefix(), CommandPrefix::Dot);
+            assert_eq!(ctx.app.mesh.command_prefix().load(), ctx.command_prefix());
+        }
+
+        #[test]
+        #[serial]
+        fn a_failing_isolated_macro_still_restores_the_outer_live_prefix() {
+            let _guard = TestConfigDirGuard::new("macros-tests");
+            let (ctx, result) = run_isolated(
+                "  - \".set command_prefix slash\"\n  - \".set command_prefix bogus\"\n",
+            );
+            assert!(result.is_err(), "the second step must fail");
+            assert_eq!(ctx.app.mesh.command_prefix().load(), ctx.command_prefix());
+        }
     }
 
     #[test]
