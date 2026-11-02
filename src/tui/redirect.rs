@@ -37,14 +37,36 @@ mod unix {
     const SETTLE_LIMIT: Duration = Duration::from_millis(50);
     /// Gap without new bytes after which the pipe counts as quiescent.
     const QUIET_GAP: Duration = Duration::from_millis(10);
+    /// Most of a command's output kept for its cell; a runaway writer is
+    /// cut here and the tail is counted rather than stored.
+    const CAPTURE_LIMIT: usize = 1024 * 1024;
 
     struct Drained {
         buf: Vec<u8>,
+        dropped: usize,
         last_read: Option<Instant>,
         eof: bool,
         /// Set by `finish`: bytes read from here on belong to no cell and
         /// go through the late-output callback instead.
         detached: bool,
+    }
+
+    impl Drained {
+        fn push(&mut self, chunk: &[u8]) {
+            let room = CAPTURE_LIMIT.saturating_sub(self.buf.len());
+            let kept = chunk.len().min(room);
+            self.buf.extend_from_slice(&chunk[..kept]);
+            self.dropped += chunk.len() - kept;
+        }
+
+        fn take_text(&mut self) -> String {
+            let mut text = String::from_utf8_lossy(&std::mem::take(&mut self.buf)).into_owned();
+            if self.dropped > 0 {
+                text.push_str(&format!("\n... {} bytes dropped\n", self.dropped));
+                self.dropped = 0;
+            }
+            text
+        }
     }
 
     struct Shared {
@@ -140,7 +162,7 @@ mod unix {
                 if drained.detached {
                     Some(String::from_utf8_lossy(&chunk[..n]).into_owned())
                 } else {
-                    drained.buf.extend_from_slice(&chunk[..n]);
+                    drained.push(&chunk[..n]);
                     drained.last_read = Some(Instant::now());
                     None
                 }
@@ -170,6 +192,7 @@ mod unix {
             let shared = Arc::new(Shared {
                 drained: Mutex::new(Drained {
                     buf: Vec::new(),
+                    dropped: 0,
                     last_read: None,
                     eof: false,
                     detached: false,
@@ -216,7 +239,7 @@ mod unix {
                     .0;
             }
             drained.detached = true;
-            String::from_utf8_lossy(&std::mem::take(&mut drained.buf)).into_owned()
+            drained.take_text()
         }
 
         /// Restores fds 1 and 2 and closes this side of the pipe; the
@@ -239,10 +262,10 @@ mod unix {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner());
                 drained.detached = true;
-                std::mem::take(&mut drained.buf)
+                drained.take_text()
             };
             if !buffered.is_empty() {
-                (self.shared.late)(String::from_utf8_lossy(&buffered).into_owned());
+                (self.shared.late)(buffered);
             }
         }
     }
@@ -380,6 +403,30 @@ mod unix {
             let late = rx.recv_timeout(Duration::from_secs(2)).unwrap();
             assert!(late.contains("buffered-r5x"), "{late}");
             assert!(!outside.contains("buffered-r5x"), "{outside}");
+        }
+
+        /// A writer that floods the pipe gets its first mebibyte kept and
+        /// the rest counted in one trailing marker.
+        #[test]
+        #[serial]
+        fn output_past_the_capture_limit_is_dropped_and_counted_once() {
+            let (saved, reader) = capture_stdout();
+            let guard = FdRedirect::begin(|_| {}).unwrap();
+            let chunk = vec![b'x'; 64 * 1024];
+            for _ in 0..32 {
+                write_fd1(&chunk);
+            }
+            let captured = guard.finish();
+            release_harness_output(saved, reader, "");
+
+            let marker = format!("\n... {} bytes dropped\n", CAPTURE_LIMIT);
+            assert_eq!(captured.len(), CAPTURE_LIMIT + marker.len());
+            assert!(
+                captured.ends_with(&marker),
+                "{}",
+                &captured[CAPTURE_LIMIT..]
+            );
+            assert_eq!(captured.matches("bytes dropped").count(), 1);
         }
     }
 }

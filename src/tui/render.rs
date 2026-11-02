@@ -48,6 +48,9 @@ fn scrub(text: &str, keep_sgr: bool) -> String {
             Some('[') => {
                 let start = i;
                 i += 2;
+                // A private-marker parameter (`<`, `=`, `>`, `?`) makes
+                // the sequence vendor-defined even when it ends in `m`.
+                let private = matches!(chars.get(i), Some(c) if ('\x3c'..='\x3f').contains(c));
                 while matches!(chars.get(i), Some(c) if ('\x30'..='\x3f').contains(c)) {
                     i += 1;
                 }
@@ -56,7 +59,7 @@ fn scrub(text: &str, keep_sgr: bool) -> String {
                 }
                 let final_byte = chars.get(i).copied();
                 i += 1;
-                if keep_sgr && final_byte == Some('m') {
+                if keep_sgr && !private && final_byte == Some('m') {
                     out.extend(&chars[start..i.min(chars.len())]);
                 }
             }
@@ -303,6 +306,17 @@ mod tests {
             "abcd"
         );
         assert_eq!(sanitize_ansi("a\x1b_unterminated"), "a");
+    }
+
+    /// `CSI > ... m` and `CSI ? ... m` are vendor key-modifier settings
+    /// shaped like SGR; they must not reach the terminal.
+    #[test]
+    fn sanitize_drops_private_marker_sequences_that_end_in_m() {
+        assert_eq!(sanitize_ansi("a\x1b[>4;1mb\x1b[?1mc"), "abc");
+        assert_eq!(
+            sanitize_ansi("\x1b[<5m\x1b[=3m\x1b[1mx\x1b[0m"),
+            "\x1b[1mx\x1b[0m"
+        );
     }
 
     #[test]
