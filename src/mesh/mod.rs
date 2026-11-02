@@ -575,8 +575,9 @@ pub(crate) mod test_support {
 
     /// A loopback port that refuses connections until the test calls `.listen(backlog)`
     /// on the returned socket, which turns it into the same byte sink `loopback_relay`
-    /// is once handed to `serve_as_sink`. A bound socket that is not listening answers
-    /// every SYN with a reset; `TcpListener::bind` would listen at once.
+    /// is once handed to `serve_as_sink`. A bound socket that is not listening accepts
+    /// nothing, though not the same way everywhere: Linux refuses the dial, macOS leaves
+    /// it to time out. `TcpListener::bind` would listen at once.
     #[cfg(unix)]
     pub(crate) async fn held_port() -> (u16, TcpSocket) {
         let socket = TcpSocket::new_v4().unwrap();

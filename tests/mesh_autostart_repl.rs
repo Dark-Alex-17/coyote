@@ -4366,7 +4366,8 @@ fn brief_confirmations_under_slash_name_their_next_command_with_the_slash_sigil(
 /// endpoint only this test opens: a closed loopback `port` where rnsd has no abstract
 /// socket, the abstract socket `@rns/<instance>` under a name no rnsd uses where it has.
 /// The port is closed rather than held because a dial to a bound socket that is not
-/// listening is not refused everywhere, and the refusal is what the test reads.
+/// listening is not refused everywhere (macOS lets it time out), and the refusal is what
+/// the test reads.
 struct LocalRnsd {
     port: u16,
     instance: String,
@@ -4476,14 +4477,12 @@ fn a_local_only_node_is_refused_until_rnsd_listens_then_joins_through_it() {
         )),
         "{refused:?}"
     );
-    if cfg!(not(any(target_os = "linux", target_os = "android"))) {
-        assert!(
-            refused.contains(&format!(
-                "is not reachable: nothing is listening at {endpoint}."
-            )),
-            "the refusal names the refused dial: {refused:?}"
-        );
-    }
+    assert!(
+        refused.contains(&format!(
+            "is not reachable: nothing is listening at {endpoint}."
+        )),
+        "the refusal names the refused dial: {refused:?}"
+    );
     assert!(
         refused.contains("start rnsd or fix mesh.interfaces."),
         "{refused:?}"
@@ -4894,10 +4893,10 @@ fn the_local_row_reports_rnsd_going_away_and_coming_back_through_the_real_binary
     rnsd.stop();
 }
 
-/// Ruling 123a through the real binary: a `local`-only `.mesh on` with nothing at the
-/// endpoint is refused on the client's FIRST failed dial, not after the whole start
-/// wait. The bound is generous against the ~1 s a refused dial takes and still well
-/// under the 5 s wait a refusal that sat out the timeout would show.
+/// Through the real binary: a `local`-only `.mesh on` with nothing at the endpoint is
+/// refused on the client's FIRST failed dial, not after the whole start wait. The bound
+/// is generous against the ~1 s a refused dial takes and still well under the 5 s wait a
+/// refusal that sat out the timeout would show.
 #[test]
 fn a_local_only_refusal_arrives_on_the_first_failed_dial_not_after_the_start_wait() {
     let rnsd = LocalRnsd::absent();
@@ -4935,14 +4934,13 @@ fn a_local_only_refusal_arrives_on_the_first_failed_dial_not_after_the_start_wai
     );
 }
 
-/// Rulings 123/124 through the real binary: a `local` entry nothing answers at, beside a
-/// relay that connects, does not refuse the start. `.mesh on` joins through the relay
-/// and warns that the local rnsd is not reachable yet, with the client's dial failure
-/// rendered as Coyote's sentence and the start-the-daemon tail; `.mesh info` lists the
-/// local row as `connecting, retrying: <that sentence>` and keeps it there while the
-/// client redials. Once a listener is up at the endpoint the background redial lands
-/// and the row reads `connected` with no second WARNING. The exact refused-dial
-/// sentence is the TCP shape's, so it is checked where that shape is the endpoint.
+/// Through the real binary: a `local` entry nothing answers at, beside a relay that
+/// connects, does not refuse the start. `.mesh on` joins through the relay and warns
+/// that the local rnsd is not reachable yet, with the client's dial failure rendered as
+/// Coyote's sentence and the start-the-daemon tail; `.mesh info` lists the local row as
+/// `connecting, retrying: <that sentence>` and keeps it there while the client redials.
+/// Once a listener is up at the endpoint the background redial lands and the row reads
+/// `connected` with no second WARNING.
 #[test]
 fn a_local_entry_beside_a_relay_starts_dialing_and_flips_to_connected_when_rnsd_listens() {
     let relay = SilentRelay::start();
@@ -4979,28 +4977,23 @@ fn a_local_entry_beside_a_relay_starts_dialing_and_flips_to_connected_when_rnsd_
         "{joined:?}"
     );
     let connecting_prefix = format!("{label}  connecting, retrying: ");
-    if cfg!(not(any(target_os = "linux", target_os = "android"))) {
-        let reason = format!("nothing is listening at {endpoint}");
-        assert_eq!(
-            warnings[0],
-            format!("{warning_prefix}{reason}; start the local rnsd"),
-            "{joined:?}"
-        );
-    }
+    let reason = format!("nothing is listening at {endpoint}");
+    assert_eq!(
+        warnings[0],
+        format!("{warning_prefix}{reason}; start the local rnsd"),
+        "{joined:?}"
+    );
 
     // Two reads a redial apart: the row holds the dial failure while nothing listens.
     for read in ["first", "after a redial"] {
         let info = command_text(&mut session, ".mesh info", "└", SESSION_PROMPT);
         let table = boxed_table(&format!(".mesh info ({read})"), &info);
         let row = table.value("interfaces[0]");
-        assert!(row.starts_with(&connecting_prefix), "{read}: {info}");
-        if cfg!(not(any(target_os = "linux", target_os = "android"))) {
-            assert_eq!(
-                row,
-                format!("{connecting_prefix}nothing is listening at {endpoint}"),
-                "{info}"
-            );
-        }
+        assert_eq!(
+            row,
+            format!("{connecting_prefix}{reason}"),
+            "{read}: {info}"
+        );
         thread::sleep(Duration::from_secs(3));
     }
 

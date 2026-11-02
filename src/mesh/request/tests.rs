@@ -2593,6 +2593,15 @@ pub(crate) mod network {
         })
         .await;
         assert!(!sent.load(Ordering::SeqCst));
+        let told = format!(
+            "Mesh response {request_id} on link {} was refused: it is {encoded} bytes and the response cap is {MAX_FETCH_RESPONSE_BYTES} bytes",
+            link_id.to_hex_string()
+        );
+        assert!(
+            debug_snapshot().contains(&told),
+            "the adapter names the frame's length and the cap: {:?}",
+            debug_snapshot()
+        );
         let about_this_reply: Vec<String> = warn_snapshot()
             .into_iter()
             .filter(|message| message.contains(&request_id.to_string()))
