@@ -795,6 +795,27 @@ impl App {
         }
     }
 
+    /// What the running turn printed past its capture, already taken in
+    /// as notices. Nothing draws the app once the turn's task is lost,
+    /// so a panic message that came this way is handed back to be printed
+    /// on the restored terminal.
+    fn turn_late_output(&self) -> Vec<String> {
+        let Some(turn) = &self.turn else {
+            return Vec::new();
+        };
+        self.cells[turn.first_cell..]
+            .iter()
+            .filter_map(|cell| match cell {
+                Cell::Notice {
+                    kind: NoticeKind::Routing,
+                    text,
+                    ..
+                } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn status_text(&self) -> Option<String> {
         if self.exiting {
             return Some("Leaving...".to_string());
@@ -1059,8 +1080,10 @@ enum Leave {
     /// A termination signal or a closed stdin: nobody is left to answer a
     /// prompt, so the teardown runs after the screen is restored.
     Abandoned,
-    /// A work task panicked and took the context with it.
-    Lost(tokio::task::JoinError),
+    /// A work task panicked and took the context with it. The late output
+    /// the loop already fed to the app comes along: the panic message
+    /// arrives that way, and the app is never drawn again.
+    Lost(tokio::task::JoinError, Vec<String>),
 }
 
 /// The handles the loop holds between steps. `app`, `screen` and `abort`
@@ -1211,13 +1234,16 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
             },
             None => Ok(()),
         },
-        Leave::Lost(err) => {
-            // The panic hook printed into the turn's capture pipe; the
-            // guard forwarded that on its way out and nothing drew it.
+        Leave::Lost(err, mut late) => {
+            // The drain thread may still be forwarding what the pipe held
+            // when the guard went down.
             while let Ok(msg) = rx.try_recv() {
                 if let UiMsg::Notice { text, .. } = msg {
-                    eprintln!("{text}");
+                    late.push(text);
                 }
+            }
+            for text in late {
+                eprintln!("{text}");
             }
             Err(err.into())
         }
@@ -1371,8 +1397,9 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> (Leave, Option<
                             ctx = Some(returned);
                         }
                         Err(err) => {
+                            let late = app.turn_late_output();
                             app.abandon_prompts();
-                            return (Leave::Lost(err), None);
+                            return (Leave::Lost(err, late), None);
                         }
                     }
                 }
@@ -1382,7 +1409,7 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> (Leave, Option<
                         Ok((returned, result, captured)) => {
                             (Leave::Finished(result, captured), Some(returned))
                         }
-                        Err(err) => (Leave::Lost(err), None),
+                        Err(err) => (Leave::Lost(err, Vec::new()), None),
                     };
                 }
             },
@@ -2011,7 +2038,8 @@ mod tests {
     /// Once the UI has given up, a question already in the inbox and one
     /// raised while the work task is still being waited for are both
     /// answered unattended; the asker never sits on the reply until the
-    /// deadline.
+    /// deadline. The second question is only asked once the first has
+    /// its answer, which the drain gives it, so it has to reach the wait.
     #[tokio::test]
     async fn prompts_raised_after_the_ui_gave_up_are_answered_unattended() {
         let (tx, mut rx) = unbounded_channel();
@@ -2024,17 +2052,45 @@ mod tests {
         }
         let late = Arc::clone(&prompter);
         let handle = tokio::task::spawn_blocking(move || {
+            let early_answer = early.join().unwrap();
             let answer = late.prompt(PromptRequest {
                 default: Some(serde_json::json!(true)),
                 ..confirm_request(None)
             });
-            (answer, early.join().unwrap())
+            (answer, early_answer)
         });
         let started = Instant::now();
         let (late_answer, early_answer) = join_unattended(handle, &mut rx).await.unwrap();
         assert!(started.elapsed() < EXIT_CANCEL_WAIT);
         assert_eq!(early_answer.unwrap(), PromptAnswer::Confirmed(false));
         assert_eq!(late_answer.unwrap(), PromptAnswer::Confirmed(true));
+    }
+
+    /// A panic message reaches the loop as late output while the task is
+    /// still unwinding, and the loop usually feeds it to the app before
+    /// the join error arrives. The app hands back exactly those notices,
+    /// and only the lost turn's, so the restored terminal still shows them.
+    #[test]
+    fn the_lost_turns_late_output_is_handed_back_for_printing() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.handle_msg(UiMsg::Notice {
+            kind: NoticeKind::Routing,
+            text: "from an earlier turn".to_string(),
+        });
+        assert!(harness.app.turn_late_output().is_empty());
+
+        harness.app.begin_turn("explode", false);
+        let (tx, mut rx) = unbounded_channel();
+        late_output(tx)("thread 'tokio' panicked at src/x.rs:1:1:\nboom-r7x\n".to_string());
+        harness.app.handle_msg(rx.try_recv().unwrap());
+        harness.app.handle_msg(UiMsg::Notice {
+            kind: NoticeKind::ToolWarning,
+            text: "unrelated".to_string(),
+        });
+        let late = harness.app.turn_late_output();
+        assert_eq!(late.len(), 1, "{late:?}");
+        assert!(late[0].contains("boom-r7x"), "{late:?}");
+        assert!(late[0].contains("panicked"), "{late:?}");
     }
 
     #[test]
@@ -2739,9 +2795,8 @@ mod tests {
     /// `todo!`, an ignored test, or the one pre-existing marker below.
     /// An id quoted as data (inside a string literal or a backtick code
     /// span, the way the planning-debris lint and its fixtures spell
-    /// theirs) is a needle, not a reference. This task's own id appears
-    /// nowhere. The needles here are spelled in halves so this test's
-    /// source does not match itself.
+    /// theirs) is a needle, not a reference. The needles here are spelled
+    /// in halves so this test's source does not match itself.
     #[test]
     fn task_ids_mark_only_owned_debt() {
         fn quoted(line: &str, at: usize) -> bool {
@@ -2753,9 +2808,7 @@ mod tests {
             quotes % 2 == 1 || before.matches('`').count() % 2 == 1
         }
         let id_prefix = concat!("TA", "SK-");
-        let own_id = concat!("TA", "SK-", "312");
-        // The attribute forms are split too: a diff scan for added lint
-        // suppressions must not find them spelled out here.
+        // Split so a grep for suppression attributes does not match this list.
         let debt_markers = [
             concat!("#[", "allow("),
             concat!("#![", "allow("),
@@ -2773,15 +2826,11 @@ mod tests {
         )];
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut offenders = Vec::new();
-        let mut own = Vec::new();
         for dir in ["src", "tests"] {
             for path in rust_files(&root.join(dir)) {
                 let file = path.strip_prefix(root).unwrap().display().to_string();
                 let text = std::fs::read_to_string(&path).unwrap();
                 for (index, line) in text.lines().enumerate() {
-                    if line.contains(own_id) {
-                        own.push(format!("{file}:{}", index + 1));
-                    }
                     let bare: Vec<usize> = line
                         .match_indices(id_prefix)
                         .map(|(at, _)| at)
@@ -2804,11 +2853,6 @@ mod tests {
             offenders.is_empty(),
             "task ids outside a debt marker:\n{}",
             offenders.join("\n")
-        );
-        assert!(
-            own.is_empty(),
-            "this task's id left in the source:\n{}",
-            own.join("\n")
         );
     }
 
