@@ -2518,7 +2518,7 @@ def apply_answer(state):
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"PR #{state.get('pr_number')} review watch stopped: {status}: {tail(state.get('ci_diagnosis', ''), 300)}"]
             _review_event(state, u, f"stop: {status}")
             _close_review_watch(state, u, kind)
-            _after_flip(state, u)
+            u["_next"] = "finish_plan"
         else:
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"PR #{state.get('pr_number')} left in draft with CI {state.get('ci_status') or 'unresolved'}: {tail(state.get('ci_diagnosis', ''), 300)}"]
             u["_next"] = "finish_plan"
