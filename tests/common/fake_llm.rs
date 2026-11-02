@@ -25,6 +25,9 @@ pub enum Reply {
 pub enum Chunk {
     /// A `delta.content` frame.
     Text(String),
+    /// A `delta.reasoning_content` frame: the model "thinking" out loud
+    /// before its answer, the shape a reasoning model streams.
+    Reasoning(String),
     /// Hold the stream until this path exists.
     WaitFor(PathBuf),
 }
@@ -234,6 +237,7 @@ fn paced_sse_response(stream: &mut TcpStream, chunks: &[Chunk]) {
     for chunk in chunks {
         let delta = match chunk {
             Chunk::Text(text) => json!({"content": text}),
+            Chunk::Reasoning(text) => json!({"reasoning_content": text}),
             Chunk::WaitFor(path) => {
                 let deadline = std::time::Instant::now() + Duration::from_secs(8);
                 while !path.exists() && std::time::Instant::now() < deadline {

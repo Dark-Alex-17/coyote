@@ -1928,3 +1928,265 @@ fn a_panic_at_start_leaves_the_alternate_screen_exactly_once() {
         assert!(push < pop, "{transcript}");
     }
 }
+
+const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
+const SYNC_END: &[u8] = b"\x1b[?2026l";
+
+/// A reasoning model's stream renders progressively too: with the
+/// reasoning delta held open on the wire the turn is visibly busy (the
+/// status row offers the interrupt), the reasoning text is already on
+/// screen and the answer is not; once released the answer lands and the
+/// status row stops ticking (it repaints once a second while it lives).
+#[test]
+#[serial]
+fn a_reasoning_stream_keeps_the_turn_busy_until_the_answer_is_sent() {
+    let dir = fresh_config_dir("reasoning-stream");
+    let _guard = TempDirGuard(dir.clone());
+    let release = dir.join("thinking-release");
+    let fake = FakeLlm::start(vec![Reply::Streamed(vec![
+        Chunk::Reasoning("pondering the question v5w".to_string()),
+        Chunk::WaitFor(release.clone()),
+        Chunk::Text("thought-out reply c3d".to_string()),
+    ])]);
+    write_fake_llm_config(&dir, &fake);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b"think about it\r").unwrap();
+    let started = std::time::Instant::now();
+    let transcript = wait_for_squeezed(
+        &mut pty,
+        "pondering the question v5w",
+        "the reasoning delta",
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "the reasoning delta was painted only after the fake gave up holding the stream"
+    );
+    assert!(
+        transcript.contains("Esc to interrupt"),
+        "no busy status row was shown while the model was reasoning:\n{transcript}"
+    );
+    let squeezed: String = transcript.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        !squeezed.contains("thought-outreplyc3d"),
+        "the answer was on screen before the fake sent it:\n{transcript}"
+    );
+    let settled = pty.read_for(Duration::from_millis(600));
+    assert!(
+        !settled
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            .contains("thought-outreplyc3d"),
+        "the answer reached the screen before the fake sent it:\n{settled}"
+    );
+
+    fs::write(&release, b"").unwrap();
+    wait_for_squeezed(
+        &mut pty,
+        "thought-out reply c3d",
+        "the answer after reasoning",
+    );
+    pty.read_for(Duration::from_millis(400));
+    let answered_at = pty.raw().len();
+    pty.read_for(Duration::from_millis(1600));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[answered_at..]));
+    assert!(
+        !since.contains("Esc to interrupt") && !since.contains("Working"),
+        "the busy status row kept repainting after the answer arrived:\n{since}"
+    );
+    assert_eq!(fake.served(), 1);
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// Frames are drawn inside synchronized updates on the real tty: every
+/// begin has its end, the pairs never nest or interleave, the first begin
+/// comes after the alternate screen is entered and the last end before it
+/// is left.
+#[test]
+#[serial]
+fn every_frame_on_the_tty_is_wrapped_in_a_synchronized_update() {
+    let dir = fresh_config_dir("sync-updates");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b".info\r").unwrap();
+    pty.wait_for("log_path", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+
+    let raw = pty.raw();
+    let enter_alt = find(raw, ENTER_ALT, 0).expect("the alternate screen was never entered");
+    let leave_alt = rfind(raw, LEAVE_ALT).expect("the alternate screen was never left");
+    let begins = count(raw, SYNC_BEGIN);
+    let ends = count(raw, SYNC_END);
+    assert!(
+        begins >= 2,
+        "fewer than two frames were drawn inside synchronized updates ({begins})"
+    );
+    assert_eq!(
+        begins, ends,
+        "synchronized updates were not balanced (begin={begins}, end={ends})"
+    );
+
+    // Walk the stream: begins and ends must strictly alternate.
+    let mut at = 0usize;
+    let mut open = false;
+    let mut first_begin = None;
+    let mut last_end = None;
+    while let Some(next) = [find(raw, SYNC_BEGIN, at), find(raw, SYNC_END, at)]
+        .into_iter()
+        .flatten()
+        .min()
+    {
+        if raw[next..].starts_with(SYNC_BEGIN) {
+            assert!(
+                !open,
+                "a synchronized update began at {next} while one was open"
+            );
+            first_begin.get_or_insert(next);
+            open = true;
+        } else {
+            assert!(open, "a synchronized update ended at {next} with none open");
+            open = false;
+            last_end = Some(next);
+        }
+        at = next + 1;
+    }
+    assert!(!open, "the last synchronized update was never ended");
+    let first_begin = first_begin.unwrap();
+    let last_end = last_end.unwrap();
+    assert!(
+        enter_alt < first_begin,
+        "a frame was drawn before the alternate screen was entered \
+         (begin={first_begin}, enter={enter_alt})"
+    );
+    assert!(
+        last_end < leave_alt,
+        "a frame ended after the alternate screen was left (end={last_end}, leave={leave_alt})"
+    );
+}
+
+/// The status row offers "Esc to interrupt" while a turn runs. Pressing
+/// Esc on a stream the model is still holding ends the turn at once: the
+/// next command is handled well before the model would have let go, the
+/// rest of the reply never lands, a fresh turn gets its own request, and
+/// the UI leaves cleanly.
+#[test]
+#[serial]
+fn esc_interrupts_a_held_stream_and_the_ui_keeps_taking_keys() {
+    let dir = fresh_config_dir("esc-interrupt");
+    let _guard = TempDirGuard(dir.clone());
+    let release = dir.join("never-released");
+    let fake = FakeLlm::start(vec![
+        Reply::Streamed(vec![
+            Chunk::Text("first half int-a1".to_string()),
+            Chunk::WaitFor(release),
+            Chunk::Text(" tail int-b2".to_string()),
+        ]),
+        Reply::Text("fresh reply after the interrupt s2".to_string()),
+    ]);
+    write_fake_llm_config(&dir, &fake);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b"stream and hold\r").unwrap();
+    wait_for_squeezed(&mut pty, "first half int-a1", "the first delta");
+    pty.wait_for("Esc to interrupt", PTY_DEADLINE)
+        .expect("the status row never offered Esc to interrupt");
+    let pressed = std::time::Instant::now();
+    pty.send(b"\x1b").unwrap();
+    // A command typed right after the interrupt runs as its own turn; had
+    // the stream still been running it would queue behind the fake's
+    // eight-second hold.
+    pty.read_for(Duration::from_millis(500));
+    let info_at = pty.raw().len();
+    pty.send(b".info\r").unwrap();
+    let transcript = pty
+        .wait_for_after("log_path", info_at, PTY_DEADLINE)
+        .expect("keys were not handled after the interrupt");
+    assert!(
+        pressed.elapsed() < Duration::from_secs(6),
+        "the command ran only after the fake gave up holding the stream, not on Esc"
+    );
+    let squeezed: String = transcript.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        !squeezed.contains("tailint-b2"),
+        "the interrupted stream's tail still reached the screen:\n{transcript}"
+    );
+
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b"next prompt\r").unwrap();
+    let transcript = wait_for_squeezed(
+        &mut pty,
+        "fresh reply after the interrupt s2",
+        "the reply to the turn after the interrupt",
+    );
+    assert_eq!(fake.served(), 2, "{transcript}");
+    let squeezed: String = transcript.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        !squeezed.contains("tailint-b2"),
+        "the interrupted stream's tail landed later:\n{transcript}"
+    );
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// A tool that records the `COYOTE_UI` it was given, the value a tool
+/// branches on to learn which surface answers its prompts.
+const UI_RECORD_TOOL: &str = "#!/usr/bin/env bash\n\
+    \n\
+    # @describe Record the UI the tool runs under.\n\
+    # @option --out! Path to write the UI name to.\n\
+    \n\
+    # @env LLM_OUTPUT=/dev/stdout The output path\n\
+    \n\
+    main() {\n\
+    \x20   local out\n\
+    \x20   out=\"$(jq -r '.out' <<< \"$LLM_TOOL_RAW_JSON\")\"\n\
+    \x20   printf '%s' \"${COYOTE_UI:-unset}\" > \"$out\"\n\
+    \x20   echo \"fixture recorded ui w7e\" >> \"$LLM_OUTPUT\"\n\
+    }\n";
+
+/// Tools run from the full-screen UI are told `COYOTE_UI=tui`.
+#[test]
+#[serial]
+fn a_tool_run_from_the_tui_sees_coyote_ui_tui() {
+    let dir = fresh_config_dir("tool-ui-env");
+    let _guard = TempDirGuard(dir.clone());
+    let out = dir.join("ui-seen");
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "fixture_ui".to_string(),
+            arguments: format!("{{\"out\": \"{}\"}}", out.display()),
+        },
+        Reply::Text("fixture done r4t".to_string()),
+    ]);
+    write_fake_llm_config(&dir, &fake);
+    write_tool(&dir, "fixture_ui.sh", UI_RECORD_TOOL);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b"call the ui tool\r").unwrap();
+    wait_for_file(&mut pty, &out, "the tool's COYOTE_UI record");
+    wait_for_squeezed(&mut pty, "fixture done r4t", "the reply after the tool");
+    assert_eq!(fs::read_to_string(&out).unwrap().trim(), "tui");
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
