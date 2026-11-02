@@ -1799,9 +1799,9 @@ def _pr_ref(state):
 
 def ci_poll(state):
     u = {}
-    if _watch_started(state):
+    if _review_mode(state):
         u["ci_polls_run"] = as_int(state.get("ci_polls_run")) + 1
-        if u["ci_polls_run"] >= REVIEW_CI_POLL_CEILING:
+        if _watch_started(state) and u["ci_polls_run"] >= REVIEW_CI_POLL_CEILING:
             u["ci_status"] = "poll_cap"
             u["_next"] = "ci_route"
             return u
@@ -1863,6 +1863,7 @@ def ci_route(state):
         # A killed poll leaves the previous visit's status behind, so this visit counts as one failed read.
         fails = as_int(state.get("ci_poll_fails")) + 1
         u["ci_poll_fails"] = fails
+        u["ci_polls_run"] = as_int(state.get("ci_polls_run")) + 1
         ledger(state, u, f"review-watch: PR #{_pr_ref(state)} CI read failed (poll node error); retry")
         if fails < CI_POLL_FAILS:
             u["_next"] = "ci_poll"
@@ -1932,6 +1933,21 @@ def _failed_run_log(root, run_id):
         return f"(log unavailable: {e})"
 
 
+def _rerun_failed(root, run_id):
+    cmd = os.environ.get("SISYPHUS_GH_RERUN_CMD")
+    try:
+        if cmd:
+            # Operator-environment test seam run through the shell; it carries the same trust as the process environment.
+            p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=GH_CALL_SECS,
+                               env={**os.environ, "SISYPHUS_RUN_ID": run_id})
+        else:
+            p = subprocess.run(["gh", "run", "rerun", run_id, "--failed"], cwd=root, capture_output=True,
+                               text=True, timeout=GH_CALL_SECS)
+        return p.returncode == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def ci_apply(state):
     u = {}
     harvest_anomalies(state, u, "ci_diagnose")
@@ -1946,20 +1962,23 @@ def ci_apply(state):
             ledger(state, u, f"ci: flake re-run budget exhausted for {exhausted}; a third red is real by definition")
         else:
             root = state.get("git_root") or state.get("project_dir") or "."
-            run_ids = []
+            checks_run, run_ids = [], []
             for name, link in as_list(state.get("ci_failing")):
+                run_id = m.group(1) if (m := re.search(r"/actions/runs/(\d+)", link or "")) else ""
+                checks_run.append((name, run_id))
+                if run_id and run_id not in run_ids:
+                    run_ids.append(run_id)
+            rerun_ids = run_ids[:CI_LOG_RUNS_MAX]
+            for name, run_id in checks_run:
+                if run_id and run_id not in rerun_ids:
+                    continue
                 reruns[name] = as_int(reruns.get(name)) + 1
-                if (m := re.search(r"/actions/runs/(\d+)", link or "")) and m.group(1) not in run_ids:
-                    run_ids.append(m.group(1))
                 ledger(state, u, f"flake-rerun: {name} (re-run {reruns[name]}/{CI_FLAKE_RERUNS})")
-            for run_id in run_ids[:CI_LOG_RUNS_MAX]:
-                if cmd := os.environ.get("SISYPHUS_GH_RERUN_CMD"):
-                    # Operator-environment test seam run through the shell; it carries the same trust as the process environment.
-                    subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=GH_CALL_SECS,
-                                   env={**os.environ, "SISYPHUS_RUN_ID": run_id})
-                else:
-                    subprocess.run(["gh", "run", "rerun", run_id, "--failed"], cwd=root, capture_output=True,
-                                   text=True, timeout=GH_CALL_SECS)
+            for run_id in run_ids:
+                if run_id not in rerun_ids:
+                    ledger(state, u, f"flake-rerun: run {run_id} not re-run (CI_LOG_RUNS_MAX reached)")
+                elif not _rerun_failed(root, run_id):
+                    ledger(state, u, f"flake-rerun: run {run_id} re-run call failed")
             u["ci_reruns"] = reruns
             u.update({"ci_polls": 0, "ci_poll_fails": 0, "ci_started_at": int(time.time()), "ci_status": "",
                       "ci_failing": []})
