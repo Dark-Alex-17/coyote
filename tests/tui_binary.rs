@@ -15,6 +15,7 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, fs, iter, process};
 
+use common::fake_llm::{FakeLlm, Reply};
 use common::pty::{Pty, strip_ansi};
 use serial_test::serial;
 
@@ -1378,5 +1379,381 @@ fn a_cold_start_with_no_cache_dir_comes_up_and_leaves_clean() {
         after[..report_at].trim().is_empty(),
         "bytes reached the terminal between the leave and the report: {:?}",
         after[..report_at].trim()
+    );
+}
+
+// ---------------------------------------------------------------------
+// Usage-probe scenarios driven by a scripted model: a real tool call in
+// the full-screen UI, so the prompt modal, the busy UI and the signal arm
+// are seen on a pty rather than through a TestBackend.
+// ---------------------------------------------------------------------
+
+/// The dry-run config with its only client pointed at `fake` instead, so a
+/// turn can carry a tool call. `save_session: false` keeps every exit
+/// prompt-free, as in [`write_dry_run_config`].
+fn write_fake_llm_config(dir: &Path, fake: &FakeLlm) {
+    let vault_pass = dir.join("vault-pass");
+    fs::write(&vault_pass, "test-password\n").unwrap();
+    fs::write(
+        dir.join("config.yaml"),
+        format!(
+            "model: fake:fake-model\n\
+             function_calling_support: true\n\
+             stream: true\n\
+             save_session: false\n\
+             vault_password_file: '{vault_pass}'\n\
+             clients:\n\
+             \x20 - type: openai-compatible\n\
+             \x20   name: fake\n\
+             \x20   api_base: '{api_base}'\n\
+             \x20   api_key: 'unused'\n\
+             \x20   models:\n\
+             \x20     - name: fake-model\n\
+             \x20       max_input_tokens: 100000\n\
+             \x20       supports_function_calling: true\n\
+             workspace_instructions: false\n\
+             memory: false\n",
+            vault_pass = vault_pass.display(),
+            api_base = fake.api_base(),
+        ),
+    )
+    .unwrap();
+}
+
+/// Drops one bash tool into the config's `functions/tools` dir; the binary
+/// builds its shim on startup. No `set -e`: the fixture `tput` on PATH
+/// exits 1 for everything but `cols`/`lines`, and the prompt helper's
+/// colour assignments would abort the tool under it.
+fn write_tool(dir: &Path, file: &str, body: &str) {
+    let tools = dir.join("functions").join("tools");
+    fs::create_dir_all(&tools).unwrap();
+    fs::write(tools.join(file), body).unwrap();
+}
+
+/// A tool that asks the user through the prompt channel and reports what
+/// it got.
+const CONFIRM_TOOL: &str = "#!/usr/bin/env bash\n\
+    \n\
+    # @describe Ask the user before continuing.\n\
+    \n\
+    # @env LLM_OUTPUT=/dev/stdout The output path\n\
+    \n\
+    # shellcheck disable=SC1090\n\
+    source \"$LLM_PROMPT_UTILS_FILE\"\n\
+    \n\
+    main() {\n\
+    \x20   local v\n\
+    \x20   v=\"$(confirm \"Proceed with the probe? k7m-q\")\"\n\
+    \x20   echo \"fixture confirm: ${v:-cancelled} k7m-r\" >> \"$LLM_OUTPUT\"\n\
+    }\n";
+
+/// A tool that marks its start at `<marker>-started`, then waits (at most
+/// eight seconds) for `<marker>-release` to appear before finishing.
+const SLEEP_TOOL: &str = "#!/usr/bin/env bash\n\
+    \n\
+    # @describe Wait until released.\n\
+    # @option --marker! Path prefix for the start and release files.\n\
+    \n\
+    # @env LLM_OUTPUT=/dev/stdout The output path\n\
+    \n\
+    main() {\n\
+    \x20   local marker\n\
+    \x20   marker=\"$(jq -r '.marker' <<< \"$LLM_TOOL_RAW_JSON\")\"\n\
+    \x20   : > \"${marker}-started\"\n\
+    \x20   for _ in $(seq 1 160); do\n\
+    \x20       [ -e \"${marker}-release\" ] && break\n\
+    \x20       sleep 0.05\n\
+    \x20   done\n\
+    \x20   echo \"fixture slept p3t\" >> \"$LLM_OUTPUT\"\n\
+    }\n";
+
+/// Pumps the pty until `path` exists, so the child's output never backs up
+/// while the test waits on a side effect.
+fn wait_for_file(pty: &mut Pty, path: &Path, what: &str) {
+    let deadline = std::time::Instant::now() + PTY_DEADLINE;
+    while !path.exists() {
+        let text = pty.read_for(Duration::from_millis(100));
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what} ({}) never appeared:\n{text}",
+            path.display()
+        );
+    }
+}
+
+/// Waits until `marker` is on screen with its surrounding whitespace
+/// squeezed out (a rendered markdown cell may wrap it), returning the
+/// transcript.
+fn wait_for_squeezed(pty: &mut Pty, marker: &str, what: &str) -> String {
+    let deadline = std::time::Instant::now() + PTY_DEADLINE;
+    let wanted: String = marker.chars().filter(|c| !c.is_whitespace()).collect();
+    loop {
+        let text = pty.read_for(Duration::from_millis(200));
+        let squeezed: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        if squeezed.contains(&wanted) {
+            return text;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what} never appeared:\n{text}"
+        );
+    }
+}
+
+/// `TuiPrompter` renders a tool's `Confirm` request as the modal and
+/// answers it: a tool asking through the prompt channel on a real tty
+/// shows its question in the UI, `y` lets the tool finish, the model's
+/// follow-up reply lands in the transcript, and no raw protocol line
+/// reaches the screen.
+#[test]
+#[serial]
+fn a_tools_confirm_request_is_the_modal_and_y_lets_the_tool_finish() {
+    let dir = fresh_config_dir("tool-confirm");
+    let _guard = TempDirGuard(dir.clone());
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "fixture_confirm".to_string(),
+            arguments: "{}".to_string(),
+        },
+        Reply::Text("fixture done z2v".to_string()),
+    ]);
+    write_fake_llm_config(&dir, &fake);
+    write_tool(&dir, "fixture_confirm.sh", CONFIRM_TOOL);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b"call the confirm tool\r").unwrap();
+    pty.wait_for("k7m-q", PTY_DEADLINE)
+        .expect("the tool's confirm question never reached the screen");
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"y").unwrap();
+    let transcript = wait_for_squeezed(&mut pty, "fixture done z2v", "the reply after the tool");
+    assert!(
+        !transcript.contains("coyote_prompt"),
+        "a raw prompt-protocol line reached the screen:\n{transcript}"
+    );
+    assert_eq!(fake.served(), 2, "{transcript}");
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// Keys are handled and frames drawn while a work task sleeps: with a tool
+/// blocked mid-turn, typed text shows up in the composer; once the tool is
+/// released the turn finishes, and Enter then submits the typed-ahead text
+/// as the next turn (it was neither lost nor swallowed).
+#[test]
+#[serial]
+fn typing_while_a_tool_sleeps_reaches_the_composer_and_submits_afterwards() {
+    let dir = fresh_config_dir("tool-sleep-keys");
+    let _guard = TempDirGuard(dir.clone());
+    let marker = dir.join("tool");
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "fixture_sleep".to_string(),
+            arguments: format!("{{\"marker\": \"{}\"}}", marker.display()),
+        },
+        Reply::Text("fixture done tail-k4q".to_string()),
+        Reply::Text("third reply m8n".to_string()),
+    ]);
+    write_fake_llm_config(&dir, &fake);
+    write_tool(&dir, "fixture_sleep.sh", SLEEP_TOOL);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b"call the sleep tool\r").unwrap();
+    wait_for_file(
+        &mut pty,
+        &dir.join("tool-started"),
+        "the sleep tool's start marker",
+    );
+    let typed_at = pty.raw().len();
+    let typed = std::time::Instant::now();
+    pty.send(b"typeahead-q9z").unwrap();
+    pty.wait_for_after("typeahead-q9z", typed_at, PTY_DEADLINE)
+        .expect("text typed while the tool slept was not drawn in the composer");
+    let drawn_after = typed.elapsed();
+    // The tool only ends when released (or after eight seconds on its
+    // own); the second model call is the sign the turn has moved on.
+    assert!(
+        !dir.join("tool-release").exists() && fake.served() == 1,
+        "text typed while the tool ran was drawn only {drawn_after:?} later, after the \
+         turn had finished (model calls served: {}); frames must be drawn and keys \
+         handled while a work task sleeps",
+        fake.served()
+    );
+
+    fs::write(dir.join("tool-release"), b"").unwrap();
+    wait_for_squeezed(
+        &mut pty,
+        "fixture done tail-k4q",
+        "the reply after the tool",
+    );
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b"\r").unwrap();
+    let transcript = wait_for_squeezed(
+        &mut pty,
+        "third reply m8n",
+        "the reply to the typed-ahead prompt",
+    );
+    assert_eq!(fake.served(), 3, "{transcript}");
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// SIGTERM while a work task is still running (a tool blocked mid-turn)
+/// still runs the leave path: the alternate screen is left, the tty is
+/// cooked and the exit is orderly. How long that takes is reported, not
+/// pinned: the plan bounds no exit time while a work task owns the context.
+#[test]
+#[serial]
+fn sigterm_during_a_running_tool_still_leaves_the_tty_cooked() {
+    let dir = fresh_config_dir("sigterm-tool");
+    let _guard = TempDirGuard(dir.clone());
+    let marker = dir.join("tool");
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "fixture_sleep".to_string(),
+            arguments: format!("{{\"marker\": \"{}\"}}", marker.display()),
+        },
+        Reply::Text("fixture done after sigterm".to_string()),
+    ]);
+    write_fake_llm_config(&dir, &fake);
+    write_tool(&dir, "fixture_sleep.sh", SLEEP_TOOL);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    let transcript = pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let pid = child_pid(&transcript);
+    pty.send(b"call the sleep tool\r").unwrap();
+    wait_for_file(
+        &mut pty,
+        &dir.join("tool-started"),
+        "the sleep tool's start marker",
+    );
+    let signalled_at = pty.raw().len();
+    let started = std::time::Instant::now();
+    // SAFETY: kill takes a pid and a signal number and touches no memory.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    let took = started.elapsed();
+
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+    assert!(
+        find(pty.raw(), LEAVE_ALT, signalled_at.saturating_sub(16)).is_some(),
+        "SIGTERM during the tool never left the alternate screen:\n{transcript}"
+    );
+    // The tool gives up on its own after eight seconds; an exit slower
+    // than that waited the turn out rather than tearing it down.
+    eprintln!("SIGTERM during a running tool: exit took {took:?} (tool runs 8s unreleased)");
+}
+
+/// Two turns in a row: the second prompt gets its own rendered reply and
+/// the first turn's cells are still there, so the transcript grows rather
+/// than being replaced.
+#[test]
+#[serial]
+fn a_second_turn_renders_after_the_first_without_losing_it() {
+    let dir = fresh_config_dir("two-turns");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b"**alpha** one-1q\r").unwrap();
+    wait_for_squeezed(&mut pty, "alpha one-1q", "the first rendered reply");
+    pty.read_for(Duration::from_millis(300));
+    let second_at = pty.raw().len();
+    pty.send(b"**beta** two-2w\r").unwrap();
+    let transcript = wait_for_squeezed(&mut pty, "beta two-2w", "the second rendered reply");
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[second_at..]));
+    assert!(
+        since.contains("**beta**"),
+        "the second prompt never reached the screen as a user cell:\n{since}"
+    );
+    assert!(
+        transcript.contains("**alpha**"),
+        "the first turn vanished from the transcript:\n{transcript}"
+    );
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// The tty check names stdin and stdout only: `coyote 2> log` is a normal
+/// run. The UI comes up, Ctrl+D leaves cleanly, and nothing of the
+/// alternate screen lands in the stderr file.
+#[test]
+#[serial]
+fn stderr_redirected_to_a_file_is_not_a_tty_refusal() {
+    let dir = fresh_config_dir("stderr-file");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let captured = dir.join("stderr.log");
+    let wrapper = format!(
+        "'{{coyote}}' <{{stdin}} 2>'{}' & cpid=$!; echo \"cpid=$cpid\"; wait $cpid; rc=$?; {{report}}",
+        captured.display()
+    );
+    let mut pty = spawn_tui_under(&dir, &[], &wrapper, "/dev/tty");
+
+    pty.wait_for("no session", PTY_DEADLINE)
+        .expect("the UI did not come up with stderr redirected to a file");
+    pty.send(b".info\r").unwrap();
+    pty.wait_for("log_path", PTY_DEADLINE).unwrap();
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+    assert!(
+        !transcript.contains("No TTY for TUI"),
+        "a stderr redirect was treated as a missing tty:\n{transcript}"
+    );
+    let file = fs::read(&captured).unwrap_or_default();
+    assert!(
+        find(&file, ENTER_ALT, 0).is_none() && find(&file, LEAVE_ALT, 0).is_none(),
+        "alt-screen escapes were written into the stderr file: {:?}",
+        String::from_utf8_lossy(&file)
+    );
+}
+
+/// A window dragged down to almost nothing and back: no panic, the chrome
+/// returns at full size and keys still work.
+#[test]
+#[serial]
+fn a_tiny_window_does_not_crash_the_ui_and_growing_back_repaints() {
+    let dir = fresh_config_dir("tiny-resize");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    for (rows, cols) in [(3u16, 12u16), (1, 1), (2, 40)] {
+        pty.resize(rows, cols).unwrap();
+        pty.read_for(Duration::from_millis(400));
+    }
+    let before = pty.raw().len();
+    pty.resize(40, 100).unwrap();
+    assert_repainted_after(&mut pty, before, "growing back from a 1x1 window");
+
+    pty.send(b".info\r").unwrap();
+    pty.wait_for("log_path", PTY_DEADLINE)
+        .expect("keys were not handled after the tiny-window round trip");
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        1,
+        "the alternate screen was left more than once (a panic restore?):\n{transcript}"
     );
 }

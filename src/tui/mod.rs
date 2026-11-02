@@ -151,15 +151,35 @@ fn late_output(tx: UnboundedSender<UiMsg>) -> impl Fn(String) + Send + 'static {
     }
 }
 
+/// Drives a work-task future to completion on a blocking-pool thread.
+/// The returned handle joins like a `tokio::spawn` one, but the future
+/// may block its thread freely; see [`spawn_turn`] for why it must.
+fn spawn_work<F>(future: F) -> JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || handle.block_on(future))
+}
+
 /// Runs one line the way the REPL would, on its own task, with fds 1 and 2
 /// captured. The context comes back with the outcome.
+///
+/// Runtime rule: the work task must never sit on a runtime worker. The
+/// turn blocks its thread for the whole of a tool call and of a sync
+/// prompt, and on the multi-thread runtime the time driver is serviced
+/// by parked workers, never by the UI loop's `block_on` thread. A worker
+/// blocked in the turn can hold the driver up with it, and every
+/// timer-driven frame then waits for the turn to end. So the body runs on
+/// the blocking pool under a nested `block_on` ([`spawn_work`]).
 pub(crate) fn spawn_turn(
     mut ctx: RequestContext,
     abort: AbortSignal,
     line: String,
     ui: UnboundedSender<UiMsg>,
 ) -> JoinHandle<(RequestContext, TurnOutcome)> {
-    tokio::spawn(async move {
+    spawn_work(async move {
         let guard = match FdRedirect::begin(late_output(ui)) {
             Ok(guard) => Some(guard),
             Err(err) => {
@@ -185,13 +205,14 @@ pub(crate) fn spawn_turn(
     })
 }
 
-/// The REPL's teardown on the work task: settles background agents, exits
-/// the session (which may ask to save it) and closes the agent bracket.
+/// The REPL's teardown on the work task, under the same runtime rule as
+/// [`spawn_turn`]: settles background agents, exits the session (which
+/// may ask to save it) and closes the agent bracket.
 fn spawn_exit(
     mut ctx: RequestContext,
     abort: AbortSignal,
 ) -> JoinHandle<(RequestContext, Result<()>, String)> {
-    tokio::spawn(async move {
+    spawn_work(async move {
         let guard = FdRedirect::begin(|_| {}).ok();
         ctx.cancel_background_tasks_and_wait(EXIT_CANCEL_WAIT).await;
         let result = ctx.exit_session();
@@ -2064,6 +2085,27 @@ mod tests {
         assert!(started.elapsed() < EXIT_CANCEL_WAIT);
         assert_eq!(early_answer.unwrap(), PromptAnswer::Confirmed(false));
         assert_eq!(late_answer.unwrap(), PromptAnswer::Confirmed(true));
+    }
+
+    /// One worker, and the work task blocks its thread for longer than the
+    /// frame is due in: the frame still fires on time, because the task
+    /// runs on the blocking pool and the lone worker stays free to service
+    /// the time driver. Spawned onto the worker instead, the frame would
+    /// wait out the whole block.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_blocking_work_task_does_not_starve_the_frame_timer() {
+        const BLOCK: Duration = Duration::from_millis(300);
+        let mut frames = FrameScheduler::new(Arc::new(SystemClock));
+        let work = spawn_work(async { std::thread::sleep(BLOCK) });
+        frames.schedule_frame_in(Duration::from_millis(10));
+        let started = Instant::now();
+        frames.next_frame().await;
+        let waited = started.elapsed();
+        assert!(
+            waited < BLOCK / 2,
+            "the frame waited {waited:?} for a {BLOCK:?} block on the work task"
+        );
+        work.await.unwrap();
     }
 
     /// A panic message reaches the loop as late output while the task is
