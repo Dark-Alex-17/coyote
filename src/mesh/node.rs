@@ -120,8 +120,10 @@ pub(crate) const REKEY_GRACE: Duration = Duration::from_secs(5);
 /// Poll interval while waiting for a TCP relay to report itself connected.
 const CONNECT_POLL: Duration = Duration::from_millis(50);
 /// Depth of the channel a `local` rnsd's shared-instance client reports its connection
-/// state on; the client drops an event when it is full.
-const LOCAL_EVENT_CAPACITY: usize = 16;
+/// state on; the client drops an event when it is full. A client failing its dial sends
+/// one event every `LOCAL_RECONNECT_WAIT`, so 64 slots outlast the start's later joins and
+/// the watcher's announce waits by minutes before a `Connected` could be dropped.
+const LOCAL_EVENT_CAPACITY: usize = 64;
 /// How long the shared-instance client waits before redialing rnsd after a drop; the row
 /// reads `lost, retrying` until a redial lands.
 const LOCAL_RECONNECT_WAIT: Duration = Duration::from_secs(2);
@@ -3002,7 +3004,8 @@ async fn watch_interfaces(
             },
             // The `local` row reads its client's own state stream, not the interface
             // events: the shared-instance client exposes no state to re-read, so an event
-            // lost to a broadcast `Lagged` could not be caught up.
+            // lost to a broadcast `Lagged` could not be caught up. This stream drops when
+            // full too, which `LOCAL_EVENT_CAPACITY` is sized to keep out of reach.
             event = next_shared_instance_event(&mut local) => {
                 let Some(runtime) = runtime.upgrade() else {
                     return;
@@ -12099,13 +12102,17 @@ mod tests {
     }
 
     /// Stands in for an rnsd that takes one connection and nothing after it: the task
-    /// accepts one connection and ends, closing the listener and that stream together,
-    /// so every later dial to the port is refused. Awaiting the task proves the port is
-    /// free for `restart_local_stub`.
+    /// accepts one connection, closes the listener and only then that stream, so the
+    /// client's first sight of the drop comes after the port is closed. A dial that
+    /// reached the backlog before the close can still land one short cycle, so a test
+    /// counting connects ties them to the drops it saw. Awaiting the task proves the port
+    /// is free for `restart_local_stub`.
     #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
     fn accept_once_then_close(listener: tokio::net::TcpListener) -> JoinHandle<()> {
         tokio::spawn(async move {
-            let (_probe, _) = listener.accept().await.unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(listener);
+            drop(stream);
         })
     }
 
@@ -12507,13 +12514,15 @@ mod tests {
     /// row `connected`, told once, and the drop that follows is the watcher's to read,
     /// which moves the row to `lost, retrying` with the kind out and no idle line. The
     /// row keeps the drop until a listener is back on the port and the client's redial
-    /// lands, which is the second connect told. The lever is written for the TCP shape,
-    /// so the test runs where that shape is the `local` endpoint (Linux and Android dial
-    /// an abstract socket there).
+    /// lands. The client redials at once after a short-lived first stream, and under
+    /// load that redial can land one extra cycle before the restart; every move into
+    /// `connected` is told once, so the count is one per drop told plus the start's. The
+    /// lever is written for the TCP shape, so the test runs where that shape is the
+    /// `local` endpoint (Linux and Android dial an abstract socket there).
     #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_local_rnsd_that_drops_the_client_at_once_starts_connected_then_reads_lost() {
-        use crate::testing::info_snapshot;
+        use crate::testing::{info_snapshot, warn_snapshot};
 
         install_log_collector();
         let (port, socket) = held_port().await;
@@ -12565,7 +12574,19 @@ mod tests {
         .await;
         assert_eq!(runtime.interface_kinds(), vec!["local"]);
         sleep(WATCH_SETTLE * 2).await;
-        assert_eq!(connects_told(), 2, "{:?}", info_snapshot());
+        let lost_line = format!("Mesh interface {label} lost rnsd; the transport is redialing it");
+        let losses_told = warn_snapshot()
+            .iter()
+            .filter(|line| **line == lost_line)
+            .count();
+        assert!(losses_told >= 1, "{:?}", warn_snapshot());
+        assert_eq!(
+            connects_told(),
+            losses_told + 1,
+            "{:?} / {:?}",
+            info_snapshot(),
+            warn_snapshot()
+        );
         assert!(
             notifier.0.lock().is_empty(),
             "a local row prints no idle line: {:?}",
