@@ -56,7 +56,8 @@ pub(crate) const KNOCK_QUEUE_CAPACITY: usize = 64;
 /// that get this far, so the cap is a backstop against a trust list of thousands, not
 /// against an attacker minting identities. An identity evicted from the map is new again
 /// when it returns, with a full bucket and one more line to spend; getting there takes
-/// 256 other trust-listed identities knocking in between.
+/// 256 other trust-listed identities knocking in between. The ceiling on terminal lines
+/// is the bucket, not this dedupe: no identity surfaces more knocks than it is admitted.
 pub(crate) const KNOCK_GATE_MAX_IDENTITIES: usize = 256;
 /// Knocks one identity may land back to back before the rest are dropped.
 pub(crate) const KNOCK_BUCKET_BURST: u32 = 3;
@@ -69,7 +70,8 @@ pub(crate) const KNOCK_BUCKET_REFILL_INTERVAL: Duration = Duration::from_secs(10
 pub(crate) const KNOCK_DROPS_REMEMBERED: usize = 16;
 /// Instances per identity the gate remembers having surfaced a knock from; the oldest
 /// goes when the list is full, so an identity knocking from more instances than this
-/// may surface one of them again. With `KNOCK_GATE_MAX_IDENTITIES` it bounds the gate.
+/// may surface one of them again. With `KNOCK_GATE_MAX_IDENTITIES` it bounds the gate's
+/// memory; the bucket, not this list, bounds the terminal lines an identity can earn.
 const KNOCK_SURFACED_DESTINATIONS_MAX: usize = 16;
 
 /// The knocker's text, cleaned and within `KNOCK_INTRO_MAX_CHARS`. Empty is allowed: a
@@ -504,7 +506,8 @@ impl GateState {
 /// dispatcher already refused the request, but a fetched knock arrives with no dispatcher
 /// in front of it, and a block may have landed since. Then a per-identity bucket, the
 /// cache, and one terminal line per instance of an identity per session, until the
-/// owner acts on that identity.
+/// owner acts on that identity. The bucket is the ceiling on terminal lines; the
+/// per-instance dedupe only keeps a repeat from an instance off the terminal.
 pub(crate) struct KnockGate {
     trust: Arc<TrustStore>,
     peers: Arc<PeerTable>,
@@ -663,6 +666,9 @@ impl KnockGate {
             model_note: None,
         });
         if !shown {
+            // The line never reached the terminal, so the instance may try again. An
+            // older instance evicted to make room for this mark is not restored; it can
+            // earn one more line, which the bucket still bounds.
             self.state
                 .lock()
                 .entry(&knock.identity_hash, now)
@@ -786,6 +792,16 @@ impl KnockGate {
     #[cfg(test)]
     pub(crate) fn tracked_identities(&self) -> Vec<String> {
         self.state.lock().identities.keys().cloned().collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn surfaced_instances(&self, identity: &str) -> Vec<String> {
+        self.state
+            .lock()
+            .identities
+            .get(&identity.to_ascii_lowercase())
+            .map(|state| state.surfaced.iter().cloned().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -3138,22 +3154,57 @@ mod tests {
             Rig::new(tag, TrustList::default().identity(identity, false))
         }
 
-        #[test]
-        fn a_knock_from_another_instance_surfaces_after_the_owner_trusts_the_first() {
-            let identity = hash_of("id-x");
-            let rig = rig_for("knock-gate-other-instance", &identity);
-            let start = now();
-
+        /// Surfaces a knock from instance A, quiets its repeat, then trusts instance C of
+        /// the same identity in the rig's trust list, as `.mesh trust` would.
+        fn surface_a_then_trust_c(rig: &Rig, identity: &str, at: Instant) {
             assert_eq!(
-                knock_at(&rig, &identity, "inst-c", start),
+                knock_at(rig, identity, "inst-a", at),
                 Admission::Admitted { surfaced: true }
             );
+            assert_eq!(
+                knock_at(rig, identity, "inst-a", at),
+                Admission::Admitted { surfaced: false }
+            );
+            TrustList::default()
+                .destination(&hash_of("inst-c"), identity)
+                .write(&rig._tmp.path);
+            assert_eq!(
+                rig.gate
+                    .trust
+                    .authorize(identity, &hash_of("inst-c"))
+                    .decision,
+                Decision::Allow
+            );
+        }
+
+        #[test]
+        fn an_instance_already_surfaced_surfaces_again_after_the_owner_trusts_another() {
+            let identity = hash_of("id-x");
+            let rig = rig_for("knock-gate-trust-resets", &identity);
+            let start = now();
+            surface_a_then_trust_c(&rig, &identity, start);
+
             rig.gate.reset_surfaced(&identity);
+
             assert_eq!(
                 knock_at(&rig, &identity, "inst-a", start),
                 Admission::Admitted { surfaced: true }
             );
             assert_eq!(rig.surface.texts().len(), 2);
+        }
+
+        #[test]
+        fn without_the_reset_an_instance_already_surfaced_stays_quiet_after_a_trust() {
+            let identity = hash_of("id-x");
+            let rig = rig_for("knock-gate-trust-no-reset", &identity);
+            let start = now();
+            surface_a_then_trust_c(&rig, &identity, start);
+
+            assert_eq!(
+                knock_at(&rig, &identity, "inst-a", start),
+                Admission::Admitted { surfaced: false }
+            );
+            assert_eq!(rig.surface.texts().len(), 1);
         }
 
         #[test]

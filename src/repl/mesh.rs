@@ -26233,6 +26233,327 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 });
             }
 
+            /// Each owner verb on an identity earns its instances a knock line again; a
+            /// declined confirmation and a repeat block that changes nothing do not.
+            mod owner_action_resets_knock_surfacing {
+                use super::*;
+                use crate::mesh::knock::{Admission, InboundKnock, KnockVia};
+                use crate::mesh::session_destination_name;
+                use rns_transport::destination::SingleInputDestination;
+                use rns_transport::identity::PrivateIdentity;
+                use rns_transport::rand_core::OsRng;
+                use std::time::Instant;
+
+                /// Identity X, kept known by its trusted instance B, with two more heard
+                /// instances C and A that nothing trusts.
+                struct Rig {
+                    started: StartedRuntime,
+                    ctx: RequestContext,
+                    identity: String,
+                    b: String,
+                    c: String,
+                    a: String,
+                }
+
+                impl Rig {
+                    async fn new(tag: &str) -> Self {
+                        let started = started_runtime(tag).await;
+                        let ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                        let now = SystemTime::now();
+                        let key = PrivateIdentity::new_from_rand(OsRng);
+                        let [b, c, a] = ["owner-b", "owner-c", "owner-a"].map(|aspect| {
+                            let name = session_destination_name(aspect);
+                            let announced = SingleInputDestination::new(key.clone(), name);
+                            let destination = announced.desc.address_hash.to_hex_string();
+                            started.runtime.peers().observe(
+                                PeerSighting {
+                                    destination_hash: destination.clone(),
+                                    identity_hash: announced
+                                        .desc
+                                        .identity
+                                        .address_hash
+                                        .to_hex_string(),
+                                    name_hash: hex_lower(name.as_name_hash_slice()),
+                                    display_name: Some("Tia".to_string()),
+                                    protocol_version: 1,
+                                    hops: 1,
+                                },
+                                now,
+                            );
+                            destination
+                        });
+                        let identity = started.runtime.peers().get(&b).unwrap().identity_hash;
+                        let rig = Self {
+                            started,
+                            ctx,
+                            identity,
+                            b,
+                            c,
+                            a,
+                        };
+                        rig.trust_instance(&rig.b);
+                        rig
+                    }
+
+                    fn trust_instance(&self, destination: &str) {
+                        self.started
+                            .runtime
+                            .trust()
+                            .trust_destination(
+                                self.ctx.app.mesh.as_ref(),
+                                destination,
+                                TrustOptions::default(),
+                                SystemTime::now(),
+                            )
+                            .unwrap();
+                    }
+
+                    fn knock_from_a(&self) -> Admission {
+                        self.started.runtime.knock_gate().admit(
+                            InboundKnock {
+                                identity_hash: self.identity.clone(),
+                                destination_hash: self.a.clone(),
+                                name_hash: String::new(),
+                                via: KnockVia::Direct,
+                                intro: None,
+                            },
+                            Instant::now(),
+                            SystemTime::now(),
+                        )
+                    }
+
+                    /// A's first knock earns its line and its repeat stays quiet.
+                    fn surface_a(&self) {
+                        assert_eq!(self.knock_from_a(), Admission::Admitted { surfaced: true });
+                        assert_eq!(self.knock_from_a(), Admission::Admitted { surfaced: false });
+                        assert_eq!(self.surfaced(), vec![self.a.clone()]);
+                    }
+
+                    fn surfaced(&self) -> Vec<String> {
+                        self.started
+                            .runtime
+                            .knock_gate()
+                            .surfaced_instances(&self.identity)
+                    }
+
+                    async fn run(&mut self, line: &str) -> String {
+                        out_of(&mut self.ctx, line).await.unwrap()
+                    }
+
+                    async fn stop(self) {
+                        assert!(self.ctx.app.mesh.stop().await.unwrap());
+                        self.started.relay_handle.abort();
+                    }
+                }
+
+                #[test]
+                #[serial]
+                fn trusting_another_instance_surfaces_a_again() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-reset-trust");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut rig = Rig::new("repl-mesh-reset-trust").await;
+                        rig.surface_a();
+
+                        let c = rig.c.clone();
+                        rig.run(&format!(".mesh trust {c} --yes")).await;
+
+                        assert_eq!(rig.knock_from_a(), Admission::Admitted { surfaced: true });
+                        rig.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn trusting_the_identity_clears_what_was_surfaced() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-reset-trust-identity");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut rig = Rig::new("repl-mesh-reset-trust-identity").await;
+                        rig.surface_a();
+
+                        let identity = rig.identity.clone();
+                        rig.run(&format!(".mesh trust --identity {identity} --yes"))
+                            .await;
+
+                        assert_eq!(rig.knock_from_a(), Admission::AlreadyTrusted);
+                        assert!(rig.surfaced().is_empty());
+                        rig.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn untrusting_an_instance_surfaces_a_again() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-reset-untrust");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut rig = Rig::new("repl-mesh-reset-untrust").await;
+                        let c = rig.c.clone();
+                        rig.trust_instance(&c);
+                        rig.surface_a();
+
+                        rig.run(&format!(".mesh untrust {c} --yes")).await;
+
+                        assert_eq!(rig.knock_from_a(), Admission::Admitted { surfaced: true });
+                        rig.stop().await;
+                    });
+                }
+
+                /// The identity is granted for all destinations behind the gate's back,
+                /// so A's line was surfaced before the grant the verb withdraws.
+                #[test]
+                #[serial]
+                fn untrusting_the_identity_surfaces_a_again() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-reset-untrust-identity");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut rig = Rig::new("repl-mesh-reset-untrust-identity").await;
+                        rig.surface_a();
+                        let identity = rig.identity.clone();
+                        rig.started
+                            .runtime
+                            .trust()
+                            .trust_identity(
+                                rig.ctx.app.mesh.as_ref(),
+                                &identity,
+                                TrustOptions::default(),
+                                SystemTime::now(),
+                            )
+                            .unwrap();
+
+                        rig.run(&format!(
+                            ".mesh untrust --identity {identity} --confirm untrust-{}",
+                            short(&identity)
+                        ))
+                        .await;
+
+                        assert_eq!(rig.knock_from_a(), Admission::Admitted { surfaced: true });
+                        rig.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn blocking_another_instance_surfaces_a_again() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-reset-block");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut rig = Rig::new("repl-mesh-reset-block").await;
+                        rig.surface_a();
+
+                        let c = rig.c.clone();
+                        rig.run(&format!(".mesh block {c} --yes")).await;
+
+                        assert_eq!(rig.knock_from_a(), Admission::Admitted { surfaced: true });
+                        rig.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn blocking_the_identity_clears_what_was_surfaced() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-reset-block-identity");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut rig = Rig::new("repl-mesh-reset-block-identity").await;
+                        rig.surface_a();
+
+                        let identity = rig.identity.clone();
+                        rig.run(&format!(".mesh block --identity {identity} --yes"))
+                            .await;
+
+                        assert_eq!(rig.knock_from_a(), Admission::Blocked);
+                        assert!(rig.surfaced().is_empty());
+                        rig.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn forgetting_the_identity_clears_what_was_surfaced() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-reset-forget");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut rig = Rig::new("repl-mesh-reset-forget").await;
+                        rig.surface_a();
+
+                        let identity = rig.identity.clone();
+                        rig.run(&format!(
+                            ".mesh forget --identity {identity} --confirm forget-{}",
+                            short(&identity)
+                        ))
+                        .await;
+
+                        assert_eq!(rig.knock_from_a(), Admission::Unknown);
+                        assert!(rig.surfaced().is_empty());
+                        rig.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn a_declined_block_leaves_a_quiet() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-reset-declined");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[false]);
+                    run_async(async {
+                        let mut rig = Rig::new("repl-mesh-reset-declined").await;
+                        rig.surface_a();
+
+                        let c = rig.c.clone();
+                        let out = rig.run(&format!(".mesh block {c}")).await;
+
+                        assert!(out.contains(NOTHING_CHANGED), "{out}");
+                        assert_eq!(prompt_script::prompts_asked(), 1);
+                        assert_eq!(rig.knock_from_a(), Admission::Admitted { surfaced: false });
+                        assert_eq!(rig.surfaced(), vec![rig.a.clone()]);
+                        rig.stop().await;
+                    });
+                }
+
+                /// The first block goes straight to the store, so only the verb's repeat
+                /// could have reset anything.
+                #[test]
+                #[serial]
+                fn a_repeat_identity_block_with_nothing_new_leaves_the_marks() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-reset-repeat-block");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut rig = Rig::new("repl-mesh-reset-repeat-block").await;
+                        rig.surface_a();
+                        let identity = rig.identity.clone();
+                        rig.started
+                            .runtime
+                            .trust()
+                            .block_identity(
+                                rig.ctx.app.mesh.as_ref(),
+                                &identity,
+                                None,
+                                SystemTime::now(),
+                            )
+                            .unwrap();
+
+                        let out = rig
+                            .run(&format!(".mesh block --identity {identity} --yes"))
+                            .await;
+
+                        assert!(out.contains("is already blocked."), "{out}");
+                        assert_eq!(rig.surfaced(), vec![rig.a.clone()]);
+                        rig.stop().await;
+                    });
+                }
+            }
+
             mod command_prefix_refusals {
                 use super::*;
                 use crate::config::{CommandPrefix, live_prefix_override};
