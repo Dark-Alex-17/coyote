@@ -1271,7 +1271,7 @@ fn strip_tool_tag(question: &str) -> &str {
 /// the answer command with the whole `message_id`, whatever the question's length.
 /// `.mesh pending` is the surface: the record is filed there before this line prints,
 /// while the inbox copy lands only once the envoy run ends.
-fn escalation_line(who: &str, question: &str, message_id: &str) -> String {
+pub(crate) fn escalation_line(who: &str, question: &str, message_id: &str) -> String {
     let words = capped_peer_text(question, PEER_LINE_MAX_CHARS).unwrap_or_default();
     let pointer = if words.cut {
         format!(" {PENDING_FULL_TEXT_POINTER}")
