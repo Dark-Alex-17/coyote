@@ -2,7 +2,7 @@ use crate::config::mesh_config::{
     DEFAULT_LOCAL_RNSD_INSTANCE, DEFAULT_LOCAL_RNSD_PORT, EnvoyMemoryConfig, MeshConfig,
     MeshInterface,
 };
-use crate::config::{ForkRekey, LivePrefix, Session, paths};
+use crate::config::{ForkRekey, LivePrefix, RequestContext, Session, paths};
 use crate::mesh::access::{AccessHandler, AccessRouting, AccessSurface, put_back};
 use crate::mesh::announce::{
     AnnounceAppData, HEARTBEAT_PERIOD_SECS, HEARTBEAT_SECS, REANNOUNCE_FLOOR_SECS,
@@ -98,7 +98,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{Mutex, broadcast, mpsc};
@@ -137,6 +137,9 @@ const LAN_CHANNEL_CAPACITY: usize = 128;
 const PEER_PERSIST_INTERVAL_SECS: u64 = 30;
 /// Refusal shared by `MeshSlot::install` and the `.mesh on` pre-check.
 pub(crate) const MESH_ALREADY_ON: &str = "Mesh is already on in this process. Run `.mesh off` first, then `.mesh on` to start it again with the current settings.";
+/// Floor between two snapshot captures made at progress points inside a turn. Turn
+/// boundaries publish regardless of it.
+pub(crate) const MESH_PROGRESS_MIN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How many (sending identity, message id) pairs the slot remembers as handed to the
 /// envoy. A body reaches a receiver twice when a link delivery's acknowledgement is lost
@@ -3521,7 +3524,8 @@ impl OwnEntryMarks {
 /// the REPL holds the session context write-locked for a whole turn, so anything that
 /// serves peers must be readable without it.
 ///
-/// `snapshot()` is the picture taken at the last turn boundary. `objective_override()`,
+/// `snapshot()` is the picture taken at the last turn boundary, or at the last progress
+/// point inside a long turn. `objective_override()`,
 /// `digest()` and `user_brief()` are live and may be newer than it. Consumers overlay
 /// `objective_override()` on `snapshot().objective` when it is `Some`. `brief()` is
 /// derived: `reassemble_brief` rebuilds it from the snapshot, the digest and the user
@@ -3560,6 +3564,17 @@ impl OwnEntryMarks {
 /// `command_prefix` is the session's configured prefix, kept in step with the config by
 /// whoever writes it, so every line printed for the human shows command hints the way
 /// the human types them.
+///
+/// `last_progress_capture` is when a progress point inside a turn last captured a
+/// snapshot, and `digest_hook` is who may regenerate the digest after one; only the
+/// interactive REPL installs a hook.
+///
+/// `pending_progress` is the latest snapshot a progress point captured too soon after
+/// the last one. While it is set, `trailing_armed` marks the one timer task that will
+/// publish it once the interval has passed. Every `publish` clears it under the same
+/// lock, so a turn boundary is never overwritten by an older progress snapshot.
+///
+/// `progress_without_node` lets a test slot take progress points with no node running.
 #[derive(Default)]
 pub(crate) struct MeshSlot {
     inner: RwLock<Option<Arc<MeshRuntime>>>,
@@ -3582,13 +3597,44 @@ pub(crate) struct MeshSlot {
     model_notes: ModelNotes,
     inbound: parking_lot::Mutex<Option<Arc<InboundStore>>>,
     command_prefix: LivePrefix,
+    last_progress_capture: parking_lot::Mutex<Option<tokio::time::Instant>>,
+    pending_progress: parking_lot::Mutex<Option<MeshSnapshot>>,
+    trailing_armed: AtomicBool,
+    digest_hook: ArcSwapOption<Arc<dyn MeshDigestHook>>,
+    #[cfg(test)]
+    progress_without_node: bool,
     #[cfg(test)]
     envoy_memory_override: ArcSwapOption<EnvoySessions>,
 }
 
+/// Offered the owning session's context at every progress point inside a turn, captured
+/// or deferred, so the digest can be regenerated without the turn's context lock. The
+/// implementation must not wait: it runs on the turn's own task.
+pub(crate) trait MeshDigestHook: Send + Sync {
+    fn on_progress(&self, ctx: &RequestContext);
+}
+
 impl MeshSlot {
+    #[cfg(test)]
+    pub(crate) fn without_node_gate() -> Self {
+        Self {
+            progress_without_node: true,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn get(&self) -> Option<Arc<MeshRuntime>> {
         self.inner.read().clone()
+    }
+
+    /// Whether a progress point has anyone to publish for. Without a running node no
+    /// peer can read the snapshot, so the capture and its timer are skipped.
+    pub(crate) fn takes_progress_points(&self) -> bool {
+        #[cfg(test)]
+        if self.progress_without_node {
+            return true;
+        }
+        self.get().is_some()
     }
 
     pub(crate) fn command_prefix(&self) -> &LivePrefix {
@@ -3830,12 +3876,91 @@ impl MeshSlot {
     }
 
     pub(crate) fn publish(&self, snapshot: MeshSnapshot) {
-        self.snapshot.store(Some(Arc::new(snapshot)));
+        {
+            let mut pending = self.pending_progress.lock();
+            *pending = None;
+            self.snapshot.store(Some(Arc::new(snapshot)));
+        }
         self.reassemble_brief();
     }
 
     pub(crate) fn snapshot(&self) -> Option<Arc<MeshSnapshot>> {
         self.snapshot.load_full()
+    }
+
+    /// Claims the next progress-point capture: `true`, and `now` recorded, when none was
+    /// made in the `MESH_PROGRESS_MIN_INTERVAL` before `now`. A claim already being
+    /// decided elsewhere counts as too soon, so this never waits.
+    pub(crate) fn progress_capture_due_at(&self, now: tokio::time::Instant) -> bool {
+        let Some(mut last) = self.last_progress_capture.try_lock() else {
+            return false;
+        };
+        if last.is_some_and(|prev| now.saturating_duration_since(prev) < MESH_PROGRESS_MIN_INTERVAL)
+        {
+            return false;
+        }
+        *last = Some(now);
+        true
+    }
+
+    /// Keeps `snapshot`, captured at a progress point that came too soon, for the timer
+    /// task to publish when the interval since the last capture has passed. One task is
+    /// armed at a time; a later deferral only replaces what it will publish. Without an
+    /// async runtime there is no timer, and the next publish supersedes the snapshot.
+    pub(crate) fn defer_progress(self: &Arc<Self>, snapshot: MeshSnapshot) {
+        *self.pending_progress.lock() = Some(snapshot);
+        if self.trailing_armed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            self.trailing_armed.store(false, Ordering::SeqCst);
+            return;
+        };
+        let slot = Arc::clone(self);
+        handle.spawn(async move { slot.publish_deferred_progress().await });
+    }
+
+    /// The armed timer: waits out the interval since the last capture, which a capture
+    /// made meanwhile pushes back, then publishes whatever is still pending. It has no
+    /// context, so it never runs the digest hook.
+    async fn publish_deferred_progress(&self) {
+        loop {
+            let due = self
+                .last_progress_capture
+                .lock()
+                .map(|prev| prev + MESH_PROGRESS_MIN_INTERVAL);
+            match due {
+                Some(due) if due > tokio::time::Instant::now() => {
+                    tokio::time::sleep_until(due).await
+                }
+                _ => break,
+            }
+        }
+        // Disarmed before the take, so a deferral racing it either lands in this publish
+        // or arms the next timer.
+        self.trailing_armed.store(false, Ordering::SeqCst);
+        {
+            let mut pending = self.pending_progress.lock();
+            let Some(snapshot) = pending.take() else {
+                return;
+            };
+            *self.last_progress_capture.lock() = Some(tokio::time::Instant::now());
+            self.snapshot.store(Some(Arc::new(snapshot)));
+        }
+        self.reassemble_brief();
+    }
+
+    /// Moves the last progress-point capture `by` into the past, as if that much time
+    /// had gone by, so a test can cross the interval without sleeping.
+    #[cfg(test)]
+    pub(crate) fn rewind_progress_clock_for_tests(&self, by: Duration) {
+        let mut last = self.last_progress_capture.lock();
+        *last = last.and_then(|prev| prev.checked_sub(by));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_progress_for_tests(&self) -> Option<MeshSnapshot> {
+        self.pending_progress.lock().clone()
     }
 
     pub(crate) fn set_objective_override(&self, objective: Option<String>) {
@@ -3966,6 +4091,22 @@ impl MeshSlot {
     /// falls back to stderr instead of a printer nobody drains any more.
     pub(crate) fn clear_notifier(&self) {
         self.notifier.store(None);
+    }
+
+    /// Installs who regenerates the digest at progress points. The interactive REPL
+    /// installs its digest driver at start-up; headless runs and the ACP server never
+    /// digest and install nothing.
+    pub(crate) fn set_digest_hook(&self, hook: Arc<dyn MeshDigestHook>) {
+        self.digest_hook.store(Some(Arc::new(hook)));
+    }
+
+    pub(crate) fn digest_hook(&self) -> Option<Arc<dyn MeshDigestHook>> {
+        self.digest_hook.load_full().map(|hook| Arc::clone(&*hook))
+    }
+
+    /// The REPL calls this as it exits, so the slot does not keep its driver alive.
+    pub(crate) fn clear_digest_hook(&self) {
+        self.digest_hook.store(None);
     }
 
     /// Renders once, then hands the lines to the installed sink. With no sink installed

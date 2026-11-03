@@ -37,8 +37,8 @@ use crate::mesh::pending::{
     PENDING_QUESTION_MAX_CHARS,
 };
 use crate::mesh::{
-    canonical_hash, capped_peer_text, display_text, redact_hashes, refusal_reply, rfc3339_utc,
-    short,
+    age_text, canonical_hash, capped_peer_text, display_text, redact_hashes, refusal_reply,
+    rfc3339_utc, short,
 };
 use crate::supervisor::escalation::{EscalationQueue, EscalationRequest};
 use crate::utils::{AbortSignal, create_abort_signal};
@@ -76,9 +76,14 @@ pub(crate) const PROVIDER_REFUSAL_TEXT: &str = "the envoy declined to answer";
 /// answer where this one would not.
 const SWITCH_MODEL_NEXT_STEP: &str =
     "; read it with .mesh inbox, or set mesh.envoy_model to another model";
-/// Appended to the system tail only when the run resumes remembered turns; a fresh
-/// thread's prompt says nothing about memory.
-const RESUMED_THREAD_NOTE: &str = "Earlier assistant turns in this conversation may be the human owner's own words, relayed by the envoy.\n";
+/// Closes the system tail only when the run resumes remembered turns; a fresh thread's
+/// prompt says nothing about memory.
+const RESUMED_THREAD_NOTE: &str = "The earlier exchanges in this thread hold earlier answers, which may be out of date: where they disagree with the session brief, the brief wins. Earlier assistant turns in this conversation may be the human owner's own words, relayed by the envoy.\n";
+/// `RESUMED_THREAD_NOTE` for a run served no brief, so there is nothing to win.
+const RESUMED_THREAD_NOTE_WITHOUT_BRIEF: &str = "The earlier exchanges in this thread hold earlier answers: they may be out of date; say so if you rely on them. Earlier assistant turns in this conversation may be the human owner's own words, relayed by the envoy.\n";
+/// A digest older than this is named in the envoy's answer, so the peer knows how old
+/// the account of the session is.
+const ENVOY_STALE_DIGEST_AGE: Duration = Duration::from_secs(15 * 60);
 /// Resumed turns stop short of the envoy model's `max_input_tokens` by one part in this
 /// many, left for the answer.
 const RESUMED_HISTORY_HEADROOM_DIVISOR: usize = 8;
@@ -124,6 +129,46 @@ pub(crate) fn compose_envoy_input(
         via = card.via,
     );
     (tail, peer_turn(card, message))
+}
+
+/// What the envoy is told about the age of what it holds, appended after the system
+/// tail. A digest older than `ENVOY_STALE_DIGEST_AGE` must be named in the answer. A
+/// resumed thread is told its remembered turns are earlier answers and the brief is
+/// current as of `snapshot_at`, the capture it was reassembled from, which a progress
+/// point inside a turn keeps newer than the digest. A fresh run with a fresh digest or
+/// none gets nothing, so its prompt is the one it had before thread memory existed. The
+/// resumed notes contain the fresh ones.
+fn handoff_age_notes(
+    resumed: bool,
+    brief: Option<&Brief>,
+    snapshot_at: Option<SystemTime>,
+    now: SystemTime,
+) -> String {
+    let digest_at = brief.and_then(|brief| brief.digest_generated_at);
+    let mut notes = String::new();
+    if let Some(at) = digest_at
+        && now.duration_since(at).unwrap_or_default() > ENVOY_STALE_DIGEST_AGE
+    {
+        let age = age_text(now, at);
+        notes.push_str(&format!(
+            "The session digest in the brief was written {age}. Say in your answer that it is as of {age}, so the peer knows how old it is.\n"
+        ));
+    }
+    if !resumed {
+        return notes;
+    }
+    match (brief, snapshot_at) {
+        (Some(_), Some(at)) => notes.push_str(&format!(
+            "The session brief above is current as of {}.\n{RESUMED_THREAD_NOTE}",
+            age_text(now, at)
+        )),
+        (Some(_), None) => {
+            notes.push_str("The session brief above is current.\n");
+            notes.push_str(RESUMED_THREAD_NOTE);
+        }
+        (None, _) => notes.push_str(RESUMED_THREAD_NOTE_WITHOUT_BRIEF),
+    }
+    notes
 }
 
 /// The user turn of one peer message. Every peer-chosen word (name, message id, title,
@@ -659,13 +704,20 @@ impl EnvoyRunner {
                 ),
             }
         }
+        // Read before the brief: a publish racing the two reads then dates the brief
+        // older than it is, never newer.
+        let snapshot_at = app.mesh.snapshot().map(|snapshot| snapshot.captured_at);
         let brief = app.mesh.brief();
         let (tail, user) =
             compose_envoy_input(brief.as_deref().map(Brief::render_for_human), card, message);
         role.append_to_prompt(&tail);
         let remembered = memory.map(RunMemory::history).unwrap_or_default();
         let total = remembered.len();
-        let history = fit_history(role.model(), role.prompt(), remembered, &user);
+        let now = SystemTime::now();
+        let notes = |resumed| handoff_age_notes(resumed, brief.as_deref(), snapshot_at, now);
+        // Fitted against the resumed notes, the longest the prompt can end up.
+        let system = format!("{}{}", role.prompt(), notes(!remembered.is_empty()));
+        let history = fit_history(role.model(), &system, remembered, &user);
         if history.len() < total {
             debug!(
                 "Mesh envoy memory for thread {} resumed {} of {total} turns; the rest did not fit the model's context",
@@ -673,9 +725,7 @@ impl EnvoyRunner {
                 history.len()
             );
         }
-        if !history.is_empty() {
-            role.append_to_prompt(RESUMED_THREAD_NOTE);
-        }
+        role.append_to_prompt(&notes(!history.is_empty()));
         let input = Input::with_history(&ctx, &user, role, history)
             .map_err(|err| EnvoyOutcome::Failed(format!("{err:#}")))?;
         let prompt_estimate = input
@@ -9140,7 +9190,10 @@ mod tests {
             ]
         );
         assert!(
-            seen[1][0].content.to_text().ends_with(RESUMED_THREAD_NOTE),
+            seen[1][0]
+                .content
+                .to_text()
+                .ends_with(RESUMED_THREAD_NOTE_WITHOUT_BRIEF),
             "{}",
             seen[1][0].content.to_text()
         );
@@ -9161,6 +9214,166 @@ mod tests {
             "and gets the prompt of a fresh thread"
         );
         source.remove_dir();
+    }
+
+    mod handoff_label_tests {
+        use super::*;
+        use crate::mesh::brief::{BriefSource, Digest};
+        use crate::mesh::snapshot::MeshSnapshot;
+        use crate::mesh::test_support::snapshot_fixture;
+
+        fn brief_with_digest_from(age: Duration, now: SystemTime) -> Brief {
+            Brief {
+                text: "## Digest\n- Working on the widget".into(),
+                digest_generated_at: Some(now - age),
+                sources: vec![BriefSource::Digest],
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn a_resumed_thread_labels_its_earlier_answers_as_possibly_out_of_date() {
+            let _cfg = TestConfigDirGuard::new("mesh-envoy-handoff-label");
+            let (source, _source) = stub_envoy_source();
+            let tmp = TempDir::new("mesh-envoy-handoff-label");
+            let app = test_app();
+            memory_for(&app, &tmp);
+            let idle = RecordingIdleSink::attach(&app);
+            let (drive, seen) = prompt_recording_drive();
+            let runner = EnvoyRunner::start_with(Arc::clone(&app), drive);
+            for (n, job) in [
+                threaded_job(&PEER_IDENTITY, "q-1", "t-9", "what is this?"),
+                threaded_job(&PEER_IDENTITY, "q-2", "t-9", "and then?"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                assert!(runner.accept(job).is_ok());
+                wait_until("the reply to land", || {
+                    idle.count("envoy replied:") == n + 1
+                })
+                .await;
+            }
+            runner.stop().await;
+
+            let seen = seen.lock();
+            assert_eq!(seen.len(), 2);
+            let fresh = seen[0][0].content.to_text();
+            assert!(!fresh.contains("earlier answers"), "{fresh}");
+            let resumed = seen[1][0].content.to_text();
+            assert!(
+                resumed.contains("they may be out of date; say so if you rely on them"),
+                "{resumed}"
+            );
+            assert!(!resumed.contains("the brief wins"), "{resumed}");
+            source.remove_dir();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn a_resumed_thread_on_an_old_brief_dates_it_and_names_the_digest_age() {
+            let _cfg = TestConfigDirGuard::new("mesh-envoy-handoff-age");
+            let (source, _source) = stub_envoy_source();
+            let tmp = TempDir::new("mesh-envoy-handoff-age");
+            let app = test_app();
+            let old = SystemTime::now() - Duration::from_secs(20 * 60);
+            app.mesh.publish(MeshSnapshot {
+                captured_at: old,
+                ..snapshot_fixture()
+            });
+            app.mesh.publish_digest(Some(Digest {
+                text: "- Working on the widget".into(),
+                generated_at: old,
+                covered_messages: 2,
+            }));
+            memory_for(&app, &tmp);
+            let idle = RecordingIdleSink::attach(&app);
+            let (drive, seen) = prompt_recording_drive();
+            let runner = EnvoyRunner::start_with(Arc::clone(&app), drive);
+            for (n, job) in [
+                threaded_job(&PEER_IDENTITY, "q-1", "t-9", "what is this?"),
+                threaded_job(&PEER_IDENTITY, "q-2", "t-9", "and then?"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                assert!(runner.accept(job).is_ok());
+                wait_until("the reply to land", || {
+                    idle.count("envoy replied:") == n + 1
+                })
+                .await;
+            }
+            runner.stop().await;
+
+            let seen = seen.lock();
+            assert_eq!(seen.len(), 2);
+            let resumed = seen[1][0].content.to_text();
+            assert!(
+                resumed.contains("Say in your answer that it is as of"),
+                "{resumed}"
+            );
+            assert!(resumed.contains("current as of"), "{resumed}");
+            source.remove_dir();
+        }
+
+        #[test]
+        fn a_stale_digest_is_named_in_the_answer_on_fresh_and_resumed_runs() {
+            let now = SystemTime::now();
+            let brief = brief_with_digest_from(Duration::from_secs(2 * 3600), now);
+            let ask = "Say in your answer that it is as of 2h ago";
+
+            let snapshot_at = Some(now - Duration::from_secs(10));
+            let fresh = handoff_age_notes(false, Some(&brief), snapshot_at, now);
+            assert!(fresh.contains(ask), "{fresh}");
+            assert!(!fresh.contains("earlier answers"), "{fresh}");
+
+            let resumed = handoff_age_notes(true, Some(&brief), snapshot_at, now);
+            assert!(resumed.contains(ask), "{resumed}");
+            assert!(
+                resumed.contains("The session brief above is current as of 10s ago."),
+                "{resumed}"
+            );
+            assert!(resumed.ends_with(RESUMED_THREAD_NOTE), "{resumed}");
+        }
+
+        #[test]
+        fn a_resumed_thread_dates_the_brief_by_its_snapshot_not_its_digest() {
+            let now = SystemTime::now();
+            let brief = brief_with_digest_from(Duration::from_secs(3 * 60), now);
+            let snapshot_at = Some(now - Duration::from_secs(20));
+
+            let resumed = handoff_age_notes(true, Some(&brief), snapshot_at, now);
+            assert_eq!(
+                resumed,
+                format!("The session brief above is current as of 20s ago.\n{RESUMED_THREAD_NOTE}")
+            );
+            assert_eq!(handoff_age_notes(false, Some(&brief), snapshot_at, now), "");
+        }
+
+        #[test]
+        fn a_fresh_run_with_no_digest_adds_nothing() {
+            let now = SystemTime::now();
+            let brief = Brief {
+                text: "## Card\nWorking".into(),
+                digest_generated_at: None,
+                sources: vec![BriefSource::Card],
+            };
+            let snapshot_at = Some(now - Duration::from_secs(5 * 60));
+
+            assert_eq!(handoff_age_notes(false, None, snapshot_at, now), "");
+            assert_eq!(handoff_age_notes(false, Some(&brief), snapshot_at, now), "");
+            assert_eq!(
+                handoff_age_notes(true, Some(&brief), snapshot_at, now),
+                format!("The session brief above is current as of 5m ago.\n{RESUMED_THREAD_NOTE}")
+            );
+            assert_eq!(
+                handoff_age_notes(true, Some(&brief), None, now),
+                format!("The session brief above is current.\n{RESUMED_THREAD_NOTE}")
+            );
+            let unbriefed = handoff_age_notes(true, None, snapshot_at, now);
+            assert_eq!(unbriefed, RESUMED_THREAD_NOTE_WITHOUT_BRIEF);
+            assert!(!unbriefed.contains("the brief wins"), "{unbriefed}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10357,7 +10570,7 @@ mod tests {
         };
         let extra = tokens(&PEER_IDENTITY).saturating_sub(tokens(&OTHER_IDENTITY));
         assert!(
-            extra >= history_tokens * 9 / 10 && extra >= 10 * note_tokens,
+            extra >= history_tokens * 9 / 10 + note_tokens,
             "resumed {} vs fresh {}: extra {extra}, history {history_tokens}, note {note_tokens}",
             tokens(&PEER_IDENTITY),
             tokens(&OTHER_IDENTITY)

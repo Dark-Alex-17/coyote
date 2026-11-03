@@ -17,6 +17,7 @@ use crate::{
 };
 
 use crate::config::ensure_parent_exists;
+use crate::config::mesh_snapshot::mesh_progress_point;
 use crate::config::paths;
 use crate::hooks::{self, HookEvent};
 use crate::mcp::{
@@ -573,6 +574,7 @@ pub async fn eval_tool_calls(
         merge_system_channel(last, escalations, notifications);
     }
 
+    mesh_progress_point(ctx);
     Ok(output)
 }
 

@@ -42,11 +42,13 @@ pub(crate) mod wire_path;
 
 pub(crate) use announce::{HEARTBEAT_PERIOD_SECS, HEARTBEAT_SECS, PATH_REQUEST_TIMEOUT};
 #[cfg(test)]
+pub(crate) use node::MESH_PROGRESS_MIN_INTERVAL;
+#[cfg(test)]
 pub(crate) use node::session_destination_name;
 pub(crate) use node::{
     AlreadyClosed, HUMAN_DECLINED, InterfaceState, InterfaceStatus, LocalEndpoint, MESH_ALREADY_ON,
-    MeshPaths, MeshRuntime, MeshSlot, NodeOptions, already_closed, loopback_endpoint,
-    refusal_reply,
+    MeshDigestHook, MeshPaths, MeshRuntime, MeshSlot, NodeOptions, already_closed,
+    loopback_endpoint, refusal_reply,
 };
 pub(crate) use peers::{PEER_STALE_AFTER, PEER_TTL, PeerRecord};
 pub(crate) use propagation_fetch::{
