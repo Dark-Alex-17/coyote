@@ -26473,6 +26473,80 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         started.relay_handle.abort();
                     });
                 }
+
+                /// `.mesh status` and `.mesh fetch` to an unheard destination ask for it,
+                /// file the answer, then refuse the way they refuse any heard peer this
+                /// node does not trust, never with the unanswered path request sentence.
+                #[test]
+                #[serial]
+                fn status_and_fetch_of_an_unheard_destination_ask_for_it_then_judge_trust() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-first-contact-status-fetch");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        for (verb, tail) in [
+                            (".mesh status {}", STATUS_REFUSAL_TAIL),
+                            (".mesh fetch {} docs/a.md", FETCH_REFUSAL_TAIL),
+                        ] {
+                            let mut fx = LateJoiner::start("repl-first-contact-status-fetch").await;
+                            let line = verb.replace("{}", &fx.to_a);
+                            let before = stdout_lines().len();
+                            let err = fx.asks_for_a(&line).await.unwrap_err().to_string();
+                            let printed = stdout_lines()[before..].join("\n");
+                            assert!(printed.contains(&fx.waiting_line()), "{line}: {printed}");
+                            assert!(err.ends_with(tail), "{line}: {err}");
+                            assert!(!err.contains("did not answer a path request"), "{err}");
+                            assert!(!err.contains("not in the peer table"), "{err}");
+                            fx.stop().await;
+                        }
+                    });
+                }
+
+                /// Only a full 32-hex destination is asked for: a prefix or a non-hex
+                /// string is answered at once (a refusal, or the verb's usage), with no
+                /// waiting line.
+                #[test]
+                #[serial]
+                fn a_short_or_non_hex_destination_is_never_asked_for() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-first-contact-malformed");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let started = started_runtime("repl-mesh-first-contact-malformed").await;
+                        let mut ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                        let non_hex = "z".repeat(32);
+                        for line in [
+                            ".mesh trust 5d5d5d5d --yes".to_string(),
+                            ".mesh info 5d5d5d5d".to_string(),
+                            format!(".mesh status {non_hex}"),
+                            format!(".mesh message {non_hex} --yes hi"),
+                        ] {
+                            let before = stdout_lines().len();
+                            let asked = Instant::now();
+                            let err = match run(&mut ctx, &line).await {
+                                Ok(_) => String::new(),
+                                Err(err) => err.to_string(),
+                            };
+                            assert!(
+                                asked.elapsed() < Duration::from_secs(1),
+                                "{line}: {:?} {err}",
+                                asked.elapsed()
+                            );
+                            let printed = stdout_lines()[before..].join("\n");
+                            assert!(
+                                !printed.contains("Asking the mesh for"),
+                                "{line}: {printed}"
+                            );
+                            assert!(
+                                !err.contains("did not answer a path request"),
+                                "{line}: {err}"
+                            );
+                        }
+                        assert!(ctx.app.mesh.stop().await.unwrap());
+                        started.relay_handle.abort();
+                    });
+                }
             }
 
             mod command_prefix_refusals {

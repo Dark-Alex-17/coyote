@@ -9435,6 +9435,68 @@ mod tests {
                 slot_a.stop().await.unwrap();
                 relay.stop().await;
             }
+
+            /// A grant for some other identity lets the unheard destination be asked for,
+            /// but the answer names A's identity, which no grant covers: the full trust
+            /// check then refuses with the same `not_trusted` envelope a heard peer gets,
+            /// and nothing reaches A.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[serial]
+            async fn mesh_send_to_an_unheard_instance_of_an_ungranted_identity_asks_then_refuses() {
+                let _guard = TestConfigDirGuard::new("mesh-tool-first-contact-ungranted");
+                let (relay, a, b) =
+                    pair_where_b_has_not_heard_a("mesh-tool-first-contact-ungranted").await;
+                let to_a = a.runtime.current_destination_hash();
+                let to_b = b.runtime.current_destination_hash();
+                let slot_a = Arc::new(MeshSlot::default());
+                slot_a.install(a.runtime.clone()).unwrap();
+                a.runtime
+                    .trust()
+                    .trust_destination(
+                        slot_a.as_ref(),
+                        &to_b,
+                        TrustOptions::default(),
+                        SystemTime::now(),
+                    )
+                    .unwrap();
+                let mut ctx = plain_ctx();
+                ctx.app.mesh.install(b.runtime.clone()).unwrap();
+                let other = derived_sighting("first-contact-other-owner", None).identity_hash;
+                b.runtime
+                    .trust()
+                    .trust_identity(
+                        ctx.app.mesh.as_ref(),
+                        &other,
+                        TrustOptions::default(),
+                        SystemTime::now(),
+                    )
+                    .unwrap();
+
+                let (sent, waited) = call(
+                    &mut ctx,
+                    "send",
+                    &json!({"to": to_a, "message": "first contact"}),
+                )
+                .await;
+                let expected = send_error(&SendError::NotTrusted {
+                    destination: to_a.clone(),
+                });
+                assert_eq!(sent, expected, "{sent}");
+                assert!(
+                    waited < PATH_REQUEST_TIMEOUT + Duration::from_secs(3),
+                    "{waited:?}"
+                );
+                assert!(
+                    b.runtime.peers().get(&to_a).is_some(),
+                    "the destination was asked for and its answer filed"
+                );
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                assert_eq!(slot_a.peer_inbox().len(), 0, "nothing reached A");
+
+                assert!(ctx.app.mesh.stop().await.unwrap());
+                slot_a.stop().await.unwrap();
+                relay.stop().await;
+            }
         }
 
         /// Serves `/fetch` the way the serving half does for `SHARED_PATH`, honouring
