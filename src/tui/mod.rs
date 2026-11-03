@@ -52,7 +52,8 @@ pub(crate) fn active() -> bool {
 
 /// Test-only harness hook: when set to `1`, `run` panics right after
 /// entering the alternate screen so a pty test can check the panic hook
-/// restores the terminal. Coyote itself never sets it.
+/// restores the terminal. Debug builds only; a release binary ignores it.
+#[cfg(debug_assertions)]
 const PANIC_AT_START_ENV: &str = "COYOTE_TUI_PANIC_AT_START";
 
 /// How long the composer must have been untouched before a bare hotkey
@@ -1481,6 +1482,7 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
     // dies the ordinary way, and `Screen`'s Drop still restores the
     // terminal if arming fails.
     let termination = Termination::arm()?;
+    #[cfg(debug_assertions)]
     if std::env::var(PANIC_AT_START_ENV).as_deref() == Ok("1") {
         panic!("{PANIC_AT_START_ENV} requested a panic after entering the alternate screen");
     }

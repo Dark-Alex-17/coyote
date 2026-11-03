@@ -8,7 +8,7 @@
 use crate::render::{MarkdownRender, RenderOptions};
 use ansi_to_tui::IntoText;
 use anyhow::Result;
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use unicode_width::UnicodeWidthChar;
 
@@ -90,13 +90,24 @@ fn scrub(text: &str, keep_sgr: bool) -> String {
 }
 
 /// Parses SGR-styled text into lines; falls back to the bare characters
-/// when the parser rejects the input.
+/// when the parser rejects the input. Conceal (SGR 8) is dropped: text a
+/// model or a tool painted invisible is still text the user is shown.
 fn styled_lines(ansi: &str) -> Vec<Line<'static>> {
     if ansi.is_empty() {
         return Vec::new();
     }
     match ansi.into_text() {
-        Ok(text) => text.lines,
+        Ok(text) => text
+            .lines
+            .into_iter()
+            .map(|mut line| {
+                line.style = line.style.remove_modifier(Modifier::HIDDEN);
+                for span in &mut line.spans {
+                    span.style = span.style.remove_modifier(Modifier::HIDDEN);
+                }
+                line
+            })
+            .collect(),
         Err(err) => {
             debug!("Falling back to plain text for a cell: {err}");
             Text::raw(scrub(ansi, false)).lines
@@ -313,7 +324,7 @@ impl RenderCache {
 mod tests {
     use super::*;
     use crate::utils::decode_bin;
-    use ratatui::style::{Color, Modifier};
+    use ratatui::style::Color;
     use syntect::highlighting::Theme;
 
     const DARK_THEME: &[u8] = include_bytes!("../../assets/monokai-extended.theme.bin");
@@ -329,6 +340,19 @@ mod tests {
         assert_eq!(sanitize_ansi(input), "link up \x1b[1mbold\x1b[0m");
         assert_eq!(sanitize_ansi("\x1b(Bx\x1b=y\tz\n"), "xy\tz\n");
         assert_eq!(sanitize_ansi("\x1b]0;title\x1b\\after"), "after");
+    }
+
+    /// Conceal is the one attribute a reader must not get: a span painted
+    /// with SGR 8 comes back visible, its other attributes intact.
+    #[test]
+    fn concealed_text_is_rendered_visible() {
+        let lines = preformatted_lines("\x1b[8;1mhidden\x1b[0m shown");
+        let hidden = every_span(&lines)
+            .find(|span| span.content == "hidden")
+            .expect("the concealed span is kept");
+        assert!(!hidden.style.add_modifier.contains(Modifier::HIDDEN));
+        assert!(hidden.style.add_modifier.contains(Modifier::BOLD));
+        assert!(every_span(&lines).all(|span| !span.style.add_modifier.contains(Modifier::HIDDEN)));
     }
 
     /// A spinner frame caught in the fd capture: the cursor move and the
