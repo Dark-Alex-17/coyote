@@ -1093,8 +1093,9 @@ impl EnvoyRunner {
     /// refusal line or the human's held answer. A run that timed out, was interrupted,
     /// found the envoy unavailable or failed said nothing of its own and adds nothing, and
     /// neither does a withheld reply or the interim escalated notice. Nor does a provider
-    /// refusal: remembering the peer's turn would replay the text the provider refused on
-    /// every later message in the thread.
+    /// refusal, even one after streamed text or after the human's held answer was taken
+    /// (the peer is still sent that answer): remembering the peer's turn would replay the
+    /// text the provider refused on every later message in the thread.
     async fn deliver(
         &self,
         message: PeerMessage,
@@ -1168,14 +1169,15 @@ impl EnvoyRunner {
         let unsent = if !owed {
             None
         } else {
-            let said_something = human_answer.is_some()
-                || matches!(
-                    outcome,
-                    EnvoyOutcome::Answered(_)
-                        | EnvoyOutcome::Declined(_)
-                        | EnvoyOutcome::Escalated { .. }
-                        | EnvoyOutcome::Refused(_)
-                );
+            let said_something = !matches!(outcome, EnvoyOutcome::ProviderRefused { .. })
+                && (human_answer.is_some()
+                    || matches!(
+                        outcome,
+                        EnvoyOutcome::Answered(_)
+                            | EnvoyOutcome::Declined(_)
+                            | EnvoyOutcome::Escalated { .. }
+                            | EnvoyOutcome::Refused(_)
+                    ));
             if let Some(memory) = memory.filter(|_| said_something) {
                 // The sender's standing is judged again here, not at run start: an
                 // owner who blocked or untrusted it meanwhile had its threads forgotten,
@@ -10020,6 +10022,121 @@ mod tests {
         assert_eq!(turns[1].role, EnvoyRole::Assistant);
         assert_eq!(turns[1].text, "yes, merge");
         source.remove_dir();
+    }
+
+    mod refusal_memory_tests {
+        use super::*;
+
+        fn refusal(partial_output: bool) -> anyhow::Error {
+            ProviderRefusal {
+                category: Some("cyber".into()),
+                explanation: None,
+                partial_output,
+            }
+            .into()
+        }
+
+        #[test]
+        fn the_owners_answer_is_what_the_peer_is_sent_after_a_provider_refusal() {
+            let message = threaded_job(&PEER_IDENTITY, "q-held", "t-9", "merge?").message;
+            let outcome = EnvoyOutcome::ProviderRefused {
+                category: Some("cyber".into()),
+            };
+
+            let out = envoy_reply(
+                &outcome,
+                Some("yes, merge"),
+                PROVIDER_REFUSAL_TEXT.into(),
+                &message,
+            )
+            .unwrap();
+
+            assert_eq!(out.disposition, Some(Disposition::Answered));
+            assert_eq!(out.content, "yes, merge");
+        }
+
+        /// The run took the human's answer and then the provider refused: the peer is
+        /// relayed that answer, and the thread remembers nothing of the run.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn a_refusal_after_the_owner_answered_is_not_remembered() {
+            let _cfg = TestConfigDirGuard::new("mesh-envoy-memory-held-refusal");
+            let (source, _source) = stub_envoy_source();
+            let tmp = TempDir::new("mesh-envoy-memory-held-refusal");
+            let app = app_holding_for(30);
+            let store = memory_for(&app, &tmp);
+            app.mesh
+                .set_inbound_store_for_tests(Arc::new(InboundStore::new(&tmp.path, "inst-a")));
+            let idle = RecordingIdleSink::attach(&app);
+            let runner = EnvoyRunner::start_with(
+                Arc::clone(&app),
+                drive_of(|ctx, _, _| async move {
+                    let mut ctx = ctx;
+                    handle_user_tool(
+                        &mut ctx,
+                        "user__ask",
+                        &json!({"question": "Should we merge?"}),
+                    )
+                    .await?;
+                    Err(refusal(false))
+                }),
+            );
+            assert!(
+                runner
+                    .accept(threaded_job(
+                        &PEER_IDENTITY,
+                        "q-held",
+                        "t-9",
+                        "merge the branch"
+                    ))
+                    .is_ok()
+            );
+            wait_until("the question to reach the human", || {
+                idle.has("asks: Should we merge?")
+            })
+            .await;
+            assert!(runner.answer("q-held", "yes, merge"));
+            wait_until("the human's answer to be relayed", || {
+                idle.count("envoy replied: yes, merge") == 1
+            })
+            .await;
+            runner.stop().await;
+
+            let turns = turns_of(&store, &PEER_IDENTITY, "q-held");
+            assert!(turns.is_empty(), "{turns:?}");
+            source.remove_dir();
+        }
+
+        /// A refusal that cut off text the provider had already streamed is still a
+        /// refusal: the peer hears the fixed refusal words and nothing is remembered.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn a_refusal_after_partial_output_is_not_remembered() {
+            let _cfg = TestConfigDirGuard::new("mesh-envoy-memory-partial-refusal");
+            let (source, _source) = stub_envoy_source();
+            let tmp = TempDir::new("mesh-envoy-memory-partial-refusal");
+            let app = test_app();
+            let store = memory_for(&app, &tmp);
+            let idle = RecordingIdleSink::attach(&app);
+            let runner = EnvoyRunner::start_with(
+                Arc::clone(&app),
+                drive_of(|_, _, _| async { Err(refusal(true)) }),
+            );
+            assert!(
+                runner
+                    .accept(threaded_job(&PEER_IDENTITY, "q-1", "t-1", "scan a port"))
+                    .is_ok()
+            );
+            wait_until("the refusal to land", || idle.has("envoy declined")).await;
+            runner.stop().await;
+
+            assert!(!idle.has("envoy replied"), "{:?}", idle.texts());
+            let turns = turns_of(&store, &PEER_IDENTITY, "t-1");
+            assert!(turns.is_empty(), "{turns:?}");
+            let turns = turns_of(&store, &PEER_IDENTITY, "q-1");
+            assert!(turns.is_empty(), "{turns:?}");
+            source.remove_dir();
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
