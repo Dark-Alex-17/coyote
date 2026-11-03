@@ -9590,6 +9590,114 @@ mod tests {
                 slot_a.stop().await.unwrap();
                 relay.stop().await;
             }
+
+            /// B restarted with A's destination trusted (bound to A's identity) and no
+            /// identity grant at all: the destination itself is trusted, so the send asks
+            /// for it once, files the answer, and reaches A.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[serial]
+            async fn mesh_send_reaches_an_unheard_destination_trusted_by_destination_alone() {
+                let _guard = TestConfigDirGuard::new("mesh-tool-first-contact-dest-tier");
+                let (relay, a, b) =
+                    pair_where_b_has_not_heard_a("mesh-tool-first-contact-dest-tier").await;
+                let to_a = a.runtime.current_destination_hash();
+                let to_b = b.runtime.current_destination_hash();
+                let slot_a = Arc::new(MeshSlot::default());
+                slot_a.install(a.runtime.clone()).unwrap();
+                a.runtime
+                    .trust()
+                    .trust_destination(
+                        slot_a.as_ref(),
+                        &to_b,
+                        TrustOptions::default(),
+                        SystemTime::now(),
+                    )
+                    .unwrap();
+                let mut ctx = plain_ctx();
+                ctx.app.mesh.install(b.runtime.clone()).unwrap();
+                let identity_of_a = current_identity(&mesh_paths(&a.tmp).identity_path)
+                    .unwrap()
+                    .address_hash()
+                    .to_hex_string();
+                let trust = b.runtime.trust();
+                let ts = "2026-01-01T00:00:00Z";
+                std::fs::write(
+                    trust.path(),
+                    format!(
+                        "version: {TRUST_FILE_VERSION}\n\
+                         identities:\n  {identity_of_a}:\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n    all_destinations: false\n\
+                         destinations:\n  {to_a}:\n    identity: {identity_of_a}\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n\
+                         denied_destinations: {{}}\n\
+                         blocked_identities: {{}}\n"
+                    ),
+                )
+                .unwrap();
+                assert!(trust.may_be_asked_for(&to_a), "A's destination is trusted");
+                assert!(b.runtime.peers().get(&to_a).is_none(), "B has not heard A");
+
+                let (sent, waited) = call(
+                    &mut ctx,
+                    "send",
+                    &json!({"to": to_a, "message": "first contact"}),
+                )
+                .await;
+                assert_eq!(sent["status"], "sent", "{sent}");
+                assert_eq!(sent["to"], to_a, "{sent}");
+                assert!(
+                    waited < PATH_REQUEST_TIMEOUT + Duration::from_secs(5),
+                    "{waited:?}"
+                );
+                assert!(b.runtime.peers().get(&to_a).is_some(), "B filed A's row");
+                wait_until("A's inbox to hold B's message", || {
+                    slot_a.peer_inbox().len() > 0
+                })
+                .await;
+
+                assert!(ctx.app.mesh.stop().await.unwrap());
+                slot_a.stop().await.unwrap();
+                relay.stop().await;
+            }
+
+            /// A destination-tier trust of some other destination is no grant that could
+            /// cover an unheard one: every tool refuses at once and A is never asked for.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[serial]
+            async fn an_unrelated_destination_trust_does_not_let_an_unheard_one_be_asked_for() {
+                let _guard = TestConfigDirGuard::new("mesh-tool-first-contact-other-dest");
+                let (relay, a, b) =
+                    pair_where_b_has_not_heard_a("mesh-tool-first-contact-other-dest").await;
+                let to_a = a.runtime.current_destination_hash();
+                let slot_a = Arc::new(MeshSlot::default());
+                slot_a.install(a.runtime.clone()).unwrap();
+                let mut ctx = plain_ctx();
+                ctx.app.mesh.install(b.runtime.clone()).unwrap();
+                let other_identity =
+                    derived_sighting("first-contact-other-dest", None).identity_hash;
+                let other_dest = hex_lower(&[0x5d; 16]);
+                let trust = b.runtime.trust();
+                let ts = "2026-01-01T00:00:00Z";
+                std::fs::write(
+                    trust.path(),
+                    format!(
+                        "version: {TRUST_FILE_VERSION}\n\
+                         identities:\n  {other_identity}:\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n    all_destinations: false\n\
+                         destinations:\n  {other_dest}:\n    identity: {other_identity}\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n\
+                         denied_destinations: {{}}\n\
+                         blocked_identities: {{}}\n"
+                    ),
+                )
+                .unwrap();
+                assert!(!trust.may_be_asked_for(&to_a));
+
+                let announces = b.announces().await;
+                refused_at_once(&mut ctx, &to_a, "unrelated destination trust").await;
+                assert_a_was_never_asked_for(&b, announces, &to_a).await;
+                assert_eq!(slot_a.peer_inbox().len(), 0, "nothing reached A");
+
+                assert!(ctx.app.mesh.stop().await.unwrap());
+                slot_a.stop().await.unwrap();
+                relay.stop().await;
+            }
         }
 
         /// Serves `/fetch` the way the serving half does for `SHARED_PATH`, honouring
