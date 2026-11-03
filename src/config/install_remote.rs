@@ -2306,18 +2306,23 @@ fn handle_missing_secrets(missing: &[String], prefix: CommandPrefix) -> Result<(
     if missing.is_empty() {
         return Ok(());
     }
-    let (added, deferred) = if *IS_STDOUT_TERMINAL {
+    let (added, deferred) = partition_missing_secrets(missing)?;
+    print_secret_summary(&added, &deferred, prefix);
+    Ok(())
+}
+
+/// Offers each missing secret to the vault where a prompt can be read;
+/// without a tty, or under the TUI (whose stdout is a tty the prompt
+/// cannot use), every secret is deferred to the summary instead.
+fn partition_missing_secrets(missing: &[String]) -> Result<(Vec<String>, Vec<String>)> {
+    if *IS_STDOUT_TERMINAL && !crate::tui::active() {
         println!(
             "\nThe merged mcp.json references {} secret(s) not yet in the vault.",
             missing.len()
         );
-        prompt_for_each_secret(missing)?
-    } else {
-        (Vec::new(), missing.to_vec())
-    };
-
-    print_secret_summary(&added, &deferred, prefix);
-    Ok(())
+        return prompt_for_each_secret(missing);
+    }
+    Ok((Vec::new(), missing.to_vec()))
 }
 
 fn prompt_for_each_secret(missing: &[String]) -> Result<(Vec<String>, Vec<String>)> {
@@ -3151,6 +3156,22 @@ mod tests {
             "COYOTE_TEST_STEP4_B".to_string(),
         ];
 
+        assert!(handle_missing_secrets(&missing, CommandPrefix::Dot).is_ok());
+    }
+
+    /// Under the TUI stdout is a tty, but the secret prompts cannot run
+    /// there: the merge still completes and every secret is deferred by
+    /// name instead of the install refusing after mcp.json was written.
+    #[test]
+    #[serial]
+    fn handle_missing_secrets_defers_all_under_the_tui() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let missing = vec!["TUI_SECRET_A".to_string(), "TUI_SECRET_B".to_string()];
+
+        let (added, deferred) = partition_missing_secrets(&missing).unwrap();
+
+        assert!(added.is_empty(), "got: {added:?}");
+        assert_eq!(deferred, missing);
         assert!(handle_missing_secrets(&missing, CommandPrefix::Dot).is_ok());
     }
 
