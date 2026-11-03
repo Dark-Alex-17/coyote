@@ -2897,6 +2897,26 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    /// Emitters paint notices for the REPL (`error_text`, a leading
+    /// newline for spacing); the sink strips that so the cell shows the
+    /// words on its first row and no escape bytes.
+    #[test]
+    fn a_painted_notice_reaches_the_frame_as_plain_words() {
+        use crate::turn::UiSink;
+        let (tx, mut rx) = unbounded_channel();
+        let sink = TuiSink::new(tx);
+        sink.notice(
+            NoticeKind::Interrupted,
+            "\n\x1b[31mResponse interrupted\x1b[0m",
+        );
+        let mut harness = Harness::standalone(40, 10);
+        harness.app.handle_msg(rx.try_recv().unwrap());
+        let frame = harness.draw();
+        let first_row = frame.lines().next().unwrap();
+        assert!(first_row.contains("Response interrupted"), "{frame}");
+        assert!(!frame.contains("[31m"), "{frame}");
+    }
+
     /// The final text of a reply is authoritative: it replaces whatever
     /// the stream had accumulated and closes the cell.
     #[test]

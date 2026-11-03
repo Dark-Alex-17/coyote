@@ -96,9 +96,14 @@ impl UiSink for TuiSink {
     }
 
     fn notice(&self, kind: NoticeKind, text: &str) {
+        // Emitters paint notices for the line-oriented REPL (red error
+        // text, a leading newline for spacing); the cell renders them as
+        // plain styled lines.
         self.send(UiMsg::Notice {
             kind,
-            text: text.to_string(),
+            text: super::render::plain_text(text)
+                .trim_start_matches('\n')
+                .to_string(),
         });
     }
 
