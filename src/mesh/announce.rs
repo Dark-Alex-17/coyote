@@ -152,8 +152,10 @@ pub(crate) fn is_variation_selector(c: char) -> bool {
 }
 
 /// The display name is withheld when any configured interface is public unless the user
-/// opted in with `display_name_on_public`.
-pub(crate) fn announce_app_data(config: &MeshConfig) -> Result<Vec<u8>> {
+/// opted in with `display_name_on_public`. A session running `agent` announces the name as
+/// `<display_name> . <agent>`; the label only decorates a name, so with no name announced
+/// there is no label either.
+pub(crate) fn announce_app_data(config: &MeshConfig, agent: Option<&str>) -> Result<Vec<u8>> {
     let public = config
         .interfaces()
         .iter()
@@ -161,13 +163,38 @@ pub(crate) fn announce_app_data(config: &MeshConfig) -> Result<Vec<u8>> {
     let display_name = if public && !config.display_name_on_public {
         None
     } else {
-        config.display_name.clone()
+        config
+            .display_name
+            .as_deref()
+            .map(|name| with_agent_label(name, agent))
     };
     AnnounceAppData {
         version: MESH_PROTOCOL_VERSION,
         display_name,
     }
     .encode()
+}
+
+const AGENT_LABEL_SEPARATOR: &str = " . ";
+
+/// The name itself is never cut: when the label does not fit in `MAX_DISPLAY_NAME_BYTES`
+/// the agent part is shortened, and when not even one of its characters fits, or it holds
+/// a character `encode` would refuse, the name goes out alone so the label can never make
+/// a start fail.
+fn with_agent_label(name: &str, agent: Option<&str>) -> String {
+    let Some(agent) = agent.filter(|agent| !agent.chars().any(is_control_or_invisible)) else {
+        return name.to_string();
+    };
+    let room = MAX_DISPLAY_NAME_BYTES.saturating_sub(name.len() + AGENT_LABEL_SEPARATOR.len());
+    let mut cut = room.min(agent.len());
+    while !agent.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let agent = agent[..cut].trim_end();
+    if agent.is_empty() {
+        return name.to_string();
+    }
+    format!("{name}{AGENT_LABEL_SEPARATOR}{agent}")
 }
 
 #[cfg(test)]
@@ -177,7 +204,7 @@ mod tests {
     use std::ops::RangeInclusive;
 
     fn decoded_name(config: &MeshConfig) -> Option<String> {
-        let bytes = announce_app_data(config).unwrap();
+        let bytes = announce_app_data(config, None).unwrap();
         AnnounceAppData::decode(&bytes).unwrap().display_name
     }
 
@@ -461,7 +488,7 @@ mod tests {
             ..MeshConfig::default()
         };
 
-        let bytes = announce_app_data(&config).unwrap();
+        let bytes = announce_app_data(&config, None).unwrap();
 
         let contains = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
         assert!(contains(b"Alex"), "the probe must be able to match");
@@ -503,5 +530,92 @@ mod tests {
             ..base
         };
         assert_eq!(decoded_name(&private_only), Some("Alex".to_string()));
+    }
+
+    mod agent_label {
+        use super::*;
+
+        fn labelled(config: &MeshConfig, agent: &str) -> Option<String> {
+            let bytes = announce_app_data(config, Some(agent)).unwrap();
+            AnnounceAppData::decode(&bytes).unwrap().display_name
+        }
+
+        fn named(name: &str) -> MeshConfig {
+            MeshConfig {
+                display_name: Some(name.to_string()),
+                ..MeshConfig::default()
+            }
+        }
+
+        #[test]
+        fn an_agent_session_announces_the_name_with_the_agent_and_a_plain_one_the_name() {
+            let config = named("alice");
+            assert_eq!(
+                labelled(&config, "pr-reviewer").as_deref(),
+                Some("alice . pr-reviewer")
+            );
+            assert_eq!(decoded_name(&config).as_deref(), Some("alice"));
+        }
+
+        #[test]
+        fn the_label_follows_the_name_on_public_and_never_stands_in_for_it() {
+            let withheld = MeshConfig {
+                interfaces: vec![MeshInterface::Lan, public()],
+                display_name_on_public: false,
+                ..named("alice")
+            };
+            assert_eq!(labelled(&withheld, "pr-reviewer"), None);
+
+            let opted_in = MeshConfig {
+                display_name_on_public: true,
+                ..withheld
+            };
+            assert_eq!(
+                labelled(&opted_in, "pr-reviewer").as_deref(),
+                Some("alice . pr-reviewer")
+            );
+
+            assert_eq!(labelled(&MeshConfig::default(), "pr-reviewer"), None);
+        }
+
+        #[test]
+        fn a_long_label_cuts_the_agent_at_a_char_boundary_and_keeps_the_name() {
+            let name = "a".repeat(50);
+            let label = labelled(&named(&name), &"é".repeat(10)).unwrap();
+            assert_eq!(label, format!("{name} . {}", "é".repeat(5)));
+            assert!(label.len() <= MAX_DISPLAY_NAME_BYTES, "{}", label.len());
+
+            let name = "a".repeat(58);
+            assert_eq!(
+                labelled(&named(&name), "pr reviewer"),
+                Some(format!("{name} . pr")),
+                "the cut lands after the space, which is trimmed"
+            );
+
+            let name = "a".repeat(60);
+            assert_eq!(
+                labelled(&named(&name), "pr-reviewer"),
+                Some(format!("{name} . p"))
+            );
+
+            for name in ["a".repeat(61), "a".repeat(64)] {
+                assert_eq!(
+                    labelled(&named(&name), "pr-reviewer").as_deref(),
+                    Some(name.as_str()),
+                    "no room for one agent char"
+                );
+            }
+        }
+
+        #[test]
+        fn an_agent_with_a_control_or_invisible_char_leaves_the_name_alone() {
+            for agent in ["pr\u{1b}[2J", "pr\u{200B}reviewer", "pr\nreviewer"] {
+                assert_eq!(
+                    labelled(&named("alice"), agent).as_deref(),
+                    Some("alice"),
+                    "{agent:?}"
+                );
+            }
+        }
     }
 }
