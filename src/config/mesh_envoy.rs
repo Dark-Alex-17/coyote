@@ -9242,7 +9242,7 @@ mod tests {
             let (drive, seen) = prompt_recording_drive();
             let runner = EnvoyRunner::start_with(Arc::clone(&app), drive);
             for (n, job) in [
-                threaded_job(&PEER_IDENTITY, "q-1", "t-9", "what is this?"),
+                root_job(&PEER_IDENTITY, "t-9", "what is this?"),
                 threaded_job(&PEER_IDENTITY, "q-2", "t-9", "and then?"),
             ]
             .into_iter()
@@ -9291,7 +9291,7 @@ mod tests {
             let (drive, seen) = prompt_recording_drive();
             let runner = EnvoyRunner::start_with(Arc::clone(&app), drive);
             for (n, job) in [
-                threaded_job(&PEER_IDENTITY, "q-1", "t-9", "what is this?"),
+                root_job(&PEER_IDENTITY, "t-9", "what is this?"),
                 threaded_job(&PEER_IDENTITY, "q-2", "t-9", "and then?"),
             ]
             .into_iter()
