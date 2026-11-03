@@ -396,7 +396,6 @@ impl Agent {
                 // starts without its knowledge base rather than refusing.
                 eprintln!("The agent has documents attached; starting without RAG");
             } else if *IS_STDOUT_TERMINAL {
-                ensure_prompts_available()?;
                 ans = Confirm::new("The agent has documents attached, init RAG?")
                     .with_default(true)
                     .prompt()?;

@@ -79,8 +79,8 @@ pub(crate) fn resolve_conflict(
         match non_interactive {
             NonInteractive::Keep => return Ok(ConflictAction::Keep),
             NonInteractive::Bail => bail!(
-                "Refusing to overwrite local file {} non-interactively. \
-                 Re-run in a terminal, with --install-force (installs), \
+                "Refusing to overwrite local file {} without a menu. \
+                 Re-run in the plain REPL, with --install-force (installs), \
                  or with --yes (updates).",
                 dst.display()
             ),
@@ -111,7 +111,9 @@ fn is_interactive() -> bool {
     if let Some(forced) = prompt_script::forced_tty() {
         return forced;
     }
-    *IS_STDOUT_TERMINAL
+    // Under the full-screen UI stdout is a tty the menu cannot use, so
+    // every caller takes its non-interactive answer instead of bailing.
+    *IS_STDOUT_TERMINAL && !crate::tui::active()
 }
 
 fn select_choice(prompt: &str) -> Result<String> {

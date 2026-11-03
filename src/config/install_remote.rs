@@ -974,7 +974,9 @@ fn resolve_uninstall_action(
     assume_yes: bool,
     sticky: &mut Option<ObsoleteAction>,
 ) -> Result<ObsoleteAction> {
-    if assume_yes || !*IS_STDOUT_TERMINAL {
+    // Under the full-screen UI the menu cannot be shown; the file is kept
+    // like the non-interactive answer rather than refused mid-uninstall.
+    if assume_yes || !*IS_STDOUT_TERMINAL || crate::tui::active() {
         return Ok(ObsoleteAction::Keep);
     }
 
@@ -2211,10 +2213,12 @@ fn resolve_mcp_conflict(name: &str, force: bool, assume_yes: bool) -> Result<Mcp
     if assume_yes {
         return Ok(McpConflictAction::KeepLocal);
     }
-    if !*IS_STDOUT_TERMINAL {
+    // The full-screen UI cannot show the menu either; the refusal names
+    // the same ways out as the non-tty one.
+    if !*IS_STDOUT_TERMINAL || crate::tui::active() {
         bail!(
-            "MCP server '{name}' already exists locally. Refusing to merge non-interactively. \
-             Re-run in a terminal, with --install-force (installs), or with --yes (updates)."
+            "MCP server '{name}' already exists locally. Refusing to merge without a menu. \
+             Re-run in the plain REPL, with --install-force (installs), or with --yes (updates)."
         );
     }
     ensure_prompts_available()?;
@@ -2329,6 +2333,8 @@ fn partition_missing_secrets(missing: &[String]) -> Result<(Vec<String>, Vec<Str
 }
 
 fn prompt_for_each_secret(missing: &[String]) -> Result<(Vec<String>, Vec<String>)> {
+    // `handle_missing_secrets` already defers everything under the UI;
+    // the check here is defence in depth for any other caller.
     ensure_prompts_available()?;
     let mut vault = Vault::init_bare()?;
     let mut password_file_ensured = false;
@@ -3065,8 +3071,7 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            err.to_string()
-                .contains("Refusing to merge non-interactively"),
+            err.to_string().contains("Refusing to merge without a menu"),
             "got: {err}"
         );
         let _ = fs::remove_dir_all(&dir);

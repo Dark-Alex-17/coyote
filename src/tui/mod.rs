@@ -226,7 +226,8 @@ pub(crate) fn spawn_turn(
             },
             Err(err) => TurnOutcome {
                 exit: false,
-                error: Some(format!("{err:?}")),
+                // The REPL's shape: message, then its causes.
+                error: Some(crate::utils::pretty_error(&err)),
                 captured,
             },
         };
@@ -487,9 +488,9 @@ impl PendingPrompt {
     /// Blank lines are dropped so a run of newlines cannot push the rest
     /// of the question past the pane.
     fn question_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let question = self
-            .req
-            .question
+        // A tool controls the question's text; escape sequences in it
+        // are stripped so none can move the cursor or hide a word.
+        let question = render::plain_text(&self.req.question)
             .lines()
             .filter(|line| !line.trim().is_empty())
             .collect::<Vec<_>>()
@@ -1578,13 +1579,23 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
             write_to_terminal(&render::sanitize_ansi(&captured));
             result
         }
-        Leave::Abandoned(ctx) => match spawn_exit(*ctx, abort.clone()).await {
-            Ok((_, result, captured)) => {
-                write_to_terminal(&render::sanitize_ansi(&captured));
-                result
+        // The exit work gets the same bounded, unattended wait the loop
+        // gives it; a teardown that never returns ends the process the
+        // way an outlived task does instead of hanging a bare terminal.
+        Leave::Abandoned(ctx) => {
+            match join_unattended(spawn_exit(*ctx, abort.clone()), &mut rx, EXIT_CANCEL_WAIT).await
+            {
+                Join::Finished((_, result, captured)) => {
+                    write_to_terminal(&render::sanitize_ansi(&captured));
+                    result
+                }
+                Join::Panicked(err) => Err(err.into()),
+                Join::TimedOut => {
+                    crate::hooks::drain_pending(EXIT_HOOK_DRAIN_TIMEOUT).await;
+                    exit_leaving_the_task_behind(&mut screen, Unfinished::Exit)
+                }
             }
-            Err(err) => Err(err.into()),
-        },
+        }
         Leave::Outlived(unfinished) => {
             crate::hooks::drain_pending(EXIT_HOOK_DRAIN_TIMEOUT).await;
             exit_leaving_the_task_behind(&mut screen, unfinished)
@@ -2089,7 +2100,13 @@ mod tests {
             harness.app.sync_from_ctx(&mut returned);
             let final_frame = harness.draw();
             insta::assert_snapshot!("stream_final", final_frame.clone());
-            assert_ne!(first_delta, final_frame);
+            // What tells the two frames apart: the status row shows the
+            // running turn under the first delta and is empty once the
+            // turn has ended.
+            assert!(first_delta.contains("Working"), "{first_delta}");
+            assert!(first_delta.contains("Esc to interrupt"), "{first_delta}");
+            assert!(!final_frame.contains("Working"), "{final_frame}");
+            assert!(!final_frame.contains("Esc to interrupt"), "{final_frame}");
             assert!(matches!(
                 harness.app.cells.last(),
                 Some(Cell::Assistant { source, done: true, .. }) if source.contains("hello")
@@ -3538,16 +3555,6 @@ mod tests {
             (
                 "src/config/install_remote.rs",
                 "select_uninstall_candidate",
-                PROMPT_GATED,
-            ),
-            (
-                "src/config/install_remote.rs",
-                "resolve_uninstall_action",
-                PROMPT_GATED,
-            ),
-            (
-                "src/config/install_remote.rs",
-                "resolve_mcp_conflict",
                 PROMPT_GATED,
             ),
             (

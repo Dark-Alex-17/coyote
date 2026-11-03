@@ -351,6 +351,26 @@ impl Vault {
 mod tests {
     use super::*;
 
+    /// Secret entry asks for the value on the raw tty; under the
+    /// full-screen UI both commands are refused before the question is
+    /// built, so no provider is touched.
+    #[test]
+    #[serial_test::serial]
+    fn secret_entry_under_the_tui_refuses_before_asking() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let vault = Vault::default_local();
+        let errors = [
+            vault.add_secret("tui-refused-secret").unwrap_err(),
+            vault.update_secret("tui-refused-secret").unwrap_err(),
+        ];
+        for err in errors {
+            assert!(
+                err.to_string().contains("not available in the TUI"),
+                "{err}"
+            );
+        }
+    }
+
     #[test]
     fn secret_re_matches_double_braces() {
         let captures = SECRET_RE.captures("{{MY_SECRET}}").unwrap().unwrap();

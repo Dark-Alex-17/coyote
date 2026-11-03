@@ -23,6 +23,7 @@ command output that never waits on a lingering child. The code is Coyote's
 own; only the design was followed.
 
 ## AIChat
+
 Coyote originally started as a fork of the fantastic
 [AIChat CLI](https://github.com/sigoden/aichat), created and maintained by
 the AIChat contributors. The initial goal was simply to fix a bug in how MCP

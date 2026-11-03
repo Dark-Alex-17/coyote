@@ -245,27 +245,36 @@ pub(crate) fn styled_line(ansi: &str) -> Line<'static> {
 /// The REPL's markdown renderer kept warm between frames.
 pub(crate) struct Renderer {
     markdown: MarkdownRender,
+    /// The user's `wrap` cap in columns, when it is a number; `auto` and
+    /// `no` leave the pane width to decide alone.
+    wrap_cap: Option<u16>,
 }
 
 impl Renderer {
     /// The width is set per call; `init` would otherwise size it from fd 1.
     pub(crate) fn new(options: RenderOptions) -> Result<Self> {
+        let wrap_cap = options
+            .wrap
+            .as_deref()
+            .and_then(|value| value.parse::<u16>().ok());
         let markdown = MarkdownRender::init(RenderOptions {
             wrap: None,
             ..options
         })?;
-        Ok(Self { markdown })
+        Ok(Self { markdown, wrap_cap })
     }
 
     /// Markdown laid out at `width` by the renderer itself: it wraps prose
     /// and lists on word boundaries and sizes tables to fit, where wrapping
     /// its painted output afterwards would break border rows mid-cell. Code
     /// lines follow the `wrap_code` option and are otherwise clipped by the
-    /// view.
+    /// view. A numeric `wrap` setting caps the width below the pane's, as
+    /// it caps the REPL's below the terminal's.
     pub(crate) fn markdown(&mut self, source: &str, width: u16) -> Vec<Line<'static>> {
         if source.is_empty() {
             return Vec::new();
         }
+        let width = self.wrap_cap.map_or(width, |cap| width.min(cap));
         self.markdown.set_wrap_width(Some(width.max(1)));
         let mut ansi = self.markdown.render(source);
         let pending_table = self.markdown.finalize();
@@ -375,6 +384,29 @@ mod tests {
 
     fn every_span<'a>(lines: &'a [Line<'a>]) -> impl Iterator<Item = &'a Span<'a>> {
         lines.iter().flat_map(|line| line.spans.iter())
+    }
+
+    /// A numeric `wrap` caps prose below the pane width the way it caps
+    /// the REPL below the terminal; `auto` and `no` do not.
+    #[test]
+    fn a_numeric_wrap_setting_caps_the_pane_width() {
+        let prose = "word ".repeat(30);
+        let widest = |lines: &[Line<'_>]| lines.iter().map(Line::width).max().unwrap_or(0);
+        let mut capped = Renderer::new(RenderOptions {
+            wrap: Some("30".to_string()),
+            ..RenderOptions::default()
+        })
+        .unwrap();
+        assert!(widest(&capped.markdown(&prose, 80)) <= 30);
+        assert!(widest(&capped.markdown(&prose, 20)) <= 20);
+        for setting in ["auto", "no"] {
+            let mut uncapped = Renderer::new(RenderOptions {
+                wrap: Some(setting.to_string()),
+                ..RenderOptions::default()
+            })
+            .unwrap();
+            assert!(widest(&uncapped.markdown(&prose, 80)) > 30, "{setting}");
+        }
     }
 
     #[test]

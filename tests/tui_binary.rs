@@ -3990,9 +3990,9 @@ fn cargo_installed_binary(dir: &Path) -> PathBuf {
     let bin_dir = dir.join("home").join(".cargo").join("bin");
     fs::create_dir_all(&bin_dir).unwrap();
     let copy = bin_dir.join("coyote");
-    if fs::hard_link(built_binary(), &copy).is_err() {
-        fs::copy(built_binary(), &copy).unwrap();
-    }
+    // A copy, never a hard link: the metadata checked afterwards must be
+    // this file's own, not shared with the binary cargo may rebuild.
+    fs::copy(built_binary(), &copy).unwrap();
     copy
 }
 
@@ -4693,7 +4693,8 @@ fn a_reply_with_concealed_text_shows_it_and_sends_no_conceal_to_the_tty() {
 /// Runs one fake-LLM turn with no session open, then `.session <name>`:
 /// the question whether to carry the exchange into the new session is
 /// asked as the modal, not refused. Returns the pty with the modal up.
-fn open_session_after_a_turn(dir: &Path, name: &str) -> Pty {
+/// The fake comes back with the pty so it outlives every later turn.
+fn open_session_after_a_turn(dir: &Path, name: &str) -> (Pty, FakeLlm) {
     let fake = FakeLlm::start(vec![Reply::Text("fixture first reply xk3".to_string())]);
     write_fake_llm_config(dir, &fake);
     let mut pty = spawn_tui(dir, &[]);
@@ -4721,7 +4722,7 @@ fn open_session_after_a_turn(dir: &Path, name: &str) -> Pty {
         );
     }
     pty.read_for(HOTKEY_GAP);
-    pty
+    (pty, fake)
 }
 
 /// Answers the open modal with `key` and checks the session comes up: the
@@ -4764,7 +4765,7 @@ fn answer_and_expect_session(mut pty: Pty, key: &[u8], name: &str, empty: bool) 
 fn dot_session_after_a_turn_asks_in_the_modal_and_n_seats_the_session() {
     let dir = fresh_config_dir("session-after-turn-n");
     let _guard = TempDirGuard(dir.clone());
-    let pty = open_session_after_a_turn(&dir, "after-turn-xk3");
+    let (pty, _fake) = open_session_after_a_turn(&dir, "after-turn-xk3");
     answer_and_expect_session(pty, b"n", "after-turn-xk3", true);
 }
 
@@ -4774,7 +4775,7 @@ fn dot_session_after_a_turn_asks_in_the_modal_and_n_seats_the_session() {
 fn dot_session_after_a_turn_asks_in_the_modal_and_y_seats_the_session() {
     let dir = fresh_config_dir("session-after-turn-y");
     let _guard = TempDirGuard(dir.clone());
-    let pty = open_session_after_a_turn(&dir, "after-turn-yk3");
+    let (pty, _fake) = open_session_after_a_turn(&dir, "after-turn-yk3");
     answer_and_expect_session(pty, b"y", "after-turn-yk3", false);
 }
 

@@ -2900,11 +2900,27 @@ mod tests {
     #[serial]
     fn wizard_prompts_under_the_tui_refuse_before_asking() {
         let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        // Under musl the driver question is not asked at all.
+        let driver = {
+            #[cfg(not(target_env = "musl"))]
+            {
+                Some(select_rag_driver().map(|_| ()).unwrap_err())
+            }
+            #[cfg(target_env = "musl")]
+            {
+                None
+            }
+        };
         let errors = [
             add_documents().map(|_| ()).unwrap_err(),
             set_graph_hops(1).map(|_| ()).unwrap_err(),
             set_chunk_overlay(0).map(|_| ()).unwrap_err(),
-        ];
+            select_extractor_model(&AppConfig::default())
+                .map(|_| ())
+                .unwrap_err(),
+        ]
+        .into_iter()
+        .chain(driver);
         for err in errors {
             assert!(
                 err.to_string().contains("not available in the TUI"),

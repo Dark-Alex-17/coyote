@@ -147,7 +147,9 @@ async fn run_command_with_output_interruptible<T: AsRef<OsStr>>(
     Ok((exit_code(output.status), stdout, stderr))
 }
 
-/// A child that does not outlive the future waiting on it.
+/// A child that does not outlive the future waiting on it. Only the
+/// direct child is killed: a loader that forks its own helpers and exits
+/// leaves them to finish on their own, as the stdout branch does too.
 struct KillOnDrop(Child);
 
 impl Drop for KillOnDrop {
