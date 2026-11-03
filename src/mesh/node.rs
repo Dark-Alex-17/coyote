@@ -1936,11 +1936,7 @@ async fn announce_destination(
     last_announce_at: &ArcSwapOption<SystemTime>,
 ) -> Result<Instant> {
     #[cfg(all(test, unix))]
-    if FAIL_NEXT_ANNOUNCE_OF
-        .lock()
-        .take_if(|failing| failing == hash)
-        .is_some()
-    {
+    if FAIL_NEXT_ANNOUNCE_OF.lock().remove(hash) {
         bail!(
             "The mesh announce for destination {} failed for the test",
             hash.to_hex_string()
@@ -1963,18 +1959,18 @@ async fn announce_destination(
     Ok(Instant::now())
 }
 
-/// The destination whose next announce, whichever path sends it, fails instead of being
-/// built; that announce consumes the entry. Keyed by destination so a start under test
-/// cannot fail another test's announce in the same process.
+/// The destinations whose next announce, whichever path sends it, fails instead of being
+/// built; that announce consumes its own entry. Keyed by destination so tests arming it
+/// at once in the same process neither fail nor disarm each other's announce.
 #[cfg(all(test, unix))]
-static FAIL_NEXT_ANNOUNCE_OF: parking_lot::Mutex<Option<AddressHash>> =
-    parking_lot::Mutex::new(None);
+static FAIL_NEXT_ANNOUNCE_OF: std::sync::LazyLock<parking_lot::Mutex<HashSet<AddressHash>>> =
+    std::sync::LazyLock::new(Default::default);
 
 /// Makes the next announce of destination `hash` fail; the one after it is sent as usual.
 /// Armed before a start, that is the start's first announce.
 #[cfg(all(test, unix))]
 pub(crate) fn fail_next_announce_of(hash: AddressHash) {
-    *FAIL_NEXT_ANNOUNCE_OF.lock() = Some(hash);
+    FAIL_NEXT_ANNOUNCE_OF.lock().insert(hash);
 }
 
 /// How many abandoned starts saw their request handlers drained before the grace window
@@ -3067,45 +3063,32 @@ async fn watch_interfaces(
                     }
                 }
                 Transition::Reconnect => {
-                    let line = if runtime.announce {
+                    let announced = if runtime.announce {
                         let outcome = tokio::select! {
                             () = cancel.cancelled() => return,
                             outcome = runtime.announce_after_reconnect() => outcome,
                         };
-                        match outcome {
-                            Ok(None) => {
-                                info!("Mesh interface {label} reconnected; announced");
-                                format!("{label} reconnected; announced")
-                            }
+                        match &outcome {
+                            Ok(None) => info!("Mesh interface {label} reconnected; announced"),
                             Ok(Some(age)) => {
-                                let age = elapsed_text(age);
                                 info!(
-                                    "Mesh interface {label} reconnected; the heartbeat will announce it (last announce {age})"
+                                    "Mesh interface {label} reconnected; the heartbeat will announce it (last announce {})",
+                                    elapsed_text(*age)
                                 );
-                                format!(
-                                    "{label} reconnected; the heartbeat will announce it (last announce {age})"
-                                )
                             }
-                            Err(err) => {
-                                warn!(
-                                    "Failed to announce the mesh node over {label} after it reconnected; the heartbeat will announce it: {}",
-                                    redact_hashes(&format!("{err:#}"))
-                                );
-                                format!(
-                                    "{label} reconnected; the announce over it failed, so the heartbeat will announce it: {}",
-                                    redact_hashes(&format!("{err:#}"))
-                                )
-                            }
+                            Err(err) => warn!(
+                                "Failed to announce the mesh node over {label} after it reconnected; the heartbeat will announce it: {}",
+                                redact_hashes(&format!("{err:#}"))
+                            ),
                         }
+                        Some(outcome)
                     } else {
                         info!("Mesh interface {label} reconnected; this node does not announce");
-                        format!(
-                            "{label} reconnected; nothing was sent over it, as this node does not announce (mesh.announce is off)"
-                        )
+                        None
                     };
                     slot.push_idle(IdleNotify {
                         source: Source::Mesh,
-                        text: line,
+                        text: reconnect_line(label, announced.as_ref()),
                         verbatim: Vec::new(),
                         origin: Origin::Local,
                         model_note: None,
@@ -3113,6 +3096,25 @@ async fn watch_interfaces(
                 }
             }
         }
+    }
+}
+
+/// The idle line for a relay that reconnected, by what became of the announce over it:
+/// `None` for a node that does not announce, else what `announce_after_reconnect`
+/// returned. A failure is told in plain words only; its cause goes to the log.
+fn reconnect_line(label: &str, announced: Option<&Result<Option<Duration>>>) -> String {
+    match announced {
+        Some(Ok(None)) => format!("{label} reconnected; announced"),
+        Some(Ok(Some(age))) => format!(
+            "{label} reconnected; this node announced {}, so it waits for the next heartbeat to announce again",
+            elapsed_text(*age)
+        ),
+        Some(Err(_)) => format!(
+            "{label} reconnected, but announcing over it failed; the next heartbeat will announce this node (details in the log)."
+        ),
+        None => format!(
+            "{label} reconnected; this node does not announce, so nothing was sent over it. To announce, set `mesh.announce` to true in the config and restart Coyote."
+        ),
     }
 }
 
@@ -12113,6 +12115,10 @@ mod tests {
         format!("private 127.0.0.1:{port}")
     }
 
+    /// How a reconnect line left to the heartbeat ends, after the age of the last announce.
+    #[cfg(unix)]
+    const DEFERRED_SUFFIX: &str = " ago, so it waits for the next heartbeat to announce again";
+
     #[cfg(unix)]
     fn states_of(runtime: &MeshRuntime) -> Vec<(String, InterfaceState)> {
         runtime
@@ -14232,7 +14238,7 @@ mod tests {
         relay.stop().await;
         let relay = TransportRelay::start_on(port).await;
         let prefix = format!(
-            "{} {label} reconnected; the heartbeat will announce it (last announce ",
+            "{} {label} reconnected; this node announced ",
             Source::Mesh.prefix()
         );
         for node in [&a, &b] {
@@ -14241,7 +14247,7 @@ mod tests {
                     rendered
                         .lines()
                         .iter()
-                        .any(|line| line.starts_with(&prefix) && line.ends_with(" ago)"))
+                        .any(|line| line.starts_with(&prefix) && line.ends_with(DEFERRED_SUFFIX))
                 })
             })
             .await;
@@ -14345,7 +14351,7 @@ mod tests {
         relay.stop().await;
         let relay = TransportRelay::start_on(port).await;
         let prefix = format!(
-            "{} {label} reconnected; the heartbeat will announce it (last announce ",
+            "{} {label} reconnected; this node announced ",
             Source::Mesh.prefix()
         );
         for node in [&a, &b] {
@@ -14356,8 +14362,8 @@ mod tests {
             let line = line_starting_with(&node.notifier, &prefix).unwrap();
             let age = line
                 .strip_prefix(&prefix)
-                .and_then(|rest| rest.strip_suffix(" ago)"))
-                .unwrap_or_else(|| panic!("the line does not end in ` ago)`: {line}"));
+                .and_then(|rest| rest.strip_suffix(DEFERRED_SUFFIX))
+                .unwrap_or_else(|| panic!("the line does not end in `{DEFERRED_SUFFIX}`: {line}"));
             let secs: u64 = age
                 .strip_suffix('s')
                 .and_then(|n| n.parse().ok())
@@ -14540,9 +14546,11 @@ mod tests {
     /// Every reconnect of a TCP relay is told, whatever became of the announce over it.
     mod reconnect_line_tests {
         use super::*;
+        use crate::mesh::card::StatusError;
+        use crate::mesh::fetch::FetchError as FileFetchError;
 
-        /// A node configured not to announce still says its relay is back, and that
-        /// nothing was sent over it.
+        /// A node configured not to announce still says its relay is back, that nothing
+        /// was sent over it, and how to turn announcing on.
         #[cfg(unix)]
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_node_that_does_not_announce_says_its_relay_reconnected() {
@@ -14573,7 +14581,7 @@ mod tests {
             wait_for_mesh_line(
                 &notifier,
                 &format!(
-                    "{} reconnected; nothing was sent over it, as this node does not announce (mesh.announce is off)",
+                    "{} reconnected; this node does not announce, so nothing was sent over it. To announce, set `mesh.announce` to true in the config and restart Coyote.",
                     private_label(port)
                 ),
             )
@@ -14583,8 +14591,9 @@ mod tests {
             relay.stop().await;
         }
 
-        /// An announce that fails after a reconnect is told on the reconnect line, with the
-        /// failure and the heartbeat that will carry the announce instead.
+        /// An announce that fails after a reconnect is told on the reconnect line in plain
+        /// words, with the heartbeat that will carry the announce instead; the cause stays
+        /// in the log.
         #[cfg(unix)]
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_failed_reconnect_announce_is_told_on_the_reconnect_line() {
@@ -14598,9 +14607,8 @@ mod tests {
             wait_for_mesh_line(
                 &a.notifier,
                 &format!(
-                    "{} reconnected; the announce over it failed, so the heartbeat will announce it: The mesh announce for destination {} failed for the test",
-                    private_label(port),
-                    a.hash8()
+                    "{} reconnected, but announcing over it failed; the next heartbeat will announce this node (details in the log).",
+                    private_label(port)
                 ),
             )
             .await;
@@ -14608,6 +14616,45 @@ mod tests {
             assert!(a.slot.stop().await.unwrap());
             assert!(b.slot.stop().await.unwrap());
             relay.stop().await;
+        }
+
+        /// The sentences this node prints for a reconnect, a silent peer and a link that
+        /// never came up are plain ASCII.
+        #[test]
+        fn the_reconnect_no_answer_and_unlinked_sentences_are_ascii() {
+            let label = "private 127.0.0.1:4242";
+            let failed: Result<Option<Duration>> = Err(anyhow!("the transport said no"));
+            let reconnect_lines = [
+                reconnect_line(label, None),
+                reconnect_line(label, Some(&Ok(None))),
+                reconnect_line(label, Some(&Ok(Some(Duration::from_secs(12))))),
+                reconnect_line(label, Some(&failed)),
+            ];
+            assert!(
+                !reconnect_lines[3].contains("the transport said no"),
+                "{}",
+                reconnect_lines[3]
+            );
+            let peer = "bb".repeat(16);
+            let own = "aa".repeat(16);
+            let no_answer = NoAnswer::new(&peer, own);
+            let never_linked = RequestError::LinkActivationTimeout {
+                path: STATUS_PATH.to_string(),
+                after: Duration::from_secs(10),
+            };
+            let sentences = reconnect_lines.into_iter().chain([
+                no_answer.to_string(),
+                no_answer.next_action(),
+                SendError::NoAnswer(no_answer.clone()).to_string(),
+                StatusError::NoAnswer(no_answer.clone()).to_string(),
+                StatusError::Transport(never_linked.clone()).to_string(),
+                FileFetchError::Transport(never_linked.clone()).to_string(),
+                SendError::Propagation(PropagationError::Link(never_linked)).to_string(),
+            ]);
+            for sentence in sentences {
+                assert!(sentence.is_ascii(), "{sentence}");
+                assert!(!sentence.contains(STATUS_PATH), "{sentence}");
+            }
         }
     }
 
