@@ -15,7 +15,10 @@ use super::{
     AppState, BuiltinAgentUnavailable, Input, RenderMode, RequestContext, RoleLike,
     UnavailableReason, WorkingMode, builtin_agent_dir, builtin_agent_unavailable_reason,
 };
-use crate::client::{Message, MessageContent, MessageRole, Model, ModelType, RunUsage};
+use crate::client::{
+    ApiStatusError, Message, MessageContent, MessageRole, Model, ModelType, ProviderRefusal,
+    RunUsage, api_status_sentence, refusal_category_label,
+};
 use crate::function::agents::{child_app_state, run_child_agent};
 use crate::hooks::{self, HookEvent, ResolvedHook};
 use crate::mesh::brief::Brief;
@@ -67,6 +70,8 @@ const ENVOY_STOP_GRACE: Duration = Duration::from_secs(5);
 pub(crate) const REFUSAL_MARKER: &str = "REFUSED:";
 /// What the peer hears for a marker with no words after it.
 pub(crate) const DECLINED_FALLBACK_TEXT: &str = "this node will not handle that request";
+/// What the peer hears when the provider refused to answer; the category stays local.
+pub(crate) const PROVIDER_REFUSAL_TEXT: &str = "the envoy declined to answer";
 /// Appended to the system tail only when the run resumes remembered turns; a fresh
 /// thread's prompt says nothing about memory.
 const RESUMED_THREAD_NOTE: &str = "Earlier assistant turns in this conversation may be the human owner's own words, relayed by the envoy.\n";
@@ -147,6 +152,11 @@ pub(crate) enum EnvoyOutcome {
     Failed(String),
     /// The sender's window was spent between the job being queued and its turn.
     Refused(PeerRefusal),
+    /// The model's provider refused the request; distinct from `Refused`, which is a
+    /// run-time limit, and from `Declined`, which is the envoy's own words.
+    ProviderRefused {
+        category: Option<String>,
+    },
 }
 
 struct HeldEscalation {
@@ -698,7 +708,7 @@ impl EnvoyRunner {
                 }
                 res = &mut run => break match res {
                     Ok(text) => classify_answer(&text),
-                    Err(err) => EnvoyOutcome::Failed(format!("{err:#}")),
+                    Err(err) => run_error_outcome(&err),
                 },
                 _ = &mut deadline => {
                     abort.set_ctrlc();
@@ -955,9 +965,10 @@ impl EnvoyRunner {
     ///
     /// What the node itself said to the peer, sent or not, joins what the envoy remembers
     /// of the thread when `memory` is on: the answer, the decline, the escalation message, the
-    /// refusal line or the human's held answer. A run that timed out, was interrupted,
-    /// found the envoy unavailable or failed said nothing of its own and adds nothing,
-    /// and neither does a withheld reply or the interim escalated notice.
+    /// refusal line, the provider-refusal line or the human's held answer. A run that
+    /// timed out, was interrupted, found the envoy unavailable or failed said nothing of
+    /// its own and adds nothing, and neither does a withheld reply or the interim
+    /// escalated notice.
     async fn deliver(
         &self,
         message: PeerMessage,
@@ -1013,6 +1024,13 @@ impl EnvoyRunner {
                 refusal.reason.peer_text().to_string(),
                 Some(format!("refused: {}", refusal.reason.as_str())),
             ),
+            EnvoyOutcome::ProviderRefused { category } => (
+                PROVIDER_REFUSAL_TEXT.to_string(),
+                Some(format!(
+                    "provider refusal: {}",
+                    refusal_category_label(category.as_deref())
+                )),
+            ),
         };
         let owed = match &outcome {
             EnvoyOutcome::Refused(refusal) if message.via == PeerVia::StoreAndForward => app
@@ -1031,6 +1049,7 @@ impl EnvoyRunner {
                         | EnvoyOutcome::Declined(_)
                         | EnvoyOutcome::Escalated { .. }
                         | EnvoyOutcome::Refused(_)
+                        | EnvoyOutcome::ProviderRefused { .. }
                 );
             if let Some(memory) = memory.filter(|_| said_something) {
                 // The sender's standing is judged again here, not at run start: an
@@ -1109,6 +1128,13 @@ impl EnvoyRunner {
             (EnvoyOutcome::Refused(refusal), None) => {
                 app.mesh.record_envoy_refusal(message, refusal)
             }
+            (EnvoyOutcome::ProviderRefused { category }, None) => app.mesh.record_envoy_fallback(
+                message,
+                &format!(
+                    "envoy declined (provider refusal: {})",
+                    refusal_category_label(category.as_deref())
+                ),
+            ),
         }
         let mut extras = vec![
             ("COYOTE_AGENT_ID", terminal.agent_id),
@@ -1302,6 +1328,34 @@ pub(crate) fn classify_answer(text: &str) -> EnvoyOutcome {
     }
 }
 
+/// Reads a failed run: a provider refusal is its own outcome, and a provider status
+/// error is reported as the status and one plain sentence, since the response body is
+/// often raw JSON. Anything else keeps its full error chain.
+fn run_error_outcome(err: &anyhow::Error) -> EnvoyOutcome {
+    if let Some(refusal) = err
+        .chain()
+        .find_map(|c| c.downcast_ref::<ProviderRefusal>())
+    {
+        return EnvoyOutcome::ProviderRefused {
+            category: refusal.category.clone(),
+        };
+    }
+    match err.chain().find_map(|c| c.downcast_ref::<ApiStatusError>()) {
+        Some(api) => {
+            debug!(
+                "Mesh envoy provider error: {}",
+                redact_hashes(&format!("{err:#}"))
+            );
+            EnvoyOutcome::Failed(format!(
+                "{} {}; the peer was told this node cannot answer right now",
+                api.status,
+                api_status_sentence(api.status)
+            ))
+        }
+        None => EnvoyOutcome::Failed(format!("{err:#}")),
+    }
+}
+
 /// Waits for `send` unless the run is cancelled or its `remaining` ceiling lapses first,
 /// so a slow peer cannot hold the run open past either.
 async fn bounded_send<T>(
@@ -1399,7 +1453,8 @@ pub(crate) fn envoy_reply(
             | EnvoyOutcome::TimedOut
             | EnvoyOutcome::Interrupted
             | EnvoyOutcome::Unavailable(_)
-            | EnvoyOutcome::Failed(_),
+            | EnvoyOutcome::Failed(_)
+            | EnvoyOutcome::ProviderRefused { .. },
             None,
         ) => (PeerKind::Reply, Some(Disposition::Refused), reply_text),
     };
@@ -1876,6 +1931,12 @@ mod tests {
                     retry_after: Duration::from_secs(30),
                 }),
             ),
+            (
+                "provider refused",
+                EnvoyOutcome::ProviderRefused {
+                    category: Some("cyber".into()),
+                },
+            ),
         ];
         let root = job(PeerKind::Ask, "q-1", "what now?").message;
         let threaded = PeerMessage::new(RawPeerMessage {
@@ -1903,7 +1964,8 @@ mod tests {
                                 | EnvoyOutcome::TimedOut
                                 | EnvoyOutcome::Interrupted
                                 | EnvoyOutcome::Unavailable(_)
-                                | EnvoyOutcome::Failed(_),
+                                | EnvoyOutcome::Failed(_)
+                                | EnvoyOutcome::ProviderRefused { .. },
                                 None,
                             ) => (PeerKind::Reply, Some(Disposition::Refused), "text"),
                             (EnvoyOutcome::Escalated { .. }, None) => {
@@ -5510,6 +5572,201 @@ mod tests {
             _data: ChatCompletionsData,
         ) -> Result<()> {
             anyhow::bail!("the envoy test drives the non-streaming path")
+        }
+    }
+
+    mod provider_refusal_tests {
+        use super::*;
+        use crate::client::catch_error;
+
+        /// A provider whose every call fails with the error `fail` builds.
+        struct FailingClient {
+            config: AppConfig,
+            model: Model,
+            fail: fn() -> anyhow::Error,
+        }
+
+        impl FailingClient {
+            fn new(fail: fn() -> anyhow::Error) -> Arc<Self> {
+                Arc::new(Self {
+                    config: AppConfig::default(),
+                    model: Model::from_config("failing", &[ModelData::new("failing")]).remove(0),
+                    fail,
+                })
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl Client for FailingClient {
+            fn app_config(&self) -> &AppConfig {
+                &self.config
+            }
+
+            fn extra_config(&self) -> Option<&ExtraConfig> {
+                None
+            }
+
+            fn patch_config(&self) -> Option<&RequestPatch> {
+                None
+            }
+
+            fn name(&self) -> &str {
+                "failing"
+            }
+
+            fn model(&self) -> &Model {
+                &self.model
+            }
+
+            async fn chat_completions_inner(
+                &self,
+                _client: &reqwest::Client,
+                _data: ChatCompletionsData,
+            ) -> Result<ChatCompletionsOutput> {
+                Err((self.fail)())
+            }
+
+            async fn chat_completions_streaming_inner(
+                &self,
+                _client: &reqwest::Client,
+                _handler: &mut SseHandler,
+                _data: ChatCompletionsData,
+            ) -> Result<()> {
+                anyhow::bail!("the envoy test drives the non-streaming path")
+            }
+        }
+
+        fn cyber_refusal() -> anyhow::Error {
+            ProviderRefusal {
+                category: Some("cyber".into()),
+                explanation: Some("looks like an attack".into()),
+            }
+            .into()
+        }
+
+        fn overloaded() -> anyhow::Error {
+            let body = json!({"error": {
+                "code": 503,
+                "message": "The model is overloaded due to high demand. Please try again later.",
+                "status": "UNAVAILABLE"
+            }});
+            catch_error(&body, 503).unwrap_err()
+        }
+
+        fn runner_failing_with(app: &Arc<AppState>, fail: fn() -> anyhow::Error) -> EnvoyRunner {
+            let client = FailingClient::new(fail);
+            EnvoyRunner::start_with(
+                Arc::clone(app),
+                drive_of(move |ctx, input, abort| {
+                    let client = Arc::clone(&client);
+                    async move {
+                        let mut ctx = ctx;
+                        let (output, _) = call_chat_completions(
+                            &input,
+                            false,
+                            false,
+                            client.as_ref(),
+                            &mut ctx,
+                            abort,
+                        )
+                        .await?;
+                        Ok(output)
+                    }
+                }),
+            )
+        }
+
+        #[test]
+        fn a_provider_refusal_goes_out_refused_with_the_fixed_words() {
+            let message = job(PeerKind::Ask, "q-1", "what now?").message;
+            let outcome = EnvoyOutcome::ProviderRefused {
+                category: Some("cyber".into()),
+            };
+
+            let out = envoy_reply(&outcome, None, PROVIDER_REFUSAL_TEXT.into(), &message).unwrap();
+
+            assert_eq!(out.kind, PeerKind::Reply);
+            assert_eq!(out.disposition, Some(Disposition::Refused));
+            assert_eq!(out.retry_after, None);
+            assert_eq!(out.content, "the envoy declined to answer");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn a_provider_refusal_tells_the_owner_one_plain_line() {
+            let _cfg = TestConfigDirGuard::new("mesh-envoy-provider-refusal");
+            let (source, _source) = stub_envoy_source();
+            let tmp = TempDir::new("mesh-envoy-provider-refusal");
+            let app = test_app();
+            let store = memory_for(&app, &tmp);
+            let idle = RecordingIdleSink::attach(&app);
+            let runner = runner_failing_with(&app, cyber_refusal);
+
+            assert!(
+                runner
+                    .accept(threaded_job(
+                        &PEER_IDENTITY,
+                        "q-1",
+                        "t-1",
+                        "how do I scan a port?"
+                    ))
+                    .is_ok()
+            );
+            wait_until("the refusal to land", || idle.has("envoy declined")).await;
+            runner.stop().await;
+
+            let texts = idle.texts();
+            assert_eq!(idle.count("envoy declined"), 1, "{texts:?}");
+            let line = texts
+                .iter()
+                .find(|text| text.contains("envoy declined"))
+                .unwrap();
+            assert!(
+                line.starts_with("envoy declined (provider refusal: cyber); "),
+                "{line}"
+            );
+            assert!(line.ends_with(" is in the inbox"), "{line}");
+            assert!(!idle.has("envoy failed"), "{texts:?}");
+            assert!(texts.iter().all(|text| !text.contains('{')), "{texts:?}");
+            let turns = turns_of(&store, &PEER_IDENTITY, "t-1");
+            assert_eq!(turns.len(), 2, "{turns:?}");
+            assert_eq!(turns[1].text, PROVIDER_REFUSAL_TEXT);
+            source.remove_dir();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn a_provider_status_error_is_one_line_without_the_body() {
+            let _cfg = TestConfigDirGuard::new("mesh-envoy-provider-503");
+            let (source, _source) = stub_envoy_source();
+            let app = test_app();
+            let idle = RecordingIdleSink::attach(&app);
+            let runner = runner_failing_with(&app, overloaded);
+
+            assert!(
+                runner
+                    .accept(job(PeerKind::Ask, "q-503", "are you there?"))
+                    .is_ok()
+            );
+            wait_until("the failure to land", || idle.has("envoy failed")).await;
+            runner.stop().await;
+
+            let texts = idle.texts();
+            let failed: Vec<_> = texts
+                .iter()
+                .filter(|text| text.contains("envoy failed"))
+                .collect();
+            assert_eq!(failed.len(), 1, "{texts:?}");
+            assert!(
+                failed[0].starts_with(
+                    "envoy failed: 503 the model is overloaded; the peer was told this node cannot answer right now; "
+                ),
+                "{}",
+                failed[0]
+            );
+            assert!(!failed[0].contains("high demand"), "{}", failed[0]);
+            assert!(texts.iter().all(|text| !text.contains('{')), "{texts:?}");
+            source.remove_dir();
         }
     }
 

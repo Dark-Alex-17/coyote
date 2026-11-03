@@ -312,6 +312,13 @@ async fn chat_completions_streaming(
                                 handler.usage(usage);
                             }
                         }
+                        "messageStop" => {
+                            if is_refusal_stop(&data["stopReason"])
+                                && !handler.has_received_visible_output()
+                            {
+                                return Err(ProviderRefusal::default().into());
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -749,6 +756,9 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
     }
 
     if text.is_empty() && tool_calls.is_empty() {
+        if is_refusal_stop(&data["stopReason"]) {
+            return Err(ProviderRefusal::default().into());
+        }
         bail!("Invalid response data: {data}");
     }
 
@@ -759,6 +769,13 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
         usage: bedrock_parse_usage(&data["usage"]),
     };
     Ok(output)
+}
+
+/// Converse reports a model-side refusal as `content_filtered`.
+/// `guardrail_intervened` is a user-configured guardrail whose message
+/// arrives as ordinary content, so it is not a refusal.
+fn is_refusal_stop(stop_reason: &Value) -> bool {
+    matches!(stop_reason.as_str(), Some("content_filtered" | "refusal"))
 }
 
 #[derive(Debug)]
@@ -1439,5 +1456,48 @@ mod tests {
             &output.thinking[1],
             ThinkingBlock::RedactedThinking { data } if data == "b64data"
         ));
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+
+    fn empty_reply(stop_reason: &str) -> Value {
+        json!({
+            "output": {"message": {"role": "assistant", "content": []}},
+            "stopReason": stop_reason,
+            "usage": {"inputTokens": 10, "outputTokens": 0, "totalTokens": 10}
+        })
+    }
+
+    #[test]
+    fn content_filtered_with_no_content_is_a_refusal_without_category() {
+        for stop_reason in ["content_filtered", "refusal"] {
+            let err = extract_chat_completions(&empty_reply(stop_reason)).unwrap_err();
+
+            let refusal = err.downcast_ref::<ProviderRefusal>().unwrap();
+            assert_eq!(refusal.category, None);
+            assert_eq!(
+                format!("{err:#}"),
+                "the model declined to answer (provider refusal: no category given)"
+            );
+        }
+    }
+
+    #[test]
+    fn guardrail_intervened_is_not_a_refusal() {
+        let err = extract_chat_completions(&empty_reply("guardrail_intervened")).unwrap_err();
+
+        assert!(err.downcast_ref::<ProviderRefusal>().is_none());
+    }
+
+    #[test]
+    fn only_model_side_stop_reasons_count_as_refusals() {
+        assert!(is_refusal_stop(&json!("content_filtered")));
+        assert!(is_refusal_stop(&json!("refusal")));
+        assert!(!is_refusal_stop(&json!("guardrail_intervened")));
+        assert!(!is_refusal_stop(&json!("end_turn")));
+        assert!(!is_refusal_stop(&Value::Null));
     }
 }

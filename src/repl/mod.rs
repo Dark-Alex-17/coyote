@@ -15,8 +15,8 @@ use self::printer::PromptPrinter;
 use self::prompt::ReplPrompt;
 
 use crate::client::{
-    Message, MessageRole, call_chat_completions, call_chat_completions_streaming,
-    call_chat_completions_streaming_quiet, init_client, oauth,
+    Message, MessageRole, ProviderRefusal, call_chat_completions, call_chat_completions_streaming,
+    call_chat_completions_streaming_quiet, init_client, oauth, refusal_category_label,
 };
 use crate::config::{
     AgentVariables, AppConfig, AssertState, CommandPrefix, EnvoyRunner, Input, LastMessage,
@@ -782,7 +782,7 @@ impl Repl {
                             }
                         }
                         Err(err) => {
-                            render_command_error(err, self.command_prefix());
+                            render_turn_error(err, self.command_prefix());
                             println!()
                         }
                     }
@@ -2113,6 +2113,28 @@ async fn ask(
     ask_with_branch(ctx, abort_signal, input, with_embeddings, None).await
 }
 
+fn provider_refusal(err: &anyhow::Error) -> Option<&ProviderRefusal> {
+    err.chain()
+        .find_map(|c| c.downcast_ref::<ProviderRefusal>())
+}
+
+/// A turn the provider refused shows one plain line instead of the error chain.
+fn render_turn_error(err: anyhow::Error, prefix: CommandPrefix) {
+    match provider_refusal_line(&err) {
+        Some(line) => eprintln!("{line}"),
+        None => render_command_error(err, prefix),
+    }
+}
+
+fn provider_refusal_line(err: &anyhow::Error) -> Option<String> {
+    provider_refusal(err).map(|refusal| {
+        format!(
+            "The model declined to answer (provider refusal: {}).",
+            refusal_category_label(refusal.category.as_deref())
+        )
+    })
+}
+
 /// `forced` bypasses the route classifier on a graph agent with a session
 /// block; `None` lets the classifier decide.
 async fn ask_with_branch(
@@ -2294,7 +2316,11 @@ async fn ask_loop(
                     if abort_signal.aborted_ctrlc() {
                         print_turn_notice(ctx, turn_interrupt_notice(ctx, &abort_signal).await);
                     }
-                    ctx.on_chat_completion_error(app.as_ref(), &input);
+                    // A refused turn has nothing to recover, so the session keeps no
+                    // interrupted marker for it.
+                    if provider_refusal(&err).is_none() {
+                        ctx.on_chat_completion_error(app.as_ref(), &input);
+                    }
                     return Err(err);
                 }
             }
@@ -4769,6 +4795,67 @@ local_hello() {\n\
         assert_eq!(format!("{marked:#}"), format!("{:#}", inner()));
         let source = std::error::Error::source(&*marked).expect("the inner error's source");
         assert_eq!(source.to_string(), "root cause");
+    }
+
+    mod provider_refusal_tests {
+        use super::*;
+
+        fn refused() -> anyhow::Error {
+            anyhow::Error::new(ProviderRefusal {
+                category: Some("cyber".into()),
+                explanation: Some("looks like an attack".into()),
+            })
+            .context("Failed to call chat-completions api")
+        }
+
+        #[test]
+        fn a_refused_turn_renders_one_line_and_leaves_the_session_alone() {
+            run_async(async {
+                let mut ctx = repl_ctx();
+                ctx.session = Some(Session::default());
+                let tokens_before = ctx.session.as_ref().unwrap().tokens();
+                let input = Input::from_str(&ctx, "scan this host", None).unwrap();
+                let mut runner = completion_runner(|_input, _ctx, _abort| {
+                    boxed_completion(async { Err(refused()) })
+                });
+
+                let err = ask_with_branch_with_runner(
+                    &mut ctx,
+                    create_abort_signal(),
+                    input,
+                    false,
+                    None,
+                    &mut runner,
+                )
+                .await
+                .unwrap_err();
+
+                assert_eq!(
+                    provider_refusal_line(&err).as_deref(),
+                    Some("The model declined to answer (provider refusal: cyber).")
+                );
+                assert!(ctx.last_message.is_none());
+                let session = ctx.session.as_ref().unwrap();
+                assert!(session.messages().is_empty());
+                assert_eq!(session.tokens(), tokens_before);
+                assert!(!session.dirty());
+            });
+        }
+
+        #[test]
+        fn a_refusal_without_a_category_says_so() {
+            let err = anyhow::Error::new(ProviderRefusal::default());
+
+            assert_eq!(
+                provider_refusal_line(&err).as_deref(),
+                Some("The model declined to answer (provider refusal: no category given).")
+            );
+        }
+
+        #[test]
+        fn any_other_turn_error_is_not_a_refusal_line() {
+            assert_eq!(provider_refusal_line(&anyhow!("boom")), None);
+        }
     }
 
     #[test]

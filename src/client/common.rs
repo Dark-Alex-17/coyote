@@ -1009,6 +1009,55 @@ impl std::fmt::Display for ApiStatusError {
 
 impl std::error::Error for ApiStatusError {}
 
+/// The model answered with a refusal and nothing else. Claude reports this
+/// as `stop_reason: refusal`; Bedrock Converse as `stopReason:
+/// content_filtered`, which carries no category.
+#[derive(Debug, Default)]
+pub struct ProviderRefusal {
+    pub category: Option<String>,
+    pub explanation: Option<String>,
+}
+
+impl ProviderRefusal {
+    pub fn from_stop_details(details: &Value) -> Self {
+        Self {
+            category: details["category"].as_str().map(str::to_string),
+            explanation: details["explanation"].as_str().map(str::to_string),
+        }
+    }
+}
+
+impl std::fmt::Display for ProviderRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the model declined to answer (provider refusal: {})",
+            refusal_category_label(self.category.as_deref())
+        )
+    }
+}
+
+impl std::error::Error for ProviderRefusal {}
+
+pub fn refusal_category_label(category: Option<&str>) -> &str {
+    category.unwrap_or("no category given")
+}
+
+/// One plain sentence for an HTTP status, so a caller can report a provider
+/// failure without echoing the response body.
+pub fn api_status_sentence(status: u16) -> &'static str {
+    match status {
+        503 | 529 => "the model is overloaded",
+        429 => "the provider is rate limiting requests",
+        401 | 403 => {
+            "the provider rejected the credentials (check the client's api_key, or set envoy_model to another model)"
+        }
+        500..=599 => "the provider had an error",
+        400..=499 => "the provider rejected the request",
+        _ => "the provider returned an unexpected status",
+    }
+}
+
 /// True when the error chain bottoms out in an [`ApiStatusError`] with
 /// status 401 EXACTLY. 403 (entitlement) and 429 (rate limit) are never
 /// auth failures, and message text is never inspected.
