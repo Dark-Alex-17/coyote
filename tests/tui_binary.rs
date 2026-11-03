@@ -15,13 +15,16 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, fs, iter, process};
 
-use common::fake_llm::{Chunk, FakeLlm, Reply};
+use common::fake_llm::{Chunk, FakeLlm, HOLD_LIMIT, Reply};
 use common::pty::{Pty, strip_ansi};
 use serial_test::serial;
 
 /// Covers the keyboard-enhancement probe, which waits two seconds for an
 /// answer a pseudo-terminal never gives.
 const PTY_DEADLINE: Duration = Duration::from_secs(20);
+/// Hotkeys on a modal only count once typing has been idle for a second
+/// (pinned by the ManualClock unit test); settle before answering.
+const HOTKEY_GAP: Duration = Duration::from_millis(1200);
 
 struct TempDirGuard(PathBuf);
 
@@ -587,14 +590,12 @@ fn sighup_during_the_startup_probe_kills_the_process() {
     let transcript = pty.wait_for("cpid=", PTY_DEADLINE).unwrap();
     let pid = child_pid(&transcript);
     // The probe opens with its query and then waits two seconds for a
-    // reply nobody here sends.
+    // reply nobody here sends; the hang-up goes out as soon as the query
+    // is seen, before a loaded host can let the wait run out.
     pty.wait_for_raw(b"\x1b[?u\x1b[c", 0, PTY_DEADLINE).unwrap();
-    std::thread::sleep(Duration::from_millis(200));
     // SAFETY: kill takes a pid and a signal number and touches no memory.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGHUP) }, 0);
-    let transcript = pty
-        .wait_for("tty-probe-done", Duration::from_secs(5))
-        .unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
 
     // The signal streams are armed only after the probe, so the kernel's
     // default disposition ends the process: 128 + SIGHUP, never an error
@@ -1080,7 +1081,7 @@ fn exit_session_shows_the_save_modal_and_saves_on_y() {
     // (pinned by the ManualClock unit test), so wait the gap out before
     // answering. Ratatui repaints only changed cells, so the modal
     // title's unchanged `S` is absent from the stream.
-    pty.read_for(Duration::from_millis(1200));
+    pty.read_for(HOTKEY_GAP);
     pty.send(b"y").unwrap();
     pty.wait_for("ession name", PTY_DEADLINE).unwrap();
     let named_at = pty.raw().len();
@@ -1392,10 +1393,6 @@ fn open_and_dirty_a_session(pty: &mut Pty) {
     pty.send(b".set skills_enabled false\r").unwrap();
     pty.read_for(Duration::from_millis(800));
 }
-
-/// Hotkeys on a modal only count once typing has been idle for a second
-/// (pinned by the ManualClock unit test); settle before answering.
-const HOTKEY_GAP: Duration = Duration::from_millis(1200);
 
 /// An unknown dot-command is an ordinary command turn that fails: the
 /// REPL's hint lands in the transcript as the error, the UI stays up and
@@ -2142,7 +2139,7 @@ fn a_streamed_reply_is_painted_before_the_stream_ends() {
     let transcript = wait_for_squeezed(&mut pty, "first half h4x", "the first delta");
     let squeezed: String = transcript.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
-        started.elapsed() < Duration::from_secs(8),
+        started.elapsed() < HOLD_LIMIT,
         "the first delta appeared only after the fake gave up holding the stream"
     );
     assert!(
@@ -2238,7 +2235,7 @@ fn a_reasoning_stream_keeps_the_turn_busy_until_the_answer_is_sent() {
         "the reasoning delta",
     );
     assert!(
-        started.elapsed() < Duration::from_secs(8),
+        started.elapsed() < HOLD_LIMIT,
         "the reasoning delta was painted only after the fake gave up holding the stream"
     );
     assert!(
@@ -2760,7 +2757,7 @@ fn ctrl_c_on_an_idle_empty_composer_quits_like_ctrl_d() {
     let mut pty = spawn_tui(&dir, &[]);
 
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
-    pty.read_for(Duration::from_millis(1200));
+    pty.read_for(HOTKEY_GAP);
     pty.send(b"\x03").unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
 
@@ -2790,7 +2787,7 @@ fn ctrl_c_with_a_draft_clears_the_composer_and_does_not_quit() {
     pty.send(b"draft to discard q9x").unwrap();
     pty.wait_for("draft to discard q9x", PTY_DEADLINE)
         .expect("the typed draft never reached the composer");
-    pty.read_for(Duration::from_millis(1200));
+    pty.read_for(HOTKEY_GAP);
     let cleared_at = pty.raw().len();
     pty.send(b"\x03").unwrap();
     pty.read_for(Duration::from_millis(800));
@@ -2807,7 +2804,7 @@ fn ctrl_c_with_a_draft_clears_the_composer_and_does_not_quit() {
 
     // Enter now must find an empty composer: no turn, no request.
     pty.send(b"\r").unwrap();
-    pty.read_for(Duration::from_millis(1200));
+    pty.read_for(HOTKEY_GAP);
     let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[cleared_at..]));
     assert!(
         !since.contains("Working"),
@@ -3033,7 +3030,7 @@ fn esc_on_an_idle_empty_composer_does_not_quit() {
     let mut pty = spawn_tui(&dir, &[]);
 
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
-    pty.read_for(Duration::from_millis(1200));
+    pty.read_for(HOTKEY_GAP);
     let pressed_at = pty.raw().len();
     pty.send(b"\x1b").unwrap();
     pty.read_for(Duration::from_millis(1000));
@@ -3375,6 +3372,7 @@ fn a_truncated_escape_at_the_end_does_not_panic() {
     assert_eq!(strip_ansi("tail\x1b"), "tail");
     assert_eq!(strip_ansi("tail\x1b["), "tail");
     assert_eq!(strip_ansi("tail\x1b]"), "tail");
+    assert_eq!(strip_ansi("tail\x1b("), "tail");
 }
 
 fn has_cloexec(fd: std::os::fd::RawFd) -> bool {
@@ -3427,7 +3425,8 @@ fn clipped_question_confirm_tool() -> String {
     RECORDING_CONFIRM_TOOL.replace("Really do it? q9d-q", &clipped_question())
 }
 
-/// Every token of the modal's hint, whitespace squeezed out.
+/// Every token of the modal's hint once the question fits, whitespace
+/// squeezed out.
 const HINT_TOKENS: [&str; 5] = [
     "y=yes",
     "n=no",
@@ -3455,8 +3454,9 @@ fn open_clipped_modal(pty: &mut Pty) -> String {
 
 /// A question taller than the screen is marked `(+N more lines; enlarge
 /// the terminal)` and `y` does nothing while it is clipped: the tool gets
-/// no answer. Once the window is enlarged the whole question is visible
-/// and `y` answers it. The hint stays whole on the 40-column screen.
+/// no answer, and the legend offers only Esc. Once the window is enlarged
+/// the whole question is visible, the full hint is back and `y` answers
+/// it.
 #[test]
 #[serial]
 fn a_clipped_confirm_question_refuses_y_until_the_terminal_is_enlarged() {
@@ -3488,12 +3488,14 @@ fn a_clipped_confirm_question_refuses_y_until_the_terminal_is_enlarged() {
         !shown.contains("q9d-clip-end"),
         "the question's tail was painted although the marker says it is clipped:\n{modal}"
     );
-    for token in HINT_TOKENS {
-        assert!(
-            shown.contains(token),
-            "the hint token {token:?} is missing from the 40-column modal:\n{modal}"
-        );
-    }
+    assert!(
+        shown.contains("Esc=cancelenlargetheterminaltoanswer"),
+        "the clipped legend is missing from the 40-column modal:\n{modal}"
+    );
+    assert!(
+        !shown.contains("y=yes"),
+        "the clipped legend still offers an approving key:\n{modal}"
+    );
 
     pty.read_for(HOTKEY_GAP);
     pty.send(b"y").unwrap();
@@ -3518,7 +3520,15 @@ fn a_clipped_confirm_question_refuses_y_until_the_terminal_is_enlarged() {
         !squeezed(&grown).contains("morelines;enlarge"),
         "the clip marker is still shown after the whole question fits:\n{grown}"
     );
-    pty.read_for(HOTKEY_GAP);
+    // `read_for` hands back the whole screen so far; the approving keys
+    // were never offered before the question fit.
+    let grown = squeezed(&pty.read_for(HOTKEY_GAP));
+    for token in HINT_TOKENS {
+        assert!(
+            grown.contains(token),
+            "the hint token {token:?} did not come back once the question fit:\n{grown}"
+        );
+    }
     pty.send(b"y").unwrap();
     wait_for_file(&mut pty, &out, "the tool's recorded answer after enlarging");
     let transcript = wait_for_squeezed(

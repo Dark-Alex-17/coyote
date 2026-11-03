@@ -8,6 +8,10 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+/// How long a `WaitFor` chunk holds the stream open before the fake gives
+/// up; a test that expects the release to come sooner asserts against it.
+pub const HOLD_LIMIT: Duration = Duration::from_secs(8);
+
 pub enum Reply {
     ToolCall {
         name: String,
@@ -241,7 +245,7 @@ fn paced_sse_response(stream: &mut TcpStream, chunks: &[Chunk], stop: &AtomicBoo
             Chunk::Text(text) => json!({"content": text}),
             Chunk::Reasoning(text) => json!({"reasoning_content": text}),
             Chunk::WaitFor(path) => {
-                let deadline = std::time::Instant::now() + Duration::from_secs(8);
+                let deadline = std::time::Instant::now() + HOLD_LIMIT;
                 while !path.exists()
                     && !stop.load(Ordering::SeqCst)
                     && std::time::Instant::now() < deadline

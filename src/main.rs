@@ -677,6 +677,9 @@ async fn run(
         true => {
             let tui = env::var(config::UiKind::ENV).as_deref() == Ok(config::UiKind::Tui.as_str());
             if tui {
+                // Refused here, before the models refresh and the REPL
+                // setup are started on the UI's behalf; `tui::run` checks
+                // again so it holds on its own, whoever calls it.
                 tui::ensure_tty()?;
             } else if !*IS_STDOUT_TERMINAL {
                 bail!("No TTY for REPL")

@@ -74,9 +74,10 @@ pub enum Event {
         line: String,
     },
     TextDelta(String),
-    /// No origin yet: every non-silent SseHandler publishes these.
+    /// The model's thinking phase began / ended. Neither carries an
+    /// origin yet: every non-silent SseHandler publishes them.
     ThinkingStarted,
-    /// No origin yet: every non-silent SseHandler publishes these.
+    /// See `ThinkingStarted`.
     ThinkingStopped,
     AssistantText {
         text: String,

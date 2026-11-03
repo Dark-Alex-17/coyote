@@ -1411,6 +1411,9 @@ fn exit_leaving_the_task_behind(screen: &mut Screen, unfinished: Unfinished) -> 
 /// Edits `text` in `editor` (resolved the way the REPL resolves its buffer
 /// editor) through a private, freshly created temp file, so no other user
 /// can pre-plant a file or symlink at the path.
+/// Hands `text` to `editor` through a private temp file and returns what
+/// came back. An editor that exits non-zero (or is killed) leaves the text
+/// as it was; the temp file is removed on every path.
 fn edit_in_editor(editor: &str, text: &str) -> std::io::Result<String> {
     let path = crate::utils::temp_file("-tui-", ".md");
     let mut options = std::fs::OpenOptions::new();
@@ -1420,14 +1423,20 @@ fn edit_in_editor(editor: &str, text: &str) -> std::io::Result<String> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    {
+    let written = (|| {
         use std::io::Write;
-        options.open(&path)?.write_all(text.as_bytes())?;
+        options.open(&path)?.write_all(text.as_bytes())
+    })();
+    if let Err(err) = written {
+        let _ = std::fs::remove_file(&path);
+        return Err(err);
     }
     let status = std::process::Command::new(editor).arg(&path).status();
     let edited = std::fs::read_to_string(&path);
     let _ = std::fs::remove_file(&path);
-    status?;
+    if !status?.success() {
+        return Ok(text.to_string());
+    }
     Ok(edited?.trim_end_matches('\n').to_string())
 }
 
@@ -1500,6 +1509,9 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
 
     let leave = run_loop(&mut shell, ctx).await;
     let mut rx = shell.rx;
+    // The event reader would otherwise keep swallowing keystrokes from
+    // the cooked terminal while the teardown below prints and waits.
+    drop(shell.stream);
     // Whatever ended the loop, no screen is left to ask on: a question
     // raised during the teardown below answers itself.
     auto_cancel.store(true, Ordering::SeqCst);
@@ -2994,6 +3006,43 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    /// Temp files `edit_in_editor` made for this process.
+    #[cfg(unix)]
+    fn editor_temp_files() -> Vec<std::path::PathBuf> {
+        let marker = format!("-{}-tui-", std::process::id());
+        std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains(&marker) && name.ends_with(".md"))
+            })
+            .collect()
+    }
+
+    /// An editor that exits non-zero has not finished the edit: the text
+    /// stays as it was, and the temp file is gone either way.
+    #[test]
+    #[cfg(unix)]
+    fn a_failing_editor_leaves_the_text_as_it_was() {
+        use std::os::unix::fs::PermissionsExt;
+        let script = crate::utils::temp_file("-editor-", ".sh");
+        std::fs::write(&script, "#!/bin/sh\nprintf changed > \"$1\"\nexit 3\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let before = editor_temp_files();
+
+        let edited = edit_in_editor(script.to_str().unwrap(), "draft").unwrap();
+        let after = editor_temp_files();
+        std::fs::remove_file(&script).unwrap();
+
+        assert_eq!(edited, "draft");
+        assert_eq!(after, before, "the editor's temp file was left behind");
+        let gone = edit_in_editor("true", "kept\n").unwrap();
+        assert_eq!(gone, "kept");
+    }
+
     /// Emitters paint notices for the REPL (`error_text`, a leading
     /// newline for spacing); the sink strips that so the cell shows the
     /// words on its first row and no escape bytes.
@@ -3537,7 +3586,7 @@ mod tests {
         let err = answer.unwrap_err().to_string();
         assert_eq!(
             err,
-            "Keyboard prompts are not available in the TUI yet; unanswered: WARNING: risky"
+            "Keyboard prompts are not available in the TUI yet; unanswered: Continue? [y/N]"
         );
     }
 
