@@ -592,8 +592,7 @@ nodes:
       Files modified: {{files_to_modify}}
       Files created: {{files_to_create}}
       Build: passed
-      Tests: passed
-      {{baseline_report}}
+      Tests: passed{{baseline_report}}
       Design: {{design_notes}}
 
   end_rejected:

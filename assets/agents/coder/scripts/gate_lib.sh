@@ -101,6 +101,32 @@ gate_test_command() {
   printf '%s' "$cmd"
 }
 
+# gate_test_command_for_run prints test command `cmd` as the gates run it:
+# every `cargo test` (or `cargo +toolchain test`) lacking --no-fail-fast gets
+# it right after `test`. Without it cargo stops at the first failing target,
+# so the failures of later targets never show and cannot be compared with the
+# baseline. Other commands are printed unchanged.
+gate_test_command_for_run() {
+  local rest=$1 out='' match after seg end_re="^[[:space:];&|)'\"]"
+  local re="(^|[[:space:];&|('\"])cargo([[:space:]]+\\+[^[:space:];&|]+)?[[:space:]]+test"
+  while [[ "$rest" =~ $re ]]; do
+    match=${BASH_REMATCH[0]}
+    out+=${rest%%"$match"*}$match
+    after=${rest#*"$match"}
+    rest=$after
+    [[ -z "$after" || "$after" =~ $end_re ]] || continue
+    seg=" ${after%%[;&|)\'\"]*} "
+    seg=${seg%%" -- "*}
+    [[ "$seg " == *" --no-fail-fast "* ]] || out+=" --no-fail-fast"
+  done
+  printf '%s' "$out$rest"
+}
+
+# GATE_JQ_CAP defines the jq filter gate_cap(sep), which joins an array of
+# test ids with `sep`, keeping the first 20 and counting the rest as
+# "(+K more)". Prepend it to a filter that uses gate_cap.
+GATE_JQ_CAP='def gate_cap($sep): if length > 20 then (.[:20] | join($sep)) + $sep + "(+\(length - 20) more)" else join($sep) end;'
+
 # gate_plain_text prints file `file` without carriage returns or ANSI escape
 # sequences (colour, cursor and charset switches).
 gate_plain_text() {
@@ -109,61 +135,182 @@ gate_plain_text() {
   tr -d '\r' <"$1" | LC_ALL=C sed -E "s/${esc}\[[0-9;?]*[A-Za-z]//g; s/${esc}[()][A-Za-z0-9]//g"
 }
 
-# gate_failing_tests prints the sorted unique ids of the failing tests named
-# in test output file `file`, one per line, for the unittest, pytest, cargo,
-# go, jest and vitest formats. Ids stay test-level: a file-level id would
-# hide a new failure in a file that already failed.
-gate_failing_tests() {
-  gate_plain_text "$1" | LC_ALL=C awk '
-    function emit(id) { if (id != "") print id }
+# gate_killed_by_signal succeeds when test output file `file` shows a cargo
+# test target aborted by a signal. Its remaining tests never ran, so the
+# failures it printed are not the whole story.
+gate_killed_by_signal() {
+  gate_plain_text "$1" | LC_ALL=C grep -qE "process didn't exit successfully: .*\(signal: [0-9]+"
+}
+
+# gate_scan_tests reads test output file `file` for the unittest, pytest,
+# cargo, go, jest and vitest formats. With mode `failing` it prints the ids
+# of the failing tests, with `passing` those shown passing, and with `reason`
+# why the failures cannot be identified (nothing when they can). The
+# failures are unidentified when no id was read, or when the runner's own
+# failure total exceeds the ids read: some failures were printed in a form
+# this does not parse, and `failing` then prints nothing. Cargo ids carry
+# their target (`<target>::<name>`) once a Running or Doc-tests header was
+# seen, jest ids their file. A jest or vitest file header yields a
+# file-level id only when no test of that file failed, so a new failure in
+# a file that already failed is still told apart.
+gate_scan_tests() {
+  gate_plain_text "$2" | LC_ALL=C awk -v mode="$1" '
+    function fail(id) { if (id != "" && !(id in failed)) { failed[id] = 1; nfail++ } }
+    function pass(id) { if (id != "") passed[id] = 1 }
+    function cargo_id(name) { return (target == "") ? name : (target "::" name) }
+    function total(n) { if (n > expected) expected = n }
+    function count_of(text, word,   n) {
+      if (!match(text, "[0-9]+ " word)) return 0
+      n = substr(text, RSTART, RLENGTH)
+      return n + 0
+    }
+    function unittest_id(text,   name, paren, tail) {
+      name = text; sub(/ .*/, "", name)
+      paren = text; sub(/^[^(]*\(/, "", paren); sub(/\).*/, "", paren)
+      tail = "." name
+      if (length(paren) > length(tail) && substr(paren, length(paren) - length(tail) + 1) == tail) return paren
+      return paren tail
+    }
     {
       line = $0
       sub(/[ \t]+$/, "", line)
     }
-    line ~ /^(FAIL|ERROR): [^ ]+ \([^)]+\)/ {
-      name = line; sub(/^[A-Z]+: /, "", name); sub(/ .*/, "", name)
-      paren = line; sub(/^[^(]*\(/, "", paren); sub(/\).*/, "", paren)
-      tail = "." name
-      if (length(paren) > length(tail) && substr(paren, length(paren) - length(tail) + 1) == tail) emit(paren)
-      else emit(paren tail)
+    line ~ /^[ \t]*Running [^(]+ \(/ {
+      target = line; sub(/^[ \t]*Running /, "", target)
+      target = substr(target, 1, index(target, " (") - 1)
+      gsub(/\\/, "/", target)
       next
     }
-    line ~ /^(FAILED|ERROR) [^ (][^ ]*( - .*)?$/ {
-      id = line; sub(/^[A-Z]+ /, "", id); sub(/ .*/, "", id)
-      if (id ~ /::/ || id ~ /\.py$/) emit(id)
+    line ~ /^[ \t]*Doc-tests [^ ]+$/ {
+      target = line; sub(/^[ \t]*/, "", target)
+      next
+    }
+    line ~ /^test result: FAILED\. / {
+      cargo_failed += count_of(line, "failed")
+      total(cargo_failed)
       next
     }
     line ~ /^test .+ \.\.\. FAILED$/ {
       id = line; sub(/^test /, "", id); sub(/ \.\.\. FAILED$/, "", id)
-      emit(id)
+      fail(cargo_id(id))
+      next
+    }
+    line ~ /^test .+ \.\.\. ok$/ {
+      id = line; sub(/^test /, "", id); sub(/ \.\.\. ok$/, "", id)
+      pass(cargo_id(id))
+      next
+    }
+    line ~ /^FAILED \((failures|errors)=/ {
+      n = 0
+      if (match(line, /failures=[0-9]+/)) n += substr(line, RSTART + 9, RLENGTH - 9) + 0
+      if (match(line, /errors=[0-9]+/)) n += substr(line, RSTART + 7, RLENGTH - 7) + 0
+      total(n)
+      next
+    }
+    line ~ /^(FAIL|ERROR): [^ ]+ \([^)]+\)/ {
+      id = line; sub(/^[A-Z]+: /, "", id)
+      fail(unittest_id(id))
+      next
+    }
+    line ~ /^[^ ]+ \([^)]+\) \.\.\. ok$/ {
+      pass(unittest_id(line))
+      next
+    }
+    line ~ /^(FAILED|ERROR) [^ (]/ {
+      id = line; sub(/^[A-Z]+ /, "", id)
+      if (index(id, " - ") > 0) id = substr(id, 1, index(id, " - ") - 1)
+      if (id ~ /::/ || id ~ /\.py$/) fail(id)
+      next
+    }
+    line ~ /::.* PASSED( |$)/ {
+      pass(substr(line, 1, index(line, " PASSED") - 1))
+      next
+    }
+    line ~ / in [0-9.]+s( \([^)]*\))?( =+)?$/ && (line ~ /[0-9]+ failed/ || line ~ /[0-9]+ error/) {
+      total(count_of(line, "failed") + count_of(line, "error"))
       next
     }
     line ~ /^[ \t]*--- FAIL: / {
       id = line; sub(/^[ \t]*--- FAIL: /, "", id); sub(/ \([^)]*\)$/, "", id)
-      emit(id)
+      fail(id)
+      next
+    }
+    line ~ /^[ \t]*--- PASS: / {
+      id = line; sub(/^[ \t]*--- PASS: /, "", id); sub(/ \([^)]*\)$/, "", id)
+      pass(id)
       next
     }
     line ~ /^FAIL[ \t]+[^ \t]+[ \t]+([0-9.]+s|\[build failed\]|\[setup failed\])$/ {
       id = line; sub(/^FAIL[ \t]+/, "", id); sub(/[ \t].*/, "", id)
-      emit("pkg:" id)
+      fail("pkg:" id)
+      next
+    }
+    line ~ /^(Tests|Test Suites):[ \t]+[0-9]+ failed/ || line ~ /^[ \t]*(Tests|Test Files)[ \t]+[0-9]+ failed/ {
+      total(count_of(line, "failed"))
       next
     }
     line ~ /^[ \t]*● / { # debris-exempt
       id = line; sub(/^[ \t]*● /, "", id) # debris-exempt
-      if (id != "Console") emit(id)
+      if (id != "Console" && id != "Test suite failed to run") fail((file == "") ? id : (file " > " id))
       next
     }
     line ~ /^[ \t]*FAIL[ \t]+.+ > / {
       id = line; sub(/^[ \t]*FAIL[ \t]+/, "", id)
-      emit(id)
+      fail(id)
+      next
+    }
+    line ~ /^[ \t]+FAIL[ \t]+[^ \t]/ {
+      file = line; sub(/^[ \t]+FAIL[ \t]+/, "", file)
+      sub(/ \[.*\]$/, "", file); sub(/ \([0-9.]+ m?s\)$/, "", file)
+      if (!(file in files)) { files[file] = 1; nfiles++; file_at[nfiles] = file }
+      next
+    }
+    END {
+      for (i = 1; i <= nfiles; i++) {
+        alone = 1
+        for (id in failed) if (index(id, file_at[i] " > ") == 1) { alone = 0; break }
+        if (alone) fail(file_at[i])
+      }
+      if (mode == "reason") {
+        if (nfail == 0) print "no test ids could be parsed"
+        else if (expected > nfail) print "the runner reported " expected " failures but only " nfail " ids were parsed"
+      } else if (mode == "failing") {
+        if (expected <= nfail) for (id in failed) print id
+      } else {
+        for (id in passed) if (!(id in failed)) print id
+      }
     }
   ' | LC_ALL=C sort -u
 }
 
+# gate_failing_tests prints the sorted unique ids of the failing tests named
+# in test output file `file`, one per line, or nothing when they cannot all
+# be identified (see gate_scan_tests) or a test target died of a signal.
+gate_failing_tests() {
+  gate_killed_by_signal "$1" && return 0
+  gate_scan_tests failing "$1"
+}
+
+# gate_passing_tests prints the sorted unique ids of the tests test output
+# file `file` shows passing, in the id forms gate_failing_tests uses.
+gate_passing_tests() {
+  gate_scan_tests passing "$1"
+}
+
+# gate_unidentified_reason prints why the failures in test output file
+# `file` cannot be identified, or nothing when gate_failing_tests names them.
+gate_unidentified_reason() {
+  if gate_killed_by_signal "$1"; then
+    printf '%s\n' "a test target was killed by a signal"
+    return 0
+  fi
+  gate_scan_tests reason "$1"
+}
+
 # gate_failure_hash prints a digest of the failure lines in test output file
 # `file`, with timings, addresses and trailing blanks normalised away so two
-# runs failing the same way hash alike. Output with no failure line still
-# hashes, to the digest of nothing.
+# runs failing the same way hash alike. It prints nothing when there is no
+# failure line, so two runs with nothing to compare never match.
 gate_failure_hash() {
   local lines
   lines=$(gate_plain_text "$1" | { LC_ALL=C grep -iE 'fail|error|panic|assert' || true; } |
@@ -172,6 +319,7 @@ gate_failure_hash() {
       -e 's/[0-9]+(\.[0-9]+)?(ms|s)([^A-Za-z0-9_]|$)/?\3/g' \
       -e 's/[[:space:]]+$//' |
     LC_ALL=C sort -u)
+  [[ -n "$lines" ]] || return 0
   if command -v sha256sum >/dev/null 2>&1; then
     printf '%s' "$lines" | sha256sum | awk '{print $1}'
   elif command -v shasum >/dev/null 2>&1; then

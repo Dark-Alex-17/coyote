@@ -18,7 +18,7 @@ fi
 # reading the failing test ids on stdin. Every outcome goes on to implement:
 # with no red baseline, verify_tests keeps its plain exit-code verdict.
 emit_baseline() {
-  jq -Rsc '
+  jq -Rsc "$GATE_JQ_CAP"'
     (split("\n") | map(select(. != "")) | unique) as $ids
     | (env.BASELINE_EXIT | tonumber) as $rc
     | {
@@ -30,19 +30,19 @@ emit_baseline() {
           if env.BASELINE_STATUS != "red" then env.BASELINE_NOTE
           elif ($ids | length) > 0 then
             "These tests already failed before you changed anything (exit \($rc)):\n"
-            + ($ids | join("\n"))
+            + ($ids | gate_cap("\n"))
             + "\n\nDo not fix them unless the request asks you to, and do not write new tests that encode the behaviour a known-failing test rejects."
           else
-            "The test suite already failed before you changed anything (exit \($rc)), and its failures could not be identified. Do not fix them unless the request asks you to."
+            "The test suite already failed before you changed anything (exit \($rc)), and its failures could not be identified (\(env.BASELINE_REASON)). Do not fix them unless the request asks you to."
           end),
         "_next": "implement"
       }'
 }
 
-export BASELINE_STATUS=none BASELINE_EXIT=0 BASELINE_HASH='' BASELINE_NOTE=''
+export BASELINE_STATUS=none BASELINE_EXIT=0 BASELINE_HASH='' BASELINE_NOTE='' BASELINE_REASON=''
 
 project_dir=$(gate_workdir "$state")
-cmd=$(gate_test_command "$project_dir")
+cmd=$(gate_test_command_for_run "$(gate_test_command "$project_dir")")
 
 if [[ -z "$cmd" ]]; then
   BASELINE_NOTE="No test command was configured or detected, so no baseline was recorded."
@@ -73,5 +73,6 @@ else
   BASELINE_STATUS=red
   BASELINE_EXIT=$exit_code
   BASELINE_HASH=$(gate_failure_hash "$out_file")
+  BASELINE_REASON=$(gate_unidentified_reason "$out_file")
   gate_failing_tests "$out_file" | emit_baseline
 fi

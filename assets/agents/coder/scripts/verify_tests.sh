@@ -15,7 +15,7 @@ else
 fi
 
 project_dir=$(gate_workdir "$state")
-cmd=$(gate_test_command "$project_dir")
+cmd=$(gate_test_command_for_run "$(gate_test_command "$project_dir")")
 
 if [[ -z "$cmd" ]]; then
   jq -nc '{
@@ -38,13 +38,14 @@ fi
 
 out_file=$(mktemp)
 ids_file=$(mktemp)
+passing_file=$(mktemp)
 state_copy=$(mktemp)
-trap 'rm -f "$out_file" "$ids_file" "$state_copy"' EXIT
+trap 'rm -f "$out_file" "$ids_file" "$passing_file" "$state_copy"' EXIT
 exit_code=0
 run_gate_until "$project_dir" "$cmd" "$deadline" "$out_file" || exit_code=$?
 output=$(cat "$out_file")
 cmd=$(gate_ran "$cmd")
-export GATE_DIR="$project_dir" GATE_DEADLINE="$deadline" GATE_FAILURE_HASH=''
+export GATE_DIR="$project_dir" GATE_DEADLINE="$deadline" GATE_FAILURE_HASH='' GATE_REASON='' GATE_SIGNAL=0
 
 # The transcript reaches jq on stdin, never as an argument: Linux caps a single
 # argv string at 128 KiB (MAX_ARG_STRLEN), and a green `cargo test --all` run
@@ -66,60 +67,77 @@ if (( GATE_TIMED_OUT == 1 )); then
 fi
 
 printf '%s' "$state" >"$state_copy"
+if (( exit_code != 0 )) && gate_killed_by_signal "$out_file"; then
+  GATE_SIGNAL=1
+fi
 if (( exit_code != 0 )) && [[ $(printf '%s' "$state" | jq -r '.baseline_status // ""') == "red" ]]; then
   gate_failing_tests "$out_file" >"$ids_file"
+  gate_passing_tests "$out_file" >"$passing_file"
   GATE_FAILURE_HASH=$(gate_failure_hash "$out_file")
+  GATE_REASON=$(gate_unidentified_reason "$out_file")
 fi
 
 # A nonzero run passes only against a red baseline with the same exit code,
 # and only when every failing id is a baseline id, or, when neither run named
-# a test, when the failure output hashes alike. A run whose failures cannot
-# be identified never passes against a baseline whose failures could.
+# a test, when the failure output hashes alike (an empty baseline hash
+# matches nothing). A run whose failures cannot be identified never passes
+# against a baseline whose failures could, and a run with a test target
+# killed by a signal never passes. A baseline id missing from a red run is
+# reported fixed only when the run shows it passing.
 trim_output "$output" | jq -Rsc \
   --arg cmd "$cmd" \
   --argjson rc "$exit_code" \
   --slurpfile st "$state_copy" \
   --rawfile ids "$ids_file" \
-  '$st[0] as $s
+  --rawfile passing "$passing_file" \
+  "$GATE_JQ_CAP"'
+  $st[0] as $s
   | (($s.baseline_status // "none") == "red") as $red
   | ($s.baseline_failures // [] | unique) as $base
   | ($ids | split("\n") | map(select(. != "")) | unique) as $cur
+  | ($passing | split("\n") | map(select(. != "")) | unique) as $shown_passing
   | ($s.baseline_exit_code // 0) as $base_rc
+  | ($s.baseline_failure_hash // "") as $base_hash
+  | (env.GATE_SIGNAL == "1") as $signal
   | (if $rc == 0 then true
-     elif ($red | not) or $rc != $base_rc then false
+     elif $signal or ($red | not) or $rc != $base_rc then false
      elif ($base | length) > 0 then ($cur | length) > 0 and ($cur - $base) == []
-     else ($cur | length) == 0 and env.GATE_FAILURE_HASH == ($s.baseline_failure_hash // "")
+     else ($cur | length) == 0 and $base_hash != "" and env.GATE_FAILURE_HASH == $base_hash
      end) as $pass
   | ("Ran: " + $cmd + "\nRan in: " + env.GATE_DIR) as $ran
   | if $pass then
-      (if $red then
+      ($base - $cur) as $gone
+      | (if $rc == 0 then $gone else $gone - ($gone - $shown_passing) end) as $fixed
+      | (if $red then
          [ (if $rc == 0 then empty
-            elif ($cur | length) > 0 then "Pre-existing failures: " + ($cur | join(", "))
-            else "Pre-existing failures: unidentified, output matches the baseline (exit \($rc))"
+            elif ($cur | length) > 0 then "Pre-existing failures: " + ($cur | gate_cap(", "))
+            else "Pre-existing failures: unidentified (\(env.GATE_REASON)), output matches the baseline (exit \($rc))"
             end),
-           (($base - $cur) | if length > 0 then "Fixed pre-existing failures: " + join(", ")
+           ($fixed | if length > 0 then "Fixed pre-existing failures: " + gate_cap(", ")
             elif $rc == 0 and ($base | length) == 0 then "Fixed pre-existing failures: unidentified, the suite now passes"
-            else empty end)
+            else empty end),
+           (($gone - $fixed) | if length > 0 then "No longer reported failing: " + gate_cap(", ") else empty end)
          ] | join("\n")
        else "" end) as $report
       | {
           "tests_ok": true,
           "tests_output": ((if $report == "" then "" else $report + "\n\n" end) + $ran + (if $rc == 0 then "" else "\nExit code: \($rc)" end) + "\n\n" + .),
-          "baseline_report": $report,
+          "baseline_report": (if $report == "" then "" else "\n" + $report end),
           "_next": "self_review"
         }
     else
-      (if $red | not then ""
+      (if $signal then "\nA test target was killed by a signal, so its remaining tests never ran; this run cannot pass against the baseline." else "" end) as $crash
+      | (if $red | not then ""
        else "\nBaseline exit code: \($base_rc) (the suite already failed before this run)"
          + (if ($cur | length) > 0 then
-              (($cur - $base) | if length > 0 then "\nNew failures: " + join(", ") else "" end)
-              + (($cur - ($cur - $base)) | if length > 0 then "\nPre-existing failures: " + join(", ") else "" end)
-            else "\nNo failing test could be identified in this output, so none can be matched to the baseline."
+              (($cur - $base) | if length > 0 then "\nNew failures: " + gate_cap(", ") else "" end)
+              + (($cur - ($cur - $base)) | if length > 0 then "\nPre-existing failures: " + gate_cap(", ") else "" end)
+            else "\nNo failing test could be identified in this output (\(env.GATE_REASON)), so none can be matched to the baseline."
             end)
        end) as $block
       | {
           "tests_ok": false,
-          "tests_output": ($ran + "\nExit code: " + ($rc | tostring) + $block + "\n\n" + .),
+          "tests_output": ($ran + "\nExit code: " + ($rc | tostring) + $crash + $block + "\n\n" + .),
           "_next": "fix_loop_gate"
         }
     end'

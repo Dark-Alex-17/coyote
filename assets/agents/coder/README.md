@@ -68,8 +68,14 @@ End nodes emit one of three sentinel outcomes for the caller:
   disclosure for the orchestrator's report, not a verdict.
   When the suite was already red before the run (see
   [Baseline tests](#baseline-tests)), a `Pre-existing failures: <ids>` line
-  follows `Tests: passed`, naming the baseline failures that still fail, and a
-  `Fixed pre-existing failures: <ids>` line names those that now pass.
+  follows `Tests: passed`, naming the baseline failures that still fail, a
+  `Fixed pre-existing failures: <ids>` line names those that now pass (the
+  run exited 0 or its output shows them passing), and a
+  `No longer reported failing: <ids>` line names those gone from a red run's
+  failures without being shown passing. When the failures could not be
+  identified, the line carries the reason instead of ids, e.g.
+  `Pre-existing failures: unidentified (no test ids could be parsed), output matches the baseline (exit 1)`
+  or `(the runner reported 3 failures but only 2 ids were parsed)`.
 - `CODER_REJECTED` — user rejected the plan at the approval gate.
 - `CODER_FAILED` — fix-loop exhausted; build/tests still failing — or the
   verification gate crashed twice (see `Verification gate error:`), or
@@ -95,19 +101,40 @@ hash of the failure lines with timings and addresses normalised away. The
 `implement` prompt lists those tests under "Tests that already failed before
 this run", and fix-loop instructions name them as pre-existing.
 
+Cargo ids carry their target (`tests/foo.rs::name`,
+`unittests src/lib.rs::name`), jest ids their file (`src/a.test.js > title`).
+A failing jest or vitest file with no failing test of its own (a suite that
+failed to run) is recorded by its file name. When the runner's own failure
+total is higher than the number of ids read, or a cargo test target was
+killed by a signal, the failures count as unidentified: some were printed in
+a form the gate cannot read, so only the hash is kept.
+
+Id lists in the `implement` prompt, the fix instructions and the report
+lines show the first 20 ids followed by `(+K more)`; the full list stays in
+`baseline_failures`.
+
 `verify_tests` then passes a red run only when the suite was already red
 and:
 
 - its exit code equals the baseline's (a different code, such as a crash on
   top of the old failures, fails), and
 - every failing test it identifies was in the baseline, or, when neither run
-  named a test, its failure output hashes the same as the baseline's.
+  named a test, its failure output hashes the same as the baseline's (output
+  with no failure lines hashes to nothing and matches nothing).
 
 Anything it cannot match fails as before: a new failing test, or a run whose
-failures cannot be identified against a baseline whose failures could. With
-no test command, a green or timed-out baseline, or a crashed `baseline_tests`
-(its fallback goes straight to `implement`), there is no baseline and
-`verify_tests` judges by the exit code alone.
+failures cannot be identified against a baseline whose failures could, or a
+run in which a test target was killed by a signal. With a green or timed-out
+baseline, or a crashed `baseline_tests` (its fallback goes straight to
+`implement`), there is no baseline and `verify_tests` judges by the exit code
+alone. With no test command `baseline_tests` records nothing and
+`verify_tests` reports `GATE NOT RUN`, which is not evidence that the tests
+pass.
+
+A test command that stops at the first failure (pytest `-x`, jest `--bail`,
+unittest `--failfast`) defeats the baseline: failures after the first never
+appear, so a new one can hide behind an old one. `cargo test` is run with
+`--no-fail-fast` added for the same reason.
 
 ## Tuning
 
@@ -139,6 +166,11 @@ working directory; each gate's transcript names the directory on its
 - `test_command` (default empty): the command `verify_tests` runs instead
   of the detected one, e.g. a targeted `cargo test --test my_suite` when the
   full suite does not fit the deadline. It takes precedence over `TEST_CMD`.
+  `baseline_tests` runs the same command, under the same `test_timeout` and
+  `build_lock`, so a red-aware run costs one extra suite run under the lock;
+  its node has the same 3600 s ceiling as `verify_tests`. A baseline that
+  times out only means there is no baseline; it never ends the run. Every
+  `cargo test` in the command gets `--no-fail-fast` unless it already has it.
 - `build_timeout` (default `900`) and `test_timeout` (default `1800`): whole
   seconds each gate may run before it kills the command's whole process
   group and ends the run with a `TIMED OUT` gate error rather than a red
