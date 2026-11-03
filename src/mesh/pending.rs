@@ -1043,6 +1043,16 @@ impl Correlations {
             .map(|entry| entry.record.thread.clone())
     }
 
+    /// Whether any question in flight was asked in `thread`, which makes it a thread
+    /// this node may continue.
+    pub(crate) fn knows_thread(&self, thread: &str) -> bool {
+        self.state
+            .lock()
+            .entries
+            .values()
+            .any(|entry| entry.record.thread == thread)
+    }
+
     /// Every question in flight, newest first by `sent_at`.
     pub(crate) fn list(&self) -> Vec<Correlation> {
         let mut entries: Vec<Correlation> = self.state.lock().entries.values().cloned().collect();
@@ -2793,6 +2803,11 @@ mod tests {
             .unwrap();
         assert_eq!(correlations.thread_of("q1"), Some("t-root".to_string()));
         assert_eq!(correlations.thread_of("nope"), None);
+        assert!(correlations.knows_thread("t-root"));
+        assert!(
+            !correlations.knows_thread("q1"),
+            "a question asked in another thread does not name its own id"
+        );
         InboundStore::new(&tmp.path, "inst")
             .upsert(
                 InboundRecord {
@@ -2809,6 +2824,7 @@ mod tests {
             .unwrap();
         assert_eq!(reopened.get("q1").unwrap().record.thread, "t-root");
         assert_eq!(reopened.thread_of("q1"), Some("t-root".to_string()));
+        assert!(reopened.knows_thread("t-root"));
         assert_eq!(
             InboundStore::new(&tmp.path, "inst")
                 .get("peer-q")

@@ -58,6 +58,7 @@ use crate::mesh::request::{
     RefusalCode, RemoteRefusal, RequestError, RequestOptions, STATUS_PATH, redact_hashes,
     request as link_request, short,
 };
+use crate::mesh::sent_threads::SentThreads;
 use crate::mesh::shares::ShareLocations;
 use crate::mesh::snapshot::MeshSnapshot;
 use crate::mesh::trust::{
@@ -69,7 +70,7 @@ use crate::mesh::{
 use crate::supervisor::notification::{SystemNotification, mesh_notification};
 
 use anyhow::{Context, Result, anyhow, bail};
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use parking_lot::RwLock;
 use rns_transport::destination::DestinationDesc;
 use rns_transport::destination::request::RequestAllow;
@@ -601,6 +602,10 @@ pub(crate) struct MeshRuntime {
     /// re-points it at the fork's store on a re-key.
     envoy_memory: ArcSwapOption<EnvoySessions>,
     envoy_memory_config: EnvoyMemoryConfig,
+    /// The threads this instance has sent or received, which the tools accept as a
+    /// thread to continue. Bound to the instance the node currently serves, like the
+    /// grants: `rebind_sent_threads` re-points it at the fork's file on a re-key.
+    sent_threads: ArcSwap<SentThreads>,
     memory: PeerMemory,
     /// Every configured interface with what it is doing, in config order.
     interface_states: RwLock<Vec<InterfaceStatus>>,
@@ -689,6 +694,7 @@ impl MeshRuntime {
             SystemTime::now(),
         )?);
         let grants = GrantStore::open(&paths.cache_dir, &instance_id, SystemTime::now())?;
+        let sent_threads = SentThreads::open(&paths.cache_dir, &instance_id)?;
         let envoy_memory =
             EnvoySessions::open(&paths.cache_dir, &instance_id, &config.envoy_memory).map(Arc::new);
         if let Some(store) = &envoy_memory {
@@ -869,6 +875,7 @@ impl MeshRuntime {
             serving,
             envoy_memory: ArcSwapOption::new(envoy_memory),
             envoy_memory_config: config.envoy_memory.clone(),
+            sent_threads: ArcSwap::from_pointee(sent_threads),
             memory: PeerMemory::default(),
             interface_states: RwLock::new(states),
             watched_interfaces: watched,
@@ -1003,6 +1010,23 @@ impl MeshRuntime {
     /// Remembers into `store` again: the infallible half of `rebind_envoy_memory`.
     pub(crate) fn restore_envoy_memory(&self, store: Option<Arc<EnvoySessions>>) {
         self.envoy_memory.store(store);
+    }
+
+    pub(crate) fn sent_threads(&self) -> Arc<SentThreads> {
+        self.sent_threads.load_full()
+    }
+
+    /// Opens the sent-threads list of `instance_id` and records into it, handing back
+    /// the list it displaces so a re-key that fails can put it back. A fork starts from
+    /// its own file, so it continues only the threads it sends or receives itself.
+    pub(crate) fn rebind_sent_threads(&self, instance_id: &str) -> Result<Arc<SentThreads>> {
+        let threads = SentThreads::open(&self.cache_dir, instance_id)?;
+        Ok(self.sent_threads.swap(Arc::new(threads)))
+    }
+
+    /// Records into `threads` again: the infallible half of `rebind_sent_threads`.
+    pub(crate) fn restore_sent_threads(&self, threads: Arc<SentThreads>) {
+        self.sent_threads.store(threads);
     }
 
     /// The share root's serving state: the local size limit, the grant store and the
@@ -3640,17 +3664,19 @@ impl MeshSlot {
     }
 
     /// Re-keys the running node for a forked session and binds the pending questions,
-    /// the grants and the envoy's memory to the fork's own files, since a fork asks its
-    /// own questions, answers its own access requests and remembers its own peer threads,
-    /// and must not collect, hand out or read the original's; a no-op while the mesh is
-    /// off. The fork's questions, grants and memory are adopted before the node re-keys
-    /// so a reply or fetch the fork's destination serves at once finds them, and a re-key
-    /// that fails puts the original's back, since the original is what stays served.
+    /// the grants, the sent-threads list and the envoy's memory to the fork's own files,
+    /// since a fork asks its own questions, answers its own access requests and
+    /// remembers its own peer threads, and must not collect, hand out or read the
+    /// original's; a no-op while the mesh is off. The fork's files are adopted before
+    /// the node re-keys so a reply or fetch the fork's destination serves at once finds
+    /// them, and a re-key that fails puts the original's back, since the original is
+    /// what stays served.
     /// Questions peers escalated before the fork are copied into the fork's inbound file
     /// so `.mesh answer` still finds them after the switch. A fork pending file this
     /// Coyote cannot read is logged and the fork starts with no questions pending, as
     /// `install` does: the node must not be reported as failed for a cache file. A fork
-    /// grants file that cannot be opened refuses the re-key, as it would refuse `start`.
+    /// grants or sent-threads file that cannot be opened refuses the re-key, as it would
+    /// refuse `start`.
     pub(crate) async fn rekey(&self, rekey: ForkRekey) -> Result<()> {
         let Some(runtime) = self.get() else {
             return Ok(());
@@ -3692,11 +3718,25 @@ impl MeshSlot {
             .context(
                 "The fork's grant store could not be opened, so the node still serves the original instance",
             );
-        let (rekeyed, displaced) = match grants_rebound {
-            Ok(displaced_grants) => {
+        let rebound = grants_rebound.and_then(|displaced_grants| {
+            match runtime.rebind_sent_threads(&rekey.fork_instance_id) {
+                Ok(displaced_threads) => Ok((displaced_grants, displaced_threads)),
+                Err(err) => {
+                    runtime.serving().restore_grants(displaced_grants);
+                    Err(err.context(
+                        "The fork's sent-threads list could not be opened, so the node still serves the original instance",
+                    ))
+                }
+            }
+        });
+        let (rekeyed, displaced) = match rebound {
+            Ok((displaced_grants, displaced_threads)) => {
                 let displaced_envoy_memory = runtime.rebind_envoy_memory(&rekey.fork_instance_id);
                 let rekeyed = runtime.rekey(rekey).await;
-                (rekeyed, Some((displaced_grants, displaced_envoy_memory)))
+                (
+                    rekeyed,
+                    Some((displaced_grants, displaced_threads, displaced_envoy_memory)),
+                )
             }
             Err(err) => (Err(err), None),
         };
@@ -3710,8 +3750,9 @@ impl MeshSlot {
                 &instance_id,
             )));
             // The original's stores were never closed, so putting them back cannot fail.
-            if let Some((original_grants, original_envoy_memory)) = displaced {
+            if let Some((original_grants, original_threads, original_envoy_memory)) = displaced {
                 runtime.serving().restore_grants(original_grants);
+                runtime.restore_sent_threads(original_threads);
                 runtime.restore_envoy_memory(original_envoy_memory);
             }
         }
@@ -3973,6 +4014,27 @@ impl MeshSlot {
         self.inbound.lock().clone()
     }
 
+    /// The threads the running instance has sent or received; `None` while the mesh is
+    /// off.
+    pub(crate) fn sent_threads(&self) -> Option<Arc<SentThreads>> {
+        self.get().map(|runtime| runtime.sent_threads())
+    }
+
+    /// Records `threads` as sent or received, so the tools accept them as threads to
+    /// continue. A failed write is only logged: the send or delivery it follows has
+    /// already happened, and the list in memory still holds the threads.
+    pub(crate) fn remember_threads(&self, threads: &[&str]) {
+        let Some(store) = self.sent_threads() else {
+            return;
+        };
+        if let Err(err) = store.record(threads) {
+            warn!(
+                "Mesh sent-threads list could not be written, so the threads just sent or received can be continued only until the node stops: {}",
+                redact_hashes(&format!("{err:#}"))
+            );
+        }
+    }
+
     /// Lets go of the escalated questions and access requests that have outlived
     /// `PENDING_TTL`, one idle line each, so the person at the keyboard learns what went
     /// without an answer. Run on the heartbeat and first thing under `.mesh pending`,
@@ -4046,7 +4108,8 @@ impl MeshSlot {
     /// in the inbox instead of being run again: the acknowledgement precedes the run, so
     /// one lost on a link brings the same body back by store-and-forward. Runs on a
     /// blocking thread off the server's request path or on the fetch task, so nothing
-    /// here awaits.
+    /// here awaits. Whatever the route, the message's thread is recorded as received
+    /// (as `file_peer` records it too), so the tools accept it as one to continue.
     pub(crate) fn deliver_peer(&self, message: PeerMessage) {
         self.deliver_peer_at(message, SystemTime::now());
     }
@@ -4054,6 +4117,7 @@ impl MeshSlot {
     pub(crate) fn deliver_peer_at(&self, mut message: PeerMessage, now: SystemTime) {
         let answered = self.answer_correlation(&mut message);
         self.remember_references(&message);
+        self.remember_threads(&[message.thread()]);
         let for_envoy = !answered && envoy_bound(message.kind, message.in_reply_to.as_deref());
         let envoy = for_envoy.then(|| self.envoy.load_full()).flatten();
         let received = ReceivedFacts::of(&message);
@@ -4539,24 +4603,30 @@ impl MeshSlot {
     /// is next sent. An answer the run itself held and wrote before a send that then
     /// failed is already the thread's last turn, so a retry of it adds nothing. A
     /// thread the store does not hold gets no record: an answer with no question before
-    /// it is not a conversation. No standing is re-checked here: the send that just
+    /// it is not a conversation. The session is the one the run used, found as the run
+    /// found it: the wire thread when the store holds it for the asker, else the
+    /// question's own id. No standing is re-checked here: the send that just
     /// succeeded was authorized, and an append that never creates a thread cannot undo
     /// a sweep. A record that cannot be read or saved is left as it is.
     fn remember_human_answer(&self, record: &InboundRecord, spoken: &str) {
         let Some(store) = self.envoy_memory() else {
             return;
         };
-        let thread = record.thread.as_str();
-        if !is_wire_id(thread) {
+        if !is_wire_id(&record.thread) {
             return;
         }
+        let now = SystemTime::now();
+        let thread = store.session_thread(
+            &record.peer_identity,
+            Some(record.thread.as_str()),
+            &record.id,
+            now,
+        );
         let answer = EnvoyTurn {
             role: EnvoyRole::Assistant,
             text: spoken.to_string(),
         };
-        if let Err(err) =
-            store.append_once(&record.peer_identity, thread, answer, SystemTime::now())
-        {
+        if let Err(err) = store.append_once(&record.peer_identity, &thread, answer, now) {
             warn!(
                 "Mesh envoy memory for thread {thread} could not be saved; the owner's answer was not remembered: {}",
                 redact_hashes(&err.to_string())
@@ -5126,6 +5196,7 @@ impl PeerSurface for MeshSlot {
     fn file_peer(&self, mut message: PeerMessage) {
         let answered = self.answer_correlation(&mut message);
         self.remember_references(&message);
+        self.remember_threads(&[message.thread()]);
         self.deliver_to_inbox(message, answered);
     }
 
@@ -15025,6 +15096,50 @@ mod tests {
             .turns;
         assert_eq!(turns.len(), peer_turns().len() + 1, "{turns:?}");
         assert_eq!(turns.last().unwrap().text, "the owner says yes");
+    }
+
+    /// An escalated question naming a thread the store did not hold ran in a new
+    /// session under its own id, so the owner's late answer joins that session, and
+    /// nothing is written under the thread the question named.
+    #[test]
+    fn a_late_answer_in_a_fresh_session_lands_under_the_question_id() {
+        let tmp = TempDir::new("node-late-answer-fresh-session");
+        let config = EnvoyMemoryConfig {
+            enabled: true,
+            ..EnvoyMemoryConfig::default()
+        };
+        let store = Arc::new(EnvoySessions::open(&tmp.path, "inst", &config).unwrap());
+        let now = SystemTime::now();
+        store
+            .save(REMEMBERED_PEER, "a-1", peer_turns(), now)
+            .unwrap();
+        let slot = MeshSlot::default();
+        slot.set_envoy_memory_for_tests(store.clone());
+
+        slot.remember_human_answer(
+            &InboundRecord {
+                peer_identity: REMEMBERED_PEER.to_string(),
+                thread: "t-authored".to_string(),
+                ..inbound_record("a-1")
+            },
+            "the owner says yes",
+        );
+
+        let turns = store
+            .load(REMEMBERED_PEER, "a-1", now)
+            .unwrap()
+            .expect("the session the run used holds the answer")
+            .turns;
+        assert_eq!(turns.len(), peer_turns().len() + 1, "{turns:?}");
+        assert_eq!(turns.last().unwrap().text, "the owner says yes");
+        assert!(
+            store
+                .load(REMEMBERED_PEER, "t-authored", now)
+                .unwrap()
+                .is_none(),
+            "nothing is kept under the thread the question named"
+        );
+        assert!(!remembered_record(&store, "t-authored").exists());
     }
 
     /// A record under the asked key that names another identity is the store's

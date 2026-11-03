@@ -109,6 +109,7 @@ pub(crate) const ON_DISK_STRUCTS: &[(&str, &[&str])] = &[
     ("identity.rs", &["Predecessor"]),
     ("peers.rs", &["PeerTableFile", "PeerRecord"]),
     ("protocol.rs", &["Compatibility"]),
+    ("sent_threads.rs", &["SentThreadsFile"]),
     (
         "propagation_fetch.rs",
         &[
@@ -416,6 +417,11 @@ mod tests {
                 "PEER_TABLE_VERSION",
                 crate::mesh::peers::PEER_TABLE_VERSION,
                 2,
+            ),
+            (
+                "SENT_THREADS_VERSION",
+                crate::mesh::sent_threads::SENT_THREADS_VERSION,
+                1,
             ),
             (
                 "PROPAGATION_STORE_VERSION",

@@ -164,11 +164,14 @@ struct TerminalHooks {
     interrupted: Vec<ResolvedHook>,
 }
 
-/// What the envoy remembers of the sender's thread, held for one run: the turns before
-/// this message, oldest first, which the run is prompted with. What is written back goes
-/// after whatever the store holds by then.
+/// What the envoy remembers of the sender's conversation, held for one run: the session
+/// it is kept under and the turns before this message, oldest first, which the run is
+/// prompted with. A resumed session's exchange goes after whatever the store holds by
+/// then; a new one's is the whole record under this message's id.
 struct RunMemory {
     store: Arc<EnvoySessions>,
+    thread: String,
+    resumed: bool,
     turns: Vec<EnvoyTurn>,
 }
 
@@ -476,25 +479,35 @@ impl EnvoyRunner {
         drop(reservation);
     }
 
-    /// The sender's thread as the envoy remembers it, when the memory is on and the
-    /// thread id is one the store keys; `None` when nothing will be remembered. A
-    /// root message (one naming no `thread`) opens its thread and loads nothing,
-    /// whatever is under its id from before. A record that cannot be read, or that
-    /// names another identity, is never used: the thread starts over and the run goes
-    /// on.
+    /// The sender's conversation as the envoy remembers it, when the memory is on and
+    /// the thread id is one the store keys; `None` when nothing will be remembered. The
+    /// session is decided here, once: a message naming a thread the store holds for
+    /// its sender resumes it, and every other message opens a new session under its own
+    /// id and loads nothing, whatever is under that id from before. A record that
+    /// cannot be read, or that names another identity, is never used: the
+    /// conversation starts over and the run goes on.
     fn recall(&self, message: &PeerMessage) -> Option<RunMemory> {
         let store = self.app.load().mesh.envoy_memory()?;
-        let thread = message.thread();
-        if !is_wire_id(thread) {
+        if !is_wire_id(message.thread()) {
             return None;
         }
-        if message.thread.is_none() {
+        let now = SystemTime::now();
+        let thread = store.session_thread(
+            &message.source_identity,
+            message.thread.as_deref(),
+            &message.message_id,
+            now,
+        );
+        let resumed = thread != message.message_id;
+        if !resumed {
             return Some(RunMemory {
                 store,
+                thread,
+                resumed,
                 turns: Vec::new(),
             });
         }
-        let turns = match store.load(&message.source_identity, thread, SystemTime::now()) {
+        let turns = match store.load(&message.source_identity, &thread, now) {
             Ok(record) => record.map(|record| record.turns).unwrap_or_default(),
             Err(EnvoyMemoryError::WrongIdentity { .. }) => {
                 warn!(
@@ -511,7 +524,12 @@ impl EnvoyRunner {
                 Vec::new()
             }
         };
-        Some(RunMemory { store, turns })
+        Some(RunMemory {
+            store,
+            thread,
+            resumed,
+            turns,
+        })
     }
 
     fn peer_card(&self, message: &PeerMessage) -> PeerCard {
@@ -1043,7 +1061,7 @@ impl EnvoyRunner {
                     .is_none_or(|runtime| runtime.trust().knows_identity(&message.source_identity));
                 if still_known {
                     let spoken = human_answer.clone().unwrap_or_else(|| reply_text.clone());
-                    remember_exchange(&memory.store, &message, card, spoken);
+                    remember_exchange(&memory, &message, card, spoken);
                 } else {
                     debug!(
                         "Mesh envoy memory for thread {} not written: {} is no longer trusted; nothing remembered",
@@ -1209,20 +1227,16 @@ fn first_pending(queue: &EscalationQueue) -> Option<EscalationRequest> {
     queue.take(id)
 }
 
-/// Adds this exchange to what the envoy remembers of the sender's thread: the peer's
+/// Adds this exchange to the session `recall` chose for the message: the peer's
 /// fenced turn and the words the node said to the peer, nothing of the brief or the
 /// per-run peer section. Written before the send and whether or not it then succeeds:
 /// the words are the node's own either way, and the peer may hear them on a retry. A
-/// follow-up's exchange goes after whatever the store holds by now, not after what the
-/// run was started with, so an answer the owner gave meanwhile stays; a root message's
-/// exchange is the whole of its thread. The store cuts and evicts; a record it refuses
-/// stays as it was.
-fn remember_exchange(
-    store: &EnvoySessions,
-    message: &PeerMessage,
-    card: &PeerCard,
-    spoken: String,
-) {
+/// resumed session's exchange goes after whatever the store holds by now, not after
+/// what the run was started with, so an answer the owner gave meanwhile stays; a new
+/// session's exchange is the whole record under the message's own id. Nothing is ever
+/// written under a thread the store did not hold when the run began. The store cuts and
+/// evicts; a record it refuses stays as it was.
+fn remember_exchange(memory: &RunMemory, message: &PeerMessage, card: &PeerCard, spoken: String) {
     let exchange = vec![
         EnvoyTurn {
             role: EnvoyRole::User,
@@ -1233,17 +1247,19 @@ fn remember_exchange(
             text: spoken,
         },
     ];
-    let thread = message.thread();
+    let store = &memory.store;
+    let thread = memory.thread.as_str();
     let now = SystemTime::now();
-    let written = match message.thread {
-        Some(_) => store.append(&message.source_identity, thread, exchange, now, true),
-        None => store.save(&message.source_identity, thread, exchange, now),
+    let written = if memory.resumed {
+        store.append(&message.source_identity, thread, exchange, now, true)
+    } else {
+        store.save(&message.source_identity, thread, exchange, now)
     };
     match written {
         Ok(()) => {}
-        // Recall loaded the follow-up's thread and already warned the owner about a
-        // record naming another identity; a root's thread was never loaded.
-        Err(err @ EnvoyMemoryError::WrongIdentity { .. }) if message.thread.is_some() => debug!(
+        // Recall loaded the resumed session and already warned the owner about a
+        // record naming another identity; a new session was never loaded.
+        Err(err @ EnvoyMemoryError::WrongIdentity { .. }) if memory.resumed => debug!(
             "Mesh envoy memory for thread {thread} could not be saved: {}",
             redact_hashes(&err.to_string())
         ),
@@ -8138,6 +8154,18 @@ mod tests {
         }
     }
 
+    /// A message naming no thread from `identity`: it opens a conversation kept under
+    /// its own `id`, which a follow-up then names as its thread.
+    fn root_job(identity: &[u8; 16], id: &str, content: &str) -> EnvoyJob {
+        EnvoyJob {
+            message: PeerMessage::new(RawPeerMessage {
+                source_identity: hex_lower(identity),
+                ..raw_job(PeerKind::Ask, id, content)
+            }),
+            reservation: None,
+        }
+    }
+
     /// A drive that keeps every prompt it is given and answers `answer N`, N counting
     /// the prompts before it.
     fn prompt_recording_drive() -> (EnvoyDrive, Arc<Mutex<Vec<Vec<Message>>>>) {
@@ -8183,6 +8211,8 @@ mod tests {
         };
         let memory = RunMemory {
             store: Arc::new(EnvoySessions::open(&tmp.path, "inst-a", &config).unwrap()),
+            thread: "t-1".into(),
+            resumed: true,
             turns: vec![
                 turn(EnvoyRole::User, "a"),
                 turn(EnvoyRole::Assistant, "b"),
@@ -8375,7 +8405,7 @@ mod tests {
         let (drive, seen) = prompt_recording_drive();
         let runner = EnvoyRunner::start_with(Arc::clone(&app), drive);
         for (n, job) in [
-            threaded_job(&PEER_IDENTITY, "q-1", "t-9", "what is this?"),
+            root_job(&PEER_IDENTITY, "t-9", "what is this?"),
             threaded_job(&PEER_IDENTITY, "q-2", "t-9", "and then?"),
             job(PeerKind::Ask, "q-3", "something else?"),
         ]
@@ -8446,7 +8476,7 @@ mod tests {
         let runner = EnvoyRunner::start_with(Arc::clone(&app), drive);
         assert!(
             runner
-                .accept(threaded_job(&PEER_IDENTITY, "q-1", "t-9", "what is this?"))
+                .accept(root_job(&PEER_IDENTITY, "t-9", "what is this?"))
                 .is_ok()
         );
         wait_until("the first reply", || idle.count("envoy replied:") == 1).await;
@@ -8465,7 +8495,12 @@ mod tests {
             "the same thread id from another identity loads nothing"
         );
         assert_eq!(turns_of(&store, &PEER_IDENTITY, "t-9").len(), 2);
-        assert_eq!(turns_of(&store, &OTHER_IDENTITY, "t-9").len(), 2);
+        assert_eq!(
+            turns_of(&store, &OTHER_IDENTITY, "q-2").len(),
+            2,
+            "and opens a new session under its own id"
+        );
+        assert!(turns_of(&store, &OTHER_IDENTITY, "t-9").is_empty());
         source.remove_dir();
     }
 
@@ -8509,7 +8544,7 @@ mod tests {
         });
         assert!(
             runner
-                .accept(threaded_job(&PEER_IDENTITY, "q-1", "t-9", "may I?"))
+                .accept(root_job(&PEER_IDENTITY, "t-9", "may I?"))
                 .is_ok()
         );
         wait_until("the first reply", || idle.count("envoy replied:") == 1).await;
@@ -8695,7 +8730,8 @@ mod tests {
                 .unwrap_or_default()
         };
 
-        assert!(runner.accept(in_thread("q-1", "first")).is_ok());
+        let root = job_from(PeerKind::Ask, "t-9", "first", &to, &identity);
+        assert!(runner.accept(root).is_ok());
         wait_until("the first reply", || idle.count("envoy replied:") == 1).await;
         assert_eq!(
             remembered().len(),
@@ -8886,8 +8922,8 @@ mod tests {
 
     /// A follow-up naming a thread past `ttl_hours` since it was last written names a
     /// thread the node does not hold. It is driven with nothing resumed and the prompt of
-    /// a fresh thread, the expired record goes, and the exchange it writes is the whole of
-    /// the thread from then on.
+    /// a fresh thread, the expired record goes, and its exchange opens a new session
+    /// under its own id.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
     async fn a_follow_up_in_an_expired_thread_starts_clean_and_the_old_turns_go() {
@@ -8942,7 +8978,8 @@ mod tests {
             !seen[0][0].content.to_text().contains(RESUMED_THREAD_NOTE),
             "and the prompt is a fresh thread's"
         );
-        let turns = turns_of(&store, &PEER_IDENTITY, "t-9");
+        assert!(turns_of(&store, &PEER_IDENTITY, "t-9").is_empty());
+        let turns = turns_of(&store, &PEER_IDENTITY, "q-2");
         assert_eq!(turns.len(), 2, "{turns:?}");
         assert!(turns[0].text.contains("Message id: q-2"), "{turns:?}");
         assert_eq!(turns[1].text, "answer 0");
@@ -8965,7 +9002,7 @@ mod tests {
         let (drive, _seen) = prompt_recording_drive();
         let runner = EnvoyRunner::start_with(Arc::clone(&app), drive);
         for (n, job) in [
-            threaded_job(&PEER_IDENTITY, "q-1", "t-9", "what is this?"),
+            root_job(&PEER_IDENTITY, "t-9", "what is this?"),
             threaded_job(&PEER_IDENTITY, "q-2", "t-9", "and then?"),
         ]
         .into_iter()
@@ -8982,7 +9019,7 @@ mod tests {
         let turns = turns_of(&store, &PEER_IDENTITY, "t-9");
         assert_eq!(turns.len(), 4, "{turns:?}");
         let destination = hex_lower(&[0xab; 16]);
-        for (turn, id) in [(&turns[0], "q-1"), (&turns[2], "q-2")] {
+        for (turn, id) in [(&turns[0], "t-9"), (&turns[2], "q-2")] {
             assert_eq!(turn.role, EnvoyRole::User);
             assert!(turn.text.starts_with(&peer_fence_begin(&destination)));
             assert!(turn.text.ends_with(&peer_fence_end(&destination)));
@@ -9052,7 +9089,7 @@ mod tests {
         .await;
         runner.stop().await;
 
-        let turns = turns_of(&store, &PEER_IDENTITY, "t-9");
+        let turns = turns_of(&store, &PEER_IDENTITY, "q-held");
         assert_eq!(turns.len(), 2, "{turns:?}");
         assert_eq!(turns[0].role, EnvoyRole::User);
         assert_eq!(turns[1].role, EnvoyRole::Assistant);
@@ -9091,7 +9128,7 @@ mod tests {
         .await;
         runner.stop().await;
 
-        let turns = turns_of(&store, &PEER_IDENTITY, "t-9");
+        let turns = turns_of(&store, &PEER_IDENTITY, "q-esc");
         assert_eq!(turns.len(), 2, "{turns:?}");
         assert_eq!(
             turns[1].text,
@@ -9126,7 +9163,7 @@ mod tests {
                 }
             })
         });
-        for (n, (id, thread)) in [("q-1", "t-9"), ("q-2", "t-9"), ("q-3", "t-fresh")]
+        for (n, (id, thread)) in [("q-1", "t-9"), ("q-2", "q-1"), ("q-3", "t-fresh")]
             .into_iter()
             .enumerate()
         {
@@ -9142,9 +9179,11 @@ mod tests {
         }
         runner.stop().await;
 
-        let turns = turns_of(&store, &PEER_IDENTITY, "t-9");
+        let turns = turns_of(&store, &PEER_IDENTITY, "q-1");
         assert_eq!(turns.len(), 2, "{turns:?}");
         assert_eq!(turns[1].text, "answer");
+        assert!(turns_of(&store, &PEER_IDENTITY, "t-9").is_empty());
+        assert!(turns_of(&store, &PEER_IDENTITY, "q-3").is_empty());
         assert!(turns_of(&store, &PEER_IDENTITY, "t-fresh").is_empty());
         source.remove_dir();
     }
@@ -9297,7 +9336,7 @@ mod tests {
         });
         assert!(
             runner
-                .accept(threaded_job(&PEER_IDENTITY, "q-1", "t-9", "first"))
+                .accept(root_job(&PEER_IDENTITY, "t-9", "first"))
                 .is_ok()
         );
         wait_until("the first run to start", || started.load(Ordering::SeqCst)).await;
@@ -9359,17 +9398,22 @@ mod tests {
                 }
             })
         });
-        let stored = |id: &str, content: &str| {
-            let mut job = threaded_job(&PEER_IDENTITY, id, "t-9", content);
+        let stored = |mut job: EnvoyJob| {
             job.message.via = PeerVia::StoreAndForward;
             job
         };
-        assert!(runner.accept(stored("q-1", "first")).is_ok());
+        let in_thread =
+            |id: &str, content: &str| stored(threaded_job(&PEER_IDENTITY, id, "t-9", content));
+        assert!(
+            runner
+                .accept(stored(root_job(&PEER_IDENTITY, "t-9", "first")))
+                .is_ok()
+        );
         wait_until("the first run to start", || started.load(Ordering::SeqCst)).await;
         // Both queue behind the run that spends the window; both are refused at run
         // time for the same reason, the first told, the second withheld.
-        assert!(runner.accept(stored("q-2", "second")).is_ok());
-        assert!(runner.accept(stored("q-3", "third")).is_ok());
+        assert!(runner.accept(in_thread("q-2", "second")).is_ok());
+        assert!(runner.accept(in_thread("q-3", "third")).is_ok());
         app.mesh
             .limits()
             .debit(&hex_lower(&PEER_IDENTITY), 400, None, Instant::now());
@@ -9385,7 +9429,7 @@ mod tests {
         assert!(idle.has("token_ceiling"));
         let turns = turns_of(&store, &PEER_IDENTITY, "t-9");
         assert_eq!(turns.len(), 4, "{turns:?}");
-        assert!(turns[0].text.contains("Message id: q-1"), "{turns:?}");
+        assert!(turns[0].text.contains("Message id: t-9"), "{turns:?}");
         assert_eq!(turns[1].text, "answer");
         assert!(turns[2].text.contains("Message id: q-2"), "{turns:?}");
         assert_eq!(turns[3].role, EnvoyRole::Assistant);
@@ -9660,7 +9704,8 @@ mod tests {
     /// The natural shape of a conversation: a `message` that opens it carries no
     /// `thread`, so it is its own thread, and the follow-up names that root's id. The
     /// record lives under the root's id alone; the follow-up's own id opens nothing, so
-    /// a third message naming it as its thread starts clean.
+    /// a third message naming it as its thread starts clean, in a new session under its
+    /// own id.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
     async fn a_root_message_without_a_thread_is_continued_under_its_own_id() {
@@ -9714,19 +9759,166 @@ mod tests {
         assert!(root_turns[2].text.contains("Message id: m-2"));
         assert_eq!(root_turns[3].text, "answer 1");
         assert!(
-            turns_of(&store, &PEER_IDENTITY, "m-2").len() == 2,
-            "m-3 opened its own record under the thread it named, and nothing else"
+            turns_of(&store, &PEER_IDENTITY, "m-3").len() == 2,
+            "m-3 opened a new session under its own id"
         );
         assert!(
-            turns_of(&store, &PEER_IDENTITY, "m-3").is_empty(),
-            "a follow-up's own id keys no record"
+            turns_of(&store, &PEER_IDENTITY, "m-2").is_empty(),
+            "a follow-up's own id keys no record, and an unheld thread named gets none"
         );
         source.remove_dir();
     }
 
+    /// A new session is keyed by the sender's identity and the message's own id; a
+    /// message resumes only a session already held for that identity under its thread.
+    /// The reply carries the thread the message came with either way.
+    mod session_keying_tests {
+        use super::*;
+
+        /// The thread each reply in the inbox carries, by the id it answers.
+        fn reply_threads(app: &AppState) -> Vec<(String, String)> {
+            let (envelopes, _) = app.mesh.peer_inbox().drain();
+            envelopes
+                .iter()
+                .map(peer_of)
+                .filter(|message| message.kind == PeerKind::Reply)
+                .map(|message| {
+                    (
+                        message.in_reply_to.clone().unwrap_or_default(),
+                        message.thread().to_string(),
+                    )
+                })
+                .collect()
+        }
+
+        async fn run_in_turn(app: &Arc<AppState>, drive: EnvoyDrive, jobs: Vec<EnvoyJob>) {
+            let idle = RecordingIdleSink::attach(app);
+            let runner = EnvoyRunner::start_with(Arc::clone(app), drive);
+            for (n, job) in jobs.into_iter().enumerate() {
+                assert!(runner.accept(job).is_ok());
+                wait_until("the reply to land", || {
+                    idle.count("envoy replied:") == n + 1
+                })
+                .await;
+            }
+            runner.stop().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn two_instances_naming_one_authored_thread_get_separate_sessions() {
+            let _cfg = TestConfigDirGuard::new("mesh-envoy-keying-authored");
+            let (source, _source) = stub_envoy_source();
+            let tmp = TempDir::new("mesh-envoy-keying-authored");
+            let app = test_app();
+            let store = memory_for(&app, &tmp);
+            let (drive, seen) = prompt_recording_drive();
+
+            run_in_turn(
+                &app,
+                drive,
+                vec![
+                    threaded_job(&PEER_IDENTITY, "i1-q", "build-status", "is it green?"),
+                    threaded_job(&PEER_IDENTITY, "i2-q", "build-status", "is it green?"),
+                ],
+            )
+            .await;
+
+            let seen = seen.lock();
+            assert_eq!(seen.len(), 2);
+            assert_eq!(
+                roles_of(&seen[1]),
+                vec![MessageRole::System, MessageRole::User],
+                "the second instance resumes nothing"
+            );
+            assert!(
+                !seen[1]
+                    .iter()
+                    .any(|message| message.content.to_text().contains("Message id: i1-q")),
+                "the first exchange is not in the second prompt"
+            );
+            for (id, answer) in [("i1-q", "answer 0"), ("i2-q", "answer 1")] {
+                let turns = turns_of(&store, &PEER_IDENTITY, id);
+                assert_eq!(turns.len(), 2, "{id}: {turns:?}");
+                assert!(turns[0].text.contains(&format!("Message id: {id}")));
+                assert_eq!(turns[1].text, answer);
+            }
+            assert!(turns_of(&store, &PEER_IDENTITY, "build-status").is_empty());
+            assert_eq!(store.stats().unwrap().0, 2, "two sessions and no other");
+            assert_eq!(
+                reply_threads(&app),
+                vec![
+                    ("i1-q".to_string(), "build-status".to_string()),
+                    ("i2-q".to_string(), "build-status".to_string()),
+                ],
+                "each reply carries the thread its message came with"
+            );
+            source.remove_dir();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn a_follow_up_naming_a_received_id_resumes_and_another_identity_does_not() {
+            let _cfg = TestConfigDirGuard::new("mesh-envoy-keying-returned-id");
+            let (source, _source) = stub_envoy_source();
+            let tmp = TempDir::new("mesh-envoy-keying-returned-id");
+            let app = test_app();
+            let store = memory_for(&app, &tmp);
+            let (drive, seen) = prompt_recording_drive();
+
+            run_in_turn(
+                &app,
+                drive,
+                vec![
+                    root_job(&PEER_IDENTITY, "m-1", "how is the build?"),
+                    threaded_job(&PEER_IDENTITY, "m-2", "m-1", "and the tests?"),
+                    threaded_job(&OTHER_IDENTITY, "m-3", "m-1", "and for me?"),
+                ],
+            )
+            .await;
+
+            let seen = seen.lock();
+            assert_eq!(seen.len(), 3);
+            assert_eq!(
+                roles_of(&seen[1]),
+                vec![
+                    MessageRole::System,
+                    MessageRole::User,
+                    MessageRole::Assistant,
+                    MessageRole::User
+                ],
+                "the follow-up resumes the root's exchange"
+            );
+            assert!(seen[1][1].content.to_text().contains("Message id: m-1"));
+            assert_eq!(seen[1][2].content.to_text(), "answer 0");
+            assert_eq!(
+                roles_of(&seen[2]),
+                vec![MessageRole::System, MessageRole::User],
+                "another identity naming the same id resumes nothing"
+            );
+            let turns = turns_of(&store, &PEER_IDENTITY, "m-1");
+            assert_eq!(turns.len(), 4, "{turns:?}");
+            assert!(turns[2].text.contains("Message id: m-2"));
+            assert_eq!(turns[3].text, "answer 1");
+            assert!(turns_of(&store, &PEER_IDENTITY, "m-2").is_empty());
+            assert!(turns_of(&store, &OTHER_IDENTITY, "m-1").is_empty());
+            assert_eq!(turns_of(&store, &OTHER_IDENTITY, "m-3").len(), 2);
+            assert_eq!(
+                reply_threads(&app),
+                vec![
+                    ("m-1".to_string(), "m-1".to_string()),
+                    ("m-2".to_string(), "m-1".to_string()),
+                    ("m-3".to_string(), "m-1".to_string()),
+                ]
+            );
+            source.remove_dir();
+        }
+    }
+
     /// The store is looked up per run, never kept by the runner: after the slot's store
     /// is swapped (as a re-key swaps it), the next run in the same thread reads the new
-    /// store, finds nothing, and writes its exchange there, the first store untouched.
+    /// store, finds nothing, and writes its exchange there in a new session under its own
+    /// id, the first store untouched.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
     async fn the_store_is_looked_up_per_run_so_a_swapped_store_takes_the_next_turn() {
@@ -9741,12 +9933,7 @@ mod tests {
         let runner = EnvoyRunner::start_with(Arc::clone(&app), drive);
         assert!(
             runner
-                .accept(threaded_job(
-                    &PEER_IDENTITY,
-                    "q-1",
-                    "t-9",
-                    "before the swap"
-                ))
+                .accept(root_job(&PEER_IDENTITY, "t-9", "before the swap"))
                 .is_ok()
         );
         wait_until("the first reply", || idle.count("envoy replied:") == 1).await;
@@ -9771,13 +9958,14 @@ mod tests {
             vec![MessageRole::System, MessageRole::User],
             "the swapped-in store holds nothing for the thread"
         );
-        let in_second = turns_of(&second, &PEER_IDENTITY, "t-9");
+        assert!(turns_of(&second, &PEER_IDENTITY, "t-9").is_empty());
+        let in_second = turns_of(&second, &PEER_IDENTITY, "q-2");
         assert_eq!(in_second.len(), 2, "{in_second:?}");
         assert!(in_second[0].text.contains("Message id: q-2"));
         assert_eq!(in_second[1].text, "answer 1");
         let in_first = turns_of(&first, &PEER_IDENTITY, "t-9");
         assert_eq!(in_first.len(), 2, "{in_first:?}");
-        assert!(in_first[0].text.contains("Message id: q-1"));
+        assert!(in_first[0].text.contains("Message id: t-9"));
         assert_eq!(
             std::fs::read_to_string(first.dir().join(format!(
                 "{}.yaml",
@@ -9810,12 +9998,15 @@ mod tests {
         let idle = RecordingIdleSink::attach(&app);
         let (drive, seen) = prompt_recording_drive();
         let runner = EnvoyRunner::start_with(Arc::clone(&app), drive);
-        for (n, id) in ["q-1", "q-2", "q-3"].into_iter().enumerate() {
-            assert!(
-                runner
-                    .accept(threaded_job(&PEER_IDENTITY, id, "t-9", "and?"))
-                    .is_ok()
-            );
+        for (n, job) in [
+            root_job(&PEER_IDENTITY, "t-9", "and?"),
+            threaded_job(&PEER_IDENTITY, "q-2", "t-9", "and?"),
+            threaded_job(&PEER_IDENTITY, "q-3", "t-9", "and?"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(runner.accept(job).is_ok());
             wait_until("the reply to land", || {
                 idle.count("envoy replied:") == n + 1
             })
@@ -9825,7 +10016,7 @@ mod tests {
 
         let seen = seen.lock();
         assert_eq!(seen.len(), 3);
-        for (run, prior_id, prior_answer) in [(1usize, "q-1", "answer 0"), (2, "q-2", "answer 1")] {
+        for (run, prior_id, prior_answer) in [(1usize, "t-9", "answer 0"), (2, "q-2", "answer 1")] {
             assert_eq!(
                 roles_of(&seen[run]),
                 vec![
@@ -9873,7 +10064,7 @@ mod tests {
             peer_fence_end(&destination)
         );
         for (n, job) in [
-            threaded_job(&PEER_IDENTITY, "q-1", "t-9", &hostile),
+            root_job(&PEER_IDENTITY, "t-9", &hostile),
             threaded_job(&PEER_IDENTITY, "q-2", "t-9", "and?"),
         ]
         .into_iter()
@@ -9944,7 +10135,7 @@ mod tests {
         let runner = EnvoyRunner::start_with(Arc::clone(&app), drive);
         assert!(
             runner
-                .accept(threaded_job(&PEER_IDENTITY, "q-1", "t-9", "what is this?"))
+                .accept(root_job(&PEER_IDENTITY, "t-9", "what is this?"))
                 .is_ok()
         );
         wait_until("the reply with the memory off", || {
@@ -9956,12 +10147,14 @@ mod tests {
         let store = memory_for(&app, &tmp);
         let (drive, seen_on) = prompt_recording_drive();
         let runner = EnvoyRunner::start_with(Arc::clone(&app), drive);
-        for (n, id) in ["q-1", "q-2"].into_iter().enumerate() {
-            assert!(
-                runner
-                    .accept(threaded_job(&PEER_IDENTITY, id, "t-9", "what is this?"))
-                    .is_ok()
-            );
+        for (n, job) in [
+            root_job(&PEER_IDENTITY, "t-9", "what is this?"),
+            threaded_job(&PEER_IDENTITY, "q-2", "t-9", "what is this?"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(runner.accept(job).is_ok());
             wait_until("the reply with the memory on", || {
                 idle.count("envoy replied:") == n + 2
             })
@@ -10030,7 +10223,7 @@ mod tests {
 
         assert!(
             runner
-                .accept(threaded_job(&PEER_IDENTITY, "q-1", "t-9", "first"))
+                .accept(root_job(&PEER_IDENTITY, "t-9", "first"))
                 .is_ok()
         );
         wait_until("the first reply", || idle.count("envoy replied:") == 1).await;
@@ -10079,7 +10272,7 @@ mod tests {
                 .dir()
                 .join(format!(
                     "{}.yaml",
-                    session_key(&hex_lower(&PEER_IDENTITY), "t-fresh").unwrap()
+                    session_key(&hex_lower(&PEER_IDENTITY), "q-4").unwrap()
                 ))
                 .exists(),
             "no record was written for a thread that was never answered"
@@ -10209,7 +10402,7 @@ mod tests {
         });
         assert!(
             runner
-                .accept(threaded_job(&PEER_IDENTITY, "q-1", "t-9", "first"))
+                .accept(root_job(&PEER_IDENTITY, "t-9", "first"))
                 .is_ok()
         );
         wait_until("the first reply", || idle.count("envoy replied:") == 1).await;

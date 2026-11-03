@@ -12,7 +12,7 @@ use crate::config::mesh_config::EnvoyMemoryConfig;
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
 use crate::mesh::trust::parse_hash;
 use crate::mesh::{
-    canonical_hash, mesh_cache_dir, parse_rfc3339, redact_hashes, rfc3339_utc,
+    canonical_hash, mesh_cache_dir, parse_rfc3339, redact_hashes, rfc3339_utc, short,
     write_atomically_owner_only,
 };
 
@@ -246,8 +246,10 @@ impl std::error::Error for EnvoyMemoryError {
     }
 }
 
-/// The file name of one thread's record: the truncated SHA-256 of the identity's address
-/// bytes, a zero byte and the thread, as 32 lowercase hex. The identity is fixed-width,
+/// The file name of one session's record: the truncated SHA-256 of the identity's address
+/// bytes, a zero byte and the session's thread, as 32 lowercase hex. The thread is the one
+/// `EnvoySessions::session_thread` picks: the id of the message that opened the session,
+/// never a thread a message named that the store did not hold. The identity is fixed-width,
 /// so the zero byte marks no boundary; it is a fixed separator that keeps this digest's
 /// input distinct from `destination_address`'s, which also chains an address hash. The
 /// identity bytes, not its hex, so the key is the same whatever case the caller spelt.
@@ -524,6 +526,42 @@ impl EnvoySessions {
             return Ok(None);
         };
         Ok(Some(record))
+    }
+
+    /// The thread a message's session is kept under. A message resumes only the
+    /// session `identity` already holds under its `wire_thread`, live and its own; any
+    /// other message, a root or one naming a thread the store does not hold, opens a
+    /// new session under its own `message_id`. A record under the wire thread that
+    /// cannot be read, or that names another identity, is warned about and not
+    /// resumed.
+    pub(crate) fn session_thread(
+        &self,
+        identity: &str,
+        wire_thread: Option<&str>,
+        message_id: &str,
+        now: SystemTime,
+    ) -> String {
+        let Some(thread) = wire_thread.filter(|thread| *thread != message_id) else {
+            return message_id.to_string();
+        };
+        match self.load(identity, thread, now) {
+            Ok(Some(_)) => thread.to_string(),
+            Ok(None) => message_id.to_string(),
+            Err(EnvoyMemoryError::WrongIdentity { .. }) => {
+                warn!(
+                    "Mesh envoy memory for thread {thread} names another identity than {}; a new conversation starts under message {message_id}",
+                    short(identity)
+                );
+                message_id.to_string()
+            }
+            Err(err) => {
+                warn!(
+                    "Mesh envoy memory for thread {thread} could not be read ({}); a new conversation starts under message {message_id}",
+                    redact_hashes(&err.to_string())
+                );
+                message_id.to_string()
+            }
+        }
     }
 
     /// Writes `turns`, cut to `max_turns` and `max_bytes` oldest exchange first, as the

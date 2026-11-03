@@ -34,6 +34,7 @@ mod protocol;
 pub(crate) mod request;
 // pub(crate): the REPL pins the shared refusal wording in its tests.
 pub(crate) mod schema;
+mod sent_threads;
 pub(crate) mod shares;
 pub(crate) mod snapshot;
 pub(crate) mod trust;
