@@ -10764,7 +10764,7 @@ pub(crate) mod network {
     /// report says unreachable while B's says delivered. Once C is on record as speaking
     /// another protocol, a second broadcast reports it refused without asking it again.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_broadcast_reaches_the_reachable_peer_and_reports_the_unreachable_one() {
+    async fn a_broadcast_reaches_the_reachable_peer_and_reports_no_answer_from_the_silent_one() {
         let recorder_c = Arc::new(Recorder::default());
         let responder_c =
             Responder::listen(recorder_c.clone(), TcpServer::DEFAULT_CLIENT_MTU).await;
