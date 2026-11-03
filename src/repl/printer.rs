@@ -34,6 +34,8 @@ pub struct PromptPrinter {
     colour: bool,
     /// Read per notification, so a `.set command_prefix` shows on the next line.
     command_prefix: LivePrefix,
+    /// Read per notification, so a resized terminal wraps the next line to its width.
+    width: Box<dyn Fn() -> usize + Send + Sync>,
 }
 
 impl PromptPrinter {
@@ -49,7 +51,14 @@ impl PromptPrinter {
             dropped: AtomicUsize::new(0),
             colour,
             command_prefix,
+            width: Box::new(terminal_width),
         }
+    }
+
+    #[cfg(test)]
+    fn with_width(mut self, width: usize) -> Self {
+        self.width = Box::new(move || width);
+        self
     }
 
     /// The receiving end of the queue for `Reedline::with_external_printer`. The
@@ -100,7 +109,7 @@ impl NotificationSink for PromptPrinter {
         let prefix = rendered.source().prefix();
         let lines = rendered.render_notification_lines(self.command_prefix.load());
         rows.extend(
-            wrap_rows(&lines, prefix, terminal_width())
+            wrap_rows(&lines, prefix, (self.width)())
                 .into_iter()
                 .map(|row| self.paint_prefix(row, prefix)),
         );
@@ -109,6 +118,47 @@ impl NotificationSink for PromptPrinter {
         // count as a dropped notification; neither is waited on.
         if self.sender.try_send(payload).is_err() {
             self.dropped.fetch_add(dropped + 1, Ordering::AcqRel);
+        }
+    }
+}
+
+#[cfg(test)]
+mod injected_width_tests {
+    use super::*;
+    use crate::config::CommandPrefix;
+    use crate::mesh::notify::Notification;
+
+    #[test]
+    fn a_wrapped_line_keeps_its_width_bound_and_its_words_at_every_width() {
+        let body = format!("{}then `.mesh trust a1`", "word ".repeat(90));
+        let prefix = Source::Knock.prefix();
+        let indent = " ".repeat(display_width(prefix) + 1);
+        for width in [20, 80, 500] {
+            let live = LivePrefix::default();
+            live.store(CommandPrefix::Slash);
+            let printer = PromptPrinter::with_colour(PROMPT_PRINTER_CAPACITY, false, live)
+                .with_width(width);
+            let attached = printer.attach();
+            printer.notify(Notification::new(Source::Knock, body.as_str()).render());
+            let payload = attached.get_line().expect("payload queued");
+            let rows: Vec<&str> = payload.lines().collect();
+            assert_eq!(rows.len() > 1, width < 500, "{width}: {rows:?}");
+            for row in &rows {
+                assert!(display_width(row) <= width, "{width}: {row:?}");
+            }
+            let words: Vec<&str> = rows
+                .iter()
+                .enumerate()
+                .map(|(index, row)| match index {
+                    0 => row.strip_prefix(prefix).unwrap_or(row).trim_start(),
+                    _ => row.strip_prefix(indent.as_str()).unwrap_or(row),
+                })
+                .collect();
+            assert_eq!(
+                words.join(" "),
+                body.replace(".mesh", "/mesh"),
+                "{width}"
+            );
         }
     }
 }
