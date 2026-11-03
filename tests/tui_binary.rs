@@ -2845,6 +2845,44 @@ fn ctrl_c_with_a_draft_clears_the_composer_and_does_not_quit() {
     assert_eq!(fake.served(), 0, "{transcript}");
 }
 
+/// Ctrl+D with a draft in the composer is not the quit chord: the UI
+/// stays up and the draft stays put; once Ctrl+C has cleared it, Ctrl+D
+/// leaves as usual.
+#[test]
+#[serial]
+fn ctrl_d_with_a_draft_does_not_quit() {
+    let dir = fresh_config_dir("ctrl-d-draft");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b"draft kept on ctrl-d w2v").unwrap();
+    pty.wait_for("draft kept on ctrl-d w2v", PTY_DEADLINE)
+        .expect("the typed draft never reached the composer");
+    pty.read_for(HOTKEY_GAP);
+    let pressed_at = pty.raw().len();
+    pty.send(b"\x04").unwrap();
+    pty.read_for(Duration::from_millis(800));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[pressed_at..]));
+    assert!(
+        !since.contains("exit="),
+        "Ctrl+D with a draft in the composer quit the UI:\n{since}"
+    );
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "Ctrl+D with a draft in the composer left the alternate screen:\n{since}"
+    );
+
+    pty.send(b"\x03").unwrap();
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
 /// Ctrl+C while a turn runs is the same soft interrupt as Esc: the held
 /// stream ends at once, the process does NOT exit, the rest of the reply
 /// never lands, and the next command is handled well before the model

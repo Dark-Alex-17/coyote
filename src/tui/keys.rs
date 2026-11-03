@@ -94,7 +94,9 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
                     Action::ClearComposer
                 }
             }
-            KeyCode::Char('d') if ctrl => Action::Quit,
+            // Readline's split: EOF only on an empty line; with a draft the
+            // chord reaches the textarea, which deletes forward.
+            KeyCode::Char('d') if ctrl && ctx.composer_empty => Action::Quit,
             KeyCode::Esc if ctx.turn_running => Action::Interrupt,
             KeyCode::Esc => Action::Nothing,
             KeyCode::Char('z') if ctrl => Action::Suspend,
@@ -164,6 +166,7 @@ mod tests {
             (ctrl('c'), typing, Action::ClearComposer),
             (ctrl('c'), running, Action::Interrupt),
             (ctrl('d'), IDLE, Action::Quit),
+            (ctrl('d'), typing, Action::ComposerInput(ctrl('d'))),
             (ctrl('d'), running, Action::Quit),
             (plain(KeyCode::Esc), IDLE, Action::Nothing),
             (plain(KeyCode::Esc), running, Action::Interrupt),
