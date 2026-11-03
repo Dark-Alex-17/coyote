@@ -26743,6 +26743,55 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         started.relay_handle.abort();
                     });
                 }
+
+                /// A hash typed in capitals is the same destination: it is asked for once,
+                /// filed under its lower-case spelling and listed by `.mesh peers`. Once
+                /// filed, the next verb on it neither asks again nor waits.
+                #[test]
+                #[serial]
+                fn an_upper_case_hash_is_asked_for_once_and_the_next_verb_does_not_ask_again() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-first-contact-upper");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = LateJoiner::start("repl-first-contact-upper").await;
+                        let to_a = fx.to_a.clone();
+                        let typed = to_a.to_ascii_uppercase();
+                        assert_ne!(typed, to_a);
+                        let out = fx.asks_for_a(&format!(".mesh info {typed}")).await.unwrap();
+                        assert!(out.contains(&fx.waiting_line()), "{out}");
+                        assert!(out.contains(&format!("destination: {to_a}")), "{out}");
+
+                        let peers = out_of(&mut fx.ctx, ".mesh peers").await.unwrap();
+                        assert!(peers.contains(short(&to_a)), "{peers}");
+
+                        for line in [
+                            format!(".mesh info {to_a}"),
+                            format!(".mesh trust {to_a} --yes"),
+                        ] {
+                            let asked = Instant::now();
+                            let out = out_of(&mut fx.ctx, &line).await.unwrap();
+                            assert!(
+                                asked.elapsed() < Duration::from_secs(2),
+                                "{line}: {:?}",
+                                asked.elapsed()
+                            );
+                            assert!(
+                                !out.contains("Asking the mesh for"),
+                                "{line} asked again for a filed peer: {out}"
+                            );
+                        }
+                        assert!(
+                            fx.b.runtime
+                                .trust()
+                                .records()
+                                .iter()
+                                .any(|record| format!("{record:?}").contains(&to_a)),
+                            "the trust landed on the filed destination"
+                        );
+                        fx.stop().await;
+                    });
+                }
             }
 
             mod command_prefix_refusals {
