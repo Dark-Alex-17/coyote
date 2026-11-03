@@ -2730,7 +2730,7 @@ fn the_enabled_line_names_the_session_entered_later_on_every_surface() {
         ],
     );
     let turn_off = string_literals(&fn_body("src/repl/mesh.rs", "turn_off_line"));
-    let template = turn_off
+    let off_template = turn_off
         .iter()
         .find(|literal| literal.contains("{state}"))
         .unwrap_or_else(|| panic!("turn_off_line has no line template: {turn_off:?}"));
@@ -2738,6 +2738,10 @@ fn the_enabled_line_names_the_session_entered_later_on_every_surface() {
         .iter()
         .find(|literal| literal.contains("stays off"))
         .unwrap_or_else(|| panic!("turn_off_line has no stays-off clause: {turn_off:?}"));
+    assert!(
+        off_template.contains("{stays_off};"),
+        "turn_off_line no longer puts the stays-off clause before the semicolon: {off_template:?}"
+    );
     let mut off_lines: Vec<String> = ["off", "already off"]
         .into_iter()
         .map(|state| {
@@ -2745,7 +2749,7 @@ fn the_enabled_line_names_the_session_entered_later_on_every_surface() {
                 turn_off.iter().any(|literal| literal == state),
                 "turn_off_line no longer says {state:?}: {turn_off:?}"
             );
-            template
+            off_template
                 .replace("{state}", state)
                 .replace("{stays_off}", "")
         })
@@ -2759,6 +2763,10 @@ fn the_enabled_line_names_the_session_entered_later_on_every_surface() {
         "Mesh-Commands.md",
         &off_lines.iter().map(String::as_str).collect::<Vec<_>>()[..],
     );
+    let stays_off_line = off_template
+        .replace("{state}", "off")
+        .replace("{stays_off}", stays_off);
+    prose("Mesh-Platform-Support.md", &[stays_off_line.as_str()]);
 }
 
 /// The `interfaces:` block is one text on every surface: the example and the
@@ -7586,7 +7594,7 @@ fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
         for needle in [
             local_tail.as_str(),
             "before any `Fetching ...` line and without asking the peer",
-            "a grant on the path is still running, the path is in the peer's last `mesh__list` listing, or the peer attached it again and that attachment is not fetched yet",
+            "a grant on the path is still running, the path was on a `mesh__list` page heard since the peer's last unprefixed first page, or the peer attached it again and that attachment is not fetched yet",
         ] {
             assert!(
                 fetch.contains(needle),
@@ -7594,7 +7602,7 @@ fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
             );
         }
         let memory_checks = if label == "Mesh-File-Sharing.md" {
-            "two `not shared, ...` rows"
+            "Only the `not shared, grant expired` row is checked once the peer has answered `not_shared`"
         } else {
             "Before that generic sentence"
         };

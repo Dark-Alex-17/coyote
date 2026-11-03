@@ -46,6 +46,9 @@ pub(crate) const FILE_FETCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(120)
 /// How many peers' last status card and last listing are kept, oldest out first.
 pub(crate) const LAST_CARD_CACHE_PEERS: usize = 32;
 pub(crate) const LAST_LIST_CACHE_PEERS: usize = 32;
+/// How many paths listed by one peer are kept across its listing pages, oldest out
+/// first, so a path read on a later page still counts as served.
+pub(crate) const LISTED_PATHS_PER_PEER: usize = 512;
 /// How many peers' claims (reference attachments and received grants) are kept, how
 /// many of each kind per peer, and how many access requests may wait on a deferred
 /// decision; each oldest out first.
@@ -1063,6 +1066,10 @@ struct PendingAccessClaim {
 pub(crate) struct PeerMemory {
     cards: Recent<StatusCard>,
     lists: Recent<Listing>,
+    /// Every path heard across the peer's listing pages since its last unprefixed
+    /// first page, which starts the set again so a path the peer stopped sharing drops
+    /// out.
+    listed_paths: Recent<VecDeque<String>>,
     claims: Recent<PeerClaims>,
     /// Keyed by the access request id.
     pending_access: Recent<PendingAccessClaim>,
@@ -1074,9 +1081,30 @@ impl PeerMemory {
             .remember(destination_hex, card, LAST_CARD_CACHE_PEERS);
     }
 
-    fn remember_list(&self, destination_hex: &str, listing: Listing) {
+    /// `from_the_start` is a page read with no cursor and no prefix.
+    fn remember_list(&self, destination_hex: &str, listing: Listing, from_the_start: bool) {
+        let mut paths = if from_the_start {
+            VecDeque::new()
+        } else {
+            self.listed_paths.get(destination_hex).unwrap_or_default()
+        };
+        for entry in &listing.entries {
+            paths.retain(|known| known != &entry.path);
+            paths.push_back(entry.path.clone());
+        }
+        while paths.len() > LISTED_PATHS_PER_PEER {
+            paths.pop_front();
+        }
+        self.listed_paths
+            .remember(destination_hex, paths, LAST_LIST_CACHE_PEERS);
         self.lists
             .remember(destination_hex, listing, LAST_LIST_CACHE_PEERS);
+    }
+
+    fn was_listed(&self, destination_hex: &str, path: &str) -> bool {
+        self.listed_paths
+            .get(destination_hex)
+            .is_some_and(|paths| paths.iter().any(|known| known == path))
     }
 
     /// The claims `identity_hex` holds at `destination_hex`; none when the entry there is
@@ -1278,7 +1306,7 @@ impl PeerMemory {
         entries: Vec<ListedFile>,
         heard_at: SystemTime,
     ) {
-        self.remember_list(destination_hex, Listing { entries, heard_at });
+        self.remember_list(destination_hex, Listing { entries, heard_at }, true);
     }
 }
 
@@ -1378,7 +1406,8 @@ pub(crate) fn not_shared_reason(
 /// one-time attachment from `identity_hex` at `destination_hex` that this node already
 /// fetched. Anything that says the peer may still serve the path keeps the answer
 /// `None` so the fetch goes out: an attachment of the path still waiting to be fetched,
-/// a grant on it that has not run out, or the path in the peer's last listing.
+/// a grant on it that has not run out, or the path on any listing page heard since the
+/// peer's last unprefixed first page.
 pub(crate) fn spent_attachment(
     memory: &PeerMemory,
     destination_hex: &str,
@@ -1400,11 +1429,7 @@ pub(crate) fn spent_attachment(
     let granted = claims
         .grants()
         .any(|claim| claim.path == path && !claim.expired_at(now));
-    let listed = memory
-        .lists
-        .get(destination_hex)
-        .is_some_and(|listing| listing.entries.iter().any(|entry| entry.path == path));
-    if granted || listed {
+    if granted || memory.was_listed(destination_hex, path) {
         return None;
     }
     Some(NotSharedReason::AlreadyFetched { message_id, staged })
@@ -1473,7 +1498,7 @@ pub(crate) fn spent_attachment_tool_message(
 ) -> String {
     let gone = if staged_present { "" } else { GONE_COPY_TAIL };
     format!(
-        "`{shown}` was a one-time attachment from {peer} and this node already fetched it; read it at `already_staged_at`.{gone} This was answered from this node's own records without asking the peer. If the peer now shares it some other way, the mesh__list call in next_action refreshes this node's copy of its listing and a fetch after that asks the peer; a fresh one-time copy needs the peer to attach it again, which mesh__request_access asks its human for."
+        "`{shown}` was a one-time attachment from {peer} and this node already fetched it; read it at `already_staged_at`.{gone} This was answered from this node's own records without asking the peer. If the peer now shares it some other way, a mesh__list call that lists the path (start with the one in next_action and follow its cursor if needed) lets a fetch after that ask the peer; a fresh one-time copy needs the peer to attach it again, which mesh__request_access asks its human for."
     )
 }
 
@@ -1614,6 +1639,7 @@ impl MeshRuntime {
                     .collect(),
                 heard_at: SystemTime::now(),
             },
+            prefix.is_none() && cursor.is_none(),
         );
         Ok(page)
     }
@@ -2882,7 +2908,7 @@ mod tests {
         };
         let remember = |n: usize, paths: &[&str]| {
             memory.remember_card(&key(n), card.clone());
-            memory.remember_list(&key(n), listing(paths));
+            memory.remember_list(&key(n), listing(paths), true);
         };
         for n in 0..=LAST_CARD_CACHE_PEERS {
             remember(n, &["first"]);
@@ -3370,19 +3396,67 @@ mod tests {
             let memory = PeerMemory::default();
             let now = SystemTime::now();
             fetched_attachment(&memory, "docs/a.md");
-            memory.remember_list(
-                PEER_DEST,
-                Listing {
-                    entries: vec![ListedFile {
-                        path: "docs/a.md".to_string(),
-                        size: 1,
-                    }],
-                    heard_at: now,
-                },
-            );
+            memory.remember_list(PEER_DEST, page(&["docs/a.md"], now), true);
             assert_eq!(
                 spent_attachment(&memory, PEER_DEST, PEER_IDENTITY, "docs/a.md", now),
                 None
+            );
+        }
+
+        fn page(paths: &[&str], heard_at: SystemTime) -> Listing {
+            Listing {
+                entries: paths
+                    .iter()
+                    .map(|path| ListedFile {
+                        path: (*path).to_string(),
+                        size: 1,
+                    })
+                    .collect(),
+                heard_at,
+            }
+        }
+
+        #[test]
+        fn a_path_listed_on_a_later_page_is_not_spent_until_a_fresh_first_page_leaves_it_out() {
+            let memory = PeerMemory::default();
+            let now = SystemTime::now();
+            let staged = fetched_attachment(&memory, "docs/a.md");
+            memory.remember_list(PEER_DEST, page(&["docs/b.md"], now), true);
+            memory.remember_list(PEER_DEST, page(&["docs/a.md"], now), false);
+            memory.remember_list(PEER_DEST, page(&["docs/c.md"], now), false);
+            assert_eq!(
+                spent_attachment(&memory, PEER_DEST, PEER_IDENTITY, "docs/a.md", now),
+                None,
+                "a path heard on page 2 still counts after paging past it"
+            );
+            memory.remember_list(PEER_DEST, page(&["docs/b.md"], now), true);
+            assert_eq!(
+                spent_attachment(&memory, PEER_DEST, PEER_IDENTITY, "docs/a.md", now),
+                Some(NotSharedReason::AlreadyFetched {
+                    message_id: "m-1".to_string(),
+                    staged,
+                }),
+                "a fresh unprefixed first page starts the listed paths again"
+            );
+        }
+
+        #[test]
+        fn the_listed_paths_keep_only_the_newest() {
+            let memory = PeerMemory::default();
+            let now = SystemTime::now();
+            fetched_attachment(&memory, "docs/a.md");
+            memory.remember_list(PEER_DEST, page(&["docs/a.md"], now), true);
+            let filler: Vec<String> = (0..LISTED_PATHS_PER_PEER)
+                .map(|n| format!("filler/{n}"))
+                .collect();
+            let filler: Vec<&str> = filler.iter().map(String::as_str).collect();
+            memory.remember_list(PEER_DEST, page(&filler, now), false);
+            assert!(
+                matches!(
+                    spent_attachment(&memory, PEER_DEST, PEER_IDENTITY, "docs/a.md", now),
+                    Some(NotSharedReason::AlreadyFetched { .. })
+                ),
+                "the oldest listed path is the first out"
             );
         }
     }

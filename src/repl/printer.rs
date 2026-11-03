@@ -163,7 +163,8 @@ fn wrap_rows(lines: &[String], prefix: &str, width: usize) -> Vec<String> {
 /// `body` broken at spaces into pieces no wider than `width` columns; the space a
 /// break lands on is dropped, and so are the spaces that would open the next piece, so
 /// a run of spaces never yields a blank row. A word wider than `width` starts its own
-/// piece and is split between characters.
+/// piece and is split between characters; its last piece may be followed by the next
+/// words.
 fn wrap_body(body: &str, width: usize) -> Vec<String> {
     let mut pieces = Vec::new();
     let mut piece = String::new();

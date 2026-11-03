@@ -55,9 +55,9 @@ pub(crate) const KNOCK_QUEUE_CAPACITY: usize = 64;
 /// Identities the gate keeps per-identity state for. Known identities are the only ones
 /// that get this far, so the cap is a backstop against a trust list of thousands, not
 /// against an attacker minting identities. An identity evicted from the map is new again
-/// when it returns, with a full bucket and one more line to spend; getting there takes
-/// 256 other trust-listed identities knocking in between. The ceiling on terminal lines
-/// is the bucket, not this dedupe: no identity surfaces more knocks than it is admitted.
+/// when it returns, with a full bucket and an empty surfaced list; the bucket still bounds
+/// the lines it can earn. Getting there takes 256 other trust-listed identities knocking
+/// in between.
 pub(crate) const KNOCK_GATE_MAX_IDENTITIES: usize = 256;
 /// Knocks one identity may land back to back before the rest are dropped.
 pub(crate) const KNOCK_BUCKET_BURST: u32 = 3;

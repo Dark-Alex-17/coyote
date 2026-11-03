@@ -8054,7 +8054,7 @@ mod tests {
             assert_eq!(
                 again["message"],
                 format!(
-                    "`{SHARED_PATH}` was a one-time attachment from {d8} and this node already fetched it; read it at `already_staged_at`. This was answered from this node's own records without asking the peer. If the peer now shares it some other way, the mesh__list call in next_action refreshes this node's copy of its listing and a fetch after that asks the peer; a fresh one-time copy needs the peer to attach it again, which mesh__request_access asks its human for."
+                    "`{SHARED_PATH}` was a one-time attachment from {d8} and this node already fetched it; read it at `already_staged_at`. This was answered from this node's own records without asking the peer. If the peer now shares it some other way, a mesh__list call that lists the path (start with the one in next_action and follow its cursor if needed) lets a fetch after that ask the peer; a fresh one-time copy needs the peer to attach it again, which mesh__request_access asks its human for."
                 ),
                 "{again}"
             );
@@ -8228,7 +8228,7 @@ mod tests {
             assert_eq!(
                 gone["message"],
                 format!(
-                    "`{SHARED_PATH}` was a one-time attachment from {d8} and this node already fetched it; read it at `already_staged_at`. That copy is no longer at that path. This was answered from this node's own records without asking the peer. If the peer now shares it some other way, the mesh__list call in next_action refreshes this node's copy of its listing and a fetch after that asks the peer; a fresh one-time copy needs the peer to attach it again, which mesh__request_access asks its human for."
+                    "`{SHARED_PATH}` was a one-time attachment from {d8} and this node already fetched it; read it at `already_staged_at`. That copy is no longer at that path. This was answered from this node's own records without asking the peer. If the peer now shares it some other way, a mesh__list call that lists the path (start with the one in next_action and follow its cursor if needed) lets a fetch after that ask the peer; a fresh one-time copy needs the peer to attach it again, which mesh__request_access asks its human for."
                 ),
                 "{gone}"
             );
@@ -8304,7 +8304,7 @@ mod tests {
                 assert_eq!(
                     spent["message"],
                     format!(
-                        "`{SHARED_PATH}` was a one-time attachment from {} and this node already fetched it; read it at `already_staged_at`. That copy is no longer at that path. This was answered from this node's own records without asking the peer. If the peer now shares it some other way, the mesh__list call in next_action refreshes this node's copy of its listing and a fetch after that asks the peer; a fresh one-time copy needs the peer to attach it again, which mesh__request_access asks its human for.",
+                        "`{SHARED_PATH}` was a one-time attachment from {} and this node already fetched it; read it at `already_staged_at`. That copy is no longer at that path. This was answered from this node's own records without asking the peer. If the peer now shares it some other way, a mesh__list call that lists the path (start with the one in next_action and follow its cursor if needed) lets a fetch after that ask the peer; a fresh one-time copy needs the peer to attach it again, which mesh__request_access asks its human for.",
                         short(&to)
                     ),
                     "{spent}"
