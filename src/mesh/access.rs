@@ -1844,10 +1844,17 @@ mod tests {
 
             let payload = attached.get_line().expect("payload queued");
             let prefix = format!("{} ", Source::Access.prefix());
-            let bodies: String = payload
+            let indent = " ".repeat(prefix.len());
+            let bodies = payload
                 .lines()
-                .map(|row| row.strip_prefix(&prefix).expect("every row is prefixed"))
-                .collect();
+                .enumerate()
+                .map(|(index, row)| {
+                    let lead = if index == 0 { &prefix } else { &indent };
+                    row.strip_prefix(lead.as_str())
+                        .expect("the first row is prefixed and the rest indented")
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
             assert_paths_kept_and_hints_slashed(&bodies);
         }
     }
