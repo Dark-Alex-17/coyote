@@ -34,7 +34,7 @@ BOUNDED = {
     "promote_verify": "B6 promote_retries<=1",
     "select_tasks": "B7 list-bounded tasks + fix queue",
     "route_verdict": "B9 adopt<=1 / B10 conformance re-run once / B11 debris<=1",
-    "apply_answer": "B8 retry<=1 / B12 design ask<=1 / B23 gate fault<=1 / user-driven choices",
+    "apply_answer": "B8 retry<=1 / B12 design ask<=1 / B23 gate fault<=1 / draft rounds<=3 (DRAFT_ROUNDS_MAX) / user-driven choices",
     "design_ask_gate": "B12 asks list-bounded",
     "wave_route": "B13 wave_fix_rounds<=1",
     "integration_test": "B14 integration_strikes<=3 / B15 conflict_cycles<=2",
@@ -74,10 +74,11 @@ def harvest_gate_targets(gates_src):
     """gate function name -> set of `_next` literals it can emit (incl. helpers)."""
     tree = ast.parse(gates_src)
     funcs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
-    prompts = {"ask_user"} | next(
-        ({v.value for v in n.value.values if isinstance(v, ast.Constant)} for n in tree.body
-         if isinstance(n, ast.Assign) and isinstance(n.value, ast.Dict) and any(getattr(t, "id", None) == "_TERMINAL_PROMPTS" for t in n.targets)),
-        {"ask_review_incomplete", "confirm_seed"})
+    found = [{v.value for v in n.value.values if isinstance(v, ast.Constant)} for n in tree.body
+             if isinstance(n, ast.Assign) and isinstance(n.value, ast.Dict) and any(getattr(t, "id", None) == "_TERMINAL_PROMPTS" for t in n.targets)]
+    if not found:
+        sys.exit("gates.py has no module-level _TERMINAL_PROMPTS dict literal; the terminal prompt edges cannot be audited")
+    prompts = {"ask_user"} | found[0]
 
     def literals(fn):
         out = set()

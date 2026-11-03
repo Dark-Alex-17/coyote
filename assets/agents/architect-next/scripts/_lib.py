@@ -28,6 +28,7 @@ STRIKE_LIMIT = 3          # 3-strike family (B1, B5, B14, B16, B18, B22)
 RERUN_ONCE = 1            # re-run-once family (B3 retry, B4, B6, B9-B13, B17, B23)
 AMEND_CYCLES_MAX = 3      # A1: amendment cycles per run
 DESIGN_ROUNDS_MAX = STRIKE_LIMIT
+DRAFT_ROUNDS_MAX = STRIKE_LIMIT  # redrafts of an LLM-drafted brief before asking for a design doc
 CONFLICT_CYCLES_MAX = 2   # Phase E parallel integration: "two failed conflict cycles -> STOP"
 WAVE_CAP = 3              # Phase E parallel eligibility: "cap concurrent code tasks at 3"
 OWNER_POLL_MAX = 2        # owner-remote-input tool budget: wait 30 / poll 25 minutes
@@ -278,7 +279,8 @@ def read_artifact(run_dir, name):
 
 STATE_KEYS = (
     "run_id", "run_dir", "phase", "mode_vector", "code_repo_path", "tasks_root", "plans_root", "base_branch_name",
-    "owner_name", "reference_root_path", "design_doc_path", "seed_path", "plan_path", "plan_slug", "plan_revision",
+    "owner_name", "reference_root_path", "design_doc_path", "seed_path", "draft_path", "draft_rounds", "draft_feedback",
+    "draft_text", "plan_path", "plan_slug", "plan_revision",
     "amend_cycles", "leak_fingerprints", "oracle_rejects", "gate1_verdict", "gate2_verdict", "sealed",
     "current_task", "current_unit", "run_branch", "group_index", "pending_fixes", "task_rounds",
     "batch_state", "wave_results", "pr_numbers", "ci_reruns", "ci_fix_strikes", "parked", "escalation",

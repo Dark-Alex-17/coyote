@@ -21,12 +21,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _lib  # noqa: E402
 from _lib import (  # noqa: E402
     AMEND_CYCLES_MAX, ARCHIVIST_AVAILABLE, CI_FLAKE_RERUNS, CI_MAX_ROUNDS, CI_POLL_FAILS, CI_POLL_SLEEP,
-    CI_WALL_SECS, CODE_VAR, CONFLICT_CYCLES_MAX, CONVENTIONS_LINE, CORE_TOOLS_REL, DESIGN_ROUNDS_MAX,
+    CI_WALL_SECS, CODE_VAR, CONFLICT_CYCLES_MAX, CONVENTIONS_LINE, CORE_TOOLS_REL, DESIGN_ROUNDS_MAX, DRAFT_ROUNDS_MAX,
     GATE1_HOUSE_LINE, GH_CALL_SECS, GH_LOOP_SECS, IDIOM_LINE, IS_UPSTREAM, LOG_EVENT_LINE, MODE_ENUMS, MULTI_IS_GROUPS,
     NO_COMMIT_MAIN_LINE, OWNER_POLL_MAX, OWNER_POLL_MINUTES, OWNER_REMOTE_INPUT, OWNER_WAIT_MINUTES,
     PERM_LOOKUPS_PER_POLL, PLANNING_VAR, POLL_VISIT_BUDGET, PR_TRACKING_ENUM, PR_URL_RE, PROBE_HOUSE_NOTE, REPO_HINT, RERUN_ONCE, RESUME_RE,
     REVIEW_MAX_POLLS, REVIEW_MAX_ROUNDS, REVIEW_POLL_SLEEP, REVIEW_UPDATE_BUDGET, REVIEW_WALL_SECS, SHA_RE, SIBLING_HINT,
-    SISYPHUS_RUN_RE, STACK_LINKING, STORE_LABEL, STORE_TOOL_PREFIX, STRIKE_LIMIT, TASKSTORE, TASK_ID_RE,
+    SISYPHUS_RUN_RE, STACK_LINKING, STORE_LABEL, STORE_TOOL_PREFIX, STRIKE_LIMIT, TAIL_CHARS, TASKSTORE, TASK_ID_RE,
     TEST_FILE_RE, VERIFY_CMD_SECS, VERIFY_SET_SECS, WAVE_CAP,
     append_artifact, as_dict, as_int, as_list, commit_planning, context_pack, core_tool, emit,
     ensure_run_dir, escalation, frontmatter, git, git_out, harvest_anomalies, harvest_anomaly_lines,
@@ -71,9 +71,19 @@ def _normalize_paths(state):
     return u
 
 
-def _need_design_doc_escalation():
+def _need_design_doc_escalation(evidence=""):
     return escalation("need_design_doc", "No readable design doc was given (design_doc variable or a .md path in the message). "
-                                         "Reply with the path, or abort.", [option("Abort the run")], tier3_ok=False)
+                                         "Reply with the path, or abort.", [option("Abort the run")], evidence=evidence, tier3_ok=False)
+
+
+def _start_draft(state, u, line):
+    u.update({"draft_rounds": 0, "draft_feedback": "", "draft_text": "", **_DRAFT_OUTPUT_RESET})
+    ledger(state, u, line)
+    u["_next"] = "draft_brief"
+
+
+# the drafting node's output keys, cleared before every draft so a reply that omits one cannot replay the last draft
+_DRAFT_OUTPUT_RESET = {"draft_possible": False, "draft_title": "", "draft_markdown": "", "draft_reason": ""}
 
 
 def _find_seed(u):
@@ -204,7 +214,8 @@ def intake(state):
                 [option(f"{k} = {MODE_ENUMS.get(k, PR_TRACKING_ENUM)[0]}", recommended=True, evidence="the documented default") for k in bad]
                 + [option("Abort the run")], tier3_ok=False))
         seed = "" if dd else _find_seed(u)
-        if not seed and (not u["design_doc_path"] or not os.path.isfile(u["design_doc_path"])):
+        draft = not dd and not seed and bool(brief.strip() or str(state.get("previous_turns") or "").strip())
+        if not seed and not draft and (not u["design_doc_path"] or not os.path.isfile(u["design_doc_path"])):
             snapshot(state, u, "intake")
             return raise_escalation(state, u, _need_design_doc_escalation())
         if tracking == "review" and _per_task_prs(state):
@@ -218,7 +229,10 @@ def intake(state):
             return raise_escalation(state, u, escalation("seed_confirm", _seed_question(seed), [
                 option("Use this seed", recommended=True), option("Draft a brief from this conversation instead"),
                 option("Give a doc path instead"), option("Abort the run")], hard_trigger=True, tier3_ok=False, data={"seed_path": seed}))
-        u["_next"] = "orient_read"
+        if draft:
+            _start_draft(state, u, "draft: no design doc and no ready seed; drafting a brief from the message and the earlier turns")
+        else:
+            u["_next"] = "orient_read"
     snapshot(state, u, "intake")
     return u
 
@@ -248,6 +262,40 @@ def orient_fault(state):
     return raise_escalation(state, u, escalation(
         "clarify", f"The design doc at {state.get('design_doc_path')} could not be read/oriented. Give the correct path, or abort.",
         [option("Abort the run")], tier3_ok=False))
+
+
+def draft_route(state):
+    u = {}
+    harvest_anomalies(state, u, "draft_brief")
+    note_script_error(state, u, "draft_brief")
+    markdown = str(state.get("draft_markdown") or "").strip()
+    if not truthy(state.get("draft_possible")) or not markdown:
+        reason = str(state.get("draft_reason") or "").strip() or "the drafting step returned no draft"
+        ledger(state, u, f"draft: not possible: {reason}")
+        return raise_escalation(state, u, _need_design_doc_escalation(
+            f"A brief could not be drafted from the message and the earlier turns: {reason}"))
+    title = str(state.get("draft_title") or "").strip()
+    if title and not re.search(r"(?m)^# ", markdown):
+        markdown = f"# {title}\n\n{markdown}"
+    run_dir = state.get("run_dir") or ""
+    write_artifact(run_dir, "design-draft.md", markdown)
+    path = os.path.abspath(os.path.join(run_dir, "design-draft.md"))
+    u.update({"draft_path": path, "draft_text": markdown})
+    ledger(state, u, f"draft: wrote {path} (redraft round {as_int(state.get('draft_rounds'))}); asking to confirm it as the design doc")
+    evidence = markdown if len(markdown) <= TAIL_CHARS else markdown[:TAIL_CHARS] + f"\n\n[... see {path} for the rest]"
+    return raise_escalation(state, u, escalation(
+        "draft_confirm", f"No design doc was given, so a brief was drafted from your message and the earlier turns at {path}. "
+                         "Use it as the design doc?",
+        [option("Use this draft", recommended=True), option("Edit the draft"), option("Abort the run")],
+        evidence=evidence, hard_trigger=True, tier3_ok=False, data={"draft_path": path}))
+
+
+def draft_fault(state):
+    u = {}
+    note_script_error(state, u, "draft_brief")
+    ledger(state, u, "draft: the drafting step failed; asking for a design doc")
+    return raise_escalation(state, u, _need_design_doc_escalation(
+        "The step that drafts a brief from the message and the earlier turns failed."))
 
 
 # ====================================================================== 2.2 design
@@ -2164,7 +2212,7 @@ def consult_route(state):
     return u
 
 
-_TERMINAL_PROMPTS = {"review_incomplete": "ask_review_incomplete", "seed_confirm": "confirm_seed"}
+_TERMINAL_PROMPTS = {"review_incomplete": "ask_review_incomplete", "seed_confirm": "confirm_seed", "draft_confirm": "confirm_draft"}
 
 
 def _terminal_prompt(esc):
@@ -2240,7 +2288,11 @@ def parse_answer(state):
     text = (state.get("last_answer_text") or state.get("last_answer") or "").strip()
     options = esc.get("options") or []
     free_text_kinds = ("design_round", "leak_question", "checklist_accept", "need_design_doc")
-    choice = text if esc.get("kind") in free_text_kinds else match_option(text, options)
+    if esc.get("kind") == "draft_confirm":
+        # a reply that names no option is feedback for the redraft, never a re-ask
+        choice = match_option(text, options) or text
+    else:
+        choice = text if esc.get("kind") in free_text_kinds else match_option(text, options)
     if choice is None:
         rounds = as_int(state.get("reask_rounds"))
         if rounds < STRIKE_LIMIT:
@@ -2280,8 +2332,35 @@ def apply_answer(state):
     abort = _answered(state, {"abort": ["abort"]}, None) == "abort"
     stop = _answered(state, {"stop": ["stop and report", "stop;", "stop"]}, None) == "stop"
 
-    if kind in ("mode_invalid", "need_design_doc", "seed_confirm", "clarify", "plan_unauthored", "promote_failed",
-                "git_setup_failed", "gate_fault") and abort:
+    if kind == "draft_confirm":
+        # matched before the generic abort check: an edit such as "do not abort, add a flag" must not abort
+        picked = match_option(answer, esc.get("options") or [])
+        draft = as_dict(esc.get("data")).get("draft_path") or state.get("draft_path") or ""
+        rounds = as_int(state.get("draft_rounds")) + 1
+        if picked == "Abort the run":
+            u["failure_reason"] = f"aborted at the user's request ({kind}): {answer}"
+            u["_next"] = "end_aborted"
+        elif picked == "Use this draft" and os.path.isfile(draft):
+            u["design_doc_path"] = os.path.abspath(draft)
+            ledger(state, u, f"draft: {draft} confirmed as the design doc")
+            u["_next"] = "orient_read"
+        elif picked == "Use this draft":
+            ledger(state, u, f"draft: {draft or '(no path)'} no longer exists; asking for a design doc")
+            raise_escalation(state, u, _need_design_doc_escalation(f"The drafted brief at {draft or '(no path)'} no longer exists."))
+        elif rounds > DRAFT_ROUNDS_MAX:
+            ledger(state, u, f"draft: not accepted after {DRAFT_ROUNDS_MAX} redrafts; asking for a design doc")
+            raise_escalation(state, u, _need_design_doc_escalation(
+                f"The drafted brief at {draft} was redrafted {DRAFT_ROUNDS_MAX} times without being accepted."))
+        else:
+            u.update({"draft_rounds": rounds, **_DRAFT_OUTPUT_RESET})
+            ledger(state, u, f"draft: redraft round {rounds}/{DRAFT_ROUNDS_MAX}")
+            if picked == "Edit the draft" or not answer.strip():
+                u["_next"] = "draft_edit"
+            else:
+                u["draft_feedback"] = answer
+                u["_next"] = "draft_brief"
+    elif kind in ("mode_invalid", "need_design_doc", "seed_confirm", "clarify", "plan_unauthored", "promote_failed",
+                  "git_setup_failed", "gate_fault") and abort:
         u["failure_reason"] = f"aborted at the user's request ({kind}): {answer}"
         u["_next"] = "end_aborted"
     elif kind == "mode_invalid":
@@ -2300,7 +2379,9 @@ def apply_answer(state):
     elif kind == "seed_confirm":
         seed = as_dict(esc.get("data")).get("seed_path") or state.get("seed_path") or ""
         a = _answered(state, {"use": ["use this seed"], "draft": ["draft a brief"], "path": ["give a doc path"]}, None)
-        if a == "use" and os.path.isfile(seed):
+        if a == "draft":
+            _start_draft(state, u, f"seed: {seed} left ready; drafting a brief from the message and the earlier turns")
+        elif a == "use" and os.path.isfile(seed):
             u["design_doc_path"] = os.path.abspath(seed)
             for k, v in (("status", "consumed"), ("consumed_by", state.get("run_id", "")), ("consumed_at", now_iso())):
                 set_frontmatter(seed, k, v)
@@ -3930,6 +4011,7 @@ def reseal_return(state):
 # ====================================================================== entry
 GATES = {
     "intake": intake, "resume_route": resume_route, "orient_fault": orient_fault,
+    "draft_route": draft_route, "draft_fault": draft_fault,
     "research_dispatch": research_dispatch, "explore_fault": explore_fault, "archivist_fault": archivist_fault,
     "librarian_fault": librarian_fault, "checklist_fault": checklist_fault, "plan_route": plan_route,
     "open_questions_gate": open_questions_gate, "quality_bar_gate": quality_bar_gate, "record_quality_bar": record_quality_bar,
