@@ -2589,7 +2589,7 @@ fn render_sync(report: &FetchReport) -> String {
         return format!("Nothing held for this node at {node}.");
     }
     let mut line = format!(
-        "Fetched from {node}: {} listed, {} wanted, {} received, {} delivered, {} duplicates, {} discarded, {} deferred.",
+        "Fetched from {node}: {} listed, {} wanted, {} received, {} delivered, {} duplicates, {} discarded, {} deferred",
         report.listed,
         report.wanted,
         report.received,
@@ -2598,10 +2598,43 @@ fn render_sync(report: &FetchReport) -> String {
         report.discarded,
         report.deferred
     );
+    if report.deferred_after_ask > 0 {
+        line.push_str(&format!(
+            ": {}; {}",
+            crate::mesh::ASKED_FOR_SOURCE,
+            crate::mesh::ASKED_FOR_SOURCE_NEXT_STEP
+        ));
+    }
+    line.push('.');
     if report.wanted == MAX_WANTS_PER_FETCH {
         line.push_str(" More may be held; run .mesh sync again.");
     }
     line
+}
+
+#[cfg(test)]
+mod sync_ask_line_tests {
+    use super::*;
+
+    #[test]
+    fn a_deferral_after_an_ask_says_so_and_what_to_run() {
+        let report = FetchReport {
+            node: "deadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+            listed: 1,
+            wanted: 1,
+            received: 1,
+            delivered: 0,
+            duplicates: 0,
+            discarded: 0,
+            deferred: 1,
+            deferred_after_ask: 1,
+            acknowledged: 0,
+        };
+        assert_eq!(
+            render_sync(&report),
+            "Fetched from deadbeef: 1 listed, 1 wanted, 1 received, 0 delivered, 0 duplicates, 0 discarded, 1 deferred: source identity not yet known; asked the mesh for its announce; the next sync delivers it once the announce arrives, or run .mesh sync in a minute."
+        );
+    }
 }
 
 fn trust(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
@@ -7333,6 +7366,7 @@ mod tests {
             destination_hash: "ab".repeat(16),
             identity_hash: "cd".repeat(16),
             name_hash: String::new(),
+            public_key: None,
             display_name: name.map(str::to_string),
             protocol_version: 1,
             compatibility: Compatibility::Compatible,
@@ -11903,6 +11937,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 duplicates: 1,
                 discarded: 1,
                 deferred: 1,
+                deferred_after_ask: 0,
                 acknowledged: 5,
             };
             let line = render_sync(&report);

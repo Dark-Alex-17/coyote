@@ -4,7 +4,9 @@
 //! session context; nothing here does.
 
 use crate::mesh::notify::{Notification, Source};
-use crate::mesh::propagation_fetch::{FetchError, FetchReport, MAX_WANTS_PER_FETCH};
+use crate::mesh::propagation_fetch::{
+    ASKED_FOR_SOURCE, ASKED_FOR_SOURCE_NEXT_STEP, FetchError, FetchReport, MAX_WANTS_PER_FETCH,
+};
 use crate::mesh::request::{RequestError, redact_hashes, short};
 use crate::supervisor::notification::SystemNotification;
 
@@ -455,7 +457,8 @@ impl SyncSchedule {
 }
 
 /// `synced 3 messages from deadbeef: 2 delivered, 1 duplicate`, naming only the non-zero
-/// outcomes.
+/// outcomes. A deferral that followed an ask for the sender's announce says so, with
+/// what to do next.
 fn synced_line(report: &FetchReport) -> String {
     let outcomes: Vec<String> = [
         (report.delivered, "delivered", "delivered"),
@@ -476,11 +479,47 @@ fn synced_line(report: &FetchReport) -> String {
         line.push_str(": ");
         line.push_str(&outcomes.join(", "));
     }
+    if report.deferred_after_ask > 0 {
+        line.push_str(&format!(
+            " ({ASKED_FOR_SOURCE}; {ASKED_FOR_SOURCE_NEXT_STEP})"
+        ));
+    }
     line
 }
 
 pub(crate) fn plural(count: usize, one: &str, many: &str) -> String {
     format!("{count} {}", if count == 1 { one } else { many })
+}
+
+#[cfg(test)]
+mod synced_ask_line_tests {
+    use super::*;
+
+    #[test]
+    fn a_deferral_after_an_ask_names_it_and_the_next_step() {
+        let mut report = FetchReport {
+            node: "deadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+            listed: 2,
+            wanted: 2,
+            received: 2,
+            delivered: 1,
+            duplicates: 0,
+            discarded: 0,
+            deferred: 1,
+            deferred_after_ask: 0,
+            acknowledged: 1,
+        };
+        assert_eq!(
+            synced_line(&report),
+            "synced 2 messages from deadbeef: 1 delivered, 1 deferred",
+            "a later sighting keeps the plain wording"
+        );
+        report.deferred_after_ask = 1;
+        assert_eq!(
+            synced_line(&report),
+            "synced 2 messages from deadbeef: 1 delivered, 1 deferred (source identity not yet known; asked the mesh for its announce; the next sync delivers it once the announce arrives, or run .mesh sync in a minute)"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -727,6 +766,7 @@ mod tests {
             duplicates,
             discarded: 0,
             deferred: 0,
+            deferred_after_ask: 0,
             acknowledged: received,
         }
     }

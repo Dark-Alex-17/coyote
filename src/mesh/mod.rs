@@ -49,7 +49,8 @@ pub(crate) use node::{
 };
 pub(crate) use peers::{PEER_STALE_AFTER, PEER_TTL, PeerRecord};
 pub(crate) use propagation_fetch::{
-    FetchError, FetchReport, LoggingInboundSink, MAX_WANTS_PER_FETCH,
+    ASKED_FOR_SOURCE, ASKED_FOR_SOURCE_NEXT_STEP, FetchError, FetchReport, LoggingInboundSink,
+    MAX_WANTS_PER_FETCH,
 };
 pub(crate) use propagation_nodes::PropagationNodeRecord;
 pub(crate) use request::{RequestOptions, redact_hashes, short};

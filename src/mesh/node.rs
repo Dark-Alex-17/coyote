@@ -2748,24 +2748,27 @@ async fn receive_announces(
         let identity_hash = desc.identity.address_hash.to_hex_string();
         let name_hash = hex_lower(&event.name_hash);
         let app_data = event.app_data.as_slice();
-        if event.is_path_response {
+        let filed = if event.is_path_response {
             filer.file_path_response(
-                destination_hash,
+                destination_hash.clone(),
                 identity_hash,
                 name_hash,
                 app_data,
                 event.hops,
                 now,
-            );
+            )
         } else {
             filer.file(
-                destination_hash,
+                destination_hash.clone(),
                 identity_hash,
                 name_hash,
                 app_data,
                 event.hops,
                 now,
-            );
+            )
+        };
+        if filed.is_some() {
+            peers.remember_public_key(&destination_hash, desc.identity.to_hex_string());
         }
     }
 }

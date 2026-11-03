@@ -4167,6 +4167,7 @@ fn code_vectors() -> Vec<Vector> {
                         destination_hash: "0b".repeat(16),
                         identity_hash: "0a".repeat(16),
                         name_hash: "0c".repeat(10),
+                        public_key: None,
                         display_name: None,
                         protocol_version: 1,
                         compatibility: Compatibility::Compatible,

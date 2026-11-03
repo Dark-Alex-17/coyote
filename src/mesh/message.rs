@@ -1921,12 +1921,12 @@ impl MeshRuntime {
 
     /// The description a request to `destination_hex` links to, as the transport holds it:
     /// filled from the peer's announce or a restored path table, with `name` the announce's
-    /// truncated name hash. The peer table is not consulted. A destination the transport
-    /// holds is answered at once with no request, even when its path has expired. One the
-    /// transport does not hold is asked for once over the network, and the answer is
-    /// waited for up to `PATH_REQUEST_TIMEOUT`. `None` when the transport holds nothing
-    /// after that wait, or at once when it cannot answer at all (a deregistered
-    /// destination whose path still stands).
+    /// truncated name hash. A destination the transport holds is answered at once with no
+    /// request, even when its path has expired. One the transport does not hold is asked
+    /// for once over the network, and the answer is waited for up to
+    /// `PATH_REQUEST_TIMEOUT`. When that brings no announce but the transport has a path,
+    /// the description is rebuilt from the key the peer table kept from an earlier
+    /// announce, once that key proves it derives the destination. `None` otherwise.
     pub(crate) async fn resolve_destination(
         &self,
         destination_hex: &str,
@@ -1934,9 +1934,15 @@ impl MeshRuntime {
         let destination = canonical_hash(destination_hex)?;
         let address_hash = AddressHash::new_from_hex_string(&destination).ok()?;
         let transport = self.transport_handle().await?;
-        let desc = transport
+        let mut desc = transport
             .resolve_destination(&address_hash, PATH_REQUEST_TIMEOUT)
             .await;
+        if desc.is_none() && transport.has_path(&address_hash).await {
+            desc = self
+                .peers()
+                .get(&destination)
+                .and_then(|record| record.verified_destination());
+        }
         if desc.is_none() {
             debug!("Mesh found no route to {}", short(&destination));
         }
