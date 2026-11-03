@@ -940,9 +940,9 @@ mod tests {
 
         /// The functions that put mesh text on the terminal or render it for one, by file:
         /// the free sinks in `src/repl/mesh.rs`, the prompt printer, the stderr fallback
-        /// of `MeshSlot::notify`, and the line renderer both of those call. Each must call
-        /// a renderer unless it is an unrendered sink.
-        const SINKS: [(&str, &str); 7] = [
+        /// of `MeshSlot::notify`, the line renderer both of those call, and the REPL's
+        /// two error printers. Each must call a renderer unless it is an unrendered sink.
+        const SINKS: [(&str, &str); 9] = [
             ("src/repl/mesh.rs", "out_text"),
             ("src/repl/mesh.rs", "err_text"),
             ("src/repl/mesh.rs", "out_path_text"),
@@ -950,21 +950,34 @@ mod tests {
             ("src/repl/printer.rs", "notify"),
             ("src/mesh/node.rs", "notify"),
             ("src/mesh/notify.rs", "render_notification_lines"),
+            ("src/render/mod.rs", "render_error"),
+            ("src/render/mod.rs", "render_command_error"),
         ];
 
         /// Sinks that print byte for byte, each with the reason it must not render hints.
-        const UNRENDERED_SINKS: [(&str, &str); 2] = [
+        const UNRENDERED_SINKS: [(&str, &str, &str); 3] = [
             (
+                "src/repl/mesh.rs",
                 "out_path_text",
                 "prints paths and share patterns, and `.vault` would become `/vault`",
             ),
             (
+                "src/repl/mesh.rs",
                 "err_path_text",
                 "the stderr twin of out_path_text, for refusals that quote patterns",
             ),
+            (
+                "src/render/mod.rs",
+                "render_error",
+                "prints errors raised outside the mesh verb, which carry no mesh hint",
+            ),
         ];
 
-        const RENDERERS: [&str; 2] = ["render_hints", "render_notification_lines"];
+        const RENDERERS: [&str; 3] = [
+            "render_hints",
+            "render_notification_lines",
+            "command_error_text",
+        ];
 
         const PRINT_MACROS: [&str; 5] = [
             "println!",
@@ -984,7 +997,9 @@ mod tests {
         }
 
         /// A print macro, `render_error`, or a `write!`/`writeln!` whose target is a
-        /// stdout or stderr handle.
+        /// stdout or stderr handle; or a stdout or stderr handle acquired or imported,
+        /// since an alias of one prints past every check above. Asking a handle whether
+        /// it is a terminal prints nothing.
         fn prints_directly(code: &str) -> bool {
             PRINT_MACROS
                 .iter()
@@ -993,6 +1008,15 @@ mod tests {
                     at_word_boundary(code, needle).any(|at| {
                         let target = code[at + needle.len()..].split(',').next().unwrap_or("");
                         target.contains("stdout") || target.contains("stderr")
+                    })
+                })
+                || ["stdout", "stderr"].iter().any(|handle| {
+                    at_word_boundary(code, handle).any(|at| {
+                        let rest = &code[at + handle.len()..];
+                        let named = !rest
+                            .starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_');
+                        let acquired = rest.starts_with("()") && !rest.starts_with("().is_terminal()");
+                        acquired || (named && code.starts_with("use "))
                     })
                 })
         }
@@ -1018,6 +1042,7 @@ mod tests {
             let mut hits = Vec::new();
             let mut rendered: BTreeMap<&str, bool> = BTreeMap::new();
             let mut item: Option<(&str, usize)> = None;
+            let mut opened_write = String::new();
             for (index, line) in lines_outside_test_modules(source).into_iter().enumerate() {
                 let code = line.trim_start();
                 let indent = line.len() - code.len();
@@ -1042,19 +1067,31 @@ mod tests {
                     }
                 }
                 let uncommented = code.split("//").next().unwrap_or(code);
+                // rustfmt puts a long `writeln!(` target on the next line, so an opened
+                // call is read together with the line after it.
+                let joined = format!("{opened_write}{code}");
+                opened_write.clear();
+                if uncommented.trim_end().ends_with("write!(")
+                    || uncommented.trim_end().ends_with("writeln!(")
+                {
+                    opened_write = uncommented.trim_end().to_string();
+                    continue;
+                }
                 match item {
                     Some((name, _)) if RENDERERS.iter().any(|r| uncommented.contains(r)) => {
                         rendered.insert(name, true);
                     }
                     Some(_) => {}
-                    None if prints_directly(code) => {
+                    None if prints_directly(&joined) => {
                         hits.push(format!("{path}:{}: {code}", index + 1));
                     }
                     None => {}
                 }
             }
             for (name, rendered) in &rendered {
-                let unrendered = UNRENDERED_SINKS.iter().any(|(sink, _)| sink == name);
+                let unrendered = UNRENDERED_SINKS
+                    .iter()
+                    .any(|(file, sink, _)| *file == path && sink == name);
                 if !rendered && !unrendered {
                     hits.push(format!("{path}: `{name}` prints without a renderer"));
                 }
@@ -1078,6 +1115,26 @@ mod tests {
                 (
                     REPL,
                     "fn show() {\n    write!(std::io::stdout().lock(), \"x\").ok();\n}\n",
+                    1,
+                ),
+                (
+                    REPL,
+                    "fn show() {\n    let _ = writeln!(\n        stderr,\n        \"x\"\n    );\n}\n",
+                    1,
+                ),
+                (
+                    REPL,
+                    "fn show() {\n    let e = std::io::stderr();\n    let _ = e;\n}\n",
+                    1,
+                ),
+                (
+                    REPL,
+                    "use std::io::stderr as quiet;\nfn show() {\n    let _ = quiet;\n}\n",
+                    1,
+                ),
+                (
+                    REPL,
+                    "use std::io::{Write, stdout};\nfn show() {}\n",
                     1,
                 ),
                 (
@@ -1153,6 +1210,15 @@ mod tests {
                 (REPL, "/// `println!` is not called here\nfn quiet() {}\n"),
                 (
                     REPL,
+                    "fn coloured() -> bool {\n    std::io::stderr().is_terminal()\n}\n",
+                ),
+                (REPL, "use crate::utils::stderr_error_text;\nfn quiet() {}\n"),
+                (
+                    "src/render/mod.rs",
+                    "pub fn render_error(err: anyhow::Error) {\n    eprintln!(\"{}\", pretty_error(&err));\n}\n",
+                ),
+                (
+                    REPL,
                     "fn quiet() {\n    // println! would skip the sink\n}\n",
                 ),
                 (
@@ -1183,7 +1249,13 @@ mod tests {
             files.retain(|(path, _)| {
                 !path.starts_with("src/mesh/conformance/") && !path.starts_with("src/mesh/fuzz/")
             });
-            for extra in ["src/repl/mesh.rs", "src/repl/printer.rs"] {
+            for extra in [
+                "src/repl/mesh.rs",
+                "src/repl/printer.rs",
+                "src/render/mod.rs",
+                "src/repl/idle.rs",
+                "src/config/mesh_envoy.rs",
+            ] {
                 files.push((
                     extra.to_string(),
                     std::fs::read_to_string(root.join(extra)).unwrap(),
