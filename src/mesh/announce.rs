@@ -182,7 +182,10 @@ const AGENT_LABEL_SEPARATOR: &str = " . ";
 /// a character `encode` would refuse, the name goes out alone so the label can never make
 /// a start fail.
 fn with_agent_label(name: &str, agent: Option<&str>) -> String {
-    let Some(agent) = agent.filter(|agent| !agent.chars().any(is_control_or_invisible)) else {
+    let Some(agent) = agent
+        .filter(|agent| !agent.chars().any(is_control_or_invisible))
+        .map(str::trim_start)
+    else {
         return name.to_string();
     };
     let room = MAX_DISPLAY_NAME_BYTES.saturating_sub(name.len() + AGENT_LABEL_SEPARATOR.len());
@@ -548,6 +551,14 @@ mod tests {
         }
 
         #[test]
+        fn spaces_around_the_agent_name_are_dropped_from_the_label() {
+            assert_eq!(
+                labelled(&named("alice"), "  pr-reviewer  ").as_deref(),
+                Some("alice . pr-reviewer")
+            );
+        }
+
+        #[test]
         fn an_agent_session_announces_the_name_with_the_agent_and_a_plain_one_the_name() {
             let config = named("alice");
             assert_eq!(
@@ -581,8 +592,8 @@ mod tests {
         #[test]
         fn a_long_label_cuts_the_agent_at_a_char_boundary_and_keeps_the_name() {
             let name = "a".repeat(50);
-            let label = labelled(&named(&name), &"é".repeat(10)).unwrap();
-            assert_eq!(label, format!("{name} . {}", "é".repeat(5)));
+            let label = labelled(&named(&name), &"\u{e9}".repeat(10)).unwrap();
+            assert_eq!(label, format!("{name} . {}", "\u{e9}".repeat(5)));
             assert!(label.len() <= MAX_DISPLAY_NAME_BYTES, "{}", label.len());
 
             let name = "a".repeat(58);
@@ -615,6 +626,70 @@ mod tests {
                     Some("alice"),
                     "{agent:?}"
                 );
+            }
+        }
+
+        #[test]
+        fn a_label_that_fits_exactly_is_kept_whole() {
+            let name = "a".repeat(64 - " . pr-reviewer".len());
+            let label = labelled(&named(&name), "pr-reviewer").unwrap();
+            assert_eq!(label, format!("{name} . pr-reviewer"));
+            assert_eq!(label.len(), MAX_DISPLAY_NAME_BYTES);
+        }
+
+        #[test]
+        fn an_empty_or_blank_agent_name_leaves_the_name_alone() {
+            for agent in ["", " ", "   "] {
+                assert_eq!(
+                    labelled(&named("alice"), agent).as_deref(),
+                    Some("alice"),
+                    "{agent:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_four_byte_agent_char_is_kept_whole_or_dropped_never_split() {
+            let name = "a".repeat(57);
+            assert_eq!(
+                labelled(&named(&name), "\u{1F980}\u{1F980}"),
+                Some(format!("{name} . \u{1F980}"))
+            );
+            let name = "a".repeat(58);
+            assert_eq!(
+                labelled(&named(&name), "\u{1F980}").as_deref(),
+                Some(name.as_str()),
+                "three bytes of room cannot hold a four-byte char"
+            );
+        }
+
+        /// The label never makes the announce refuse to encode: for every name length up
+        /// to the cap and a spread of agent names, the bytes encode, decode, stay within
+        /// the cap and start with the untouched name.
+        #[test]
+        fn no_agent_name_makes_a_valid_name_fail_to_announce() {
+            let agents = [
+                "pr-reviewer",
+                "a",
+                "\u{e9}\u{e9}\u{e9}",
+                "\u{1F980}x",
+                "x y z",
+                "Alex \u{2764}\u{FE0F}",
+                &"z".repeat(200),
+            ];
+            for len in 1..=MAX_DISPLAY_NAME_BYTES {
+                let name = "n".repeat(len);
+                for agent in agents {
+                    let bytes = announce_app_data(&named(&name), Some(agent))
+                        .unwrap_or_else(|err| panic!("{len} {agent:?}: {err}"));
+                    let decoded = AnnounceAppData::decode(&bytes)
+                        .and_then(|data| data.display_name)
+                        .unwrap_or_else(|| panic!("{len} {agent:?}: does not decode"));
+                    assert!(decoded.len() <= MAX_DISPLAY_NAME_BYTES);
+                    assert!(decoded.starts_with(&name), "{decoded:?}");
+                    let rest = &decoded[name.len()..];
+                    assert!(rest.is_empty() || rest.starts_with(" . "), "{decoded:?}");
+                }
             }
         }
     }
