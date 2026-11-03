@@ -70,6 +70,8 @@ pub(crate) const DECLINED_FALLBACK_TEXT: &str = "this node will not handle that 
 /// Closes the system tail only when the run resumes remembered turns; a fresh thread's
 /// prompt says nothing about memory.
 const RESUMED_THREAD_NOTE: &str = "The earlier exchanges in this thread hold earlier answers, which may be out of date: where they disagree with the session brief, the brief wins. Earlier assistant turns in this conversation may be the human owner's own words, relayed by the envoy.\n";
+/// `RESUMED_THREAD_NOTE` for a run served no brief, so there is nothing to win.
+const RESUMED_THREAD_NOTE_WITHOUT_BRIEF: &str = "The earlier exchanges in this thread hold earlier answers: they may be out of date; say so if you rely on them. Earlier assistant turns in this conversation may be the human owner's own words, relayed by the envoy.\n";
 /// A digest older than this is named in the envoy's answer, so the peer knows how old
 /// the account of the session is.
 const ENVOY_STALE_DIGEST_AGE: Duration = Duration::from_secs(15 * 60);
@@ -146,13 +148,15 @@ fn handoff_age_notes(
     }
     match (brief, snapshot_at) {
         (Some(_), Some(at)) => notes.push_str(&format!(
-            "The session brief above is current as of {}.\n",
+            "The session brief above is current as of {}.\n{RESUMED_THREAD_NOTE}",
             age_text(now, at)
         )),
-        (Some(_), None) => notes.push_str("The session brief above is current.\n"),
-        (None, _) => {}
+        (Some(_), None) => {
+            notes.push_str("The session brief above is current.\n");
+            notes.push_str(RESUMED_THREAD_NOTE);
+        }
+        (None, _) => notes.push_str(RESUMED_THREAD_NOTE_WITHOUT_BRIEF),
     }
-    notes.push_str(RESUMED_THREAD_NOTE);
     notes
 }
 
@@ -628,13 +632,15 @@ impl EnvoyRunner {
                 ),
             }
         }
+        // Read before the brief: a publish racing the two reads then dates the brief
+        // older than it is, never newer.
+        let snapshot_at = app.mesh.snapshot().map(|snapshot| snapshot.captured_at);
         let brief = app.mesh.brief();
         let (tail, user) =
             compose_envoy_input(brief.as_deref().map(Brief::render_for_human), card, message);
         role.append_to_prompt(&tail);
         let remembered = memory.map(RunMemory::history).unwrap_or_default();
         let total = remembered.len();
-        let snapshot_at = app.mesh.snapshot().map(|snapshot| snapshot.captured_at);
         let now = SystemTime::now();
         let notes = |resumed| handoff_age_notes(resumed, brief.as_deref(), snapshot_at, now);
         // Fitted against the resumed notes, the longest the prompt can end up.
@@ -8454,7 +8460,10 @@ mod tests {
             ]
         );
         assert!(
-            seen[1][0].content.to_text().ends_with(RESUMED_THREAD_NOTE),
+            seen[1][0]
+                .content
+                .to_text()
+                .ends_with(RESUMED_THREAD_NOTE_WITHOUT_BRIEF),
             "{}",
             seen[1][0].content.to_text()
         );
@@ -8479,7 +8488,9 @@ mod tests {
 
     mod handoff_label_tests {
         use super::*;
-        use crate::mesh::brief::BriefSource;
+        use crate::mesh::brief::{BriefSource, Digest};
+        use crate::mesh::snapshot::MeshSnapshot;
+        use crate::mesh::test_support::snapshot_fixture;
 
         fn brief_with_digest_from(age: Duration, now: SystemTime) -> Brief {
             Brief {
@@ -8521,9 +8532,57 @@ mod tests {
             assert!(!fresh.contains("earlier answers"), "{fresh}");
             let resumed = seen[1][0].content.to_text();
             assert!(
-                resumed.contains("earlier answers, which may be out of date"),
+                resumed.contains("they may be out of date; say so if you rely on them"),
                 "{resumed}"
             );
+            assert!(!resumed.contains("the brief wins"), "{resumed}");
+            source.remove_dir();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn a_resumed_thread_on_an_old_brief_dates_it_and_names_the_digest_age() {
+            let _cfg = TestConfigDirGuard::new("mesh-envoy-handoff-age");
+            let (source, _source) = stub_envoy_source();
+            let tmp = TempDir::new("mesh-envoy-handoff-age");
+            let app = test_app();
+            let old = SystemTime::now() - Duration::from_secs(20 * 60);
+            app.mesh.publish(MeshSnapshot {
+                captured_at: old,
+                ..snapshot_fixture()
+            });
+            app.mesh.publish_digest(Some(Digest {
+                text: "- Working on the widget".into(),
+                generated_at: old,
+                covered_messages: 2,
+            }));
+            memory_for(&app, &tmp);
+            let idle = RecordingIdleSink::attach(&app);
+            let (drive, seen) = prompt_recording_drive();
+            let runner = EnvoyRunner::start_with(Arc::clone(&app), drive);
+            for (n, job) in [
+                threaded_job(&PEER_IDENTITY, "q-1", "t-9", "what is this?"),
+                threaded_job(&PEER_IDENTITY, "q-2", "t-9", "and then?"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                assert!(runner.accept(job).is_ok());
+                wait_until("the reply to land", || {
+                    idle.count("envoy replied:") == n + 1
+                })
+                .await;
+            }
+            runner.stop().await;
+
+            let seen = seen.lock();
+            assert_eq!(seen.len(), 2);
+            let resumed = seen[1][0].content.to_text();
+            assert!(
+                resumed.contains("Say in your answer that it is as of"),
+                "{resumed}"
+            );
+            assert!(resumed.contains("current as of"), "{resumed}");
             source.remove_dir();
         }
 
@@ -8581,6 +8640,9 @@ mod tests {
                 handoff_age_notes(true, Some(&brief), None, now),
                 format!("The session brief above is current.\n{RESUMED_THREAD_NOTE}")
             );
+            let unbriefed = handoff_age_notes(true, None, snapshot_at, now);
+            assert_eq!(unbriefed, RESUMED_THREAD_NOTE_WITHOUT_BRIEF);
+            assert!(!unbriefed.contains("the brief wins"), "{unbriefed}");
         }
     }
 
