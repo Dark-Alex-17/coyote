@@ -3455,7 +3455,7 @@ mod tests {
         use crate::mesh::identity::load_or_mint_identity;
         use crate::mesh::mesh_cache_dir;
         use crate::mesh::node::{MeshRuntime, MeshSlot, NodeOptions};
-        use crate::mesh::propagation_nodes::PropagationNodeTable;
+        use crate::mesh::propagation_nodes::{PROPAGATION_NODE_TABLE_FILE, PropagationNodeTable};
         use crate::mesh::request::network::{request_sent_as, request_went_as};
         use crate::mesh::request::{NAME_HASH_LEN, SizeBranch};
         use crate::mesh::test_support::{
@@ -4435,8 +4435,9 @@ mod tests {
         async fn a_fresh_runtime_fetches_from_the_persisted_node_without_hearing_it_announce() {
             let fake = FakeNode::listen_with_mtu(TcpServer::DEFAULT_CLIENT_MTU).await;
             let tmp = TempDir::new("fetch-net-persisted-node");
-            let table_path = mesh_cache_dir(&tmp.path.join("cache")).join("propagation-nodes.json");
-            let persisted = PropagationNodeTable::load(table_path).unwrap();
+            let table_path =
+                mesh_cache_dir(&tmp.path.join("cache")).join(PROPAGATION_NODE_TABLE_FILE);
+            let persisted = PropagationNodeTable::load(table_path, SystemTime::now()).unwrap();
             persisted.observe(
                 PropagationNode {
                     destination: fake.listener.desc,
@@ -4497,7 +4498,8 @@ mod tests {
                 .identity(&identity_hex(&a_identity), true)
                 .write(&b_tmp.path.join("config"));
             let persisted = PropagationNodeTable::load(
-                mesh_cache_dir(&b_tmp.path.join("cache")).join("propagation-nodes.json"),
+                mesh_cache_dir(&b_tmp.path.join("cache")).join(PROPAGATION_NODE_TABLE_FILE),
+                SystemTime::now(),
             )
             .unwrap();
             persisted.observe(

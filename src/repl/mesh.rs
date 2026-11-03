@@ -6824,11 +6824,12 @@ fn predecessors_text(
 }
 
 /// Nearest first, the most recently heard breaking ties, so the row the node picks for
-/// store-and-forward is the top one.
+/// store-and-forward is the top one. A node the pickers skip as aged out is not listed.
 fn propagation_node_rows(
     mut nodes: Vec<PropagationNodeRecord>,
     now: SystemTime,
 ) -> Vec<(String, String)> {
+    nodes.retain(|node| !node.is_expired(now));
     nodes.sort_by_key(|node| (node.hops, std::cmp::Reverse(node.last_seen)));
     let mut rows = Vec::new();
     if nodes.is_empty() {
@@ -9741,7 +9742,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             "one row and no selection rule before a node is heard"
         );
 
-        let record = |hops: u8, aspect: &str| PropagationNodeRecord {
+        let record = |hops: u8, aspect: &str, last_seen: SystemTime| PropagationNodeRecord {
             node: PropagationNode {
                 destination: SingleOutputDestination::new(
                     *TransportIdentity::new_from_rand(OsRng).as_identity(),
@@ -9753,14 +9754,16 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 propagation_enabled: true,
             },
             hops,
-            last_seen: now - Duration::from_secs(60),
+            last_seen,
         };
-        let far = record(3, "far");
-        let near = record(1, "near");
+        let heard = now - Duration::from_secs(60);
+        let far = record(3, "far", heard);
+        let near = record(1, "near", heard);
+        let aged_out = record(0, "aged", now - Duration::from_secs(365 * 24 * 60 * 60));
         let far_hex = far.node.destination.address_hash.to_hex_string();
         let near_hex = near.node.destination.address_hash.to_hex_string();
-        let rows = propagation_node_rows(vec![far, near], now);
-        assert_eq!(rows.len(), 2, "one row per node heard: {rows:?}");
+        let rows = propagation_node_rows(vec![far, near, aged_out], now);
+        assert_eq!(rows.len(), 2, "one row per node heard, none for one aged out: {rows:?}");
         assert!(
             rows[0].0 == "propagation_nodes[0]" && rows[0].1.contains(&near_hex),
             "the renderer itself puts the 1-hop node first: {rows:?}"

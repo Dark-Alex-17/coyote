@@ -48,7 +48,9 @@ use crate::mesh::propagation::{
     self, OutboundMessage, PropagationError, PropagationNode, PropagationOptions,
 };
 use crate::mesh::propagation_fetch::{self, FetchError, FetchOptions, FetchReport, InboundSink};
-use crate::mesh::propagation_nodes::PropagationNodeTable;
+use crate::mesh::propagation_nodes::{
+    PROPAGATION_NODE_TABLE_FILE, PersistTrigger, PropagationNodeTable,
+};
 use crate::mesh::protocol::{Compatibility, MESH_PROTOCOL_MIN_SUPPORTED, MESH_PROTOCOL_VERSION};
 #[cfg(all(test, unix))]
 use crate::mesh::request::RequestHandler;
@@ -690,7 +692,8 @@ impl MeshRuntime {
             SystemTime::now(),
         )?);
         let propagation_nodes = Arc::new(PropagationNodeTable::load(
-            mesh_cache_dir(&paths.cache_dir).join("propagation-nodes.json"),
+            mesh_cache_dir(&paths.cache_dir).join(PROPAGATION_NODE_TABLE_FILE),
+            SystemTime::now(),
         )?);
         let grants = GrantStore::open(&paths.cache_dir, &instance_id, SystemTime::now())?;
         let envoy_memory =
@@ -1794,12 +1797,7 @@ impl MeshRuntime {
                 redact_hashes(&format!("{err:#}"))
             );
         }
-        if let Err(err) = self.propagation_nodes.persist_if_dirty() {
-            warn!(
-                "Failed to persist the mesh propagation node table on stop: {}",
-                redact_hashes(&format!("{err:#}"))
-            );
-        }
+        self.propagation_nodes.persist_if_dirty_or_warn(PersistTrigger::Stop);
         debug!(
             "Stopped mesh node {} (instance {}, destination {})",
             short(&self.fingerprint),
@@ -3324,12 +3322,7 @@ async fn persist_tables_periodically(
                         redact_hashes(&format!("{err:#}"))
                     );
                 }
-                if let Err(err) = propagation_nodes.persist_if_dirty() {
-                    warn!(
-                        "Failed to persist the mesh propagation node table: {}",
-                        redact_hashes(&format!("{err:#}"))
-                    );
-                }
+                propagation_nodes.persist_if_dirty_or_warn(PersistTrigger::Timer);
             }
         }
     }
