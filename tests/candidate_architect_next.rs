@@ -4960,6 +4960,104 @@ fn readme_gh_seam_row_names_exactly_the_seams_gates_reads() {
     }
 }
 
+/// Escalation kinds `apply_answer` answers that carry a watch prefix but
+/// belong to the review gauntlet, not the `pr_tracking` watch.
+const GAUNTLET_REVIEW_KINDS: &[&str] = &["review_incomplete"];
+
+/// The README's `pr_tracking` review watch row names the variable's graph
+/// default, every node of the watch loop, the Update comment heading, the
+/// hardening framing and every watch escalation `apply_answer` in
+/// `gates.py` answers, so a stop condition added to the gates without the
+/// row recording it surfaces here.
+#[test]
+fn readme_pr_tracking_row_names_every_stop_condition() {
+    let row = adjustments_row("| `pr_tracking` review watch |");
+    let variables = variable_list(&candidate_dir().join("graph.yaml"));
+    let default = variables
+        .iter()
+        .find(|v| v["name"].as_str() == Some("pr_tracking"))
+        .and_then(|v| v["default"].as_str())
+        .expect("graph.yaml declares no pr_tracking default");
+    let declared = format!("`pr_tracking`, default `{default}`");
+    assert!(
+        row.contains(&declared),
+        "the pr_tracking row lost {declared:?}: {row}"
+    );
+    for node in [
+        "review_poll",
+        "review_route",
+        "review_triage",
+        "review_apply",
+        "review_update",
+        "ci_poll",
+    ] {
+        assert!(
+            row.contains(&format!("`{node}`")),
+            "the pr_tracking row lost the loop node {node}: {row}"
+        );
+    }
+    for clause in [
+        "`## Update @ ",
+        "keeps today's routing except these hardening fixes",
+    ] {
+        assert!(
+            row.contains(clause),
+            "the pr_tracking row lost {clause:?}: {row}"
+        );
+    }
+
+    let gates = fs::read_to_string(candidate_dir().join("scripts/gates.py")).unwrap();
+    let lines: Vec<&str> = gates.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| l.starts_with("def apply_answer("))
+        .expect("gates.py has no def apply_answer(");
+    let end = lines[start + 1..]
+        .iter()
+        .position(|l| l.starts_with("def "))
+        .map_or(lines.len(), |n| start + 1 + n);
+    let condition_re = fancy_regex::Regex::new(r"^\s*(el)?if .*\bkind (==|in \()").unwrap();
+    let kind_re = fancy_regex::Regex::new(r#""((?:review|watch|ci)_[a-z_]+)""#).unwrap();
+    let mut handled = BTreeSet::new();
+    let mut at = start + 1;
+    while at < end {
+        if !condition_re.is_match(lines[at]).unwrap() {
+            at += 1;
+            continue;
+        }
+        let mut condition = String::new();
+        while at < end {
+            condition.push_str(lines[at]);
+            condition.push('\n');
+            at += 1;
+            if lines[at - 1].trim_end().ends_with(':') {
+                break;
+            }
+        }
+        for c in kind_re.captures_iter(&condition) {
+            handled.insert(c.unwrap()[1].to_string());
+        }
+    }
+    for sentinel in ["ci_unsure", "review_exhausted", "watch_visit_cap"]
+        .into_iter()
+        .chain(GAUNTLET_REVIEW_KINDS.iter().copied())
+    {
+        assert!(
+            handled.contains(sentinel),
+            "the apply_answer extractor missed {sentinel}: {handled:?}"
+        );
+    }
+    for kind in handled
+        .iter()
+        .filter(|k| !GAUNTLET_REVIEW_KINDS.contains(&k.as_str()))
+    {
+        assert!(
+            row.contains(&format!("`{kind}`")),
+            "the pr_tracking row does not name the stop condition {kind}: {row}"
+        );
+    }
+}
+
 /// The README's recorded battery figures are runs of the current batteries,
 /// so they can never sit below the floors the wrapper enforces, and the
 /// session check figure is its script's literal closing line.
