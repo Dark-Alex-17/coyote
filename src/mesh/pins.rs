@@ -624,6 +624,74 @@ mod tests {
         }
     }
 
+    mod envoy_model_row_tests {
+        use super::*;
+
+        const CONFIG_EXAMPLE: &str =
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/config.example.yaml"));
+        const CONFIG_TEMPLATE: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/config-template.yaml"
+        ));
+        const AGENT_EXAMPLE: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/config.agent.example.yaml"
+        ));
+
+        /// The `envoy_model:` line and the comment lines that continue it.
+        fn envoy_model_block(text: &str) -> Option<String> {
+            let lines: Vec<&str> = text.lines().collect();
+            let at = lines
+                .iter()
+                .position(|line| line.trim_start().starts_with("envoy_model:"))?;
+            let continued = lines[at + 1..]
+                .iter()
+                .take_while(|line| line.trim_start().starts_with('#'));
+            Some(
+                std::iter::once(&lines[at])
+                    .chain(continued)
+                    .map(|line| line.trim())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+        }
+
+        /// The envoy model is one node-wide setting: the README row, the example config
+        /// and the template say the same thing, and the agent example offers no
+        /// per-agent override, since the envoy always runs as the built-in agent.
+        #[test]
+        fn the_envoy_model_is_one_mesh_setting_described_alike_everywhere() {
+            let row = README
+                .lines()
+                .find(|line| line.starts_with("| `mesh.envoy_model`"))
+                .expect("the README has a mesh.envoy_model row");
+            let cells: Vec<&str> = row.split('|').map(str::trim).collect();
+            assert_eq!(
+                cells[1..4],
+                [
+                    "`mesh.envoy_model`",
+                    "`null`",
+                    "Model the envoy answers peers with; `null` uses the configured `model_id` (the envoy never follows a `.model` switch). Behaviour varies by model: if the default refuses or over-escalates, point this at a cheaper model or one from another provider",
+                ],
+                "{row}"
+            );
+
+            let example = envoy_model_block(CONFIG_EXAMPLE).expect("config.example.yaml");
+            let template = envoy_model_block(CONFIG_TEMPLATE).expect("config-template.yaml");
+            assert_eq!(example, template);
+            for clause in [
+                "envoy_model: null",
+                "Model the envoy answers peers with",
+                "null = the configured model_id",
+                "the envoy never follows a `.model` switch",
+                "if the default refuses or over-escalates",
+            ] {
+                assert!(example.contains(clause), "{clause:?} not in {example}");
+            }
+            assert_eq!(envoy_model_block(AGENT_EXAMPLE), None);
+        }
+    }
+
     /// The envoy memory file name for one (identity, thread) is fixed by this vector: a
     /// change to the digest input would silently orphan every record on disk.
     #[test]

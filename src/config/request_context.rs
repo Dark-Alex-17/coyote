@@ -2066,10 +2066,7 @@ impl RequestContext {
     }
 
     pub fn envoy_model(&self) -> Option<String> {
-        self.agent
-            .as_ref()
-            .and_then(|a| a.envoy_model().map(|s| s.to_string()))
-            .or_else(|| self.app.config.mesh.envoy_model.clone())
+        self.app.config.mesh.envoy_model.clone()
     }
 
     pub fn compression_info(&self, app: &AppConfig) -> Result<CompressionInfo> {
@@ -10748,27 +10745,6 @@ mod tests {
             ..(*ctx.app).clone()
         });
         assert_eq!(ctx.envoy_model(), Some("openai:app-model".to_string()));
-    }
-
-    #[test]
-    fn envoy_model_agent_overrides_app_config() {
-        let mut ctx = create_test_ctx();
-        ctx.app = Arc::new(AppState {
-            config: Arc::new(AppConfig {
-                mesh: MeshConfig {
-                    envoy_model: Some("openai:app-model".to_string()),
-                    ..MeshConfig::default()
-                },
-                ..(*ctx.app.config).clone()
-            }),
-            ..(*ctx.app).clone()
-        });
-        ctx.agent = Some(Agent::test_new(AgentConfig {
-            name: "test-agent".to_string(),
-            envoy_model: Some("openai:agent-model".to_string()),
-            ..AgentConfig::default()
-        }));
-        assert_eq!(ctx.envoy_model(), Some("openai:agent-model".to_string()));
     }
 
     fn windowed_model(max_input_tokens: usize) -> Model {

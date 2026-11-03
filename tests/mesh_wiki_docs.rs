@@ -806,11 +806,7 @@ fn the_mesh_page_says_envoy_behaviour_varies_by_model_and_what_a_refusal_sends()
             .collect::<Vec<_>>()
             .join("\n")
     };
-    for file in [
-        "assets/config-template.yaml",
-        "config.example.yaml",
-        "config.agent.example.yaml",
-    ] {
+    for file in ["assets/config-template.yaml", "config.example.yaml"] {
         let comment = envoy_model_comment(file, &read(repo_root().join(file)));
         assert!(
             comment.contains("Behaviour varies by model"),

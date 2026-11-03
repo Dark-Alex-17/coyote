@@ -982,10 +982,6 @@ impl Agent {
         self.config.brief_model.as_deref()
     }
 
-    pub fn envoy_model(&self) -> Option<&str> {
-        self.config.envoy_model.as_deref()
-    }
-
     pub fn hooks(&self) -> &HooksMap {
         static NONE: LazyLock<HooksMap> = LazyLock::new(HooksMap::default);
         if self.is_builtin() {
@@ -1216,8 +1212,6 @@ pub struct AgentConfig {
     pub compression_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub brief_model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub envoy_model: Option<String>,
     #[serde(default)]
     pub description: String,
     #[serde(default)]
