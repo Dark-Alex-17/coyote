@@ -303,6 +303,8 @@ mesh:
   digest_prompt: null            # Prompt used to build the shareable session digest. If null or blank, uses built-in default
   brief_model: null              # Model used to build the digest (e.g. 'openai:gpt-4o-mini') (default: null = the session's current model)
   envoy_model: null              # Model the envoy answers peers with (default: null = the configured model_id; the envoy never follows a `.model` switch)
+                                 # Behaviour varies by model: a cautious one escalates more; if the default refuses or over-escalates, point this at
+                                 # a cheaper model or one from another provider
   envoy_escalation_timeout: 0    # Seconds the envoy holds a peer's question open for the human before handing it off (default: 0 = hand off at once; the
                                  # question stays open for `.mesh answer`; a hold longer than the 120 s run ceiling is cut to it)
   knock_retention_hours: 24      # How long unanswered knocks from known identities are kept (default: 24; must be 1 or more)

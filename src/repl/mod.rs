@@ -15,8 +15,8 @@ use self::printer::PromptPrinter;
 use self::prompt::ReplPrompt;
 
 use crate::client::{
-    Message, MessageRole, call_chat_completions, call_chat_completions_streaming,
-    call_chat_completions_streaming_quiet, init_client, oauth,
+    Message, MessageRole, ProviderRefusal, call_chat_completions, call_chat_completions_streaming,
+    call_chat_completions_streaming_quiet, init_client, oauth, refusal_category_label,
 };
 use crate::config::{
     AgentVariables, AppConfig, AssertState, CommandPrefix, EnvoyRunner, Input, LastMessage,
@@ -782,7 +782,7 @@ impl Repl {
                             }
                         }
                         Err(err) => {
-                            render_command_error(err, self.command_prefix());
+                            render_turn_error(err, self.command_prefix());
                             println!()
                         }
                     }
@@ -2113,6 +2113,28 @@ async fn ask(
     ask_with_branch(ctx, abort_signal, input, with_embeddings, None).await
 }
 
+fn provider_refusal(err: &anyhow::Error) -> Option<&ProviderRefusal> {
+    err.chain()
+        .find_map(|c| c.downcast_ref::<ProviderRefusal>())
+}
+
+/// A turn the provider refused shows one plain line instead of the error chain.
+fn render_turn_error(err: anyhow::Error, prefix: CommandPrefix) {
+    match provider_refusal_line(&err) {
+        Some(line) => eprintln!("{}", prefix.render_hints(&line)),
+        None => render_command_error(err, prefix),
+    }
+}
+
+fn provider_refusal_line(err: &anyhow::Error) -> Option<String> {
+    provider_refusal(err).map(|refusal| {
+        format!(
+            "The model declined to answer (provider refusal: {}). Rephrase the request or switch with .model <name>.",
+            refusal_category_label(refusal.category.as_deref())
+        )
+    })
+}
+
 /// `forced` bypasses the route classifier on a graph agent with a session
 /// block; `None` lets the classifier decide.
 async fn ask_with_branch(
@@ -2287,6 +2309,16 @@ async fn ask_loop(
                         input.refresh_session(ctx);
                         retried_after_compress = true;
                         continue;
+                    }
+                    // A refused turn with no tool round to keep has nothing to recover,
+                    // so the session keeps no interrupted marker for it, and the input
+                    // the runner left as the last message is not offered to `.regenerate`.
+                    if input.tool_calls().is_none()
+                        && let Some(refusal) = provider_refusal(&err)
+                    {
+                        debug!("provider refusal explanation: {:?}", refusal.explanation);
+                        ctx.discontinuous_last_message();
+                        return Err(err);
                     }
                     // A request aborted by Ctrl-C without streamed text ends
                     // here rather than in the interrupted arm below, and gets
@@ -4769,6 +4801,121 @@ local_hello() {\n\
         assert_eq!(format!("{marked:#}"), format!("{:#}", inner()));
         let source = std::error::Error::source(&*marked).expect("the inner error's source");
         assert_eq!(source.to_string(), "root cause");
+    }
+
+    mod provider_refusal_tests {
+        use super::*;
+
+        fn refused() -> anyhow::Error {
+            anyhow::Error::new(ProviderRefusal {
+                category: Some("cyber".into()),
+                explanation: Some("looks like an attack".into()),
+            })
+            .context("Failed to call chat-completions api")
+        }
+
+        #[test]
+        #[serial]
+        fn a_refused_turn_renders_one_line_and_leaves_the_session_alone() {
+            let _guard = crate::testing::TestConfigDirGuard::new("repl");
+            run_async(async {
+                let mut ctx = repl_ctx();
+                ctx.session = Some(Session::default());
+                let mut answered = completion_runner(|input, ctx, _abort| {
+                    ctx.before_chat_completion(input).unwrap();
+                    boxed_completion(async { Ok(("first reply".to_string(), vec![])) })
+                });
+                turn(&mut ctx, "hello", None, &mut answered).await.unwrap();
+                let recorded = exchange(&ctx);
+                let tokens_before = ctx.session.as_ref().unwrap().tokens();
+                // Runs the before-hook the real runner runs, so the refused input
+                // is the last message when the error comes back.
+                let mut runner = completion_runner(|input, ctx, _abort| {
+                    ctx.before_chat_completion(input).unwrap();
+                    boxed_completion(async { Err(refused()) })
+                });
+
+                let err = turn(&mut ctx, "scan this host", None, &mut runner)
+                    .await
+                    .unwrap_err();
+
+                assert_eq!(
+                    provider_refusal_line(&err).as_deref(),
+                    Some(
+                        "The model declined to answer (provider refusal: cyber). Rephrase the request or switch with .model <name>."
+                    )
+                );
+                assert!(
+                    ctx.last_message
+                        .as_ref()
+                        .is_none_or(|last| !last.continuous),
+                    "a refused input is not offered to .regenerate"
+                );
+                let regenerate = run_repl_command(&mut ctx, create_abort_signal(), ".regenerate")
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    format!("{regenerate:#}"),
+                    "Unable to regenerate the response"
+                );
+                assert_eq!(exchange(&ctx), recorded);
+                let session = ctx.session.as_ref().unwrap();
+                assert_eq!(session.tokens(), tokens_before);
+            });
+        }
+
+        #[test]
+        #[serial]
+        fn a_refusal_after_a_tool_round_keeps_the_round() {
+            let _guard = crate::testing::TestConfigDirGuard::new("repl");
+            run_async(async {
+                let mut ctx = repl_ctx();
+                ctx.session = Some(Session::default());
+                let mut round = Some(vec![ToolResult::new(
+                    ToolCall::new("t".into(), json!({}), Some("id-1".into())),
+                    json!("ok"),
+                )]);
+                let mut runner = completion_runner(move |input, ctx, _abort| {
+                    ctx.before_chat_completion(input).unwrap();
+                    let reply = match round.take() {
+                        Some(results) => Ok(("calling a tool".to_string(), results)),
+                        None => Err(refused()),
+                    };
+                    boxed_completion(async move { reply })
+                });
+
+                let err = turn(&mut ctx, "scan this host", None, &mut runner)
+                    .await
+                    .unwrap_err();
+
+                assert!(provider_refusal_line(&err).is_some(), "{err:#}");
+                let exchange = exchange(&ctx);
+                let roles: Vec<MessageRole> = exchange.iter().map(|(role, _)| *role).collect();
+                assert_eq!(
+                    roles,
+                    [MessageRole::User, MessageRole::Tool, MessageRole::Assistant]
+                );
+                assert_eq!(exchange[2].1, "[Response interrupted due to error]");
+            });
+        }
+
+        #[test]
+        fn a_refusal_without_a_category_says_so() {
+            let err = anyhow::Error::new(ProviderRefusal::default());
+
+            assert_eq!(
+                provider_refusal_line(&err).as_deref(),
+                Some(
+                    "The model declined to answer (provider refusal: no category given). \
+                     Rephrase the request or switch with .model <name>."
+                )
+            );
+        }
+
+        #[test]
+        fn any_other_turn_error_is_not_a_refusal_line() {
+            assert_eq!(provider_refusal_line(&anyhow!("boom")), None);
+        }
     }
 
     #[test]

@@ -4369,11 +4369,22 @@ impl MeshSlot {
     /// at the keyboard gets one line carrying `reason` in place of the plain summary,
     /// since the summary alone would not tell them the envoy was tried.
     pub(crate) fn record_envoy_fallback(&self, original: PeerMessage, reason: &str) {
+        self.record_envoy_fallback_with_next(original, reason, "");
+    }
+
+    /// `record_envoy_fallback` with `next` after the summary, for a fallback whose line
+    /// should also say what the person at the keyboard can do about it.
+    pub(crate) fn record_envoy_fallback_with_next(
+        &self,
+        original: PeerMessage,
+        reason: &str,
+        next: &str,
+    ) {
         let text = format!(
             "{reason}; {}",
             original.summary_line_with_tail(
                 self.display_name_of(&original).as_deref(),
-                " is in the inbox"
+                &format!(" is in the inbox{next}")
             )
         );
         let id8 = short(&original.source_identity).to_string();

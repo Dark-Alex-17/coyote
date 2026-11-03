@@ -716,6 +716,66 @@ fn the_mesh_page_describes_the_count_on_a_folded_notification() {
     );
 }
 
+/// The envoy's behaviour depends on its model, and a provider can refuse a question
+/// outright; the Mesh page's `envoy_model` paragraph says so and quotes the words the
+/// peer then hears. The code side is checked on every run.
+#[test]
+fn the_mesh_page_says_envoy_behaviour_varies_by_model_and_what_a_refusal_sends() {
+    let envoy = read(repo_root().join("src/config/mesh_envoy.rs"));
+    assert!(
+        envoy.contains("PROVIDER_REFUSAL_TEXT: &str = \"the envoy declined to answer\";"),
+        "the provider refusal reply text changed; update Mesh.md and this test"
+    );
+    // The `envoy_model:` line and the comment lines that continue it.
+    let envoy_model_comment = |label: &str, text: &str| -> String {
+        let lines: Vec<&str> = text.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("envoy_model:"))
+            .unwrap_or_else(|| panic!("{label} has no `envoy_model:` line"));
+        std::iter::once(lines[at])
+            .chain(
+                lines[at + 1..]
+                    .iter()
+                    .copied()
+                    .take_while(|line| line.trim_start().starts_with('#')),
+            )
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    for file in [
+        "assets/config-template.yaml",
+        "config.example.yaml",
+        "config.agent.example.yaml",
+    ] {
+        let comment = envoy_model_comment(file, &read(repo_root().join(file)));
+        assert!(
+            comment.contains("Behaviour varies by model"),
+            "{file}'s envoy_model comment does not say behaviour varies by model: {comment}"
+        );
+    }
+    let Some(wiki) = wiki_dir() else { return };
+    let configuration = envoy_model_comment(
+        "Mesh-Configuration.md",
+        &read(wiki.join("Mesh-Configuration.md")),
+    );
+    assert!(
+        configuration.contains("Behaviour varies by model"),
+        "Mesh-Configuration.md's yaml envoy_model comment does not say behaviour varies by model: {configuration}"
+    );
+    let page = flat(&read(wiki.join("Mesh.md")));
+    for sentence in [
+        "`envoy_model` sets the model the envoy answers with; it never follows a `.model` switch. Behaviour varies by model:",
+        "a cautious model escalates more, and a provider may refuse a question outright (the peer then hears `the envoy declined to answer`).",
+        "If the default model refuses or over-escalates, point `envoy_model` at a cheaper model or one from another provider.",
+    ] {
+        assert!(
+            page.contains(sentence),
+            "Mesh.md's envoy_model paragraph does not say {sentence:?}"
+        );
+    }
+}
+
 /// The one format literal of the marker function `name` in `src/utils/untrusted_content.rs`,
 /// its `{}` placeholder replaced by `placeholder`. The four marker functions there must
 /// each keep exactly one `"..."` literal with one `{}`, since this is how the pages are

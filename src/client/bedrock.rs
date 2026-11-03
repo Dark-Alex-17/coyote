@@ -219,6 +219,9 @@ async fn chat_completions_streaming(
     let mut reasoning_state = 0;
     let mut thinking_text = String::new();
     let mut thinking_signature = String::new();
+    // Converse sends the usage after `messageStop`, so a refusal is returned only once
+    // the stream has ended and the billed tokens are on record.
+    let mut refused = false;
 
     let mut stream = res.bytes_stream();
     let mut buffer = BytesMut::new();
@@ -312,6 +315,13 @@ async fn chat_completions_streaming(
                                 handler.usage(usage);
                             }
                         }
+                        "messageStop" if is_refusal_stop(&data["stopReason"]) => {
+                            if handler.has_received_visible_output() {
+                                debug!("stream ended with a provider refusal after partial output");
+                            } else {
+                                refused = true;
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -328,6 +338,9 @@ async fn chat_completions_streaming(
                 }
             }
         }
+    }
+    if refused {
+        return Err(ProviderRefusal::default().into());
     }
     Ok(())
 }
@@ -749,6 +762,9 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
     }
 
     if text.is_empty() && tool_calls.is_empty() {
+        if is_refusal_stop(&data["stopReason"]) {
+            return Err(ProviderRefusal::default().into());
+        }
         bail!("Invalid response data: {data}");
     }
 
@@ -759,6 +775,13 @@ fn extract_chat_completions(data: &Value) -> Result<ChatCompletionsOutput> {
         usage: bedrock_parse_usage(&data["usage"]),
     };
     Ok(output)
+}
+
+/// Converse reports a model-side refusal as `content_filtered`.
+/// `guardrail_intervened` is a user-configured guardrail whose message
+/// arrives as ordinary content, so it is not a refusal.
+fn is_refusal_stop(stop_reason: &Value) -> bool {
+    matches!(stop_reason.as_str(), Some("content_filtered" | "refusal"))
 }
 
 #[derive(Debug)]
@@ -1439,5 +1462,112 @@ mod tests {
             &output.thinking[1],
             ThinkingBlock::RedactedThinking { data } if data == "b64data"
         ));
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+    use aws_smithy_eventstream::frame::write_message_to;
+    use aws_smithy_types::event_stream::{Header, HeaderValue, Message};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn empty_reply(stop_reason: &str) -> Value {
+        json!({
+            "output": {"message": {"role": "assistant", "content": []}},
+            "stopReason": stop_reason,
+            "usage": {"inputTokens": 10, "outputTokens": 0, "totalTokens": 10}
+        })
+    }
+
+    #[test]
+    fn content_filtered_with_no_content_is_a_refusal_without_category() {
+        for stop_reason in ["content_filtered", "refusal"] {
+            let err = extract_chat_completions(&empty_reply(stop_reason)).unwrap_err();
+
+            let refusal = err.downcast_ref::<ProviderRefusal>().unwrap();
+            assert_eq!(refusal.category, None);
+            assert_eq!(
+                format!("{err:#}"),
+                "the model declined to answer (provider refusal: no category given)"
+            );
+        }
+    }
+
+    #[test]
+    fn guardrail_intervened_is_not_a_refusal() {
+        let err = extract_chat_completions(&empty_reply("guardrail_intervened")).unwrap_err();
+
+        assert!(err.downcast_ref::<ProviderRefusal>().is_none());
+    }
+
+    #[test]
+    fn only_model_side_stop_reasons_count_as_refusals() {
+        assert!(is_refusal_stop(&json!("content_filtered")));
+        assert!(is_refusal_stop(&json!("refusal")));
+        assert!(!is_refusal_stop(&json!("guardrail_intervened")));
+        assert!(!is_refusal_stop(&json!("end_turn")));
+        assert!(!is_refusal_stop(&Value::Null));
+    }
+
+    fn event(kind: &'static str, data: Value) -> Vec<u8> {
+        let message = Message::new(data.to_string().into_bytes())
+            .add_header(Header::new(
+                ":message-type",
+                HeaderValue::String("event".into()),
+            ))
+            .add_header(Header::new(":event-type", HeaderValue::String(kind.into())));
+        let mut frame = Vec::new();
+        write_message_to(&message, &mut frame).unwrap();
+        frame
+    }
+
+    /// Serves one canned event stream to the first request, then closes.
+    async fn serve_events(body: Vec<u8>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 8192];
+            let _ = sock.read(&mut buf).await;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.amazon.eventstream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            sock.write_all(head.as_bytes()).await.unwrap();
+            sock.write_all(&body).await.unwrap();
+        });
+        format!("http://{addr}/")
+    }
+
+    #[tokio::test]
+    async fn a_streamed_refusal_is_returned_after_the_usage_that_follows_it() {
+        let body = [
+            event("messageStop", json!({"stopReason": "content_filtered"})),
+            event(
+                "metadata",
+                json!({"usage": {"inputTokens": 10, "outputTokens": 3, "totalTokens": 13}}),
+            ),
+        ]
+        .concat();
+        let url = serve_events(body).await;
+        let (sender, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut handler = SseHandler::new(sender, crate::utils::create_abort_signal());
+        handler.set_silent(true);
+        let builder = ReqwestClient::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(url);
+
+        let err = chat_completions_streaming(builder, &mut handler)
+            .await
+            .unwrap_err();
+
+        assert!(err.downcast_ref::<ProviderRefusal>().is_some(), "{err:#}");
+        let (_, _, _, usage) = handler.take();
+        let usage = usage.unwrap();
+        assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(usage.output_tokens, Some(3));
     }
 }

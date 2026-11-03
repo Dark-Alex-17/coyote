@@ -1537,6 +1537,12 @@ fn a_decline_and_every_answerless_run_go_out_refused_with_no_retry_hint() -> Res
             EnvoyOutcome::Unavailable(UnavailableReason::NoSource),
         ),
         ("failed", EnvoyOutcome::Failed("boom".to_string())),
+        (
+            "provider refused",
+            EnvoyOutcome::ProviderRefused {
+                category: Some("cyber".to_string()),
+            },
+        ),
     ] {
         let out = sent(&outcome, None)?;
         same(&format!("{label}: kind"), out.kind, PeerKind::Reply)?;

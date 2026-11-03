@@ -15,7 +15,10 @@ use super::{
     AppState, BuiltinAgentUnavailable, Input, RenderMode, RequestContext, RoleLike,
     UnavailableReason, WorkingMode, builtin_agent_dir, builtin_agent_unavailable_reason,
 };
-use crate::client::{Message, MessageContent, MessageRole, Model, ModelType, RunUsage};
+use crate::client::{
+    ApiStatusError, Message, MessageContent, MessageRole, Model, ModelType, ProviderRefusal,
+    RunUsage, api_status_sentence, refusal_category_label,
+};
 use crate::function::agents::{child_app_state, run_child_agent};
 use crate::hooks::{self, HookEvent, ResolvedHook};
 use crate::mesh::brief::Brief;
@@ -26,7 +29,7 @@ use crate::mesh::idle::{IdleNotify, Origin};
 use crate::mesh::limits::{PeerRefusal, RefusalReason};
 use crate::mesh::message::{
     Disposition, OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_LINE_MAX_CHARS, PEER_TITLE_MAX_CHARS,
-    PENDING_FULL_TEXT_POINTER, PeerKind, PeerMessage, PeerVia, SendError, is_wire_id,
+    PENDING_FULL_TEXT_POINTER, Part, PeerKind, PeerMessage, PeerVia, SendError, is_wire_id,
 };
 use crate::mesh::notify::Source;
 use crate::mesh::pending::{
@@ -67,12 +70,20 @@ const ENVOY_STOP_GRACE: Duration = Duration::from_secs(5);
 pub(crate) const REFUSAL_MARKER: &str = "REFUSED:";
 /// What the peer hears for a marker with no words after it.
 pub(crate) const DECLINED_FALLBACK_TEXT: &str = "this node will not handle that request";
+/// What the peer hears when the provider refused to answer; the category stays local.
+pub(crate) const PROVIDER_REFUSAL_TEXT: &str = "the envoy declined to answer";
+/// Ends the owner's line when the provider refused or failed, since another model may
+/// answer where this one would not.
+const SWITCH_MODEL_NEXT_STEP: &str =
+    "; read it with .mesh inbox, or set mesh.envoy_model to another model";
 /// Appended to the system tail only when the run resumes remembered turns; a fresh
 /// thread's prompt says nothing about memory.
 const RESUMED_THREAD_NOTE: &str = "Earlier assistant turns in this conversation may be the human owner's own words, relayed by the envoy.\n";
 /// Resumed turns stop short of the envoy model's `max_input_tokens` by one part in this
 /// many, left for the answer.
 const RESUMED_HISTORY_HEADROOM_DIVISOR: usize = 8;
+/// Most characters of one text or data part the envoy is shown.
+const ENVOY_PART_TEXT_MAX_CHARS: usize = 1000;
 
 /// How one job is driven to text. Production is `run_child_agent`; tests inject closures.
 pub(crate) type EnvoyDrive = Arc<
@@ -116,7 +127,8 @@ pub(crate) fn compose_envoy_input(
 }
 
 /// The user turn of one peer message. Every peer-chosen word (name, message id, title,
-/// text) goes inside the fence. Also what the envoy remembers of the peer's side of a thread.
+/// text, the list of parts) goes inside the fence. Also what the envoy remembers of the
+/// peer's side of a thread.
 fn peer_turn(card: &PeerCard, message: &PeerMessage) -> String {
     let title_line = message
         .title
@@ -124,11 +136,64 @@ fn peer_turn(card: &PeerCard, message: &PeerMessage) -> String {
         .and_then(|title| display_text(title, PEER_TITLE_MAX_CHARS))
         .map(|title| format!("Title: {title}\n"))
         .unwrap_or_default();
+    let parts = envoy_parts_summary(message);
+    let parts = if parts.is_empty() {
+        parts
+    } else {
+        format!("\n{parts}")
+    };
     let data = format!(
-        "Name: {}\nMessage id: {}\n{title_line}{}",
+        "Name: {}\nMessage id: {}\n{title_line}{}{parts}",
         card.who, card.message_id, message.content
     );
     fence_peer_text(&message.source_destination, &data)
+}
+
+/// One line per part of `message`, read by the envoy inside the fence after the text:
+/// where an inline file was staged, what a reference file can be fetched as, a text or
+/// data part's content quoted as data and cut at `ENVOY_PART_TEXT_MAX_CHARS`, and how
+/// many parts did not arrive. Empty for a message with no parts. A file is only named
+/// here, never read: the envoy does not see or serve file bytes.
+fn envoy_parts_summary(message: &PeerMessage) -> String {
+    use Part::{Data, File, Text};
+
+    let quoted = |label: &str, content: &str| -> Option<String> {
+        let clean = display_text(content, usize::MAX)?;
+        let quote = match clean.char_indices().nth(ENVOY_PART_TEXT_MAX_CHARS) {
+            Some((cut, _)) => format!("\"{}\" (cut)", clean[..cut].trim_end()),
+            None => format!("\"{clean}\""),
+        };
+        Some(format!("{label}, quoted as data: {quote}"))
+    };
+    let mut lines: Vec<String> = message
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            File {
+                name,
+                size,
+                staged: Some(staged),
+                ..
+            } => Some(format!(
+                "attached: {name} ({size} B), staged at {}",
+                staged.display()
+            )),
+            File {
+                size,
+                reference: Some(reference),
+                ..
+            } => Some(format!("fetchable as {reference} ({size} B)")),
+            File { name, size, .. } => Some(format!("listed but not sent: {name} ({size} B)")),
+            Text { text } => quoted("text part", text),
+            Data { data } => quoted("data part", &data.to_string()),
+        })
+        .collect();
+    match message.dropped_parts {
+        0 => {}
+        1 => lines.push("1 part did not arrive".to_string()),
+        dropped => lines.push(format!("{dropped} parts did not arrive")),
+    }
+    lines.join("\n")
 }
 
 pub(crate) enum EnvoyOutcome {
@@ -145,8 +210,16 @@ pub(crate) enum EnvoyOutcome {
     Interrupted,
     Unavailable(UnavailableReason),
     Failed(String),
+    /// The model's provider returned an error, reported as its status or kind and one
+    /// plain sentence; the body is never carried.
+    ProviderFailed(String),
     /// The sender's window was spent between the job being queued and its turn.
     Refused(PeerRefusal),
+    /// The model's provider refused the request; distinct from `Refused`, which is a
+    /// run-time limit, and from `Declined`, which is the envoy's own words.
+    ProviderRefused {
+        category: Option<String>,
+    },
 }
 
 struct HeldEscalation {
@@ -259,8 +332,8 @@ pub(crate) struct EnvoyRunner {
     app: ArcSwap<AppState>,
     jobs: mpsc::Sender<EnvoyJob>,
     held: Mutex<Option<HeldEscalation>>,
-    /// The human's answer a held run took, kept so the peer still hears it when that
-    /// run then fails to deliver.
+    /// The human's answers a held run took, in order. The peer hears them word for word
+    /// in place of whatever the run then comes to.
     consumed_answer: Mutex<Option<String>>,
     cancel: CancellationToken,
     current_abort: Mutex<Option<AbortSignal>>,
@@ -697,8 +770,13 @@ impl EnvoyRunner {
                     };
                 }
                 res = &mut run => break match res {
-                    Ok(text) => classify_answer(&text),
-                    Err(err) => EnvoyOutcome::Failed(format!("{err:#}")),
+                    // Once the owner's answer is taken it is the reply, so the model's
+                    // final text after it is not read for a decline.
+                    Ok(text) => match self.consumed_answer.lock().clone() {
+                        Some(answer) => EnvoyOutcome::Answered(answer),
+                        None => classify_answer(&text),
+                    },
+                    Err(err) => run_error_outcome(&err),
                 },
                 _ = &mut deadline => {
                     abort.set_ctrlc();
@@ -945,8 +1023,10 @@ impl EnvoyRunner {
 
     /// Replies to the peer, records the exchange for the session and fires the result
     /// hook. A reply that cannot be sent still gets recorded, with one line telling the
-    /// human why the peer did not hear it. A held run that took the human's answer and
-    /// then failed to deliver still gets that answer to the peer. An escalated question
+    /// human why the peer did not hear it. A held run that took the human's answer sends
+    /// that answer to the peer word for word as `answered`, whatever the run came to; the
+    /// model's own final text is never sent, and `drive` reads a run that finished after
+    /// taking the answer as that answer without classifying the text. An escalated question
     /// leaves the store only once the peer has heard its answer; an unsent one stays open
     /// so `.mesh answer` can send it again. A run-time refusal of a stored message is
     /// replied to once per identity, per reason, per hour, on the claim the accept-time
@@ -956,8 +1036,10 @@ impl EnvoyRunner {
     /// What the node itself said to the peer, sent or not, joins what the envoy remembers
     /// of the thread when `memory` is on: the answer, the decline, the escalation message, the
     /// refusal line or the human's held answer. A run that timed out, was interrupted,
-    /// found the envoy unavailable or failed said nothing of its own and adds nothing,
-    /// and neither does a withheld reply or the interim escalated notice.
+    /// found the envoy unavailable or failed said nothing of its own and adds nothing, and
+    /// neither does a withheld reply or the interim escalated notice. Nor does a provider
+    /// refusal: remembering the peer's turn would replay the text the provider refused on
+    /// every later message in the thread.
     async fn deliver(
         &self,
         message: PeerMessage,
@@ -971,11 +1053,11 @@ impl EnvoyRunner {
         let app = self.app.load();
         // Always taken, so an answer consumed by this run can never be replayed to the
         // next job's peer.
-        let consumed = self.consumed_answer.lock().take();
-        let human_answer = match &outcome {
-            EnvoyOutcome::Answered(_) | EnvoyOutcome::Declined(_) => None,
-            _ => consumed.and_then(|text| display_text(&text, PEER_CONTENT_MAX_CHARS)),
-        };
+        let human_answer = self
+            .consumed_answer
+            .lock()
+            .take()
+            .and_then(|text| display_text(&text, PEER_CONTENT_MAX_CHARS));
         // The filed question is settled only by the envoy's own last word on an
         // escalated run or by the human's; an escalation or a failure leaves it open.
         let settles_question = human_answer.is_some()
@@ -1002,7 +1084,7 @@ impl EnvoyRunner {
                 "this node cannot answer right now".to_string(),
                 Some(format!("unavailable: {reason}")),
             ),
-            EnvoyOutcome::Failed(err) => {
+            EnvoyOutcome::Failed(err) | EnvoyOutcome::ProviderFailed(err) => {
                 warn!("Mesh envoy run for {id} failed: {}", redact_hashes(err));
                 (
                     "this node cannot answer right now".to_string(),
@@ -1012,6 +1094,13 @@ impl EnvoyRunner {
             EnvoyOutcome::Refused(refusal) => (
                 refusal.reason.peer_text().to_string(),
                 Some(format!("refused: {}", refusal.reason.as_str())),
+            ),
+            EnvoyOutcome::ProviderRefused { category } => (
+                PROVIDER_REFUSAL_TEXT.to_string(),
+                Some(format!(
+                    "provider refusal: {}",
+                    refusal_category_label(category.as_deref())
+                )),
             ),
         };
         let owed = match &outcome {
@@ -1089,10 +1178,10 @@ impl EnvoyRunner {
             self.forget_question(&id);
         }
         match (&outcome, &human_answer) {
-            (EnvoyOutcome::Answered(text) | EnvoyOutcome::Declined(text), _) => {
+            (_, Some(text)) => app.mesh.record_envoy_exchange(&message, text),
+            (EnvoyOutcome::Answered(text) | EnvoyOutcome::Declined(text), None) => {
                 app.mesh.record_envoy_exchange(&message, text)
             }
-            (_, Some(text)) => app.mesh.record_envoy_exchange(&message, text),
             (EnvoyOutcome::Escalated { .. }, None) => app.mesh.record_envoy_escalated(message, &id),
             (EnvoyOutcome::TimedOut, None) => {
                 app.mesh.record_envoy_fallback(message, "envoy timed out")
@@ -1106,8 +1195,23 @@ impl EnvoyRunner {
             (EnvoyOutcome::Failed(err), None) => app
                 .mesh
                 .record_envoy_fallback(message, &format!("envoy failed: {err}")),
+            (EnvoyOutcome::ProviderFailed(err), None) => app.mesh.record_envoy_fallback_with_next(
+                message,
+                &format!("envoy failed: {err}"),
+                SWITCH_MODEL_NEXT_STEP,
+            ),
             (EnvoyOutcome::Refused(refusal), None) => {
                 app.mesh.record_envoy_refusal(message, refusal)
+            }
+            (EnvoyOutcome::ProviderRefused { category }, None) => {
+                app.mesh.record_envoy_fallback_with_next(
+                    message,
+                    &format!(
+                        "envoy declined (provider refusal: {})",
+                        refusal_category_label(category.as_deref())
+                    ),
+                    SWITCH_MODEL_NEXT_STEP,
+                )
             }
         }
         let mut extras = vec![
@@ -1176,13 +1280,18 @@ impl EnvoySink for EnvoyRunner {
         if held.as_ref().is_none_or(|held| held.id != id) {
             return false;
         }
-        // Set before the send so the run can never deliver without it on record.
-        *self.consumed_answer.lock() = Some(text.to_string());
+        // Set before the send so the run can never deliver without it on record. A run
+        // that asks more than once owes the peer every answer it took.
+        let earlier = self.consumed_answer.lock().clone();
+        *self.consumed_answer.lock() = Some(match &earlier {
+            Some(earlier) => format!("{earlier} / {text}"),
+            None => text.to_string(),
+        });
         let taken = held
             .take()
             .is_some_and(|held| held.reply_tx.send(text.to_string()).is_ok());
         if !taken {
-            *self.consumed_answer.lock() = None;
+            *self.consumed_answer.lock() = earlier;
         }
         taken
     }
@@ -1302,6 +1411,51 @@ pub(crate) fn classify_answer(text: &str) -> EnvoyOutcome {
     }
 }
 
+/// Reads a failed run: a provider refusal is its own outcome, and a provider status
+/// error or a reply the client could not read is reported as one plain sentence, since
+/// the response body is often raw JSON. Anything else keeps its full error chain.
+fn run_error_outcome(err: &anyhow::Error) -> EnvoyOutcome {
+    if let Some(refusal) = err
+        .chain()
+        .find_map(|c| c.downcast_ref::<ProviderRefusal>())
+    {
+        if let Some(explanation) = &refusal.explanation {
+            debug!(
+                "Mesh envoy provider refusal explanation: {}",
+                redact_hashes(explanation)
+            );
+        }
+        return EnvoyOutcome::ProviderRefused {
+            category: refusal.category.clone(),
+        };
+    }
+    let plain = match err.chain().find_map(|c| c.downcast_ref::<ApiStatusError>()) {
+        Some(api) => format!("{} {}", api.status, api_status_sentence(api.status)),
+        None => match unreadable_reply_sentence(err) {
+            Some(sentence) => sentence.to_string(),
+            None => return EnvoyOutcome::Failed(format!("{err:#}")),
+        },
+    };
+    debug!(
+        "Mesh envoy provider error: {}",
+        redact_hashes(&format!("{err:#}"))
+    );
+    EnvoyOutcome::ProviderFailed(format!(
+        "{plain}; the peer was told this node cannot answer right now"
+    ))
+}
+
+/// The clients bail with these words, followed by the raw body, when a successful
+/// response holds nothing they can read.
+fn unreadable_reply_sentence(err: &anyhow::Error) -> Option<&'static str> {
+    err.chain().find_map(|cause| {
+        cause
+            .to_string()
+            .contains("Invalid response data")
+            .then_some("the provider sent a reply the envoy could not read")
+    })
+}
+
 /// Waits for `send` unless the run is cancelled or its `remaining` ceiling lapses first,
 /// so a slow peer cannot hold the run open past either.
 async fn bounded_send<T>(
@@ -1367,14 +1521,14 @@ pub(crate) fn escalated_notice(message: &PeerMessage) -> Result<OutboundPeer, Se
 }
 
 /// What the peer hears for `outcome`, in the thread of the message it answers: the
-/// human's words when they took the question, else `reply_text`. Only a final outcome
-/// goes out as a `Reply`; the escalation message is a `Message` naming the question, so
-/// the asker's correlation stays open for the human's answer, and a `Message` carries no
-/// disposition. Every reply says what it is: the envoy's and the human's answers are
-/// `answered`; a decline, and a run that ended without an answer, are `refused` with no
-/// retry hint; a run-time refusal is not the envoy's answer, so that one goes out as the
-/// typed refusal reply with its fields and retry hint. Words only: the envoy never
-/// attaches a part.
+/// human's words as they gave them when they took the question, whatever the outcome,
+/// else `reply_text`. Only a final outcome goes out as a `Reply`; the escalation message
+/// is a `Message` naming the question, so the asker's correlation stays open for the
+/// human's answer, and a `Message` carries no disposition. Every reply says what it is:
+/// the envoy's and the human's answers are `answered`; a decline, and a run that ended
+/// without an answer, are `refused` with no retry hint; a run-time refusal is not the
+/// envoy's answer, so that one goes out as the typed refusal reply with its fields and
+/// retry hint. Words only: the envoy never attaches a part.
 pub(crate) fn envoy_reply(
     outcome: &EnvoyOutcome,
     human_answer: Option<&str>,
@@ -1399,7 +1553,9 @@ pub(crate) fn envoy_reply(
             | EnvoyOutcome::TimedOut
             | EnvoyOutcome::Interrupted
             | EnvoyOutcome::Unavailable(_)
-            | EnvoyOutcome::Failed(_),
+            | EnvoyOutcome::Failed(_)
+            | EnvoyOutcome::ProviderFailed(_)
+            | EnvoyOutcome::ProviderRefused { .. },
             None,
         ) => (PeerKind::Reply, Some(Disposition::Refused), reply_text),
     };
@@ -1876,6 +2032,12 @@ mod tests {
                     retry_after: Duration::from_secs(30),
                 }),
             ),
+            (
+                "provider refused",
+                EnvoyOutcome::ProviderRefused {
+                    category: Some("cyber".into()),
+                },
+            ),
         ];
         let root = job(PeerKind::Ask, "q-1", "what now?").message;
         let threaded = PeerMessage::new(RawPeerMessage {
@@ -1903,7 +2065,9 @@ mod tests {
                                 | EnvoyOutcome::TimedOut
                                 | EnvoyOutcome::Interrupted
                                 | EnvoyOutcome::Unavailable(_)
-                                | EnvoyOutcome::Failed(_),
+                                | EnvoyOutcome::Failed(_)
+                                | EnvoyOutcome::ProviderFailed(_)
+                                | EnvoyOutcome::ProviderRefused { .. },
                                 None,
                             ) => (PeerKind::Reply, Some(Disposition::Refused), "text"),
                             (EnvoyOutcome::Escalated { .. }, None) => {
@@ -2363,7 +2527,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn a_held_escalation_answered_in_time_lets_the_envoy_answer_the_peer() {
+    async fn a_held_escalation_answered_in_time_relays_the_human_s_words_to_the_peer() {
         let _cfg = TestConfigDirGuard::new("mesh-envoy-held");
         let (source, _source) = stub_envoy_source();
         let tmp = TempDir::new("mesh-envoy-held");
@@ -2400,7 +2564,7 @@ mod tests {
         assert_eq!(envelopes.len(), 2);
         let reply = peer_of(&envelopes[1]);
         assert_eq!(reply.kind, PeerKind::Reply);
-        assert_eq!(reply.content, "the human said: yes, merge");
+        assert_eq!(reply.content, "yes, merge");
         // The mesh is off, so the reply never left: the question stays on file for a
         // retry through `.mesh answer`.
         assert!(store.get("msg-held").unwrap().is_some());
@@ -3464,8 +3628,8 @@ mod tests {
     }
 
     /// A held escalation on the wire: the peer hears `escalated` first, and once the
-    /// human answers in time, the envoy's own `answered` reply; no escalation `Message`
-    /// is ever sent and the question leaves the store.
+    /// human answers in time, the human's words as the `answered` reply; no escalation
+    /// `Message` is ever sent and the question leaves the store.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
@@ -3512,7 +3676,7 @@ mod tests {
         assert_eq!(heard[1].kind, PeerKind::Reply);
         assert_eq!(heard[1].disposition, Some(Disposition::Answered));
         assert_eq!(heard[1].retry_after, None);
-        assert_eq!(heard[1].content, "the human said: yes");
+        assert_eq!(heard[1].content, "yes");
         assert!(
             heard.iter().all(|body| body.kind != PeerKind::Message),
             "{heard:?}"
@@ -3522,6 +3686,94 @@ mod tests {
 
         link.close(&app).await;
         source.remove_dir();
+    }
+
+    mod answer_rollback_tests {
+        use super::*;
+
+        /// An answer the held run can no longer take leaves the answers it took earlier
+        /// as they were.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn an_answer_the_run_cannot_take_keeps_the_earlier_answer() {
+            let _cfg = TestConfigDirGuard::new("mesh-envoy-answer-rollback");
+            let runner = EnvoyRunner::start_with(
+                test_app(),
+                drive_of(|_, _, _| async { Ok(String::new()) }),
+            );
+            let (reply_tx, reply_rx) = oneshot::channel();
+            drop(reply_rx);
+            *runner.held.lock() = Some(HeldEscalation {
+                id: "q-1".into(),
+                reply_tx,
+            });
+            *runner.consumed_answer.lock() = Some("a".into());
+
+            assert!(!runner.answer("q-1", "b"));
+
+            assert_eq!(runner.consumed_answer.lock().as_deref(), Some("a"));
+            runner.stop().await;
+        }
+    }
+
+    #[cfg(unix)]
+    mod in_hold_answer_tests {
+        use super::*;
+
+        /// The owner's answer given inside the hold is what the peer hears, word for word
+        /// and `answered`, even though the model then writes a decline of its own.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn the_owner_s_in_hold_answer_reaches_the_peer_verbatim_as_answered() {
+            let _cfg = TestConfigDirGuard::new("mesh-envoy-in-hold-answer");
+            let (source, _source) = stub_envoy_source();
+            let app = app_holding_for(60);
+            let link = LiveLink::open("envoy-in-hold", &app).await;
+            let idle = RecordingIdleSink::attach(&app);
+            let store = app.mesh.inbound_store().expect("install opens the store");
+            let runner = EnvoyRunner::start_with(
+                Arc::clone(&app),
+                escalating_drive(|_| "REFUSED: the owner has turned this down".to_string()),
+            );
+            runner.attach();
+            app.mesh
+                .deliver_peer(link.ask("in-hold", "merge the branch"));
+            wait_until("the peer to hear the escalation", || {
+                !link.heard_for("in-hold").is_empty()
+            })
+            .await;
+            wait_until("the human to be told", || {
+                idle.has("`.mesh answer in-hold \"<text>\"`")
+            })
+            .await;
+            assert!(runner.holds("in-hold"));
+
+            assert!(runner.answer("in-hold", "Denied."));
+            wait_until("the peer to hear the answer", || {
+                link.heard_for("in-hold").len() >= 2
+            })
+            .await;
+            runner.stop().await;
+
+            let heard = link.heard_for("in-hold");
+            assert_eq!(heard.len(), 2, "{heard:?}");
+            assert_escalated_notice(&heard[0], "in-hold");
+            assert_eq!(heard[1].kind, PeerKind::Reply);
+            assert_eq!(heard[1].content, "Denied.");
+            assert_eq!(heard[1].disposition, Some(Disposition::Answered));
+            assert_eq!(heard[1].retry_after, None);
+            assert!(store.get("in-hold").unwrap().is_none());
+            assert_eq!(
+                idle.count("envoy replied: Denied."),
+                1,
+                "{:?}",
+                idle.texts()
+            );
+            assert!(!idle.has("turned this down"), "{:?}", idle.texts());
+
+            link.close(&app).await;
+            source.remove_dir();
+        }
     }
 
     /// With no wait configured the peer still hears `escalated` first, then the escalation
@@ -3710,10 +3962,7 @@ mod tests {
         runner.stop().await;
 
         let (envelopes, _) = app.mesh.peer_inbox().drain();
-        assert_eq!(
-            peer_of(&envelopes[1]).content,
-            "the human said: yes, right now"
-        );
+        assert_eq!(peer_of(&envelopes[1]).content, "yes, right now");
         source.remove_dir();
     }
 
@@ -5440,6 +5689,8 @@ mod tests {
         config: AppConfig,
         model: Model,
         replies: Mutex<std::collections::VecDeque<ChatCompletionsOutput>>,
+        /// When set, every reply is built from the request's messages, serialised.
+        compose: Option<fn(&str) -> String>,
         requests: Mutex<Vec<SeenRequest>>,
     }
 
@@ -5450,12 +5701,24 @@ mod tests {
 
     impl ScriptedClient {
         fn new(replies: Vec<ChatCompletionsOutput>) -> Arc<Self> {
+            Self::build(replies, None)
+        }
+
+        fn composing(compose: fn(&str) -> String) -> Arc<Self> {
+            Self::build(Vec::new(), Some(compose))
+        }
+
+        fn build(
+            replies: Vec<ChatCompletionsOutput>,
+            compose: Option<fn(&str) -> String>,
+        ) -> Arc<Self> {
             let mut data = ModelData::new("scripted");
             data.supports_function_calling = true;
             Arc::new(Self {
                 config: AppConfig::default(),
                 model: Model::from_config("scripted", &[data]).remove(0),
                 replies: Mutex::new(replies.into()),
+                compose,
                 requests: Mutex::new(Vec::new()),
             })
         }
@@ -5488,8 +5751,10 @@ mod tests {
             _client: &reqwest::Client,
             data: ChatCompletionsData,
         ) -> Result<ChatCompletionsOutput> {
+            let messages = serde_json::to_string(&data.messages)?;
+            let composed = self.compose.map(|compose| compose(&messages));
             self.requests.lock().push(SeenRequest {
-                messages: serde_json::to_string(&data.messages)?,
+                messages,
                 functions: data
                     .functions
                     .unwrap_or_default()
@@ -5497,6 +5762,9 @@ mod tests {
                     .map(|f| f.name)
                     .collect(),
             });
+            if let Some(text) = composed {
+                return Ok(ChatCompletionsOutput::new(&text));
+            }
             self.replies
                 .lock()
                 .pop_front()
@@ -5510,6 +5778,453 @@ mod tests {
             _data: ChatCompletionsData,
         ) -> Result<()> {
             anyhow::bail!("the envoy test drives the non-streaming path")
+        }
+    }
+
+    mod provider_refusal_tests {
+        use super::*;
+        use crate::client::catch_error;
+
+        /// A provider whose every call fails with the error `fail` builds.
+        struct FailingClient {
+            config: AppConfig,
+            model: Model,
+            fail: fn() -> anyhow::Error,
+        }
+
+        impl FailingClient {
+            fn new(fail: fn() -> anyhow::Error) -> Arc<Self> {
+                Arc::new(Self {
+                    config: AppConfig::default(),
+                    model: Model::from_config("failing", &[ModelData::new("failing")]).remove(0),
+                    fail,
+                })
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl Client for FailingClient {
+            fn app_config(&self) -> &AppConfig {
+                &self.config
+            }
+
+            fn extra_config(&self) -> Option<&ExtraConfig> {
+                None
+            }
+
+            fn patch_config(&self) -> Option<&RequestPatch> {
+                None
+            }
+
+            fn name(&self) -> &str {
+                "failing"
+            }
+
+            fn model(&self) -> &Model {
+                &self.model
+            }
+
+            async fn chat_completions_inner(
+                &self,
+                _client: &reqwest::Client,
+                _data: ChatCompletionsData,
+            ) -> Result<ChatCompletionsOutput> {
+                Err((self.fail)())
+            }
+
+            async fn chat_completions_streaming_inner(
+                &self,
+                _client: &reqwest::Client,
+                _handler: &mut SseHandler,
+                _data: ChatCompletionsData,
+            ) -> Result<()> {
+                anyhow::bail!("the envoy test drives the non-streaming path")
+            }
+        }
+
+        fn cyber_refusal() -> anyhow::Error {
+            ProviderRefusal {
+                category: Some("cyber".into()),
+                explanation: Some("looks like an attack".into()),
+            }
+            .into()
+        }
+
+        fn overloaded() -> anyhow::Error {
+            let body = json!({"error": {
+                "code": 503,
+                "message": "The model is overloaded due to high demand. Please try again later.",
+                "status": "UNAVAILABLE"
+            }});
+            catch_error(&body, 503).unwrap_err()
+        }
+
+        fn unreadable() -> anyhow::Error {
+            anyhow::anyhow!("Invalid response data: {}", json!({"x": 1}))
+                .context("Failed to call chat-completions api")
+        }
+
+        fn sender8() -> String {
+            short(&hex_lower(&[0xab; 16])).to_string()
+        }
+
+        fn runner_failing_with(
+            app: &Arc<AppState>,
+            fail: fn() -> anyhow::Error,
+        ) -> Arc<EnvoyRunner> {
+            let client = FailingClient::new(fail);
+            EnvoyRunner::start_with(
+                Arc::clone(app),
+                drive_of(move |ctx, input, abort| {
+                    let client = Arc::clone(&client);
+                    async move {
+                        let mut ctx = ctx;
+                        let (output, _) = call_chat_completions(
+                            &input,
+                            false,
+                            false,
+                            client.as_ref(),
+                            &mut ctx,
+                            abort,
+                        )
+                        .await?;
+                        Ok(output)
+                    }
+                }),
+            )
+        }
+
+        #[test]
+        fn a_provider_refusal_goes_out_refused_with_the_fixed_words() {
+            let message = job(PeerKind::Ask, "q-1", "what now?").message;
+            let outcome = EnvoyOutcome::ProviderRefused {
+                category: Some("cyber".into()),
+            };
+
+            let out = envoy_reply(&outcome, None, PROVIDER_REFUSAL_TEXT.into(), &message).unwrap();
+
+            assert_eq!(out.kind, PeerKind::Reply);
+            assert_eq!(out.disposition, Some(Disposition::Refused));
+            assert_eq!(out.retry_after, None);
+            assert_eq!(out.content, "the envoy declined to answer");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn a_provider_refusal_tells_the_owner_one_plain_line() {
+            let _cfg = TestConfigDirGuard::new("mesh-envoy-provider-refusal");
+            let (source, _source) = stub_envoy_source();
+            let tmp = TempDir::new("mesh-envoy-provider-refusal");
+            let app = test_app();
+            let store = memory_for(&app, &tmp);
+            let idle = RecordingIdleSink::attach(&app);
+            let runner = runner_failing_with(&app, cyber_refusal);
+
+            assert!(
+                runner
+                    .accept(threaded_job(
+                        &PEER_IDENTITY,
+                        "q-1",
+                        "t-1",
+                        "how do I scan a port?"
+                    ))
+                    .is_ok()
+            );
+            wait_until("the refusal to land", || idle.has("envoy declined")).await;
+            runner.stop().await;
+
+            let texts = idle.texts();
+            assert_eq!(idle.count("envoy declined"), 1, "{texts:?}");
+            let line = texts
+                .iter()
+                .find(|text| text.contains("envoy declined"))
+                .unwrap();
+            assert_eq!(
+                line,
+                &format!(
+                    "envoy declined (provider refusal: cyber); {} asks: how do I scan a port? is in the inbox; read it with .mesh inbox, or set mesh.envoy_model to another model",
+                    sender8()
+                )
+            );
+            assert!(!idle.has("envoy failed"), "{texts:?}");
+            assert!(texts.iter().all(|text| !text.contains('{')), "{texts:?}");
+            let turns = turns_of(&store, &PEER_IDENTITY, "t-1");
+            assert!(turns.is_empty(), "{turns:?}");
+            source.remove_dir();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn a_provider_status_error_is_one_line_without_the_body() {
+            let _cfg = TestConfigDirGuard::new("mesh-envoy-provider-503");
+            let (source, _source) = stub_envoy_source();
+            let app = test_app();
+            let idle = RecordingIdleSink::attach(&app);
+            let runner = runner_failing_with(&app, overloaded);
+
+            assert!(
+                runner
+                    .accept(job(PeerKind::Ask, "q-503", "are you there?"))
+                    .is_ok()
+            );
+            wait_until("the failure to land", || idle.has("envoy failed")).await;
+            runner.stop().await;
+
+            let texts = idle.texts();
+            let failed: Vec<_> = texts
+                .iter()
+                .filter(|text| text.contains("envoy failed"))
+                .collect();
+            assert_eq!(failed.len(), 1, "{texts:?}");
+            assert_eq!(
+                failed[0],
+                &format!(
+                    "envoy failed: 503 the model is overloaded; the peer was told this node cannot answer right now; {} asks: are you there? is in the inbox; read it with .mesh inbox, or set mesh.envoy_model to another model",
+                    sender8()
+                )
+            );
+            assert!(texts.iter().all(|text| !text.contains('{')), "{texts:?}");
+            source.remove_dir();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn an_unreadable_reply_is_one_line_without_the_body() {
+            let _cfg = TestConfigDirGuard::new("mesh-envoy-provider-unreadable");
+            let (source, _source) = stub_envoy_source();
+            let app = test_app();
+            let idle = RecordingIdleSink::attach(&app);
+            let runner = runner_failing_with(&app, unreadable);
+
+            assert!(
+                runner
+                    .accept(job(PeerKind::Ask, "q-bad", "are you there?"))
+                    .is_ok()
+            );
+            wait_until("the failure to land", || idle.has("envoy failed")).await;
+            runner.stop().await;
+
+            let texts = idle.texts();
+            assert_eq!(idle.count("envoy failed"), 1, "{texts:?}");
+            let line = texts
+                .iter()
+                .find(|text| text.contains("envoy failed"))
+                .unwrap();
+            assert_eq!(
+                line,
+                &format!(
+                    "envoy failed: the provider sent a reply the envoy could not read; the peer was told this node cannot answer right now; {} asks: are you there? is in the inbox; read it with .mesh inbox, or set mesh.envoy_model to another model",
+                    sender8()
+                )
+            );
+            assert!(texts.iter().all(|text| !text.contains('{')), "{texts:?}");
+            source.remove_dir();
+        }
+
+        #[test]
+        fn an_ordinary_run_error_keeps_its_chain() {
+            let err = anyhow::anyhow!("disk full").context("could not write the session");
+
+            let EnvoyOutcome::Failed(why) = run_error_outcome(&err) else {
+                panic!("an ordinary error is a plain failure");
+            };
+            assert_eq!(why, "could not write the session: disk full");
+        }
+    }
+
+    mod parts_summary_tests {
+        use super::*;
+
+        fn part(value: serde_json::Value) -> Part {
+            serde_json::from_value(value).unwrap()
+        }
+
+        fn message_carrying(parts: Vec<Part>, dropped_parts: u32) -> PeerMessage {
+            let mut message = job(PeerKind::Ask, "msg-parts", "see the attached").message;
+            message.parts = parts;
+            message.dropped_parts = dropped_parts;
+            message
+        }
+
+        fn staged_file(name: &str, size: u64, staged: &str) -> Part {
+            part(json!({
+                "type": "file",
+                "name": name,
+                "size": size,
+                "sha256": "00".repeat(32),
+                "staged": staged,
+            }))
+        }
+
+        #[test]
+        fn a_message_with_no_parts_lists_nothing() {
+            assert_eq!(envoy_parts_summary(&message_carrying(Vec::new(), 0)), "");
+        }
+
+        #[test]
+        fn each_part_kind_gets_its_own_line_in_order() {
+            let message = message_carrying(
+                vec![
+                    staged_file("docs/hello.md", 13, "/staging/abababab/docs/hello.md"),
+                    part(json!({
+                        "type": "file",
+                        "name": "report.pdf",
+                        "size": 2048,
+                        "sha256": "11".repeat(32),
+                        "reference": "shared/report.pdf",
+                    })),
+                    part(json!({
+                        "type": "file",
+                        "name": "notes.txt",
+                        "size": 7,
+                        "sha256": "22".repeat(32),
+                    })),
+                    part(json!({"type": "text", "text": "see the attached notes"})),
+                    part(json!({"type": "data", "data": {"k": "v"}})),
+                ],
+                2,
+            );
+            assert_eq!(
+                envoy_parts_summary(&message),
+                [
+                    "attached: docs/hello.md (13 B), staged at /staging/abababab/docs/hello.md",
+                    "fetchable as shared/report.pdf (2048 B)",
+                    "listed but not sent: notes.txt (7 B)",
+                    "text part, quoted as data: \"see the attached notes\"",
+                    "data part, quoted as data: \"{\"k\":\"v\"}\"",
+                    "2 parts did not arrive",
+                ]
+                .join("\n")
+            );
+        }
+
+        #[test]
+        fn a_long_text_part_is_cut_and_says_so() {
+            let whole = "x".repeat(ENVOY_PART_TEXT_MAX_CHARS);
+            let long = "x".repeat(ENVOY_PART_TEXT_MAX_CHARS + 5);
+            let message = message_carrying(
+                vec![
+                    part(json!({"type": "text", "text": whole})),
+                    part(json!({"type": "text", "text": long})),
+                ],
+                1,
+            );
+            assert_eq!(
+                envoy_parts_summary(&message),
+                format!(
+                    "text part, quoted as data: \"{whole}\"\ntext part, quoted as data: \"{whole}\" (cut)\n1 part did not arrive"
+                )
+            );
+        }
+
+        #[test]
+        fn the_parts_list_goes_inside_the_fence_after_the_text() {
+            let message = message_carrying(
+                vec![staged_file(
+                    "docs/hello.md",
+                    13,
+                    "/staging/abababab/docs/hello.md",
+                )],
+                0,
+            );
+            let card = PeerCard {
+                who: "alice".into(),
+                instance: short(&message.source_destination).into(),
+                verb: "asked",
+                message_id: "msg-parts".into(),
+                via: "direct link",
+            };
+            let (tail, user) = compose_envoy_input(None, &card, &message);
+            assert_eq!(
+                user,
+                fence_peer_text(
+                    &message.source_destination,
+                    "Name: alice\nMessage id: msg-parts\nsee the attached\nattached: docs/hello.md (13 B), staged at /staging/abababab/docs/hello.md"
+                )
+            );
+            assert!(!tail.contains("docs/hello.md"), "{tail}");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn the_envoy_reads_an_inline_file_s_line_and_its_reply_names_the_file() {
+            let _cfg = TestConfigDirGuard::new("mesh-envoy-parts");
+            let (source, _source) = stub_envoy_source();
+            let tmp = TempDir::new("mesh-envoy-parts");
+            let staged = tmp
+                .path
+                .join("inbox")
+                .join("abababab")
+                .join("docs/hello.md");
+            std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+            std::fs::write(&staged, b"Hello, mesh!\n").unwrap();
+            let staged = staged.display().to_string();
+            let app = test_app();
+            let _idle = RecordingIdleSink::attach(&app);
+            // The reply names whatever file the request's `attached:` line names.
+            let client = ScriptedClient::composing(|messages| {
+                match messages
+                    .split_once("attached: ")
+                    .and_then(|(_, rest)| rest.split_once(" ("))
+                {
+                    Some((name, _)) => format!("Thanks, {name} arrived."),
+                    None => "Nothing was attached.".to_string(),
+                }
+            });
+            let runner = EnvoyRunner::start_with(Arc::clone(&app), {
+                let client = Arc::clone(&client);
+                drive_of(move |ctx, input, abort| {
+                    let client = Arc::clone(&client);
+                    async move {
+                        let mut ctx = ctx;
+                        let (output, _) = call_chat_completions(
+                            &input,
+                            false,
+                            false,
+                            client.as_ref(),
+                            &mut ctx,
+                            abort,
+                        )
+                        .await?;
+                        Ok(output)
+                    }
+                })
+            });
+            runner.attach();
+            let message = message_carrying(vec![staged_file("docs/hello.md", 13, &staged)], 0);
+            let destination = message.source_destination.clone();
+            app.mesh.deliver_peer(message);
+            wait_until("the reply to land in the inbox", || {
+                app.mesh.peer_inbox().len() >= 2
+            })
+            .await;
+            runner.stop().await;
+
+            let requests = client.requests.lock();
+            assert_eq!(requests.len(), 1);
+            let sent = &requests[0].messages;
+            let begin = sent
+                .find(&peer_fence_begin(&destination))
+                .expect("the fence opens");
+            let end = sent
+                .find(&peer_fence_end(&destination))
+                .expect("the fence closes");
+            // The request is JSON, so a path with a backslash in it is sent escaped.
+            let attached = serde_json::to_string(&format!(
+                "attached: docs/hello.md (13 B), staged at {staged}"
+            ))
+            .unwrap();
+            let line = sent
+                .find(attached.trim_matches('"'))
+                .unwrap_or_else(|| panic!("no attached line in {sent}"));
+            assert!(begin < line && line < end, "{sent}");
+
+            let (envelopes, _) = app.mesh.peer_inbox().drain();
+            assert_eq!(envelopes.len(), 2);
+            let reply = peer_of(&envelopes[1]);
+            assert_eq!(reply.kind, PeerKind::Reply);
+            assert_eq!(reply.content, "Thanks, docs/hello.md arrived.");
+            source.remove_dir();
         }
     }
 
@@ -5821,7 +6536,7 @@ mod tests {
 
         assert!(runner.answer("live-untold", "yes"));
         wait_until("the run to end with the human's answer", || {
-            idle.has("envoy replied: the human said: yes")
+            idle.has("envoy replied: yes")
         })
         .await;
         runner.stop().await;
@@ -5953,7 +6668,7 @@ mod tests {
         assert_escalated_notice(&heard[0], "live-twice");
         assert_eq!(heard[1].kind, PeerKind::Reply);
         assert_eq!(heard[1].disposition, Some(Disposition::Answered));
-        assert_eq!(heard[1].content, "the human said: yes / main");
+        assert_eq!(heard[1].content, "yes / main");
         assert!(
             heard.iter().all(|body| body.kind != PeerKind::Message),
             "{heard:?}"
@@ -6173,7 +6888,7 @@ mod tests {
         assert_eq!(heard[1].kind, PeerKind::Reply);
         assert_eq!(heard[1].disposition, Some(Disposition::Answered));
         assert_eq!(heard[1].thread.as_deref(), Some("live-stall"));
-        assert_eq!(heard[1].content, "the human said: yes");
+        assert_eq!(heard[1].content, "yes");
         assert!(
             idle.pushed
                 .lock()
@@ -6499,13 +7214,8 @@ mod tests {
         assert_eq!(heard[1].kind, PeerKind::Reply, "{heard:?}");
         assert_eq!(heard[1].disposition, Some(Disposition::Answered));
         assert_eq!(heard[1].thread.as_deref(), Some("stall-lapse"));
-        assert_eq!(heard[1].content, "the human said: yes");
-        assert_eq!(
-            idle.count("envoy replied: the human said: yes"),
-            1,
-            "{:?}",
-            idle.texts()
-        );
+        assert_eq!(heard[1].content, "yes");
+        assert_eq!(idle.count("envoy replied: yes"), 1, "{:?}", idle.texts());
         assert_eq!(
             idle.count("envoy escalated to the human"),
             0,
@@ -6688,7 +7398,7 @@ mod tests {
 
         assert!(runner.answer("failed-hook", "yes"));
         wait_until("the run to end with the human's answer", || {
-            idle.has("envoy replied: the human said: yes")
+            idle.has("envoy replied: yes")
         })
         .await;
         runner.stop().await;
@@ -7095,7 +7805,7 @@ mod tests {
         // The human answers through the real surface; the live run takes it.
         app_b.mesh.answer_inbound(&id, "yes").await.unwrap();
         let replied = peer.collect(&id, 20).await;
-        assert_collected(&replied, &id, &peer.to_b, "answered", "the human said: yes");
+        assert_collected(&replied, &id, &peer.to_b, "answered", "yes");
         runner.stop().await;
         assert!(
             store_b.get(&id).unwrap().is_none(),
@@ -7254,7 +7964,7 @@ mod tests {
 
         app_b.mesh.answer_inbound(&id, "yes").await.unwrap();
         let replied = peer.collect(&id, 20).await;
-        assert_collected(&replied, &id, &peer.to_b, "answered", "the human said: yes");
+        assert_collected(&replied, &id, &peer.to_b, "answered", "yes");
         runner.stop().await;
         assert!(
             store_b.get(&id).unwrap().is_none(),
