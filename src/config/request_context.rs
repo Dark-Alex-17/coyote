@@ -7333,7 +7333,7 @@ impl RequestContext {
                 "--dry-run",
             ],
             "deny" | "unshare" => &["--global", "--workspace", "--yes", "--dry-run"],
-            _ => &["--peer ", "--effective"],
+            _ => &["--peer ", "--effective", "--all"],
         };
         let excluded = |flag: &str| match flag {
             "--global" => prior.contains(&"--workspace"),
@@ -7341,6 +7341,7 @@ impl RequestContext {
             "--yes" => prior.contains(&"--dry-run"),
             "--dry-run" => prior.contains(&"--yes"),
             "--peer " => prior.contains(&"--force"),
+            "--all" => !prior.contains(&"--effective"),
             "--force" => {
                 prior.contains(&"--peer")
                     || positional.is_some_and(|token| token.contains(GLOB_METACHARACTERS))
@@ -39666,7 +39667,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn repl_complete_mesh_shares_offers_its_two_flags_and_a_used_flag_is_not_offered_again() {
+    async fn repl_complete_mesh_shares_offers_all_only_after_effective_and_a_used_flag_is_not_offered_again()
+     {
         let _guard = HelperConfigDirGuard::new();
         let fixture = seed_mesh_completion_fixture("rc-mesh-complete-shares").await;
         let _root = publish_share_root(&fixture.ctx, "rc-mesh-complete-shares-root");
@@ -39677,6 +39679,10 @@ mod tests {
         );
         assert_eq!(
             completion_values(&fixture.complete(&["shares", "--effective", ""])),
+            ["--peer ", "--all"]
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["shares", "--effective", "--all", ""])),
             ["--peer "]
         );
         assert_eq!(

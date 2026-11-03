@@ -28,10 +28,10 @@ use crate::mesh::pending::{
     question_not_an_access_request,
 };
 use crate::mesh::shares::{
-    BuiltinHit, DEFAULT_LIST_WALK_BOUND, GLOB_METACHARACTERS, LIST_PAGE_SIZE, Layer, MatchCount,
-    Mutation, PeerRef, RawKind, ShareLocations, ShareSet, Verdict as ShareVerdict, WriteScope,
-    case_folding_hint, is_broad_pattern, is_canonical_peer, protected_segment, validate_override,
-    validate_pattern,
+    ALL_LIST_ROWS, BuiltinHit, DEFAULT_LIST_WALK_BOUND, GLOB_METACHARACTERS, LIST_PAGE_SIZE, Layer,
+    MatchCount, Mutation, PeerRef, RawKind, ShareLocations, ShareSet, Verdict as ShareVerdict,
+    WriteScope, case_folding_hint, is_broad_pattern, is_canonical_peer, protected_segment,
+    validate_override, validate_pattern,
 };
 use crate::mesh::trust::{
     BindingConflict, Decision, Forgotten, IdentityStanding, KeyChange, LiveMesh, Rule, ServedBy,
@@ -189,7 +189,7 @@ pub(super) const VERBS: &[(&str, &str, &str)] = &[
     (
         "shares",
         "List the share rules and the file each came from, or the files a peer can fetch",
-        ".mesh shares [--peer <identity|destination>] [--effective]",
+        ".mesh shares [--peer <identity|destination>] [--effective [--all]]",
     ),
     (
         "grant",
@@ -3967,11 +3967,19 @@ fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
 
 /// `.mesh shares`: the rules as the two files hold them, or with `--effective` the files
 /// they resolve to under the root with the verdict a fetch of each would get. Inspection
-/// only, so it works while the mesh is off and never prints a file's contents.
+/// only, so it works while the mesh is off and never prints a file's contents. `--all`
+/// widens `--effective` to every file under the root, whether an allow names it or not.
 fn shares(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
-    let args = parse_mutation_args(rest.unwrap_or(""), "shares", &["--peer", "--effective"])?;
+    let args = parse_mutation_args(
+        rest.unwrap_or(""),
+        "shares",
+        &["--peer", "--effective", "--all"],
+    )?;
     if let Some(token) = args.positional.first() {
         return Err(unexpected(token, "shares"));
+    }
+    if args.all && !args.effective {
+        bail!("`--all` works with `--effective`: run `.mesh shares --effective --all`.");
     }
     let peer = args
         .peer
@@ -4003,6 +4011,8 @@ fn shares(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             &share_audience(peer.as_deref()),
             &root,
             case,
+            args.all,
+            DEFAULT_LIST_WALK_BOUND,
         )
     } else {
         render_share_rules(&set, &peer_ref, peer.as_deref(), ctx.command_prefix())
@@ -4300,14 +4310,15 @@ fn render_effective_shares(
     audience: &str,
     root: &Path,
     case: Option<bool>,
+    all: bool,
+    walk_bound: usize,
 ) -> String {
     let case_insensitive = case.unwrap_or(false);
-    let resolved = set.resolve(
-        peer,
-        case_insensitive,
-        DEFAULT_LIST_WALK_BOUND,
-        LIST_PAGE_SIZE,
-    );
+    let resolved = if all {
+        set.resolve_all(peer, case_insensitive, walk_bound, ALL_LIST_ROWS)
+    } else {
+        set.resolve(peer, case_insensitive, walk_bound, LIST_PAGE_SIZE)
+    };
     let mut lines = Vec::new();
     if case.is_none() {
         lines.push(
@@ -4315,17 +4326,21 @@ fn render_effective_shares(
                 .to_string(),
         );
     }
-    if resolved.entries.is_empty() {
+    if resolved.entries.is_empty() && !all {
         lines.push(format!(
             "Nothing resolves: no allow rule names an existing file under {}.",
             root.display()
         ));
         return lines.join("\n");
     }
-    lines.push(format!(
-        "Files {audience} can fetch from {}:",
-        root.display()
-    ));
+    lines.push(if all {
+        format!(
+            "Every file under {} and what it is to {audience}:",
+            root.display()
+        )
+    } else {
+        format!("Files {audience} can fetch from {}:", root.display())
+    });
     let mut table = mesh_table(&["path", "verdict"]);
     for entry in &resolved.entries {
         let verdict = match entry.verdict {
@@ -4338,9 +4353,19 @@ fn render_effective_shares(
         table.add_row([entry.path.as_str(), verdict]);
     }
     lines.push(table.to_string());
-    if resolved.capped {
+    if resolved.capped && !all {
         lines.push(format!(
             "listing capped at {LIST_PAGE_SIZE} entries; narrow the patterns, or pass `--peer <hash>` to see one peer's view."
+        ));
+    }
+    if all {
+        lines.push("shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in deny: a secret name nothing serves unless an override names the file; protected: inside .git or a config directory, never served; not allowed: no allow rule names it.".to_string());
+    }
+    if all && resolved.capped {
+        let at_least = if resolved.truncated { "at least " } else { "" };
+        let more = resolved.total - ALL_LIST_ROWS;
+        lines.push(format!(
+            "... and {at_least}{more} more files not shown (--all stops at {ALL_LIST_ROWS} rows); pass --peer <hash>, or drop --all to see only the files an allow rule names."
         ));
     }
     if resolved.truncated {
@@ -8768,6 +8793,8 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             "every trusted peer",
             &fx.root,
             Some(false),
+            false,
+            DEFAULT_LIST_WALK_BOUND,
         );
         assert_eq!(fx.placeholders(&text), EFFECTIVE_SHARES_SNAPSHOT);
     }
@@ -8782,6 +8809,77 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
 ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
 │ src/vault/keys.yaml ┆ denied        │
 └─────────────────────┴───────────────┘"#;
+
+    mod effective_all_snapshot {
+        use super::*;
+
+        fn render_all(fx: &ShareSnapshot, walk_bound: usize) -> String {
+            render_effective_shares(
+                &fx.set(),
+                &PeerRef::unscoped(),
+                "every trusted peer",
+                &fx.root,
+                Some(false),
+                true,
+                walk_bound,
+            )
+        }
+
+        /// The whole `.mesh shares --effective --all` text with no allow rule: a secret
+        /// name, a file under `.git` and a plain source file, each with its verdict.
+        #[test]
+        fn effective_shares_all_table_snapshot() {
+            let fx = ShareSnapshot::new(
+                "repl-mesh-effective-all-snapshot",
+                "version: 1\n",
+                &[".env", ".git/config", "src/main.rs"],
+            );
+            let text = render_all(&fx, DEFAULT_LIST_WALK_BOUND);
+            assert_eq!(fx.placeholders(&text), EFFECTIVE_SHARES_ALL_SNAPSHOT);
+        }
+
+        const EFFECTIVE_SHARES_ALL_SNAPSHOT: &str = r#"Every file under <root> and what it is to every trusted peer:
+┌─────────────┬───────────────┐
+│ path        ┆ verdict       │
+╞═════════════╪═══════════════╡
+│ .env        ┆ built-in deny │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ .git/config ┆ protected     │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ src/main.rs ┆ not allowed   │
+└─────────────┴───────────────┘
+shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in deny: a secret name nothing serves unless an override names the file; protected: inside .git or a config directory, never served; not allowed: no allow rule names it."#;
+
+        /// A walk that stops at its bound past the row cap can only say how many more
+        /// it saw, so the count reads `at least` and the bound line follows it. The bound
+        /// counts the root and every file it visits.
+        #[test]
+        fn a_walk_cut_by_its_bound_past_the_row_cap_says_at_least() {
+            let files: Vec<String> = (0..ALL_LIST_ROWS + 10)
+                .map(|i| format!("f{i:04}.md"))
+                .collect();
+            let names: Vec<&str> = files.iter().map(String::as_str).collect();
+            let fx = ShareSnapshot::new("repl-mesh-effective-all-bound", "version: 1\n", &names);
+            let walk_bound = ALL_LIST_ROWS + 5;
+            let seen = walk_bound - 1;
+
+            let text = render_all(&fx, walk_bound);
+
+            assert_eq!(table_rows(&text).len(), ALL_LIST_ROWS, "{text}");
+            let footer = table_footer(&text);
+            assert_eq!(
+                footer[1..],
+                [
+                    format!(
+                        "... and at least {} more files not shown (--all stops at {ALL_LIST_ROWS} rows); pass --peer <hash>, or drop --all to see only the files an allow rule names.",
+                        seen - ALL_LIST_ROWS
+                    ),
+                    "The walk stopped at its bound, so files may be missing.".to_string(),
+                ],
+                "{footer:?}"
+            );
+        }
+    }
 
     /// The node facts of a bare `.mesh info` with the node on, the shipped default (the
     /// local rnsd, as a non-Linux host labels it) connected, nothing retired or heard yet:
@@ -29610,6 +29708,134 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         assert!(table_footer(&out).is_empty(), "{:?}", table_footer(&out));
                         fx.stop().await;
                     });
+                }
+
+                mod effective_all {
+                    use super::*;
+
+                    const LEGEND: &str = "shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in deny: a secret name nothing serves unless an override names the file; protected: inside .git or a config directory, never served; not allowed: no allow rule names it.";
+
+                    /// With no allow rule, `--all` still lists every file under the root
+                    /// with what it is, where plain `--effective` has nothing to resolve.
+                    #[test]
+                    #[serial]
+                    fn shares_effective_all_lists_every_file_with_its_verdict_and_a_legend() {
+                        let _guard = TestConfigDirGuard::new("repl-mesh-shares-all");
+                        let _capture = capture::install();
+                        let _script = prompt_script::install(&[]);
+                        run_async(async {
+                            let mut fx = ShareFixture::new(
+                                "repl-mesh-shares-all",
+                                &[".env", ".git/config", "src/main.rs"],
+                            )
+                            .await;
+                            fx.write_global("version: 1\n");
+
+                            let out = out_of(&mut fx.ctx, ".mesh shares --effective --all")
+                                .await
+                                .unwrap();
+                            assert_eq!(
+                                out.lines().next().unwrap(),
+                                format!(
+                                    "Every file under {} and what it is to every trusted peer:",
+                                    fx.root.path.display()
+                                ),
+                                "{out}"
+                            );
+                            assert_eq!(
+                                table_rows(&out),
+                                [
+                                    [".env", "built-in deny"],
+                                    [".git/config", "protected"],
+                                    ["src/main.rs", "not allowed"],
+                                ],
+                                "{out}"
+                            );
+                            assert_eq!(table_footer(&out), [LEGEND], "{out}");
+                            fx.stop().await;
+                        });
+                    }
+
+                    /// Past the row cap `--all` shows exactly that many rows and counts the
+                    /// rest on a line under the legend.
+                    #[test]
+                    #[serial]
+                    fn shares_effective_all_past_the_row_cap_counts_the_files_not_shown() {
+                        let _guard = TestConfigDirGuard::new("repl-mesh-shares-all-cap");
+                        let _capture = capture::install();
+                        let _script = prompt_script::install(&[]);
+                        run_async(async {
+                            let files: Vec<String> = (0..ALL_LIST_ROWS + 5)
+                                .map(|i| format!("docs/f{i:04}.md"))
+                                .collect();
+                            let names: Vec<&str> = files.iter().map(String::as_str).collect();
+                            let mut fx =
+                                ShareFixture::new("repl-mesh-shares-all-cap", &names).await;
+                            fx.write_global("version: 1\nallow:\n- pattern: docs/**\n");
+
+                            let out = out_of(&mut fx.ctx, ".mesh shares --effective --all")
+                                .await
+                                .unwrap();
+                            let rows = table_rows(&out);
+                            let listed: Vec<&str> =
+                                rows.iter().map(|row| row[0].as_str()).collect();
+                            assert_eq!(listed, names[..ALL_LIST_ROWS].to_vec(), "{out}");
+                            assert_eq!(
+                                table_footer(&out),
+                                [
+                                    LEGEND.to_string(),
+                                    format!(
+                                        "... and 5 more files not shown (--all stops at {ALL_LIST_ROWS} rows); pass --peer <hash>, or drop --all to see only the files an allow rule names."
+                                    ),
+                                ],
+                                "{out}"
+                            );
+                            fx.stop().await;
+                        });
+                    }
+
+                    #[test]
+                    #[serial]
+                    fn shares_all_without_effective_is_refused_naming_the_full_command() {
+                        let _guard = TestConfigDirGuard::new("repl-mesh-shares-all-alone");
+                        let _capture = capture::install();
+                        let _script = prompt_script::install(&[]);
+                        run_async(async {
+                            let mut fx =
+                                ShareFixture::new("repl-mesh-shares-all-alone", &["docs/a.md"])
+                                    .await;
+
+                            assert_eq!(
+                                refusal(&mut fx.ctx, ".mesh shares --all").await,
+                                "`--all` works with `--effective`: run `.mesh shares --effective --all`."
+                            );
+                            fx.stop().await;
+                        });
+                    }
+
+                    /// A directory inside `.git` whose name no peer could ask for is left out,
+                    /// so its raw name never reaches the terminal.
+                    #[test]
+                    #[serial]
+                    fn shares_effective_all_leaves_out_a_collapsed_dir_with_no_wire_name() {
+                        let _guard = TestConfigDirGuard::new("repl-mesh-shares-all-invalid");
+                        let _capture = capture::install();
+                        let _script = prompt_script::install(&[]);
+                        run_async(async {
+                            let mut fx = ShareFixture::new(
+                                "repl-mesh-shares-all-invalid",
+                                &[".git/good/x", ".git/a\u{200B}b/x"],
+                            )
+                            .await;
+                            fx.write_global("version: 1\n");
+
+                            let out = out_of(&mut fx.ctx, ".mesh shares --effective --all")
+                                .await
+                                .unwrap();
+                            assert_eq!(table_rows(&out), [[".git/good/", "protected"]], "{out}");
+                            fx.stop().await;
+                        });
+                    }
                 }
 
                 /// `shares` is inspection and reads the files the node would serve from

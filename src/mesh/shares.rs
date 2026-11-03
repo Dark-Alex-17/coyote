@@ -51,6 +51,8 @@ const SHARES_FILE_REMEDY: Remedy =
 pub(crate) const DEFAULT_LIST_WALK_BOUND: usize = 100_000;
 /// Entries per listing page, the wire's cap.
 pub(crate) const LIST_PAGE_SIZE: usize = 1_000;
+/// Rows the owner's `--all` view of the share root shows before it says it was cut.
+pub(crate) const ALL_LIST_ROWS: usize = 200;
 
 /// What no allow reaches, at any depth. The secret names are liftable by an `override`
 /// naming the exact file. `.git` and `.git/**` sit here only so the text match, the
@@ -268,12 +270,14 @@ pub(crate) struct Listing {
 
 /// The human's view of what `list` serves a peer and what it holds back: every regular
 /// file an allow names with its verdict, so a deny that swallows an allow is visible.
-/// `truncated` says the walk hit its bound; `capped` that entries past `cap` were cut.
+/// `truncated` says the walk hit its bound; `capped` that entries past `cap` were cut,
+/// and `total` how many there were before the cut.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct Resolved {
     pub entries: Vec<ResolvedEntry>,
     pub truncated: bool,
     pub capped: bool,
+    pub total: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -916,23 +920,26 @@ impl ShareSet {
         let Ok(rules) = self.rules(peer, case_insensitive) else {
             return Resolved::default();
         };
-        let walk = self.walk_allows(&rules, peer, walk_bound);
-        let truncated = walk.truncated;
-        let mut entries: Vec<ResolvedEntry> = walk
-            .sorted()
-            .into_iter()
-            .map(|candidate| ResolvedEntry {
-                path: candidate.path,
-                verdict: candidate.verdict,
-            })
-            .collect();
-        let capped = entries.len() > cap;
-        entries.truncate(cap);
-        Resolved {
-            entries,
-            truncated,
-            capped,
-        }
+        self.walk_allows(&rules, peer, walk_bound).resolved(cap)
+    }
+
+    /// `resolve` for every file under the share root, whether an allow names it or not,
+    /// for the owner's own view; nothing here reaches a peer. A protected directory is
+    /// entered one level: its own files get their verdict, and each directory in it is
+    /// one `<dir>/` row marked `Protected`, its contents never read.
+    pub(crate) fn resolve_all(
+        &self,
+        peer: &PeerRef<'_>,
+        case_insensitive: bool,
+        walk_bound: usize,
+        cap: usize,
+    ) -> Resolved {
+        let Ok(rules) = self.rules(peer, case_insensitive) else {
+            return Resolved::default();
+        };
+        let mut walk = Walk::new(&rules, walk_bound, usize::MAX).including_unallowed();
+        walk.run(rules.canonical_root.clone());
+        walk.resolved(cap)
     }
 
     /// Counts only the `Shared` verdicts, up to `cap` and no further, so a thousand denied
@@ -966,8 +973,9 @@ impl ShareSet {
     /// to `cap` and no further, so a verb can ask whether the pattern a human is about to
     /// write is broad before it writes it. Independent of every allow and deny on disk;
     /// `.git` and the protected directories are never entered and a symlinked directory
-    /// never followed, as in `list`. Fails only for a pattern the files would refuse or a
-    /// root that does not resolve.
+    /// never followed, as in `list`; the `--all` walk lists a protected directory's own
+    /// files and never descends further, and served reads never enter it. Fails only for
+    /// a pattern the files would refuse or a root that does not resolve.
     pub(crate) fn count_matches(
         &self,
         pattern: &str,
@@ -1234,7 +1242,8 @@ pub(crate) fn case_folding_hint(root: &Path) -> Option<bool> {
 /// the human's view of what the denies hold back. Symlinked directories are never
 /// entered, since a link can take the walk anywhere and `**` is the user's promise about
 /// this tree alone; a symlinked file is judged on what it resolves to, as a fetch of it
-/// would be.
+/// would be. `.git` and the protected directories are never entered by served reads; the
+/// `--all` walk lists a protected directory's own files and never descends further.
 struct Walk<'a> {
     rules: &'a ShareRules,
     remaining: usize,
@@ -1244,6 +1253,9 @@ struct Walk<'a> {
     capped: bool,
     /// When set, only files with this verdict are kept and counted against `cap`.
     only: Option<Verdict>,
+    /// Keeps files no allow names and enters protected directories one level, for the
+    /// owner's `--all` view.
+    all: bool,
     candidates: Vec<Candidate>,
 }
 
@@ -1263,12 +1275,18 @@ impl<'a> Walk<'a> {
             cap,
             capped: false,
             only: None,
+            all: false,
             candidates: Vec::new(),
         }
     }
 
     fn keeping_only(mut self, verdict: Verdict) -> Self {
         self.only = Some(verdict);
+        self
+    }
+
+    fn including_unallowed(mut self) -> Self {
+        self.all = true;
         self
     }
 
@@ -1296,8 +1314,8 @@ impl<'a> Walk<'a> {
     }
 
     fn run(&mut self, start: PathBuf) {
-        let mut stack = vec![start];
-        while let Some(path) = stack.pop() {
+        let mut stack = vec![(start, false)];
+        while let Some((path, in_protected)) = stack.pop() {
             if self.capped {
                 return;
             }
@@ -1310,15 +1328,19 @@ impl<'a> Walk<'a> {
                 continue;
             };
             if metadata.is_dir() {
-                if path.file_name().is_some_and(|name| name == ".git")
-                    || self.rules.is_protected(&path)
-                {
+                if in_protected {
+                    self.collapsed(&path);
+                    continue;
+                }
+                let protected = path.file_name().is_some_and(|name| name == ".git")
+                    || self.rules.is_protected(&path);
+                if protected && !self.all {
                     continue;
                 }
                 let Ok(children) = fs::read_dir(&path) else {
                     continue;
                 };
-                stack.extend(children.flatten().map(|child| child.path()));
+                stack.extend(children.flatten().map(|child| (child.path(), protected)));
             } else if metadata.is_file() || metadata.file_type().is_symlink() {
                 self.file(&path);
             }
@@ -1326,8 +1348,8 @@ impl<'a> Walk<'a> {
     }
 
     /// Keeps `path` if its name under the root is a wire path and an allow names what it
-    /// resolves to, a regular file. A name the grammar refuses is left out, since no peer
-    /// could fetch it.
+    /// resolves to, a regular file; the `--all` walk does not ask for the allow. A name
+    /// the grammar refuses is left out, since no peer could fetch it.
     fn file(&mut self, path: &Path) {
         let Some(wire_text) = self.wire_text(path) else {
             return;
@@ -1338,21 +1360,42 @@ impl<'a> Walk<'a> {
         let Ok(canonical) = canonicalize(path) else {
             return;
         };
-        if !self.rules.allow_names(&canonical) {
+        if !self.all && !self.rules.allow_names(&canonical) {
             return;
         }
         if !fs::metadata(&canonical).is_ok_and(|metadata| metadata.is_file()) {
             return;
         }
         let verdict = self.rules.verdict(&wire, &canonical);
-        if self.only.is_some_and(|only| only != verdict) {
-            return;
-        }
-        self.candidates.push(Candidate {
+        self.keep(Candidate {
             path: wire_text,
             canonical,
             verdict,
         });
+    }
+
+    /// A directory inside a protected one, kept as a single `<dir>/` row so the owner
+    /// sees it exists without the walk reading what it holds. A name the grammar refuses
+    /// is left out, as in `file`, so a raw name never reaches the terminal.
+    fn collapsed(&mut self, path: &Path) {
+        let Some(wire_text) = self.wire_text(path) else {
+            return;
+        };
+        if WirePath::parse(&wire_text).is_err() {
+            return;
+        }
+        self.keep(Candidate {
+            path: format!("{wire_text}/"),
+            canonical: path.to_path_buf(),
+            verdict: Verdict::Protected,
+        });
+    }
+
+    fn keep(&mut self, candidate: Candidate) {
+        if self.only.is_some_and(|only| only != candidate.verdict) {
+            return;
+        }
+        self.candidates.push(candidate);
         self.capped = self.candidates.len() >= self.cap;
     }
 
@@ -1365,6 +1408,26 @@ impl<'a> Walk<'a> {
         candidates.sort_by(|left, right| left.path.cmp(&right.path));
         candidates.dedup_by(|left, right| left.path == right.path);
         candidates
+    }
+
+    fn resolved(self, cap: usize) -> Resolved {
+        let truncated = self.truncated;
+        let mut entries: Vec<ResolvedEntry> = self
+            .sorted()
+            .into_iter()
+            .map(|candidate| ResolvedEntry {
+                path: candidate.path,
+                verdict: candidate.verdict,
+            })
+            .collect();
+        let total = entries.len();
+        entries.truncate(cap);
+        Resolved {
+            entries,
+            truncated,
+            capped: total > cap,
+            total,
+        }
     }
 }
 
@@ -3075,6 +3138,143 @@ mod tests {
 
         assert_eq!(listed_paths(&listing), ["docs/a.md"]);
         assert!(!listing.truncated);
+    }
+
+    mod resolve_all_tests {
+        use super::*;
+
+        fn resolve_all(set: &ShareSet, walk_bound: usize, cap: usize) -> Resolved {
+            set.resolve_all(&PeerRef::unscoped(), false, walk_bound, cap)
+        }
+
+        fn paths(resolved: &Resolved) -> Vec<&str> {
+            resolved
+                .entries
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect()
+        }
+
+        fn entry(path: &str, verdict: Verdict) -> ResolvedEntry {
+            ResolvedEntry {
+                path: path.into(),
+                verdict,
+            }
+        }
+
+        #[test]
+        fn classifies_builtin_protected_and_not_allowed() {
+            let fx = Fixture::new("resolve-all-verdicts");
+            for path in [".env", ".git/config", "src/main.rs"] {
+                fx.file(path);
+            }
+
+            let resolved = resolve_all(&fx.load(), DEFAULT_LIST_WALK_BOUND, LIST_PAGE_SIZE);
+
+            assert_eq!(
+                resolved.entries,
+                [
+                    entry(".env", Verdict::BuiltinDenied),
+                    entry(".git/config", Verdict::Protected),
+                    entry("src/main.rs", Verdict::NotAllowed),
+                ]
+            );
+            assert!(!resolved.truncated);
+            assert!(!resolved.capped);
+            assert_eq!(resolved.total, 3);
+        }
+
+        #[test]
+        fn nested_git_objects_collapse_to_one_row() {
+            let fx = Fixture::new("resolve-all-collapse");
+            for path in [
+                ".git/HEAD",
+                ".git/objects/ab/cdef",
+                ".git/objects/pack/p",
+                "vendor/lib/.git/objects/12/3456",
+                "vendor/lib/a.rs",
+            ] {
+                fx.file(path);
+            }
+
+            let resolved = resolve_all(&fx.load(), DEFAULT_LIST_WALK_BOUND, LIST_PAGE_SIZE);
+
+            assert_eq!(
+                resolved.entries,
+                [
+                    entry(".git/HEAD", Verdict::Protected),
+                    entry(".git/objects/", Verdict::Protected),
+                    entry("vendor/lib/.git/objects/", Verdict::Protected),
+                    entry("vendor/lib/a.rs", Verdict::NotAllowed),
+                ]
+            );
+        }
+
+        #[test]
+        fn list_and_resolve_unchanged_by_all_walk() {
+            let (fx, set) = resolve_fixture("resolve-all-served");
+            fx.file(".git/objects/ab/cdef");
+            let resolve = || {
+                set.resolve(
+                    &PeerRef::unscoped(),
+                    false,
+                    DEFAULT_LIST_WALK_BOUND,
+                    LIST_PAGE_SIZE,
+                )
+            };
+            let (listed_before, resolved_before) =
+                (listing(&set, None, DEFAULT_LIST_WALK_BOUND), resolve());
+
+            let all = resolve_all(&set, DEFAULT_LIST_WALK_BOUND, LIST_PAGE_SIZE);
+
+            assert!(paths(&all).contains(&".git/objects/"), "{:?}", paths(&all));
+            assert!(paths(&all).contains(&".git/config"), "{:?}", paths(&all));
+            let listed = listing(&set, None, DEFAULT_LIST_WALK_BOUND);
+            assert_eq!(listed, listed_before);
+            assert_eq!(listed_paths(&listed), ["docs/a.md"]);
+            let resolved = resolve();
+            assert_eq!(resolved, resolved_before);
+            assert_eq!(paths(&resolved), [".env", "docs/a.md", "src/vault/k"]);
+        }
+
+        #[test]
+        fn invalid_wire_dir_name_is_not_collapsed() {
+            let fx = Fixture::new("resolve-all-invalid");
+            for path in [".git/good/x", ".git/a\u{200B}b/x"] {
+                fx.file(path);
+            }
+
+            let resolved = resolve_all(&fx.load(), DEFAULT_LIST_WALK_BOUND, LIST_PAGE_SIZE);
+
+            assert_eq!(resolved.entries, [entry(".git/good/", Verdict::Protected)]);
+        }
+
+        #[test]
+        fn total_counts_before_cap_for_resolve_and_resolve_all() {
+            let (_fx, set) = resolve_fixture("resolve-all-total");
+
+            let resolved = set.resolve(&PeerRef::unscoped(), false, DEFAULT_LIST_WALK_BOUND, 1);
+            assert_eq!(paths(&resolved), [".env"]);
+            assert_eq!(resolved.total, 3);
+            assert!(resolved.capped);
+
+            let whole = resolve_all(&set, DEFAULT_LIST_WALK_BOUND, LIST_PAGE_SIZE);
+            let cut = resolve_all(&set, DEFAULT_LIST_WALK_BOUND, 2);
+            assert!(whole.entries.len() > 2, "{:?}", paths(&whole));
+            assert_eq!(whole.total, whole.entries.len());
+            assert!(!whole.capped);
+            assert_eq!(cut.entries, whole.entries[..2]);
+            assert_eq!(cut.total, whole.total);
+            assert!(cut.capped);
+        }
+
+        #[test]
+        fn reports_a_walk_cut_short() {
+            let (_fx, set) = resolve_fixture("resolve-all-bound");
+
+            assert!(resolve_all(&set, 2, LIST_PAGE_SIZE).truncated);
+            assert!(!resolve_all(&set, DEFAULT_LIST_WALK_BOUND, LIST_PAGE_SIZE).truncated);
+        }
     }
 
     #[test]
