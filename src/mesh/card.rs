@@ -2,8 +2,8 @@ use crate::mesh::brief::{Digest, digest_objective_for};
 use crate::mesh::display_text;
 use crate::mesh::node::{MeshRuntime, MeshSlot};
 use crate::mesh::request::{
-    AdmittedRequest, DispatchError, Handler, RemoteRefusal, Reply, RequestError, RequestOptions,
-    STATUS_PATH,
+    AdmittedRequest, DispatchError, Handler, NoAnswer, RemoteRefusal, Reply, RequestError,
+    RequestOptions, STATUS_PATH, request_remedy,
 };
 use crate::mesh::snapshot::{MeshSnapshot, TurnState};
 
@@ -520,12 +520,14 @@ impl Handler for StatusHandler {
 /// rather than `anyhow`; `?` into an `anyhow::Result` still works through `std::error::Error`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StatusError {
-    /// The request itself failed: no link, no answer in time, refused with a code other
-    /// than `NoAccess`, or this node is not running. A status request is answered live or
-    /// not at all; nothing queues it.
+    /// The request itself failed: no link, refused with a code other than `NoAccess`, or
+    /// this node is not running. A status request is answered live or not at all; nothing
+    /// queues it.
     Transport(RequestError),
     /// The peer answered `NoAccess`: this node trusts it, but it has not trusted this instance.
     NotTrustedByPeer(RemoteRefusal),
+    /// The link came up but the peer did not answer in time.
+    NoAnswer(NoAnswer),
     /// The peer let the request through but nothing there serves `/status`.
     NotServed(DispatchError),
     /// The reply is not a card: not a map, or a required key is missing or the wrong type.
@@ -538,6 +540,11 @@ pub(crate) enum StatusError {
 impl fmt::Display for StatusError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Transport(err) if err.is_retryable_wait() => write!(
+                f,
+                "{err}. {}. A status request is answered live or not at all; nothing queues it for later.",
+                request_remedy(err)
+            ),
             Self::Transport(err) => write!(
                 f,
                 "{err}. A status request is answered live or not at all; nothing queues it for later."
@@ -545,6 +552,10 @@ impl fmt::Display for StatusError {
             Self::NotTrustedByPeer(refusal) => write!(
                 f,
                 "{refusal} A status request is answered live or not at all; nothing queues it for later."
+            ),
+            Self::NoAnswer(no_answer) => write!(
+                f,
+                "{no_answer} A status request is answered live or not at all; nothing queues it for later."
             ),
             Self::NotServed(DispatchError::NoProvider { path }) => write!(
                 f,
@@ -590,14 +601,14 @@ impl MeshRuntime {
         let reply = self
             .request(destination, STATUS_PATH, Value::Nil, options)
             .await
-            .map_err(|err| {
-                if err.is_access_refusal() {
-                    StatusError::NotTrustedByPeer(
-                        self.remote_refusal(&destination.address_hash.to_hex_string()),
-                    )
-                } else {
-                    StatusError::Transport(err)
+            .map_err(|err| match err {
+                err if err.is_access_refusal() => StatusError::NotTrustedByPeer(
+                    self.remote_refusal(&destination.address_hash.to_hex_string()),
+                ),
+                RequestError::Timeout { .. } => {
+                    StatusError::NoAnswer(self.no_answer(&destination.address_hash.to_hex_string()))
                 }
+                err => StatusError::Transport(err),
             })?;
         if let Some(error) = DispatchError::from_value(&reply) {
             return Err(StatusError::NotServed(error));
@@ -606,6 +617,48 @@ impl MeshRuntime {
         self.memory()
             .remember_card(&destination.address_hash.to_hex_string(), card.clone());
         Ok(card)
+    }
+}
+
+#[cfg(test)]
+mod no_answer_tests {
+    #[cfg(unix)]
+    use super::*;
+    #[cfg(unix)]
+    use crate::mesh::request::short;
+    #[cfg(unix)]
+    use crate::mesh::test_support::beside_a_stub_that_does_not_know_it;
+
+    /// The link came up and the peer said nothing to `/status`: the error names the
+    /// silence and the remedy on the peer's side, not the request's raw timeout.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_silent_peer_is_reported_as_no_answer() {
+        let (stub, started, slot) = beside_a_stub_that_does_not_know_it("status-no-answer").await;
+        let runtime = &started.runtime;
+        let to = stub.destination_hex();
+        let desc = runtime.resolve_destination(&to).await.unwrap();
+        let options = RequestOptions {
+            request_timeout: Duration::from_secs(2),
+            link_timeout: Duration::from_secs(2),
+        };
+
+        let err = runtime
+            .request_status_with(&desc, options)
+            .await
+            .unwrap_err();
+
+        let own = runtime.current_destination_hash();
+        assert_eq!(err, StatusError::NoAnswer(NoAnswer::new(&to, own.clone())));
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "no answer from {}: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance). A status request is answered live or not at all; nothing queues it for later.",
+                short(&to)
+            )
+        );
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
     }
 }
 

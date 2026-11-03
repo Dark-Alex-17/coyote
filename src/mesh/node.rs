@@ -56,9 +56,9 @@ use crate::mesh::protocol::{Compatibility, MESH_PROTOCOL_MIN_SUPPORTED, MESH_PRO
 use crate::mesh::request::RequestHandler;
 use crate::mesh::request::{
     ACCESS_PATH, Dispatcher, Envelope, FETCH_PATH, KNOCK_PATH, KNOWN_PATHS, LIST_PATH,
-    LibraryHandler, MAX_FETCH_RESPONSE_BYTES, MAX_REQUEST_PAYLOAD_BYTES, MESSAGE_PATH, OriginName,
-    RefusalCode, RemoteRefusal, RequestError, RequestOptions, STATUS_PATH, redact_hashes,
-    request as link_request, short,
+    LibraryHandler, MAX_FETCH_RESPONSE_BYTES, MAX_REQUEST_PAYLOAD_BYTES, MESSAGE_PATH, NoAnswer,
+    OriginName, RefusalCode, RemoteRefusal, RequestError, RequestOptions, STATUS_PATH,
+    redact_hashes, request as link_request, short,
 };
 use crate::mesh::sent_threads::SentThreads;
 use crate::mesh::shares::ShareLocations;
@@ -999,6 +999,12 @@ impl MeshRuntime {
         )
     }
 
+    /// A peer's silence after the link came up, with this node by the same current
+    /// destination `remote_refusal` names.
+    pub(crate) fn no_answer(&self, destination: &str) -> NoAnswer {
+        NoAnswer::new(destination, self.current_destination_hash())
+    }
+
     pub(crate) fn cache_dir(&self) -> &Path {
         &self.cache_dir
     }
@@ -1455,6 +1461,8 @@ impl MeshRuntime {
     /// A link that came up and drew no reply is kept apart from one that never came up:
     /// a peer that does not trust this identity answers a knock with silence, so that
     /// outcome is reported as unanswered, never as the peer being unreachable.
+    /// A wait that ran out on this node's side, or with the peer's answer still
+    /// arriving, is neither: it is reported with the retry and not stored.
     /// Posts to the propagation node queue behind `posting`, since `propagate` needs one
     /// caller per node at a time.
     pub(crate) async fn knock_with(
@@ -1481,9 +1489,11 @@ impl MeshRuntime {
                 });
             }
             Err(err @ RequestError::Timeout { .. }) => (KnockFallback::Unanswered, err),
-            Err(err @ (RequestError::LinkFailed(_) | RequestError::LinkClosed)) => {
-                (KnockFallback::Unreachable, err)
-            }
+            Err(
+                err @ (RequestError::LinkActivationTimeout { .. }
+                | RequestError::LinkFailed(_)
+                | RequestError::LinkClosed),
+            ) => (KnockFallback::Unreachable, err),
             Err(RequestError::NotRunning | RequestError::Shutdown) => {
                 return Err(KnockError::NotRunning);
             }
@@ -1977,11 +1987,7 @@ async fn announce_destination(
     last_announce_at: &ArcSwapOption<SystemTime>,
 ) -> Result<Instant> {
     #[cfg(all(test, unix))]
-    if FAIL_NEXT_ANNOUNCE_OF
-        .lock()
-        .take_if(|failing| failing == hash)
-        .is_some()
-    {
+    if FAIL_NEXT_ANNOUNCE_OF.lock().remove(hash) {
         bail!(
             "The mesh announce for destination {} failed for the test",
             hash.to_hex_string()
@@ -2004,18 +2010,18 @@ async fn announce_destination(
     Ok(Instant::now())
 }
 
-/// The destination whose next announce, whichever path sends it, fails instead of being
-/// built; that announce consumes the entry. Keyed by destination so a start under test
-/// cannot fail another test's announce in the same process.
+/// The destinations whose next announce, whichever path sends it, fails instead of being
+/// built; that announce consumes its own entry. Keyed by destination so tests arming it
+/// at once in the same process neither fail nor disarm each other's announce.
 #[cfg(all(test, unix))]
-static FAIL_NEXT_ANNOUNCE_OF: parking_lot::Mutex<Option<AddressHash>> =
-    parking_lot::Mutex::new(None);
+static FAIL_NEXT_ANNOUNCE_OF: std::sync::LazyLock<parking_lot::Mutex<HashSet<AddressHash>>> =
+    std::sync::LazyLock::new(Default::default);
 
 /// Makes the next announce of destination `hash` fail; the one after it is sent as usual.
 /// Armed before a start, that is the start's first announce.
 #[cfg(all(test, unix))]
 pub(crate) fn fail_next_announce_of(hash: AddressHash) {
-    *FAIL_NEXT_ANNOUNCE_OF.lock() = Some(hash);
+    FAIL_NEXT_ANNOUNCE_OF.lock().insert(hash);
 }
 
 /// How many abandoned starts saw their request handlers drained before the grace window
@@ -3022,7 +3028,9 @@ fn reconcile_tcp_after_lag(
 /// it held through the closed socket, and the heartbeat is up to an hour away. That
 /// announce honours and resets the floor, so a relay that flaps cannot make this node
 /// announce more often than once per `REANNOUNCE_FLOOR_SECS`; the first connect of a
-/// relay that was down at start is the one announce without it. A `Connected` for a
+/// relay that was down at start is the one announce without it. Every reconnect is told
+/// to the user with what became of its announce: sent, deferred to the heartbeat, failed,
+/// or not sent at all by a node that does not announce. A `Connected` for a
 /// client already marked connected, such as the connect at start the stream still held
 /// when the watcher began, tells nothing. A drop is only logged: the client redials on
 /// its own. A watcher that fell behind the stream reads each client's status instead,
@@ -3111,35 +3119,22 @@ async fn watch_interfaces(
                     }
                 }
                 Transition::Reconnect => {
-                    if !runtime.announce {
-                        continue;
+                    let announced = if runtime.announce {
+                        Some(tokio::select! {
+                            () = cancel.cancelled() => return,
+                            outcome = runtime.announce_after_reconnect() => outcome,
+                        })
+                    } else {
+                        None
+                    };
+                    let line = reconnect_line(label, announced.as_ref());
+                    match &announced {
+                        Some(Err(err)) => warn!(
+                            "Mesh interface {line} Cause: {}",
+                            redact_hashes(&format!("{err:#}"))
+                        ),
+                        _ => info!("Mesh interface {line}"),
                     }
-                    let outcome = tokio::select! {
-                        () = cancel.cancelled() => return,
-                        outcome = runtime.announce_after_reconnect() => outcome,
-                    };
-                    let line = match outcome {
-                        Ok(None) => {
-                            info!("Mesh interface {label} reconnected; announced");
-                            format!("{label} reconnected; announced")
-                        }
-                        Ok(Some(age)) => {
-                            let age = elapsed_text(age);
-                            info!(
-                                "Mesh interface {label} reconnected; the heartbeat will announce it (last announce {age})"
-                            );
-                            format!(
-                                "{label} reconnected; the heartbeat will announce it (last announce {age})"
-                            )
-                        }
-                        Err(err) => {
-                            warn!(
-                                "Failed to announce the mesh node over {label} after it reconnected; the heartbeat will announce it: {}",
-                                redact_hashes(&format!("{err:#}"))
-                            );
-                            continue;
-                        }
-                    };
                     slot.push_idle(IdleNotify {
                         source: Source::Mesh,
                         text: line,
@@ -3150,6 +3145,25 @@ async fn watch_interfaces(
                 }
             }
         }
+    }
+}
+
+/// The idle line for a relay that reconnected, by what became of the announce over it:
+/// `None` for a node that does not announce, else what `announce_after_reconnect`
+/// returned. A failure is told in plain words only; its cause goes to the log.
+fn reconnect_line(label: &str, announced: Option<&Result<Option<Duration>>>) -> String {
+    match announced {
+        Some(Ok(None)) => format!("{label} reconnected; announced"),
+        Some(Ok(Some(age))) => format!(
+            "{label} reconnected; this node announced {}, so it waits for the next heartbeat to announce again",
+            elapsed_text(*age)
+        ),
+        Some(Err(_)) => format!(
+            "{label} reconnected, but announcing over it failed; the next heartbeat will announce this node (details in the log)."
+        ),
+        None => format!(
+            "{label} reconnected; this node does not announce, so nothing was sent over it. To announce, set `mesh.announce` to true in the config and restart Coyote."
+        ),
     }
 }
 
@@ -5596,6 +5610,71 @@ impl EnvoySink for FullEnvoy {
     }
 
     fn interrupt(&self) {}
+}
+
+#[cfg(test)]
+mod no_answer_tests {
+    #[cfg(unix)]
+    use super::*;
+    #[cfg(unix)]
+    use crate::mesh::test_support::beside_a_stub_that_does_not_know_it;
+
+    /// A knock whose wait ran out on this node's side, or with the peer's answer still
+    /// arriving, is told as the retry, neither unreachable nor unanswered.
+    #[test]
+    fn a_knock_wait_short_of_silence_reads_as_the_retry() {
+        use super::KnockError;
+        use crate::mesh::request::{RequestError, request_remedy};
+        use std::time::Duration;
+
+        let (path, after) = ("/knock".to_string(), Duration::from_secs(15));
+        for err in [
+            RequestError::LocalTimeout {
+                path: path.clone(),
+                after,
+            },
+            RequestError::IdentifyTimeout {
+                path: path.clone(),
+                after,
+            },
+            RequestError::ResponseIncomplete { path, after },
+        ] {
+            let remedy = request_remedy(&err);
+            let text = KnockError::Direct(err).to_string();
+            assert!(text.ends_with(remedy), "{text}");
+            assert!(!text.contains("unreachable"), "{text}");
+            assert!(!text.contains("no answer"), "{text}");
+        }
+    }
+
+    /// A knock on a peer gone before the link could come up was never heard, so with no
+    /// propagation node known it is reported unreachable rather than unanswered.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_knock_whose_link_never_comes_up_is_unreachable_not_unanswered() {
+        let (stub, started, slot) = beside_a_stub_that_does_not_know_it("knock-never-linked").await;
+        let runtime = &started.runtime;
+        let desc = runtime
+            .resolve_destination(&stub.destination_hex())
+            .await
+            .unwrap();
+        stub.stop().await;
+        let options = KnockOptions {
+            request: RequestOptions {
+                request_timeout: Duration::from_secs(2),
+                link_timeout: Duration::from_secs(2),
+            },
+            propagation: PropagationOptions::default(),
+        };
+
+        let err = runtime
+            .knock_with(&desc, &KnockIntro::new("hello").unwrap(), options)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err, KnockError::NoPropagationNode);
+        assert!(slot.stop().await.unwrap());
+    }
 }
 
 // Tests that start a runtime are unix-only: they run on the loopback fixtures under
@@ -11565,6 +11644,268 @@ mod tests {
         relay.stop().await;
     }
 
+    /// First contact with a destination this node has not heard: B, restarted with no
+    /// peer table, learns A only by asking for it.
+    #[cfg(unix)]
+    mod first_contact_tests {
+        use super::*;
+        use crate::mesh::message::FirstContactMiss;
+        use crate::mesh::test_support::{
+            derived_sighting, pair_where_b_has_not_heard_a, wait_for_peer,
+        };
+
+        struct LateJoiner {
+            relay: TransportRelay,
+            a: StartedRuntime,
+            b: StartedRuntime,
+            slot_a: Arc<MeshSlot>,
+            slot_b: Arc<MeshSlot>,
+            to_a: String,
+            to_b: String,
+        }
+
+        impl LateJoiner {
+            async fn start(tag: &str) -> Self {
+                let (relay, a, b) = pair_where_b_has_not_heard_a(tag).await;
+                let to_a = a.runtime.current_destination_hash();
+                let to_b = b.runtime.current_destination_hash();
+                let slot_a = Arc::new(MeshSlot::default());
+                slot_a.install(a.runtime.clone()).unwrap();
+                let slot_b = Arc::new(MeshSlot::default());
+                slot_b.install(b.runtime.clone()).unwrap();
+                Self {
+                    relay,
+                    a,
+                    b,
+                    slot_a,
+                    slot_b,
+                    to_a,
+                    to_b,
+                }
+            }
+
+            async fn assert_b_lacks_a(&self) {
+                assert!(
+                    self.b.runtime.peers().get(&self.to_a).is_none(),
+                    "B has no row for A"
+                );
+                assert!(
+                    !self.b.knows_identity_of(&self.to_a).await,
+                    "B's transport holds nothing of A"
+                );
+            }
+
+            fn identity_of_a(&self) -> String {
+                self.a
+                    .runtime
+                    .transport_identity
+                    .address_hash()
+                    .to_hex_string()
+            }
+
+            async fn stop(self) {
+                self.slot_b.stop().await.unwrap();
+                self.slot_a.stop().await.unwrap();
+                self.relay.stop().await;
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_unheard_destination_is_asked_for_filed_trusted_and_answers_status_both_ways() {
+            let pair = LateJoiner::start("first-contact-trust").await;
+
+            let asked = Instant::now();
+            let row = pair
+                .b
+                .runtime
+                .peer_asking_if_unheard(&pair.to_a)
+                .await
+                .expect("the relay answers the path request with A's announce");
+            assert!(
+                asked.elapsed() < PATH_REQUEST_TIMEOUT + Duration::from_secs(1),
+                "one path request and a short grace: {:?}",
+                asked.elapsed()
+            );
+            assert_eq!(row.destination_hash, pair.to_a);
+            assert_eq!(row.identity_hash, pair.identity_of_a());
+            assert!(pair.b.runtime.peers().get(&pair.to_a).is_some());
+
+            pair.b
+                .runtime
+                .trust()
+                .trust_destination(
+                    pair.slot_b.as_ref(),
+                    &pair.to_a,
+                    TrustOptions::default(),
+                    SystemTime::now(),
+                )
+                .expect("B trusts A once the row is filed");
+            status_round_trip(&pair.slot_b, &pair.slot_a).await;
+            status_round_trip(&pair.slot_a, &pair.slot_b).await;
+            pair.stop().await;
+        }
+
+        /// A send to an unheard instance of an identity trusted for all destinations asks
+        /// for it, then judges the identity the answer carries.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_send_to_an_unheard_instance_of_a_trusted_identity_asks_and_is_delivered() {
+            let pair = LateJoiner::start("first-contact-send").await;
+            pair.b
+                .runtime
+                .trust()
+                .trust_identity(
+                    pair.slot_b.as_ref(),
+                    &pair.identity_of_a(),
+                    TrustOptions::default(),
+                    SystemTime::now(),
+                )
+                .unwrap();
+            pair.a
+                .runtime
+                .trust()
+                .trust_destination(
+                    pair.slot_a.as_ref(),
+                    &pair.to_b,
+                    TrustOptions::default(),
+                    SystemTime::now(),
+                )
+                .unwrap();
+
+            let message =
+                OutboundPeer::new(PeerKind::Message, "first contact", None, None, None).unwrap();
+            let outcome = pair.b.runtime.send_peer(&pair.to_a, &message).await;
+            assert!(outcome.is_ok(), "the send reached A: {outcome:?}");
+            assert!(pair.b.runtime.peers().get(&pair.to_a).is_some());
+            pair.stop().await;
+        }
+
+        /// With no grant that could cover the destination, or with the destination
+        /// blocked, a send is refused before any path request: it returns at once and B
+        /// still holds nothing of A.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_send_no_grant_could_allow_is_refused_without_asking() {
+            let pair = LateJoiner::start("first-contact-refused").await;
+            let message =
+                OutboundPeer::new(PeerKind::Message, "first contact", None, None, None).unwrap();
+            let refused = |outcome: Result<SendOutcome, SendError>| {
+                assert!(
+                    matches!(outcome, Err(SendError::NotTrusted { .. })),
+                    "{outcome:?}"
+                );
+            };
+
+            let asked = Instant::now();
+            refused(pair.b.runtime.send_peer(&pair.to_a, &message).await);
+            assert!(
+                asked.elapsed() < Duration::from_secs(1),
+                "{:?}",
+                asked.elapsed()
+            );
+            pair.assert_b_lacks_a().await;
+
+            let trust = pair.b.runtime.trust();
+            trust
+                .trust_identity(
+                    pair.slot_b.as_ref(),
+                    &pair.identity_of_a(),
+                    TrustOptions::default(),
+                    SystemTime::now(),
+                )
+                .unwrap();
+            trust
+                .deny_destination(
+                    pair.slot_b.as_ref(),
+                    &pair.to_a,
+                    None,
+                    SystemTime::now(),
+                    false,
+                )
+                .unwrap();
+            let asked = Instant::now();
+            refused(pair.b.runtime.send_peer(&pair.to_a, &message).await);
+            assert!(
+                asked.elapsed() < Duration::from_secs(1),
+                "{:?}",
+                asked.elapsed()
+            );
+            pair.assert_b_lacks_a().await;
+            pair.stop().await;
+        }
+
+        /// A row swept after `PEER_TTL` leaves the transport's path standing. Asking for
+        /// the destination still sends a path request, and A's answer files the row
+        /// again; the held path alone would file nothing.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_destination_the_transport_holds_without_a_row_is_asked_for_and_filed_again() {
+            let relay = TransportRelay::start().await;
+            let a = started_runtime_on("first-contact-held-a", relay.port).await;
+            let b = started_runtime_on("first-contact-held-b", relay.port).await;
+            let to_a = a.runtime.current_destination_hash();
+            let peers = b.runtime.peers();
+            wait_for_peer(&b.runtime, &to_a).await;
+            assert_eq!(
+                peers.sweep(SystemTime::now() + PEER_TTL + Duration::from_secs(60)),
+                vec![to_a.clone()]
+            );
+            assert!(peers.get(&to_a).is_none());
+            assert!(
+                b.runtime.path_known(&to_a).await,
+                "the transport still holds a path to A"
+            );
+
+            let asked = Instant::now();
+            let row = b
+                .runtime
+                .peer_asking_if_unheard(&to_a)
+                .await
+                .expect("A answers the path request and is filed again");
+            assert!(
+                asked.elapsed() < PATH_REQUEST_TIMEOUT,
+                "{:?}",
+                asked.elapsed()
+            );
+            assert_eq!(row.destination_hash, to_a);
+            assert!(peers.get(&to_a).is_some());
+
+            for started in [b, a] {
+                let slot = Arc::new(MeshSlot::default());
+                slot.install(started.runtime.clone()).unwrap();
+                slot.stop().await.unwrap();
+            }
+            relay.stop().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_destination_nothing_answers_for_is_given_up_within_the_path_request_bound() {
+            let relay = TransportRelay::start().await;
+            let started = started_runtime_on("first-contact-unreachable", relay.port).await;
+            let stranger =
+                derived_sighting("first-contact-unreachable-stranger", None).destination_hash;
+
+            let asked = Instant::now();
+            assert_eq!(
+                started
+                    .runtime
+                    .peer_asking_if_unheard(&stranger)
+                    .await
+                    .err(),
+                Some(FirstContactMiss::NoAnswer)
+            );
+            let waited = asked.elapsed();
+            assert!(
+                waited >= PATH_REQUEST_TIMEOUT
+                    && waited < PATH_REQUEST_TIMEOUT + Duration::from_secs(2),
+                "{waited:?}"
+            );
+            assert!(started.runtime.peers().get(&stranger).is_none());
+
+            let slot = Arc::new(MeshSlot::default());
+            slot.install(started.runtime.clone()).unwrap();
+            slot.stop().await.unwrap();
+            relay.stop().await;
+        }
+    }
+
     /// The peer table is no gate on resolving: a destination the transport does not hold
     /// is asked for once, row or no row. The cached twin a listing uses returns `None` at
     /// once for either, so a sweep over silent peers never pays the path-request wait.
@@ -12293,6 +12634,10 @@ mod tests {
     fn private_label(port: u16) -> String {
         format!("private 127.0.0.1:{port}")
     }
+
+    /// How a reconnect line left to the heartbeat ends, after the age of the last announce.
+    #[cfg(unix)]
+    const DEFERRED_SUFFIX: &str = " ago, so it waits for the next heartbeat to announce again";
 
     #[cfg(unix)]
     fn states_of(runtime: &MeshRuntime) -> Vec<(String, InterfaceState)> {
@@ -14440,7 +14785,7 @@ mod tests {
         relay.stop().await;
         let relay = TransportRelay::start_on(port).await;
         let prefix = format!(
-            "{} {label} reconnected; the heartbeat will announce it (last announce ",
+            "{} {label} reconnected; this node announced ",
             Source::Mesh.prefix()
         );
         for node in [&a, &b] {
@@ -14449,7 +14794,7 @@ mod tests {
                     rendered
                         .lines()
                         .iter()
-                        .any(|line| line.starts_with(&prefix) && line.ends_with(" ago)"))
+                        .any(|line| line.starts_with(&prefix) && line.ends_with(DEFERRED_SUFFIX))
                 })
             })
             .await;
@@ -14553,7 +14898,7 @@ mod tests {
         relay.stop().await;
         let relay = TransportRelay::start_on(port).await;
         let prefix = format!(
-            "{} {label} reconnected; the heartbeat will announce it (last announce ",
+            "{} {label} reconnected; this node announced ",
             Source::Mesh.prefix()
         );
         for node in [&a, &b] {
@@ -14564,8 +14909,8 @@ mod tests {
             let line = line_starting_with(&node.notifier, &prefix).unwrap();
             let age = line
                 .strip_prefix(&prefix)
-                .and_then(|rest| rest.strip_suffix(" ago)"))
-                .unwrap_or_else(|| panic!("the line does not end in ` ago)`: {line}"));
+                .and_then(|rest| rest.strip_suffix(DEFERRED_SUFFIX))
+                .unwrap_or_else(|| panic!("the line does not end in `{DEFERRED_SUFFIX}`: {line}"));
             let secs: u64 = age
                 .strip_suffix('s')
                 .and_then(|n| n.parse().ok())
@@ -14743,6 +15088,121 @@ mod tests {
             metrics.num_alive_tasks() == 0
         })
         .await;
+    }
+
+    /// Every reconnect of a TCP relay is told, whatever became of the announce over it.
+    mod reconnect_line_tests {
+        use super::*;
+        use crate::mesh::card::StatusError;
+        use crate::mesh::fetch::FetchError as FileFetchError;
+
+        /// A node configured not to announce still says its relay is back, that nothing
+        /// was sent over it, and how to turn announcing on.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_node_that_does_not_announce_says_its_relay_reconnected() {
+            let relay = TransportRelay::start().await;
+            let port = relay.port;
+            let tmp = TempDir::new("node-reconnect-line-silent");
+            let mut session = Session::default();
+            let runtime = MeshRuntime::start(
+                &MeshConfig {
+                    announce: false,
+                    ..private_config(port)
+                },
+                true,
+                &mut session,
+                mesh_paths(&tmp),
+                NodeOptions::default(),
+            )
+            .await
+            .unwrap();
+            let slot = Arc::new(MeshSlot::default());
+            let notifier = Arc::new(RecordingSink::default());
+            slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+            slot.install(runtime.clone()).unwrap();
+            sleep(Duration::from_millis(2500)).await;
+
+            relay.stop().await;
+            let relay = TransportRelay::start_on(port).await;
+            wait_for_mesh_line(
+                &notifier,
+                &format!(
+                    "{} reconnected; this node does not announce, so nothing was sent over it. To announce, set `mesh.announce` to true in the config and restart Coyote.",
+                    private_label(port)
+                ),
+            )
+            .await;
+
+            assert!(slot.stop().await.unwrap());
+            relay.stop().await;
+        }
+
+        /// An announce that fails after a reconnect is told on the reconnect line in plain
+        /// words, with the heartbeat that will carry the announce instead; the cause stays
+        /// in the log.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_failed_reconnect_announce_is_told_on_the_reconnect_line() {
+            let (relay, a, b) = two_nodes_on_a_relay("node-reconnect-line-failed").await;
+            let port = relay.port;
+            a.expire_announce_floor().await;
+            fail_next_announce_of(AddressHash::new_from_hex_string(&a.hash).unwrap());
+
+            relay.stop().await;
+            let relay = TransportRelay::start_on(port).await;
+            wait_for_mesh_line(
+                &a.notifier,
+                &format!(
+                    "{} reconnected, but announcing over it failed; the next heartbeat will announce this node (details in the log).",
+                    private_label(port)
+                ),
+            )
+            .await;
+
+            assert!(a.slot.stop().await.unwrap());
+            assert!(b.slot.stop().await.unwrap());
+            relay.stop().await;
+        }
+
+        /// The sentences this node prints for a reconnect, a silent peer and a link that
+        /// never came up are plain ASCII.
+        #[test]
+        fn the_reconnect_no_answer_and_unlinked_sentences_are_ascii() {
+            let label = "private 127.0.0.1:4242";
+            let failed: Result<Option<Duration>> = Err(anyhow!("the transport said no"));
+            let reconnect_lines = [
+                reconnect_line(label, None),
+                reconnect_line(label, Some(&Ok(None))),
+                reconnect_line(label, Some(&Ok(Some(Duration::from_secs(12))))),
+                reconnect_line(label, Some(&failed)),
+            ];
+            assert!(
+                !reconnect_lines[3].contains("the transport said no"),
+                "{}",
+                reconnect_lines[3]
+            );
+            let peer = "bb".repeat(16);
+            let own = "aa".repeat(16);
+            let no_answer = NoAnswer::new(&peer, own);
+            let never_linked = RequestError::LinkActivationTimeout {
+                path: STATUS_PATH.to_string(),
+                after: Duration::from_secs(10),
+            };
+            let sentences = reconnect_lines.into_iter().chain([
+                no_answer.to_string(),
+                no_answer.next_action(),
+                SendError::NoAnswer(no_answer.clone()).to_string(),
+                StatusError::NoAnswer(no_answer.clone()).to_string(),
+                StatusError::Transport(never_linked.clone()).to_string(),
+                FileFetchError::Transport(never_linked.clone()).to_string(),
+                SendError::Propagation(PropagationError::Link(never_linked)).to_string(),
+            ]);
+            for sentence in sentences {
+                assert!(sentence.is_ascii(), "{sentence}");
+                assert!(!sentence.contains(STATUS_PATH), "{sentence}");
+            }
+        }
     }
 
     /// Stopping a node whose relay has just gone away, beside a relay it never reached,

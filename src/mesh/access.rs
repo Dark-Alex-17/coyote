@@ -22,8 +22,8 @@ use crate::mesh::grants::DEFAULT_GRANT_TTL;
 use crate::mesh::idle::{IdleNotify, Origin};
 use crate::mesh::message::PEER_REQUEST_TIMEOUT;
 use crate::mesh::message::{
-    Disposition, OutboundPeer, PEER_WIRE_VERSION, PartLimits, PeerKind, PeerVia, RawPart,
-    SendError, SendOutcome, is_wire_id, propagation_remedy, unreachable_cause,
+    Disposition, FirstContactMiss, OutboundPeer, PEER_WIRE_VERSION, PartLimits, PeerKind, PeerVia,
+    RawPart, SendError, SendOutcome, is_wire_id, propagation_remedy, unreachable_cause,
 };
 use crate::mesh::node::{MeshRuntime, MeshSlot};
 use crate::mesh::notify::Source;
@@ -38,8 +38,8 @@ use crate::mesh::propagation_fetch::{InboundMessage, InboundSink};
 use crate::mesh::protocol::describe_version;
 use crate::mesh::request::{
     ACCESS_PATH, AdmittedRequest, DEFAULT_LINK_TIMEOUT, DispatchError, Handler, NAME_HASH_LEN,
-    OriginName, RefusalCode, RemoteRefusal, Reply, RequestError, RequestOptions, refusal_remedy,
-    request_remedy,
+    NoAnswer, OriginName, RefusalCode, RemoteRefusal, Reply, RequestError, RequestOptions,
+    refusal_remedy, request_remedy,
 };
 use crate::mesh::shares::PeerRef;
 use crate::mesh::shares::{Mutation, ShareSet, WriteScope};
@@ -330,6 +330,12 @@ pub(crate) enum AccessError {
     /// Trusted, but the transport holds no identity for it and the network did not answer
     /// this node's path request in time, so there is no description to link to.
     UnknownDestination,
+    /// Unheard, but the trust list could allow it, so the network was asked for it and
+    /// no row was filed.
+    Unheard {
+        destination: String,
+        miss: FirstContactMiss,
+    },
     /// The request breaks a rule the peer would refuse it for; the text names the rule.
     Invalid(&'static str),
     /// The pending store would not file the request, so nothing was sent.
@@ -361,6 +367,9 @@ pub(crate) enum AccessError {
         max: u16,
     },
     NoPropagationNode,
+    /// The link came up but the peer did not answer, and no propagation node is known to
+    /// hold the request, so nothing was queued.
+    NoAnswer(NoAnswer),
     Propagation(PropagationError),
 }
 
@@ -380,6 +389,7 @@ impl fmt::Display for AccessError {
                 "The destination {} Try again in a minute; nothing was queued for it, because a request can be held on a propagation node only after the peer's announce has been heard. `.mesh peers` shows when it was last heard.",
                 unreachable_cause()
             ),
+            Self::Unheard { destination, miss } => write!(f, "{}", miss.refusal(destination)),
             Self::Invalid(rule) => write!(
                 f,
                 "The access request was not sent: {rule}. {}",
@@ -430,6 +440,10 @@ impl fmt::Display for AccessError {
             Self::NoPropagationNode => write!(
                 f,
                 "The peer is unreachable and no propagation node is known yet to hold the access request for it. Run `.mesh peers` to see which nodes this Coyote has heard from."
+            ),
+            Self::NoAnswer(no_answer) => write!(
+                f,
+                "{no_answer} Nothing was queued, because no propagation node is known yet to hold the access request for it; `.mesh peers` lists the nodes this Coyote has heard from."
             ),
             Self::Propagation(err) => write!(
                 f,
@@ -488,8 +502,16 @@ impl MeshSlot {
         let Some(destination) = canonical_hash(peer_destination) else {
             return Err(AccessError::Untrusted);
         };
-        let Some(peer) = runtime.peers().get(&destination) else {
-            return Err(AccessError::Untrusted);
+        let peer = match runtime.peers().get(&destination) {
+            Some(peer) => peer,
+            None if runtime.trust().may_be_asked_for(&destination) => runtime
+                .peer_asking_if_unheard(&destination)
+                .await
+                .map_err(|miss| AccessError::Unheard {
+                    destination: destination.clone(),
+                    miss,
+                })?,
+            None => return Err(AccessError::Untrusted),
         };
         if runtime
             .trust()
@@ -605,6 +627,7 @@ impl MeshRuntime {
             }
             Err(
                 err @ (RequestError::Timeout { .. }
+                | RequestError::LinkActivationTimeout { .. }
                 | RequestError::LinkFailed(_)
                 | RequestError::LinkClosed),
             ) => err,
@@ -647,10 +670,15 @@ impl MeshRuntime {
         };
         // Selected before queueing behind another post: a requester with no node to fall
         // back on is told so at once rather than after someone else's transfer.
-        let node = self
-            .propagation_nodes()
-            .select_for_posting()
-            .map_err(|_| AccessError::NoPropagationNode)?;
+        let node =
+            self.propagation_nodes()
+                .select_for_posting()
+                .map_err(|_| match unreachable {
+                    RequestError::Timeout { .. } => {
+                        AccessError::NoAnswer(self.no_answer(&dest_hex))
+                    }
+                    _ => AccessError::NoPropagationNode,
+                })?;
         let node_hex = node.destination.address_hash.to_hex_string();
         debug!(
             "Mesh access request {id} to {dest8} could not be delivered over a link ({}); storing it with propagation node {}",
@@ -1610,6 +1638,111 @@ fn path_state(root: Option<&Path>, path: &str) -> String {
             || "missing".to_string(),
             |meta| format!("exists, {}", human_size(meta.len())),
         )
+}
+
+#[cfg(test)]
+mod no_answer_tests {
+    #[cfg(unix)]
+    use super::*;
+    #[cfg(unix)]
+    use crate::mesh::test_support::beside_a_stub_that_does_not_know_it;
+
+    /// A wait that ran out on this node's side, or with the peer's answer still arriving,
+    /// is told as the retry, never as the peer being unreachable.
+    #[test]
+    fn a_wait_short_of_silence_reads_as_the_retry_not_unreachable() {
+        use super::AccessError;
+        use crate::mesh::request::{RequestError, request_remedy};
+        use std::time::Duration;
+
+        let (path, after) = ("/access".to_string(), Duration::from_secs(15));
+        for err in [
+            RequestError::LocalTimeout {
+                path: path.clone(),
+                after,
+            },
+            RequestError::IdentifyTimeout {
+                path: path.clone(),
+                after,
+            },
+            RequestError::ResponseIncomplete { path, after },
+        ] {
+            let remedy = request_remedy(&err);
+            let text = AccessError::Direct(err).to_string();
+            assert!(text.ends_with(remedy), "{text}");
+            assert!(!text.contains("unreachable"), "{text}");
+        }
+    }
+
+    #[cfg(unix)]
+    fn quick() -> AccessOptions {
+        AccessOptions {
+            request: RequestOptions {
+                request_timeout: Duration::from_secs(2),
+                link_timeout: Duration::from_secs(2),
+            },
+            propagation: PropagationOptions::default(),
+        }
+    }
+
+    /// The link came up and the peer said nothing to the access request, and no
+    /// propagation node is known: the result names the silence, the remedy on the peer's
+    /// side, and that nothing was queued.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_silent_peer_with_no_propagation_node_is_reported_as_no_answer() {
+        let (stub, started, slot) = beside_a_stub_that_does_not_know_it("access-no-answer").await;
+        let runtime = &started.runtime;
+        let to = stub.destination_hex();
+        let desc = runtime.resolve_destination(&to).await.unwrap();
+        let request = validate_access("acc-1", vec!["src/x.rs".to_string()], "").unwrap();
+
+        let err = runtime
+            .request_access_wire(&desc, &request, quick())
+            .await
+            .unwrap_err();
+
+        let own = runtime.current_destination_hash();
+        assert_eq!(err, AccessError::NoAnswer(NoAnswer::new(&to, own.clone())));
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "no answer from {}: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance). Nothing was queued, because no propagation node is known yet to hold the access request for it; `.mesh peers` lists the nodes this Coyote has heard from.",
+                short(&to)
+            )
+        );
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
+    /// A peer gone before the link could come up was never asked anything, so with no
+    /// propagation node known the request keeps the unreachable wording.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_link_that_never_comes_up_keeps_the_unreachable_wording() {
+        let (stub, started, slot) =
+            beside_a_stub_that_does_not_know_it("access-never-linked").await;
+        let runtime = &started.runtime;
+        let desc = runtime
+            .resolve_destination(&stub.destination_hex())
+            .await
+            .unwrap();
+        let request = validate_access("acc-1", vec!["src/x.rs".to_string()], "").unwrap();
+        stub.stop().await;
+
+        let err = runtime
+            .request_access_wire(&desc, &request, quick())
+            .await
+            .unwrap_err();
+
+        assert_eq!(err, AccessError::NoPropagationNode);
+        assert!(
+            err.to_string()
+                .starts_with("The peer is unreachable and no propagation node is known yet"),
+            "{err}"
+        );
+        assert!(slot.stop().await.unwrap());
+    }
 }
 
 #[cfg(test)]

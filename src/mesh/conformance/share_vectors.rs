@@ -281,7 +281,10 @@ fn reply_error(err: &FetchError) -> Result<ReplyError, String> {
         FetchError::Oversize { len } => ReplyError::Oversize(*len),
         FetchError::Corrupt => ReplyError::Corrupt,
         FetchError::UnknownStatus => ReplyError::UnknownStatus,
-        FetchError::Transport(_) | FetchError::NotTrustedByPeer(_) | FetchError::Stage(_) => {
+        FetchError::Transport(_)
+        | FetchError::NotTrustedByPeer(_)
+        | FetchError::NoAnswer(_)
+        | FetchError::Stage(_) => {
             return Err(format!("a pure read ended in {err:?}"));
         }
     })

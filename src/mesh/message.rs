@@ -18,12 +18,12 @@ use crate::mesh::propagation::{OutboundMessage, PropagationError, PropagationOpt
 use crate::mesh::propagation_fetch::{InboundMessage, InboundSink};
 use crate::mesh::protocol::describe_version;
 use crate::mesh::request::{
-    AdmittedRequest, DEFAULT_LINK_TIMEOUT, Handler, MESSAGE_PATH, NAME_HASH_LEN, OriginName,
-    RefusalCode, RemoteRefusal, Reply, RequestError, RequestOptions, redact_hashes, refusal_remedy,
-    request_remedy, short,
+    AdmittedRequest, DEFAULT_LINK_TIMEOUT, Handler, MESSAGE_PATH, NAME_HASH_LEN, NoAnswer,
+    OriginName, RefusalCode, RemoteRefusal, Reply, RequestError, RequestOptions, redact_hashes,
+    refusal_remedy, request_remedy, short,
 };
 use crate::mesh::trust::{
-    Decision, IdentityStanding, KeyChangeOutcome, OriginVerdict, Rule, TrustStore,
+    Decision, IdentityStanding, KeyChangeOutcome, OriginVerdict, Rule, TrustStore, same_hash,
 };
 use crate::mesh::wire_path::WirePath;
 use crate::mesh::{CappedText, canonical_hash, capped_peer_text, display_text, hex_lower};
@@ -77,6 +77,10 @@ pub(crate) const PEER_INBOX_CAPACITY: usize = 64;
 /// peer that is up replies well inside this; a longer wait only delays the fallback.
 pub(crate) const PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const PEER_LINK_TIMEOUT: Duration = DEFAULT_LINK_TIMEOUT;
+/// How long a path response's announce is given to reach the peer table once it has been
+/// heard, and how often the table is looked at meanwhile.
+const PATH_RESPONSE_FILING_GRACE: Duration = Duration::from_secs(1);
+const PATH_RESPONSE_FILING_POLL: Duration = Duration::from_millis(25);
 /// Recipients a broadcast sends to at once. Each open link costs the transport a handler
 /// lock round; a trust list of dozens must not open dozens of links in one burst.
 pub(crate) const BROADCAST_MAX_CONCURRENCY: usize = 4;
@@ -1349,6 +1353,12 @@ pub(crate) enum SendError {
     UnknownDestination {
         destination: String,
     },
+    /// Unheard, but the trust list could allow it, so the network was asked for it and
+    /// no row was filed. Nothing is queued, as for `UnknownDestination`.
+    Unheard {
+        destination: String,
+        miss: FirstContactMiss,
+    },
     NotRunning,
     ContentTooLong {
         chars: usize,
@@ -1387,6 +1397,9 @@ pub(crate) enum SendError {
         max: u16,
     },
     NoPropagationNode,
+    /// The link came up but the peer did not answer, and no propagation node is known to
+    /// hold the message, so nothing was queued.
+    NoAnswer(NoAnswer),
     Propagation(PropagationError),
     /// The peer answered, but not with the acknowledgement for this id.
     NotAcknowledged,
@@ -1404,6 +1417,7 @@ impl fmt::Display for SendError {
                 "{} Nothing was queued for it: this node holds no key for the peer, and a message can be held on a propagation node only once the peer's announce has brought its key. Try again after it announces; `.mesh peers` shows when it was last heard.",
                 unreachable_head(destination)
             ),
+            Self::Unheard { destination, miss } => write!(f, "{}", miss.refusal(destination)),
             Self::NotRunning => write!(
                 f,
                 "The mesh node has been stopped; run `.mesh on` to start it again"
@@ -1458,6 +1472,10 @@ impl fmt::Display for SendError {
             Self::NoPropagationNode => write!(
                 f,
                 "The peer is unreachable and no propagation node is known yet to hold the message for it. Run `.mesh peers` to see which nodes this Coyote has heard from."
+            ),
+            Self::NoAnswer(no_answer) => write!(
+                f,
+                "{no_answer} Nothing was queued, because no propagation node is known yet to hold the message for it; `.mesh peers` lists the nodes this Coyote has heard from."
             ),
             Self::Propagation(err) => write!(
                 f,
@@ -1557,11 +1575,11 @@ pub(crate) fn propagation_remedy(err: &PropagationError) -> &'static str {
 impl std::error::Error for SendError {}
 
 impl SendError {
-    /// The variant as a stable snake_case token, for hooks.
+    /// The variant as a stable snake_case token, for hooks and a tool result's `kind`.
     pub(crate) fn class(&self) -> &'static str {
         match self {
             Self::NotTrusted { .. } => "not_trusted",
-            Self::UnknownDestination { .. } => "unknown_destination",
+            Self::UnknownDestination { .. } | Self::Unheard { .. } => "unknown_destination",
             Self::NotRunning => "not_running",
             Self::ContentTooLong { .. } => "content_too_long",
             Self::TitleTooLong { .. } => "title_too_long",
@@ -1572,6 +1590,7 @@ impl SendError {
             Self::Direct(_) => "direct",
             Self::IncompatibleVersion { .. } => "incompatible_version",
             Self::NoPropagationNode => "no_propagation_node",
+            Self::NoAnswer(_) => "no_answer",
             Self::Propagation(_) => "propagation",
             Self::NotAcknowledged => "not_acknowledged",
         }
@@ -1616,6 +1635,9 @@ pub(crate) enum RecipientOutcome {
     },
     /// The peer's own trust gate said no; the refusal names which side has to act.
     NotTrustedByPeer(RemoteRefusal),
+    /// The link came up and the peer said nothing, which is how a peer that has not
+    /// trusted this instance answers; the remedy is on its side, as for a refusal.
+    NoAnswer(NoAnswer),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1652,9 +1674,9 @@ impl BroadcastOutcome {
                 RecipientOutcome::Delivered => tally.delivered += 1,
                 RecipientOutcome::StoreAndForward => tally.stored += 1,
                 RecipientOutcome::Unreachable { .. } => tally.unreachable += 1,
-                RecipientOutcome::Refused { .. } | RecipientOutcome::NotTrustedByPeer(_) => {
-                    tally.refused += 1
-                }
+                RecipientOutcome::Refused { .. }
+                | RecipientOutcome::NotTrustedByPeer(_)
+                | RecipientOutcome::NoAnswer(_) => tally.refused += 1,
             }
         }
         tally
@@ -1688,11 +1710,14 @@ impl MeshRuntime {
     }
 
     /// `send_peer` with its timeouts chosen. Trust is checked before anything touches
-    /// the wire, and a destination the peer table has never heard is as untrusted as one
-    /// the list refuses. Only the peer-unreachable errors fall back to store-and-forward:
+    /// the wire. A destination the peer table has never heard is first asked for on the
+    /// mesh when the trust list would let it through, and refused unasked otherwise.
+    /// Only the peer-unreachable errors and a silent peer fall back to store-and-forward:
     /// a refusal of any code means the peer heard and said no, and storing a message it
-    /// has refused would deliver it behind its back. Posts to the propagation node queue
-    /// behind `posting`, since `propagate` needs one caller per node at a time.
+    /// has refused would deliver it behind its back. A wait that ran out on this node's
+    /// side, or with the peer's answer still arriving, is reported with the retry and
+    /// not stored. Posts to the propagation node queue behind `posting`, since
+    /// `propagate` needs one caller per node at a time.
     pub(crate) async fn send_peer_with(
         &self,
         destination_hex: &str,
@@ -1740,7 +1765,17 @@ impl MeshRuntime {
         let not_trusted = || SendError::NotTrusted {
             destination: destination.clone(),
         };
-        let peer = self.peers().get(&destination).ok_or_else(not_trusted)?;
+        let peer = match self.peers().get(&destination) {
+            Some(peer) => peer,
+            None if self.trust().may_be_asked_for(&destination) => self
+                .peer_asking_if_unheard(&destination)
+                .await
+                .map_err(|miss| SendError::Unheard {
+                    destination: destination.clone(),
+                    miss,
+                })?,
+            None => return Err(not_trusted()),
+        };
         if self
             .trust()
             .authorize(&peer.identity_hash, &destination)
@@ -1779,6 +1814,7 @@ impl MeshRuntime {
             }
             Err(
                 err @ (RequestError::Timeout { .. }
+                | RequestError::LinkActivationTimeout { .. }
                 | RequestError::LinkFailed(_)
                 | RequestError::LinkClosed),
             ) => err,
@@ -1821,10 +1857,15 @@ impl MeshRuntime {
         };
         // Selected before queueing behind another post: a sender with no node to fall
         // back on is told so at once rather than after someone else's transfer.
-        let node = self
-            .propagation_nodes()
-            .select_for_posting()
-            .map_err(|_| SendError::NoPropagationNode)?;
+        let node =
+            self.propagation_nodes()
+                .select_for_posting()
+                .map_err(|_| match unreachable {
+                    RequestError::Timeout { .. } => {
+                        SendError::NoAnswer(self.no_answer(&destination))
+                    }
+                    _ => SendError::NoPropagationNode,
+                })?;
         let node_hex = node.destination.address_hash.to_hex_string();
         debug!(
             "Mesh {kind} {id} to {dest8} could not be delivered over a link ({}); storing it with propagation node {}",
@@ -1925,6 +1966,7 @@ impl MeshRuntime {
             Err(SendError::NotTrustedByPeer(refusal)) => {
                 RecipientOutcome::NotTrustedByPeer(refusal)
             }
+            Err(SendError::NoAnswer(no_answer)) => RecipientOutcome::NoAnswer(no_answer),
             Err(
                 err @ (SendError::Refused(_)
                 | SendError::Throttled { .. }
@@ -1997,6 +2039,75 @@ impl MeshRuntime {
         desc
     }
 
+    /// The peer table's row for `destination_hex`. A destination without one is asked for
+    /// with one path request on the network, even when the transport still holds a path
+    /// to it (a row swept after `PEER_TTL`), since only a fresh announce files a row. The
+    /// answer is waited for up to `PATH_REQUEST_TIMEOUT`, and an announce that arrives is
+    /// given `PATH_RESPONSE_FILING_GRACE` to be filed by the announce receiver.
+    pub(crate) async fn peer_asking_if_unheard(
+        &self,
+        destination_hex: &str,
+    ) -> Result<PeerRecord, FirstContactMiss> {
+        let destination = canonical_hash(destination_hex).ok_or(FirstContactMiss::NoAnswer)?;
+        let peers = self.peers();
+        if let Some(peer) = peers.get(&destination) {
+            return Ok(peer);
+        }
+        let address_hash = AddressHash::new_from_hex_string(&destination)
+            .map_err(|_| FirstContactMiss::NoAnswer)?;
+        let transport = self
+            .transport_handle()
+            .await
+            .ok_or(FirstContactMiss::NoAnswer)?;
+        let mut announces = transport.recv_announces().await;
+        // A held path makes the transport drop an answer that replays the announce it
+        // already has, or one emitted in the same second, so that answer would file no row.
+        transport.expire_path(&address_hash).await;
+        transport.request_path(&address_hash, None, None).await;
+        let deadline = tokio::time::Instant::now() + PATH_REQUEST_TIMEOUT;
+        let mut answered_at = None;
+        let mut listening = true;
+        loop {
+            if let Some(peer) = peers.get(&destination) {
+                return Ok(peer);
+            }
+            let now = tokio::time::Instant::now();
+            let gave_up = match answered_at {
+                Some(at) => now >= at + PATH_RESPONSE_FILING_GRACE,
+                None => now >= deadline,
+            };
+            if gave_up {
+                break;
+            }
+            tokio::select! {
+                event = announces.recv(), if listening => match event {
+                    Ok(event) => {
+                        let heard = event.destination.lock().await.desc.address_hash.to_hex_string();
+                        if same_hash(&heard, &destination) {
+                            answered_at.get_or_insert_with(tokio::time::Instant::now);
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => listening = false,
+                },
+                () = tokio::time::sleep(PATH_RESPONSE_FILING_POLL) => {}
+            }
+        }
+        if answered_at.is_some() {
+            debug!(
+                "Mesh heard an announce from {} but filed no peer row for it",
+                short(&destination)
+            );
+            Err(FirstContactMiss::NotCoyote)
+        } else {
+            debug!(
+                "Mesh got no answer to its path request for {}",
+                short(&destination)
+            );
+            Err(FirstContactMiss::NoAnswer)
+        }
+    }
+
     /// `resolve_destination` without the path request: what the transport holds now, for
     /// a listing that must not wait on a peer that is not there.
     pub(crate) async fn resolve_destination_cached(
@@ -2028,6 +2139,40 @@ impl MeshRuntime {
 /// could not route to; each surface adds what, if anything, was queued for it.
 pub(crate) fn unreachable_head(destination: &str) -> String {
     format!("Destination {destination} {}", unreachable_cause())
+}
+
+/// Why asking the network for a destination the peer table lacks filed no row for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FirstContactMiss {
+    /// Nothing announced the destination within `PATH_REQUEST_TIMEOUT`.
+    NoAnswer,
+    /// The destination announced, but the announce was not one a Coyote node sends.
+    NotCoyote,
+}
+
+impl FirstContactMiss {
+    /// The refusal every surface gives for this miss, naming the destination short.
+    pub(crate) fn refusal(self, destination: &str) -> String {
+        match self {
+            Self::NoAnswer => unanswered_path_request(destination),
+            Self::NotCoyote => answered_not_as_coyote(destination),
+        }
+    }
+}
+
+pub(crate) fn unanswered_path_request(destination: &str) -> String {
+    format!(
+        "{} did not answer a path request within {} s: it is not on any interface this node joined, or it is not announcing. Check the hash, or wait for its announce (`.mesh peers`).",
+        short(destination),
+        PATH_REQUEST_TIMEOUT.as_secs()
+    )
+}
+
+pub(crate) fn answered_not_as_coyote(destination: &str) -> String {
+    format!(
+        "{} answered, but not as a Coyote node; check the hash.",
+        short(destination)
+    )
 }
 
 /// The cause part of `unreachable_head`, for a refusal that does not name the destination.
@@ -2405,6 +2550,110 @@ impl ModelNotes {
             ));
         }
         notes
+    }
+}
+
+#[cfg(test)]
+mod no_answer_tests {
+    #[cfg(unix)]
+    use super::*;
+    #[cfg(unix)]
+    use crate::mesh::test_support::beside_a_stub_that_does_not_know_it;
+
+    /// A wait that ran out on this node's side, or with the peer's answer still arriving,
+    /// is told as the retry, never as the peer being unreachable.
+    #[test]
+    fn a_wait_short_of_silence_reads_as_the_retry_not_unreachable() {
+        use super::SendError;
+        use crate::mesh::request::{RequestError, request_remedy};
+        use std::time::Duration;
+
+        let (path, after) = ("/message".to_string(), Duration::from_secs(15));
+        for err in [
+            RequestError::LocalTimeout {
+                path: path.clone(),
+                after,
+            },
+            RequestError::IdentifyTimeout {
+                path: path.clone(),
+                after,
+            },
+            RequestError::ResponseIncomplete { path, after },
+        ] {
+            let remedy = request_remedy(&err);
+            let text = SendError::Direct(err).to_string();
+            assert!(text.ends_with(remedy), "{text}");
+            assert!(!text.contains("unreachable"), "{text}");
+        }
+    }
+
+    #[cfg(unix)]
+    fn quick() -> PeerSendOptions {
+        PeerSendOptions {
+            request: RequestOptions {
+                request_timeout: Duration::from_secs(2),
+                link_timeout: Duration::from_secs(2),
+            },
+            propagation: PropagationOptions::default(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn hello() -> OutboundPeer {
+        OutboundPeer::new(PeerKind::Message, "hello", None, None, None).unwrap()
+    }
+
+    /// The link came up and the peer said nothing, and no propagation node is known: the
+    /// send names the silence, the remedy on the peer's side, and that nothing was queued.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_silent_peer_with_no_propagation_node_is_reported_as_no_answer() {
+        let (stub, started, slot) = beside_a_stub_that_does_not_know_it("message-no-answer").await;
+        let runtime = &started.runtime;
+        let to = stub.destination_hex();
+        assert!(runtime.propagation_nodes().select().is_err());
+
+        let err = runtime
+            .send_peer_with(&to, &hello(), quick())
+            .await
+            .unwrap_err();
+
+        let own = runtime.current_destination_hash();
+        assert_eq!(err, SendError::NoAnswer(NoAnswer::new(&to, own.clone())));
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "no answer from {}: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance). Nothing was queued, because no propagation node is known yet to hold the message for it; `.mesh peers` lists the nodes this Coyote has heard from.",
+                short(&to)
+            )
+        );
+        assert_eq!(err.class(), "no_answer");
+        assert!(stub.seen().is_empty(), "{:?}", stub.seen());
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
+    /// A peer that knows this identity but has not trusted this instance answers
+    /// `NoAccess`, and that answer keeps the refusal sentence.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_no_access_answer_keeps_the_refusal_sentence() {
+        let (stub, started, slot) = beside_a_stub_that_does_not_know_it("message-no-access").await;
+        let runtime = &started.runtime;
+        stub.know_identity(runtime.fingerprint());
+        let to = stub.destination_hex();
+
+        let err = runtime
+            .send_peer_with(&to, &hello(), quick())
+            .await
+            .unwrap_err();
+
+        let refusal = runtime.remote_refusal(&to);
+        assert_eq!(err, SendError::NotTrustedByPeer(refusal.clone()));
+        assert_eq!(err.to_string(), refusal.to_string());
+        assert!(err.to_string().contains(" refused the request: "), "{err}");
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
     }
 }
 
@@ -3820,6 +4069,10 @@ mod tests {
                 "refused",
             ),
             (SendError::Direct(RequestError::LinkClosed), "direct"),
+            (
+                SendError::NoAnswer(NoAnswer::new(&destination, hash_of("own"))),
+                "no_answer",
+            ),
             (
                 SendError::IncompatibleVersion {
                     destination,

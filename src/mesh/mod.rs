@@ -829,6 +829,96 @@ pub(crate) mod test_support {
         }
     }
 
+    /// A relay with nodes A and B on it where A has filed B but B holds nothing of A:
+    /// no peer table row and no identity in its transport. Both meet first, then B is
+    /// stopped, its `peers.json` deleted and B restarted, so the relay's single
+    /// rebroadcast of A's start announce cannot reach the new B. The restarted B's start
+    /// announce can go out before its client has dialed the relay, so the relay asks for
+    /// B's path until it hears B on the new link. Returns the relay, A and B.
+    #[cfg(unix)]
+    pub(crate) async fn pair_where_b_has_not_heard_a(
+        tag: &str,
+    ) -> (TransportRelay, StartedRuntime, StartedRuntime) {
+        let relay = TransportRelay::start_on_with_retries(closed_port().await, 0).await;
+        let a = started_runtime_on(&format!("{tag}-a"), relay.port).await;
+        let mut b = started_runtime_on(&format!("{tag}-b"), relay.port).await;
+        let to_a = a.runtime.current_destination_hash();
+        let to_b = b.runtime.current_destination_hash();
+        wait_for_peer(&a.runtime, &to_b).await;
+        wait_for_peer(&b.runtime, &to_a).await;
+
+        let mut relay_announces = relay.announces().await;
+        let slot_b = Arc::new(MeshSlot::default());
+        slot_b.install(b.runtime.clone()).unwrap();
+        assert!(slot_b.stop().await.unwrap());
+        std::fs::remove_file(
+            super::mesh_cache_dir(&mesh_paths(&b.tmp).cache_dir).join("peers.json"),
+        )
+        .expect("B's stop wrote its peer table");
+        b.restart_on(relay.port).await;
+        let hash_b = AddressHash::new_from_hex_string(&to_b).unwrap();
+        let deadline = tokio::time::Instant::now() + PEER_FILING_TIMEOUT;
+        loop {
+            let heard = tokio::time::timeout(PATH_REQUEST_INTERVAL, async {
+                loop {
+                    let event = match relay_announces.recv().await {
+                        Ok(event) => event,
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => {
+                            panic!("the relay's announce channel closed before it heard B")
+                        }
+                    };
+                    if event.destination.lock().await.desc.address_hash == hash_b {
+                        return;
+                    }
+                }
+            });
+            if heard.await.is_ok() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the relay never heard the restarted B ({to_b})"
+            );
+            relay.transport.request_path(&hash_b, None, None).await;
+        }
+
+        assert!(b.runtime.peers().get(&to_a).is_none(), "B has no row for A");
+        assert!(
+            !b.knows_identity_of(&to_a).await,
+            "B's transport holds nothing of A"
+        );
+        (relay, a, b)
+    }
+
+    /// A runtime that has filed and trusts a `PeerStub` whose trust list names nobody, so
+    /// a link to the stub comes up and every request on it draws the silence a Coyote
+    /// gives an identity it does not know. The slot holds the runtime, as a trust grant
+    /// needs a live node.
+    #[cfg(unix)]
+    pub(crate) async fn beside_a_stub_that_does_not_know_it(
+        tag: &str,
+    ) -> (PeerStub, StartedRuntime, Arc<MeshSlot>) {
+        let stub = PeerStub::listen(&format!("{tag}-stub"), TcpServer::DEFAULT_CLIENT_MTU).await;
+        let started = started_runtime_on(tag, stub.port()).await;
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        stub.wait_to_be_filed(&started.runtime.peers(), &to).await;
+        started
+            .runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .expect("the node trusts the stub");
+        (stub, started, slot)
+    }
+
     pub(crate) fn private_config(port: u16) -> MeshConfig {
         MeshConfig {
             interfaces: vec![MeshInterface::Private {
@@ -1528,6 +1618,16 @@ pub(crate) mod test_support {
                 .destination_identity(&hash)
                 .await
                 .is_some()
+        }
+
+        /// Every announce and path response the node's transport accepts from now on.
+        pub(crate) async fn announces(&self) -> broadcast::Receiver<AnnounceEvent> {
+            self.runtime
+                .transport_handle()
+                .await
+                .expect("the node is running")
+                .recv_announces()
+                .await
         }
     }
 

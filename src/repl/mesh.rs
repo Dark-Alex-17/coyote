@@ -228,6 +228,9 @@ const MESSAGE_REFUSAL_TAIL: &str = "Nothing is sent to a destination this node d
 const FETCH_REFUSAL_TAIL: &str = "Nothing is fetched from a destination this node does not trust.";
 const STATUS_REFUSAL_TAIL: &str = "Status is only requested from trusted destinations.";
 const KNOCK_REFUSAL_TAIL: &str = "A knock is not sent to a destination this node has blocked or an identity it has blocked; `.mesh unblock <destination>` or `.mesh trust <destination>` lifts the one, `.mesh unblock --identity <identity>` the other.";
+const UNHEARD_KNOCK_REFUSAL_TAIL: &str = "A knock is not sent to a destination this node has blocked, and the mesh is not asked about one it has not heard; `.mesh unblock <destination>` lifts the block.";
+const INFO_REFUSAL_TAIL: &str = "This node does not ask the mesh about a destination it has blocked and not heard; `.mesh unblock <destination>` lifts the block.";
+const TRUST_REFUSAL_TAIL: &str = "This node does not ask the mesh about a destination it has blocked and not heard; run `.mesh unblock <destination>`, then `.mesh trust <destination>` again.";
 const INBOX_CONTENT_MAX_CHARS: usize = 200;
 const NOTHING_CHANGED: &str = "Nothing was changed.";
 const DRY_RUN_NOTHING_CHANGED: &str = "This was a dry run; nothing changed.";
@@ -256,16 +259,16 @@ pub(crate) async fn run(
         "off" => turn_off(ctx, rest).await,
         "peers" => peers(ctx),
         "knocks" => knocks(ctx),
-        "info" => info(ctx, rest),
+        "info" => info(ctx, &abort_signal, rest).await,
         "status" => status(ctx, &abort_signal, rest).await,
         "brief" => brief(ctx, rest),
         "inbox" => inbox(ctx, rest),
         "pending" => pending(ctx),
         "answer" => answer(ctx, rest).await,
         "dismiss" => dismiss(ctx, rest).await,
-        "message" => message(ctx, rest).await,
+        "message" => message(ctx, &abort_signal, rest).await,
         "broadcast" => broadcast(ctx, rest).await,
-        "trust" => trust(ctx, rest),
+        "trust" => trust(ctx, &abort_signal, rest).await,
         "untrust" => untrust(ctx, rest),
         "forget" => forget(ctx, rest),
         "block" => block(ctx, rest),
@@ -613,7 +616,7 @@ fn knocks(ctx: &RequestContext) -> Result<()> {
 
 const NODE_OFF_LINE: &str = "node: off - .mesh on joins";
 
-fn info(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
+async fn info(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&str>) -> Result<()> {
     let Some(rest) = rest else {
         let node = ctx.app.mesh.get();
         // A running node lists every interface itself, with its state, under the same
@@ -646,11 +649,7 @@ fn info(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let runtime = live(ctx)?;
     let destination = destination_hash(ctx, rest.trim())?;
     let now = SystemTime::now();
-    let peer = runtime.peers().get(&destination);
-    let table = runtime.peers().snapshot();
-    let successor = peer
-        .as_ref()
-        .and_then(|peer| peer.successor_in(&table, now));
+    let mut peer = runtime.peers().get(&destination);
     let knock = match runtime.knock_gate().cache().list(now) {
         Ok(knocks) => match knocks
             .into_iter()
@@ -669,16 +668,27 @@ fn info(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         Err(err) => return Err(err),
     };
     let identity = match (&peer, &knock) {
-        (Some(peer), _) => peer.identity_hash.as_str(),
-        (None, KnockLookup::Knocked(knock)) => knock.identity_hash.as_str(),
-        (None, _) => bail!(
-            "Destination {destination} has not been heard from: it is not in the peer table and has not knocked. Run `.mesh peers` or `.mesh knocks` to see who has."
-        ),
+        (Some(peer), _) => peer.identity_hash.clone(),
+        (None, KnockLookup::Knocked(knock)) => knock.identity_hash.clone(),
+        (None, _) => {
+            let Some(asked) =
+                heard_or_asked(&runtime, &destination, INFO_REFUSAL_TAIL, abort_signal).await?
+            else {
+                return Ok(());
+            };
+            let identity = asked.identity_hash.clone();
+            peer = Some(asked);
+            identity
+        }
     };
+    let table = runtime.peers().snapshot();
+    let successor = peer
+        .as_ref()
+        .and_then(|peer| peer.successor_in(&table, now));
     let store = runtime.trust();
     let trust = trust_label(
-        store.authorize(identity, &destination),
-        store.identity_standing(identity),
+        store.authorize(&identity, &destination),
+        store.identity_standing(&identity),
     );
     out_text(&render_peer_detail(
         &destination,
@@ -724,7 +734,12 @@ async fn status(
         StatusArg::Fetch(token) => {
             let runtime = live(ctx)?;
             let destination = destination_hash(ctx, token)?;
-            peer_for_contact(&runtime, &destination, STATUS_REFUSAL_TAIL)?;
+            if peer_for_contact(&runtime, &destination, STATUS_REFUSAL_TAIL, abort_signal)
+                .await?
+                .is_none()
+            {
+                return Ok(());
+            }
             let desc = match route_to(&runtime, &destination, abort_signal).await {
                 Ok(desc) => desc,
                 Err(Unrouted::NoAnswer) => bail!(
@@ -1481,7 +1496,11 @@ fn no_open_question(id: &str) -> String {
     format!("No open question has id {id}. `.mesh pending` lists the ones this node knows about.")
 }
 
-async fn message(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
+async fn message(
+    ctx: &RequestContext,
+    abort_signal: &AbortSignal,
+    rest: Option<&str>,
+) -> Result<()> {
     let Some(rest) = rest else {
         out_text(&render_verb_help("message"));
         return Ok(());
@@ -1498,7 +1517,11 @@ async fn message(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         return Ok(());
     };
     let runtime = live(ctx)?;
-    let peer = peer_for_contact(&runtime, &destination, MESSAGE_REFUSAL_TAIL)?;
+    let Some(peer) =
+        peer_for_contact(&runtime, &destination, MESSAGE_REFUSAL_TAIL, abort_signal).await?
+    else {
+        return Ok(());
+    };
     let attachment = prepared_attachment(ctx, attach, &runtime)?;
     let trust = runtime.trust();
     out_text(&format!(
@@ -1539,12 +1562,17 @@ async fn message(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
 }
 
 /// The pre-flight every verb that contacts one peer runs: a destination the trust list
-/// denies is refused whether or not it has been heard; an unheard one is a not-heard
-/// error; a heard one is refused on any verdict short of Allow, `only` being the verb's
-/// own rule.
-fn peer_for_contact(runtime: &MeshRuntime, destination: &str, only: &str) -> Result<PeerRecord> {
-    let Some(peer) = runtime.peers().get(destination) else {
-        return Err(unheard_refusal(runtime, destination, only));
+/// denies is refused whether or not it has been heard; an unheard one is asked of the
+/// mesh first; a heard one is refused on any verdict short of Allow, `only` being the
+/// verb's own rule. `None` when Ctrl-C ended the wait for an unheard one.
+async fn peer_for_contact(
+    runtime: &MeshRuntime,
+    destination: &str,
+    only: &str,
+    abort_signal: &AbortSignal,
+) -> Result<Option<PeerRecord>> {
+    let Some(peer) = heard_or_asked(runtime, destination, only, abort_signal).await? else {
+        return Ok(None);
     };
     let trust = runtime.trust();
     let verdict = trust.authorize(&peer.identity_hash, destination);
@@ -1552,7 +1580,42 @@ fn peer_for_contact(runtime: &MeshRuntime, destination: &str, only: &str) -> Res
     if let Some(refusal) = trust_refusal(destination, verdict, standing, only) {
         bail!(refusal);
     }
-    Ok(peer)
+    Ok(Some(peer))
+}
+
+/// The peer table's row for `destination`. One the table lacks is asked of the mesh with
+/// one path request, unless the trust list denies the destination, which is refused
+/// unasked with `tail`. `None` when Ctrl-C ended the wait, which has been said.
+async fn heard_or_asked(
+    runtime: &MeshRuntime,
+    destination: &str,
+    tail: &str,
+    abort_signal: &AbortSignal,
+) -> Result<Option<PeerRecord>> {
+    if let Some(peer) = runtime.peers().get(destination) {
+        return Ok(Some(peer));
+    }
+    if let Some(refusal) = unheard_denial(runtime, destination, tail) {
+        bail!(refusal);
+    }
+    out_text(&format!(
+        "Asking the mesh for {}'s announce; Ctrl-C cancels...",
+        short(destination)
+    ));
+    result_follows();
+    tokio::select! {
+        peer = runtime.peer_asking_if_unheard(destination) => match peer {
+            Ok(peer) => Ok(Some(peer)),
+            Err(miss) => bail!(miss.refusal(destination)),
+        },
+        _ = wait_user_interrupt(Some(abort_signal)) => {
+            out_text(&format!(
+                "Stopped waiting for {}'s announce; nothing changed. Run the command again to ask once more.",
+                short(destination)
+            ));
+            Ok(None)
+        }
+    }
 }
 
 /// Why a verb that links to one peer has no route to link over.
@@ -1919,18 +1982,14 @@ fn attaching_notice(attachment: &Attachment, destination: &str) -> String {
     }
 }
 
-/// Why a destination not in the peer table is refused: the trust list's denial of the
-/// destination itself when there is one, otherwise that it has not been heard.
-fn unheard_refusal(runtime: &MeshRuntime, destination: &str, tail: &str) -> anyhow::Error {
+/// The trust list's denial of a destination the peer table does not hold, when there is
+/// one; such a destination is not asked of the mesh.
+fn unheard_denial(runtime: &MeshRuntime, destination: &str, tail: &str) -> Option<String> {
     let verdict = runtime.trust().authorize("", destination);
-    if verdict.rule == Rule::DestinationDenied
-        && let Some(refusal) = trust_refusal(destination, verdict, IdentityStanding::Unknown, tail)
-    {
-        return anyhow!(refusal);
+    if verdict.rule != Rule::DestinationDenied {
+        return None;
     }
-    anyhow!(
-        "Destination {destination} has not been heard from: it is not in the peer table. Only peers this node has heard announce can be contacted; check `.mesh peers`."
-    )
+    trust_refusal(destination, verdict, IdentityStanding::Unknown, tail)
 }
 
 async fn broadcast(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
@@ -1991,8 +2050,15 @@ async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     };
     let destination = destination_hash(ctx, target)?;
     let runtime = live(ctx)?;
-    let Some(peer) = runtime.peers().get(&destination) else {
-        return Err(unheard_refusal(&runtime, &destination, KNOCK_REFUSAL_TAIL));
+    let Some(peer) = heard_or_asked(
+        &runtime,
+        &destination,
+        UNHEARD_KNOCK_REFUSAL_TAIL,
+        abort_signal,
+    )
+    .await?
+    else {
+        return Ok(());
     };
     let trust = runtime.trust();
     let verdict = trust.authorize(&peer.identity_hash, &destination);
@@ -2115,11 +2181,17 @@ async fn request(
         .filter(|identity| {
             runtime.trust().authorize(identity, &destination).rule == Rule::IdentityBlocked
         });
-    peer_for_contact(
+    if peer_for_contact(
         &runtime,
         &destination,
         &request_refusal_tail(&destination, blocked_identity.as_deref()),
-    )?;
+        abort_signal,
+    )
+    .await?
+    .is_none()
+    {
+        return Ok(());
+    }
     let reason = args.reason.as_deref().unwrap_or("");
     // The id is only for the check; the send mints its own.
     let id = uuid::Uuid::new_v4().simple().to_string();
@@ -2316,7 +2388,11 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     };
     let destination = destination_hash(ctx, &args.destination)?;
     let runtime = live(ctx)?;
-    let record = peer_for_contact(&runtime, &destination, FETCH_REFUSAL_TAIL)?;
+    let Some(record) =
+        peer_for_contact(&runtime, &destination, FETCH_REFUSAL_TAIL, abort_signal).await?
+    else {
+        return Ok(());
+    };
     let shown = shown_pattern(&args.path);
     let peer = short(&destination);
     if let Some(reason) = spent_attachment(
@@ -2922,7 +2998,7 @@ mod sync_ask_line_tests {
     }
 }
 
-fn trust(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
+async fn trust(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&str>) -> Result<()> {
     let Some(rest) = rest else {
         out_text(&render_verb_help("trust"));
         return Ok(());
@@ -2945,11 +3021,20 @@ fn trust(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         return Ok(());
     };
     let store = trust_store(ctx)?;
-    let mesh: &dyn LiveMesh = ctx.app.mesh.as_ref();
+    let mesh = &*ctx.app.mesh;
     let now = SystemTime::now();
     match arg {
         TrustArg::Destination { target, label, yes } => {
             let destination = destination_hash(ctx, &target)?;
+            if let Some(runtime) = mesh.get()
+                && runtime.peers().get(&destination).is_none()
+                && mesh.knock(&destination, now).is_none()
+                && heard_or_asked(&runtime, &destination, TRUST_REFUSAL_TAIL, abort_signal)
+                    .await?
+                    .is_none()
+            {
+                return Ok(());
+            }
             let refused = store.records().iter().any(|record| {
                 record.tier == Tier::Destination && record.hash == destination && record.denied
             });
@@ -7670,6 +7755,10 @@ fn render_broadcast(outcome: &BroadcastOutcome) -> String {
                 refused += 1;
                 refusal.to_string()
             }
+            RecipientOutcome::NoAnswer(no_answer) => {
+                refused += 1;
+                no_answer.to_string()
+            }
         };
         lines.push(format!(
             "  {} ({}): {status}",
@@ -12074,6 +12163,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         use super::{INFO_SNAPSHOT, key_change_line_of};
         use super::{table_footer, table_header, table_rows};
         use crate::config::{AppConfig, AppState, Session, WorkingMode};
+        use crate::mesh::message::{answered_not_as_coyote, unanswered_path_request};
         use crate::repl::run_repl_command;
         use crate::testing::TestConfigDirGuard;
         use crate::utils::create_abort_signal;
@@ -15641,18 +15731,16 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "{err}"
                     );
 
+                    let waiting = format!(
+                        "Asking the mesh for {}'s announce; Ctrl-C cancels...",
+                        short(&hash)
+                    );
                     let err = run(&mut ctx, &format!(".mesh info {hash}"))
                         .await
                         .unwrap_err()
                         .to_string();
-                    assert!(
-                        err.contains(&hash) && err.contains("not been heard"),
-                        "{err}"
-                    );
-                    assert!(
-                        err.contains(".mesh peers") && err.contains(".mesh knocks"),
-                        "{err}"
-                    );
+                    assert_eq!(err, unanswered_path_request(&hash));
+                    assert!(stdout_lines().contains(&waiting), "{:?}", stdout_lines());
 
                     let err = run(&mut ctx, ".mesh info nothex")
                         .await
@@ -15680,7 +15768,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .await
                         .unwrap_err()
                         .to_string();
-                    assert!(err.contains(&hash) && err.contains(".mesh peers"), "{err}");
+                    assert_eq!(err, unanswered_path_request(&hash));
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();
@@ -19542,6 +19630,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             display_name: Some("Tia".to_string()),
                             protocol_version: 1,
                             hops: 1,
+                            public_key: None,
                         },
                         now,
                     );
@@ -19946,12 +20035,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             }
 
             /// `.mesh info <whole destination>` for a destination in neither the peer table
-            /// nor the knock cache names both places to look, in the one sentence; once
+            /// nor the knock cache asks the mesh for it and says nothing answered; once
             /// the cache cannot be read, the same lookup reports the cache rather than
-            /// claiming the destination was never heard from.
+            /// asking.
             #[test]
             #[serial]
-            fn info_on_a_destination_never_heard_from_names_both_places_to_look() {
+            fn info_on_a_destination_never_heard_from_asks_the_mesh_and_says_nothing_answered() {
                 use crate::mesh::hex_lower;
 
                 let _guard = TestConfigDirGuard::new("repl-mesh-info-unheard");
@@ -19966,12 +20055,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .await
                         .unwrap_err()
                         .to_string();
-                    assert_eq!(
-                        err,
-                        format!(
-                            "Destination {unheard} has not been heard from: it is not in the peer table and has not knocked. Run `.mesh peers` or `.mesh knocks` to see who has."
-                        )
-                    );
+                    assert_eq!(err, unanswered_path_request(&unheard));
 
                     let cache_path = started.runtime.knock_gate().cache().path().to_path_buf();
                     std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
@@ -19982,7 +20066,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .to_string();
                     assert!(err.contains("knock cache"), "{err}");
                     assert!(
-                        !err.contains("has not been heard from"),
+                        !err.contains("did not answer a path request"),
                         "an unreadable cache is reported, not read as silence: {err}"
                     );
 
@@ -20432,8 +20516,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
             /// The message gate runs BEFORE any notice or prompt and
             /// refuses every non-Allow verdict. A destination the node has not heard (and
-            /// the trust list does not deny) is a not-heard error, never an announcement or
-            /// a consent question; a heard peer whose verdict is not Allow ("untrusted",
+            /// the trust list does not deny) is asked for, and when nothing answers that is
+            /// the error, never an announcement or a consent question; a heard peer whose
+            /// verdict is not Allow ("untrusted",
             /// the default-closed standing) is refused naming that standing, and a leading
             /// `--yes` does not turn it into a send. Nothing may reach `send_peer`, which
             /// would refuse the same peer as NotTrusted after the human had already consented.
@@ -20467,7 +20552,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         now,
                     );
 
-                    // Not heard, not denied: a not-heard error, no notice, no prompt.
+                    // Not heard, not denied: asked for, then the unanswered error, no notice,
+                    // no prompt.
+                    let waiting = format!(
+                        "Asking the mesh for {}'s announce; Ctrl-C cancels...",
+                        short(&unheard)
+                    );
                     for line in [
                         format!(".mesh message {unheard} hello"),
                         format!(".mesh message --yes {unheard} hello"),
@@ -20476,10 +20566,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let before = stdout_lines().len();
                         let err = run(&mut ctx, &line).await.unwrap_err().to_string();
                         let out = stdout_lines()[before..].to_vec();
-                        assert!(
-                            err.contains("has not been heard"),
-                            "{line}: an unheard destination is a not-heard error: {err}"
-                        );
+                        assert_eq!(err, unanswered_path_request(&unheard), "{line}");
+                        assert!(out.contains(&waiting), "{line}: {out:?}");
                         assert_eq!(
                             prompt_script::prompts_asked(),
                             asked_before,
@@ -20644,14 +20732,19 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
                     let unheard = hex_lower(&[0x77; 16]);
 
+                    let waiting = format!(
+                        "Asking the mesh for {}'s announce; Ctrl-C cancels...",
+                        short(&unheard)
+                    );
                     for line in [
                         format!(".mesh knock {unheard}"),
                         format!(".mesh knock {unheard} --yes --intro \"hi\""),
                     ] {
                         let before = stdout_lines().len();
                         let err = run(&mut ctx, &line).await.unwrap_err().to_string();
-                        assert!(err.contains("has not been heard"), "{line}: {err}");
+                        assert_eq!(err, unanswered_path_request(&unheard), "{line}");
                         let out = stdout_lines()[before..].to_vec();
+                        assert!(out.contains(&waiting), "{line}: {out:?}");
                         assert!(
                             !out.iter().any(|text| text.starts_with("This knocks on")),
                             "{line}: no notice for an unheard destination: {out:?}"
@@ -20666,7 +20759,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
             /// `.mesh message <dest>` applies the SAME trust gate as
             /// `.mesh status <dest>`, so for one destination both verbs classify the refusal
-            /// the same way: plain unheard -> not-heard; unheard but denied at the
+            /// the same way: plain unheard -> not-heard once the path request goes
+            /// unanswered; unheard but denied at the
             /// destination tier -> blocked (instance); heard untrusted, blocked (instance)
             /// or blocked (identity) -> that standing.
             #[test]
@@ -20721,7 +20815,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             "blocked (identity)"
                         } else if err.contains(" is untrusted ") {
                             "untrusted"
-                        } else if err.contains("has not been heard") {
+                        } else if err.contains("did not answer a path request") {
                             "not-heard"
                         } else {
                             "other"
@@ -20767,10 +20861,15 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
                     }
                     let out = stdout_lines();
+                    let waiting = format!(
+                        "Asking the mesh for {}'s announce; Ctrl-C cancels...",
+                        short(&unheard)
+                    );
                     assert!(
-                        !out.iter().any(|line| line.contains("Asking")
-                            || line.contains("This sends your text to")
-                            || line.starts_with("Sent ")),
+                        !out.iter()
+                            .any(|line| (line.contains("Asking") && *line != waiting)
+                                || line.contains("This sends your text to")
+                                || line.starts_with("Sent ")),
                         "no notice or link toward a refused destination: {out:?}"
                     );
 
@@ -21315,8 +21414,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             }
 
             /// A knock carries the same proof as an announce, so a destination heard only
-            /// through the knock cache can be trusted; one in neither place is sent to the
-            /// lists that show what can be.
+            /// through the knock cache can be trusted; one in neither place is asked for,
+            /// and fails naming the list that shows what can be.
             #[test]
             #[serial]
             fn trust_accepts_a_destination_that_only_knocked() {
@@ -21360,7 +21459,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     let (other, _, _) = announced_peer();
                     let err = refusal(&mut ctx, &format!(".mesh trust {other} --yes")).await;
-                    assert!(err.contains(".mesh knocks"), "{err}");
+                    assert_eq!(err, unanswered_path_request(&other));
                     assert_eq!(prompt_script::prompts_asked(), 0);
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
@@ -26497,10 +26596,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .block_identity(slot, &blocked_identity, None, now)
                         .unwrap();
 
-                    for (destination, standing) in [
-                        (&denied, "blocked (instance)"),
-                        (&unheard_denied, "blocked (instance)"),
-                        (&blocked, "blocked (identity)"),
+                    for (destination, standing, tail) in [
+                        (&denied, "blocked (instance)", KNOCK_REFUSAL_TAIL),
+                        (
+                            &unheard_denied,
+                            "blocked (instance)",
+                            UNHEARD_KNOCK_REFUSAL_TAIL,
+                        ),
+                        (&blocked, "blocked (identity)", KNOCK_REFUSAL_TAIL),
                     ] {
                         let before = stdout_lines().len();
                         let err =
@@ -26513,7 +26616,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             !err.contains("has not been heard"),
                             "{standing}: the deny is named, not the missing peer row: {err}"
                         );
-                        assert!(err.contains(KNOCK_REFUSAL_TAIL), "{standing}: {err}");
+                        assert!(err.contains(tail), "{standing}: {err}");
                         assert!(
                             stdout_lines()[before..].is_empty(),
                             "{standing}: refused before the notice: {:?}",
@@ -26733,6 +26836,72 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     started.relay_handle.abort();
                     stub.stop().await;
                 });
+            }
+
+            mod no_answer_tests {
+                use super::*;
+
+                /// The peer is a stub behind the real dispatcher that knows no identity, so
+                /// a link to it comes up and then nothing answers. This node trusts it, and
+                /// `.mesh message` and `.mesh status` both end on the no-answer sentence
+                /// naming the command the peer's owner runs, never the unreachable one.
+                #[test]
+                #[serial]
+                fn message_and_status_to_a_silent_peer_say_no_answer() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-no-answer");
+                    let _script = prompt_script::install(&[]);
+                    let _capture = capture::install();
+                    run_async(async {
+                        let stub = PeerStub::listen(
+                            "repl-mesh-no-answer-stub",
+                            TcpServer::DEFAULT_CLIENT_MTU,
+                        )
+                        .await;
+                        let started = started_runtime_on("repl-mesh-no-answer", stub.port()).await;
+                        let mut ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                        stub.announce(Some("Tia")).await;
+                        let peer = stub.destination_hex();
+                        stub.wait_to_be_filed(&started.runtime.peers(), &peer).await;
+                        out_of(&mut ctx, &format!(".mesh trust {peer} --yes"))
+                            .await
+                            .unwrap();
+                        let own = started.runtime.current_destination_hash();
+                        let no_answer = format!(
+                            "no answer from {}: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance).",
+                            short(&peer)
+                        );
+
+                        let err = run(&mut ctx, &format!(".mesh message {peer} --yes hello"))
+                            .await
+                            .unwrap_err()
+                            .to_string();
+                        assert_eq!(
+                            err,
+                            format!(
+                                "{no_answer} Nothing was queued, because no propagation node is known yet to hold the message for it; `.mesh peers` lists the nodes this Coyote has heard from."
+                            )
+                        );
+
+                        let err = run(&mut ctx, &format!(".mesh status {peer}"))
+                            .await
+                            .unwrap_err()
+                            .to_string();
+                        assert_eq!(
+                            err,
+                            format!(
+                                "{no_answer} A status request is answered live or not at all; nothing queues it for later."
+                            )
+                        );
+                        assert!(!err.contains("unreachable"), "{err}");
+                        assert!(err.is_ascii(), "{err}");
+                        assert!(stub.seen().is_empty(), "{:?}", stub.seen());
+
+                        assert!(ctx.app.mesh.stop().await.unwrap());
+                        started.relay_handle.abort();
+                        stub.stop().await;
+                    });
+                }
             }
 
             /// `.mesh status` against a trusted, reachable peer that accepts the request but
@@ -27088,6 +27257,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                     display_name: Some("Tia".to_string()),
                                     protocol_version: 1,
                                     hops: 1,
+                                    public_key: None,
                                 },
                                 now,
                             );
@@ -27364,6 +27534,493 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 }
             }
 
+            /// The verbs that take one destination, typed on B for an A that joined first
+            /// on a relay that replays no announce: B asks the mesh once, the answer files
+            /// A, and the verb carries on as it would for a heard peer.
+            #[cfg(unix)]
+            mod first_contact_tests {
+                use super::*;
+                use crate::mesh::identity::current_identity;
+                use crate::mesh::test_support::{
+                    mesh_paths, pair_where_b_has_not_heard_a, wait_until,
+                };
+                use crate::supervisor::mailbox::EnvelopePayload;
+
+                struct LateJoiner {
+                    relay: TransportRelay,
+                    a: StartedRuntime,
+                    b: StartedRuntime,
+                    slot_a: Arc<MeshSlot>,
+                    ctx: RequestContext,
+                    to_a: String,
+                    to_b: String,
+                }
+
+                impl LateJoiner {
+                    async fn start(tag: &str) -> Self {
+                        let (relay, a, b) = pair_where_b_has_not_heard_a(tag).await;
+                        let to_a = a.runtime.current_destination_hash();
+                        let to_b = b.runtime.current_destination_hash();
+                        let slot_a = Arc::new(MeshSlot::default());
+                        slot_a.install(a.runtime.clone()).unwrap();
+                        let ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(b.runtime.clone()).unwrap();
+                        Self {
+                            relay,
+                            a,
+                            b,
+                            slot_a,
+                            ctx,
+                            to_a,
+                            to_b,
+                        }
+                    }
+
+                    fn waiting_line(&self) -> String {
+                        format!(
+                            "Asking the mesh for {}'s announce; Ctrl-C cancels...",
+                            short(&self.to_a)
+                        )
+                    }
+
+                    /// Runs `line` on B, which must ask for A once, within the path-request
+                    /// bound and a short grace, and file it.
+                    async fn asks_for_a(&mut self, line: &str) -> Result<String> {
+                        let asked = Instant::now();
+                        let out = out_of(&mut self.ctx, line).await;
+                        assert!(
+                            asked.elapsed() < PATH_REQUEST_TIMEOUT + Duration::from_secs(3),
+                            "{line}: {:?}",
+                            asked.elapsed()
+                        );
+                        assert!(
+                            self.b.runtime.peers().get(&self.to_a).is_some(),
+                            "{line}: B filed A from the path response"
+                        );
+                        out
+                    }
+
+                    fn a_trusts_b(&self) {
+                        self.a
+                            .runtime
+                            .trust()
+                            .trust_destination(
+                                self.slot_a.as_ref(),
+                                &self.to_b,
+                                TrustOptions::default(),
+                                SystemTime::now(),
+                            )
+                            .unwrap();
+                    }
+
+                    async fn stop(self) {
+                        assert!(self.ctx.app.mesh.stop().await.unwrap());
+                        assert!(self.slot_a.stop().await.unwrap());
+                        self.relay.stop().await;
+                    }
+                }
+
+                #[test]
+                #[serial]
+                fn trust_of_an_unheard_destination_asks_for_it_and_status_then_works_both_ways() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-first-contact-trust");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = LateJoiner::start("repl-first-contact-trust").await;
+                        let to_a = fx.to_a.clone();
+                        let out = fx
+                            .asks_for_a(&format!(".mesh trust {to_a} --yes"))
+                            .await
+                            .unwrap();
+                        assert!(out.contains(&fx.waiting_line()), "{out}");
+                        assert!(out.contains(&format!("Trusted {}", short(&to_a))), "{out}");
+
+                        fx.a_trusts_b();
+                        let card = out_of(&mut fx.ctx, &format!(".mesh status {to_a}"))
+                            .await
+                            .unwrap();
+                        assert!(
+                            card.contains(&format!(
+                                "Asking {} for its status card; Ctrl-C cancels...",
+                                short(&to_a)
+                            )),
+                            "{card}"
+                        );
+                        for field in ["name: ", "objective: ", "state: "] {
+                            assert!(
+                                card.lines().any(|line| line.starts_with(field)),
+                                "A's card shows `{field}`: {card}"
+                            );
+                        }
+                        status_round_trip(&fx.slot_a, &fx.ctx.app.mesh).await;
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn info_of_an_unheard_destination_asks_for_it_and_shows_the_row() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-first-contact-info");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let mut fx = LateJoiner::start("repl-first-contact-info").await;
+                        let to_a = fx.to_a.clone();
+                        let out = fx.asks_for_a(&format!(".mesh info {to_a}")).await.unwrap();
+                        assert!(out.contains(&fx.waiting_line()), "{out}");
+                        assert!(out.contains(&format!("destination: {to_a}")), "{out}");
+                        assert!(
+                            out.contains(&format!(
+                                "identity: {}",
+                                fx.b.runtime.peers().get(&to_a).unwrap().identity_hash
+                            )),
+                            "{out}"
+                        );
+                        fx.stop().await;
+                    });
+                }
+
+                /// A trusts B, so the knock is answered over the link rather than waiting out
+                /// the silence a stranger's knock gets.
+                #[test]
+                #[serial]
+                fn knock_on_an_unheard_destination_asks_for_it_then_knocks() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-first-contact-knock");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = LateJoiner::start("repl-first-contact-knock").await;
+                        fx.a_trusts_b();
+                        let to_a = fx.to_a.clone();
+                        let out = fx
+                            .asks_for_a(&format!(".mesh knock {to_a} --yes"))
+                            .await
+                            .unwrap();
+                        assert!(out.contains(&fx.waiting_line()), "{out}");
+                        assert!(
+                            out.contains(&format!(
+                                "Knocked on {} directly; the peer decides whether to trust this instance.",
+                                short(&to_a)
+                            )),
+                            "A took the knock over the link and answered it: {out}"
+                        );
+                        fx.stop().await;
+                    });
+                }
+
+                /// B trusts A's identity for all destinations before it has heard A, so
+                /// the first `.mesh message` asks for A, passes the trust check on the
+                /// identity the answer carries, and delivers the message to A's inbox.
+                #[test]
+                #[serial]
+                fn message_to_an_unheard_instance_of_a_trusted_identity_asks_for_it_and_delivers() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-first-contact-message");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = LateJoiner::start("repl-first-contact-message").await;
+                        let to_a = fx.to_a.clone();
+                        fx.a_trusts_b();
+                        let identity_of_a = current_identity(&mesh_paths(&fx.a.tmp).identity_path)
+                            .unwrap()
+                            .address_hash()
+                            .to_hex_string();
+                        fx.b.runtime
+                            .trust()
+                            .trust_identity(
+                                fx.ctx.app.mesh.as_ref(),
+                                &identity_of_a,
+                                TrustOptions::default(),
+                                SystemTime::now(),
+                            )
+                            .unwrap();
+
+                        let out = fx
+                            .asks_for_a(&format!(".mesh message {to_a} --yes hello"))
+                            .await
+                            .unwrap();
+                        assert!(out.contains(&fx.waiting_line()), "{out}");
+                        wait_until("A's inbox to hold B's message", || {
+                            fx.slot_a.peer_inbox().len() > 0
+                        })
+                        .await;
+                        let (delivered, _) = fx.slot_a.peer_inbox().drain();
+                        let contents: Vec<_> = delivered
+                            .iter()
+                            .filter_map(|envelope| match &envelope.payload {
+                                EnvelopePayload::Peer(message) => Some(message.content.as_str()),
+                                _ => None,
+                            })
+                            .collect();
+                        assert_eq!(contents, ["hello"], "{delivered:?}");
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
+                /// A hash nothing answers for fails after one path request with the line
+                /// that says so; a blocked one is refused at once, with no waiting line.
+                #[test]
+                #[serial]
+                fn an_unanswered_hash_fails_within_the_bound_and_a_blocked_one_is_not_asked_for() {
+                    use crate::mesh::hex_lower;
+
+                    let _guard = TestConfigDirGuard::new("repl-mesh-first-contact-unanswered");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let started = started_runtime("repl-mesh-first-contact-unanswered").await;
+                        let mut ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                        let unheard = hex_lower(&[0x5d; 16]);
+                        assert_eq!(
+                            unanswered_path_request(&unheard),
+                            format!(
+                                "{} did not answer a path request within 5 s: it is not on any interface this node joined, or it is not announcing. Check the hash, or wait for its announce (`.mesh peers`).",
+                                short(&unheard)
+                            )
+                        );
+                        for line in [
+                            format!(".mesh trust {unheard} --yes"),
+                            format!(".mesh status {unheard}"),
+                        ] {
+                            let asked = Instant::now();
+                            assert_eq!(
+                                refusal(&mut ctx, &line).await,
+                                unanswered_path_request(&unheard),
+                                "{line}"
+                            );
+                            let waited = asked.elapsed();
+                            assert!(
+                                waited >= PATH_REQUEST_TIMEOUT
+                                    && waited < PATH_REQUEST_TIMEOUT + Duration::from_secs(3),
+                                "{line}: {waited:?}"
+                            );
+                        }
+                        assert!(ctx.app.mesh.get().unwrap().trust().records().is_empty());
+
+                        out_of(&mut ctx, &format!(".mesh block {unheard} --yes"))
+                            .await
+                            .unwrap();
+                        let printed = stdout_lines().len();
+                        let asked = Instant::now();
+                        let err = refusal(&mut ctx, &format!(".mesh info {unheard}")).await;
+                        assert!(
+                            asked.elapsed() < Duration::from_secs(1),
+                            "{:?}",
+                            asked.elapsed()
+                        );
+                        assert!(err.ends_with(INFO_REFUSAL_TAIL), "{err}");
+                        assert_eq!(stdout_lines().len(), printed, "nothing was asked: {err}");
+                        for (line, tail) in [
+                            (format!(".mesh trust {unheard} --yes"), TRUST_REFUSAL_TAIL),
+                            (
+                                format!(".mesh knock {unheard} --yes"),
+                                UNHEARD_KNOCK_REFUSAL_TAIL,
+                            ),
+                        ] {
+                            let asked = Instant::now();
+                            let err = refusal(&mut ctx, &line).await;
+                            assert!(
+                                asked.elapsed() < Duration::from_secs(1),
+                                "{line}: {:?}",
+                                asked.elapsed()
+                            );
+                            assert!(err.ends_with(tail), "{line}: {err}");
+                            assert_eq!(stdout_lines().len(), printed, "{line}: nothing was asked");
+                        }
+                        assert!(
+                            !UNHEARD_KNOCK_REFUSAL_TAIL.contains(".mesh trust"),
+                            "trust refuses an unheard blocked destination too, so it is no remedy"
+                        );
+
+                        assert!(ctx.app.mesh.stop().await.unwrap());
+                        started.relay_handle.abort();
+                    });
+                }
+
+                /// Ctrl-C during the wait for an unheard destination's announce ends it
+                /// with a line that says nothing changed: no trust record, no prompt.
+                #[test]
+                #[serial]
+                fn ctrl_c_while_asking_for_an_unheard_destination_changes_nothing() {
+                    use crate::mesh::hex_lower;
+
+                    let _guard = TestConfigDirGuard::new("repl-mesh-first-contact-ctrl-c");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let started = started_runtime("repl-mesh-first-contact-ctrl-c").await;
+                        let mut ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                        let unheard = hex_lower(&[0x6e; 16]);
+
+                        let press_after = Duration::from_millis(600);
+                        let signal = create_abort_signal();
+                        let pressed = signal.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(press_after).await;
+                            pressed.set_ctrlc();
+                        });
+                        let before = stdout_lines().len();
+                        let asked = Instant::now();
+                        let line = format!(".mesh trust {unheard} --yes");
+                        let outcome = Box::pin(run_repl_command(&mut ctx, signal, &line)).await;
+                        let waited = asked.elapsed();
+                        assert!(
+                            outcome.is_ok(),
+                            "an interrupted wait is not an error: {outcome:?}"
+                        );
+                        assert!(
+                            waited >= press_after && waited < PATH_REQUEST_TIMEOUT,
+                            "Ctrl-C ended the wait: {waited:?}"
+                        );
+                        let out = stdout_lines()[before..].join("\n");
+                        assert!(
+                            out.contains(&format!(
+                                "Stopped waiting for {}'s announce; nothing changed. Run the command again to ask once more.",
+                                short(&unheard)
+                            )),
+                            "{out}"
+                        );
+                        assert!(ctx.app.mesh.get().unwrap().trust().records().is_empty());
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+
+                        assert!(ctx.app.mesh.stop().await.unwrap());
+                        started.relay_handle.abort();
+                    });
+                }
+
+                /// `.mesh status`, `.mesh fetch` and `.mesh request` to an unheard destination
+                /// ask for it, file the answer, then refuse the way they refuse any heard peer
+                /// this node does not trust, never with the unanswered path request sentence.
+                #[test]
+                #[serial]
+                fn status_and_fetch_of_an_unheard_destination_ask_for_it_then_judge_trust() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-first-contact-status-fetch");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        for verb in [
+                            ".mesh status {}",
+                            ".mesh fetch {} docs/a.md",
+                            ".mesh request {} docs/a.md",
+                        ] {
+                            let mut fx = LateJoiner::start("repl-first-contact-status-fetch").await;
+                            let line = verb.replace("{}", &fx.to_a);
+                            let tail = match verb.split(' ').nth(1) {
+                                Some("status") => STATUS_REFUSAL_TAIL.to_string(),
+                                Some("fetch") => FETCH_REFUSAL_TAIL.to_string(),
+                                _ => request_refusal_tail(&fx.to_a, None),
+                            };
+                            let before = stdout_lines().len();
+                            let err = fx.asks_for_a(&line).await.unwrap_err().to_string();
+                            let printed = stdout_lines()[before..].join("\n");
+                            assert!(printed.contains(&fx.waiting_line()), "{line}: {printed}");
+                            assert!(err.ends_with(&tail), "{line}: {err}");
+                            assert!(!err.contains("did not answer a path request"), "{err}");
+                            assert!(!err.contains("not in the peer table"), "{err}");
+                            fx.stop().await;
+                        }
+                    });
+                }
+
+                /// Only a full 32-hex destination is asked for: a prefix or a non-hex
+                /// string is answered at once (a refusal, or the verb's usage), with no
+                /// waiting line.
+                #[test]
+                #[serial]
+                fn a_short_or_non_hex_destination_is_never_asked_for() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-first-contact-malformed");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let started = started_runtime("repl-mesh-first-contact-malformed").await;
+                        let mut ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                        let non_hex = "z".repeat(32);
+                        for line in [
+                            ".mesh trust 5d5d5d5d --yes".to_string(),
+                            ".mesh info 5d5d5d5d".to_string(),
+                            format!(".mesh status {non_hex}"),
+                            format!(".mesh message {non_hex} --yes hi"),
+                        ] {
+                            let before = stdout_lines().len();
+                            let asked = Instant::now();
+                            let err = match run(&mut ctx, &line).await {
+                                Ok(_) => String::new(),
+                                Err(err) => err.to_string(),
+                            };
+                            assert!(
+                                asked.elapsed() < Duration::from_secs(1),
+                                "{line}: {:?} {err}",
+                                asked.elapsed()
+                            );
+                            let printed = stdout_lines()[before..].join("\n");
+                            assert!(
+                                !printed.contains("Asking the mesh for"),
+                                "{line}: {printed}"
+                            );
+                            assert!(
+                                !err.contains("did not answer a path request"),
+                                "{line}: {err}"
+                            );
+                        }
+                        assert!(ctx.app.mesh.stop().await.unwrap());
+                        started.relay_handle.abort();
+                    });
+                }
+
+                /// A hash typed in capitals is the same destination: it is asked for once,
+                /// filed under its lower-case spelling and listed by `.mesh peers`. Once
+                /// filed, the next verb on it neither asks again nor waits.
+                #[test]
+                #[serial]
+                fn an_upper_case_hash_is_asked_for_once_and_the_next_verb_does_not_ask_again() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-first-contact-upper");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = LateJoiner::start("repl-first-contact-upper").await;
+                        let to_a = fx.to_a.clone();
+                        let typed = to_a.to_ascii_uppercase();
+                        assert_ne!(typed, to_a);
+                        let out = fx.asks_for_a(&format!(".mesh info {typed}")).await.unwrap();
+                        assert!(out.contains(&fx.waiting_line()), "{out}");
+                        assert!(out.contains(&format!("destination: {to_a}")), "{out}");
+
+                        let peers = out_of(&mut fx.ctx, ".mesh peers").await.unwrap();
+                        assert!(peers.contains(short(&to_a)), "{peers}");
+
+                        for line in [
+                            format!(".mesh info {to_a}"),
+                            format!(".mesh trust {to_a} --yes"),
+                        ] {
+                            let asked = Instant::now();
+                            let out = out_of(&mut fx.ctx, &line).await.unwrap();
+                            assert!(
+                                asked.elapsed() < Duration::from_secs(2),
+                                "{line}: {:?}",
+                                asked.elapsed()
+                            );
+                            assert!(
+                                !out.contains("Asking the mesh for"),
+                                "{line} asked again for a filed peer: {out}"
+                            );
+                        }
+                        assert!(
+                            fx.b.runtime
+                                .trust()
+                                .records()
+                                .iter()
+                                .any(|record| format!("{record:?}").contains(&to_a)),
+                            "the trust landed on the filed destination"
+                        );
+                        fx.stop().await;
+                    });
+                }
+            }
+
             mod command_prefix_refusals {
                 use super::*;
                 use crate::config::{CommandPrefix, live_prefix_override};
@@ -27377,7 +28034,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                 /// The refusals of the trust verbs and of `.mesh message` leave the REPL
                 /// as `.mesh` errors, so each hint they carry is spelled in the prefix the
-                /// session was switched to.
+                /// session was switched to. `.mesh message` to a hash never heard fails
+                /// with the same unanswered path request sentence the trust row checks.
                 #[test]
                 #[serial]
                 fn trust_and_message_refusals_spell_their_hints_in_the_prefix() {
@@ -27393,7 +28051,6 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let (unheard, _, _) = announced_peer();
                         let (heard, _) = heard_peer(&started.runtime, "Tia", SystemTime::now());
                         let unknown_identity = hex_lower(&[0x5b; 16]);
-                        let never_heard = hex_lower(&[0x6c; 16]);
 
                         for (prefix, sigil, mesh) in PREFIXES {
                             let typed = ctx.command_prefix().display();
@@ -27401,14 +28058,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 .await
                                 .unwrap();
                             for (line, hint) in [
-                                (format!("trust {unheard} --yes"), "knocks"),
+                                (format!("trust {unheard} --yes"), "peers"),
                                 (
                                     format!("untrust --identity {unknown_identity}"),
                                     "trust --identity",
                                 ),
                                 ("block nothex00".to_string(), "peers"),
                                 (format!("message {heard} hi"), "peers"),
-                                (format!("message {never_heard} hi"), "peers"),
                             ] {
                                 let err = run(&mut ctx, &format!("{sigil}mesh {line}"))
                                     .await
@@ -43137,8 +43793,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 /// identity at a destination. When the row ages out of the peer table the
                 /// claims stay in memory: `forget --identity` still counts them, but `fetch
                 /// <dest> <TAB>` offers only the destination's last listing, since the verb
-                /// itself refuses a destination the table no longer holds without asking the
-                /// peer; the same identity announcing again brings every claim back onto the
+                /// itself sends a path request for a destination the table no longer holds,
+                /// though the transport still has a path to it, and refuses it when the
+                /// stub's path response files no row (it carries no Coyote announce data);
+                /// the same identity announcing again brings every claim back onto the
                 /// prompt and the fetch goes through.
                 #[test]
                 #[serial]
@@ -43196,10 +43854,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
                         assert_eq!(
                             refusal(&mut fx.ctx, &format!(".mesh fetch {dest} docs/a.md")).await,
-                            format!(
-                                "Destination {dest} has not been heard from: it is not in the peer table. Only peers this node has heard announce can be contacted; check `.mesh peers`."
-                            ),
-                            "the verb refuses the swept destination before any request"
+                            answered_not_as_coyote(&dest),
+                            "the verb asks for the swept destination, the stub answers without a Coyote announce, and it is refused before any request"
                         );
                         assert!(fx.heard().is_empty(), "nothing reached the peer");
                         let out = out_of(
@@ -43308,19 +43964,6 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 untrusted_refusal,
                             ),
                             (
-                                format!(".mesh fetch {unheard} docs/a.md"),
-                                unheard_refusal(&runtime, &unheard, FETCH_REFUSAL_TAIL).to_string(),
-                            ),
-                            (
-                                format!(".mesh request {unheard} docs/a.md"),
-                                unheard_refusal(
-                                    &runtime,
-                                    &unheard,
-                                    &request_refusal_tail(&unheard, None),
-                                )
-                                .to_string(),
-                            ),
-                            (
                                 ".mesh fetch stub docs/a.md".to_string(),
                                 "'stub' is not a destination hash: expected a destination hash or a unique prefix of one `.mesh peers` lists (8 or more characters)."
                                     .to_string(),
@@ -43348,6 +43991,19 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             assert_eq!(refusal(&mut fx.ctx, &line).await, expected, "{line}");
                             assert_eq!(stdout_lines().len(), printed, "{line} prints nothing");
                         }
+                        let printed = stdout_lines().len();
+                        assert_eq!(
+                            refusal(&mut fx.ctx, &format!(".mesh fetch {unheard} docs/a.md")).await,
+                            unanswered_path_request(&unheard),
+                            "an unheard destination is asked for, and nothing answers"
+                        );
+                        assert_eq!(
+                            stdout_lines()[printed..].first(),
+                            Some(&format!(
+                                "Asking the mesh for {}'s announce; Ctrl-C cancels...",
+                                short(&unheard)
+                            ))
+                        );
                         assert!(fx.heard().is_empty(), "{:?}", fx.heard());
                         assert!(!fx.inbox_root().exists());
                         assert_eq!(prompt_script::prompts_asked(), 0);

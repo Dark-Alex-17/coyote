@@ -12,8 +12,19 @@ use std::time::Duration;
 /// `anyhow::Result` still works through `std::error::Error`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RequestError {
-    /// No response arrived within `after`; the link may still be up.
+    /// The request went out on an active link and no part of a response arrived within
+    /// `after`; the link may still be up.
     Timeout { path: String, after: Duration },
+    /// The link to the peer did not come up within `after`, so nothing was asked.
+    LinkActivationTimeout { path: String, after: Duration },
+    /// This node's own wait ran out before the request left it: the link lock stayed
+    /// held, or the transport did not take the request, within `after`.
+    LocalTimeout { path: String, after: Duration },
+    /// The identity proof could not be put on the link within `after`, so the peer was
+    /// never asked.
+    IdentifyTimeout { path: String, after: Duration },
+    /// The peer began a response but it had not finished arriving within `after`.
+    ResponseIncomplete { path: String, after: Duration },
     /// The link could not be established or the packet could not be put on its interface.
     LinkFailed(String),
     /// The link closed while the request was pending, or was gone by the time we replied.
@@ -57,6 +68,19 @@ impl RequestError {
     pub(crate) fn is_access_refusal(&self) -> bool {
         matches!(self, Self::Refused(RefusalCode::NoAccess))
     }
+
+    /// `true` for a wait that ran out for a reason other than the peer's silence: the link
+    /// never came up, this node's own side was slow, or an answer was still arriving. None
+    /// of these says anything about the peer's trust, and a retry is the step.
+    pub(crate) fn is_retryable_wait(&self) -> bool {
+        matches!(
+            self,
+            Self::LinkActivationTimeout { .. }
+                | Self::LocalTimeout { .. }
+                | Self::IdentifyTimeout { .. }
+                | Self::ResponseIncomplete { .. }
+        )
+    }
 }
 
 impl fmt::Display for RequestError {
@@ -65,6 +89,26 @@ impl fmt::Display for RequestError {
             Self::Timeout { path, after } => write!(
                 f,
                 "No response to the mesh request {path} within {:.1}s",
+                after.as_secs_f64()
+            ),
+            Self::LinkActivationTimeout { after, .. } => write!(
+                f,
+                "No mesh link to the peer came up within {:.1}s",
+                after.as_secs_f64()
+            ),
+            Self::LocalTimeout { after, .. } => write!(
+                f,
+                "This node could not hand the request to its own mesh link within {:.1}s",
+                after.as_secs_f64()
+            ),
+            Self::IdentifyTimeout { after, .. } => write!(
+                f,
+                "This node could not prove its identity to the peer within {:.1}s",
+                after.as_secs_f64()
+            ),
+            Self::ResponseIncomplete { after, .. } => write!(
+                f,
+                "The peer started to answer, but the answer had not finished arriving within {:.1}s",
                 after.as_secs_f64()
             ),
             Self::LinkFailed(reason) => write!(f, "The mesh link failed: {reason}"),
@@ -155,7 +199,13 @@ impl RefusalCode {
 /// serve only a caller that wraps without the remap.
 pub(crate) fn request_remedy(err: &RequestError) -> &'static str {
     match err {
-        RequestError::Timeout { .. } | RequestError::LinkFailed(_) | RequestError::LinkClosed => {
+        RequestError::Timeout { .. }
+        | RequestError::LinkActivationTimeout { .. }
+        | RequestError::LocalTimeout { .. }
+        | RequestError::IdentifyTimeout { .. }
+        | RequestError::ResponseIncomplete { .. }
+        | RequestError::LinkFailed(_)
+        | RequestError::LinkClosed => {
             "Try again in a minute; `.mesh peers` shows when the peer was last heard"
         }
         RequestError::Oversize { .. } => {
@@ -278,5 +328,135 @@ impl fmt::Display for RemoteRefusal {
             " refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance). (This node does trust {dest8}.)",
             own = self.own_destination
         )
+    }
+}
+
+/// A peer that opened the link and then said nothing to a request. A Coyote answers
+/// every identity it trusts, even with a refusal, and stays silent to one it does not
+/// know or has blocked, so silence after the link came up means the remedy is on the
+/// peer's side, as for a `RemoteRefusal`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NoAnswer {
+    destination: String,
+    own_destination: String,
+}
+
+impl NoAnswer {
+    pub(crate) fn new(destination: &str, own_destination: String) -> Self {
+        Self {
+            destination: destination.to_string(),
+            own_destination,
+        }
+    }
+
+    /// What the model can still do about it, for a tool result's `next_action`. A peer
+    /// that stays silent filed no knock, so unlike a refusal nothing reached its owner.
+    pub(crate) fn next_action(&self) -> String {
+        format!(
+            "Nothing on this node lifts it: ask the person at {} to run .mesh trust {} (or .mesh unblock {} if they blocked this instance); the peer did not answer, so nothing reached them.",
+            short(&self.destination),
+            self.own_destination,
+            self.own_destination
+        )
+    }
+}
+
+/// As a tool result carries it, in the same three fields as a `RemoteRefusal`.
+impl Serialize for NoAnswer {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("NoAnswer", 3)?;
+        state.serialize_field("kind", "no_answer")?;
+        state.serialize_field("message", &self.to_string())?;
+        state.serialize_field("next_action", &self.next_action())?;
+        state.end()
+    }
+}
+
+impl fmt::Display for NoAnswer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "no answer from {}: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance).",
+            short(&self.destination),
+            own = self.own_destination
+        )
+    }
+}
+
+#[cfg(test)]
+mod no_answer_tests {
+    use super::*;
+
+    #[test]
+    fn no_answer_names_the_peer_and_the_command_its_owner_runs() {
+        let peer = "bb".repeat(16);
+        let own = "aa".repeat(16);
+        let no_answer = NoAnswer::new(&peer, own.clone());
+
+        assert_eq!(
+            no_answer.to_string(),
+            format!(
+                "no answer from bbbbbbbb: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance)."
+            )
+        );
+        let next = no_answer.next_action();
+        assert!(next.is_ascii(), "{next}");
+        assert!(next.contains(&format!(".mesh trust {own}")), "{next}");
+        assert!(!next.contains("knock"), "silence filed no knock: {next}");
+    }
+
+    #[test]
+    fn a_link_that_never_came_up_says_so_and_shares_the_retry() {
+        let err = RequestError::LinkActivationTimeout {
+            path: "/message".to_string(),
+            after: Duration::from_secs(10),
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "No mesh link to the peer came up within 10.0s"
+        );
+        assert_eq!(
+            request_remedy(&err),
+            request_remedy(&RequestError::LinkClosed)
+        );
+    }
+
+    /// A wait that ran out on this side, or with an answer still arriving, names neither
+    /// the request path nor the peer's trust, and shares the retry.
+    #[test]
+    fn waits_short_of_silence_read_plainly_and_share_the_retry() {
+        let after = Duration::from_secs(15);
+        let path = "/status".to_string();
+        let waits = [
+            RequestError::LinkActivationTimeout {
+                path: path.clone(),
+                after,
+            },
+            RequestError::LocalTimeout {
+                path: path.clone(),
+                after,
+            },
+            RequestError::IdentifyTimeout {
+                path: path.clone(),
+                after,
+            },
+            RequestError::ResponseIncomplete {
+                path: path.clone(),
+                after,
+            },
+        ];
+        for err in waits {
+            let text = err.to_string();
+            assert!(err.is_retryable_wait(), "{err:?}");
+            assert!(text.is_ascii(), "{text}");
+            assert!(!text.contains(&path), "{text}");
+            assert!(!text.contains("trust"), "{text}");
+            assert_eq!(
+                request_remedy(&err),
+                "Try again in a minute; `.mesh peers` shows when the peer was last heard"
+            );
+        }
+        assert!(!RequestError::Timeout { path, after }.is_retryable_wait());
     }
 }

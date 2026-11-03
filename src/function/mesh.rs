@@ -300,9 +300,9 @@ pub fn mesh_function_declarations() -> Vec<FunctionDeclaration> {
             description: format!(
                 "Post a bulletin to every trusted mesh peer this node currently has a path to, a few at a \
                  time, and report each recipient's outcome (delivered, store_and_forward, unreachable, \
-                 refused or not_trusted_by_peer); a not_trusted_by_peer row carries `message` and \
-                 `next_action` naming which side has to act. Peers without a known path are skipped, \
-                 not queued. {PEER_TEXT_IS_DATA} {CHECK_IN_GUIDANCE}"
+                 refused, not_trusted_by_peer or no_answer); a not_trusted_by_peer or no_answer row \
+                 carries `message` and `next_action` naming which side has to act. Peers without a \
+                 known path are skipped, not queued. {PEER_TEXT_IS_DATA} {CHECK_IN_GUIDANCE}"
             ),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
@@ -557,8 +557,12 @@ fn collect_timeout(args: &Value) -> Result<Duration> {
 }
 
 /// The one trust gate for a request addressed to a peer: `peer` must be the canonical
-/// hash of an instance this node has heard announce and trusts. Every miss is the same
-/// `not_trusted` envelope, so a caller learns nothing about which.
+/// hash of an instance this node trusts. One it has not heard announce is asked for
+/// only when the trust list could allow it, so the model cannot send path requests at
+/// will. That ask takes up to `PATH_REQUEST_TIMEOUT` and one that files no row is an
+/// `unknown_destination` envelope, so the delay and the kind tell a caller the trust
+/// list could allow the destination. Every miss it rules out unasked is the same
+/// immediate `not_trusted` envelope, so a caller learns nothing about which.
 async fn trusted_peer(runtime: &MeshRuntime, peer: &str) -> Result<(String, PeerRecord), Value> {
     let not_trusted = || {
         send_error(&SendError::NotTrusted {
@@ -568,8 +572,15 @@ async fn trusted_peer(runtime: &MeshRuntime, peer: &str) -> Result<(String, Peer
     let Some(destination) = canonical_hash(peer) else {
         return Err(not_trusted());
     };
-    let Some(record) = runtime.peers().get(&destination) else {
-        return Err(not_trusted());
+    let record = match runtime.peers().get(&destination) {
+        Some(record) => record,
+        None if runtime.trust().may_be_asked_for(&destination) => {
+            match runtime.peer_asking_if_unheard(&destination).await {
+                Ok(record) => record,
+                Err(miss) => return Err(send_error(&SendError::Unheard { destination, miss })),
+            }
+        }
+        None => return Err(not_trusted()),
     };
     if runtime
         .trust()
@@ -596,15 +607,19 @@ async fn resolved_destination(
 ) -> Result<DestinationDesc, Value> {
     match runtime.resolve_destination(destination).await {
         Some(desc) => Ok(desc),
-        None => Err(json!({
-            "status": "error",
-            "kind": "unknown_destination",
-            "message": format!(
-                "{} A list or fetch runs live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard.",
-                unreachable_head(destination)
-            ),
-        })),
+        None => Err(unreachable_live(destination)),
     }
+}
+
+fn unreachable_live(destination: &str) -> Value {
+    json!({
+        "status": "error",
+        "kind": "unknown_destination",
+        "message": format!(
+            "{} A list or fetch runs live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard.",
+            unreachable_head(destination)
+        ),
+    })
 }
 
 /// `in_reply_to` turns a plain message into a reply, or with `kind: "note"` into an
@@ -756,31 +771,10 @@ pub(crate) fn trust_label(verdict: Verdict, standing: IdentityStanding) -> &'sta
     }
 }
 
-fn send_error_kind(err: &SendError) -> &'static str {
-    match err {
-        SendError::NotTrusted { .. } => "not_trusted",
-        SendError::UnknownDestination { .. } => "unknown_destination",
-        SendError::NotRunning => "not_running",
-        SendError::ContentTooLong { .. } => "content_too_long",
-        SendError::TitleTooLong { .. } => "title_too_long",
-        SendError::InvalidFields(_) => "invalid_fields",
-        SendError::UnknownThread(_) => "unknown_thread",
-        SendError::InvalidParts(_) => "invalid_parts",
-        SendError::Refused(_) | SendError::Throttled { .. } | SendError::NotTrustedByPeer(_) => {
-            "refused"
-        }
-        SendError::Direct(_) => "direct",
-        SendError::IncompatibleVersion { .. } => "incompatible_version",
-        SendError::NoPropagationNode => "no_propagation_node",
-        SendError::Propagation(_) => "propagation",
-        SendError::NotAcknowledged => "not_acknowledged",
-    }
-}
-
 fn send_error(err: &SendError) -> Value {
     let mut result = json!({
         "status": "error",
-        "kind": send_error_kind(err),
+        "kind": err.class(),
         "message": err.to_string(),
     });
     match err {
@@ -790,6 +784,7 @@ fn send_error(err: &SendError) -> Value {
         SendError::UnknownThread(_) => {
             result["next_action"] = json!(UNKNOWN_THREAD_NEXT_ACTION);
         }
+        SendError::NoAnswer(no_answer) => result["next_action"] = json!(no_answer.next_action()),
         _ => {}
     }
     result
@@ -913,8 +908,14 @@ async fn handle_peers(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
                 }
                 Err(err) => {
                     peers[index]["status_error"] = json!(err.to_string());
-                    if let StatusError::NotTrustedByPeer(refusal) = &err {
-                        peers[index]["next_action"] = json!(refusal.next_action());
+                    match &err {
+                        StatusError::NotTrustedByPeer(refusal) => {
+                            peers[index]["next_action"] = json!(refusal.next_action());
+                        }
+                        StatusError::NoAnswer(no_answer) => {
+                            peers[index]["next_action"] = json!(no_answer.next_action());
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1603,6 +1604,7 @@ fn fetch_error_kind(err: &FileFetchError) -> &'static str {
     match err {
         FileFetchError::Transport(_) => "transport",
         FileFetchError::NotTrustedByPeer(_) => "refused",
+        FileFetchError::NoAnswer(_) => "no_answer",
         FileFetchError::NotServed => "not_served",
         FileFetchError::Malformed(_) => "malformed",
         FileFetchError::Oversize { .. } => "oversize",
@@ -1646,8 +1648,14 @@ fn fetch_error(err: &FileFetchError, verb: FetchVerb) -> Value {
         "kind": fetch_error_kind(err),
         "message": message,
     });
-    if let FileFetchError::NotTrustedByPeer(refusal) = err {
-        result["next_action"] = json!(refusal.next_action());
+    match err {
+        FileFetchError::NotTrustedByPeer(refusal) => {
+            result["next_action"] = json!(refusal.next_action());
+        }
+        FileFetchError::NoAnswer(no_answer) => {
+            result["next_action"] = json!(no_answer.next_action());
+        }
+        _ => {}
     }
     result
 }
@@ -1656,7 +1664,7 @@ fn access_error_kind(err: &AccessError) -> &'static str {
     match err {
         AccessError::NotRunning => "not_running",
         AccessError::Untrusted => "not_trusted",
-        AccessError::UnknownDestination => "unknown_destination",
+        AccessError::UnknownDestination | AccessError::Unheard { .. } => "unknown_destination",
         AccessError::Invalid(_) => "invalid",
         AccessError::NotFiled(_) => "not_filed",
         AccessError::Refused(_)
@@ -1668,6 +1676,7 @@ fn access_error_kind(err: &AccessError) -> &'static str {
         AccessError::Direct(_) => "direct",
         AccessError::IncompatibleVersion { .. } => "incompatible_version",
         AccessError::NoPropagationNode => "no_propagation_node",
+        AccessError::NoAnswer(_) => "no_answer",
         AccessError::Propagation(_) => "propagation",
     }
 }
@@ -1681,8 +1690,14 @@ fn access_result(outcome: Result<AccessRequestOutcome, AccessError>) -> Value {
                 "kind": access_error_kind(&err),
                 "message": err.to_string(),
             });
-            if let AccessError::NotTrustedByPeer(refusal) = &err {
-                result["next_action"] = json!(refusal.next_action());
+            match &err {
+                AccessError::NotTrustedByPeer(refusal) => {
+                    result["next_action"] = json!(refusal.next_action());
+                }
+                AccessError::NoAnswer(no_answer) => {
+                    result["next_action"] = json!(no_answer.next_action());
+                }
+                _ => {}
             }
             return result;
         }
@@ -1720,6 +1735,37 @@ fn access_result(outcome: Result<AccessRequestOutcome, AccessError>) -> Value {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod no_answer_tests {
+    use super::*;
+    use crate::mesh::request::NoAnswer;
+
+    /// A peer that stayed silent once the link came up is `no_answer` from every builder,
+    /// send, fetch and access alike, with the same `next_action` and the sentence as the
+    /// error's own text.
+    #[test]
+    fn a_silent_peer_is_no_answer_with_a_next_action_from_each_error_builder() {
+        let no_answer = NoAnswer::new(&hex_lower(&[0xbb; 16]), hex_lower(&[0xaa; 16]));
+        let sent_err = SendError::NoAnswer(no_answer.clone());
+        let fetched_err = FileFetchError::NoAnswer(no_answer.clone());
+        let asked_err = AccessError::NoAnswer(no_answer.clone());
+        let sent = send_error(&sent_err);
+        let fetched = fetch_error(&fetched_err, FetchVerb::Fetch);
+        let asked = access_result(Err(asked_err.clone()));
+        for (result, text) in [
+            (&sent, sent_err.to_string()),
+            (&fetched, fetched_err.to_string()),
+            (&asked, asked_err.to_string()),
+        ] {
+            assert_eq!(result["status"], "error", "{result}");
+            assert_eq!(result["kind"], "no_answer", "{result}");
+            assert_eq!(result["message"], text, "{result}");
+            assert!(text.starts_with("no answer from bbbbbbbb: "), "{text}");
+            assert_eq!(result["next_action"], no_answer.next_action(), "{result}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2052,7 +2098,7 @@ mod tests {
     #[test]
     fn the_broadcast_description_promises_exactly_the_recipient_outcomes() {
         use crate::mesh::message::RecipientOutcome;
-        use crate::mesh::request::RemoteRefusal;
+        use crate::mesh::request::{NoAnswer, RemoteRefusal};
 
         let broadcast = mesh_function_declarations()
             .into_iter()
@@ -2089,6 +2135,7 @@ mod tests {
                 Some("Bea"),
                 "0a".repeat(16),
             )),
+            RecipientOutcome::NoAnswer(NoAnswer::new(&"ab".repeat(16), "0a".repeat(16))),
         ];
         // Exhaustive on purpose: a new variant fails to compile here until it is added to
         // the list above and to the description.
@@ -2098,7 +2145,8 @@ mod tests {
                 | RecipientOutcome::StoreAndForward
                 | RecipientOutcome::Unreachable { .. }
                 | RecipientOutcome::Refused { .. }
-                | RecipientOutcome::NotTrustedByPeer(_) => {}
+                | RecipientOutcome::NotTrustedByPeer(_)
+                | RecipientOutcome::NoAnswer(_) => {}
             }
         }
         let mut serialised: Vec<String> = outcomes
@@ -6242,8 +6290,8 @@ mod tests {
         /// `mesh__peers` with `with_status: true` sweeps `/status` at its own 5 s / 5 s
         /// while this node's `mesh.request_timeout_secs` and `link_timeout_secs` sit at the
         /// one-year cap. A trusted, reachable peer that never answers costs the sweep about
-        /// five seconds, not a year; its row carries `status_error` naming the 5 s the
-        /// sweep waited; and the deadlines the node handed its client for the one `/status`
+        /// five seconds, not a year; its row carries a `status_error` saying the peer did
+        /// not answer; and the deadlines the node handed its client for the one `/status`
         /// request are the sweep's, not the raised ones.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]
@@ -6304,7 +6352,7 @@ mod tests {
                 .as_str()
                 .unwrap_or_else(|| panic!("no status_error: {row}"));
             assert!(
-                error.starts_with("No response to the mesh request /status within 5.0s"),
+                error.starts_with(&format!("no answer from {}:", short(&to))),
                 "{error}"
             );
             assert!(
@@ -9636,6 +9684,497 @@ mod tests {
 
             assert!(ctx.app.mesh.stop().await.unwrap());
             started.relay_handle.abort();
+        }
+
+        /// A tool addressed to a destination this node has not heard may ask the mesh for
+        /// it only when the trust list could allow it; otherwise the refusal comes before
+        /// any path request, so a model cannot send path requests at will.
+        mod first_contact_tests {
+            use super::*;
+            use crate::mesh::PATH_REQUEST_TIMEOUT;
+            use crate::mesh::identity::current_identity;
+            use crate::mesh::message::unanswered_path_request;
+            use crate::mesh::test_support::{mesh_paths, pair_where_b_has_not_heard_a, wait_until};
+            use crate::mesh::trust::TRUST_FILE_VERSION;
+            use crate::supervisor::mailbox::EnvelopePayload;
+            use rns_transport::hash::AddressHash;
+            use std::time::Instant;
+            use tokio::sync::broadcast::error::RecvError;
+
+            fn calls(to: &str) -> Vec<(&'static str, Value)> {
+                vec![
+                    ("send", json!({"to": to, "message": "first contact"})),
+                    ("ask", json!({"to": to, "message": "first contact?"})),
+                    ("list", json!({"peer": to})),
+                    ("fetch", json!({"peer": to, "path": "docs/a.md"})),
+                    (
+                        "request_access",
+                        json!({"peer": to, "paths": ["docs/a.md"], "reason": "probe"}),
+                    ),
+                ]
+            }
+
+            async fn call(ctx: &mut RequestContext, tool: &str, args: &Value) -> (Value, Duration) {
+                let asked = Instant::now();
+                let result = handle_mesh_tool(ctx, &format!("{MESH_FUNCTION_PREFIX}{tool}"), args)
+                    .await
+                    .unwrap();
+                (result, asked.elapsed())
+            }
+
+            async fn refused_at_once(ctx: &mut RequestContext, to: &str, case: &str) {
+                for (tool, args) in calls(to) {
+                    let (result, waited) = call(ctx, tool, &args).await;
+                    assert_eq!(result["kind"], "not_trusted", "{case} {tool}: {result}");
+                    assert!(
+                        waited < Duration::from_secs(1),
+                        "{case} {tool}: no path request was waited on: {waited:?}"
+                    );
+                }
+            }
+
+            /// Watches B's transport for an announce or path response from A for longer
+            /// than one path request could take to be answered, then checks B still holds
+            /// nothing of A: a refusal that asked nothing draws no answer.
+            async fn assert_a_was_never_asked_for(
+                b: &StartedRuntime,
+                mut announces: tokio::sync::broadcast::Receiver<
+                    rns_transport::transport::AnnounceEvent,
+                >,
+                to_a: &str,
+            ) {
+                let hash_a = AddressHash::new_from_hex_string(to_a).unwrap();
+                let heard =
+                    tokio::time::timeout(PATH_REQUEST_TIMEOUT + Duration::from_secs(1), async {
+                        loop {
+                            match announces.recv().await {
+                                Ok(event) => {
+                                    if event.destination.lock().await.desc.address_hash == hash_a {
+                                        return;
+                                    }
+                                }
+                                Err(RecvError::Lagged(_)) => continue,
+                                Err(RecvError::Closed) => panic!("B's announce channel closed"),
+                            }
+                        }
+                    })
+                    .await;
+                assert!(
+                    heard.is_err(),
+                    "nothing from A reached B, so no path request went out"
+                );
+                assert!(b.runtime.peers().get(to_a).is_none(), "B has no row for A");
+                assert!(
+                    !b.knows_identity_of(to_a).await,
+                    "B's transport holds nothing of A"
+                );
+            }
+
+            /// A live A sits behind the relay, so a path request from B would draw its
+            /// answer. With no grant that could cover A, with A's destination denied, and
+            /// with A's destination bound to an identity B has blocked, every tool is
+            /// refused at once and no answer from A ever arrives.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[serial]
+            async fn refusals_of_a_live_unheard_instance_send_no_path_request() {
+                let _guard = TestConfigDirGuard::new("mesh-tool-first-contact-unasked");
+                let (relay, a, b) =
+                    pair_where_b_has_not_heard_a("mesh-tool-first-contact-unasked").await;
+                let to_a = a.runtime.current_destination_hash();
+                let slot_a = Arc::new(MeshSlot::default());
+                slot_a.install(a.runtime.clone()).unwrap();
+                let mut ctx = plain_ctx();
+                ctx.app.mesh.install(b.runtime.clone()).unwrap();
+
+                let announces = b.announces().await;
+                refused_at_once(&mut ctx, &to_a, "no grant").await;
+                assert_a_was_never_asked_for(&b, announces, &to_a).await;
+
+                let trust = b.runtime.trust();
+                let other = derived_sighting("first-contact-unasked-owner", None).identity_hash;
+                trust
+                    .trust_identity(
+                        ctx.app.mesh.as_ref(),
+                        &other,
+                        TrustOptions::default(),
+                        SystemTime::now(),
+                    )
+                    .unwrap();
+                trust
+                    .deny_destination(ctx.app.mesh.as_ref(), &to_a, None, SystemTime::now(), false)
+                    .unwrap();
+                let announces = b.announces().await;
+                refused_at_once(&mut ctx, &to_a, "denied destination").await;
+                assert_a_was_never_asked_for(&b, announces, &to_a).await;
+
+                let identity_of_a = current_identity(&mesh_paths(&a.tmp).identity_path)
+                    .unwrap()
+                    .address_hash()
+                    .to_hex_string();
+                let ts = "2026-01-01T00:00:00Z";
+                std::fs::write(
+                    trust.path(),
+                    format!(
+                        "version: {TRUST_FILE_VERSION}\n\
+                         identities:\n  {identity_of_a}:\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n    all_destinations: false\n  {other}:\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n    all_destinations: true\n\
+                         destinations:\n  {to_a}:\n    identity: {identity_of_a}\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n\
+                         denied_destinations: {{}}\n\
+                         blocked_identities:\n  {identity_of_a}:\n    added_at: {ts}\n    note: null\n"
+                    ),
+                )
+                .unwrap();
+                assert!(
+                    !trust.may_be_asked_for(&to_a),
+                    "the rewritten trust file binds A's destination to its blocked identity"
+                );
+                let announces = b.announces().await;
+                let (sent, waited) = call(
+                    &mut ctx,
+                    "send",
+                    &json!({"to": to_a, "message": "first contact"}),
+                )
+                .await;
+                assert_eq!(sent["kind"], "not_trusted", "{sent}");
+                assert!(waited < Duration::from_secs(1), "{waited:?}");
+                assert_a_was_never_asked_for(&b, announces, &to_a).await;
+                assert_eq!(slot_a.peer_inbox().len(), 0, "nothing reached A");
+
+                assert!(ctx.app.mesh.stop().await.unwrap());
+                slot_a.stop().await.unwrap();
+                relay.stop().await;
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[serial]
+            async fn an_unheard_destination_no_grant_could_allow_is_refused_before_any_path_request()
+             {
+                let _guard = TestConfigDirGuard::new("mesh-tool-first-contact-refused");
+                let started = started_runtime("mesh-tool-first-contact-refused").await;
+                let mut ctx = plain_ctx();
+                ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                let unheard = hex_lower(&[0x3c; 16]);
+
+                refused_at_once(&mut ctx, &unheard, "no grant").await;
+
+                let trust = started.runtime.trust();
+                let identity = derived_sighting("first-contact-owner", None).identity_hash;
+                trust
+                    .trust_identity(
+                        ctx.app.mesh.as_ref(),
+                        &identity,
+                        TrustOptions::default(),
+                        SystemTime::now(),
+                    )
+                    .unwrap();
+                trust
+                    .deny_destination(
+                        ctx.app.mesh.as_ref(),
+                        &unheard,
+                        None,
+                        SystemTime::now(),
+                        false,
+                    )
+                    .unwrap();
+                refused_at_once(&mut ctx, &unheard, "blocked destination").await;
+
+                assert!(started.runtime.peers().get(&unheard).is_none());
+                assert!(ctx.app.mesh.correlations().list().is_empty());
+                assert!(ctx.app.mesh.stop().await.unwrap());
+                started.relay_handle.abort();
+            }
+
+            /// With an identity trusted for all destinations, an unheard destination may be
+            /// its instance, so each tool asks once; nothing answers here, so the tool waits
+            /// out the path request and says so in the REPL's words.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[serial]
+            async fn an_unheard_destination_an_identity_grant_could_cover_is_asked_for() {
+                let _guard = TestConfigDirGuard::new("mesh-tool-first-contact-asked");
+                let started = started_runtime("mesh-tool-first-contact-asked").await;
+                let mut ctx = plain_ctx();
+                ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                let identity = derived_sighting("first-contact-owner", None).identity_hash;
+                started
+                    .runtime
+                    .trust()
+                    .trust_identity(
+                        ctx.app.mesh.as_ref(),
+                        &identity,
+                        TrustOptions::default(),
+                        SystemTime::now(),
+                    )
+                    .unwrap();
+                let unheard = hex_lower(&[0x4b; 16]);
+
+                for (tool, args) in calls(&unheard) {
+                    let (result, waited) = call(&mut ctx, tool, &args).await;
+                    assert!(
+                        waited >= PATH_REQUEST_TIMEOUT,
+                        "{tool}: the destination was asked for: {waited:?} {result}"
+                    );
+                    assert_ne!(result["kind"], "not_trusted", "{tool}: {result}");
+                    assert_eq!(result["kind"], "unknown_destination", "{tool}: {result}");
+                    assert_eq!(
+                        result["message"],
+                        unanswered_path_request(&unheard),
+                        "{tool}: the tools say what the REPL says"
+                    );
+                }
+
+                assert!(ctx.app.mesh.stop().await.unwrap());
+                started.relay_handle.abort();
+            }
+
+            /// B, restarted with no peer table, learns of A only by asking. B trusts A's
+            /// identity for all destinations before that, so the model's send reaches A
+            /// directly.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[serial]
+            async fn mesh_send_reaches_an_unheard_instance_of_an_identity_trusted_for_all() {
+                let _guard = TestConfigDirGuard::new("mesh-tool-first-contact-send");
+                let (relay, a, b) =
+                    pair_where_b_has_not_heard_a("mesh-tool-first-contact-send").await;
+                let to_a = a.runtime.current_destination_hash();
+                let to_b = b.runtime.current_destination_hash();
+                let slot_a = Arc::new(MeshSlot::default());
+                slot_a.install(a.runtime.clone()).unwrap();
+                let mut ctx = plain_ctx();
+                ctx.app.mesh.install(b.runtime.clone()).unwrap();
+
+                let identity_of_a = current_identity(&mesh_paths(&a.tmp).identity_path)
+                    .unwrap()
+                    .address_hash()
+                    .to_hex_string();
+                b.runtime
+                    .trust()
+                    .trust_identity(
+                        ctx.app.mesh.as_ref(),
+                        &identity_of_a,
+                        TrustOptions::default(),
+                        SystemTime::now(),
+                    )
+                    .unwrap();
+                a.runtime
+                    .trust()
+                    .trust_destination(
+                        slot_a.as_ref(),
+                        &to_b,
+                        TrustOptions::default(),
+                        SystemTime::now(),
+                    )
+                    .unwrap();
+
+                let (sent, waited) = call(
+                    &mut ctx,
+                    "send",
+                    &json!({"to": to_a, "message": "first contact"}),
+                )
+                .await;
+                assert_eq!(sent["status"], "sent", "{sent}");
+                assert_eq!(sent["via"], "direct", "{sent}");
+                assert_eq!(sent["to"], to_a, "{sent}");
+                assert!(
+                    waited < PATH_REQUEST_TIMEOUT + Duration::from_secs(5),
+                    "one path request, then the send: {waited:?}"
+                );
+                let row = b
+                    .runtime
+                    .peers()
+                    .get(&to_a)
+                    .expect("B filed A's row from the answer");
+                assert_eq!(row.identity_hash, identity_of_a);
+
+                wait_until("A's inbox to hold B's message", || {
+                    slot_a.peer_inbox().len() > 0
+                })
+                .await;
+                let (delivered, _) = slot_a.peer_inbox().drain();
+                let messages: Vec<_> = delivered
+                    .iter()
+                    .filter_map(|envelope| match &envelope.payload {
+                        EnvelopePayload::Peer(message) => Some(message),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(messages.len(), 1, "{delivered:?}");
+                assert_eq!(messages[0].content, "first contact");
+                assert_eq!(messages[0].source_destination, to_b);
+                assert_eq!(messages[0].message_id, sent["id"].as_str().unwrap());
+
+                assert!(ctx.app.mesh.stop().await.unwrap());
+                slot_a.stop().await.unwrap();
+                relay.stop().await;
+            }
+
+            /// A grant for some other identity lets the unheard destination be asked for,
+            /// but the answer names A's identity, which no grant covers: the full trust
+            /// check then refuses with the same `not_trusted` envelope a heard peer gets,
+            /// and nothing reaches A.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[serial]
+            async fn mesh_send_to_an_unheard_instance_of_an_ungranted_identity_asks_then_refuses() {
+                let _guard = TestConfigDirGuard::new("mesh-tool-first-contact-ungranted");
+                let (relay, a, b) =
+                    pair_where_b_has_not_heard_a("mesh-tool-first-contact-ungranted").await;
+                let to_a = a.runtime.current_destination_hash();
+                let to_b = b.runtime.current_destination_hash();
+                let slot_a = Arc::new(MeshSlot::default());
+                slot_a.install(a.runtime.clone()).unwrap();
+                a.runtime
+                    .trust()
+                    .trust_destination(
+                        slot_a.as_ref(),
+                        &to_b,
+                        TrustOptions::default(),
+                        SystemTime::now(),
+                    )
+                    .unwrap();
+                let mut ctx = plain_ctx();
+                ctx.app.mesh.install(b.runtime.clone()).unwrap();
+                let other = derived_sighting("first-contact-other-owner", None).identity_hash;
+                b.runtime
+                    .trust()
+                    .trust_identity(
+                        ctx.app.mesh.as_ref(),
+                        &other,
+                        TrustOptions::default(),
+                        SystemTime::now(),
+                    )
+                    .unwrap();
+
+                let (sent, waited) = call(
+                    &mut ctx,
+                    "send",
+                    &json!({"to": to_a, "message": "first contact"}),
+                )
+                .await;
+                let expected = send_error(&SendError::NotTrusted {
+                    destination: to_a.clone(),
+                });
+                assert_eq!(sent, expected, "{sent}");
+                assert!(
+                    waited < PATH_REQUEST_TIMEOUT + Duration::from_secs(3),
+                    "{waited:?}"
+                );
+                assert!(
+                    b.runtime.peers().get(&to_a).is_some(),
+                    "the destination was asked for and its answer filed"
+                );
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                assert_eq!(slot_a.peer_inbox().len(), 0, "nothing reached A");
+
+                assert!(ctx.app.mesh.stop().await.unwrap());
+                slot_a.stop().await.unwrap();
+                relay.stop().await;
+            }
+
+            /// B restarted with A's destination trusted (bound to A's identity) and no
+            /// identity grant at all: the destination itself is trusted, so the send asks
+            /// for it once, files the answer, and reaches A.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[serial]
+            async fn mesh_send_reaches_an_unheard_destination_trusted_by_destination_alone() {
+                let _guard = TestConfigDirGuard::new("mesh-tool-first-contact-dest-tier");
+                let (relay, a, b) =
+                    pair_where_b_has_not_heard_a("mesh-tool-first-contact-dest-tier").await;
+                let to_a = a.runtime.current_destination_hash();
+                let to_b = b.runtime.current_destination_hash();
+                let slot_a = Arc::new(MeshSlot::default());
+                slot_a.install(a.runtime.clone()).unwrap();
+                a.runtime
+                    .trust()
+                    .trust_destination(
+                        slot_a.as_ref(),
+                        &to_b,
+                        TrustOptions::default(),
+                        SystemTime::now(),
+                    )
+                    .unwrap();
+                let mut ctx = plain_ctx();
+                ctx.app.mesh.install(b.runtime.clone()).unwrap();
+                let identity_of_a = current_identity(&mesh_paths(&a.tmp).identity_path)
+                    .unwrap()
+                    .address_hash()
+                    .to_hex_string();
+                let trust = b.runtime.trust();
+                let ts = "2026-01-01T00:00:00Z";
+                std::fs::write(
+                    trust.path(),
+                    format!(
+                        "version: {TRUST_FILE_VERSION}\n\
+                         identities:\n  {identity_of_a}:\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n    all_destinations: false\n\
+                         destinations:\n  {to_a}:\n    identity: {identity_of_a}\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n\
+                         denied_destinations: {{}}\n\
+                         blocked_identities: {{}}\n"
+                    ),
+                )
+                .unwrap();
+                assert!(trust.may_be_asked_for(&to_a), "A's destination is trusted");
+                assert!(b.runtime.peers().get(&to_a).is_none(), "B has not heard A");
+
+                let (sent, waited) = call(
+                    &mut ctx,
+                    "send",
+                    &json!({"to": to_a, "message": "first contact"}),
+                )
+                .await;
+                assert_eq!(sent["status"], "sent", "{sent}");
+                assert_eq!(sent["to"], to_a, "{sent}");
+                assert!(
+                    waited < PATH_REQUEST_TIMEOUT + Duration::from_secs(5),
+                    "{waited:?}"
+                );
+                assert!(b.runtime.peers().get(&to_a).is_some(), "B filed A's row");
+                wait_until("A's inbox to hold B's message", || {
+                    slot_a.peer_inbox().len() > 0
+                })
+                .await;
+
+                assert!(ctx.app.mesh.stop().await.unwrap());
+                slot_a.stop().await.unwrap();
+                relay.stop().await;
+            }
+
+            /// A destination-tier trust of some other destination is no grant that could
+            /// cover an unheard one: every tool refuses at once and A is never asked for.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[serial]
+            async fn an_unrelated_destination_trust_does_not_let_an_unheard_one_be_asked_for() {
+                let _guard = TestConfigDirGuard::new("mesh-tool-first-contact-other-dest");
+                let (relay, a, b) =
+                    pair_where_b_has_not_heard_a("mesh-tool-first-contact-other-dest").await;
+                let to_a = a.runtime.current_destination_hash();
+                let slot_a = Arc::new(MeshSlot::default());
+                slot_a.install(a.runtime.clone()).unwrap();
+                let mut ctx = plain_ctx();
+                ctx.app.mesh.install(b.runtime.clone()).unwrap();
+                let other_identity =
+                    derived_sighting("first-contact-other-dest", None).identity_hash;
+                let other_dest = hex_lower(&[0x5d; 16]);
+                let trust = b.runtime.trust();
+                let ts = "2026-01-01T00:00:00Z";
+                std::fs::write(
+                    trust.path(),
+                    format!(
+                        "version: {TRUST_FILE_VERSION}\n\
+                         identities:\n  {other_identity}:\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n    all_destinations: false\n\
+                         destinations:\n  {other_dest}:\n    identity: {other_identity}\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n\
+                         denied_destinations: {{}}\n\
+                         blocked_identities: {{}}\n"
+                    ),
+                )
+                .unwrap();
+                assert!(!trust.may_be_asked_for(&to_a));
+
+                let announces = b.announces().await;
+                refused_at_once(&mut ctx, &to_a, "unrelated destination trust").await;
+                assert_a_was_never_asked_for(&b, announces, &to_a).await;
+                assert_eq!(slot_a.peer_inbox().len(), 0, "nothing reached A");
+
+                assert!(ctx.app.mesh.stop().await.unwrap());
+                slot_a.stop().await.unwrap();
+                relay.stop().await;
+            }
         }
 
         /// Serves `/fetch` the way the serving half does for `SHARED_PATH`, honouring

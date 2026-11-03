@@ -104,6 +104,22 @@ fn every_request_error_has_a_next_step() {
             path: "/status".to_string(),
             after: Duration::from_secs(5),
         },
+        RequestError::LinkActivationTimeout {
+            path: "/status".to_string(),
+            after: Duration::from_secs(5),
+        },
+        RequestError::LocalTimeout {
+            path: "/status".to_string(),
+            after: Duration::from_secs(5),
+        },
+        RequestError::IdentifyTimeout {
+            path: "/status".to_string(),
+            after: Duration::from_secs(5),
+        },
+        RequestError::ResponseIncomplete {
+            path: "/status".to_string(),
+            after: Duration::from_secs(5),
+        },
         RequestError::LinkFailed("no path".to_string()),
         RequestError::LinkClosed,
         RequestError::Oversize { len: 9, max: 8 },
@@ -196,6 +212,7 @@ fn no_access_is_named_at_exactly_one_site_outside_the_error_module() {
     let constructed = [&refused, ");"].concat();
     let markers = [
         ["#[cfg(test)]", "\nmod tests"].concat(),
+        ["#[cfg(test)]", "\nmod no_answer_tests"].concat(),
         ["#[cfg(test)]", "\npub(crate) mod test_support"].concat(),
     ];
     let mut sites = Vec::new();
@@ -2291,6 +2308,44 @@ pub(crate) mod network {
         );
         requester.stop().await;
         responder.stop().await;
+    }
+
+    mod no_answer_tests {
+        use super::*;
+
+        /// A peer that serves the request but whose answer is still arriving when the
+        /// request's time runs out has not stayed silent, so the request ends as an
+        /// incomplete response, never as the `Timeout` that reads as distrust. The
+        /// recorder serves every identity, as a peer that trusts this one does; holding
+        /// the responder's interface manager once the first part has landed keeps its
+        /// inbound path from reading the part requests, so the transfer stalls.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_trusted_peer_whose_answer_is_still_arriving_is_not_silence() {
+            let recorder = Arc::new(Recorder::default());
+            let (responder, requester, desc) = pair(recorder.clone()).await;
+            let (in_flight, seen) = hanging_request(&requester, &recorder, &desc).await;
+            let mut random = vec![0u8; MAX_REQUEST_PAYLOAD_BYTES / 2];
+            RngCore::fill_bytes(&mut OsRng, &mut random);
+            let bytes = ResponseFrame::new(seen.request_id, Value::Binary(random)).encode();
+            let mut events = requester.transport.resource_events();
+            let hash = answer_as_resource(&responder, &requester, &seen, bytes).await;
+            await_inbound_progress(&mut events, hash).await;
+
+            let manager = responder.transport.iface_manager();
+            let held = manager.lock().await;
+            let result = timeout(INTEROP_TIMEOUT, in_flight).await.unwrap().unwrap();
+            drop(held);
+
+            assert_eq!(
+                result.unwrap_err(),
+                RequestError::ResponseIncomplete {
+                    path: "/slow".to_string(),
+                    after: SHORT_REQUEST_TIMEOUT,
+                }
+            );
+            requester.stop().await;
+            responder.stop().await;
+        }
     }
 
     /// A reply resource that fails mid-transfer takes down the one request it answered
@@ -8976,7 +9031,7 @@ pub(crate) mod network {
             .request_status_with(&pair.responder.desc, short_options())
             .await
             .unwrap_err();
-        assert_eq!(err, StatusError::Transport(timed_out(STATUS_PATH)));
+        assert_eq!(err, StatusError::NoAnswer(pair.node_a.no_answer(&b_hex)));
         assert_eq!(handler.calls(), 0);
 
         let (trust, _tmp) = trusts_a.open("request-status-client-placeholder");
@@ -10721,7 +10776,7 @@ pub(crate) mod network {
     /// report says unreachable while B's says delivered. Once C is on record as speaking
     /// another protocol, a second broadcast reports it refused without asking it again.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_broadcast_reaches_the_reachable_peer_and_reports_the_unreachable_one() {
+    async fn a_broadcast_reaches_the_reachable_peer_and_reports_no_answer_from_the_silent_one() {
         let recorder_c = Arc::new(Recorder::default());
         let responder_c =
             Responder::listen(recorder_c.clone(), TcpServer::DEFAULT_CLIENT_MTU).await;
@@ -10788,9 +10843,7 @@ pub(crate) mod network {
         let c_report = report(&c_instance);
         assert_eq!(
             c_report.outcome,
-            RecipientOutcome::Unreachable {
-                reason: SendError::NoPropagationNode.to_string(),
-            }
+            RecipientOutcome::NoAnswer(pair.node_a.no_answer(&c_instance))
         );
         assert_eq!(c_report.display_name.as_deref(), Some("Cy"));
         assert_eq!(pair.recorder_b.last().path_hash, PathHash::of(MESSAGE_PATH));

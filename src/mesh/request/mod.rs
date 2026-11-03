@@ -18,7 +18,9 @@ pub(crate) use dispatch::{
     KNOWN_PATHS, KnockEvent, KnockSink, LIST_PATH, MAX_FETCH_RESPONSE_BYTES,
     MAX_REQUEST_PAYLOAD_BYTES, MESSAGE_PATH, STATUS_PATH, describe_path,
 };
-pub(crate) use error::{RefusalCode, RemoteRefusal, RequestError, refusal_remedy, request_remedy};
+pub(crate) use error::{
+    NoAnswer, RefusalCode, RemoteRefusal, RequestError, refusal_remedy, request_remedy,
+};
 pub(crate) use frame::{Envelope, NAME_HASH_LEN, OriginName};
 #[cfg(test)]
 pub(crate) use frame::{EnvelopeError, PathHash, RequestId};

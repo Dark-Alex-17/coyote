@@ -19,7 +19,8 @@ use crate::mesh::message::{PEER_LINK_TIMEOUT, PEER_REQUEST_TIMEOUT, PEER_WIRE_VE
 use crate::mesh::node::MeshRuntime;
 use crate::mesh::request::{
     AdmittedRequest, DispatchError, FETCH_PATH, Handler, LIST_PATH, MAX_REQUEST_PAYLOAD_BYTES,
-    RefusalCode, RemoteRefusal, Reply, RequestError, RequestOptions, Settlement,
+    NoAnswer, RefusalCode, RemoteRefusal, Reply, RequestError, RequestOptions, Settlement,
+    request_remedy,
 };
 use crate::mesh::shares::{
     self, DEFAULT_LIST_WALK_BOUND, LIST_PAGE_SIZE, Listed, PeerRef, Served, ServedFile,
@@ -934,11 +935,13 @@ pub(crate) fn read_fetch_reply(value: &Value) -> Result<FetchReply, FetchError> 
 /// one, and neither does a status word the peer made up.
 #[derive(Debug)]
 pub(crate) enum FetchError {
-    /// The request failed for any reason but the peer's `NoAccess`.
+    /// The request failed for any reason but the peer's `NoAccess` or its silence.
     Transport(RequestError),
     /// The peer answered `NoAccess`: this node trusts it, but it has not trusted this
     /// instance.
     NotTrustedByPeer(RemoteRefusal),
+    /// The link came up but the peer did not answer in time.
+    NoAnswer(NoAnswer),
     /// The peer let the request through but serves no files.
     NotServed,
     /// The reply is not the shape this Coyote reads; names the key that broke it.
@@ -955,8 +958,12 @@ pub(crate) enum FetchError {
 impl fmt::Display for FetchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Transport(err) if err.is_retryable_wait() => {
+                write!(f, "{err}. {}.", request_remedy(err))
+            }
             Self::Transport(err) => write!(f, "{err}"),
             Self::NotTrustedByPeer(refusal) => write!(f, "{refusal}"),
+            Self::NoAnswer(no_answer) => write!(f, "{no_answer}"),
             Self::NotServed => write!(f, "peer does not share files"),
             Self::Malformed(key) => write!(f, "the peer's reply could not be read: `{key}`"),
             Self::Oversize { len } => write!(
@@ -1582,15 +1589,17 @@ impl<T: Default> Recent<T> {
 }
 
 impl MeshRuntime {
-    /// A request failure as a listing or fetch reports it: the peer's `NoAccess` names
-    /// which side has not trusted whom; anything else is the transport's to describe.
+    /// A request failure as a listing or fetch reports it: the peer's `NoAccess` or its
+    /// silence once the link came up names which side has not trusted whom; anything else
+    /// is the transport's to describe.
     fn fetch_failure(&self, destination: &DestinationDesc, err: RequestError) -> FetchError {
-        if err.is_access_refusal() {
-            FetchError::NotTrustedByPeer(
-                self.remote_refusal(&destination.address_hash.to_hex_string()),
-            )
-        } else {
-            FetchError::Transport(err)
+        let dest_hex = destination.address_hash.to_hex_string();
+        match err {
+            err if err.is_access_refusal() => {
+                FetchError::NotTrustedByPeer(self.remote_refusal(&dest_hex))
+            }
+            RequestError::Timeout { .. } => FetchError::NoAnswer(self.no_answer(&dest_hex)),
+            err => FetchError::Transport(err),
         }
     }
 
@@ -1725,6 +1734,72 @@ impl MeshRuntime {
     /// included, if it is among the last `LAST_LIST_CACHE_PEERS` peers listed.
     pub(crate) fn last_listing(&self, destination_hex: &str) -> Option<Listing> {
         self.memory().lists.get(destination_hex)
+    }
+}
+
+#[cfg(test)]
+mod no_answer_tests {
+    #[cfg(unix)]
+    use super::*;
+    #[cfg(unix)]
+    use crate::mesh::test_support::beside_a_stub_that_does_not_know_it;
+
+    /// How a listing or a fetch reports each way a request can end without a reply: the
+    /// peer's silence on a link that came up names the remedy on the peer's side, its
+    /// `NoAccess` keeps the refusal sentence, and a link that never came up stays the
+    /// transport's to describe.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn silence_after_the_link_came_up_is_reported_as_no_answer() {
+        let (stub, started, slot) = beside_a_stub_that_does_not_know_it("fetch-no-answer").await;
+        let runtime = &started.runtime;
+        let to = stub.destination_hex();
+        let desc = runtime.resolve_destination(&to).await.unwrap();
+        let own = runtime.current_destination_hash();
+        let after = Duration::from_secs(2);
+
+        let silent = runtime.fetch_failure(
+            &desc,
+            RequestError::Timeout {
+                path: FETCH_PATH.to_string(),
+                after,
+            },
+        );
+        let FetchError::NoAnswer(no_answer) = &silent else {
+            panic!("{silent:?}");
+        };
+        assert_eq!(*no_answer, NoAnswer::new(&to, own.clone()));
+        assert_eq!(
+            silent.to_string(),
+            format!(
+                "no answer from {}: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance).",
+                short(&to)
+            )
+        );
+
+        let refused = runtime.fetch_failure(&desc, RequestError::Refused(RefusalCode::NoAccess));
+        assert_eq!(refused.to_string(), runtime.remote_refusal(&to).to_string());
+
+        let never_linked = runtime.fetch_failure(
+            &desc,
+            RequestError::LinkActivationTimeout {
+                path: LIST_PATH.to_string(),
+                after,
+            },
+        );
+        assert!(
+            matches!(
+                never_linked,
+                FetchError::Transport(RequestError::LinkActivationTimeout { .. })
+            ),
+            "{never_linked:?}"
+        );
+        assert_eq!(
+            never_linked.to_string(),
+            "No mesh link to the peer came up within 2.0s. Try again in a minute; `.mesh peers` shows when the peer was last heard."
+        );
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
     }
 }
 

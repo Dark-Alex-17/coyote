@@ -1691,10 +1691,11 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
     );
     no_entries("after unblock <destination>");
 
-    // The verb that line names is refused until the hash announces or knocks, and
-    // writes nothing.
+    // The verb that line names asks the mesh for the unheard hash first; nothing on the
+    // relay answers for it, so it is refused and writes nothing.
     let expected = format!(
-        "Destination {dest} is not in the peer table and has not knocked. Run `.mesh peers` to see the nodes that have announced or `.mesh knocks` to see who asked to be trusted, and trust one of those."
+        "{} did not answer a path request within 5 s: it is not on any interface this node joined, or it is not announcing. Check the hash, or wait for its announce (`.mesh peers`).",
+        &dest[..8]
     );
     let out = trust_verb(
         &mut session,
@@ -3138,10 +3139,11 @@ fn untrust_of_an_instance_under_an_identity_grant_refuses_at_a_cold_prompt_and_b
     assert!(trust_file_keys(&dir, "destinations").is_empty());
     assert_eq!(trust_file_keys(&dir, "identities"), vec![id.clone()]);
 
-    // The verb that line names is refused until the hash announces or knocks; the grant
-    // stands and no record is written.
+    // The verb that line names asks the mesh for the unheard hash first; nothing answers,
+    // so the grant stands and no record is written.
     let expected = format!(
-        "Destination {dest} is not in the peer table and has not knocked. Run `.mesh peers` to see the nodes that have announced or `.mesh knocks` to see who asked to be trusted, and trust one of those."
+        "{} did not answer a path request within 5 s: it is not on any interface this node joined, or it is not announcing. Check the hash, or wait for its announce (`.mesh peers`).",
+        &dest[..8]
     );
     let out = trust_verb(
         &mut session,

@@ -90,7 +90,8 @@ enum Case {
     HandlerTimeout,
     /// A requester that hears nothing ends in `Timeout` after its request timeout.
     RequestTimeout,
-    /// A link that never comes up ends the request in `Timeout` at the link timeout.
+    /// A link that never comes up ends the request in `LinkActivationTimeout` at the link
+    /// timeout.
     LinkTimeout,
     /// A destination the transport has no path to ends the request in `LinkFailed` at once,
     /// naming the destination truncated.
@@ -1099,7 +1100,10 @@ mod loopback {
         .await
         .unwrap_err();
 
-        assert!(matches!(err, RequestError::Timeout { .. }), "{err:?}");
+        assert!(
+            matches!(err, RequestError::LinkActivationTimeout { .. }),
+            "{err:?}"
+        );
         assert_eq!(recorder.seen_count(), 0);
         requester.stop().await;
     }

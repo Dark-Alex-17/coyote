@@ -245,6 +245,26 @@ impl fmt::Display for PropagationError {
                 "The propagation node did not finish the transfer within {:.1}s",
                 after.as_secs_f64()
             ),
+            Self::Link(RequestError::LinkActivationTimeout { after, .. }) => write!(
+                f,
+                "No mesh link to the propagation node came up within {:.1}s",
+                after.as_secs_f64()
+            ),
+            Self::Link(RequestError::LocalTimeout { after, .. }) => write!(
+                f,
+                "This node could not hand the message to its own link to the propagation node within {:.1}s",
+                after.as_secs_f64()
+            ),
+            Self::Link(RequestError::IdentifyTimeout { after, .. }) => write!(
+                f,
+                "This node could not prove its identity to the propagation node within {:.1}s",
+                after.as_secs_f64()
+            ),
+            Self::Link(RequestError::ResponseIncomplete { after, .. }) => write!(
+                f,
+                "The propagation node started to answer, but the answer had not finished arriving within {:.1}s",
+                after.as_secs_f64()
+            ),
             Self::Link(err) => write!(f, "{err}"),
             Self::TransferFailed => {
                 write!(f, "The transfer to the propagation node did not complete")
@@ -1215,6 +1235,40 @@ mod tests {
     const MEASURED_COST: u32 = 16;
     /// The reference's default per-transfer limit, `PROPAGATION_LIMIT` (`LXMRouter.py:55`).
     const DEFAULT_LIMIT_KB: i64 = 256;
+
+    /// Every timed-out wait on the way to a propagation node names the node, never the
+    /// peer the message is for, and never the raw request path.
+    #[test]
+    fn timed_out_waits_name_the_propagation_node() {
+        let (path, after) = ("lxmf.propagation".to_string(), Duration::from_secs(10));
+        for err in [
+            RequestError::Timeout {
+                path: path.clone(),
+                after,
+            },
+            RequestError::LinkActivationTimeout {
+                path: path.clone(),
+                after,
+            },
+            RequestError::LocalTimeout {
+                path: path.clone(),
+                after,
+            },
+            RequestError::IdentifyTimeout {
+                path: path.clone(),
+                after,
+            },
+            RequestError::ResponseIncomplete {
+                path: path.clone(),
+                after,
+            },
+        ] {
+            let text = PropagationError::Link(err).to_string();
+            assert!(text.contains("propagation node"), "{text}");
+            assert!(!text.contains("peer"), "{text}");
+            assert!(!text.contains(&path), "{text}");
+        }
+    }
 
     fn app_data_from(slots: Vec<rmpv::Value>) -> Vec<u8> {
         let mut out = Vec::new();
