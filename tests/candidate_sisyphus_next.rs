@@ -51,7 +51,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "sisyphus-next";
 const CANDIDATE_NAMES: [&str; 2] = ["sisyphus-next", "architect-next"];
-const SMOKE_FLOOR: usize = 444;
+const SMOKE_FLOOR: usize = 471;
 
 fn agents_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents")
@@ -165,6 +165,7 @@ fn sisyphus_seam_scrub_removes_every_seam_and_keeps_the_rest() {
     let seams = [
         "SISYPHUS_GH_X",
         "SISYPHUS_GH_REPLY_CMD",
+        "SISYPHUS_GH_PERM_CMD",
         "SISYPHUS_CI_SLEEP",
         "SISYPHUS_REVIEW_SLEEP",
         "SISYPHUS_ASK_OWNER_BIN",
@@ -1379,8 +1380,10 @@ fn smoke_summary_and_exit_code_cover_a_check_recorded_last() {
 /// the CI poll ceiling, the reply before each resolve, the trusted author of
 /// an own comment, the crashed-poll count toward `pr_review_polls`, the
 /// crashed-`ci_poll` read failure in `ci_route`, the `CI_LOG_RUNS_MAX` cap on
-/// flake re-runs, the stale CI status reset after resolving and the seen-id
-/// split of a mixed-author thread.
+/// flake re-runs, the stale CI status reset after resolving, the seen-id
+/// split of a mixed-author thread, read access left out of
+/// `TRUSTED_PERMISSIONS` and the CHANGES_REQUESTED check in the approval
+/// fallback.
 #[test]
 fn smoke_rows_go_red_under_the_recorded_sabotages() {
     let Some(python) = python3() else { return };
@@ -1457,6 +1460,20 @@ fn smoke_rows_go_red_under_the_recorded_sabotages() {
              or []]}",
             "pr_tracking review: a re-poll after the untrusted skip still yields the untriaged \
              trusted request, not the stranger",
+        ),
+        (
+            "read-permission",
+            "TRUSTED_PERMISSIONS = (\"admin\", \"maintain\", \"write\")",
+            "TRUSTED_PERMISSIONS = (\"admin\", \"maintain\", \"write\", \"read\")",
+            "pr_tracking review: a COLLABORATOR with read permission is untrusted: body withheld",
+        ),
+        (
+            "approval-veto",
+            "approved = \"APPROVED\" in latest.values() and \"CHANGES_REQUESTED\" not in \
+             latest.values()",
+            "approved = \"APPROVED\" in latest.values()",
+            "pr_tracking review: author A APPROVED and author B CHANGES_REQUESTED, no \
+             reviewDecision, does not approve",
         ),
     ];
     for (label, old, new, row) in sabotages {
@@ -3727,6 +3744,7 @@ fn readme_pr_tracking_row_names_the_loop_stops_and_parent_rule() {
         "round_cap",
         "owner_judgment",
         "poll_error",
+        "truncated",
         "pr_review_closed",
         "pr_review_exhausted",
         "pr_review_round_cap",
@@ -3742,6 +3760,9 @@ fn readme_pr_tracking_row_names_the_loop_stops_and_parent_rule() {
         "SISYPHUS_GH_RERUN_CMD",
         "SISYPHUS_REVIEW_SLEEP",
         "SISYPHUS_GH_REPLY_CMD",
+        "SISYPHUS_GH_PERM_CMD",
+        "pr_review_truncated",
+        "pr_review_perms",
         "pr_review_reply",
         "RESOLVE_DEADLINE_SECS = 480",
     ];
@@ -3762,12 +3783,13 @@ fn readme_pr_tracking_row_names_the_loop_stops_and_parent_rule() {
     assert!(row.contains(parent), "missing {parent:?} in: {row}");
     let architect = "architect-next does not pass `pr_tracking=review` to its task sisyphus";
     assert!(row.contains(architect), "missing {architect:?} in: {row}");
-    let trust = "Only comments from OWNER/MEMBER/COLLABORATOR accounts (`authorAssociation`) \
-                 reach triage and the coder; every other account's comments are ledgered and \
-                 escalated to the owner as `pr_review_owner_judgment` with their bodies \
-                 withheld, answerable only with skip or stop, and this is enforced in \
-                 `gates.py`, not by the prompt.";
+    let trust = "Only comments from trusted accounts reach triage and the coder; every other \
+                 account's comments are ledgered and escalated to the owner as \
+                 `pr_review_owner_judgment` with their bodies withheld, answerable only with \
+                 skip or stop, and this is enforced in `gates.py`, not by the prompt.";
     assert!(row.contains(trust), "missing {trust:?} in: {row}");
+    let permission = "`gh api repos/{owner}/{repo}/collaborators/{login}/permission`";
+    assert!(row.contains(permission), "missing {permission:?} in: {row}");
     let stranger = "A stranger's approval never ends the watch";
     assert!(row.contains(stranger), "missing {stranger:?} in: {row}");
     let stale = "in place of the reply and resolve calls";
