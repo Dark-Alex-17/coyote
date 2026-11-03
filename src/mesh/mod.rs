@@ -853,8 +853,12 @@ pub(crate) mod test_support {
         loop {
             let heard = tokio::time::timeout(PATH_REQUEST_INTERVAL, async {
                 loop {
-                    let Ok(event) = relay_announces.recv().await else {
-                        continue;
+                    let event = match relay_announces.recv().await {
+                        Ok(event) => event,
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => {
+                            panic!("the relay's announce channel closed before it heard B")
+                        }
                     };
                     if event.destination.lock().await.desc.address_hash == hash_b {
                         return;

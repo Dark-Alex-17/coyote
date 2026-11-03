@@ -11234,7 +11234,10 @@ mod tests {
     #[cfg(unix)]
     mod first_contact_tests {
         use super::*;
-        use crate::mesh::test_support::{derived_sighting, pair_where_b_has_not_heard_a};
+        use crate::mesh::message::FirstContactMiss;
+        use crate::mesh::test_support::{
+            derived_sighting, pair_where_b_has_not_heard_a, wait_for_peer,
+        };
 
         struct LateJoiner {
             relay: TransportRelay,
@@ -11414,6 +11417,49 @@ mod tests {
             pair.stop().await;
         }
 
+        /// A row swept after `PEER_TTL` leaves the transport's path standing. Asking for
+        /// the destination still sends a path request, and A's answer files the row
+        /// again; the held path alone would file nothing.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_destination_the_transport_holds_without_a_row_is_asked_for_and_filed_again() {
+            let relay = TransportRelay::start().await;
+            let a = started_runtime_on("first-contact-held-a", relay.port).await;
+            let b = started_runtime_on("first-contact-held-b", relay.port).await;
+            let to_a = a.runtime.current_destination_hash();
+            let peers = b.runtime.peers();
+            wait_for_peer(&b.runtime, &to_a).await;
+            assert_eq!(
+                peers.sweep(SystemTime::now() + PEER_TTL + Duration::from_secs(60)),
+                vec![to_a.clone()]
+            );
+            assert!(peers.get(&to_a).is_none());
+            assert!(
+                b.runtime.path_known(&to_a).await,
+                "the transport still holds a path to A"
+            );
+
+            let asked = Instant::now();
+            let row = b
+                .runtime
+                .peer_asking_if_unheard(&to_a)
+                .await
+                .expect("A answers the path request and is filed again");
+            assert!(
+                asked.elapsed() < PATH_REQUEST_TIMEOUT,
+                "{:?}",
+                asked.elapsed()
+            );
+            assert_eq!(row.destination_hash, to_a);
+            assert!(peers.get(&to_a).is_some());
+
+            for started in [b, a] {
+                let slot = Arc::new(MeshSlot::default());
+                slot.install(started.runtime.clone()).unwrap();
+                slot.stop().await.unwrap();
+            }
+            relay.stop().await;
+        }
+
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_destination_nothing_answers_for_is_given_up_within_the_path_request_bound() {
             let relay = TransportRelay::start().await;
@@ -11422,12 +11468,13 @@ mod tests {
                 derived_sighting("first-contact-unreachable-stranger", None).destination_hash;
 
             let asked = Instant::now();
-            assert!(
+            assert_eq!(
                 started
                     .runtime
                     .peer_asking_if_unheard(&stranger)
                     .await
-                    .is_none()
+                    .err(),
+                Some(FirstContactMiss::NoAnswer)
             );
             let waited = asked.elapsed();
             assert!(

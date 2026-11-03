@@ -11434,6 +11434,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         use super::{INFO_SNAPSHOT, key_change_line_of};
         use super::{table_footer, table_header, table_rows};
         use crate::config::{AppConfig, AppState, Session, WorkingMode};
+        use crate::mesh::message::{answered_not_as_coyote, unanswered_path_request};
         use crate::repl::run_repl_command;
         use crate::testing::TestConfigDirGuard;
         use crate::utils::create_abort_signal;
@@ -26314,7 +26315,11 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             #[cfg(unix)]
             mod first_contact_tests {
                 use super::*;
-                use crate::mesh::test_support::pair_where_b_has_not_heard_a;
+                use crate::mesh::identity::current_identity;
+                use crate::mesh::test_support::{
+                    mesh_paths, pair_where_b_has_not_heard_a, wait_until,
+                };
+                use crate::supervisor::mailbox::EnvelopePayload;
 
                 struct LateJoiner {
                     relay: TransportRelay,
@@ -26407,9 +26412,22 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         assert!(out.contains(&format!("Trusted {}", short(&to_a))), "{out}");
 
                         fx.a_trusts_b();
-                        out_of(&mut fx.ctx, &format!(".mesh status {to_a}"))
+                        let card = out_of(&mut fx.ctx, &format!(".mesh status {to_a}"))
                             .await
                             .unwrap();
+                        assert!(
+                            card.contains(&format!(
+                                "Asking {} for its status card; Ctrl-C cancels...",
+                                short(&to_a)
+                            )),
+                            "{card}"
+                        );
+                        for field in ["name: ", "objective: ", "state: "] {
+                            assert!(
+                                card.lines().any(|line| line.starts_with(field)),
+                                "A's card shows `{field}`: {card}"
+                            );
+                        }
                         status_round_trip(&fx.slot_a, &fx.ctx.app.mesh).await;
                         fx.stop().await;
                     });
@@ -26454,30 +26472,63 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             .await
                             .unwrap();
                         assert!(out.contains(&fx.waiting_line()), "{out}");
+                        assert!(
+                            out.contains(&format!(
+                                "Knocked on {} directly; the peer decides whether to trust this instance.",
+                                short(&to_a)
+                            )),
+                            "A took the knock over the link and answered it: {out}"
+                        );
                         fx.stop().await;
                     });
                 }
 
-                /// `.mesh message` asks for the unheard destination, then applies the trust
-                /// check a heard peer gets; once trusted, the message is delivered.
+                /// B trusts A's identity for all destinations before it has heard A, so
+                /// the first `.mesh message` asks for A, passes the trust check on the
+                /// identity the answer carries, and delivers the message to A's inbox.
                 #[test]
                 #[serial]
-                fn message_to_an_unheard_destination_asks_for_it_then_applies_trust() {
+                fn message_to_an_unheard_instance_of_a_trusted_identity_asks_for_it_and_delivers() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-first-contact-message");
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
                     run_async(async {
                         let mut fx = LateJoiner::start("repl-first-contact-message").await;
                         let to_a = fx.to_a.clone();
-                        let line = format!(".mesh message {to_a} --yes hello");
-                        let err = fx.asks_for_a(&line).await.unwrap_err().to_string();
-                        assert!(err.ends_with(MESSAGE_REFUSAL_TAIL), "{err}");
-
                         fx.a_trusts_b();
-                        out_of(&mut fx.ctx, &format!(".mesh trust {to_a} --yes"))
+                        let identity_of_a = current_identity(&mesh_paths(&fx.a.tmp).identity_path)
+                            .unwrap()
+                            .address_hash()
+                            .to_hex_string();
+                        fx.b.runtime
+                            .trust()
+                            .trust_identity(
+                                fx.ctx.app.mesh.as_ref(),
+                                &identity_of_a,
+                                TrustOptions::default(),
+                                SystemTime::now(),
+                            )
+                            .unwrap();
+
+                        let out = fx
+                            .asks_for_a(&format!(".mesh message {to_a} --yes hello"))
                             .await
                             .unwrap();
-                        out_of(&mut fx.ctx, &line).await.unwrap();
+                        assert!(out.contains(&fx.waiting_line()), "{out}");
+                        wait_until("A's inbox to hold B's message", || {
+                            fx.slot_a.peer_inbox().len() > 0
+                        })
+                        .await;
+                        let (delivered, _) = fx.slot_a.peer_inbox().drain();
+                        let contents: Vec<_> = delivered
+                            .iter()
+                            .filter_map(|envelope| match &envelope.payload {
+                                EnvelopePayload::Peer(message) => Some(message.content.as_str()),
+                                _ => None,
+                            })
+                            .collect();
+                        assert_eq!(contents, ["hello"], "{delivered:?}");
+                        assert_eq!(prompt_script::prompts_asked(), 0);
                         fx.stop().await;
                     });
                 }
@@ -26536,6 +26587,79 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         );
                         assert!(err.ends_with(INFO_REFUSAL_TAIL), "{err}");
                         assert_eq!(stdout_lines().len(), printed, "nothing was asked: {err}");
+                        for (line, tail) in [
+                            (format!(".mesh trust {unheard} --yes"), TRUST_REFUSAL_TAIL),
+                            (
+                                format!(".mesh knock {unheard} --yes"),
+                                UNHEARD_KNOCK_REFUSAL_TAIL,
+                            ),
+                        ] {
+                            let asked = Instant::now();
+                            let err = refusal(&mut ctx, &line).await;
+                            assert!(
+                                asked.elapsed() < Duration::from_secs(1),
+                                "{line}: {:?}",
+                                asked.elapsed()
+                            );
+                            assert!(err.ends_with(tail), "{line}: {err}");
+                            assert_eq!(stdout_lines().len(), printed, "{line}: nothing was asked");
+                        }
+                        assert!(
+                            !UNHEARD_KNOCK_REFUSAL_TAIL.contains(".mesh trust"),
+                            "trust refuses an unheard blocked destination too, so it is no remedy"
+                        );
+
+                        assert!(ctx.app.mesh.stop().await.unwrap());
+                        started.relay_handle.abort();
+                    });
+                }
+
+                /// Ctrl-C during the wait for an unheard destination's announce ends it
+                /// with a line that says nothing changed: no trust record, no prompt.
+                #[test]
+                #[serial]
+                fn ctrl_c_while_asking_for_an_unheard_destination_changes_nothing() {
+                    use crate::mesh::hex_lower;
+
+                    let _guard = TestConfigDirGuard::new("repl-mesh-first-contact-ctrl-c");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let started = started_runtime("repl-mesh-first-contact-ctrl-c").await;
+                        let mut ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                        let unheard = hex_lower(&[0x6e; 16]);
+
+                        let press_after = Duration::from_millis(600);
+                        let signal = create_abort_signal();
+                        let pressed = signal.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(press_after).await;
+                            pressed.set_ctrlc();
+                        });
+                        let before = stdout_lines().len();
+                        let asked = Instant::now();
+                        let line = format!(".mesh trust {unheard} --yes");
+                        let outcome = Box::pin(run_repl_command(&mut ctx, signal, &line)).await;
+                        let waited = asked.elapsed();
+                        assert!(
+                            outcome.is_ok(),
+                            "an interrupted wait is not an error: {outcome:?}"
+                        );
+                        assert!(
+                            waited >= press_after && waited < PATH_REQUEST_TIMEOUT,
+                            "Ctrl-C ended the wait: {waited:?}"
+                        );
+                        let out = stdout_lines()[before..].join("\n");
+                        assert!(
+                            out.contains(&format!(
+                                "Stopped waiting for {}'s announce; nothing changed. Run the command again to ask once more.",
+                                short(&unheard)
+                            )),
+                            "{out}"
+                        );
+                        assert!(ctx.app.mesh.get().unwrap().trust().records().is_empty());
+                        assert_eq!(prompt_script::prompts_asked(), 0);
 
                         assert!(ctx.app.mesh.stop().await.unwrap());
                         started.relay_handle.abort();
@@ -41683,8 +41807,10 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 /// identity at a destination. When the row ages out of the peer table the
                 /// claims stay in memory: `forget --identity` still counts them, but `fetch
                 /// <dest> <TAB>` offers only the destination's last listing, since the verb
-                /// itself refuses a destination the table no longer holds without asking the
-                /// peer; the same identity announcing again brings every claim back onto the
+                /// itself sends a path request for a destination the table no longer holds,
+                /// though the transport still has a path to it, and refuses it when the
+                /// stub's path response files no row (it carries no Coyote announce data);
+                /// the same identity announcing again brings every claim back onto the
                 /// prompt and the fetch goes through.
                 #[test]
                 #[serial]
@@ -41742,8 +41868,8 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         );
                         assert_eq!(
                             refusal(&mut fx.ctx, &format!(".mesh fetch {dest} docs/a.md")).await,
-                            unanswered_path_request(&dest),
-                            "the verb asks for the swept destination, nothing re-files it, and it is refused before any request"
+                            answered_not_as_coyote(&dest),
+                            "the verb asks for the swept destination, the stub answers without a Coyote announce, and it is refused before any request"
                         );
                         assert!(fx.heard().is_empty(), "nothing reached the peer");
                         let out = out_of(

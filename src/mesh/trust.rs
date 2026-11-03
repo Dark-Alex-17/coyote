@@ -5316,6 +5316,30 @@ mod tests {
 
             assert!(fx.store.may_be_asked_for(&unrecorded));
         }
+
+        /// An identity listed as trusted for all destinations but also blocked, which
+        /// only a hand-edited file can hold, grants nothing, so it is no reason to ask.
+        #[test]
+        fn an_identity_trusted_for_all_but_blocked_is_no_reason_to_ask() {
+            let fx = Fixture::new("trust-ask-identity-tier-blocked");
+            let blocked = fake_hash(0x91);
+            let ts = "2026-01-01T00:00:00Z";
+            fs::create_dir_all(fx.store.path().parent().unwrap()).unwrap();
+            fs::write(
+                fx.store.path(),
+                format!(
+                    "version: {TRUST_FILE_VERSION}\n\
+                     identities:\n  {blocked}:\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n    all_destinations: true\n\
+                     destinations: {{}}\n\
+                     denied_destinations: {{}}\n\
+                     blocked_identities:\n  {blocked}:\n    added_at: {ts}\n    note: null\n"
+                ),
+            )
+            .unwrap();
+            let store = fx.reopen();
+
+            assert!(!store.may_be_asked_for(&fake_hash(0x92)));
+        }
     }
 
     #[test]
