@@ -7477,7 +7477,7 @@ fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
     let gone_tail = const_str("src/mesh/fetch.rs", "GONE_COPY_TAIL");
     assert_eq!(gone_tail, " That copy is no longer at that path.");
     for (path, name) in [
-        ("src/repl/mesh.rs", "fetch"),
+        ("src/repl/mesh.rs", "not_shared_refusal"),
         ("src/function/mesh.rs", "fetch_result"),
     ] {
         assert!(

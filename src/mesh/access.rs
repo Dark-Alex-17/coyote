@@ -3799,7 +3799,10 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert!(err.contains("The peer refused the message"), "{err}");
+        assert!(
+            err.contains("refused it: it is already answering a message from this identity"),
+            "{err}"
+        );
         assert!(!err.contains("already closed"), "{err}");
         assert_eq!(err.lines().count(), 1, "{err}");
         assert!(installed.grants().is_empty(), "{:?}", installed.grants());
