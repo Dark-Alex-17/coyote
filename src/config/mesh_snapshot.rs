@@ -3,7 +3,7 @@ use crate::mesh::snapshot::{BriefState, MeshSnapshot, RepoInfo, TurnState};
 
 use std::env;
 use std::path::PathBuf;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 impl RequestContext {
     /// Copies out everything the mesh may serve about this session. Owned data only, so the
@@ -31,6 +31,19 @@ impl RequestContext {
             captured_at: SystemTime::now(),
         }
     }
+
+    /// Whether this context is the session the mesh describes, so its progress may be
+    /// published. Admitted: the REPL's root context, a top-level agent (graph and
+    /// architect agents included), the branches a top-level graph run forks (their todo
+    /// list is a copy of the root's), and a non-isolated macro, which runs on the outer
+    /// context. Refused: an envoy run and every spawned or graph-node child agent (depth
+    /// above zero, an agent id of their own), and an isolated macro's context, whose
+    /// steps are published from the outer context instead.
+    pub(crate) fn owns_mesh_session(&self) -> bool {
+        self.current_depth == 0
+            && self.self_agent_id.is_none()
+            && !(self.macro_flag && !self.macro_non_isolated)
+    }
 }
 
 pub fn publish_mesh_snapshot(ctx: &RequestContext, state: TurnState) {
@@ -47,6 +60,26 @@ pub fn refresh_mesh_snapshot(ctx: &RequestContext) {
         .map(|snapshot| snapshot.state)
         .unwrap_or_else(TurnState::working_now);
     publish_mesh_snapshot(ctx, state);
+}
+
+/// A progress point inside a turn: a tool batch has completed, which is where the todo
+/// tools, `agent__collect` and `job__collect` run. Refreshes the published snapshot at
+/// most once per `MESH_PROGRESS_MIN_INTERVAL`. Nothing happens for a context that does
+/// not own the session, or before a turn boundary has published the first snapshot:
+/// until then there is no turn state to keep.
+/// Works from the context it is handed and the slot alone, never the turn's lock.
+pub(crate) fn mesh_progress_point(ctx: &RequestContext) {
+    mesh_progress_point_at(ctx, Instant::now());
+}
+
+fn mesh_progress_point_at(ctx: &RequestContext, now: Instant) {
+    if !ctx.owns_mesh_session() || ctx.app.mesh.snapshot().is_none() {
+        return;
+    }
+    if !ctx.app.mesh.progress_capture_due_at(now) {
+        return;
+    }
+    refresh_mesh_snapshot(ctx);
 }
 
 #[cfg(test)]
@@ -415,5 +448,160 @@ mod tests {
             inner_sites >= 3,
             "found only {inner_sites} REPL command sites"
         );
+    }
+}
+
+#[cfg(test)]
+mod progress_point_tests {
+    use super::*;
+    use crate::config::{AppConfig, AppState, WorkingMode};
+    use crate::function::{ToolCall, eval_tool_calls};
+    use crate::mesh::MESH_PROGRESS_MIN_INTERVAL;
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// A root context that may use the todo tools.
+    fn todo_ctx() -> RequestContext {
+        let app = AppState {
+            config: Arc::new(AppConfig {
+                auto_continue: true,
+                ..Default::default()
+            }),
+            ..AppState::test_default()
+        };
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Repl);
+        ctx.tool_scope.functions.append_todo_functions();
+        ctx
+    }
+
+    async fn add_todo_batch(ctx: &mut RequestContext, task: &str) {
+        let call = ToolCall::new(
+            "todo__add".into(),
+            json!({ "task": task }),
+            Some(format!("call-{task}")),
+        );
+        eval_tool_calls(ctx, vec![call]).await.unwrap();
+    }
+
+    fn published(ctx: &RequestContext) -> Arc<MeshSnapshot> {
+        ctx.app.mesh.snapshot().expect("a snapshot is published")
+    }
+
+    #[test]
+    fn captures_are_at_least_the_interval_apart() {
+        let mut ctx = todo_ctx();
+        publish_mesh_snapshot(&ctx, TurnState::working_now());
+        let start = Instant::now();
+
+        ctx.todo_list.add("first");
+        mesh_progress_point_at(&ctx, start);
+        assert_eq!(published(&ctx).todo.todos.len(), 1);
+
+        ctx.todo_list.add("second");
+        mesh_progress_point_at(
+            &ctx,
+            start + MESH_PROGRESS_MIN_INTERVAL - Duration::from_millis(1),
+        );
+        assert_eq!(published(&ctx).todo.todos.len(), 1, "too soon to capture");
+
+        mesh_progress_point_at(&ctx, start + MESH_PROGRESS_MIN_INTERVAL);
+        assert_eq!(published(&ctx).todo.todos.len(), 2);
+    }
+
+    #[test]
+    fn a_capture_keeps_the_published_turn_state() {
+        let mut ctx = todo_ctx();
+        let working = TurnState::working_now();
+        publish_mesh_snapshot(&ctx, working);
+        ctx.todo_list.add("first");
+
+        mesh_progress_point_at(&ctx, Instant::now());
+
+        assert_eq!(published(&ctx).state, working);
+    }
+
+    #[test]
+    fn nothing_is_published_before_the_first_turn_boundary() {
+        let ctx = todo_ctx();
+        mesh_progress_point_at(&ctx, Instant::now());
+        assert!(ctx.app.mesh.snapshot().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_tight_tool_loop_publishes_once() {
+        let mut ctx = todo_ctx();
+        publish_mesh_snapshot(&ctx, TurnState::working_now());
+        let mut last = published(&ctx);
+        let mut captures = 0;
+
+        for n in 0..10 {
+            add_todo_batch(&mut ctx, &format!("task-{n}")).await;
+            let now = published(&ctx);
+            if !Arc::ptr_eq(&now, &last) {
+                captures += 1;
+            }
+            last = now;
+        }
+
+        assert_eq!(captures, 1);
+        assert_eq!(
+            last.todo.todos.len(),
+            1,
+            "only the first batch was captured"
+        );
+        assert_eq!(ctx.todo_list.todos.len(), 10);
+    }
+
+    #[test]
+    fn only_the_owning_session_publishes_progress() {
+        let root = todo_ctx();
+        assert!(root.owns_mesh_session(), "the REPL root");
+
+        let mut non_isolated_macro = todo_ctx();
+        non_isolated_macro.macro_flag = true;
+        non_isolated_macro.macro_non_isolated = true;
+        assert!(
+            non_isolated_macro.owns_mesh_session(),
+            "a non-isolated macro"
+        );
+
+        let mut envoy = todo_ctx();
+        envoy.current_depth = 1;
+        envoy.self_agent_id = Some("envoy-1".into());
+        assert!(!envoy.owns_mesh_session(), "an envoy run");
+
+        let mut child = todo_ctx();
+        child.current_depth = 2;
+        child.self_agent_id = Some("child-1".into());
+        assert!(!child.owns_mesh_session(), "a spawned child");
+
+        let mut isolated_macro = todo_ctx();
+        isolated_macro.macro_flag = true;
+        assert!(!isolated_macro.owns_mesh_session(), "an isolated macro");
+    }
+
+    #[tokio::test]
+    async fn an_envoy_or_child_batch_on_the_shared_slot_leaves_the_snapshot_alone() {
+        let mut root = todo_ctx();
+        root.todo_list.add("the root's task");
+        publish_mesh_snapshot(&root, TurnState::working_now());
+        let before = published(&root);
+
+        for (depth, agent_id) in [(1, "envoy-1"), (2, "child-1")] {
+            let mut other = RequestContext::new(Arc::clone(&root.app), WorkingMode::Cmd);
+            other.tool_scope.functions.append_todo_functions();
+            other.current_depth = depth;
+            other.self_agent_id = Some(agent_id.into());
+            assert!(Arc::ptr_eq(&other.app.mesh, &root.app.mesh));
+
+            add_todo_batch(&mut other, agent_id).await;
+
+            assert_eq!(other.todo_list.todos.len(), 1, "{agent_id} ran its batch");
+            let after = published(&root);
+            assert!(Arc::ptr_eq(&after, &before), "{agent_id} published");
+            assert_eq!(after.todo, before.todo);
+            assert_eq!(after.captured_at, before.captured_at);
+        }
     }
 }

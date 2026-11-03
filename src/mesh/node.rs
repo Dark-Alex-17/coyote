@@ -133,6 +133,9 @@ const LAN_CHANNEL_CAPACITY: usize = 128;
 const PEER_PERSIST_INTERVAL_SECS: u64 = 30;
 /// Refusal shared by `MeshSlot::install` and the `.mesh on` pre-check.
 pub(crate) const MESH_ALREADY_ON: &str = "Mesh is already on in this process. Run `.mesh off` first, then `.mesh on` to start it again with the current settings.";
+/// Floor between two snapshot captures made at progress points inside a turn. Turn
+/// boundaries publish regardless of it.
+pub(crate) const MESH_PROGRESS_MIN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How many (sending identity, message id) pairs the slot remembers as handed to the
 /// envoy. A body reaches a receiver twice when a link delivery's acknowledgement is lost
@@ -3427,7 +3430,8 @@ impl OwnEntryMarks {
 /// the REPL holds the session context write-locked for a whole turn, so anything that
 /// serves peers must be readable without it.
 ///
-/// `snapshot()` is the picture taken at the last turn boundary. `objective_override()`,
+/// `snapshot()` is the picture taken at the last turn boundary, or at the last progress
+/// point inside a long turn. `objective_override()`,
 /// `digest()` and `user_brief()` are live and may be newer than it. Consumers overlay
 /// `objective_override()` on `snapshot().objective` when it is `Some`. `brief()` is
 /// derived: `reassemble_brief` rebuilds it from the snapshot, the digest and the user
@@ -3466,6 +3470,9 @@ impl OwnEntryMarks {
 /// `command_prefix` is the session's configured prefix, kept in step with the config by
 /// whoever writes it, so every line printed for the human shows command hints the way
 /// the human types them.
+///
+/// `last_progress_capture` is when a progress point inside a turn last captured a
+/// snapshot.
 #[derive(Default)]
 pub(crate) struct MeshSlot {
     inner: RwLock<Option<Arc<MeshRuntime>>>,
@@ -3488,6 +3495,7 @@ pub(crate) struct MeshSlot {
     model_notes: ModelNotes,
     inbound: parking_lot::Mutex<Option<Arc<InboundStore>>>,
     command_prefix: LivePrefix,
+    last_progress_capture: parking_lot::Mutex<Option<Instant>>,
     #[cfg(test)]
     envoy_memory_override: ArcSwapOption<EnvoySessions>,
 }
@@ -3725,6 +3733,21 @@ impl MeshSlot {
 
     pub(crate) fn snapshot(&self) -> Option<Arc<MeshSnapshot>> {
         self.snapshot.load_full()
+    }
+
+    /// Claims the next progress-point capture: `true`, and `now` recorded, when none was
+    /// made in the `MESH_PROGRESS_MIN_INTERVAL` before `now`. A claim already being
+    /// decided elsewhere counts as too soon, so this never waits.
+    pub(crate) fn progress_capture_due_at(&self, now: Instant) -> bool {
+        let Some(mut last) = self.last_progress_capture.try_lock() else {
+            return false;
+        };
+        if last.is_some_and(|last| now.saturating_duration_since(last) < MESH_PROGRESS_MIN_INTERVAL)
+        {
+            return false;
+        }
+        *last = Some(now);
+        true
     }
 
     pub(crate) fn set_objective_override(&self, objective: Option<String>) {
