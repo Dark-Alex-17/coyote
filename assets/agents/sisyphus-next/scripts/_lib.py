@@ -40,6 +40,7 @@ REVIEW_MAX_ROUNDS = STRIKE_LIMIT  # review fix rounds per run, the 3-strike fami
 REVIEW_CI_POLL_BUDGET = 60  # a fix round starts only while ci_polls_run is below this, leaving the next CI watch headroom under the per-node cap
 REVIEW_CI_POLL_CEILING = 90  # review mode stops the CI watch here, below the per-node visit cap of 100
 RESOLVE_DEADLINE_SECS = 480  # below the pr_review_resolve node timeout of 600 with one GH_CALL_SECS call of margin
+REVIEW_PERM_SECS = 120  # per-poll wall-clock budget for uncached permission reads; inside the pr_review_poll node timeout
 TAIL_CHARS = 6000         # trim_output class: evidence tails handed to llm nodes
 
 # Fork constants (the ONLY script-level fork deltas; design doc section 7).

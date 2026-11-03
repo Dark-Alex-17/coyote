@@ -1757,8 +1757,8 @@ nodes:
     type: script
     description: Bounded self-loop over the PR's reviews, comments and threads once CI is green (pr_tracking review; B16 poll and wall-clock caps).
     script: scripts/pr_review_poll.py
-    # REVIEW_POLL_SLEEP (600) + one GH_CALL_SECS read (90) + 60 margin
-    timeout: 750
+    # REVIEW_POLL_SLEEP (600) + one GH_CALL_SECS read (90) + REVIEW_PERM_SECS (120) + 90 margin
+    timeout: 900
     fallback: pr_review_route
 
   pr_review_route:

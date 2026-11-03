@@ -20,7 +20,7 @@ from _lib import (  # noqa: E402
     CI_FLAKE_RERUNS, CI_LOG_RUNS_MAX, CI_POLL_FAILS, CI_POLL_SLEEP, CI_WALL_SECS, CLARIFY_MAX, DELEGATED_RE,
     GH_CALL_SECS, OWNER_POLL_MAX, OWNER_POLL_MINUTES, OWNER_REMOTE_INPUT, OWNER_WAIT_MINUTES, PROBE_HOUSE_NOTE,
     QUALITY_RE, REASK_MAX, RERUN_ONCE, RESOLVE_DEADLINE_SECS, RESUME_RE, REVIEW_CI_POLL_BUDGET,
-    REVIEW_CI_POLL_CEILING, REVIEW_MAX_POLLS, REVIEW_MAX_ROUNDS, REVIEW_POLL_SLEEP, REVIEW_WALL_SECS,
+    REVIEW_CI_POLL_CEILING, REVIEW_MAX_POLLS, REVIEW_MAX_ROUNDS, REVIEW_PERM_SECS, REVIEW_POLL_SLEEP, REVIEW_WALL_SECS,
     STRIKE_LIMIT, SUBTASK_MAX, added_lines_since,
     append_artifact, as_dict, as_int, as_list, changed_files_since, emit, ensure_run_dir,
     escalation, git, git_out, harvest_anomalies, ledger, load_state, match_option,
@@ -2135,14 +2135,21 @@ def _read_permission(state, login):
         return ""
 
 
-def _author_trusted(state, u, login, association):
-    """OWNER, or a trusted association whose repo permission is write or above; read once per login per run."""
+def _author_trusted(state, u, login, association, started):
+    """OWNER, or a trusted association whose repo permission is write or above; read once per login per run.
+
+    A read that could end more than REVIEW_PERM_SECS after `started` is not made, and the login stays untrusted.
+    """
     if association == "OWNER":
         return True
     if association not in TRUSTED_ASSOCIATIONS:
         return False
     perms = u.setdefault("pr_review_perms", dict(as_dict(state.get("pr_review_perms"))))
-    if login not in perms:
+    if login not in perms and time.time() - started + GH_CALL_SECS > REVIEW_PERM_SECS:
+        perms[login] = False
+        ledger(state, u, f"review-watch: PR #{_pr_ref(state)} {login} permission not read (REVIEW_PERM_SECS); "
+                         "untrusted")
+    elif login not in perms:
         word = _read_permission(state, login)
         perms[login] = word in TRUSTED_PERMISSIONS
         ledger(state, u, f"review-watch: PR #{_pr_ref(state)} {login} permission {word or 'unreadable'}")
@@ -2250,6 +2257,19 @@ def _read_pr_review(state):
         return None
 
 
+def _window_boundary_known(doc, key, known):
+    """Whether a truncated connection's oldest returned node is already known, so every older node was handled
+    in an earlier window. `last:N` returns nodes oldest first."""
+    m = re.fullmatch(r"reviewThreads\[(\d+)\]\.comments", key)
+    nodes = (doc.get("reviewThreads") or [])[int(m.group(1))].get("comments") if m else doc.get(key)
+    if not nodes:
+        return False
+    oldest = nodes[0]
+    if key == "reviewThreads":
+        return oldest.get("isResolved") or all(known(c) for c in oldest.get("comments") or [])
+    return known(oldest)
+
+
 def pr_review_poll(state):
     u = {}
     watch = as_int(state.get("pr_review_watch_polls"))
@@ -2274,16 +2294,47 @@ def pr_review_poll(state):
             u["_next"] = "pr_review_poll"
         return u
     u["pr_review_poll_fails"] = 0
-    if doc.get("truncated"):
-        u["pr_review_truncated"] = doc["truncated"]
+    perm_started = time.time()
+
+    def trusted(c):
+        return _author_trusted(state, u, c.get("author"), c.get("association"), perm_started)
+
+    seen = as_list(state.get("pr_review_seen"))
+    seen_ids = {str(s) for s in seen}
+
+    if doc.get("state") == "OPEN" and doc.get("reviewDecision") == "APPROVED":
+        # Approval ends the watch before any permission read or truncation check: only a login already cached as
+        # trusted keeps its body in the left-open follow-ups.
+        perms = as_dict(state.get("pr_review_perms"))
+
+        def cached(c):
+            return c.get("association") == "OWNER" or (_association_trusted(c) and perms.get(c.get("author")) is True)
+
+        u["pr_review_items"], u["pr_review_untrusted"] = _pr_review_items(doc, seen, cached)
+        u["pr_review_status"] = "approved"
+        u["_next"] = "pr_review_route"
+        return u
+
+    def known(c):
+        body = (c.get("body") or "").strip()
+        return c.get("id") in seen_ids or not body or _own_comment(body, c.get("association"), lambda: trusted(c))
+
+    truncated = []
+    for key in doc.get("truncated") or []:
+        # Without a reviewDecision the status is worked out from the latest review per author, which an older
+        # review outside the window can still change, so a truncated reviews window always stops the watch.
+        if (key != "reviews" or doc.get("reviewDecision")) and _window_boundary_known(doc, key, known):
+            ledger(state, u, f"review-watch: PR #{_pr_ref(state)} {key} window boundary already seen; "
+                             "older history skipped")
+        else:
+            truncated.append(key)
+    if truncated:
+        u["pr_review_truncated"] = truncated
         u["pr_review_status"] = "truncated"
         u["_next"] = "pr_review_route"
         return u
 
-    def trusted(c):
-        return _author_trusted(state, u, c.get("author"), c.get("association"))
-
-    items, untrusted = _pr_review_items(doc, as_list(state.get("pr_review_seen")), trusted)
+    items, untrusted = _pr_review_items(doc, seen, trusted)
     u["pr_review_items"] = items
     u["pr_review_untrusted"] = untrusted
     u["pr_review_status"] = _pr_review_status(doc, items + untrusted, trusted)
