@@ -2067,11 +2067,17 @@ fn knock_report(dest8: &str, outcome: &KnockOutcome) -> String {
 }
 
 /// The rule a request to an untrusted destination is refused by, naming the command that
-/// trusts it.
-fn request_refusal_tail(destination: &str) -> String {
-    format!(
-        "Nothing is asked of a destination this node does not trust; `.mesh trust {destination}` trusts it."
-    )
+/// trusts it. A blocked identity outranks a trust record for its destination, so it has
+/// to be unblocked first.
+fn request_refusal_tail(destination: &str, blocked_identity: Option<&str>) -> String {
+    match blocked_identity {
+        Some(identity) => format!(
+            "Nothing is asked of a destination this node does not trust; `.mesh unblock --identity {identity}` and then `.mesh trust {destination}` trust it."
+        ),
+        None => format!(
+            "Nothing is asked of a destination this node does not trust; `.mesh trust {destination}` trusts it."
+        ),
+    }
 }
 
 /// `.mesh request <destination> <path>... [--reason "text"] [--yes]`: asks a trusted
@@ -2092,7 +2098,18 @@ async fn request(
     };
     let destination = destination_hash(ctx, &args.destination)?;
     let runtime = live(ctx)?;
-    peer_for_contact(&runtime, &destination, &request_refusal_tail(&destination))?;
+    let blocked_identity = runtime
+        .peers()
+        .get(&destination)
+        .map(|peer| peer.identity_hash)
+        .filter(|identity| {
+            runtime.trust().authorize(identity, &destination).rule == Rule::IdentityBlocked
+        });
+    peer_for_contact(
+        &runtime,
+        &destination,
+        &request_refusal_tail(&destination, blocked_identity.as_deref()),
+    )?;
     let reason = args.reason.as_deref().unwrap_or("");
     // The id is only for the check; the send mints its own.
     let id = uuid::Uuid::new_v4().simple().to_string();
@@ -2142,16 +2159,30 @@ async fn send_request(
         valid.paths.len()
     ));
     result_follows();
-    // A late interrupt leaves the correlation open: the request may already be with
-    // the peer, and its decision still settles here.
-    let outcome = tokio::select! {
-        outcome = ctx.app.mesh.request_access(destination, &valid.paths, reason) => outcome,
+    // The send runs as its own task so a late interrupt ends only the wait: the request
+    // may already be with the peer, and the task still settles an inline answer (a grant
+    // remembered, a refusal's correlation and claim dropped) or leaves the correlation
+    // open for a decision that comes later.
+    let mesh = Arc::clone(&ctx.app.mesh);
+    let (to, paths, why) = (
+        destination.to_string(),
+        valid.paths.clone(),
+        reason.to_string(),
+    );
+    let mut handle = tokio::spawn(async move { mesh.request_access(&to, &paths, &why).await });
+    let joined = tokio::select! {
+        joined = &mut handle => joined,
         _ = wait_user_interrupt(Some(abort_signal)) => {
             out_text(&format!(
                 "Request interrupted; it may still reach {d8}. If it does, the decision arrives as an idle line; .mesh inbox lists it."
             ));
             return Ok(());
         }
+    };
+    let Ok(outcome) = joined else {
+        bail!(
+            "The access request to {d8} stopped before it could finish; nothing more is known about it. `.mesh pending` and `.mesh inbox` show what reached this node; try `.mesh request` again."
+        );
     };
     match outcome {
         Ok(outcome) => out_path_text(&request_outcome_line(
@@ -4567,7 +4598,7 @@ fn render_effective_shares(
         let at_least = if resolved.truncated { "at least " } else { "" };
         let more = resolved.total - ALL_LIST_ROWS;
         lines.push(format!(
-            "... and {at_least}{more} more files not shown (--all stops at {ALL_LIST_ROWS} rows); pass --peer <hash>, or drop --all to see only the files an allow rule names."
+            "... and {at_least}{more} more rows not shown (--all stops at {ALL_LIST_ROWS} rows); drop --all to see only the files an allow rule names."
         ));
     }
     if resolved.truncated {
@@ -9288,7 +9319,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 footer[1..],
                 [
                     format!(
-                        "... and at least {} more files not shown (--all stops at {ALL_LIST_ROWS} rows); pass --peer <hash>, or drop --all to see only the files an allow rule names.",
+                        "... and at least {} more rows not shown (--all stops at {ALL_LIST_ROWS} rows); drop --all to see only the files an allow rule names.",
                         seen - ALL_LIST_ROWS
                     ),
                     "The walk stopped at its bound, so files may be missing.".to_string(),
@@ -19231,6 +19262,79 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
+            /// `.mesh request` to a trusted peer nothing on the network can route to
+            /// fails after the route wait with what to try next, never opens a link, and
+            /// leaves no correlation behind.
+            #[test]
+            #[serial]
+            fn request_to_a_trusted_but_unroutable_peer_sends_nothing() {
+                use crate::mesh::hex_lower;
+                use crate::mesh::session_destination_name;
+                use crate::mesh::test_support::PeerSighting;
+                use crate::mesh::trust::{LiveMesh, TrustOptions};
+                use rns_transport::destination::SingleInputDestination;
+                use rns_transport::identity::PrivateIdentity;
+                use rns_transport::rand_core::OsRng;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-request-unresolvable");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-request-unresolvable").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let now = SystemTime::now();
+                    let name = session_destination_name("probe");
+                    let announced =
+                        SingleInputDestination::new(PrivateIdentity::new_from_rand(OsRng), name);
+                    let trusted = announced.desc.address_hash.to_hex_string();
+                    started.runtime.peers().observe(
+                        PeerSighting {
+                            destination_hash: trusted.clone(),
+                            identity_hash: announced.desc.identity.address_hash.to_hex_string(),
+                            name_hash: hex_lower(name.as_name_hash_slice()),
+                            display_name: Some("Tia".to_string()),
+                            protocol_version: 1,
+                            hops: 1,
+                        },
+                        now,
+                    );
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    started
+                        .runtime
+                        .trust()
+                        .trust_destination(slot, &trusted, TrustOptions::default(), now)
+                        .unwrap();
+
+                    let err = run(
+                        &mut ctx,
+                        &format!(".mesh request {trusted} docs/a.md --yes"),
+                    )
+                    .await
+                    .unwrap_err()
+                    .to_string();
+                    assert!(err.contains("could not be reached"), "{err}");
+                    assert!(
+                        err.ends_with(
+                            "Try again in a minute; nothing was sent. `.mesh peers` shows when it was last heard."
+                        ),
+                        "{err}"
+                    );
+                    let out = stdout_lines();
+                    assert!(
+                        !out.iter().any(|line| line.contains("Asking")),
+                        "no link is opened toward an unresolvable peer: {out:?}"
+                    );
+                    assert!(
+                        ctx.app.mesh.correlations().list().is_empty(),
+                        "{:?}",
+                        ctx.app.mesh.correlations().list()
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
             /// `.mesh status <dest>` on a trusted peer that answers `NoAccess` (it has this
             /// node's identity on its list but not this instance) fails with the line that
             /// names which side has not trusted whom and the command the peer's owner runs,
@@ -19295,7 +19399,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             /// behave alike.
             #[test]
             #[serial]
-            fn ctrl_c_during_the_route_wait_ends_status_knock_and_fetch_without_a_refusal() {
+            fn ctrl_c_during_the_route_wait_ends_status_knock_fetch_and_request_without_a_refusal()
+            {
                 use crate::mesh::PATH_REQUEST_TIMEOUT;
                 use crate::mesh::hex_lower;
                 use crate::mesh::session_destination_name;
@@ -19400,6 +19505,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             "{line}: an interrupted wait is not reported as a refusal: {err:?}"
                         );
                     }
+                    assert!(
+                        ctx.app.mesh.correlations().list().is_empty(),
+                        "a request interrupted before its route opens no correlation: {:?}",
+                        ctx.app.mesh.correlations().list()
+                    );
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();
@@ -30206,7 +30316,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 [
                                     LEGEND.to_string(),
                                     format!(
-                                        "... and 5 more files not shown (--all stops at {ALL_LIST_ROWS} rows); pass --peer <hash>, or drop --all to see only the files an allow rule names."
+                                        "... and 5 more rows not shown (--all stops at {ALL_LIST_ROWS} rows); drop --all to see only the files an allow rule names."
                                     ),
                                 ],
                                 "{out}"
@@ -34845,18 +34955,30 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         ACCESS_PATH, AdmittedRequest, Handler, RefusalCode, Reply,
                     };
                     use async_trait::async_trait;
+                    use std::sync::atomic::{AtomicBool, Ordering};
 
                     /// The stub's `/access`: keeps every request that reaches it and
-                    /// answers with the outcome set, or not at all while none is.
+                    /// answers with the outcome set, or not at all while none is. A held
+                    /// stub answers only once released.
                     #[derive(Default)]
                     struct ScriptedAccess {
                         answer: Mutex<Option<AccessOutcome>>,
                         asked: Mutex<Vec<ValidAccess>>,
+                        held: AtomicBool,
+                        release: tokio::sync::Notify,
                     }
 
                     impl ScriptedAccess {
                         fn answer(&self, outcome: AccessOutcome) {
                             *self.answer.lock() = Some(outcome);
+                        }
+
+                        fn hold(&self) {
+                            self.held.store(true, Ordering::SeqCst);
+                        }
+
+                        fn release(&self) {
+                            self.release.notify_one();
                         }
 
                         fn asked(&self) -> Vec<ValidAccess> {
@@ -34872,6 +34994,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             };
                             let id = access.id.clone();
                             self.asked.lock().push(access);
+                            if self.held.load(Ordering::SeqCst) {
+                                self.release.notified().await;
+                            }
                             match &*self.answer.lock() {
                                 Some(outcome) => Reply::Value(access_reply(&id, outcome)),
                                 None => Reply::Silent,
@@ -34940,7 +35065,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 &untrusted,
                                 verdict,
                                 standing,
-                                &request_refusal_tail(&untrusted),
+                                &request_refusal_tail(&untrusted, None),
                             )
                             .unwrap();
                             assert!(
@@ -34981,6 +35106,58 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                     .to_string()
                                     .ends_with("Shorten the reason to at most 500 characters.")
                             );
+                            assert_nothing_asked(&fx, &access);
+                            fx.stop().await;
+                        });
+                    }
+
+                    /// A destination whose identity is blocked is not lifted by trusting
+                    /// the destination alone, so the refusal names the unblock first.
+                    #[test]
+                    #[serial]
+                    fn a_request_to_a_blocked_identity_names_the_unblock_and_sends_nothing() {
+                        use crate::mesh::trust::LiveMesh;
+
+                        let _guard = TestConfigDirGuard::new("repl-mesh-request-blocked");
+                        let _capture = capture::install();
+                        let _script = prompt_script::install(&[]);
+                        run_async(async {
+                            let (mut fx, access) = fixture("repl-mesh-request-blocked").await;
+                            let runtime = fx.started.runtime.clone();
+                            let now = SystemTime::now();
+                            let (blocked, identity) = heard_peer(&runtime, "Sly", now);
+                            let slot: &dyn LiveMesh = fx.ctx.app.mesh.as_ref();
+                            runtime
+                                .trust()
+                                .block_identity(slot, &identity, None, now)
+                                .unwrap();
+                            let verdict = runtime.trust().authorize(&identity, &blocked);
+                            assert_eq!(verdict.rule, Rule::IdentityBlocked);
+                            let standing = runtime.trust().identity_standing(&identity);
+                            let expected = trust_refusal(
+                                &blocked,
+                                verdict,
+                                standing,
+                                &request_refusal_tail(&blocked, Some(&identity)),
+                            )
+                            .unwrap();
+                            let before = stdout_lines().len();
+
+                            let err = refusal(
+                                &mut fx.ctx,
+                                &format!(".mesh request {blocked} a.md --yes"),
+                            )
+                            .await;
+
+                            assert_eq!(err, expected);
+                            assert!(
+                                err.ends_with(&format!(
+                                    "`.mesh unblock --identity {identity}` and then `.mesh trust {blocked}` trust it."
+                                )),
+                                "{err}"
+                            );
+                            assert_eq!(stdout_lines().len(), before);
+                            assert_eq!(prompt_script::prompts_asked(), 0);
                             assert_nothing_asked(&fx, &access);
                             fx.stop().await;
                         });
@@ -35084,7 +35261,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                     fx.dest()
                                 )
                             );
-                            assert!(fx.ctx.app.mesh.correlations().get(&asked.id).is_some());
+                            assert!(fx.ctx.app.mesh.correlations().is_open(&asked.id));
                             fx.stop().await;
                         });
                     }
@@ -35221,7 +35398,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     /// Ctrl-C once the request is on its way ends the wait for the reply
                     /// and says the request may still land; its correlation stays open so
-                    /// a decision that does come is still matched.
+                    /// a decision that does come is still matched, and the send itself runs
+                    /// on, so a reply that comes after the interrupt is still settled.
                     #[test]
                     #[serial]
                     fn ctrl_c_after_the_send_says_the_request_may_still_reach_the_peer() {
@@ -35230,6 +35408,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let _script = prompt_script::install(&[]);
                         run_async(async {
                             let (mut fx, access) = fixture("repl-mesh-request-ctrl-c").await;
+                            access.answer(AccessOutcome::Refused(AccessRefusal::Duplicate));
+                            access.hold();
                             let to = fx.stub.destination_hex();
                             let signal = create_abort_signal();
                             let pressed = signal.clone();
@@ -35268,7 +35448,16 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             );
                             let asked = access.asked();
                             assert_eq!(asked.len(), 1, "{asked:?}");
-                            assert!(fx.ctx.app.mesh.correlations().get(&asked[0].id).is_some());
+                            let id = asked[0].id.clone();
+                            assert!(fx.ctx.app.mesh.correlations().is_open(&id));
+
+                            access.release();
+                            let identity = fx.stub.identity_hex();
+                            wait_until("the late refusal to close the request", || {
+                                !fx.ctx.app.mesh.correlations().is_open(&id)
+                                    && fx.started.runtime.memory().claim_count(&identity) == 0
+                            })
+                            .await;
                             fx.stop().await;
                         });
                     }

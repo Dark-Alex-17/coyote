@@ -917,16 +917,25 @@ impl ShareSet {
         walk_bound: usize,
         cap: usize,
     ) -> Resolved {
-        let Ok(rules) = self.rules(peer, case_insensitive) else {
-            return Resolved::default();
+        let rules = match self.rules(peer, case_insensitive) {
+            Ok(rules) => rules,
+            Err(err) => {
+                debug!(
+                    "Mesh share rules could not be built, so nothing is resolved: {}",
+                    redact_hashes(&format!("{err}"))
+                );
+                return Resolved::default();
+            }
         };
         self.walk_allows(&rules, peer, walk_bound).resolved(cap)
     }
 
     /// `resolve` for every file under the share root, whether an allow names it or not,
-    /// for the owner's own view; nothing here reaches a peer. A protected directory is
-    /// entered one level: its own files get their verdict, and each directory in it is
-    /// one `<dir>/` row marked `Protected`, its contents never read.
+    /// for the owner's own view; nothing here reaches a peer. Symlinked directories and
+    /// names the wire grammar refuses are left out, as no peer could fetch them. A
+    /// protected directory is entered one level: its own files get their verdict, and
+    /// each directory in it is one `<dir>/` row marked `Protected`, its contents never
+    /// read.
     pub(crate) fn resolve_all(
         &self,
         peer: &PeerRef<'_>,
@@ -934,8 +943,15 @@ impl ShareSet {
         walk_bound: usize,
         cap: usize,
     ) -> Resolved {
-        let Ok(rules) = self.rules(peer, case_insensitive) else {
-            return Resolved::default();
+        let rules = match self.rules(peer, case_insensitive) {
+            Ok(rules) => rules,
+            Err(err) => {
+                debug!(
+                    "Mesh share rules could not be built, so nothing is resolved: {}",
+                    redact_hashes(&format!("{err}"))
+                );
+                return Resolved::default();
+            }
         };
         let mut walk = Walk::new(&rules, walk_bound, usize::MAX).including_unallowed();
         walk.run(rules.canonical_root.clone());
@@ -1236,14 +1252,15 @@ pub(crate) fn case_folding_hint(root: &Path) -> Option<bool> {
     Some(fs::symlink_metadata(root.join(swapped)).is_ok())
 }
 
-/// The directory walk behind `list`, `resolve` and `count_matches`: an explicit stack, a
-/// budget of entries to visit, a cap on the files kept, and every regular file an allow
-/// names, unopened and with its verdict, so one traversal serves a peer's listing and
-/// the human's view of what the denies hold back. Symlinked directories are never
-/// entered, since a link can take the walk anywhere and `**` is the user's promise about
-/// this tree alone; a symlinked file is judged on what it resolves to, as a fetch of it
-/// would be. `.git` and the protected directories are never entered by served reads; the
-/// `--all` walk lists a protected directory's own files and never descends further.
+/// The directory walk behind `list`, `resolve`, `resolve_all` and `count_matches`: an
+/// explicit stack, a budget of entries to visit, a cap on the files kept, and every
+/// regular file an allow names (every file, for the `--all` walk), unopened and with its
+/// verdict, so one traversal serves a peer's listing and the human's view of what the
+/// denies hold back. Symlinked directories are never entered, since a link can take the
+/// walk anywhere and `**` is the user's promise about this tree alone; a symlinked file
+/// is judged on what it resolves to, as a fetch of it would be. `.git` and the protected
+/// directories are never entered by served reads; the `--all` walk lists a protected
+/// directory's own files and never descends further.
 struct Walk<'a> {
     rules: &'a ShareRules,
     remaining: usize,
@@ -3274,6 +3291,57 @@ mod tests {
 
             assert!(resolve_all(&set, 2, LIST_PAGE_SIZE).truncated);
             assert!(!resolve_all(&set, DEFAULT_LIST_WALK_BOUND, LIST_PAGE_SIZE).truncated);
+        }
+    }
+
+    /// Usage-probe coverage: the owner's `--all` view next to what a peer is served,
+    /// with all five verdicts in one share root.
+    mod resolve_all_usage_tests {
+        use super::*;
+
+        #[test]
+        fn all_five_verdicts_show_and_the_peer_listing_still_serves_only_the_shared_file() {
+            let fx = Fixture::new("resolve-all-five-verdicts");
+            let mut set = fx.load();
+            set.apply(allow("docs/a.md"), WriteScope::Global).unwrap();
+            set.apply(allow("docs/c.md"), WriteScope::Global).unwrap();
+            set.apply(deny("docs/c.md"), WriteScope::Workspace).unwrap();
+            for path in [".env", ".git/config", "docs/a.md", "docs/b.md", "docs/c.md"] {
+                fx.file(path);
+            }
+
+            let resolved = set.resolve_all(
+                &PeerRef::unscoped(),
+                false,
+                DEFAULT_LIST_WALK_BOUND,
+                ALL_LIST_ROWS,
+            );
+            let verdict_of = |path: &str| {
+                resolved
+                    .entries
+                    .iter()
+                    .find(|entry| entry.path.as_str() == path)
+                    .map(|entry| entry.verdict)
+            };
+
+            assert_eq!(verdict_of(".env"), Some(Verdict::BuiltinDenied));
+            assert_eq!(verdict_of(".git/config"), Some(Verdict::Protected));
+            assert_eq!(verdict_of("docs/a.md"), Some(Verdict::Shared));
+            assert_eq!(verdict_of("docs/b.md"), Some(Verdict::NotAllowed));
+            assert_eq!(verdict_of("docs/c.md"), Some(Verdict::Denied));
+            for entry in &resolved.entries {
+                if entry
+                    .path
+                    .as_str()
+                    .starts_with(&format!("{WORKSPACE_COYOTE_DIR_NAME}/"))
+                {
+                    assert_eq!(entry.verdict, Verdict::Protected, "{}", entry.path.as_str());
+                }
+            }
+            assert_eq!(resolved.total, resolved.entries.len());
+
+            let listing = listing(&set, None, DEFAULT_LIST_WALK_BOUND);
+            assert_eq!(listed_paths(&listing), ["docs/a.md"]);
         }
     }
 
