@@ -1691,11 +1691,14 @@ impl MeshRuntime {
     }
 
     /// `send_peer` with its timeouts chosen. Trust is checked before anything touches
-    /// the wire, and a destination the peer table has never heard is as untrusted as one
-    /// the list refuses. Only the peer-unreachable errors fall back to store-and-forward:
+    /// the wire. A destination the peer table has never heard is first asked for on the
+    /// mesh when the trust list would let it through, and refused unasked otherwise.
+    /// Only the peer-unreachable errors and a silent peer fall back to store-and-forward:
     /// a refusal of any code means the peer heard and said no, and storing a message it
-    /// has refused would deliver it behind its back. Posts to the propagation node queue
-    /// behind `posting`, since `propagate` needs one caller per node at a time.
+    /// has refused would deliver it behind its back. A wait that ran out on this node's
+    /// side, or with the peer's answer still arriving, is reported with the retry and
+    /// not stored. Posts to the propagation node queue behind `posting`, since
+    /// `propagate` needs one caller per node at a time.
     pub(crate) async fn send_peer_with(
         &self,
         destination_hex: &str,
@@ -1793,9 +1796,6 @@ impl MeshRuntime {
             Err(
                 err @ (RequestError::Timeout { .. }
                 | RequestError::LinkActivationTimeout { .. }
-                | RequestError::LocalTimeout { .. }
-                | RequestError::IdentifyTimeout { .. }
-                | RequestError::ResponseIncomplete { .. }
                 | RequestError::LinkFailed(_)
                 | RequestError::LinkClosed),
             ) => err,
@@ -2505,6 +2505,33 @@ mod no_answer_tests {
     use super::*;
     #[cfg(unix)]
     use crate::mesh::test_support::beside_a_stub_that_does_not_know_it;
+
+    /// A wait that ran out on this node's side, or with the peer's answer still arriving,
+    /// is told as the retry, never as the peer being unreachable.
+    #[test]
+    fn a_wait_short_of_silence_reads_as_the_retry_not_unreachable() {
+        use super::SendError;
+        use crate::mesh::request::{RequestError, request_remedy};
+        use std::time::Duration;
+
+        let (path, after) = ("/message".to_string(), Duration::from_secs(15));
+        for err in [
+            RequestError::LocalTimeout {
+                path: path.clone(),
+                after,
+            },
+            RequestError::IdentifyTimeout {
+                path: path.clone(),
+                after,
+            },
+            RequestError::ResponseIncomplete { path, after },
+        ] {
+            let remedy = request_remedy(&err);
+            let text = SendError::Direct(err).to_string();
+            assert!(text.ends_with(remedy), "{text}");
+            assert!(!text.contains("unreachable"), "{text}");
+        }
+    }
 
     #[cfg(unix)]
     fn quick() -> PeerSendOptions {

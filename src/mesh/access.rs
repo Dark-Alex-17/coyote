@@ -618,9 +618,6 @@ impl MeshRuntime {
             Err(
                 err @ (RequestError::Timeout { .. }
                 | RequestError::LinkActivationTimeout { .. }
-                | RequestError::LocalTimeout { .. }
-                | RequestError::IdentifyTimeout { .. }
-                | RequestError::ResponseIncomplete { .. }
                 | RequestError::LinkFailed(_)
                 | RequestError::LinkClosed),
             ) => err,
@@ -1632,6 +1629,33 @@ mod no_answer_tests {
     use super::*;
     #[cfg(unix)]
     use crate::mesh::test_support::beside_a_stub_that_does_not_know_it;
+
+    /// A wait that ran out on this node's side, or with the peer's answer still arriving,
+    /// is told as the retry, never as the peer being unreachable.
+    #[test]
+    fn a_wait_short_of_silence_reads_as_the_retry_not_unreachable() {
+        use super::AccessError;
+        use crate::mesh::request::{RequestError, request_remedy};
+        use std::time::Duration;
+
+        let (path, after) = ("/access".to_string(), Duration::from_secs(15));
+        for err in [
+            RequestError::LocalTimeout {
+                path: path.clone(),
+                after,
+            },
+            RequestError::IdentifyTimeout {
+                path: path.clone(),
+                after,
+            },
+            RequestError::ResponseIncomplete { path, after },
+        ] {
+            let remedy = request_remedy(&err);
+            let text = AccessError::Direct(err).to_string();
+            assert!(text.ends_with(remedy), "{text}");
+            assert!(!text.contains("unreachable"), "{text}");
+        }
+    }
 
     #[cfg(unix)]
     fn quick() -> AccessOptions {

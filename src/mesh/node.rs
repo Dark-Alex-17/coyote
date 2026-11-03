@@ -1413,6 +1413,8 @@ impl MeshRuntime {
     /// A link that came up and drew no reply is kept apart from one that never came up:
     /// a peer that does not trust this identity answers a knock with silence, so that
     /// outcome is reported as unanswered, never as the peer being unreachable.
+    /// A wait that ran out on this node's side, or with the peer's answer still
+    /// arriving, is neither: it is reported with the retry and not stored.
     /// Posts to the propagation node queue behind `posting`, since `propagate` needs one
     /// caller per node at a time.
     pub(crate) async fn knock_with(
@@ -1441,9 +1443,6 @@ impl MeshRuntime {
             Err(err @ RequestError::Timeout { .. }) => (KnockFallback::Unanswered, err),
             Err(
                 err @ (RequestError::LinkActivationTimeout { .. }
-                | RequestError::LocalTimeout { .. }
-                | RequestError::IdentifyTimeout { .. }
-                | RequestError::ResponseIncomplete { .. }
                 | RequestError::LinkFailed(_)
                 | RequestError::LinkClosed),
             ) => (KnockFallback::Unreachable, err),
@@ -3064,31 +3063,24 @@ async fn watch_interfaces(
                 }
                 Transition::Reconnect => {
                     let announced = if runtime.announce {
-                        let outcome = tokio::select! {
+                        Some(tokio::select! {
                             () = cancel.cancelled() => return,
                             outcome = runtime.announce_after_reconnect() => outcome,
-                        };
-                        match &outcome {
-                            Ok(None) => info!("Mesh interface {label} reconnected; announced"),
-                            Ok(Some(age)) => {
-                                info!(
-                                    "Mesh interface {label} reconnected; the heartbeat will announce it (last announce {})",
-                                    elapsed_text(*age)
-                                );
-                            }
-                            Err(err) => warn!(
-                                "Failed to announce the mesh node over {label} after it reconnected; the heartbeat will announce it: {}",
-                                redact_hashes(&format!("{err:#}"))
-                            ),
-                        }
-                        Some(outcome)
+                        })
                     } else {
-                        info!("Mesh interface {label} reconnected; this node does not announce");
                         None
                     };
+                    let line = reconnect_line(label, announced.as_ref());
+                    match &announced {
+                        Some(Err(err)) => warn!(
+                            "Mesh interface {line} Cause: {}",
+                            redact_hashes(&format!("{err:#}"))
+                        ),
+                        _ => info!("Mesh interface {line}"),
+                    }
                     slot.push_idle(IdleNotify {
                         source: Source::Mesh,
-                        text: reconnect_line(label, announced.as_ref()),
+                        text: line,
                         verbatim: Vec::new(),
                         origin: Origin::Local,
                         model_note: None,
@@ -5313,6 +5305,34 @@ mod no_answer_tests {
     use super::*;
     #[cfg(unix)]
     use crate::mesh::test_support::beside_a_stub_that_does_not_know_it;
+
+    /// A knock whose wait ran out on this node's side, or with the peer's answer still
+    /// arriving, is told as the retry, neither unreachable nor unanswered.
+    #[test]
+    fn a_knock_wait_short_of_silence_reads_as_the_retry() {
+        use super::KnockError;
+        use crate::mesh::request::{RequestError, request_remedy};
+        use std::time::Duration;
+
+        let (path, after) = ("/knock".to_string(), Duration::from_secs(15));
+        for err in [
+            RequestError::LocalTimeout {
+                path: path.clone(),
+                after,
+            },
+            RequestError::IdentifyTimeout {
+                path: path.clone(),
+                after,
+            },
+            RequestError::ResponseIncomplete { path, after },
+        ] {
+            let remedy = request_remedy(&err);
+            let text = KnockError::Direct(err).to_string();
+            assert!(text.ends_with(remedy), "{text}");
+            assert!(!text.contains("unreachable"), "{text}");
+            assert!(!text.contains("no answer"), "{text}");
+        }
+    }
 
     /// A knock on a peer gone before the link could come up was never heard, so with no
     /// propagation node known it is reported unreachable rather than unanswered.
