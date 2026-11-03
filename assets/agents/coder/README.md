@@ -16,11 +16,13 @@ flowchart TD
     analyze_request["analyze_request<br/>llm + output_schema"] --> route_complexity
     route_complexity{"route_complexity<br/>script"}
     route_complexity -->|"complexity ≥ 7"| gate_approval
-    route_complexity -->|else| implement
+    route_complexity -->|else| baseline_tests
     route_complexity -. "script crashed" .-> gate_approval
     gate_approval{{"gate_approval<br/>approval"}}
-    gate_approval -->|yes| implement
+    gate_approval -->|yes| baseline_tests
     gate_approval -->|no| end_rejected
+    baseline_tests{"baseline_tests<br/>script"} --> implement
+    baseline_tests -. "script crashed" .-> implement
     implement["implement<br/>llm + fs tools"] --> verify_build
     verify_build{"verify_build<br/>script"}
     verify_build -->|pass| verify_tests
@@ -64,6 +66,10 @@ End nodes emit one of three sentinel outcomes for the caller:
   recorded survives even when the self-review did not run: `self_review_fault`
   copies the `ASK --` lines from the implement passes into `design_notes`. A
   disclosure for the orchestrator's report, not a verdict.
+  When the suite was already red before the run (see
+  [Baseline tests](#baseline-tests)), a `Pre-existing failures: <ids>` line
+  follows `Tests: passed`, naming the baseline failures that still fail, and a
+  `Fixed pre-existing failures: <ids>` line names those that now pass.
 - `CODER_REJECTED` — user rejected the plan at the approval gate.
 - `CODER_FAILED` — fix-loop exhausted; build/tests still failing — or the
   verification gate crashed twice (see `Verification gate error:`), or
@@ -77,6 +83,31 @@ End nodes emit one of three sentinel outcomes for the caller:
   `verify_tests TIMED OUT` (killed at `build_timeout` / `test_timeout`) or
   with `TIMED OUT` (killed by the engine at the node timeout), and the run
   ends at once instead of spending fix attempts on code nothing showed broken.
+
+## Baseline tests
+
+Before `implement` first runs, `baseline_tests` runs the test command once on
+the untouched tree (the same command, directory, `test_timeout` and
+`build_lock` as `verify_tests`). It never runs again after edits, and it
+never ends the run. A red run records its exit code, the failing test ids it
+can read from unittest, pytest, cargo, go, jest and vitest output, and a
+hash of the failure lines with timings and addresses normalised away. The
+`implement` prompt lists those tests under "Tests that already failed before
+this run", and fix-loop instructions name them as pre-existing.
+
+`verify_tests` then passes a red run only when the suite was already red
+and:
+
+- its exit code equals the baseline's (a different code, such as a crash on
+  top of the old failures, fails), and
+- every failing test it identifies was in the baseline, or, when neither run
+  named a test, its failure output hashes the same as the baseline's.
+
+Anything it cannot match fails as before: a new failing test, or a run whose
+failures cannot be identified against a baseline whose failures could. With
+no test command, a green or timed-out baseline, or a crashed `baseline_tests`
+(its fallback goes straight to `implement`), there is no baseline and
+`verify_tests` judges by the exit code alone.
 
 ## Tuning
 

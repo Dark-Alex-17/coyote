@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Helpers for the coder's verify_build and verify_tests gates. Sourced after
-# .shared/utils.sh, never run on its own.
+# Helpers for the coder's baseline_tests, verify_build and verify_tests gates.
+# Sourced after .shared/utils.sh, never run on its own.
 
 # gate_posix_path prints `path` in the form bash's own file tests and dirname
 # read. A Windows drive path (C:\x or C:/x), which is what a Git Bash script
@@ -83,6 +83,102 @@ gate_deadline() {
   [[ -n "$value" ]] || value=$fallback
   [[ "$value" =~ ^[0-9]+$ ]] || return 1
   printf '%s' "$((10#$value))"
+}
+
+# gate_test_command prints the test command for directory `dir`: the
+# test_command variable, then TEST_CMD, then the detected one. Prints
+# nothing when there is none.
+gate_test_command() {
+  local dir=$1 cmd
+  if [[ -n "${LLM_AGENT_VAR_TEST_COMMAND:-}" ]]; then
+    cmd="$LLM_AGENT_VAR_TEST_COMMAND"
+  elif [[ -n "${TEST_CMD:-}" ]]; then
+    cmd="$TEST_CMD"
+  else
+    cmd=$(detect_project "$dir" | jq -r '.test // ""')
+  fi
+  [[ "$cmd" == "null" ]] && cmd=''
+  printf '%s' "$cmd"
+}
+
+# gate_plain_text prints file `file` without carriage returns or ANSI escape
+# sequences (colour, cursor and charset switches).
+gate_plain_text() {
+  local esc
+  esc=$(printf '\033')
+  tr -d '\r' <"$1" | LC_ALL=C sed -E "s/${esc}\[[0-9;?]*[A-Za-z]//g; s/${esc}[()][A-Za-z0-9]//g"
+}
+
+# gate_failing_tests prints the sorted unique ids of the failing tests named
+# in test output file `file`, one per line, for the unittest, pytest, cargo,
+# go, jest and vitest formats. Ids stay test-level: a file-level id would
+# hide a new failure in a file that already failed.
+gate_failing_tests() {
+  gate_plain_text "$1" | LC_ALL=C awk '
+    function emit(id) { if (id != "") print id }
+    {
+      line = $0
+      sub(/[ \t]+$/, "", line)
+    }
+    line ~ /^(FAIL|ERROR): [^ ]+ \([^)]+\)/ {
+      name = line; sub(/^[A-Z]+: /, "", name); sub(/ .*/, "", name)
+      paren = line; sub(/^[^(]*\(/, "", paren); sub(/\).*/, "", paren)
+      tail = "." name
+      if (length(paren) > length(tail) && substr(paren, length(paren) - length(tail) + 1) == tail) emit(paren)
+      else emit(paren tail)
+      next
+    }
+    line ~ /^(FAILED|ERROR) [^ (][^ ]*( - .*)?$/ {
+      id = line; sub(/^[A-Z]+ /, "", id); sub(/ .*/, "", id)
+      if (id ~ /::/ || id ~ /\.py$/) emit(id)
+      next
+    }
+    line ~ /^test .+ \.\.\. FAILED$/ {
+      id = line; sub(/^test /, "", id); sub(/ \.\.\. FAILED$/, "", id)
+      emit(id)
+      next
+    }
+    line ~ /^[ \t]*--- FAIL: / {
+      id = line; sub(/^[ \t]*--- FAIL: /, "", id); sub(/ \([^)]*\)$/, "", id)
+      emit(id)
+      next
+    }
+    line ~ /^FAIL[ \t]+[^ \t]+[ \t]+([0-9.]+s|\[build failed\]|\[setup failed\])$/ {
+      id = line; sub(/^FAIL[ \t]+/, "", id); sub(/[ \t].*/, "", id)
+      emit("pkg:" id)
+      next
+    }
+    line ~ /^[ \t]*● / { # debris-exempt
+      id = line; sub(/^[ \t]*● /, "", id) # debris-exempt
+      if (id != "Console") emit(id)
+      next
+    }
+    line ~ /^[ \t]*FAIL[ \t]+.+ > / {
+      id = line; sub(/^[ \t]*FAIL[ \t]+/, "", id)
+      emit(id)
+    }
+  ' | LC_ALL=C sort -u
+}
+
+# gate_failure_hash prints a digest of the failure lines in test output file
+# `file`, with timings, addresses and trailing blanks normalised away so two
+# runs failing the same way hash alike. Output with no failure line still
+# hashes, to the digest of nothing.
+gate_failure_hash() {
+  local lines
+  lines=$(gate_plain_text "$1" | { LC_ALL=C grep -iE 'fail|error|panic|assert' || true; } |
+    LC_ALL=C sed -E \
+      -e 's/0x[0-9A-Fa-f]+/0x?/g' \
+      -e 's/[0-9]+(\.[0-9]+)?(ms|s)([^A-Za-z0-9_]|$)/?\3/g' \
+      -e 's/[[:space:]]+$//' |
+    LC_ALL=C sort -u)
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$lines" | sha256sum | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$lines" | shasum -a 256 | awk '{print $1}'
+  else
+    printf '%s' "$lines" | cksum | awk '{print $1}'
+  fi
 }
 
 # run_gate_until runs `cmd` through run_gate inside `dir`, writing its

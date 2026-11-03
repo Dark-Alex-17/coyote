@@ -85,8 +85,13 @@ if [[ "$build_ok" != "true" ]]; then
   fix_instructions=$(printf '## Fix loop status (attempt %d of %d)\n\nThe previous attempt failed the build.\n\nBuild output:\n```\n%s\n```\n\nIdentify the minimal fix and apply it. Do not refactor.' \
     "$next_attempts" "$max_fix_attempts" "$build_output")
 else
-  fix_instructions=$(printf '## Fix loop status (attempt %d of %d)\n\nBuild passed but tests failed.\n\nTest output:\n```\n%s\n```\n\nIdentify the minimal fix and apply it. Do not refactor.' \
-    "$next_attempts" "$max_fix_attempts" "$tests_output")
+  baseline_failures=$(echo "$state" | jq -r '.baseline_failures // [] | join(", ")')
+  pre_existing=''
+  if [[ -n "$baseline_failures" ]]; then
+    pre_existing="Pre-existing failures, already failing before you started: ${baseline_failures}. They are not yours to fix unless the request asks you to, and do not write tests that encode their behaviour."$'\n\n'
+  fi
+  fix_instructions=$(printf '## Fix loop status (attempt %d of %d)\n\nBuild passed but tests failed.\n\nTest output:\n```\n%s\n```\n\n%sIdentify the minimal fix and apply it. Do not refactor.' \
+    "$next_attempts" "$max_fix_attempts" "$tests_output" "$pre_existing")
 fi
 
 # fix_instructions embeds a gate transcript; feed it to jq on stdin so it can
