@@ -529,6 +529,105 @@ fn smoke_env_restore_check_fails_when_the_runs_root_is_not_restored() {
     assert_no_bytecode_under_candidate();
 }
 
+/// Each guard in gates.py, removed from a scratch copy, turns its smoke row
+/// red: read access left out of `TRUSTED_PERMISSIONS`, the
+/// CHANGES_REQUESTED veto in the approval fallback, the `fix_origin_return`
+/// target `fix_done` returns to, the overflow stop in `review_poll`, the
+/// `>=` that stops `review_poll` at `POLL_VISIT_BUDGET`, the PR head check
+/// before `review_update` resolves anything, the trusted author of an own
+/// comment and the failed-read exclusion that keeps `_poll_permissions`
+/// from re-reading the same failing logins every poll.
+#[test]
+fn smoke_rows_go_red_under_the_recorded_sabotages() {
+    let Some(python) = python3() else { return };
+    let Some(yq) = mikefarah_yq() else { return };
+    let sabotages = [
+        (
+            "read-permission",
+            "TRUSTED_PERMISSIONS = (\"admin\", \"maintain\", \"write\")",
+            "TRUSTED_PERMISSIONS = (\"admin\", \"maintain\", \"write\", \"read\")",
+            "permission: a COLLABORATOR with read -> untrusted, no body, one lookup",
+        ),
+        (
+            "approval-veto",
+            "return not any(r[\"state\"] == \"CHANGES_REQUESTED\" for r in verdicts) and any(",
+            "return any(",
+            "approval: empty decision, one author approves on head, another's latest requests \
+             changes -> not approved",
+        ),
+        (
+            "fix-origin",
+            "ret = state.get(\"fix_origin_return\") or state.get(\"fix_return_to\") or ",
+            "ret = state.get(\"fix_return_to\") or ",
+            "fix origin: fix_done after a BLOCKED review fix round -> review_update, origin \
+             cleared",
+        ),
+        (
+            "truncation",
+            "    if overflow:\n        u.update({\"review_status\": \"truncated\"",
+            "    if False:\n        u.update({\"review_status\": \"truncated\"",
+            "truncation: reviewThreads totalCount 101 -> truncated -> review_route, overflow in \
+             review_truncated, review_items untouched",
+        ),
+        (
+            "visit-budget",
+            "    u[\"review_polls_run\"] = runs + 1\n    if runs >= POLL_VISIT_BUDGET:\n",
+            "    u[\"review_polls_run\"] = runs + 1\n    if runs > POLL_VISIT_BUDGET:\n",
+            "watch: review_poll at the run-wide visit budget -> visit_cap -> review_route",
+        ),
+        (
+            "push-check",
+            "    if not sha or oid != sha:\n",
+            "    if False:\n",
+            "watch: review_update with a head mismatch -> review_push_mismatch, nothing resolved \
+             or posted, stop ledgered",
+        ),
+        (
+            "own-author",
+            "return _trusted(state, u, c) and (OWN_MARKER in body",
+            "return (OWN_MARKER in body",
+            "own marker: an untrusted comment carrying the marker is not own -> an untrusted item",
+        ),
+        (
+            "permission-stall",
+            "if login and login not in cached and login not in failed]",
+            "if login and login not in cached]",
+            "permission stall: a single failing login is read once across three polls",
+        ),
+    ];
+    for (label, old, new, row) in sabotages {
+        let scratch = scratch_dir(&format!("sabotage-{label}"));
+        let copy = scratch_candidate_copy(&scratch);
+        let gates = copy.join("scripts").join("gates.py");
+        let text = fs::read_to_string(&gates).unwrap();
+        assert_eq!(
+            text.matches(old).count(),
+            1,
+            "{label}: {old:?} must occur exactly once in gates.py"
+        );
+        fs::write(&gates, text.replacen(old, new, 1)).unwrap();
+        let mut cmd = battery(&python, &scratch);
+        cmd.current_dir(&copy)
+            .env("PATH", path_with(yq.parent().unwrap()))
+            .arg("scripts/smoke_test.py");
+        let output = output_with_timeout(&mut cmd, BATTERY_LIMIT, &format!("sabotage {label}"));
+        let report = transcript(&output);
+        assert!(
+            !output.status.success(),
+            "{label}: the battery passed with the guard removed:\n{report}"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let fail = format!("FAIL {row}");
+        assert!(
+            stdout.lines().any(|l| l
+                .strip_prefix(&fail)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with("  ("))),
+            "{label}: no `{fail}` line:\n{report}"
+        );
+    }
+    assert_no_bytecode_under_candidate();
+}
+
 #[test]
 fn session_block_check_passes_under_mikefarah_yq() {
     let Some(yq) = mikefarah_yq() else { return };
@@ -5060,6 +5159,81 @@ fn readme_pr_tracking_row_names_every_stop_condition() {
         assert!(
             row.contains(&format!("`{kind}`")),
             "the pr_tracking row does not name the stop condition {kind}: {row}"
+        );
+    }
+}
+
+/// The README's `pr_tracking` row lists the hardening fixes that apply in
+/// both modes with the numbers the shipped graph, `_lib.py` and `gates.py`
+/// carry, so a retuned timeout, budget or marker cannot leave the row
+/// quoting the old value.
+#[test]
+fn readme_pr_tracking_row_lists_each_hardening_fix_with_its_number() {
+    let row = adjustments_row("| `pr_tracking` review watch |");
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let shipped: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let timeout = |node: &str| {
+        shipped["nodes"][node]["timeout"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("graph.yaml gives {node} an integer timeout"))
+    };
+    let cap = shipped["settings"]["max_loop_iterations"]
+        .as_i64()
+        .expect("graph.yaml sets an integer settings.max_loop_iterations");
+    let gates = fs::read_to_string(candidate_dir().join("scripts/gates.py")).unwrap();
+    let marker = gates
+        .lines()
+        .find_map(|l| l.strip_prefix("OWN_MARKER = \"")?.strip_suffix('"'))
+        .expect("gates.py has no OWN_MARKER = \"...\" line");
+    for node in ["ci_evidence", "flip_ready"] {
+        assert_eq!(
+            timeout(node),
+            timeout("ci_apply"),
+            "the pr_tracking row gives {node} the ci_apply timeout"
+        );
+    }
+
+    let Some(values) = lib_ints(
+        &["POLL_VISIT_BUDGET", "GH_CALL_SECS"],
+        "lib-hardening-numbers",
+    ) else {
+        return;
+    };
+    let bound = |name: &str| values[name].as_i64().unwrap();
+    let fixes = [
+        (
+            "the ci_poll timeout",
+            format!("the `ci_poll` timeout {}", timeout("ci_poll")),
+        ),
+        (
+            "the ci_apply timeout",
+            format!(
+                "the `ci_apply`, `ci_evidence` and `flip_ready` timeouts {}",
+                timeout("ci_apply")
+            ),
+        ),
+        (
+            "the read failure count",
+            "a stale or killed poll counted as one read failure".to_string(),
+        ),
+        (
+            "POLL_VISIT_BUDGET",
+            format!("`POLL_VISIT_BUDGET` ({})", bound("POLL_VISIT_BUDGET")),
+        ),
+        (
+            "settings.max_loop_iterations",
+            format!("`settings.max_loop_iterations` ({cap})"),
+        ),
+        ("OWN_MARKER", format!("`{marker}`")),
+        (
+            "GH_CALL_SECS",
+            format!("`GH_CALL_SECS` ({})", bound("GH_CALL_SECS")),
+        ),
+    ];
+    for (item, phrase) in fixes {
+        assert!(
+            row.contains(&phrase),
+            "the pr_tracking row does not record {item} as {phrase:?}: {row}"
         );
     }
 }
