@@ -557,7 +557,10 @@ fn resolve_obsolete(path: &str, sticky: &mut Option<ObsoleteAction>) -> Result<O
         return Ok(action);
     }
 
-    if !*IS_STDOUT_TERMINAL {
+    // Under the TUI stdout is a tty the menu cannot use; keeping the file
+    // matches the non-interactive answer rather than refusing after
+    // apply_plan has already written the update.
+    if !*IS_STDOUT_TERMINAL || crate::tui::active() {
         return Ok(ObsoleteAction::Keep);
     }
 
@@ -3173,6 +3176,20 @@ mod tests {
         assert!(added.is_empty(), "got: {added:?}");
         assert_eq!(deferred, missing);
         assert!(handle_missing_secrets(&missing, CommandPrefix::Dot).is_ok());
+    }
+
+    /// A modified obsolete file is kept under the TUI, the same answer the
+    /// non-interactive path gives, instead of refusing mid-update.
+    #[test]
+    #[serial]
+    fn resolve_obsolete_keeps_under_the_tui() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let mut sticky = None;
+
+        let action = resolve_obsolete("macros/old.yaml", &mut sticky).unwrap();
+
+        assert_eq!(action, ObsoleteAction::Keep);
+        assert_eq!(sticky, None);
     }
 
     fn write_manifest(root: &Path, yaml: &str) {

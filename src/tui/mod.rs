@@ -3387,11 +3387,6 @@ mod tests {
             ("src/config/conflict.rs", "select_choice", PROMPT_GATED),
             (
                 "src/config/install_remote.rs",
-                "resolve_obsolete",
-                PROMPT_GATED,
-            ),
-            (
-                "src/config/install_remote.rs",
                 "uninstall_bundle",
                 PROMPT_GATED,
             ),
