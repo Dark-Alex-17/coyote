@@ -5793,7 +5793,7 @@ pub(crate) mod network {
             rig.gate.cache().list(SystemTime::now()).unwrap().len() == 2
         })
         .await;
-        assert_eq!(surface.count(), 1, "one line per identity per session");
+        assert_eq!(surface.count(), 1, "one line per instance per session");
         assert_eq!(
             rig.gate.cache().list(SystemTime::now()).unwrap()[0].intro,
             None
@@ -8165,11 +8165,15 @@ pub(crate) mod network {
             .await
             .unwrap_err();
 
-        assert_eq!(err, AccessError::Refused(RefusalCode::Throttled));
+        let destination = pair.responder.desc.address_hash.to_hex_string();
         assert_eq!(
             err.to_string(),
-            "The peer refused the access request: throttled (0xf6). Wait a minute and try again"
+            format!(
+                "{} refused it: it is busy with a request from this identity (one at a time per identity). Try again in a minute.",
+                &destination[..8]
+            )
         );
+        assert_eq!(err, AccessError::Throttled { destination });
         assert_eq!(pair.recorder_b.last().path_hash, PathHash::of(ACCESS_PATH));
         sleep(Duration::from_millis(500)).await;
         node.nothing_else_received();

@@ -7,7 +7,7 @@ use crate::mesh::card::{CardSource, DISPLAY_NAME_MAX_CHARS, StatusHandler, rende
 use crate::mesh::envoy_sessions::{EnvoyMemoryError, EnvoySessions, RememberedOf};
 use crate::mesh::fetch::{
     FILE_FETCH_REQUEST_TIMEOUT, FetchError as FileFetchError, Fetched, GONE_COPY_TAIL,
-    NotSharedReason, not_shared_reason, not_shared_sentence,
+    NotSharedReason, not_shared_reason, not_shared_sentence, spent_attachment,
 };
 use crate::mesh::grants::DEFAULT_GRANT_TTL;
 use crate::mesh::identity::{self, Predecessor, fingerprint};
@@ -429,18 +429,11 @@ async fn join(ctx: &mut RequestContext, options: JoinOptions) -> Result<()> {
 
 async fn turn_off(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
     let args = parse_args(rest, &["--yes"], "off")?;
-    // Typed `.mesh off` is the run's decision: with `mesh.enabled: true` in config.yaml
-    // the sessions entered after it would otherwise join again.
-    let stays_off = if ctx.mesh_enabled_in_config {
-        " (it stays off for the rest of this run; `.mesh on` joins again)"
-    } else {
-        ""
-    };
     if ctx.app.mesh.get().is_none() {
         ctx.set_mesh_enabled_for_session(false);
         let app = Arc::clone(&ctx.app.config);
         ctx.refresh_mesh_tools(&app);
-        out_text(&format!("Mesh is already off for this session{stays_off}."));
+        out_text(&turn_off_line(true, ctx.mesh_enabled_in_config));
         return Ok(());
     }
     let question =
@@ -452,10 +445,21 @@ async fn turn_off(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
     let stopped = stop_node(ctx).await;
     ctx.set_mesh_enabled_for_session(false);
     stopped?;
-    out_text(&format!(
-        "Mesh is off for this session{stays_off}. Run `.mesh on` to join again."
-    ));
+    out_text(&turn_off_line(false, ctx.mesh_enabled_in_config));
     Ok(())
+}
+
+/// What `.mesh off` prints, naming `.mesh on` once. Typed `.mesh off` is the run's
+/// decision: with `mesh.enabled: true` in config.yaml the sessions entered after it
+/// would otherwise join again, so the line says it stays off.
+fn turn_off_line(already_off: bool, mesh_enabled_in_config: bool) -> String {
+    let state = if already_off { "already off" } else { "off" };
+    let stays_off = if mesh_enabled_in_config {
+        " (it stays off for the rest of this run)"
+    } else {
+        ""
+    };
+    format!("Mesh is {state} for this session{stays_off}; `.mesh on` joins again.")
 }
 
 /// The one leave site behind every REPL path that exits a session: `.exit session`, and
@@ -2072,6 +2076,19 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     let runtime = live(ctx)?;
     let record = peer_for_contact(&runtime, &destination, FETCH_REFUSAL_TAIL)?;
     let shown = shown_pattern(&args.path);
+    let peer = short(&destination);
+    if let Some(reason) = spent_attachment(
+        runtime.memory(),
+        &destination,
+        &record.identity_hash,
+        &args.path,
+        SystemTime::now(),
+    ) {
+        bail!(
+            "{} This was answered from this node's own records without asking {peer}; if {peer} now shares it some other way, a mesh__list call from the model that lists the path (following its cursor if needed) lets the next fetch ask {peer}.",
+            not_shared_refusal(peer, &shown, &args.path, &reason)
+        );
+    }
     let desc = match route_to(&runtime, &destination, abort_signal).await {
         Ok(desc) => desc,
         Err(Unrouted::NoAnswer) => bail!(
@@ -2085,7 +2102,6 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
             return Ok(());
         }
     };
-    let peer = short(&destination);
     out_path_text(&format!(
         "Fetching `{shown}` from {peer} over the mesh (up to {} s)...",
         FILE_FETCH_REQUEST_TIMEOUT.as_secs()
@@ -2120,13 +2136,7 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
                 &args.path,
                 SystemTime::now(),
             );
-            let mut sentence = not_shared_sentence(peer, &shown, &args.path, &reason);
-            if let NotSharedReason::AlreadyFetched { staged, .. } = &reason
-                && !staged.is_file()
-            {
-                sentence.push_str(GONE_COPY_TAIL);
-            }
-            bail!(sentence)
+            bail!(not_shared_refusal(peer, &shown, &args.path, &reason))
         }
         Ok(Fetched::InvalidPath { rule }) => bail!(
             "{}",
@@ -2163,6 +2173,18 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
         Err(err) => bail!(err.to_string()),
     }
     Ok(())
+}
+
+/// The refusal for a path the peer did not serve, read against what this node knows,
+/// with the gone-copy tail when an already fetched copy has since been removed.
+fn not_shared_refusal(peer: &str, shown: &str, path: &str, reason: &NotSharedReason) -> String {
+    let mut sentence = not_shared_sentence(peer, shown, path, reason);
+    if let NotSharedReason::AlreadyFetched { staged, .. } = reason
+        && !staged.is_file()
+    {
+        sentence.push_str(GONE_COPY_TAIL);
+    }
+    sentence
 }
 
 struct FetchArgs {
@@ -2707,6 +2729,7 @@ fn trust(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 TrustOptions { label, note: None },
                 now,
             )?;
+            reset_knock_surfacing(ctx, &outcome.identity_hash);
             let mut lines = vec![trusted_destination_line(&store, &outcome)];
             if outcome.deny_lifted {
                 lines.push("The refusal on this instance is lifted.".to_string());
@@ -2739,6 +2762,7 @@ fn trust(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             }
             let change =
                 store.trust_identity(mesh, &identity, TrustOptions { label, note: None }, now)?;
+            reset_knock_surfacing(ctx, &identity);
             out_text(&format!(
                 "Trusted identity {}, all destinations - {}.",
                 short(&identity),
@@ -2753,6 +2777,14 @@ fn trust(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The owner just acted on `identity`, so each of its instances earns one knock line
+/// again. A mesh that is off holds no gate and so nothing to reset.
+fn reset_knock_surfacing(ctx: &RequestContext, identity: &str) {
+    if let Some(runtime) = ctx.app.mesh.get() {
+        runtime.knock_gate().reset_surfaced(identity);
+    }
 }
 
 /// Without `--confirm` this is a dry run: it lists what would go and prints the token that
@@ -2886,6 +2918,7 @@ fn untrust(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             }
             let name = identity_name(&store, mesh, &preview.identity, &destination);
             let outcome = store.untrust_destination(mesh, &destination, false)?;
+            reset_knock_surfacing(ctx, &outcome.identity);
             out_text(&format!(
                 "Untrusted {name} ({}): its destination record is gone; the identity {} stays known. {}",
                 short(&destination),
@@ -2895,7 +2928,11 @@ fn untrust(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         }
         UntrustArg::Identity { target, confirm } => {
             let identity = identity_hash(ctx, &target)?;
+            let confirmed = confirm.is_some();
             untrust_identity(&store, mesh, &identity, confirm, now)?;
+            if confirmed {
+                reset_knock_surfacing(ctx, &identity);
+            }
         }
     }
     Ok(())
@@ -3320,6 +3357,9 @@ fn block(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 return Ok(());
             }
             let outcome = store.deny_destination(mesh, &destination, note, now, false)?;
+            if let Some(identity) = &outcome.identity {
+                reset_knock_surfacing(ctx, identity);
+            }
             let identity_clause = outcome
                 .identity
                 .as_deref()
@@ -3337,12 +3377,16 @@ fn block(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         }
         BlockArg::Identity { target, yes, note } => {
             let identity = identity_hash(ctx, &target)?;
-            block_identity(&store, mesh, &identity, yes, note, now)?;
+            if block_identity(&store, mesh, &identity, yes, note, now)? {
+                reset_knock_surfacing(ctx, &identity);
+            }
         }
     }
     Ok(())
 }
 
+/// Whether the identity was blocked; a repeat block without a note and a declined
+/// confirmation change nothing.
 fn block_identity(
     store: &TrustStore,
     mesh: &dyn LiveMesh,
@@ -3350,12 +3394,12 @@ fn block_identity(
     yes: bool,
     note: Option<String>,
     now: SystemTime,
-) -> Result<()> {
+) -> Result<bool> {
     // A note is the one thing a repeat block changes; without one there is nothing to ask.
     if note.is_none() && store.is_blocked_identity(identity) {
         out_text(&format!("identity {} is already blocked.", short(identity)));
         out_text(NOTHING_CHANGED);
-        return Ok(());
+        return Ok(false);
     }
     let memory = store.remembered_envoy_threads(identity);
     let mut memory_clause = match &memory {
@@ -3385,7 +3429,7 @@ fn block_identity(
     ));
     if !confirm_or_flag(&format!("Block {}?", short(identity)), "--yes", yes)? {
         out_text(NOTHING_CHANGED);
-        return Ok(());
+        return Ok(false);
     }
     let removed = store.block_identity(mesh, identity, note, now)?;
     let mut lines = vec![format!("Blocked {}.", short(identity))];
@@ -3402,7 +3446,7 @@ fn block_identity(
         store.remembered_envoy_threads(identity),
     ));
     out_text(&lines.join("\n"));
-    Ok(())
+    Ok(true)
 }
 
 fn unblock(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
@@ -7388,6 +7432,46 @@ mod tests {
     use rns_transport::rand_core::OsRng;
     use std::path::PathBuf;
     use std::time::Duration;
+
+    mod turn_off_line_tests {
+        use super::*;
+
+        #[test]
+        fn mesh_off_names_mesh_on_once_with_the_mesh_off_in_config() {
+            for (already_off, line) in [
+                (
+                    false,
+                    "Mesh is off for this session; `.mesh on` joins again.",
+                ),
+                (
+                    true,
+                    "Mesh is already off for this session; `.mesh on` joins again.",
+                ),
+            ] {
+                let shown = turn_off_line(already_off, false);
+                assert_eq!(shown, line);
+                assert_eq!(shown.matches(".mesh on").count(), 1, "{shown}");
+            }
+        }
+
+        #[test]
+        fn mesh_off_names_mesh_on_once_with_the_mesh_on_in_config() {
+            for (already_off, line) in [
+                (
+                    false,
+                    "Mesh is off for this session (it stays off for the rest of this run); `.mesh on` joins again.",
+                ),
+                (
+                    true,
+                    "Mesh is already off for this session (it stays off for the rest of this run); `.mesh on` joins again.",
+                ),
+            ] {
+                let shown = turn_off_line(already_off, true);
+                assert_eq!(shown, line);
+                assert_eq!(shown.matches(".mesh on").count(), 1, "{shown}");
+            }
+        }
+    }
 
     fn peer(name: Option<&str>, seen_secs_ago: u64, now: SystemTime) -> PeerRecord {
         PeerRecord {
@@ -11585,7 +11669,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     assert_eq!(
                         out.last().unwrap(),
                         &format!(
-                            "Mesh is already off for this session (it stays off for the rest of this run; `{mesh} on` joins again)."
+                            "Mesh is already off for this session (it stays off for the rest of this run); `{mesh} on` joins again."
                         ),
                         "{prefix}"
                     );
@@ -12293,7 +12377,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             assert!(!guard.path.join("config.yaml").exists());
             assert!(
                 stdout_lines().iter().any(|line| {
-                    line == "Mesh is already off for this session (it stays off for the rest of this run; `.mesh on` joins again)."
+                    line == "Mesh is already off for this session (it stays off for the rest of this run); `.mesh on` joins again."
                 }),
                 "{:?}",
                 stdout_lines()
@@ -12305,7 +12389,8 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             assert!(
                 stdout_lines()
                     .iter()
-                    .any(|line| line == "Mesh is already off for this session."),
+                    .any(|line| line
+                        == "Mesh is already off for this session; `.mesh on` joins again."),
                 "{:?}",
                 stdout_lines()
             );
@@ -14720,7 +14805,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     // says so; the gate agrees until `.mesh on`.
                     assert!(
                         stdout_lines().iter().any(|line| {
-                            line == "Mesh is off for this session (it stays off for the rest of this run; `.mesh on` joins again). Run `.mesh on` to join again."
+                            line == "Mesh is off for this session (it stays off for the rest of this run); `.mesh on` joins again."
                         }),
                         "{:?}",
                         stdout_lines()
@@ -14788,7 +14873,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     );
                     assert!(
                         !out.iter()
-                            .any(|line| line.contains("Run `.mesh on` to join again")),
+                            .any(|line| line.starts_with("Mesh is off for this session")),
                         "the `.mesh off` wording belongs to a typed `.mesh off`: {out:?}"
                     );
                     started.relay_handle.abort();
@@ -26251,6 +26336,327 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();
                 });
+            }
+
+            /// Each owner verb on an identity earns its instances a knock line again; a
+            /// declined confirmation and a repeat block that changes nothing do not.
+            mod owner_action_resets_knock_surfacing {
+                use super::*;
+                use crate::mesh::knock::{Admission, InboundKnock, KnockVia};
+                use crate::mesh::session_destination_name;
+                use rns_transport::destination::SingleInputDestination;
+                use rns_transport::identity::PrivateIdentity;
+                use rns_transport::rand_core::OsRng;
+                use std::time::Instant;
+
+                /// Identity X, kept known by its trusted instance B, with two more heard
+                /// instances C and A that nothing trusts.
+                struct Rig {
+                    started: StartedRuntime,
+                    ctx: RequestContext,
+                    identity: String,
+                    b: String,
+                    c: String,
+                    a: String,
+                }
+
+                impl Rig {
+                    async fn new(tag: &str) -> Self {
+                        let started = started_runtime(tag).await;
+                        let ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                        let now = SystemTime::now();
+                        let key = PrivateIdentity::new_from_rand(OsRng);
+                        let [b, c, a] = ["owner-b", "owner-c", "owner-a"].map(|aspect| {
+                            let name = session_destination_name(aspect);
+                            let announced = SingleInputDestination::new(key.clone(), name);
+                            let destination = announced.desc.address_hash.to_hex_string();
+                            started.runtime.peers().observe(
+                                PeerSighting {
+                                    destination_hash: destination.clone(),
+                                    identity_hash: announced
+                                        .desc
+                                        .identity
+                                        .address_hash
+                                        .to_hex_string(),
+                                    name_hash: hex_lower(name.as_name_hash_slice()),
+                                    display_name: Some("Tia".to_string()),
+                                    protocol_version: 1,
+                                    hops: 1,
+                                },
+                                now,
+                            );
+                            destination
+                        });
+                        let identity = started.runtime.peers().get(&b).unwrap().identity_hash;
+                        let rig = Self {
+                            started,
+                            ctx,
+                            identity,
+                            b,
+                            c,
+                            a,
+                        };
+                        rig.trust_instance(&rig.b);
+                        rig
+                    }
+
+                    fn trust_instance(&self, destination: &str) {
+                        self.started
+                            .runtime
+                            .trust()
+                            .trust_destination(
+                                self.ctx.app.mesh.as_ref(),
+                                destination,
+                                TrustOptions::default(),
+                                SystemTime::now(),
+                            )
+                            .unwrap();
+                    }
+
+                    fn knock_from_a(&self) -> Admission {
+                        self.started.runtime.knock_gate().admit(
+                            InboundKnock {
+                                identity_hash: self.identity.clone(),
+                                destination_hash: self.a.clone(),
+                                name_hash: String::new(),
+                                via: KnockVia::Direct,
+                                intro: None,
+                            },
+                            Instant::now(),
+                            SystemTime::now(),
+                        )
+                    }
+
+                    /// A's first knock earns its line and its repeat stays quiet.
+                    fn surface_a(&self) {
+                        assert_eq!(self.knock_from_a(), Admission::Admitted { surfaced: true });
+                        assert_eq!(self.knock_from_a(), Admission::Admitted { surfaced: false });
+                        assert_eq!(self.surfaced(), vec![self.a.clone()]);
+                    }
+
+                    fn surfaced(&self) -> Vec<String> {
+                        self.started
+                            .runtime
+                            .knock_gate()
+                            .surfaced_instances(&self.identity)
+                    }
+
+                    async fn run(&mut self, line: &str) -> String {
+                        out_of(&mut self.ctx, line).await.unwrap()
+                    }
+
+                    async fn stop(self) {
+                        assert!(self.ctx.app.mesh.stop().await.unwrap());
+                        self.started.relay_handle.abort();
+                    }
+                }
+
+                #[test]
+                #[serial]
+                fn trusting_another_instance_surfaces_a_again() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-reset-trust");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut rig = Rig::new("repl-mesh-reset-trust").await;
+                        rig.surface_a();
+
+                        let c = rig.c.clone();
+                        rig.run(&format!(".mesh trust {c} --yes")).await;
+
+                        assert_eq!(rig.knock_from_a(), Admission::Admitted { surfaced: true });
+                        rig.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn trusting_the_identity_clears_what_was_surfaced() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-reset-trust-identity");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut rig = Rig::new("repl-mesh-reset-trust-identity").await;
+                        rig.surface_a();
+
+                        let identity = rig.identity.clone();
+                        rig.run(&format!(".mesh trust --identity {identity} --yes"))
+                            .await;
+
+                        assert_eq!(rig.knock_from_a(), Admission::AlreadyTrusted);
+                        assert!(rig.surfaced().is_empty());
+                        rig.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn untrusting_an_instance_surfaces_a_again() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-reset-untrust");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut rig = Rig::new("repl-mesh-reset-untrust").await;
+                        let c = rig.c.clone();
+                        rig.trust_instance(&c);
+                        rig.surface_a();
+
+                        rig.run(&format!(".mesh untrust {c} --yes")).await;
+
+                        assert_eq!(rig.knock_from_a(), Admission::Admitted { surfaced: true });
+                        rig.stop().await;
+                    });
+                }
+
+                /// The identity is granted for all destinations behind the gate's back,
+                /// so A's line was surfaced before the grant the verb withdraws.
+                #[test]
+                #[serial]
+                fn untrusting_the_identity_surfaces_a_again() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-reset-untrust-identity");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut rig = Rig::new("repl-mesh-reset-untrust-identity").await;
+                        rig.surface_a();
+                        let identity = rig.identity.clone();
+                        rig.started
+                            .runtime
+                            .trust()
+                            .trust_identity(
+                                rig.ctx.app.mesh.as_ref(),
+                                &identity,
+                                TrustOptions::default(),
+                                SystemTime::now(),
+                            )
+                            .unwrap();
+
+                        rig.run(&format!(
+                            ".mesh untrust --identity {identity} --confirm untrust-{}",
+                            short(&identity)
+                        ))
+                        .await;
+
+                        assert_eq!(rig.knock_from_a(), Admission::Admitted { surfaced: true });
+                        rig.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn blocking_another_instance_surfaces_a_again() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-reset-block");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut rig = Rig::new("repl-mesh-reset-block").await;
+                        rig.surface_a();
+
+                        let c = rig.c.clone();
+                        rig.run(&format!(".mesh block {c} --yes")).await;
+
+                        assert_eq!(rig.knock_from_a(), Admission::Admitted { surfaced: true });
+                        rig.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn blocking_the_identity_clears_what_was_surfaced() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-reset-block-identity");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut rig = Rig::new("repl-mesh-reset-block-identity").await;
+                        rig.surface_a();
+
+                        let identity = rig.identity.clone();
+                        rig.run(&format!(".mesh block --identity {identity} --yes"))
+                            .await;
+
+                        assert_eq!(rig.knock_from_a(), Admission::Blocked);
+                        assert!(rig.surfaced().is_empty());
+                        rig.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn forgetting_the_identity_clears_what_was_surfaced() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-reset-forget");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut rig = Rig::new("repl-mesh-reset-forget").await;
+                        rig.surface_a();
+
+                        let identity = rig.identity.clone();
+                        rig.run(&format!(
+                            ".mesh forget --identity {identity} --confirm forget-{}",
+                            short(&identity)
+                        ))
+                        .await;
+
+                        assert_eq!(rig.knock_from_a(), Admission::Unknown);
+                        assert!(rig.surfaced().is_empty());
+                        rig.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn a_declined_block_leaves_a_quiet() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-reset-declined");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[false]);
+                    run_async(async {
+                        let mut rig = Rig::new("repl-mesh-reset-declined").await;
+                        rig.surface_a();
+
+                        let c = rig.c.clone();
+                        let out = rig.run(&format!(".mesh block {c}")).await;
+
+                        assert!(out.contains(NOTHING_CHANGED), "{out}");
+                        assert_eq!(prompt_script::prompts_asked(), 1);
+                        assert_eq!(rig.knock_from_a(), Admission::Admitted { surfaced: false });
+                        assert_eq!(rig.surfaced(), vec![rig.a.clone()]);
+                        rig.stop().await;
+                    });
+                }
+
+                /// The first block goes straight to the store, so only the verb's repeat
+                /// could have reset anything.
+                #[test]
+                #[serial]
+                fn a_repeat_identity_block_with_nothing_new_leaves_the_marks() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-reset-repeat-block");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut rig = Rig::new("repl-mesh-reset-repeat-block").await;
+                        rig.surface_a();
+                        let identity = rig.identity.clone();
+                        rig.started
+                            .runtime
+                            .trust()
+                            .block_identity(
+                                rig.ctx.app.mesh.as_ref(),
+                                &identity,
+                                None,
+                                SystemTime::now(),
+                            )
+                            .unwrap();
+
+                        let out = rig
+                            .run(&format!(".mesh block --identity {identity} --yes"))
+                            .await;
+
+                        assert!(out.contains("is already blocked."), "{out}");
+                        assert_eq!(rig.surfaced(), vec![rig.a.clone()]);
+                        rig.stop().await;
+                    });
+                }
             }
 
             mod command_prefix_refusals {
@@ -40810,30 +41216,41 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         fs::write(&staged, b"# a\n").unwrap();
                         memory.remember_reference(&dest, &identity, "m-1", "docs/a.md");
                         memory.mark_fetched(&dest, "docs/a.md", &staged);
-                        fx.queue("not_shared", vec![]);
+                        assert_eq!(fx.heard().len(), 2, "both refusals so far were the peer's");
+                        let before = stdout_lines().len();
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
-                                "`docs/a.md` was a one-time attachment from {dest} and this node already fetched it (staged at {staged}). Ask for it again with .mesh message {dest} if you need a fresh copy.",
+                                "`docs/a.md` was a one-time attachment from {dest} and this node already fetched it (staged at {staged}). Ask for it again with .mesh message {dest} if you need a fresh copy. This was answered from this node's own records without asking {dest}; if {dest} now shares it some other way, a mesh__list call from the model that lists the path (following its cursor if needed) lets the next fetch ask {dest}.",
                                 dest = fx.dest(),
                                 staged = staged.display()
                             ),
-                            "a fetched reference is read first"
+                            "a spent attachment is answered from the claims"
+                        );
+                        assert!(
+                            !stdout_lines()[before..]
+                                .iter()
+                                .any(|line| line.starts_with("Fetching")),
+                            "a spent attachment prints no Fetching line: {:?}",
+                            &stdout_lines()[before..]
                         );
 
                         fs::remove_file(&staged).unwrap();
-                        fx.queue("not_shared", vec![]);
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
-                                "`docs/a.md` was a one-time attachment from {dest} and this node already fetched it (staged at {staged}). Ask for it again with .mesh message {dest} if you need a fresh copy. That copy is no longer at that path.",
+                                "`docs/a.md` was a one-time attachment from {dest} and this node already fetched it (staged at {staged}). Ask for it again with .mesh message {dest} if you need a fresh copy. That copy is no longer at that path. This was answered from this node's own records without asking {dest}; if {dest} now shares it some other way, a mesh__list call from the model that lists the path (following its cursor if needed) lets the next fetch ask {dest}.",
                                 dest = fx.dest(),
                                 staged = staged.display()
                             ),
                             "a staged copy that has since gone is said to be gone"
                         );
 
-                        assert_eq!(fx.heard().len(), 4, "every refusal was the peer's answer");
+                        assert_eq!(
+                            fx.heard().len(),
+                            2,
+                            "a spent attachment never reaches the peer"
+                        );
                         fx.stop().await;
                     });
                 }
@@ -40964,14 +41381,18 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             "the fetched attachment is no longer offered"
                         );
 
-                        fx.queue("not_shared", vec![]);
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
-                                "`docs/a.md` was a one-time attachment from {dest8} and this node already fetched it (staged at {staged}). Ask for it again with .mesh message {dest8} if you need a fresh copy.",
+                                "`docs/a.md` was a one-time attachment from {dest8} and this node already fetched it (staged at {staged}). Ask for it again with .mesh message {dest8} if you need a fresh copy. This was answered from this node's own records without asking {dest8}; if {dest8} now shares it some other way, a mesh__list call from the model that lists the path (following its cursor if needed) lets the next fetch ask {dest8}.",
                                 dest8 = fx.dest()
                             ),
                             "the refusal names the path the Staged line printed"
+                        );
+                        assert_eq!(
+                            fx.heard().len(),
+                            1,
+                            "the spent attachment never reached the peer"
                         );
 
                         fx.queue("not_shared", vec![]);
@@ -40989,7 +41410,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             "a refused fetch takes nothing off the list"
                         );
 
-                        assert_eq!(fx.heard().len(), 3, "every answer was the peer's");
+                        assert_eq!(fx.heard().len(), 2, "every other answer was the peer's");
                         fx.stop().await;
                     });
                 }

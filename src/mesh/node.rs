@@ -8903,7 +8903,10 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(err.contains("The peer refused the message"), "{err}");
+        assert!(
+            err.contains("refused it: it is already answering a message from this identity"),
+            "{err}"
+        );
         assert!(
             store.get("a-1").unwrap().is_some(),
             "the question is put back"
@@ -9173,7 +9176,10 @@ mod tests {
         let err = slot.answer_inbound("a-1", "yes").await.unwrap_err();
 
         let err = err.to_string();
-        assert!(err.contains("The peer refused the message"), "{err}");
+        assert!(
+            err.contains("refused it: it is already answering a message from this identity"),
+            "{err}"
+        );
         assert!(!err.contains("another process"), "{err}");
         assert!(
             store.get("a-1").unwrap().is_some(),
@@ -9276,7 +9282,10 @@ mod tests {
             .unwrap_err();
 
         let err = err.to_string();
-        assert!(err.contains("The peer refused the message"), "{err}");
+        assert!(
+            err.contains("refused it: it is already answering a message from this identity"),
+            "{err}"
+        );
         assert!(!err.contains("another process"), "{err}");
         assert!(!err.contains("could not be taken back"), "{err}");
         assert!(store.get("q-1").unwrap().is_some(), "put back as pending");

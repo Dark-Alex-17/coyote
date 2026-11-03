@@ -9,7 +9,8 @@ use crate::mesh::card::{
 };
 use crate::mesh::fetch::{
     FetchError as FileFetchError, Fetched, GONE_COPY_TAIL, NotSharedReason, SharesPage,
-    grant_expires_at, not_shared_reason, not_shared_tool_message,
+    grant_expires_at, not_shared_reason, not_shared_tool_message, spent_attachment,
+    spent_attachment_tool_message,
 };
 use crate::mesh::message::{
     OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_TITLE_MAX_CHARS, PeerKind, SendError,
@@ -584,14 +585,21 @@ async fn trusted_destination(
     peer: &str,
 ) -> Result<(PeerRecord, DestinationDesc), Value> {
     let (destination, record) = trusted_peer(runtime, peer).await?;
-    match runtime.resolve_destination(&destination).await {
-        Some(desc) => Ok((record, desc)),
+    Ok((record, resolved_destination(runtime, &destination).await?))
+}
+
+async fn resolved_destination(
+    runtime: &MeshRuntime,
+    destination: &str,
+) -> Result<DestinationDesc, Value> {
+    match runtime.resolve_destination(destination).await {
+        Some(desc) => Ok(desc),
         None => Err(json!({
             "status": "error",
             "kind": "unknown_destination",
             "message": format!(
                 "{} A list or fetch runs live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard.",
-                unreachable_head(&destination)
+                unreachable_head(destination)
             ),
         })),
     }
@@ -721,7 +729,9 @@ fn send_error_kind(err: &SendError) -> &'static str {
         SendError::TitleTooLong { .. } => "title_too_long",
         SendError::InvalidFields(_) => "invalid_fields",
         SendError::InvalidParts(_) => "invalid_parts",
-        SendError::Refused(_) | SendError::NotTrustedByPeer(_) => "refused",
+        SendError::Refused(_) | SendError::Throttled { .. } | SendError::NotTrustedByPeer(_) => {
+            "refused"
+        }
         SendError::Direct(_) => "direct",
         SendError::IncompatibleVersion { .. } => "incompatible_version",
         SendError::NoPropagationNode => "no_propagation_node",
@@ -1268,8 +1278,21 @@ async fn handle_fetch(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
         None => None,
         Some(hex) => Some(parse_sha256(hex)?),
     };
-    let (record, desc) = match trusted_destination(runtime, peer).await {
+    let (destination, record) = match trusted_peer(runtime, peer).await {
         Ok(trusted) => trusted,
+        Err(refusal) => return Ok(refusal),
+    };
+    if let Some(reason) = spent_attachment(
+        runtime.memory(),
+        &destination,
+        &record.identity_hash,
+        path,
+        SystemTime::now(),
+    ) {
+        return Ok(spent_attachment_result(&destination, path, &reason).await);
+    }
+    let desc = match resolved_destination(runtime, &destination).await {
+        Ok(desc) => desc,
         Err(refusal) => return Ok(refusal),
     };
     let outcome = runtime.fetch_file(&desc, path, if_sha256).await;
@@ -1391,6 +1414,17 @@ fn is_cursor_shaped(cursor: &str) -> bool {
         && cursor
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b'-'))
+}
+
+/// The `not_shared` result for a spent attachment, marked as answered from this node's
+/// claims so the model can tell it from the peer's own answer.
+async fn spent_attachment_result(peer: &str, path: &str, spent: &NotSharedReason) -> Value {
+    let mut result = fetch_result(peer, path, Ok(Fetched::NotShared), spent).await;
+    let present = result["already_staged_present"] == true;
+    result["message"] = json!(spent_attachment_tool_message(short(peer), path, present));
+    result["next_action"] = json!(format!("mesh__list --peer {peer}"));
+    result["answered_from"] = json!("local_claims");
+    result
 }
 
 /// The fetch as the model reads it. A staged file is named by its path and hash and,
@@ -1575,7 +1609,9 @@ fn access_error_kind(err: &AccessError) -> &'static str {
         AccessError::UnknownDestination => "unknown_destination",
         AccessError::Invalid(_) => "invalid",
         AccessError::NotFiled(_) => "not_filed",
-        AccessError::Refused(_) | AccessError::NotTrustedByPeer(_) => "refused",
+        AccessError::Refused(_)
+        | AccessError::Throttled { .. }
+        | AccessError::NotTrustedByPeer(_) => "refused",
         AccessError::NotServed(_) => "not_served",
         AccessError::UnknownStatus => "unknown_status",
         AccessError::Malformed(_) => "malformed",
@@ -7863,11 +7899,12 @@ mod tests {
         /// as `granted until <time>` while it lasts and not once it has run out, after
         /// which the peer's `not_shared` reads `grant_expired` naming that expiry; a
         /// reference attachment is offered as `attachment from <id8>, not fetched` until
-        /// the fetch stages it, after which the same `not_shared` reads `already_fetched`
-        /// naming where the bytes landed; a path this node knows nothing about reads
-        /// `unknown` with the generic sentence; so does the fetched attachment once the
-        /// peer table binds the destination to another identity, with nothing written
-        /// under it. The peer's answer is the same bare `not_shared` every time.
+        /// the fetch stages it, after which a fetch of it reads `already_fetched` naming
+        /// where the bytes landed, answered from this node's claims; a path this node
+        /// knows nothing about reads `unknown` with the generic sentence; so does the
+        /// fetched attachment once the peer table binds the destination to another
+        /// identity, with nothing written under it. Every answer the peer gives is the
+        /// same bare `not_shared`.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]
         async fn a_not_shared_fetch_reads_what_the_tools_own_calls_left_in_the_claims() {
@@ -8019,10 +8056,11 @@ mod tests {
             assert_eq!(
                 again["message"],
                 format!(
-                    "`{SHARED_PATH}` was a one-time attachment from {d8} and this node already fetched it; read it at `already_staged_at`. A fresh copy needs the peer to attach it again; the mesh__request_access call in next_action asks its human."
+                    "`{SHARED_PATH}` was a one-time attachment from {d8} and this node already fetched it; read it at `already_staged_at`. This was answered from this node's own records without asking the peer. If the peer now shares it some other way, a mesh__list call that lists the path (start with the one in next_action and follow its cursor if needed) lets a fetch after that ask the peer; a fresh one-time copy needs the peer to attach it again, which mesh__request_access asks its human for."
                 ),
                 "{again}"
             );
+            assert_eq!(again["answered_from"], "local_claims", "{again}");
             assert!(
                 Path::new(&staged_path).is_file(),
                 "the staged path named is this node's own copy: {staged_path}"
@@ -8120,11 +8158,11 @@ mod tests {
 
         /// Through the tools alone, once the staged copy has gone: a reference fetched
         /// once stays remembered as fetched, so `fetch <dest> <TAB>` keeps omitting it and
-        /// the peer's bare `not_shared` still reads `already_fetched`; the result now says
-        /// `already_staged_present: false`, still names where the copy was and which
-        /// message carried it, its `message` ends on `That copy is no longer at that path.`
-        /// and `next_action` is the same exact `mesh__request_access` call as before. The
-        /// peer's answer is the same bare `not_shared` whether the copy is there or not.
+        /// a fetch of it still reads `already_fetched`, answered from this node's claims;
+        /// the result now says `already_staged_present: false`, still names where the
+        /// copy was and which message carried it, its `message` says `That copy is no
+        /// longer at that path.` and `next_action` is the mesh__list call that refreshes
+        /// the peer's listing.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]
         async fn the_tool_says_when_the_already_fetched_copy_has_gone_from_this_node() {
@@ -8193,13 +8231,13 @@ mod tests {
             assert_eq!(
                 gone["message"],
                 format!(
-                    "`{SHARED_PATH}` was a one-time attachment from {d8} and this node already fetched it; read it at `already_staged_at`. A fresh copy needs the peer to attach it again; the mesh__request_access call in next_action asks its human. That copy is no longer at that path."
+                    "`{SHARED_PATH}` was a one-time attachment from {d8} and this node already fetched it; read it at `already_staged_at`. That copy is no longer at that path. This was answered from this node's own records without asking the peer. If the peer now shares it some other way, a mesh__list call that lists the path (start with the one in next_action and follow its cursor if needed) lets a fetch after that ask the peer; a fresh one-time copy needs the peer to attach it again, which mesh__request_access asks its human for."
                 ),
                 "{gone}"
             );
             assert_eq!(
                 gone["next_action"],
-                request_access_call(&to, SHARED_PATH),
+                format!("mesh__list --peer {to}"),
                 "{gone}"
             );
             assert!(
@@ -8214,6 +8252,96 @@ mod tests {
 
             assert!(live.ctx.app.mesh.stop().await.unwrap());
             live.stub.stop().await;
+        }
+
+        mod spent_attachment_tool_tests {
+            use super::*;
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            /// Answers `not_shared` to every `/fetch` and counts what it heard.
+            #[derive(Default)]
+            struct CountingFetch {
+                heard: AtomicUsize,
+            }
+
+            #[async_trait]
+            impl Handler for CountingFetch {
+                async fn handle(&self, _request: AdmittedRequest) -> Reply {
+                    self.heard.fetch_add(1, Ordering::SeqCst);
+                    Reply::Value(rmpv::Value::Map(vec![
+                        (rmpv::Value::from("v"), rmpv::Value::from(1u64)),
+                        (rmpv::Value::from("status"), rmpv::Value::from("not_shared")),
+                    ]))
+                }
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[serial]
+            async fn a_spent_attachment_is_answered_from_the_claims_without_asking_the_peer() {
+                let mut live = trusted_stub("mesh-tool-fetch-spent").await;
+                let runtime = live.started.runtime.clone();
+                let to = live.to.clone();
+                let fetch = format!("{MESH_FUNCTION_PREFIX}fetch");
+                let counting = Arc::new(CountingFetch::default());
+                live.stub.serve(FETCH_PATH, counting.clone());
+                let staged = PathBuf::from("/nonexistent/coyote-inbox/plan.md");
+                runtime.memory().remember_reference(
+                    &to,
+                    &live.stub.identity_hex(),
+                    "0123456789abcdef0123456789abcdef",
+                    SHARED_PATH,
+                );
+                runtime.memory().mark_fetched(&to, SHARED_PATH, &staged);
+
+                let spent = handle_mesh_tool(
+                    &mut live.ctx,
+                    &fetch,
+                    &json!({"peer": to, "path": SHARED_PATH}),
+                )
+                .await
+                .unwrap();
+                assert_eq!(spent["status"], "not_shared", "{spent}");
+                assert_eq!(spent["reason"], "already_fetched", "{spent}");
+                assert_eq!(spent["already_staged_at"], json!(staged), "{spent}");
+                assert_eq!(spent["already_staged_present"], false, "{spent}");
+                assert_eq!(
+                    spent["message"],
+                    format!(
+                        "`{SHARED_PATH}` was a one-time attachment from {} and this node already fetched it; read it at `already_staged_at`. That copy is no longer at that path. This was answered from this node's own records without asking the peer. If the peer now shares it some other way, a mesh__list call that lists the path (start with the one in next_action and follow its cursor if needed) lets a fetch after that ask the peer; a fresh one-time copy needs the peer to attach it again, which mesh__request_access asks its human for.",
+                        short(&to)
+                    ),
+                    "{spent}"
+                );
+                assert_eq!(spent["answered_from"], "local_claims", "{spent}");
+                assert_eq!(
+                    spent["next_action"],
+                    format!("mesh__list --peer {to}"),
+                    "{spent}"
+                );
+                assert_eq!(
+                    counting.heard.load(Ordering::SeqCst),
+                    0,
+                    "a spent attachment never reaches the peer"
+                );
+
+                let asked = handle_mesh_tool(
+                    &mut live.ctx,
+                    &fetch,
+                    &json!({"peer": to, "path": "other/thing.md"}),
+                )
+                .await
+                .unwrap();
+                assert_eq!(asked["reason"], "unknown", "{asked}");
+                assert!(asked.get("answered_from").is_none(), "{asked}");
+                assert_eq!(
+                    counting.heard.load(Ordering::SeqCst),
+                    1,
+                    "a path this node knows nothing about goes to the peer"
+                );
+
+                assert!(live.ctx.app.mesh.stop().await.unwrap());
+                live.stub.stop().await;
+            }
         }
 
         /// A peer names any number it likes as a grant's end. One this node cannot read

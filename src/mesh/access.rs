@@ -334,9 +334,14 @@ pub(crate) enum AccessError {
     Invalid(&'static str),
     /// The pending store would not file the request, so nothing was sent.
     NotFiled(String),
-    /// The peer answered with a refusal code other than `NoAccess`; nothing is stored for
-    /// a peer that said no.
+    /// The peer answered with a refusal code other than `NoAccess` or `Throttled`;
+    /// nothing is stored for a peer that said no.
     Refused(RefusalCode),
+    /// The peer answered `Throttled`: it is still busy with a request from this
+    /// identity. Nothing is stored; the text names the peer by its short hash.
+    Throttled {
+        destination: String,
+    },
     /// The peer answered `NoAccess`: this node trusts it, but it has not trusted this
     /// instance. Nothing is stored; the remedy is on the peer's side.
     NotTrustedByPeer(RemoteRefusal),
@@ -388,6 +393,11 @@ impl fmt::Display for AccessError {
                 f,
                 "The peer refused the access request: {code}. {}",
                 refusal_remedy(*code)
+            ),
+            Self::Throttled { destination } => write!(
+                f,
+                "{} refused it: it is busy with a request from this identity (one at a time per identity). Try again in a minute.",
+                short(destination)
             ),
             Self::NotTrustedByPeer(refusal) => write!(f, "{refusal}"),
             Self::NotServed(_) => write!(
@@ -605,6 +615,12 @@ impl MeshRuntime {
                 return Err(AccessError::NotTrustedByPeer(
                     self.remote_refusal(&dest_hex),
                 ));
+            }
+            Err(RequestError::Refused(code @ RefusalCode::Throttled)) => {
+                debug!("Mesh access request {id} to {dest8} was refused: {code}");
+                return Err(AccessError::Throttled {
+                    destination: dest_hex,
+                });
             }
             Err(RequestError::Refused(code)) => {
                 debug!("Mesh access request {id} to {dest8} was refused: {code}");
@@ -1844,10 +1860,17 @@ mod tests {
 
             let payload = attached.get_line().expect("payload queued");
             let prefix = format!("{} ", Source::Access.prefix());
-            let bodies: String = payload
+            let indent = " ".repeat(prefix.len());
+            let bodies = payload
                 .lines()
-                .map(|row| row.strip_prefix(&prefix).expect("every row is prefixed"))
-                .collect();
+                .enumerate()
+                .map(|(index, row)| {
+                    let lead = if index == 0 { &prefix } else { &indent };
+                    row.strip_prefix(lead.as_str())
+                        .expect("the first row is prefixed and the rest indented")
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
             assert_paths_kept_and_hints_slashed(&bodies);
         }
     }
@@ -3777,7 +3800,10 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert!(err.contains("The peer refused the message"), "{err}");
+        assert!(
+            err.contains("refused it: it is already answering a message from this identity"),
+            "{err}"
+        );
         assert!(!err.contains("already closed"), "{err}");
         assert_eq!(err.lines().count(), 1, "{err}");
         assert!(installed.grants().is_empty(), "{:?}", installed.grants());
@@ -5451,6 +5477,9 @@ mod tests {
             AccessError::Invalid("a path is not a wire path"),
             AccessError::NotFiled("the pending store is read-only".to_string()),
             AccessError::Refused(RefusalCode::InvalidData),
+            AccessError::Throttled {
+                destination: destination(),
+            },
             AccessError::NotServed(DispatchError::NoProvider {
                 path: ACCESS_PATH.to_string(),
             }),
@@ -5559,10 +5588,6 @@ mod tests {
             "The access request could not be sent: Malformed mesh request frame: short frame. The peer answered in a form this Coyote could not read; it may run a different Coyote"
         );
         assert_eq!(
-            AccessError::Refused(RefusalCode::Throttled).to_string(),
-            "The peer refused the access request: throttled (0xf6). Wait a minute and try again"
-        );
-        assert_eq!(
             AccessError::Refused(RefusalCode::NotFound).to_string(),
             "The peer refused the access request: not found (0xfd). The peer has nothing under that name; check it and try again"
         );
@@ -5570,6 +5595,19 @@ mod tests {
             AccessError::Propagation(PropagationError::TransferFailed).to_string(),
             "The peer is unreachable and the access request could not be stored: The transfer to the propagation node did not complete. Try again in a minute; `.mesh peers` shows when the peer was last heard"
         );
+    }
+
+    mod throttle_wording_tests {
+        use super::*;
+
+        #[test]
+        fn a_throttled_access_request_names_the_peer_and_says_to_try_again_in_a_minute() {
+            let destination = "0123456789abcdef".repeat(2);
+            assert_eq!(
+                AccessError::Throttled { destination }.to_string(),
+                "01234567 refused it: it is busy with a request from this identity (one at a time per identity). Try again in a minute."
+            );
+        }
     }
 
     #[cfg(unix)]

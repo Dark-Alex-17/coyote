@@ -67,7 +67,8 @@ impl PromptPrinter {
     }
 
     /// `row` with its bracketed prefix in the tool-call name colour when colour is on;
-    /// the body keeps its bytes either way.
+    /// the body keeps its bytes either way. Only a notification's first row carries
+    /// the prefix, so continuation rows pass through as they are.
     fn paint_prefix(&self, row: String, prefix: &str) -> String {
         if !self.colour {
             return row;
@@ -129,37 +130,84 @@ fn display_width(text: &str) -> usize {
     text.chars().map(|c| c.width().unwrap_or(0)).sum()
 }
 
-/// Splits each rendered `"{prefix} body"` line into rows no wider than `width`
-/// display columns, never inside a character. Every row repeats the prefix so a
-/// continuation can never pass for a notification from another source.
+/// Lays one notification's rendered `"{prefix} body"` lines out as rows no wider than
+/// `width` display columns. The prefix appears once, on the first row; every later
+/// row, whether it continues a wrapped line or starts the next line, is indented by
+/// the prefix width plus one. Column 0 of every row is therefore the prefix or a
+/// space, never peer text, so a body cannot pass for a notification from another
+/// source. Rows break at spaces; only a word wider than a whole row is split, and
+/// never inside a character.
 fn wrap_rows(lines: &[String], prefix: &str, width: usize) -> Vec<String> {
     let width = width.max(MIN_WRAP_WIDTH);
-    let body_width = width.saturating_sub(display_width(prefix) + 1).max(1);
-    let mut rows = Vec::new();
-    for line in lines {
-        let body = line
-            .strip_prefix(prefix)
-            .map(|rest| rest.strip_prefix(' ').unwrap_or(rest))
-            .unwrap_or(line);
-        if body.is_empty() {
-            rows.push(line.clone());
+    let indent = " ".repeat(display_width(prefix) + 1);
+    let body_width = width.saturating_sub(indent.len()).max(1);
+    lines
+        .iter()
+        .flat_map(|line| {
+            let body = line
+                .strip_prefix(prefix)
+                .map(|rest| rest.strip_prefix(' ').unwrap_or(rest))
+                .unwrap_or(line);
+            wrap_body(body, body_width)
+        })
+        .enumerate()
+        .map(|(index, body)| match (index, body.is_empty()) {
+            (0, true) => prefix.to_string(),
+            (0, false) => format!("{prefix} {body}"),
+            (_, true) => body,
+            (_, false) => format!("{indent}{body}"),
+        })
+        .collect()
+}
+
+/// `body` broken at spaces into pieces no wider than `width` columns; the space a
+/// break lands on is dropped, and so are the spaces that would open the next piece, so
+/// a run of spaces never yields a blank row. A word wider than `width` starts its own
+/// piece and is split between characters; its last piece may be followed by the next
+/// words.
+fn wrap_body(body: &str, width: usize) -> Vec<String> {
+    let mut pieces = Vec::new();
+    let mut piece = String::new();
+    let mut piece_width = 0;
+    let mut opens_a_row = false;
+    for (index, word) in body.split(' ').enumerate() {
+        if opens_a_row && word.is_empty() {
             continue;
         }
-        let mut row = String::new();
-        let mut row_width = 0;
-        for c in body.chars() {
-            let w = c.width().unwrap_or(0);
-            if row_width + w > body_width && !row.is_empty() {
-                rows.push(format!("{prefix} {row}"));
-                row.clear();
-                row_width = 0;
+        let word_width = display_width(word);
+        if index > 0 && !opens_a_row {
+            if piece_width + 1 + word_width <= width {
+                piece.push(' ');
+                piece.push_str(word);
+                piece_width += 1 + word_width;
+                continue;
             }
-            row.push(c);
-            row_width += w;
+            let kept = piece.trim_end();
+            if !kept.is_empty() {
+                pieces.push(kept.to_string());
+            }
+            piece.clear();
+            piece_width = 0;
+            if word.is_empty() {
+                opens_a_row = true;
+                continue;
+            }
         }
-        rows.push(format!("{prefix} {row}"));
+        opens_a_row = false;
+        for c in word.chars() {
+            let w = c.width().unwrap_or(0);
+            if piece_width + w > width && !piece.is_empty() {
+                pieces.push(std::mem::take(&mut piece));
+                piece_width = 0;
+            }
+            piece.push(c);
+            piece_width += w;
+        }
     }
-    rows
+    if pieces.is_empty() || !piece.is_empty() {
+        pieces.push(piece);
+    }
+    pieces
 }
 
 #[cfg(test)]
@@ -196,11 +244,12 @@ mod tests {
             PromptPrinter::with_colour(PROMPT_PRINTER_CAPACITY, false, live)
         }
 
-        /// The payload's rows rejoined into one body per prefix, so an assertion holds at
-        /// whatever width the terminal running the test wraps them to.
+        /// The payload's rows rejoined into one body, so an assertion holds at whatever
+        /// width the terminal running the test wraps them to. The bodies here are words,
+        /// so every break fell on a space.
         fn unwrapped(payload: &str, prefix: &str) -> String {
             let rows: Vec<String> = payload.lines().map(str::to_string).collect();
-            bodies(&rows, prefix)
+            bodies(&rows, prefix).join(" ")
         }
 
         /// The idle lines a person acts on: a knock, an access request, and the envoy
@@ -242,7 +291,7 @@ mod tests {
         fn a_wrapped_line_is_rendered_before_it_is_measured() {
             let printer = printer_under(CommandPrefix::Slash);
             let attached = printer.attach();
-            let body = format!("{} then `.mesh trust 1a2b3c4d`", "x".repeat(450));
+            let body = format!("{}then `.mesh trust 1a2b3c4d`", "word ".repeat(90));
             printer.notify(Notification::new(Source::Knock, body.as_str()).render());
             let payload = attached.get_line().expect("payload queued");
             let rows: Vec<String> = payload.lines().map(str::to_string).collect();
@@ -254,7 +303,7 @@ mod tests {
                 );
             }
             assert_eq!(
-                bodies(&rows, Source::Knock.prefix()),
+                bodies(&rows, Source::Knock.prefix()).join(" "),
                 body.replace(".mesh", "/mesh")
             );
         }
@@ -331,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn colour_on_paints_every_wrapped_row_and_leaves_the_bodies_whole() {
+    fn colour_on_paints_the_one_prefix_of_a_wrapped_line_and_leaves_the_body_whole() {
         let printer = painted(PROMPT_PRINTER_CAPACITY);
         let attached = printer.attach();
         let body = "x".repeat(NOTIFICATION_LINE_MAX_CHARS);
@@ -339,10 +388,12 @@ mod tests {
         let payload = attached.get_line().unwrap();
         let rows: Vec<String> = payload.lines().map(str::to_string).collect();
         let prefix = tool_name_text_forced("[mesh]");
-        for row in &rows {
-            assert!(row.starts_with(&prefix), "{row:?}");
+        assert!(rows.len() > 1, "{rows:?}");
+        assert!(rows[0].starts_with(&prefix), "{:?}", rows[0]);
+        for row in &rows[1..] {
+            assert!(!row.contains('\u{1b}'), "{row:?}");
         }
-        assert_eq!(bodies(&rows, &prefix), body);
+        assert_eq!(bodies(&rows, &prefix).concat(), body);
     }
 
     #[test]
@@ -421,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_line_text_is_one_payload_with_every_line_prefixed() {
+    fn multi_line_text_is_one_payload_with_one_prefix() {
         let printer = plain(PROMPT_PRINTER_CAPACITY);
         let attached = printer.attach();
         printer.notify(Notification::new(Source::Message, "one\ntwo\nthree").render());
@@ -432,8 +483,8 @@ mod tests {
             lines,
             vec![
                 "[mesh:message] one",
-                "[mesh:message] two",
-                "[mesh:message] three"
+                "               two",
+                "               three"
             ]
         );
     }
@@ -488,7 +539,11 @@ mod tests {
         let rows: Vec<&str> = payload.lines().collect();
         assert_eq!(
             rows,
-            vec!["[mesh:message] hi", "[mesh:message] [mesh:knock] fake"]
+            vec!["[mesh:message] hi", "               [mesh:knock] fake"]
+        );
+        assert!(
+            rows.iter().skip(1).all(|row| !row.starts_with('[')),
+            "{rows:?}"
         );
     }
 
@@ -514,27 +569,49 @@ mod tests {
         assert_eq!(landed, PROMPT_PRINTER_CAPACITY);
     }
 
-    fn bodies(rows: &[String], prefix: &str) -> String {
+    /// Each row's body: the first row's after the prefix, every later row's after the
+    /// indent. Panics on a row that has neither, so a caller also checks the layout.
+    /// `prefix` may be painted; the indent follows its visible width.
+    fn bodies<'a>(rows: &'a [String], prefix: &str) -> Vec<&'a str> {
+        let indent = " ".repeat(display_width(&strip_escapes(prefix)) + 1);
         rows.iter()
-            .map(|row| {
-                row.strip_prefix(prefix)
-                    .and_then(|rest| rest.strip_prefix(' '))
-                    .unwrap_or_else(|| panic!("row lacks the prefix: {row:?}"))
+            .enumerate()
+            .map(|(index, row)| {
+                let body = if index == 0 {
+                    row.strip_prefix(prefix)
+                        .and_then(|rest| rest.strip_prefix(' '))
+                } else {
+                    row.strip_prefix(indent.as_str())
+                };
+                body.unwrap_or_else(|| panic!("row {index} is out of layout: {row:?}"))
             })
             .collect()
     }
 
+    fn strip_escapes(painted: &str) -> String {
+        let mut plain = String::new();
+        let mut chars = painted.chars();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                chars.by_ref().find(|c| c.is_ascii_alphabetic());
+            } else {
+                plain.push(c);
+            }
+        }
+        plain
+    }
+
     #[test]
-    fn wrap_splits_a_long_line_into_prefixed_rows_that_fit_the_width() {
+    fn wrap_hard_splits_a_word_wider_than_a_row_under_one_prefix() {
         let prefix = Source::Mesh.prefix();
         let body = "x".repeat(512);
         let rows = wrap_rows(&[format!("{prefix} {body}")], prefix, 79);
         assert!(rows.len() > 1, "{rows:?}");
         for row in &rows {
             assert!(display_width(row) <= 79, "{row:?}");
-            assert!(row.starts_with("[mesh] "), "{row:?}");
         }
-        assert_eq!(bodies(&rows, prefix), body);
+        assert!(rows[0].starts_with("[mesh] "), "{rows:?}");
+        assert_eq!(bodies(&rows, prefix).concat(), body);
     }
 
     #[test]
@@ -544,28 +621,113 @@ mod tests {
         let rows = wrap_rows(&[format!("{prefix} {body}")], prefix, 79);
         for row in &rows {
             assert!(display_width(row) <= 79, "{row:?}");
-            assert!(row.starts_with("[mesh:message] "), "{row:?}");
         }
-        assert_eq!(bodies(&rows, prefix), body);
+        assert_eq!(bodies(&rows, prefix).concat(), body);
     }
 
     #[test]
-    fn wrap_below_the_minimum_width_still_terminates_with_prefixed_rows() {
+    fn wrap_below_the_minimum_width_still_terminates_under_one_prefix() {
         let prefix = Source::Propagation.prefix();
         let body = "y".repeat(100);
         let rows = wrap_rows(&[format!("{prefix} {body}")], prefix, 3);
         assert!(rows.len() > 1, "{rows:?}");
-        for row in &rows {
-            assert!(row.starts_with("[mesh:propagation] "), "{row:?}");
-        }
-        assert_eq!(bodies(&rows, prefix), body);
+        assert_eq!(bodies(&rows, prefix).concat(), body);
     }
 
     #[test]
     fn wrap_leaves_a_short_line_and_a_bare_prefix_unchanged() {
         let prefix = Source::Knock.prefix();
-        let lines = vec![format!("{prefix} short"), prefix.to_string()];
-        assert_eq!(wrap_rows(&lines, prefix, 79), lines);
+        for lines in [vec![format!("{prefix} short")], vec![prefix.to_string()]] {
+            assert_eq!(wrap_rows(&lines, prefix, 79), lines);
+        }
+    }
+
+    #[test]
+    fn wrap_turns_no_run_of_spaces_into_a_blank_row_or_a_leading_space() {
+        assert_eq!(wrap_body(" abcdefgh", 5), ["abcde", "fgh"]);
+        assert_eq!(wrap_body("abc      def", 4), ["abc", "def"]);
+        let prefix = Source::Mesh.prefix();
+        assert_eq!(
+            wrap_rows(
+                &[format!("{prefix} one  two   three    four")],
+                prefix,
+                MIN_WRAP_WIDTH
+            ),
+            ["[mesh] one  two", "       three", "       four"]
+        );
+    }
+
+    mod idle_wrap_tests {
+        use super::*;
+        use crate::config::mesh_envoy::escalation_line;
+
+        const MESSAGE_ID: &str = "0123456789abcdef0123456789abcdef";
+
+        /// A question long enough to be cut, so the line carries the pending pointer
+        /// and the whole answer command after the peer's words.
+        fn escalated() -> String {
+            let question = (0..30)
+                .map(|i| format!("word{i:07}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            escalation_line("Tia", &question, MESSAGE_ID)
+        }
+
+        fn rendered_rows(source: Source, text: &str, width: usize) -> Vec<String> {
+            let rendered = Notification::new(source, text).render();
+            wrap_rows(rendered.lines(), source.prefix(), width)
+        }
+
+        #[test]
+        fn an_escalation_line_wraps_on_words_under_one_prefix_at_common_widths() {
+            let line = escalated();
+            assert!(line.contains("(full text: .mesh pending);"), "{line}");
+            let prefix = Source::Message.prefix();
+            let indent = " ".repeat(display_width(prefix) + 1);
+            for width in [80, 120, 200] {
+                let rows = rendered_rows(Source::Message, &line, width);
+                assert!(rows.len() > 1, "{width}: {rows:?}");
+                assert_eq!(rows.concat().matches(prefix).count(), 1, "{rows:?}");
+                assert!(rows[0].starts_with(&format!("{prefix} ")), "{rows:?}");
+                for row in &rows[1..] {
+                    assert!(row.starts_with(&indent), "{row:?}");
+                    assert!(!row[indent.len()..].starts_with(' '), "{row:?}");
+                }
+                for row in &rows {
+                    assert!(display_width(row) <= width, "{width}: {row:?}");
+                }
+                let tokens: Vec<&str> = bodies(&rows, prefix)
+                    .iter()
+                    .flat_map(|body| body.split_whitespace())
+                    .collect();
+                assert_eq!(tokens, line.split_whitespace().collect::<Vec<_>>());
+                assert!(tokens.contains(&"pending);"), "{tokens:?}");
+                assert!(tokens.contains(&MESSAGE_ID), "{tokens:?}");
+            }
+        }
+
+        #[test]
+        fn a_two_line_knock_prints_one_prefix() {
+            let identity = "cd".repeat(16);
+            let destination = "ab".repeat(16);
+            let text = format!(
+                "\"Tia\" (identity {identity}) knocks from instance {destination}\ntrust: .mesh trust {destination} | who: .mesh info {destination} | silence: .mesh block --identity {identity}"
+            );
+            let prefix = Source::Knock.prefix();
+            let rows = rendered_rows(Source::Knock, &text, 200);
+            assert_eq!(
+                rows,
+                vec![
+                    format!(
+                        "{prefix} \"Tia\" (identity {identity}) knocks from instance {destination}"
+                    ),
+                    format!(
+                        "{} trust: .mesh trust {destination} | who: .mesh info {destination} | silence: .mesh block --identity {identity}",
+                        " ".repeat(display_width(prefix))
+                    ),
+                ]
+            );
+        }
     }
 
     fn source(relative: &str) -> String {
@@ -645,11 +807,11 @@ mod tests {
 
     /// The whole idle path, as the REPL wires it: an over-budget ask the envoy
     /// escalated is recorded on the slot, the real idle driver takes it off the slot's
-    /// idle sink, renders it, and the painted printer hands it to the editor. Every
-    /// row carries the painted prefix, however many the terminal width wraps the line
-    /// into; the bodies joined back are the one composed line, whose peer words stop on
-    /// a word within the budget and whose tail (`is in the inbox` and the pointer) sits
-    /// whole after them.
+    /// idle sink, renders it, and the painted printer hands it to the editor. The
+    /// first row carries the painted prefix and the rest are plain indented rows,
+    /// however many the terminal width wraps the line into; the bodies joined back are
+    /// the one composed line, whose peer words stop on a word within the budget and
+    /// whose tail (`is in the inbox` and the pointer) sits whole after them.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_cut_peer_ask_reaches_the_editor_painted_with_its_tail_whole() {
         use crate::config::{AppState, RequestContext, WorkingMode};
@@ -714,15 +876,14 @@ mod tests {
         let prefix = tool_name_text_forced(Source::Message.prefix());
         assert!(prefix.contains("\u{1b}["), "{prefix:?}");
         let rows: Vec<String> = payload.lines().map(str::to_string).collect();
-        for row in &rows {
-            assert!(row.starts_with(&prefix), "{row:?}");
-            let body = &row[prefix.len()..];
+        assert!(rows[0].starts_with(&prefix), "{:?}", rows[0]);
+        for body in bodies(&rows, &prefix) {
             assert!(
                 !body.contains('\u{1b}'),
-                "only the prefix is painted: {row:?}"
+                "only the prefix is painted: {body:?}"
             );
         }
-        let line = bodies(&rows, &prefix);
+        let line = bodies(&rows, &prefix).join(" ");
         let kept = (0..13)
             .map(|i| format!("word{i:07}"))
             .collect::<Vec<_>>()
@@ -744,7 +905,9 @@ mod tests {
     }
 
     /// The same path with colour settled off: the editor gets the same composed line
-    /// in plain bytes, no escape anywhere in the payload.
+    /// in plain bytes, no escape anywhere in the payload. The peer's words are one
+    /// run longer than a narrow terminal row, so the rows are compared to the line
+    /// with the whitespace taken out.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_cut_peer_ask_reaches_the_editor_plain_when_colour_is_off() {
         use crate::config::{AppState, RequestContext, WorkingMode};
@@ -799,13 +962,13 @@ mod tests {
 
         assert!(!payload.contains('\u{1b}'), "{payload:?}");
         let rows: Vec<String> = payload.lines().map(str::to_string).collect();
-        let line = bodies(&rows, Source::Message.prefix());
+        let squeezed = |text: &str| text.split_whitespace().collect::<String>();
         assert_eq!(
-            line,
-            format!(
+            squeezed(&bodies(&rows, Source::Message.prefix()).join(" ")),
+            squeezed(&format!(
                 "envoy escalated to the human; abababab asks: {}... is in the inbox (full text: .mesh inbox)",
                 "q".repeat(160)
-            )
+            ))
         );
     }
 }

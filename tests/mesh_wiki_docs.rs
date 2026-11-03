@@ -2729,13 +2729,44 @@ fn the_enabled_line_names_the_session_entered_later_on_every_surface() {
             "`.exit session` leaves the mesh",
         ],
     );
+    let turn_off = string_literals(&fn_body("src/repl/mesh.rs", "turn_off_line"));
+    let off_template = turn_off
+        .iter()
+        .find(|literal| literal.contains("{state}"))
+        .unwrap_or_else(|| panic!("turn_off_line has no line template: {turn_off:?}"));
+    let stays_off = turn_off
+        .iter()
+        .find(|literal| literal.contains("stays off"))
+        .unwrap_or_else(|| panic!("turn_off_line has no stays-off clause: {turn_off:?}"));
+    assert!(
+        off_template.contains("{stays_off};"),
+        "turn_off_line no longer puts the stays-off clause before the semicolon: {off_template:?}"
+    );
+    let mut off_lines: Vec<String> = ["off", "already off"]
+        .into_iter()
+        .map(|state| {
+            assert!(
+                turn_off.iter().any(|literal| literal == state),
+                "turn_off_line no longer says {state:?}: {turn_off:?}"
+            );
+            off_template
+                .replace("{state}", state)
+                .replace("{stays_off}", "")
+        })
+        .collect();
+    off_lines.push(format!("`{}` before the semicolon", stays_off.trim()));
+    off_lines.push(
+        "Leaving the mesh: the session that owns this node's instance id is being exited."
+            .to_string(),
+    );
     prose(
         "Mesh-Commands.md",
-        &[
-            "it stays off for the rest of this run; `.mesh on` joins again",
-            "Leaving the mesh: the session that owns this node's instance id is being exited.",
-        ],
+        &off_lines.iter().map(String::as_str).collect::<Vec<_>>()[..],
     );
+    let stays_off_line = off_template
+        .replace("{state}", "off")
+        .replace("{stays_off}", stays_off);
+    prose("Mesh-Platform-Support.md", &[stays_off_line.as_str()]);
 }
 
 /// The `interfaces:` block is one text on every surface: the example and the
@@ -7476,7 +7507,7 @@ fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
     let gone_tail = const_str("src/mesh/fetch.rs", "GONE_COPY_TAIL");
     assert_eq!(gone_tail, " That copy is no longer at that path.");
     for (path, name) in [
-        ("src/repl/mesh.rs", "fetch"),
+        ("src/repl/mesh.rs", "not_shared_refusal"),
         ("src/function/mesh.rs", "fetch_result"),
     ] {
         assert!(
@@ -7484,6 +7515,23 @@ fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
             "{path}'s {name} no longer appends GONE_COPY_TAIL for a staged copy that is gone"
         );
     }
+    assert_eq!(
+        fn_body("src/repl/mesh.rs", "fetch")
+            .matches("not_shared_refusal(")
+            .count(),
+        2,
+        "the REPL's fetch no longer builds both of its not_shared refusals (the one answered from this node's claims and the one after the peer's answer) through not_shared_refusal"
+    );
+    let local_tail = string_literals(&fn_body("src/repl/mesh.rs", "fetch"))
+        .into_iter()
+        .find(|literal| literal.contains("answered from this node's own records"))
+        .and_then(|literal| literal.strip_prefix("{} ").map(str::to_string))
+        .expect("the REPL's fetch says a spent attachment was answered from this node's records")
+        .replace("{peer}", "<dest8>");
+    assert!(
+        local_tail.contains("mesh__list"),
+        "the local answer no longer names the mesh__list refresh: {local_tail}"
+    );
     for literal in [
         ".mesh message {peer}",
         ".mesh info {peer}",
@@ -7543,8 +7591,18 @@ fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
             fetch.contains(&gone),
             "{label}'s `.mesh fetch` section does not say {gone:?}:\n{fetch}"
         );
+        for needle in [
+            local_tail.as_str(),
+            "before any `Fetching ...` line and without asking the peer",
+            "a grant on the path is still running, the path was on a `mesh__list` page heard since the peer's last unprefixed first page, or the peer attached it again and that attachment is not fetched yet",
+        ] {
+            assert!(
+                fetch.contains(needle),
+                "{label}'s `.mesh fetch` section does not say {needle:?}:\n{fetch}"
+            );
+        }
         let memory_checks = if label == "Mesh-File-Sharing.md" {
-            "two `not shared, ...` rows"
+            "Only the `not shared, grant expired` row is checked once the peer has answered `not_shared`"
         } else {
             "Before that generic sentence"
         };
@@ -7621,6 +7679,16 @@ fn both_tool_tables_name_the_not_shared_reason_words_the_fetch_tool_returns() {
         !not_shared_arm.contains("\"staged_path\""),
         "fetch_result's not_shared arm sets staged_path, the staged result's key: {not_shared_arm}"
     );
+    let spent = fn_body("src/function/mesh.rs", "spent_attachment_result");
+    for needle in [
+        "result[\"answered_from\"] = json!(\"local_claims\")",
+        "mesh__list --peer",
+    ] {
+        assert!(
+            spent.contains(needle),
+            "spent_attachment_result no longer carries {needle:?}: {spent}"
+        );
+    }
 
     let Some(wiki) = wiki_dir() else { return };
     for label in ["Mesh.md", "Mesh-File-Sharing.md"] {
@@ -7641,6 +7709,7 @@ fn both_tool_tables_name_the_not_shared_reason_words_the_fetch_tool_returns() {
             "`already_fetched` with `already_staged_at` + `message_id` and `already_staged_present`",
             "`grant_expired` with `expired_at`",
             "a `next_action` naming the `mesh__request_access` call",
+            "`answered_from: local_claims` and a `next_action` naming the `mesh__list` call",
         ] {
             assert!(
                 row.contains(needle),
