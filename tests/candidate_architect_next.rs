@@ -8,12 +8,12 @@
 //! against the prose `architect/config.yaml`) and `mode_matrix.py` (the
 //! marker map against the prose `architect/instructions.md` plus all 48 mode
 //! combinations walked to `end_complete`; several minutes, so opt-in).
-//! `audit_graph.py`, `check_session_block.sh` and `mode_matrix.py` need the
-//! Go `yq` by mikefarah and skip without it, or fail when
-//! `ARCHITECT_NEXT_REQUIRE_YQ` is set. Every battery and candidate gate run
-//! points `HOME`, `LLM_ROOT_DIR`, `COYOTE_CACHE_DIR`, `TMPDIR` and
-//! `ARCHITECT_RUNS_ROOT` at a scratch directory; the review gauntlet's own
-//! scripts get a scratch `HOME` and `TMPDIR` only. Every run sets
+//! `audit_graph.py`, `check_session_block.sh`, `mode_matrix.py` and
+//! `smoke_test.py` (its graph rows) need the Go `yq` by mikefarah and skip
+//! without it, or fail when `ARCHITECT_NEXT_REQUIRE_YQ` is set. Every battery
+//! and candidate gate run points `HOME`, `LLM_ROOT_DIR`, `COYOTE_CACHE_DIR`,
+//! `TMPDIR` and `ARCHITECT_RUNS_ROOT` at a scratch directory; the review
+//! gauntlet's own scripts get a scratch `HOME` and `TMPDIR` only. Every run sets
 //! `PYTHONDONTWRITEBYTECODE=1`, so nothing under `assets/` or
 //! `~/.config/coyote` is read or written, and every command that runs git
 //! or a gate ignores the system and user git config. Every git, script and
@@ -407,9 +407,12 @@ fn audit_graph_reports_no_problems() {
 #[test]
 fn smoke_battery_passes_every_check() {
     let Some(python) = python3() else { return };
+    let Some(yq) = mikefarah_yq() else { return };
     let scratch = scratch_dir("smoke");
     let output = output_with_timeout(
-        battery(&python, &scratch).arg("scripts/smoke_test.py"),
+        battery(&python, &scratch)
+            .env("PATH", path_with(yq.parent().unwrap()))
+            .arg("scripts/smoke_test.py"),
         BATTERY_LIMIT,
         "smoke",
     );
@@ -445,11 +448,14 @@ fn smoke_battery_passes_every_check() {
 #[test]
 fn smoke_summary_and_exit_code_cover_a_check_recorded_last() {
     let Some(python) = python3() else { return };
+    let Some(yq) = mikefarah_yq() else { return };
     let scratch = scratch_dir("tally");
     let copy = scratch_candidate_copy(&scratch);
     let run = |copy: &Path| {
         let mut cmd = battery(&python, &scratch);
-        cmd.current_dir(copy).arg("scripts/smoke_test.py");
+        cmd.current_dir(copy)
+            .env("PATH", path_with(yq.parent().unwrap()))
+            .arg("scripts/smoke_test.py");
         output_with_timeout(&mut cmd, BATTERY_LIMIT, "smoke tally")
     };
 

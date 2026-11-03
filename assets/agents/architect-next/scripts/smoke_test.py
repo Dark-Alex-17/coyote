@@ -72,6 +72,14 @@ def check(name, cond, detail=""):
     print(("ok   " if cond else "FAIL ") + name + (f"  ({detail})" if detail and not cond else ""))
 
 
+def guarded(name, fn):
+    try:
+        cond, detail = fn()
+    except Exception as e:
+        cond, detail = False, f"raised {type(e).__name__}: {e}"
+    check(name, cond, detail)
+
+
 def git(repo, *a, check_=True):
     p = subprocess.run(["git", "-C", repo, *a], capture_output=True, text=True)
     if check_ and p.returncode != 0:
@@ -1256,23 +1264,24 @@ _real_pr_comment, posted = gates._pr_comment, []
 gates._pr_comment = lambda s, n, b: (posted.append(b), _real_pr_comment(s, n, b))[1]
 try:
     u = gates.review_update(base_state(**TRIAGED, review_triage_items=FIX_ALL, ci_rounds=5, ci_polls=7, ci_poll_fails=2))
-    u_none = gates.review_update(base_state(**TRIAGED, review_triage_items=FIX_ALL[:2] + [dict(FIX_ALL[2], action="none", reason="docs are out of scope")]))
+    u_none = gates.review_update(base_state(**TRIAGED, review_triage_items=FIX_ALL[:2] + [dict(t, action="none", reason="docs are out of scope") for t in FIX_ALL[2:3]]))
 finally:
     gates._pr_comment = _real_pr_comment
 calls = read_file(REVIEW_CALLS).splitlines() if os.path.isfile(REVIEW_CALLS) else []
-check("review watch: review_update -> thread resolved, Update comment posted, every item seen, CI watch re-armed (rounds kept) -> ci_poll",
-      u["_next"] == "ci_poll" and calls[:2] == ["resolve TH1", "comment"] and u["review_seen"] == rids and u["ci_polls"] == 0 and u["ci_poll_fails"] == 0
-      and "ci_rounds" not in u and u["review_items"] == [] and ledgered(u, f"update @ {head}: posted") and ledgered(u, f"review-watch: PR #99 addressed {rids[0]} -> {head}"), calls)
-check("review watch: review_update Update comment maps each item to the head SHA and names the items left unaddressed",
-      len(posted) == 2 and posted[0].startswith(f"## Update @ {head}\n") and all(f"- {i}: {head}" in posted[0] for i in rids)
-      and f"Not addressed:\n- {rids[2]}: docs are out of scope" in posted[1] and f"- {rids[2]}: {head}" not in posted[1], posted)
+guarded("review watch: review_update -> thread resolved, Update comment posted, every item seen, CI watch re-armed (rounds kept) -> ci_poll",
+        lambda: (u["_next"] == "ci_poll" and calls[:2] == ["resolve TH1", "comment"] and u["review_seen"] == rids and u["ci_polls"] == 0 and u["ci_poll_fails"] == 0
+                 and "ci_rounds" not in u and u["review_items"] == [] and ledgered(u, f"update @ {head}: posted")
+                 and ledgered(u, f"review-watch: PR #99 addressed {rids[0]} -> {head}"), calls))
+guarded("review watch: review_update Update comment maps each item to the head SHA and names the items left unaddressed",
+        lambda: (len(posted) == 2 and posted[0].startswith(f"## Update @ {head}\n") and all(f"- {i}: {head}" in posted[0] for i in rids)
+                 and f"Not addressed:\n- {rids[2]}: docs are out of scope" in posted[1] and f"- {rids[2]}: {head}" not in posted[1], posted))
 check("review watch: ci_route green while watching -> review_poll (no second flip)", gates.ci_route(base_state(**WATCH, ci_status="green"))["_next"] == "review_poll")
 
 u = gates.review_apply(base_state(**TRIAGED, review_triage_items=[dict(t, action="none", reason="praise") for t in FIX_ALL]))
 check("review watch: review_apply all none -> review_poll, ids seen, no fix round", u["_next"] == "review_poll" and u["review_seen"] == rids and "fix_request" not in u)
 u = gates.review_apply(base_state(**TRIAGED, review_triage_items=FIX_ALL[:2]))
-check("review watch: review_apply triage missing an item -> owner -> review_owner_judgment",
-      u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "review_owner_judgment" and u["escalation"]["data"]["items"] == [rids[2]])
+guarded("review watch: review_apply triage missing an item -> owner -> review_owner_judgment",
+        lambda: (u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "review_owner_judgment" and u["escalation"]["data"]["items"] == [rids[2]], u.get("escalation")))
 
 u = gates.ci_apply(base_state(**WATCH, ci_verdict="real", failing_checks=["test"], ci_failing=[("test", "l")], ci_fix_strikes={"99": {"test": STRIKE_LIMIT}}))
 check("review watch: CI red past the fix budget while watching -> ci_exhausted (hard trigger)", u["escalation"]["kind"] == "ci_exhausted" and u["escalation"]["hard_trigger"])
@@ -1328,11 +1337,12 @@ u = gates.review_poll(base_state(**WATCH, review_poll_fails=CI_POLL_FAILS - 1))
 check("review watch: review_poll consecutive read errors at the cap -> poll_error -> review_route", u["review_status"] == "poll_error" and u["_next"] == "review_route")
 check("review watch: review_route poll_error -> review_exhausted", gates.review_route(base_state(**WATCH, review_status="poll_error"))["escalation"]["kind"] == "review_exhausted")
 
-OWNER_ONE = [FIX_ALL[0], dict(FIX_ALL[1], action="owner", reason="disputes scope"), FIX_ALL[2]]
+OWNER_ONE = [dict(t, action="owner", reason="disputes scope") if n == 1 else t for n, t in enumerate(FIX_ALL)]
 u = gates.review_apply(base_state(**TRIAGED, review_triage_items=OWNER_ONE))
-check("review watch: review_apply one owner item -> review_owner_judgment (hard trigger) quoting it",
-      u["escalation"]["kind"] == "review_owner_judgment" and u["escalation"]["hard_trigger"] and u["review_status"] == "owner_judgment"
-      and u["escalation"]["data"]["items"] == [rids[1]] and "add a test for the empty widget" in u["escalation"]["question"] and "fix_request" not in u)
+guarded("review watch: review_apply one owner item -> review_owner_judgment (hard trigger) quoting it",
+        lambda: (u["escalation"]["kind"] == "review_owner_judgment" and u["escalation"]["hard_trigger"] and u["review_status"] == "owner_judgment"
+                 and u["escalation"]["data"]["items"] == [rids[1]] and "add a test for the empty widget" in u["escalation"]["question"] and "fix_request" not in u,
+                 u.get("escalation")))
 
 u = AA("review_exhausted", "Keep watching (re-arm the review watch)", **WATCH, review_polls=9, review_rounds=REVIEW_MAX_POLLS, review_poll_fails=2, review_started_at=1, review_status="wall_cap")
 check("review watch: apply_answer review_exhausted keep -> review_poll with the counters and wall clock re-armed",
@@ -1348,12 +1358,13 @@ u = AA("review_round_cap", "Resume with one more fix round", **TRIAGED, review_t
 check("review watch: apply_answer review_round_cap one more -> review_apply one below the cap", u["_next"] == "review_apply" and u["review_fix_rounds"] == REVIEW_MAX_ROUNDS - 1)
 u = AA("review_round_cap", "Stop watching and report", **WATCH, review_status="round_cap")
 check("review watch: apply_answer review_round_cap stop -> finish_plan, outcome round_cap", u["_next"] == "finish_plan" and u["review_outcomes"] == {"99": "round_cap"})
-OJ = escalation("review_owner_judgment", "q", [], data={"items": [rids[1]]})
+OJ = escalation("review_owner_judgment", "q", [], data={"items": rids[1:2]})
 u = AA("review_owner_judgment", "Address it as a fix round", esc=OJ, **TRIAGED, review_triage_items=OWNER_ONE)
 check("review watch: apply_answer review_owner_judgment address -> fix_round with the owner item as a fix item",
       u["_next"] == "fix_round" and u["fix_request"]["source"] == "review" and len(u["fix_request"]["items"]) == 3 and u["review_fix_rounds"] == 1)
 u = AA("review_owner_judgment", "Skip it and keep watching", esc=OJ, **TRIAGED, review_triage_items=OWNER_ONE, review_seen=["x"])
-check("review watch: apply_answer review_owner_judgment skip -> review_poll with the owner item seen", u["_next"] == "review_poll" and u["review_seen"] == ["x", rids[1]])
+guarded("review watch: apply_answer review_owner_judgment skip -> review_poll with the owner item seen",
+        lambda: (u["_next"] == "review_poll" and u["review_seen"] == ["x", rids[1]], u.get("review_seen")))
 u = AA("review_owner_judgment", "Stop watching and report", esc=OJ, **TRIAGED, review_triage_items=OWNER_ONE, review_status="owner_judgment")
 check("review watch: apply_answer review_owner_judgment stop -> finish_plan, outcome owner_judgment",
       u["_next"] == "finish_plan" and u["review_outcomes"] == {"99": "owner_judgment"} and u["review_watching"] is False)
@@ -1370,14 +1381,32 @@ check("review watch: entry script review_poll.py through GRAPH_STATE -> JSON wit
       p.returncode == 0 and json.loads(p.stdout.strip().splitlines()[-1])["_next"] == "review_route", p.stderr[-300:])
 
 # ---------------------------------------------------------------- watch hardening: node timeouts, stale statuses, visit budget, push check
-GRAPH = json.loads(subprocess.run(["yq", "-o=json", ".", os.path.join(HERE, "..", "graph.yaml")], capture_output=True, text=True).stdout)
-NODES, SEEDS = GRAPH["nodes"], GRAPH["initial_state"]
+def read_graph():
+    try:
+        p = subprocess.run(["yq", "-o=json", ".", os.path.join(HERE, "..", "graph.yaml")], capture_output=True, text=True)
+    except FileNotFoundError as e:
+        return None, f"yq not found: {e}"
+    if p.returncode != 0:
+        return None, f"yq failed to read graph.yaml (exit {p.returncode}): {p.stderr.strip()}"
+    try:
+        graph = json.loads(p.stdout)
+    except json.JSONDecodeError as e:
+        return None, f"yq output is not JSON: {e}"
+    return (graph, "") if isinstance(graph, dict) else (None, f"yq output is not a mapping: {p.stdout[:200]}")
+
+
+GRAPH, graph_error = read_graph()
+check("graph.yaml: read through mikefarah yq", GRAPH is not None, graph_error)
+# without the graph every graph row still runs, and fails, against this empty shape
+GRAPH = GRAPH or {"nodes": {}, "initial_state": {}, "settings": {}, "variables": []}
+NODES, SEEDS = GRAPH.get("nodes") or {}, GRAPH.get("initial_state") or {}
 check("watch: ci_poll / review_poll node timeouts cover the sleep plus one gh read; review_update covers its thread budget plus the "
       "in-flight thread, the head check and the comment",
-      NODES["ci_poll"]["timeout"] > CI_POLL_SLEEP + GH_CALL_SECS and NODES["review_poll"]["timeout"] > REVIEW_POLL_SLEEP + GH_CALL_SECS
-      and NODES["review_update"]["timeout"] >= REVIEW_UPDATE_BUDGET + 4 * GH_CALL_SECS + 60,
-      {k: NODES[k].get("timeout") for k in ("ci_poll", "review_poll", "review_update")})
-check("watch: review_route has a timeout above the slack_ping subprocess bound (60s)", NODES["review_route"].get("timeout", 0) > 60, NODES["review_route"].get("timeout"))
+      NODES.get("ci_poll", {}).get("timeout", 0) > CI_POLL_SLEEP + GH_CALL_SECS and NODES.get("review_poll", {}).get("timeout", 0) > REVIEW_POLL_SLEEP + GH_CALL_SECS
+      and NODES.get("review_update", {}).get("timeout", 0) >= REVIEW_UPDATE_BUDGET + 4 * GH_CALL_SECS + 60,
+      {k: NODES.get(k, {}).get("timeout") for k in ("ci_poll", "review_poll", "review_update")})
+check("watch: review_route has a timeout above the slack_ping subprocess bound (60s)", NODES.get("review_route", {}).get("timeout", 0) > 60,
+      NODES.get("review_route", {}).get("timeout"))
 check("watch: ci_polls_run and review_polls_run seeded at 0", SEEDS.get("ci_polls_run") == 0 and SEEDS.get("review_polls_run") == 0)
 
 _real_run, _real_gh_timeout, gh_timeouts = subprocess.run, gates.GH_CALL_SECS, []
@@ -1473,10 +1502,10 @@ try:
 finally:
     gates._pr_comment = _real_pr_comment
 calls = read_file(REVIEW_CALLS).splitlines() if os.path.isfile(REVIEW_CALLS) else []
-check("watch: review_update past its time budget -> remaining threads left unresolved, listed, ledgered and not seen",
-      u["_next"] == "ci_poll" and not any(c.startswith("resolve") for c in calls) and u.get("review_seen") == rids[1:]
-      and len(posted) == 1 and f"Not resolved (time budget):\n- {rids[0]}" in posted[0] and f"- {rids[1]}: {head}" in posted[0]
-      and ledgered(u, f"review-watch: PR #99 not resolved (time budget) {rids[0]}"), (calls, u.get("review_seen"), posted))
+guarded("watch: review_update past its time budget -> remaining threads left unresolved, listed, ledgered and not seen",
+        lambda: (u["_next"] == "ci_poll" and not any(c.startswith("resolve") for c in calls) and u.get("review_seen") == rids[1:]
+                 and len(posted) == 1 and f"Not resolved (time budget):\n- {rids[0]}" in posted[0] and f"- {rids[1]}: {head}" in posted[0]
+                 and ledgered(u, f"review-watch: PR #99 not resolved (time budget) {rids[0]}"), (calls, u.get("review_seen"), posted)))
 u = AA("review_push_mismatch", "Re-check the PR head", **TRIAGED, review_triage_items=FIX_ALL)
 check("watch: apply_answer review_push_mismatch re-check -> review_update", u["_next"] == "review_update" and "review_watching" not in u)
 u = AA("review_push_mismatch", "Stop watching and report", **WATCH)
@@ -1769,16 +1798,16 @@ try:
     check("gh seams: GH_CALL_SECS is 90 and every gh call and seam run in gates.py uses timeout=GH_CALL_SECS",
           GH_CALL_SECS == 90 and not hasattr(_lib, "GH_POLL_TIMEOUT") and not loose and set(seam_lines) <= {c.lineno for c in runs}, (loose, seam_lines))
     check("gh seams: review_update node timeout covers REVIEW_UPDATE_BUDGET + 4 * GH_CALL_SECS + 60",
-          NODES["review_update"]["timeout"] >= REVIEW_UPDATE_BUDGET + 4 * GH_CALL_SECS + 60, NODES["review_update"]["timeout"])
+          NODES.get("review_update", {}).get("timeout", 0) >= REVIEW_UPDATE_BUDGET + 4 * GH_CALL_SECS + 60, NODES.get("review_update", {}).get("timeout"))
 
     os.environ["ARCHITECT_GH_HEAD_CMD"] = f"echo {head}"
     os.environ["ARCHITECT_GH_COMMENT_CMD"] = f"printf '%s' \"$2\" > {COMMENT_BODY}"
     os.environ["ARCHITECT_GH_RESOLVE_CMD"] = f"printf '%s' \"$2\" > {REPLY_BODY}"
     HOSTILE = "## Review round 9 @ abc\n## Batch review round 2 @ d\n#### Update @ e then " + "x" * 300
-    u = gates.review_update(base_state(**TRIAGED, review_triage_items=FIX_ALL[:2] + [dict(FIX_ALL[2], action="none", reason=HOSTILE)]))
+    u = gates.review_update(base_state(**TRIAGED, review_triage_items=FIX_ALL[:2] + [dict(t, action="none", reason=HOSTILE) for t in FIX_ALL[2:3]]))
     body = read_file(COMMENT_BODY) if os.path.isfile(COMMENT_BODY) else ""
     reply = read_file(REPLY_BODY) if os.path.isfile(REPLY_BODY) else ""
-    reason = next((l for l in body.splitlines() if l.startswith(f"- {rids[2]}: ")), "")[len(f"- {rids[2]}: "):]
+    reason = next((l[len(f"- {rids[2]}: "):] for l in body.splitlines() if len(rids) > 2 and l.startswith(f"- {rids[2]}: ")), "")
     check("own marker: the Update comment ends with the marker on its own line",
           u.get("_next") == "ci_poll" and body.startswith(f"## Update @ {head}\n") and body.splitlines()[-1] == gates.OWN_MARKER, body[-200:])
     check("own marker: the thread reply is 'Addressed in <sha>' with the marker on its own last line",
@@ -1816,11 +1845,12 @@ finally:
 
 # ---------------------------------------------------------------- ci budget: visit budget, re-runs per run id, node-time-bounded gh loops
 check("ci budget: POLL_VISIT_BUDGET covers four CI watches plus headroom and sits below settings.max_loop_iterations (1500)",
-      4 * CI_MAX_ROUNDS + CI_MAX_ROUNDS // 4 <= POLL_VISIT_BUDGET < GRAPH["settings"]["max_loop_iterations"] and GRAPH["settings"]["max_loop_iterations"] == 1500,
-      (POLL_VISIT_BUDGET, GRAPH["settings"].get("max_loop_iterations")))
+      4 * CI_MAX_ROUNDS + CI_MAX_ROUNDS // 4 <= POLL_VISIT_BUDGET < GRAPH.get("settings", {}).get("max_loop_iterations", 0)
+      and GRAPH.get("settings", {}).get("max_loop_iterations") == 1500,
+      (POLL_VISIT_BUDGET, GRAPH.get("settings", {}).get("max_loop_iterations")))
 LOOP_NODES = ("ci_apply", "ci_evidence", "flip_ready")
 check("ci budget: ci_apply / ci_evidence / flip_ready node timeouts cover GH_LOOP_SECS + 2 * GH_CALL_SECS + 30",
-      all(NODES[k].get("timeout", 0) >= GH_LOOP_SECS + 2 * GH_CALL_SECS + 30 for k in LOOP_NODES), {k: NODES[k].get("timeout") for k in LOOP_NODES})
+      all(NODES.get(k, {}).get("timeout", 0) >= GH_LOOP_SECS + 2 * GH_CALL_SECS + 30 for k in LOOP_NODES), {k: NODES.get(k, {}).get("timeout") for k in LOOP_NODES})
 
 BUDGET_ENV = ("ARCHITECT_GH_RERUN_CMD", "ARCHITECT_GH_LOG_CMD", "ARCHITECT_GH_VIEW_CMD", "ARCHITECT_GH_READY_CMD", "ARCHITECT_GH_CHECKS_CMD")
 _budget_saved = {k: os.environ.get(k) for k in BUDGET_ENV}
@@ -1950,17 +1980,25 @@ try:
     FEED_TRIAGE = [{"id": "thread:TH40:C40", "action": "fix"}, {"id": "comment:I40", "action": "owner"},
                    {"id": "comment:I41", "action": "none", "reason": "praise"}, {"id": "thread:TH41:C42", "action": "fix"}]
     EARLIER = ["human said x", "PR #99 comment:I40 (carol): fix the docs"]
-    u = gates.review_update(base_state(**WATCH, review_items=FEED, review_triage_items=FEED_TRIAGE, external_feedback=EARLIER))
-    check("watch whetstone: review_update feeds each addressed trusted item (id, author, body tail), never a none item, an item without a body or a duplicate",
-          u.get("_next") == "ci_poll"
-          and u.get("external_feedback") == EARLIER + [f"PR #99 thread:TH40:C40 (bob): <untrusted-review-data>\n{gates.tail(LONG, 600)}\n</untrusted-review-data>"],
-          u.get("external_feedback"))
+    FED = {}
+
+    def fed_update():
+        FED.update(gates.review_update(base_state(**WATCH, review_items=FEED, review_triage_items=FEED_TRIAGE, external_feedback=EARLIER)))
+        return (FED.get("_next") == "ci_poll"
+                and FED.get("external_feedback") == EARLIER + [f"PR #99 thread:TH40:C40 (bob): <untrusted-review-data>\n{gates.tail(LONG, 600)}\n</untrusted-review-data>"],
+                FED.get("external_feedback"))
+
+    guarded("watch whetstone: review_update feeds each addressed trusted item (id, author, body tail), never a none item, an item without a body or a duplicate",
+            fed_update)
     check("watch whetstone: whetstone_gate after a fed review_update -> run_whetstone",
-          gates.whetstone_gate(base_state(external_feedback=u.get("external_feedback", [])))["_next"] == "run_whetstone")
-    u = gates.review_update(base_state(**WATCH, review_items=FEED[2:3], review_triage_items=FEED_TRIAGE[2:3]))
-    check("watch whetstone: a review_update that addressed nothing leaves external_feedback empty -> whetstone skipped",
-          u.get("external_feedback") == [] and gates.whetstone_gate(base_state(external_feedback=u.get("external_feedback")))["_next"] == "summarize_run",
-          u.get("external_feedback"))
+          gates.whetstone_gate(base_state(external_feedback=FED.get("external_feedback", [])))["_next"] == "run_whetstone")
+
+    def unfed_update():
+        u = gates.review_update(base_state(**WATCH, review_items=FEED[2:3], review_triage_items=FEED_TRIAGE[2:3]))
+        return (u.get("external_feedback") == [] and gates.whetstone_gate(base_state(external_feedback=u.get("external_feedback")))["_next"] == "summarize_run",
+                u.get("external_feedback"))
+
+    guarded("watch whetstone: a review_update that addressed nothing leaves external_feedback empty -> whetstone skipped", unfed_update)
 finally:
     for _k, _v in _watch_saved.items():
         if _v is None:
@@ -1998,13 +2036,18 @@ try:
     BARE = clean_item("thread:TB:C2", "TB", "bob")
     LEAK = clean_item("thread:TL:C3", "TL", "eve", body=SENTINEL)
     STRAY = clean_item("threadcomment:C4", "TS", "eve")
-    u, calls, body = clean_update([GOOD, BARE, LEAK, STRAY], review_seen=["x"], review_untrusted=[
-        {"id": LEAK["id"], "author": "eve", "association": "NONE"}, {"id": STRAY["id"], "author": "eve", "association": "NONE"}])
-    feed = u.get("external_feedback", [])
-    check("cleanup: review_update resolves, lists and feeds only the trusted item with a body; the bodiless one is seen, the untrusted ids are not",
-          u.get("_next") == "ci_poll" and calls == ["resolve TG"] and f"- {GOOD['id']}: {head}" in body
-          and not any(i["id"] in body for i in (BARE, LEAK, STRAY)) and [f.split(" (")[0] for f in feed] == [f"PR #99 {GOOD['id']}"]
-          and u.get("review_seen") == ["x", GOOD["id"], BARE["id"]] and no_sentinel(u) and SENTINEL not in body, (calls, body, feed, u.get("review_seen")))
+    feed = []
+
+    def mixed_update():
+        u, calls, body = clean_update([GOOD, BARE, LEAK, STRAY], review_seen=["x"], review_untrusted=[
+            {"id": LEAK["id"], "author": "eve", "association": "NONE"}, {"id": STRAY["id"], "author": "eve", "association": "NONE"}])
+        feed.extend(u.get("external_feedback", []))
+        return (u.get("_next") == "ci_poll" and calls == ["resolve TG"] and f"- {GOOD['id']}: {head}" in body
+                and not any(i["id"] in body for i in (BARE, LEAK, STRAY)) and [f.split(" (")[0] for f in feed] == [f"PR #99 {GOOD['id']}"]
+                and u.get("review_seen") == ["x", GOOD["id"], BARE["id"]] and no_sentinel(u) and SENTINEL not in body, (calls, body, feed, u.get("review_seen")))
+
+    guarded("cleanup: review_update resolves, lists and feeds only the trusted item with a body; the bodiless one is seen, the untrusted ids are not",
+            mixed_update)
     entry = feed[0] if feed else ""
     prefix = f"PR #99 {GOOD['id']} (bob): "
     check("cleanup: a review-sourced external_feedback entry wraps the body in untrusted-review-data markers, the id prefix outside them",
@@ -2138,14 +2181,14 @@ try:
     LONG_THREAD["comments"]["totalCount"] = 1 + len(LONG_REPLIES)
     paged(reviewThreads={"totalCount": 1, "nodes": [LONG_THREAD]})
     u = gates.review_poll(base_state(**WATCH, review_seen=["thread:TH60:C118"]))
-    got = u.get("review_items", [{}])[0]
+    got = (u.get("review_items") or [{}])[0]
     check("truncation: a 60-comment thread read as root + last 50 with a new newest reply -> an item keyed on that reply, root body and author kept",
           u.get("review_status") == "comments" and got.get("id") == "thread:TH60:C119" and got.get("body", "").startswith("the root ask\n\n")
           and got.get("author") == "bob", u)
     paged(reviewThreads={"totalCount": 101, "nodes": []})
     u = gates.review_poll(base_state(**WATCH, review_items=ITEMS))
     check("truncation: reviewThreads totalCount 101 -> truncated -> review_route, overflow in review_truncated, review_items untouched",
-          u.get("review_status") == "truncated" and u.get("_next") == "review_route" and u.get("review_truncated", [{}])[0].get("list") == "reviewThreads"
+          u.get("review_status") == "truncated" and u.get("_next") == "review_route" and (u.get("review_truncated") or [{}])[0].get("list") == "reviewThreads"
           and "review_items" not in u, u)
     check("truncation: review_truncated seeded empty in initial_state", SEEDS.get("review_truncated") == [])
     RT = gates.review_route(base_state(**WATCH, **u))
@@ -2311,7 +2354,7 @@ try:
           calls == ["resolve TA"] and u.get("review_seen") == ["thread:TA:C1"]
           and all(ledgered(u, f"review-watch: PR #99 not resolved (time budget) thread:{t}:C1") for t in ("TB", "TC")), (calls, u.get("review_seen")))
 
-    PR_TRACKING_DESC = next(v for v in GRAPH["variables"] if v["name"] == "pr_tracking")["description"]
+    PR_TRACKING_DESC = next((v.get("description", "") for v in GRAPH.get("variables", []) if v.get("name") == "pr_tracking"), "")
     check("stack scope: the pr_tracking description drops 'exactly as before' and says per-task PRs are not watched",
           "exactly as before" not in PR_TRACKING_DESC and "per-task PRs are not watched" in PR_TRACKING_DESC, PR_TRACKING_DESC)
 finally:
@@ -2458,8 +2501,8 @@ try:
     check("permission: the open_pr seam comment names ARCHITECT_GH_PERM_CMD and its login arg",
           re.search(r"# ARCHITECT_GH_\{[A-Z,]*\bPERM\b[A-Z,]*\}_CMD", OPEN_PR) and "perm the reviewer login" in OPEN_PR)
     check("permission: PERM_LOOKUPS_PER_POLL is 2 and the review_poll node timeout covers the sleep, the review read and every lookup",
-          _lib.PERM_LOOKUPS_PER_POLL == 2 and NODES["review_poll"]["timeout"] > REVIEW_POLL_SLEEP + (1 + _lib.PERM_LOOKUPS_PER_POLL) * GH_CALL_SECS,
-          NODES["review_poll"]["timeout"])
+          _lib.PERM_LOOKUPS_PER_POLL == 2 and NODES.get("review_poll", {}).get("timeout", 0) > REVIEW_POLL_SLEEP + (1 + _lib.PERM_LOOKUPS_PER_POLL) * GH_CALL_SECS,
+          NODES.get("review_poll", {}).get("timeout"))
     check("permission: review_permissions seeded empty in initial_state", SEEDS.get("review_permissions") == {})
 finally:
     os.environ.pop("ARCHITECT_GH_PERM_CMD", None)
