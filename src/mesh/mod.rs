@@ -1610,6 +1610,16 @@ pub(crate) mod test_support {
                 .await
                 .is_some()
         }
+
+        /// Every announce and path response the node's transport accepts from now on.
+        pub(crate) async fn announces(&self) -> broadcast::Receiver<AnnounceEvent> {
+            self.runtime
+                .transport_handle()
+                .await
+                .expect("the node is running")
+                .recv_announces()
+                .await
+        }
     }
 
     /// A runtime joined to a loopback relay, with its identity and cache under a temp dir.

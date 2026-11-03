@@ -9308,9 +9308,8 @@ mod tests {
                 slot_a.install(a.runtime.clone()).unwrap();
                 let mut ctx = plain_ctx();
                 ctx.app.mesh.install(b.runtime.clone()).unwrap();
-                let transport_b = b.runtime.transport_handle().await.unwrap();
 
-                let announces = transport_b.recv_announces().await;
+                let announces = b.announces().await;
                 refused_at_once(&mut ctx, &to_a, "no grant").await;
                 assert_a_was_never_asked_for(&b, announces, &to_a).await;
 
@@ -9327,7 +9326,7 @@ mod tests {
                 trust
                     .deny_destination(ctx.app.mesh.as_ref(), &to_a, None, SystemTime::now(), false)
                     .unwrap();
-                let announces = transport_b.recv_announces().await;
+                let announces = b.announces().await;
                 refused_at_once(&mut ctx, &to_a, "denied destination").await;
                 assert_a_was_never_asked_for(&b, announces, &to_a).await;
 
@@ -9351,7 +9350,7 @@ mod tests {
                     !trust.may_be_asked_for(&to_a),
                     "the rewritten trust file binds A's destination to its blocked identity"
                 );
-                let announces = transport_b.recv_announces().await;
+                let announces = b.announces().await;
                 let (sent, waited) = call(
                     &mut ctx,
                     "send",
