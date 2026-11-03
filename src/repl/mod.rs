@@ -3879,6 +3879,8 @@ local_hello() {\n\
             ctx.app
                 .mesh
                 .set_digest_hook(Arc::clone(&digest) as Arc<dyn MeshDigestHook>);
+            // The boundary of an earlier turn saw this session; in-turn points never fence.
+            digest.driver.lock().observe_session(&ctx);
             publish_mesh_snapshot(&ctx, TurnState::working_now());
             let boundary = ctx.app.mesh.snapshot().unwrap();
             let published: Published = Arc::default();

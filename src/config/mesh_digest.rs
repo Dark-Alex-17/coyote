@@ -341,7 +341,10 @@ impl MeshDigestDriver {
     }
 
     /// Production entry at a progress point inside a turn, which already holds the
-    /// context: `maybe_refresh_with` minus the `try_read`.
+    /// context: `maybe_refresh_with` minus the `try_read`, and it never fences. A session
+    /// cannot change mid-turn, so a fingerprint other than the one the boundary last saw
+    /// is a delegate swapped into `agent` for a chat turn; that progress point is skipped,
+    /// leaving the digest, its epoch and any generation in flight alone.
     pub(crate) fn maybe_refresh_in_turn<F, Fut>(
         &mut self,
         ctx: &RequestContext,
@@ -351,6 +354,12 @@ impl MeshDigestDriver {
         F: Fn(Input) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<String>> + Send,
     {
+        if self.last_session.as_ref() != Some(&SessionFingerprint::of(ctx)) {
+            debug!(
+                "Mesh digest skipped this progress point: the session differs from the one the turn boundary saw"
+            );
+            return;
+        }
         if let Some(planned) = self.plan_from(ctx, now) {
             self.spawn_generation(planned, now, fetch);
         }
@@ -1303,6 +1312,69 @@ mod tests {
 
     mod in_turn_digest_tests {
         use super::*;
+        use crate::config::request_context::Delegate;
+        use crate::config::tool_scope::McpRuntime;
+        use crate::config::{Agent, AgentConfig};
+        use crate::function::Functions;
+
+        fn test_agent(name: &str) -> Agent {
+            Agent::test_new(AgentConfig {
+                name: name.to_string(),
+                ..AgentConfig::default()
+            })
+        }
+
+        /// A delegated chat turn swaps the chat agent into `agent` for the turn's length,
+        /// so its progress points see another fingerprint than the boundaries do.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_delegated_chat_turn_neither_fences_nor_spawns() {
+            let mut ctx = test_ctx(MeshBrief::Auto);
+            add_n_turns(&mut ctx, 4);
+            ctx.agent = Some(test_agent("graph-agent"));
+            ctx.delegate = Some(Delegate {
+                name: "helper".to_string(),
+                agent: test_agent("helper"),
+                functions: Functions::default(),
+                mcp_runtime: McpRuntime::default(),
+                rag: None,
+                rag_key: None,
+                parked: None,
+                interactive: false,
+            });
+            let ctx = shared(ctx);
+            let model = Arc::new(FakeModel::default());
+            let mut driver = MeshDigestDriver::without_node_gate();
+            let start = Instant::now();
+            driver.maybe_refresh_with(&ctx, start, model.fetch(FIXED_DIGEST));
+            wait_for_task(&mut driver).await;
+            let served = ctx.read().app.mesh.digest().expect("the boundary digested");
+            let epoch = ctx.read().app.mesh.digest_epoch();
+
+            {
+                let mut turn = ctx.write();
+                assert!(turn.enter_delegate_turn());
+                turn.todo_list.add("write the seam");
+                driver.maybe_refresh_in_turn(
+                    &turn,
+                    start + MESH_DIGEST_MIN_INTERVAL + Duration::from_secs(1),
+                    model.fetch(FIXED_DIGEST),
+                );
+                assert!(driver.task.is_none(), "the delegated turn spawned a digest");
+                assert_eq!(turn.app.mesh.digest_epoch(), epoch);
+                let digest = turn.app.mesh.digest().expect("the digest was cleared");
+                assert!(Arc::ptr_eq(&digest, &served));
+                turn.leave_delegate_turn();
+            }
+
+            driver.maybe_refresh_with(
+                &ctx,
+                start + MESH_DIGEST_MIN_INTERVAL * 2,
+                model.fetch(FIXED_DIGEST),
+            );
+            wait_for_task(&mut driver).await;
+            assert_eq!(model.calls(), 2, "the boundary digested the todo change");
+            assert_eq!(ctx.read().app.mesh.digest_epoch(), epoch);
+        }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_todo_change_regenerates_in_turn_at_most_once_per_interval() {
