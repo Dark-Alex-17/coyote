@@ -1384,8 +1384,8 @@ check("review watch: entry script review_poll.py through GRAPH_STATE -> JSON wit
 def read_graph():
     try:
         p = subprocess.run(["yq", "-o=json", ".", os.path.join(HERE, "..", "graph.yaml")], capture_output=True, text=True)
-    except FileNotFoundError as e:
-        return None, f"yq not found: {e}"
+    except OSError as e:
+        return None, f"yq not runnable: {e}"
     if p.returncode != 0:
         return None, f"yq failed to read graph.yaml (exit {p.returncode}): {p.stderr.strip()}"
     try:
