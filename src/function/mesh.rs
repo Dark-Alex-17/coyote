@@ -20,7 +20,7 @@ use crate::mesh::pending::{
     DEFAULT_COLLECT_TIMEOUT, PENDING_QUESTION_MAX_CHARS, PENDING_RECORD_VERSION, PendingRecord,
     PendingState, WaitOutcome,
 };
-use crate::mesh::request::short;
+use crate::mesh::request::{is_peer_side_remedy, short};
 use crate::mesh::trust::{Decision, IdentityStanding, Rule, Verdict};
 use crate::mesh::{
     MeshRuntime, MeshSlot, PeerRecord, RequestOptions, canonical_hash, decode_hex, display_text,
@@ -507,7 +507,15 @@ fn refusal_hints(result: Value, prefix: CommandPrefix) -> Value {
     }
 }
 
+/// A peer-side refusal is left whole: its sentence quotes the peer's name and both
+/// fields name commands the peer's owner runs, not this node.
 fn with_prose_hints(mut value: Value, prefix: CommandPrefix) -> Value {
+    if value["next_action"]
+        .as_str()
+        .is_some_and(is_peer_side_remedy)
+    {
+        return value;
+    }
     for key in ["message", "next_action"] {
         if let Some(Value::String(text)) = value.get_mut(key)
             && let Cow::Owned(rendered) = prefix.render_hints(text)
@@ -516,6 +524,33 @@ fn with_prose_hints(mut value: Value, prefix: CommandPrefix) -> Value {
         }
     }
     value
+}
+
+#[cfg(test)]
+mod peer_text_prefix_tests {
+    use super::*;
+    use crate::mesh::request::{NoAnswer, RemoteRefusal};
+
+    #[test]
+    fn a_peer_side_refusal_keeps_its_canonical_next_action_under_slash() {
+        let own = hex_lower(&[0xaa; 16]);
+        let refusal = RemoteRefusal::new(&hex_lower(&[0xbb; 16]), Some(".info Bea"), own.clone());
+        let result = send_error(&SendError::NotTrustedByPeer(refusal.clone()));
+        let rendered = with_prose_hints(result.clone(), CommandPrefix::Slash);
+        assert_eq!(rendered, result);
+        assert_eq!(rendered["next_action"], refusal.next_action());
+        assert!(
+            rendered["next_action"]
+                .as_str()
+                .is_some_and(|action| action.contains(&format!("run .mesh trust {own}"))),
+            "{rendered}"
+        );
+        let silent = send_error(&SendError::NoAnswer(NoAnswer::new(
+            &hex_lower(&[0xbb; 16]),
+            own,
+        )));
+        assert_eq!(with_prose_hints(silent.clone(), CommandPrefix::Slash), silent);
+    }
 }
 
 /// Moves the notes the slot queued while this turn held the context onto the context's
