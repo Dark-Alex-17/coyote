@@ -50,7 +50,8 @@ pub(crate) struct PropagationNodeFile {
 }
 
 /// One remembered node. A field may be added inside a version only with a default, so an
-/// older file still loads; a field this build does not know refuses the file.
+/// older file still loads. A field this build does not know makes the file unreadable, so
+/// it is set aside as corrupt; only a file of another version is refused and left in place.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StoredNode {

@@ -11162,7 +11162,7 @@ mod tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "Destination {destination} could not be reached: this node asked the network for a route to it and got no answer within 5 s. The peer may be offline or on a network this node cannot reach. Try again in a minute; nothing was queued for it, because a message can be held on a propagation node only after the peer's announce has been heard. `.mesh peers` shows when it was last heard."
+                "Destination {destination} could not be reached: this node asked the network for a route to it and got no answer within 5 s. The peer may be offline or on a network this node cannot reach. Nothing was queued for it: this node holds no key for the peer, and a message can be held on a propagation node only once the peer's announce has brought its key. Try again after it announces; `.mesh peers` shows when it was last heard."
             )
         );
         slot.stop().await.unwrap();
@@ -11407,12 +11407,11 @@ mod tests {
         slot.stop().await.unwrap();
     }
 
-    /// The current contract for a destination whose description the transport holds but
-    /// whose path has expired, with no peer table row (a row's stored key would ask for a
-    /// path first): resolving answers at once with the description and asks nothing, and
-    /// a request to it fails at once as `LinkFailed` naming no known path rather than
-    /// waiting out a deadline. The node's transport sends no path request of its own on
-    /// the way to the link.
+    /// The current contract for a destination whose description is held but whose path
+    /// has expired: resolving answers at once with the description and asks nothing,
+    /// and a request to it fails at once as `LinkFailed` naming no known path rather
+    /// than waiting out a deadline. The node's transport sends no path request of its
+    /// own on the way to the link.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_held_destination_whose_path_expired_resolves_at_once_and_its_request_fails_fast() {
@@ -11423,10 +11422,6 @@ mod tests {
         let to = stub.destination_hex();
         stub.wait_to_be_filed(&runtime.peers(), &to).await;
         let desc = runtime.resolve_destination(&to).await.unwrap();
-        assert_eq!(
-            runtime.peers().sweep(SystemTime::now() + PEER_TTL),
-            vec![to.clone()]
-        );
         let transport = runtime.transport_handle().await.unwrap();
         assert!(
             transport.expire_path(&desc.address_hash).await,
@@ -15054,6 +15049,83 @@ mod tests {
             node.next_received().await;
 
             stop(&runtime).await;
+            node.stop().await;
+        }
+
+        /// A restarted runtime knows an offline peer only from its kept row and key: the
+        /// transport holds no description for it and nothing answers its path request. The
+        /// stored key is still enough to hold the message on the persisted propagation node.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_message_to_an_offline_peer_known_by_its_stored_key_is_held_on_a_propagation_node()
+         {
+            use crate::mesh::trust::TrustOptions;
+
+            let mut node = PostingNode::listen(TcpServer::DEFAULT_CLIENT_MTU).await;
+            let tmp = TempDir::new("node-send-offline-stored-key");
+            let cache = mesh_cache_dir(&tmp.path.join("cache"));
+            let nodes = PropagationNodeTable::load(
+                cache.join(PROPAGATION_NODE_TABLE_FILE),
+                SystemTime::now(),
+            )
+            .unwrap();
+            nodes.observe(
+                PropagationNode {
+                    destination: node.desc,
+                    stamp_cost: 0,
+                    per_transfer_limit_kb: FETCH_TRANSFER_LIMIT_KB,
+                    propagation_enabled: true,
+                },
+                1,
+                SystemTime::now(),
+            );
+            nodes.persist_if_dirty().unwrap();
+            let peer = TransportIdentity::new_from_rand(OsRng);
+            let desc = SingleInputDestination::new(peer, session_destination_name("offline")).desc;
+            let destination = desc.address_hash.to_hex_string();
+            let peers = PeerTable::load(cache.join("peers.json"), SystemTime::now()).unwrap();
+            peers.observe(
+                PeerSighting {
+                    destination_hash: destination.clone(),
+                    identity_hash: desc.identity.address_hash.to_hex_string(),
+                    name_hash: hex_lower(desc.name.as_name_hash_slice()),
+                    public_key: Some(desc.identity.to_hex_string()),
+                    display_name: Some("Off".to_string()),
+                    protocol_version: 1,
+                    hops: 1,
+                },
+                SystemTime::now(),
+            );
+            peers.persist_if_dirty().unwrap();
+
+            let runtime = start_on(&tmp, node.port).await;
+            let slot = Arc::new(MeshSlot::default());
+            slot.install(runtime.clone()).unwrap();
+            runtime
+                .trust()
+                .trust_destination(
+                    slot.as_ref(),
+                    &destination,
+                    TrustOptions::default(),
+                    SystemTime::now(),
+                )
+                .unwrap();
+            let transport = runtime.transport_handle().await.unwrap();
+            assert!(
+                transport
+                    .destination_desc(&desc.address_hash)
+                    .await
+                    .is_none()
+            );
+            assert!(!transport.has_path(&desc.address_hash).await);
+
+            let message =
+                OutboundPeer::new(PeerKind::Message, "held for later", None, None, None).unwrap();
+            let outcome = runtime.send_peer(&destination, &message).await.unwrap();
+
+            assert_eq!(outcome.via, PeerVia::StoreAndForward);
+            node.next_received().await;
+
+            assert!(slot.stop().await.unwrap());
             node.stop().await;
         }
     }

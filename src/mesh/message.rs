@@ -1342,9 +1342,10 @@ pub(crate) enum SendError {
     NotTrusted {
         destination: String,
     },
-    /// Trusted, but the transport holds no identity for it and the network did not answer
-    /// this node's path request in time, so there is no description to link to. Nothing is
-    /// queued: a propagation node can hold a message only for an identity that is known.
+    /// Trusted, but neither the peer table nor the transport holds a key for it, and the
+    /// network did not answer this node's path request in time, so there is no description
+    /// to link to. Nothing is queued: a propagation node can hold a message only for a
+    /// peer whose key is known, and a key arrives only with the peer's announce.
     UnknownDestination {
         destination: String,
     },
@@ -1392,7 +1393,7 @@ impl fmt::Display for SendError {
             ),
             Self::UnknownDestination { destination } => write!(
                 f,
-                "{} Try again in a minute; nothing was queued for it, because a message can be held on a propagation node only after the peer's announce has been heard. `.mesh peers` shows when it was last heard.",
+                "{} Nothing was queued for it: this node holds no key for the peer, and a message can be held on a propagation node only once the peer's announce has brought its key. Try again after it announces; `.mesh peers` shows when it was last heard.",
                 unreachable_head(destination)
             ),
             Self::NotRunning => write!(
@@ -1922,12 +1923,14 @@ impl MeshRuntime {
     /// The description a request to `destination_hex` links to, with `name` the announce's
     /// truncated name hash. A key the peer table kept from an earlier announce comes first,
     /// once it proves it derives the destination, so a restart does not wait on a fresh
-    /// announce. A link needs a path, so without one a single path request is sent and
-    /// waited on for up to `PATH_REQUEST_TIMEOUT`, and the description is returned only if
-    /// a path then stands. Without such a key the transport's description is used: one it
-    /// holds is answered at once with no request, even when its path has expired, and one
-    /// it does not hold is asked for once over the network and waited for up to
-    /// `PATH_REQUEST_TIMEOUT`. `None` otherwise.
+    /// announce. It is answered at once when the transport already holds a description or
+    /// a path for it; otherwise a single path request is sent and waited on for up to
+    /// `PATH_REQUEST_TIMEOUT`. The kept description is returned whether or not a path
+    /// arrived: without one the direct attempt fails fast at the link, and `send` then
+    /// holds the message on a propagation node, which needs only the key. Without such a
+    /// key the transport's description is used: one it holds is answered at once with no
+    /// request, even when its path has expired, and one it does not hold is asked for once
+    /// over the network and waited for up to `PATH_REQUEST_TIMEOUT`. `None` otherwise.
     pub(crate) async fn resolve_destination(
         &self,
         destination_hex: &str,
@@ -1940,10 +1943,22 @@ impl MeshRuntime {
             .get(&destination)
             .and_then(|record| record.verified_destination());
         let desc = match persisted {
-            Some(desc) => transport
-                .await_path(&address_hash, PATH_REQUEST_TIMEOUT, None)
-                .await
-                .then_some(desc),
+            Some(desc) => {
+                let known = transport.destination_desc(&address_hash).await.is_some()
+                    || transport.has_path(&address_hash).await;
+                if !known
+                    && !transport
+                        .await_path(&address_hash, PATH_REQUEST_TIMEOUT, None)
+                        .await
+                {
+                    debug!(
+                        "Mesh found no path to {} within {} s; using its stored key, so a send can fall back to a propagation node",
+                        short(&destination),
+                        PATH_REQUEST_TIMEOUT.as_secs()
+                    );
+                }
+                Some(desc)
+            }
             None => {
                 transport
                     .resolve_destination(&address_hash, PATH_REQUEST_TIMEOUT)

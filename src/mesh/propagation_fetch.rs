@@ -693,6 +693,7 @@ pub(crate) struct FetchStore {
     delivered: BoundedSet,
     deferred: BTreeMap<TransientId, Deferred>,
     cursor: Option<SyncCursor>,
+    unsaved_deliveries: bool,
 }
 
 impl FetchStore {
@@ -720,6 +721,7 @@ impl FetchStore {
             delivered: BoundedSet::new("delivered message"),
             deferred: BTreeMap::new(),
             cursor: loaded.cursor,
+            unsaved_deliveries: false,
         };
         for (id, seen_at) in loaded.seen {
             store.seen.insert_at(id, seen_at, now);
@@ -749,7 +751,18 @@ impl FetchStore {
     }
 
     pub(crate) fn record_delivered(&mut self, message_id: [u8; 32], now: SystemTime) -> bool {
+        self.unsaved_deliveries = true;
         self.delivered.insert_at(message_id, now, now)
+    }
+
+    /// Writes the store if it records a delivery not yet on disk, so a fetch dropped
+    /// while it waits on the network does not deliver those bodies again next sync.
+    fn persist_deliveries(&mut self) -> Result<(), FetchError> {
+        if self.unsaved_deliveries {
+            self.persist()?;
+            self.unsaved_deliveries = false;
+        }
+        Ok(())
     }
 
     /// Counts one more sighting of `id` without a key for its source. Sightings are
@@ -1324,11 +1337,14 @@ impl BodyPipeline<'_> {
     /// time for a sender that may never return. A body skipped for want of time or past
     /// `MAX_SOURCE_ASKS_PER_FETCH` stays unasked, so a later sync asks. An answered ask
     /// is followed by one more key lookup. `Err(asked)` when the key is still unknown.
+    /// The bodies delivered so far are written to disk before an ask waits on the
+    /// network; if they cannot be, the ask is skipped rather than risk delivering them
+    /// twice, and the write after the body loop reports the failure.
     async fn ask_then_retry(
         &self,
         source: &AddressHash,
         transient_id: &TransientId,
-        store: &FetchStore,
+        store: &mut FetchStore,
     ) -> Result<Result<Identity, bool>, RequestError> {
         if store
             .deferral_of(transient_id)
@@ -1348,7 +1364,17 @@ impl BodyPipeline<'_> {
                 );
                 return Ok(Err(false));
             }
-            None => self.keys.ask_for_source(source).await?,
+            None => {
+                if let Err(err) = store.persist_deliveries() {
+                    debug!(
+                        "Propagation fetch from {}: claimed source {source_hex} not asked for yet: the messages delivered so far could not be saved first ({}); a later sync asks",
+                        self.node,
+                        redact_hashes(&err.to_string())
+                    );
+                    return Ok(Err(false));
+                }
+                self.keys.ask_for_source(source).await?
+            }
         };
         if ask != SourceAsk::NoTimeLeft {
             self.asked.lock().insert(*source, ask);
@@ -1392,7 +1418,7 @@ impl BodyPipeline<'_> {
         &self,
         body: &[u8],
         transient_id: &TransientId,
-        store: &FetchStore,
+        store: &mut FetchStore,
     ) -> Result<Result<InboundMessage, Discard>, RequestError> {
         if let Err(discard) = check_bounds(body) {
             return Ok(Err(discard));
@@ -1637,7 +1663,8 @@ pub(crate) async fn fetch(
 /// the ids round 3 tells the node to delete: every body but the deferred ones, each id once
 /// however often it was served. The body loop is non-cancellable by design, so cancellation
 /// is not a loop exit path; aborting the `fetch_propagated` future mid-loop skips the
-/// persist.
+/// persist here, but not the one `ask_then_retry` makes before waiting on the network, so
+/// only the bodies since the last ask can be delivered again.
 async fn process_and_persist(
     pipeline: &BodyPipeline<'_>,
     bodies: &[Vec<u8>],
@@ -3436,6 +3463,81 @@ mod tests {
                 bench.sink.only().content.as_deref(),
                 Some(&b"hello again"[..])
             );
+        }
+
+        /// Knows one sender's key and never answers an ask for any other, so a fetch that
+        /// reaches such an ask can only end by being dropped.
+        struct StalledAskKeys {
+            source: AddressHash,
+            identity: Identity,
+        }
+
+        #[async_trait]
+        impl SourceKeys for StalledAskKeys {
+            async fn identity_for(
+                &self,
+                source: &AddressHash,
+            ) -> Result<Option<Identity>, RequestError> {
+                Ok((*source == self.source).then_some(self.identity))
+            }
+
+            async fn ask_for_source(
+                &self,
+                _source: &AddressHash,
+            ) -> Result<SourceAsk, RequestError> {
+                std::future::pending().await
+            }
+        }
+
+        #[tokio::test]
+        async fn a_fetch_dropped_during_an_ask_does_not_deliver_its_earlier_bodies_again() {
+            let known = CorePrivateIdentity::new_from_rand(OsRng);
+            let known_id = transport_identity_of(&known);
+            let stranger = CorePrivateIdentity::new_from_rand(OsRng);
+            let mut bench = AskBench::new("fetch-ask-dropped", &known_id);
+            let me = bench.me();
+            let bodies = vec![
+                honest_body(&known, &me, b"delivered before the ask"),
+                honest_body(&stranger, &me, b"waits on the ask"),
+            ];
+            let stalled = StalledAskKeys {
+                source: lxmf_delivery_hash(&known_id),
+                identity: known_id,
+            };
+            let pipeline = BodyPipeline {
+                recipient: &bench.recipient,
+                delivery: lxmf_delivery_hash(&me),
+                keys: &stalled,
+                trust: &bench.trust,
+                sink: &bench.sink,
+                node: "fake",
+                asked: Mutex::default(),
+            };
+            let mut report = FetchReport::new("fake".to_string());
+
+            let dropped = tokio::time::timeout(
+                Duration::from_millis(200),
+                process_bodies(&pipeline, &bodies, &mut bench.store, &mut report),
+            )
+            .await;
+
+            assert!(dropped.is_err(), "the ask never answers");
+            assert_eq!(bench.sink.count(), 1);
+
+            bench.store = FetchStore::load(bench.store.path.clone(), SystemTime::now()).unwrap();
+            let keys = AskingKeys::default();
+            keys.known
+                .lock()
+                .insert(lxmf_delivery_hash(&known_id), known_id);
+
+            let report = bench.fetch(&keys, &bodies).await;
+
+            assert_eq!(
+                bench.sink.count(),
+                1,
+                "the first body is not delivered again"
+            );
+            assert_eq!((report.delivered, report.duplicates), (0, 1));
         }
     }
 

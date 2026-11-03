@@ -1601,6 +1601,7 @@ impl ReceiptFixture {
             return (
                 BodyOutcome::Deferred {
                     attempts: earlier.map_or(0, |s| s.attempts).saturating_add(1),
+                    // `MutableKeys` keeps the default `ask_for_source`: no fuzz body is asked for.
                     asked: false,
                 },
                 Stage::SourceKey,

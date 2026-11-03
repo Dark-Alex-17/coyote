@@ -43,9 +43,9 @@ use crate::mesh::{
     AlreadyClosed, FetchError, FetchReport, HEARTBEAT_PERIOD_SECS, HEARTBEAT_SECS, HUMAN_DECLINED,
     InterfaceState, InterfaceStatus, LocalEndpoint, LoggingInboundSink, MAX_WANTS_PER_FETCH,
     MESH_ALREADY_ON, MeshPaths, MeshRuntime, NodeOptions, PATH_REQUEST_TIMEOUT, PEER_STALE_AFTER,
-    PEER_TTL, PeerRecord, PropagationNodeRecord, age_text, canonical_hash, canonicalize,
-    decode_hex, destination_address, display_text, hex_lower, human_size, loopback_endpoint,
-    parse_rfc3339, redact_hashes, refuse_symlink, rfc3339_utc, short, span_text,
+    PEER_TTL, PROPAGATION_NODE_TTL, PeerRecord, PropagationNodeRecord, age_text, canonical_hash,
+    canonicalize, decode_hex, destination_address, display_text, hex_lower, human_size,
+    loopback_endpoint, parse_rfc3339, redact_hashes, refuse_symlink, rfc3339_utc, short, span_text,
 };
 use crate::repl::printer::terminal_width;
 use crate::supervisor::mailbox::EnvelopePayload;
@@ -6850,14 +6850,20 @@ fn propagation_node_rows(
     mut nodes: Vec<PropagationNodeRecord>,
     now: SystemTime,
 ) -> Vec<(String, String)> {
+    let heard = nodes.len();
     nodes.retain(|node| !node.is_expired(now));
     nodes.sort_by_key(|node| (node.hops, std::cmp::Reverse(node.last_seen)));
     let mut rows = Vec::new();
     if nodes.is_empty() {
-        rows.push((
-            "propagation_nodes".to_string(),
-            "none heard yet".to_string(),
-        ));
+        let none = if heard == 0 {
+            "none heard yet".to_string()
+        } else {
+            format!(
+                "none heard in the last {} h ({heard} aged out); .mesh sync finds one once it announces again",
+                PROPAGATION_NODE_TTL.as_secs() / 3600
+            )
+        };
+        rows.push(("propagation_nodes".to_string(), none));
     }
     for (i, record) in nodes.iter().enumerate() {
         rows.push((
@@ -9797,6 +9803,21 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         assert!(
             rows[1].0 == "propagation_nodes[1]" && rows[1].1.contains(&far_hex),
             "{rows:?}"
+        );
+
+        let stale = now - PROPAGATION_NODE_TTL - Duration::from_secs(60);
+        let rows = propagation_node_rows(
+            vec![record(1, "old", stale), record(2, "older", stale)],
+            now,
+        );
+        assert_eq!(
+            rows,
+            vec![(
+                "propagation_nodes".to_string(),
+                "none heard in the last 24 h (2 aged out); .mesh sync finds one once it announces again"
+                    .to_string()
+            )],
+            "nodes that all aged out are counted, not reported as never heard"
         );
     }
 
