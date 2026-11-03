@@ -770,7 +770,12 @@ impl EnvoyRunner {
                     };
                 }
                 res = &mut run => break match res {
-                    Ok(text) => classify_answer(&text),
+                    // Once the owner's answer is taken it is the reply, so the model's
+                    // final text after it is not read for a decline.
+                    Ok(text) => match self.consumed_answer.lock().clone() {
+                        Some(answer) => EnvoyOutcome::Answered(answer),
+                        None => classify_answer(&text),
+                    },
                     Err(err) => run_error_outcome(&err),
                 },
                 _ = &mut deadline => {
@@ -1020,7 +1025,8 @@ impl EnvoyRunner {
     /// hook. A reply that cannot be sent still gets recorded, with one line telling the
     /// human why the peer did not hear it. A held run that took the human's answer sends
     /// that answer to the peer word for word as `answered`, whatever the run came to; the
-    /// model's own final text is neither sent nor classified. An escalated question
+    /// model's own final text is never sent, and `drive` reads a run that finished after
+    /// taking the answer as that answer without classifying the text. An escalated question
     /// leaves the store only once the peer has heard its answer; an unsent one stays open
     /// so `.mesh answer` can send it again. A run-time refusal of a stored message is
     /// replied to once per identity, per reason, per hour, on the claim the accept-time
@@ -3686,6 +3692,34 @@ mod tests {
         source.remove_dir();
     }
 
+    mod answer_rollback_tests {
+        use super::*;
+
+        /// An answer the held run can no longer take leaves the answers it took earlier
+        /// as they were.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn an_answer_the_run_cannot_take_keeps_the_earlier_answer() {
+            let _cfg = TestConfigDirGuard::new("mesh-envoy-answer-rollback");
+            let runner = EnvoyRunner::start_with(
+                test_app(),
+                drive_of(|_, _, _| async { Ok(String::new()) }),
+            );
+            let (reply_tx, reply_rx) = oneshot::channel();
+            drop(reply_rx);
+            *runner.held.lock() = Some(HeldEscalation {
+                id: "q-1".into(),
+                reply_tx,
+            });
+            *runner.consumed_answer.lock() = Some("a".into());
+
+            assert!(!runner.answer("q-1", "b"));
+
+            assert_eq!(runner.consumed_answer.lock().as_deref(), Some("a"));
+            runner.stop().await;
+        }
+    }
+
     #[cfg(unix)]
     mod in_hold_answer_tests {
         use super::*;
@@ -5659,6 +5693,8 @@ mod tests {
         config: AppConfig,
         model: Model,
         replies: Mutex<std::collections::VecDeque<ChatCompletionsOutput>>,
+        /// When set, every reply is built from the request's messages, serialised.
+        compose: Option<fn(&str) -> String>,
         requests: Mutex<Vec<SeenRequest>>,
     }
 
@@ -5669,12 +5705,24 @@ mod tests {
 
     impl ScriptedClient {
         fn new(replies: Vec<ChatCompletionsOutput>) -> Arc<Self> {
+            Self::build(replies, None)
+        }
+
+        fn composing(compose: fn(&str) -> String) -> Arc<Self> {
+            Self::build(Vec::new(), Some(compose))
+        }
+
+        fn build(
+            replies: Vec<ChatCompletionsOutput>,
+            compose: Option<fn(&str) -> String>,
+        ) -> Arc<Self> {
             let mut data = ModelData::new("scripted");
             data.supports_function_calling = true;
             Arc::new(Self {
                 config: AppConfig::default(),
                 model: Model::from_config("scripted", &[data]).remove(0),
                 replies: Mutex::new(replies.into()),
+                compose,
                 requests: Mutex::new(Vec::new()),
             })
         }
@@ -5707,8 +5755,10 @@ mod tests {
             _client: &reqwest::Client,
             data: ChatCompletionsData,
         ) -> Result<ChatCompletionsOutput> {
+            let messages = serde_json::to_string(&data.messages)?;
+            let composed = self.compose.map(|compose| compose(&messages));
             self.requests.lock().push(SeenRequest {
-                messages: serde_json::to_string(&data.messages)?,
+                messages,
                 functions: data
                     .functions
                     .unwrap_or_default()
@@ -5716,6 +5766,9 @@ mod tests {
                     .map(|f| f.name)
                     .collect(),
             });
+            if let Some(text) = composed {
+                return Ok(ChatCompletionsOutput::new(&text));
+            }
             self.replies
                 .lock()
                 .pop_front()
@@ -6113,9 +6166,16 @@ mod tests {
             let staged = staged.display().to_string();
             let app = test_app();
             let _idle = RecordingIdleSink::attach(&app);
-            let client = ScriptedClient::new(vec![ChatCompletionsOutput::new(
-                "Thanks, docs/hello.md arrived.",
-            )]);
+            // The reply names whatever file the request's `attached:` line names.
+            let client = ScriptedClient::composing(|messages| {
+                match messages
+                    .split_once("attached: ")
+                    .and_then(|(_, rest)| rest.split_once(" ("))
+                {
+                    Some((name, _)) => format!("Thanks, {name} arrived."),
+                    None => "Nothing was attached.".to_string(),
+                }
+            });
             let runner = EnvoyRunner::start_with(Arc::clone(&app), {
                 let client = Arc::clone(&client);
                 drive_of(move |ctx, input, abort| {
