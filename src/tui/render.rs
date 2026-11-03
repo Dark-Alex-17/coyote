@@ -61,7 +61,13 @@ fn scrub(text: &str, keep_sgr: bool) -> String {
                 let final_byte = chars.get(i).copied();
                 i += 1;
                 if keep_sgr && !private && final_byte == Some('m') {
-                    out.extend(&chars[start..i.min(chars.len())]);
+                    let params: String = chars[start + 2..i - 1].iter().collect();
+                    if let Some(kept) = without_conceal(&params) {
+                        out.push(ESC);
+                        out.push('[');
+                        out.push_str(&kept);
+                        out.push('m');
+                    }
                 }
             }
             Some(c) if STRING_INTRODUCERS.contains(c) => {
@@ -87,6 +93,42 @@ fn scrub(text: &str, keep_sgr: bool) -> String {
         }
     }
     out
+}
+
+/// The SGR parameter list without conceal (8); None when nothing but
+/// conceal was asked for. The arguments of an extended colour (`38;5;n`,
+/// `38;2;r;g;b` and the 48/58 twins) are carried over untouched, so a
+/// colour index of 8 is not mistaken for the attribute.
+fn without_conceal(params: &str) -> Option<String> {
+    if !params.split(';').any(|p| p == "8") {
+        return Some(params.to_string());
+    }
+    let parts: Vec<&str> = params.split(';').collect();
+    let mut kept: Vec<&str> = Vec::with_capacity(parts.len());
+    let mut i = 0;
+    while i < parts.len() {
+        let part = parts[i];
+        let span = match part {
+            "38" | "48" | "58" => match parts.get(i + 1) {
+                Some(&"5") => 3,
+                Some(&"2") => 5,
+                _ => 1,
+            },
+            "8" => {
+                i += 1;
+                continue;
+            }
+            _ => 1,
+        };
+        let end = (i + span).min(parts.len());
+        kept.extend_from_slice(&parts[i..end]);
+        i = end;
+    }
+    if kept.is_empty() {
+        None
+    } else {
+        Some(kept.join(";"))
+    }
 }
 
 /// Parses SGR-styled text into lines; falls back to the bare characters
@@ -353,6 +395,17 @@ mod tests {
         assert!(!hidden.style.add_modifier.contains(Modifier::HIDDEN));
         assert!(hidden.style.add_modifier.contains(Modifier::BOLD));
         assert!(every_span(&lines).all(|span| !span.style.add_modifier.contains(Modifier::HIDDEN)));
+        // The kept-SGR scrub (what the exit prints) drops it as well.
+        assert_eq!(sanitize_ansi("\x1b[8mhidden\x1b[0m"), "hidden\x1b[0m");
+        assert_eq!(
+            sanitize_ansi("\x1b[8;1mx\x1b[1;8;4my"),
+            "\x1b[1mx\x1b[1;4my"
+        );
+        assert_eq!(sanitize_ansi("\x1b[m\x1b[38;5;8mz"), "\x1b[m\x1b[38;5;8mz");
+        assert_eq!(
+            sanitize_ansi("\x1b[8;38;5;8;48;2;8;8;8mz"),
+            "\x1b[38;5;8;48;2;8;8;8mz"
+        );
     }
 
     /// A spinner frame caught in the fd capture: the cursor move and the

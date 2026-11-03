@@ -4234,7 +4234,7 @@ impl RequestContext {
         if self.macro_flag {
             bail!("No macro");
         }
-        ensure_editor_available()?;
+        ensure_prompts_available()?;
         let ans = Confirm::new("Create a new macro?")
             .with_default(true)
             .prompt()?;

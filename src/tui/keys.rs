@@ -61,6 +61,13 @@ pub(crate) enum Action {
 
 pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    // Job control and repaint are the terminal's, not the modal's: they
+    // work the same whatever is on screen.
+    match key.code {
+        KeyCode::Char('z') if ctrl => return Action::Suspend,
+        KeyCode::Char('l') if ctrl => return Action::ScheduleFrame,
+        _ => {}
+    }
     match ctx.modal {
         Some(ModalKind::Confirm { default, tool }) => {
             let answerable = ctx.idle_ok && ctx.question_fully_shown;
@@ -99,11 +106,9 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             KeyCode::Char('d') if ctrl && ctx.composer_empty => Action::Quit,
             KeyCode::Esc if ctx.turn_running => Action::Interrupt,
             KeyCode::Esc => Action::Nothing,
-            KeyCode::Char('z') if ctrl => Action::Suspend,
             // The editor would inherit fds 1 and 2 on the turn's capture pipe.
             KeyCode::Char('o') if ctrl && ctx.turn_running => Action::Nothing,
             KeyCode::Char('o') if ctrl => Action::OpenEditor,
-            KeyCode::Char('l') if ctrl => Action::ScheduleFrame,
             KeyCode::Char('j') if ctrl => Action::InsertNewline,
             KeyCode::Enter
                 if key
@@ -207,6 +212,29 @@ mod tests {
         let typed = plain(KeyCode::Char('x'));
         assert_eq!(map_key(typed, &IDLE), Action::ComposerInput(typed));
         assert_eq!(map_key(typed, &running), Action::ComposerInput(typed));
+    }
+
+    /// Suspend and repaint belong to the terminal: a modal, answerable or
+    /// not, does not take them.
+    #[test]
+    fn suspend_and_repaint_work_under_every_modal() {
+        let confirm = KeyContext {
+            modal: Some(ModalKind::Confirm {
+                default: false,
+                tool: true,
+            }),
+            idle_ok: false,
+            question_fully_shown: false,
+            ..IDLE
+        };
+        let input = KeyContext {
+            modal: Some(ModalKind::Input),
+            ..IDLE
+        };
+        for ctx in [confirm, input] {
+            assert_eq!(map_key(ctrl('z'), &ctx), Action::Suspend, "{ctx:?}");
+            assert_eq!(map_key(ctrl('l'), &ctx), Action::ScheduleFrame, "{ctx:?}");
+        }
     }
 
     #[test]

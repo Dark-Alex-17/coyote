@@ -1,0 +1,28 @@
+---
+source: src/tui/mod.rs
+expression: frame
+---
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"Session name:                                                                   "
+"notes                                                                           "
+"Enter = answer  Esc = cancel                                                    "
+"openai:test-model . no session . agents 0 . jobs 0                              "

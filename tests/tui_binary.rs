@@ -3842,7 +3842,9 @@ impl CpuLoad {
             .filter_map(|_| {
                 Command::new("sh")
                     .arg("-c")
-                    .arg("while :; do :; done")
+                    // Counted, so a loop that outlives its test (a killed
+                    // harness) still burns out on its own within a minute.
+                    .arg("i=0; while [ $i -lt 40000000 ]; do i=$((i+1)); done")
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
@@ -4066,16 +4068,25 @@ fn assert_refused_through_the_prompt_gate(flow: &GatedFlow) {
 
     // The keys typed after the refusal reach the composer and submit
     // as an ordinary dry-run turn: a prompt left reading stdin would
-    // have eaten them instead.
+    // have eaten them instead. Matched with the whitespace squeezed out:
+    // the composer may be painted over two frames, with the blank cells
+    // between the words skipped by cursor moves.
     let typed_at = pty.raw().len();
     pty.send(b"still live g4r").unwrap();
-    pty.wait_for_after("still live g4r", typed_at, PTY_DEADLINE)
-        .unwrap_or_else(|e| {
-            panic!(
-                "{}: keys typed after the refused `{}` did not reach the composer: {e:?}",
-                flow.scenario, flow.command
-            )
-        });
+    let typed_deadline = std::time::Instant::now() + PTY_DEADLINE;
+    loop {
+        pty.read_for(Duration::from_millis(200));
+        let since_typed = strip_ansi(&String::from_utf8_lossy(&pty.raw()[typed_at..]));
+        if squeezed(&since_typed).contains("stillliveg4r") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < typed_deadline,
+            "{}: keys typed after the refused `{}` did not reach the composer:\n{since_typed}",
+            flow.scenario,
+            flow.command
+        );
+    }
     pty.send(b"\r").unwrap();
     pty.read_for(Duration::from_millis(800));
     pty.send(b".info\r").unwrap();

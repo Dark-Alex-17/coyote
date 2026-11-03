@@ -698,8 +698,9 @@ impl App {
             ));
         }
         if let Some(error) = &outcome.error {
+            // Errors arrive painted for the REPL like notices do.
             self.cells.push(Cell::Error {
-                text: error.clone(),
+                text: render::plain_text(error),
                 cache: LineCache::default(),
             });
         }
@@ -1002,6 +1003,16 @@ impl App {
             if i == 0 && *open_line {
                 if let Some(last) = lines.last_mut() {
                     last.push_str(piece);
+                    // A stream that never breaks its line would grow one
+                    // line without bound; it keeps its newest text, like
+                    // late output does.
+                    if last.len() > LATE_OUTPUT_LIMIT {
+                        let cut = last.len() - LATE_OUTPUT_LIMIT;
+                        let cut = (cut..=last.len())
+                            .find(|at| last.is_char_boundary(*at))
+                            .unwrap_or(last.len());
+                        last.drain(..cut);
+                    }
                 }
             } else if !(last_is_open && piece.is_empty()) {
                 lines.push(piece.to_string());
@@ -1401,6 +1412,23 @@ enum Join<T> {
     TimedOut,
 }
 
+/// Writes to fd 1 after the screen is restored; a failed write (the
+/// terminal is gone) is dropped rather than raised, unlike `print!`.
+fn write_to_terminal(text: &str) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(text.as_bytes());
+    let _ = out.flush();
+}
+
+/// The stderr twin of `write_to_terminal`.
+fn write_to_stderr(text: &str) {
+    use std::io::Write;
+    let mut err = std::io::stderr().lock();
+    let _ = err.write_all(text.as_bytes());
+    let _ = err.flush();
+}
+
 /// Ends the process once the UI gave up on a work task that never handed
 /// the context back. The task runs on a blocking-pool thread, which
 /// nothing can cancel, and the `Runtime` dropped at the end of `main`
@@ -1532,14 +1560,16 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
     }
     // What the exit printed goes to the restored terminal with its colours
     // but without anything that could move the cursor or change a mode.
+    // A terminal that is already gone (EIO after a hang-up) must not turn
+    // the write into a panic ahead of the hook drain below.
     let result = match leave {
         Leave::Finished(result, captured) => {
-            print!("{}", render::sanitize_ansi(&captured));
+            write_to_terminal(&render::sanitize_ansi(&captured));
             result
         }
         Leave::Abandoned(ctx) => match spawn_exit(*ctx, abort.clone()).await {
             Ok((_, result, captured)) => {
-                print!("{}", render::sanitize_ansi(&captured));
+                write_to_terminal(&render::sanitize_ansi(&captured));
                 result
             }
             Err(err) => Err(err.into()),
@@ -1551,7 +1581,7 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
         Leave::Lost(err, mut late) => {
             settle_late_notices(&mut rx, &mut late).await;
             for text in late {
-                eprintln!("{}", render::plain_text(&text));
+                write_to_stderr(&format!("{}\n", render::plain_text(&text)));
             }
             Err(err.into())
         }
@@ -1938,6 +1968,34 @@ mod tests {
                 .join()
                 .unwrap()
         })
+    }
+
+    /// Tool output that never breaks its line keeps only its newest
+    /// text, the same bound the late-output cell has.
+    #[test]
+    fn a_newline_free_tool_stream_keeps_a_bounded_tail() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("explain", false);
+        harness
+            .app
+            .append_tool_output(Some("c1".to_string()), b"head-m3z-");
+        harness.app.append_tool_output(
+            Some("c1".to_string()),
+            "y".repeat(LATE_OUTPUT_LIMIT).as_bytes(),
+        );
+        harness
+            .app
+            .append_tool_output(Some("c1".to_string()), "tail-m3z".as_bytes());
+        let Some(Cell::Text { lines, .. }) = harness.app.cells.last() else {
+            panic!("the tool output did not land in a text cell");
+        };
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].len(), LATE_OUTPUT_LIMIT);
+        assert!(
+            lines[0].ends_with("tail-m3z"),
+            "the newest text was dropped"
+        );
+        assert!(!lines[0].contains("head-m3z"), "the oldest text was kept");
     }
 
     #[test]
@@ -2429,6 +2487,8 @@ mod tests {
         let req = PromptRequest::new(PromptAction::Input, "Session name:", Origin::detached());
         let asker = ask_on_a_thread(&mut harness, req);
         harness.type_text("notes");
+        let frame = harness.draw();
+        insta::assert_snapshot!("input_modal_80x24", frame);
         assert_eq!(harness.press(KeyCode::Enter), None);
         assert_eq!(
             asker.join().unwrap().unwrap(),
@@ -3345,10 +3405,19 @@ mod tests {
                 {
                     continue;
                 }
+                // The prompt gate counts only ahead of the first prompt
+                // builder in the body: a check after the question has
+                // been asked guards nothing.
+                let gate_at = body.find("ensure_prompts_available()");
+                let first_builder = NEEDLES[7..]
+                    .iter()
+                    .filter_map(|needle| body.find(needle))
+                    .min();
                 readers.push(KeyboardReader {
                     gated: body.contains("crate::tui::active()")
                         || body.contains("ensure_editor_available()"),
-                    prompt_gated: body.contains("ensure_prompts_available()"),
+                    prompt_gated: gate_at
+                        .is_some_and(|gate| first_builder.is_none_or(|builder| gate < builder)),
                     file,
                     function,
                 });
@@ -3392,7 +3461,6 @@ mod tests {
             ("src/client/common.rs", "select_model", BEFORE_UI),
             ("src/client/common.rs", "prompt_input_string", BEFORE_UI),
             ("src/client/macros.rs", "create_client_config", BEFORE_UI),
-            ("src/config/agent.rs", "init", PROMPT_GATED),
             ("src/config/agent.rs", "init_graph_rags", PROMPT_GATED),
             ("src/config/bundles.rs", "resolve_bundle_name", PROMPT_GATED),
             ("src/config/conflict.rs", "select_choice", PROMPT_GATED),
@@ -3434,6 +3502,7 @@ mod tests {
                 "edit_mcp_config",
                 VIA_EDIT_GATE,
             ),
+            ("src/config/request_context.rs", "new_macro", PROMPT_GATED),
             ("src/config/request_context.rs", "new_role", PROMPT_GATED),
             ("src/config/request_context.rs", "save_role", PROMPT_GATED),
             ("src/config/update.rs", "run_self_update", PROMPT_GATED),
@@ -3534,7 +3603,7 @@ mod tests {
                     if reader.prompt_gated {
                         format!("{file}:{function} calls ensure_prompts_available but is listed as: {reason}")
                     } else {
-                        format!("{file}:{function} is listed as prompt-gated but never calls ensure_prompts_available")
+                        format!("{file}:{function} is listed as prompt-gated but does not call ensure_prompts_available ahead of its first prompt")
                     }
                 })
             })
@@ -3746,8 +3815,8 @@ mod tests {
 
     /// Comments in the UI's sources describe the code, not the process
     /// that produced it: none carries the vocabulary of a plan or a
-    /// review. The needles are spelled in halves so this test's source
-    /// does not match itself.
+    /// review. The needles are spelled in halves (or built from parts) so
+    /// this test's source does not match itself.
     #[test]
     fn ui_comments_carry_no_planning_vocabulary() {
         let needles = [
@@ -3757,6 +3826,33 @@ mod tests {
             concat!("spec-", "first"),
         ]
         .map(str::to_lowercase);
+        // Word-bounded needles: the word itself, a letter after `R-`, or
+        // the word followed by a digit, with no letter or digit touching
+        // either side.
+        let bounded = [concat!("rul", "ing"), concat!("rul", "ings")];
+        let is_boundary = |c: Option<char>| c.is_none_or(|c| !c.is_alphanumeric());
+        let bounded_hit = |lower: &str, raw: &str| {
+            let word = bounded.iter().any(|needle| {
+                lower.match_indices(needle).any(|(at, _)| {
+                    is_boundary(lower[..at].chars().next_back())
+                        && is_boundary(lower[at + needle.len()..].chars().next())
+                })
+            });
+            let ruling_id = raw.match_indices(concat!("R", "-")).any(|(at, _)| {
+                let after = raw[at + 2..].chars().next();
+                is_boundary(raw[..at].chars().next_back())
+                    && after.is_some_and(|c| c.is_ascii_uppercase())
+                    && is_boundary(raw[at + 3..].chars().next())
+            });
+            let numbered_round = lower.match_indices(concat!("rou", "nd ")).any(|(at, _)| {
+                is_boundary(lower[..at].chars().next_back())
+                    && lower[at + 6..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_digit())
+            });
+            word || ruling_id || numbered_round
+        };
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut files = rust_files(&root.join("src/tui"));
         files.extend(rust_files(&root.join("tests/common")));
@@ -3770,7 +3866,8 @@ mod tests {
                     continue;
                 }
                 let lower = line.to_lowercase();
-                if needles.iter().any(|needle| lower.contains(needle)) {
+                if needles.iter().any(|needle| lower.contains(needle)) || bounded_hit(&lower, line)
+                {
                     offenders.push(format!("{file}:{}: {}", index + 1, line.trim()));
                 }
             }

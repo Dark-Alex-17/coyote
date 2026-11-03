@@ -391,7 +391,11 @@ impl Agent {
             Some(rag)
         } else if !agent_config.documents.is_empty() && !info_flag {
             let mut ans = false;
-            if *IS_STDOUT_TERMINAL {
+            if crate::tui::active() {
+                // The question has no modal of its own yet; the agent
+                // starts without its knowledge base rather than refusing.
+                eprintln!("The agent has documents attached; starting without RAG");
+            } else if *IS_STDOUT_TERMINAL {
                 ensure_prompts_available()?;
                 ans = Confirm::new("The agent has documents attached, init RAG?")
                     .with_default(true)
