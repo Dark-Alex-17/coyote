@@ -429,18 +429,11 @@ async fn join(ctx: &mut RequestContext, options: JoinOptions) -> Result<()> {
 
 async fn turn_off(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
     let args = parse_args(rest, &["--yes"], "off")?;
-    // Typed `.mesh off` is the run's decision: with `mesh.enabled: true` in config.yaml
-    // the sessions entered after it would otherwise join again.
-    let stays_off = if ctx.mesh_enabled_in_config {
-        " (it stays off for the rest of this run; `.mesh on` joins again)"
-    } else {
-        ""
-    };
     if ctx.app.mesh.get().is_none() {
         ctx.set_mesh_enabled_for_session(false);
         let app = Arc::clone(&ctx.app.config);
         ctx.refresh_mesh_tools(&app);
-        out_text(&format!("Mesh is already off for this session{stays_off}."));
+        out_text(&turn_off_line(true, ctx.mesh_enabled_in_config));
         return Ok(());
     }
     let question =
@@ -452,10 +445,21 @@ async fn turn_off(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
     let stopped = stop_node(ctx).await;
     ctx.set_mesh_enabled_for_session(false);
     stopped?;
-    out_text(&format!(
-        "Mesh is off for this session{stays_off}. Run `.mesh on` to join again."
-    ));
+    out_text(&turn_off_line(false, ctx.mesh_enabled_in_config));
     Ok(())
+}
+
+/// What `.mesh off` prints, naming `.mesh on` once. Typed `.mesh off` is the run's
+/// decision: with `mesh.enabled: true` in config.yaml the sessions entered after it
+/// would otherwise join again, so the line says it stays off.
+fn turn_off_line(already_off: bool, mesh_enabled_in_config: bool) -> String {
+    let state = if already_off { "already off" } else { "off" };
+    let stays_off = if mesh_enabled_in_config {
+        " (it stays off for the rest of this run)"
+    } else {
+        ""
+    };
+    format!("Mesh is {state} for this session{stays_off}; `.mesh on` joins again.")
 }
 
 /// The one leave site behind every REPL path that exits a session: `.exit session`, and
@@ -7328,6 +7332,46 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
+    mod turn_off_line_tests {
+        use super::*;
+
+        #[test]
+        fn mesh_off_names_mesh_on_once_with_the_mesh_off_in_config() {
+            for (already_off, line) in [
+                (
+                    false,
+                    "Mesh is off for this session; `.mesh on` joins again.",
+                ),
+                (
+                    true,
+                    "Mesh is already off for this session; `.mesh on` joins again.",
+                ),
+            ] {
+                let shown = turn_off_line(already_off, false);
+                assert_eq!(shown, line);
+                assert_eq!(shown.matches(".mesh on").count(), 1, "{shown}");
+            }
+        }
+
+        #[test]
+        fn mesh_off_names_mesh_on_once_with_the_mesh_on_in_config() {
+            for (already_off, line) in [
+                (
+                    false,
+                    "Mesh is off for this session (it stays off for the rest of this run); `.mesh on` joins again.",
+                ),
+                (
+                    true,
+                    "Mesh is already off for this session (it stays off for the rest of this run); `.mesh on` joins again.",
+                ),
+            ] {
+                let shown = turn_off_line(already_off, true);
+                assert_eq!(shown, line);
+                assert_eq!(shown.matches(".mesh on").count(), 1, "{shown}");
+            }
+        }
+    }
+
     fn peer(name: Option<&str>, seen_secs_ago: u64, now: SystemTime) -> PeerRecord {
         PeerRecord {
             destination_hash: "ab".repeat(16),
@@ -11502,7 +11546,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     assert_eq!(
                         out.last().unwrap(),
                         &format!(
-                            "Mesh is already off for this session (it stays off for the rest of this run; `{mesh} on` joins again)."
+                            "Mesh is already off for this session (it stays off for the rest of this run); `{mesh} on` joins again."
                         ),
                         "{prefix}"
                     );
@@ -12209,7 +12253,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             assert!(!guard.path.join("config.yaml").exists());
             assert!(
                 stdout_lines().iter().any(|line| {
-                    line == "Mesh is already off for this session (it stays off for the rest of this run; `.mesh on` joins again)."
+                    line == "Mesh is already off for this session (it stays off for the rest of this run); `.mesh on` joins again."
                 }),
                 "{:?}",
                 stdout_lines()
@@ -12221,7 +12265,8 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             assert!(
                 stdout_lines()
                     .iter()
-                    .any(|line| line == "Mesh is already off for this session."),
+                    .any(|line| line
+                        == "Mesh is already off for this session; `.mesh on` joins again."),
                 "{:?}",
                 stdout_lines()
             );
@@ -14631,7 +14676,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     // says so; the gate agrees until `.mesh on`.
                     assert!(
                         stdout_lines().iter().any(|line| {
-                            line == "Mesh is off for this session (it stays off for the rest of this run; `.mesh on` joins again). Run `.mesh on` to join again."
+                            line == "Mesh is off for this session (it stays off for the rest of this run); `.mesh on` joins again."
                         }),
                         "{:?}",
                         stdout_lines()
@@ -14699,7 +14744,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     );
                     assert!(
                         !out.iter()
-                            .any(|line| line.contains("Run `.mesh on` to join again")),
+                            .any(|line| line.starts_with("Mesh is off for this session")),
                         "the `.mesh off` wording belongs to a typed `.mesh off`: {out:?}"
                     );
                     started.relay_handle.abort();

@@ -1023,7 +1023,7 @@ fn entering_a_session_joins_and_mesh_off_holds_until_mesh_on_while_exit_session_
     // ... and `.exit session` while on leaves the mesh without taking it again.
     let left = command_prints(&mut session, ".exit session", LEAVING_PATTERN, BARE_PROMPT);
     assert!(
-        !left.contains(STAYS_OFF) && !left.contains("Run `.mesh on` to join again"),
+        !left.contains(STAYS_OFF) && !left.contains("Mesh is off for this session"),
         "leaving on `.exit session` is not a typed `.mesh off`: {left:?}"
     );
     probe.wait_for_marker_count("MESH_STOPPED", 2);
@@ -1132,7 +1132,7 @@ fn entering_an_agent_session_joins_and_leaving_it_by_any_path_leaves_the_mesh() 
     // `.exit agent` takes the session with it, so the mesh is left first.
     let left = command_prints(&mut session, ".exit agent", LEAVING_PATTERN, BARE_PROMPT);
     assert!(
-        !left.contains(STAYS_OFF) && !left.contains("Run `.mesh on` to join again"),
+        !left.contains(STAYS_OFF) && !left.contains("Mesh is off for this session"),
         "leaving on `.exit agent` is not a typed `.mesh off`: {left:?}"
     );
     probe.wait_for_marker_count("MESH_STOPPED", 1);
