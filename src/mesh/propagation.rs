@@ -1212,6 +1212,13 @@ mod tests {
 
     /// A cost every mine reaches within a handful of nonces.
     const CHEAP_COST: u32 = 1;
+    /// A cost no mine reaches inside a test's lifetime: 2^60 expected hashes.
+    const ENDLESS_COST: u32 = 60;
+    /// A cost a debug build mines in roughly half a second (measured at 0.1-0.8 s), so a
+    /// run of them fills the window the not-blocked test measures over.
+    const MEASURED_COST: u32 = 16;
+    /// The reference's default per-transfer limit, `PROPAGATION_LIMIT` (`LXMRouter.py:55`).
+    const DEFAULT_LIMIT_KB: i64 = 256;
 
     /// Every timed-out wait on the way to a propagation node names the node, never the
     /// peer the message is for, and never the raw request path.
@@ -1246,13 +1253,6 @@ mod tests {
             assert!(!text.contains(&path), "{text}");
         }
     }
-    /// A cost no mine reaches inside a test's lifetime: 2^60 expected hashes.
-    const ENDLESS_COST: u32 = 60;
-    /// A cost a debug build mines in roughly half a second (measured at 0.1-0.8 s), so a
-    /// run of them fills the window the not-blocked test measures over.
-    const MEASURED_COST: u32 = 16;
-    /// The reference's default per-transfer limit, `PROPAGATION_LIMIT` (`LXMRouter.py:55`).
-    const DEFAULT_LIMIT_KB: i64 = 256;
 
     fn app_data_from(slots: Vec<rmpv::Value>) -> Vec<u8> {
         let mut out = Vec::new();
