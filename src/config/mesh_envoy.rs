@@ -1035,10 +1035,11 @@ impl EnvoyRunner {
     ///
     /// What the node itself said to the peer, sent or not, joins what the envoy remembers
     /// of the thread when `memory` is on: the answer, the decline, the escalation message, the
-    /// refusal line, the provider-refusal line or the human's held answer. A run that
-    /// timed out, was interrupted, found the envoy unavailable or failed said nothing of
-    /// its own and adds nothing, and neither does a withheld reply or the interim
-    /// escalated notice.
+    /// refusal line or the human's held answer. A run that timed out, was interrupted,
+    /// found the envoy unavailable or failed said nothing of its own and adds nothing, and
+    /// neither does a withheld reply or the interim escalated notice. Nor does a provider
+    /// refusal: remembering the peer's turn would replay the text the provider refused on
+    /// every later message in the thread.
     async fn deliver(
         &self,
         message: PeerMessage,
@@ -1119,7 +1120,6 @@ impl EnvoyRunner {
                         | EnvoyOutcome::Declined(_)
                         | EnvoyOutcome::Escalated { .. }
                         | EnvoyOutcome::Refused(_)
-                        | EnvoyOutcome::ProviderRefused { .. }
                 );
             if let Some(memory) = memory.filter(|_| said_something) {
                 // The sender's standing is judged again here, not at run start: an
@@ -1449,14 +1449,10 @@ fn run_error_outcome(err: &anyhow::Error) -> EnvoyOutcome {
 /// response holds nothing they can read.
 fn unreadable_reply_sentence(err: &anyhow::Error) -> Option<&'static str> {
     err.chain().find_map(|cause| {
-        let message = cause.to_string();
-        if message.contains("Invalid response data") {
-            Some("the provider sent a reply the envoy could not read")
-        } else if message.contains("Blocked due to safety") {
-            Some("the provider blocked the reply for safety")
-        } else {
-            None
-        }
+        cause
+            .to_string()
+            .contains("Invalid response data")
+            .then_some("the provider sent a reply the envoy could not read")
     })
 }
 
@@ -5953,8 +5949,7 @@ mod tests {
             assert!(!idle.has("envoy failed"), "{texts:?}");
             assert!(texts.iter().all(|text| !text.contains('{')), "{texts:?}");
             let turns = turns_of(&store, &PEER_IDENTITY, "t-1");
-            assert_eq!(turns.len(), 2, "{turns:?}");
-            assert_eq!(turns[1].text, PROVIDER_REFUSAL_TEXT);
+            assert!(turns.is_empty(), "{turns:?}");
             source.remove_dir();
         }
 

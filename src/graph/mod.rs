@@ -46,14 +46,16 @@ pub(crate) fn wall_clock(secs: u64) -> Option<Duration> {
 /// `empty completion` is raised by the llm-node loop when a node says
 /// nothing on any turn; nodes at the default `max_attempts: 1` fail to
 /// their `fallback:` on it, retry is opt-in via `max_attempts`.
-/// A [`ProviderRefusal`] is transient on the same terms, since it is the
-/// typed form of a reply that would otherwise read as an empty completion.
+/// A [`ProviderRefusal`] is never transient: the same context is refused
+/// again, so the node goes to its `fallback:` at once.
 pub(crate) fn is_transient_error(err: &Error) -> bool {
+    if err.chain().any(|c| c.is::<ProviderRefusal>()) {
+        return false;
+    }
     if err.chain().any(|c| {
         c.downcast_ref::<reqwest::Error>()
             .is_some_and(|e| e.is_connect() || e.is_timeout())
             || c.is::<tokio::time::error::Elapsed>()
-            || c.is::<ProviderRefusal>()
     }) {
         return true;
     }
@@ -207,7 +209,7 @@ mod tests {
     }
 
     #[test]
-    fn is_transient_error_treats_a_provider_refusal_like_an_empty_completion() {
+    fn is_transient_error_never_retries_a_provider_refusal() {
         let err = anyhow::Error::new(client::ProviderRefusal {
             category: Some("cyber".into()),
             explanation: None,
@@ -215,8 +217,7 @@ mod tests {
         .context("Failed to call chat-completions api")
         .context("Agent 'domain-reviewer' failed");
 
-        assert!(!format!("{err:#}").contains("empty completion"));
-        assert!(is_transient_error(&err));
+        assert!(!is_transient_error(&err));
     }
 
     #[test]
