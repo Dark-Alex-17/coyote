@@ -749,6 +749,11 @@ impl Repl {
             }
         }
 
+        // Without a seed the first turn's progress points would find no boundary
+        // fingerprint and skip the digest. No delegate is parked between turns, so this
+        // is the session the first turn starts in.
+        self.digest.lock().observe_session(&self.ctx.read());
+
         print_pause_banner(&self.ctx.read());
 
         loop {
@@ -3879,7 +3884,8 @@ local_hello() {\n\
             ctx.app
                 .mesh
                 .set_digest_hook(Arc::clone(&digest) as Arc<dyn MeshDigestHook>);
-            // The boundary of an earlier turn saw this session; in-turn points never fence.
+            // The same seed `Repl::run` makes before its first turn, so this first turn
+            // has no boundary of its own behind it; in-turn points never fence.
             digest.driver.lock().observe_session(&ctx);
             publish_mesh_snapshot(&ctx, TurnState::working_now());
             let boundary = ctx.app.mesh.snapshot().unwrap();
@@ -9085,6 +9091,33 @@ local_hello() {\n\
         assert!(
             !source[run_at..mesh_stop_at].contains(&replay_propagated),
             "a replay failure in Repl::run must not skip the shutdown"
+        );
+    }
+
+    #[test]
+    fn repl_run_seeds_the_digest_session_after_autostart_and_before_the_first_turn() {
+        let strip = |s: &str| s.split_whitespace().collect::<String>();
+        let source = strip(include_str!("mod.rs"));
+        let run_start = strip(&["pub async fn run(", "&mut self)"].concat());
+        let autostart = strip(&["mesh::auto", "start(&mut ctx).await"].concat());
+        let seed = strip(&["self.digest.lock().", "observe_session(&self.ctx.read());"].concat());
+        let first_turn = strip(&["let sig = self.editor.", "read_line(&self.prompt);"].concat());
+
+        let position = |needle: &str| {
+            let first = source
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} missing"));
+            assert_eq!(source.rfind(needle), Some(first), "{needle} not unique");
+            first
+        };
+        let seed_at = position(&seed);
+        assert!(
+            position(&run_start) < position(&autostart) && position(&autostart) < seed_at,
+            "the seed follows the autostart inside Repl::run"
+        );
+        assert!(
+            seed_at < position(&first_turn),
+            "the seed precedes the turn loop"
         );
     }
 

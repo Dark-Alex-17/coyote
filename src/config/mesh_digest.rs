@@ -368,8 +368,9 @@ impl MeshDigestDriver {
     /// Production entry at a progress point inside a turn, which already holds the
     /// context: `maybe_refresh_with` minus the `try_read`, and it never fences. A session
     /// cannot change mid-turn, so a fingerprint other than the one the boundary last saw
-    /// is a delegate swapped into `agent` for a chat turn; that progress point is skipped,
-    /// leaving the digest, its epoch and any generation in flight alone.
+    /// is a delegate swapped into `agent` for a chat turn, or there is no boundary
+    /// fingerprint yet because nothing observed the session; either way that progress
+    /// point is skipped, leaving the digest, its epoch and any generation in flight alone.
     pub(crate) fn maybe_refresh_in_turn<F, Fut>(
         &mut self,
         ctx: &RequestContext,
