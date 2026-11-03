@@ -12,7 +12,7 @@ use crate::config::mesh_config::EnvoyMemoryConfig;
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
 use crate::mesh::trust::parse_hash;
 use crate::mesh::{
-    canonical_hash, mesh_cache_dir, parse_rfc3339, redact_hashes, rfc3339_utc,
+    canonical_hash, mesh_cache_dir, parse_rfc3339, redact_hashes, rfc3339_utc, short,
     write_atomically_owner_only,
 };
 
@@ -86,6 +86,15 @@ pub(crate) struct Forgotten {
 pub(crate) struct RememberedOf {
     pub threads: usize,
     pub unreadable_stores: usize,
+}
+
+/// The session `EnvoySessions::session_thread` chose for a message: the thread it is kept
+/// under and, when it resumes one the store holds, that record as loaded. `resumed` is
+/// `None` for a new session, kept under the message's own id.
+#[derive(Debug)]
+pub(crate) struct SessionThread {
+    pub thread: String,
+    pub resumed: Option<EnvoySessionFile>,
 }
 
 /// One `<key>.yaml`: the retained turns of one peer thread. The shape is a stable on-disk
@@ -246,8 +255,10 @@ impl std::error::Error for EnvoyMemoryError {
     }
 }
 
-/// The file name of one thread's record: the truncated SHA-256 of the identity's address
-/// bytes, a zero byte and the thread, as 32 lowercase hex. The identity is fixed-width,
+/// The file name of one session's record: the truncated SHA-256 of the identity's address
+/// bytes, a zero byte and the session's thread, as 32 lowercase hex. The thread is the one
+/// `EnvoySessions::session_thread` picks: the id of the message that opened the session,
+/// never a thread a message named that the store did not hold. The identity is fixed-width,
 /// so the zero byte marks no boundary; it is a fixed separator that keeps this digest's
 /// input distinct from `destination_address`'s, which also chains an address hash. The
 /// identity bytes, not its hex, so the key is the same whatever case the caller spelt.
@@ -524,6 +535,76 @@ impl EnvoySessions {
             return Ok(None);
         };
         Ok(Some(record))
+    }
+
+    /// The thread a message's session is kept under. A message resumes only the
+    /// session `identity` already holds under its `wire_thread`, live and its own; any
+    /// other message, a root or one naming a thread the store does not hold, opens a
+    /// new session under its own `message_id`. A record under the wire thread that
+    /// cannot be read, or that names another identity, is warned about and not
+    /// resumed; so is a store whose index or lock cannot be used, with advice for the
+    /// whole store rather than the thread. The record resumed comes back with the
+    /// choice, so it is loaded once.
+    pub(crate) fn session_thread(
+        &self,
+        identity: &str,
+        wire_thread: Option<&str>,
+        message_id: &str,
+        now: SystemTime,
+    ) -> SessionThread {
+        let fresh = || SessionThread {
+            thread: message_id.to_string(),
+            resumed: None,
+        };
+        let Some(thread) = wire_thread.filter(|thread| *thread != message_id) else {
+            return fresh();
+        };
+        match self.load(identity, thread, now) {
+            Ok(Some(record)) => SessionThread {
+                thread: thread.to_string(),
+                resumed: Some(record),
+            },
+            Ok(None) => fresh(),
+            Err(EnvoyMemoryError::WrongIdentity { .. }) => {
+                warn!(
+                    "Mesh envoy memory for thread {thread} belongs to another identity than {}, so it was not resumed for this sender. A new conversation starts under message {message_id} and the other record is left alone; nothing needs to be done.",
+                    short(identity)
+                );
+                fresh()
+            }
+            Err(err) if self.is_record_error(&err, identity, thread) => {
+                warn!(
+                    "Mesh envoy memory for thread {thread} could not be read ({}), so it was not resumed. A new conversation starts under message {message_id}; run `.mesh memory forget {} {thread}` to clear the unreadable record.",
+                    redact_hashes(&err.to_string()),
+                    short(identity)
+                );
+                fresh()
+            }
+            Err(err) => {
+                warn!(
+                    "Mesh envoy memory could not be used ({}), so thread {thread} was not resumed. A new conversation starts under message {message_id}. Check that the cache directory is readable and writable and the disk has room; if the index cannot be read, run `.mesh memory forget all` to empty the store.",
+                    redact_hashes(&err.to_string())
+                );
+                fresh()
+            }
+        }
+    }
+
+    /// Whether `err` is about the one record `identity`'s `thread` is kept in, rather
+    /// than the index, the lock or the store as a whole.
+    fn is_record_error(&self, err: &EnvoyMemoryError, identity: &str, thread: &str) -> bool {
+        let Ok((_, key)) = resolve(identity, thread) else {
+            return false;
+        };
+        let record = self.record_path(&key);
+        matches!(
+            err,
+            EnvoyMemoryError::Version { path, .. }
+                | EnvoyMemoryError::Unversioned { path, .. }
+                | EnvoyMemoryError::NotARecord { path, .. }
+                | EnvoyMemoryError::Io { path, .. }
+                if *path == record
+        )
     }
 
     /// Writes `turns`, cut to `max_turns` and `max_bytes` oldest exchange first, as the
@@ -1186,6 +1267,7 @@ fn read_versioned<T: DeserializeOwned>(
 mod tests {
     use super::*;
     use crate::mesh::test_support::TempDir;
+    use crate::testing::{install_log_collector, warn_snapshot};
     use std::time::Duration;
 
     const IDENTITY_A: &str = "0123456789abcdef0123456789abcdef";
@@ -2924,5 +3006,139 @@ mod tests {
         };
         assert!(std::error::Error::source(&io).is_some());
         assert!(io.to_string().contains("disk full"), "{io}");
+    }
+
+    #[test]
+    fn a_message_whose_thread_is_its_own_id_opens_a_new_session_under_it() {
+        let tmp = TempDir::new("envoy-sessions-thread-own-id");
+        let store = store(&tmp, &enabled());
+        store
+            .save(IDENTITY_A, "m-1", exchange(1), t(1_000))
+            .unwrap();
+
+        for wire_thread in [Some("m-1"), None] {
+            let session = store.session_thread(IDENTITY_A, wire_thread, "m-1", t(1_000));
+
+            assert_eq!(session.thread, "m-1", "{wire_thread:?}");
+            assert!(session.resumed.is_none(), "{wire_thread:?}");
+        }
+    }
+
+    #[test]
+    fn a_thread_held_for_the_sender_is_resumed_with_its_record() {
+        let tmp = TempDir::new("envoy-sessions-thread-held");
+        let store = store(&tmp, &enabled());
+        store
+            .save(IDENTITY_A, "m-1", exchange(1), t(1_000))
+            .unwrap();
+
+        let session = store.session_thread(IDENTITY_A, Some("m-1"), "m-2", t(1_000));
+
+        assert_eq!(session.thread, "m-1");
+        let record = session.resumed.expect("the held record comes back");
+        assert_eq!(record.thread, "m-1");
+        assert_eq!(record.turns, exchange(1));
+    }
+
+    #[test]
+    fn a_thread_the_store_does_not_hold_opens_a_new_session_under_the_message_id() {
+        let tmp = TempDir::new("envoy-sessions-thread-not-held");
+        let store = store(&tmp, &enabled());
+        store
+            .save(IDENTITY_A, "m-1", exchange(1), t(1_000))
+            .unwrap();
+
+        let session = store.session_thread(IDENTITY_A, Some("build-status"), "m-2", t(1_000));
+
+        assert_eq!(session.thread, "m-2");
+        assert!(session.resumed.is_none());
+        assert_eq!(
+            store.load(IDENTITY_A, "build-status", t(1_000)).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_thread_whose_record_names_another_identity_is_not_resumed_and_is_left_alone() {
+        install_log_collector();
+        let tmp = TempDir::new("envoy-sessions-thread-other-identity");
+        let store = store(&tmp, &enabled());
+        store
+            .save(IDENTITY_A, "t-other", exchange(1), t(1_000))
+            .unwrap();
+        let path = record_path(&store, IDENTITY_A, "t-other");
+        let planted = fs::read_to_string(&path)
+            .unwrap()
+            .replace(IDENTITY_A, IDENTITY_B);
+        fs::write(&path, &planted).unwrap();
+
+        let session = store.session_thread(IDENTITY_A, Some("t-other"), "m-2", t(1_000));
+
+        assert_eq!(session.thread, "m-2");
+        assert!(session.resumed.is_none());
+        assert_eq!(fs::read_to_string(&path).unwrap(), planted);
+        let expected = format!(
+            "Mesh envoy memory for thread t-other belongs to another identity than {}, so it was not resumed for this sender. A new conversation starts under message m-2 and the other record is left alone; nothing needs to be done.",
+            short(IDENTITY_A)
+        );
+        let warns = warn_snapshot();
+        assert!(warns.contains(&expected), "captured: {warns:#?}");
+    }
+
+    #[test]
+    fn a_thread_whose_record_cannot_be_read_is_not_resumed_and_names_the_forget_command() {
+        install_log_collector();
+        let tmp = TempDir::new("envoy-sessions-thread-unreadable");
+        let store = store(&tmp, &enabled());
+        store
+            .save(IDENTITY_A, "t-unreadable", exchange(1), t(1_000))
+            .unwrap();
+        fs::write(record_path(&store, IDENTITY_A, "t-unreadable"), "{not yaml").unwrap();
+
+        let session = store.session_thread(IDENTITY_A, Some("t-unreadable"), "m-2", t(1_000));
+
+        assert_eq!(session.thread, "m-2");
+        assert!(session.resumed.is_none());
+        let forget = format!(".mesh memory forget {} t-unreadable", short(IDENTITY_A));
+        let warns = warn_snapshot();
+        assert!(
+            warns.iter().any(|message| message
+                .starts_with("Mesh envoy memory for thread t-unreadable could not be read (")
+                && message.contains(
+                    "so it was not resumed. A new conversation starts under message m-2"
+                )
+                && message.contains(&forget)),
+            "captured: {warns:#?}"
+        );
+    }
+
+    /// An index that cannot be read is no fault of one thread, so the warning points
+    /// at the whole store instead of forgetting the thread.
+    #[test]
+    fn a_store_whose_index_cannot_be_read_is_not_resumed_and_names_forget_all() {
+        install_log_collector();
+        let tmp = TempDir::new("envoy-sessions-index-unreadable");
+        let store = store(&tmp, &enabled());
+        store
+            .save(IDENTITY_A, "t-held", exchange(1), t(1_000))
+            .unwrap();
+        fs::write(store.dir().join(INDEX_FILE), "{not json").unwrap();
+
+        let session = store.session_thread(IDENTITY_A, Some("t-held"), "m-3", t(1_000));
+
+        assert_eq!(session.thread, "m-3");
+        assert!(session.resumed.is_none());
+        let forget_thread = format!(".mesh memory forget {} t-held", short(IDENTITY_A));
+        let warns = warn_snapshot();
+        assert!(
+            warns.iter().any(|message| message
+                .starts_with("Mesh envoy memory could not be used (")
+                && message.contains(
+                    "so thread t-held was not resumed. A new conversation starts under message m-3"
+                )
+                && message.contains("`.mesh memory forget all`")
+                && !message.contains(&forget_thread)),
+            "captured: {warns:#?}"
+        );
     }
 }

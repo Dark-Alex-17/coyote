@@ -1359,6 +1359,9 @@ pub(crate) enum SendError {
         max: usize,
     },
     InvalidFields(&'static str),
+    /// A thread the caller named that this node has neither sent nor received, so it
+    /// would author a conversation rather than continue one. Nothing is sent.
+    UnknownThread(String),
     /// A part breaks a rule the receiver would drop it for; the text names the rule.
     InvalidParts(&'static str),
     /// The peer answered with a refusal code other than `NoAccess` or `Throttled`;
@@ -1417,6 +1420,10 @@ impl fmt::Display for SendError {
                 f,
                 "The message fields were refused: {reason}{}",
                 fields_remedy(reason)
+            ),
+            Self::UnknownThread(thread) => write!(
+                f,
+                "\"{thread}\" is not a thread this node has seen. Omit thread to start a conversation; to continue one, pass the thread from the earlier message or reply."
             ),
             Self::InvalidParts(reason) => write!(
                 f,
@@ -1559,6 +1566,7 @@ impl SendError {
             Self::ContentTooLong { .. } => "content_too_long",
             Self::TitleTooLong { .. } => "title_too_long",
             Self::InvalidFields(_) => "invalid_fields",
+            Self::UnknownThread(_) => "unknown_thread",
             Self::InvalidParts(_) => "invalid_parts",
             Self::Refused(_) | Self::Throttled { .. } | Self::NotTrustedByPeer(_) => "refused",
             Self::Direct(_) => "direct",
@@ -3799,6 +3807,7 @@ mod tests {
                 "title_too_long",
             ),
             (SendError::InvalidFields("too deep"), "invalid_fields"),
+            (SendError::UnknownThread("t-1".into()), "unknown_thread"),
             (SendError::Refused(RefusalCode::NoAccess), "refused"),
             (
                 SendError::Throttled {

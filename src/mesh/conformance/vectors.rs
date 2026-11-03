@@ -4165,6 +4165,7 @@ fn code_vectors() -> Vec<Vector> {
                         kind: InboundKind::Question,
                         paths: Vec::new(),
                         reason: String::new(),
+                        session_thread: String::new(),
                     },
                 )?;
                 refuses_an_unknown_key(

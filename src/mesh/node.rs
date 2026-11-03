@@ -60,6 +60,7 @@ use crate::mesh::request::{
     RefusalCode, RemoteRefusal, RequestError, RequestOptions, STATUS_PATH, redact_hashes,
     request as link_request, short,
 };
+use crate::mesh::sent_threads::SentThreads;
 use crate::mesh::shares::ShareLocations;
 use crate::mesh::snapshot::MeshSnapshot;
 use crate::mesh::trust::{
@@ -72,7 +73,7 @@ use crate::mesh::{
 use crate::supervisor::notification::{SystemNotification, mesh_notification};
 
 use anyhow::{Context, Result, anyhow, bail};
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use parking_lot::RwLock;
 use rns_transport::destination::DestinationDesc;
 use rns_transport::destination::request::RequestAllow;
@@ -604,6 +605,10 @@ pub(crate) struct MeshRuntime {
     /// re-points it at the fork's store on a re-key.
     envoy_memory: ArcSwapOption<EnvoySessions>,
     envoy_memory_config: EnvoyMemoryConfig,
+    /// The threads this instance has sent or received, which the tools accept as a
+    /// thread to continue. Bound to the instance the node currently serves, like the
+    /// grants: `rebind_sent_threads` re-points it at the fork's file on a re-key.
+    sent_threads: ArcSwap<SentThreads>,
     memory: PeerMemory,
     /// Every configured interface with what it is doing, in config order.
     interface_states: RwLock<Vec<InterfaceStatus>>,
@@ -696,6 +701,7 @@ impl MeshRuntime {
             SystemTime::now(),
         )?);
         let grants = GrantStore::open(&paths.cache_dir, &instance_id, SystemTime::now())?;
+        let sent_threads = SentThreads::open(&paths.cache_dir, &instance_id)?;
         let envoy_memory =
             EnvoySessions::open(&paths.cache_dir, &instance_id, &config.envoy_memory).map(Arc::new);
         if let Some(store) = &envoy_memory {
@@ -876,6 +882,7 @@ impl MeshRuntime {
             serving,
             envoy_memory: ArcSwapOption::new(envoy_memory),
             envoy_memory_config: config.envoy_memory.clone(),
+            sent_threads: ArcSwap::from_pointee(sent_threads),
             memory: PeerMemory::default(),
             interface_states: RwLock::new(states),
             watched_interfaces: watched,
@@ -1011,6 +1018,23 @@ impl MeshRuntime {
     /// Remembers into `store` again: the infallible half of `rebind_envoy_memory`.
     pub(crate) fn restore_envoy_memory(&self, store: Option<Arc<EnvoySessions>>) {
         self.envoy_memory.store(store);
+    }
+
+    pub(crate) fn sent_threads(&self) -> Arc<SentThreads> {
+        self.sent_threads.load_full()
+    }
+
+    /// Opens the sent-threads list of `instance_id` and records into it, handing back
+    /// the list it displaces so a re-key that fails can put it back. A fork starts from
+    /// its own file, so it continues only the threads it sends or receives itself.
+    pub(crate) fn rebind_sent_threads(&self, instance_id: &str) -> Result<Arc<SentThreads>> {
+        let threads = SentThreads::open(&self.cache_dir, instance_id)?;
+        Ok(self.sent_threads.swap(Arc::new(threads)))
+    }
+
+    /// Records into `threads` again: the infallible half of `rebind_sent_threads`.
+    pub(crate) fn restore_sent_threads(&self, threads: Arc<SentThreads>) {
+        self.sent_threads.store(threads);
     }
 
     /// The share root's serving state: the local size limit, the grant store and the
@@ -3699,17 +3723,19 @@ impl MeshSlot {
     }
 
     /// Re-keys the running node for a forked session and binds the pending questions,
-    /// the grants and the envoy's memory to the fork's own files, since a fork asks its
-    /// own questions, answers its own access requests and remembers its own peer threads,
-    /// and must not collect, hand out or read the original's; a no-op while the mesh is
-    /// off. The fork's questions, grants and memory are adopted before the node re-keys
-    /// so a reply or fetch the fork's destination serves at once finds them, and a re-key
-    /// that fails puts the original's back, since the original is what stays served.
+    /// the grants, the sent-threads list and the envoy's memory to the fork's own files,
+    /// since a fork asks its own questions, answers its own access requests and
+    /// remembers its own peer threads, and must not collect, hand out or read the
+    /// original's; a no-op while the mesh is off. The fork's files are adopted before
+    /// the node re-keys so a reply or fetch the fork's destination serves at once finds
+    /// them, and a re-key that fails puts the original's back, since the original is
+    /// what stays served.
     /// Questions peers escalated before the fork are copied into the fork's inbound file
     /// so `.mesh answer` still finds them after the switch. A fork pending file this
     /// Coyote cannot read is logged and the fork starts with no questions pending, as
     /// `install` does: the node must not be reported as failed for a cache file. A fork
-    /// grants file that cannot be opened refuses the re-key, as it would refuse `start`.
+    /// grants or sent-threads file that cannot be opened refuses the re-key, as it would
+    /// refuse `start`.
     pub(crate) async fn rekey(&self, rekey: ForkRekey) -> Result<()> {
         let Some(runtime) = self.get() else {
             return Ok(());
@@ -3751,11 +3777,25 @@ impl MeshSlot {
             .context(
                 "The fork's grant store could not be opened, so the node still serves the original instance",
             );
-        let (rekeyed, displaced) = match grants_rebound {
-            Ok(displaced_grants) => {
+        let rebound = grants_rebound.and_then(|displaced_grants| {
+            match runtime.rebind_sent_threads(&rekey.fork_instance_id) {
+                Ok(displaced_threads) => Ok((displaced_grants, displaced_threads)),
+                Err(err) => {
+                    runtime.serving().restore_grants(displaced_grants);
+                    Err(err.context(
+                        "The fork's sent-threads list could not be opened, so the node still serves the original instance and its grants. Move the fork's sent-threads file named below aside, then fork again.",
+                    ))
+                }
+            }
+        });
+        let (rekeyed, displaced) = match rebound {
+            Ok((displaced_grants, displaced_threads)) => {
                 let displaced_envoy_memory = runtime.rebind_envoy_memory(&rekey.fork_instance_id);
                 let rekeyed = runtime.rekey(rekey).await;
-                (rekeyed, Some((displaced_grants, displaced_envoy_memory)))
+                (
+                    rekeyed,
+                    Some((displaced_grants, displaced_threads, displaced_envoy_memory)),
+                )
             }
             Err(err) => (Err(err), None),
         };
@@ -3769,8 +3809,9 @@ impl MeshSlot {
                 &instance_id,
             )));
             // The original's stores were never closed, so putting them back cannot fail.
-            if let Some((original_grants, original_envoy_memory)) = displaced {
+            if let Some((original_grants, original_threads, original_envoy_memory)) = displaced {
                 runtime.serving().restore_grants(original_grants);
+                runtime.restore_sent_threads(original_threads);
                 runtime.restore_envoy_memory(original_envoy_memory);
             }
         }
@@ -4032,6 +4073,38 @@ impl MeshSlot {
         self.inbound.lock().clone()
     }
 
+    /// The threads the running instance has sent or received; `None` while the mesh is
+    /// off.
+    pub(crate) fn sent_threads(&self) -> Option<Arc<SentThreads>> {
+        self.get().map(|runtime| runtime.sent_threads())
+    }
+
+    /// Records `thread` as one this instance sent or opened, so the tools accept it as a
+    /// thread to continue.
+    pub(crate) fn remember_sent_thread(&self, thread: &str) {
+        self.remember_thread(|store| store.record_sent(thread));
+    }
+
+    /// Records `thread` as one a peer sent, so the tools accept it as a thread to
+    /// continue.
+    pub(crate) fn remember_received_thread(&self, thread: &str) {
+        self.remember_thread(|store| store.record_received(thread));
+    }
+
+    /// A failed write is only logged: the send or delivery it follows has already
+    /// happened, and the list in memory still holds the thread.
+    fn remember_thread(&self, record: impl FnOnce(&SentThreads) -> Result<()>) {
+        let Some(store) = self.sent_threads() else {
+            return;
+        };
+        if let Err(err) = record(&store) {
+            warn!(
+                "Mesh sent-threads list could not be written, so the thread just sent or received can be continued only until the node stops. Check the permissions and free space of the mesh cache directory; the error says which file: {}",
+                redact_hashes(&format!("{err:#}"))
+            );
+        }
+    }
+
     /// Lets go of the escalated questions and access requests that have outlived
     /// `PENDING_TTL`, one idle line each, so the person at the keyboard learns what went
     /// without an answer. Run on the heartbeat and first thing under `.mesh pending`,
@@ -4105,7 +4178,8 @@ impl MeshSlot {
     /// in the inbox instead of being run again: the acknowledgement precedes the run, so
     /// one lost on a link brings the same body back by store-and-forward. Runs on a
     /// blocking thread off the server's request path or on the fetch task, so nothing
-    /// here awaits.
+    /// here awaits. Whatever the route, the message's thread is recorded as received
+    /// (as `file_peer` records it too), so the tools accept it as one to continue.
     pub(crate) fn deliver_peer(&self, message: PeerMessage) {
         self.deliver_peer_at(message, SystemTime::now());
     }
@@ -4113,6 +4187,7 @@ impl MeshSlot {
     pub(crate) fn deliver_peer_at(&self, mut message: PeerMessage, now: SystemTime) {
         let answered = self.answer_correlation(&mut message);
         self.remember_references(&message);
+        self.remember_received_thread(message.thread());
         let for_envoy = !answered && envoy_bound(message.kind, message.in_reply_to.as_deref());
         let envoy = for_envoy.then(|| self.envoy.load_full()).flatten();
         let received = ReceivedFacts::of(&message);
@@ -4609,24 +4684,39 @@ impl MeshSlot {
     /// is next sent. An answer the run itself held and wrote before a send that then
     /// failed is already the thread's last turn, so a retry of it adds nothing. A
     /// thread the store does not hold gets no record: an answer with no question before
-    /// it is not a conversation. No standing is re-checked here: the send that just
+    /// it is not a conversation. The session is the one the run used: the record names
+    /// it when the escalation filed it, and a session gone since gets nothing. A record
+    /// filed before it named its session falls back to the run's footprint: a new
+    /// session always wrote under the question's own id and a resumed one never did, so
+    /// a record under the id is the session, and only with none there is it the wire
+    /// thread. Choosing afresh could pick a thread that became held after the run, hours
+    /// before this answer. No standing is re-checked here: the send that just
     /// succeeded was authorized, and an append that never creates a thread cannot undo
     /// a sweep. A record that cannot be read or saved is left as it is.
     fn remember_human_answer(&self, record: &InboundRecord, spoken: &str) {
         let Some(store) = self.envoy_memory() else {
             return;
         };
-        let thread = record.thread.as_str();
-        if !is_wire_id(thread) {
+        if !is_wire_id(&record.thread) {
             return;
         }
+        let now = SystemTime::now();
+        let thread = if !record.session_thread.is_empty() {
+            record.session_thread.as_str()
+        } else {
+            // A record under the id that cannot be read is still the session: the
+            // append below refuses it and says so, rather than landing in the wire
+            // thread.
+            match store.load(&record.peer_identity, &record.id, now) {
+                Ok(None) => record.thread.as_str(),
+                Ok(Some(_)) | Err(_) => record.id.as_str(),
+            }
+        };
         let answer = EnvoyTurn {
             role: EnvoyRole::Assistant,
             text: spoken.to_string(),
         };
-        if let Err(err) =
-            store.append_once(&record.peer_identity, thread, answer, SystemTime::now())
-        {
+        if let Err(err) = store.append_once(&record.peer_identity, thread, answer, now) {
             warn!(
                 "Mesh envoy memory for thread {thread} could not be saved; the owner's answer was not remembered: {}",
                 redact_hashes(&err.to_string())
@@ -5196,6 +5286,7 @@ impl PeerSurface for MeshSlot {
     fn file_peer(&self, mut message: PeerMessage) {
         let answered = self.answer_correlation(&mut message);
         self.remember_references(&message);
+        self.remember_received_thread(message.thread());
         self.deliver_to_inbox(message, answered);
     }
 
@@ -8105,6 +8196,7 @@ mod tests {
             kind: InboundKind::Question,
             paths: Vec::new(),
             reason: String::new(),
+            session_thread: String::new(),
         }
     }
 
@@ -15438,6 +15530,95 @@ mod tests {
         assert_eq!(turns.last().unwrap().text, "the owner says yes");
     }
 
+    /// An escalated question naming a thread the store did not hold ran in a new
+    /// session under its own id, so the owner's late answer joins that session, and
+    /// nothing is written under the thread the question named.
+    #[test]
+    fn a_late_answer_in_a_fresh_session_lands_under_the_question_id() {
+        let tmp = TempDir::new("node-late-answer-fresh-session");
+        let config = EnvoyMemoryConfig {
+            enabled: true,
+            ..EnvoyMemoryConfig::default()
+        };
+        let store = Arc::new(EnvoySessions::open(&tmp.path, "inst", &config).unwrap());
+        let now = SystemTime::now();
+        store
+            .save(REMEMBERED_PEER, "a-1", peer_turns(), now)
+            .unwrap();
+        let slot = MeshSlot::default();
+        slot.set_envoy_memory_for_tests(store.clone());
+
+        slot.remember_human_answer(
+            &InboundRecord {
+                peer_identity: REMEMBERED_PEER.to_string(),
+                thread: "t-authored".to_string(),
+                ..inbound_record("a-1")
+            },
+            "the owner says yes",
+        );
+
+        let turns = store
+            .load(REMEMBERED_PEER, "a-1", now)
+            .unwrap()
+            .expect("the session the run used holds the answer")
+            .turns;
+        assert_eq!(turns.len(), peer_turns().len() + 1, "{turns:?}");
+        assert_eq!(turns.last().unwrap().text, "the owner says yes");
+        assert!(
+            store
+                .load(REMEMBERED_PEER, "t-authored", now)
+                .unwrap()
+                .is_none(),
+            "nothing is kept under the thread the question named"
+        );
+        assert!(!remembered_record(&store, "t-authored").exists());
+    }
+
+    /// The thread the question named became held after its run, as another message
+    /// in it opened that session meanwhile. The owner's answer still joins the session
+    /// the run used, under the question's id, and the newer one is left as it was.
+    #[test]
+    fn a_late_answer_stays_in_its_session_when_the_wire_thread_is_held_since() {
+        let tmp = TempDir::new("node-late-answer-thread-held-since");
+        let config = EnvoyMemoryConfig {
+            enabled: true,
+            ..EnvoyMemoryConfig::default()
+        };
+        let store = Arc::new(EnvoySessions::open(&tmp.path, "inst", &config).unwrap());
+        let now = SystemTime::now();
+        store
+            .save(REMEMBERED_PEER, "a-1", peer_turns(), now)
+            .unwrap();
+        store
+            .save(REMEMBERED_PEER, "t-later", peer_turns(), now)
+            .unwrap();
+        let held_since = std::fs::read(remembered_record(&store, "t-later")).unwrap();
+        let slot = MeshSlot::default();
+        slot.set_envoy_memory_for_tests(store.clone());
+
+        slot.remember_human_answer(
+            &InboundRecord {
+                peer_identity: REMEMBERED_PEER.to_string(),
+                thread: "t-later".to_string(),
+                ..inbound_record("a-1")
+            },
+            "the owner says yes",
+        );
+
+        let turns = store
+            .load(REMEMBERED_PEER, "a-1", now)
+            .unwrap()
+            .expect("the session the run used holds the answer")
+            .turns;
+        assert_eq!(turns.len(), peer_turns().len() + 1, "{turns:?}");
+        assert_eq!(turns.last().unwrap().text, "the owner says yes");
+        assert_eq!(
+            std::fs::read(remembered_record(&store, "t-later")).unwrap(),
+            held_since,
+            "the thread held since is untouched"
+        );
+    }
+
     /// A record under the asked key that names another identity is the store's
     /// refusal, not the late answer's to override: the file is left byte for byte.
     #[test]
@@ -15475,6 +15656,134 @@ mod tests {
             store.load(REMEMBERED_PEER, "t-9", now),
             Err(EnvoyMemoryError::WrongIdentity { .. })
         ));
+    }
+
+    /// A record that names the session its run wrote to is answered there, whatever
+    /// the wire thread holds by then: the thread that became held after the run is
+    /// left as it was.
+    #[test]
+    fn a_late_answer_lands_in_the_session_the_record_names() {
+        let tmp = TempDir::new("node-late-answer-named-session");
+        let config = EnvoyMemoryConfig {
+            enabled: true,
+            ..EnvoyMemoryConfig::default()
+        };
+        let store = Arc::new(EnvoySessions::open(&tmp.path, "inst", &config).unwrap());
+        let now = SystemTime::now();
+        store
+            .save(REMEMBERED_PEER, "a-1", peer_turns(), now)
+            .unwrap();
+        store
+            .save(REMEMBERED_PEER, "t-later", peer_turns(), now)
+            .unwrap();
+        let held_since = std::fs::read(remembered_record(&store, "t-later")).unwrap();
+        let slot = MeshSlot::default();
+        slot.set_envoy_memory_for_tests(store.clone());
+
+        slot.remember_human_answer(
+            &InboundRecord {
+                peer_identity: REMEMBERED_PEER.to_string(),
+                thread: "t-later".to_string(),
+                session_thread: "a-1".to_string(),
+                ..inbound_record("a-1")
+            },
+            "the owner says yes",
+        );
+
+        let turns = store
+            .load(REMEMBERED_PEER, "a-1", now)
+            .unwrap()
+            .expect("the session the record names holds the answer")
+            .turns;
+        assert_eq!(turns.len(), peer_turns().len() + 1, "{turns:?}");
+        assert_eq!(turns.last().unwrap().text, "the owner says yes");
+        assert_eq!(
+            std::fs::read(remembered_record(&store, "t-later")).unwrap(),
+            held_since,
+            "the thread held since is untouched"
+        );
+    }
+
+    /// The session the record names was deleted before the answer came, while the wire
+    /// thread became held: the answer is remembered nowhere, and never in the wire
+    /// thread, which belongs to another conversation.
+    #[test]
+    fn a_late_answer_whose_session_is_gone_is_remembered_nowhere() {
+        let tmp = TempDir::new("node-late-answer-session-gone");
+        let config = EnvoyMemoryConfig {
+            enabled: true,
+            ..EnvoyMemoryConfig::default()
+        };
+        let store = Arc::new(EnvoySessions::open(&tmp.path, "inst", &config).unwrap());
+        let now = SystemTime::now();
+        store
+            .save(REMEMBERED_PEER, "a-1", peer_turns(), now)
+            .unwrap();
+        store
+            .save(REMEMBERED_PEER, "t-later", peer_turns(), now)
+            .unwrap();
+        store.delete(REMEMBERED_PEER, "a-1").unwrap();
+        let held_since = std::fs::read(remembered_record(&store, "t-later")).unwrap();
+        let slot = MeshSlot::default();
+        slot.set_envoy_memory_for_tests(store.clone());
+
+        slot.remember_human_answer(
+            &InboundRecord {
+                peer_identity: REMEMBERED_PEER.to_string(),
+                thread: "t-later".to_string(),
+                session_thread: "a-1".to_string(),
+                ..inbound_record("a-1")
+            },
+            "the owner says yes",
+        );
+
+        assert!(store.load(REMEMBERED_PEER, "a-1", now).unwrap().is_none());
+        assert!(!remembered_record(&store, "a-1").exists());
+        assert_eq!(
+            std::fs::read(remembered_record(&store, "t-later")).unwrap(),
+            held_since,
+            "the wire thread is untouched"
+        );
+    }
+
+    /// A record filed before it named its session, with an unreadable record under the
+    /// question's id: that record is still the session, so the append refuses it and
+    /// nothing is written to the wire thread.
+    #[test]
+    fn a_late_answer_over_an_unreadable_session_writes_nothing_to_the_wire_thread() {
+        let tmp = TempDir::new("node-late-answer-unreadable-session");
+        let config = EnvoyMemoryConfig {
+            enabled: true,
+            ..EnvoyMemoryConfig::default()
+        };
+        let store = Arc::new(EnvoySessions::open(&tmp.path, "inst", &config).unwrap());
+        let now = SystemTime::now();
+        store
+            .save(REMEMBERED_PEER, "a-1", peer_turns(), now)
+            .unwrap();
+        store
+            .save(REMEMBERED_PEER, "t-later", peer_turns(), now)
+            .unwrap();
+        std::fs::write(remembered_record(&store, "a-1"), "turns: [unclosed").unwrap();
+        let held_since = std::fs::read(remembered_record(&store, "t-later")).unwrap();
+        let slot = MeshSlot::default();
+        slot.set_envoy_memory_for_tests(store.clone());
+
+        slot.remember_human_answer(
+            &InboundRecord {
+                peer_identity: REMEMBERED_PEER.to_string(),
+                thread: "t-later".to_string(),
+                ..inbound_record("a-1")
+            },
+            "the owner says yes",
+        );
+
+        assert!(store.load(REMEMBERED_PEER, "a-1", now).is_err());
+        assert_eq!(
+            std::fs::read(remembered_record(&store, "t-later")).unwrap(),
+            held_since,
+            "the wire thread is untouched"
+        );
     }
 
     #[cfg(unix)]
@@ -17436,6 +17745,131 @@ mod tests {
             InstanceLock::acquire(&cache_dir, &original_id).is_err(),
             "a refused re-key keeps the original instance lock"
         );
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// A fork sent-threads list at a version this build does not write refuses the
+    /// re-key: the error says the node stays the original and what to do, the original's
+    /// grants are served again and the original's list still answers the tools.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_newer_fork_sent_threads_file_refuses_the_rekey_and_keeps_the_original() {
+        use crate::mesh::shares::PeerRef;
+
+        let started = started_runtime("node-rekey-sent-threads-newer").await;
+        let cache_dir = started.runtime.cache_dir().to_path_buf();
+        let original_id = started.runtime.current_instance_id();
+        let fork_id = fresh_instance_id();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        slot.remember_sent_thread("m-original");
+        let original_path = slot.sent_threads().unwrap().path().to_path_buf();
+        let now = SystemTime::now();
+        let peer_destination = hex_lower(&[0x3f; 16]);
+        let peer = PeerRef {
+            identity: "ignored-by-grants",
+            destination: &peer_destination,
+        };
+        GrantStore::new(&cache_dir, &original_id)
+            .grant(
+                "0123456789abcdef",
+                &peer_destination,
+                &["docs/original.md".into()],
+                None,
+                now,
+            )
+            .unwrap();
+        let fork_path = SentThreads::open(&cache_dir, &fork_id)
+            .unwrap()
+            .path()
+            .to_path_buf();
+        let newer = br#"{"version": 2, "sent": ["m-fork"], "received": []}"#;
+        std::fs::create_dir_all(fork_path.parent().unwrap()).unwrap();
+        std::fs::write(&fork_path, newer).unwrap();
+
+        let err = slot
+            .rekey(ForkRekey {
+                original_instance_id: Some(original_id.clone()),
+                fork_instance_id: fork_id.clone(),
+            })
+            .await
+            .unwrap_err();
+        let chain = format!("{err:#}");
+
+        assert!(
+            chain.contains(
+                "The fork's sent-threads list could not be opened, so the node still serves the original instance and its grants. Move the fork's sent-threads file named below aside, then fork again."
+            ),
+            "{chain}"
+        );
+        assert!(chain.contains(&fork_path.display().to_string()), "{chain}");
+        assert_eq!(started.runtime.current_instance_id(), original_id);
+        assert!(
+            started
+                .runtime
+                .serving()
+                .grants()
+                .is_granted(&peer, "docs/original.md", now)
+                .unwrap(),
+            "the original's grants are served again"
+        );
+        let threads = slot.sent_threads().unwrap();
+        assert_eq!(threads.path(), original_path);
+        assert!(threads.contains("m-original"));
+        assert!(!threads.contains("m-fork"));
+        assert_eq!(
+            std::fs::read(&fork_path).unwrap(),
+            newer,
+            "the refused file is left as it was"
+        );
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// After a re-key the tools read the fork's own sent-threads list: a thread in the
+    /// fork's file is known, one the original sent is not, and a new send records into
+    /// the fork's file.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rekey_rebinds_the_sent_threads_list_to_the_fork_instance() {
+        let started = started_runtime("node-rekey-sent-threads").await;
+        let cache_dir = started.runtime.cache_dir().to_path_buf();
+        let original_id = started.runtime.current_instance_id();
+        let fork_id = fresh_instance_id();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        slot.remember_sent_thread("m-original");
+        let fork_path = SentThreads::open(&cache_dir, &fork_id)
+            .unwrap()
+            .path()
+            .to_path_buf();
+        std::fs::create_dir_all(fork_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &fork_path,
+            br#"{"version": 1, "sent": ["m-fork"], "received": ["t-fork"]}"#,
+        )
+        .unwrap();
+
+        slot.rekey(ForkRekey {
+            original_instance_id: Some(original_id.clone()),
+            fork_instance_id: fork_id.clone(),
+        })
+        .await
+        .unwrap();
+
+        let threads = slot.sent_threads().unwrap();
+        assert_eq!(threads.path(), fork_path);
+        assert!(threads.contains("m-fork"));
+        assert!(threads.contains("t-fork"));
+        assert!(
+            !threads.contains("m-original"),
+            "a fork continues only its own threads"
+        );
+        slot.remember_sent_thread("m-new");
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&fork_path).unwrap()).unwrap();
+        assert_eq!(written["sent"], serde_json::json!(["m-fork", "m-new"]));
         assert!(slot.stop().await.unwrap());
         started.relay_handle.abort();
     }

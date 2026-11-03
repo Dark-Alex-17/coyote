@@ -13123,6 +13123,7 @@ pub(crate) mod network {
                     kind: InboundKind::Question,
                     paths: Vec::new(),
                     reason: String::new(),
+                    session_thread: String::new(),
                 },
                 now,
             )
@@ -13141,6 +13142,7 @@ pub(crate) mod network {
                     kind: InboundKind::Access,
                     paths: vec!["docs/theirs.md".to_string()],
                     reason: "theirs".to_string(),
+                    session_thread: String::new(),
                 },
                 now,
             )

@@ -596,6 +596,69 @@ fn the_mesh_page_carries_the_send_ask_and_collect_one_liners_the_declarations_op
     }
 }
 
+/// The `thread` argument both send tools share says to omit it for a new conversation
+/// and that any other value than a continued thread is refused; the Mesh page's
+/// `mesh__send` row says the same of its `thread` cell, the `mesh__ask` row points its
+/// `thread` at that cell, and the paragraph under the table names the `unknown_thread`
+/// kind the refusal carries. The code side is checked on every run.
+#[test]
+fn the_mesh_page_says_a_thread_is_omitted_to_start_and_anything_else_is_refused() {
+    let declarations = fn_body("src/function/mesh.rs", "mesh_function_declarations");
+    let (_, thread_schema) = declarations
+        .split_once("let thread_schema = JsonSchema {")
+        .expect("mesh_function_declarations declares thread_schema");
+    let description = thread_schema
+        .split_once("description: Some(\"")
+        .and_then(|(_, rest)| rest.split_once("\".into())"))
+        .map(|(description, _)| description)
+        .expect("thread_schema has a description");
+    let rule = "Omit for a new conversation; reuse the thread that came back in the reply to continue. A thread shown on a received message continues it too; any other value is refused.";
+    assert!(
+        description.contains(rule),
+        "thread_schema does not say {rule:?}: {description}"
+    );
+    let kinds = read(repo_root().join("src/mesh/message.rs"));
+    assert!(
+        kinds.contains("Self::UnknownThread(_) => \"unknown_thread\","),
+        "SendError::UnknownThread does not carry the kind unknown_thread"
+    );
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Mesh.md"));
+    let row = page
+        .lines()
+        .find(|line| line.starts_with("| `mesh__send`"))
+        .expect("Mesh.md has a mesh__send row");
+    let arguments = &table_cells(row)[1];
+    let thread_cell = arguments
+        .split_once("`thread` (")
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .map(|(cell, _)| cell.to_lowercase())
+        .unwrap_or_else(|| panic!("the mesh__send row does not describe `thread`: {row}"));
+    for clause in ["omit for a new conversation", "any other value is refused"] {
+        assert!(
+            thread_cell.contains(clause),
+            "the mesh__send row's `thread` cell does not say {clause:?}: {row}"
+        );
+    }
+    let ask_row = page
+        .lines()
+        .find(|line| line.starts_with("| `mesh__ask`"))
+        .expect("Mesh.md has a mesh__ask row");
+    assert!(
+        ask_row.contains("`thread` (as for `mesh__send`)"),
+        "the mesh__ask row does not point its `thread` at mesh__send: {ask_row}"
+    );
+    let flattened = flat(&page);
+    let (_, under_table) = flattened
+        .split_once("`thread` continues a conversation; it is never made up.")
+        .expect("Mesh.md has the thread paragraph under the tools table");
+    let paragraph = under_table.split("In one line each:").next().unwrap();
+    assert!(
+        paragraph.contains("`kind: unknown_thread`"),
+        "the thread paragraph does not name unknown_thread: {paragraph}"
+    );
+}
+
 /// `mesh__peers` reports `compatibility` by the two words `Compatibility::status_word`
 /// returns, with `compatibility_note` beside an incompatible one, and the Mesh page's
 /// peers row says so. The code side is checked on every run.

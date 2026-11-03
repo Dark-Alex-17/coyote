@@ -803,6 +803,7 @@ impl AccessSurface for MeshSlot {
             kind: InboundKind::Access,
             paths: request.paths.clone(),
             reason: request.reason.clone(),
+            session_thread: String::new(),
         };
         // The rule is judged and the record filed under one lock, so a burst of
         // requests from one identity cannot each see the cap unreached and all be filed.
@@ -1892,6 +1893,7 @@ mod tests {
             kind: InboundKind::Question,
             paths: Vec::new(),
             reason: String::new(),
+            session_thread: String::new(),
         }
     }
 

@@ -434,6 +434,7 @@ impl BareSlot {
                     kind: InboundKind::Question,
                     paths: Vec::new(),
                     reason: String::new(),
+                    session_thread: String::new(),
                 },
                 SystemTime::now(),
             )

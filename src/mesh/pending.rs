@@ -64,11 +64,12 @@ impl PendingState {
     }
 }
 
-/// One line of `pending-<instance_id>.jsonl`. Unknown fields are rejected, so any change
-/// to the layout, a field added included, bumps `PENDING_RECORD_VERSION` and a reader
-/// refuses the whole file on a version it does not write. `reply` is the exception,
-/// carried with `#[serde(default)]` and skipped when `None`: a line without one loads as
-/// a question not yet answered.
+/// One line of `pending-<instance_id>.jsonl`. Unknown fields are rejected, so any layout
+/// change bumps `PENDING_RECORD_VERSION` and a reader refuses the whole file on a version
+/// it does not write. The one exception is a field added with `#[serde(default)]`, which
+/// keeps the version because a line written without it still loads: `reply` is such a
+/// field, skipped when `None`, and a line without one loads as a question not yet
+/// answered.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PendingRecord {
@@ -311,9 +312,10 @@ pub(crate) fn question_not_an_access_request(id: &str) -> String {
 
 /// One line of `inbound-<instance_id>.jsonl`. Same on-disk discipline as
 /// `PendingRecord`: unknown fields are rejected and any layout change bumps
-/// `INBOUND_RECORD_VERSION`. `kind`, `paths` and `reason` are the exception, carried
-/// with `#[serde(default)]`: a version 2 line without them loads as a question with no
-/// paths and no reason.
+/// `INBOUND_RECORD_VERSION`, except a field added with `#[serde(default)]`, which keeps
+/// the version. `kind`, `paths`, `reason` and `session_thread` are such fields: a
+/// version 2 line without them loads as a question with no paths, no reason and no
+/// envoy session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct InboundRecord {
@@ -339,6 +341,10 @@ pub(crate) struct InboundRecord {
     pub paths: Vec<String>,
     #[serde(default)]
     pub reason: String,
+    /// The envoy memory session the run that escalated this question wrote to, so a
+    /// late answer lands there. Empty when memory was off or the record predates it.
+    #[serde(default)]
+    pub session_thread: String,
 }
 
 impl InboundRecord {
@@ -1043,6 +1049,16 @@ impl Correlations {
             .map(|entry| entry.record.thread.clone())
     }
 
+    /// Whether any question in flight was asked in `thread`, which makes it a thread
+    /// this node may continue.
+    pub(crate) fn knows_thread(&self, thread: &str) -> bool {
+        self.state
+            .lock()
+            .entries
+            .values()
+            .any(|entry| entry.record.thread == thread)
+    }
+
     /// Every question in flight, newest first by `sent_at`.
     pub(crate) fn list(&self) -> Vec<Correlation> {
         let mut entries: Vec<Correlation> = self.state.lock().entries.values().cloned().collect();
@@ -1448,6 +1464,7 @@ mod tests {
             kind: InboundKind::Question,
             paths: Vec::new(),
             reason: String::new(),
+            session_thread: String::new(),
         }
     }
 
@@ -1468,6 +1485,7 @@ mod tests {
             store.upsert(inbound("new", t(base)), t(base)).unwrap();
             let mut proposed = inbound("old", t(base - 10));
             proposed.envoy_question = "second thoughts".into();
+            proposed.session_thread = "old-session".into();
             store.upsert(proposed, t(base)).unwrap();
         }
 
@@ -1483,6 +1501,7 @@ mod tests {
             "an upsert keeps its place"
         );
         assert_eq!(listed[1].envoy_question, "second thoughts");
+        assert_eq!(listed[1].session_thread, "old-session");
         assert_eq!(store.get("old").unwrap(), Some(listed[1].clone()));
         assert!(
             InboundStore::new(&tmp.path, "inst-b")
@@ -1990,7 +2009,7 @@ mod tests {
         let store = InboundStore::new(&tmp.path, "inst");
         let mut question = serde_json::to_value(inbound("q", t(1_000))).unwrap();
         let fields = question.as_object_mut().unwrap();
-        for placeholder in ["kind", "paths", "reason"] {
+        for placeholder in ["kind", "paths", "reason", "session_thread"] {
             assert!(fields.remove(placeholder).is_some());
         }
         assert_eq!(
@@ -2010,6 +2029,7 @@ mod tests {
         assert_eq!(listed[1].kind, InboundKind::Question);
         assert!(listed[1].paths.is_empty());
         assert!(listed[1].reason.is_empty());
+        assert!(listed[1].session_thread.is_empty());
         assert_eq!(listed[0].kind, InboundKind::Access);
         assert_eq!(listed[0].paths, vec!["src/x.rs".to_string()]);
         assert_eq!(listed[0].reason, "need it");
@@ -2793,10 +2813,16 @@ mod tests {
             .unwrap();
         assert_eq!(correlations.thread_of("q1"), Some("t-root".to_string()));
         assert_eq!(correlations.thread_of("nope"), None);
+        assert!(correlations.knows_thread("t-root"));
+        assert!(
+            !correlations.knows_thread("q1"),
+            "a question asked in another thread does not name its own id"
+        );
         InboundStore::new(&tmp.path, "inst")
             .upsert(
                 InboundRecord {
                     thread: "t-in".into(),
+                    session_thread: "t-session".into(),
                     ..inbound("peer-q", now)
                 },
                 now,
@@ -2809,14 +2835,13 @@ mod tests {
             .unwrap();
         assert_eq!(reopened.get("q1").unwrap().record.thread, "t-root");
         assert_eq!(reopened.thread_of("q1"), Some("t-root".to_string()));
-        assert_eq!(
-            InboundStore::new(&tmp.path, "inst")
-                .get("peer-q")
-                .unwrap()
-                .unwrap()
-                .thread,
-            "t-in"
-        );
+        assert!(reopened.knows_thread("t-root"));
+        let filed = InboundStore::new(&tmp.path, "inst")
+            .get("peer-q")
+            .unwrap()
+            .unwrap();
+        assert_eq!(filed.thread, "t-in");
+        assert_eq!(filed.session_thread, "t-session");
     }
 
     #[test]
