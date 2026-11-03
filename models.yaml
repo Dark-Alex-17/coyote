@@ -923,9 +923,9 @@
   - name: gemma-4-26b-a4b-it
     type: chat
     max_input_tokens: 262144
-    input_price: 0.064
-    output_price: 0.193
-    cache_read_price: 0.032
+    input_price: 0.08
+    output_price: 0.241
+    cache_read_price: 0.04
     max_output_tokens: 32768
     supports_vision: true
     supports_function_calling: true
@@ -6562,6 +6562,7 @@
     max_input_tokens: 131072
     input_price: 0.5
     output_price: 2.0
+    cache_read_price: 0.07
     max_output_tokens: 32768
     supports_function_calling: true
   - name: qwen3-next-80b-a3b-thinking
@@ -8044,9 +8045,9 @@
   - name: deepseek/deepseek-v4-flash-0731
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.119
-    output_price: 0.238
-    cache_read_price: 0.0238
+    input_price: 0.059
+    output_price: 0.3
+    cache_read_price: 0.035
     max_output_tokens: 943718
     supports_function_calling: true
   - name: deepseek/deepseek-v4-flash-vision-exp
@@ -8483,9 +8484,9 @@
   - name: google/gemma-4-26b-a4b-it
     type: chat
     max_input_tokens: 262144
-    input_price: 0.064
-    output_price: 0.193
-    cache_read_price: 0.032
+    input_price: 0.08
+    output_price: 0.241
+    cache_read_price: 0.04
     max_output_tokens: 32768
     supports_vision: true
     supports_function_calling: true
@@ -8671,9 +8672,10 @@
   - name: meta-llama/llama-3.3-70b-instruct
     type: chat
     max_input_tokens: 131072
-    input_price: 0.1
-    output_price: 0.32
-    max_output_tokens: 16384
+    input_price: 0.2
+    output_price: 0.52
+    cache_read_price: 0.1
+    max_output_tokens: 128000
     supports_function_calling: true
   - name: meta-llama/llama-4-maverick
     type: chat
@@ -8841,9 +8843,9 @@
   - name: minimax/minimax-m3.1-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.15
-    output_price: 0.6
-    cache_read_price: 0.015
+    input_price: 0.075
+    output_price: 0.3
+    cache_read_price: 0.0075
     max_output_tokens: 524288
     supports_vision: true
     supports_function_calling: true
@@ -9139,18 +9141,6 @@
     max_output_tokens: 235929
     supports_vision: true
     supports_function_calling: true
-  - name: nousresearch/hermes-3-llama-3.1-405b
-    type: chat
-    max_input_tokens: 131072
-    input_price: 1.0
-    output_price: 1.0
-    max_output_tokens: 16384
-  - name: nousresearch/hermes-3-llama-3.1-70b
-    type: chat
-    max_input_tokens: 131072
-    input_price: 0.7
-    output_price: 0.7
-    max_output_tokens: 16384
   - name: nousresearch/hermes-4-405b
     type: chat
     max_input_tokens: 131072
@@ -10483,8 +10473,8 @@
   - name: qwen/qwen3-coder-30b-a3b-instruct
     type: chat
     max_input_tokens: 262144
-    input_price: 0.07
-    output_price: 0.28
+    input_price: 0.15
+    output_price: 0.6
     max_output_tokens: 235929
     supports_function_calling: true
   - name: qwen/qwen3-coder-flash
@@ -10507,9 +10497,10 @@
   - name: qwen/qwen3-next-80b-a3b-instruct
     type: chat
     max_input_tokens: 262144
-    input_price: 0.09
+    input_price: 0.1
     output_price: 1.1
-    max_output_tokens: 16384
+    cache_read_price: 0.07
+    max_output_tokens: 235929
     supports_function_calling: true
   - name: qwen/qwen3-vl-235b-a22b-instruct
     type: chat
@@ -11262,7 +11253,16 @@
     max_input_tokens: 1048576
     input_price: 0.37
     output_price: 1.25
-    cache_read_price: 0.09
+    cache_read_price: 0.075
+    max_output_tokens: 131072
+    supports_vision: true
+    supports_function_calling: true
+  - name: z-ai/glm-5.3-flashx-legal
+    type: chat
+    max_input_tokens: 1048576
+    input_price: 0.37
+    output_price: 1.25
+    cache_read_price: 0.075
     max_output_tokens: 131072
     supports_vision: true
     supports_function_calling: true
@@ -11449,6 +11449,7 @@
     input_price: 2.0
     output_price: 6.0
     cache_read_price: 0.5
+    cache_write_price: 0.0
     max_output_tokens: 450000
     supports_vision: true
     supports_function_calling: true
