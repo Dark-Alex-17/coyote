@@ -228,20 +228,15 @@ pub async fn run_loader_command(
     debug!("run `{cmd_eval}`");
     let (cmd, args) = cmd_args.split_at(1);
     let cmd = &cmd[0];
-    // A loader needs nothing from the keyboard, so under the TUI it runs
-    // with stdin closed rather than inheriting the raw tty the event
-    // stream is reading.
-    let stdin = if crate::tui::active() {
-        Stdio::null()
-    } else {
-        Stdio::inherit()
-    };
     if use_stdout {
-        let (status, stdout, stderr) = run_command_with_output_interruptible(cmd, args, stdin)
-            .await
-            .with_context(|| {
-                format!("Unable to run `{cmd_eval}`, Perhaps '{cmd}' is not installed?")
-            })?;
+        // A loader read through its stdout needs nothing from the
+        // keyboard: stdin is closed, as `Command::output` always did.
+        let (status, stdout, stderr) =
+            run_command_with_output_interruptible(cmd, args, Stdio::null())
+                .await
+                .with_context(|| {
+                    format!("Unable to run `{cmd_eval}`, Perhaps '{cmd}' is not installed?")
+                })?;
         if status != 0 {
             let err = if !stderr.is_empty() {
                 stderr
@@ -252,6 +247,14 @@ pub async fn run_loader_command(
         }
         Ok(stdout)
     } else {
+        // A file-writing loader keeps the REPL's inherited stdin; under
+        // the TUI it runs with stdin closed rather than inheriting the
+        // raw tty the event stream is reading.
+        let stdin = if crate::tui::active() {
+            Stdio::null()
+        } else {
+            Stdio::inherit()
+        };
         let status = wait_for_status_interruptible(cmd, args, stdin)
             .await
             .with_context(|| {
@@ -458,6 +461,29 @@ mod tests {
             pid_file.display()
         );
         assert_aborted_loader_is_reaped(&loader, &pid_file).await;
+    }
+
+    /// A stdout loader never inherits the terminal's stdin, in the REPL
+    /// as well as under the UI: a loader that reads `-` after its file
+    /// sees EOF at once instead of waiting on the keyboard.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stdout_loader_reads_eof_from_stdin() {
+        let input = temp_file("-loader-input-", ".txt");
+        std::fs::write(&input, "from the file q2m\n").unwrap();
+        let loaded = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_loader_command(
+                input.to_str().unwrap(),
+                "txt",
+                "sh -c 'cat \"$1\" -' loader",
+            ),
+        )
+        .await
+        .expect("the loader waited on stdin")
+        .unwrap();
+        let _ = std::fs::remove_file(&input);
+        assert_eq!(loaded, "from the file q2m\n");
     }
 
     #[cfg(unix)]
