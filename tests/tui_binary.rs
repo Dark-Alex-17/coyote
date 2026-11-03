@@ -322,6 +322,10 @@ fn signal_leaves_the_tty_cooked(scenario: &str, signal: libc::c_int) {
 /// printed, or the message lands on a screen that is about to vanish.
 #[test]
 #[serial]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "the panic hook is compiled out of release builds"
+)]
 fn a_panic_after_entering_the_alternate_screen_still_restores_the_tty() {
     let dir = fresh_config_dir("panic");
     let _guard = TempDirGuard(dir.clone());
@@ -2190,6 +2194,10 @@ fn a_streamed_reply_is_painted_before_the_stream_ends() {
 /// leaves the alternate screen or disables bracketed paste a second time.
 #[test]
 #[serial]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "the panic hook is compiled out of release builds"
+)]
 fn a_panic_at_start_leaves_the_alternate_screen_exactly_once() {
     let dir = fresh_config_dir("panic-once");
     let _guard = TempDirGuard(dir.clone());
