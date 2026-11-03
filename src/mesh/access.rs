@@ -5475,6 +5475,9 @@ mod tests {
             AccessError::Invalid("a path is not a wire path"),
             AccessError::NotFiled("the pending store is read-only".to_string()),
             AccessError::Refused(RefusalCode::InvalidData),
+            AccessError::Throttled {
+                destination: destination(),
+            },
             AccessError::NotServed(DispatchError::NoProvider {
                 path: ACCESS_PATH.to_string(),
             }),

@@ -523,12 +523,11 @@ async fn sync_outcome(
 /// Knock, reply and access lines are never folded into a summary: each is bounded
 /// upstream and carries something a fold would lose, a line the peer cannot earn again.
 /// A knock surfaces once per instance of an identity until the owner acts on that
-/// identity, only for an identity already
-/// trusted at the identity tier (`KnockGate::admit` drops unknown ones), and its line
-/// carries the full hash the `.mesh trust` hint needs. A reply answers a question this
-/// node asked, so replies are bounded by our own asks. An access request is capped per
-/// identity (`ACCESS_MAX_PENDING_PER_IDENTITY`) and its line carries the id the grant
-/// verb needs.
+/// identity, only for an identity already trusted at the identity tier
+/// (`KnockGate::admit` drops unknown ones), and its line carries the full hash the
+/// `.mesh trust` hint needs. A reply answers a question this node asked, so replies are
+/// bounded by our own asks. An access request is capped per identity
+/// (`ACCESS_MAX_PENDING_PER_IDENTITY`) and its line carries the id the grant verb needs.
 fn exempt_from_folding(source: Source) -> bool {
     matches!(source, Source::Knock | Source::Reply | Source::Access)
 }

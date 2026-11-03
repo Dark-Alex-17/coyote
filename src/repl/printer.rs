@@ -161,24 +161,38 @@ fn wrap_rows(lines: &[String], prefix: &str, width: usize) -> Vec<String> {
 }
 
 /// `body` broken at spaces into pieces no wider than `width` columns; the space a
-/// break lands on is dropped. A word wider than `width` starts its own piece and is
-/// split between characters.
+/// break lands on is dropped, and so are the spaces that would open the next piece, so
+/// a run of spaces never yields a blank row. A word wider than `width` starts its own
+/// piece and is split between characters.
 fn wrap_body(body: &str, width: usize) -> Vec<String> {
     let mut pieces = Vec::new();
     let mut piece = String::new();
     let mut piece_width = 0;
+    let mut opens_a_row = false;
     for (index, word) in body.split(' ').enumerate() {
+        if opens_a_row && word.is_empty() {
+            continue;
+        }
         let word_width = display_width(word);
-        if index > 0 {
+        if index > 0 && !opens_a_row {
             if piece_width + 1 + word_width <= width {
                 piece.push(' ');
                 piece.push_str(word);
                 piece_width += 1 + word_width;
                 continue;
             }
-            pieces.push(std::mem::take(&mut piece));
+            let kept = piece.trim_end();
+            if !kept.is_empty() {
+                pieces.push(kept.to_string());
+            }
+            piece.clear();
             piece_width = 0;
+            if word.is_empty() {
+                opens_a_row = true;
+                continue;
+            }
         }
+        opens_a_row = false;
         for c in word.chars() {
             let w = c.width().unwrap_or(0);
             if piece_width + w > width && !piece.is_empty() {
@@ -189,7 +203,9 @@ fn wrap_body(body: &str, width: usize) -> Vec<String> {
             piece_width += w;
         }
     }
-    pieces.push(piece);
+    if pieces.is_empty() || !piece.is_empty() {
+        pieces.push(piece);
+    }
     pieces
 }
 
@@ -623,6 +639,21 @@ mod tests {
         for lines in [vec![format!("{prefix} short")], vec![prefix.to_string()]] {
             assert_eq!(wrap_rows(&lines, prefix, 79), lines);
         }
+    }
+
+    #[test]
+    fn wrap_turns_no_run_of_spaces_into_a_blank_row_or_a_leading_space() {
+        assert_eq!(wrap_body(" abcdefgh", 5), ["abcde", "fgh"]);
+        assert_eq!(wrap_body("abc      def", 4), ["abc", "def"]);
+        let prefix = Source::Mesh.prefix();
+        assert_eq!(
+            wrap_rows(
+                &[format!("{prefix} one  two   three    four")],
+                prefix,
+                MIN_WRAP_WIDTH
+            ),
+            ["[mesh] one  two", "       three", "       four"]
+        );
     }
 
     mod idle_wrap_tests {

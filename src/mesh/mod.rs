@@ -239,7 +239,10 @@ pub(crate) fn capped_peer_text(text: &str, budget: usize) -> Option<CappedText> 
         None => &clean[..end],
     };
     Some(CappedText {
-        text: format!("{}{CUT_MARKER}", kept.trim_end().trim_end_matches('.')),
+        text: format!(
+            "{}{CUT_MARKER}",
+            kept.trim_end().trim_end_matches('.').trim_end()
+        ),
         cut: true,
     })
 }
@@ -1743,6 +1746,13 @@ mod tests {
             assert_eq!(capped.text, format!("{}...", long_words(13)));
             assert!(!capped.text.contains("...."), "{:?}", capped.text);
             let capped = capped_peer_text("abcd... efgh", 8).unwrap();
+            assert_eq!(capped.text, "abcd...");
+        }
+
+        #[test]
+        fn a_period_after_a_space_leaves_no_space_before_the_marker() {
+            let capped = capped_peer_text("abcd . efghij", 7).unwrap();
+            assert!(capped.cut);
             assert_eq!(capped.text, "abcd...");
         }
     }
