@@ -716,6 +716,30 @@ fn the_mesh_page_describes_the_count_on_a_folded_notification() {
     );
 }
 
+/// The envoy's behaviour depends on its model, and a provider can refuse a question
+/// outright; the Mesh page's `envoy_model` paragraph says so and quotes the words the
+/// peer then hears. The code side is checked on every run.
+#[test]
+fn the_mesh_page_says_envoy_behaviour_varies_by_model_and_what_a_refusal_sends() {
+    let envoy = read(repo_root().join("src/config/mesh_envoy.rs"));
+    assert!(
+        envoy.contains("PROVIDER_REFUSAL_TEXT: &str = \"the envoy declined to answer\";"),
+        "the provider refusal reply text changed; update Mesh.md and this test"
+    );
+    let Some(wiki) = wiki_dir() else { return };
+    let page = flat(&read(wiki.join("Mesh.md")));
+    for sentence in [
+        "`envoy_model` sets the model the envoy answers with; it never follows a `.model` switch. Behaviour varies by model:",
+        "a cautious model escalates more, and a provider may refuse a question outright (the peer then hears `the envoy declined to answer`).",
+        "If the default model refuses or over-escalates, point `envoy_model` at a cheaper model or one from another provider.",
+    ] {
+        assert!(
+            page.contains(sentence),
+            "Mesh.md's envoy_model paragraph does not say {sentence:?}"
+        );
+    }
+}
+
 /// The one format literal of the marker function `name` in `src/utils/untrusted_content.rs`,
 /// its `{}` placeholder replaced by `placeholder`. The four marker functions there must
 /// each keep exactly one `"..."` literal with one `{}`, since this is how the pages are
