@@ -5706,7 +5706,7 @@ pub(crate) mod network {
             (
                 notes[0].source,
                 notes[0].origin.clone(),
-                notes[0].text.clone(),
+                notes[0].text.plain(),
             )
         }
     }
@@ -5896,7 +5896,7 @@ pub(crate) mod network {
             assert_eq!(notes[0].source, Source::Knock);
             assert_eq!(notes[0].origin, Origin::Peer(b_identity[..8].to_string()));
             assert!(notes[0].model_note.is_none());
-            let text = &notes[0].text;
+            let text = notes[0].text.plain();
             assert!(text.contains(&format!("(identity {b_identity})")), "{text}");
             assert!(
                 text.contains(&format!("knocks from instance {b_instance}: \"hello\"")),
@@ -6568,7 +6568,7 @@ pub(crate) mod network {
             assert_eq!(notes.len(), 1, "{notes:#?}");
             assert_eq!(notes[0].source, Source::Mesh);
             assert_eq!(notes[0].origin, Origin::Peer(b_identity[..8].to_string()));
-            let text = &notes[0].text;
+            let text = notes[0].text.plain();
             assert!(text.starts_with("warning: "), "{text}");
             assert!(text.contains("is served while it asks"), "{text}");
             assert!(
@@ -6651,7 +6651,7 @@ pub(crate) mod network {
             let notes = idle.0.lock();
             assert_eq!(notes.len(), 1, "no knock is filed: {notes:#?}");
             assert_eq!(notes[0].source, Source::Mesh);
-            let text = &notes[0].text;
+            let text = notes[0].text.plain();
             assert!(text.starts_with("error: "), "{text}");
             assert!(text.contains("is refused when it asks"), "{text}");
             assert!(
@@ -6719,7 +6719,7 @@ pub(crate) mod network {
             assert_eq!(notes.len(), 1, "{notes:#?}");
             assert_eq!(notes[0].source, Source::Mesh);
             assert_eq!(notes[0].origin, Origin::Peer(b_identity[..8].to_string()));
-            let text = &notes[0].text;
+            let text = notes[0].text.plain();
             assert!(text.starts_with("warning: "), "{text}");
             assert!(text.contains(&earlier.to_hex_string()), "{text}");
             assert!(text.contains(&b_identity), "{text}");
@@ -6795,7 +6795,7 @@ pub(crate) mod network {
             assert_eq!(notes.len(), 1, "{notes:#?}");
             assert_eq!(notes[0].source, Source::Mesh);
             assert_eq!(notes[0].origin, Origin::Peer(b_identity[..8].to_string()));
-            let text = &notes[0].text;
+            let text = notes[0].text.plain();
             assert!(text.starts_with("error: "), "{text}");
             assert!(text.contains(&earlier.to_hex_string()), "{text}");
             assert!(text.contains(&b_identity), "{text}");
@@ -6916,7 +6916,7 @@ pub(crate) mod network {
         .unwrap_err();
         assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
         assert_eq!(fs::read(&trust_path).unwrap(), before);
-        let line = idle.0.lock()[0].text.clone();
+        let line = idle.0.lock()[0].text.plain();
         assert!(line.starts_with("error: "), "{line}");
         assert!(
             line.contains(&format!(".mesh trust {b_instance}")),
@@ -7018,9 +7018,10 @@ pub(crate) mod network {
         {
             let notes = idle.0.lock();
             assert_eq!(notes.len(), 1, "{notes:#?}");
-            assert!(notes[0].text.starts_with("error: "), "{}", notes[0].text);
+            let text = notes[0].text.plain();
+            assert!(text.starts_with("error: "), "{text}");
             assert!(
-                notes[0].text.contains("is refused when it asks"),
+                text.contains("is refused when it asks"),
                 "{}",
                 notes[0].text
             );
@@ -7164,7 +7165,7 @@ pub(crate) mod network {
         .await;
         wait_until("the warning to surface", || !idle.0.lock().is_empty()).await;
         assert_eq!(idle.0.lock().len(), 1, "{:#?}", idle.0.lock());
-        assert!(idle.0.lock()[0].text.starts_with("warning: "));
+        assert!(idle.0.lock()[0].text.plain().starts_with("warning: "));
         let marked_at = fs::metadata(&trust_path).unwrap().modified().unwrap();
         tokio::time::sleep(Duration::from_millis(30)).await;
 
@@ -7276,7 +7277,7 @@ pub(crate) mod network {
         {
             let notes = idle.0.lock();
             assert_eq!(notes.len(), 1, "{notes:#?}");
-            let text = &notes[0].text;
+            let text = notes[0].text.plain();
             assert!(text.starts_with("error: "), "{text}");
             assert!(text.contains(&b_identity), "names the peer: {text}");
             assert!(
@@ -7382,7 +7383,7 @@ pub(crate) mod network {
         );
         wait_until("the error to surface", || !idle.0.lock().is_empty()).await;
         assert_eq!(idle.0.lock().len(), 1, "{:#?}", idle.0.lock());
-        assert!(idle.0.lock()[0].text.starts_with("error: "));
+        assert!(idle.0.lock()[0].text.plain().starts_with("error: "));
         pair.stop_node_a().await;
     }
 
@@ -7433,7 +7434,7 @@ pub(crate) mod network {
             assert_eq!(notes.len(), 1, "{notes:#?}");
             assert_eq!(notes[0].source, Source::Mesh);
             assert_eq!(notes[0].origin, Origin::Peer(b_identity[..8].to_string()));
-            let text = &notes[0].text;
+            let text = notes[0].text.plain();
             assert!(text.starts_with("error: "), "{text}");
             assert!(text.contains(&b_identity), "names the stranger: {text}");
             assert!(
@@ -7555,7 +7556,7 @@ pub(crate) mod network {
             let notes = idle.0.lock();
             assert_eq!(notes.len(), 1, "{notes:#?}");
             assert_eq!(notes[0].origin, Origin::Peer(b_identity[..8].to_string()));
-            let text = &notes[0].text;
+            let text = notes[0].text.plain();
             assert!(text.starts_with("error: "), "{text}");
             assert!(text.contains(&earlier.to_hex_string()), "{text}");
             assert!(text.contains(&b_identity), "{text}");
@@ -9466,7 +9467,7 @@ pub(crate) mod network {
             assert_eq!(lines[0].source, Source::Message);
             assert_eq!(lines[0].origin, Origin::Peer(b_identity[..8].to_string()));
             assert_eq!(
-                lines[0].text,
+                lines[0].text.plain(),
                 format!("{} says: hello from B", &b_instance[..8]),
                 "B never announced a name, so its instance names it"
             );
@@ -9792,7 +9793,7 @@ pub(crate) mod network {
         assert_eq!(refused, RequestError::Refused(RefusalCode::Throttled));
         assert!(envoy.job_ids().is_empty());
         nothing_filed(&pair, &slot);
-        let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.clone()).collect();
+        let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.plain()).collect();
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains("peer_concurrency"), "{lines:?}");
 
@@ -9827,7 +9828,7 @@ pub(crate) mod network {
         assert_eq!(refused, RequestError::Refused(RefusalCode::Throttled));
         sleep(Duration::from_millis(500)).await;
         nothing_filed(&pair, &slot);
-        let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.clone()).collect();
+        let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.plain()).collect();
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains("envoy_busy"), "{lines:?}");
         pair.stop_node_a().await;
@@ -9856,7 +9857,7 @@ pub(crate) mod network {
         assert!(envoy.job_ids().is_empty());
         sleep(Duration::from_millis(500)).await;
         nothing_filed(&pair, &slot);
-        let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.clone()).collect();
+        let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.plain()).collect();
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains("token_ceiling"), "{lines:?}");
         pair.stop_node_a().await;
@@ -9911,7 +9912,7 @@ pub(crate) mod network {
                 outcome
             );
         }
-        let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.clone()).collect();
+        let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.plain()).collect();
         assert!(
             lines.iter().all(|line| !line.contains("refus")),
             "{lines:?}"
@@ -9976,7 +9977,7 @@ pub(crate) mod network {
         assert!(envoy.job_ids().is_empty());
         sleep(Duration::from_millis(500)).await;
         nothing_filed(&pair, &slot);
-        let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.clone()).collect();
+        let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.plain()).collect();
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].contains("cost_ceiling"), "{lines:?}");
         assert!(lines[0].contains("refused on its link"), "{lines:?}");
@@ -10033,7 +10034,7 @@ pub(crate) mod network {
                 .messages,
             1
         );
-        let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.clone()).collect();
+        let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.plain()).collect();
         assert!(
             lines.iter().all(|line| !line.contains("refus")),
             "{lines:?}"
@@ -10108,7 +10109,7 @@ pub(crate) mod network {
             2,
             "the bulletin and the notice are counted; the reply and the refused question are not"
         );
-        let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.clone()).collect();
+        let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.plain()).collect();
         let refusals: Vec<&String> = lines.iter().filter(|line| line.contains("refus")).collect();
         assert_eq!(refusals.len(), 1, "{lines:?}");
         assert!(refusals[0].contains("envoy_busy"), "{lines:?}");
@@ -10177,7 +10178,7 @@ pub(crate) mod network {
         );
         assert_eq!(messages(), 1, "a refused message is not counted");
         assert_eq!(pair.recorder_b.seen_count(), 0, "no reply follows the code");
-        let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.clone()).collect();
+        let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.plain()).collect();
         let refusals: Vec<&String> = lines.iter().filter(|line| line.contains("refus")).collect();
         assert_eq!(refusals.len(), 1, "{lines:?}");
         assert!(refusals[0].contains("peer_concurrency"), "{lines:?}");
@@ -10241,7 +10242,7 @@ pub(crate) mod network {
                 .messages,
             1
         );
-        let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.clone()).collect();
+        let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.plain()).collect();
         assert!(
             lines.iter().all(|line| !line.contains("refus")),
             "{lines:?}"
@@ -10278,7 +10279,7 @@ pub(crate) mod network {
             envoy.job_ids() == [message.id.clone()]
         })
         .await;
-        let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.clone()).collect();
+        let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.plain()).collect();
         assert!(
             lines.iter().all(|line| !line.contains("token_ceiling")),
             "{lines:?}"
@@ -11108,12 +11109,13 @@ pub(crate) mod network {
             assert!(
                 notes[0]
                     .text
+                    .plain()
                     .contains("asks for 1 path:\n  `src/secret.rs` (exists,"),
                 "{}",
                 notes[0].text
             );
             assert!(
-                notes[0].text.contains(".mesh grant acc-1"),
+                notes[0].text.plain().contains(".mesh grant acc-1"),
                 "{}",
                 notes[0].text
             );
@@ -12579,11 +12581,16 @@ pub(crate) mod network {
             assert!(
                 notes[0]
                     .text
+                    .plain()
                     .contains("asks for 1 path:\n  `src/secret.rs`"),
                 "{}",
                 notes[0].text
             );
-            assert!(!notes[0].text.contains("other.rs"), "{}", notes[0].text);
+            assert!(
+                !notes[0].text.plain().contains("other.rs"),
+                "{}",
+                notes[0].text
+            );
         }
         let records = slot
             .inbound_store()
@@ -12878,10 +12885,10 @@ pub(crate) mod network {
             // The reason clause: ANSI and the bell stripped, the carriage return and the
             // line feed made spaces, so the reason stays on the verbs' line and the verbs
             // are the last thing on it.
-            let (_, reason_clause) = notes[0]
-                .text
+            let text = notes[0].text.plain();
+            let (_, reason_clause) = text
                 .rsplit_once("\nreason: \"")
-                .unwrap_or_else(|| panic!("{:?}", notes[0].text));
+                .unwrap_or_else(|| panic!("{text:?}"));
             assert!(reason_clause.starts_with("need  "), "{reason_clause:?}");
             assert!(
                 reason_clause.contains(
@@ -12891,8 +12898,8 @@ pub(crate) mod network {
             );
             assert!(!reason_clause.contains("[31m"), "{reason_clause:?}");
             assert!(!reason_clause.contains('\r'), "{reason_clause:?}");
-            assert!(!notes[0].text.contains('\u{1b}'), "{:?}", notes[0].text);
-            assert!(!notes[0].text.contains('\u{7}'), "{:?}", notes[0].text);
+            assert!(!text.contains('\u{1b}'), "{text:?}");
+            assert!(!text.contains('\u{7}'), "{text:?}");
         }
 
         pair.recorder_b.queue(Script::Acknowledge);

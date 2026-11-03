@@ -3,7 +3,7 @@
 //! bounded queue. The driver loop itself lives under `src/repl/`, where it may touch the
 //! session context; nothing here does.
 
-use crate::mesh::notify::{Notification, Source};
+use crate::mesh::notify::{NoticeText, Notification, Source};
 use crate::mesh::propagation_fetch::{
     ASKED_FOR_SOURCE, FetchError, FetchReport, MAX_WANTS_PER_FETCH,
 };
@@ -51,12 +51,11 @@ pub(crate) enum Origin {
 
 /// One event for the driver. `text` is the human line; `model_note`, when present, is the
 /// same event for the model's transcript. The model note is boxed so a note handed back
-/// on overflow stays small. `verbatim` carries `Notification::verbatim` through.
+/// on overflow stays small.
 #[derive(Debug)]
 pub(crate) struct IdleNotify {
     pub(crate) source: Source,
-    pub(crate) text: String,
-    pub(crate) verbatim: Vec<usize>,
+    pub(crate) text: NoticeText,
     pub(crate) origin: Origin,
     pub(crate) model_note: Option<Box<SystemNotification>>,
 }

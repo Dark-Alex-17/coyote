@@ -14496,7 +14496,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
             impl IdleSink for Recording {
                 fn push(&self, note: IdleNotify) -> std::result::Result<(), IdleNotify> {
-                    self.0.lock().push(note.text);
+                    self.0.lock().push(note.text.plain());
                     Ok(())
                 }
 
@@ -14562,8 +14562,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert!(ctx.app.mesh.push_idle(IdleNotify {
                         source: Source::Mesh,
-                        text: "still routed".to_string(),
-                        verbatim: Vec::new(),
+                        text: "still routed".into(),
                         origin: Origin::Local,
                         model_note: None,
                     }));
@@ -15306,8 +15305,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(ctx.app.config.mesh.enabled);
                     assert!(ctx.app.mesh.push_idle(IdleNotify {
                         source: Source::Mesh,
-                        text: "routed after on".to_string(),
-                        verbatim: Vec::new(),
+                        text: "routed after on".into(),
                         origin: Origin::Local,
                         model_note: None,
                     }));

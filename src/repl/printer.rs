@@ -670,12 +670,12 @@ mod tests {
                 .map(|i| format!("word{i:07}"))
                 .collect::<Vec<_>>()
                 .join(" ");
-            escalation_line("Tia", &question, MESSAGE_ID)
+            escalation_line("Tia", &question, MESSAGE_ID).plain()
         }
 
         fn rendered_rows(source: Source, text: &str, width: usize) -> Vec<String> {
             let rendered = Notification::new(source, text).render();
-            wrap_rows(rendered.lines(), source.prefix(), width)
+            wrap_rows(&rendered.lines(), source.prefix(), width)
         }
 
         #[test]

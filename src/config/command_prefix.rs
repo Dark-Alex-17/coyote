@@ -97,12 +97,13 @@ fn is_hint_name(rest: &str) -> bool {
     len > 0 && BUILTIN_NAMES.contains(&&rest[..len]) && !continues_as_path(&rest[len..])
 }
 
-/// A builtin name followed by `/` or by `.` and more name characters is a dotfile path
-/// such as `.vault/key` or `.mcp.json`, not a command hint.
+/// A builtin name followed by a path separator, a glob star, or `.` and more name
+/// characters is a dotfile path such as `.vault/key`, `.vault\key`, `.vault*` or
+/// `.mcp.json`, not a command hint.
 fn continues_as_path(tail: &str) -> bool {
     let mut chars = tail.chars();
     match chars.next() {
-        Some('/') => true,
+        Some('/' | '\\' | '*') => true,
         Some('.') => chars
             .next()
             .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '*' | '_' | '-')),
@@ -384,13 +385,16 @@ mod tests {
     mod path_shaped_tails {
         use super::*;
 
-        const PATHS: [&str; 6] = [
+        const PATHS: [&str; 9] = [
             "allow `.vault/key`",
             "deny .vault/** for everyone",
             "wrote .session/notes.md",
             "read .info.md and .rag_v2",
             "under (.agent/tools)",
             "\".file.tar-gz\"",
+            "share .vault\\key on Windows",
+            "deny .vault* to peers",
+            "edit .mcp.json",
         ];
 
         #[test]

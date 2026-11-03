@@ -31,7 +31,7 @@ use crate::mesh::message::{
     Disposition, OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_LINE_MAX_CHARS, PEER_TITLE_MAX_CHARS,
     PENDING_FULL_TEXT_POINTER, Part, PeerKind, PeerMessage, PeerVia, SendError, is_wire_id,
 };
-use crate::mesh::notify::Source;
+use crate::mesh::notify::{NoticeText, Source};
 use crate::mesh::pending::{
     INBOUND_ENVOY_QUESTION_MAX_CHARS, INBOUND_RECORD_VERSION, InboundKind, InboundRecord,
     PENDING_QUESTION_MAX_CHARS,
@@ -1003,7 +1003,6 @@ impl EnvoyRunner {
             source: Source::Message,
             origin: Origin::Peer(short(&message.source_identity).to_string()),
             text: escalation_line(&card.who, question, &message.message_id),
-            verbatim: Vec::new(),
             model_note: None,
         });
         if let Some(hold) = hold {
@@ -1067,11 +1066,10 @@ impl EnvoyRunner {
         app.mesh.push_idle(IdleNotify {
             source: Source::Message,
             origin: Origin::Peer(short(&message.source_identity).to_string()),
-            text: format!(
-                "the envoy could not tell {} its question was escalated: {why}",
-                card.who
-            ),
-            verbatim: Vec::new(),
+            text: NoticeText::default()
+                .frame("the envoy could not tell ")
+                .peer(card.who.as_str())
+                .frame(format!(" its question was escalated: {why}")),
             model_note: None,
         });
     }
@@ -1222,11 +1220,10 @@ impl EnvoyRunner {
             app.mesh.push_idle(IdleNotify {
                 source: Source::Message,
                 origin: Origin::Peer(short(&message.source_identity).to_string()),
-                text: format!(
-                    "the envoy's reply to {} could not be sent: {why}{retry}",
-                    card.who
-                ),
-                verbatim: Vec::new(),
+                text: NoticeText::default()
+                    .frame("the envoy's reply to ")
+                    .peer(card.who.as_str())
+                    .frame(format!(" could not be sent: {why}{retry}")),
                 model_note: None,
             });
         } else if settles_question {
@@ -1431,17 +1428,42 @@ fn strip_tool_tag(question: &str) -> &str {
 /// the answer command with the whole `message_id`, whatever the question's length.
 /// `.mesh pending` is the surface: the record is filed there before this line prints,
 /// while the inbox copy lands only once the envoy run ends.
-pub(crate) fn escalation_line(who: &str, question: &str, message_id: &str) -> String {
+/// The name and the question are peer runs, printed as the peer wrote them.
+pub(crate) fn escalation_line(who: &str, question: &str, message_id: &str) -> NoticeText {
     let words = capped_peer_text(question, PEER_LINE_MAX_CHARS).unwrap_or_default();
     let pointer = if words.cut {
         format!(" {PENDING_FULL_TEXT_POINTER}")
     } else {
         String::new()
     };
-    format!(
-        "{who} asks: {}{pointer}; answer with `.mesh answer {message_id} \"<text>\"`",
-        words.text
-    )
+    NoticeText::default()
+        .peer(who)
+        .frame(" asks: ")
+        .peer(words.text)
+        .frame(format!(
+            "{pointer}; answer with `.mesh answer {message_id} \"<text>\"`"
+        ))
+}
+
+#[cfg(test)]
+mod peer_text_prefix_tests {
+    use super::*;
+    use crate::config::CommandPrefix;
+    use crate::mesh::notify::{Notification, Source};
+
+    #[test]
+    fn the_peer_question_keeps_its_bytes_while_the_hint_follows_the_prefix() {
+        let text = escalation_line(".info", "can I read .vault? please .session list", "q-1");
+        let lines = Notification::new(Source::Message, text)
+            .render()
+            .render_notification_lines(CommandPrefix::Slash);
+        assert_eq!(
+            lines,
+            [
+                "[mesh:message] .info asks: can I read .vault? please .session list; answer with `/mesh answer q-1 \"<text>\"`"
+            ]
+        );
+    }
 }
 
 /// Reads the envoy's final text as its outcome: words after a leading `REFUSED:` are a
@@ -1773,7 +1795,7 @@ mod tests {
             self.pushed
                 .lock()
                 .iter()
-                .map(|note| note.text.clone())
+                .map(|note| note.text.plain())
                 .collect()
         }
 
@@ -1897,7 +1919,7 @@ mod tests {
     #[test]
     fn the_escalation_line_keeps_the_whole_answer_command_past_a_long_question() {
         assert_eq!(
-            escalation_line("alice", "Should we merge?", "msg-esc-1"),
+            escalation_line("alice", "Should we merge?", "msg-esc-1").plain(),
             "alice asks: Should we merge?; answer with `.mesh answer msg-esc-1 \"<text>\"`"
         );
 
@@ -1909,7 +1931,8 @@ mod tests {
             .join(" ");
         assert_eq!(question.chars().count(), 359);
         assert_eq!(question.chars().nth(PEER_LINE_MAX_CHARS), Some('0'));
-        let line = escalation_line("alice", &question, "0123456789abcdef0123456789abcdef");
+        let line =
+            escalation_line("alice", &question, "0123456789abcdef0123456789abcdef").plain();
         let kept = (0..13)
             .map(|i| format!("word{i:07}"))
             .collect::<Vec<_>>()
@@ -3953,7 +3976,7 @@ mod tests {
                 .lock()
                 .upgrade()
                 .is_some_and(|runner| runner.holds(self.id));
-            self.pushed.lock().push((note.text, held));
+            self.pushed.lock().push((note.text.plain(), held));
             Ok(())
         }
 
@@ -4137,10 +4160,10 @@ mod tests {
         let pushed = idle.pushed.lock();
         let expired_at = pushed
             .iter()
-            .position(|note| note.text == expiry)
+            .position(|note| note.text.plain() == expiry)
             .unwrap_or_else(|| panic!("the expired row is announced: {pushed:?}"));
         assert_eq!(
-            pushed.iter().filter(|note| note.text == expiry).count(),
+            pushed.iter().filter(|note| note.text.plain() == expiry).count(),
             1,
             "the displaced row is announced once: {pushed:?}"
         );
@@ -4152,7 +4175,11 @@ mod tests {
         );
         let advertised_at = pushed
             .iter()
-            .position(|note| note.text.contains("`.mesh answer msg-x \"<text>\"`"))
+            .position(|note| {
+                note.text
+                    .plain()
+                    .contains("`.mesh answer msg-x \"<text>\"`")
+            })
             .unwrap();
         assert!(expired_at < advertised_at, "{pushed:?}");
         drop(pushed);

@@ -4,7 +4,10 @@
 //! merged into tool results for the model to read. Nothing here goes to the model.
 
 use crate::config::CommandPrefix;
-use crate::mesh::display_text;
+use crate::mesh::display_chars;
+
+use std::borrow::Cow;
+use std::fmt;
 
 /// Peer-supplied text reaches the terminal through this path, so both dimensions of a
 /// notification are bounded: characters per line and lines per notification.
@@ -50,33 +53,148 @@ impl Source {
     }
 }
 
+/// One run of a notification line. A sink spells the command hints of `Frame` text, the
+/// words this node writes, in the live prefix, and prints `Peer` text as it is: what a
+/// peer wrote, a path it named, or words quoted back to the person. A peer's `.vault` or
+/// `.mesh trust x` therefore reads as it was written even on a line that carries a hint.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Notification {
-    pub(crate) source: Source,
-    pub(crate) text: String,
-    /// Indices of the lines of `text` that quote peer-named paths. Sinks print them as
-    /// they are, so a path such as `.vault` is never mistaken for a command hint.
-    pub(crate) verbatim: Vec<usize>,
+pub(crate) enum NoticeSpan {
+    Frame(String),
+    Peer(String),
 }
 
-impl Notification {
-    pub(crate) fn new(source: Source, text: impl Into<String>) -> Self {
-        Self {
-            source,
-            text: text.into(),
-            verbatim: Vec::new(),
+impl NoticeSpan {
+    fn text(&self) -> &str {
+        match self {
+            Self::Frame(text) | Self::Peer(text) => text,
         }
     }
 
-    pub(crate) fn with_verbatim(
-        source: Source,
-        text: impl Into<String>,
-        verbatim: Vec<usize>,
-    ) -> Self {
+    fn with_text(&self, text: String) -> Self {
+        match self {
+            Self::Frame(_) => Self::Frame(text),
+            Self::Peer(_) => Self::Peer(text),
+        }
+    }
+
+    fn render(&self, prefix: CommandPrefix) -> Cow<'_, str> {
+        match self {
+            Self::Frame(text) => prefix.render_hints(text),
+            Self::Peer(text) => Cow::Borrowed(text),
+        }
+    }
+}
+
+/// A notification's text as runs of frame and peer text, in order. A `\n` inside any run
+/// ends the line, so one run may span lines.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct NoticeText(Vec<NoticeSpan>);
+
+impl NoticeText {
+    pub(crate) fn frame(mut self, text: impl Into<String>) -> Self {
+        self.0.push(NoticeSpan::Frame(text.into()));
+        self
+    }
+
+    pub(crate) fn peer(mut self, text: impl Into<String>) -> Self {
+        self.0.push(NoticeSpan::Peer(text.into()));
+        self
+    }
+
+    pub(crate) fn then(mut self, rest: NoticeText) -> Self {
+        self.0.extend(rest.0);
+        self
+    }
+
+    /// The text with every run joined, as the terminal shows it under the dot prefix.
+    pub(crate) fn plain(&self) -> String {
+        self.0.iter().map(NoticeSpan::text).collect()
+    }
+
+    fn lines(&self) -> Vec<Vec<NoticeSpan>> {
+        let mut lines = vec![Vec::new()];
+        for span in &self.0 {
+            for (index, piece) in span.text().split('\n').enumerate() {
+                if index > 0 {
+                    lines.push(Vec::new());
+                }
+                if !piece.is_empty()
+                    && let Some(line) = lines.last_mut()
+                {
+                    line.push(span.with_text(piece.to_string()));
+                }
+            }
+        }
+        lines
+    }
+}
+
+impl From<String> for NoticeText {
+    fn from(text: String) -> Self {
+        Self::default().frame(text)
+    }
+}
+
+impl From<&str> for NoticeText {
+    fn from(text: &str) -> Self {
+        Self::default().frame(text)
+    }
+}
+
+impl fmt::Display for NoticeText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.plain())
+    }
+}
+
+/// One line's runs cleaned as `display_text` cleans a line: each run's escapes and
+/// invisible characters gone, then the line trimmed and cut to `max_chars` as a whole.
+/// Neighbouring runs of one kind are joined. A line that cleans to nothing is `None`.
+fn clean_line(spans: &[NoticeSpan], max_chars: usize) -> Option<Vec<NoticeSpan>> {
+    let cleaned: Vec<NoticeSpan> = spans
+        .iter()
+        .map(|span| span.with_text(display_chars(span.text())))
+        .collect();
+    let joined: String = cleaned.iter().map(NoticeSpan::text).collect();
+    let start = joined.len() - joined.trim_start().len();
+    let body = joined[start..].trim_end();
+    if body.is_empty() {
+        return None;
+    }
+    let capped = match body.char_indices().nth(max_chars) {
+        Some((cut, _)) => &body[..cut],
+        None => body,
+    };
+    let end = start + capped.trim_end().len();
+    let mut kept: Vec<NoticeSpan> = Vec::new();
+    let mut at = 0;
+    for span in &cleaned {
+        let (from, to) = (at.max(start), (at + span.text().len()).min(end));
+        at += span.text().len();
+        if from >= to {
+            continue;
+        }
+        let piece = &joined[from..to];
+        match (kept.last_mut(), span) {
+            (Some(NoticeSpan::Frame(text)), NoticeSpan::Frame(_))
+            | (Some(NoticeSpan::Peer(text)), NoticeSpan::Peer(_)) => text.push_str(piece),
+            _ => kept.push(span.with_text(piece.to_string())),
+        }
+    }
+    Some(kept)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Notification {
+    pub(crate) source: Source,
+    pub(crate) text: NoticeText,
+}
+
+impl Notification {
+    pub(crate) fn new(source: Source, text: impl Into<NoticeText>) -> Self {
         Self {
             source,
             text: text.into(),
-            verbatim,
         }
     }
 
@@ -87,44 +205,47 @@ impl Notification {
     /// prefix so the event is never silent.
     #[cfg(test)]
     pub(crate) fn render_lines(&self) -> Vec<String> {
-        self.render_marked_lines()
-            .into_iter()
-            .map(|(line, _)| line)
-            .collect()
+        self.render_spans().iter().map(|line| joined(line)).collect()
     }
 
-    fn render_marked_lines(&self) -> Vec<(String, bool)> {
+    fn render_spans(&self) -> Vec<Vec<NoticeSpan>> {
         let prefix = self.source.prefix();
         // Split before sanitising: `sanitize_display_text` maps `\n` to a space.
-        let mut lines: Vec<(String, bool)> = self
+        let mut lines: Vec<Vec<NoticeSpan>> = self
             .text
-            .split('\n')
-            .enumerate()
-            .filter_map(|(index, piece)| {
-                let piece = piece.strip_suffix('\r').unwrap_or(piece);
-                display_text(piece, NOTIFICATION_LINE_MAX_CHARS)
-                    .map(|line| (format!("{prefix} {line}"), self.verbatim.contains(&index)))
+            .lines()
+            .iter()
+            .filter_map(|spans| clean_line(spans, NOTIFICATION_LINE_MAX_CHARS))
+            .map(|spans| {
+                let mut line = vec![NoticeSpan::Frame(format!("{prefix} "))];
+                line.extend(spans);
+                line
             })
             .collect();
         if lines.is_empty() {
-            return vec![(prefix.to_string(), false)];
+            return vec![vec![NoticeSpan::Frame(prefix.to_string())]];
         }
         if lines.len() > NOTIFICATION_MAX_LINES {
             let more = lines.len() - NOTIFICATION_MAX_LINES;
             lines.truncate(NOTIFICATION_MAX_LINES);
-            lines.push((format!("{prefix} (+{more} more lines)"), false));
+            lines.push(vec![NoticeSpan::Frame(format!(
+                "{prefix} (+{more} more lines)"
+            ))]);
         }
         lines
     }
 
     pub(crate) fn render(self) -> RenderedNotification {
-        let (lines, verbatim) = self.render_marked_lines().into_iter().unzip();
         RenderedNotification {
             source: self.source,
-            lines,
-            verbatim,
+            lines: self.render_spans(),
         }
     }
+}
+
+#[cfg(test)]
+fn joined(line: &[NoticeSpan]) -> String {
+    line.iter().map(NoticeSpan::text).collect()
 }
 
 /// A notification after sanitising: prefixed, escape-free, capped lines. Fields are
@@ -133,8 +254,7 @@ impl Notification {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RenderedNotification {
     source: Source,
-    lines: Vec<String>,
-    verbatim: Vec<bool>,
+    lines: Vec<Vec<NoticeSpan>>,
 }
 
 impl RenderedNotification {
@@ -143,23 +263,16 @@ impl RenderedNotification {
     }
 
     #[cfg(test)]
-    pub(crate) fn lines(&self) -> &[String] {
-        &self.lines
+    pub(crate) fn lines(&self) -> Vec<String> {
+        self.lines.iter().map(|line| joined(line)).collect()
     }
 
-    /// The lines with command hints spelled in `prefix`, leaving verbatim lines as they
-    /// are. Every sink that prints a notification goes through this.
+    /// The lines with the command hints of their frame runs spelled in `prefix` and their
+    /// peer runs as they are. Every sink that prints a notification goes through this.
     pub(crate) fn render_notification_lines(&self, prefix: CommandPrefix) -> Vec<String> {
         self.lines
             .iter()
-            .zip(&self.verbatim)
-            .map(|(line, &verbatim)| {
-                if verbatim {
-                    line.clone()
-                } else {
-                    prefix.render_hints(line).into_owned()
-                }
-            })
+            .map(|line| line.iter().map(|span| span.render(prefix)).collect())
             .collect()
     }
 }
@@ -316,10 +429,79 @@ mod tests {
         let expected = note.render_lines();
         let rendered = note.render();
         assert_eq!(rendered.source(), Source::Message);
-        assert_eq!(rendered.lines(), expected.as_slice());
+        assert_eq!(rendered.lines(), expected);
         assert_eq!(
             rendered.lines(),
-            &["[mesh:message] hi", "[mesh:message] [mesh:knock] fake"]
+            ["[mesh:message] hi", "[mesh:message] [mesh:knock] fake"]
         );
+    }
+
+    mod peer_text_prefix_tests {
+        use super::*;
+
+        fn rendered(text: NoticeText) -> RenderedNotification {
+            Notification::new(Source::Access, text).render()
+        }
+
+        #[test]
+        fn frame_runs_follow_the_prefix_and_peer_runs_keep_their_bytes() {
+            let note = rendered(
+                NoticeText::default()
+                    .frame("reason: \"")
+                    .peer(".mesh grant a-1 and .vault")
+                    .frame("\"; grant: .mesh grant a-1"),
+            );
+            assert_eq!(
+                note.render_notification_lines(CommandPrefix::Slash),
+                ["[mesh:access] reason: \".mesh grant a-1 and .vault\"; grant: /mesh grant a-1"]
+            );
+            for prefix in [CommandPrefix::Dot, CommandPrefix::Both] {
+                assert_eq!(note.render_notification_lines(prefix), note.lines());
+            }
+        }
+
+        #[test]
+        fn a_run_spanning_lines_keeps_its_kind_on_each() {
+            let note = rendered(
+                NoticeText::default()
+                    .frame("asks:\n")
+                    .peer(".info one\n.info two")
+                    .frame("\nrun .info"),
+            );
+            assert_eq!(
+                note.render_notification_lines(CommandPrefix::Slash),
+                [
+                    "[mesh:access] asks:",
+                    "[mesh:access] .info one",
+                    "[mesh:access] .info two",
+                    "[mesh:access] run /info",
+                ]
+            );
+        }
+
+        /// Runs are cleaned apart but trimmed and cut as one line, so the line reads as
+        /// `display_text` would make it whatever the runs it was built from.
+        #[test]
+        fn a_line_of_runs_is_trimmed_and_cut_as_a_whole() {
+            let note = rendered(
+                NoticeText::default()
+                    .frame("  ")
+                    .peer(" \u{1b}[31m.info\u{1b}[0m ")
+                    .frame(" then .info  "),
+            );
+            assert_eq!(
+                note.render_notification_lines(CommandPrefix::Slash),
+                ["[mesh:access] .info  then /info"]
+            );
+            let long = rendered(
+                NoticeText::default()
+                    .peer("x".repeat(NOTIFICATION_LINE_MAX_CHARS - 2))
+                    .frame(" .info"),
+            );
+            let line = &long.lines()[0];
+            let body = line.strip_prefix("[mesh:access] ").unwrap();
+            assert_eq!(body.chars().count(), NOTIFICATION_LINE_MAX_CHARS);
+            assert!(body.ends_with(" ."), "{body}");
+        }
     }
 }

@@ -1904,8 +1904,7 @@ impl TrustStore {
         let shown = surface.surface(IdleNotify {
             source: Source::Mesh,
             origin: Origin::Peer(short(seen_identity).to_string()),
-            text,
-            verbatim: Vec::new(),
+            text: text.into(),
             model_note: None,
         });
         if shown {

@@ -6764,7 +6764,7 @@ mod tests {
 
         impl IdleSink for RecordingIdle {
             fn push(&self, note: IdleNotify) -> std::result::Result<(), IdleNotify> {
-                self.0.lock().push(note.text);
+                self.0.lock().push(note.text.plain());
                 Ok(())
             }
 

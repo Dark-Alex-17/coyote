@@ -190,14 +190,7 @@ pub(crate) fn canonical_hash(text: &str) -> Option<String> {
 /// `max_chars` characters on a character boundary with no trailing whitespace. Blank text
 /// is `None`. Escapes go first so a sequence's own bytes never survive as spaces.
 pub(crate) fn display_text(text: &str, max_chars: usize) -> Option<String> {
-    let cleaned: String = sanitize_display_text(text)
-        .chars()
-        .map(|c| match c {
-            '\u{2028}' | '\u{2029}' => ' ',
-            c => c,
-        })
-        .filter(|c| !announce::is_control_or_invisible(*c) && !announce::is_variation_selector(*c))
-        .collect();
+    let cleaned = display_chars(text);
     let trimmed = cleaned.trim();
     if trimmed.is_empty() {
         return None;
@@ -207,6 +200,19 @@ pub(crate) fn display_text(text: &str, max_chars: usize) -> Option<String> {
         None => trimmed,
     };
     Some(capped.trim_end().to_string())
+}
+
+/// `display_text` before it trims and cuts, for a caller that cleans the runs of one line
+/// apart and trims the line as a whole.
+pub(crate) fn display_chars(text: &str) -> String {
+    sanitize_display_text(text)
+        .chars()
+        .map(|c| match c {
+            '\u{2028}' | '\u{2029}' => ' ',
+            c => c,
+        })
+        .filter(|c| !announce::is_control_or_invisible(*c) && !announce::is_variation_selector(*c))
+        .collect()
 }
 
 /// Peer text cut for one terminal line, and whether it was cut: a caller that appends a

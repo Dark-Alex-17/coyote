@@ -13,6 +13,7 @@ use crate::mesh::events::MeshEvent;
 use crate::mesh::inbox::InboxStaging;
 use crate::mesh::limits::PeerRefusal;
 use crate::mesh::node::MeshRuntime;
+use crate::mesh::notify::NoticeText;
 use crate::mesh::peers::PeerRecord;
 use crate::mesh::propagation::{OutboundMessage, PropagationError, PropagationOptions};
 use crate::mesh::propagation_fetch::{InboundMessage, InboundSink};
@@ -376,24 +377,32 @@ impl PeerMessage {
     /// `"<name or dest8> says|asks|replies|announces: <words>"`, one terminal line, with
     /// `(full text: .mesh inbox)` after it when the words were cut. The display name is
     /// the peer table's, cleaned again here since it is peer text too; without one the
-    /// sender is named by the short hash of its instance.
-    pub(crate) fn summary_line(&self, display_name: Option<&str>) -> String {
+    /// sender is named by the short hash of its instance. The name and the words are the
+    /// peer's runs; the rest is frame.
+    pub(crate) fn summary_line(&self, display_name: Option<&str>) -> NoticeText {
         self.summary_line_with_tail(display_name, "")
     }
 
     /// `summary_line` with `tail` between the words and the pointer, so a line that goes
     /// on after the summary still names `.mesh inbox` once and last.
-    pub(crate) fn summary_line_with_tail(&self, display_name: Option<&str>, tail: &str) -> String {
-        let who = display_name
-            .and_then(|name| display_text(name, DISPLAY_NAME_MAX_CHARS))
-            .unwrap_or_else(|| short(&self.source_destination).to_string());
+    pub(crate) fn summary_line_with_tail(
+        &self,
+        display_name: Option<&str>,
+        tail: &str,
+    ) -> NoticeText {
+        let who = match display_name.and_then(|name| display_text(name, DISPLAY_NAME_MAX_CHARS)) {
+            Some(name) => NoticeText::default().peer(name),
+            None => NoticeText::default().frame(short(&self.source_destination)),
+        };
         let words = self.capped_words(PEER_LINE_MAX_CHARS);
         let pointer = if words.cut {
             format!(" {INBOX_FULL_TEXT_POINTER}")
         } else {
             String::new()
         };
-        format!("{who} {}: {}{tail}{pointer}", self.kind.verb(), words.text)
+        who.frame(format!(" {}: ", self.kind.verb()))
+            .peer(words.text)
+            .frame(format!("{tail}{pointer}"))
     }
 
     /// The words an idle line shows for this message, cut for `budget` characters: the
@@ -2815,7 +2824,7 @@ mod tests {
         let blank = PeerMessage::new(raw("  \u{1b}[2J \n"));
         assert_eq!(blank.content, "");
         assert_eq!(
-            blank.summary_line(None),
+            blank.summary_line(None).plain(),
             format!("{} says: (no text)", &hash_of("instance")[..8])
         );
 
@@ -2835,7 +2844,7 @@ mod tests {
             content: format!("first line\nsecond {}", "w".repeat(PEER_LINE_MAX_CHARS)),
             ..raw("")
         });
-        let line = message.summary_line(Some("Bea\u{1b}[2Jtrice"));
+        let line = message.summary_line(Some("Bea\u{1b}[2Jtrice")).plain();
         assert_eq!(
             line, "Beatrice asks: first line second... (full text: .mesh inbox)",
             "the run of w's does not fit beside the first words, so the cut lands after them"
@@ -2848,7 +2857,7 @@ mod tests {
         ] {
             let message = PeerMessage::new(RawPeerMessage { kind, ..raw("yo") });
             assert_eq!(
-                message.summary_line(Some("  ")),
+                message.summary_line(Some("  ")).plain(),
                 format!("{} {verb}: yo", &hash_of("instance")[..8])
             );
         }
@@ -2857,7 +2866,7 @@ mod tests {
             ..raw("")
         });
         assert_eq!(
-            titled.summary_line(None),
+            titled.summary_line(None).plain(),
             format!("{} says: Subject", &hash_of("instance")[..8])
         );
     }
@@ -2876,7 +2885,7 @@ mod tests {
             content: long,
             ..raw("")
         });
-        let line = message.summary_line(Some("Bea"));
+        let line = message.summary_line(Some("Bea")).plain();
         assert!(line.ends_with("... (full text: .mesh inbox)"), "{line}");
         let words = line
             .strip_prefix("Bea says: ")
@@ -2900,7 +2909,7 @@ mod tests {
             content: format!("{exact}x"),
             ..raw("")
         });
-        let line = message.summary_line(Some("Bea"));
+        let line = message.summary_line(Some("Bea")).plain();
         assert_eq!(line, format!("Bea says: {exact}x"));
         assert!(!line.contains("..."));
     }
@@ -2926,7 +2935,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         assert_eq!(kept.chars().count(), PEER_TITLE_MAX_CHARS - 1);
-        let line = message.summary_line(None);
+        let line = message.summary_line(None).plain();
         assert_eq!(line, format!("{} says: {kept}", &hash_of("instance")[..8]));
         assert!(!line.contains("..."), "{line}");
 
@@ -2935,7 +2944,7 @@ mod tests {
             ..raw("")
         });
         assert_eq!(
-            short_title.summary_line(Some("Bea")),
+            short_title.summary_line(Some("Bea")).plain(),
             "Bea says: short title"
         );
 
@@ -2948,7 +2957,7 @@ mod tests {
             content: punctuated,
             ..raw("")
         });
-        let line = message.summary_line(Some("Bea"));
+        let line = message.summary_line(Some("Bea")).plain();
         assert_eq!(
             line,
             format!("Bea says: {},... (full text: .mesh inbox)", "p".repeat(150))
@@ -2966,7 +2975,7 @@ mod tests {
                 ..raw("")
             });
             assert_eq!(
-                message.summary_line(Some("Bea")),
+                message.summary_line(Some("Bea")).plain(),
                 format!("Bea says: {}... (full text: .mesh inbox)", "p".repeat(150))
             );
         }

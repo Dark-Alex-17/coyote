@@ -327,36 +327,27 @@ impl DriverLoop {
         let IdleNotify {
             source,
             text,
-            verbatim,
             origin,
             model_note,
         } = note;
         let model_note = model_note.map(|note| *note);
         match origin {
             Origin::Local => {
-                self.deliver(
-                    Notification::with_verbatim(source, text, verbatim),
-                    model_note,
-                );
+                self.deliver(Notification::new(source, text), model_note);
             }
             Origin::Peer(peer) => {
                 if exempt_from_folding(source) {
-                    self.deliver(
-                        Notification::with_verbatim(source, text, verbatim),
-                        model_note,
-                    );
+                    self.deliver(Notification::new(source, text), model_note);
                     return;
                 }
-                if self.coalescer.fold_repeat(&peer, source, &text) {
+                let line = text.plain();
+                if self.coalescer.fold_repeat(&peer, source, &line) {
                     return;
                 }
                 let now = tokio::time::Instant::now().into_std();
                 if self.rate_limiter.admit(source, now) {
-                    self.coalescer.remember_delivered(&peer, source, &text);
-                    self.deliver(
-                        Notification::with_verbatim(source, text, verbatim),
-                        model_note,
-                    );
+                    self.coalescer.remember_delivered(&peer, source, &line);
+                    self.deliver(Notification::new(source, text), model_note);
                 } else {
                     self.coalescer.fold(&peer);
                 }
@@ -650,8 +641,7 @@ mod tests {
     fn note(text: &str, model_note: Option<SystemNotification>) -> IdleNotify {
         IdleNotify {
             source: Source::Mesh,
-            text: text.to_string(),
-            verbatim: Vec::new(),
+            text: text.into(),
             origin: Origin::Local,
             model_note: model_note.map(Box::new),
         }
@@ -660,8 +650,7 @@ mod tests {
     fn peer_note(peer: &str, text: &str, model_note: Option<SystemNotification>) -> IdleNotify {
         IdleNotify {
             source: Source::Message,
-            text: text.to_string(),
-            verbatim: Vec::new(),
+            text: text.into(),
             origin: Origin::Peer(peer.to_string()),
             model_note: model_note.map(Box::new),
         }
@@ -1421,7 +1410,7 @@ mod tests {
         let returned = handle
             .push(note("overflows", None))
             .expect_err("a full queue hands the note back");
-        assert_eq!(returned.text, "overflows");
+        assert_eq!(returned.text.plain(), "overflows");
         assert_eq!(handle.overflow(), 1);
     }
 
@@ -1489,7 +1478,7 @@ mod tests {
         let returned = handle
             .push(note("late", None))
             .expect_err("a stopped driver hands the note back");
-        assert_eq!(returned.text, "late");
+        assert_eq!(returned.text.plain(), "late");
         assert_eq!(handle.overflow(), 0);
         assert!(
             ctx.try_read()
