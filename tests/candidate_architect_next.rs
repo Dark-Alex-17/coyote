@@ -8,12 +8,12 @@
 //! against the prose `architect/config.yaml`) and `mode_matrix.py` (the
 //! marker map against the prose `architect/instructions.md` plus all 48 mode
 //! combinations walked to `end_complete`; several minutes, so opt-in).
-//! `audit_graph.py`, `check_session_block.sh` and `mode_matrix.py` need the
-//! Go `yq` by mikefarah and skip without it, or fail when
-//! `ARCHITECT_NEXT_REQUIRE_YQ` is set. Every battery and candidate gate run
-//! points `HOME`, `LLM_ROOT_DIR`, `COYOTE_CACHE_DIR`, `TMPDIR` and
-//! `ARCHITECT_RUNS_ROOT` at a scratch directory; the review gauntlet's own
-//! scripts get a scratch `HOME` and `TMPDIR` only. Every run sets
+//! `audit_graph.py`, `check_session_block.sh`, `mode_matrix.py` and
+//! `smoke_test.py` (its graph rows) need the Go `yq` by mikefarah and skip
+//! without it, or fail when `ARCHITECT_NEXT_REQUIRE_YQ` is set. Every battery
+//! and candidate gate run points `HOME`, `LLM_ROOT_DIR`, `COYOTE_CACHE_DIR`,
+//! `TMPDIR` and `ARCHITECT_RUNS_ROOT` at a scratch directory; the review
+//! gauntlet's own scripts get a scratch `HOME` and `TMPDIR` only. Every run sets
 //! `PYTHONDONTWRITEBYTECODE=1`, so nothing under `assets/` or
 //! `~/.config/coyote` is read or written, and every command that runs git
 //! or a gate ignores the system and user git config. Every git, script and
@@ -47,7 +47,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "architect-next";
-const SMOKE_FLOOR: usize = 365;
+const SMOKE_FLOOR: usize = 614;
 const MATRIX_FLOOR: usize = 53;
 const _: () = assert!(MATRIX_FLOOR >= 53, "the matrix floor never drops below 53");
 
@@ -407,9 +407,12 @@ fn audit_graph_reports_no_problems() {
 #[test]
 fn smoke_battery_passes_every_check() {
     let Some(python) = python3() else { return };
+    let Some(yq) = mikefarah_yq() else { return };
     let scratch = scratch_dir("smoke");
     let output = output_with_timeout(
-        battery(&python, &scratch).arg("scripts/smoke_test.py"),
+        battery(&python, &scratch)
+            .env("PATH", path_with(yq.parent().unwrap()))
+            .arg("scripts/smoke_test.py"),
         BATTERY_LIMIT,
         "smoke",
     );
@@ -445,11 +448,14 @@ fn smoke_battery_passes_every_check() {
 #[test]
 fn smoke_summary_and_exit_code_cover_a_check_recorded_last() {
     let Some(python) = python3() else { return };
+    let Some(yq) = mikefarah_yq() else { return };
     let scratch = scratch_dir("tally");
     let copy = scratch_candidate_copy(&scratch);
     let run = |copy: &Path| {
         let mut cmd = battery(&python, &scratch);
-        cmd.current_dir(copy).arg("scripts/smoke_test.py");
+        cmd.current_dir(copy)
+            .env("PATH", path_with(yq.parent().unwrap()))
+            .arg("scripts/smoke_test.py");
         output_with_timeout(&mut cmd, BATTERY_LIMIT, "smoke tally")
     };
 
@@ -520,6 +526,105 @@ fn smoke_env_restore_check_fails_when_the_runs_root_is_not_restored() {
         !output.status.success(),
         "an unrestored runs root must fail the battery:\n{report}"
     );
+    assert_no_bytecode_under_candidate();
+}
+
+/// Each guard in gates.py, removed from a scratch copy, turns its smoke row
+/// red: read access left out of `TRUSTED_PERMISSIONS`, the
+/// CHANGES_REQUESTED veto in the approval fallback, the `fix_origin_return`
+/// target `fix_done` returns to, the overflow stop in `review_poll`, the
+/// `>=` that stops `review_poll` at `POLL_VISIT_BUDGET`, the PR head check
+/// before `review_update` resolves anything, the trusted author of an own
+/// comment and the failed-read exclusion that keeps `_poll_permissions`
+/// from re-reading the same failing logins every poll.
+#[test]
+fn smoke_rows_go_red_under_the_recorded_sabotages() {
+    let Some(python) = python3() else { return };
+    let Some(yq) = mikefarah_yq() else { return };
+    let sabotages = [
+        (
+            "read-permission",
+            "TRUSTED_PERMISSIONS = (\"admin\", \"maintain\", \"write\")",
+            "TRUSTED_PERMISSIONS = (\"admin\", \"maintain\", \"write\", \"read\")",
+            "permission: a COLLABORATOR with read -> untrusted, no body, one lookup",
+        ),
+        (
+            "approval-veto",
+            "return not any(r[\"state\"] == \"CHANGES_REQUESTED\" for r in verdicts) and any(",
+            "return any(",
+            "approval: empty decision, one author approves on head, another's latest requests \
+             changes -> not approved",
+        ),
+        (
+            "fix-origin",
+            "ret = state.get(\"fix_origin_return\") or state.get(\"fix_return_to\") or ",
+            "ret = state.get(\"fix_return_to\") or ",
+            "fix origin: fix_done after a BLOCKED review fix round -> review_update, origin \
+             cleared",
+        ),
+        (
+            "truncation",
+            "    if overflow:\n        u.update({\"review_status\": \"truncated\"",
+            "    if False:\n        u.update({\"review_status\": \"truncated\"",
+            "truncation: reviewThreads totalCount 101 -> truncated -> review_route, overflow in \
+             review_truncated, review_items untouched",
+        ),
+        (
+            "visit-budget",
+            "    u[\"review_polls_run\"] = runs + 1\n    if runs >= POLL_VISIT_BUDGET:\n",
+            "    u[\"review_polls_run\"] = runs + 1\n    if runs > POLL_VISIT_BUDGET:\n",
+            "watch: review_poll at the run-wide visit budget -> visit_cap -> review_route",
+        ),
+        (
+            "push-check",
+            "    if not sha or oid != sha:\n",
+            "    if False:\n",
+            "watch: review_update with a head mismatch -> review_push_mismatch, nothing resolved \
+             or posted, stop ledgered",
+        ),
+        (
+            "own-author",
+            "return _trusted(state, u, c) and (OWN_MARKER in body",
+            "return (OWN_MARKER in body",
+            "own marker: an untrusted comment carrying the marker is not own -> an untrusted item",
+        ),
+        (
+            "permission-stall",
+            "if login and login not in cached and login not in failed]",
+            "if login and login not in cached]",
+            "permission stall: a single failing login is read once across three polls",
+        ),
+    ];
+    for (label, old, new, row) in sabotages {
+        let scratch = scratch_dir(&format!("sabotage-{label}"));
+        let copy = scratch_candidate_copy(&scratch);
+        let gates = copy.join("scripts").join("gates.py");
+        let text = fs::read_to_string(&gates).unwrap();
+        assert_eq!(
+            text.matches(old).count(),
+            1,
+            "{label}: {old:?} must occur exactly once in gates.py"
+        );
+        fs::write(&gates, text.replacen(old, new, 1)).unwrap();
+        let mut cmd = battery(&python, &scratch);
+        cmd.current_dir(&copy)
+            .env("PATH", path_with(yq.parent().unwrap()))
+            .arg("scripts/smoke_test.py");
+        let output = output_with_timeout(&mut cmd, BATTERY_LIMIT, &format!("sabotage {label}"));
+        let report = transcript(&output);
+        assert!(
+            !output.status.success(),
+            "{label}: the battery passed with the guard removed:\n{report}"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let fail = format!("FAIL {row}");
+        assert!(
+            stdout.lines().any(|l| l
+                .strip_prefix(&fail)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with("  ("))),
+            "{label}: no `{fail}` line:\n{report}"
+        );
+    }
     assert_no_bytecode_under_candidate();
 }
 
@@ -1011,6 +1116,17 @@ fn names_of(vars: &[serde_yaml::Value]) -> Vec<&str> {
     vars.iter().map(|v| v["name"].as_str().unwrap()).collect()
 }
 
+/// Candidate variables the prose twin has no counterpart for. Every mirror
+/// check compares the candidate's list less these against the twin's.
+const GRAPH_ONLY_VARIABLES: &[&str] = &["pr_tracking"];
+
+fn mirrored(vars: &[serde_yaml::Value]) -> Vec<serde_yaml::Value> {
+    vars.iter()
+        .filter(|v| !GRAPH_ONLY_VARIABLES.contains(&v["name"].as_str().unwrap()))
+        .cloned()
+        .collect()
+}
+
 fn description_of<'a>(vars: &'a [serde_yaml::Value], name: &str) -> &'a str {
     vars.iter()
         .find(|v| v["name"].as_str() == Some(name))
@@ -1050,13 +1166,14 @@ fn build_lock_is_declared_at_the_prose_twins_position() {
     );
 }
 
-/// The candidate declares the prose twin's variables in the same order, name
-/// for name and `default` for `default`, with a missing default counted as
-/// null on both sides. `check_session_block.sh` runs the same comparison but
-/// needs the mikefarah `yq`; this one runs without it.
+/// The candidate, less its graph-only variables, declares the prose twin's
+/// variables in the same order, name for name and `default` for `default`,
+/// with a missing default counted as null on both sides.
+/// `check_session_block.sh` runs the same comparison but needs the mikefarah
+/// `yq`; this one runs without it.
 #[test]
 fn variables_mirror_the_prose_twin_name_for_name_and_default_for_default() {
-    let candidate = variable_list(&candidate_dir().join("graph.yaml"));
+    let candidate = mirrored(&variable_list(&candidate_dir().join("graph.yaml")));
     let prose = variable_list(&agents_dir().join("architect/config.yaml"));
     assert_eq!(
         names_of(&candidate),
@@ -1078,6 +1195,44 @@ fn variables_mirror_the_prose_twin_name_for_name_and_default_for_default() {
             "{name}: the default drifted from the prose twin's"
         );
     }
+}
+
+/// `pr_tracking` is declared in the graph with default `ci`, it is the only
+/// candidate variable the prose twin lacks, and `check_session_block.sh`
+/// exempts exactly the same set from its mirror.
+#[test]
+fn pr_tracking_is_the_only_graph_only_variable() {
+    let candidate = variable_list(&candidate_dir().join("graph.yaml"));
+    let prose = variable_list(&agents_dir().join("architect/config.yaml"));
+    let twin = names_of(&prose);
+    let extra: Vec<&str> = names_of(&candidate)
+        .into_iter()
+        .filter(|n| !twin.contains(n))
+        .collect();
+    assert_eq!(
+        extra, GRAPH_ONLY_VARIABLES,
+        "the candidate's variables beyond the prose twin's"
+    );
+    let tracking = candidate
+        .iter()
+        .find(|v| v["name"].as_str() == Some("pr_tracking"))
+        .expect("graph.yaml declares no pr_tracking variable");
+    assert_eq!(
+        tracking["default"].as_str(),
+        Some("ci"),
+        "pr_tracking default"
+    );
+
+    let quoted: Vec<String> = GRAPH_ONLY_VARIABLES
+        .iter()
+        .map(|n| format!("\"{n}\""))
+        .collect();
+    let line = format!("GRAPH_ONLY='[{}]'", quoted.join(", "));
+    let check = fs::read_to_string(candidate_dir().join("scripts/check_session_block.sh")).unwrap();
+    assert!(
+        check.lines().any(|l| l == line),
+        "check_session_block.sh must exempt exactly {GRAPH_ONLY_VARIABLES:?} via `{line}`"
+    );
 }
 
 /// Lines the toolchain pattern matches without naming a toolchain command,
@@ -2136,10 +2291,10 @@ fn readme_toolchain_census_matches_the_live_grep() {
     );
     assert_eq!(
         gates_lines,
-        vec![41, 2628, 2637],
+        vec![44, 2724, 2733],
         "the gates.py toolchain hits moved; update the README census and its prose"
     );
-    for line in [2628, 2637] {
+    for line in [2724, 2733] {
         assert!(
             text.contains(&format!("`gates.py:{line}`")) || text.contains(&format!("`:{line}`")),
             "the README prose must cite gates.py:{line}"
@@ -2514,9 +2669,9 @@ fn info_by_name_lists_the_graph_and_seats_a_build_lock_override() {
 }
 
 /// The variables block the binary renders for `coyote -a architect-next
-/// --info` is exactly the prose twin's variable list, name for name and in
-/// order (`build_lock` included), so a consumer sees no variable the twin
-/// lacks and misses none it has.
+/// --info`, less the graph-only variables, is exactly the prose twin's
+/// variable list, name for name and in order (`build_lock` included), so a
+/// consumer sees no other variable the twin lacks and misses none it has.
 #[test]
 fn info_by_name_lists_exactly_the_prose_twins_variables_in_order() {
     let scratch = scratch_dir("info-vars");
@@ -2525,6 +2680,7 @@ fn info_by_name_lists_exactly_the_prose_twins_variables_in_order() {
     let listed: Vec<&str> = info_variables(&stdout)
         .into_iter()
         .map(|l| l.split_once(':').map_or(l, |(name, _)| name))
+        .filter(|name| !GRAPH_ONLY_VARIABLES.contains(name))
         .collect();
     let prose = variable_list(&agents_dir().join("architect/config.yaml"));
     let twin = names_of(&prose);
@@ -3809,13 +3965,14 @@ fn re_entry_has_no_session_ledger_and_the_readme_no_honesty_sentence() {
 const FROZEN_GRAPH_BOUNDS: &[(&str, i64)] = &[
     ("max_agent_depth", 10),
     ("max_concurrent_agents", 10),
-    ("settings.max_loop_iterations", 1000),
+    ("settings.max_loop_iterations", 1500),
     ("settings.timeout", 0),
 ];
 
 /// Every integer field of every node in the shipped baseline (`timeout`,
 /// `max_attempts`, `max_iterations`, `max_concurrency`), the staging values
-/// plus the frozen budgets row; a node absent here declares none.
+/// plus the frozen budgets row and the review watch nodes; a node absent here
+/// declares none.
 const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("amend_plan", "max_iterations", 20),
     ("amend_plan", "timeout", 1800),
@@ -3835,10 +3992,10 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("branch_setup", "timeout", 300),
     ("checklist_librarian", "max_attempts", 2),
     ("checklist_librarian", "timeout", 3600),
-    ("ci_apply", "timeout", 120),
+    ("ci_apply", "timeout", 390),
     ("ci_diagnose", "timeout", 600),
-    ("ci_evidence", "timeout", 300),
-    ("ci_poll", "timeout", 120),
+    ("ci_evidence", "timeout", 390),
+    ("ci_poll", "timeout", 180),
     ("claim_task", "timeout", 600),
     ("compose_delegation", "timeout", 60),
     ("consult_navigator", "max_attempts", 1),
@@ -3852,7 +4009,7 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("explore_slice_team", "timeout", 1800),
     ("final_report", "timeout", 300),
     ("finish_plan", "timeout", 600),
-    ("flip_ready", "timeout", 300),
+    ("flip_ready", "timeout", 390),
     ("gate1", "max_attempts", 2),
     ("gate1", "timeout", 3600),
     ("gate2", "max_attempts", 2),
@@ -3882,6 +4039,11 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("promote_tasks", "max_iterations", 45),
     ("promote_tasks", "timeout", 3600),
     ("promote_verify", "timeout", 600),
+    ("review_apply", "timeout", 120),
+    ("review_poll", "timeout", 900),
+    ("review_route", "timeout", 120),
+    ("review_triage", "timeout", 600),
+    ("review_update", "timeout", 1020),
     ("run_adversary", "max_attempts", 1),
     ("run_adversary", "timeout", 7200),
     ("run_gauntlet", "max_attempts", 1),
@@ -3914,6 +4076,7 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
     "body_fix_rounds",
     "ci_poll_fails",
     "ci_polls",
+    "ci_polls_run",
     "ci_rounds",
     "ci_started_at",
     "design_rounds",
@@ -3924,6 +4087,12 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
     "owner_polls",
     "promote_retries",
     "reask_rounds",
+    "review_fix_rounds",
+    "review_poll_fails",
+    "review_polls",
+    "review_polls_run",
+    "review_rounds",
+    "review_started_at",
     "wave_fix_rounds",
     "wave_index",
 ];
@@ -3940,10 +4109,29 @@ const FROZEN_SCRIPT_BOUNDS: &[(&str, &str, &str, i64)] = &[
     ("CI_WALL_SECS", "", "14400", 14400),
     ("CONFLICT_CYCLES_MAX", "", "2", 2),
     ("DESIGN_ROUNDS_MAX", "", "STRIKE_LIMIT", 3),
+    ("GH_CALL_SECS", "", "90", 90),
+    ("GH_LOOP_SECS", "", "180", 180),
     ("OWNER_POLL_MAX", "", "2", 2),
     ("OWNER_POLL_MINUTES", "", "25", 25),
     ("OWNER_WAIT_MINUTES", "", "30", 30),
+    ("PERM_LOOKUPS_PER_POLL", "", "2", 2),
+    (
+        "POLL_VISIT_BUDGET",
+        "",
+        "4 * CI_MAX_ROUNDS + CI_MAX_ROUNDS",
+        1200,
+    ),
     ("RERUN_ONCE", "", "1", 1),
+    (
+        "REVIEW_MAX_POLLS",
+        "",
+        "REVIEW_WALL_SECS // REVIEW_POLL_SLEEP",
+        144,
+    ),
+    ("REVIEW_MAX_ROUNDS", "", "STRIKE_LIMIT", 3),
+    ("REVIEW_POLL_SLEEP", "", "600", 600),
+    ("REVIEW_UPDATE_BUDGET", "", "600", 600),
+    ("REVIEW_WALL_SECS", "", "86400", 86400),
     ("STRIKE_LIMIT", "", "3", 3),
     ("TAIL_CHARS", "", "6000", 6000),
     ("VERIFY_CMD_SECS", "", "900", 900),
@@ -4075,12 +4263,14 @@ fn graph_and_gate_budgets_equal_the_frozen_baseline() {
     );
 }
 
-/// The engine's per-node visit cap outlasts one full CI watch: `ci_poll`
-/// revisits itself up to `CI_MAX_ROUNDS` times before it routes the timeout,
-/// so a cap at or below that value ends the watch as an engine error. The
-/// cap covers four group PRs, each watched to that wall cap.
+/// The engine's per-node visit cap outlasts every poll loop `_lib` bounds:
+/// `ci_poll` revisits itself up to `CI_MAX_ROUNDS` times and `review_poll` up
+/// to `REVIEW_MAX_POLLS` times per PR before each routes its timeout, so a
+/// cap at or below either value ends the watch as an engine error. The cap
+/// covers four group PRs, each watched to both wall caps, and also stays
+/// above the review fix-round bound `REVIEW_MAX_ROUNDS`.
 #[test]
-fn loop_cap_exceeds_the_ci_poll_rounds_lib_computes() {
+fn loop_cap_exceeds_the_ci_and_review_poll_rounds_lib_computes() {
     let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
     let shipped: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
     let cap = shipped["settings"]["max_loop_iterations"]
@@ -4090,25 +4280,170 @@ fn loop_cap_exceeds_the_ci_poll_rounds_lib_computes() {
     let Some(python) = python3() else {
         return;
     };
-    let scratch = scratch_dir("lib-ci-rounds");
+    let scratch = scratch_dir("lib-poll-rounds");
     let mut cmd = battery(&python, &scratch);
     cmd.current_dir(candidate_dir().join("scripts")).args([
         "-c",
-        "import json, _lib\nprint(json.dumps({\"CI_MAX_ROUNDS\": _lib.CI_MAX_ROUNDS}))\n",
+        "import json, _lib\nprint(json.dumps({k: getattr(_lib, k) for k in \
+         (\"CI_MAX_ROUNDS\", \"REVIEW_MAX_POLLS\", \"REVIEW_MAX_ROUNDS\")}))\n",
     ]);
-    let out = output_with_timeout(&mut cmd, GATE_LIMIT, "_lib CI_MAX_ROUNDS");
+    let out = output_with_timeout(&mut cmd, GATE_LIMIT, "_lib poll bounds");
     assert_no_bytecode_under_candidate();
-    let values = parse_json_stdout("_lib CI_MAX_ROUNDS", &out);
-    let rounds = values["CI_MAX_ROUNDS"].as_i64().unwrap();
+    let values = parse_json_stdout("_lib poll bounds", &out);
+    let bound = |name: &str| values[name].as_i64().unwrap();
+    let rounds = bound("CI_MAX_ROUNDS");
     assert!(
         cap >= 4 * rounds,
         "settings.max_loop_iterations {cap} does not cover four group PRs of CI_MAX_ROUNDS {rounds} polls each"
     );
+    let polls = bound("REVIEW_MAX_POLLS");
+    assert!(
+        cap >= 4 * polls,
+        "settings.max_loop_iterations {cap} does not cover four group PRs of REVIEW_MAX_POLLS {polls} polls each"
+    );
+    for name in ["REVIEW_MAX_POLLS", "REVIEW_MAX_ROUNDS"] {
+        assert!(
+            bound(name) < cap,
+            "{name} {} is not below settings.max_loop_iterations {cap}",
+            bound(name)
+        );
+    }
+}
+
+fn lib_ints(names: &[&str], label: &str) -> Option<serde_json::Value> {
+    let python = python3()?;
+    let scratch = scratch_dir(label);
+    let mut cmd = battery(&python, &scratch);
+    let keys: Vec<String> = names.iter().map(|n| format!("{n:?}")).collect();
+    cmd.current_dir(candidate_dir().join("scripts")).args([
+        "-c",
+        &format!(
+            "import json, _lib\nprint(json.dumps({{k: getattr(_lib, k) for k in ({},)}}))\n",
+            keys.join(", ")
+        ),
+    ]);
+    let out = output_with_timeout(&mut cmd, GATE_LIMIT, label);
+    assert_no_bytecode_under_candidate();
+    Some(parse_json_stdout(label, &out))
+}
+
+/// A poll node sleeps and then makes its gh calls, so its timeout has to
+/// outlast all of them: an engine kill mid-sleep leaves the PR status from
+/// the previous visit standing as if it were fresh. `ci_poll` makes one call;
+/// `review_poll` makes the review read plus up to `PERM_LOOKUPS_PER_POLL`
+/// permission reads. `review_update` spends up to `REVIEW_UPDATE_BUDGET` on
+/// thread replies, and four gh calls fall outside that budget: the PR head
+/// read before it, the reply and resolve of the thread that straddles it, and
+/// the closing update comment. `ci_apply`, `ci_evidence` and `flip_ready`
+/// stop starting looped gh calls once `GH_LOOP_SECS` has passed, so the call
+/// started just inside that limit runs a full `GH_CALL_SECS` past it; one
+/// more call outside the loop and a 30 second margin for the gate's own work
+/// fill the rest of the timeout.
+#[test]
+fn poll_node_timeouts_cover_the_sleep_and_one_gh_call() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let shipped: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let timeout = |node: &str| {
+        shipped["nodes"][node]["timeout"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("graph.yaml gives {node} an integer timeout"))
+    };
+
+    let Some(values) = lib_ints(
+        &[
+            "GH_CALL_SECS",
+            "GH_LOOP_SECS",
+            "CI_POLL_SLEEP",
+            "PERM_LOOKUPS_PER_POLL",
+            "REVIEW_POLL_SLEEP",
+            "REVIEW_UPDATE_BUDGET",
+        ],
+        "lib-poll-timeouts",
+    ) else {
+        return;
+    };
+    let bound = |name: &str| values[name].as_i64().unwrap();
+    let gh = bound("GH_CALL_SECS");
+    let ci_sleep = bound("CI_POLL_SLEEP");
+    assert!(
+        timeout("ci_poll") > ci_sleep + gh,
+        "ci_poll timeout {} does not outlast CI_POLL_SLEEP {ci_sleep} plus GH_CALL_SECS {gh}",
+        timeout("ci_poll")
+    );
+    let review_sleep = bound("REVIEW_POLL_SLEEP");
+    let lookups = bound("PERM_LOOKUPS_PER_POLL");
+    assert!(
+        timeout("review_poll") > review_sleep + (1 + lookups) * gh,
+        "review_poll timeout {} does not outlast REVIEW_POLL_SLEEP {review_sleep} plus {} GH_CALL_SECS {gh} \
+         (the review read and PERM_LOOKUPS_PER_POLL {lookups} permission reads)",
+        timeout("review_poll"),
+        1 + lookups
+    );
+    let budget = bound("REVIEW_UPDATE_BUDGET");
+    assert!(
+        timeout("review_update") >= budget + 4 * gh,
+        "review_update timeout {} does not cover REVIEW_UPDATE_BUDGET {budget} plus four GH_CALL_SECS {gh}",
+        timeout("review_update")
+    );
+    let gh_loop = bound("GH_LOOP_SECS");
+    for node in ["ci_apply", "ci_evidence", "flip_ready"] {
+        assert!(
+            timeout(node) >= gh_loop + 2 * gh + 30,
+            "{node} timeout {} does not cover GH_LOOP_SECS {gh_loop} plus two GH_CALL_SECS {gh} plus 30",
+            timeout(node)
+        );
+    }
+}
+
+/// `POLL_VISIT_BUDGET` counts poll visits across the whole run so the watch
+/// stops by name before the engine's per-node cap ends it as an error, yet
+/// still lets four group PRs each run a CI watch to its wall cap with at
+/// least a quarter of one watch to spare, and fits one full review watch. The
+/// run-wide counters it is checked against start at zero.
+#[test]
+fn poll_visit_budget_stops_the_watch_before_the_engine_cap() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let shipped: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let cap = shipped["settings"]["max_loop_iterations"]
+        .as_i64()
+        .expect("graph.yaml sets an integer settings.max_loop_iterations");
+    for seed in ["ci_polls_run", "review_polls_run"] {
+        assert_eq!(
+            shipped["initial_state"][seed].as_i64(),
+            Some(0),
+            "initial_state does not seed {seed} at 0"
+        );
+    }
+
+    let Some(values) = lib_ints(
+        &["POLL_VISIT_BUDGET", "CI_MAX_ROUNDS", "REVIEW_MAX_POLLS"],
+        "lib-poll-visit-budget",
+    ) else {
+        return;
+    };
+    let bound = |name: &str| values[name].as_i64().unwrap();
+    let budget = bound("POLL_VISIT_BUDGET");
+    assert!(
+        budget < cap,
+        "POLL_VISIT_BUDGET {budget} is not below settings.max_loop_iterations {cap}"
+    );
+    let rounds = bound("CI_MAX_ROUNDS");
+    assert!(
+        budget >= 4 * rounds + rounds / 4,
+        "POLL_VISIT_BUDGET {budget} leaves no headroom over four group PRs of CI_MAX_ROUNDS {rounds} polls each"
+    );
+    for name in ["CI_MAX_ROUNDS", "REVIEW_MAX_POLLS"] {
+        assert!(
+            budget >= bound(name),
+            "POLL_VISIT_BUDGET {budget} does not fit one full watch of {name} {}",
+            bound(name)
+        );
+    }
 }
 
 /// How each llm node's output schema carries the `anomalies` channel in the
-/// staging baseline: `Plain` is the optional string-array property,
-/// `NoSchema` is a node with no `output_schema` at all.
+/// staging baseline plus `review_triage`: `Plain` is the optional
+/// string-array property, `NoSchema` is a node with no `output_schema` at all.
 #[derive(Clone, Copy, Debug)]
 enum AnomaliesChannel {
     Plain,
@@ -4128,6 +4463,7 @@ const FROZEN_LLM_ANOMALIES: &[(&str, AnomaliesChannel)] = &[
     ("pr_body_fix", AnomaliesChannel::NoSchema),
     ("pr_summary", AnomaliesChannel::Plain),
     ("promote_tasks", AnomaliesChannel::NoSchema),
+    ("review_triage", AnomaliesChannel::Plain),
     ("summarize_run", AnomaliesChannel::NoSchema),
     ("task_done", AnomaliesChannel::NoSchema),
 ];
@@ -4729,6 +5065,179 @@ fn readme_gh_seam_row_names_exactly_the_seams_gates_reads() {
     }
 }
 
+/// Escalation kinds `apply_answer` answers that carry a watch prefix but
+/// belong to the review gauntlet, not the `pr_tracking` watch.
+const GAUNTLET_REVIEW_KINDS: &[&str] = &["review_incomplete"];
+
+/// The README's `pr_tracking` review watch row names the variable's graph
+/// default, every node of the watch loop, the Update comment heading, the
+/// hardening framing and every watch escalation `apply_answer` in
+/// `gates.py` answers, so a stop condition added to the gates without the
+/// row recording it surfaces here.
+#[test]
+fn readme_pr_tracking_row_names_every_stop_condition() {
+    let row = adjustments_row("| `pr_tracking` review watch |");
+    let variables = variable_list(&candidate_dir().join("graph.yaml"));
+    let default = variables
+        .iter()
+        .find(|v| v["name"].as_str() == Some("pr_tracking"))
+        .and_then(|v| v["default"].as_str())
+        .expect("graph.yaml declares no pr_tracking default");
+    let declared = format!("`pr_tracking`, default `{default}`");
+    assert!(
+        row.contains(&declared),
+        "the pr_tracking row lost {declared:?}: {row}"
+    );
+    for node in [
+        "review_poll",
+        "review_route",
+        "review_triage",
+        "review_apply",
+        "review_update",
+        "ci_poll",
+    ] {
+        assert!(
+            row.contains(&format!("`{node}`")),
+            "the pr_tracking row lost the loop node {node}: {row}"
+        );
+    }
+    for clause in [
+        "`## Update @ ",
+        "keeps today's routing except these hardening fixes",
+    ] {
+        assert!(
+            row.contains(clause),
+            "the pr_tracking row lost {clause:?}: {row}"
+        );
+    }
+
+    let gates = fs::read_to_string(candidate_dir().join("scripts/gates.py")).unwrap();
+    let lines: Vec<&str> = gates.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| l.starts_with("def apply_answer("))
+        .expect("gates.py has no def apply_answer(");
+    let end = lines[start + 1..]
+        .iter()
+        .position(|l| l.starts_with("def "))
+        .map_or(lines.len(), |n| start + 1 + n);
+    let condition_re = fancy_regex::Regex::new(r"^\s*(el)?if .*\bkind (==|in \()").unwrap();
+    let kind_re = fancy_regex::Regex::new(r#""((?:review|watch|ci)_[a-z_]+)""#).unwrap();
+    let mut handled = BTreeSet::new();
+    let mut at = start + 1;
+    while at < end {
+        if !condition_re.is_match(lines[at]).unwrap() {
+            at += 1;
+            continue;
+        }
+        let mut condition = String::new();
+        while at < end {
+            condition.push_str(lines[at]);
+            condition.push('\n');
+            at += 1;
+            if lines[at - 1].trim_end().ends_with(':') {
+                break;
+            }
+        }
+        for c in kind_re.captures_iter(&condition) {
+            handled.insert(c.unwrap()[1].to_string());
+        }
+    }
+    for sentinel in ["ci_unsure", "review_exhausted", "watch_visit_cap"]
+        .into_iter()
+        .chain(GAUNTLET_REVIEW_KINDS.iter().copied())
+    {
+        assert!(
+            handled.contains(sentinel),
+            "the apply_answer extractor missed {sentinel}: {handled:?}"
+        );
+    }
+    for kind in handled
+        .iter()
+        .filter(|k| !GAUNTLET_REVIEW_KINDS.contains(&k.as_str()))
+    {
+        assert!(
+            row.contains(&format!("`{kind}`")),
+            "the pr_tracking row does not name the stop condition {kind}: {row}"
+        );
+    }
+}
+
+/// The README's `pr_tracking` row lists the hardening fixes that apply in
+/// both modes with the numbers the shipped graph, `_lib.py` and `gates.py`
+/// carry, so a retuned timeout, budget or marker cannot leave the row
+/// quoting the old value.
+#[test]
+fn readme_pr_tracking_row_lists_each_hardening_fix_with_its_number() {
+    let row = adjustments_row("| `pr_tracking` review watch |");
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let shipped: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let timeout = |node: &str| {
+        shipped["nodes"][node]["timeout"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("graph.yaml gives {node} an integer timeout"))
+    };
+    let cap = shipped["settings"]["max_loop_iterations"]
+        .as_i64()
+        .expect("graph.yaml sets an integer settings.max_loop_iterations");
+    let gates = fs::read_to_string(candidate_dir().join("scripts/gates.py")).unwrap();
+    let marker = gates
+        .lines()
+        .find_map(|l| l.strip_prefix("OWN_MARKER = \"")?.strip_suffix('"'))
+        .expect("gates.py has no OWN_MARKER = \"...\" line");
+    for node in ["ci_evidence", "flip_ready"] {
+        assert_eq!(
+            timeout(node),
+            timeout("ci_apply"),
+            "the pr_tracking row gives {node} the ci_apply timeout"
+        );
+    }
+
+    let Some(values) = lib_ints(
+        &["POLL_VISIT_BUDGET", "GH_CALL_SECS"],
+        "lib-hardening-numbers",
+    ) else {
+        return;
+    };
+    let bound = |name: &str| values[name].as_i64().unwrap();
+    let fixes = [
+        (
+            "the ci_poll timeout",
+            format!("the `ci_poll` timeout {}", timeout("ci_poll")),
+        ),
+        (
+            "the ci_apply timeout",
+            format!(
+                "the `ci_apply`, `ci_evidence` and `flip_ready` timeouts {}",
+                timeout("ci_apply")
+            ),
+        ),
+        (
+            "the read failure count",
+            "a stale or killed poll counted as one read failure".to_string(),
+        ),
+        (
+            "POLL_VISIT_BUDGET",
+            format!("`POLL_VISIT_BUDGET` ({})", bound("POLL_VISIT_BUDGET")),
+        ),
+        (
+            "settings.max_loop_iterations",
+            format!("`settings.max_loop_iterations` ({cap})"),
+        ),
+        ("OWN_MARKER", format!("`{marker}`")),
+        (
+            "GH_CALL_SECS",
+            format!("`GH_CALL_SECS` ({})", bound("GH_CALL_SECS")),
+        ),
+    ];
+    for (item, phrase) in fixes {
+        assert!(
+            row.contains(&phrase),
+            "the pr_tracking row does not record {item} as {phrase:?}: {row}"
+        );
+    }
+}
+
 /// The README's recorded battery figures are runs of the current batteries,
 /// so they can never sit below the floors the wrapper enforces, and the
 /// session check figure is its script's literal closing line.
@@ -4788,9 +5297,11 @@ fn census_files(root: &Path) -> BTreeSet<String> {
 
 /// The README's recorded census is a live `diff -u` against the staging
 /// tree: the same set of differing files, each with the hunk count it
-/// states, and no file on one side only. The staging tree lives outside this
-/// repo, so the check runs only when `ARCHITECT_NEXT_STAGING_DIR` is set, and
-/// fails when that value is not a directory.
+/// states. A file only the candidate has is diffed against `/dev/null`, so it
+/// must be listed too; a staging file the candidate lacks fails. The staging
+/// tree lives outside this repo, so the check runs only when
+/// `ARCHITECT_NEXT_STAGING_DIR` is set, and fails when that value is not a
+/// directory.
 #[test]
 fn readme_census_matches_a_live_diff_against_the_staging_tree() {
     let staging = std::env::var_os("ARCHITECT_NEXT_STAGING_DIR").filter(|v| !v.is_empty());
@@ -4805,19 +5316,23 @@ fn readme_census_matches_a_live_diff_against_the_staging_tree() {
     );
     let ours = census_files(&candidate_dir());
     let theirs = census_files(&staging);
-    let only_ours: Vec<&String> = ours.difference(&theirs).collect();
     let only_staging: Vec<&String> = theirs.difference(&ours).collect();
     assert!(
-        only_ours.is_empty() && only_staging.is_empty(),
-        "files on one side only: candidate {only_ours:?}, staging {only_staging:?}"
+        only_staging.is_empty(),
+        "staging files the candidate lacks: {only_staging:?}"
     );
 
     let mut live = BTreeMap::new();
     for rel in &ours {
+        let base = if theirs.contains(rel) {
+            staging.join(rel)
+        } else {
+            PathBuf::from("/dev/null")
+        };
         let out = output_with_timeout(
             Command::new("diff")
                 .arg("-u")
-                .arg(staging.join(rel))
+                .arg(base)
                 .arg(candidate_dir().join(rel)),
             GATE_LIMIT,
             "diff -u",

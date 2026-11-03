@@ -43,6 +43,8 @@ BOUNDED = {
     "pr_body": "B17 body_fix_rounds<=1",
     "ci_apply": "B18 fix strikes<=3 per check per PR / B19 flake reruns<=2 per check per PR",
     "ci_poll": "B20 rounds<=240 + wall 14400s + poll fails<=3",
+    "review_poll": "review rounds<=144 + wall 86400s + poll fails<=3",
+    "review_apply": "review fix rounds<=3 per PR",
     "ask_owner_route": "B21 owner_polls<=2",
     "parse_answer": "B22 reask_rounds<=3",
     "wave_integrate": "wave_index list-bounded",
