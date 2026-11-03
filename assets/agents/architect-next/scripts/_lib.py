@@ -278,7 +278,7 @@ def read_artifact(run_dir, name):
 
 STATE_KEYS = (
     "run_id", "run_dir", "phase", "mode_vector", "code_repo_path", "tasks_root", "plans_root", "base_branch_name",
-    "owner_name", "reference_root_path", "design_doc_path", "plan_path", "plan_slug", "plan_revision",
+    "owner_name", "reference_root_path", "design_doc_path", "seed_path", "plan_path", "plan_slug", "plan_revision",
     "amend_cycles", "leak_fingerprints", "oracle_rejects", "gate1_verdict", "gate2_verdict", "sealed",
     "current_task", "current_unit", "run_branch", "group_index", "pending_fixes", "task_rounds",
     "batch_state", "wave_results", "pr_numbers", "ci_reruns", "ci_fix_strikes", "parked", "escalation",

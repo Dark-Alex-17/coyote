@@ -71,6 +71,41 @@ def _normalize_paths(state):
     return u
 
 
+def _need_design_doc_escalation():
+    return escalation("need_design_doc", "No readable design doc was given (design_doc variable or a .md path in the message). "
+                                         "Reply with the path, or abort.", [option("Abort the run")], tier3_ok=False)
+
+
+def _find_seed(u):
+    """The newest ready engineer seed for this project, or ""."""
+    projects = {os.path.realpath(p) for p in (u["code_repo_path"], u.get("git_root")) if p}
+    dirs = {}
+    for base in (u["plans_root"], os.path.join(u["code_repo_path"], "plans")):
+        d = os.path.join(base, "engineer-handoffs")
+        dirs.setdefault(os.path.realpath(d), d)
+    found = []
+    for d in dirs.values():
+        for name in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+            path = os.path.join(d, name)
+            if not name.endswith(".md") or not os.path.isfile(path):
+                continue
+            fm, _ = frontmatter(read_file(path))
+            if fm.get("status") != "ready":
+                continue
+            if not fm.get("project") or os.path.realpath(os.path.expanduser(fm["project"])) not in projects:
+                continue
+            found.append((fm.get("created", ""), os.path.getmtime(path), path))
+    return max(found)[2] if found else ""
+
+
+def _seed_question(path):
+    fm, body = frontmatter(read_file(path))
+    m = re.search(r"(?m)^# (.+)$", body)
+    title = fm.get("title") or (m.group(1).strip() if m else "(untitled)")
+    return (f"No design doc path was given. The engineer left a ready seed at {path}: {title!r} "
+            f"(created {fm.get('created') or 'unknown'}). Use it as the design doc?")
+
+
 def intake(state):
     brief = state.get("initial_prompt") or ""
     u = _normalize_paths(state)
@@ -168,16 +203,24 @@ def intake(state):
                 "mode_invalid", f"Unknown mode value(s): {bad}. Which value should apply?",
                 [option(f"{k} = {MODE_ENUMS.get(k, PR_TRACKING_ENUM)[0]}", recommended=True, evidence="the documented default") for k in bad]
                 + [option("Abort the run")], tier3_ok=False))
-        if not u["design_doc_path"] or not os.path.isfile(u["design_doc_path"]):
+        seed = "" if dd else _find_seed(u)
+        if not seed and (not u["design_doc_path"] or not os.path.isfile(u["design_doc_path"])):
             snapshot(state, u, "intake")
-            return raise_escalation(state, u, escalation(
-                "need_design_doc", "No readable design doc was given (design_doc variable or a .md path in the message). "
-                                   "Reply with the path, or abort.", [option("Abort the run")], tier3_ok=False))
+            return raise_escalation(state, u, _need_design_doc_escalation())
         if tracking == "review" and _per_task_prs(state):
             line = "review-watch: not started: per-task PRs are not watched (pr_tracking=review needs pr_strategy single or PR groups)"
             ledger(state, u, line)
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [line]
-        u["_next"] = "orient_read"
+        if seed:
+            u["seed_path"] = seed
+            u["ask_question"] = _seed_question(seed)
+            u["escalation"] = escalation("seed_confirm", u["ask_question"], [
+                option("Use this seed", recommended=True), option("Draft a brief from this conversation instead"),
+                option("Give a doc path instead"), option("Abort the run")], data={"seed_path": seed})
+            ledger(state, u, f"seed: found {seed}; asking to confirm it as the design doc")
+            u["_next"] = "confirm_seed"
+        else:
+            u["_next"] = "orient_read"
     snapshot(state, u, "intake")
     return u
 
@@ -2236,8 +2279,8 @@ def apply_answer(state):
     abort = _answered(state, {"abort": ["abort"]}, None) == "abort"
     stop = _answered(state, {"stop": ["stop and report", "stop;", "stop"]}, None) == "stop"
 
-    if kind in ("mode_invalid", "need_design_doc", "clarify", "plan_unauthored", "promote_failed", "git_setup_failed",
-                "gate_fault") and abort:
+    if kind in ("mode_invalid", "need_design_doc", "seed_confirm", "clarify", "plan_unauthored", "promote_failed",
+                "git_setup_failed", "gate_fault") and abort:
         u["failure_reason"] = f"aborted at the user's request ({kind}): {answer}"
         u["_next"] = "end_aborted"
     elif kind == "mode_invalid":
@@ -2253,6 +2296,18 @@ def apply_answer(state):
         else:
             u["failure_reason"] = f"no readable design doc at {p!r}"
             u["_next"] = "end_blocked"
+    elif kind == "seed_confirm":
+        seed = as_dict(esc.get("data")).get("seed_path") or state.get("seed_path") or ""
+        a = _answered(state, {"use": ["use this seed"], "draft": ["draft a brief"], "path": ["give a doc path"]}, None)
+        if a == "use" and os.path.isfile(seed):
+            u["design_doc_path"] = os.path.abspath(seed)
+            for k, v in (("status", "consumed"), ("consumed_by", state.get("run_id", "")), ("consumed_at", now_iso())):
+                set_frontmatter(seed, k, v)
+            ledger(state, u, f"seed: {seed} consumed as the design doc")
+            u["_next"] = "orient_read"
+        else:
+            ledger(state, u, f"seed: {seed} left ready ({a or 'unmatched'}: {tail(answer, 120)}); asking for a design doc")
+            raise_escalation(state, u, _need_design_doc_escalation())
     elif kind == "clarify":
         p = os.path.expanduser(answer.strip().split()[0]) if answer.strip() else ""
         if p and os.path.isfile(p):

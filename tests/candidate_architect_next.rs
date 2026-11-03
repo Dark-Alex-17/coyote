@@ -47,7 +47,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "architect-next";
-const SMOKE_FLOOR: usize = 614;
+const SMOKE_FLOOR: usize = 626;
 const MATRIX_FLOOR: usize = 53;
 const _: () = assert!(MATRIX_FLOOR >= 53, "the matrix floor never drops below 53");
 
@@ -594,6 +594,18 @@ fn smoke_rows_go_red_under_the_recorded_sabotages() {
             "if login and login not in cached]",
             "permission stall: a single failing login is read once across three polls",
         ),
+        (
+            "seed-ready",
+            "            if fm.get(\"status\") != \"ready\":\n",
+            "            if False:\n",
+            "intake seed: another project / consumed / no frontmatter -> ignored, need_design_doc",
+        ),
+        (
+            "seed-consumed",
+            "                set_frontmatter(seed, k, v)\n",
+            "                pass\n",
+            "apply_answer: seed_confirm use -> design doc is the seed, orient_read, seed consumed",
+        ),
     ];
     for (label, old, new, row) in sabotages {
         let scratch = scratch_dir(&format!("sabotage-{label}"));
@@ -653,6 +665,29 @@ fn session_block_check_passes_under_mikefarah_yq() {
             .any(|l| l.starts_with("ok variables mirror architect")),
         "{report}"
     );
+}
+
+/// The run's seed pickup reads what the attached engineer writes, and the
+/// standalone handoff paragraph is hidden in attached mode, so the
+/// architect-attachment block itself must state the seed contract.
+#[test]
+fn engineer_architect_block_states_the_seed_contract() {
+    let text = fs::read_to_string(agents_dir().join("engineer/instructions.md")).unwrap();
+    let open = "<!-- when:chat_agent_for=architect -->";
+    let start = text.find(open).expect("no architect-attachment block") + open.len();
+    let block = &text[start..start + text[start..].find("<!-- end -->").unwrap()];
+    for needle in [
+        "plans/engineer-handoffs/",
+        "status: ready",
+        "project:",
+        "created:",
+        "never edit a seed whose status is `consumed`",
+    ] {
+        assert!(
+            block.contains(needle),
+            "the architect-attachment block does not state {needle:?}:\n{block}"
+        );
+    }
 }
 
 /// Opt-in: the walk runs all 48 mode combinations through the real gates
@@ -2291,10 +2326,10 @@ fn readme_toolchain_census_matches_the_live_grep() {
     );
     assert_eq!(
         gates_lines,
-        vec![44, 2724, 2733],
+        vec![44, 2779, 2788],
         "the gates.py toolchain hits moved; update the README census and its prose"
     );
-    for line in [2724, 2733] {
+    for line in [2779, 2788] {
         assert!(
             text.contains(&format!("`gates.py:{line}`")) || text.contains(&format!("`:{line}`")),
             "the README prose must cite gates.py:{line}"

@@ -246,6 +246,63 @@ st_bad = gates.intake({"initial_prompt": f"go {DESIGN}", **STORE.variables(DESIG
 check("intake: unknown mode value -> escalation mode_invalid (fail-safe, never a default)", st_bad["_next"] == "escalate_gate" and st_bad["escalation"]["kind"] == "mode_invalid")
 st_nd = gates.intake({"initial_prompt": "implement the thing", **STORE.variables("", TMP)})
 check("intake: no design doc -> escalation need_design_doc", st_nd["_next"] == "escalate_gate" and st_nd["escalation"]["kind"] == "need_design_doc")
+SEEDS = os.path.join(PLANS, "engineer-handoffs")
+
+
+def seed(name, created, status="ready", project=CODE, fm=True):
+    path = os.path.join(SEEDS, name)
+    head = f"---\nstatus: {status}\nproject: {project}\ncreated: {created}\ntitle: Seed {name}\n---\n\n" if fm else ""
+    write(path, head + f"# Seed {name}\n\nBuild the widget.\n")
+    return path
+
+
+def seed_status(path):
+    return gates.frontmatter(read_file(path))[0].get("status")
+
+
+seed("other.md", "2030-01-01T00:00:00Z", project=os.path.join(TMP, "elsewhere"))
+seed("used.md", "2030-01-02T00:00:00Z", status="consumed")
+seed("bare.md", "", fm=False)
+u = gates.intake({"initial_prompt": "implement the thing", **STORE.variables("", TMP)})
+check("intake seed: another project / consumed / no frontmatter -> ignored, need_design_doc",
+      u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "need_design_doc" and not u.get("seed_path"), u.get("seed_path"))
+SEED_OLD = seed("old.md", "2026-01-01T00:00:00Z")
+SEED = seed("new.md", "2026-02-01T00:00:00Z")
+u = gates.intake({"initial_prompt": f"Implement the design at {DESIGN}", **STORE.variables(DESIGN, TMP)})
+check("intake seed: an explicit design doc wins over a ready seed, seed untouched",
+      u["_next"] == "orient_read" and u["design_doc_path"] == DESIGN and not u.get("seed_path") and seed_status(SEED) == "ready")
+st_seed = gates.intake({"initial_prompt": "okay, go ahead and get started", **STORE.variables("", TMP)})
+check("intake seed: no doc path + two ready seeds -> confirm_seed on the newest, not yet consumed",
+      st_seed["_next"] == "confirm_seed" and st_seed["escalation"]["kind"] == "seed_confirm" and st_seed["seed_path"] == SEED
+      and st_seed["escalation"]["data"]["seed_path"] == SEED and SEED in st_seed["ask_question"] and "Seed new.md" in st_seed["ask_question"]
+      and "2026-02-01T00:00:00Z" in st_seed["ask_question"] and seed_status(SEED) == "ready", st_seed.get("_next"))
+check("intake seed: seed_path survives in state.json", json.loads(read_file(os.path.join(st_seed["run_dir"], "state.json")))["seed_path"] == SEED)
+os.remove(SEED_OLD)
+_groups = gates.MULTI_IS_GROUPS
+gates.MULTI_IS_GROUPS = False
+u = gates.intake({"initial_prompt": "do it", **STORE.variables("", TMP, pr_strategy="multi", pr_tracking="review")})
+gates.MULTI_IS_GROUPS = _groups
+check("intake seed: the review-watch follow-up is recorded once before confirm_seed",
+      u["_next"] == "confirm_seed" and len([f for f in u.get("follow_ups", []) if f.startswith("review-watch: not started")]) == 1, u.get("follow_ups"))
+E_SEED = st_seed["escalation"]
+u = gates.parse_answer(base_state(escalation=E_SEED, last_answer_text="2"))
+check("parse_answer: seed_confirm number -> the option text", u["last_answer"] == "Draft a brief from this conversation instead")
+for answer, row in (("Abort the run", "abort -> end_aborted"), ("Give a doc path instead", "doc path -> need_design_doc"),
+                    ("Draft a brief from this conversation instead", "draft -> need_design_doc"), ("banana", "unmatched -> need_design_doc")):
+    u = gates.apply_answer(base_state(escalation=E_SEED, last_answer=answer, seed_path=SEED))
+    want = ("end_aborted", "") if answer.startswith("Abort") else ("escalate_gate", "need_design_doc")
+    check(f"apply_answer: seed_confirm {row}, seed still ready",
+          (u["_next"], u.get("escalation", {}).get("kind", "")) == want and seed_status(SEED) == "ready" and "design_doc_path" not in u,
+          u.get("_next"))
+u = gates.apply_answer(base_state(escalation=E_SEED, last_answer="Use this seed", seed_path=SEED, run_id="seed-run"))
+fm_seed = gates.frontmatter(read_file(SEED))[0]
+check("apply_answer: seed_confirm use -> design doc is the seed, orient_read, seed consumed",
+      u["_next"] == "orient_read" and u["design_doc_path"] == SEED and fm_seed.get("status") == "consumed"
+      and fm_seed.get("consumed_by") == "seed-run" and fm_seed.get("consumed_at") and "follow_ups" not in u, fm_seed)
+u = gates.intake({"initial_prompt": "go ahead", **STORE.variables("", TMP)})
+check("intake seed: a consumed seed is not picked again -> need_design_doc",
+      u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "need_design_doc" and not u.get("seed_path"), u.get("seed_path"))
+shutil.rmtree(SEEDS)
 write(os.path.join(st["run_dir"], "tasks.json"), json.dumps([{"id": "TASK-101", "status": "complete"}]))
 gates.snapshot(st, {"sealed": True, "gate2_verdict": "OKAY", "plan_path": PLAN}, "task TASK-101 done")
 st2 = gates.intake({"initial_prompt": f"Fix these CI failures: X\nArchitect run id: {rid}", **STORE.variables(DESIGN, TMP)})

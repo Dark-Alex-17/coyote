@@ -23534,6 +23534,7 @@ mod tests {
                             "ci_route",
                             "claim_task",
                             "compose_delegation",
+                            "confirm_seed",
                             "consult_navigator",
                             "consult_route",
                             "debt_assign",

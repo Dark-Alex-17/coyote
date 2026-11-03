@@ -122,6 +122,10 @@ session:
       mixes both, route CHAT: the engineer can always conclude with an artifact
       the user explicitly runs, but a wrongly-routed RUN performs writes nobody
       asked for.
+      A bare go-ahead ("okay, go ahead and get started", "do it") after the
+      conversation discussed work to implement routes RUN; the run picks up the
+      engineer's ready seed or drafts a brief from the conversation and confirms
+      it with the user before any write.
   chat:
     agent: engineer
     variables:
@@ -148,6 +152,7 @@ initial_state:
   reference_root_path: ''
   core_tools: ''
   design_doc_path: ''
+  seed_path: ''
   design_title: ''
   owner_away: false
   top_level: true
@@ -396,6 +401,27 @@ nodes:
     description: Re-entry switch on the phase recorded at exit (A2/A14).
     script: scripts/resume_route.py
     fallback: end_failure
+
+  confirm_seed:
+    id: confirm_seed
+    type: approval
+    description: No design doc was given - confirm the engineer's newest ready seed as the design doc.
+    question: |
+      {{ask_question}}
+    options:
+      - 'Use this seed'
+      - 'Draft a brief from this conversation instead'
+      - 'Give a doc path instead'
+      - 'Abort the run'
+    routes:
+      'Use this seed': apply_answer
+      'Draft a brief from this conversation instead': apply_answer
+      'Give a doc path instead': apply_answer
+      'Abort the run': apply_answer
+    on_other: parse_answer
+    state_updates:
+      last_answer: '{{choice}}'
+      last_answer_text: '{{choice}}'
 
   orient_read:
     id: orient_read
