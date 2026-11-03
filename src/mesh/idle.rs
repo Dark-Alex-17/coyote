@@ -4,7 +4,9 @@
 //! session context; nothing here does.
 
 use crate::mesh::notify::{Notification, Source};
-use crate::mesh::propagation_fetch::{FetchError, FetchReport, MAX_WANTS_PER_FETCH};
+use crate::mesh::propagation_fetch::{
+    ASKED_FOR_SOURCE, FetchError, FetchReport, MAX_WANTS_PER_FETCH,
+};
 use crate::mesh::request::{RequestError, redact_hashes, short};
 use crate::supervisor::notification::SystemNotification;
 
@@ -455,7 +457,8 @@ impl SyncSchedule {
 }
 
 /// `synced 3 messages from deadbeef: 2 delivered, 1 duplicate`, naming only the non-zero
-/// outcomes.
+/// outcomes. A deferral that followed an ask for the sender's announce says so, with
+/// what to do next.
 fn synced_line(report: &FetchReport) -> String {
     let outcomes: Vec<String> = [
         (report.delivered, "delivered", "delivered"),
@@ -476,11 +479,96 @@ fn synced_line(report: &FetchReport) -> String {
         line.push_str(": ");
         line.push_str(&outcomes.join(", "));
     }
+    if let Some(suffix) = sync_ask_suffix(report.deferred, report.deferred_after_ask) {
+        line.push_str(&format!(" ({suffix})"));
+    }
     line
+}
+
+/// Why some of a sync's deferred messages wait on an announce and what to do next, shared
+/// by the idle sync line and `.mesh sync`.
+pub(crate) fn sync_ask_suffix(deferred: usize, deferred_after_ask: usize) -> Option<String> {
+    if deferred_after_ask == 0 {
+        return None;
+    }
+    let (them, arrival) = if deferred_after_ask == 1 {
+        ("it", "the announce arrives")
+    } else {
+        ("them", "the announces arrive")
+    };
+    let share = if deferred_after_ask < deferred {
+        format!("for {deferred_after_ask} of {deferred}, ")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "{share}{ASKED_FOR_SOURCE}; the next sync delivers {them} once {arrival}, or run .mesh sync in a minute"
+    ))
 }
 
 pub(crate) fn plural(count: usize, one: &str, many: &str) -> String {
     format!("{count} {}", if count == 1 { one } else { many })
+}
+
+#[cfg(test)]
+mod synced_ask_line_tests {
+    use super::*;
+
+    #[test]
+    fn a_deferral_after_an_ask_names_it_and_the_next_step() {
+        let mut report = FetchReport {
+            node: "deadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+            listed: 2,
+            wanted: 2,
+            received: 2,
+            delivered: 1,
+            duplicates: 0,
+            discarded: 0,
+            deferred: 1,
+            deferred_after_ask: 0,
+            acknowledged: 1,
+        };
+        assert_eq!(
+            synced_line(&report),
+            "synced 2 messages from deadbeef: 1 delivered, 1 deferred",
+            "a later sighting keeps the plain wording"
+        );
+        report.deferred_after_ask = 1;
+        assert_eq!(
+            synced_line(&report),
+            "synced 2 messages from deadbeef: 1 delivered, 1 deferred (source identity not yet known; asked the mesh for its announce; the next sync delivers it once the announce arrives, or run .mesh sync in a minute)"
+        );
+    }
+
+    #[test]
+    fn a_partial_ask_gives_the_count_and_picks_the_pronoun_by_it() {
+        let mut report = FetchReport {
+            node: "deadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+            listed: 3,
+            wanted: 3,
+            received: 3,
+            delivered: 0,
+            duplicates: 0,
+            discarded: 0,
+            deferred: 3,
+            deferred_after_ask: 1,
+            acknowledged: 0,
+        };
+        assert_eq!(
+            synced_line(&report),
+            "synced 3 messages from deadbeef: 3 deferred (for 1 of 3, source identity not yet known; asked the mesh for its announce; the next sync delivers it once the announce arrives, or run .mesh sync in a minute)"
+        );
+        report.deferred_after_ask = 2;
+        assert_eq!(
+            synced_line(&report),
+            "synced 3 messages from deadbeef: 3 deferred (for 2 of 3, source identity not yet known; asked the mesh for its announce; the next sync delivers them once the announces arrive, or run .mesh sync in a minute)"
+        );
+        report.deferred_after_ask = 3;
+        assert_eq!(
+            synced_line(&report),
+            "synced 3 messages from deadbeef: 3 deferred (source identity not yet known; asked the mesh for its announce; the next sync delivers them once the announces arrive, or run .mesh sync in a minute)"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -727,6 +815,7 @@ mod tests {
             duplicates,
             discarded: 0,
             deferred: 0,
+            deferred_after_ask: 0,
             acknowledged: received,
         }
     }

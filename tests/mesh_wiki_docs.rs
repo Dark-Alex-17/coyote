@@ -5080,7 +5080,7 @@ fn the_mesh_pages_tell_the_restart_story_as_a_path_request_with_the_timeout_the_
 
     let message_rs = read(repo_root().join("src").join("mesh").join("message.rs"));
     let repl = read(repo_root().join("src").join("repl").join("mesh.rs"));
-    let send_tail = "Try again in a minute; nothing was queued for it, because a message can be held on a propagation node only after the peer's announce has been heard. `.mesh peers` shows when it was last heard.";
+    let send_tail = "Nothing was queued for it: this node holds no key for the peer, and a message can be held on a propagation node only once the peer's announce has brought its key. Try again after it announces; `.mesh peers` shows when it was last heard.";
     let status_tail = "A status request is answered live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard.";
     let knock_tail = "Try again in a minute; nothing was queued for it, because a knock can be held on a propagation node only after the peer's announce has been heard. `.mesh peers` shows when it was last heard.";
     let fetch_tail = "A fetch runs live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard.";

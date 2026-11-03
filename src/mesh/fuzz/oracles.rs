@@ -1285,7 +1285,7 @@ impl Model {
                 self.delivered.insert(id);
                 self.delivered_log.push(id);
             }
-            BodyOutcome::Deferred { attempts } => {
+            BodyOutcome::Deferred { attempts, .. } => {
                 self.deferrals
                     .entry(transient)
                     .or_insert(Sighting {
@@ -1298,7 +1298,7 @@ impl Model {
                 Discard::Oversize { .. }
                 | Discard::Undersize { .. }
                 | Discard::Duplicate
-                | Discard::UnknownSource,
+                | Discard::UnknownSource { .. },
             ) => {}
             BodyOutcome::Discarded(_) => self.record(transient),
         }
@@ -1601,6 +1601,8 @@ impl ReceiptFixture {
             return (
                 BodyOutcome::Deferred {
                     attempts: earlier.map_or(0, |s| s.attempts).saturating_add(1),
+                    // `MutableKeys` keeps the default `ask_for_source`: no fuzz body is asked for.
+                    asked: false,
                 },
                 Stage::SourceKey,
             );
@@ -1643,6 +1645,7 @@ impl ReceiptFixture {
             trust: &self.trust,
             sink: &bench.sink,
             node: "fuzz",
+            asked: Default::default(),
         };
         let observed = self
             .rt
@@ -1814,10 +1817,22 @@ pub(super) fn check_receipt_deferral_budget(fx: &ReceiptFixture) -> Result<(), S
     let mut bench = fx.bench();
     let outcomes = run_sequence(fx, &mut bench, &sequence)?;
     let expected = [
-        BodyOutcome::Deferred { attempts: 1 },
-        BodyOutcome::Deferred { attempts: 2 },
-        BodyOutcome::Deferred { attempts: 3 },
-        BodyOutcome::Deferred { attempts: 4 },
+        BodyOutcome::Deferred {
+            attempts: 1,
+            asked: false,
+        },
+        BodyOutcome::Deferred {
+            attempts: 2,
+            asked: false,
+        },
+        BodyOutcome::Deferred {
+            attempts: 3,
+            asked: false,
+        },
+        BodyOutcome::Deferred {
+            attempts: 4,
+            asked: false,
+        },
         BodyOutcome::Discarded(Discard::UnknownSourceBudgetSpent),
         BodyOutcome::Discarded(Discard::Duplicate),
     ];

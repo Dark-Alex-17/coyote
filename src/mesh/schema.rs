@@ -120,6 +120,10 @@ pub(crate) const ON_DISK_STRUCTS: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "propagation_nodes.rs",
+        &["PropagationNodeFile", "StoredNode"],
+    ),
+    (
         "shares.rs",
         &["SharesFile", "AllowEntry", "DenyEntry", "OverrideEntry"],
     ),
@@ -420,6 +424,11 @@ mod tests {
             (
                 "PROPAGATION_STORE_VERSION",
                 crate::mesh::propagation_fetch::PROPAGATION_STORE_VERSION,
+                1,
+            ),
+            (
+                "PROPAGATION_NODE_TABLE_VERSION",
+                crate::mesh::propagation_nodes::PROPAGATION_NODE_TABLE_VERSION,
                 1,
             ),
             (

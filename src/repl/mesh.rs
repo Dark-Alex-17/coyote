@@ -11,7 +11,7 @@ use crate::mesh::fetch::{
 };
 use crate::mesh::grants::DEFAULT_GRANT_TTL;
 use crate::mesh::identity::{self, Predecessor, fingerprint};
-use crate::mesh::idle::plural;
+use crate::mesh::idle::{plural, sync_ask_suffix};
 use crate::mesh::knock::{
     DroppedKnocks, KNOCK_BUCKET_REFILL_INTERVAL, KNOCK_DROPS_REMEMBERED,
     KNOCK_IS_NOT_FIRST_CONTACT, KnockFallback, KnockIntro, KnockOutcome, KnockVia,
@@ -43,9 +43,9 @@ use crate::mesh::{
     AlreadyClosed, FetchError, FetchReport, HEARTBEAT_PERIOD_SECS, HEARTBEAT_SECS, HUMAN_DECLINED,
     InterfaceState, InterfaceStatus, LocalEndpoint, LoggingInboundSink, MAX_WANTS_PER_FETCH,
     MESH_ALREADY_ON, MeshPaths, MeshRuntime, NodeOptions, PATH_REQUEST_TIMEOUT, PEER_STALE_AFTER,
-    PEER_TTL, PeerRecord, PropagationNodeRecord, age_text, canonical_hash, canonicalize,
-    decode_hex, destination_address, display_text, hex_lower, human_size, loopback_endpoint,
-    parse_rfc3339, redact_hashes, refuse_symlink, rfc3339_utc, short, span_text,
+    PEER_TTL, PROPAGATION_NODE_TTL, PeerRecord, PropagationNodeRecord, age_text, canonical_hash,
+    canonicalize, decode_hex, destination_address, display_text, hex_lower, human_size,
+    loopback_endpoint, parse_rfc3339, redact_hashes, refuse_symlink, rfc3339_utc, short, span_text,
 };
 use crate::repl::printer::terminal_width;
 use crate::supervisor::mailbox::EnvelopePayload;
@@ -2589,7 +2589,7 @@ fn render_sync(report: &FetchReport) -> String {
         return format!("Nothing held for this node at {node}.");
     }
     let mut line = format!(
-        "Fetched from {node}: {} listed, {} wanted, {} received, {} delivered, {} duplicates, {} discarded, {} deferred.",
+        "Fetched from {node}: {} listed, {} wanted, {} received, {} delivered, {} duplicates, {} discarded, {} deferred",
         report.listed,
         report.wanted,
         report.received,
@@ -2598,10 +2598,64 @@ fn render_sync(report: &FetchReport) -> String {
         report.discarded,
         report.deferred
     );
+    if let Some(suffix) = sync_ask_suffix(report.deferred, report.deferred_after_ask) {
+        line.push_str(&format!(": {suffix}"));
+    }
+    line.push('.');
     if report.wanted == MAX_WANTS_PER_FETCH {
         line.push_str(" More may be held; run .mesh sync again.");
     }
     line
+}
+
+#[cfg(test)]
+mod sync_ask_line_tests {
+    use super::*;
+
+    #[test]
+    fn a_deferral_after_an_ask_says_so_and_what_to_run() {
+        let report = FetchReport {
+            node: "deadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+            listed: 1,
+            wanted: 1,
+            received: 1,
+            delivered: 0,
+            duplicates: 0,
+            discarded: 0,
+            deferred: 1,
+            deferred_after_ask: 1,
+            acknowledged: 0,
+        };
+        assert_eq!(
+            render_sync(&report),
+            "Fetched from deadbeef: 1 listed, 1 wanted, 1 received, 0 delivered, 0 duplicates, 0 discarded, 1 deferred: source identity not yet known; asked the mesh for its announce; the next sync delivers it once the announce arrives, or run .mesh sync in a minute."
+        );
+    }
+
+    #[test]
+    fn a_partial_ask_gives_the_count_and_picks_the_pronoun_by_it() {
+        let mut report = FetchReport {
+            node: "deadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+            listed: 3,
+            wanted: 3,
+            received: 3,
+            delivered: 0,
+            duplicates: 0,
+            discarded: 0,
+            deferred: 3,
+            deferred_after_ask: 1,
+            acknowledged: 0,
+        };
+        assert_eq!(
+            render_sync(&report),
+            "Fetched from deadbeef: 3 listed, 3 wanted, 3 received, 0 delivered, 0 duplicates, 0 discarded, 3 deferred: for 1 of 3, source identity not yet known; asked the mesh for its announce; the next sync delivers it once the announce arrives, or run .mesh sync in a minute."
+        );
+        report.deferred_after_ask = 3;
+        assert_eq!(
+            render_sync(&report),
+            "Fetched from deadbeef: 3 listed, 3 wanted, 3 received, 0 delivered, 0 duplicates, 0 discarded, 3 deferred: source identity not yet known; asked the mesh for its announce; the next sync delivers them once the announces arrive, or run .mesh sync in a minute."
+        );
+    }
 }
 
 fn trust(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
@@ -6791,18 +6845,25 @@ fn predecessors_text(
 }
 
 /// Nearest first, the most recently heard breaking ties, so the row the node picks for
-/// store-and-forward is the top one.
+/// store-and-forward is the top one. A node the pickers skip as aged out is not listed.
 fn propagation_node_rows(
     mut nodes: Vec<PropagationNodeRecord>,
     now: SystemTime,
 ) -> Vec<(String, String)> {
+    let heard = nodes.len();
+    nodes.retain(|node| !node.is_expired(now));
     nodes.sort_by_key(|node| (node.hops, std::cmp::Reverse(node.last_seen)));
     let mut rows = Vec::new();
     if nodes.is_empty() {
-        rows.push((
-            "propagation_nodes".to_string(),
-            "none heard yet".to_string(),
-        ));
+        let none = if heard == 0 {
+            "none heard yet".to_string()
+        } else {
+            format!(
+                "none heard in the last {} h ({heard} aged out); .mesh sync finds one once it announces again",
+                PROPAGATION_NODE_TTL.as_secs() / 3600
+            )
+        };
+        rows.push(("propagation_nodes".to_string(), none));
     }
     for (i, record) in nodes.iter().enumerate() {
         rows.push((
@@ -7333,6 +7394,7 @@ mod tests {
             destination_hash: "ab".repeat(16),
             identity_hash: "cd".repeat(16),
             name_hash: String::new(),
+            public_key: None,
             display_name: name.map(str::to_string),
             protocol_version: 1,
             compatibility: Compatibility::Compatible,
@@ -9707,7 +9769,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             "one row and no selection rule before a node is heard"
         );
 
-        let record = |hops: u8, aspect: &str| PropagationNodeRecord {
+        let record = |hops: u8, aspect: &str, last_seen: SystemTime| PropagationNodeRecord {
             node: PropagationNode {
                 destination: SingleOutputDestination::new(
                     *TransportIdentity::new_from_rand(OsRng).as_identity(),
@@ -9719,14 +9781,20 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 propagation_enabled: true,
             },
             hops,
-            last_seen: now - Duration::from_secs(60),
+            last_seen,
         };
-        let far = record(3, "far");
-        let near = record(1, "near");
+        let heard = now - Duration::from_secs(60);
+        let far = record(3, "far", heard);
+        let near = record(1, "near", heard);
+        let aged_out = record(0, "aged", now - Duration::from_secs(365 * 24 * 60 * 60));
         let far_hex = far.node.destination.address_hash.to_hex_string();
         let near_hex = near.node.destination.address_hash.to_hex_string();
-        let rows = propagation_node_rows(vec![far, near], now);
-        assert_eq!(rows.len(), 2, "one row per node heard: {rows:?}");
+        let rows = propagation_node_rows(vec![far, near, aged_out], now);
+        assert_eq!(
+            rows.len(),
+            2,
+            "one row per node heard, none for one aged out: {rows:?}"
+        );
         assert!(
             rows[0].0 == "propagation_nodes[0]" && rows[0].1.contains(&near_hex),
             "the renderer itself puts the 1-hop node first: {rows:?}"
@@ -9735,6 +9803,21 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         assert!(
             rows[1].0 == "propagation_nodes[1]" && rows[1].1.contains(&far_hex),
             "{rows:?}"
+        );
+
+        let stale = now - PROPAGATION_NODE_TTL - Duration::from_secs(60);
+        let rows = propagation_node_rows(
+            vec![record(1, "old", stale), record(2, "older", stale)],
+            now,
+        );
+        assert_eq!(
+            rows,
+            vec![(
+                "propagation_nodes".to_string(),
+                "none heard in the last 24 h (2 aged out); .mesh sync finds one once it announces again"
+                    .to_string()
+            )],
+            "nodes that all aged out are counted, not reported as never heard"
         );
     }
 
@@ -11903,6 +11986,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 duplicates: 1,
                 discarded: 1,
                 deferred: 1,
+                deferred_after_ask: 0,
                 acknowledged: 5,
             };
             let line = render_sync(&report);
@@ -13641,6 +13725,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         destination_hash: destination.clone(),
                         identity_hash: identity.clone(),
                         name_hash,
+                        public_key: None,
                         display_name: Some(name.to_string()),
                         protocol_version: 1,
                         hops: 1,
@@ -13932,6 +14017,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                 destination_hash: destination.clone(),
                                 identity_hash: announced.desc.identity.address_hash.to_hex_string(),
                                 name_hash: hex_lower(name.as_name_hash_slice()),
+                                public_key: None,
                                 display_name: Some("Tia".to_string()),
                                 protocol_version: 1,
                                 hops: 1,
@@ -14004,6 +14090,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                 destination_hash: destination.clone(),
                                 identity_hash: announced.desc.identity.address_hash.to_hex_string(),
                                 name_hash: hex_lower(name.as_name_hash_slice()),
+                                public_key: None,
                                 display_name: Some("Tia".to_string()),
                                 protocol_version: 1,
                                 hops: 1,
@@ -14077,6 +14164,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         destination_hash: hex_lower(&[dest; 16]),
                         identity_hash: hex_lower(&[identity; 16]),
                         name_hash: String::new(),
+                        public_key: None,
                         display_name: Some(name.to_string()),
                         protocol_version: 1,
                         hops: 1,
@@ -14228,6 +14316,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             destination_hash: peer.clone(),
                             identity_hash: hex_lower(&[0xcd; 16]),
                             name_hash: String::new(),
+                            public_key: None,
                             display_name: Some("Tia".to_string()),
                             protocol_version: 1,
                             hops: 1,
@@ -16524,6 +16613,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         destination_hash: destination.clone(),
                         identity_hash: identity.clone(),
                         name_hash: hex_lower(dest_name.as_name_hash_slice()),
+                        public_key: None,
                         display_name: Some(name.to_string()),
                         protocol_version: 1,
                         hops: 1,
@@ -18683,6 +18773,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             destination_hash: trusted.clone(),
                             identity_hash: announced.desc.identity.address_hash.to_hex_string(),
                             name_hash: hex_lower(name.as_name_hash_slice()),
+                            public_key: None,
                             display_name: Some("Tia".to_string()),
                             protocol_version: 1,
                             hops: 1,
@@ -18808,6 +18899,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             destination_hash: trusted.clone(),
                             identity_hash: announced.desc.identity.address_hash.to_hex_string(),
                             name_hash: hex_lower(name.as_name_hash_slice()),
+                            public_key: None,
                             display_name: Some("Tia".to_string()),
                             protocol_version: 1,
                             hops: 1,
@@ -18911,6 +19003,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         destination_hash: hex_lower(&[dest; 16]),
                         identity_hash: hex_lower(&[identity; 16]),
                         name_hash: String::new(),
+                        public_key: None,
                         display_name: Some(name.to_string()),
                         protocol_version: 1,
                         hops: 1,
@@ -19023,6 +19116,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             destination_hash: known.clone(),
                             identity_hash: hex_lower(&[0x5b; 16]),
                             name_hash: String::new(),
+                            public_key: None,
                             display_name: Some("Kay".to_string()),
                             protocol_version: 1,
                             hops: 2,
@@ -19246,6 +19340,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                 destination_hash: twin.clone(),
                                 identity_hash: hex_lower(&[0x5c; 16]),
                                 name_hash: String::new(),
+                                public_key: None,
                                 display_name: Some(name.to_string()),
                                 protocol_version: 1,
                                 hops: 1,
@@ -19408,6 +19503,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         destination_hash: hex_lower(&[dest; 16]),
                         identity_hash: hex_lower(&[identity; 16]),
                         name_hash: String::new(),
+                        public_key: None,
                         display_name: Some(name.to_string()),
                         protocol_version: 1,
                         hops: 1,
@@ -19429,6 +19525,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             destination_hash: trusted.clone(),
                             identity_hash: announced.desc.identity.address_hash.to_hex_string(),
                             name_hash: hex_lower(name.as_name_hash_slice()),
+                            public_key: None,
                             display_name: Some("Tia".to_string()),
                             protocol_version: 1,
                             hops: 1,
@@ -19577,6 +19674,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             destination_hash: untrusted.clone(),
                             identity_hash: hex_lower(&[0x89; 16]),
                             name_hash: String::new(),
+                            public_key: None,
                             display_name: Some("Uma".to_string()),
                             protocol_version: 1,
                             hops: 1,
@@ -19804,6 +19902,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         destination_hash: hex_lower(&[dest; 16]),
                         identity_hash: hex_lower(&[identity; 16]),
                         name_hash: String::new(),
+                        public_key: None,
                         display_name: Some(name.to_string()),
                         protocol_version: 1,
                         hops: 1,
@@ -24153,6 +24252,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             destination_hash: dest.clone(),
                             identity_hash: impostor_id.clone(),
                             name_hash,
+                            public_key: None,
                             display_name: Some("Tia".to_string()),
                             protocol_version: 1,
                             hops: 1,
@@ -24818,6 +24918,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             destination_hash: dest.clone(),
                             identity_hash: other.clone(),
                             name_hash: other_name_hash,
+                            public_key: None,
                             display_name: Some("Mallory".to_string()),
                             protocol_version: 1,
                             hops: 1,
@@ -26036,6 +26137,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                 destination_hash: destination.clone(),
                                 identity_hash: announced.desc.identity.address_hash.to_hex_string(),
                                 name_hash: hex_lower(name.as_name_hash_slice()),
+                                public_key: None,
                                 display_name: Some("Tia".to_string()),
                                 protocol_version: 1,
                                 hops: 1,
@@ -41095,6 +41197,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                 destination_hash: dest.clone(),
                                 identity_hash: rotated.clone(),
                                 name_hash: row.name_hash.clone(),
+                                public_key: None,
                                 display_name: row.display_name.clone(),
                                 protocol_version: row.protocol_version,
                                 hops: row.hops,

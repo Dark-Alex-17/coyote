@@ -51,7 +51,7 @@ pub(crate) use peers::{PEER_STALE_AFTER, PEER_TTL, PeerRecord};
 pub(crate) use propagation_fetch::{
     FetchError, FetchReport, LoggingInboundSink, MAX_WANTS_PER_FETCH,
 };
-pub(crate) use propagation_nodes::PropagationNodeRecord;
+pub(crate) use propagation_nodes::{PROPAGATION_NODE_TTL, PropagationNodeRecord};
 pub(crate) use request::{RequestOptions, redact_hashes, short};
 
 use crate::config::sanitize_display_text;
@@ -1353,6 +1353,7 @@ pub(crate) mod test_support {
             destination_hash: desc.address_hash.to_hex_string(),
             identity_hash: desc.identity.address_hash.to_hex_string(),
             name_hash: hex_lower(name.as_name_hash_slice()),
+            public_key: None,
             display_name: display_name.map(str::to_string),
             protocol_version: 1,
             hops: 1,

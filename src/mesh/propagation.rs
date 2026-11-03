@@ -9,8 +9,10 @@
 //! a message through their identity-key fallback, so this is a forward-secrecy gap, not an
 //! interop one.
 
+use crate::mesh::destination_address;
 use crate::mesh::request::{
-    DEFAULT_LINK_TIMEOUT, Deadline, RefusalCode, RequestError, SizeBranch, open_link, short,
+    DEFAULT_LINK_TIMEOUT, Deadline, NAME_HASH_LEN, RefusalCode, RequestError, SizeBranch,
+    open_link, short,
 };
 
 use lxmf_core::announce::{pn_stamp_cost_from_app_data, validate_pn_announce_data};
@@ -321,6 +323,20 @@ pub(crate) fn lxmf_delivery_hash(identity: &Identity) -> AddressHash {
     SingleOutputDestination::new(*identity, DestinationName::new(APP_NAME, DELIVERY_ASPECT))
         .desc
         .address_hash
+}
+
+/// `lxmf_delivery_hash` for an identity known only by its address hash, as a peer table
+/// row without a key knows it.
+pub(crate) fn lxmf_delivery_hash_of(identity_hash: &AddressHash) -> AddressHash {
+    let name = DestinationName::new(APP_NAME, DELIVERY_ASPECT);
+    let name_hash = <[u8; NAME_HASH_LEN]>::try_from(name.as_name_hash_slice())
+        .expect("a destination name hash is NAME_HASH_LEN bytes");
+    destination_address(&name_hash, identity_hash)
+}
+
+/// The `lxmf.propagation` destination `identity` announces as a propagation node.
+pub(crate) fn propagation_node_destination(identity: Identity) -> DestinationDesc {
+    SingleOutputDestination::new(identity, DestinationName::new(APP_NAME, PROPAGATION_ASPECT)).desc
 }
 
 /// A signed message from `sender` to the recipient whose delivery hash is

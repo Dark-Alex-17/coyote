@@ -58,10 +58,13 @@ use crate::mesh::propagation::{
     prepare_envelope,
 };
 use crate::mesh::propagation_fetch::{
-    Discard, InboundMessage, InboundSink, MAX_FETCHED_MESSAGE_BYTES, MIN_FETCHED_MESSAGE_BYTES,
-    PROPAGATION_STORE_VERSION, check_bounds,
+    Discard, FetchError, InboundMessage, InboundSink, MAX_FETCHED_MESSAGE_BYTES,
+    MIN_FETCHED_MESSAGE_BYTES, PROPAGATION_STORE_VERSION, check_bounds,
 };
-use crate::mesh::propagation_nodes::{PROPAGATION_NODE_TABLE_MAX_ENTRIES, PropagationNodeTable};
+use crate::mesh::propagation_nodes::{
+    PROPAGATION_NODE_TABLE_MAX_ENTRIES, PROPAGATION_NODE_TABLE_VERSION, PROPAGATION_NODE_TTL,
+    PropagationNodeFile, PropagationNodeTable, StoredNode,
+};
 use crate::mesh::protocol::{
     Compatibility, MESH_PROTOCOL_MIN_SUPPORTED, MESH_PROTOCOL_VERSION, VersionRefusal,
     protocol_supported,
@@ -966,6 +969,7 @@ fn sighting(peer: &Announced) -> PeerSighting {
         destination_hash: peer.destination_hash.clone(),
         identity_hash: peer.identity_hash.clone(),
         name_hash: peer.name_hash.clone(),
+        public_key: None,
         display_name: Some("Bob".to_string()),
         protocol_version: MESH_PROTOCOL_VERSION,
         hops: 2,
@@ -2492,19 +2496,31 @@ fn pn_vectors() -> Vec<Vector> {
             }),
         ),
         row(
-            "pn-table-selects-a-node-long-after-its-sighting",
-            Kind::Valid,
+            "pn-table-selects-a-node-until-its-ttl-runs-out",
+            Kind::Boundary,
             Case::Custom(|| {
-                let table = PropagationNodeTable::new();
                 let node = propagation_node(20, 128);
                 let hash = node.destination.address_hash.to_hex_string();
-                table.observe(node, 1, t(1_000));
+                let heard = PropagationNodeTable::new();
+                heard.observe(
+                    node.clone(),
+                    1,
+                    SystemTime::now() - PROPAGATION_NODE_TTL + Duration::from_secs(60),
+                );
                 same(
-                    "selected long after the sighting",
-                    table
+                    "selected a minute before the ttl runs out",
+                    heard
                         .select()
                         .map(|node| node.destination.address_hash.to_hex_string()),
                     Ok(hash),
+                )?;
+                let aged = PropagationNodeTable::new();
+                aged.observe(node, 1, SystemTime::now() - PROPAGATION_NODE_TTL);
+                same(
+                    "skipped once the ttl has run out",
+                    aged.select()
+                        .map(|node| node.destination.address_hash.to_hex_string()),
+                    Err(FetchError::NoPropagationNode),
                 )
             }),
         ),
@@ -2517,9 +2533,10 @@ fn pn_vectors() -> Vec<Vector> {
                 let near_old = propagation_node(20, 128);
                 let near_new = propagation_node(20, 128);
                 let expected = near_new.destination.address_hash.to_hex_string();
-                table.observe(far, 1, t(9_000));
-                table.observe(near_old, 0, t(1_000));
-                table.observe(near_new, 0, t(2_000));
+                let now = SystemTime::now();
+                table.observe(far, 1, now);
+                table.observe(near_old, 0, now - Duration::from_secs(8_000));
+                table.observe(near_new, 0, now - Duration::from_secs(7_000));
                 same(
                     "fewest hops, most recent first",
                     table
@@ -4058,6 +4075,11 @@ fn code_vectors() -> Vec<Vector> {
                 same("PREDECESSOR_RECORD_VERSION", PREDECESSOR_RECORD_VERSION, 1)?;
                 same("PEER_TABLE_VERSION", PEER_TABLE_VERSION, 2)?;
                 same("PROPAGATION_STORE_VERSION", PROPAGATION_STORE_VERSION, 1)?;
+                same(
+                    "PROPAGATION_NODE_TABLE_VERSION",
+                    PROPAGATION_NODE_TABLE_VERSION,
+                    1,
+                )?;
                 same("SHARES_FILE_VERSION", SHARES_FILE_VERSION, 1)?;
                 same("GRANT_RECORD_VERSION", GRANT_RECORD_VERSION, 1)
             }),
@@ -4167,12 +4189,32 @@ fn code_vectors() -> Vec<Vector> {
                         destination_hash: "0b".repeat(16),
                         identity_hash: "0a".repeat(16),
                         name_hash: "0c".repeat(10),
+                        public_key: None,
                         display_name: None,
                         protocol_version: 1,
                         compatibility: Compatibility::Compatible,
                         hops: 1,
                         first_seen: UNIX_EPOCH,
                         last_seen: UNIX_EPOCH,
+                    },
+                )?;
+                refuses_an_unknown_key(
+                    "PropagationNodeFile",
+                    &PropagationNodeFile {
+                        version: PROPAGATION_NODE_TABLE_VERSION,
+                        nodes: vec![],
+                    },
+                )?;
+                refuses_an_unknown_key(
+                    "StoredNode",
+                    &StoredNode {
+                        destination_hash: "0b".repeat(16),
+                        public_key: "0a".repeat(64),
+                        hops: 1,
+                        last_heard: UNIX_EPOCH,
+                        stamp_cost: 8,
+                        per_transfer_limit_kb: 256,
+                        propagation_enabled: true,
                     },
                 )?;
                 match serde_json::from_value::<Compatibility>(
@@ -4331,6 +4373,7 @@ fn time_vectors() -> Vec<Vector> {
                             destination_hash: hash(index),
                             identity_hash: base.identity_hash.clone(),
                             name_hash: base.name_hash.clone(),
+                            public_key: None,
                             display_name: None,
                             protocol_version: 1,
                             hops: 1,
@@ -4344,6 +4387,7 @@ fn time_vectors() -> Vec<Vector> {
                         destination_hash: hash(PEER_TABLE_MAX_ENTRIES),
                         identity_hash: base.identity_hash.clone(),
                         name_hash: base.name_hash.clone(),
+                        public_key: None,
                         display_name: None,
                         protocol_version: 1,
                         hops: 1,

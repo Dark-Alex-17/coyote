@@ -48,7 +48,9 @@ use crate::mesh::propagation::{
     self, OutboundMessage, PropagationError, PropagationNode, PropagationOptions,
 };
 use crate::mesh::propagation_fetch::{self, FetchError, FetchOptions, FetchReport, InboundSink};
-use crate::mesh::propagation_nodes::PropagationNodeTable;
+use crate::mesh::propagation_nodes::{
+    PROPAGATION_NODE_TABLE_FILE, PersistTrigger, PropagationNodeTable,
+};
 use crate::mesh::protocol::{Compatibility, MESH_PROTOCOL_MIN_SUPPORTED, MESH_PROTOCOL_VERSION};
 #[cfg(all(test, unix))]
 use crate::mesh::request::RequestHandler;
@@ -64,7 +66,8 @@ use crate::mesh::trust::{
     Decision, InstancePresence, KeyChangeOutcome, TrustStore, decode_name_hash, parse_hash,
 };
 use crate::mesh::{
-    canonical_hash, display_text, elapsed_text, hex_lower, identity, mesh_cache_dir,
+    PATH_REQUEST_TIMEOUT, canonical_hash, display_text, elapsed_text, hex_lower, identity,
+    mesh_cache_dir,
 };
 use crate::supervisor::notification::{SystemNotification, mesh_notification};
 
@@ -688,6 +691,10 @@ impl MeshRuntime {
             mesh_cache_dir(&paths.cache_dir).join("peers.json"),
             SystemTime::now(),
         )?);
+        let propagation_nodes = Arc::new(PropagationNodeTable::load(
+            mesh_cache_dir(&paths.cache_dir).join(PROPAGATION_NODE_TABLE_FILE),
+            SystemTime::now(),
+        )?);
         let grants = GrantStore::open(&paths.cache_dir, &instance_id, SystemTime::now())?;
         let envoy_memory =
             EnvoySessions::open(&paths.cache_dir, &instance_id, &config.envoy_memory).map(Arc::new);
@@ -890,7 +897,7 @@ impl MeshRuntime {
                 destination_hash: hash.to_hex_string(),
             }),
             peers,
-            propagation_nodes: Arc::new(PropagationNodeTable::new()),
+            propagation_nodes,
             trust,
             request_handler,
             dispatcher,
@@ -923,8 +930,9 @@ impl MeshRuntime {
             runtime.peers.clone(),
             runtime.cancellation_token(),
         )));
-        runtime.register_task(tokio::spawn(persist_peers_periodically(
+        runtime.register_task(tokio::spawn(persist_tables_periodically(
             runtime.peers.clone(),
+            runtime.propagation_nodes.clone(),
             runtime.cancellation_token(),
         )));
         runtime
@@ -1312,13 +1320,15 @@ impl MeshRuntime {
             .ok_or(PropagationError::Link(RequestError::NotRunning))?;
         let sender = to_core_private_identity(&self.transport_identity);
         let origin = self.destination.lock().await.origin;
+        let cancel = self.cancellation_token();
+        request_path_to_node(&transport, node, &cancel, PropagationError::Cancelled).await?;
         propagation::propagate(
             &transport,
             &sender,
             recipient,
             node,
             &build(&origin),
-            self.cancellation_token(),
+            cancel,
             options,
         )
         .await?;
@@ -1521,6 +1531,8 @@ impl MeshRuntime {
             .ok_or(FetchError::Link(RequestError::NotRunning))?;
         let node = self.propagation_nodes.select()?;
         let mut store = propagation_fetch::FetchStore::load(store_path, SystemTime::now())?;
+        let cancel = self.cancellation_token();
+        request_path_to_node(&transport, &node, &cancel, FetchError::Cancelled).await?;
         let peers = PeerRouting {
             trust: &self.trust,
             surface: self.peer_surface.lock().as_ref().and_then(Weak::upgrade),
@@ -1544,7 +1556,7 @@ impl MeshRuntime {
             &mut store,
             &routing,
             &FetchOptions::default(),
-            self.cancellation_token(),
+            cancel,
         )
         .await
     }
@@ -1787,6 +1799,8 @@ impl MeshRuntime {
                 redact_hashes(&format!("{err:#}"))
             );
         }
+        self.propagation_nodes
+            .persist_if_dirty_or_warn(PersistTrigger::Stop);
         debug!(
             "Stopped mesh node {} (instance {}, destination {})",
             short(&self.fingerprint),
@@ -2394,16 +2408,46 @@ fn decode_announce(destination_hash: &str, app_data: &[u8], hops: u8) -> Option<
     Some(decoded)
 }
 
-/// Files one received announce in the peer table; `None` when it is not a Coyote announce.
-fn record_announce(
-    peers: &PeerTable,
+/// Who a received announce says it is: its destination, identity and name hashes, and
+/// the identity's key as `Identity::to_hex_string` writes it. The transport verified
+/// that these derive one another before handing the announce over.
+struct AnnouncedDestination {
     destination_hash: String,
     identity_hash: String,
     name_hash: String,
+    public_key: Option<String>,
+}
+
+#[cfg(test)]
+impl AnnouncedDestination {
+    fn without_key(
+        destination_hash: impl Into<String>,
+        identity_hash: impl Into<String>,
+        name_hash: impl Into<String>,
+    ) -> Self {
+        Self {
+            destination_hash: destination_hash.into(),
+            identity_hash: identity_hash.into(),
+            name_hash: name_hash.into(),
+            public_key: None,
+        }
+    }
+}
+
+/// Files one received announce in the peer table; `None` when it is not a Coyote announce.
+fn record_announce(
+    peers: &PeerTable,
+    announced: AnnouncedDestination,
     app_data: &[u8],
     hops: u8,
     now: SystemTime,
 ) -> Option<FiledAnnounce> {
+    let AnnouncedDestination {
+        destination_hash,
+        identity_hash,
+        name_hash,
+        public_key,
+    } = announced;
     let decoded = decode_announce(&destination_hash, app_data, hops)?;
     let compatibility = Compatibility::of(decoded.version);
     if let Compatibility::Incompatible { found } = compatibility {
@@ -2417,6 +2461,7 @@ fn record_announce(
             destination_hash: destination_hash.clone(),
             identity_hash,
             name_hash,
+            public_key,
             display_name: decoded.display_name.clone(),
             protocol_version: decoded.version,
             hops,
@@ -2559,19 +2604,18 @@ impl AnnounceFiler<'_> {
     /// as a first sighting through `file`.
     fn file_path_response(
         &mut self,
-        destination_hash: String,
-        identity_hash: String,
-        name_hash: String,
+        announced: AnnouncedDestination,
         app_data: &[u8],
         hops: u8,
         now: SystemTime,
     ) -> Option<PeerChange> {
-        if self.peers.get(&destination_hash).is_some() {
-            let decoded = decode_announce(&destination_hash, app_data, hops)?;
+        if self.peers.get(&announced.destination_hash).is_some() {
+            let decoded = decode_announce(&announced.destination_hash, app_data, hops)?;
             let refreshed = self.peers.refresh_route(PeerSighting {
-                destination_hash: destination_hash.clone(),
-                identity_hash: identity_hash.clone(),
-                name_hash: name_hash.clone(),
+                destination_hash: announced.destination_hash.clone(),
+                identity_hash: announced.identity_hash.clone(),
+                name_hash: announced.name_hash.clone(),
+                public_key: announced.public_key.clone(),
                 display_name: decoded.display_name,
                 protocol_version: decoded.version,
                 hops,
@@ -2581,40 +2625,26 @@ impl AnnounceFiler<'_> {
             if refreshed {
                 debug!(
                     "Refreshed the route to mesh peer {} from a path response",
-                    short(&destination_hash)
+                    short(&announced.destination_hash)
                 );
-                self.note_key_change(&identity_hash, &name_hash, now);
+                self.note_key_change(&announced.identity_hash, &announced.name_hash, now);
                 return Some(PeerChange::Refreshed);
             }
         }
-        self.file(
-            destination_hash,
-            identity_hash,
-            name_hash,
-            app_data,
-            hops,
-            now,
-        )
+        self.file(announced, app_data, hops, now)
     }
 
     fn file(
         &mut self,
-        destination_hash: String,
-        identity_hash: String,
-        name_hash: String,
+        announced: AnnouncedDestination,
         app_data: &[u8],
         hops: u8,
         now: SystemTime,
     ) -> Option<PeerChange> {
-        let filed = record_announce(
-            self.peers,
-            destination_hash.clone(),
-            identity_hash.clone(),
-            name_hash.clone(),
-            app_data,
-            hops,
-            now,
-        )?;
+        let destination_hash = announced.destination_hash.clone();
+        let identity_hash = announced.identity_hash.clone();
+        let name_hash = announced.name_hash.clone();
+        let filed = record_announce(self.peers, announced, app_data, hops, now)?;
         self.trust
             .mark_seen(&destination_hash, &identity_hash, &name_hash, now);
         self.note_key_change(&identity_hash, &name_hash, now);
@@ -2744,28 +2774,17 @@ async fn receive_announces(
         ) {
             continue;
         }
-        let destination_hash = desc.address_hash.to_hex_string();
-        let identity_hash = desc.identity.address_hash.to_hex_string();
-        let name_hash = hex_lower(&event.name_hash);
+        let announced = AnnouncedDestination {
+            destination_hash: desc.address_hash.to_hex_string(),
+            identity_hash: desc.identity.address_hash.to_hex_string(),
+            name_hash: hex_lower(&event.name_hash),
+            public_key: Some(desc.identity.to_hex_string()),
+        };
         let app_data = event.app_data.as_slice();
         if event.is_path_response {
-            filer.file_path_response(
-                destination_hash,
-                identity_hash,
-                name_hash,
-                app_data,
-                event.hops,
-                now,
-            );
+            filer.file_path_response(announced, app_data, event.hops, now);
         } else {
-            filer.file(
-                destination_hash,
-                identity_hash,
-                name_hash,
-                app_data,
-                event.hops,
-                now,
-            );
+            filer.file(announced, app_data, event.hops, now);
         }
     }
 }
@@ -3272,7 +3291,46 @@ async fn sweep_pending(slot: Weak<MeshSlot>, cancel: CancellationToken) {
     }
 }
 
-async fn persist_peers_periodically(peers: Arc<PeerTable>, cancel: CancellationToken) {
+/// A node loaded from the persisted table may have no path yet, and a link needs one: this
+/// transport does not rebroadcast announces, so the path comes only from an answered
+/// request. One request, waited on for `PATH_REQUEST_TIMEOUT`; without an answer the link
+/// fails as it would have. Stopping the node ends the wait with `cancelled`, the caller's
+/// own error for a stop.
+async fn request_path_to_node<E>(
+    transport: &Transport,
+    node: &PropagationNode,
+    cancel: &CancellationToken,
+    cancelled: E,
+) -> Result<(), E> {
+    let hash = node.destination.address_hash;
+    if transport.has_path(&hash).await {
+        return Ok(());
+    }
+    debug!(
+        "Mesh has no path to propagation node {}; asking the mesh for one",
+        short(&hash.to_hex_string())
+    );
+    tokio::select! {
+        () = cancel.cancelled() => return Err(cancelled),
+        found = transport.await_path(&hash, PATH_REQUEST_TIMEOUT, None) => {
+            if !found {
+                debug!(
+                    "Mesh heard no path to propagation node {} within {}s; the link to it \
+                     will likely fail for want of one, and the next attempt asks again",
+                    short(&hash.to_hex_string()),
+                    PATH_REQUEST_TIMEOUT.as_secs()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn persist_tables_periodically(
+    peers: Arc<PeerTable>,
+    propagation_nodes: Arc<PropagationNodeTable>,
+    cancel: CancellationToken,
+) {
     let mut ticks = interval(Duration::from_secs(PEER_PERSIST_INTERVAL_SECS));
     // The first tick of an interval fires immediately; nothing has changed since load.
     ticks.tick().await;
@@ -3286,6 +3344,7 @@ async fn persist_peers_periodically(peers: Arc<PeerTable>, cancel: CancellationT
                         redact_hashes(&format!("{err:#}"))
                     );
                 }
+                propagation_nodes.persist_if_dirty_or_warn(PersistTrigger::Timer);
             }
         }
     }
@@ -10112,18 +10171,14 @@ mod tests {
 
         let added = record_announce(
             &peers,
-            coyote_hash.to_string(),
-            "identity".to_string(),
-            "name".to_string(),
+            AnnouncedDestination::without_key(coyote_hash, "identity", "name"),
             &app_data,
             2,
             now,
         );
         let ignored = record_announce(
             &peers,
-            other_hash.to_string(),
-            "identity".to_string(),
-            "name".to_string(),
+            AnnouncedDestination::without_key(other_hash, "identity", "name"),
             b"LXMF\x00\x01",
             1,
             now,
@@ -10169,9 +10224,7 @@ mod tests {
 
         let change = record_announce(
             &peers,
-            "emoji-peer".to_string(),
-            "identity".to_string(),
-            "name".to_string(),
+            AnnouncedDestination::without_key("emoji-peer", "identity", "name"),
             &app_data,
             1,
             now,
@@ -10181,6 +10234,69 @@ mod tests {
         let recorded = peers.snapshot();
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].display_name.as_deref(), Some(name));
+    }
+
+    /// A table this version wrote before keys were kept loads with no key, and the next
+    /// announce filed through `record_announce` fills it in without a version change.
+    #[test]
+    fn a_table_without_keys_loads_and_the_next_announce_fills_the_key() {
+        let tmp = TempDir::new("node-peer-key-fill");
+        let path = tmp.path.join("peers.json");
+        let now = SystemTime::now();
+        let identity = *TransportIdentity::new_from_rand(OsRng).as_identity();
+        let name = session_destination_name("instance");
+        let name_hash = <[u8; NAME_HASH_LEN]>::try_from(name.as_name_hash_slice()).unwrap();
+        let announced = || AnnouncedDestination {
+            destination_hash: destination_address(&name_hash, &identity.address_hash)
+                .to_hex_string(),
+            identity_hash: identity.address_hash.to_hex_string(),
+            name_hash: hex_lower(&name_hash),
+            public_key: Some(identity.to_hex_string()),
+        };
+        let destination = announced().destination_hash;
+        let app_data = AnnounceAppData {
+            version: MESH_PROTOCOL_VERSION,
+            display_name: Some("Ada".to_string()),
+        }
+        .encode()
+        .unwrap();
+        let writer = PeerTable::load(path.clone(), now).unwrap();
+        record_announce(&writer, announced(), &app_data, 1, now).unwrap();
+        writer.persist_if_dirty().unwrap();
+        let mut file: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        file["peers"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("public_key");
+        assert_eq!(
+            file["version"],
+            serde_json::json!(crate::mesh::peers::PEER_TABLE_VERSION)
+        );
+        std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+
+        let table = PeerTable::load(path.clone(), now).unwrap();
+        let row = table.get(&destination).unwrap();
+        assert_eq!(row.public_key, None);
+        assert!(row.verified_destination().is_none());
+
+        let later = now + Duration::from_secs(60);
+        let change = record_announce(&table, announced(), &app_data, 1, later);
+        assert_eq!(
+            change.map(|filed| filed.change),
+            Some(PeerChange::Refreshed)
+        );
+        table.persist_if_dirty().unwrap();
+
+        let row = PeerTable::load(path, now)
+            .unwrap()
+            .get(&destination)
+            .unwrap();
+        assert_eq!(row.public_key, Some(identity.to_hex_string()));
+        let desc = row
+            .verified_destination()
+            .expect("the announced key verifies");
+        assert_eq!(desc.address_hash.to_hex_string(), destination);
     }
 
     #[test]
@@ -10208,9 +10324,11 @@ mod tests {
         let identity = "cd".repeat(16);
 
         let change = filer.file(
-            destination.clone(),
-            identity.clone(),
-            "ef".repeat(10),
+            AnnouncedDestination::without_key(
+                destination.clone(),
+                identity.clone(),
+                "ef".repeat(10),
+            ),
             &app_data,
             3,
             now,
@@ -10238,9 +10356,11 @@ mod tests {
         assert_eq!(env_value(&envs, "COYOTE_MESH_FIRST_SEEN"), Some("true"));
 
         let change = filer.file(
-            destination.clone(),
-            identity.clone(),
-            "ef".repeat(10),
+            AnnouncedDestination::without_key(
+                destination.clone(),
+                identity.clone(),
+                "ef".repeat(10),
+            ),
             &app_data,
             3,
             now + Duration::from_secs(1),
@@ -10252,9 +10372,11 @@ mod tests {
         );
 
         let change = filer.file(
-            destination.clone(),
-            identity.clone(),
-            "ef".repeat(10),
+            AnnouncedDestination::without_key(
+                destination.clone(),
+                identity.clone(),
+                "ef".repeat(10),
+            ),
             &app_data,
             2,
             now + Duration::from_secs(2),
@@ -10271,9 +10393,11 @@ mod tests {
         .encode()
         .unwrap();
         filer.file(
-            destination.clone(),
-            identity.clone(),
-            "ef".repeat(10),
+            AnnouncedDestination::without_key(
+                destination.clone(),
+                identity.clone(),
+                "ef".repeat(10),
+            ),
             &renamed,
             2,
             now + Duration::from_secs(3),
@@ -10282,9 +10406,11 @@ mod tests {
         assert_eq!(env_value(&envs, "COYOTE_MESH_PEER_NAME"), Some("Beatrix"));
 
         filer.file(
-            destination.clone(),
-            identity.clone(),
-            "ef".repeat(10),
+            AnnouncedDestination::without_key(
+                destination.clone(),
+                identity.clone(),
+                "ef".repeat(10),
+            ),
             &renamed,
             2,
             now + Duration::from_secs(4),
@@ -10292,9 +10418,11 @@ mod tests {
         assert!(sink.drain().is_empty());
 
         filer.file(
-            destination.clone(),
-            identity.clone(),
-            "ef".repeat(10),
+            AnnouncedDestination::without_key(
+                destination.clone(),
+                identity.clone(),
+                "ef".repeat(10),
+            ),
             &renamed,
             2,
             now + Duration::from_secs(3 + HEARTBEAT_SECS),
@@ -10307,9 +10435,7 @@ mod tests {
         );
 
         let ignored = filer.file(
-            "12".repeat(16),
-            identity,
-            "ef".repeat(10),
+            AnnouncedDestination::without_key("12".repeat(16), identity, "ef".repeat(10)),
             b"LXMF\x00\x01",
             1,
             now,
@@ -10374,9 +10500,11 @@ mod tests {
 
         let heard_at = at(2_000);
         let change = filer.file(
-            a_destination.clone(),
-            a_hex.clone(),
-            name_hex.clone(),
+            AnnouncedDestination::without_key(
+                a_destination.clone(),
+                a_hex.clone(),
+                name_hex.clone(),
+            ),
             &app_data("Ada"),
             2,
             heard_at,
@@ -10387,9 +10515,11 @@ mod tests {
 
         let responded_at = at(2_100);
         let change = filer.file_path_response(
-            a_destination.clone(),
-            a_hex.clone(),
-            name_hex.clone(),
+            AnnouncedDestination::without_key(
+                a_destination.clone(),
+                a_hex.clone(),
+                name_hex.clone(),
+            ),
             &app_data("Ada"),
             4,
             responded_at,
@@ -10407,9 +10537,11 @@ mod tests {
 
         let announced_at = at(2_200);
         let change = filer.file(
-            a_destination.clone(),
-            a_hex.clone(),
-            name_hex.clone(),
+            AnnouncedDestination::without_key(
+                a_destination.clone(),
+                a_hex.clone(),
+                name_hex.clone(),
+            ),
             &app_data("Ada"),
             4,
             announced_at,
@@ -10435,6 +10567,7 @@ mod tests {
                 destination_hash: b_destination.clone(),
                 identity_hash: b_hex.clone(),
                 name_hash: name_hex.clone(),
+                public_key: None,
                 display_name: None,
                 protocol_version: MESH_PROTOCOL_VERSION,
                 hops: 1,
@@ -10443,9 +10576,11 @@ mod tests {
         );
         let rotated_at = at(2_400);
         let change = filer.file_path_response(
-            b_destination.clone(),
-            b_hex.clone(),
-            name_hex.clone(),
+            AnnouncedDestination::without_key(
+                b_destination.clone(),
+                b_hex.clone(),
+                name_hex.clone(),
+            ),
             &app_data("Ada"),
             1,
             rotated_at,
@@ -10466,9 +10601,7 @@ mod tests {
         );
 
         let change = filer.file_path_response(
-            c_destination.clone(),
-            c_hex,
-            name_hex,
+            AnnouncedDestination::without_key(c_destination.clone(), c_hex, name_hex),
             &app_data("Cy"),
             1,
             rotated_at,
@@ -10517,9 +10650,7 @@ mod tests {
         .unwrap();
 
         let change = filer.file(
-            new_destination.clone(),
-            new_hex.clone(),
-            name_hex,
+            AnnouncedDestination::without_key(new_destination.clone(), new_hex.clone(), name_hex),
             &app_data,
             1,
             now,
@@ -10592,9 +10723,7 @@ mod tests {
         let file =
             |filer: &mut AnnounceFiler<'_>, destination: &str, identity: &str, when: SystemTime| {
                 filer.file(
-                    destination.to_string(),
-                    identity.to_string(),
-                    name_hex.clone(),
+                    AnnouncedDestination::without_key(destination, identity, name_hex.clone()),
                     &app_data,
                     1,
                     when,
@@ -10706,9 +10835,11 @@ mod tests {
         .unwrap();
         let file_new = |filer: &mut AnnounceFiler<'_>, n: u32, at: SystemTime| {
             let change = filer.file(
-                hex_lower(&n.to_be_bytes()).repeat(4),
-                "cd".repeat(16),
-                "ef".repeat(10),
+                AnnouncedDestination::without_key(
+                    hex_lower(&n.to_be_bytes()).repeat(4),
+                    "cd".repeat(16),
+                    "ef".repeat(10),
+                ),
                 &app_data,
                 1,
                 at,
@@ -11031,7 +11162,7 @@ mod tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "Destination {destination} could not be reached: this node asked the network for a route to it and got no answer within 5 s. The peer may be offline or on a network this node cannot reach. Try again in a minute; nothing was queued for it, because a message can be held on a propagation node only after the peer's announce has been heard. `.mesh peers` shows when it was last heard."
+                "Destination {destination} could not be reached: this node asked the network for a route to it and got no answer within 5 s. The peer may be offline or on a network this node cannot reach. Nothing was queued for it: this node holds no key for the peer, and a message can be held on a propagation node only once the peer's announce has brought its key. Try again after it announces; `.mesh peers` shows when it was last heard."
             )
         );
         slot.stop().await.unwrap();
@@ -11237,9 +11368,9 @@ mod tests {
         relay.stop().await;
     }
 
-    /// The description is the transport's, not the peer table's: a peer whose row the
-    /// sweep has aged out still resolves, at once, for as long as the transport holds what
-    /// its announce taught.
+    /// Without a row the description is the transport's: a peer whose row the sweep has
+    /// aged out still resolves, at once, for as long as the transport holds what its
+    /// announce taught.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_peer_whose_row_was_swept_still_resolves_through_the_transport() {
@@ -11323,6 +11454,64 @@ mod tests {
         let slot = Arc::new(MeshSlot::default());
         slot.install(runtime.clone()).unwrap();
         slot.stop().await.unwrap();
+    }
+
+    /// After a restart the runtime has heard no announce, so its transport holds neither
+    /// the peer's description nor a path, and the key the peer table kept is what resolves
+    /// it. The one path request the resolve sends is answered by the peer, and the
+    /// description returned is the one rebuilt from the stored key.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_restarted_node_resolves_a_peer_by_its_stored_key_once_a_path_request_is_answered() {
+        let stub = PeerStub::listen(
+            "node-resolve-stored-key-stub",
+            TcpServer::DEFAULT_CLIENT_MTU,
+        )
+        .await;
+        let mut started = started_runtime_on("node-resolve-stored-key", stub.port()).await;
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        stub.wait_to_be_filed(&started.runtime.peers(), &to).await;
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        assert!(slot.stop().await.unwrap());
+        started.restart_on(stub.port()).await;
+
+        let stored = started
+            .runtime
+            .peers()
+            .get(&to)
+            .expect("the row is read back from peers.json");
+        let expected = stored
+            .verified_destination()
+            .expect("the announce's key was stored with the row and verifies");
+        let hash = expected.address_hash;
+        let transport = started.runtime.transport_handle().await.unwrap();
+        assert!(!started.knows_identity_of(&to).await);
+        assert!(transport.destination_desc(&hash).await.is_none());
+        assert!(!transport.has_path(&hash).await);
+
+        let desc = started
+            .runtime
+            .resolve_destination(&to)
+            .await
+            .expect("the peer answers the path request");
+
+        assert_eq!(desc.address_hash, hash);
+        assert_eq!(
+            desc.identity.to_hex_string(),
+            expected.identity.to_hex_string()
+        );
+        assert_eq!(
+            desc.name.as_name_hash_slice(),
+            expected.name.as_name_hash_slice()
+        );
+        assert!(transport.has_path(&hash).await);
+
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        slot.stop().await.unwrap();
+        stub.stop().await;
     }
 
     /// A reference the send never carried is not left lent: the one-off grant written
@@ -12948,6 +13137,7 @@ mod tests {
                 destination_hash: row.destination_hash.clone(),
                 identity_hash: row.identity_hash.clone(),
                 name_hash: foreign.clone(),
+                public_key: None,
                 display_name: row.display_name.clone(),
                 protocol_version: row.protocol_version,
                 hops: row.hops,
@@ -14715,6 +14905,7 @@ mod tests {
                 destination_hash: "persisted-on-stop".to_string(),
                 identity_hash: "identity".to_string(),
                 name_hash: "name".to_string(),
+                public_key: None,
                 display_name: None,
                 protocol_version: 1,
                 hops: 1,
@@ -14737,6 +14928,206 @@ mod tests {
         assert_eq!(file.peers.len(), 1);
         assert_eq!(file.peers[0].destination_hash, "persisted-on-stop");
         relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    mod persisted_propagation_node_tests {
+        use super::*;
+        use crate::mesh::propagation::test_support::FakeNode as PostingNode;
+        use crate::mesh::propagation_fetch::FETCH_TRANSFER_LIMIT_KB;
+        use crate::mesh::test_support::FakeNode;
+
+        const FETCH_DEADLINE: Duration = Duration::from_secs(30);
+
+        async fn start_on(tmp: &TempDir, port: u16) -> Arc<MeshRuntime> {
+            let mut session = Session::default();
+            MeshRuntime::start(
+                &private_config(port),
+                true,
+                &mut session,
+                mesh_paths(tmp),
+                NodeOptions::default(),
+            )
+            .await
+            .unwrap()
+        }
+
+        async fn stop(runtime: &Arc<MeshRuntime>) {
+            let slot = Arc::new(MeshSlot::default());
+            slot.install(runtime.clone()).unwrap();
+            assert!(slot.stop().await.unwrap());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_node_heard_before_stop_is_fetched_from_after_a_restart_without_an_announce() {
+            // A `MeshRuntime` joins with `TcpClient`'s default MTU, so the fake matches it.
+            let fake = FakeNode::listen_with_mtu(TcpServer::DEFAULT_CLIENT_MTU).await;
+            let tmp = TempDir::new("node-persist-propagation-nodes");
+            let table_path =
+                mesh_cache_dir(&tmp.path.join("cache")).join(PROPAGATION_NODE_TABLE_FILE);
+
+            let first = start_on(&tmp, fake.listener.port).await;
+            fake.announce().await;
+            wait_until("the runtime to file the propagation node", || {
+                first.propagation_nodes().select().is_ok()
+            })
+            .await;
+            stop(&first).await;
+            assert!(
+                table_path.exists(),
+                "{} must exist after stop",
+                table_path.display()
+            );
+
+            let second = start_on(&tmp, fake.listener.port).await;
+            let selected = second.propagation_nodes().select().unwrap();
+            assert_eq!(
+                selected.destination.address_hash.to_hex_string(),
+                fake.hex()
+            );
+            let sink = CountingSink::default();
+            fake.script.reply_with([rmpv::Value::Array(vec![])]);
+            let report = tokio::time::timeout(FETCH_DEADLINE, second.fetch_propagated(&sink))
+                .await
+                .expect("the fetch must finish within FETCH_DEADLINE")
+                .unwrap();
+            assert_eq!(report.node, fake.hex());
+            assert_eq!(report.listed, 0);
+
+            stop(&second).await;
+            fake.stop().await;
+        }
+
+        /// The node never announces, so the only way the runtime learns a path to it is the
+        /// request the post makes before opening its link.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_post_to_a_persisted_node_with_no_path_asks_for_one_and_succeeds() {
+            let mut node = PostingNode::listen(TcpServer::DEFAULT_CLIENT_MTU).await;
+            let tmp = TempDir::new("node-post-persisted-node");
+            let table_path =
+                mesh_cache_dir(&tmp.path.join("cache")).join(PROPAGATION_NODE_TABLE_FILE);
+            let persisted = PropagationNodeTable::load(table_path, SystemTime::now()).unwrap();
+            persisted.observe(
+                PropagationNode {
+                    destination: node.desc,
+                    stamp_cost: 0,
+                    per_transfer_limit_kb: FETCH_TRANSFER_LIMIT_KB,
+                    propagation_enabled: true,
+                },
+                1,
+                SystemTime::now(),
+            );
+            persisted.persist_if_dirty().unwrap();
+
+            let runtime = start_on(&tmp, node.port).await;
+            let selected = runtime.propagation_nodes().select().unwrap();
+            let transport = runtime.transport_handle().await.unwrap();
+            assert!(
+                !transport.has_path(&node.desc.address_hash).await,
+                "a node that never announced has no path yet"
+            );
+
+            let recipient = *TransportIdentity::new_from_rand(OsRng).as_identity();
+            let options = PropagationOptions {
+                reject_window: Duration::from_millis(300),
+                ..PropagationOptions::default()
+            };
+            runtime
+                .post_to_node(
+                    &recipient,
+                    &selected,
+                    |_| OutboundMessage {
+                        title: None,
+                        content: b"posted after a path request".to_vec(),
+                        fields: None,
+                    },
+                    &options,
+                )
+                .await
+                .unwrap();
+            assert!(transport.has_path(&node.desc.address_hash).await);
+            node.next_received().await;
+
+            stop(&runtime).await;
+            node.stop().await;
+        }
+
+        /// A restarted runtime knows an offline peer only from its kept row and key: the
+        /// transport holds no description for it and nothing answers its path request. The
+        /// stored key is still enough to hold the message on the persisted propagation node.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_message_to_an_offline_peer_known_by_its_stored_key_is_held_on_a_propagation_node()
+         {
+            use crate::mesh::trust::TrustOptions;
+
+            let mut node = PostingNode::listen(TcpServer::DEFAULT_CLIENT_MTU).await;
+            let tmp = TempDir::new("node-send-offline-stored-key");
+            let cache = mesh_cache_dir(&tmp.path.join("cache"));
+            let nodes = PropagationNodeTable::load(
+                cache.join(PROPAGATION_NODE_TABLE_FILE),
+                SystemTime::now(),
+            )
+            .unwrap();
+            nodes.observe(
+                PropagationNode {
+                    destination: node.desc,
+                    stamp_cost: 0,
+                    per_transfer_limit_kb: FETCH_TRANSFER_LIMIT_KB,
+                    propagation_enabled: true,
+                },
+                1,
+                SystemTime::now(),
+            );
+            nodes.persist_if_dirty().unwrap();
+            let peer = TransportIdentity::new_from_rand(OsRng);
+            let desc = SingleInputDestination::new(peer, session_destination_name("offline")).desc;
+            let destination = desc.address_hash.to_hex_string();
+            let peers = PeerTable::load(cache.join("peers.json"), SystemTime::now()).unwrap();
+            peers.observe(
+                PeerSighting {
+                    destination_hash: destination.clone(),
+                    identity_hash: desc.identity.address_hash.to_hex_string(),
+                    name_hash: hex_lower(desc.name.as_name_hash_slice()),
+                    public_key: Some(desc.identity.to_hex_string()),
+                    display_name: Some("Off".to_string()),
+                    protocol_version: 1,
+                    hops: 1,
+                },
+                SystemTime::now(),
+            );
+            peers.persist_if_dirty().unwrap();
+
+            let runtime = start_on(&tmp, node.port).await;
+            let slot = Arc::new(MeshSlot::default());
+            slot.install(runtime.clone()).unwrap();
+            runtime
+                .trust()
+                .trust_destination(
+                    slot.as_ref(),
+                    &destination,
+                    TrustOptions::default(),
+                    SystemTime::now(),
+                )
+                .unwrap();
+            let transport = runtime.transport_handle().await.unwrap();
+            assert!(
+                transport
+                    .destination_desc(&desc.address_hash)
+                    .await
+                    .is_none()
+            );
+            assert!(!transport.has_path(&desc.address_hash).await);
+
+            let message =
+                OutboundPeer::new(PeerKind::Message, "held for later", None, None, None).unwrap();
+            let outcome = runtime.send_peer(&destination, &message).await.unwrap();
+
+            assert_eq!(outcome.via, PeerVia::StoreAndForward);
+            node.next_received().await;
+
+            assert!(slot.stop().await.unwrap());
+            node.stop().await;
+        }
     }
 
     #[cfg(unix)]
@@ -15892,6 +16283,7 @@ mod tests {
                 destination_hash: old_destination.clone(),
                 identity_hash: old.address_hash().to_hex_string(),
                 name_hash: hex_lower(&origin),
+                public_key: None,
                 display_name: None,
                 protocol_version: MESH_PROTOCOL_VERSION,
                 hops: 1,
@@ -16655,6 +17047,7 @@ mod tests {
                 destination_hash: instance.clone(),
                 identity_hash: REMEMBERED_PEER.to_string(),
                 name_hash: hex_lower(&origin),
+                public_key: None,
                 display_name: None,
                 protocol_version: MESH_PROTOCOL_VERSION,
                 hops: 1,
@@ -17293,9 +17686,7 @@ mod tests {
 
         let change = record_announce(
             &table,
-            hash.clone(),
-            "cd".repeat(16),
-            "ef".repeat(10),
+            AnnouncedDestination::without_key(hash.clone(), "cd".repeat(16), "ef".repeat(10)),
             &app_data,
             1,
             now,
@@ -17337,9 +17728,7 @@ mod tests {
         assert_eq!(
             record_announce(
                 peers.as_ref(),
-                to.clone(),
-                filed.identity_hash,
-                filed.name_hash,
+                AnnouncedDestination::without_key(to.clone(), filed.identity_hash, filed.name_hash),
                 &app_data,
                 filed.hops,
                 SystemTime::now(),
@@ -17394,6 +17783,7 @@ mod tests {
                 destination_hash: hash.clone(),
                 identity_hash: "cd".repeat(16),
                 name_hash: "ef".repeat(10),
+                public_key: None,
                 display_name: None,
                 protocol_version: MESH_PROTOCOL_VERSION,
                 hops: 1,
@@ -17855,6 +18245,7 @@ mod tests {
                 display_name: Some("Stub".to_string()),
                 protocol_version: MESH_PROTOCOL_VERSION,
                 hops: 1,
+                public_key: None,
             },
             ten_days_ago,
         );

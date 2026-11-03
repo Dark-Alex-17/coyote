@@ -6,24 +6,28 @@
 //! against the key its claimed source announced and checked against the trust list, in
 //! that order, before anything outside this module sees it. What passes leaves through
 //! `InboundSink` as plain owned data. A body whose claimed source has no known key yet is
-//! neither recorded nor acknowledged, so the node keeps it for a later fetch, a bounded
-//! number of times.
+//! first met by one path request for that source's destination, when the peer table knows
+//! it; if the key is still unknown, the body is neither recorded nor acknowledged, so the
+//! node keeps it for a later fetch, a bounded number of times.
 
 use crate::mesh::peers::PeerTable;
-use crate::mesh::propagation::{PropagationNode, lxmf_delivery_hash};
+use crate::mesh::propagation::{PropagationNode, lxmf_delivery_hash, lxmf_delivery_hash_of};
 use crate::mesh::request::{
     DEFAULT_LINK_TIMEOUT, Deadline, MAX_REQUEST_PAYLOAD_BYTES, RefusalCode, RequestError, link_to,
     redact_hashes, request_on_link, short,
 };
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_cause, version_refusal};
 use crate::mesh::trust::{IdentityStanding, TrustStore};
-use crate::mesh::{canonical_hash, hex_lower, parse_rfc3339, rfc3339_utc, write_atomically};
+use crate::mesh::{
+    PATH_REQUEST_TIMEOUT, canonical_hash, hex_lower, parse_rfc3339, rfc3339_utc, write_atomically,
+};
 use crate::utils::fs::{read_holder_pid, write_holder_pid};
 
 use async_trait::async_trait;
 use lxmf_core::identity::PrivateIdentity as CorePrivateIdentity;
 use lxmf_core::message::WireMessage;
 use lxmf_core::stamp::invalid_stamp_value;
+use parking_lot::Mutex;
 use rmpv::Value;
 use rns_transport::hash::AddressHash;
 use rns_transport::identity::{Identity, PrivateIdentity as TransportIdentity};
@@ -110,6 +114,15 @@ pub(crate) const UNKNOWN_SOURCE_DEFERRAL_HORIZON: Duration =
 /// How many deferred transient ids are tracked. Past this, the one first deferred longest
 /// ago goes first; a node serving unresolvable bodies without end cannot grow the table.
 pub(crate) const MAX_DEFERRED_IDS: usize = 256;
+
+/// How many senders one fetch asks the mesh for. A node serving bodies from many
+/// unknown senders cannot make one sync flood the mesh with path requests; a sender
+/// past the cap stays unasked and a later sync asks for it.
+pub(crate) const MAX_SOURCE_ASKS_PER_FETCH: usize = 4;
+
+/// Room left on the key-lookup deadline beyond a full path request before an ask is
+/// made, since the transport's wait can run slightly past its own timeout.
+const SOURCE_ASK_HEADROOM: Duration = Duration::from_secs(1);
 
 pub(crate) const PROPAGATION_STORE_VERSION: u64 = 1;
 
@@ -363,8 +376,15 @@ pub(crate) struct FetchReport {
     pub duplicates: usize,
     pub discarded: usize,
     pub deferred: usize,
+    /// Of `deferred`, the bodies whose sender this fetch asked the mesh for before
+    /// deferring them.
+    pub deferred_after_ask: usize,
     pub acknowledged: usize,
 }
+
+/// Why a body was deferred after this node asked the mesh for its sender's announce.
+pub(crate) const ASKED_FOR_SOURCE: &str =
+    "source identity not yet known; asked the mesh for its announce";
 
 impl FetchReport {
     fn new(node: String) -> Self {
@@ -377,6 +397,7 @@ impl FetchReport {
             duplicates: 0,
             discarded: 0,
             deferred: 0,
+            deferred_after_ask: 0,
             acknowledged: 0,
         }
     }
@@ -535,6 +556,10 @@ struct DeferredRecord {
     transient_id: String,
     attempts: u8,
     first_seen_at: String,
+    /// Defaults to false, so a store written before the field existed loads inside the
+    /// same version with every deferral unasked, and the next sync asks for each once.
+    #[serde(default)]
+    asked: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -642,6 +667,9 @@ impl BoundedSet {
 pub(crate) struct Deferred {
     pub attempts: u8,
     pub first_seen_at: SystemTime,
+    /// Whether a path request for the body's sender has gone out. Once it has, later
+    /// sightings do not ask again.
+    pub asked: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -665,6 +693,7 @@ pub(crate) struct FetchStore {
     delivered: BoundedSet,
     deferred: BTreeMap<TransientId, Deferred>,
     cursor: Option<SyncCursor>,
+    unsaved_deliveries: bool,
 }
 
 impl FetchStore {
@@ -692,6 +721,7 @@ impl FetchStore {
             delivered: BoundedSet::new("delivered message"),
             deferred: BTreeMap::new(),
             cursor: loaded.cursor,
+            unsaved_deliveries: false,
         };
         for (id, seen_at) in loaded.seen {
             store.seen.insert_at(id, seen_at, now);
@@ -721,15 +751,28 @@ impl FetchStore {
     }
 
     pub(crate) fn record_delivered(&mut self, message_id: [u8; 32], now: SystemTime) -> bool {
+        self.unsaved_deliveries = true;
         self.delivered.insert_at(message_id, now, now)
+    }
+
+    /// Writes the store if it records a delivery not yet on disk, so a fetch dropped
+    /// while it waits on the network does not deliver those bodies again next sync.
+    fn persist_deliveries(&mut self) -> Result<(), FetchError> {
+        if self.unsaved_deliveries {
+            self.persist()?;
+            self.unsaved_deliveries = false;
+        }
+        Ok(())
     }
 
     /// Counts one more sighting of `id` without a key for its source. Sightings are
     /// deferred until `MAX_UNKNOWN_SOURCE_DEFERRALS` have been and
     /// `UNKNOWN_SOURCE_DEFERRAL_HORIZON` has passed since the first; the next spends the
-    /// budget, and the caller records the id as processed instead.
-    pub(crate) fn defer(&mut self, id: TransientId, now: SystemTime) -> Deferral {
+    /// budget, and the caller records the id as processed instead. `asked` marks the
+    /// deferral asked for; an unasked sighting never clears an earlier ask.
+    pub(crate) fn defer(&mut self, id: TransientId, now: SystemTime, asked: bool) -> Deferral {
         if let Some(entry) = self.deferred.get_mut(&id) {
+            entry.asked |= asked;
             let held = now.duration_since(entry.first_seen_at).unwrap_or_default();
             if entry.attempts >= MAX_UNKNOWN_SOURCE_DEFERRALS
                 && held >= UNKNOWN_SOURCE_DEFERRAL_HORIZON
@@ -749,13 +792,13 @@ impl FetchStore {
             Deferred {
                 attempts: 1,
                 first_seen_at: now,
+                asked,
             },
         );
         self.evict_deferred();
         Deferral::Retry { attempts: 1 }
     }
 
-    #[cfg(test)]
     pub(crate) fn deferral_of(&self, id: &TransientId) -> Option<Deferred> {
         self.deferred.get(id).copied()
     }
@@ -818,6 +861,7 @@ impl FetchStore {
                     transient_id: hex_lower(id),
                     attempts: entry.attempts,
                     first_seen_at: rfc3339_utc(entry.first_seen_at),
+                    asked: entry.asked,
                 })
                 .collect(),
             cursor: self.cursor.as_ref().map(|cursor| CursorRecord {
@@ -883,6 +927,7 @@ fn parse_store_file(bytes: &[u8]) -> Result<Loaded, StoreParse> {
                 Deferred {
                     attempts: record.attempts,
                     first_seen_at: time_field(&record.first_seen_at, "first_seen_at")?,
+                    asked: record.asked,
                 },
             ))
         })
@@ -980,8 +1025,9 @@ pub(crate) enum Discard {
     /// Not addressed to us, not decryptable to us, or not a message once decrypted.
     Undecryptable(String),
     /// No announced public key matches the `lxmf.delivery` hash it names as its source.
-    /// Deferred rather than recorded: the node keeps the body for a later fetch.
-    UnknownSource,
+    /// Deferred rather than recorded: the node keeps the body for a later fetch. `asked`
+    /// when this node asked the mesh for the source's announce while screening it.
+    UnknownSource { asked: bool },
     /// `UnknownSource` once more after `MAX_UNKNOWN_SOURCE_DEFERRALS` deferrals and
     /// `UNKNOWN_SOURCE_DEFERRAL_HORIZON`; recorded and acknowledged like any other discard.
     UnknownSourceBudgetSpent,
@@ -1000,7 +1046,10 @@ impl Discard {
     fn is_recorded(&self) -> bool {
         !matches!(
             self,
-            Self::Oversize { .. } | Self::Undersize { .. } | Self::Duplicate | Self::UnknownSource
+            Self::Oversize { .. }
+                | Self::Undersize { .. }
+                | Self::Duplicate
+                | Self::UnknownSource { .. }
         )
     }
 }
@@ -1022,7 +1071,9 @@ impl fmt::Display for Discard {
             }
             Self::Duplicate => write!(f, "already processed"),
             Self::Undecryptable(reason) => write!(f, "not a message for us: {reason}"),
-            Self::UnknownSource => write!(f, "no public key known for the claimed source"),
+            Self::UnknownSource { .. } => {
+                write!(f, "no public key known for the claimed source")
+            }
             Self::UnknownSourceBudgetSpent => write!(
                 f,
                 "no public key known for the claimed source after {MAX_UNKNOWN_SOURCE_DEFERRALS} or more deferrals over at least {} s; giving up on it",
@@ -1040,11 +1091,25 @@ impl fmt::Display for Discard {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BodyOutcome {
     Delivered,
-    /// Left on the node for a later fetch: neither recorded nor acknowledged.
+    /// Left on the node for a later fetch: neither recorded nor acknowledged. `asked` when
+    /// this fetch asked the mesh for the sender's announce before deferring it.
     Deferred {
         attempts: u8,
+        asked: bool,
     },
     Discarded(Discard),
+}
+
+/// What came of asking the mesh for a sender's announce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceAsk {
+    /// A path request went out; `true` when an answer arrived within the wait.
+    Asked(bool),
+    /// No peer table row derives the sender, so there is no destination to ask for.
+    NotInTable,
+    /// The fetch's key-lookup deadline could not cover a full path request, so none went
+    /// out and the sender stays unasked for a later sync.
+    NoTimeLeft,
 }
 
 /// Turns the `lxmf.delivery` hash a message names as its source into the public key that
@@ -1052,17 +1117,28 @@ pub(crate) enum BodyOutcome {
 #[async_trait]
 pub(crate) trait SourceKeys: Send + Sync {
     async fn identity_for(&self, source: &AddressHash) -> Result<Option<Identity>, RequestError>;
+
+    /// Asks the mesh for the announce that would make `identity_for(source)` answer, and
+    /// waits for it within the lookup's bound.
+    async fn ask_for_source(&self, _source: &AddressHash) -> Result<SourceAsk, RequestError> {
+        Ok(SourceAsk::NotInTable)
+    }
 }
 
-/// Keys from the transport's announce cache. A reference LXMF peer announces
-/// `lxmf.delivery` itself, so the source hash is looked up directly. A Coyote peer
-/// announces its own destination instead, so the peer table's destinations are resolved
+/// Keys from the peer table and the transport's announce cache. A Coyote peer announces
+/// its own destination rather than `lxmf.delivery`, so the peer table's rows are resolved
 /// once, up front, to the identities behind them and indexed by the delivery hash each
-/// derives; the table is bounded, so the index is.
+/// derives: a key the table kept and verified first, so a peer heard before a restart
+/// resolves with no announce since, else the one the transport holds. A reference LXMF
+/// peer announces `lxmf.delivery` itself, so its source hash is looked up in the
+/// transport directly. Every row also maps the delivery hash its identity hash derives to
+/// its destination, which is what `ask_for_source` asks the mesh for; the table is
+/// bounded, so both indexes are.
 struct TransportKeys<'a> {
     transport: &'a Transport,
     deadline: Deadline,
     by_delivery: HashMap<AddressHash, Identity>,
+    destination_by_delivery: HashMap<AddressHash, AddressHash>,
 }
 
 impl<'a> TransportKeys<'a> {
@@ -1072,6 +1148,7 @@ impl<'a> TransportKeys<'a> {
         deadline: Deadline,
     ) -> Result<Self, RequestError> {
         let mut by_delivery = HashMap::new();
+        let mut destination_by_delivery = HashMap::new();
         for record in peers.snapshot() {
             let Some(hex) = canonical_hash(&record.destination_hash) else {
                 continue;
@@ -1079,10 +1156,20 @@ impl<'a> TransportKeys<'a> {
             let Ok(destination) = AddressHash::new_from_hex_string(&hex) else {
                 continue;
             };
-            if let Some(identity) = deadline
-                .bound(GET_PATH, transport.destination_identity(&destination))
-                .await?
+            if let Some(identity_hash) = canonical_hash(&record.identity_hash)
+                .and_then(|hex| AddressHash::new_from_hex_string(&hex).ok())
             {
+                destination_by_delivery.insert(lxmf_delivery_hash_of(&identity_hash), destination);
+            }
+            let identity = match record.verified_destination() {
+                Some(desc) => Some(desc.identity),
+                None => {
+                    deadline
+                        .bound(GET_PATH, transport.destination_identity(&destination))
+                        .await?
+                }
+            };
+            if let Some(identity) = identity {
                 by_delivery.insert(lxmf_delivery_hash(&identity), identity);
             }
         }
@@ -1090,13 +1177,19 @@ impl<'a> TransportKeys<'a> {
             transport,
             deadline,
             by_delivery,
+            destination_by_delivery,
         })
     }
 }
 
 #[async_trait]
 impl SourceKeys for TransportKeys<'_> {
+    /// The index first, then the transport under the source hash itself, then under the
+    /// destination a peer table row maps it to, which an answered `ask_for_source` fills.
     async fn identity_for(&self, source: &AddressHash) -> Result<Option<Identity>, RequestError> {
+        if let Some(identity) = self.by_delivery.get(source) {
+            return Ok(Some(*identity));
+        }
         if let Some(identity) = self
             .deadline
             .bound(GET_PATH, self.transport.destination_identity(source))
@@ -1104,7 +1197,38 @@ impl SourceKeys for TransportKeys<'_> {
         {
             return Ok(Some(identity));
         }
-        Ok(self.by_delivery.get(source).copied())
+        let Some(destination) = self.destination_by_delivery.get(source) else {
+            return Ok(None);
+        };
+        let identity = self
+            .deadline
+            .bound(GET_PATH, self.transport.destination_identity(destination))
+            .await?;
+        Ok(identity.filter(|identity| lxmf_delivery_hash(identity) == *source))
+    }
+
+    /// A path request for the destination of the peer table row whose identity derives
+    /// `source`. The answer is an announce, which the transport and the announce loop
+    /// file as they file any other. Every ask in one fetch shares the key-lookup deadline,
+    /// so an ask that could not wait out a full path request with headroom is skipped
+    /// rather than let the deadline expire and fail the whole fetch; that body defers
+    /// unasked instead.
+    async fn ask_for_source(&self, source: &AddressHash) -> Result<SourceAsk, RequestError> {
+        let Some(destination) = self.destination_by_delivery.get(source) else {
+            return Ok(SourceAsk::NotInTable);
+        };
+        if self.deadline.remaining() <= PATH_REQUEST_TIMEOUT + SOURCE_ASK_HEADROOM {
+            return Ok(SourceAsk::NoTimeLeft);
+        }
+        let answer = self
+            .deadline
+            .bound(
+                GET_PATH,
+                self.transport
+                    .resolve_destination(destination, PATH_REQUEST_TIMEOUT),
+            )
+            .await?;
+        Ok(SourceAsk::Asked(answer.is_some()))
     }
 }
 
@@ -1117,6 +1241,10 @@ pub(crate) struct BodyPipeline<'a> {
     pub trust: &'a TrustStore,
     pub sink: &'a dyn InboundSink,
     pub node: &'a str,
+    /// The sources this fetch has asked the mesh for or found nothing to ask for, so one
+    /// sender's bodies cost one ask however many of them the node serves. A skip for
+    /// want of time is not kept, since it says nothing about the sender.
+    pub asked: Mutex<HashMap<AddressHash, SourceAsk>>,
 }
 
 pub(crate) fn check_bounds(body: &[u8]) -> Result<(), Discard> {
@@ -1154,28 +1282,34 @@ impl BodyPipeline<'_> {
                 self.sink.deliver(message);
                 Ok(BodyOutcome::Delivered)
             }
-            Err(Discard::UnknownSource) => match store.defer(transient_id, now) {
-                Deferral::Retry { attempts } => {
-                    debug!(
-                        "Propagation fetch from {}: deferred transient {}: {}, sighting {attempts} (kept for at least {MAX_UNKNOWN_SOURCE_DEFERRALS} sightings and {} s)",
-                        self.node,
-                        short(&hex_lower(&transient_id)),
-                        Discard::UnknownSource,
-                        UNKNOWN_SOURCE_DEFERRAL_HORIZON.as_secs()
-                    );
-                    Ok(BodyOutcome::Deferred { attempts })
+            Err(unknown @ Discard::UnknownSource { asked }) => {
+                match store.defer(transient_id, now, asked) {
+                    Deferral::Retry { attempts } => {
+                        let ask_note = if asked {
+                            format!("; {ASKED_FOR_SOURCE}")
+                        } else {
+                            String::new()
+                        };
+                        debug!(
+                            "Propagation fetch from {}: deferred transient {}: {unknown}{ask_note}, sighting {attempts} (kept for at least {MAX_UNKNOWN_SOURCE_DEFERRALS} sightings and {} s)",
+                            self.node,
+                            short(&hex_lower(&transient_id)),
+                            UNKNOWN_SOURCE_DEFERRAL_HORIZON.as_secs()
+                        );
+                        Ok(BodyOutcome::Deferred { attempts, asked })
+                    }
+                    Deferral::BudgetSpent { attempts, held } => {
+                        store.insert(transient_id, now);
+                        warn!(
+                            "Propagation fetch from {}: giving up on transient {} after {attempts} deferrals over {} s; no key for its claimed source",
+                            self.node,
+                            short(&hex_lower(&transient_id)),
+                            held.as_secs()
+                        );
+                        Ok(BodyOutcome::Discarded(Discard::UnknownSourceBudgetSpent))
+                    }
                 }
-                Deferral::BudgetSpent { attempts, held } => {
-                    store.insert(transient_id, now);
-                    warn!(
-                        "Propagation fetch from {}: giving up on transient {} after {attempts} deferrals over {} s; no key for its claimed source",
-                        self.node,
-                        short(&hex_lower(&transient_id)),
-                        held.as_secs()
-                    );
-                    Ok(BodyOutcome::Discarded(Discard::UnknownSourceBudgetSpent))
-                }
-            },
+            }
             Err(discard) => Ok(self.discard(transient_id, discard, store, now)),
         }
     }
@@ -1198,11 +1332,93 @@ impl BodyPipeline<'_> {
         BodyOutcome::Discarded(discard)
     }
 
+    /// Asks the mesh once per source per fetch, and only for a body not asked for at an
+    /// earlier sync: asking again at every sync would put a path request on the mesh each
+    /// time for a sender that may never return. A body skipped for want of time or past
+    /// `MAX_SOURCE_ASKS_PER_FETCH` stays unasked, so a later sync asks. An answered ask
+    /// is followed by one more key lookup. `Err(asked)` when the key is still unknown.
+    /// The bodies delivered so far are written to disk before an ask waits on the
+    /// network; if they cannot be, the ask is skipped rather than risk delivering them
+    /// twice, and the write after the body loop reports the failure.
+    async fn ask_then_retry(
+        &self,
+        source: &AddressHash,
+        transient_id: &TransientId,
+        store: &mut FetchStore,
+    ) -> Result<Result<Identity, bool>, RequestError> {
+        if store
+            .deferral_of(transient_id)
+            .is_some_and(|deferral| deferral.asked)
+        {
+            return Ok(Err(false));
+        }
+        let source_full = source.to_hex_string();
+        let source_hex = short(&source_full);
+        let earlier = self.asked.lock().get(source).copied();
+        let ask = match earlier {
+            Some(ask) => return Ok(Err(matches!(ask, SourceAsk::Asked(_)))),
+            None if self.asks_made() >= MAX_SOURCE_ASKS_PER_FETCH => {
+                debug!(
+                    "Propagation fetch from {}: claimed source {source_hex} not asked for yet: this fetch already asked the mesh for {MAX_SOURCE_ASKS_PER_FETCH} senders; a later sync asks",
+                    self.node
+                );
+                return Ok(Err(false));
+            }
+            None => {
+                if let Err(err) = store.persist_deliveries() {
+                    debug!(
+                        "Propagation fetch from {}: claimed source {source_hex} not asked for yet: the messages delivered so far could not be saved first ({}); a later sync asks",
+                        self.node,
+                        redact_hashes(&err.to_string())
+                    );
+                    return Ok(Err(false));
+                }
+                self.keys.ask_for_source(source).await?
+            }
+        };
+        if ask != SourceAsk::NoTimeLeft {
+            self.asked.lock().insert(*source, ask);
+        }
+        match ask {
+            SourceAsk::Asked(true) => Ok(self.keys.identity_for(source).await?.ok_or(true)),
+            SourceAsk::Asked(false) => {
+                debug!(
+                    "Propagation fetch from {}: asked the mesh for claimed source {source_hex}, and no announce arrived within {} s",
+                    self.node,
+                    PATH_REQUEST_TIMEOUT.as_secs()
+                );
+                Ok(Err(true))
+            }
+            SourceAsk::NotInTable => {
+                debug!(
+                    "Propagation fetch from {}: claimed source {source_hex} is not in the peer table, so there is no destination to ask the mesh for",
+                    self.node
+                );
+                Ok(Err(false))
+            }
+            SourceAsk::NoTimeLeft => {
+                debug!(
+                    "Propagation fetch from {}: claimed source {source_hex} not asked for yet: this fetch's key-lookup time is nearly spent; the next sync asks",
+                    self.node
+                );
+                Ok(Err(false))
+            }
+        }
+    }
+
+    fn asks_made(&self) -> usize {
+        self.asked
+            .lock()
+            .values()
+            .filter(|ask| matches!(ask, SourceAsk::Asked(_)))
+            .count()
+    }
+
     async fn screen(
         &self,
         body: &[u8],
         transient_id: &TransientId,
-        store: &FetchStore,
+        store: &mut FetchStore,
     ) -> Result<Result<InboundMessage, Discard>, RequestError> {
         if let Err(discard) = check_bounds(body) {
             return Ok(Err(discard));
@@ -1227,8 +1443,12 @@ impl BodyPipeline<'_> {
             return Ok(Err(Discard::Duplicate));
         }
         let source = AddressHash::new(wire.source);
-        let Some(identity) = self.keys.identity_for(&source).await? else {
-            return Ok(Err(Discard::UnknownSource));
+        let identity = match self.keys.identity_for(&source).await? {
+            Some(identity) => identity,
+            None => match self.ask_then_retry(&source, transient_id, store).await? {
+                Ok(identity) => identity,
+                Err(asked) => return Ok(Err(Discard::UnknownSource { asked })),
+            },
         };
         if wire.verify(&to_core_identity(&identity)) != Ok(true) {
             return Ok(Err(Discard::BadSignature));
@@ -1408,6 +1628,7 @@ pub(crate) async fn fetch(
         trust,
         sink,
         node: node_short,
+        asked: Mutex::default(),
     };
     let acks =
         process_and_persist(&pipeline, &bodies, store, &mut report, &node_hex, failed).await?;
@@ -1442,7 +1663,8 @@ pub(crate) async fn fetch(
 /// the ids round 3 tells the node to delete: every body but the deferred ones, each id once
 /// however often it was served. The body loop is non-cancellable by design, so cancellation
 /// is not a loop exit path; aborting the `fetch_propagated` future mid-loop skips the
-/// persist.
+/// persist here, but not the one `ask_then_retry` makes before waiting on the network, so
+/// only the bodies since the last ask can be delivered again.
 async fn process_and_persist(
     pipeline: &BodyPipeline<'_>,
     bodies: &[Vec<u8>],
@@ -1469,8 +1691,11 @@ async fn process_bodies(
     for body in bodies {
         match pipeline.process(body, store, SystemTime::now()).await? {
             BodyOutcome::Delivered => report.delivered += 1,
-            BodyOutcome::Deferred { .. } => {
+            BodyOutcome::Deferred { asked, .. } => {
                 report.deferred += 1;
+                if asked {
+                    report.deferred_after_ask += 1;
+                }
                 continue;
             }
             BodyOutcome::Discarded(Discard::Duplicate) => report.duplicates += 1,
@@ -1930,6 +2155,7 @@ mod tests {
             trust,
             sink,
             node: "fake",
+            asked: Mutex::default(),
         };
         pipeline.process(body, store, now).await.unwrap()
     }
@@ -1938,7 +2164,9 @@ mod tests {
         match outcome {
             BodyOutcome::Discarded(discard) => discard,
             BodyOutcome::Delivered => panic!("expected a discard, the body was delivered"),
-            BodyOutcome::Deferred { attempts } => panic!("expected a discard, deferred {attempts}"),
+            BodyOutcome::Deferred { attempts, .. } => {
+                panic!("expected a discard, deferred {attempts}")
+            }
         }
     }
 
@@ -2043,7 +2271,10 @@ mod tests {
         let forged_again = body_from(&a, &lxmf_delivery_hash(&b_id), &me, b"again");
         assert_eq!(
             bench.process(&forged_again).await,
-            BodyOutcome::Deferred { attempts: 1 }
+            BodyOutcome::Deferred {
+                attempts: 1,
+                asked: false
+            }
         );
         assert!(!bench.store.contains(&transient_id_of(&forged_again)));
         bench.keys.know(&b_id);
@@ -2086,7 +2317,10 @@ mod tests {
 
         assert_eq!(
             bench.process_at(&body, first).await,
-            BodyOutcome::Deferred { attempts: 1 }
+            BodyOutcome::Deferred {
+                attempts: 1,
+                asked: false
+            }
         );
         assert!(
             !bench.store.contains(&id),
@@ -2107,7 +2341,10 @@ mod tests {
             let at = first + Duration::from_secs(15 * u64::from(attempts - 1));
             assert_eq!(
                 bench.process_at(&body, at).await,
-                BodyOutcome::Deferred { attempts }
+                BodyOutcome::Deferred {
+                    attempts,
+                    asked: false
+                }
             );
             assert!(!bench.store.contains(&id));
         }
@@ -2157,7 +2394,10 @@ mod tests {
         let later_id = transient_id_of(&later);
         assert_eq!(
             bench.process(&later).await,
-            BodyOutcome::Deferred { attempts: 1 }
+            BodyOutcome::Deferred {
+                attempts: 1,
+                asked: false
+            }
         );
         bench.keys.know(&sender_id);
         assert_eq!(bench.process(&later).await, BodyOutcome::Delivered);
@@ -2185,12 +2425,18 @@ mod tests {
 
         assert_eq!(
             bench.process_at(&body, first).await,
-            BodyOutcome::Deferred { attempts: 1 }
+            BodyOutcome::Deferred {
+                attempts: 1,
+                asked: false
+            }
         );
         let past_the_horizon = first + UNKNOWN_SOURCE_DEFERRAL_HORIZON + Duration::from_secs(1);
         assert_eq!(
             bench.process_at(&body, past_the_horizon).await,
-            BodyOutcome::Deferred { attempts: 2 },
+            BodyOutcome::Deferred {
+                attempts: 2,
+                asked: false
+            },
             "time alone does not spend the budget"
         );
         assert!(!bench.store.contains(&id));
@@ -2208,14 +2454,14 @@ mod tests {
             let mut id = [0u8; 32];
             id[..8].copy_from_slice(&(i as u64).to_be_bytes());
             assert_eq!(
-                store.defer(id, t(1_000 + i as u64)),
+                store.defer(id, t(1_000 + i as u64), false),
                 Deferral::Retry { attempts: 1 }
             );
             ids.push(id);
         }
         // A repeat keeps its first sighting, so it is still the oldest.
         assert_eq!(
-            store.defer(ids[0], t(9_000)),
+            store.defer(ids[0], t(9_000), false),
             Deferral::Retry { attempts: 2 }
         );
         assert_eq!(
@@ -2224,7 +2470,7 @@ mod tests {
         );
 
         assert_eq!(
-            store.defer(id(0xff), t(9_001)),
+            store.defer(id(0xff), t(9_001), false),
             Deferral::Retry { attempts: 1 }
         );
 
@@ -2639,11 +2885,11 @@ mod tests {
         assert!(store.insert(id(0xab), t(5_000)));
         assert!(store.record_delivered(id(0xcd), t(5_000)));
         assert_eq!(
-            store.defer(id(0xef), t(4_999)),
+            store.defer(id(0xef), t(4_999), true),
             Deferral::Retry { attempts: 1 }
         );
         assert_eq!(
-            store.defer(id(0xef), t(5_000)),
+            store.defer(id(0xef), t(5_000), false),
             Deferral::Retry { attempts: 2 }
         );
         store.record_sync("cafe", t(5_001), 3);
@@ -2664,6 +2910,10 @@ mod tests {
         assert_eq!(json["deferred"][0]["transient_id"], hex_lower(&id(0xef)));
         assert_eq!(json["deferred"][0]["attempts"], 2);
         assert_eq!(json["deferred"][0]["first_seen_at"], "1970-01-01T01:23:19Z");
+        assert_eq!(
+            json["deferred"][0]["asked"], true,
+            "an unasked sighting keeps the earlier ask"
+        );
         assert_eq!(json["deferred"].as_array().unwrap().len(), 1);
         assert_eq!(json["cursor"]["node"], "cafe");
         assert_eq!(json["cursor"]["last_synced_at"], "1970-01-01T01:23:21Z");
@@ -2680,6 +2930,7 @@ mod tests {
             Some(Deferred {
                 attempts: 2,
                 first_seen_at: t(4_999),
+                asked: true,
             })
         );
         assert_eq!(reloaded.len(), 1);
@@ -2915,6 +3166,7 @@ mod tests {
                     destination_hash,
                     identity_hash: unknown_but_valid.clone(),
                     name_hash: String::new(),
+                    public_key: None,
                     display_name: None,
                     protocol_version: 1,
                     hops: i as u8,
@@ -2973,21 +3225,341 @@ mod tests {
         assert_eq!(checked, 2);
     }
 
+    mod source_ask_tests {
+        use super::*;
+
+        /// Keys a test registers, plus the sources the peer table could name a
+        /// destination for, each with the key an answered ask would bring (`None` when the
+        /// mesh stays silent). Counts the asks that reached it and the requests that went
+        /// out.
+        #[derive(Default)]
+        struct AskingKeys {
+            known: Mutex<HashMap<AddressHash, Identity>>,
+            in_table: HashMap<AddressHash, Option<Identity>>,
+            asks: Mutex<usize>,
+            requests: Mutex<Vec<AddressHash>>,
+        }
+
+        impl AskingKeys {
+            fn in_table(mut self, identity: &Identity, answers: bool) -> Self {
+                self.in_table
+                    .insert(lxmf_delivery_hash(identity), answers.then_some(*identity));
+                self
+            }
+
+            fn asks(&self) -> usize {
+                *self.asks.lock()
+            }
+
+            fn requests(&self) -> Vec<AddressHash> {
+                self.requests.lock().clone()
+            }
+        }
+
+        #[async_trait]
+        impl SourceKeys for AskingKeys {
+            async fn identity_for(
+                &self,
+                source: &AddressHash,
+            ) -> Result<Option<Identity>, RequestError> {
+                Ok(self.known.lock().get(source).copied())
+            }
+
+            async fn ask_for_source(
+                &self,
+                source: &AddressHash,
+            ) -> Result<SourceAsk, RequestError> {
+                *self.asks.lock() += 1;
+                let Some(answer) = self.in_table.get(source) else {
+                    return Ok(SourceAsk::NotInTable);
+                };
+                self.requests.lock().push(*source);
+                if let Some(identity) = answer {
+                    self.known.lock().insert(*source, *identity);
+                }
+                Ok(SourceAsk::Asked(answer.is_some()))
+            }
+        }
+
+        struct AskBench {
+            recipient: CorePrivateIdentity,
+            trust: Arc<TrustStore>,
+            sink: CountingSink,
+            store: FetchStore,
+            _tmp: TempDir,
+        }
+
+        impl AskBench {
+            fn new(tag: &str, trusted: &Identity) -> Self {
+                let (trust, tmp) = TrustList::default()
+                    .identity(&identity_hex(trusted), true)
+                    .open(tag);
+                let store =
+                    FetchStore::load(tmp.path.join("propagation.json"), SystemTime::now()).unwrap();
+                Self {
+                    recipient: CorePrivateIdentity::new_from_rand(OsRng),
+                    trust,
+                    sink: CountingSink::default(),
+                    store,
+                    _tmp: tmp,
+                }
+            }
+
+            fn me(&self) -> Identity {
+                transport_identity_of(&self.recipient)
+            }
+
+            /// One fetch's worth of bodies through one pipeline, so asks are shared the
+            /// way they are within a real fetch.
+            async fn fetch(&mut self, keys: &AskingKeys, bodies: &[Vec<u8>]) -> FetchReport {
+                let pipeline = BodyPipeline {
+                    recipient: &self.recipient,
+                    delivery: lxmf_delivery_hash(&transport_identity_of(&self.recipient)),
+                    keys,
+                    trust: &self.trust,
+                    sink: &self.sink,
+                    node: "fake",
+                    asked: Mutex::default(),
+                };
+                let mut report = FetchReport::new("fake".to_string());
+                process_bodies(&pipeline, bodies, &mut self.store, &mut report)
+                    .await
+                    .unwrap();
+                report
+            }
+        }
+
+        #[tokio::test]
+        async fn a_source_in_the_peer_table_is_asked_for_once_per_fetch_before_deferring() {
+            install_log_collector();
+            let sender = CorePrivateIdentity::new_from_rand(OsRng);
+            let sender_id = transport_identity_of(&sender);
+            let mut bench = AskBench::new("fetch-ask-once", &sender_id);
+            let keys = AskingKeys::default().in_table(&sender_id, false);
+            let me = bench.me();
+            let bodies = vec![
+                honest_body(&sender, &me, b"first"),
+                honest_body(&sender, &me, b"second"),
+            ];
+
+            let report = bench.fetch(&keys, &bodies).await;
+
+            assert_eq!(keys.requests(), vec![lxmf_delivery_hash(&sender_id)]);
+            assert_eq!(
+                keys.asks(),
+                1,
+                "the second body from the same source does not ask"
+            );
+            assert_eq!((report.deferred, report.deferred_after_ask), (2, 2));
+            assert_eq!(bench.sink.count(), 0);
+            let line = debug_snapshot()
+                .into_iter()
+                .find(|line| {
+                    line.contains(short(&hex_lower(&transient_id_of(&bodies[0]))))
+                        && line.contains("deferred transient")
+                })
+                .expect("a deferral line for the first body");
+            assert!(
+                line.contains(&format!("claimed source; {ASKED_FOR_SOURCE}, sighting 1")),
+                "{line}"
+            );
+
+            let report = bench.fetch(&keys, &bodies).await;
+
+            assert_eq!(keys.asks(), 1, "a later sighting does not ask again");
+            assert_eq!((report.deferred, report.deferred_after_ask), (2, 0));
+            for body in &bodies {
+                assert_eq!(
+                    bench
+                        .store
+                        .deferral_of(&transient_id_of(body))
+                        .map(|d| d.attempts),
+                    Some(2)
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_source_the_peer_table_does_not_know_is_deferred_with_no_request() {
+            install_log_collector();
+            let sender = CorePrivateIdentity::new_from_rand(OsRng);
+            let sender_id = transport_identity_of(&sender);
+            let mut bench = AskBench::new("fetch-ask-none", &sender_id);
+            let keys = AskingKeys::default();
+            let body = honest_body(&sender, &bench.me(), b"from afar");
+
+            let report = bench.fetch(&keys, std::slice::from_ref(&body)).await;
+
+            assert!(keys.requests().is_empty());
+            assert_eq!((report.deferred, report.deferred_after_ask), (1, 0));
+            let expected = format!(
+                "Propagation fetch from fake: claimed source {} is not in the peer table, so there is no destination to ask the mesh for",
+                short(&lxmf_delivery_hash(&sender_id).to_hex_string())
+            );
+            assert!(
+                debug_snapshot().iter().any(|line| line == &expected),
+                "no debug line {expected:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn senders_past_the_ask_cap_stay_unasked_for_a_later_sync() {
+            install_log_collector();
+            let senders: Vec<_> = (0..=MAX_SOURCE_ASKS_PER_FETCH)
+                .map(|_| CorePrivateIdentity::new_from_rand(OsRng))
+                .collect();
+            let ids: Vec<_> = senders.iter().map(transport_identity_of).collect();
+            let mut bench = AskBench::new("fetch-ask-cap", &ids[0]);
+            let keys = ids
+                .iter()
+                .fold(AskingKeys::default(), |keys, id| keys.in_table(id, false));
+            let me = bench.me();
+            let bodies: Vec<_> = senders
+                .iter()
+                .map(|sender| honest_body(sender, &me, b"many"))
+                .collect();
+
+            let report = bench.fetch(&keys, &bodies).await;
+
+            assert_eq!(keys.requests().len(), MAX_SOURCE_ASKS_PER_FETCH);
+            assert_eq!(
+                (report.deferred, report.deferred_after_ask),
+                (MAX_SOURCE_ASKS_PER_FETCH + 1, MAX_SOURCE_ASKS_PER_FETCH)
+            );
+            let last = transient_id_of(bodies.last().unwrap());
+            assert_eq!(bench.store.deferral_of(&last).map(|d| d.asked), Some(false));
+            let expected = format!(
+                "Propagation fetch from fake: claimed source {} not asked for yet: this fetch already asked the mesh for {MAX_SOURCE_ASKS_PER_FETCH} senders; a later sync asks",
+                short(&lxmf_delivery_hash(ids.last().unwrap()).to_hex_string())
+            );
+            assert!(
+                debug_snapshot().iter().any(|line| line == &expected),
+                "no debug line {expected:?}"
+            );
+
+            let report = bench.fetch(&keys, &bodies).await;
+
+            assert_eq!(
+                keys.requests().len(),
+                MAX_SOURCE_ASKS_PER_FETCH + 1,
+                "only the sender left unasked is asked for at the next sync"
+            );
+            assert_eq!(report.deferred_after_ask, 1);
+        }
+
+        #[tokio::test]
+        async fn an_answered_ask_delivers_the_body_in_the_same_fetch() {
+            let sender = CorePrivateIdentity::new_from_rand(OsRng);
+            let sender_id = transport_identity_of(&sender);
+            let mut bench = AskBench::new("fetch-ask-answered", &sender_id);
+            let keys = AskingKeys::default().in_table(&sender_id, true);
+            let body = honest_body(&sender, &bench.me(), b"hello again");
+
+            let report = bench.fetch(&keys, std::slice::from_ref(&body)).await;
+
+            assert_eq!(keys.requests().len(), 1);
+            assert_eq!((report.delivered, report.deferred), (1, 0));
+            assert_eq!(
+                bench.sink.only().content.as_deref(),
+                Some(&b"hello again"[..])
+            );
+        }
+
+        /// Knows one sender's key and never answers an ask for any other, so a fetch that
+        /// reaches such an ask can only end by being dropped.
+        struct StalledAskKeys {
+            source: AddressHash,
+            identity: Identity,
+        }
+
+        #[async_trait]
+        impl SourceKeys for StalledAskKeys {
+            async fn identity_for(
+                &self,
+                source: &AddressHash,
+            ) -> Result<Option<Identity>, RequestError> {
+                Ok((*source == self.source).then_some(self.identity))
+            }
+
+            async fn ask_for_source(
+                &self,
+                _source: &AddressHash,
+            ) -> Result<SourceAsk, RequestError> {
+                std::future::pending().await
+            }
+        }
+
+        #[tokio::test]
+        async fn a_fetch_dropped_during_an_ask_does_not_deliver_its_earlier_bodies_again() {
+            let known = CorePrivateIdentity::new_from_rand(OsRng);
+            let known_id = transport_identity_of(&known);
+            let stranger = CorePrivateIdentity::new_from_rand(OsRng);
+            let mut bench = AskBench::new("fetch-ask-dropped", &known_id);
+            let me = bench.me();
+            let bodies = vec![
+                honest_body(&known, &me, b"delivered before the ask"),
+                honest_body(&stranger, &me, b"waits on the ask"),
+            ];
+            let stalled = StalledAskKeys {
+                source: lxmf_delivery_hash(&known_id),
+                identity: known_id,
+            };
+            let pipeline = BodyPipeline {
+                recipient: &bench.recipient,
+                delivery: lxmf_delivery_hash(&me),
+                keys: &stalled,
+                trust: &bench.trust,
+                sink: &bench.sink,
+                node: "fake",
+                asked: Mutex::default(),
+            };
+            let mut report = FetchReport::new("fake".to_string());
+
+            let dropped = tokio::time::timeout(
+                Duration::from_millis(200),
+                process_bodies(&pipeline, &bodies, &mut bench.store, &mut report),
+            )
+            .await;
+
+            assert!(dropped.is_err(), "the ask never answers");
+            assert_eq!(bench.sink.count(), 1);
+
+            bench.store = FetchStore::load(bench.store.path.clone(), SystemTime::now()).unwrap();
+            let keys = AskingKeys::default();
+            keys.known
+                .lock()
+                .insert(lxmf_delivery_hash(&known_id), known_id);
+
+            let report = bench.fetch(&keys, &bodies).await;
+
+            assert_eq!(
+                bench.sink.count(),
+                1,
+                "the first body is not delivered again"
+            );
+            assert_eq!((report.delivered, report.duplicates), (0, 1));
+        }
+    }
+
     #[cfg(unix)]
     mod network {
         use super::*;
         use crate::config::Session;
+        use crate::mesh::announce::AnnounceAppData;
+        use crate::mesh::identity::load_or_mint_identity;
         use crate::mesh::mesh_cache_dir;
         use crate::mesh::node::{MeshRuntime, MeshSlot, NodeOptions};
+        use crate::mesh::propagation_nodes::{PROPAGATION_NODE_TABLE_FILE, PropagationNodeTable};
         use crate::mesh::request::network::{request_sent_as, request_went_as};
         use crate::mesh::request::{NAME_HASH_LEN, SizeBranch};
         use crate::mesh::test_support::{
-            Connector, FakeNode, INTEROP_TIMEOUT, LEGACY_LINK_MTU, POLL, mesh_paths,
-            private_config, started_runtime, wait_until,
+            Connector, FakeNode, INTEROP_TIMEOUT, LEGACY_LINK_MTU, POLL, StartedRuntime,
+            mesh_paths, private_config, started_runtime, started_runtime_on, wait_until,
         };
 
         use rns_transport::destination::DestinationName;
         use rns_transport::identity::PrivateIdentity as TransportIdentity;
+        use rns_transport::identity_bridge::to_transport_private_identity;
         use rns_transport::iface::InterfaceSharedConfig;
         use rns_transport::iface::tcp_server::TcpServer;
         use rns_transport::resource::ResourceEventKind;
@@ -3052,16 +3624,9 @@ mod tests {
                     .await;
             }
 
-            /// Hears `identity`'s `name` announce from the fake and waits until our transport
-            /// can resolve the announced hash to the key behind it.
-            async fn learn_announce(
-                &mut self,
-                fake: &FakeNode,
-                identity: TransportIdentity,
-                name: DestinationName,
-            ) -> AddressHash {
-                // Our interface is new to its transport, whose announce ingress control holds
-                // a second announce arriving within a second of the node's for a minute.
+            /// Our interface is new to its transport, whose announce ingress control holds a
+            /// second announce arriving within a second of the node's for a minute.
+            async fn admit_every_announce(&self) {
                 self.connector
                     .transport
                     .iface_manager()
@@ -3074,6 +3639,17 @@ mod tests {
                             ..InterfaceSharedConfig::default()
                         },
                     );
+            }
+
+            /// Hears `identity`'s `name` announce from the fake and waits until our transport
+            /// can resolve the announced hash to the key behind it.
+            async fn learn_announce(
+                &mut self,
+                fake: &FakeNode,
+                identity: TransportIdentity,
+                name: DestinationName,
+            ) -> AddressHash {
+                self.admit_every_announce().await;
                 let announced = fake.announce_as(identity, name).await;
                 self.connector.learn(&announced).await;
                 let deadline = Instant::now() + INTEROP_TIMEOUT;
@@ -3095,10 +3671,18 @@ mod tests {
 
             /// One fetch on a store reopened from disk, as `fetch_propagated` does each time.
             async fn fetch(&self) -> Result<FetchReport, FetchError> {
+                self.fetch_within(INTEROP_TIMEOUT).await
+            }
+
+            /// `fetch` with `request_timeout` bounding each request and the key lookups.
+            async fn fetch_within(
+                &self,
+                request_timeout: Duration,
+            ) -> Result<FetchReport, FetchError> {
                 let mut store = self.store();
                 let options = FetchOptions {
                     link_timeout: DEFAULT_LINK_TIMEOUT,
-                    request_timeout: INTEROP_TIMEOUT,
+                    request_timeout,
                 };
                 timeout(
                     FETCH_DEADLINE,
@@ -3170,6 +3754,7 @@ mod tests {
                     duplicates: 0,
                     discarded: 2,
                     deferred: 0,
+                    deferred_after_ask: 0,
                     acknowledged: 2,
                 }
             );
@@ -3499,6 +4084,7 @@ mod tests {
                     destination_hash: coyote_hash.to_hex_string(),
                     identity_hash: identity_hex(&sender_identity),
                     name_hash: hex_lower(&name.hash.as_slice()[..NAME_HASH_LEN]),
+                    public_key: None,
                     display_name: Some("Sender".to_string()),
                     protocol_version: 1,
                     hops: 1,
@@ -3526,6 +4112,150 @@ mod tests {
             let store = fetcher.store();
             assert!(store.contains(&body_id));
             assert_eq!(store.deferral_of(&body_id), None);
+
+            fetcher.stop().await;
+            fake.stop().await;
+        }
+
+        /// Seats `sender` on the fake under a session destination and records it in the
+        /// fetcher's peer table, leaving the fetcher's transport unaware of it, as after a
+        /// restart. Returns the session destination's hash.
+        async fn seat_unheard_peer(
+            fake: &FakeNode,
+            fetcher: &Fetcher,
+            sender: TransportIdentity,
+        ) -> AddressHash {
+            let sender_identity = *sender.as_identity();
+            fetcher.admit_every_announce().await;
+            let name = session_destination_name("test");
+            let scope_hash = fake
+                .listener
+                .transport
+                .add_destination(sender, name)
+                .await
+                .lock()
+                .await
+                .desc
+                .address_hash;
+            fetcher.peers.observe(
+                PeerSighting {
+                    destination_hash: scope_hash.to_hex_string(),
+                    identity_hash: identity_hex(&sender_identity),
+                    name_hash: hex_lower(&name.hash.as_slice()[..NAME_HASH_LEN]),
+                    public_key: None,
+                    display_name: Some("Sender".to_string()),
+                    protocol_version: 1,
+                    hops: 1,
+                },
+                SystemTime::now(),
+            );
+            assert!(
+                fetcher
+                    .connector
+                    .transport
+                    .destination_identity(&scope_hash)
+                    .await
+                    .is_none(),
+                "the transport has not heard the sender"
+            );
+            scope_hash
+        }
+
+        /// The sender is in the peer table but has not announced to this transport. The
+        /// fetch's path request for the sender's destination draws the announce, and the
+        /// body is delivered in the same fetch rather than deferred.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_peer_table_sender_unknown_to_the_transport_is_asked_for_and_delivered() {
+            let fake = FakeNode::listen().await;
+            let sender = TransportIdentity::new_from_rand(OsRng);
+            let sender_core = to_core_private_identity(&sender);
+            let sender_identity = *sender.as_identity();
+            let fetcher = Fetcher::join(
+                &fake,
+                "fetch-net-ask-for-source",
+                TrustList::default().identity(&identity_hex(&sender_identity), true),
+            )
+            .await;
+            let scope_hash = seat_unheard_peer(&fake, &fetcher, sender).await;
+            let body = honest_body(&sender_core, &fetcher.identity(), b"asked for");
+            let body_id = transient_id_of(&body);
+            fake.script
+                .reply_with([ids_value(&[body_id]), bodies(&[body]), Value::Array(vec![])]);
+
+            let report = fetcher.fetch().await.unwrap();
+
+            assert_eq!(
+                (report.delivered, report.deferred, report.deferred_after_ask),
+                (1, 0, 0)
+            );
+            assert_eq!(fetcher.sink.only().transient_id, body_id);
+            assert!(
+                fetcher
+                    .connector
+                    .transport
+                    .destination_identity(&scope_hash)
+                    .await
+                    .is_some(),
+                "the answer to the path request filled the transport"
+            );
+
+            fetcher.stop().await;
+            fake.stop().await;
+        }
+
+        /// A fetch whose key-lookup deadline cannot cover a path request with headroom
+        /// sends none: the body defers unasked and the fetch still succeeds. The next sync,
+        /// with time to spare, asks and delivers.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_fetch_short_of_time_defers_unasked_and_the_next_sync_asks() {
+            let fake = FakeNode::listen().await;
+            let sender = TransportIdentity::new_from_rand(OsRng);
+            let sender_core = to_core_private_identity(&sender);
+            let sender_identity = *sender.as_identity();
+            let fetcher = Fetcher::join(
+                &fake,
+                "fetch-net-ask-no-time",
+                TrustList::default().identity(&identity_hex(&sender_identity), true),
+            )
+            .await;
+            let scope_hash = seat_unheard_peer(&fake, &fetcher, sender).await;
+            let body = honest_body(&sender_core, &fetcher.identity(), b"later");
+            let body_id = transient_id_of(&body);
+            let served = [
+                ids_value(&[body_id]),
+                bodies(std::slice::from_ref(&body)),
+                Value::Array(vec![]),
+            ];
+            fake.script.reply_with(served.clone());
+
+            let report = fetcher
+                .fetch_within(PATH_REQUEST_TIMEOUT + SOURCE_ASK_HEADROOM)
+                .await
+                .expect("a fetch short of time defers rather than timing out");
+
+            assert_eq!(
+                (report.delivered, report.deferred, report.deferred_after_ask),
+                (0, 1, 0)
+            );
+            assert!(
+                fetcher
+                    .connector
+                    .transport
+                    .destination_identity(&scope_hash)
+                    .await
+                    .is_none(),
+                "no path request went out, since an ask waits for its answer"
+            );
+            assert_eq!(
+                fetcher.store().deferral_of(&body_id).map(|d| d.asked),
+                Some(false)
+            );
+
+            fake.script.reply_with(served);
+            let report = fetcher.fetch().await.unwrap();
+
+            assert_eq!((report.delivered, report.deferred), (1, 0));
+            assert_eq!(fetcher.sink.only().transient_id, body_id);
 
             fetcher.stop().await;
             fake.stop().await;
@@ -3582,6 +4312,7 @@ mod tests {
                 trust: &fetcher.trust,
                 sink: &fetcher.sink,
                 node: "fake",
+                asked: Mutex::default(),
             };
             let mut store = fetcher.store();
             let mut report = FetchReport::new(fake.hex());
@@ -3793,6 +4524,173 @@ mod tests {
             assert_eq!(outcome, Err(FetchError::Cancelled));
             assert_eq!(sink.count(), 0);
 
+            fake.stop().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_fresh_runtime_fetches_from_the_persisted_node_without_hearing_it_announce() {
+            let fake = FakeNode::listen_with_mtu(TcpServer::DEFAULT_CLIENT_MTU).await;
+            let tmp = TempDir::new("fetch-net-persisted-node");
+            let table_path =
+                mesh_cache_dir(&tmp.path.join("cache")).join(PROPAGATION_NODE_TABLE_FILE);
+            let persisted = PropagationNodeTable::load(table_path, SystemTime::now()).unwrap();
+            persisted.observe(
+                PropagationNode {
+                    destination: fake.listener.desc,
+                    stamp_cost: 0,
+                    per_transfer_limit_kb: FETCH_TRANSFER_LIMIT_KB,
+                    propagation_enabled: true,
+                },
+                1,
+                SystemTime::now(),
+            );
+            persisted.persist_if_dirty().unwrap();
+
+            let mut session = Session::default();
+            let runtime = MeshRuntime::start(
+                &private_config(fake.listener.port),
+                true,
+                &mut session,
+                mesh_paths(&tmp),
+                NodeOptions::default(),
+            )
+            .await
+            .unwrap();
+            let selected = runtime.propagation_nodes().select().unwrap();
+            assert_eq!(
+                selected.destination.address_hash.to_hex_string(),
+                fake.hex()
+            );
+
+            let sink = CountingSink::default();
+            fake.script.reply_with([Value::Array(vec![])]);
+            let report = timeout(FETCH_DEADLINE, runtime.fetch_propagated(&sink))
+                .await
+                .expect("the fetch must finish within FETCH_DEADLINE")
+                .unwrap();
+            assert_eq!(report.node, fake.hex());
+            assert_eq!(report.listed, 0);
+
+            let slot = Arc::new(MeshSlot::default());
+            slot.install(runtime.clone()).unwrap();
+            assert!(slot.stop().await.unwrap());
+            fake.stop().await;
+        }
+
+        /// B hears A's announce, then both stop. A's message waits on the node, and B,
+        /// restarted with a transport that has never heard A, delivers it on its first
+        /// fetch with the key its peer table kept. The body is built from A's identity
+        /// key rather than captured off a post, since the fake node serves fetches only.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_restarted_runtime_delivers_a_peer_message_with_the_key_it_persisted() {
+            let fake = FakeNode::listen_with_mtu(TcpServer::DEFAULT_CLIENT_MTU).await;
+            let a = started_runtime_on("fetch-net-restart-a", fake.listener.port).await;
+            let a_core = load_or_mint_identity(&mesh_paths(&a.tmp).identity_path).unwrap();
+            let a_identity = transport_identity_of(&a_core);
+            let a_destination = a.runtime.destination_hash().await;
+
+            let b_tmp = TempDir::new("fetch-net-restart-b");
+            TrustList::default()
+                .identity(&identity_hex(&a_identity), true)
+                .write(&b_tmp.path.join("config"));
+            let persisted = PropagationNodeTable::load(
+                mesh_cache_dir(&b_tmp.path.join("cache")).join(PROPAGATION_NODE_TABLE_FILE),
+                SystemTime::now(),
+            )
+            .unwrap();
+            persisted.observe(
+                PropagationNode {
+                    destination: fake.listener.desc,
+                    stamp_cost: 0,
+                    per_transfer_limit_kb: FETCH_TRANSFER_LIMIT_KB,
+                    propagation_enabled: true,
+                },
+                1,
+                SystemTime::now(),
+            );
+            persisted.persist_if_dirty().unwrap();
+            let mut session = Session::default();
+            let runtime = MeshRuntime::start(
+                &private_config(fake.listener.port),
+                true,
+                &mut session,
+                mesh_paths(&b_tmp),
+                NodeOptions::default(),
+            )
+            .await
+            .unwrap();
+            let mut b = StartedRuntime {
+                runtime,
+                session,
+                relay_handle: tokio::spawn(std::future::ready(())),
+                tmp: b_tmp,
+            };
+            let b_core = load_or_mint_identity(&mesh_paths(&b.tmp).identity_path).unwrap();
+
+            // The fake relays nothing between its clients, so it announces A's destination
+            // with A's key itself, as a transport between the two would.
+            let a_name = session_destination_name(&a.runtime.instance_id().await);
+            let app_data = AnnounceAppData {
+                version: 1,
+                display_name: Some("Ana".to_string()),
+            }
+            .encode()
+            .unwrap();
+            let announced = fake
+                .listener
+                .transport
+                .add_destination(to_transport_private_identity(&a_core), a_name)
+                .await;
+            let packet = announced
+                .lock()
+                .await
+                .announce(OsRng, Some(&app_data))
+                .unwrap();
+            fake.listener.transport.send_packet(packet).await;
+            let peers = b.runtime.peers();
+            wait_until("B to file A with its public key", || {
+                peers
+                    .snapshot()
+                    .iter()
+                    .any(|peer| peer.destination_hash == a_destination && peer.public_key.is_some())
+            })
+            .await;
+
+            let b_slot = Arc::new(MeshSlot::default());
+            b_slot.install(b.runtime.clone()).unwrap();
+            assert!(b_slot.stop().await.unwrap());
+            let a_slot = Arc::new(MeshSlot::default());
+            a_slot.install(a.runtime.clone()).unwrap();
+            assert!(a_slot.stop().await.unwrap());
+
+            let body = honest_body(
+                &a_core,
+                &transport_identity_of(&b_core),
+                b"while you were away",
+            );
+            let body_id = transient_id_of(&body);
+            fake.script
+                .reply_with([ids_value(&[body_id]), bodies(&[body]), Value::Array(vec![])]);
+            b.restart_on(fake.listener.port).await;
+            assert!(!b.knows_identity_of(&a_destination).await);
+
+            let sink = CountingSink::default();
+            let report = timeout(FETCH_DEADLINE, b.runtime.fetch_propagated(&sink))
+                .await
+                .expect("the fetch must finish within FETCH_DEADLINE")
+                .unwrap();
+
+            assert_eq!((report.delivered, report.deferred), (1, 0));
+            assert_eq!(sink.only().transient_id, body_id);
+            assert_eq!(sink.only().source_identity_hash, identity_hex(&a_identity));
+            assert!(
+                !b.knows_identity_of(&a_destination).await,
+                "the key came from the peer table, not from asking the mesh"
+            );
+
+            let slot = Arc::new(MeshSlot::default());
+            slot.install(b.runtime.clone()).unwrap();
+            assert!(slot.stop().await.unwrap());
             fake.stop().await;
         }
     }
