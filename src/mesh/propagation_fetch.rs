@@ -1169,16 +1169,21 @@ impl SourceKeys for TransportKeys<'_> {
 
     /// A path request for the destination of the peer table row whose identity derives
     /// `source`. The answer is an announce, which the transport and the announce loop
-    /// file as they file any other.
+    /// file as they file any other. Every ask in one fetch shares the key-lookup deadline,
+    /// so an ask that could not wait out a full path request is skipped rather than let
+    /// the deadline expire and fail the whole fetch; that body defers instead.
     async fn ask_for_source(&self, source: &AddressHash) -> Result<bool, RequestError> {
         let Some(destination) = self.destination_by_delivery.get(source) else {
             return Ok(false);
         };
-        let wait = PATH_REQUEST_TIMEOUT.min(self.deadline.remaining());
+        if self.deadline.remaining() <= PATH_REQUEST_TIMEOUT {
+            return Ok(false);
+        }
         self.deadline
             .bound(
                 GET_PATH,
-                self.transport.resolve_destination(destination, wait),
+                self.transport
+                    .resolve_destination(destination, PATH_REQUEST_TIMEOUT),
             )
             .await?;
         Ok(true)
