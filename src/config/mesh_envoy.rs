@@ -492,43 +492,20 @@ impl EnvoyRunner {
             return None;
         }
         let now = SystemTime::now();
-        let thread = store.session_thread(
+        let session = store.session_thread(
             &message.source_identity,
             message.thread.as_deref(),
             &message.message_id,
             now,
         );
-        let resumed = thread != message.message_id;
-        if !resumed {
-            return Some(RunMemory {
-                store,
-                thread,
-                resumed,
-                turns: Vec::new(),
-            });
-        }
-        let turns = match store.load(&message.source_identity, &thread, now) {
-            Ok(record) => record.map(|record| record.turns).unwrap_or_default(),
-            Err(EnvoyMemoryError::WrongIdentity { .. }) => {
-                warn!(
-                    "Mesh envoy memory for thread {thread} names another identity than {}; the thread starts over",
-                    short(&message.source_identity)
-                );
-                Vec::new()
-            }
-            Err(err) => {
-                warn!(
-                    "Mesh envoy memory for thread {thread} could not be read ({}); the thread starts over",
-                    redact_hashes(&err.to_string())
-                );
-                Vec::new()
-            }
-        };
         Some(RunMemory {
             store,
-            thread,
-            resumed,
-            turns,
+            thread: session.thread,
+            resumed: session.resumed.is_some(),
+            turns: session
+                .resumed
+                .map(|record| record.turns)
+                .unwrap_or_default(),
         })
     }
 
@@ -8823,7 +8800,7 @@ mod tests {
         let warned = warn_snapshot();
         assert!(
             warned.iter().any(|line| line.contains(&format!(
-                "memory for thread {thread} names another identity"
+                "memory for thread {thread} belongs to another identity"
             ))),
             "{warned:?}"
         );
@@ -8914,7 +8891,7 @@ mod tests {
         assert!(
             !warned
                 .iter()
-                .any(|line| line.contains("names another identity")),
+                .any(|line| line.contains("belongs to another identity")),
             "a root's thread is never recalled, so recall warns of nothing: {warned:?}"
         );
         source.remove_dir();

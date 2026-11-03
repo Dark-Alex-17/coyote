@@ -694,7 +694,7 @@ fn refuse_unseen_thread(slot: &MeshSlot, out: &OutboundPeer) -> Result<(), SendE
                 Ok(records) => records.iter().any(|record| record.thread == thread),
                 Err(err) => {
                     debug!(
-                        "Mesh thread {thread} could not be looked up in the inbound store: {}",
+                        "Mesh thread {thread} could not be looked up in the inbound store ({}), so an escalated question in it does not count as seen and the send is refused unless this node sent, received or asked in the thread. `.mesh pending` reads the same store and shows whether it can be read.",
                         redact_hashes(&err.to_string())
                     );
                     false
@@ -934,7 +934,9 @@ async fn handle_send(slot: &MeshSlot, runtime: &MeshRuntime, args: &Value) -> Re
     match runtime.send_peer(to, &out).await {
         Ok(outcome) => {
             let thread = sent_thread(&out);
-            slot.remember_threads(&[out.id.as_str(), thread.unwrap_or(&out.id)]);
+            if let Some(thread) = thread {
+                slot.remember_sent_thread(thread);
+            }
             let mut result = json!({
                 "status": "sent",
                 "id": outcome.id,
@@ -1007,7 +1009,7 @@ async fn handle_ask(ctx: &RequestContext, runtime: &MeshRuntime, args: &Value) -
             return Ok(send_error(&err));
         }
     };
-    slot.remember_threads(&[out.id.as_str(), thread.as_str()]);
+    slot.remember_sent_thread(&thread);
 
     if wait {
         return Ok(collect_reply(ctx, &outcome.id, timeout).await);
@@ -7033,7 +7035,7 @@ mod tests {
                 )
                 .unwrap();
 
-            ctx.app.mesh.remember_threads(&["t-1"]);
+            ctx.app.mesh.remember_sent_thread("t-1");
             let asked = handle_mesh_tool(
                 &mut ctx,
                 &format!("{MESH_FUNCTION_PREFIX}ask"),
@@ -7475,12 +7477,17 @@ mod tests {
             fn held_threads(live: &TrustedStub) -> Vec<String> {
                 let path = live.started.runtime.sent_threads().path().to_path_buf();
                 let file: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-                file["threads"]
-                    .as_array()
-                    .unwrap()
+                ["sent", "received"]
                     .iter()
+                    .flat_map(|list| file[list].as_array().unwrap().iter())
                     .map(|thread| thread.as_str().unwrap().to_string())
                     .collect()
+            }
+
+            async fn send_in(live: &mut TrustedStub, args: Value) -> Value {
+                handle_mesh_tool(&mut live.ctx, &format!("{MESH_FUNCTION_PREFIX}send"), &args)
+                    .await
+                    .unwrap()
             }
 
             #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7602,6 +7609,107 @@ mod tests {
                 let seen = live.stub.seen();
                 assert_eq!(seen.len(), 1, "{seen:?}");
                 assert_eq!(seen[0].thread.as_deref(), Some("t-recv"));
+
+                assert!(live.ctx.app.mesh.stop().await.unwrap());
+                live.stub.stop().await;
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[serial]
+            async fn the_id_of_a_follow_up_in_a_thread_is_not_a_thread() {
+                let mut live = trusted_stub("mesh-tool-thread-follow-up").await;
+                let to = live.to.clone();
+                let root = send_in(&mut live, json!({"to": to, "message": "hello"})).await;
+                assert_eq!(root["status"], "sent", "{root}");
+                let thread = root["thread"].as_str().unwrap().to_string();
+                let follow_up = send_in(
+                    &mut live,
+                    json!({"to": to, "message": "and also", "thread": thread}),
+                )
+                .await;
+                assert_eq!(follow_up["status"], "sent", "{follow_up}");
+                let follow_up_id = follow_up["id"].as_str().unwrap().to_string();
+                assert_ne!(follow_up_id, thread);
+
+                let refused = send_in(
+                    &mut live,
+                    json!({"to": to, "message": "more", "thread": follow_up_id}),
+                )
+                .await;
+
+                assert_eq!(refused["status"], "error", "{refused}");
+                assert_eq!(refused["kind"], "unknown_thread", "{refused}");
+                assert_eq!(held_threads(&live), vec![thread]);
+                assert_eq!(live.stub.seen().len(), 2, "{:?}", live.stub.seen());
+
+                assert!(live.ctx.app.mesh.stop().await.unwrap());
+                live.stub.stop().await;
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[serial]
+            async fn the_thread_of_a_filed_inbound_continues_with_nothing_recorded() {
+                let mut live = trusted_stub("mesh-tool-thread-inbound").await;
+                let to = live.to.clone();
+                live.ctx
+                    .app
+                    .mesh
+                    .inbound_store()
+                    .unwrap()
+                    .upsert(
+                        InboundRecord {
+                            version: INBOUND_RECORD_VERSION,
+                            id: "a-x".into(),
+                            peer_destination: to.clone(),
+                            peer_identity: live.stub.identity_hex(),
+                            thread: "t-x".into(),
+                            question: "may I?".into(),
+                            envoy_question: String::new(),
+                            received_at: rfc3339_utc(SystemTime::now()),
+                            kind: InboundKind::Question,
+                            paths: Vec::new(),
+                            reason: String::new(),
+                        },
+                        SystemTime::now(),
+                    )
+                    .unwrap();
+                assert!(!live.started.runtime.sent_threads().contains("t-x"));
+
+                let sent = send_in(
+                    &mut live,
+                    json!({"to": to, "message": "about that", "thread": "t-x"}),
+                )
+                .await;
+
+                assert_eq!(sent["status"], "sent", "{sent}");
+                assert_eq!(sent["thread"], "t-x", "{sent}");
+                let seen = live.stub.seen();
+                assert_eq!(seen.len(), 1, "{seen:?}");
+                assert_eq!(seen[0].thread.as_deref(), Some("t-x"));
+
+                assert!(live.ctx.app.mesh.stop().await.unwrap());
+                live.stub.stop().await;
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[serial]
+            async fn the_thread_of_an_open_question_continues_with_nothing_recorded() {
+                let mut live = trusted_stub("mesh-tool-thread-open-question").await;
+                let to = live.to.clone();
+                open_question(&live.ctx.app.mesh, "q-open");
+                assert!(!live.started.runtime.sent_threads().contains("q-open"));
+
+                let sent = send_in(
+                    &mut live,
+                    json!({"to": to, "message": "still there?", "thread": "q-open"}),
+                )
+                .await;
+
+                assert_eq!(sent["status"], "sent", "{sent}");
+                assert_eq!(sent["thread"], "q-open", "{sent}");
+                let seen = live.stub.seen();
+                assert_eq!(seen.len(), 1, "{seen:?}");
+                assert_eq!(seen[0].thread.as_deref(), Some("q-open"));
 
                 assert!(live.ctx.app.mesh.stop().await.unwrap());
                 live.stub.stop().await;
