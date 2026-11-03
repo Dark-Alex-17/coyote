@@ -272,8 +272,9 @@ u = gates.intake({"initial_prompt": f"Implement the design at {DESIGN}", **STORE
 check("intake seed: an explicit design doc wins over a ready seed, seed untouched",
       u["_next"] == "orient_read" and u["design_doc_path"] == DESIGN and not u.get("seed_path") and seed_status(SEED) == "ready")
 st_seed = gates.intake({"initial_prompt": "okay, go ahead and get started", **STORE.variables("", TMP)})
-check("intake seed: no doc path + two ready seeds -> confirm_seed on the newest, not yet consumed",
-      st_seed["_next"] == "confirm_seed" and st_seed["escalation"]["kind"] == "seed_confirm" and st_seed["seed_path"] == SEED
+check("intake seed: no doc path + two ready seeds -> hard-trigger seed_confirm escalation on the newest, not yet consumed",
+      st_seed["_next"] == "escalate_gate" and st_seed["escalation"]["kind"] == "seed_confirm" and st_seed["escalation"]["hard_trigger"] is True
+      and st_seed["seed_path"] == SEED
       and st_seed["escalation"]["data"]["seed_path"] == SEED and SEED in st_seed["ask_question"] and "Seed new.md" in st_seed["ask_question"]
       and "2026-02-01T00:00:00Z" in st_seed["ask_question"] and seed_status(SEED) == "ready", st_seed.get("_next"))
 check("intake seed: seed_path survives in state.json", json.loads(read_file(os.path.join(st_seed["run_dir"], "state.json")))["seed_path"] == SEED)
@@ -282,9 +283,18 @@ _groups = gates.MULTI_IS_GROUPS
 gates.MULTI_IS_GROUPS = False
 u = gates.intake({"initial_prompt": "do it", **STORE.variables("", TMP, pr_strategy="multi", pr_tracking="review")})
 gates.MULTI_IS_GROUPS = _groups
-check("intake seed: the review-watch follow-up is recorded once before confirm_seed",
-      u["_next"] == "confirm_seed" and len([f for f in u.get("follow_ups", []) if f.startswith("review-watch: not started")]) == 1, u.get("follow_ups"))
+check("intake seed: the review-watch follow-up is recorded once before the seed_confirm escalation",
+      u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "seed_confirm"
+      and len([f for f in u.get("follow_ups", []) if f.startswith("review-watch: not started")]) == 1, u.get("follow_ups"))
 E_SEED = st_seed["escalation"]
+check("escalate_gate: seed_confirm skips the ladder under escalation_policy=autonomous",
+      gates.escalate_gate(base_state(escalation=E_SEED, escalation_policy="autonomous"))["_next"] == "ask_dispatch")
+u = gates.ask_dispatch(base_state(escalation=E_SEED, top_level=True, owner_away=False))
+check("ask_dispatch: seed_confirm -> confirm_seed, parked recorded", u["_next"] == "confirm_seed" and u["parked"] == "seed_confirm", u)
+check("ask_owner_route: seed_confirm with no Slack reply -> confirm_seed",
+      gates.ask_owner_route(base_state(escalation=E_SEED, owner_polls=1, owner_poll_result="TIMEOUT: ask_owner poll exceeded its budget"))["_next"] == "confirm_seed")
+check("_terminal_prompt: review_incomplete and an unknown kind keep their prompts",
+      gates._terminal_prompt({"kind": "review_incomplete"}) == "ask_review_incomplete" and gates._terminal_prompt({"kind": "banana"}) == "ask_user")
 u = gates.parse_answer(base_state(escalation=E_SEED, last_answer_text="2"))
 check("parse_answer: seed_confirm number -> the option text", u["last_answer"] == "Draft a brief from this conversation instead")
 for answer, row in (("Abort the run", "abort -> end_aborted"), ("Give a doc path instead", "doc path -> need_design_doc"),
@@ -1465,6 +1475,8 @@ check("watch: ci_poll / review_poll node timeouts cover the sleep plus one gh re
 check("watch: review_route has a timeout above the slack_ping subprocess bound (60s)", NODES.get("review_route", {}).get("timeout", 0) > 60,
       NODES.get("review_route", {}).get("timeout"))
 check("watch: ci_polls_run and review_polls_run seeded at 0", SEEDS.get("ci_polls_run") == 0 and SEEDS.get("review_polls_run") == 0)
+check("graph: confirm_seed offers exactly the seed_confirm options intake raises",
+      NODES.get("confirm_seed", {}).get("options") == [o["text"] for o in E_SEED["options"]], NODES.get("confirm_seed", {}).get("options"))
 
 _real_run, _real_gh_timeout, gh_timeouts = subprocess.run, gates.GH_CALL_SECS, []
 subprocess.run = lambda *a, **kw: (gh_timeouts.append(kw.get("timeout")), _real_run(*a, **kw))[1]

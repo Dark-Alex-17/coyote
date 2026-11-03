@@ -275,10 +275,12 @@ The wrapper's live test groups:
 Seed pickup: when neither the `design_doc` variable nor a `.md` path in the message names a
 design doc, `intake` looks for the newest `status: ready` seed the engineer wrote for this
 project under `plans/engineer-handoffs/` (the planning store's and the code repo's, by
-`created:`, then mtime) and asks through `confirm_seed` before using it. Using it marks the
-seed `status: consumed`, so no later run picks it again; any other answer leaves it ready and
-falls back to `need_design_doc`, as does a run with no ready seed. An explicit path never
-looks for a seed.
+`created:`, then mtime) and asks before using it. The question is a hard-trigger
+`seed_confirm` escalation, so it goes through `escalate_gate` and `ask_dispatch` (parked
+snapshot, owner-away Slack path) to `confirm_seed` even under `escalation_policy=autonomous`.
+Using it marks the seed `status: consumed`, so no later run picks it again; any other answer
+leaves it ready and falls back to `need_design_doc`, as does a run with no ready seed. An
+explicit path never looks for a seed.
 
 The mode-matrix run is the one ignored test.
 

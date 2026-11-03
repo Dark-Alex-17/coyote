@@ -213,14 +213,12 @@ def intake(state):
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [line]
         if seed:
             u["seed_path"] = seed
-            u["ask_question"] = _seed_question(seed)
-            u["escalation"] = escalation("seed_confirm", u["ask_question"], [
-                option("Use this seed", recommended=True), option("Draft a brief from this conversation instead"),
-                option("Give a doc path instead"), option("Abort the run")], data={"seed_path": seed})
             ledger(state, u, f"seed: found {seed}; asking to confirm it as the design doc")
-            u["_next"] = "confirm_seed"
-        else:
-            u["_next"] = "orient_read"
+            snapshot(state, u, "intake")
+            return raise_escalation(state, u, escalation("seed_confirm", _seed_question(seed), [
+                option("Use this seed", recommended=True), option("Draft a brief from this conversation instead"),
+                option("Give a doc path instead"), option("Abort the run")], hard_trigger=True, tier3_ok=False, data={"seed_path": seed}))
+        u["_next"] = "orient_read"
     snapshot(state, u, "intake")
     return u
 
@@ -2166,8 +2164,11 @@ def consult_route(state):
     return u
 
 
+_TERMINAL_PROMPTS = {"review_incomplete": "ask_review_incomplete", "seed_confirm": "confirm_seed"}
+
+
 def _terminal_prompt(esc):
-    return "ask_review_incomplete" if esc.get("kind") == "review_incomplete" else "ask_user"
+    return _TERMINAL_PROMPTS.get(esc.get("kind"), "ask_user")
 
 
 def _slack_ping(state, text):

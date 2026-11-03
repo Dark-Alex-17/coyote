@@ -74,6 +74,10 @@ def harvest_gate_targets(gates_src):
     """gate function name -> set of `_next` literals it can emit (incl. helpers)."""
     tree = ast.parse(gates_src)
     funcs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    prompts = {"ask_user"} | next(
+        ({v.value for v in n.value.values if isinstance(v, ast.Constant)} for n in tree.body
+         if isinstance(n, ast.Assign) and isinstance(n.value, ast.Dict) and any(getattr(t, "id", None) == "_TERMINAL_PROMPTS" for t in n.targets)),
+        {"ask_review_incomplete", "confirm_seed"})
 
     def literals(fn):
         out = set()
@@ -97,7 +101,7 @@ def harvest_gate_targets(gates_src):
                 if name == "raise_escalation":
                     out.add("escalate_gate")
                 if name == "_terminal_prompt":
-                    out.update({"ask_user", "ask_review_incomplete"})
+                    out.update(prompts)
                 if name in funcs and name.startswith("_") and name not in ("_terminal_prompt",):
                     out.update(literals(funcs[name]))
         return out

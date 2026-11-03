@@ -391,6 +391,8 @@ nodes:
       (fail-safe: an unknown value asks), resolve the design doc, create the A2 run
       directory (outside both repos), write the brief, detect re-entry
       ("Architect run id:"), confirm the owner identity, and pull the planning repo.
+      With no design doc named, pick up the engineer's newest ready seed and raise a
+      hard-trigger seed_confirm escalation for it.
     script: scripts/intake.py
     timeout: 120
     fallback: end_failure
@@ -405,7 +407,10 @@ nodes:
   confirm_seed:
     id: confirm_seed
     type: approval
-    description: No design doc was given - confirm the engineer's newest ready seed as the design doc.
+    description: >-
+      Terminal prompt for the seed_confirm escalation, reached from ask_dispatch or
+      ask_owner_route through _terminal_prompt - confirm the engineer's newest ready
+      seed as the design doc.
     question: |
       {{ask_question}}
     options:
