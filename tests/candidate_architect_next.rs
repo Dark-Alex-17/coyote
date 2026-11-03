@@ -2186,10 +2186,10 @@ fn readme_toolchain_census_matches_the_live_grep() {
     );
     assert_eq!(
         gates_lines,
-        vec![42, 2701, 2710],
+        vec![43, 2718, 2727],
         "the gates.py toolchain hits moved; update the README census and its prose"
     );
-    for line in [2701, 2710] {
+    for line in [2718, 2727] {
         assert!(
             text.contains(&format!("`gates.py:{line}`")) || text.contains(&format!("`:{line}`")),
             "the README prose must cite gates.py:{line}"
