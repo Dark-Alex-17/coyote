@@ -18,9 +18,9 @@ use crate::mesh::propagation::{OutboundMessage, PropagationError, PropagationOpt
 use crate::mesh::propagation_fetch::{InboundMessage, InboundSink};
 use crate::mesh::protocol::describe_version;
 use crate::mesh::request::{
-    AdmittedRequest, DEFAULT_LINK_TIMEOUT, Handler, MESSAGE_PATH, NAME_HASH_LEN, OriginName,
-    RefusalCode, RemoteRefusal, Reply, RequestError, RequestOptions, redact_hashes, refusal_remedy,
-    request_remedy, short,
+    AdmittedRequest, DEFAULT_LINK_TIMEOUT, Handler, MESSAGE_PATH, NAME_HASH_LEN, NoAnswer,
+    OriginName, RefusalCode, RemoteRefusal, Reply, RequestError, RequestOptions, redact_hashes,
+    refusal_remedy, request_remedy, short,
 };
 use crate::mesh::trust::{
     Decision, IdentityStanding, KeyChangeOutcome, OriginVerdict, Rule, TrustStore,
@@ -1382,6 +1382,9 @@ pub(crate) enum SendError {
         max: u16,
     },
     NoPropagationNode,
+    /// The link came up but the peer did not answer, and no propagation node is known to
+    /// hold the message, so nothing was queued.
+    NoAnswer(NoAnswer),
     Propagation(PropagationError),
     /// The peer answered, but not with the acknowledgement for this id.
     NotAcknowledged,
@@ -1444,6 +1447,10 @@ impl fmt::Display for SendError {
             Self::NoPropagationNode => write!(
                 f,
                 "The peer is unreachable and no propagation node is known yet to hold the message for it. Run `.mesh peers` to see which nodes this Coyote has heard from."
+            ),
+            Self::NoAnswer(no_answer) => write!(
+                f,
+                "{no_answer} Nothing was queued, because no propagation node is known yet to hold the message for it; `.mesh peers` lists the nodes this Coyote has heard from."
             ),
             Self::Propagation(err) => write!(
                 f,
@@ -1557,6 +1564,7 @@ impl SendError {
             Self::Direct(_) => "direct",
             Self::IncompatibleVersion { .. } => "incompatible_version",
             Self::NoPropagationNode => "no_propagation_node",
+            Self::NoAnswer(_) => "no_answer",
             Self::Propagation(_) => "propagation",
             Self::NotAcknowledged => "not_acknowledged",
         }
@@ -1772,6 +1780,7 @@ impl MeshRuntime {
             }
             Err(
                 err @ (RequestError::Timeout { .. }
+                | RequestError::LinkActivationTimeout { .. }
                 | RequestError::LinkFailed(_)
                 | RequestError::LinkClosed),
             ) => err,
@@ -1808,10 +1817,15 @@ impl MeshRuntime {
         };
         // Selected before queueing behind another post: a sender with no node to fall
         // back on is told so at once rather than after someone else's transfer.
-        let node = self
-            .propagation_nodes()
-            .select_for_posting()
-            .map_err(|_| SendError::NoPropagationNode)?;
+        let node =
+            self.propagation_nodes()
+                .select_for_posting()
+                .map_err(|_| match unreachable {
+                    RequestError::Timeout { .. } => {
+                        SendError::NoAnswer(self.no_answer(&destination))
+                    }
+                    _ => SendError::NoPropagationNode,
+                })?;
         let node_hex = node.destination.address_hash.to_hex_string();
         debug!(
             "Mesh {kind} {id} to {dest8} could not be delivered over a link ({}); storing it with propagation node {}",
@@ -2394,6 +2408,83 @@ impl ModelNotes {
             ));
         }
         notes
+    }
+}
+
+#[cfg(test)]
+mod no_answer_tests {
+    #[cfg(unix)]
+    use super::*;
+    #[cfg(unix)]
+    use crate::mesh::test_support::beside_a_stub_that_does_not_know_it;
+
+    #[cfg(unix)]
+    fn quick() -> PeerSendOptions {
+        PeerSendOptions {
+            request: RequestOptions {
+                request_timeout: Duration::from_secs(2),
+                link_timeout: Duration::from_secs(2),
+            },
+            propagation: PropagationOptions::default(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn hello() -> OutboundPeer {
+        OutboundPeer::new(PeerKind::Message, "hello", None, None, None).unwrap()
+    }
+
+    /// The link came up and the peer said nothing, and no propagation node is known: the
+    /// send names the silence, the remedy on the peer's side, and that nothing was queued.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_silent_peer_with_no_propagation_node_is_reported_as_no_answer() {
+        let (stub, started, slot) = beside_a_stub_that_does_not_know_it("message-no-answer").await;
+        let runtime = &started.runtime;
+        let to = stub.destination_hex();
+        assert!(runtime.propagation_nodes().select().is_err());
+
+        let err = runtime
+            .send_peer_with(&to, &hello(), quick())
+            .await
+            .unwrap_err();
+
+        let own = runtime.current_destination_hash();
+        assert_eq!(err, SendError::NoAnswer(NoAnswer::new(&to, own.clone())));
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "no answer from {}: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance). Nothing was queued, because no propagation node is known yet to hold the message for it; `.mesh peers` lists the nodes this Coyote has heard from.",
+                short(&to)
+            )
+        );
+        assert_eq!(err.class(), "no_answer");
+        assert!(stub.seen().is_empty(), "{:?}", stub.seen());
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
+    /// A peer that knows this identity but has not trusted this instance answers
+    /// `NoAccess`, and that answer keeps the refusal sentence.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_no_access_answer_keeps_the_refusal_sentence() {
+        let (stub, started, slot) = beside_a_stub_that_does_not_know_it("message-no-access").await;
+        let runtime = &started.runtime;
+        stub.know_identity(runtime.fingerprint());
+        let to = stub.destination_hex();
+
+        let err = runtime
+            .send_peer_with(&to, &hello(), quick())
+            .await
+            .unwrap_err();
+
+        let refusal = runtime.remote_refusal(&to);
+        assert_eq!(err, SendError::NotTrustedByPeer(refusal.clone()));
+        assert_eq!(err.to_string(), refusal.to_string());
+        assert!(err.to_string().contains(" refused the request: "), "{err}");
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
     }
 }
 

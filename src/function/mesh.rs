@@ -748,6 +748,7 @@ fn send_error_kind(err: &SendError) -> &'static str {
         SendError::Direct(_) => "direct",
         SendError::IncompatibleVersion { .. } => "incompatible_version",
         SendError::NoPropagationNode => "no_propagation_node",
+        SendError::NoAnswer(_) => "no_answer",
         SendError::Propagation(_) => "propagation",
         SendError::NotAcknowledged => "not_acknowledged",
     }
@@ -759,8 +760,12 @@ fn send_error(err: &SendError) -> Value {
         "kind": send_error_kind(err),
         "message": err.to_string(),
     });
-    if let SendError::NotTrustedByPeer(refusal) = err {
-        result["next_action"] = json!(refusal.next_action());
+    match err {
+        SendError::NotTrustedByPeer(refusal) => {
+            result["next_action"] = json!(refusal.next_action());
+        }
+        SendError::NoAnswer(no_answer) => result["next_action"] = json!(no_answer.next_action()),
+        _ => {}
     }
     result
 }
@@ -883,8 +888,14 @@ async fn handle_peers(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
                 }
                 Err(err) => {
                     peers[index]["status_error"] = json!(err.to_string());
-                    if let StatusError::NotTrustedByPeer(refusal) = &err {
-                        peers[index]["next_action"] = json!(refusal.next_action());
+                    match &err {
+                        StatusError::NotTrustedByPeer(refusal) => {
+                            peers[index]["next_action"] = json!(refusal.next_action());
+                        }
+                        StatusError::NoAnswer(no_answer) => {
+                            peers[index]["next_action"] = json!(no_answer.next_action());
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1542,6 +1553,7 @@ fn fetch_error_kind(err: &FileFetchError) -> &'static str {
     match err {
         FileFetchError::Transport(_) => "transport",
         FileFetchError::NotTrustedByPeer(_) => "refused",
+        FileFetchError::NoAnswer(_) => "no_answer",
         FileFetchError::NotServed => "not_served",
         FileFetchError::Malformed(_) => "malformed",
         FileFetchError::Oversize { .. } => "oversize",
@@ -1585,8 +1597,14 @@ fn fetch_error(err: &FileFetchError, verb: FetchVerb) -> Value {
         "kind": fetch_error_kind(err),
         "message": message,
     });
-    if let FileFetchError::NotTrustedByPeer(refusal) = err {
-        result["next_action"] = json!(refusal.next_action());
+    match err {
+        FileFetchError::NotTrustedByPeer(refusal) => {
+            result["next_action"] = json!(refusal.next_action());
+        }
+        FileFetchError::NoAnswer(no_answer) => {
+            result["next_action"] = json!(no_answer.next_action());
+        }
+        _ => {}
     }
     result
 }
@@ -1605,6 +1623,7 @@ fn access_error_kind(err: &AccessError) -> &'static str {
         AccessError::Direct(_) => "direct",
         AccessError::IncompatibleVersion { .. } => "incompatible_version",
         AccessError::NoPropagationNode => "no_propagation_node",
+        AccessError::NoAnswer(_) => "no_answer",
         AccessError::Propagation(_) => "propagation",
     }
 }
@@ -1618,8 +1637,14 @@ fn access_result(outcome: Result<AccessRequestOutcome, AccessError>) -> Value {
                 "kind": access_error_kind(&err),
                 "message": err.to_string(),
             });
-            if let AccessError::NotTrustedByPeer(refusal) = &err {
-                result["next_action"] = json!(refusal.next_action());
+            match &err {
+                AccessError::NotTrustedByPeer(refusal) => {
+                    result["next_action"] = json!(refusal.next_action());
+                }
+                AccessError::NoAnswer(no_answer) => {
+                    result["next_action"] = json!(no_answer.next_action());
+                }
+                _ => {}
             }
             return result;
         }
@@ -1657,6 +1682,37 @@ fn access_result(outcome: Result<AccessRequestOutcome, AccessError>) -> Value {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod no_answer_tests {
+    use super::*;
+    use crate::mesh::request::NoAnswer;
+
+    /// A peer that stayed silent once the link came up is `no_answer` from every builder,
+    /// send, fetch and access alike, with the same `next_action` and the sentence as the
+    /// error's own text.
+    #[test]
+    fn a_silent_peer_is_no_answer_with_a_next_action_from_each_error_builder() {
+        let no_answer = NoAnswer::new(&hex_lower(&[0xbb; 16]), hex_lower(&[0xaa; 16]));
+        let sent_err = SendError::NoAnswer(no_answer.clone());
+        let fetched_err = FileFetchError::NoAnswer(no_answer.clone());
+        let asked_err = AccessError::NoAnswer(no_answer.clone());
+        let sent = send_error(&sent_err);
+        let fetched = fetch_error(&fetched_err, FetchVerb::Fetch);
+        let asked = access_result(Err(asked_err.clone()));
+        for (result, text) in [
+            (&sent, sent_err.to_string()),
+            (&fetched, fetched_err.to_string()),
+            (&asked, asked_err.to_string()),
+        ] {
+            assert_eq!(result["status"], "error", "{result}");
+            assert_eq!(result["kind"], "no_answer", "{result}");
+            assert_eq!(result["message"], text, "{result}");
+            assert!(text.starts_with("no answer from bbbbbbbb: "), "{text}");
+            assert_eq!(result["next_action"], no_answer.next_action(), "{result}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -6169,8 +6225,8 @@ mod tests {
         /// `mesh__peers` with `with_status: true` sweeps `/status` at its own 5 s / 5 s
         /// while this node's `mesh.request_timeout_secs` and `link_timeout_secs` sit at the
         /// one-year cap. A trusted, reachable peer that never answers costs the sweep about
-        /// five seconds, not a year; its row carries `status_error` naming the 5 s the
-        /// sweep waited; and the deadlines the node handed its client for the one `/status`
+        /// five seconds, not a year; its row carries a `status_error` saying the peer did
+        /// not answer; and the deadlines the node handed its client for the one `/status`
         /// request are the sweep's, not the raised ones.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]
@@ -6231,7 +6287,7 @@ mod tests {
                 .as_str()
                 .unwrap_or_else(|| panic!("no status_error: {row}"));
             assert!(
-                error.starts_with("No response to the mesh request /status within 5.0s"),
+                error.starts_with(&format!("no answer from {}:", short(&to))),
                 "{error}"
             );
             assert!(

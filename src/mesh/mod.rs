@@ -879,6 +879,34 @@ pub(crate) mod test_support {
         (relay, a, b)
     }
 
+    /// A runtime that has filed and trusts a `PeerStub` whose trust list names nobody, so
+    /// a link to the stub comes up and every request on it draws the silence a Coyote
+    /// gives an identity it does not know. The slot holds the runtime, as a trust grant
+    /// needs a live node.
+    #[cfg(unix)]
+    pub(crate) async fn beside_a_stub_that_does_not_know_it(
+        tag: &str,
+    ) -> (PeerStub, StartedRuntime, Arc<MeshSlot>) {
+        let stub = PeerStub::listen(&format!("{tag}-stub"), TcpServer::DEFAULT_CLIENT_MTU).await;
+        let started = started_runtime_on(tag, stub.port()).await;
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        stub.wait_to_be_filed(&started.runtime.peers(), &to).await;
+        started
+            .runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .expect("the node trusts the stub");
+        (stub, started, slot)
+    }
+
     pub(crate) fn private_config(port: u16) -> MeshConfig {
         MeshConfig {
             interfaces: vec![MeshInterface::Private {

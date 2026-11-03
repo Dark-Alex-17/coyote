@@ -12,8 +12,10 @@ use std::time::Duration;
 /// `anyhow::Result` still works through `std::error::Error`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RequestError {
-    /// No response arrived within `after`; the link may still be up.
+    /// The link came up but no response arrived within `after`; the link may still be up.
     Timeout { path: String, after: Duration },
+    /// The link to the peer did not come up within `after`, so nothing was asked.
+    LinkActivationTimeout { path: String, after: Duration },
     /// The link could not be established or the packet could not be put on its interface.
     LinkFailed(String),
     /// The link closed while the request was pending, or was gone by the time we replied.
@@ -65,6 +67,11 @@ impl fmt::Display for RequestError {
             Self::Timeout { path, after } => write!(
                 f,
                 "No response to the mesh request {path} within {:.1}s",
+                after.as_secs_f64()
+            ),
+            Self::LinkActivationTimeout { path, after } => write!(
+                f,
+                "No mesh link for the request {path} came up within {:.1}s",
                 after.as_secs_f64()
             ),
             Self::LinkFailed(reason) => write!(f, "The mesh link failed: {reason}"),
@@ -155,7 +162,10 @@ impl RefusalCode {
 /// serve only a caller that wraps without the remap.
 pub(crate) fn request_remedy(err: &RequestError) -> &'static str {
     match err {
-        RequestError::Timeout { .. } | RequestError::LinkFailed(_) | RequestError::LinkClosed => {
+        RequestError::Timeout { .. }
+        | RequestError::LinkActivationTimeout { .. }
+        | RequestError::LinkFailed(_)
+        | RequestError::LinkClosed => {
             "Try again in a minute; `.mesh peers` shows when the peer was last heard"
         }
         RequestError::Oversize { .. } => {
@@ -278,5 +288,86 @@ impl fmt::Display for RemoteRefusal {
             " refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance). (This node does trust {dest8}.)",
             own = self.own_destination
         )
+    }
+}
+
+/// A peer that opened the link and then said nothing to a request. A Coyote answers
+/// every identity it trusts, even with a refusal, and stays silent to one it does not
+/// know or has blocked, so silence after the link came up means the remedy is on the
+/// peer's side, as for a `RemoteRefusal`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NoAnswer {
+    destination: String,
+    own_destination: String,
+}
+
+impl NoAnswer {
+    pub(crate) fn new(destination: &str, own_destination: String) -> Self {
+        Self {
+            destination: destination.to_string(),
+            own_destination,
+        }
+    }
+
+    /// What the model can still do about it, for a tool result's `next_action`. A peer
+    /// that stays silent filed no knock, so unlike a refusal nothing reached its owner.
+    pub(crate) fn next_action(&self) -> String {
+        format!(
+            "Nothing on this node lifts it: ask the person at {} to run .mesh trust {} (or .mesh unblock {} if they blocked this instance); the peer did not answer, so nothing reached them.",
+            short(&self.destination),
+            self.own_destination,
+            self.own_destination
+        )
+    }
+}
+
+impl fmt::Display for NoAnswer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "no answer from {}: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance).",
+            short(&self.destination),
+            own = self.own_destination
+        )
+    }
+}
+
+#[cfg(test)]
+mod no_answer_tests {
+    use super::*;
+
+    #[test]
+    fn no_answer_names_the_peer_and_the_command_its_owner_runs() {
+        let peer = "bb".repeat(16);
+        let own = "aa".repeat(16);
+        let no_answer = NoAnswer::new(&peer, own.clone());
+
+        assert_eq!(
+            no_answer.to_string(),
+            format!(
+                "no answer from bbbbbbbb: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance)."
+            )
+        );
+        let next = no_answer.next_action();
+        assert!(next.is_ascii(), "{next}");
+        assert!(next.contains(&format!(".mesh trust {own}")), "{next}");
+        assert!(!next.contains("knock"), "silence filed no knock: {next}");
+    }
+
+    #[test]
+    fn a_link_that_never_came_up_says_so_and_shares_the_retry() {
+        let err = RequestError::LinkActivationTimeout {
+            path: "/message".to_string(),
+            after: Duration::from_secs(10),
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "No mesh link for the request /message came up within 10.0s"
+        );
+        assert_eq!(
+            request_remedy(&err),
+            request_remedy(&RequestError::LinkClosed)
+        );
     }
 }

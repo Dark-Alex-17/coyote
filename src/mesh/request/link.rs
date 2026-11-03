@@ -44,7 +44,8 @@ impl Default for RequestOptions {
 }
 
 /// When one phase of a request gives up, and the option that set it, which the `Timeout`
-/// error reports. Every wait against the transport or a link lock runs under one.
+/// and `LinkActivationTimeout` errors report. Every wait against the transport or a link
+/// lock runs under one.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Deadline {
     at: Instant,
@@ -75,6 +76,25 @@ impl Deadline {
 
     pub(crate) fn expired(self, path: &str) -> RequestError {
         RequestError::Timeout {
+            path: path.to_string(),
+            after: self.after,
+        }
+    }
+
+    /// `bound` for the waits before a link is active, whose expiry means the peer was
+    /// never reached rather than that it did not answer.
+    async fn bound_activation<T>(
+        self,
+        path: &str,
+        wait: impl Future<Output = T>,
+    ) -> Result<T, RequestError> {
+        timeout_at(self.at, wait)
+            .await
+            .map_err(|_| self.activation_expired(path))
+    }
+
+    fn activation_expired(self, path: &str) -> RequestError {
+        RequestError::LinkActivationTimeout {
             path: path.to_string(),
             after: self.after,
         }
@@ -242,7 +262,10 @@ pub(crate) async fn open_link(
     deadline: Deadline,
 ) -> Result<Arc<tokio::sync::Mutex<Link>>, RequestError> {
     let destination_hex = destination.address_hash.to_hex_string();
-    let link = match deadline.bound(path, transport.link(*destination)).await? {
+    let link = match deadline
+        .bound_activation(path, transport.link(*destination))
+        .await?
+    {
         Ok(link) => link,
         Err(RnsError::NoPath) => {
             return Err(RequestError::LinkFailed(format!(
@@ -256,14 +279,16 @@ pub(crate) async fn open_link(
         }
     };
     let activation = deadline
-        .bound(
+        .bound_activation(
             path,
             await_link_activation(transport, &link, deadline.remaining()),
         )
         .await?;
     match activation {
         Ok(()) => {}
-        Err(err) if err.kind() == ErrorKind::TimedOut => return Err(deadline.expired(path)),
+        Err(err) if err.kind() == ErrorKind::TimedOut => {
+            return Err(deadline.activation_expired(path));
+        }
         Err(err) => return Err(RequestError::LinkFailed(err.to_string())),
     }
     let link_id = deadline

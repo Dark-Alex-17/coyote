@@ -54,9 +54,9 @@ use crate::mesh::protocol::{Compatibility, MESH_PROTOCOL_MIN_SUPPORTED, MESH_PRO
 use crate::mesh::request::RequestHandler;
 use crate::mesh::request::{
     ACCESS_PATH, Dispatcher, Envelope, FETCH_PATH, KNOCK_PATH, KNOWN_PATHS, LIST_PATH,
-    LibraryHandler, MAX_FETCH_RESPONSE_BYTES, MAX_REQUEST_PAYLOAD_BYTES, MESSAGE_PATH, OriginName,
-    RefusalCode, RemoteRefusal, RequestError, RequestOptions, STATUS_PATH, redact_hashes,
-    request as link_request, short,
+    LibraryHandler, MAX_FETCH_RESPONSE_BYTES, MAX_REQUEST_PAYLOAD_BYTES, MESSAGE_PATH, NoAnswer,
+    OriginName, RefusalCode, RemoteRefusal, RequestError, RequestOptions, STATUS_PATH,
+    redact_hashes, request as link_request, short,
 };
 use crate::mesh::shares::ShareLocations;
 use crate::mesh::snapshot::MeshSnapshot;
@@ -976,6 +976,12 @@ impl MeshRuntime {
         )
     }
 
+    /// A peer's silence after the link came up, with this node by the same current
+    /// destination `remote_refusal` names.
+    pub(crate) fn no_answer(&self, destination: &str) -> NoAnswer {
+        NoAnswer::new(destination, self.current_destination_hash())
+    }
+
     pub(crate) fn cache_dir(&self) -> &Path {
         &self.cache_dir
     }
@@ -1433,9 +1439,11 @@ impl MeshRuntime {
                 });
             }
             Err(err @ RequestError::Timeout { .. }) => (KnockFallback::Unanswered, err),
-            Err(err @ (RequestError::LinkFailed(_) | RequestError::LinkClosed)) => {
-                (KnockFallback::Unreachable, err)
-            }
+            Err(
+                err @ (RequestError::LinkActivationTimeout { .. }
+                | RequestError::LinkFailed(_)
+                | RequestError::LinkClosed),
+            ) => (KnockFallback::Unreachable, err),
             Err(RequestError::NotRunning | RequestError::Shutdown) => {
                 return Err(KnockError::NotRunning);
             }
@@ -5283,6 +5291,43 @@ impl EnvoySink for FullEnvoy {
     }
 
     fn interrupt(&self) {}
+}
+
+#[cfg(test)]
+mod no_answer_tests {
+    #[cfg(unix)]
+    use super::*;
+    #[cfg(unix)]
+    use crate::mesh::test_support::beside_a_stub_that_does_not_know_it;
+
+    /// A knock on a peer gone before the link could come up was never heard, so with no
+    /// propagation node known it is reported unreachable rather than unanswered.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_knock_whose_link_never_comes_up_is_unreachable_not_unanswered() {
+        let (stub, started, slot) = beside_a_stub_that_does_not_know_it("knock-never-linked").await;
+        let runtime = &started.runtime;
+        let desc = runtime
+            .resolve_destination(&stub.destination_hex())
+            .await
+            .unwrap();
+        stub.stop().await;
+        let options = KnockOptions {
+            request: RequestOptions {
+                request_timeout: Duration::from_secs(2),
+                link_timeout: Duration::from_secs(2),
+            },
+            propagation: PropagationOptions::default(),
+        };
+
+        let err = runtime
+            .knock_with(&desc, &KnockIntro::new("hello").unwrap(), options)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err, KnockError::NoPropagationNode);
+        assert!(slot.stop().await.unwrap());
+    }
 }
 
 // Tests that start a runtime are unix-only: they run on the loopback fixtures under

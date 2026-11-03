@@ -104,6 +104,10 @@ fn every_request_error_has_a_next_step() {
             path: "/status".to_string(),
             after: Duration::from_secs(5),
         },
+        RequestError::LinkActivationTimeout {
+            path: "/status".to_string(),
+            after: Duration::from_secs(5),
+        },
         RequestError::LinkFailed("no path".to_string()),
         RequestError::LinkClosed,
         RequestError::Oversize { len: 9, max: 8 },
@@ -8964,7 +8968,7 @@ pub(crate) mod network {
             .request_status_with(&pair.responder.desc, short_options())
             .await
             .unwrap_err();
-        assert_eq!(err, StatusError::Transport(timed_out(STATUS_PATH)));
+        assert_eq!(err, StatusError::NoAnswer(pair.node_a.no_answer(&b_hex)));
         assert_eq!(handler.calls(), 0);
 
         let (trust, _tmp) = trusts_a.open("request-status-client-placeholder");
@@ -10777,7 +10781,7 @@ pub(crate) mod network {
         assert_eq!(
             c_report.outcome,
             RecipientOutcome::Unreachable {
-                reason: SendError::NoPropagationNode.to_string(),
+                reason: SendError::NoAnswer(pair.node_a.no_answer(&c_instance)).to_string(),
             }
         );
         assert_eq!(c_report.display_name.as_deref(), Some("Cy"));
