@@ -71,6 +71,10 @@ const COMPOSER_MAX_ROWS: u16 = 8;
 /// terminal is tall enough.
 const TRANSCRIPT_MIN_ROWS: u16 = 4;
 const INPUT_HINT: &str = "Enter = answer  Esc = cancel";
+/// The confirm legend while part of the question is off screen: nothing
+/// clipped may be approved, so the approving keys are not offered. Esc
+/// leads so a narrow wrap never splits it from its meaning.
+const CLIPPED_HINT: &str = "Esc = cancel  enlarge the terminal to answer";
 const COMPOSER_PLACEHOLDER: &str = "Type a prompt or a .command; Enter sends";
 /// How long the status row waits between two ticks of its elapsed time.
 const STATUS_TICK: Duration = Duration::from_secs(1);
@@ -445,15 +449,25 @@ impl PendingPrompt {
         }
     }
 
-    fn hint(&self) -> String {
+    /// The legend under the modal; a confirm whose question is clipped
+    /// offers only Esc.
+    fn hint(&self, clipped: bool) -> String {
         match self.kind() {
             ModalKind::Input => INPUT_HINT.to_string(),
+            ModalKind::Confirm { .. } if clipped => CLIPPED_HINT.to_string(),
             ModalKind::Confirm { default, tool } => confirm_hint(default, tool),
         }
     }
 
-    fn hint_lines(&self, width: u16) -> Vec<Line<'static>> {
-        render::plain_lines(&self.hint(), width, DIM)
+    fn hint_lines(&self, width: u16, clipped: bool) -> Vec<Line<'static>> {
+        render::plain_lines(&self.hint(clipped), width, DIM)
+    }
+
+    /// Rows reserved for the legend: enough for either wording, so the
+    /// swap to the clipped one never changes the layout.
+    fn hint_rows(&self, width: u16) -> u16 {
+        row_count(self.hint_lines(width, false).len())
+            .max(row_count(self.hint_lines(width, true).len()))
     }
 
     /// The question wrapped to `width`, every line of it: what the user
@@ -475,7 +489,7 @@ impl PendingPrompt {
     /// row, the footer, the modal's middle row and its hint are fixed, and
     /// `TRANSCRIPT_MIN_ROWS` stay with the transcript.
     fn question_cap(&self, width: u16, height: u16) -> u16 {
-        let fixed = 3 + TRANSCRIPT_MIN_ROWS + row_count(self.hint_lines(width).len());
+        let fixed = 3 + TRANSCRIPT_MIN_ROWS + self.hint_rows(width);
         height.saturating_sub(fixed).max(1)
     }
 
@@ -483,13 +497,32 @@ impl PendingPrompt {
         row_count(self.question_lines(width).len()).clamp(1, self.question_cap(width, height))
     }
 
-    fn question_fully_shown(&self, width: u16, height: u16) -> bool {
-        row_count(self.question_lines(width).len()) <= self.question_cap(width, height)
+    /// Whether the cap a frame `height` tall allows leaves the whole
+    /// question on screen.
+    fn question_fits_cap(&self, width: u16, height: u16) -> bool {
+        self.question_fits_rows(width, self.question_cap(width, height))
+    }
+
+    /// Whether `rows` of the pane hold the whole question.
+    fn question_fits_rows(&self, width: u16, rows: u16) -> bool {
+        row_count(self.question_lines(width).len()) <= rows
     }
 
     /// Rows of the whole modal: question, field or tool row, hint.
     fn rows(&self, width: u16, height: u16) -> u16 {
-        self.question_rows(width, height) + 1 + row_count(self.hint_lines(width).len())
+        self.question_rows(width, height) + 1 + self.hint_rows(width)
+    }
+
+    /// The question, middle and legend rows inside the modal's `area`.
+    /// A frame too short for the layout squeezes the question first;
+    /// what it actually received is what answerability is judged on.
+    fn areas(&self, area: Rect) -> [Rect; 3] {
+        Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(self.hint_rows(area.width)),
+        ])
+        .areas(area)
     }
 }
 
@@ -538,6 +571,9 @@ pub(crate) struct App {
     /// The area of the last frame drawn; what a modal's question cap and
     /// its clipped state are judged against between frames.
     frame_area: Option<Rect>,
+    /// The rows the front prompt's question received in the last frame,
+    /// None until it has been drawn.
+    question_area: Option<Rect>,
     clock: Arc<dyn Clock>,
     frames: FrameScheduler,
     renderer: Renderer,
@@ -563,6 +599,7 @@ impl App {
             usage: String::new(),
             last_keystroke: None,
             frame_area: None,
+            question_area: None,
             frames: FrameScheduler::new(Arc::clone(&clock)),
             clock,
             renderer,
@@ -672,8 +709,16 @@ impl App {
         let idle_ok = self
             .last_keystroke
             .is_none_or(|at| self.clock.now().duration_since(at) >= HOTKEY_IDLE);
+        // The cap says what the frame should allow; the rows the last
+        // draw actually gave the question say what it got. A frame too
+        // short for the layout squeezes the question below its cap.
         let question_fully_shown = match (self.prompts.front(), self.frame_area) {
-            (Some(prompt), Some(area)) => prompt.question_fully_shown(area.width, area.height),
+            (Some(prompt), Some(area)) => {
+                prompt.question_fits_cap(area.width, area.height)
+                    && self
+                        .question_area
+                        .is_none_or(|given| prompt.question_fits_rows(given.width, given.height))
+            }
             _ => true,
         };
         KeyContext {
@@ -796,6 +841,7 @@ impl App {
             // repeated hotkey must not answer it on the first prompt's
             // momentum.
             self.last_keystroke = Some(self.clock.now());
+            self.question_area = None;
         }
     }
 
@@ -872,6 +918,9 @@ impl App {
                 return;
             }
         };
+        if self.prompts.is_empty() {
+            self.question_area = None;
+        }
         self.prompts.push_back(PendingPrompt { req, reply, field });
     }
 
@@ -1038,10 +1087,17 @@ impl App {
 
         frame.render_widget(StatusStrip(self.status_text()), status);
 
-        match self.prompts.front() {
-            Some(prompt) => frame.render_widget(PromptModal(prompt), bottom),
-            None => frame.render_widget(&self.composer, bottom),
-        }
+        self.question_area = match self.prompts.front() {
+            Some(prompt) => {
+                let [question, ..] = prompt.areas(bottom.intersection(area));
+                frame.render_widget(PromptModal(prompt), bottom);
+                Some(question)
+            }
+            None => {
+                frame.render_widget(&self.composer, bottom);
+                None
+            }
+        };
 
         frame.render_widget(
             FooterBar {
@@ -1116,7 +1172,8 @@ impl Widget for FooterBar {
 
 /// A prompt drawn where the composer was: question, origin, hint. A
 /// question taller than its rows is cut with a marker counting the hidden
-/// lines; the cap grows with the terminal, so enlarging it shows them.
+/// lines and a legend offering only Esc; the cap grows with the terminal,
+/// so enlarging it shows them.
 struct PromptModal<'a>(&'a PendingPrompt);
 
 impl Widget for PromptModal<'_> {
@@ -1125,17 +1182,12 @@ impl Widget for PromptModal<'_> {
         if area.is_empty() {
             return;
         }
-        let hint_lines = self.0.hint_lines(area.width);
-        let [question, middle, hint] = Layout::vertical([
-            Constraint::Min(1),
-            Constraint::Length(1),
-            Constraint::Length(row_count(hint_lines.len())),
-        ])
-        .areas(area);
+        let [question, middle, hint] = self.0.areas(area);
         let req = &self.0.req;
         let mut lines = self.0.question_lines(area.width);
         let visible = usize::from(question.height);
-        if lines.len() > visible && visible > 0 {
+        let clipped = lines.len() > visible;
+        if clipped && visible > 0 {
             let kept = visible - 1;
             let hidden = lines.len() - kept;
             lines.truncate(kept);
@@ -1154,7 +1206,7 @@ impl Widget for PromptModal<'_> {
                 }
             }
         }
-        Paragraph::new(hint_lines).render(hint, buf);
+        Paragraph::new(self.0.hint_lines(area.width, clipped)).render(hint, buf);
     }
 }
 
@@ -2682,6 +2734,11 @@ mod tests {
             "{rendered}"
         );
         assert!(!rendered.contains("line 11 of"), "{rendered}");
+        assert!(
+            squeezed(&rendered).contains("Esc=cancelenlargetheterminaltoanswer"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("y = yes"), "{rendered}");
         harness.clock.advance(HOTKEY_IDLE);
         for key in [KeyCode::Char('y'), KeyCode::Char('a'), KeyCode::Enter] {
             assert_eq!(harness.press(key), None);
@@ -2700,6 +2757,44 @@ mod tests {
             squeezed(&rendered).contains(&squeezed(&question)),
             "{rendered}"
         );
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Char('y')), None);
+        assert_eq!(
+            asker.join().unwrap().unwrap(),
+            PromptAnswer::Confirmed(true)
+        );
+    }
+
+    /// A frame too short for status, modal and footer squeezes the
+    /// question below the rows its cap promised; the rows it actually
+    /// received decide, so nothing approves it until the terminal grows.
+    #[test]
+    fn a_question_squeezed_by_a_tiny_frame_cannot_be_approved() {
+        let mut harness = Harness::standalone(40, 5);
+        harness.app.begin_turn("clean up", false);
+        let question = "line 1 of the question\nline 2 of the question\nline 3 of the question";
+        let req = PromptRequest {
+            tool: Some("fs_rm".to_string()),
+            ..PromptRequest::new(PromptAction::Confirm, question, Origin::detached())
+        };
+        let asker = ask_on_a_thread(&mut harness, req);
+        harness.draw();
+        let given = harness.app.question_area.expect("the modal was drawn");
+        assert!(given.height < 3, "{given:?}");
+        harness.clock.advance(HOTKEY_IDLE);
+        for key in [KeyCode::Char('y'), KeyCode::Char('a'), KeyCode::Enter] {
+            assert_eq!(harness.press(key), None);
+            assert_eq!(
+                harness.app.prompts.len(),
+                1,
+                "{key:?} answered a squeezed question"
+            );
+        }
+        assert!(!asker.is_finished());
+
+        harness.resize(40, 24);
+        let rendered = harness.draw();
+        assert!(rendered.contains("line 3 of the question"), "{rendered}");
         harness.clock.advance(HOTKEY_IDLE);
         assert_eq!(harness.press(KeyCode::Char('y')), None);
         assert_eq!(

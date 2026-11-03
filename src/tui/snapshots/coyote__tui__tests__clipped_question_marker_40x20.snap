@@ -19,6 +19,6 @@ expression: rendered.clone()
 "line 10 of the question                 "
 "(+2 more lines; enlarge the terminal)   "
 "tool: fs_rm                             "
-"y = yes  n = no  a = yes for this       "
-"session  Enter = yes  Esc = cancel      "
+"Esc = cancel  enlarge the terminal to   "
+"answer                                  "
 "openai:test-model . no session . agents "
