@@ -3428,11 +3428,6 @@ mod tests {
             ),
             ("src/config/request_context.rs", "new_role", PROMPT_GATED),
             ("src/config/request_context.rs", "save_role", PROMPT_GATED),
-            (
-                "src/config/request_context.rs",
-                "use_session_recording_rebuild",
-                PROMPT_GATED,
-            ),
             ("src/config/update.rs", "run_self_update", PROMPT_GATED),
             ("src/main.rs", "shell_execute", CLI_ONLY),
             ("src/main.rs", "resolve_oauth_client", PROMPT_GATED),

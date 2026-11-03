@@ -6336,13 +6336,13 @@ impl RequestContext {
                     && (*continuous && !output.is_empty())
                     && self.agent.is_some() == input.with_agent()
                 {
-                    ensure_prompts_available()?;
-                    let ans = Confirm::new(
+                    let ans = self.prompt(self.prompt_request(
+                        PromptAction::Confirm,
                         "Start a session that incorporates the last question and answer?",
-                    )
-                    .with_default(false)
-                    .prompt()?;
-                    if ans {
+                        Vec::new(),
+                        Some(serde_json::json!(false)),
+                    ))?;
+                    if ans == PromptAnswer::Confirmed(true) {
                         incorporate_last_exchange(session, input, output)?;
                     }
                 }
@@ -14378,6 +14378,58 @@ mod tests {
 
         assert!(ctx.session.is_some());
         assert_eq!(ctx.session.as_ref().unwrap().name(), TEMP_SESSION_NAME);
+    }
+
+    /// After a recorded exchange the question whether to carry it into the
+    /// new session goes through the context's prompter, so under the TUI
+    /// it is a modal rather than a refusal; "no" still seats the session.
+    #[test]
+    #[serial]
+    fn use_session_after_an_exchange_asks_through_the_prompter_under_the_tui() {
+        let _guard = TestConfigDirGuard::new();
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let sessions_dir = paths::local_dir("sessions");
+        create_dir_all(&sessions_dir).unwrap();
+
+        let mut ctx = create_test_ctx();
+        let prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]));
+        ctx.prompter = prompter.clone();
+        let input = Input::from_str(&ctx, "what happened?", None).unwrap();
+        ctx.last_message = Some(LastMessage::new(input, "reply".to_string()));
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_session(&app, None, utils::create_abort_signal())).unwrap();
+
+        let session = ctx.session.as_ref().expect("the temp session was seated");
+        assert_eq!(session.name(), TEMP_SESSION_NAME);
+        assert!(session.is_empty(), "a declined exchange was incorporated");
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert_eq!(requests[0].action, PromptAction::Confirm);
+        assert!(
+            requests[0]
+                .question
+                .contains("incorporates the last question"),
+            "{requests:?}"
+        );
+        assert_eq!(requests[0].default, Some(serde_json::json!(false)));
+    }
+
+    #[test]
+    #[serial]
+    fn use_session_after_an_exchange_incorporates_it_when_confirmed() {
+        let _guard = TestConfigDirGuard::new();
+        let sessions_dir = paths::local_dir("sessions");
+        create_dir_all(&sessions_dir).unwrap();
+
+        let mut ctx = create_test_ctx();
+        ctx.prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Confirmed(true)]));
+        let input = Input::from_str(&ctx, "what happened?", None).unwrap();
+        ctx.last_message = Some(LastMessage::new(input, "reply".to_string()));
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_session(&app, None, utils::create_abort_signal())).unwrap();
+
+        let session = ctx.session.as_ref().expect("the temp session was seated");
+        assert!(!session.is_empty(), "the confirmed exchange was dropped");
     }
 
     #[test]

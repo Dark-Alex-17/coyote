@@ -4609,3 +4609,91 @@ fn a_reply_with_concealed_text_shows_it_and_sends_no_conceal_to_the_tty() {
         "the conceal sequence reached the normal screen as text:\n{visible_after}"
     );
 }
+
+/// Runs one fake-LLM turn with no session open, then `.session <name>`:
+/// the question whether to carry the exchange into the new session is
+/// asked as the modal, not refused. Returns the pty with the modal up.
+fn open_session_after_a_turn(dir: &Path, name: &str) -> Pty {
+    let fake = FakeLlm::start(vec![Reply::Text("fixture first reply xk3".to_string())]);
+    write_fake_llm_config(dir, &fake);
+    let mut pty = spawn_tui(dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b"first question xk3\r").unwrap();
+    wait_for_squeezed(&mut pty, "fixture first reply xk3", "the first reply");
+    pty.read_for(Duration::from_millis(500));
+    let asked_at = pty.raw().len();
+    pty.send(format!(".session {name}\r").as_bytes()).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        pty.read_for(Duration::from_millis(200));
+        let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[asked_at..]));
+        assert!(
+            !since.contains(PROMPT_REFUSAL),
+            "`.session` after a turn was refused instead of asking in the modal:\n{since}"
+        );
+        if squeezed(&since).contains("incorporatesthelastquestionandanswer") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "`.session` after a turn did not ask about the last exchange within 10s:\n{since}"
+        );
+    }
+    pty.read_for(HOTKEY_GAP);
+    pty
+}
+
+/// Answers the open modal with `key` and checks the session comes up: the
+/// footer names it, `.info session` shows it empty or holding the
+/// exchange, and the UI leaves clean. (The window is grown first: the
+/// repaint that forces paints every footer cell, where an incremental one
+/// skips the cells the old footer shared, and the whole table then fits.)
+fn answer_and_expect_session(mut pty: Pty, key: &[u8], name: &str, empty: bool) {
+    pty.send(key).unwrap();
+    pty.read_for(Duration::from_millis(800));
+    let grown_at = pty.raw().len();
+    pty.resize(120, 120).unwrap();
+    pty.read_for(Duration::from_millis(800));
+    let grown = strip_ansi(&String::from_utf8_lossy(&pty.raw()[grown_at..]));
+    assert!(
+        squeezed(&grown).contains(name),
+        "the footer does not name `{name}` after answering the modal with {key:?}:\n{grown}"
+    );
+    let info_at = pty.raw().len();
+    pty.send(b".info session\r").unwrap();
+    pty.wait_for_after("total_tokens", info_at, PTY_DEADLINE)
+        .expect("`.info session` never rendered after the modal was answered");
+    pty.read_for(Duration::from_millis(800));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[info_at..]));
+    assert_eq!(
+        squeezed(&since).contains("total_tokens0"),
+        empty,
+        "the session after answering with {key:?} should be empty: {empty}\n{since}"
+    );
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// `n` to the incorporate question seats the named session, empty.
+#[test]
+#[serial]
+fn dot_session_after_a_turn_asks_in_the_modal_and_n_seats_the_session() {
+    let dir = fresh_config_dir("session-after-turn-n");
+    let _guard = TempDirGuard(dir.clone());
+    let pty = open_session_after_a_turn(&dir, "after-turn-xk3");
+    answer_and_expect_session(pty, b"n", "after-turn-xk3", true);
+}
+
+/// `y` to the incorporate question seats the named session holding the exchange.
+#[test]
+#[serial]
+fn dot_session_after_a_turn_asks_in_the_modal_and_y_seats_the_session() {
+    let dir = fresh_config_dir("session-after-turn-y");
+    let _guard = TempDirGuard(dir.clone());
+    let pty = open_session_after_a_turn(&dir, "after-turn-yk3");
+    answer_and_expect_session(pty, b"y", "after-turn-yk3", false);
+}
