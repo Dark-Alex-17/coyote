@@ -169,6 +169,19 @@ fn peer_dir(peer_destination: &str) -> String {
     canonical.unwrap_or_else(|| peer_destination.to_ascii_lowercase())
 }
 
+/// A path `stage` returned for `peer_destination`, relative to the inbox root
+/// (`<peer-dest32>/<rel>`), read off the layout so the caller needs no root. `None` when
+/// the path holds no file under that peer's directory.
+pub(crate) fn inbox_relative(staged: &Path, peer_destination: &str) -> Option<String> {
+    let dir = peer_dir(peer_destination);
+    let mut components = staged.components();
+    components.find(|part| part.as_os_str() == dir.as_str())?;
+    let rest: Vec<String> = components
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    (!rest.is_empty()).then(|| format!("{dir}/{}", rest.join("/")))
+}
+
 /// `create_dir_all` with every directory it creates owner-only, in the mkdir itself rather
 /// than by a chmod afterwards; a directory that already existed is not touched.
 fn create_dirs_owner_only(path: &Path) -> io::Result<()> {
@@ -873,6 +886,36 @@ mod tests {
             !canonical_root.join(&PEER[..8]).exists(),
             "no 8-char directory"
         );
+    }
+
+    mod inbox_relative_tests {
+        use super::*;
+
+        #[test]
+        fn a_staged_path_reads_relative_to_the_root_from_the_peer_directory_on() {
+            let tmp = TempDir::new("inbox-relative");
+            let inbox = staging(&tmp);
+            let rel = WirePath::parse("docs/sub/a.md").unwrap();
+
+            let staged = inbox.stage(PEER, &rel, &digest(b"x"), b"x").unwrap();
+
+            assert_eq!(
+                inbox_relative(&staged, PEER).as_deref(),
+                Some(format!("{DEST32}/docs/sub/a.md").as_str())
+            );
+        }
+
+        #[test]
+        fn a_path_outside_that_peer_s_directory_has_no_relative_form() {
+            assert_eq!(
+                inbox_relative(Path::new("/inbox/0123/docs/a.md"), PEER),
+                None
+            );
+            assert_eq!(
+                inbox_relative(&Path::new("/inbox").join(DEST32), PEER),
+                None
+            );
+        }
     }
 
     /// A root that is "gone again" is reported as an I/O failure of the inbox, never as a

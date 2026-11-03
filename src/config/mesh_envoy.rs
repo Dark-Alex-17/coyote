@@ -26,6 +26,7 @@ use crate::mesh::envoy::{EnvoyJob, EnvoySink, fence_peer_text};
 use crate::mesh::envoy_sessions::{EnvoyMemoryError, EnvoyRole, EnvoySessions, EnvoyTurn};
 use crate::mesh::events::MeshEvent;
 use crate::mesh::idle::{IdleNotify, Origin};
+use crate::mesh::inbox::inbox_relative;
 use crate::mesh::limits::{PeerRefusal, RefusalReason};
 use crate::mesh::message::{
     Disposition, OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_LINE_MAX_CHARS, PEER_TITLE_MAX_CHARS,
@@ -195,10 +196,12 @@ fn peer_turn(card: &PeerCard, message: &PeerMessage) -> String {
 }
 
 /// One line per part of `message`, read by the envoy inside the fence after the text:
-/// where an inline file was staged, what a reference file can be fetched as, a text or
-/// data part's content quoted as data and cut at `ENVOY_PART_TEXT_MAX_CHARS`, and how
-/// many parts did not arrive. Empty for a message with no parts. A file is only named
-/// here, never read: the envoy does not see or serve file bytes.
+/// where in the inbox an inline file was staged, relative to the inbox root so the
+/// envoy never learns this node's filesystem layout, what a reference file can be
+/// fetched as, a text or data part's content quoted as data and cut at
+/// `ENVOY_PART_TEXT_MAX_CHARS`, and how many parts did not arrive. Empty for a message
+/// with no parts. A file is only named here, never read: the envoy does not see or
+/// serve file bytes.
 fn envoy_parts_summary(message: &PeerMessage) -> String {
     use Part::{Data, File, Text};
 
@@ -219,10 +222,14 @@ fn envoy_parts_summary(message: &PeerMessage) -> String {
                 size,
                 staged: Some(staged),
                 ..
-            } => Some(format!(
-                "attached: {name} ({size} B), staged at {}",
-                staged.display()
-            )),
+            } => Some(
+                match inbox_relative(staged, &message.source_destination) {
+                    Some(relative) => {
+                        format!("attached: {name} ({size} B), staged in the inbox at {relative}")
+                    }
+                    None => format!("attached: {name} ({size} B), staged in the inbox"),
+                },
+            ),
             File {
                 size,
                 reference: Some(reference),
@@ -6111,6 +6118,15 @@ mod tests {
             }))
         }
 
+        /// The test peer's directory under the inbox root.
+        fn peer_dir() -> String {
+            hex_lower(&[0xab; 16])
+        }
+
+        fn staged_under_root(rel: &str) -> String {
+            format!("/staging/inst-a/{}/{rel}", peer_dir())
+        }
+
         #[test]
         fn a_message_with_no_parts_lists_nothing() {
             assert_eq!(envoy_parts_summary(&message_carrying(Vec::new(), 0)), "");
@@ -6120,7 +6136,7 @@ mod tests {
         fn each_part_kind_gets_its_own_line_in_order() {
             let message = message_carrying(
                 vec![
-                    staged_file("docs/hello.md", 13, "/staging/abababab/docs/hello.md"),
+                    staged_file("docs/hello.md", 13, &staged_under_root("docs/hello.md")),
                     part(json!({
                         "type": "file",
                         "name": "report.pdf",
@@ -6142,7 +6158,11 @@ mod tests {
             assert_eq!(
                 envoy_parts_summary(&message),
                 [
-                    "attached: docs/hello.md (13 B), staged at /staging/abababab/docs/hello.md",
+                    format!(
+                        "attached: docs/hello.md (13 B), staged in the inbox at {}/docs/hello.md",
+                        peer_dir()
+                    )
+                    .as_str(),
                     "fetchable as shared/report.pdf (2048 B)",
                     "listed but not sent: notes.txt (7 B)",
                     "text part, quoted as data: \"see the attached notes\"",
@@ -6178,7 +6198,7 @@ mod tests {
                 vec![staged_file(
                     "docs/hello.md",
                     13,
-                    "/staging/abababab/docs/hello.md",
+                    &staged_under_root("docs/hello.md"),
                 )],
                 0,
             );
@@ -6194,10 +6214,41 @@ mod tests {
                 user,
                 fence_peer_text(
                     &message.source_destination,
-                    "Name: alice\nMessage id: msg-parts\nsee the attached\nattached: docs/hello.md (13 B), staged at /staging/abababab/docs/hello.md"
+                    &format!(
+                        "Name: alice\nMessage id: msg-parts\nsee the attached\nattached: docs/hello.md (13 B), staged in the inbox at {}/docs/hello.md",
+                        peer_dir()
+                    )
                 )
             );
             assert!(!tail.contains("docs/hello.md"), "{tail}");
+        }
+
+        mod inbox_relative_path_tests {
+            use super::*;
+
+            #[test]
+            fn a_staged_file_never_shows_the_absolute_path() {
+                let staged = staged_under_root("docs/hello.md");
+                let message = message_carrying(vec![staged_file("docs/hello.md", 13, &staged)], 0);
+
+                let summary = envoy_parts_summary(&message);
+
+                assert!(!summary.contains("/staging"), "{summary}");
+                assert!(!summary.contains(&staged), "{summary}");
+            }
+
+            #[test]
+            fn a_staged_path_outside_the_peer_s_directory_names_only_the_file() {
+                let message = message_carrying(
+                    vec![staged_file("docs/hello.md", 13, "/elsewhere/docs/hello.md")],
+                    0,
+                );
+
+                assert_eq!(
+                    envoy_parts_summary(&message),
+                    "attached: docs/hello.md (13 B), staged in the inbox"
+                );
+            }
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6209,7 +6260,7 @@ mod tests {
             let staged = tmp
                 .path
                 .join("inbox")
-                .join("abababab")
+                .join(peer_dir())
                 .join("docs/hello.md");
             std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
             std::fs::write(&staged, b"Hello, mesh!\n").unwrap();
@@ -6264,15 +6315,16 @@ mod tests {
             let end = sent
                 .find(&peer_fence_end(&destination))
                 .expect("the fence closes");
-            // The request is JSON, so a path with a backslash in it is sent escaped.
-            let attached = serde_json::to_string(&format!(
-                "attached: docs/hello.md (13 B), staged at {staged}"
-            ))
-            .unwrap();
+            let attached = format!(
+                "attached: docs/hello.md (13 B), staged in the inbox at {}/docs/hello.md",
+                peer_dir()
+            );
             let line = sent
-                .find(attached.trim_matches('"'))
+                .find(&attached)
                 .unwrap_or_else(|| panic!("no attached line in {sent}"));
             assert!(begin < line && line < end, "{sent}");
+            let absolute = serde_json::to_string(&staged).unwrap();
+            assert!(!sent.contains(absolute.trim_matches('"')), "{sent}");
 
             let (envelopes, _) = app.mesh.peer_inbox().drain();
             assert_eq!(envelopes.len(), 2);
