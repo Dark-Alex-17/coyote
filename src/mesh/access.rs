@@ -478,8 +478,13 @@ impl MeshSlot {
         let Some(destination) = canonical_hash(peer_destination) else {
             return Err(AccessError::Untrusted);
         };
-        let Some(peer) = runtime.peers().get(&destination) else {
-            return Err(AccessError::Untrusted);
+        let peer = match runtime.peers().get(&destination) {
+            Some(peer) => peer,
+            None if runtime.trust().may_be_asked_for(&destination) => runtime
+                .peer_asking_if_unheard(&destination)
+                .await
+                .ok_or(AccessError::UnknownDestination)?,
+            None => return Err(AccessError::Untrusted),
         };
         if runtime
             .trust()

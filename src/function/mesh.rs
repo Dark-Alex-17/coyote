@@ -554,9 +554,15 @@ fn collect_timeout(args: &Value) -> Result<Duration> {
 }
 
 /// The one trust gate for a request addressed to a peer: `peer` must be the canonical
-/// hash of an instance this node has heard announce and trusts. Every miss is the same
-/// `not_trusted` envelope, so a caller learns nothing about which.
-async fn trusted_peer(runtime: &MeshRuntime, peer: &str) -> Result<(String, PeerRecord), Value> {
+/// hash of an instance this node trusts. One it has not heard announce is asked for
+/// only when the trust list could allow it, so the model cannot send path requests at
+/// will; an unanswered one is the caller's `unanswered` envelope. Every other miss is the
+/// same `not_trusted` envelope, so a caller learns nothing about which.
+async fn trusted_peer(
+    runtime: &MeshRuntime,
+    peer: &str,
+    unanswered: fn(&str) -> Value,
+) -> Result<(String, PeerRecord), Value> {
     let not_trusted = || {
         send_error(&SendError::NotTrusted {
             destination: peer.to_string(),
@@ -565,8 +571,15 @@ async fn trusted_peer(runtime: &MeshRuntime, peer: &str) -> Result<(String, Peer
     let Some(destination) = canonical_hash(peer) else {
         return Err(not_trusted());
     };
-    let Some(record) = runtime.peers().get(&destination) else {
-        return Err(not_trusted());
+    let record = match runtime.peers().get(&destination) {
+        Some(record) => record,
+        None if runtime.trust().may_be_asked_for(&destination) => {
+            match runtime.peer_asking_if_unheard(&destination).await {
+                Some(record) => record,
+                None => return Err(unanswered(&destination)),
+            }
+        }
+        None => return Err(not_trusted()),
     };
     if runtime
         .trust()
@@ -583,18 +596,28 @@ async fn trusted_destination(
     runtime: &MeshRuntime,
     peer: &str,
 ) -> Result<(PeerRecord, DestinationDesc), Value> {
-    let (destination, record) = trusted_peer(runtime, peer).await?;
+    let (destination, record) = trusted_peer(runtime, peer, unreachable_live).await?;
     match runtime.resolve_destination(&destination).await {
         Some(desc) => Ok((record, desc)),
-        None => Err(json!({
-            "status": "error",
-            "kind": "unknown_destination",
-            "message": format!(
-                "{} A list or fetch runs live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard.",
-                unreachable_head(&destination)
-            ),
-        })),
+        None => Err(unreachable_live(&destination)),
     }
+}
+
+fn unreachable_live(destination: &str) -> Value {
+    json!({
+        "status": "error",
+        "kind": "unknown_destination",
+        "message": format!(
+            "{} A list or fetch runs live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard.",
+            unreachable_head(destination)
+        ),
+    })
+}
+
+fn unreachable_message(destination: &str) -> Value {
+    send_error(&SendError::UnknownDestination {
+        destination: destination.to_string(),
+    })
 }
 
 /// `in_reply_to` turns a plain message into a reply, or with `kind: "note"` into an
@@ -934,7 +957,7 @@ async fn handle_ask(ctx: &RequestContext, runtime: &MeshRuntime, args: &Value) -
         Ok(out) => out,
         Err(err) => return Ok(send_error(&err)),
     };
-    let (destination, peer) = match trusted_peer(runtime, to).await {
+    let (destination, peer) = match trusted_peer(runtime, to, unreachable_message).await {
         Ok(trusted) => trusted,
         Err(refusal) => return Ok(refusal),
     };

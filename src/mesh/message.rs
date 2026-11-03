@@ -77,6 +77,10 @@ pub(crate) const PEER_INBOX_CAPACITY: usize = 64;
 /// peer that is up replies well inside this; a longer wait only delays the fallback.
 pub(crate) const PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const PEER_LINK_TIMEOUT: Duration = DEFAULT_LINK_TIMEOUT;
+/// How long a path response's announce is given to reach the peer table once the
+/// transport holds the destination, and how often the table is looked at meanwhile.
+const PATH_RESPONSE_FILING_GRACE: Duration = Duration::from_secs(1);
+const PATH_RESPONSE_FILING_POLL: Duration = Duration::from_millis(25);
 /// Recipients a broadcast sends to at once. Each open link costs the transport a handler
 /// lock round; a trust list of dozens must not open dozens of links in one burst.
 pub(crate) const BROADCAST_MAX_CONCURRENCY: usize = 4;
@@ -1721,7 +1725,17 @@ impl MeshRuntime {
         let not_trusted = || SendError::NotTrusted {
             destination: destination.clone(),
         };
-        let peer = self.peers().get(&destination).ok_or_else(not_trusted)?;
+        let unanswered = || SendError::UnknownDestination {
+            destination: destination.clone(),
+        };
+        let peer = match self.peers().get(&destination) {
+            Some(peer) => peer,
+            None if self.trust().may_be_asked_for(&destination) => self
+                .peer_asking_if_unheard(&destination)
+                .await
+                .ok_or_else(unanswered)?,
+            None => return Err(not_trusted()),
+        };
         if self
             .trust()
             .authorize(&peer.identity_hash, &destination)
@@ -1733,9 +1747,7 @@ impl MeshRuntime {
         let desc = self
             .resolve_destination(&destination)
             .await
-            .ok_or_else(|| SendError::UnknownDestination {
-                destination: destination.clone(),
-            })?;
+            .ok_or_else(unanswered)?;
         let dest8 = short(&destination);
         let (kind, id) = (message.kind, message.id.as_str());
         let unreachable = match self
@@ -1941,6 +1953,35 @@ impl MeshRuntime {
             debug!("Mesh found no route to {}", short(&destination));
         }
         desc
+    }
+
+    /// The peer table's row for `destination_hex`. A destination without one is asked for
+    /// once with `resolve_destination`, and the announce that answers is given
+    /// `PATH_RESPONSE_FILING_GRACE` to be filed by the announce receiver. `None` when
+    /// nothing answered, or the answer was not a Coyote announce.
+    pub(crate) async fn peer_asking_if_unheard(&self, destination_hex: &str) -> Option<PeerRecord> {
+        let destination = canonical_hash(destination_hex)?;
+        let peers = self.peers();
+        if let Some(peer) = peers.get(&destination) {
+            return Some(peer);
+        }
+        self.resolve_destination(&destination).await?;
+        let filed = async {
+            loop {
+                if let Some(peer) = peers.get(&destination) {
+                    return peer;
+                }
+                tokio::time::sleep(PATH_RESPONSE_FILING_POLL).await;
+            }
+        };
+        let peer = tokio::time::timeout(PATH_RESPONSE_FILING_GRACE, filed).await.ok();
+        if peer.is_none() {
+            debug!(
+                "Mesh resolved {} but filed no peer row for it",
+                short(&destination)
+            );
+        }
+        peer
     }
 
     /// `resolve_destination` without the path request: what the transport holds now, for

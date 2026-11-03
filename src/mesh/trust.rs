@@ -1400,6 +1400,16 @@ impl TrustStore {
         self.authorize(identity_hash, destination_hash).decision == Decision::Allow
     }
 
+    /// Whether a tool may ask the network for a destination it has not heard, before its
+    /// identity is known: never for a denied destination, nor for one whose trust record
+    /// is bound to a blocked identity. Otherwise a trust record for the destination
+    /// suffices, and with none, any identity trusted for all destinations might own it.
+    /// The answer's identity still goes through `authorize`.
+    pub(crate) fn may_be_asked_for(&self, destination_hash: &str) -> bool {
+        self.loaded()
+            .may_be_asked_for(&destination_hash.to_ascii_lowercase())
+    }
+
     /// The identity-tier gate: known (on disk or for the session) and not blocked, so its
     /// instances may knock. It says nothing about which destinations are allowed; that is
     /// `authorize`.
@@ -1787,12 +1797,7 @@ impl TrustStore {
         seen_identity: &str,
         now: SystemTime,
     ) -> Option<(String, String)> {
-        if !state
-            .file
-            .identities
-            .values()
-            .any(|entry| entry.all_destinations)
-        {
+        if !state.any_trusted_for_all() {
             return None;
         }
         if state.holds_instance(seen_identity, name_hash_bytes) {
@@ -2774,6 +2779,29 @@ impl State {
             .identities
             .get(identity)
             .is_some_and(|entry| entry.all_destinations)
+    }
+
+    fn any_trusted_for_all(&self) -> bool {
+        self.file
+            .identities
+            .values()
+            .any(|entry| entry.all_destinations)
+    }
+
+    /// `destination` is canonical lower hex; see `TrustStore::may_be_asked_for`.
+    fn may_be_asked_for(&self, destination: &str) -> bool {
+        if self.file.denied_destinations.contains_key(destination) {
+            return false;
+        }
+        let bound = self
+            .file
+            .destinations
+            .get(destination)
+            .or_else(|| self.session_destinations.get(destination));
+        match bound {
+            Some(entry) => self.authorize(&entry.identity, destination).decision == Decision::Allow,
+            None => self.any_trusted_for_all(),
+        }
     }
 
     /// Records that the presence rung refused `presenter` the instance `name_hash` held by

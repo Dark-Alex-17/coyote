@@ -220,6 +220,8 @@ const MESSAGE_REFUSAL_TAIL: &str = "Nothing is sent to a destination this node d
 const FETCH_REFUSAL_TAIL: &str = "Nothing is fetched from a destination this node does not trust.";
 const STATUS_REFUSAL_TAIL: &str = "Status is only requested from trusted destinations.";
 const KNOCK_REFUSAL_TAIL: &str = "A knock is not sent to a destination this node has blocked or an identity it has blocked; `.mesh unblock <destination>` or `.mesh trust <destination>` lifts the one, `.mesh unblock --identity <identity>` the other.";
+const INFO_REFUSAL_TAIL: &str = "This node does not ask the mesh about a destination it has blocked and not heard; `.mesh unblock <destination>` lifts the block.";
+const TRUST_REFUSAL_TAIL: &str = "This node does not ask the mesh about a destination it has blocked and not heard; run `.mesh unblock <destination>`, then `.mesh trust <destination>` again.";
 const INBOX_CONTENT_MAX_CHARS: usize = 200;
 const NOTHING_CHANGED: &str = "Nothing was changed.";
 const DRY_RUN_NOTHING_CHANGED: &str = "This was a dry run; nothing changed.";
@@ -248,16 +250,16 @@ pub(crate) async fn run(
         "off" => turn_off(ctx, rest).await,
         "peers" => peers(ctx),
         "knocks" => knocks(ctx),
-        "info" => info(ctx, rest),
+        "info" => info(ctx, &abort_signal, rest).await,
         "status" => status(ctx, &abort_signal, rest).await,
         "brief" => brief(ctx, rest),
         "inbox" => inbox(ctx, rest),
         "pending" => pending(ctx),
         "answer" => answer(ctx, rest).await,
         "dismiss" => dismiss(ctx, rest).await,
-        "message" => message(ctx, rest).await,
+        "message" => message(ctx, &abort_signal, rest).await,
         "broadcast" => broadcast(ctx, rest).await,
-        "trust" => trust(ctx, rest),
+        "trust" => trust(ctx, &abort_signal, rest).await,
         "untrust" => untrust(ctx, rest),
         "forget" => forget(ctx, rest),
         "block" => block(ctx, rest),
@@ -594,7 +596,7 @@ fn knocks(ctx: &RequestContext) -> Result<()> {
 
 const NODE_OFF_LINE: &str = "node: off - .mesh on joins";
 
-fn info(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
+async fn info(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&str>) -> Result<()> {
     let Some(rest) = rest else {
         let node = ctx.app.mesh.get();
         // A running node lists every interface itself, with its state, under the same
@@ -627,11 +629,7 @@ fn info(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let runtime = live(ctx)?;
     let destination = destination_hash(ctx, rest.trim())?;
     let now = SystemTime::now();
-    let peer = runtime.peers().get(&destination);
-    let table = runtime.peers().snapshot();
-    let successor = peer
-        .as_ref()
-        .and_then(|peer| peer.successor_in(&table, now));
+    let mut peer = runtime.peers().get(&destination);
     let knock = match runtime.knock_gate().cache().list(now) {
         Ok(knocks) => match knocks
             .into_iter()
@@ -650,16 +648,27 @@ fn info(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         Err(err) => return Err(err),
     };
     let identity = match (&peer, &knock) {
-        (Some(peer), _) => peer.identity_hash.as_str(),
-        (None, KnockLookup::Knocked(knock)) => knock.identity_hash.as_str(),
-        (None, _) => bail!(
-            "Destination {destination} has not been heard from: it is not in the peer table and has not knocked. Run `.mesh peers` or `.mesh knocks` to see who has."
-        ),
+        (Some(peer), _) => peer.identity_hash.clone(),
+        (None, KnockLookup::Knocked(knock)) => knock.identity_hash.clone(),
+        (None, _) => {
+            let Some(asked) =
+                heard_or_asked(&runtime, &destination, INFO_REFUSAL_TAIL, abort_signal).await?
+            else {
+                return Ok(());
+            };
+            let identity = asked.identity_hash.clone();
+            peer = Some(asked);
+            identity
+        }
     };
+    let table = runtime.peers().snapshot();
+    let successor = peer
+        .as_ref()
+        .and_then(|peer| peer.successor_in(&table, now));
     let store = runtime.trust();
     let trust = trust_label(
-        store.authorize(identity, &destination),
-        store.identity_standing(identity),
+        store.authorize(&identity, &destination),
+        store.identity_standing(&identity),
     );
     out_text(&render_peer_detail(
         &destination,
@@ -705,7 +714,12 @@ async fn status(
         StatusArg::Fetch(token) => {
             let runtime = live(ctx)?;
             let destination = destination_hash(ctx, token)?;
-            peer_for_contact(&runtime, &destination, STATUS_REFUSAL_TAIL)?;
+            if peer_for_contact(&runtime, &destination, STATUS_REFUSAL_TAIL, abort_signal)
+                .await?
+                .is_none()
+            {
+                return Ok(());
+            }
             let desc = match route_to(&runtime, &destination, abort_signal).await {
                 Ok(desc) => desc,
                 Err(Unrouted::NoAnswer) => bail!(
@@ -1462,7 +1476,11 @@ fn no_open_question(id: &str) -> String {
     format!("No open question has id {id}. `.mesh pending` lists the ones this node knows about.")
 }
 
-async fn message(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
+async fn message(
+    ctx: &RequestContext,
+    abort_signal: &AbortSignal,
+    rest: Option<&str>,
+) -> Result<()> {
     let Some(rest) = rest else {
         out_text(&render_verb_help("message"));
         return Ok(());
@@ -1479,7 +1497,11 @@ async fn message(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         return Ok(());
     };
     let runtime = live(ctx)?;
-    let peer = peer_for_contact(&runtime, &destination, MESSAGE_REFUSAL_TAIL)?;
+    let Some(peer) =
+        peer_for_contact(&runtime, &destination, MESSAGE_REFUSAL_TAIL, abort_signal).await?
+    else {
+        return Ok(());
+    };
     let attachment = prepared_attachment(ctx, attach, &runtime)?;
     let trust = runtime.trust();
     out_text(&format!(
@@ -1520,12 +1542,17 @@ async fn message(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
 }
 
 /// The pre-flight every verb that contacts one peer runs: a destination the trust list
-/// denies is refused whether or not it has been heard; an unheard one is a not-heard
-/// error; a heard one is refused on any verdict short of Allow, `only` being the verb's
-/// own rule.
-fn peer_for_contact(runtime: &MeshRuntime, destination: &str, only: &str) -> Result<PeerRecord> {
-    let Some(peer) = runtime.peers().get(destination) else {
-        return Err(unheard_refusal(runtime, destination, only));
+/// denies is refused whether or not it has been heard; an unheard one is asked of the
+/// mesh first; a heard one is refused on any verdict short of Allow, `only` being the
+/// verb's own rule. `None` when Ctrl-C ended the wait for an unheard one.
+async fn peer_for_contact(
+    runtime: &MeshRuntime,
+    destination: &str,
+    only: &str,
+    abort_signal: &AbortSignal,
+) -> Result<Option<PeerRecord>> {
+    let Some(peer) = heard_or_asked(runtime, destination, only, abort_signal).await? else {
+        return Ok(None);
     };
     let trust = runtime.trust();
     let verdict = trust.authorize(&peer.identity_hash, destination);
@@ -1533,7 +1560,50 @@ fn peer_for_contact(runtime: &MeshRuntime, destination: &str, only: &str) -> Res
     if let Some(refusal) = trust_refusal(destination, verdict, standing, only) {
         bail!(refusal);
     }
-    Ok(peer)
+    Ok(Some(peer))
+}
+
+/// The peer table's row for `destination`. One the table lacks is asked of the mesh with
+/// one path request, unless the trust list denies the destination, which is refused
+/// unasked with `tail`. `None` when Ctrl-C ended the wait, which has been said.
+async fn heard_or_asked(
+    runtime: &MeshRuntime,
+    destination: &str,
+    tail: &str,
+    abort_signal: &AbortSignal,
+) -> Result<Option<PeerRecord>> {
+    if let Some(peer) = runtime.peers().get(destination) {
+        return Ok(Some(peer));
+    }
+    if let Some(refusal) = unheard_denial(runtime, destination, tail) {
+        bail!(refusal);
+    }
+    out_text(&format!(
+        "Asking the mesh for {}'s announce; Ctrl-C cancels...",
+        short(destination)
+    ));
+    result_follows();
+    tokio::select! {
+        peer = runtime.peer_asking_if_unheard(destination) => match peer {
+            Some(peer) => Ok(Some(peer)),
+            None => bail!(unanswered_path_request(destination)),
+        },
+        _ = wait_user_interrupt(Some(abort_signal)) => {
+            out_text(&format!(
+                "Stopped waiting for {}'s announce; nothing changed. Run the command again to ask once more.",
+                short(destination)
+            ));
+            Ok(None)
+        }
+    }
+}
+
+fn unanswered_path_request(destination: &str) -> String {
+    format!(
+        "{} did not answer a path request within {} s: it is not on any interface this node joined, or it is not announcing. Check the hash, or wait for its announce (`.mesh peers`).",
+        short(destination),
+        PATH_REQUEST_TIMEOUT.as_secs()
+    )
 }
 
 /// Why a verb that links to one peer has no route to link over.
@@ -1900,18 +1970,14 @@ fn attaching_notice(attachment: &Attachment, destination: &str) -> String {
     }
 }
 
-/// Why a destination not in the peer table is refused: the trust list's denial of the
-/// destination itself when there is one, otherwise that it has not been heard.
-fn unheard_refusal(runtime: &MeshRuntime, destination: &str, tail: &str) -> anyhow::Error {
+/// The trust list's denial of a destination the peer table does not hold, when there is
+/// one; such a destination is not asked of the mesh.
+fn unheard_denial(runtime: &MeshRuntime, destination: &str, tail: &str) -> Option<String> {
     let verdict = runtime.trust().authorize("", destination);
-    if verdict.rule == Rule::DestinationDenied
-        && let Some(refusal) = trust_refusal(destination, verdict, IdentityStanding::Unknown, tail)
-    {
-        return anyhow!(refusal);
+    if verdict.rule != Rule::DestinationDenied {
+        return None;
     }
-    anyhow!(
-        "Destination {destination} has not been heard from: it is not in the peer table. Only peers this node has heard announce can be contacted; check `.mesh peers`."
-    )
+    trust_refusal(destination, verdict, IdentityStanding::Unknown, tail)
 }
 
 async fn broadcast(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
@@ -1972,8 +2038,10 @@ async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     };
     let destination = destination_hash(ctx, target)?;
     let runtime = live(ctx)?;
-    let Some(peer) = runtime.peers().get(&destination) else {
-        return Err(unheard_refusal(&runtime, &destination, KNOCK_REFUSAL_TAIL));
+    let Some(peer) =
+        heard_or_asked(&runtime, &destination, KNOCK_REFUSAL_TAIL, abort_signal).await?
+    else {
+        return Ok(());
     };
     let trust = runtime.trust();
     let verdict = trust.authorize(&peer.identity_hash, &destination);
@@ -2070,7 +2138,11 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     };
     let destination = destination_hash(ctx, &args.destination)?;
     let runtime = live(ctx)?;
-    let record = peer_for_contact(&runtime, &destination, FETCH_REFUSAL_TAIL)?;
+    let Some(record) =
+        peer_for_contact(&runtime, &destination, FETCH_REFUSAL_TAIL, abort_signal).await?
+    else {
+        return Ok(());
+    };
     let shown = shown_pattern(&args.path);
     let desc = match route_to(&runtime, &destination, abort_signal).await {
         Ok(desc) => desc,
@@ -2604,7 +2676,7 @@ fn render_sync(report: &FetchReport) -> String {
     line
 }
 
-fn trust(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
+async fn trust(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&str>) -> Result<()> {
     let Some(rest) = rest else {
         out_text(&render_verb_help("trust"));
         return Ok(());
@@ -2627,11 +2699,20 @@ fn trust(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         return Ok(());
     };
     let store = trust_store(ctx)?;
-    let mesh: &dyn LiveMesh = ctx.app.mesh.as_ref();
+    let mesh = &*ctx.app.mesh;
     let now = SystemTime::now();
     match arg {
         TrustArg::Destination { target, label, yes } => {
             let destination = destination_hash(ctx, &target)?;
+            if let Some(runtime) = mesh.get()
+                && runtime.peers().get(&destination).is_none()
+                && mesh.knock(&destination, now).is_none()
+                && heard_or_asked(&runtime, &destination, TRUST_REFUSAL_TAIL, abort_signal)
+                    .await?
+                    .is_none()
+            {
+                return Ok(());
+            }
             let refused = store.records().iter().any(|record| {
                 record.tier == Tier::Destination && record.hash == destination && record.denied
             });
