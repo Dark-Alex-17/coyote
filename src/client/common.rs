@@ -1009,13 +1009,19 @@ impl std::fmt::Display for ApiStatusError {
 
 impl std::error::Error for ApiStatusError {}
 
-/// The model answered with a refusal and nothing else. Claude reports this
+/// The model's provider refused the request. Claude reports this
 /// as `stop_reason: refusal`; Bedrock Converse as `stopReason:
-/// content_filtered`, which carries no category.
+/// content_filtered`, which carries no category; Gemini as a
+/// `promptFeedback.blockReason` or a `finishReason: SAFETY`.
+///
+/// `partial_output` is set when a stream refused after visible output had
+/// already reached the handler: the handler keeps that text, and the turn
+/// must still not be remembered as an answer.
 #[derive(Debug, Default)]
 pub struct ProviderRefusal {
     pub category: Option<String>,
     pub explanation: Option<String>,
+    pub partial_output: bool,
 }
 
 impl ProviderRefusal {
@@ -1023,6 +1029,7 @@ impl ProviderRefusal {
         Self {
             category: details["category"].as_str().map(str::to_string),
             explanation: details["explanation"].as_str().map(str::to_string),
+            partial_output: false,
         }
     }
 }

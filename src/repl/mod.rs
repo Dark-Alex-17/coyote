@@ -5043,6 +5043,7 @@ local_hello() {\n\
             anyhow::Error::new(ProviderRefusal {
                 category: Some("cyber".into()),
                 explanation: Some("looks like an attack".into()),
+                partial_output: false,
             })
             .context("Failed to call chat-completions api")
         }

@@ -213,6 +213,7 @@ mod tests {
         let err = anyhow::Error::new(client::ProviderRefusal {
             category: Some("cyber".into()),
             explanation: None,
+            partial_output: false,
         })
         .context("Failed to call chat-completions api")
         .context("Agent 'domain-reviewer' failed");

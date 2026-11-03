@@ -5898,6 +5898,7 @@ mod tests {
             ProviderRefusal {
                 category: Some("cyber".into()),
                 explanation: Some("looks like an attack".into()),
+                partial_output: false,
             }
             .into()
         }
