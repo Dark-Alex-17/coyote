@@ -1578,6 +1578,19 @@ fn a_bracketed_paste_with_a_newline_lands_in_the_composer_unsubmitted() {
         !since.contains("Working"),
         "a paste containing a newline was submitted as a prompt:\n{since}"
     );
+    // The CR split the paste: the second piece sits on the row right
+    // under the first, at the same column, not on the first row after an
+    // embedded control byte.
+    let first = painted_at(pty.raw(), b"pasted-a1x", before);
+    let second = painted_at(pty.raw(), b"pasted-b2x", before);
+    let (Some(&(row_a, col_a)), Some(&(row_b, col_b))) = (first.last(), second.last()) else {
+        panic!("the pasted pieces were not positioned on screen:\n{since}");
+    };
+    assert_eq!(
+        (row_b, col_b),
+        (row_a + 1, col_a),
+        "the pasted lines are not stacked ({first:?} / {second:?}):\n{since}"
+    );
 
     // The pasted draft must be cleared before Ctrl+D is the quit chord.
     pty.send(b"\x03").unwrap();
@@ -3321,6 +3334,21 @@ fn a_fenced_dot_command_runs_as_a_command_and_not_as_a_prompt() {
     pty.wait_for_after(".info", before, PTY_DEADLINE)
         .expect("the pasted fence never reached the composer");
     pty.read_for(Duration::from_millis(300));
+    // Three pasted lines, three stacked composer rows.
+    let fences = painted_at(pty.raw(), b":::", before);
+    let command = painted_at(pty.raw(), b".info", before);
+    let (Some(&(open, col)), Some(&(close, _)), Some(&(middle, _))) =
+        (fences.first(), fences.last(), command.last())
+    else {
+        panic!("the fenced paste was not positioned on screen");
+    };
+    assert_eq!(
+        middle,
+        open + 1,
+        "fences at {fences:?}, command at {command:?}"
+    );
+    assert_eq!(close, open + 2, "fences at {fences:?}");
+    assert_eq!(command.last().map(|p| p.1), Some(col), "{command:?}");
     let submitted = pty.raw().len();
     pty.send(b"\r").unwrap();
     let since = pty

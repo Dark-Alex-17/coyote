@@ -748,6 +748,10 @@ impl App {
             TermInput::Key(key) => self.handle_key(key),
             TermInput::Paste(text) => {
                 self.last_keystroke = Some(self.clock.now());
+                // Terminals deliver a multi-line paste with the line ends
+                // they use themselves (CR, CRLF or LF); the composer and
+                // the field take one shape.
+                let text = text.replace("\r\n", "\n").replace('\r', "\n");
                 match self.prompts.front_mut() {
                     // A confirm has no field, and the composer is hidden
                     // under the modal: a paste there would land where the
@@ -2433,6 +2437,22 @@ mod tests {
         harness.clock.advance(HOTKEY_IDLE);
         harness.press(KeyCode::Esc);
         assert_eq!(asker.join().unwrap().unwrap(), PromptAnswer::Cancelled);
+    }
+
+    /// A paste keeps its line breaks whichever line end the terminal
+    /// used: CR, CRLF and LF all split the composer the same way.
+    #[test]
+    fn a_paste_with_carriage_returns_lands_line_by_line() {
+        let mut harness = Harness::standalone(80, 24);
+        harness
+            .app
+            .handle_input(TermInput::Paste("a\rb\r\nc\nd".to_string()));
+        assert_eq!(harness.app.composer.lines(), ["a", "b", "c", "d"]);
+        assert!(
+            !harness.app.composer_text().contains('\r'),
+            "{:?}",
+            harness.app.composer_text()
+        );
     }
 
     /// Enter tapped while the turn runs maps to nothing, but it is still
