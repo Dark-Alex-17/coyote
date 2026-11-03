@@ -317,9 +317,7 @@ async fn chat_completions_streaming(
                         }
                         "messageStop" if is_refusal_stop(&data["stopReason"]) => {
                             if handler.has_received_visible_output() {
-                                debug!(
-                                    "stream ended with a provider refusal after partial output"
-                                );
+                                debug!("stream ended with a provider refusal after partial output");
                             } else {
                                 refused = true;
                             }

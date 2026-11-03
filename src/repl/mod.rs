@@ -4846,7 +4846,9 @@ local_hello() {\n\
                     )
                 );
                 assert!(
-                    ctx.last_message.as_ref().is_none_or(|last| !last.continuous),
+                    ctx.last_message
+                        .as_ref()
+                        .is_none_or(|last| !last.continuous),
                     "a refused input is not offered to .regenerate"
                 );
                 let regenerate = run_repl_command(&mut ctx, create_abort_signal(), ".regenerate")
