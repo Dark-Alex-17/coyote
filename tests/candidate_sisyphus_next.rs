@@ -51,7 +51,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "sisyphus-next";
 const CANDIDATE_NAMES: [&str; 2] = ["sisyphus-next", "architect-next"];
-const SMOKE_FLOOR: usize = 471;
+const SMOKE_FLOOR: usize = 482;
 
 fn agents_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents")
@@ -1382,8 +1382,9 @@ fn smoke_summary_and_exit_code_cover_a_check_recorded_last() {
 /// crashed-`ci_poll` read failure in `ci_route`, the `CI_LOG_RUNS_MAX` cap on
 /// flake re-runs, the stale CI status reset after resolving, the seen-id
 /// split of a mixed-author thread, read access left out of
-/// `TRUSTED_PERMISSIONS` and the CHANGES_REQUESTED check in the approval
-/// fallback.
+/// `TRUSTED_PERMISSIONS`, the CHANGES_REQUESTED check in the approval
+/// fallback and a failed permission read cached as untrusted rather than
+/// retried.
 #[test]
 fn smoke_rows_go_red_under_the_recorded_sabotages() {
     let Some(python) = python3() else { return };
@@ -1474,6 +1475,13 @@ fn smoke_rows_go_red_under_the_recorded_sabotages() {
             "approved = \"APPROVED\" in latest.values()",
             "pr_tracking review: author A APPROVED and author B CHANGES_REQUESTED, no \
              reviewDecision, does not approve",
+        ),
+        (
+            "failed-permission",
+            "        perms[login] = word in TRUSTED_PERMISSIONS\n",
+            "        perms[login] = (word in TRUSTED_PERMISSIONS) if word else None\n",
+            "pr_tracking review: three failing permission reads -> all untrusted within one poll, \
+             each cached False",
         ),
     ];
     for (label, old, new, row) in sabotages {
@@ -2682,7 +2690,7 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("plan_research", "timeout", 300),
     ("plan_subtasks", "timeout", 600),
     ("pr_review_apply", "timeout", 120),
-    ("pr_review_poll", "timeout", 750),
+    ("pr_review_poll", "timeout", 900),
     ("pr_review_reply", "timeout", 600),
     ("pr_review_resolve", "timeout", 600),
     ("pr_review_triage", "timeout", 600),
@@ -2756,6 +2764,7 @@ const FROZEN_SCRIPT_BOUNDS: &[(&str, &str)] = &[
     ("REVIEW_CI_POLL_CEILING", "90"),
     ("REVIEW_MAX_POLLS", "80"),
     ("REVIEW_MAX_ROUNDS", "STRIKE_LIMIT"),
+    ("REVIEW_PERM_SECS", "120"),
     ("REVIEW_POLL_SLEEP", "600"),
     ("REVIEW_WALL_SECS", "REVIEW_MAX_POLLS * REVIEW_POLL_SLEEP"),
     ("STRIKE_LIMIT", "3"),
@@ -2931,7 +2940,8 @@ fn review_watch_caps_stay_below_the_per_node_visit_cap() {
 }
 
 /// A poll node sleeps and then makes one gh call bounded by `GH_CALL_SECS`,
-/// `pr_review_resolve` and `pr_review_reply` start no call past
+/// `pr_review_poll` also spends up to `REVIEW_PERM_SECS` on permission
+/// reads, `pr_review_resolve` and `pr_review_reply` start no call past
 /// `RESOLVE_DEADLINE_SECS`, and
 /// `ci_route` and `ci_apply` make one gh call per distinct CI run, up to
 /// `CI_LOG_RUNS_MAX`, so each node timeout has to exceed that worst case or
@@ -2960,6 +2970,14 @@ fn poll_node_timeouts_cover_the_sleep_and_one_gh_call() {
             "{node} timeout {limit} does not exceed {wait} {secs} + GH_CALL_SECS {gh_call}"
         );
     }
+    let sleep = lib_constant(&lib, "REVIEW_POLL_SLEEP");
+    let perm = lib_constant(&lib, "REVIEW_PERM_SECS");
+    let limit = timeout("pr_review_poll");
+    assert!(
+        limit > sleep + gh_call + perm,
+        "pr_review_poll timeout {limit} does not exceed REVIEW_POLL_SLEEP {sleep} + GH_CALL_SECS \
+         {gh_call} + REVIEW_PERM_SECS {perm}"
+    );
     let runs = lib_constant(&lib, "CI_LOG_RUNS_MAX");
     for node in ["ci_route", "ci_apply"] {
         let limit = timeout(node);
@@ -3765,6 +3783,7 @@ fn readme_pr_tracking_row_names_the_loop_stops_and_parent_rule() {
         "pr_review_perms",
         "pr_review_reply",
         "RESOLVE_DEADLINE_SECS = 480",
+        "REVIEW_PERM_SECS",
     ];
     for name in names {
         assert!(
