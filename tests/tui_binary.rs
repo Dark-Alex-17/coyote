@@ -3405,3 +3405,437 @@ fn the_pty_pair_is_close_on_exec_on_both_sides() {
     );
     pty.wait_for("spawned-ok", PTY_DEADLINE).unwrap();
 }
+
+// ---------------------------------------------------------------------
+// The clipped confirm modal, the hint on a narrow screen, the
+// editor-backed commands and the `!shell` arm under the UI, and the
+// `.info` capture under CPU load.
+// ---------------------------------------------------------------------
+
+/// A `Remove '<path>'?` question whose path alone spans 13 rows at 40
+/// columns (520 chars, broken at the width), so a 20-row screen cannot
+/// show it whole.
+fn clipped_question() -> String {
+    let path: String = (0..13)
+        .map(|i| format!("/component-{i:02}-{}", "x".repeat(24)))
+        .collect();
+    format!("q9d-clip Remove '{path}'? q9d-clip-end")
+}
+
+/// The recording confirm tool asking [`clipped_question`] instead.
+fn clipped_question_confirm_tool() -> String {
+    RECORDING_CONFIRM_TOOL.replace("Really do it? q9d-q", &clipped_question())
+}
+
+/// Every token of the modal's hint, whitespace squeezed out.
+const HINT_TOKENS: [&str; 5] = [
+    "y=yes",
+    "n=no",
+    "a=yesforthissession",
+    "Enter=yes",
+    "Esc=cancel",
+];
+
+/// Starts the UI at 40x20 with the clipped-question confirm tool, submits
+/// the prompt and returns once the modal's clip marker is on screen,
+/// handing back the printable bytes since the prompt was sent.
+fn open_clipped_modal(pty: &mut Pty) -> String {
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.resize(20, 40).unwrap();
+    pty.read_for(Duration::from_millis(500));
+    let before = pty.raw().len();
+    pty.send(b"call the confirm tool\r").unwrap();
+    pty.wait_for_after("q9d-clip", before, PTY_DEADLINE)
+        .expect("the tool's confirm question never reached the 40x20 screen");
+    pty.wait_for_after("more lines", before, PTY_DEADLINE)
+        .expect("the clipped question showed no `(+N more lines` marker");
+    pty.read_for(Duration::from_millis(500));
+    strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]))
+}
+
+/// A question taller than the screen is marked `(+N more lines; enlarge
+/// the terminal)` and `y` does nothing while it is clipped: the tool gets
+/// no answer. Once the window is enlarged the whole question is visible
+/// and `y` answers it. The hint stays whole on the 40-column screen.
+#[test]
+#[serial]
+fn a_clipped_confirm_question_refuses_y_until_the_terminal_is_enlarged() {
+    let dir = fresh_config_dir("confirm-clipped-y");
+    let _guard = TempDirGuard(dir.clone());
+    let out = dir.join("confirm-answer");
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "fixture_confirm_rec".to_string(),
+            arguments: format!("{{\"out\": \"{}\"}}", out.display()),
+        },
+        Reply::Text("fixture clipped done c7y".to_string()),
+    ]);
+    write_fake_llm_config(&dir, &fake);
+    write_tool(
+        &dir,
+        "fixture_confirm_rec.sh",
+        &clipped_question_confirm_tool(),
+    );
+    let mut pty = spawn_tui(&dir, &[]);
+
+    let modal = open_clipped_modal(&mut pty);
+    let shown = squeezed(&modal);
+    assert!(
+        shown.contains("(+") && shown.contains("morelines;enlargetheterminal)"),
+        "no `(+N more lines; enlarge the terminal)` marker on the clipped modal:\n{modal}"
+    );
+    assert!(
+        !shown.contains("q9d-clip-end"),
+        "the question's tail was painted although the marker says it is clipped:\n{modal}"
+    );
+    for token in HINT_TOKENS {
+        assert!(
+            shown.contains(token),
+            "the hint token {token:?} is missing from the 40-column modal:\n{modal}"
+        );
+    }
+
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"y").unwrap();
+    let after_y = pty.read_for(Duration::from_secs(2));
+    assert!(
+        !out.exists(),
+        "`y` answered the confirm while its question was clipped (the tool recorded {:?}):\n{after_y}",
+        fs::read_to_string(&out).unwrap_or_default()
+    );
+    assert_eq!(
+        fake.served(),
+        1,
+        "the turn moved on while the modal was clipped:\n{after_y}"
+    );
+
+    let grown_at = pty.raw().len();
+    pty.resize(50, 100).unwrap();
+    let grown = pty
+        .wait_for_after("q9d-clip-end", grown_at, PTY_DEADLINE)
+        .expect("enlarging the terminal did not reveal the rest of the question");
+    assert!(
+        !squeezed(&grown).contains("morelines;enlarge"),
+        "the clip marker is still shown after the whole question fits:\n{grown}"
+    );
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"y").unwrap();
+    wait_for_file(&mut pty, &out, "the tool's recorded answer after enlarging");
+    let transcript = wait_for_squeezed(
+        &mut pty,
+        "fixture clipped done c7y",
+        "the reply after the tool",
+    );
+    assert_eq!(
+        fs::read_to_string(&out).unwrap().trim(),
+        "1",
+        "`y` on the fully visible modal did not reach the tool as a yes:\n{transcript}"
+    );
+    assert_eq!(fake.served(), 2, "{transcript}");
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// Esc still cancels a clipped confirm: the tool reads no yes, the turn
+/// finishes with the model's follow-up and the UI keeps taking keys.
+#[test]
+#[serial]
+fn esc_still_cancels_a_clipped_confirm_question() {
+    let dir = fresh_config_dir("confirm-clipped-esc");
+    let _guard = TempDirGuard(dir.clone());
+    let out = dir.join("confirm-answer");
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "fixture_confirm_rec".to_string(),
+            arguments: format!("{{\"out\": \"{}\"}}", out.display()),
+        },
+        Reply::Text("fixture clipped esc c7e".to_string()),
+    ]);
+    write_fake_llm_config(&dir, &fake);
+    write_tool(
+        &dir,
+        "fixture_confirm_rec.sh",
+        &clipped_question_confirm_tool(),
+    );
+    let mut pty = spawn_tui(&dir, &[]);
+
+    let _modal = open_clipped_modal(&mut pty);
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"\x1b").unwrap();
+    wait_for_file(&mut pty, &out, "the tool's recorded answer to Esc");
+    let transcript = wait_for_squeezed(&mut pty, "fixture clipped esc c7e", "the reply after Esc");
+    let answer = fs::read_to_string(&out).unwrap();
+    assert_ne!(
+        answer.trim(),
+        "1",
+        "Esc on the clipped modal reached the tool as a yes:\n{transcript}"
+    );
+    assert_eq!(fake.served(), 2, "{transcript}");
+
+    pty.send(b".info\r").unwrap();
+    pty.wait_for("log_path", PTY_DEADLINE)
+        .expect("keys were not handled after Esc on the clipped modal");
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// Writes an `$EDITOR` that only records that it was launched and returns
+/// its path.
+fn recording_editor(dir: &Path, launched: &Path) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let editor = dir.join("recording-editor.sh");
+    fs::write(
+        &editor,
+        format!("#!/bin/sh\n: > '{}'\nexit 0\n", launched.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&editor, fs::Permissions::from_mode(0o755)).unwrap();
+    editor.to_str().unwrap().to_string()
+}
+
+/// Files under `dir` (outside the cache) that were not there before and
+/// carry `name` in their path.
+fn new_files_named(dir: &Path, before: &[PathBuf], name: &str) -> Vec<PathBuf> {
+    walk(dir)
+        .into_iter()
+        .filter(|path| !before.contains(path))
+        .filter(|path| !path.to_string_lossy().contains("/cache/"))
+        .filter(|path| path.to_string_lossy().contains(name))
+        .collect()
+}
+
+/// `.role <new-name>` scaffolds a role in `$EDITOR` in the REPL; the UI
+/// refuses it before anything is written: no role file, no editor, the
+/// terminal never released, and the UI keeps taking keys.
+/// (`RequestContext::new_role` asks `Create a new role?` through a raw
+/// `inquire::Confirm` before it reaches the editor gate, so under the UI
+/// the question is invisible behind `Working`, and the first key it eats
+/// restores cooked mode under the UI - the terminal state this pins.)
+#[test]
+#[serial]
+fn dot_role_for_a_new_role_is_refused_before_it_writes_anything() {
+    let dir = fresh_config_dir("role-refused");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let launched = dir.join("editor-launched");
+    let editor = recording_editor(&dir, &launched);
+    let mut pty = spawn_tui(&dir, &[("EDITOR", &editor), ("VISUAL", &editor)]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let files_before = walk(&dir);
+    let before = pty.raw().len();
+    pty.send(b".role new-role-xk3\r").unwrap();
+    let since = pty
+        .wait_for_after("not available in the TUI", before, PTY_DEADLINE)
+        .unwrap_or_else(|e| {
+            panic!(
+                "`.role <new>` was not refused with the TUI notice; the turn sat on \
+                 `Working` with the REPL's `Create a new role?` prompt hidden: {e:?}\n{}",
+                strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]))
+            )
+        });
+    pty.read_for(Duration::from_millis(500));
+
+    let role_files = new_files_named(&dir, &files_before, "new-role-xk3");
+    assert!(
+        role_files.is_empty(),
+        "the refused `.role` still wrote {role_files:?}:\n{since}"
+    );
+    assert!(
+        !launched.exists(),
+        "the refused `.role` still launched the editor:\n{since}"
+    );
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "the refused `.role` released the terminal:\n{since}"
+    );
+
+    pty.send(b".info\r").unwrap();
+    pty.wait_for_after("log_path", before, PTY_DEADLINE)
+        .expect("keys were not handled after the refused `.role`");
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+    assert!(
+        new_files_named(&dir, &files_before, "new-role-xk3").is_empty(),
+        "a role file appeared by the time the UI left:\n{transcript}"
+    );
+}
+
+/// `.edit session` on a live named session opens its yaml in `$EDITOR`
+/// in the REPL; the UI refuses it before the session is written to disk.
+#[test]
+#[serial]
+fn dot_edit_session_is_refused_before_the_session_is_written() {
+    let dir = fresh_config_dir("edit-session-refused");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let launched = dir.join("editor-launched");
+    let editor = recording_editor(&dir, &launched);
+    let mut pty = spawn_tui(&dir, &[("EDITOR", &editor), ("VISUAL", &editor)]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b".session named-sess-xk3\r").unwrap();
+    pty.wait_for("named-sess-xk3", PTY_DEADLINE)
+        .expect("the named session never showed in the footer");
+    pty.read_for(Duration::from_millis(500));
+    let files_before = walk(&dir);
+    let before = pty.raw().len();
+    pty.send(b".edit session\r").unwrap();
+    let since = pty
+        .wait_for_after("not available in the TUI", before, PTY_DEADLINE)
+        .expect("`.edit session` was not refused with the TUI notice");
+    pty.read_for(Duration::from_millis(500));
+
+    let session_files = new_files_named(&dir, &files_before, "named-sess-xk3");
+    assert!(
+        session_files.is_empty(),
+        "the refused `.edit session` still wrote {session_files:?}:\n{since}"
+    );
+    assert!(
+        !launched.exists(),
+        "the refused `.edit session` still launched the editor:\n{since}"
+    );
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "the refused `.edit session` released the terminal:\n{since}"
+    );
+
+    pty.send(b".info\r").unwrap();
+    pty.wait_for_after("log_path", before, PTY_DEADLINE)
+        .expect("keys were not handled after the refused `.edit session`");
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// A `!shell` line is a command, not a message for the model: the fake
+/// model is never asked, and the line lands as the UI's refusal of the
+/// shell passthrough instead of a reply.
+#[test]
+#[serial]
+fn a_bang_shell_line_is_a_command_and_never_reaches_the_model() {
+    let dir = fresh_config_dir("bang-shell");
+    let _guard = TempDirGuard(dir.clone());
+    let fake = FakeLlm::start(vec![Reply::Text(
+        "fixture must not be served b4s".to_string(),
+    )]);
+    write_fake_llm_config(&dir, &fake);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let before = pty.raw().len();
+    pty.send(b"!ls\r").unwrap();
+    let since = pty
+        .wait_for_after("not available in the TUI", before, PTY_DEADLINE)
+        .expect("`!ls` was neither run nor refused as a command");
+    pty.read_for(Duration::from_millis(800));
+    let since = format!(
+        "{since}{}",
+        strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]))
+    );
+    assert_eq!(
+        fake.served(),
+        0,
+        "`!ls` was sent to the model as a prompt:\n{since}"
+    );
+    assert!(
+        !since.contains("b4s"),
+        "the model's reply landed for a `!shell` line:\n{since}"
+    );
+
+    pty.send(b".info\r").unwrap();
+    pty.wait_for_after("log_path", before, PTY_DEADLINE)
+        .expect("keys were not handled after the refused `!ls`");
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+    assert_eq!(fake.served(), 0, "{transcript}");
+}
+
+/// Busy loops on every core for the life of the guard.
+struct CpuLoad(Vec<std::process::Child>);
+
+impl CpuLoad {
+    fn start() -> CpuLoad {
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let children = (0..cores * 2)
+            .filter_map(|_| {
+                Command::new("sh")
+                    .arg("-c")
+                    .arg("while :; do :; done")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .ok()
+            })
+            .collect();
+        CpuLoad(children)
+    }
+}
+
+impl Drop for CpuLoad {
+    fn drop(&mut self) {
+        for child in &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Under CPU load the `.info` table still lands in the Command cell
+/// directly under `> .info`: the capture waits for its drain thread
+/// rather than calling the pipe quiet early and routing the table into a
+/// later notice a row lower. Three cold starts, each on a fresh screen so
+/// the row placement is unambiguous.
+#[test]
+#[serial]
+fn dot_info_lands_in_its_command_cell_under_cpu_load() {
+    let load = CpuLoad::start();
+    for round in 0..3 {
+        let dir = fresh_config_dir(&format!("info-under-load-{round}"));
+        let _guard = TempDirGuard(dir.clone());
+        write_dry_run_config(&dir);
+        let mut pty = spawn_tui(&dir, &[]);
+
+        pty.wait_for("no session", PTY_DEADLINE).unwrap();
+        pty.resize(80, 100).unwrap();
+        pty.read_for(Duration::from_millis(300));
+        let info_at = pty.raw().len();
+        pty.send(b".info\r").unwrap();
+        pty.wait_for_after("log_path", info_at, PTY_DEADLINE)
+            .unwrap_or_else(|e| panic!("round {round}: the `.info` table never appeared: {e:?}"));
+        pty.read_for(Duration::from_millis(800));
+        let printable = strip_ansi(&String::from_utf8_lossy(&pty.raw()[info_at..]));
+        let header_rows = painted_at(pty.raw(), b"> .info", info_at);
+        let &(header_row, 1) = header_rows.first().unwrap_or_else(|| {
+            panic!("round {round}: `> .info` was never painted at column one:\n{printable}")
+        }) else {
+            panic!("round {round}: `> .info` was painted mid-row: {header_rows:?}");
+        };
+        let first_rows = painted_at(pty.raw(), b"model", info_at);
+        assert!(
+            first_rows.contains(&(header_row + 1, 1)),
+            "round {round}: under load the table's first row was not painted directly under \
+             `> .info` (row {header_row}); `model` was painted at {first_rows:?}:\n{printable}"
+        );
+
+        pty.send(b"\x04").unwrap();
+        let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+        assert_eq!(exit_code(&transcript), 0, "round {round}: {transcript}");
+        assert_tty_restored(&transcript);
+    }
+    drop(load);
+}
