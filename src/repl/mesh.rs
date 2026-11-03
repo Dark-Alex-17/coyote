@@ -14936,18 +14936,16 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         "{err}"
                     );
 
+                    let waiting = format!(
+                        "Asking the mesh for {}'s announce; Ctrl-C cancels...",
+                        short(&hash)
+                    );
                     let err = run(&mut ctx, &format!(".mesh info {hash}"))
                         .await
                         .unwrap_err()
                         .to_string();
-                    assert!(
-                        err.contains(&hash) && err.contains("not been heard"),
-                        "{err}"
-                    );
-                    assert!(
-                        err.contains(".mesh peers") && err.contains(".mesh knocks"),
-                        "{err}"
-                    );
+                    assert_eq!(err, unanswered_path_request(&hash));
+                    assert!(stdout_lines().contains(&waiting), "{:?}", stdout_lines());
 
                     let err = run(&mut ctx, ".mesh info nothex")
                         .await
@@ -14975,7 +14973,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         .await
                         .unwrap_err()
                         .to_string();
-                    assert!(err.contains(&hash) && err.contains(".mesh peers"), "{err}");
+                    assert_eq!(err, unanswered_path_request(&hash));
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();
@@ -19626,8 +19624,9 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
 
             /// The message gate runs BEFORE any notice or prompt and
             /// refuses every non-Allow verdict. A destination the node has not heard (and
-            /// the trust list does not deny) is a not-heard error, never an announcement or
-            /// a consent question; a heard peer whose verdict is not Allow ("untrusted",
+            /// the trust list does not deny) is asked for, and when nothing answers that is
+            /// the error, never an announcement or a consent question; a heard peer whose
+            /// verdict is not Allow ("untrusted",
             /// the default-closed standing) is refused naming that standing, and a leading
             /// `--yes` does not turn it into a send. Nothing may reach `send_peer`, which
             /// would refuse the same peer as NotTrusted after the human had already consented.
@@ -19660,7 +19659,12 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         now,
                     );
 
-                    // Not heard, not denied: a not-heard error, no notice, no prompt.
+                    // Not heard, not denied: asked for, then the unanswered error, no notice,
+                    // no prompt.
+                    let waiting = format!(
+                        "Asking the mesh for {}'s announce; Ctrl-C cancels...",
+                        short(&unheard)
+                    );
                     for line in [
                         format!(".mesh message {unheard} hello"),
                         format!(".mesh message --yes {unheard} hello"),
@@ -19669,10 +19673,8 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         let before = stdout_lines().len();
                         let err = run(&mut ctx, &line).await.unwrap_err().to_string();
                         let out = stdout_lines()[before..].to_vec();
-                        assert!(
-                            err.contains("has not been heard"),
-                            "{line}: an unheard destination is a not-heard error: {err}"
-                        );
+                        assert_eq!(err, unanswered_path_request(&unheard), "{line}");
+                        assert!(out.contains(&waiting), "{line}: {out:?}");
                         assert_eq!(
                             prompt_script::prompts_asked(),
                             asked_before,
@@ -19837,14 +19839,19 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
                     let unheard = hex_lower(&[0x77; 16]);
 
+                    let waiting = format!(
+                        "Asking the mesh for {}'s announce; Ctrl-C cancels...",
+                        short(&unheard)
+                    );
                     for line in [
                         format!(".mesh knock {unheard}"),
                         format!(".mesh knock {unheard} --yes --intro \"hi\""),
                     ] {
                         let before = stdout_lines().len();
                         let err = run(&mut ctx, &line).await.unwrap_err().to_string();
-                        assert!(err.contains("has not been heard"), "{line}: {err}");
+                        assert_eq!(err, unanswered_path_request(&unheard), "{line}");
                         let out = stdout_lines()[before..].to_vec();
+                        assert!(out.contains(&waiting), "{line}: {out:?}");
                         assert!(
                             !out.iter().any(|text| text.starts_with("This knocks on")),
                             "{line}: no notice for an unheard destination: {out:?}"
@@ -19859,7 +19866,8 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
 
             /// `.mesh message <dest>` applies the SAME trust gate as
             /// `.mesh status <dest>`, so for one destination both verbs classify the refusal
-            /// the same way: plain unheard -> not-heard; unheard but denied at the
+            /// the same way: plain unheard -> not-heard once the path request goes
+            /// unanswered; unheard but denied at the
             /// destination tier -> blocked (instance); heard untrusted, blocked (instance)
             /// or blocked (identity) -> that standing.
             #[test]
@@ -19913,7 +19921,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             "blocked (identity)"
                         } else if err.contains(" is untrusted ") {
                             "untrusted"
-                        } else if err.contains("has not been heard") {
+                        } else if err.contains("did not answer a path request") {
                             "not-heard"
                         } else {
                             "other"
@@ -19959,10 +19967,15 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         );
                     }
                     let out = stdout_lines();
+                    let waiting = format!(
+                        "Asking the mesh for {}'s announce; Ctrl-C cancels...",
+                        short(&unheard)
+                    );
                     assert!(
-                        !out.iter().any(|line| line.contains("Asking")
-                            || line.contains("This sends your text to")
-                            || line.starts_with("Sent ")),
+                        !out.iter()
+                            .any(|line| (line.contains("Asking") && *line != waiting)
+                                || line.contains("This sends your text to")
+                                || line.starts_with("Sent ")),
                         "no notice or link toward a refused destination: {out:?}"
                     );
 
@@ -20507,8 +20520,8 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             }
 
             /// A knock carries the same proof as an announce, so a destination heard only
-            /// through the knock cache can be trusted; one in neither place is sent to the
-            /// lists that show what can be.
+            /// through the knock cache can be trusted; one in neither place is asked for,
+            /// and fails naming the list that shows what can be.
             #[test]
             #[serial]
             fn trust_accepts_a_destination_that_only_knocked() {
@@ -20552,7 +20565,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
 
                     let (other, _, _) = announced_peer();
                     let err = refusal(&mut ctx, &format!(".mesh trust {other} --yes")).await;
-                    assert!(err.contains(".mesh knocks"), "{err}");
+                    assert_eq!(err, unanswered_path_request(&other));
                     assert_eq!(prompt_script::prompts_asked(), 0);
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
@@ -26233,7 +26246,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             #[cfg(unix)]
             mod first_contact_tests {
                 use super::*;
-                use crate::mesh::test_support::wait_for_peer;
+                use crate::mesh::test_support::pair_where_b_has_not_heard_a;
 
                 struct LateJoiner {
                     relay: TransportRelay,
@@ -26247,16 +26260,9 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
 
                 impl LateJoiner {
                     async fn start(tag: &str) -> Self {
-                        let relay =
-                            TransportRelay::start_on_with_retries(closed_port().await, 0).await;
-                        let mut relay_announces = relay.announces().await;
-                        let a = started_runtime_on(&format!("{tag}-a"), relay.port).await;
+                        let (relay, a, b) = pair_where_b_has_not_heard_a(tag).await;
                         let to_a = a.runtime.current_destination_hash();
-                        TransportRelay::heard_from(&mut relay_announces, &to_a).await;
-                        let b = started_runtime_on(&format!("{tag}-b"), relay.port).await;
                         let to_b = b.runtime.current_destination_hash();
-                        wait_for_peer(&a.runtime, &to_b).await;
-                        assert!(b.runtime.peers().get(&to_a).is_none(), "B has not heard A");
                         let slot_a = Arc::new(MeshSlot::default());
                         slot_a.install(a.runtime.clone()).unwrap();
                         let ctx = ctx_with(MeshConfig::default(), true);
@@ -26330,10 +26336,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             .await
                             .unwrap();
                         assert!(out.contains(&fx.waiting_line()), "{out}");
-                        assert!(
-                            out.contains(&format!("Trusted {}", short(&to_a))),
-                            "{out}"
-                        );
+                        assert!(out.contains(&format!("Trusted {}", short(&to_a))), "{out}");
 
                         fx.a_trusts_b();
                         out_of(&mut fx.ctx, &format!(".mesh status {to_a}"))
@@ -26448,7 +26451,11 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         let printed = stdout_lines().len();
                         let asked = Instant::now();
                         let err = refusal(&mut ctx, &format!(".mesh info {unheard}")).await;
-                        assert!(asked.elapsed() < Duration::from_secs(1), "{:?}", asked.elapsed());
+                        assert!(
+                            asked.elapsed() < Duration::from_secs(1),
+                            "{:?}",
+                            asked.elapsed()
+                        );
                         assert!(err.ends_with(INFO_REFUSAL_TAIL), "{err}");
                         assert_eq!(stdout_lines().len(), printed, "nothing was asked: {err}");
 
@@ -26471,7 +26478,8 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
 
                 /// The refusals of the trust verbs and of `.mesh message` leave the REPL
                 /// as `.mesh` errors, so each hint they carry is spelled in the prefix the
-                /// session was switched to.
+                /// session was switched to. `.mesh message` to a hash never heard fails
+                /// with the same unanswered path request sentence the trust row checks.
                 #[test]
                 #[serial]
                 fn trust_and_message_refusals_spell_their_hints_in_the_prefix() {
@@ -26487,7 +26495,6 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         let (unheard, _, _) = announced_peer();
                         let (heard, _) = heard_peer(&started.runtime, "Tia", SystemTime::now());
                         let unknown_identity = hex_lower(&[0x5b; 16]);
-                        let never_heard = hex_lower(&[0x6c; 16]);
 
                         for (prefix, sigil, mesh) in PREFIXES {
                             let typed = ctx.command_prefix().display();
@@ -26495,14 +26502,13 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                 .await
                                 .unwrap();
                             for (line, hint) in [
-                                (format!("trust {unheard} --yes"), "knocks"),
+                                (format!("trust {unheard} --yes"), "peers"),
                                 (
                                     format!("untrust --identity {unknown_identity}"),
                                     "trust --identity",
                                 ),
                                 ("block nothex00".to_string(), "peers"),
                                 (format!("message {heard} hi"), "peers"),
-                                (format!("message {never_heard} hi"), "peers"),
                             ] {
                                 let err = run(&mut ctx, &format!("{sigil}mesh {line}"))
                                     .await

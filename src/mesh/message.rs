@@ -1974,7 +1974,9 @@ impl MeshRuntime {
                 tokio::time::sleep(PATH_RESPONSE_FILING_POLL).await;
             }
         };
-        let peer = tokio::time::timeout(PATH_RESPONSE_FILING_GRACE, filed).await.ok();
+        let peer = tokio::time::timeout(PATH_RESPONSE_FILING_GRACE, filed)
+            .await
+            .ok();
         if peer.is_none() {
             debug!(
                 "Mesh resolved {} but filed no peer row for it",

@@ -821,6 +821,42 @@ pub(crate) mod test_support {
         }
     }
 
+    /// A relay with nodes A and B on it where A has filed B but B holds nothing of A:
+    /// no peer table row and no identity in its transport. Both meet first, then B is
+    /// stopped, its `peers.json` deleted and B restarted, so the relay's single
+    /// rebroadcast of A's start announce cannot reach the new B. Returns the relay,
+    /// A and B.
+    #[cfg(unix)]
+    pub(crate) async fn pair_where_b_has_not_heard_a(
+        tag: &str,
+    ) -> (TransportRelay, StartedRuntime, StartedRuntime) {
+        let relay = TransportRelay::start_on_with_retries(closed_port().await, 0).await;
+        let a = started_runtime_on(&format!("{tag}-a"), relay.port).await;
+        let mut b = started_runtime_on(&format!("{tag}-b"), relay.port).await;
+        let to_a = a.runtime.current_destination_hash();
+        let to_b = b.runtime.current_destination_hash();
+        wait_for_peer(&a.runtime, &to_b).await;
+        wait_for_peer(&b.runtime, &to_a).await;
+
+        let mut relay_announces = relay.announces().await;
+        let slot_b = MeshSlot::default();
+        slot_b.install(b.runtime.clone()).unwrap();
+        assert!(slot_b.stop().await.unwrap());
+        std::fs::remove_file(
+            super::mesh_cache_dir(&mesh_paths(&b.tmp).cache_dir).join("peers.json"),
+        )
+        .expect("B's stop wrote its peer table");
+        b.restart_on(relay.port).await;
+        TransportRelay::heard_from(&mut relay_announces, &to_b).await;
+
+        assert!(b.runtime.peers().get(&to_a).is_none(), "B has no row for A");
+        assert!(
+            !b.knows_identity_of(&to_a).await,
+            "B's transport holds nothing of A"
+        );
+        (relay, a, b)
+    }
+
     pub(crate) fn private_config(port: u16) -> MeshConfig {
         MeshConfig {
             interfaces: vec![MeshInterface::Private {

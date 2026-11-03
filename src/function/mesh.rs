@@ -9184,6 +9184,9 @@ mod tests {
         mod first_contact_tests {
             use super::*;
             use crate::mesh::PATH_REQUEST_TIMEOUT;
+            use crate::mesh::identity::current_identity;
+            use crate::mesh::test_support::{mesh_paths, pair_where_b_has_not_heard_a, wait_until};
+            use crate::supervisor::mailbox::EnvelopePayload;
             use std::time::Instant;
 
             fn calls(to: &str) -> Vec<(&'static str, Value)> {
@@ -9241,7 +9244,13 @@ mod tests {
                     )
                     .unwrap();
                 trust
-                    .deny_destination(ctx.app.mesh.as_ref(), &unheard, None, SystemTime::now(), false)
+                    .deny_destination(
+                        ctx.app.mesh.as_ref(),
+                        &unheard,
+                        None,
+                        SystemTime::now(),
+                        false,
+                    )
                     .unwrap();
                 refused_at_once(&mut ctx, &unheard, "blocked destination").await;
 
@@ -9288,6 +9297,87 @@ mod tests {
 
                 assert!(ctx.app.mesh.stop().await.unwrap());
                 started.relay_handle.abort();
+            }
+
+            /// B, restarted with no peer table, learns of A only by asking. B trusts A's
+            /// identity for all destinations before that, so the model's send reaches A
+            /// directly.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[serial]
+            async fn mesh_send_reaches_an_unheard_instance_of_an_identity_trusted_for_all() {
+                let _guard = TestConfigDirGuard::new("mesh-tool-first-contact-send");
+                let (relay, a, b) =
+                    pair_where_b_has_not_heard_a("mesh-tool-first-contact-send").await;
+                let to_a = a.runtime.current_destination_hash();
+                let to_b = b.runtime.current_destination_hash();
+                let slot_a = Arc::new(MeshSlot::default());
+                slot_a.install(a.runtime.clone()).unwrap();
+                let mut ctx = plain_ctx();
+                ctx.app.mesh.install(b.runtime.clone()).unwrap();
+
+                let identity_of_a = current_identity(&mesh_paths(&a.tmp).identity_path)
+                    .unwrap()
+                    .address_hash()
+                    .to_hex_string();
+                b.runtime
+                    .trust()
+                    .trust_identity(
+                        ctx.app.mesh.as_ref(),
+                        &identity_of_a,
+                        TrustOptions::default(),
+                        SystemTime::now(),
+                    )
+                    .unwrap();
+                a.runtime
+                    .trust()
+                    .trust_destination(
+                        slot_a.as_ref(),
+                        &to_b,
+                        TrustOptions::default(),
+                        SystemTime::now(),
+                    )
+                    .unwrap();
+
+                let (sent, waited) = call(
+                    &mut ctx,
+                    "send",
+                    &json!({"to": to_a, "message": "first contact"}),
+                )
+                .await;
+                assert_eq!(sent["status"], "sent", "{sent}");
+                assert_eq!(sent["via"], "direct", "{sent}");
+                assert_eq!(sent["to"], to_a, "{sent}");
+                assert!(
+                    waited < PATH_REQUEST_TIMEOUT + Duration::from_secs(5),
+                    "one path request, then the send: {waited:?}"
+                );
+                let row = b
+                    .runtime
+                    .peers()
+                    .get(&to_a)
+                    .expect("B filed A's row from the answer");
+                assert_eq!(row.identity_hash, identity_of_a);
+
+                wait_until("A's inbox to hold B's message", || {
+                    slot_a.peer_inbox().len() > 0
+                })
+                .await;
+                let (delivered, _) = slot_a.peer_inbox().drain();
+                let messages: Vec<_> = delivered
+                    .iter()
+                    .filter_map(|envelope| match &envelope.payload {
+                        EnvelopePayload::Peer(message) => Some(message),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(messages.len(), 1, "{delivered:?}");
+                assert_eq!(messages[0].content, "first contact");
+                assert_eq!(messages[0].source_destination, to_b);
+                assert_eq!(messages[0].message_id, sent["id"].as_str().unwrap());
+
+                assert!(ctx.app.mesh.stop().await.unwrap());
+                slot_a.stop().await.unwrap();
+                relay.stop().await;
             }
         }
 

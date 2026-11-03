@@ -11170,12 +11170,12 @@ mod tests {
         relay.stop().await;
     }
 
-    /// First contact with a destination this node has not heard. The relay replays no
-    /// announce, so B, joining after A, learns A only by asking for it.
+    /// First contact with a destination this node has not heard: B, restarted with no
+    /// peer table, learns A only by asking for it.
     #[cfg(unix)]
     mod first_contact_tests {
         use super::*;
-        use crate::mesh::test_support::{closed_port, derived_sighting, wait_for_peer};
+        use crate::mesh::test_support::{derived_sighting, pair_where_b_has_not_heard_a};
 
         struct LateJoiner {
             relay: TransportRelay,
@@ -11188,22 +11188,15 @@ mod tests {
         }
 
         impl LateJoiner {
-            /// A joins first and the relay files its announce; B joins second, so A hears
-            /// B announce and B has heard nothing of A.
             async fn start(tag: &str) -> Self {
-                let relay = TransportRelay::start_on_with_retries(closed_port().await, 0).await;
-                let mut relay_announces = relay.announces().await;
-                let a = started_runtime_on(&format!("{tag}-a"), relay.port).await;
+                let (relay, a, b) = pair_where_b_has_not_heard_a(tag).await;
                 let to_a = a.runtime.current_destination_hash();
-                TransportRelay::heard_from(&mut relay_announces, &to_a).await;
-                let b = started_runtime_on(&format!("{tag}-b"), relay.port).await;
                 let to_b = b.runtime.current_destination_hash();
-                wait_for_peer(&a.runtime, &to_b).await;
                 let slot_a = Arc::new(MeshSlot::default());
                 slot_a.install(a.runtime.clone()).unwrap();
                 let slot_b = Arc::new(MeshSlot::default());
                 slot_b.install(b.runtime.clone()).unwrap();
-                let pair = Self {
+                Self {
                     relay,
                     a,
                     b,
@@ -11211,9 +11204,7 @@ mod tests {
                     slot_b,
                     to_a,
                     to_b,
-                };
-                pair.assert_b_lacks_a().await;
-                pair
+                }
             }
 
             async fn assert_b_lacks_a(&self) {
@@ -11243,8 +11234,7 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn an_unheard_destination_is_asked_for_filed_trusted_and_answers_status_both_ways()
-        {
+        async fn an_unheard_destination_is_asked_for_filed_trusted_and_answers_status_both_ways() {
             let pair = LateJoiner::start("first-contact-trust").await;
 
             let asked = Instant::now();
@@ -11329,7 +11319,11 @@ mod tests {
 
             let asked = Instant::now();
             refused(pair.b.runtime.send_peer(&pair.to_a, &message).await);
-            assert!(asked.elapsed() < Duration::from_secs(1), "{:?}", asked.elapsed());
+            assert!(
+                asked.elapsed() < Duration::from_secs(1),
+                "{:?}",
+                asked.elapsed()
+            );
             pair.assert_b_lacks_a().await;
 
             let trust = pair.b.runtime.trust();
@@ -11352,7 +11346,11 @@ mod tests {
                 .unwrap();
             let asked = Instant::now();
             refused(pair.b.runtime.send_peer(&pair.to_a, &message).await);
-            assert!(asked.elapsed() < Duration::from_secs(1), "{:?}", asked.elapsed());
+            assert!(
+                asked.elapsed() < Duration::from_secs(1),
+                "{:?}",
+                asked.elapsed()
+            );
             pair.assert_b_lacks_a().await;
             pair.stop().await;
         }
@@ -11374,7 +11372,8 @@ mod tests {
             );
             let waited = asked.elapsed();
             assert!(
-                waited >= PATH_REQUEST_TIMEOUT && waited < PATH_REQUEST_TIMEOUT + Duration::from_secs(2),
+                waited >= PATH_REQUEST_TIMEOUT
+                    && waited < PATH_REQUEST_TIMEOUT + Duration::from_secs(2),
                 "{waited:?}"
             );
             assert!(started.runtime.peers().get(&stranger).is_none());

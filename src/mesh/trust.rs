@@ -5231,6 +5231,94 @@ mod tests {
         assert!(fx.store.undeny_destination(&fx.mesh, &b, false).is_err());
     }
 
+    mod may_be_asked_for_tests {
+        use super::*;
+
+        #[test]
+        fn a_denied_destination_is_never_asked_for_even_under_an_identity_trusted_for_all() {
+            let fx = Fixture::new("trust-ask-denied");
+            let destination = fake_hash(0x51);
+            fx.trust_identity(&fake_hash(0x52), t(2_000));
+            assert!(fx.store.may_be_asked_for(&destination));
+
+            fx.store
+                .deny_destination(&fx.mesh, &destination, None, t(3_000), false)
+                .unwrap();
+
+            assert!(!fx.store.may_be_asked_for(&destination));
+            assert!(!fx.store.may_be_asked_for(&destination.to_ascii_uppercase()));
+        }
+
+        /// Blocking through the store drops the identity's destination records, so the
+        /// bound-and-blocked state only arises from a hand-edited or externally written
+        /// file. Another identity trusted for all destinations is present so that only the
+        /// binding can explain the refusal.
+        #[test]
+        fn a_destination_bound_to_a_blocked_identity_is_not_asked_for() {
+            let fx = Fixture::new("trust-ask-bound-blocked");
+            let (blocked, destination, other) = (fake_hash(0x61), fake_hash(0x62), fake_hash(0x63));
+            let ts = "2026-01-01T00:00:00Z";
+            fs::create_dir_all(fx.store.path().parent().unwrap()).unwrap();
+            fs::write(
+                fx.store.path(),
+                format!(
+                    "version: {TRUST_FILE_VERSION}\n\
+                     identities:\n  {blocked}:\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n    all_destinations: false\n  {other}:\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n    all_destinations: true\n\
+                     destinations:\n  {destination}:\n    identity: {blocked}\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n\
+                     denied_destinations: {{}}\n\
+                     blocked_identities:\n  {blocked}:\n    added_at: {ts}\n    note: null\n"
+                ),
+            )
+            .unwrap();
+            let store = fx.reopen();
+
+            assert!(!store.may_be_asked_for(&destination));
+            assert!(
+                store.may_be_asked_for(&fake_hash(0x64)),
+                "an unrecorded destination may still belong to the identity trusted for all"
+            );
+        }
+
+        #[test]
+        fn a_destination_bound_to_an_allowed_identity_is_asked_for() {
+            let fx = Fixture::new("trust-ask-bound-allowed");
+            let peer = announced("alpha");
+            fx.announce(&peer, t(2_000));
+            fx.trust_destination(&peer, t(3_000));
+
+            assert!(fx.store.may_be_asked_for(&peer.destination_hash));
+            assert!(
+                fx.store
+                    .may_be_asked_for(&peer.destination_hash.to_ascii_uppercase())
+            );
+        }
+
+        #[test]
+        fn an_unrecorded_destination_with_no_identity_trusted_for_all_is_not_asked_for() {
+            let fx = Fixture::new("trust-ask-no-grant");
+            let unrecorded = fake_hash(0x71);
+            assert!(!fx.store.may_be_asked_for(&unrecorded));
+
+            let peer = announced("alpha");
+            fx.announce(&peer, t(2_000));
+            fx.trust_destination(&peer, t(3_000));
+
+            assert!(
+                !fx.store.may_be_asked_for(&unrecorded),
+                "a known identity trusted for one destination covers no other"
+            );
+        }
+
+        #[test]
+        fn an_unrecorded_destination_is_asked_for_once_some_identity_is_trusted_for_all() {
+            let fx = Fixture::new("trust-ask-identity-tier");
+            let unrecorded = fake_hash(0x81);
+            fx.trust_identity(&fake_hash(0x82), t(2_000));
+
+            assert!(fx.store.may_be_asked_for(&unrecorded));
+        }
+    }
+
     #[test]
     fn deny_destination_takes_the_record_with_it_and_lists_the_deny_once() {
         let fx = Fixture::new("trust-deny-listed");
