@@ -78,7 +78,7 @@ variables:
     description: "Task sizing for the plan: 'standard' (default, ~1 engineer-day tasks - today's behavior, unchanged) or 'micro' (tasks sized to one file/seam with exact signatures and EXECUTABLE acceptance criteria, grouped into plan-section batches; per task only coder verify + the adversary criteria check run, the full review gauntlet runs once per batch; designed for small/local implementer models and for runs where per-task blast radius must be minimal)"
     default: 'standard'
   - name: pr_tracking
-    description: "'ci' (default) watches the PR's CI until green, flips it ready and finishes, exactly as before; 'review' then keeps watching the PR for review activity: approval stops the watch, new comments become fix rounds through the CI fix path (push, re-watch CI, watch again), and closed/merged, the review round or wall-clock cap, CI exhausted, or a comment needing owner judgment stop it with the reason sent to the owner"
+    description: "'ci' (default) watches the PR's CI until green, flips it ready and finishes, with today's routing plus the hardening fixes listed in the README (poll timeouts, stale-poll counting, the run-wide poll budget, the own-comment marker, bounded gh calls); 'review' then keeps watching each single or group PR for review activity (per-task PRs are not watched): approval stops the watch, new comments become fix rounds through the CI fix path (push, re-watch CI, watch again), and closed/merged, the review round or wall-clock cap, CI exhausted, or a comment needing owner judgment stop it with the reason sent to the owner"
     default: 'ci'
 
 settings:
