@@ -2,7 +2,7 @@ use crate::config::mesh_config::{
     DEFAULT_LOCAL_RNSD_INSTANCE, DEFAULT_LOCAL_RNSD_PORT, EnvoyMemoryConfig, MeshConfig,
     MeshInterface,
 };
-use crate::config::{ForkRekey, LivePrefix, Session, paths};
+use crate::config::{ForkRekey, LivePrefix, RequestContext, Session, paths};
 use crate::mesh::access::{AccessHandler, AccessRouting, AccessSurface, put_back};
 use crate::mesh::announce::{
     AnnounceAppData, HEARTBEAT_PERIOD_SECS, HEARTBEAT_SECS, REANNOUNCE_FLOOR_SECS,
@@ -3472,7 +3472,8 @@ impl OwnEntryMarks {
 /// the human types them.
 ///
 /// `last_progress_capture` is when a progress point inside a turn last captured a
-/// snapshot.
+/// snapshot, and `digest_hook` is who may regenerate the digest after one; only the
+/// interactive REPL installs a hook.
 #[derive(Default)]
 pub(crate) struct MeshSlot {
     inner: RwLock<Option<Arc<MeshRuntime>>>,
@@ -3496,8 +3497,16 @@ pub(crate) struct MeshSlot {
     inbound: parking_lot::Mutex<Option<Arc<InboundStore>>>,
     command_prefix: LivePrefix,
     last_progress_capture: parking_lot::Mutex<Option<Instant>>,
+    digest_hook: ArcSwapOption<Arc<dyn MeshDigestHook>>,
     #[cfg(test)]
     envoy_memory_override: ArcSwapOption<EnvoySessions>,
+}
+
+/// Offered the owning session's context after a progress point inside a turn has captured
+/// a snapshot, so the digest can be regenerated without the turn's context lock. The
+/// implementation must not wait: it runs on the turn's own task.
+pub(crate) trait MeshDigestHook: Send + Sync {
+    fn on_progress(&self, ctx: &RequestContext);
 }
 
 impl MeshSlot {
@@ -3750,6 +3759,14 @@ impl MeshSlot {
         true
     }
 
+    /// Moves the last progress-point capture `by` into the past, as if that much time
+    /// had gone by, so a test can cross the interval without sleeping.
+    #[cfg(test)]
+    pub(crate) fn rewind_progress_clock_for_tests(&self, by: Duration) {
+        let mut last = self.last_progress_capture.lock();
+        *last = last.and_then(|last| last.checked_sub(by));
+    }
+
     pub(crate) fn set_objective_override(&self, objective: Option<String>) {
         self.objective_override.store(non_blank(objective));
         self.reassemble_brief();
@@ -3878,6 +3895,22 @@ impl MeshSlot {
     /// falls back to stderr instead of a printer nobody drains any more.
     pub(crate) fn clear_notifier(&self) {
         self.notifier.store(None);
+    }
+
+    /// Installs who regenerates the digest at progress points. The interactive REPL
+    /// installs its digest driver at start-up; headless runs and the ACP server never
+    /// digest and install nothing.
+    pub(crate) fn set_digest_hook(&self, hook: Arc<dyn MeshDigestHook>) {
+        self.digest_hook.store(Some(Arc::new(hook)));
+    }
+
+    pub(crate) fn digest_hook(&self) -> Option<Arc<dyn MeshDigestHook>> {
+        self.digest_hook.load_full().map(|hook| Arc::clone(&*hook))
+    }
+
+    /// The REPL calls this as it exits, so the slot does not keep its driver alive.
+    pub(crate) fn clear_digest_hook(&self) {
+        self.digest_hook.store(None);
     }
 
     /// Renders once, then hands the lines to the installed sink. With no sink installed

@@ -30,6 +30,7 @@ use crate::graph::dispatch::{GraphTurn, run_graph_turn};
 use crate::graph::llm::{CompletionFuture, CompletionRunner};
 use crate::graph::route::Branch;
 use crate::hooks::{self, HookEvent};
+use crate::mesh::MeshDigestHook;
 use crate::mesh::events::MeshHookSink;
 use crate::mesh::notify::NotificationSink;
 use crate::mesh::snapshot::TurnState;
@@ -615,7 +616,7 @@ pub struct Repl {
     prompt: ReplPrompt,
     abort_signal: AbortSignal,
     idle: Option<IdleDriver>,
-    digest: MeshDigestDriver,
+    digest: Arc<parking_lot::Mutex<MeshDigestDriver>>,
     envoy: Arc<EnvoyRunner>,
     mesh_hooks: Arc<MeshHookBridge>,
 }
@@ -634,6 +635,10 @@ impl Repl {
         ctx.app
             .mesh
             .set_hook_sink(Arc::clone(&mesh_hooks) as Arc<dyn MeshHookSink>);
+        let digest = Arc::new(parking_lot::Mutex::new(MeshDigestDriver::new()));
+        ctx.app
+            .mesh
+            .set_digest_hook(Arc::clone(&digest) as Arc<dyn MeshDigestHook>);
         let app_state = Arc::clone(&ctx.app);
         let ctx = Arc::new(RwLock::new(ctx));
         let editor = Self::create_editor(Arc::clone(&ctx), app.as_ref(), &printer)?;
@@ -650,7 +655,7 @@ impl Repl {
             prompt,
             abort_signal,
             idle: Some(idle),
-            digest: MeshDigestDriver::new(),
+            digest,
             envoy,
             mesh_hooks,
         })
@@ -726,8 +731,9 @@ impl Repl {
         drain_stale_tty_input();
 
         if mesh::autostart_wanted(&self.ctx.read()) {
-            // The digest is observed and refreshed at turn boundaries only, so the brief
-            // is assembled at the first one, exactly as after a `.mesh on` typed in a turn.
+            // The digest is observed and refreshed at turn boundaries and progress points
+            // only, so the brief is assembled at the first one, exactly as after a
+            // `.mesh on` typed in a turn.
             let result = {
                 let mut ctx = self.ctx.write();
                 publish_mesh_snapshot(&ctx, TurnState::working_now());
@@ -762,14 +768,14 @@ impl Repl {
                             run_repl_command(&mut ctx, self.abort_signal.clone(), &line).await;
                         self.envoy.refresh(&ctx.app);
                         self.mesh_hooks.refresh(&ctx.app);
-                        self.digest.observe_session(&ctx);
+                        self.digest.lock().observe_session(&ctx);
                         publish_mesh_snapshot(&ctx, TurnState::idle_now());
                         result
                     };
                     // An exiting turn, or one Ctrl-D cut short, spawns nothing: shutdown
                     // below would only abort it.
                     if !matches!(result, Ok(true)) && !self.abort_signal.aborted_ctrld() {
-                        self.digest.maybe_refresh(&self.ctx);
+                        self.digest.lock().maybe_refresh(&self.ctx);
                     }
                     match result {
                         Ok(exit) => {
@@ -817,7 +823,9 @@ impl Repl {
         // Notifier first: lines from children and the envoy winding down under `stop`
         // then reach stderr instead of a printer the loop above no longer drains.
         self.ctx.read().app.mesh.clear_notifier();
-        self.digest.shutdown().await;
+        self.ctx.read().app.mesh.clear_digest_hook();
+        let digest_shutdown = self.digest.lock().shutdown();
+        digest_shutdown.await;
         if let Some(idle) = self.idle.take() {
             idle.stop().await;
         }
@@ -3746,6 +3754,171 @@ local_hello() {\n\
             .skip_while(|m| m.role.is_system())
             .map(|m| (m.role, m.content.to_text()))
             .collect()
+    }
+
+    mod progress_turn_tests {
+        use super::*;
+        use crate::config::mesh_config::{MeshBrief, MeshConfig};
+        use crate::function::eval_tool_calls;
+        use crate::mesh::card::build_card;
+        use crate::mesh::snapshot::MeshSnapshot;
+        use crate::mesh::{MESH_PROGRESS_MIN_INTERVAL, MeshDigestHook};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant, SystemTime};
+
+        const BATCHES: usize = 3;
+
+        /// What a peer could read right after a batch: the published snapshot and the
+        /// card's age for it.
+        type Published = Arc<parking_lot::Mutex<Vec<(Arc<MeshSnapshot>, Option<u64>)>>>;
+
+        /// The real digest driver behind the slot's hook, held at one instant so every
+        /// progress point of the turn falls inside one digest interval, with a model that
+        /// only counts its calls.
+        struct FrozenClockDigest {
+            driver: parking_lot::Mutex<MeshDigestDriver>,
+            now: Instant,
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl MeshDigestHook for FrozenClockDigest {
+            fn on_progress(&self, ctx: &RequestContext) {
+                let calls = Arc::clone(&self.calls);
+                self.driver
+                    .lock()
+                    .maybe_refresh_in_turn(ctx, self.now, move |_input| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        async { Ok("- Working on the widget".to_string()) }
+                    });
+            }
+        }
+
+        /// A root context with the mesh brief on `auto`, the todo tools, and one earlier
+        /// exchange: too little transcript for growth alone to start a digest.
+        fn digesting_ctx() -> RequestContext {
+            let app = AppState {
+                config: Arc::new(AppConfig {
+                    auto_continue: true,
+                    max_auto_continues: 0,
+                    mesh: MeshConfig {
+                        enabled: true,
+                        brief: MeshBrief::Auto,
+                        ..MeshConfig::default()
+                    },
+                    ..AppConfig::default()
+                }),
+                ..AppState::test_default()
+            };
+            let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Repl);
+            ctx.tool_scope.functions.append_todo_functions();
+            ctx.session = Some(Session::default());
+            let input = Input::from_str(&ctx, "start the widget", None).unwrap();
+            ctx.session
+                .as_mut()
+                .unwrap()
+                .add_message(&input, "on it")
+                .unwrap();
+            ctx
+        }
+
+        /// Runs `BATCHES` tool batches of one `todo__add` each through the real
+        /// `eval_tool_calls`, then answers. The progress clock is moved past the interval
+        /// before each batch, as in a turn whose batches are 5 s apart.
+        fn todo_batches(
+            published: Published,
+        ) -> impl for<'a> FnMut(
+            &'a Input,
+            &'a mut RequestContext,
+            AbortSignal,
+        ) -> CompletionFuture<'a>
+        + Send {
+            let mut batch = 0;
+            completion_runner(move |_input, ctx, _abort| {
+                batch += 1;
+                let n = batch;
+                let published = Arc::clone(&published);
+                boxed_completion(async move {
+                    if n > BATCHES {
+                        return Ok(("done".to_string(), vec![]));
+                    }
+                    ctx.app
+                        .mesh
+                        .rewind_progress_clock_for_tests(MESH_PROGRESS_MIN_INTERVAL);
+                    let call = ToolCall::new(
+                        "todo__add".into(),
+                        json!({ "task": format!("step-{n}") }),
+                        Some(format!("call-{n}")),
+                    );
+                    let results = eval_tool_calls(ctx, vec![call]).await?;
+                    let snapshot = ctx.app.mesh.snapshot().expect("a snapshot is published");
+                    let card = build_card(
+                        Some(&snapshot),
+                        None,
+                        None,
+                        None,
+                        None,
+                        &[],
+                        SystemTime::now(),
+                    );
+                    published.lock().push((snapshot, card.snapshot_age_secs));
+                    Ok((String::new(), results))
+                })
+            })
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn three_tool_batches_publish_three_snapshots_and_digest_once() {
+            let _guard = crate::testing::TestConfigDirGuard::new("repl");
+            let mut ctx = digesting_ctx();
+            let digest = Arc::new(FrozenClockDigest {
+                driver: parking_lot::Mutex::new(MeshDigestDriver::without_node_gate()),
+                now: Instant::now(),
+                calls: Arc::default(),
+            });
+            ctx.app
+                .mesh
+                .set_digest_hook(Arc::clone(&digest) as Arc<dyn MeshDigestHook>);
+            publish_mesh_snapshot(&ctx, TurnState::working_now());
+            let boundary = ctx.app.mesh.snapshot().unwrap();
+            let published: Published = Arc::default();
+            let mut runner = todo_batches(Arc::clone(&published));
+
+            turn(&mut ctx, "build the widget", None, &mut runner)
+                .await
+                .unwrap();
+
+            let published = published.lock().clone();
+            assert_eq!(published.len(), BATCHES);
+            let mut previous = boundary;
+            for (n, (snapshot, age)) in published.into_iter().enumerate() {
+                assert!(!Arc::ptr_eq(&snapshot, &previous), "batch {n} published");
+                assert_eq!(
+                    snapshot.todo.todos.len(),
+                    n + 1,
+                    "batch {n} moved the todo count"
+                );
+                assert!(snapshot.captured_at > previous.captured_at);
+                assert!(
+                    age.is_some_and(|age| age <= 1),
+                    "batch {n} card age {age:?}"
+                );
+                previous = snapshot;
+            }
+
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while ctx.app.mesh.digest().is_none() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the todo change regenerated the digest in the turn");
+            assert_eq!(
+                digest.calls.load(Ordering::SeqCst),
+                1,
+                "the later batches fell inside the digest interval"
+            );
+        }
     }
 
     #[test]
@@ -8825,7 +8998,7 @@ local_hello() {\n\
             .concat(),
         );
         let refresh = strip(&["self.envoy.", "refresh(&ctx.app)"].concat());
-        let observe = strip(&["self.digest.", "observe_session(&ctx)"].concat());
+        let observe = strip(&["self.digest.lock().", "observe_session(&ctx)"].concat());
         let envoy_stop = strip(&["self.envoy.", "stop().await;"].concat());
         let mesh_stop = strip(&["if let Err(err) = mesh.", "stop().await"].concat());
         let run_start = strip(&["pub async fn run(", "&mut self)"].concat());

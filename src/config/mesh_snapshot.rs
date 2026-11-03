@@ -64,9 +64,9 @@ pub fn refresh_mesh_snapshot(ctx: &RequestContext) {
 
 /// A progress point inside a turn: a tool batch has completed, which is where the todo
 /// tools, `agent__collect` and `job__collect` run. Refreshes the published snapshot at
-/// most once per `MESH_PROGRESS_MIN_INTERVAL`. Nothing happens for a context that does
-/// not own the session, or before a turn boundary has published the first snapshot:
-/// until then there is no turn state to keep.
+/// most once per `MESH_PROGRESS_MIN_INTERVAL`, then offers the context to the digest
+/// hook. Nothing happens for a context that does not own the session, or before a turn
+/// boundary has published the first snapshot: until then there is no turn state to keep.
 /// Works from the context it is handed and the slot alone, never the turn's lock.
 pub(crate) fn mesh_progress_point(ctx: &RequestContext) {
     mesh_progress_point_at(ctx, Instant::now());
@@ -80,6 +80,9 @@ fn mesh_progress_point_at(ctx: &RequestContext, now: Instant) {
         return;
     }
     refresh_mesh_snapshot(ctx);
+    if let Some(hook) = ctx.app.mesh.digest_hook() {
+        hook.on_progress(ctx);
+    }
 }
 
 #[cfg(test)]

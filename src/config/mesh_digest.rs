@@ -13,11 +13,12 @@ use super::request_context::{
     plan_summarization_chunks, render_summarization_chunk,
 };
 use super::session::KeepPolicy;
+use super::todo::TodoList;
 use super::{Input, RequestContext, RoleLike, SUMMARY_CONTEXT_PROMPT, Session};
 use crate::client::{Message, MessageRole, Model, ModelType};
 use crate::config::mesh_config::MeshBrief;
 use crate::mesh::brief::{DIGEST_MAX_CHARS, Digest, sanitize_block};
-use crate::mesh::{MeshSlot, redact_hashes};
+use crate::mesh::{MeshDigestHook, MeshSlot, redact_hashes};
 
 use anyhow::{Result, anyhow};
 use log::{debug, warn};
@@ -251,6 +252,15 @@ impl Drop for InFlightGuard {
     }
 }
 
+/// A generation the gates let through: the copied request, where to publish it, the
+/// epoch it started under and the in-flight claim it holds until it ends.
+struct PlannedDigest {
+    request: DigestRequest,
+    mesh: Arc<MeshSlot>,
+    epoch: u64,
+    guard: InFlightGuard,
+}
+
 /// What a digest is bound to. The session name alone does not do: every unsaved session
 /// is named `temp` and two agents may each have a session of the same name, so the agent
 /// and the session's mesh instance id (minted when the node is installed, re-minted on
@@ -276,9 +286,10 @@ impl SessionFingerprint {
     }
 }
 
-/// Decides at each REPL turn boundary whether the digest is worth regenerating and runs
-/// the generation on its own task. Held by the REPL, which is the only caller: headless
-/// runs and the ACP server publish snapshots but never digest.
+/// Decides at each REPL turn boundary, and at the progress points inside a turn, whether
+/// the digest is worth regenerating and runs the generation on its own task. Held by the
+/// REPL, which is the only caller: headless runs and the ACP server publish snapshots but
+/// never digest.
 ///
 /// One generation runs at a time; the task handle is kept so exit can abort it rather
 /// than orphan a model call. Each generation also carries the digest epoch it started
@@ -288,12 +299,14 @@ impl SessionFingerprint {
 /// against it and not only against the digest already served. The REPL also reports each
 /// turn's session through `observe_session` under its own guard, since the boundary's
 /// `try_read` is skipped while the idle driver holds the context and a session switch
-/// must not slip past the fence.
+/// must not slip past the fence. `last_todo` is the task list as it stood at the last
+/// attempt, so a changed list is worth a digest even when the transcript has barely grown.
 pub(crate) struct MeshDigestDriver {
     in_flight: Arc<AtomicBool>,
     task: Option<JoinHandle<()>>,
     pending_covered: Option<usize>,
     last_attempt: Option<Instant>,
+    last_todo: TodoList,
     last_session: Option<SessionFingerprint>,
     /// Whether a node must be installed before tokens are spent. Always so in
     /// production; tests that never bring a node up lift it.
@@ -306,7 +319,7 @@ impl MeshDigestDriver {
     }
 
     #[cfg(test)]
-    fn without_node_gate() -> Self {
+    pub(crate) fn without_node_gate() -> Self {
         Self::with_node_required(false)
     }
 
@@ -316,6 +329,7 @@ impl MeshDigestDriver {
             task: None,
             pending_covered: None,
             last_attempt: None,
+            last_todo: TodoList::default(),
             last_session: None,
             node_required,
         }
@@ -324,6 +338,22 @@ impl MeshDigestDriver {
     /// Production entry, called at the REPL Idle turn boundary with no context guard held.
     pub(crate) fn maybe_refresh(&mut self, ctx: &Arc<RwLock<RequestContext>>) {
         self.maybe_refresh_with(ctx, Instant::now(), timed_fetch);
+    }
+
+    /// Production entry at a progress point inside a turn, which already holds the
+    /// context: `maybe_refresh_with` minus the `try_read`.
+    pub(crate) fn maybe_refresh_in_turn<F, Fut>(
+        &mut self,
+        ctx: &RequestContext,
+        now: Instant,
+        fetch: F,
+    ) where
+        F: Fn(Input) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<String>> + Send,
+    {
+        if let Some(planned) = self.plan_from(ctx, now) {
+            self.spawn_generation(planned, now, fetch);
+        }
     }
 
     /// Fences the digest at a session boundary: when the agent or session differs from
@@ -348,7 +378,8 @@ impl MeshDigestDriver {
     /// is never served stale or for another session. Generation is then spawned only when
     /// the mesh is on, the brief is `auto`, the transcript grew by
     /// `MESH_DIGEST_MIN_NEW_MESSAGES` over the served digest (or shrank below what the
-    /// served or the pending digest covers, after a history edit),
+    /// served or the pending digest covers, after a history edit, or the task list
+    /// changed since the last attempt),
     /// `MESH_DIGEST_MIN_INTERVAL` has passed since the last attempt and nothing is in
     /// flight.
     pub(crate) fn maybe_refresh_with<F, Fut>(
@@ -360,9 +391,27 @@ impl MeshDigestDriver {
         F: Fn(Input) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<String>> + Send,
     {
-        let Some((request, mesh, epoch, guard)) = self.plan(ctx, now) else {
+        let Some(ctx) = ctx.try_read() else {
+            debug!("Mesh digest skipped this turn boundary: the session context is busy");
             return;
         };
+        if let Some(planned) = self.plan_from(&ctx, now) {
+            drop(ctx);
+            self.spawn_generation(planned, now, fetch);
+        }
+    }
+
+    fn spawn_generation<F, Fut>(&mut self, planned: PlannedDigest, now: Instant, fetch: F)
+    where
+        F: Fn(Input) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<String>> + Send,
+    {
+        let PlannedDigest {
+            request,
+            mesh,
+            epoch,
+            guard,
+        } = planned;
         self.last_attempt = Some(now);
         self.pending_covered = Some(request.covered_messages);
         self.task = Some(tokio::spawn(async move {
@@ -383,15 +432,8 @@ impl MeshDigestDriver {
         }));
     }
 
-    fn plan(
-        &mut self,
-        ctx: &Arc<RwLock<RequestContext>>,
-        now: Instant,
-    ) -> Option<(DigestRequest, Arc<MeshSlot>, u64, InFlightGuard)> {
-        let Some(ctx) = ctx.try_read() else {
-            debug!("Mesh digest skipped this turn boundary: the session context is busy");
-            return None;
-        };
+    /// The gates both entries share; see `maybe_refresh_with`.
+    fn plan_from(&mut self, ctx: &RequestContext, now: Instant) -> Option<PlannedDigest> {
         let app = &ctx.app;
         // Nobody can fetch the brief while the mesh is off, so a digest would only spend
         // tokens, and one already served or in flight must not outlive the node.
@@ -399,7 +441,7 @@ impl MeshDigestDriver {
             self.clear(&app.mesh);
             return None;
         }
-        self.observe_session(&ctx);
+        self.observe_session(ctx);
         if app.config.mesh.brief != MeshBrief::Auto {
             self.clear(&app.mesh);
             return None;
@@ -416,10 +458,11 @@ impl MeshDigestDriver {
         }
         let grew = len >= covered + MESH_DIGEST_MIN_NEW_MESSAGES;
         let shrunk = len < covered.max(self.pending_covered.unwrap_or(0));
+        let todo_changed = ctx.todo_list != self.last_todo;
         if shrunk {
             self.clear(&app.mesh);
         }
-        if !grew && !shrunk {
+        if !grew && !shrunk && !todo_changed {
             return None;
         }
         if self
@@ -437,8 +480,13 @@ impl MeshDigestDriver {
         }
         let guard = InFlightGuard(Arc::clone(&self.in_flight));
         let request = ctx.mesh_digest_request()?;
-        let epoch = app.mesh.digest_epoch();
-        Some((request, Arc::clone(&app.mesh), epoch, guard))
+        self.last_todo = ctx.todo_list.clone();
+        Some(PlannedDigest {
+            request,
+            mesh: Arc::clone(&app.mesh),
+            epoch: app.mesh.digest_epoch(),
+            guard,
+        })
     }
 
     /// Drops the served digest and the generation in flight under a new epoch, so
@@ -464,10 +512,15 @@ impl MeshDigestDriver {
 
     /// Aborts any generation in flight and waits for its task to finish, so the REPL exits
     /// with no model call still running.
-    pub(crate) async fn shutdown(&mut self) {
-        if let Some(task) = self.task.take() {
-            task.abort();
-            let _ = task.await;
+    /// Takes the task synchronously, so the REPL can release the driver's lock before
+    /// awaiting the abort.
+    pub(crate) fn shutdown(&mut self) -> impl Future<Output = ()> + Send + use<> {
+        let task = self.task.take();
+        async move {
+            if let Some(task) = task {
+                task.abort();
+                let _ = task.await;
+            }
         }
     }
 }
@@ -480,6 +533,18 @@ impl Drop for MeshDigestDriver {
         if let Some(task) = self.task.take() {
             task.abort();
         }
+    }
+}
+
+/// The REPL's driver as the slot's digest hook. A driver already locked by the turn
+/// boundary means this progress point is skipped, never waited for.
+impl MeshDigestHook for parking_lot::Mutex<MeshDigestDriver> {
+    fn on_progress(&self, ctx: &RequestContext) {
+        let Some(mut driver) = self.try_lock() else {
+            debug!("Mesh digest skipped this progress point: the digest driver is busy");
+            return;
+        };
+        driver.maybe_refresh_in_turn(ctx, Instant::now(), timed_fetch);
     }
 }
 
@@ -774,8 +839,8 @@ mod tests {
         let refresh = ["maybe_", "refresh"].concat();
         let driver = ["MeshDigest", "Driver"].concat();
         let turn = ["run_repl_", "command(&mut ctx, self.abort_signal"].concat();
-        let observe = ["digest.observe_", "session("].concat();
-        let shutdown = ["digest.shut", "down().await"].concat();
+        let observe = ["digest.lock().observe_", "session("].concat();
+        let shutdown = ["digest.lock().shut", "down();"].concat();
         let idle_publish = ["idle_", "now()"].concat();
         let idle_stop = ["idle.stop", "().await"].concat();
 
@@ -1234,6 +1299,80 @@ mod tests {
         wait_for_task(&mut driver).await;
         assert_eq!(model.calls(), 2);
         assert_eq!(ctx.read().app.mesh.digest().unwrap().covered_messages, 16);
+    }
+
+    mod in_turn_digest_tests {
+        use super::*;
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_todo_change_regenerates_in_turn_at_most_once_per_interval() {
+            let mut ctx = test_ctx(MeshBrief::Auto);
+            add_n_turns(&mut ctx, 4);
+            let ctx = shared(ctx);
+            let model = Arc::new(FakeModel::default());
+            let mut driver = MeshDigestDriver::without_node_gate();
+            let start = Instant::now();
+            driver.maybe_refresh_with(&ctx, start, model.fetch(FIXED_DIGEST));
+            wait_for_task(&mut driver).await;
+            assert_eq!(model.calls(), 1);
+
+            // The turn holds the context for its whole length; the in-turn entry works
+            // from the guard it is handed.
+            let mut turn = ctx.write();
+            let after_interval = start + MESH_DIGEST_MIN_INTERVAL + Duration::from_secs(1);
+            driver.maybe_refresh_in_turn(&turn, after_interval, model.fetch(FIXED_DIGEST));
+            assert!(
+                driver.task.is_none(),
+                "nothing changed since the last digest"
+            );
+
+            turn.todo_list.add("write the seam");
+            driver.maybe_refresh_in_turn(
+                &turn,
+                start + MESH_DIGEST_MIN_INTERVAL / 2,
+                model.fetch(FIXED_DIGEST),
+            );
+            assert!(driver.task.is_none(), "too soon after the last attempt");
+
+            driver.maybe_refresh_in_turn(&turn, after_interval, model.fetch(FIXED_DIGEST));
+            wait_for_task(&mut driver).await;
+            assert_eq!(model.calls(), 2, "the todo change regenerated the digest");
+
+            turn.mark_todo_done(1);
+            driver.maybe_refresh_in_turn(
+                &turn,
+                after_interval + Duration::from_secs(1),
+                model.fetch(FIXED_DIGEST),
+            );
+            assert!(driver.task.is_none(), "one generation per interval");
+            assert_eq!(model.calls(), 2);
+
+            driver.maybe_refresh_in_turn(
+                &turn,
+                after_interval + MESH_DIGEST_MIN_INTERVAL,
+                model.fetch(FIXED_DIGEST),
+            );
+            wait_for_task(&mut driver).await;
+            assert_eq!(model.calls(), 3);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_busy_driver_skips_the_progress_point() {
+            let mut ctx = test_ctx(MeshBrief::Auto);
+            add_n_turns(&mut ctx, 4);
+            ctx.todo_list.add("write the seam");
+            let hook = Arc::new(parking_lot::Mutex::new(
+                MeshDigestDriver::without_node_gate(),
+            ));
+
+            let held = hook.lock();
+            hook.on_progress(&ctx);
+            assert!(
+                held.task.is_none(),
+                "the hook waited for or bypassed the lock"
+            );
+            assert!(held.last_attempt.is_none());
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
