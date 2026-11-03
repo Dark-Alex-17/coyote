@@ -150,7 +150,7 @@ fn render_card(card: &StatusCard) -> Option<String> {
     sanitize_block(&lines.join("\n"), usize::MAX)
 }
 
-fn render_todo(todo: &TodoList) -> Option<String> {
+pub(crate) fn render_todo(todo: &TodoList) -> Option<String> {
     if todo.goal.trim().is_empty() && todo.todos.is_empty() {
         return None;
     }
