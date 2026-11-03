@@ -2732,7 +2732,8 @@ fn the_enabled_line_names_the_session_entered_later_on_every_surface() {
     prose(
         "Mesh-Commands.md",
         &[
-            "it stays off for the rest of this run; `.mesh on` joins again",
+            "Mesh is off for this session; `.mesh on` joins again.",
+            "`(it stays off for the rest of this run)` before the semicolon",
             "Leaving the mesh: the session that owns this node's instance id is being exited.",
         ],
     );
