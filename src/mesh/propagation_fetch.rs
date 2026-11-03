@@ -3316,6 +3316,7 @@ mod tests {
         use crate::config::Session;
         use crate::mesh::mesh_cache_dir;
         use crate::mesh::node::{MeshRuntime, MeshSlot, NodeOptions};
+        use crate::mesh::propagation_nodes::PropagationNodeTable;
         use crate::mesh::request::network::{request_sent_as, request_went_as};
         use crate::mesh::request::{NAME_HASH_LEN, SizeBranch};
         use crate::mesh::test_support::{
@@ -4208,6 +4209,53 @@ mod tests {
             assert_eq!(outcome, Err(FetchError::Cancelled));
             assert_eq!(sink.count(), 0);
 
+            fake.stop().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_fresh_runtime_fetches_from_the_persisted_node_without_hearing_it_announce() {
+            let fake = FakeNode::listen_with_mtu(TcpServer::DEFAULT_CLIENT_MTU).await;
+            let tmp = TempDir::new("fetch-net-persisted-node");
+            let table_path =
+                mesh_cache_dir(&tmp.path.join("cache")).join("propagation-nodes.json");
+            let persisted = PropagationNodeTable::load(table_path).unwrap();
+            persisted.observe(
+                PropagationNode {
+                    destination: fake.listener.desc,
+                    stamp_cost: 0,
+                    per_transfer_limit_kb: FETCH_TRANSFER_LIMIT_KB,
+                    propagation_enabled: true,
+                },
+                1,
+                SystemTime::now(),
+            );
+            persisted.persist_if_dirty().unwrap();
+
+            let mut session = Session::default();
+            let runtime = MeshRuntime::start(
+                &private_config(fake.listener.port),
+                true,
+                &mut session,
+                mesh_paths(&tmp),
+                NodeOptions::default(),
+            )
+            .await
+            .unwrap();
+            let selected = runtime.propagation_nodes().select().unwrap();
+            assert_eq!(selected.destination.address_hash.to_hex_string(), fake.hex());
+
+            let sink = CountingSink::default();
+            fake.script.reply_with([Value::Array(vec![])]);
+            let report = timeout(FETCH_DEADLINE, runtime.fetch_propagated(&sink))
+                .await
+                .expect("the fetch must finish within FETCH_DEADLINE")
+                .unwrap();
+            assert_eq!(report.node, fake.hex());
+            assert_eq!(report.listed, 0);
+
+            let slot = Arc::new(MeshSlot::default());
+            slot.install(runtime.clone()).unwrap();
+            assert!(slot.stop().await.unwrap());
             fake.stop().await;
         }
     }
