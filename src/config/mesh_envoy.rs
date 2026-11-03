@@ -10628,11 +10628,11 @@ mod tests {
                 [
                     EnvoyTurn {
                         role: EnvoyRole::User,
-                        text: "q ".repeat(200),
+                        text: "q ".repeat(400),
                     },
                     EnvoyTurn {
                         role: EnvoyRole::Assistant,
-                        text: "a ".repeat(200),
+                        text: "a ".repeat(400),
                     },
                 ]
             })
@@ -10688,7 +10688,7 @@ mod tests {
         };
         let extra = tokens(&PEER_IDENTITY).saturating_sub(tokens(&OTHER_IDENTITY));
         assert!(
-            extra >= history_tokens * 9 / 10 + note_tokens,
+            extra >= history_tokens * 9 / 10 + note_tokens && extra >= 10 * note_tokens,
             "resumed {} vs fresh {}: extra {extra}, history {history_tokens}, note {note_tokens}",
             tokens(&PEER_IDENTITY),
             tokens(&OTHER_IDENTITY)
