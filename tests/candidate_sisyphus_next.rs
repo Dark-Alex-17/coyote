@@ -21,6 +21,8 @@
 //! with `GIT_CONFIG_NOSYSTEM=1` and `GIT_CONFIG_GLOBAL` set to the null device,
 //! so neither the caller's agent variables nor its repository, its injected
 //! git config or any system or user git config reach a fixture.
+//! The batteries also drop every `SISYPHUS_GH_*` seam plus `SISYPHUS_CI_SLEEP`
+//! and `SISYPHUS_REVIEW_SLEEP`, so a caller's seams cannot replace theirs.
 //!
 //! Every real-binary run starts from a scratch config dir whose `mcp.json`
 //! defines no server (`{"mcpServers": {}}`), checked before each spawn, so no
@@ -49,7 +51,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const CANDIDATE: &str = "sisyphus-next";
 const CANDIDATE_NAMES: [&str; 2] = ["sisyphus-next", "architect-next"];
-const SMOKE_FLOOR: usize = 251;
+const SMOKE_FLOOR: usize = 482;
 
 fn agents_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents")
@@ -131,6 +133,61 @@ fn without_agent_vars(cmd: &mut Command) {
             cmd.env_remove(key);
         }
     }
+}
+
+const SISYPHUS_SEAMS: &[&str] = &[
+    "SISYPHUS_CI_SLEEP",
+    "SISYPHUS_REVIEW_SLEEP",
+    "SISYPHUS_ASK_OWNER_BIN",
+    "SISYPHUS_SLACK_PING_BIN",
+];
+
+/// The gates run `SISYPHUS_GH_*` commands in place of `gh`, read the CI and
+/// review poll sleeps from the environment and run the owner-question and
+/// Slack-ping binaries named by `SISYPHUS_ASK_OWNER_BIN` and
+/// `SISYPHUS_SLACK_PING_BIN`, so a developer's own seams would replace the
+/// batteries' fixtures.
+fn without_sisyphus_seams(cmd: &mut Command) {
+    without_sisyphus_seams_from(cmd, std::env::vars_os().map(|(key, _)| key));
+}
+
+fn without_sisyphus_seams_from(cmd: &mut Command, names: impl IntoIterator<Item = OsString>) {
+    for name in names {
+        let text = name.to_string_lossy();
+        if text.starts_with("SISYPHUS_GH_") || SISYPHUS_SEAMS.contains(&text.as_ref()) {
+            cmd.env_remove(name);
+        }
+    }
+}
+
+#[test]
+fn sisyphus_seam_scrub_removes_every_seam_and_keeps_the_rest() {
+    let seams = [
+        "SISYPHUS_GH_X",
+        "SISYPHUS_GH_REPLY_CMD",
+        "SISYPHUS_GH_PERM_CMD",
+        "SISYPHUS_CI_SLEEP",
+        "SISYPHUS_REVIEW_SLEEP",
+        "SISYPHUS_ASK_OWNER_BIN",
+        "SISYPHUS_SLACK_PING_BIN",
+    ];
+    let names = seams
+        .iter()
+        .chain(&["SISYPHUS_FAKE_KEEP"])
+        .map(OsString::from);
+    let mut cmd = Command::new("true");
+    without_sisyphus_seams_from(&mut cmd, names);
+    let envs: BTreeMap<OsString, Option<OsString>> = cmd
+        .get_envs()
+        .map(|(k, v)| (k.to_os_string(), v.map(OsStr::to_os_string)))
+        .collect();
+    for seam in seams {
+        assert_eq!(envs.get(OsStr::new(seam)), Some(&None), "{seam}: {envs:?}");
+    }
+    assert!(
+        !envs.contains_key(OsStr::new("SISYPHUS_FAKE_KEEP")),
+        "{envs:?}"
+    );
 }
 
 /// Inherited overrides such as `COYOTE_WORKSPACE_CONFIG_DIR`, `COYOTE_PROVIDER`
@@ -236,7 +293,8 @@ fn without_git_repo_vars(cmd: &mut Command) {
 }
 
 /// A command that runs inside the candidate dir with every path-bearing
-/// variable pointed at the scratch dir and no agent variables inherited.
+/// variable pointed at the scratch dir and no agent variables or gate seams
+/// inherited.
 fn battery(program: &Path, scratch: &TempDirGuard) -> Command {
     let mut cmd = Command::new(program);
     cmd.current_dir(candidate_dir())
@@ -249,6 +307,7 @@ fn battery(program: &Path, scratch: &TempDirGuard) -> Command {
         .env_remove("GRAPH_STATE")
         .env_remove("GRAPH_STATE_FILE");
     without_agent_vars(&mut cmd);
+    without_sisyphus_seams(&mut cmd);
     without_git_repo_vars(&mut cmd);
     cmd.env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null");
@@ -365,6 +424,31 @@ fn smoke_git_scrub_lists_equal_the_wrappers() {
     assert_eq!(smoke_tuple("GIT_CONFIG_PREFIXES"), set(GIT_CONFIG_PREFIXES));
 }
 
+/// smoke_test.py and `battery()` scrub the same named seams, and both drop
+/// the `SISYPHUS_GH_*` commands by prefix rather than by name, so a new gh
+/// seam such as `SISYPHUS_GH_REPLY_CMD` needs no list entry in either.
+#[test]
+fn smoke_scrub_list_matches_the_wrapper_seam_list() {
+    let wrapper: BTreeSet<String> = SISYPHUS_SEAMS.iter().map(|s| s.to_string()).collect();
+    assert_eq!(smoke_tuple("SCRUBBED_SEAMS"), wrapper);
+    let smoke = fs::read_to_string(candidate_dir().join("scripts/smoke_test.py")).unwrap();
+    assert!(
+        smoke.contains("k.startswith(\"SISYPHUS_GH_\")"),
+        "smoke_test.py no longer scrubs SISYPHUS_GH_* by prefix"
+    );
+    let mut cmd = Command::new("true");
+    without_sisyphus_seams_from(&mut cmd, [OsString::from("SISYPHUS_GH_REPLY_CMD")]);
+    let envs: BTreeMap<OsString, Option<OsString>> = cmd
+        .get_envs()
+        .map(|(k, v)| (k.to_os_string(), v.map(OsStr::to_os_string)))
+        .collect();
+    assert_eq!(
+        envs.get(OsStr::new("SISYPHUS_GH_REPLY_CMD")),
+        Some(&None),
+        "{envs:?}"
+    );
+}
+
 /// Config injected through `GIT_CONFIG_COUNT` after the wrapper's own scrub
 /// points the hooks path at a failing pre-commit hook, so the battery's
 /// scratch `git commit` passes only because smoke_test.py drops it.
@@ -422,6 +506,29 @@ fn smoke_battery_ignores_a_user_config_swapped_in_through_the_environment() {
     assert_no_bytecode_under_candidate();
 }
 
+/// Gate seams set after the wrapper's own scrub: failing review, checks and
+/// resolve commands and a review poll sleep. The battery's fixtures set every
+/// seam before reading it, so its env row is what would fail if smoke_test.py
+/// kept one of them.
+#[test]
+fn smoke_battery_drops_seams_injected_through_the_environment() {
+    let Some(python) = python3() else { return };
+    let scratch = scratch_dir("smoke-seams");
+    let output = battery(&python, &scratch)
+        .env("SISYPHUS_GH_REVIEWS_CMD", "exit 7")
+        .env("SISYPHUS_GH_CHECKS_CMD", "exit 7")
+        .env("SISYPHUS_GH_RESOLVE_CMD", "exit 7")
+        .env("SISYPHUS_REVIEW_SLEEP", "5")
+        .arg("scripts/smoke_test.py")
+        .output()
+        .unwrap();
+    let report = transcript(&output);
+    assert!(output.status.success(), "{report}");
+    let (passed, total) = smoke_summary(&String::from_utf8_lossy(&output.stdout));
+    assert_eq!(passed, total, "{report}");
+    assert_no_bytecode_under_candidate();
+}
+
 #[test]
 fn readme_hygiene_row_lists_the_scrubbed_git_variables() {
     let readme = fs::read_to_string(candidate_dir().join("README.md")).unwrap();
@@ -463,6 +570,28 @@ fn readme_hygiene_row_states_the_wrapper_run_isolation() {
                     cache dirs";
     assert!(row.contains(sentence), "missing {sentence:?} in: {row}");
     assert!(row.contains("`tests/candidate_sisyphus_next.rs`"), "{row}");
+}
+
+/// The hygiene row names the seam scrub that smoke_test.py and `battery()`
+/// both apply, the owner-question and Slack-ping binary overrides included.
+#[test]
+fn readme_hygiene_row_states_the_seam_scrub() {
+    let readme = fs::read_to_string(candidate_dir().join("README.md")).unwrap();
+    let row = readme
+        .lines()
+        .find(|l| l.starts_with("| battery env hygiene |"))
+        .expect("README has a battery env hygiene row");
+    let sentence = "The battery also drops every variable starting with `SISYPHUS_GH_` plus \
+                    `SISYPHUS_CI_SLEEP` and `SISYPHUS_REVIEW_SLEEP` at start, so a caller's \
+                    seams cannot replace its fixtures, and the wrapper's `battery()` removes \
+                    the same names";
+    assert!(row.contains(sentence), "missing {sentence:?} in: {row}");
+    for name in ["SISYPHUS_ASK_OWNER_BIN", "SISYPHUS_SLACK_PING_BIN"] {
+        assert!(
+            row.contains(&format!("`{name}`")),
+            "{name} missing from: {row}"
+        );
+    }
 }
 
 /// Hunks in `diff -u old new`, or `None` when the files are identical. A file
@@ -588,6 +717,8 @@ fn session_block_check_passes_under_mikefarah_yq() {
             .any(|l| l.starts_with("ok variables mirror sisyphus")),
         "{report}"
     );
+    let graph_only = "ok variables mirror sisyphus (names + defaults; graph-only: pr_tracking)";
+    assert!(stdout.lines().any(|l| l == graph_only), "{report}");
 }
 
 /// The engine forwards a script-node crash only along `fallback:`, so the
@@ -1035,6 +1166,41 @@ fn build_lock_is_declared_at_the_prose_twins_position() {
     );
 }
 
+/// `pr_tracking` is the candidate's one graph-only variable: declared last
+/// with default `ci`, described with both values and the parent that never
+/// passes `review` down, absent from the prose twin, and named in the
+/// session check's exclusion list.
+#[test]
+fn pr_tracking_is_a_graph_only_variable_declared_last_with_default_ci() {
+    let candidate = variable_list(&candidate_dir().join("graph.yaml"));
+    let last = candidate.last().expect("the candidate declares variables");
+    assert_eq!(
+        last["name"].as_str(),
+        Some("pr_tracking"),
+        "{:?}",
+        names_of(&candidate)
+    );
+    assert_eq!(last["default"].as_str(), Some("ci"), "pr_tracking default");
+    let description = last["description"].as_str().unwrap();
+    for word in ["'ci'", "'review'", "architect-next"] {
+        assert!(
+            description.contains(word),
+            "missing {word:?} in: {description}"
+        );
+    }
+    let prose = variable_list(&agents_dir().join("sisyphus/config.yaml"));
+    assert!(
+        !names_of(&prose).contains(&"pr_tracking"),
+        "the prose sisyphus declares pr_tracking: {:?}",
+        names_of(&prose)
+    );
+    let check = fs::read_to_string(candidate_dir().join("scripts/check_session_block.sh")).unwrap();
+    assert!(
+        check.lines().any(|l| l == "GRAPH_ONLY_VARS='pr_tracking'"),
+        "check_session_block.sh does not list pr_tracking as graph-only"
+    );
+}
+
 /// The gates stay project-agnostic: no script or graph prompt names a
 /// toolchain command (verification commands come from the brief). The smoke
 /// battery's fixtures are the one place such words may appear.
@@ -1206,6 +1372,148 @@ fn smoke_summary_and_exit_code_cover_a_check_recorded_last() {
         !broken.status.success(),
         "a failure recorded last must fail the battery:\n{report}"
     );
+}
+
+/// Each guard in gates.py, removed from a scratch copy, turns its smoke row
+/// red: the trust filter (every association the fixtures use counts as
+/// trusted), the remote-head check before resolving, the post-flip gate on
+/// the CI poll ceiling, the reply before each resolve, the trusted author of
+/// an own comment, the crashed-poll count toward `pr_review_polls`, the
+/// crashed-`ci_poll` read failure in `ci_route`, the `CI_LOG_RUNS_MAX` cap on
+/// flake re-runs, the stale CI status reset after resolving, the seen-id
+/// split of a mixed-author thread, read access left out of
+/// `TRUSTED_PERMISSIONS`, the CHANGES_REQUESTED check in the approval
+/// fallback and a failed permission read cached as untrusted rather than
+/// retried.
+#[test]
+fn smoke_rows_go_red_under_the_recorded_sabotages() {
+    let Some(python) = python3() else { return };
+    let sabotages = [
+        (
+            "trust",
+            "TRUSTED_ASSOCIATIONS = (\"OWNER\", \"MEMBER\", \"COLLABORATOR\")",
+            "TRUSTED_ASSOCIATIONS = (\"OWNER\", \"MEMBER\", \"COLLABORATOR\", \"CONTRIBUTOR\", \
+             \"FIRST_TIME_CONTRIBUTOR\", \"NONE\")",
+            "pr_tracking review: untrusted thread, review and comment -> pr_review_untrusted \
+             without a body key",
+        ),
+        (
+            "head",
+            "    if not head or remote != head:\n",
+            "    if False:\n",
+            "pr_tracking review: pr_review_resolve on a head mismatch -> push_unconfirmed, \
+             nothing replied or resolved",
+        ),
+        (
+            "ceiling",
+            "if _watch_started(state) and u[\"ci_polls_run\"] >= REVIEW_CI_POLL_CEILING:",
+            "if u[\"ci_polls_run\"] >= REVIEW_CI_POLL_CEILING:",
+            "pr_tracking review: ci_poll before the flip counts in ci_polls_run but never \
+             poll_caps",
+        ),
+        (
+            "reply-first",
+            "        elif not _reply_thread(state, tid, f\"Addressed in {head}\\n\\n{OWN_MARKER}\"):\n            \
+             reply_failed.append(tid)\n",
+            "",
+            "pr_tracking review: pr_review_resolve replies then resolves a fix thread and only \
+             replies to a skip thread",
+        ),
+        (
+            "own-author",
+            "return association in TRUSTED_ASSOCIATIONS and (",
+            "return True and (",
+            "pr_tracking review: an untrusted comment with the own marker is not own: untrusted, \
+             no body",
+        ),
+        (
+            "crashed-poll",
+            "        u[\"pr_review_polls\"] = as_int(state.get(\"pr_review_polls\")) + 1\n",
+            "        u[\"pr_review_polls\"] = as_int(state.get(\"pr_review_polls\"))\n",
+            "pr_tracking review: a crashed poll increments pr_review_polls",
+        ),
+        (
+            "ci-crash",
+            "    crashed = _review_mode(state) and bool(state.get(\"last_script_error\"))\n",
+            "    crashed = False\n",
+            "pr_tracking review: a stale green after a ci_poll node error is one read failure and \
+             a retry",
+        ),
+        (
+            "rerun-cap",
+            "rerun_ids = run_ids[:CI_LOG_RUNS_MAX]",
+            "rerun_ids = run_ids",
+            "pr_tracking review: ci_apply flake re-runs and charges at most CI_LOG_RUNS_MAX runs \
+             and ledgers the rest",
+        ),
+        (
+            "status-reset",
+            "    u[\"pr_review_pending\"] = []\n    u.update({\"ci_polls\": 0, \"ci_poll_fails\": 0, \
+             \"ci_started_at\": int(time.time()), \"ci_status\": \"\",",
+            "    u[\"pr_review_pending\"] = []\n    u.update({\"ci_polls\": 0, \"ci_poll_fails\": 0, \
+             \"ci_started_at\": int(time.time()), \"ci_status\": state.get(\"ci_status\", \"\"),",
+            "pr_tracking review: pr_review_resolve resets ci_status and ci_failing",
+        ),
+        (
+            "mixed-thread",
+            "entry = {**thread, \"url\": \"\", \"seen_ids\": stranger_ids}",
+            "entry = {**thread, \"url\": \"\", \"seen_ids\": [c.get(\"id\") for c in t.get(\"comments\") \
+             or []]}",
+            "pr_tracking review: a re-poll after the untrusted skip still yields the untriaged \
+             trusted request, not the stranger",
+        ),
+        (
+            "read-permission",
+            "TRUSTED_PERMISSIONS = (\"admin\", \"maintain\", \"write\")",
+            "TRUSTED_PERMISSIONS = (\"admin\", \"maintain\", \"write\", \"read\")",
+            "pr_tracking review: a COLLABORATOR with read permission is untrusted: body withheld",
+        ),
+        (
+            "approval-veto",
+            "approved = \"APPROVED\" in latest.values() and \"CHANGES_REQUESTED\" not in \
+             latest.values()",
+            "approved = \"APPROVED\" in latest.values()",
+            "pr_tracking review: author A APPROVED and author B CHANGES_REQUESTED, no \
+             reviewDecision, does not approve",
+        ),
+        (
+            "failed-permission",
+            "        perms[login] = word in TRUSTED_PERMISSIONS\n",
+            "        perms[login] = (word in TRUSTED_PERMISSIONS) if word else None\n",
+            "pr_tracking review: three failing permission reads -> all untrusted within one poll, \
+             each cached False",
+        ),
+    ];
+    for (label, old, new, row) in sabotages {
+        let scratch = scratch_dir(&format!("sabotage-{label}"));
+        let copy = scratch_candidate_copy(&scratch);
+        let gates = copy.join("scripts").join("gates.py");
+        let text = fs::read_to_string(&gates).unwrap();
+        assert_eq!(
+            text.matches(old).count(),
+            1,
+            "{label}: {old:?} must occur exactly once in gates.py"
+        );
+        fs::write(&gates, text.replacen(old, new, 1)).unwrap();
+        let output = battery(&python, &scratch)
+            .current_dir(&copy)
+            .arg("scripts/smoke_test.py")
+            .output()
+            .unwrap();
+        let report = transcript(&output);
+        assert!(
+            !output.status.success(),
+            "{label}: the battery passed with the guard removed:\n{report}"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let fail = format!("FAIL {row}");
+        assert!(
+            stdout.lines().any(|l| l
+                .strip_prefix(&fail)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with("  ("))),
+            "{label}: no `{fail}` line:\n{report}"
+        );
+    }
 }
 
 /// The shipped `debt_scan` node lifted verbatim into a two-node graph with
@@ -2338,7 +2646,8 @@ const FROZEN_GRAPH_BOUNDS: &[(&str, i64)] = &[
 ];
 
 /// Every integer field of every node in the staging baseline (`timeout`,
-/// `max_attempts`, `max_iterations`); a node absent here declares none.
+/// `max_attempts`, `max_iterations`) plus the review-watch nodes; a node
+/// absent here declares none.
 const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("architecture_review", "max_attempts", 1),
     ("architecture_review", "timeout", 3600),
@@ -2350,9 +2659,10 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("build_gauntlet_prompt", "timeout", 60),
     ("check_inbox_final", "timeout", 300),
     ("check_inbox_pre", "timeout", 300),
-    ("ci_apply", "timeout", 120),
+    ("ci_apply", "timeout", 300),
     ("ci_diagnose", "timeout", 600),
-    ("ci_poll", "timeout", 120),
+    ("ci_poll", "timeout", 180),
+    ("ci_route", "timeout", 300),
     ("compose_brief", "timeout", 600),
     ("consult_navigator", "max_attempts", 1),
     ("consult_navigator", "timeout", 1800),
@@ -2379,6 +2689,11 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("oracle_strikeout", "timeout", 1800),
     ("plan_research", "timeout", 300),
     ("plan_subtasks", "timeout", 600),
+    ("pr_review_apply", "timeout", 120),
+    ("pr_review_poll", "timeout", 900),
+    ("pr_review_reply", "timeout", 600),
+    ("pr_review_resolve", "timeout", 600),
+    ("pr_review_triage", "timeout", 600),
     ("research_answer", "max_iterations", 45),
     ("research_answer", "timeout", 3600),
     ("run_coder", "max_attempts", 1),
@@ -2404,6 +2719,7 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
     "ci_fix_strikes",
     "ci_poll_fails",
     "ci_polls",
+    "ci_polls_run",
     "ci_started_at",
     "clarify_rounds",
     "debris_reruns",
@@ -2414,6 +2730,11 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
     "obs_rounds",
     "oracle_retries",
     "owner_polls",
+    "pr_review_poll_fails",
+    "pr_review_polls",
+    "pr_review_rounds",
+    "pr_review_started_at",
+    "pr_review_watch_polls",
     "reask_rounds",
     "rejected_rounds",
     "review_rounds",
@@ -2423,18 +2744,29 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
 ];
 
 /// The bound constants in `scripts/_lib.py` the gates route on (the
-/// re-run-once family covers `debris_reruns`), as written in the baseline.
+/// re-run-once family covers `debris_reruns`), as written in the baseline,
+/// plus the review-watch bounds.
 const FROZEN_SCRIPT_BOUNDS: &[(&str, &str)] = &[
     ("CI_FLAKE_RERUNS", "2"),
+    ("CI_LOG_RUNS_MAX", "3"),
     ("CI_POLL_FAILS", "3"),
     ("CI_POLL_SLEEP", "60"),
     ("CI_WALL_SECS", "14400"),
     ("CLARIFY_MAX", "STRIKE_LIMIT"),
+    ("GH_CALL_SECS", "90"),
     ("OWNER_POLL_MAX", "2"),
     ("OWNER_POLL_MINUTES", "25"),
     ("OWNER_WAIT_MINUTES", "30"),
     ("REASK_MAX", "STRIKE_LIMIT"),
     ("RERUN_ONCE", "1"),
+    ("RESOLVE_DEADLINE_SECS", "480"),
+    ("REVIEW_CI_POLL_BUDGET", "60"),
+    ("REVIEW_CI_POLL_CEILING", "90"),
+    ("REVIEW_MAX_POLLS", "80"),
+    ("REVIEW_MAX_ROUNDS", "STRIKE_LIMIT"),
+    ("REVIEW_PERM_SECS", "120"),
+    ("REVIEW_POLL_SLEEP", "600"),
+    ("REVIEW_WALL_SECS", "REVIEW_MAX_POLLS * REVIEW_POLL_SLEEP"),
     ("STRIKE_LIMIT", "3"),
     ("SUBTASK_MAX", "3"),
     ("TAIL_CHARS", "6000"),
@@ -2552,6 +2884,174 @@ fn graph_and_gate_budgets_equal_the_frozen_baseline() {
     );
 }
 
+/// The integer value of a `_lib.py` constant whose right-hand side is an
+/// integer literal or the name of another such constant.
+fn lib_constant(lib: &str, name: &str) -> i64 {
+    let prefix = format!("{name} = ");
+    let value = lib
+        .lines()
+        .find_map(|l| l.strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("_lib.py assigns no {name}"))
+        .split('#')
+        .next()
+        .unwrap()
+        .trim();
+    value.parse().unwrap_or_else(|_| lib_constant(lib, value))
+}
+
+/// The engine caps the visits to each node at `settings.max_loop_iterations`,
+/// so review mode has to reach its own caps first: the review poll budget
+/// with the round cap and one visit to spare on `pr_review_poll`, and on
+/// `ci_poll` the run-wide CI poll ceiling, with the budget past which no fix
+/// round starts below that ceiling. The ceiling bounds the `ci_poll` visits
+/// because review mode counts every visit into `ci_polls_run` from the first
+/// poll of the run, and a first post-flip poll that finds the count at the
+/// ceiling caps at once. Only these review-mode bounds are checked; ci mode
+/// puts no run-wide cap on `ci_poll`.
+#[test]
+fn review_watch_caps_stay_below_the_per_node_visit_cap() {
+    let lib = fs::read_to_string(candidate_dir().join("scripts/_lib.py")).unwrap();
+    let polls = lib_constant(&lib, "REVIEW_MAX_POLLS");
+    let rounds = lib_constant(&lib, "REVIEW_MAX_ROUNDS");
+    let ci_budget = lib_constant(&lib, "REVIEW_CI_POLL_BUDGET");
+    let ci_ceiling = lib_constant(&lib, "REVIEW_CI_POLL_CEILING");
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let shipped: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let cap = shipped["settings"]["max_loop_iterations"]
+        .as_i64()
+        .expect("settings.max_loop_iterations is an integer");
+    assert!(
+        polls + rounds + 1 < cap,
+        "REVIEW_MAX_POLLS {polls} + REVIEW_MAX_ROUNDS {rounds} + 1 reaches the cap {cap}"
+    );
+    assert!(
+        ci_budget < cap,
+        "REVIEW_CI_POLL_BUDGET {ci_budget} reaches the cap {cap}"
+    );
+    assert!(
+        ci_ceiling < cap,
+        "REVIEW_CI_POLL_CEILING {ci_ceiling} reaches the cap {cap}, so ci_poll visits counted \
+         from the first poll could hit the engine cap first"
+    );
+    assert!(
+        ci_budget < ci_ceiling,
+        "REVIEW_CI_POLL_BUDGET {ci_budget} is not below REVIEW_CI_POLL_CEILING {ci_ceiling}"
+    );
+}
+
+/// A poll node sleeps and then makes one gh call bounded by `GH_CALL_SECS`,
+/// `pr_review_poll` also spends up to `REVIEW_PERM_SECS` on permission
+/// reads, `pr_review_resolve` and `pr_review_reply` start no call past
+/// `RESOLVE_DEADLINE_SECS`, and
+/// `ci_route` and `ci_apply` make one gh call per distinct CI run, up to
+/// `CI_LOG_RUNS_MAX`, so each node timeout has to exceed that worst case or
+/// the engine kills the node mid-call.
+#[test]
+fn poll_node_timeouts_cover_the_sleep_and_one_gh_call() {
+    let lib = fs::read_to_string(candidate_dir().join("scripts/_lib.py")).unwrap();
+    let gh_call = lib_constant(&lib, "GH_CALL_SECS");
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let shipped: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let timeout = |node: &str| {
+        shipped["nodes"][node]["timeout"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("{node} has an integer timeout"))
+    };
+    for (node, wait) in [
+        ("ci_poll", "CI_POLL_SLEEP"),
+        ("pr_review_poll", "REVIEW_POLL_SLEEP"),
+        ("pr_review_resolve", "RESOLVE_DEADLINE_SECS"),
+        ("pr_review_reply", "RESOLVE_DEADLINE_SECS"),
+    ] {
+        let secs = lib_constant(&lib, wait);
+        let limit = timeout(node);
+        assert!(
+            limit > secs + gh_call,
+            "{node} timeout {limit} does not exceed {wait} {secs} + GH_CALL_SECS {gh_call}"
+        );
+    }
+    let sleep = lib_constant(&lib, "REVIEW_POLL_SLEEP");
+    let perm = lib_constant(&lib, "REVIEW_PERM_SECS");
+    let limit = timeout("pr_review_poll");
+    assert!(
+        limit > sleep + gh_call + perm,
+        "pr_review_poll timeout {limit} does not exceed REVIEW_POLL_SLEEP {sleep} + GH_CALL_SECS \
+         {gh_call} + REVIEW_PERM_SECS {perm}"
+    );
+    let runs = lib_constant(&lib, "CI_LOG_RUNS_MAX");
+    for node in ["ci_route", "ci_apply"] {
+        let limit = timeout(node);
+        assert!(
+            limit > runs * gh_call,
+            "{node} timeout {limit} does not exceed CI_LOG_RUNS_MAX {runs} * GH_CALL_SECS {gh_call}"
+        );
+    }
+}
+
+/// Each `subprocess.run(...)` call in `source` as its 1-based line number and
+/// the call text up to the matching close paren. Parens inside string
+/// literals and comments do not count.
+fn subprocess_run_calls(source: &str) -> Vec<(usize, &str)> {
+    let needle = "subprocess.run(";
+    let mut calls = Vec::new();
+    for (at, _) in source.match_indices(needle) {
+        let (mut depth, mut quote, mut escaped, mut comment) = (0usize, None, false, false);
+        let mut end = None;
+        for (offset, c) in source[at + needle.len() - 1..].char_indices() {
+            if comment {
+                comment = c != '\n';
+            } else if let Some(q) = quote {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == q {
+                    quote = None;
+                }
+            } else if c == '"' || c == '\'' {
+                quote = Some(c);
+            } else if c == '#' {
+                comment = true;
+            } else if c == '(' {
+                depth += 1;
+            } else if c == ')' {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(at + needle.len() + offset);
+                    break;
+                }
+            }
+        }
+        let line = source[..at].matches('\n').count() + 1;
+        let end = end.unwrap_or_else(|| panic!("gates.py:{line}: unbalanced subprocess.run call"));
+        calls.push((line, &source[at..end]));
+    }
+    calls
+}
+
+/// The node timeouts above assume no gh call outlives `GH_CALL_SECS`, so
+/// every `gh` call and every shell-run seam standing in for one has to pass
+/// that timeout.
+#[test]
+fn every_gh_and_seam_run_in_gates_carries_the_gh_call_timeout() {
+    let gates = fs::read_to_string(candidate_dir().join("scripts/gates.py")).unwrap();
+    let gh_calls: Vec<(usize, &str)> = subprocess_run_calls(&gates)
+        .into_iter()
+        .filter(|(_, call)| call.contains("\"gh\"") || call.contains("shell=True"))
+        .collect();
+    assert!(
+        gh_calls.len() >= 10,
+        "the scan found only {} gh or seam calls in gates.py",
+        gh_calls.len()
+    );
+    for (line, call) in gh_calls {
+        assert!(
+            call.contains("timeout=GH_CALL_SECS"),
+            "gates.py:{line}: a gh or seam call without timeout=GH_CALL_SECS: {call}"
+        );
+    }
+}
+
 /// How each llm node's output schema carries the `anomalies` channel in the
 /// staging baseline: `Plain` and `Described` are the two property shapes,
 /// `NoSchema` is a node with no `output_schema` at all.
@@ -2575,6 +3075,7 @@ const FROZEN_LLM_ANOMALIES: &[(&str, AnomaliesChannel)] = &[
     ("observability_pass", AnomaliesChannel::Plain),
     ("plan_research", AnomaliesChannel::Plain),
     ("plan_subtasks", AnomaliesChannel::Plain),
+    ("pr_review_triage", AnomaliesChannel::Plain),
     ("research_answer", AnomaliesChannel::NoSchema),
     ("send_breach_notice", AnomaliesChannel::NoSchema),
     ("summarize_run", AnomaliesChannel::NoSchema),
@@ -3227,9 +3728,123 @@ fn readme_ci_budget_row_separates_per_watch_from_per_run_counters() {
     for sentence in [
         "Per-watch budgets are `ci_polls`, `ci_poll_fails` and `ci_started_at`: they reset every time a watch starts (`ci_gate`, the owner's re-run answer, a flake re-run).",
         "Per-run budgets are `ci_reruns` (per check, `CI_FLAKE_RERUNS`) and `ci_fix_strikes` (`STRIKE_LIMIT`).",
+        "With `pr_tracking` set to `review`, the review watch adds the per-watch budgets `pr_review_watch_polls` and `pr_review_poll_fails`, reset at each watch start, and the per-run budgets `pr_review_polls` (`REVIEW_MAX_POLLS`), `pr_review_started_at` (`REVIEW_WALL_SECS`), `pr_review_rounds` (`REVIEW_MAX_ROUNDS`) and `ci_polls_run` (`REVIEW_CI_POLL_BUDGET`).",
+        "`ci_fix_strikes` stays per run across review rounds",
     ] {
         assert!(row.contains(sentence), "missing {sentence:?} in {row}");
     }
+}
+
+/// The review-watch row names every stop status, every escalation kind, the
+/// seams, each `REVIEW_*` bound exactly as the frozen bounds record it, the
+/// trust boundary on commenters, the run-wide CI poll count, the escalation
+/// channel with no remote owner input, the rule that keeps a delegated run and a
+/// parent's task sisyphus out of the watch, and the engine facts that make
+/// the watch an in-graph loop; those engine facts are checked against the
+/// source files the row cites. The resolve seam is no longer described as
+/// standing in for the reply call.
+#[test]
+fn readme_pr_tracking_row_names_the_loop_stops_and_parent_rule() {
+    let readme = fs::read_to_string(candidate_dir().join("README.md")).unwrap();
+    let section = readme
+        .split("\n## ")
+        .find(|s| s.starts_with("Landed-upstream adjustments"))
+        .expect("README has a Landed-upstream adjustments section");
+    let row = section
+        .lines()
+        .find(|l| l.starts_with("| pr_tracking review watch |"))
+        .unwrap_or_else(|| panic!("missing pr_tracking review watch row:\n{section}"));
+    let names = [
+        "approved",
+        "closed",
+        "merged",
+        "wall_cap",
+        "round_cap",
+        "owner_judgment",
+        "poll_error",
+        "truncated",
+        "pr_review_closed",
+        "pr_review_exhausted",
+        "pr_review_round_cap",
+        "pr_review_owner_judgment",
+        "ci_exhausted",
+        "ci_infra",
+        "ci_poll_cap",
+        "pr_review_push_unconfirmed",
+        "SISYPHUS_GH_REVIEWS_CMD",
+        "SISYPHUS_GH_RESOLVE_CMD",
+        "SISYPHUS_GH_HEAD_CMD",
+        "SISYPHUS_GH_RUN_LOG_CMD",
+        "SISYPHUS_GH_RERUN_CMD",
+        "SISYPHUS_REVIEW_SLEEP",
+        "SISYPHUS_GH_REPLY_CMD",
+        "SISYPHUS_GH_PERM_CMD",
+        "pr_review_truncated",
+        "pr_review_perms",
+        "pr_review_reply",
+        "RESOLVE_DEADLINE_SECS = 480",
+        "REVIEW_PERM_SECS",
+    ];
+    for name in names {
+        assert!(
+            row.contains(&format!("`{name}`")),
+            "{name} missing from: {row}"
+        );
+    }
+    for (name, value) in FROZEN_SCRIPT_BOUNDS
+        .iter()
+        .filter(|(n, _)| n.starts_with("REVIEW_"))
+    {
+        let bound = format!("`{name} = {value}`");
+        assert!(row.contains(&bound), "missing {bound} in: {row}");
+    }
+    let parent = "a delegated run never starts the watch";
+    assert!(row.contains(parent), "missing {parent:?} in: {row}");
+    let architect = "architect-next does not pass `pr_tracking=review` to its task sisyphus";
+    assert!(row.contains(architect), "missing {architect:?} in: {row}");
+    let trust = "Only comments from trusted accounts reach triage and the coder; every other \
+                 account's comments are ledgered and escalated to the owner as \
+                 `pr_review_owner_judgment` with their bodies withheld, answerable only with \
+                 skip or stop, and this is enforced in `gates.py`, not by the prompt.";
+    assert!(row.contains(trust), "missing {trust:?} in: {row}");
+    let permission = "`gh api repos/{owner}/{repo}/collaborators/{login}/permission`";
+    assert!(row.contains(permission), "missing {permission:?} in: {row}");
+    let stranger = "A stranger's approval never ends the watch";
+    assert!(row.contains(stranger), "missing {stranger:?} in: {row}");
+    let stale = "in place of the reply and resolve calls";
+    assert!(!row.contains(stale), "stale {stale:?} in: {row}");
+    let ceiling = "In review mode `ci_polls_run` counts every CI poll of the run, the polls \
+                   before the flip and the crashed polls that `ci_route` counts included; the \
+                   `REVIEW_CI_POLL_CEILING` cap applies only once the watch has started \
+                   (`_watch_started`), and at once on the first poll after the flip if the \
+                   count is already at the ceiling";
+    assert!(row.contains(ceiling), "missing {ceiling:?} in: {row}");
+    let owner = "Upstream `OWNER_REMOTE_INPUT` is False, so `ask_owner_poll` never runs: a \
+                 stop reaches the parent orchestrator through `ask_user` when the run is a \
+                 child, and the owner through the terminal `ask_user` at the top level.";
+    assert!(row.contains(owner), "missing {owner:?} in: {row}");
+    let lib = fs::read_to_string(candidate_dir().join("scripts/_lib.py")).unwrap();
+    assert!(
+        lib.lines()
+            .any(|l| l.starts_with("OWNER_REMOTE_INPUT = False")),
+        "_lib.py no longer sets OWNER_REMOTE_INPUT = False"
+    );
+    let design = "a graph node cannot keep a background child past the node: \
+                  `src/graph/llm.rs` reaps node-local jobs (`reap_jobs`) on every llm node \
+                  exit, and the unreclaimed-task guardrail in `src/function/agents.rs` cancels \
+                  the spawned agents a turn leaves behind";
+    assert!(row.contains(design), "missing {design:?} in: {row}");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let llm = fs::read_to_string(root.join("src/graph/llm.rs")).unwrap();
+    assert!(
+        llm.contains("reap_jobs("),
+        "src/graph/llm.rs no longer calls reap_jobs"
+    );
+    let agents = fs::read_to_string(root.join("src/function/agents.rs")).unwrap();
+    assert!(
+        agents.contains("unreclaimed"),
+        "src/function/agents.rs no longer carries the unreclaimed-task guardrail"
+    );
 }
 
 /// Every entry shim dispatches `run("<its own stem>")`, that name is a key of
