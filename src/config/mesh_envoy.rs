@@ -1931,8 +1931,7 @@ mod tests {
             .join(" ");
         assert_eq!(question.chars().count(), 359);
         assert_eq!(question.chars().nth(PEER_LINE_MAX_CHARS), Some('0'));
-        let line =
-            escalation_line("alice", &question, "0123456789abcdef0123456789abcdef").plain();
+        let line = escalation_line("alice", &question, "0123456789abcdef0123456789abcdef").plain();
         let kept = (0..13)
             .map(|i| format!("word{i:07}"))
             .collect::<Vec<_>>()
@@ -4163,7 +4162,10 @@ mod tests {
             .position(|note| note.text.plain() == expiry)
             .unwrap_or_else(|| panic!("the expired row is announced: {pushed:?}"));
         assert_eq!(
-            pushed.iter().filter(|note| note.text.plain() == expiry).count(),
+            pushed
+                .iter()
+                .filter(|note| note.text.plain() == expiry)
+                .count(),
             1,
             "the displaced row is announced once: {pushed:?}"
         );

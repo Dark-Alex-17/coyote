@@ -549,7 +549,10 @@ mod peer_text_prefix_tests {
             &hex_lower(&[0xbb; 16]),
             own,
         )));
-        assert_eq!(with_prose_hints(silent.clone(), CommandPrefix::Slash), silent);
+        assert_eq!(
+            with_prose_hints(silent.clone(), CommandPrefix::Slash),
+            silent
+        );
     }
 }
 

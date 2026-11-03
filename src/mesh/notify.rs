@@ -210,7 +210,10 @@ impl Notification {
     /// prefix so the event is never silent.
     #[cfg(test)]
     pub(crate) fn render_lines(&self) -> Vec<String> {
-        self.render_spans().iter().map(|line| joined(line)).collect()
+        self.render_spans()
+            .iter()
+            .map(|line| joined(line))
+            .collect()
     }
 
     fn render_spans(&self) -> Vec<Vec<NoticeSpan>> {

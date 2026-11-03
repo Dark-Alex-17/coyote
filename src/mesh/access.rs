@@ -1625,12 +1625,18 @@ mod peer_text_prefix_tests {
         let rendered = Notification::new(Source::Access, text).render();
         let lines = rendered.render_notification_lines(CommandPrefix::Slash);
         assert_eq!(lines[0], "[mesh:access] \".session\" asks for 1 path:");
-        assert!(lines[1].starts_with("[mesh:access] `.vault` ("), "{lines:?}");
+        assert!(
+            lines[1].starts_with("[mesh:access] `.vault` ("),
+            "{lines:?}"
+        );
         assert_eq!(
             lines[2],
             "[mesh:access] reason: \"need .vault and run .mesh grant a-1 --standing\"; grant: /mesh grant a-1 [--standing] | refuse: /mesh refuse a-1"
         );
-        assert_eq!(rendered.render_notification_lines(CommandPrefix::Dot), rendered.lines());
+        assert_eq!(
+            rendered.render_notification_lines(CommandPrefix::Dot),
+            rendered.lines()
+        );
     }
 }
 

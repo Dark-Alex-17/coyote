@@ -80,7 +80,8 @@ fn quoted_text<'a>(link: &'a (dyn std::error::Error + 'static)) -> Option<&'a No
     if let Some(verb) = link.downcast_ref::<MeshVerbError>() {
         return quoted_text(verb.0.as_ref());
     }
-    link.downcast_ref::<QuotingError>().map(|quoting| &quoting.0)
+    link.downcast_ref::<QuotingError>()
+        .map(|quoting| &quoting.0)
 }
 
 /// Marks an error the `.mesh` verb raised. Display and source pass straight through, so
@@ -114,7 +115,7 @@ impl std::error::Error for MeshVerbError {
 pub(crate) struct QuotingError(NoticeText);
 
 impl QuotingError {
-    pub(crate) fn new(text: NoticeText) -> anyhow::Error {
+    pub(crate) fn wrap(text: NoticeText) -> anyhow::Error {
         anyhow::Error::new(Self(text))
     }
 }

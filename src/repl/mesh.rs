@@ -51,8 +51,8 @@ use crate::mesh::{
     canonicalize, decode_hex, destination_address, display_text, hex_lower, human_size,
     loopback_endpoint, parse_rfc3339, redact_hashes, refuse_symlink, rfc3339_utc, short, span_text,
 };
-use crate::repl::printer::terminal_width;
 use crate::render::QuotingError;
+use crate::repl::printer::terminal_width;
 use crate::supervisor::mailbox::EnvelopePayload;
 use crate::utils::{
     AbortSignal, NO_COLOR, drain_stale_tty_input, home_relative, tool_name_text_forced,
@@ -4635,7 +4635,7 @@ fn refuse_unservable(
 /// The requested path is the peer's text, quoted as it wrote it; the remedy is this
 /// node's own and follows the prefix.
 fn unservable(shown: String, why: impl std::fmt::Display, id: &str) -> anyhow::Error {
-    QuotingError::new(NoticeText::default().peer(shown).frame(format!(
+    QuotingError::wrap(NoticeText::default().peer(shown).frame(format!(
         " would not be served even once granted ({why}); refuse the request with `.mesh refuse {id}`, or lift the rule first."
     )))
 }
@@ -4646,7 +4646,7 @@ fn no_share_rule(
     global: impl std::fmt::Display,
     workspace: impl std::fmt::Display,
 ) -> anyhow::Error {
-    QuotingError::new(
+    QuotingError::wrap(
         NoticeText::default()
             .frame("No share rule has the pattern `")
             .peer(pattern)
@@ -4673,7 +4673,11 @@ mod peer_text_prefix_tests {
     #[test]
     fn a_grant_refused_over_a_bare_vault_keeps_the_path_and_slashes_the_hint() {
         for err in [
-            unservable(listed_paths(&[".vault".to_string()]), "a deny rule names it", "a-1"),
+            unservable(
+                listed_paths(&[".vault".to_string()]),
+                "a deny rule names it",
+                "a-1",
+            ),
             unservable(
                 listed_paths(&[".vault".to_string()]),
                 "it is not a regular file",
@@ -4892,7 +4896,7 @@ fn shown_refusal(refusal: &str) -> String {
 /// A `.mesh` error that quotes a share file refused at load; the file's words keep
 /// their bytes whatever the prefix.
 fn refused_at_load(refusal: &str, tail: &str) -> anyhow::Error {
-    QuotingError::new(
+    QuotingError::wrap(
         NoticeText::default()
             .peer(shown_refusal(refusal))
             .frame(tail),

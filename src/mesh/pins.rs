@@ -1013,9 +1013,10 @@ mod tests {
                 || ["stdout", "stderr"].iter().any(|handle| {
                     at_word_boundary(code, handle).any(|at| {
                         let rest = &code[at + handle.len()..];
-                        let named = !rest
-                            .starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_');
-                        let acquired = rest.starts_with("()") && !rest.starts_with("().is_terminal()");
+                        let named =
+                            !rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_');
+                        let acquired =
+                            rest.starts_with("()") && !rest.starts_with("().is_terminal()");
                         acquired || (named && code.starts_with("use "))
                     })
                 })
@@ -1132,11 +1133,7 @@ mod tests {
                     "use std::io::stderr as quiet;\nfn show() {\n    let _ = quiet;\n}\n",
                     1,
                 ),
-                (
-                    REPL,
-                    "use std::io::{Write, stdout};\nfn show() {}\n",
-                    1,
-                ),
+                (REPL, "use std::io::{Write, stdout};\nfn show() {}\n", 1),
                 (
                     REPL,
                     "fn show(err: Error) {\n    render_error(err);\n}\n",
@@ -1212,7 +1209,10 @@ mod tests {
                     REPL,
                     "fn coloured() -> bool {\n    std::io::stderr().is_terminal()\n}\n",
                 ),
-                (REPL, "use crate::utils::stderr_error_text;\nfn quiet() {}\n"),
+                (
+                    REPL,
+                    "use crate::utils::stderr_error_text;\nfn quiet() {}\n",
+                ),
                 (
                     "src/render/mod.rs",
                     "pub fn render_error(err: anyhow::Error) {\n    eprintln!(\"{}\", pretty_error(&err));\n}\n",

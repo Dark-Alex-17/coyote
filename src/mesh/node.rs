@@ -4609,12 +4609,12 @@ impl MeshSlot {
         reason: &str,
         next: &str,
     ) {
-        let text = NoticeText::default()
-            .frame(format!("{reason}; "))
-            .then(original.summary_line_with_tail(
+        let text = NoticeText::default().frame(format!("{reason}; ")).then(
+            original.summary_line_with_tail(
                 self.display_name_of(&original).as_deref(),
                 &format!(" is in the inbox{next}"),
-            ));
+            ),
+        );
         let id8 = short(&original.source_identity).to_string();
         self.file_in_inbox(original, false);
         self.push_idle(IdleNotify {
@@ -6372,10 +6372,22 @@ mod tests {
             ],
             "only a reply that answers an open question is a reply line"
         );
-        assert_eq!(pushed[0].text.plain(), format!("{dest8} says: words of m-1"));
-        assert_eq!(pushed[1].text.plain(), format!("{dest8} announces: words of b-1"));
-        assert_eq!(pushed[2].text.plain(), format!("{dest8} asks: words of a-1"));
-        assert_eq!(pushed[3].text.plain(), format!("{dest8} replies: words of r-1"));
+        assert_eq!(
+            pushed[0].text.plain(),
+            format!("{dest8} says: words of m-1")
+        );
+        assert_eq!(
+            pushed[1].text.plain(),
+            format!("{dest8} announces: words of b-1")
+        );
+        assert_eq!(
+            pushed[2].text.plain(),
+            format!("{dest8} asks: words of a-1")
+        );
+        assert_eq!(
+            pushed[3].text.plain(),
+            format!("{dest8} replies: words of r-1")
+        );
         drop(pushed);
         assert_eq!(
             slot.correlations()
@@ -6425,7 +6437,11 @@ mod tests {
         assert_eq!(events, ["peer_bulletin", "peer_reply", "peer_message"]);
         let pushed = idle.pushed.lock();
         assert_eq!(pushed.len(), 3);
-        assert!(pushed.iter().all(|note| !note.text.plain().contains("envoy")));
+        assert!(
+            pushed
+                .iter()
+                .all(|note| !note.text.plain().contains("envoy"))
+        );
     }
 
     #[test]
@@ -6675,7 +6691,10 @@ mod tests {
             "{}",
             pushed[0].text
         );
-        assert_eq!(pushed[1].text.plain(), format!("{dest8} says: words of m-1"));
+        assert_eq!(
+            pushed[1].text.plain(),
+            format!("{dest8} says: words of m-1")
+        );
     }
 
     #[test]
@@ -6950,7 +6969,10 @@ mod tests {
         assert_eq!(pushed.len(), 2, "the summary line and one busy line");
         let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
         let id8 = &hex_lower(&PEER_IDENTITY)[..8];
-        assert_eq!(pushed[0].text.plain(), format!("{dest8} asks: words of a-1"));
+        assert_eq!(
+            pushed[0].text.plain(),
+            format!("{dest8} asks: words of a-1")
+        );
         assert_eq!(
             pushed[1].text.plain(),
             format!(

@@ -136,8 +136,8 @@ mod injected_width_tests {
         for width in [20, 80, 500] {
             let live = LivePrefix::default();
             live.store(CommandPrefix::Slash);
-            let printer = PromptPrinter::with_colour(PROMPT_PRINTER_CAPACITY, false, live)
-                .with_width(width);
+            let printer =
+                PromptPrinter::with_colour(PROMPT_PRINTER_CAPACITY, false, live).with_width(width);
             let attached = printer.attach();
             printer.notify(Notification::new(Source::Knock, body.as_str()).render());
             let payload = attached.get_line().expect("payload queued");
@@ -154,11 +154,7 @@ mod injected_width_tests {
                     _ => row.strip_prefix(indent.as_str()).unwrap_or(row),
                 })
                 .collect();
-            assert_eq!(
-                words.join(" "),
-                body.replace(".mesh", "/mesh"),
-                "{width}"
-            );
+            assert_eq!(words.join(" "), body.replace(".mesh", "/mesh"), "{width}");
         }
     }
 }
