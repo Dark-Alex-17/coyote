@@ -119,9 +119,26 @@ const JOB_CONTROL_WRAPPER: &str = "set -m; '{coyote}' <{stdin}; rc=$?; \
      echo \"stopped-tty-flags: $(stty -a </dev/tty | tr -s '\\n\\t' '  ')\"; echo stopped-probe-done; \
      sleep 1; fg %1; rc=$?; done; {report}";
 
+/// The build's own binary; every spawn goes through [`spawn_binary_under`].
+fn built_binary() -> &'static Path {
+    Path::new(env!("CARGO_BIN_EXE_coyote"))
+}
+
 /// The one place the binary is launched: `wrapper` is one of the two bash
 /// scripts above and `stdin` the path the binary's stdin is redirected from.
 fn spawn_tui_under(dir: &Path, extra_env: &[(&str, &str)], wrapper: &str, stdin: &str) -> Pty {
+    spawn_binary_under(built_binary(), dir, extra_env, wrapper, stdin)
+}
+
+/// [`spawn_tui_under`] for a copy of the binary living elsewhere (the
+/// self-update path classifies the install by where the executable is).
+fn spawn_binary_under(
+    binary: &Path,
+    dir: &Path,
+    extra_env: &[(&str, &str)],
+    wrapper: &str,
+    stdin: &str,
+) -> Pty {
     let home = dir.join("home");
     let fixture_bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bin");
     let path = env::join_paths(
@@ -137,7 +154,7 @@ fn spawn_tui_under(dir: &Path, extra_env: &[(&str, &str)], wrapper: &str, stdin:
     cmd.arg("-c")
         .arg(
             wrapper
-                .replace("{coyote}", env!("CARGO_BIN_EXE_coyote"))
+                .replace("{coyote}", binary.to_str().unwrap())
                 .replace("{stdin}", stdin)
                 .replace("{report}", TTY_REPORT),
         )
@@ -3848,4 +3865,747 @@ fn dot_info_lands_in_its_command_cell_under_cpu_load() {
         assert_tty_restored(&transcript);
     }
     drop(load);
+}
+
+// ---------------------------------------------------------------------
+// The one prompt gate in front of every keyboard prompt a command can
+// reach, the Input modal an agent variable raises instead, a confirm on
+// a screen too short for its question, the interrupted notice's plain
+// text, and concealed text in a reply.
+// ---------------------------------------------------------------------
+
+/// The refusal every keyboard prompt a dot-command can reach is turned
+/// into under the UI.
+const PROMPT_REFUSAL: &str = "Interactive prompts are not available in the TUI yet";
+
+/// A dot-command flow that reaches a keyboard prompt in the REPL.
+struct GatedFlow {
+    scenario: &'static str,
+    /// Commands sent before the gated one, each followed by a settle.
+    prelude: &'static [&'static str],
+    command: &'static str,
+    /// Path fragments no new file outside the cache may carry afterwards.
+    footprints: &'static [&'static str],
+    /// Fixture written into the config dir before the UI starts.
+    setup: Option<fn(&Path)>,
+    /// Where the binary under test lives; `None` runs the build's own.
+    binary: Option<fn(&Path) -> PathBuf>,
+}
+
+/// The dry-run config with two embedding models on the dry-run client, so
+/// creating a RAG has something to ask about (which model, which
+/// documents) instead of failing on "No available embedding model".
+fn write_dry_run_config_with_embeddings(dir: &Path) {
+    write_config(
+        dir,
+        "\x20     - name: dry-embed-a\n\
+         \x20       type: embedding\n\
+         \x20       max_input_tokens: 2048\n\
+         \x20       default_chunk_size: 1000\n\
+         \x20       max_batch_size: 100\n\
+         \x20     - name: dry-embed-b\n\
+         \x20       type: embedding\n\
+         \x20       max_input_tokens: 2048\n\
+         \x20       default_chunk_size: 1000\n\
+         \x20       max_batch_size: 100\n\
+         save_session: false\n",
+    );
+}
+
+/// A copy of the binary under `<home>/.cargo/bin`, where the self-update
+/// path classifies it as a Cargo install and asks `Update anyway?` before
+/// it goes anywhere near the network.
+fn cargo_installed_binary(dir: &Path) -> PathBuf {
+    let bin_dir = dir.join("home").join(".cargo").join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let copy = bin_dir.join("coyote");
+    if fs::hard_link(built_binary(), &copy).is_err() {
+        fs::copy(built_binary(), &copy).unwrap();
+    }
+    copy
+}
+
+/// Drives one prompt-backed flow and checks it is refused through the
+/// gate: the refusal lands in a Command cell on its own (no key is sent
+/// after Enter, so a flow that waited on stdin would sit on `Working`),
+/// it lands promptly (a gate behind a network round trip or a download
+/// would not), nothing of the flow is written to the config dir, the
+/// terminal is never released, and the UI keeps taking keys and leaves
+/// clean on Ctrl+D.
+fn assert_refused_through_the_prompt_gate(flow: &GatedFlow) {
+    let dir = fresh_config_dir(flow.scenario);
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    if let Some(setup) = flow.setup {
+        setup(&dir);
+    }
+    let binary = flow
+        .binary
+        .map(|place| place(&dir))
+        .unwrap_or_else(|| built_binary().to_path_buf());
+    let binary_before = fs::metadata(&binary).unwrap();
+    let launched = dir.join("editor-launched");
+    let editor = recording_editor(&dir, &launched);
+    let config_before = fs::read_to_string(dir.join("config.yaml")).unwrap();
+    let mut pty = spawn_binary_under(
+        &binary,
+        &dir,
+        &[("EDITOR", &editor), ("VISUAL", &editor)],
+        WAIT_WRAPPER,
+        "/dev/tty",
+    );
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    for step in flow.prelude {
+        pty.send(format!("{step}\r").as_bytes()).unwrap();
+        pty.read_for(Duration::from_millis(800));
+    }
+    let files_before = walk(&dir);
+    let before = pty.raw().len();
+    let sent = std::time::Instant::now();
+    pty.send(format!("{}\r", flow.command).as_bytes()).unwrap();
+    let since = pty
+        .wait_for_after(PROMPT_REFUSAL, before, PTY_DEADLINE)
+        .unwrap_or_else(|e| {
+            panic!(
+                "{}: `{}` was not refused with {PROMPT_REFUSAL:?}; the turn is waiting on a \
+                 keyboard prompt the UI cannot show, or went past the gate: {e:?}\n{}",
+                flow.scenario,
+                flow.command,
+                strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]))
+            )
+        });
+    let took = sent.elapsed();
+    assert!(
+        took < Duration::from_secs(10),
+        "{}: the refusal of `{}` took {took:?}; the gate did not run first:\n{since}",
+        flow.scenario,
+        flow.command
+    );
+    pty.read_for(Duration::from_millis(500));
+
+    for footprint in flow.footprints {
+        let written = new_files_named(&dir, &files_before, footprint);
+        assert!(
+            written.is_empty(),
+            "{}: the refused `{}` still wrote {written:?}:\n{since}",
+            flow.scenario,
+            flow.command
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(dir.join("config.yaml")).unwrap(),
+        config_before,
+        "{}: the refused `{}` rewrote config.yaml:\n{since}",
+        flow.scenario,
+        flow.command
+    );
+    let binary_after = fs::metadata(&binary).unwrap();
+    assert!(
+        binary_after.len() == binary_before.len()
+            && binary_after.modified().unwrap() == binary_before.modified().unwrap(),
+        "{}: the refused `{}` touched the binary at {}",
+        flow.scenario,
+        flow.command,
+        binary.display()
+    );
+    assert!(
+        !launched.exists(),
+        "{}: the refused `{}` launched the editor:\n{since}",
+        flow.scenario,
+        flow.command
+    );
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "{}: the refused `{}` released the terminal:\n{since}",
+        flow.scenario,
+        flow.command
+    );
+
+    // The keys typed after the refusal reach the composer and submit
+    // as an ordinary dry-run turn: a prompt left reading stdin would
+    // have eaten them instead.
+    let typed_at = pty.raw().len();
+    pty.send(b"still live g4r").unwrap();
+    pty.wait_for_after("still live g4r", typed_at, PTY_DEADLINE)
+        .unwrap_or_else(|e| {
+            panic!(
+                "{}: keys typed after the refused `{}` did not reach the composer: {e:?}",
+                flow.scenario, flow.command
+            )
+        });
+    pty.send(b"\r").unwrap();
+    pty.read_for(Duration::from_millis(800));
+    pty.send(b".info\r").unwrap();
+    pty.wait_for_after("log_path", typed_at, PTY_DEADLINE)
+        .unwrap_or_else(|e| {
+            panic!(
+                "{}: `.info` after the refused `{}` never rendered: {e:?}",
+                flow.scenario, flow.command
+            )
+        });
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{}: {transcript}", flow.scenario);
+    assert_tty_restored(&transcript);
+    for footprint in flow.footprints {
+        let written = new_files_named(&dir, &files_before, footprint);
+        assert!(
+            written.is_empty(),
+            "{}: {written:?} appeared by the time the UI left:\n{transcript}",
+            flow.scenario
+        );
+    }
+}
+
+/// `.save role` on a temp role asks for a name in the REPL.
+#[test]
+#[serial]
+fn dot_save_role_on_a_temp_role_is_refused_through_the_prompt_gate() {
+    assert_refused_through_the_prompt_gate(&GatedFlow {
+        scenario: "gate-save-role",
+        prelude: &[".temp-role you are the temp role g4r"],
+        command: ".save role",
+        footprints: &["g4r", "/roles/"],
+        setup: None,
+        binary: None,
+    });
+}
+
+/// `.vault add <name>` asks for the secret's value in the REPL.
+#[test]
+#[serial]
+fn dot_vault_add_is_refused_through_the_prompt_gate() {
+    assert_refused_through_the_prompt_gate(&GatedFlow {
+        scenario: "gate-vault-add",
+        prelude: &[],
+        command: ".vault add vault-secret-g4r",
+        footprints: &["g4r", "vault"],
+        setup: None,
+        binary: None,
+    });
+}
+
+/// `.rag <new-name>` asks which embedding model and documents to use in
+/// the REPL.
+#[test]
+#[serial]
+fn dot_rag_for_a_new_rag_is_refused_through_the_prompt_gate() {
+    assert_refused_through_the_prompt_gate(&GatedFlow {
+        scenario: "gate-rag-create",
+        prelude: &[],
+        command: ".rag new-rag-g4r",
+        footprints: &["g4r", "/rags/"],
+        setup: Some(write_dry_run_config_with_embeddings),
+        binary: None,
+    });
+}
+
+/// `.update` on a Cargo-installed binary warns and asks `Update anyway?`
+/// in the REPL before it checks for or downloads anything; under the UI
+/// the gate refuses it right there, with no network round trip first and
+/// the binary untouched.
+#[test]
+#[serial]
+fn dot_update_on_a_cargo_install_is_refused_through_the_prompt_gate() {
+    assert_refused_through_the_prompt_gate(&GatedFlow {
+        scenario: "gate-update",
+        prelude: &[],
+        command: ".update",
+        footprints: &["coyote-update-write-test"],
+        setup: None,
+        binary: Some(cargo_installed_binary),
+    });
+}
+
+/// An agent whose `username` variable has no default, so starting it asks
+/// for the value.
+fn write_agent_needing_a_variable(dir: &Path, name: &str) {
+    let agent_dir = dir.join("agents").join(name);
+    fs::create_dir_all(&agent_dir).unwrap();
+    fs::write(
+        agent_dir.join("config.yaml"),
+        format!(
+            "name: {name}\n\
+             description: an agent with a variable\n\
+             version: 0.1.0\n\
+             instructions: |\n\
+             \x20 You are an assistant for {{{{username}}}}. Reply briefly.\n\
+             variables:\n\
+             \x20 - name: username\n\
+             \x20   description: Your user name\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// `.agent <name>` for an agent whose variable has no default asks for
+/// the value through the prompter, not on the raw tty: under the UI the
+/// question is the Input modal (name, description, `Enter = answer`),
+/// typing a value and Enter answers it, the agent comes up with that
+/// value, and no refusal, no raw prompt and no released terminal are
+/// seen on the way.
+#[test]
+#[serial]
+fn dot_agent_needing_a_variable_asks_in_the_input_modal_and_enter_answers_it() {
+    let dir = fresh_config_dir("agent-variable-modal");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    write_agent_needing_a_variable(&dir, "vars-agent-g4r");
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let before = pty.raw().len();
+    pty.send(b".agent vars-agent-g4r\r").unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let modal = loop {
+        pty.read_for(Duration::from_millis(200));
+        let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
+        let flat = squeezed(&since);
+        assert!(
+            !since.contains(PROMPT_REFUSAL),
+            "the agent's variable was refused instead of asked in the Input modal:\n{since}"
+        );
+        if flat.contains("username(Yourusername)") && flat.contains("Enter=answer") {
+            break since;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "`.agent` with an unset variable did not raise the Input modal within 10s:\n{since}"
+        );
+    };
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "the variable question released the terminal:\n{modal}"
+    );
+
+    pty.read_for(HOTKEY_GAP);
+    let typed_at = pty.raw().len();
+    pty.send(b"typed-user-g4r").unwrap();
+    pty.wait_for_after("typed-user-g4r", typed_at, PTY_DEADLINE)
+        .expect("the typed value never showed in the Input modal");
+    pty.send(b"\r").unwrap();
+    pty.read_for(Duration::from_millis(1500));
+
+    // The agent is up with the value: `.info agent` exports its
+    // variables and the interpolated instructions, and the question is
+    // no longer on screen. The export runs to well over a hundred rows
+    // (the built-in tool guidance is appended to the instructions), so
+    // the window is made tall enough to show it whole.
+    pty.resize(300, 120).unwrap();
+    pty.read_for(Duration::from_millis(800));
+    let info_at = pty.raw().len();
+    pty.send(b".info agent\r").unwrap();
+    pty.wait_for_after("config_file", info_at, PTY_DEADLINE)
+        .expect("`.info agent` never rendered after the modal was answered");
+    pty.read_for(Duration::from_millis(800));
+    let info = strip_ansi(&String::from_utf8_lossy(&pty.raw()[info_at..]));
+    let flat = squeezed(&info);
+    assert!(
+        flat.contains("username:typed-user-g4r"),
+        "`.info agent` does not carry the value typed into the Input modal:\n{info}"
+    );
+    assert!(
+        flat.contains("assistantfortyped-user-g4r"),
+        "the agent's instructions were not interpolated with the typed value:\n{info}"
+    );
+    assert!(
+        info.contains("vars-agent-g4r"),
+        "`.info agent` did not name the agent:\n{info}"
+    );
+    assert!(
+        !flat.contains("Enter=answer"),
+        "the Input modal is still up after Enter:\n{info}"
+    );
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// The recording confirm tool that also marks the moment it asks, so a
+/// test can tell "the modal is up" apart from "the question is painted"
+/// on a screen too short to paint it.
+const ASKING_CONFIRM_TOOL: &str = "#!/usr/bin/env bash\n\
+    \n\
+    # @describe Ask the user before continuing and record the answer.\n\
+    # @option --out! Where to write the answer.\n\
+    \n\
+    # @env LLM_OUTPUT=/dev/stdout The output path\n\
+    \n\
+    # shellcheck disable=SC1090\n\
+    source \"$LLM_PROMPT_UTILS_FILE\"\n\
+    \n\
+    main() {\n\
+    \x20   local out v\n\
+    \x20   out=\"$(jq -r '.out' <<< \"$LLM_TOOL_RAW_JSON\")\"\n\
+    \x20   : > \"$out.asked\"\n\
+    \x20   v=\"$(confirm \"Really do it? q9d-q\")\"\n\
+    \x20   printf '%s' \"${v:-cancelled}\" > \"$out\"\n\
+    \x20   echo \"fixture confirm: ${v:-cancelled} q9d-r\" >> \"$LLM_OUTPUT\"\n\
+    }\n";
+
+/// The asking confirm tool with a three-line question: too tall for the
+/// rows a 40x5 frame can give it, short enough to fit once the window
+/// grows.
+fn three_line_question_confirm_tool() -> String {
+    ASKING_CONFIRM_TOOL.replace(
+        "\"Really do it? q9d-q\"",
+        "\"line one q3l-a\"$'\\n'\"line two q3l-b\"$'\\n'\"line three q3l-c\"",
+    )
+}
+
+/// Starts the confirm flow on a `rows`x40 screen: resizes once the UI is
+/// up, submits the prompt, waits for the tool to ask and hands back the
+/// printable bytes since the prompt was sent after a moment for the
+/// modal to paint.
+fn open_confirm_on_short_screen(pty: &mut Pty, asked: &Path, rows: u16) -> String {
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.resize(rows, 40).unwrap();
+    pty.read_for(Duration::from_millis(500));
+    let before = pty.raw().len();
+    pty.send(b"call the confirm tool\r").unwrap();
+    wait_for_file(pty, asked, "the tool's confirm request");
+    pty.read_for(Duration::from_millis(1000));
+    strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]))
+}
+
+/// Pumps the pty until the fake has served `n` requests.
+fn wait_for_served(pty: &mut Pty, fake: &FakeLlm, n: usize, what: &str) {
+    let deadline = std::time::Instant::now() + PTY_DEADLINE;
+    while fake.served() < n {
+        let text = pty.read_for(Duration::from_millis(100));
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: the fake served {} of {n} requests:\n{text}",
+            fake.served()
+        );
+    }
+}
+
+/// A three-line question on a 40x5 frame cannot be shown whole: the modal
+/// says so, offers only Esc, and `y` does nothing (the tool gets no
+/// answer). Once the window is tall enough the whole question and the
+/// approving keys are painted and `y` answers it.
+#[test]
+#[serial]
+fn a_three_line_confirm_on_a_five_row_screen_refuses_y_until_the_terminal_is_enlarged() {
+    let dir = fresh_config_dir("confirm-squeezed-5-rows");
+    let _guard = TempDirGuard(dir.clone());
+    let out = dir.join("confirm-answer");
+    let asked = dir.join("confirm-answer.asked");
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "fixture_confirm_rec".to_string(),
+            arguments: format!("{{\"out\": \"{}\"}}", out.display()),
+        },
+        Reply::Text("fixture squeezed done s5r".to_string()),
+    ]);
+    write_fake_llm_config(&dir, &fake);
+    write_tool(
+        &dir,
+        "fixture_confirm_rec.sh",
+        &three_line_question_confirm_tool(),
+    );
+    let mut pty = spawn_tui(&dir, &[]);
+
+    let shown = open_confirm_on_short_screen(&mut pty, &asked, 5);
+    let flat = squeezed(&shown);
+    assert!(
+        !flat.contains("linethreeq3l-c"),
+        "a 40x5 frame painted the whole three-line question (then `y` must answer, and this \
+         case is moot):\n{shown}"
+    );
+    assert!(
+        flat.contains("enlargetheterminal"),
+        "the squeezed question carries no `enlarge the terminal` marker or legend:\n{shown}"
+    );
+    assert!(
+        !flat.contains("y=yes"),
+        "the squeezed modal still offers an approving key:\n{shown}"
+    );
+
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"y").unwrap();
+    pty.read_for(Duration::from_millis(1500));
+    assert!(
+        !out.exists(),
+        "`y` answered a question the 40x5 frame could not show whole: the tool recorded {:?}",
+        fs::read_to_string(&out).unwrap_or_default()
+    );
+
+    let grown_at = pty.raw().len();
+    pty.resize(24, 40).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let grown = loop {
+        pty.read_for(Duration::from_millis(200));
+        let grown = strip_ansi(&String::from_utf8_lossy(&pty.raw()[grown_at..]));
+        let flat = squeezed(&grown);
+        if flat.contains("linethreeq3l-c") && flat.contains("y=yes") {
+            break grown;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "after growing to 40x24 the whole question and the approving keys were not painted:\n{grown}"
+        );
+    };
+    assert!(
+        !squeezed(&grown).contains("enlargetheterminal"),
+        "the enlarge legend is still shown once the question fits:\n{grown}"
+    );
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"y").unwrap();
+    wait_for_file(&mut pty, &out, "the tool's recorded answer after enlarging");
+    assert_eq!(
+        fs::read_to_string(&out).unwrap().trim(),
+        "1",
+        "`y` after enlarging did not reach the tool as a yes"
+    );
+    wait_for_squeezed(
+        &mut pty,
+        "fixture squeezed done s5r",
+        "the reply after the answered confirm",
+    );
+    assert_eq!(fake.served(), 2);
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// A one-line question fits a 40x5 frame: the question and the approving
+/// keys are painted, `y` reaches the tool as a yes, the turn finishes
+/// with the model's follow-up, and the UI is still taking keys. (A tiny
+/// frame has no transcript rows; the window is grown to read the reply.)
+#[test]
+#[serial]
+fn a_one_line_confirm_fits_a_five_row_screen_and_y_answers_it() {
+    let dir = fresh_config_dir("confirm-fits-5-rows");
+    let _guard = TempDirGuard(dir.clone());
+    let out = dir.join("confirm-answer");
+    let asked = dir.join("confirm-answer.asked");
+    let reply = "fixture short screen done f5r";
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "fixture_confirm_rec".to_string(),
+            arguments: format!("{{\"out\": \"{}\"}}", out.display()),
+        },
+        Reply::Text(reply.to_string()),
+    ]);
+    write_fake_llm_config(&dir, &fake);
+    write_tool(&dir, "fixture_confirm_rec.sh", ASKING_CONFIRM_TOOL);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    let shown = open_confirm_on_short_screen(&mut pty, &asked, 5);
+    let flat = squeezed(&shown);
+    assert!(
+        flat.contains("Reallydoit?q9d-q"),
+        "the one-line question was not painted whole on the 5-row screen:\n{shown}"
+    );
+    assert!(
+        !flat.contains("enlargetheterminal"),
+        "the question is painted whole yet the modal says to enlarge the terminal:\n{shown}"
+    );
+    assert!(
+        flat.contains("y=yes"),
+        "the question fits but the modal does not offer the approving keys:\n{shown}"
+    );
+
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"y").unwrap();
+    wait_for_file(
+        &mut pty,
+        &out,
+        "the tool's recorded answer on the 5-row screen",
+    );
+    assert_eq!(
+        fs::read_to_string(&out).unwrap().trim(),
+        "1",
+        "`y` on the 5-row modal did not reach the tool as a yes"
+    );
+    wait_for_served(&mut pty, &fake, 2, "the turn after the answered confirm");
+
+    // Grow the window to read the reply; the turn must have finished and
+    // the UI must still be taking keys.
+    let grown_at = pty.raw().len();
+    pty.resize(24, 80).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let painted = loop {
+        pty.read_for(Duration::from_millis(200));
+        let grown = strip_ansi(&String::from_utf8_lossy(&pty.raw()[grown_at..]));
+        if squeezed(&grown).contains(&squeezed(reply)) {
+            break grown;
+        }
+        if std::time::Instant::now() >= deadline {
+            // Say whether the UI is alive at all before failing.
+            let alive_at = pty.raw().len();
+            pty.send(b".info\r").unwrap();
+            let alive = pty
+                .wait_for_after("log_path", alive_at, Duration::from_secs(5))
+                .is_ok();
+            pty.send(b"\x04").unwrap();
+            let exited = pty
+                .wait_for("tty-probe-done", Duration::from_secs(8))
+                .ok()
+                .map(|t| exit_code(&t));
+            panic!(
+                "the reply after the answered confirm never appeared on the grown screen \
+                 (fake served {}; UI answered `.info` afterwards: {alive}; exit after Ctrl+D: \
+                 {exited:?}):\n{grown}",
+                fake.served()
+            );
+        }
+    };
+    assert!(
+        !squeezed(&painted).contains("y=yes"),
+        "the answered modal is still up after the turn finished:\n{painted}"
+    );
+
+    pty.send(b".info\r").unwrap();
+    pty.wait_for_after("log_path", grown_at, PTY_DEADLINE)
+        .expect("keys were not handled after the confirm on the 5-row screen");
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// Esc on a held stream leaves the interrupted notice as plain words: the
+/// REPL paints it red, the UI must scrub that before it reaches a cell.
+/// Under `NO_COLOR` nothing may paint red, so a `[31m` anywhere after the
+/// Esc - as painted text or as a live escape - is the REPL's colouring
+/// leaking through.
+#[test]
+#[serial]
+fn esc_on_a_held_stream_shows_the_interrupted_notice_as_plain_words() {
+    let dir = fresh_config_dir("esc-notice-plain");
+    let _guard = TempDirGuard(dir.clone());
+    let release = dir.join("never-released");
+    let fake = FakeLlm::start(vec![Reply::Streamed(vec![
+        Chunk::Text("partial before esc n3p".to_string()),
+        Chunk::WaitFor(release),
+        Chunk::Text(" tail never shown n3q".to_string()),
+    ])]);
+    write_fake_llm_config(&dir, &fake);
+    let mut pty = spawn_tui(&dir, &[("NO_COLOR", "1")]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b".session\r").unwrap();
+    pty.wait_for("temp", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(500));
+    pty.send(b"stream and hold\r").unwrap();
+    wait_for_squeezed(&mut pty, "partial before esc n3p", "the first delta");
+    pty.wait_for("Esc to interrupt", PTY_DEADLINE)
+        .expect("the status row never offered Esc to interrupt");
+    let pressed_at = pty.raw().len();
+    pty.send(b"\x1b").unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    loop {
+        pty.read_for(Duration::from_millis(200));
+        let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[pressed_at..]));
+        if squeezed(&since).contains("Responseinterrupted") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no cell said `Response interrupted` after Esc:\n{since}"
+        );
+    }
+    pty.read_for(Duration::from_millis(800));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[pressed_at..]));
+    assert!(
+        !since.contains("[31m") && !since.contains("[0m") && !since.contains("[1m"),
+        "the interrupted notice carried its colouring as text:\n{since}"
+    );
+    let raw_since = &pty.raw()[pressed_at..];
+    let coloured: Vec<_> = sgr_params(raw_since)
+        .into_iter()
+        .filter(|p| is_colour_sgr(p))
+        .collect();
+    assert!(
+        coloured.is_empty(),
+        "NO_COLOR=1 but colour SGRs were emitted after the interrupt: {coloured:?}\n{since}"
+    );
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// A reply that conceals a word with SGR 8 shows it anyway: the UI never
+/// hides text it was given, never forwards the conceal attribute to the
+/// terminal, and never paints the sequence as text.
+#[test]
+#[serial]
+fn a_reply_with_concealed_text_shows_it_and_sends_no_conceal_to_the_tty() {
+    let dir = fresh_config_dir("conceal-visible");
+    let _guard = TempDirGuard(dir.clone());
+    let fake = FakeLlm::start(vec![Reply::Text(
+        "before c8a \x1b[8mhidden-word-c8b\x1b[28m after c8c".to_string(),
+    )]);
+    write_fake_llm_config(&dir, &fake);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let submitted_at = pty.raw().len();
+    pty.send(b"conceal please\r").unwrap();
+    let transcript = wait_for_squeezed(&mut pty, "after c8c", "the reply's tail");
+    assert_eq!(fake.served(), 1, "{transcript}");
+    pty.read_for(Duration::from_millis(600));
+
+    let raw = pty.raw();
+    let visible = strip_ansi(&String::from_utf8_lossy(&raw[submitted_at..]));
+    assert!(
+        squeezed(&visible).contains("hidden-word-c8b"),
+        "the concealed word was not painted:\n{visible}"
+    );
+    assert!(
+        !visible.contains("[8m") && !visible.contains("[28m"),
+        "the conceal sequence was painted as text:\n{visible}"
+    );
+    let concealing: Vec<_> = sgr_params(&raw[submitted_at..])
+        .into_iter()
+        .filter(|p| p.contains(&8))
+        .collect();
+    assert!(
+        concealing.is_empty(),
+        "a conceal SGR reached the tty: {concealing:?}\n{visible}"
+    );
+
+    // A full repaint keeps the word visible too.
+    let repaint_at = raw.len();
+    pty.resize(30, 90).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let repainted = loop {
+        pty.read_for(Duration::from_millis(200));
+        let repainted = strip_ansi(&String::from_utf8_lossy(&pty.raw()[repaint_at..]));
+        if squeezed(&repainted).contains("afterc8c") {
+            break repainted;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the reply was not repainted after the resize:\n{repainted}"
+        );
+    };
+    assert!(
+        squeezed(&repainted).contains("hidden-word-c8b"),
+        "the concealed word vanished on repaint:\n{repainted}"
+    );
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+    let visible_after = strip_ansi(&String::from_utf8_lossy(pty.raw()));
+    assert!(
+        !visible_after.contains("[8m"),
+        "the conceal sequence reached the normal screen as text:\n{visible_after}"
+    );
 }
