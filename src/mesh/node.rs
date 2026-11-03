@@ -64,7 +64,8 @@ use crate::mesh::trust::{
     Decision, InstancePresence, KeyChangeOutcome, TrustStore, decode_name_hash, parse_hash,
 };
 use crate::mesh::{
-    canonical_hash, display_text, elapsed_text, hex_lower, identity, mesh_cache_dir,
+    PATH_REQUEST_TIMEOUT, canonical_hash, display_text, elapsed_text, hex_lower, identity,
+    mesh_cache_dir,
 };
 use crate::supervisor::notification::{SystemNotification, mesh_notification};
 
@@ -688,6 +689,9 @@ impl MeshRuntime {
             mesh_cache_dir(&paths.cache_dir).join("peers.json"),
             SystemTime::now(),
         )?);
+        let propagation_nodes = Arc::new(PropagationNodeTable::load(
+            mesh_cache_dir(&paths.cache_dir).join("propagation-nodes.json"),
+        )?);
         let grants = GrantStore::open(&paths.cache_dir, &instance_id, SystemTime::now())?;
         let envoy_memory =
             EnvoySessions::open(&paths.cache_dir, &instance_id, &config.envoy_memory).map(Arc::new);
@@ -890,7 +894,7 @@ impl MeshRuntime {
                 destination_hash: hash.to_hex_string(),
             }),
             peers,
-            propagation_nodes: Arc::new(PropagationNodeTable::new()),
+            propagation_nodes,
             trust,
             request_handler,
             dispatcher,
@@ -923,8 +927,9 @@ impl MeshRuntime {
             runtime.peers.clone(),
             runtime.cancellation_token(),
         )));
-        runtime.register_task(tokio::spawn(persist_peers_periodically(
+        runtime.register_task(tokio::spawn(persist_tables_periodically(
             runtime.peers.clone(),
+            runtime.propagation_nodes.clone(),
             runtime.cancellation_token(),
         )));
         runtime
@@ -1312,6 +1317,7 @@ impl MeshRuntime {
             .ok_or(PropagationError::Link(RequestError::NotRunning))?;
         let sender = to_core_private_identity(&self.transport_identity);
         let origin = self.destination.lock().await.origin;
+        request_path_to_node(&transport, node).await;
         propagation::propagate(
             &transport,
             &sender,
@@ -1521,6 +1527,7 @@ impl MeshRuntime {
             .ok_or(FetchError::Link(RequestError::NotRunning))?;
         let node = self.propagation_nodes.select()?;
         let mut store = propagation_fetch::FetchStore::load(store_path, SystemTime::now())?;
+        request_path_to_node(&transport, &node).await;
         let peers = PeerRouting {
             trust: &self.trust,
             surface: self.peer_surface.lock().as_ref().and_then(Weak::upgrade),
@@ -1784,6 +1791,12 @@ impl MeshRuntime {
         if let Err(err) = self.peers.persist_if_dirty() {
             warn!(
                 "Failed to persist the mesh peer table on stop: {}",
+                redact_hashes(&format!("{err:#}"))
+            );
+        }
+        if let Err(err) = self.propagation_nodes.persist_if_dirty() {
+            warn!(
+                "Failed to persist the mesh propagation node table on stop: {}",
                 redact_hashes(&format!("{err:#}"))
             );
         }
@@ -3275,7 +3288,29 @@ async fn sweep_pending(slot: Weak<MeshSlot>, cancel: CancellationToken) {
     }
 }
 
-async fn persist_peers_periodically(peers: Arc<PeerTable>, cancel: CancellationToken) {
+/// A node loaded from the persisted table may have no path yet, and a link needs one: this
+/// transport does not rebroadcast announces, so the path comes only from an answered
+/// request. One request, waited on for `PATH_REQUEST_TIMEOUT`; without an answer the link
+/// fails as it would have.
+async fn request_path_to_node(transport: &Transport, node: &PropagationNode) {
+    let hash = node.destination.address_hash;
+    if transport.has_path(&hash).await {
+        return;
+    }
+    debug!(
+        "Mesh has no path to propagation node {}; asking the mesh for one",
+        short(&hash.to_hex_string())
+    );
+    transport
+        .await_path(&hash, PATH_REQUEST_TIMEOUT, None)
+        .await;
+}
+
+async fn persist_tables_periodically(
+    peers: Arc<PeerTable>,
+    propagation_nodes: Arc<PropagationNodeTable>,
+    cancel: CancellationToken,
+) {
     let mut ticks = interval(Duration::from_secs(PEER_PERSIST_INTERVAL_SECS));
     // The first tick of an interval fires immediately; nothing has changed since load.
     ticks.tick().await;
@@ -3286,6 +3321,12 @@ async fn persist_peers_periodically(peers: Arc<PeerTable>, cancel: CancellationT
                 if let Err(err) = peers.persist_if_dirty() {
                     warn!(
                         "Failed to persist the mesh peer table: {}",
+                        redact_hashes(&format!("{err:#}"))
+                    );
+                }
+                if let Err(err) = propagation_nodes.persist_if_dirty() {
+                    warn!(
+                        "Failed to persist the mesh propagation node table: {}",
                         redact_hashes(&format!("{err:#}"))
                     );
                 }

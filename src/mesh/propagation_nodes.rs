@@ -1,23 +1,114 @@
 //! The LXMF propagation nodes this node has heard announce, and which of them a fetch
-//! should ask. Kept in memory only: a `DestinationDesc` is not serialisable, nodes
-//! re-announce on their own schedule, and what has to survive a restart (which messages
-//! were already fetched) lives in the fetch store instead.
+//! should ask. Mirrored to `<cache_dir>/mesh/propagation-nodes.json` so a sync right
+//! after a restart finds the node it used before, rather than waiting out the node's
+//! announce interval. Each record keeps the node's public key, and its destination is
+//! rebuilt from that key on load, so a record whose key does not derive its stored hash is
+//! dropped rather than trusted.
 
 use crate::mesh::peers::PeerChange;
-use crate::mesh::propagation::{MAX_ACCEPTED_STAMP_COST, PropagationNode, PropagationNodeError};
+use crate::mesh::propagation::{
+    MAX_ACCEPTED_STAMP_COST, PropagationNode, PropagationNodeError, propagation_node_destination,
+};
 use crate::mesh::propagation_fetch::FetchError;
 use crate::mesh::request::{redact_hashes, short};
+use crate::mesh::schema::{Remedy, VersionProbe, unversioned_cause, version_refusal};
+use crate::mesh::{decode_hex, write_atomically_owner_only};
 
+use anyhow::{Context, Result, bail};
 use parking_lot::Mutex;
 use rns_transport::destination::DestinationDesc;
+use rns_transport::identity::Identity;
+use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 /// Upper bound on remembered propagation nodes; the least recently heard is evicted first.
 /// A mesh runs a handful of nodes, not hundreds: every one stores every message for every
 /// recipient it serves, so operators deploy few of them, and a fetch only ever asks one.
 pub(crate) const PROPAGATION_NODE_TABLE_MAX_ENTRIES: usize = 32;
+
+pub(crate) const PROPAGATION_NODE_TABLE_VERSION: u64 = 1;
+
+/// `propagation-nodes.json` whole: the version first, then the nodes.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PropagationNodeFile {
+    version: u64,
+    nodes: Vec<StoredNode>,
+}
+
+/// One remembered node. A field may be added inside a version only with a default, so an
+/// older file still loads; a field this build does not know refuses the file.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredNode {
+    destination_hash: String,
+    /// Lower hex as `Identity::to_hex_string` writes it.
+    public_key: String,
+    hops: u8,
+    last_heard: SystemTime,
+    stamp_cost: u32,
+    per_transfer_limit_kb: u64,
+    propagation_enabled: bool,
+}
+
+impl StoredNode {
+    fn of(record: &PropagationNodeRecord) -> Self {
+        Self {
+            destination_hash: record.node.destination.address_hash.to_hex_string(),
+            public_key: record.node.destination.identity.to_hex_string(),
+            hops: record.hops,
+            last_heard: record.last_seen,
+            stamp_cost: record.node.stamp_cost,
+            per_transfer_limit_kb: record.node.per_transfer_limit_kb,
+            propagation_enabled: record.node.propagation_enabled,
+        }
+    }
+
+    /// The record with its destination rebuilt from the key; `None` when the key is not
+    /// one or does not derive the stored hash.
+    fn into_record(self) -> Option<PropagationNodeRecord> {
+        let identity = decode_hex(&self.public_key).and_then(|bytes| {
+            let (encryption, signing) = bytes.split_at(bytes.len() / 2);
+            Identity::try_new_from_slices(encryption, signing).ok()
+        });
+        let Some(identity) = identity else {
+            debug!(
+                "Dropped stored propagation node {}: its public key is not a key",
+                short(&self.destination_hash)
+            );
+            return None;
+        };
+        let destination = propagation_node_destination(identity);
+        if destination.address_hash.to_hex_string() != self.destination_hash {
+            debug!(
+                "Dropped stored propagation node {}: its public key derives {}",
+                short(&self.destination_hash),
+                short(&destination.address_hash.to_hex_string())
+            );
+            return None;
+        }
+        Some(PropagationNodeRecord {
+            node: PropagationNode {
+                destination,
+                stamp_cost: self.stamp_cost,
+                per_transfer_limit_kb: self.per_transfer_limit_kb,
+                propagation_enabled: self.propagation_enabled,
+            },
+            hops: self.hops,
+            last_seen: self.last_heard,
+        })
+    }
+}
+
+enum NodeFileParse {
+    Version(u64),
+    Corrupt(String),
+}
 
 #[derive(Clone)]
 pub(crate) struct PropagationNodeRecord {
@@ -26,17 +117,86 @@ pub(crate) struct PropagationNodeRecord {
     pub last_seen: SystemTime,
 }
 
-/// Keyed by destination hash. Time is always passed in so ordering is testable without a
-/// clock.
+/// Keyed by destination hash and mirrored to `path` as JSON. Time is always passed in so
+/// ordering is testable without a clock.
 pub(crate) struct PropagationNodeTable {
+    path: PathBuf,
     inner: Mutex<BTreeMap<String, PropagationNodeRecord>>,
+    /// Set by every change since the last write, so a burst of announces costs one write.
+    dirty: AtomicBool,
 }
 
 impl PropagationNodeTable {
+    /// An empty table with nowhere it is ever written.
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
+        Self::empty(PathBuf::new())
+    }
+
+    fn empty(path: PathBuf) -> Self {
         Self {
+            path,
             inner: Mutex::new(BTreeMap::new()),
+            dirty: AtomicBool::new(false),
         }
+    }
+
+    /// Loads the table at `path`, keeping the `PROPAGATION_NODE_TABLE_MAX_ENTRIES` most
+    /// recently heard. A missing file is an empty table. A file whose version is readable
+    /// but not `PROPAGATION_NODE_TABLE_VERSION` is refused and left in place, since the
+    /// remedy depends on which Coyote wrote it; one that cannot be read or parsed is moved
+    /// aside to `<path>.corrupt` with a warning and the table starts empty, since nodes
+    /// announce again and must never keep the mesh from starting.
+    pub(crate) fn load(path: PathBuf) -> Result<Self> {
+        let stored = match fs::read(&path) {
+            Ok(bytes) => match parse_node_file(&bytes) {
+                Ok(stored) => stored,
+                Err(NodeFileParse::Version(found)) => bail!(version_refusal(
+                    "propagation node table",
+                    &path,
+                    None,
+                    found,
+                    PROPAGATION_NODE_TABLE_VERSION,
+                    Remedy::Cache
+                )),
+                Err(NodeFileParse::Corrupt(what)) => set_aside_corrupt(&path, what),
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(err) => set_aside_corrupt(&path, format!("could not be read: {err}")),
+        };
+        let mut records: Vec<PropagationNodeRecord> = stored
+            .into_iter()
+            .filter_map(StoredNode::into_record)
+            .collect();
+        records.sort_by_key(|record| Reverse(record.last_seen));
+        records.truncate(PROPAGATION_NODE_TABLE_MAX_ENTRIES);
+        let table = Self::empty(path);
+        table.inner.lock().extend(
+            records
+                .into_iter()
+                .map(|record| (record.node.destination.address_hash.to_hex_string(), record)),
+        );
+        Ok(table)
+    }
+
+    /// Writes the table only if it changed since the last write; the flag is cleared before
+    /// the snapshot is taken so a change mid-write is not lost, and restored on failure.
+    pub(crate) fn persist_if_dirty(&self) -> Result<()> {
+        if !self.dirty.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+        self.persist()
+            .inspect_err(|_| self.dirty.store(true, Ordering::Release))
+    }
+
+    fn persist(&self) -> Result<()> {
+        let file = PropagationNodeFile {
+            version: PROPAGATION_NODE_TABLE_VERSION,
+            nodes: self.snapshot().iter().map(StoredNode::of).collect(),
+        };
+        let json = serde_json::to_vec_pretty(&file)
+            .context("Failed to serialize the mesh propagation node table")?;
+        write_atomically_owner_only(&self.path, &json)
     }
 
     /// Files one received announce when it is a propagation node's. Returns `false` for
@@ -94,6 +254,7 @@ impl PropagationNodeTable {
             if let Some(record) = nodes.get_mut(&key) {
                 record.node = node;
                 record.hops = hops;
+                self.dirty.store(true, Ordering::Release);
                 return PeerChange::Refreshed;
             }
         }
@@ -125,6 +286,7 @@ impl PropagationNodeTable {
             nodes.remove(&oldest);
             debug!("Evicted propagation node {}", short(&oldest));
         }
+        self.dirty.store(true, Ordering::Release);
         change
     }
 
@@ -160,6 +322,273 @@ impl PropagationNodeTable {
 
     pub(crate) fn snapshot(&self) -> Vec<PropagationNodeRecord> {
         self.inner.lock().values().cloned().collect()
+    }
+}
+
+/// Reads the version alone first so a file from another layout is refused by its version
+/// rather than set aside as corrupt for whatever field that layout added or dropped.
+fn parse_node_file(bytes: &[u8]) -> Result<Vec<StoredNode>, NodeFileParse> {
+    let probe: VersionProbe = serde_json::from_slice(bytes).map_err(|err| {
+        NodeFileParse::Corrupt(format!(
+            "{}: {err}",
+            unversioned_cause(PROPAGATION_NODE_TABLE_VERSION)
+        ))
+    })?;
+    if probe.version != PROPAGATION_NODE_TABLE_VERSION {
+        return Err(NodeFileParse::Version(probe.version));
+    }
+    let file: PropagationNodeFile = serde_json::from_slice(bytes).map_err(|err| {
+        NodeFileParse::Corrupt(format!(
+            "is not a version-{PROPAGATION_NODE_TABLE_VERSION} propagation node table: {err}"
+        ))
+    })?;
+    Ok(file.nodes)
+}
+
+/// Warns about a table that cannot be used, renames it to `<path>.corrupt` (replacing any
+/// earlier one) and returns the empty list the node starts with. A failed rename is only
+/// warned about; the file is cache and nothing downstream depends on the move.
+fn set_aside_corrupt(path: &Path, what_happened: String) -> Vec<StoredNode> {
+    let aside = path.with_extension("json.corrupt");
+    warn!(
+        "Mesh propagation node table '{}' {}. Starting with no propagation nodes; they re-appear as they announce. The file is kept at '{}'.",
+        path.display(),
+        redact_hashes(&what_happened),
+        aside.display()
+    );
+    if let Err(err) = fs::rename(path, &aside) {
+        warn!(
+            "Failed to move the unusable mesh propagation node table '{}' to '{}': {}",
+            path.display(),
+            aside.display(),
+            redact_hashes(&err.to_string())
+        );
+    }
+    Vec::new()
+}
+
+#[cfg(test)]
+mod persisted_table_tests {
+    use super::super::test_support::TempDir;
+    use super::*;
+    use crate::testing::{debug_snapshot, install_log_collector, warn_snapshot};
+
+    use rns_transport::identity::PrivateIdentity as TransportIdentity;
+    use rns_transport::rand_core::OsRng;
+    use std::time::Duration;
+
+    fn node() -> PropagationNode {
+        PropagationNode {
+            destination: propagation_node_destination(
+                *TransportIdentity::new_from_rand(OsRng).as_identity(),
+            ),
+            stamp_cost: 8,
+            per_transfer_limit_kb: 256,
+            propagation_enabled: true,
+        }
+    }
+
+    fn t(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    fn path_in(tmp: &TempDir) -> PathBuf {
+        tmp.path.join("mesh").join("propagation-nodes.json")
+    }
+
+    fn hex(node: &PropagationNode) -> String {
+        node.destination.address_hash.to_hex_string()
+    }
+
+    #[test]
+    fn a_heard_node_round_trips_and_is_selected_after_a_reload() {
+        let tmp = TempDir::new("pn-table-round-trip");
+        let table = PropagationNodeTable::load(path_in(&tmp)).unwrap();
+        let near = node();
+        let mut far = node();
+        far.stamp_cost = 3;
+        far.propagation_enabled = false;
+        table.observe(near.clone(), 1, t(100));
+        table.observe(far.clone(), 4, t(200));
+        table.persist_if_dirty().unwrap();
+
+        let reloaded = PropagationNodeTable::load(path_in(&tmp)).unwrap();
+
+        assert_eq!(hex(&reloaded.select().unwrap()), hex(&near));
+        let far_record = reloaded
+            .snapshot()
+            .into_iter()
+            .find(|record| hex(&record.node) == hex(&far))
+            .unwrap();
+        assert_eq!(
+            (far_record.hops, far_record.last_seen),
+            (4, t(200)),
+            "hops and when it was last heard survive"
+        );
+        assert_eq!(far_record.node.stamp_cost, 3);
+        assert_eq!(far_record.node.per_transfer_limit_kb, 256);
+        assert!(!far_record.node.propagation_enabled);
+        assert_eq!(
+            far_record.node.destination.identity.to_hex_string(),
+            far.destination.identity.to_hex_string()
+        );
+    }
+
+    #[test]
+    fn a_clean_table_is_not_written_and_a_missing_file_creates_nothing() {
+        let tmp = TempDir::new("pn-table-dirty");
+        let table = PropagationNodeTable::load(path_in(&tmp)).unwrap();
+        assert!(table.snapshot().is_empty());
+        table.persist_if_dirty().unwrap();
+        assert!(!tmp.path.join("mesh").exists());
+
+        table.observe(node(), 1, t(1));
+        table.persist_if_dirty().unwrap();
+        assert!(path_in(&tmp).exists());
+        fs::remove_file(path_in(&tmp)).unwrap();
+        table.persist_if_dirty().unwrap();
+        assert!(
+            !path_in(&tmp).exists(),
+            "a clean table is not written again"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_file_is_readable_by_its_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new("pn-table-mode");
+        let table = PropagationNodeTable::load(path_in(&tmp)).unwrap();
+        table.observe(node(), 1, t(1));
+        table.persist_if_dirty().unwrap();
+
+        let mode = fs::metadata(path_in(&tmp)).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn another_version_is_refused_and_left_in_place() {
+        let tmp = TempDir::new("pn-table-version");
+        fs::create_dir_all(tmp.path.join("mesh")).unwrap();
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "version": PROPAGATION_NODE_TABLE_VERSION + 1,
+            "nodes": [],
+        }))
+        .unwrap();
+        fs::write(path_in(&tmp), &bytes).unwrap();
+
+        let err = match PropagationNodeTable::load(path_in(&tmp)) {
+            Ok(_) => panic!("a newer table must be refused"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(err.contains("Mesh propagation node table"), "{err}");
+        assert!(err.contains(&path_in(&tmp).display().to_string()), "{err}");
+        assert!(err.contains("upgrade Coyote"), "{err}");
+        assert!(err.contains("move the file aside"), "{err}");
+        assert_eq!(fs::read(path_in(&tmp)).unwrap(), bytes);
+    }
+
+    #[test]
+    fn an_unreadable_file_is_set_aside_and_the_table_starts_empty() {
+        install_log_collector();
+        let tmp = TempDir::new("pn-table-corrupt");
+        fs::create_dir_all(tmp.path.join("mesh")).unwrap();
+        let aside = tmp.path.join("mesh").join("propagation-nodes.json.corrupt");
+        for bytes in [
+            b"{not json".to_vec(),
+            serde_json::to_vec(&serde_json::json!({
+                "version": PROPAGATION_NODE_TABLE_VERSION,
+                "nodes": [],
+                "later": true,
+            }))
+            .unwrap(),
+        ] {
+            fs::write(path_in(&tmp), &bytes).unwrap();
+
+            let table = PropagationNodeTable::load(path_in(&tmp)).unwrap();
+
+            assert!(table.snapshot().is_empty());
+            assert!(!path_in(&tmp).exists());
+            assert_eq!(fs::read(&aside).unwrap(), bytes);
+        }
+        let path_text = path_in(&tmp).display().to_string();
+        assert!(
+            warn_snapshot().iter().any(
+                |line| line.contains(&path_text) && line.contains(&aside.display().to_string())
+            ),
+            "no warning names {path_text}"
+        );
+    }
+
+    /// A record whose key does not derive its stored hash is dropped on load; the rest of
+    /// the file still loads.
+    #[test]
+    fn a_record_whose_key_does_not_derive_its_hash_is_dropped() {
+        install_log_collector();
+        let tmp = TempDir::new("pn-table-tampered");
+        let table = PropagationNodeTable::load(path_in(&tmp)).unwrap();
+        let kept = node();
+        let tampered = node();
+        table.observe(kept.clone(), 1, t(1));
+        table.observe(tampered.clone(), 1, t(2));
+        table.persist_if_dirty().unwrap();
+        let mut file: serde_json::Value =
+            serde_json::from_slice(&fs::read(path_in(&tmp)).unwrap()).unwrap();
+        for stored in file["nodes"].as_array_mut().unwrap() {
+            if stored["destination_hash"] == serde_json::json!(hex(&tampered)) {
+                stored["public_key"] = serde_json::json!(kept.destination.identity.to_hex_string());
+            }
+        }
+        fs::write(path_in(&tmp), serde_json::to_vec(&file).unwrap()).unwrap();
+
+        let reloaded = PropagationNodeTable::load(path_in(&tmp)).unwrap();
+
+        let hashes: Vec<String> = reloaded.snapshot().iter().map(|r| hex(&r.node)).collect();
+        assert_eq!(hashes, vec![hex(&kept)]);
+        let dropped = format!(
+            "Dropped stored propagation node {}: its public key derives {}",
+            short(&hex(&tampered)),
+            short(&hex(&kept))
+        );
+        assert!(
+            debug_snapshot().iter().any(|line| line == &dropped),
+            "no debug line {dropped:?}"
+        );
+    }
+
+    #[test]
+    fn a_file_over_the_cap_keeps_the_most_recently_heard() {
+        let tmp = TempDir::new("pn-table-cap");
+        let nodes: Vec<PropagationNode> = (0..=PROPAGATION_NODE_TABLE_MAX_ENTRIES)
+            .map(|_| node())
+            .collect();
+        let records: Vec<StoredNode> = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, node)| {
+                StoredNode::of(&PropagationNodeRecord {
+                    node: node.clone(),
+                    hops: 1,
+                    last_seen: t(1_000 + i as u64),
+                })
+            })
+            .collect();
+        fs::create_dir_all(tmp.path.join("mesh")).unwrap();
+        let file = PropagationNodeFile {
+            version: PROPAGATION_NODE_TABLE_VERSION,
+            nodes: records,
+        };
+        fs::write(path_in(&tmp), serde_json::to_vec(&file).unwrap()).unwrap();
+
+        let table = PropagationNodeTable::load(path_in(&tmp)).unwrap();
+
+        let kept: Vec<String> = table.snapshot().iter().map(|r| hex(&r.node)).collect();
+        assert_eq!(kept.len(), PROPAGATION_NODE_TABLE_MAX_ENTRIES);
+        assert!(
+            !kept.contains(&hex(&nodes[0])),
+            "the oldest is the one left out"
+        );
     }
 }
 

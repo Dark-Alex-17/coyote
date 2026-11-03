@@ -334,6 +334,11 @@ pub(crate) fn lxmf_delivery_hash_of(identity_hash: &AddressHash) -> AddressHash 
     destination_address(&name_hash, identity_hash)
 }
 
+/// The `lxmf.propagation` destination `identity` announces as a propagation node.
+pub(crate) fn propagation_node_destination(identity: Identity) -> DestinationDesc {
+    SingleOutputDestination::new(identity, DestinationName::new(APP_NAME, PROPAGATION_ASPECT)).desc
+}
+
 /// A signed message from `sender` to the recipient whose delivery hash is
 /// `recipient_delivery`, laid out as `LXMessage.pack` does (`LXMessage.py:359-383`). A
 /// missing title goes as empty bytes and missing fields as an empty map, which is what the
