@@ -335,7 +335,7 @@ enum DestinationFilter {
     Heard,
     /// `info`: the peer table and the knock cache.
     HeardOrKnocked,
-    /// `status`, `message`, `fetch`: heard peers the list allows, which is what the
+    /// `status`, `message`, `fetch`, `request`: heard peers the list allows, which is what the
     /// sender checks before anything leaves the node.
     TrustedAndHeard,
     /// `trust`: heard peers whose row kept the name hash and knockers whose newest knock
@@ -6177,6 +6177,8 @@ impl RequestContext {
             values = self.mesh_completion_decision_verb(args[0], &args[1..]);
         } else if cmd == ".mesh" && args.len() >= 2 && args[0] == "fetch" {
             values = self.mesh_completion_fetch(&args[1..]);
+        } else if cmd == ".mesh" && args.len() >= 2 && args[0] == "request" {
+            values = self.mesh_completion_request(&args[1..]);
         } else if cmd == ".mesh" && args.len() >= 2 && args[0] == "inbox" {
             values = mesh_completion_inbox(&args[1..]);
         } else if cmd == ".mesh" && args.len() == 2 && args[0] == "memory" {
@@ -7248,6 +7250,61 @@ impl RequestContext {
             _ if prior.contains(&"--if-sha256") => Vec::new(),
             _ => vec![("--if-sha256 ".to_string(), None)],
         }
+    }
+
+    /// Completions for `.mesh request`, `rest` being everything after the verb, from the
+    /// node's caches alone. Until the destination is given, the trusted heard peers; after
+    /// it, at every position, the paths of that peer's last listing not typed yet, then
+    /// `--reason ` and `--yes`, each offered once. Nothing follows `--reason`, whose value
+    /// is free text and never counts as the destination or a path. A path that would not
+    /// display as the peer spelled it is left out, since no `.mesh request` could type it.
+    fn mesh_completion_request(&self, rest: &[&str]) -> Vec<(String, Option<String>)> {
+        let Some((_, prior)) = rest.split_last() else {
+            return Vec::new();
+        };
+        let Some(runtime) = self.app.mesh.get() else {
+            return Vec::new();
+        };
+        if prior.last() == Some(&"--reason") {
+            return Vec::new();
+        }
+        let mut positionals = Vec::new();
+        let mut words = prior.iter();
+        while let Some(word) = words.next() {
+            match *word {
+                "--yes" => {}
+                "--reason" => {
+                    words.next();
+                }
+                _ => positionals.push(*word),
+            }
+        }
+        let Some((destination, typed)) = positionals.split_first() else {
+            return self.mesh_completion_destinations(DestinationFilter::TrustedAndHeard);
+        };
+        let now = SystemTime::now();
+        let listing = runtime.last_listing(destination);
+        let listed = listing.iter().flat_map(|listing| {
+            let heard = age_text(now, listing.heard_at);
+            listing.entries.iter().map(move |entry| {
+                let description = format!("{} B . listed {heard}", entry.size);
+                (entry.path.as_str(), description)
+            })
+        });
+        let mut offered = HashSet::new();
+        let mut values: Vec<(String, Option<String>)> = listed
+            .filter(|(path, _)| display_text(path, WIRE_PATH_MAX_BYTES).as_deref() == Some(*path))
+            .filter(|(path, _)| !typed.contains(path))
+            .filter(|(path, _)| offered.insert(*path))
+            .map(|(path, description)| (path.to_string(), Some(description)))
+            .collect();
+        if !prior.contains(&"--reason") {
+            values.push(("--reason ".to_string(), None));
+        }
+        if !prior.contains(&"--yes") {
+            values.push(("--yes".to_string(), None));
+        }
+        values
     }
 
     /// Completions for `.mesh answer` and `.mesh message` once the id or destination is
@@ -39696,6 +39753,159 @@ mod tests {
         );
 
         fixture.stop().await;
+    }
+
+    mod mesh_request_completion {
+        use super::*;
+        #[cfg(unix)]
+        use crate::mesh::fetch::ListedFile;
+
+        #[cfg(unix)]
+        fn seed_listing(fixture: &MeshCompletionFixture, paths: &[&str]) {
+            let runtime = fixture.ctx.app.mesh.get().unwrap();
+            runtime.memory().remember_listing_for_tests(
+                &fixture.trusted_destination,
+                paths
+                    .iter()
+                    .map(|path| ListedFile {
+                        path: path.to_string(),
+                        size: 0,
+                    })
+                    .collect(),
+                SystemTime::now(),
+            );
+        }
+
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn repl_complete_mesh_request_offers_trusted_heard_destinations() {
+            let _guard = HelperConfigDirGuard::new();
+            let fixture = seed_mesh_completion_fixture("rc-mesh-complete-request").await;
+
+            assert_eq!(
+                completion_values(&fixture.complete(&["request", ""])),
+                [fixture.trusted_destination.as_str()],
+                "never a heard-only peer, a blocked instance or an identity record"
+            );
+
+            fixture.stop().await;
+        }
+
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn repl_complete_mesh_request_offers_the_last_listing_then_both_flags() {
+            let _guard = HelperConfigDirGuard::new();
+            let fixture = seed_mesh_completion_fixture("rc-mesh-complete-request-paths").await;
+            let trusted = fixture.trusted_destination.clone();
+
+            assert_eq!(
+                completion_values(&fixture.complete(&["request", &trusted, ""])),
+                ["--reason ", "--yes"],
+                "no listing heard yet"
+            );
+            seed_listing(&fixture, &["docs/a.md", "README.md", "docs/a.md"]);
+            assert_eq!(
+                completion_values(&fixture.complete(&["request", &trusted, ""])),
+                ["docs/a.md", "README.md", "--reason ", "--yes"],
+                "the last listing once each in its own order, then the flags"
+            );
+
+            fixture.stop().await;
+        }
+
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn repl_complete_mesh_request_does_not_offer_a_typed_path_again() {
+            let _guard = HelperConfigDirGuard::new();
+            let fixture = seed_mesh_completion_fixture("rc-mesh-complete-request-typed").await;
+            let trusted = fixture.trusted_destination.clone();
+            seed_listing(&fixture, &["docs/a.md", "README.md", "notes.md"]);
+
+            assert_eq!(
+                completion_values(&fixture.complete(&["request", &trusted, "docs/a.md", ""])),
+                ["README.md", "notes.md", "--reason ", "--yes"]
+            );
+            assert_eq!(
+                completion_values(&fixture.complete(&[
+                    "request",
+                    &trusted,
+                    "docs/a.md",
+                    "--reason",
+                    "README.md",
+                    ""
+                ])),
+                ["README.md", "notes.md", "--yes"],
+                "the reason is not a typed path"
+            );
+
+            fixture.stop().await;
+        }
+
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn repl_complete_mesh_request_does_not_offer_a_used_flag_again() {
+            let _guard = HelperConfigDirGuard::new();
+            let fixture = seed_mesh_completion_fixture("rc-mesh-complete-request-flags").await;
+            let trusted = fixture.trusted_destination.clone();
+            seed_listing(&fixture, &["docs/a.md", "notes.md"]);
+
+            assert_eq!(
+                completion_values(&fixture.complete(&["request", &trusted, "--yes", ""])),
+                ["docs/a.md", "notes.md", "--reason "]
+            );
+            assert_eq!(
+                completion_values(&fixture.complete(&["request", &trusted, "--reason", "why", ""])),
+                ["docs/a.md", "notes.md", "--yes"]
+            );
+            assert_eq!(
+                completion_values(&fixture.complete(&[
+                    "request",
+                    "--yes",
+                    &trusted,
+                    "--reason",
+                    "why",
+                    "docs/a.md",
+                    ""
+                ])),
+                ["notes.md"],
+                "the destination is the first word that is neither a flag nor a reason"
+            );
+
+            fixture.stop().await;
+        }
+
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn repl_complete_mesh_request_offers_nothing_after_reason() {
+            let _guard = HelperConfigDirGuard::new();
+            let fixture = seed_mesh_completion_fixture("rc-mesh-complete-request-reason").await;
+            let trusted = fixture.trusted_destination.clone();
+            seed_listing(&fixture, &["docs/a.md"]);
+
+            assert!(
+                fixture
+                    .complete(&["request", &trusted, "docs/a.md", "--reason", ""])
+                    .is_empty()
+            );
+
+            fixture.stop().await;
+        }
+
+        #[test]
+        fn repl_complete_mesh_request_offers_nothing_while_the_mesh_is_off() {
+            let ctx = create_test_ctx();
+
+            assert!(ctx.repl_complete(".mesh", &["request", ""], "").is_empty());
+            assert!(
+                ctx.repl_complete(".mesh", &["request", "abc", ""], "")
+                    .is_empty()
+            );
+        }
     }
 
     /// `allow` and `deny` refuse while the mesh is off, so nothing probes the tree for them;
