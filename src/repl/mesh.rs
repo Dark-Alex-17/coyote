@@ -2657,6 +2657,7 @@ fn trust(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 TrustOptions { label, note: None },
                 now,
             )?;
+            reset_knock_surfacing(ctx, &outcome.identity_hash);
             let mut lines = vec![trusted_destination_line(&store, &outcome)];
             if outcome.deny_lifted {
                 lines.push("The refusal on this instance is lifted.".to_string());
@@ -2689,6 +2690,7 @@ fn trust(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             }
             let change =
                 store.trust_identity(mesh, &identity, TrustOptions { label, note: None }, now)?;
+            reset_knock_surfacing(ctx, &identity);
             out_text(&format!(
                 "Trusted identity {}, all destinations - {}.",
                 short(&identity),
@@ -2703,6 +2705,14 @@ fn trust(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The owner just acted on `identity`, so each of its instances earns one knock line
+/// again. A mesh that is off holds no gate and so nothing to reset.
+fn reset_knock_surfacing(ctx: &RequestContext, identity: &str) {
+    if let Some(runtime) = ctx.app.mesh.get() {
+        runtime.knock_gate().reset_surfaced(identity);
+    }
 }
 
 /// Without `--confirm` this is a dry run: it lists what would go and prints the token that
@@ -2836,6 +2846,7 @@ fn untrust(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             }
             let name = identity_name(&store, mesh, &preview.identity, &destination);
             let outcome = store.untrust_destination(mesh, &destination, false)?;
+            reset_knock_surfacing(ctx, &outcome.identity);
             out_text(&format!(
                 "Untrusted {name} ({}): its destination record is gone; the identity {} stays known. {}",
                 short(&destination),
@@ -2845,7 +2856,11 @@ fn untrust(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         }
         UntrustArg::Identity { target, confirm } => {
             let identity = identity_hash(ctx, &target)?;
+            let confirmed = confirm.is_some();
             untrust_identity(&store, mesh, &identity, confirm, now)?;
+            if confirmed {
+                reset_knock_surfacing(ctx, &identity);
+            }
         }
     }
     Ok(())
@@ -3270,6 +3285,9 @@ fn block(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 return Ok(());
             }
             let outcome = store.deny_destination(mesh, &destination, note, now, false)?;
+            if let Some(identity) = &outcome.identity {
+                reset_knock_surfacing(ctx, identity);
+            }
             let identity_clause = outcome
                 .identity
                 .as_deref()
@@ -3287,12 +3305,16 @@ fn block(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         }
         BlockArg::Identity { target, yes, note } => {
             let identity = identity_hash(ctx, &target)?;
-            block_identity(&store, mesh, &identity, yes, note, now)?;
+            if block_identity(&store, mesh, &identity, yes, note, now)? {
+                reset_knock_surfacing(ctx, &identity);
+            }
         }
     }
     Ok(())
 }
 
+/// Whether the identity was blocked; a repeat block without a note and a declined
+/// confirmation change nothing.
 fn block_identity(
     store: &TrustStore,
     mesh: &dyn LiveMesh,
@@ -3300,12 +3322,12 @@ fn block_identity(
     yes: bool,
     note: Option<String>,
     now: SystemTime,
-) -> Result<()> {
+) -> Result<bool> {
     // A note is the one thing a repeat block changes; without one there is nothing to ask.
     if note.is_none() && store.is_blocked_identity(identity) {
         out_text(&format!("identity {} is already blocked.", short(identity)));
         out_text(NOTHING_CHANGED);
-        return Ok(());
+        return Ok(false);
     }
     let memory = store.remembered_envoy_threads(identity);
     let mut memory_clause = match &memory {
@@ -3335,7 +3357,7 @@ fn block_identity(
     ));
     if !confirm_or_flag(&format!("Block {}?", short(identity)), "--yes", yes)? {
         out_text(NOTHING_CHANGED);
-        return Ok(());
+        return Ok(false);
     }
     let removed = store.block_identity(mesh, identity, note, now)?;
     let mut lines = vec![format!("Blocked {}.", short(identity))];
@@ -3352,7 +3374,7 @@ fn block_identity(
         store.remembered_envoy_threads(identity),
     ));
     out_text(&lines.join("\n"));
-    Ok(())
+    Ok(true)
 }
 
 fn unblock(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {

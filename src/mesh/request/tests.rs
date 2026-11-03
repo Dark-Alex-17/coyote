@@ -5790,7 +5790,7 @@ pub(crate) mod network {
             rig.gate.cache().list(SystemTime::now()).unwrap().len() == 2
         })
         .await;
-        assert_eq!(surface.count(), 1, "one line per identity per session");
+        assert_eq!(surface.count(), 1, "one line per instance per session");
         assert_eq!(
             rig.gate.cache().list(SystemTime::now()).unwrap()[0].intro,
             None

@@ -522,7 +522,8 @@ async fn sync_outcome(
 
 /// Knock, reply and access lines are never folded into a summary: each is bounded
 /// upstream and carries something a fold would lose, a line the peer cannot earn again.
-/// A knock is admitted once per identity per process, only for an identity already
+/// A knock surfaces once per instance of an identity until the owner acts on that
+/// identity, only for an identity already
 /// trusted at the identity tier (`KnockGate::admit` drops unknown ones), and its line
 /// carries the full hash the `.mesh trust` hint needs. A reply answers a question this
 /// node asked, so replies are bounded by our own asks. An access request is capped per

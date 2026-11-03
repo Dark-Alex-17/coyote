@@ -67,6 +67,10 @@ pub(crate) const KNOCK_BUCKET_REFILL_INTERVAL: Duration = Duration::from_secs(10
 /// list is full. Only drops within the last refill interval are reported, so the cap
 /// bites only on an identity dropped more often than that within one interval.
 pub(crate) const KNOCK_DROPS_REMEMBERED: usize = 16;
+/// Instances per identity the gate remembers having surfaced a knock from; the oldest
+/// goes when the list is full, so an identity knocking from more instances than this
+/// may surface one of them again. With `KNOCK_GATE_MAX_IDENTITIES` it bounds the gate.
+const KNOCK_SURFACED_DESTINATIONS_MAX: usize = 16;
 
 /// The knocker's text, cleaned and within `KNOCK_INTRO_MAX_CHARS`. Empty is allowed: a
 /// knock needs no words.
@@ -389,7 +393,8 @@ pub(crate) struct DroppedKnocks {
 
 struct IdentityState {
     last_seen: Instant,
-    surfaced: bool,
+    /// The instances whose knock earned its line this session, oldest first.
+    surfaced: VecDeque<String>,
     tokens: u32,
     last_refill: Instant,
     drops: VecDeque<Instant>,
@@ -399,7 +404,7 @@ impl IdentityState {
     fn new(now: Instant) -> Self {
         Self {
             last_seen: now,
-            surfaced: false,
+            surfaced: VecDeque::new(),
             tokens: KNOCK_BUCKET_BURST,
             last_refill: now,
             drops: VecDeque::new(),
@@ -422,6 +427,17 @@ impl IdentityState {
             .last_refill
             .checked_add(KNOCK_BUCKET_REFILL_INTERVAL.saturating_mul(intervals))
             .unwrap_or(now);
+    }
+
+    fn was_surfaced(&self, destination: &str) -> bool {
+        self.surfaced.iter().any(|surfaced| surfaced == destination)
+    }
+
+    fn mark_surfaced(&mut self, destination: &str) {
+        if self.surfaced.len() >= KNOCK_SURFACED_DESTINATIONS_MAX {
+            self.surfaced.pop_front();
+        }
+        self.surfaced.push_back(destination.to_string());
     }
 
     /// Spends one token if the bucket has one, crediting whole refill intervals first; a
@@ -487,7 +503,8 @@ impl GateState {
 /// The trust list's answer to a knock, applied once more where knocks land: the
 /// dispatcher already refused the request, but a fetched knock arrives with no dispatcher
 /// in front of it, and a block may have landed since. Then a per-identity bucket, the
-/// cache, and one terminal line per identity per session.
+/// cache, and one terminal line per instance of an identity per session, until the
+/// owner acts on that identity.
 pub(crate) struct KnockGate {
     trust: Arc<TrustStore>,
     peers: Arc<PeerTable>,
@@ -515,7 +532,7 @@ impl KnockGate {
     }
 
     /// A knock admitted before this is called is cached but not surfaced, and not marked
-    /// as surfaced either, so the identity's next knock still earns its one line.
+    /// as surfaced either, so the instance's next knock still earns its one line.
     pub(crate) fn attach(&self, surface: Weak<dyn KnockSurface>) {
         *self.surface.lock() = Some(surface);
     }
@@ -633,10 +650,10 @@ impl KnockGate {
         {
             let mut state = self.state.lock();
             let entry = state.entry(&knock.identity_hash, now);
-            if entry.surfaced {
+            if entry.was_surfaced(&knock.destination_hash) {
                 return Admission::Admitted { surfaced: false };
             }
-            entry.surfaced = true;
+            entry.mark_surfaced(&knock.destination_hash);
         }
         let shown = surface.surface(IdleNotify {
             source: Source::Knock,
@@ -646,7 +663,11 @@ impl KnockGate {
             model_note: None,
         });
         if !shown {
-            self.state.lock().entry(&knock.identity_hash, now).surfaced = false;
+            self.state
+                .lock()
+                .entry(&knock.identity_hash, now)
+                .surfaced
+                .retain(|surfaced| *surfaced != knock.destination_hash);
         }
         Admission::Admitted { surfaced: shown }
     }
@@ -721,6 +742,17 @@ impl KnockGate {
         let identity = identity.trim().to_ascii_lowercase();
         self.state.lock().identities.remove(&identity);
         self.cache.forget_identity(&identity)
+    }
+
+    /// Clears which instances of `identity` already had their knock surfaced, so after
+    /// the owner trusts, untrusts or blocks it each of them earns a line again. Unlike
+    /// `forget_identity` the bucket and the drops stay, so an owner action never lets
+    /// an identity knock faster. `identity` is read as canonical lower hex.
+    pub(crate) fn reset_surfaced(&self, identity: &str) {
+        let identity = identity.trim().to_ascii_lowercase();
+        if let Some(state) = self.state.lock().identities.get_mut(&identity) {
+            state.surfaced.clear();
+        }
     }
 
     /// The identities the rate limit has dropped a knock from within the last refill
@@ -1230,7 +1262,7 @@ mod tests {
     }
 
     #[test]
-    fn a_known_identity_from_an_untrusted_instance_is_admitted_surfaced_once_and_cached() {
+    fn a_known_identity_from_an_untrusted_instance_is_admitted_surfaced_per_instance_and_cached() {
         let identity = hash_of("id-a");
         let rig = Rig::new(
             "knock-gate-admit",
@@ -1262,10 +1294,10 @@ mod tests {
             now(),
             SystemTime::now(),
         );
-        assert_eq!(second, Admission::Admitted { surfaced: false });
+        assert_eq!(second, Admission::Admitted { surfaced: true });
 
         let notes = rig.surface.notes.lock();
-        assert_eq!(notes.len(), 1, "one line per identity per session");
+        assert_eq!(notes.len(), 2, "one line per instance per session");
         assert_eq!(notes[0].source, Source::Knock);
         assert_eq!(notes[0].origin, Origin::Peer(identity[..8].to_string()));
         assert!(
@@ -1388,9 +1420,9 @@ mod tests {
         let start = now();
 
         let admissions: Vec<Admission> = (0..5)
-            .map(|n| {
+            .map(|_| {
                 rig.gate.admit(
-                    knock_from(&identity, &hash_of(&format!("inst-{n}")), KnockVia::Direct),
+                    knock_from(&identity, &hash_of("inst-0"), KnockVia::Direct),
                     start,
                     SystemTime::now(),
                 )
@@ -1411,7 +1443,7 @@ mod tests {
         assert_eq!(rig.cached().len(), KNOCK_BUCKET_BURST as usize);
 
         let refilled = rig.gate.admit(
-            knock_from(&identity, &hash_of("inst-late"), KnockVia::Direct),
+            knock_from(&identity, &hash_of("inst-0"), KnockVia::Direct),
             start + KNOCK_BUCKET_REFILL_INTERVAL,
             SystemTime::now(),
         );
@@ -1497,7 +1529,7 @@ mod tests {
         );
         assert_eq!(
             rig.gate.admit(
-                knock_from(&noisy, &hash_of("inst-after-read"), KnockVia::Direct),
+                knock_from(&noisy, &hash_of("inst-0"), KnockVia::Direct),
                 start + KNOCK_BUCKET_REFILL_INTERVAL,
                 SystemTime::now(),
             ),
@@ -1537,7 +1569,7 @@ mod tests {
         );
         assert_eq!(
             rig.gate.admit(
-                knock_from(&identity, &hash_of("inst-late"), KnockVia::Direct),
+                knock_from(&identity, &hash_of("inst-0"), KnockVia::Direct),
                 later,
                 SystemTime::now(),
             ),
@@ -2992,23 +3024,24 @@ mod tests {
                 .identity(&quiet, false),
         );
         let start = now();
-        let knock = |identity: &str, n: usize, at: Instant| {
+        let knock = |identity: &str, at: Instant| {
             rig.gate.admit(
-                knock_from(identity, &hash_of(&format!("i{n}")), KnockVia::Direct),
+                knock_from(
+                    identity,
+                    &hash_of(&format!("inst-{identity}")),
+                    KnockVia::Direct,
+                ),
                 at,
                 SystemTime::now(),
             )
         };
 
-        for n in 0..KNOCK_BUCKET_BURST as usize {
-            assert!(matches!(
-                knock(&noisy, n, start),
-                Admission::Admitted { .. }
-            ));
+        for _ in 0..KNOCK_BUCKET_BURST {
+            assert!(matches!(knock(&noisy, start), Admission::Admitted { .. }));
         }
-        assert_eq!(knock(&noisy, 10, start), Admission::RateLimited);
+        assert_eq!(knock(&noisy, start), Admission::RateLimited);
         assert_eq!(
-            knock(&quiet, 11, start),
+            knock(&quiet, start),
             Admission::Admitted { surfaced: true },
             "one identity's flood never touches another's bucket"
         );
@@ -3016,33 +3049,33 @@ mod tests {
 
         let two_later = start + KNOCK_BUCKET_REFILL_INTERVAL * 2;
         assert_eq!(
-            knock(&noisy, 20, two_later),
+            knock(&noisy, two_later),
             Admission::Admitted { surfaced: false }
         );
         assert_eq!(
-            knock(&noisy, 21, two_later),
+            knock(&noisy, two_later),
             Admission::Admitted { surfaced: false }
         );
         assert_eq!(
-            knock(&noisy, 22, two_later),
+            knock(&noisy, two_later),
             Admission::RateLimited,
             "two intervals return exactly two tokens"
         );
 
         let much_later = start + KNOCK_BUCKET_REFILL_INTERVAL * 100;
-        for n in 30..30 + KNOCK_BUCKET_BURST as usize {
+        for _ in 0..KNOCK_BUCKET_BURST {
             assert_eq!(
-                knock(&noisy, n, much_later),
+                knock(&noisy, much_later),
                 Admission::Admitted { surfaced: false }
             );
         }
         assert_eq!(
-            knock(&noisy, 40, much_later),
+            knock(&noisy, much_later),
             Admission::RateLimited,
             "a long silence refills to the burst and no further"
         );
 
-        assert_eq!(rig.surface.texts().len(), 2, "still one line per identity");
+        assert_eq!(rig.surface.texts().len(), 2, "still one line per instance");
         let cached = rig.cached();
         let noisy_records = cached
             .iter()
@@ -3088,6 +3121,114 @@ mod tests {
         );
         assert_eq!(rig.surface.texts().len(), KNOCK_GATE_MAX_IDENTITIES + 2);
         assert!(!rig.gate.tracked_identities().contains(&identities[1]));
+    }
+
+    mod surfaced_per_instance_tests {
+        use super::*;
+
+        fn knock_at(rig: &Rig, identity: &str, instance: &str, at: Instant) -> Admission {
+            rig.gate.admit(
+                knock_from(identity, &hash_of(instance), KnockVia::Direct),
+                at,
+                SystemTime::now(),
+            )
+        }
+
+        fn rig_for(tag: &str, identity: &str) -> Rig {
+            Rig::new(tag, TrustList::default().identity(identity, false))
+        }
+
+        #[test]
+        fn a_knock_from_another_instance_surfaces_after_the_owner_trusts_the_first() {
+            let identity = hash_of("id-x");
+            let rig = rig_for("knock-gate-other-instance", &identity);
+            let start = now();
+
+            assert_eq!(
+                knock_at(&rig, &identity, "inst-c", start),
+                Admission::Admitted { surfaced: true }
+            );
+            rig.gate.reset_surfaced(&identity);
+            assert_eq!(
+                knock_at(&rig, &identity, "inst-a", start),
+                Admission::Admitted { surfaced: true }
+            );
+            assert_eq!(rig.surface.texts().len(), 2);
+        }
+
+        #[test]
+        fn a_repeat_from_the_same_instance_stays_quiet_until_the_owner_acts() {
+            let identity = hash_of("id-x");
+            let rig = rig_for("knock-gate-repeat-instance", &identity);
+            let start = now();
+
+            assert_eq!(
+                knock_at(&rig, &identity, "inst-a", start),
+                Admission::Admitted { surfaced: true }
+            );
+            assert_eq!(
+                knock_at(&rig, &identity, "inst-a", start),
+                Admission::Admitted { surfaced: false }
+            );
+            rig.gate.reset_surfaced(&identity.to_ascii_uppercase());
+            assert_eq!(
+                knock_at(&rig, &identity, "inst-a", start),
+                Admission::Admitted { surfaced: true },
+                "an owner action on the identity earns its instances a line again"
+            );
+            assert_eq!(rig.surface.texts().len(), 2);
+        }
+
+        #[test]
+        fn resetting_the_surfaced_marks_keeps_the_bucket_and_the_drops() {
+            let identity = hash_of("id-x");
+            let rig = rig_for("knock-gate-reset-keeps-bucket", &identity);
+            let start = now();
+            for _ in 0..=KNOCK_BUCKET_BURST {
+                knock_at(&rig, &identity, "inst-a", start);
+            }
+            assert_eq!(rig.gate.dropped_knocks(start)[0].count, 1);
+
+            rig.gate.reset_surfaced(&identity);
+
+            assert_eq!(rig.gate.dropped_knocks(start)[0].count, 1);
+            assert_eq!(
+                knock_at(&rig, &identity, "inst-b", start),
+                Admission::RateLimited
+            );
+            assert_eq!(rig.surface.texts().len(), 1);
+        }
+
+        #[test]
+        fn the_instances_remembered_per_identity_are_capped_oldest_first() {
+            let identity = hash_of("id-x");
+            let rig = rig_for("knock-gate-surfaced-cap", &identity);
+            let start = now();
+            let cap = KNOCK_SURFACED_DESTINATIONS_MAX as u32;
+            for n in 0..=cap {
+                assert_eq!(
+                    knock_at(
+                        &rig,
+                        &identity,
+                        &format!("inst-{n}"),
+                        start + KNOCK_BUCKET_REFILL_INTERVAL * n
+                    ),
+                    Admission::Admitted { surfaced: true },
+                    "inst-{n}"
+                );
+            }
+            let later = start + KNOCK_BUCKET_REFILL_INTERVAL * (cap + 1);
+            assert_eq!(
+                knock_at(&rig, &identity, &format!("inst-{cap}"), later),
+                Admission::Admitted { surfaced: false },
+                "the newest instance is still remembered"
+            );
+            assert_eq!(
+                knock_at(&rig, &identity, "inst-0", later),
+                Admission::Admitted { surfaced: true },
+                "the oldest instance made room past the cap"
+            );
+        }
     }
 
     #[test]
@@ -3177,7 +3318,7 @@ mod tests {
             SystemTime::now(),
         );
         assert_eq!(third, Admission::Admitted { surfaced: false });
-        assert_eq!(live.texts().len(), 1, "one line per identity per session");
+        assert_eq!(live.texts().len(), 1, "one line per instance per session");
     }
 
     /// A surfaceless gate over `list` whose hook fires land in the returned sink.
