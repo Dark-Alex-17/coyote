@@ -890,7 +890,8 @@ mod tests {
         let refresh = ["maybe_", "refresh"].concat();
         let driver = ["MeshDigest", "Driver"].concat();
         let turn = ["run_repl_", "command(&mut ctx, self.abort_signal"].concat();
-        let observe = ["digest.lock().observe_", "session("].concat();
+        let observe = ["digest.lock().observe_", "session(&ctx)"].concat();
+        let seed = ["digest.lock().observe_", "session(&self.ctx.read())"].concat();
         let shutdown = ["digest.lock().shut", "down();"].concat();
         let idle_publish = ["idle_", "now()"].concat();
         let idle_stop = ["idle.stop", "().await"].concat();
@@ -948,6 +949,16 @@ mod tests {
         let observe_sites = line_indices(&repl_lines, &observe);
         assert_eq!(observe_sites.len(), 1, "{observe_sites:?}");
         let observe_at = observe_sites[0];
+        // The one other observe seeds the driver before the first turn, so that turn's
+        // progress points have a boundary fingerprint to compare against.
+        let seed_sites = line_indices(&repl_lines, &seed);
+        assert_eq!(seed_sites.len(), 1, "{seed_sites:?}");
+        assert!(
+            seed_sites[0] < turn_at,
+            "{seed} at line {} must precede the turn loop at line {}",
+            seed_sites[0] + 1,
+            turn_at + 1
+        );
         assert!(
             observe_at > turn_at && observe_at <= turn_at + 8,
             "{observe} at line {} is not within 8 lines after the turn at line {}",
@@ -1540,20 +1551,27 @@ mod tests {
                 driver: parking_lot::Mutex::new(driver),
                 model: Arc::clone(&model),
             });
-            let mut ctx = shared_ctx.write();
-            ctx.app.mesh.set_digest_hook(hook.clone());
-            publish_mesh_snapshot(&ctx, TurnState::working_now());
+            let generation = {
+                let mut ctx = shared_ctx.write();
+                ctx.app.mesh.set_digest_hook(hook.clone());
+                publish_mesh_snapshot(&ctx, TurnState::working_now());
 
-            mesh_progress_point(&ctx);
-            assert!(hook.driver.lock().task.is_none(), "nothing changed yet");
-            ctx.mark_todo_done(1);
-            mesh_progress_point(&ctx);
-            assert!(
-                ctx.app.mesh.pending_progress_for_tests().is_some(),
-                "the second point fell inside the snapshot interval"
-            );
+                mesh_progress_point(&ctx);
+                assert!(hook.driver.lock().task.is_none(), "nothing changed yet");
+                ctx.mark_todo_done(1);
+                mesh_progress_point(&ctx);
+                assert!(
+                    ctx.app.mesh.pending_progress_for_tests().is_some(),
+                    "the second point fell inside the snapshot interval"
+                );
+                hook.driver
+                    .lock()
+                    .task
+                    .take()
+                    .expect("the deferred point spawned a generation")
+            };
 
-            wait_for_task(&mut hook.driver.lock()).await;
+            generation.await.unwrap();
             assert_eq!(model.calls(), 2);
             let requests = model.requests();
             assert!(
