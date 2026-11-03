@@ -3314,17 +3314,20 @@ mod tests {
     mod network {
         use super::*;
         use crate::config::Session;
+        use crate::mesh::announce::AnnounceAppData;
+        use crate::mesh::identity::load_or_mint_identity;
         use crate::mesh::mesh_cache_dir;
         use crate::mesh::node::{MeshRuntime, MeshSlot, NodeOptions};
         use crate::mesh::propagation_nodes::PropagationNodeTable;
         use crate::mesh::request::network::{request_sent_as, request_went_as};
         use crate::mesh::request::{NAME_HASH_LEN, SizeBranch};
         use crate::mesh::test_support::{
-            Connector, FakeNode, INTEROP_TIMEOUT, LEGACY_LINK_MTU, POLL, mesh_paths,
-            private_config, started_runtime, wait_until,
+            Connector, FakeNode, INTEROP_TIMEOUT, LEGACY_LINK_MTU, POLL, StartedRuntime,
+            mesh_paths, private_config, started_runtime, started_runtime_on, wait_until,
         };
 
         use rns_transport::destination::DestinationName;
+        use rns_transport::identity_bridge::to_transport_private_identity;
         use rns_transport::identity::PrivateIdentity as TransportIdentity;
         use rns_transport::iface::InterfaceSharedConfig;
         use rns_transport::iface::tcp_server::TcpServer;
@@ -4255,6 +4258,121 @@ mod tests {
 
             let slot = Arc::new(MeshSlot::default());
             slot.install(runtime.clone()).unwrap();
+            assert!(slot.stop().await.unwrap());
+            fake.stop().await;
+        }
+
+        /// B hears A's announce, then both stop. A's message waits on the node, and B,
+        /// restarted with a transport that has never heard A, delivers it on its first
+        /// fetch with the key its peer table kept. The body is built from A's identity
+        /// key rather than captured off a post, since the fake node serves fetches only.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_restarted_runtime_delivers_a_peer_message_with_the_key_it_persisted() {
+            let fake = FakeNode::listen_with_mtu(TcpServer::DEFAULT_CLIENT_MTU).await;
+            let a = started_runtime_on("fetch-net-restart-a", fake.listener.port).await;
+            let a_core = load_or_mint_identity(&mesh_paths(&a.tmp).identity_path).unwrap();
+            let a_identity = transport_identity_of(&a_core);
+            let a_destination = a.runtime.destination_hash().await;
+
+            let b_tmp = TempDir::new("fetch-net-restart-b");
+            TrustList::default()
+                .identity(&identity_hex(&a_identity), true)
+                .write(&b_tmp.path.join("config"));
+            let persisted = PropagationNodeTable::load(
+                mesh_cache_dir(&b_tmp.path.join("cache")).join("propagation-nodes.json"),
+            )
+            .unwrap();
+            persisted.observe(
+                PropagationNode {
+                    destination: fake.listener.desc,
+                    stamp_cost: 0,
+                    per_transfer_limit_kb: FETCH_TRANSFER_LIMIT_KB,
+                    propagation_enabled: true,
+                },
+                1,
+                SystemTime::now(),
+            );
+            persisted.persist_if_dirty().unwrap();
+            let mut session = Session::default();
+            let runtime = MeshRuntime::start(
+                &private_config(fake.listener.port),
+                true,
+                &mut session,
+                mesh_paths(&b_tmp),
+                NodeOptions::default(),
+            )
+            .await
+            .unwrap();
+            let mut b = StartedRuntime {
+                runtime,
+                session,
+                relay_handle: tokio::spawn(std::future::ready(())),
+                tmp: b_tmp,
+            };
+            let b_core = load_or_mint_identity(&mesh_paths(&b.tmp).identity_path).unwrap();
+
+            // The fake relays nothing between its clients, so it announces A's destination
+            // with A's key itself, as a transport between the two would.
+            let a_name = session_destination_name(&a.runtime.instance_id().await);
+            let app_data = AnnounceAppData {
+                version: 1,
+                display_name: Some("Ana".to_string()),
+            }
+            .encode()
+            .unwrap();
+            let announced = fake
+                .listener
+                .transport
+                .add_destination(to_transport_private_identity(&a_core), a_name)
+                .await;
+            let packet = announced
+                .lock()
+                .await
+                .announce(OsRng, Some(&app_data))
+                .unwrap();
+            fake.listener.transport.send_packet(packet).await;
+            let peers = b.runtime.peers();
+            wait_until("B to file A with its public key", || {
+                peers.snapshot().iter().any(|peer| {
+                    peer.destination_hash == a_destination && peer.public_key.is_some()
+                })
+            })
+            .await;
+
+            let b_slot = Arc::new(MeshSlot::default());
+            b_slot.install(b.runtime.clone()).unwrap();
+            assert!(b_slot.stop().await.unwrap());
+            let a_slot = Arc::new(MeshSlot::default());
+            a_slot.install(a.runtime.clone()).unwrap();
+            assert!(a_slot.stop().await.unwrap());
+
+            let body = honest_body(
+                &a_core,
+                &transport_identity_of(&b_core),
+                b"while you were away",
+            );
+            let body_id = transient_id_of(&body);
+            fake.script
+                .reply_with([ids_value(&[body_id]), bodies(&[body]), Value::Array(vec![])]);
+            b.restart_on(fake.listener.port).await;
+            assert!(!b.knows_identity_of(&a_destination).await);
+
+            let sink = CountingSink::default();
+            let report = timeout(FETCH_DEADLINE, b.runtime.fetch_propagated(&sink))
+                .await
+                .expect("the fetch must finish within FETCH_DEADLINE")
+                .unwrap();
+
+            assert_eq!((report.delivered, report.deferred), (1, 0));
+            assert_eq!(sink.only().transient_id, body_id);
+            assert_eq!(sink.only().source_identity_hash, identity_hex(&a_identity));
+            assert!(
+                !b.knows_identity_of(&a_destination).await,
+                "the key came from the peer table, not from asking the mesh"
+            );
+
+            let slot = Arc::new(MeshSlot::default());
+            slot.install(b.runtime.clone()).unwrap();
             assert!(slot.stop().await.unwrap());
             fake.stop().await;
         }
