@@ -121,9 +121,16 @@ pub(crate) fn compose_envoy_input(
 /// What the envoy is told about the age of what it holds, appended after the system
 /// tail. A digest older than `ENVOY_STALE_DIGEST_AGE` must be named in the answer. A
 /// resumed thread is told its remembered turns are earlier answers and the brief is
-/// current as of its digest. A fresh run with a fresh digest or none gets nothing, so its
-/// prompt is the one it had before thread memory existed.
-fn handoff_age_notes(resumed: bool, brief: Option<&Brief>, now: SystemTime) -> String {
+/// current as of `snapshot_at`, the capture it was reassembled from, which a progress
+/// point inside a turn keeps newer than the digest. A fresh run with a fresh digest or
+/// none gets nothing, so its prompt is the one it had before thread memory existed. The
+/// resumed notes contain the fresh ones.
+fn handoff_age_notes(
+    resumed: bool,
+    brief: Option<&Brief>,
+    snapshot_at: Option<SystemTime>,
+    now: SystemTime,
+) -> String {
     let digest_at = brief.and_then(|brief| brief.digest_generated_at);
     let mut notes = String::new();
     if let Some(at) = digest_at
@@ -137,7 +144,7 @@ fn handoff_age_notes(resumed: bool, brief: Option<&Brief>, now: SystemTime) -> S
     if !resumed {
         return notes;
     }
-    match (brief, digest_at) {
+    match (brief, snapshot_at) {
         (Some(_), Some(at)) => notes.push_str(&format!(
             "The session brief above is current as of {}.\n",
             age_text(now, at)
@@ -627,7 +634,12 @@ impl EnvoyRunner {
         role.append_to_prompt(&tail);
         let remembered = memory.map(RunMemory::history).unwrap_or_default();
         let total = remembered.len();
-        let history = fit_history(role.model(), role.prompt(), remembered, &user);
+        let snapshot_at = app.mesh.snapshot().map(|snapshot| snapshot.captured_at);
+        let now = SystemTime::now();
+        let notes = |resumed| handoff_age_notes(resumed, brief.as_deref(), snapshot_at, now);
+        // Fitted against the resumed notes, the longest the prompt can end up.
+        let system = format!("{}{}", role.prompt(), notes(!remembered.is_empty()));
+        let history = fit_history(role.model(), &system, remembered, &user);
         if history.len() < total {
             debug!(
                 "Mesh envoy memory for thread {} resumed {} of {total} turns; the rest did not fit the model's context",
@@ -635,11 +647,7 @@ impl EnvoyRunner {
                 history.len()
             );
         }
-        role.append_to_prompt(&handoff_age_notes(
-            !history.is_empty(),
-            brief.as_deref(),
-            SystemTime::now(),
-        ));
+        role.append_to_prompt(&notes(!history.is_empty()));
         let input = Input::with_history(&ctx, &user, role, history)
             .map_err(|err| EnvoyOutcome::Failed(format!("{err:#}")))?;
         let prompt_estimate = input
@@ -8525,30 +8533,32 @@ mod tests {
             let brief = brief_with_digest_from(Duration::from_secs(2 * 3600), now);
             let ask = "Say in your answer that it is as of 2h ago";
 
-            let fresh = handoff_age_notes(false, Some(&brief), now);
+            let snapshot_at = Some(now - Duration::from_secs(10));
+            let fresh = handoff_age_notes(false, Some(&brief), snapshot_at, now);
             assert!(fresh.contains(ask), "{fresh}");
             assert!(!fresh.contains("earlier answers"), "{fresh}");
 
-            let resumed = handoff_age_notes(true, Some(&brief), now);
+            let resumed = handoff_age_notes(true, Some(&brief), snapshot_at, now);
             assert!(resumed.contains(ask), "{resumed}");
             assert!(
-                resumed.contains("The session brief above is current as of 2h ago."),
+                resumed.contains("The session brief above is current as of 10s ago."),
                 "{resumed}"
             );
             assert!(resumed.ends_with(RESUMED_THREAD_NOTE), "{resumed}");
         }
 
         #[test]
-        fn a_fresh_digest_is_dated_only_for_a_resumed_thread() {
+        fn a_resumed_thread_dates_the_brief_by_its_snapshot_not_its_digest() {
             let now = SystemTime::now();
             let brief = brief_with_digest_from(Duration::from_secs(3 * 60), now);
+            let snapshot_at = Some(now - Duration::from_secs(20));
 
-            let resumed = handoff_age_notes(true, Some(&brief), now);
+            let resumed = handoff_age_notes(true, Some(&brief), snapshot_at, now);
             assert_eq!(
                 resumed,
-                format!("The session brief above is current as of 3m ago.\n{RESUMED_THREAD_NOTE}")
+                format!("The session brief above is current as of 20s ago.\n{RESUMED_THREAD_NOTE}")
             );
-            assert_eq!(handoff_age_notes(false, Some(&brief), now), "");
+            assert_eq!(handoff_age_notes(false, Some(&brief), snapshot_at, now), "");
         }
 
         #[test]
@@ -8559,11 +8569,16 @@ mod tests {
                 digest_generated_at: None,
                 sources: vec![BriefSource::Card],
             };
+            let snapshot_at = Some(now - Duration::from_secs(5 * 60));
 
-            assert_eq!(handoff_age_notes(false, None, now), "");
-            assert_eq!(handoff_age_notes(false, Some(&brief), now), "");
+            assert_eq!(handoff_age_notes(false, None, snapshot_at, now), "");
+            assert_eq!(handoff_age_notes(false, Some(&brief), snapshot_at, now), "");
             assert_eq!(
-                handoff_age_notes(true, Some(&brief), now),
+                handoff_age_notes(true, Some(&brief), snapshot_at, now),
+                format!("The session brief above is current as of 5m ago.\n{RESUMED_THREAD_NOTE}")
+            );
+            assert_eq!(
+                handoff_age_notes(true, Some(&brief), None, now),
                 format!("The session brief above is current.\n{RESUMED_THREAD_NOTE}")
             );
         }
@@ -9728,7 +9743,7 @@ mod tests {
         };
         let extra = tokens(&PEER_IDENTITY).saturating_sub(tokens(&OTHER_IDENTITY));
         assert!(
-            extra >= history_tokens * 9 / 10 && extra >= 10 * note_tokens,
+            extra >= history_tokens * 9 / 10 + note_tokens,
             "resumed {} vs fresh {}: extra {extra}, history {history_tokens}, note {note_tokens}",
             tokens(&PEER_IDENTITY),
             tokens(&OTHER_IDENTITY)
