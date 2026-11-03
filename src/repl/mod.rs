@@ -28,7 +28,8 @@ use crate::turn::driver::{
 use crate::turn::{TurnDriver, TurnMode};
 use crate::utils::{
     AbortSignal, SHELL, UserInterrupt, abortable_run_with_spinner, create_abort_signal,
-    dimmed_text, drain_stale_tty_input, resync_cursor_queries, run_command, set_text, temp_file,
+    dimmed_text, drain_stale_tty_input, ensure_prompts_available, resync_cursor_queries,
+    run_command, set_text, temp_file,
 };
 
 use crate::sandbox::SANDBOX_ENV_FLAG;
@@ -964,6 +965,7 @@ pub async fn run_repl_command_with_prefix(
                             .unwrap_or_default();
                         let (mut arguments, missing) = resolve_prompt_args(&declared, provided);
                         for key in missing {
+                            ensure_prompts_available()?;
                             let value = Text::new(&prompt_arg_inquire_label(server, name, &key))
                                 .prompt()
                                 .with_context(|| {

@@ -415,6 +415,7 @@ impl Rag {
         if !*IS_STDOUT_TERMINAL {
             bail!("Cannot run attach wizard in non-interactive mode");
         }
+        ensure_prompts_available()?;
         // Checked before any prompt or secret is created, so a name that
         // collides with another RAG's kit is refused at once.
         check_rag_kit_slot(save_path, name)?;
@@ -1093,6 +1094,7 @@ impl Rag {
         if has_error {
             let mut aborted = true;
             if *IS_STDOUT_TERMINAL && total > 0 {
+                ensure_prompts_available()?;
                 let ans = Confirm::new("Some documents failed to load. Continue?")
                     .with_default(false)
                     .prompt()?;
@@ -1975,6 +1977,7 @@ fn driver_auth_header(driver: &str) -> (&'static str, &'static str) {
 }
 
 fn select_embedding_model(models: &[&Model]) -> Result<String> {
+    ensure_prompts_available()?;
     let max_width = models.iter().map(|v| v.id().len()).max().unwrap_or(0);
     let models: Vec<_> = models
         .iter()
@@ -2002,6 +2005,7 @@ pub(crate) fn select_rag_driver() -> Result<String> {
             "yaml   — portable, in-memory HNSW; usable from several Coyote processes at once (default)",
             "duckdb — persistent on-disk store; vectors and content survive restarts; HNSW approximate search.",
         ];
+        ensure_prompts_available()?;
         let sel = Select::new("RAG storage driver:", options)
             .with_starting_cursor(0)
             .prompt()?;
@@ -2022,6 +2026,7 @@ pub(crate) fn select_rag_driver() -> Result<String> {
 const EXTRACTOR_SKIP: &str = "Skip";
 
 fn select_extractor_model(app: &AppConfig) -> Result<Option<String>> {
+    ensure_prompts_available()?;
     let models = list_models(app, ModelType::Chat);
     if models.is_empty() {
         return Ok(None);
@@ -2076,6 +2081,7 @@ impl fmt::Display for SelectOption {
 }
 
 fn set_chunk_size(model: &Model) -> Result<usize> {
+    ensure_prompts_available()?;
     let default_value = model.default_chunk_size().to_string();
     let help_message = model
         .max_tokens_per_chunk()
@@ -2098,6 +2104,7 @@ fn set_chunk_size(model: &Model) -> Result<usize> {
 }
 
 fn set_graph_hops(default_value: usize) -> Result<usize> {
+    ensure_prompts_available()?;
     let value = Text::new("Set graph expansion hops:")
         .with_default(&default_value.to_string())
         .with_help_message("Number of hops to expand from matched entities (0 = seed nodes only, 1 = direct neighbors, 2 = neighbors of neighbors)")
@@ -2113,6 +2120,7 @@ fn set_graph_hops(default_value: usize) -> Result<usize> {
 }
 
 fn set_chunk_overlay(default_value: usize) -> Result<usize> {
+    ensure_prompts_available()?;
     let value = Text::new("Set chunk overlay:")
         .with_default(&default_value.to_string())
         .with_validator(move |text: &str| {
@@ -2127,6 +2135,7 @@ fn set_chunk_overlay(default_value: usize) -> Result<usize> {
 }
 
 fn add_documents() -> Result<Vec<String>> {
+    ensure_prompts_available()?;
     let text = Text::new("Add documents:")
         .with_validator(required!("This field is required"))
         .with_help_message("e.g. file;dir/;dir/**/*.{md,mdx};loader:resource;url;website/**")
@@ -2308,6 +2317,7 @@ fn resolve_or_create_api_key_secret(vault: &Vault, secret_name: &str) -> Result<
             .with_context(|| format!("Cannot read secret '{secret_name}' from the vault"));
     }
 
+    ensure_prompts_available()?;
     let create = Confirm::new(&format!(
         "Secret '{secret_name}' is not in the vault. Create it now?"
     ))
@@ -2879,6 +2889,25 @@ mod tests {
         assert_eq!(ids, vec![DocumentId::new(0, 0)]);
         assert_eq!(embeddings, "[Source: notes.txt]\nthe only chunk");
         assert_eq!(sources, "- notes.txt");
+    }
+
+    /// The RAG wizard's free-standing prompts ask on the raw tty; under
+    /// the full-screen UI each is refused before it is built.
+    #[test]
+    #[serial]
+    fn wizard_prompts_under_the_tui_refuse_before_asking() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let errors = [
+            add_documents().map(|_| ()).unwrap_err(),
+            set_graph_hops(1).map(|_| ()).unwrap_err(),
+            set_chunk_overlay(0).map(|_| ()).unwrap_err(),
+        ];
+        for err in errors {
+            assert!(
+                err.to_string().contains("not available in the TUI"),
+                "{err}"
+            );
+        }
     }
 
     #[test]

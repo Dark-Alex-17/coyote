@@ -1,6 +1,6 @@
 use crate::config::ensure_parent_exists;
 use crate::sandbox::{SANDBOX_ENV_FLAG, sandbox_secret_env_var};
-use crate::utils::drain_stale_tty_input;
+use crate::utils::{drain_stale_tty_input, ensure_prompts_available};
 use crate::vault::{SECRET_RE, Vault};
 use anyhow::Result;
 use anyhow::anyhow;
@@ -69,6 +69,7 @@ pub fn create_vault_password_file(vault: &mut Vault) -> Result<()> {
             }
         }
 
+        ensure_prompts_available()?;
         drain_stale_tty_input();
         let ans = Confirm::new(
             format!(
@@ -109,6 +110,7 @@ pub fn create_vault_password_file(vault: &mut Vault) -> Result<()> {
             }
         }
     } else {
+        ensure_prompts_available()?;
         drain_stale_tty_input();
         let ans = Confirm::new("No password file configured. Do you want to create one now?")
             .with_default(true)
@@ -188,6 +190,7 @@ pub fn create_vault_password_file(vault: &mut Vault) -> Result<()> {
 }
 
 pub fn prompt_provider_choice() -> Result<Option<SupportedProvider>> {
+    ensure_prompts_available()?;
     drain_stale_tty_input();
     let choices = vec![
         "local - encrypted file on this machine",
@@ -223,6 +226,7 @@ pub fn prompt_provider_choice() -> Result<Option<SupportedProvider>> {
 }
 
 fn prompt_aws_provider() -> Result<SupportedProvider> {
+    ensure_prompts_available()?;
     let aws_profile = Text::new("AWS profile name:")
         .with_default("default")
         .with_validator(required!())
@@ -249,6 +253,7 @@ fn prompt_aws_provider() -> Result<SupportedProvider> {
 }
 
 fn prompt_gcp_provider() -> Result<SupportedProvider> {
+    ensure_prompts_available()?;
     let gcp_project_id = Text::new("GCP project ID:")
         .with_validator(required!())
         .with_help_message("The project that hosts your Secret Manager secrets")
@@ -268,6 +273,7 @@ fn prompt_gcp_provider() -> Result<SupportedProvider> {
 }
 
 fn prompt_azure_provider() -> Result<SupportedProvider> {
+    ensure_prompts_available()?;
     let vault_name = Text::new("Azure Key Vault name:")
         .with_validator(required!())
         .with_help_message("Just the vault name; the https endpoint is auto-derived")
@@ -283,6 +289,7 @@ fn prompt_azure_provider() -> Result<SupportedProvider> {
 }
 
 fn prompt_gopass_provider() -> Result<SupportedProvider> {
+    ensure_prompts_available()?;
     let store_raw = Text::new("gopass store (leave blank for default):").prompt()?;
     let store = match store_raw.trim() {
         "" => None,
@@ -297,6 +304,7 @@ fn prompt_gopass_provider() -> Result<SupportedProvider> {
 }
 
 fn prompt_one_password_provider() -> Result<SupportedProvider> {
+    ensure_prompts_available()?;
     let vault_raw = Text::new("1Password vault (leave blank for default):").prompt()?;
     let vault = match vault_raw.trim() {
         "" => None,
@@ -477,6 +485,7 @@ fn set_password_file_permissions(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use anyhow::Error;
+    use serial_test::serial;
     use std::cell::RefCell;
 
     fn not_found(name: &str) -> Error {
@@ -650,5 +659,27 @@ mod tests {
             err.contains("coyote --authenticate"),
             "expected hint contents, got: {err}"
         );
+    }
+
+    /// The provider wizard asks on the raw tty; under the full-screen UI
+    /// every one of its prompts is refused before it is built.
+    #[test]
+    #[serial]
+    fn provider_prompts_under_the_tui_refuse_before_asking() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let errors = [
+            prompt_provider_choice().map(|_| ()).unwrap_err(),
+            prompt_aws_provider().map(|_| ()).unwrap_err(),
+            prompt_gcp_provider().map(|_| ()).unwrap_err(),
+            prompt_azure_provider().map(|_| ()).unwrap_err(),
+            prompt_gopass_provider().map(|_| ()).unwrap_err(),
+            prompt_one_password_provider().map(|_| ()).unwrap_err(),
+        ];
+        for err in errors {
+            assert!(
+                err.to_string().contains("not available in the TUI"),
+                "{err}"
+            );
+        }
     }
 }

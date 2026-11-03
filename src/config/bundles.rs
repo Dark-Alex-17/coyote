@@ -4,7 +4,7 @@ use super::install_remote::{
 use super::{paths, request_context};
 use crate::config::AssetCategory;
 use crate::function::write_file_atomic;
-use crate::utils::IS_STDOUT_TERMINAL;
+use crate::utils::{IS_STDOUT_TERMINAL, ensure_prompts_available};
 
 use anyhow::{Context, Result, bail};
 use chrono::{SecondsFormat, Utc};
@@ -281,6 +281,7 @@ impl BundleStore {
                 && manifest_name.is_some()
                 && *IS_STDOUT_TERMINAL
             {
+                ensure_prompts_available()?;
                 let proceed = Confirm::new(&format!(
                     "Bundle name '{base}' is already used by an install from \
                      '{other_source}' (a fork or typo-squat?). Track this install \

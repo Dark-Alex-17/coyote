@@ -392,6 +392,7 @@ impl Agent {
         } else if !agent_config.documents.is_empty() && !info_flag {
             let mut ans = false;
             if *IS_STDOUT_TERMINAL {
+                ensure_prompts_available()?;
                 ans = Confirm::new("The agent has documents attached, init RAG?")
                     .with_default(true)
                     .prompt()?;
@@ -1416,6 +1417,7 @@ async fn init_graph_rags(
                     );
                 }
 
+                ensure_prompts_available()?;
                 let ans = Confirm::new(&format!(
                     "Initialize RAG knowledge base for rag node '{node_id}'?"
                 ))

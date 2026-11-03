@@ -5,7 +5,7 @@
 //! keep-all/replace-all semantics are identical everywhere, including when
 //! one sticky scope spans several install locations in a single run.
 
-use crate::utils::IS_STDOUT_TERMINAL;
+use crate::utils::{IS_STDOUT_TERMINAL, ensure_prompts_available};
 
 use anyhow::{Context, Result, bail};
 use inquire::Select;
@@ -119,6 +119,7 @@ fn select_choice(prompt: &str) -> Result<String> {
     if prompt_script::active() {
         return Ok(prompt_script::next_answer(prompt));
     }
+    ensure_prompts_available()?;
     Select::new(
         prompt,
         vec!["keep", "replace", "keep-all", "replace-all", "abort"],
@@ -241,6 +242,19 @@ mod tests {
             resolve_conflict(&dst(), "macros", &mut sticky, NonInteractive::Bail).unwrap(),
             ConflictAction::Replace
         ));
+    }
+
+    /// The conflict menu asks on the raw tty; under the full-screen UI it
+    /// is refused before the menu is built.
+    #[test]
+    #[serial]
+    fn select_choice_under_the_tui_refuses_before_asking() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let err = select_choice("Conflict on example.yaml").unwrap_err();
+        assert!(
+            err.to_string().contains("not available in the TUI"),
+            "{err}"
+        );
     }
 
     #[test]

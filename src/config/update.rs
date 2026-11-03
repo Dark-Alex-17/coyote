@@ -1,4 +1,4 @@
-use crate::utils::warning_text;
+use crate::utils::{ensure_prompts_available, warning_text};
 use anyhow::{Context, Result, bail};
 use dunce::canonicalize;
 use inquire::Confirm;
@@ -120,6 +120,7 @@ pub fn run_self_update(requested: Option<String>, force: bool) -> Result<()> {
         if force {
             println!("--force specified; updating anyway.");
         } else if io::stdin().is_terminal() {
+            ensure_prompts_available()?;
             let proceed = Confirm::new("Update anyway?")
                 .with_default(false)
                 .prompt()?;

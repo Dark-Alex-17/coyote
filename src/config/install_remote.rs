@@ -10,7 +10,7 @@ use crate::config::{
 };
 use crate::mcp::{McpServer, McpServersConfig};
 use crate::utils;
-use crate::utils::IS_STDOUT_TERMINAL;
+use crate::utils::{IS_STDOUT_TERMINAL, ensure_prompts_available};
 use crate::vault::{SECRET_RE, Vault, create_vault_password_file, interpolate_secrets};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::ValueEnum;
@@ -561,6 +561,7 @@ fn resolve_obsolete(path: &str, sticky: &mut Option<ObsoleteAction>) -> Result<O
         return Ok(ObsoleteAction::Keep);
     }
 
+    ensure_prompts_available()?;
     let prompt = format!(
         "Obsolete file {path} is no longer shipped by the bundle and has local modifications"
     );
@@ -680,6 +681,7 @@ pub fn uninstall_bundle(spec: &str, assume_yes: bool) -> Result<()> {
                  re-run with --yes to confirm"
             );
         }
+        ensure_prompts_available()?;
         println!(
             "Bundle '{name}' owns {} file(s) and {} mcp.json server(s).",
             record.files.len(),
@@ -793,6 +795,7 @@ fn select_uninstall_candidate(store: &BundleStore, spec: &str) -> Result<Option<
                 );
             }
 
+            ensure_prompts_available()?;
             let picked = Select::new(
                 &format!("Multiple bundles match '{spec}'; which one should be uninstalled?"),
                 described.clone(),
@@ -976,6 +979,7 @@ fn resolve_uninstall_action(
         return Ok(action);
     }
 
+    ensure_prompts_available()?;
     let choice = Select::new(prompt, vec!["keep", "delete", "keep-all", "delete-all"])
         .prompt()
         .with_context(|| "failed to read uninstall choice")?;
@@ -2210,6 +2214,7 @@ fn resolve_mcp_conflict(name: &str, force: bool, assume_yes: bool) -> Result<Mcp
              Re-run in a terminal, with --install-force (installs), or with --yes (updates)."
         );
     }
+    ensure_prompts_available()?;
     let rename_label = format!("rename remote as \"{name}-remote\"");
     let prompt = format!("Conflict on MCP server '{name}'");
     let choice = Select::new(
@@ -2316,6 +2321,7 @@ fn handle_missing_secrets(missing: &[String], prefix: CommandPrefix) -> Result<(
 }
 
 fn prompt_for_each_secret(missing: &[String]) -> Result<(Vec<String>, Vec<String>)> {
+    ensure_prompts_available()?;
     let mut vault = Vault::init_bare()?;
     let mut password_file_ensured = false;
     let mut added = Vec::new();

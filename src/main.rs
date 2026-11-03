@@ -985,6 +985,7 @@ fn resolve_oauth_client(
             0 => bail!("No OAuth-capable clients configured."),
             1 => find_by_name(&candidates[0]).unwrap(),
             _ => {
+                ensure_prompts_available()?;
                 let choice =
                     Select::new("Select a client to authenticate:", candidates.clone()).prompt()?;
                 find_by_name(&choice)

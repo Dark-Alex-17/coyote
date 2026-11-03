@@ -201,6 +201,17 @@ pub fn ensure_editor_available() -> Result<()> {
     Ok(())
 }
 
+/// Whether an inquire prompt can take the terminal right now. Every REPL
+/// command that still asks on the raw tty checks this before it builds
+/// the prompt, so under the full-screen UI the refusal lands in the
+/// transcript instead of a question nobody can see.
+pub fn ensure_prompts_available() -> Result<()> {
+    if crate::tui::active() {
+        bail!("Interactive prompts are not available in the TUI yet"); // TASK-315
+    }
+    Ok(())
+}
+
 pub fn edit_file(editor: &str, path: &Path) -> Result<()> {
     ensure_editor_available()?;
     let mut child = Command::new(editor).arg(path).spawn()?;

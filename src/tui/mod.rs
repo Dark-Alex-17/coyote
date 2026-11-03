@@ -3052,6 +3052,8 @@ mod tests {
         file: String,
         function: String,
         gated: bool,
+        /// The body calls `ensure_prompts_available()` before its prompt.
+        prompt_gated: bool,
     }
 
     /// The name on a `fn` line, if the line declares one.
@@ -3168,6 +3170,7 @@ mod tests {
                 readers.push(KeyboardReader {
                     gated: body.contains("crate::tui::active()")
                         || body.contains("ensure_editor_available()"),
+                    prompt_gated: body.contains("ensure_prompts_available()"),
                     file,
                     function,
                 });
@@ -3177,13 +3180,16 @@ mod tests {
     }
 
     /// Every direct keyboard reader outside this module either checks the
-    /// TUI flag (itself, or through `ensure_editor_available`) or is listed
-    /// here with the reason it stays REPL-only, so a new reader cannot
-    /// appear without a decision about the TUI.
+    /// TUI flag (itself, or through `ensure_editor_available`) or is
+    /// listed here with the reason it stays REPL-only, so a new reader
+    /// cannot appear without a decision about the TUI. A `PROMPT_GATED`
+    /// row is only honoured when the fn body really calls
+    /// `ensure_prompts_available()`, and a body that does cannot hide
+    /// under another reason.
     #[test]
     fn every_direct_keyboard_reader_is_gated_or_accounted_for() {
-        const DIRECT_TTY: &str =
-            "reaches the tty directly; routing through ctx.prompter is a follow-up";
+        const PROMPT_GATED: &str = "reachable from a REPL command; refuses through \
+            ensure_prompts_available, routing through ctx.prompter is owned debt";
         const BEFORE_UI: &str = "first-run config wizard; runs before any UI starts";
         const CLI_ONLY: &str = "a CLI flow (-e, --mcp); the process never reaches a UI";
         const REPL_PROMPTER: &str =
@@ -3207,39 +3213,39 @@ mod tests {
             ("src/client/common.rs", "select_model", BEFORE_UI),
             ("src/client/common.rs", "prompt_input_string", BEFORE_UI),
             ("src/client/macros.rs", "create_client_config", BEFORE_UI),
-            ("src/config/agent.rs", "init", DIRECT_TTY),
-            ("src/config/agent.rs", "init_graph_rags", DIRECT_TTY),
-            ("src/config/bundles.rs", "resolve_bundle_name", DIRECT_TTY),
-            ("src/config/conflict.rs", "select_choice", DIRECT_TTY),
+            ("src/config/agent.rs", "init", PROMPT_GATED),
+            ("src/config/agent.rs", "init_graph_rags", PROMPT_GATED),
+            ("src/config/bundles.rs", "resolve_bundle_name", PROMPT_GATED),
+            ("src/config/conflict.rs", "select_choice", PROMPT_GATED),
             (
                 "src/config/install_remote.rs",
                 "resolve_obsolete",
-                DIRECT_TTY,
+                PROMPT_GATED,
             ),
             (
                 "src/config/install_remote.rs",
                 "uninstall_bundle",
-                DIRECT_TTY,
+                PROMPT_GATED,
             ),
             (
                 "src/config/install_remote.rs",
                 "select_uninstall_candidate",
-                DIRECT_TTY,
+                PROMPT_GATED,
             ),
             (
                 "src/config/install_remote.rs",
                 "resolve_uninstall_action",
-                DIRECT_TTY,
+                PROMPT_GATED,
             ),
             (
                 "src/config/install_remote.rs",
                 "resolve_mcp_conflict",
-                DIRECT_TTY,
+                PROMPT_GATED,
             ),
             (
                 "src/config/install_remote.rs",
                 "prompt_for_each_secret",
-                DIRECT_TTY,
+                PROMPT_GATED,
             ),
             ("src/config/mod.rs", "confirm_asset_overwrite", VIA_GATE),
             ("src/config/mod.rs", "create_config_file", BEFORE_UI),
@@ -3254,40 +3260,40 @@ mod tests {
                 "edit_mcp_config",
                 VIA_EDIT_GATE,
             ),
-            ("src/config/request_context.rs", "new_role", DIRECT_TTY),
-            ("src/config/request_context.rs", "save_role", DIRECT_TTY),
+            ("src/config/request_context.rs", "new_role", PROMPT_GATED),
+            ("src/config/request_context.rs", "save_role", PROMPT_GATED),
             (
                 "src/config/request_context.rs",
                 "use_session_recording_rebuild",
-                DIRECT_TTY,
+                PROMPT_GATED,
             ),
-            ("src/config/update.rs", "run_self_update", DIRECT_TTY),
+            ("src/config/update.rs", "run_self_update", PROMPT_GATED),
             ("src/main.rs", "shell_execute", CLI_ONLY),
-            ("src/main.rs", "resolve_oauth_client", DIRECT_TTY),
+            ("src/main.rs", "resolve_oauth_client", PROMPT_GATED),
             ("src/mcp/manage.rs", "handle_remove", CLI_ONLY),
             ("src/mcp/manage.rs", "handle_add", CLI_ONLY),
             ("src/mcp/manage.rs", "provision_secrets", CLI_ONLY),
             ("src/prompt/mod.rs", "select", REPL_PROMPTER),
             ("src/prompt/mod.rs", "confirm", REPL_PROMPTER),
             ("src/prompt/mod.rs", "prompt", REPL_PROMPTER),
-            ("src/rag/mod.rs", "attach", DIRECT_TTY),
-            ("src/rag/mod.rs", "sync_documents", DIRECT_TTY),
-            ("src/rag/mod.rs", "select_embedding_model", DIRECT_TTY),
-            ("src/rag/mod.rs", "select_rag_driver", DIRECT_TTY),
-            ("src/rag/mod.rs", "select_extractor_model", DIRECT_TTY),
-            ("src/rag/mod.rs", "set_chunk_size", DIRECT_TTY),
-            ("src/rag/mod.rs", "set_graph_hops", DIRECT_TTY),
-            ("src/rag/mod.rs", "set_chunk_overlay", DIRECT_TTY),
-            ("src/rag/mod.rs", "add_documents", DIRECT_TTY),
+            ("src/rag/mod.rs", "attach", PROMPT_GATED),
+            ("src/rag/mod.rs", "sync_documents", PROMPT_GATED),
+            ("src/rag/mod.rs", "select_embedding_model", PROMPT_GATED),
+            ("src/rag/mod.rs", "select_rag_driver", PROMPT_GATED),
+            ("src/rag/mod.rs", "select_extractor_model", PROMPT_GATED),
+            ("src/rag/mod.rs", "set_chunk_size", PROMPT_GATED),
+            ("src/rag/mod.rs", "set_graph_hops", PROMPT_GATED),
+            ("src/rag/mod.rs", "set_chunk_overlay", PROMPT_GATED),
+            ("src/rag/mod.rs", "add_documents", PROMPT_GATED),
             (
                 "src/rag/mod.rs",
                 "resolve_or_create_api_key_secret",
-                DIRECT_TTY,
+                PROMPT_GATED,
             ),
             (
                 "src/repl/mod.rs",
                 "run_repl_command_with_prefix",
-                DIRECT_TTY,
+                PROMPT_GATED,
             ),
             ("src/repl/mod.rs", "handle_shell_passthrough", VIA_RUN_GATE),
             (
@@ -3295,22 +3301,22 @@ mod tests {
                 "drain_terminal_events",
                 REPL_PAINTER,
             ),
-            ("src/vault/mod.rs", "add_secret", DIRECT_TTY),
-            ("src/vault/mod.rs", "update_secret", DIRECT_TTY),
+            ("src/vault/mod.rs", "add_secret", PROMPT_GATED),
+            ("src/vault/mod.rs", "update_secret", PROMPT_GATED),
             (
                 "src/vault/utils.rs",
                 "create_vault_password_file",
-                DIRECT_TTY,
+                PROMPT_GATED,
             ),
-            ("src/vault/utils.rs", "prompt_provider_choice", DIRECT_TTY),
-            ("src/vault/utils.rs", "prompt_aws_provider", DIRECT_TTY),
-            ("src/vault/utils.rs", "prompt_gcp_provider", DIRECT_TTY),
-            ("src/vault/utils.rs", "prompt_azure_provider", DIRECT_TTY),
-            ("src/vault/utils.rs", "prompt_gopass_provider", DIRECT_TTY),
+            ("src/vault/utils.rs", "prompt_provider_choice", PROMPT_GATED),
+            ("src/vault/utils.rs", "prompt_aws_provider", PROMPT_GATED),
+            ("src/vault/utils.rs", "prompt_gcp_provider", PROMPT_GATED),
+            ("src/vault/utils.rs", "prompt_azure_provider", PROMPT_GATED),
+            ("src/vault/utils.rs", "prompt_gopass_provider", PROMPT_GATED),
             (
                 "src/vault/utils.rs",
                 "prompt_one_password_provider",
-                DIRECT_TTY,
+                PROMPT_GATED,
             ),
         ];
         let readers = keyboard_readers();
@@ -3343,6 +3349,26 @@ mod tests {
             stale.is_empty(),
             "allowlist entries with no matching ungated reader:\n{}",
             stale.join("\n")
+        );
+        let mislabelled: Vec<String> = allowlist
+            .iter()
+            .filter_map(|(file, function, reason)| {
+                let reader = readers
+                    .iter()
+                    .find(|r| r.file == *file && r.function == *function)?;
+                (reader.prompt_gated != (*reason == PROMPT_GATED)).then(|| {
+                    if reader.prompt_gated {
+                        format!("{file}:{function} calls ensure_prompts_available but is listed as: {reason}")
+                    } else {
+                        format!("{file}:{function} is listed as prompt-gated but never calls ensure_prompts_available")
+                    }
+                })
+            })
+            .collect();
+        assert!(
+            mislabelled.is_empty(),
+            "allowlist reasons that disagree with the fn body:\n{}",
+            mislabelled.join("\n")
         );
         assert!(
             readers.iter().any(|r| r.file == "src/utils/input.rs"
@@ -3492,6 +3518,10 @@ mod tests {
             (
                 "src/utils/command.rs",
                 "bail!(\"Editing files is not available in the TUI yet\")",
+            ),
+            (
+                "src/utils/command.rs",
+                "bail!(\"Interactive prompts are not available in the TUI yet\")",
             ),
             (
                 "src/utils/input.rs",

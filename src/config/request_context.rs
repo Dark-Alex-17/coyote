@@ -57,8 +57,8 @@ use crate::turn::{StdoutSink, UiSink};
 use crate::utils::process::ProcessStamp;
 use crate::utils::{
     AbortSignal, UserInterrupt, abortable_run_with_spinner, create_abort_signal, edit_file,
-    ensure_editor_available, estimate_token_length, fuzzy_filter, get_env_name, list_file_names,
-    now, render_prompt, temp_file,
+    ensure_editor_available, ensure_prompts_available, estimate_token_length, fuzzy_filter,
+    get_env_name, list_file_names, now, render_prompt, temp_file,
 };
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use serde::Serialize;
@@ -4120,6 +4120,7 @@ impl RequestContext {
         if self.macro_flag {
             bail!("No role");
         }
+        ensure_prompts_available()?;
         let ans = Confirm::new("Create a new role?")
             .with_default(true)
             .prompt()?;
@@ -4145,6 +4146,7 @@ impl RequestContext {
             None => bail!("No role"),
         };
         if role_name == TEMP_ROLE_NAME {
+            ensure_prompts_available()?;
             role_name = Text::new("Role name:")
                 .with_validator(|input: &str| {
                     let input = input.trim();
@@ -6334,6 +6336,7 @@ impl RequestContext {
                     && (*continuous && !output.is_empty())
                     && self.agent.is_some() == input.with_agent()
                 {
+                    ensure_prompts_available()?;
                     let ans = Confirm::new(
                         "Start a session that incorporates the last question and answer?",
                     )
@@ -11896,6 +11899,38 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    /// `.role <new>` asks `Create a new role?` and `.save role` on a temp
+    /// role asks for its name, both on the raw tty; under the full-screen
+    /// UI each is refused before the question is built and no role file
+    /// appears.
+    #[test]
+    #[serial]
+    fn new_role_and_save_role_under_the_tui_refuse_before_asking() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        ctx.use_temp_role(&app, "a temporary role").unwrap();
+        let roles_dir = paths::role_file("tui-refused-new-role")
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        assert!(
+            !roles_dir.exists(),
+            "{} exists before the refusal",
+            roles_dir.display()
+        );
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let err = ctx.new_role(&app, "tui-refused-new-role").unwrap_err();
+        assert_refused_under_the_tui(err);
+        let err = ctx.save_role(None).unwrap_err();
+        assert_refused_under_the_tui(err);
+        assert!(
+            !roles_dir.exists(),
+            "the refusal created {}",
+            roles_dir.display()
+        );
     }
 
     /// A seeded child hands out the very signal `agent__cancel` sets; the
