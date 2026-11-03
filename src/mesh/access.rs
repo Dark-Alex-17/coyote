@@ -22,8 +22,8 @@ use crate::mesh::grants::DEFAULT_GRANT_TTL;
 use crate::mesh::idle::{IdleNotify, Origin};
 use crate::mesh::message::PEER_REQUEST_TIMEOUT;
 use crate::mesh::message::{
-    Disposition, OutboundPeer, PEER_WIRE_VERSION, PartLimits, PeerKind, PeerVia, RawPart,
-    SendError, SendOutcome, is_wire_id, propagation_remedy, unreachable_cause,
+    Disposition, FirstContactMiss, OutboundPeer, PEER_WIRE_VERSION, PartLimits, PeerKind, PeerVia,
+    RawPart, SendError, SendOutcome, is_wire_id, propagation_remedy, unreachable_cause,
 };
 use crate::mesh::node::{MeshRuntime, MeshSlot};
 use crate::mesh::notify::Source;
@@ -330,6 +330,12 @@ pub(crate) enum AccessError {
     /// Trusted, but the transport holds no identity for it and the network did not answer
     /// this node's path request in time, so there is no description to link to.
     UnknownDestination,
+    /// Unheard, but the trust list could allow it, so the network was asked for it and
+    /// no row was filed.
+    Unheard {
+        destination: String,
+        miss: FirstContactMiss,
+    },
     /// The request breaks a rule the peer would refuse it for; the text names the rule.
     Invalid(&'static str),
     /// The pending store would not file the request, so nothing was sent.
@@ -378,6 +384,7 @@ impl fmt::Display for AccessError {
                 "The destination {} Try again in a minute; nothing was queued for it, because a request can be held on a propagation node only after the peer's announce has been heard. `.mesh peers` shows when it was last heard.",
                 unreachable_cause()
             ),
+            Self::Unheard { destination, miss } => write!(f, "{}", miss.refusal(destination)),
             Self::Invalid(rule) => write!(
                 f,
                 "The access request was not sent: {rule}. {}",
@@ -490,7 +497,10 @@ impl MeshSlot {
             None if runtime.trust().may_be_asked_for(&destination) => runtime
                 .peer_asking_if_unheard(&destination)
                 .await
-                .ok_or(AccessError::UnknownDestination)?,
+                .map_err(|miss| AccessError::Unheard {
+                    destination: destination.clone(),
+                    miss,
+                })?,
             None => return Err(AccessError::Untrusted),
         };
         if runtime

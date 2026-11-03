@@ -220,6 +220,7 @@ const MESSAGE_REFUSAL_TAIL: &str = "Nothing is sent to a destination this node d
 const FETCH_REFUSAL_TAIL: &str = "Nothing is fetched from a destination this node does not trust.";
 const STATUS_REFUSAL_TAIL: &str = "Status is only requested from trusted destinations.";
 const KNOCK_REFUSAL_TAIL: &str = "A knock is not sent to a destination this node has blocked or an identity it has blocked; `.mesh unblock <destination>` or `.mesh trust <destination>` lifts the one, `.mesh unblock --identity <identity>` the other.";
+const UNHEARD_KNOCK_REFUSAL_TAIL: &str = "A knock is not sent to a destination this node has blocked, and the mesh is not asked about one it has not heard; `.mesh unblock <destination>` lifts the block.";
 const INFO_REFUSAL_TAIL: &str = "This node does not ask the mesh about a destination it has blocked and not heard; `.mesh unblock <destination>` lifts the block.";
 const TRUST_REFUSAL_TAIL: &str = "This node does not ask the mesh about a destination it has blocked and not heard; run `.mesh unblock <destination>`, then `.mesh trust <destination>` again.";
 const INBOX_CONTENT_MAX_CHARS: usize = 200;
@@ -1585,8 +1586,8 @@ async fn heard_or_asked(
     result_follows();
     tokio::select! {
         peer = runtime.peer_asking_if_unheard(destination) => match peer {
-            Some(peer) => Ok(Some(peer)),
-            None => bail!(unanswered_path_request(destination)),
+            Ok(peer) => Ok(Some(peer)),
+            Err(miss) => bail!(miss.refusal(destination)),
         },
         _ = wait_user_interrupt(Some(abort_signal)) => {
             out_text(&format!(
@@ -1596,14 +1597,6 @@ async fn heard_or_asked(
             Ok(None)
         }
     }
-}
-
-fn unanswered_path_request(destination: &str) -> String {
-    format!(
-        "{} did not answer a path request within {} s: it is not on any interface this node joined, or it is not announcing. Check the hash, or wait for its announce (`.mesh peers`).",
-        short(destination),
-        PATH_REQUEST_TIMEOUT.as_secs()
-    )
 }
 
 /// Why a verb that links to one peer has no route to link over.
@@ -2038,8 +2031,13 @@ async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     };
     let destination = destination_hash(ctx, target)?;
     let runtime = live(ctx)?;
-    let Some(peer) =
-        heard_or_asked(&runtime, &destination, KNOCK_REFUSAL_TAIL, abort_signal).await?
+    let Some(peer) = heard_or_asked(
+        &runtime,
+        &destination,
+        UNHEARD_KNOCK_REFUSAL_TAIL,
+        abort_signal,
+    )
+    .await?
     else {
         return Ok(());
     };

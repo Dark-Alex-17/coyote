@@ -2782,10 +2782,9 @@ impl State {
     }
 
     fn any_trusted_for_all(&self) -> bool {
-        self.file
-            .identities
-            .values()
-            .any(|entry| entry.all_destinations)
+        self.file.identities.iter().any(|(identity, entry)| {
+            entry.all_destinations && !self.file.blocked_identities.contains_key(identity)
+        })
     }
 
     /// `destination` is canonical lower hex; see `TrustStore::may_be_asked_for`.
