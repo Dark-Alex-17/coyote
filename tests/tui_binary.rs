@@ -1772,52 +1772,39 @@ fn wait_for_file(pty: &mut Pty, path: &Path, what: &str) {
     }
 }
 
-/// A document loader (`$1` in, the document on stdout) that marks its
-/// start next to the input, ignores SIGTERM and SIGINT, and sleeps well
-/// past the exit deadline. A stdout loader runs under a plain blocking
-/// `output()` with no abort check, so this is a turn nothing can stop; a
-/// file-writing (`$2`) loader would not do, because its wait is polled and
-/// an abort kills it, and neither would a tool, because the runner
-/// SIGKILLs an aborted tool and no trap survives that.
-const STUBBORN_LOADER: &str = "#!/usr/bin/env bash\n\
-    trap '' TERM INT\n\
-    : > \"$1.started\"\n\
-    sleep 30\n\
-    cat \"$1\"\n";
-
 /// A turn that does not stop when told to: the UI waits out
 /// `EXIT_CANCEL_WAIT` and then ends the process without it, still with
 /// the tty restored, the alternate screen left and a notice saying what
 /// was left behind. The exit is bounded: the wrapper's report lands
 /// within ten seconds of the kill.
+///
+/// Nothing a user can configure makes such a turn any more: an aborted
+/// loader is killed and an aborted tool is SIGKILLed, so the turn is the
+/// binary's `COYOTE_TUI_STUBBORN_TURN` hook, which keeps the work task
+/// on its thread past the deadline after the reply has streamed.
 /// `sigterm_during_a_running_tool_still_leaves_the_tty_cooked` is the
 /// cooperating twin.
 #[test]
 #[serial]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "the stubborn-turn hook is compiled out of release builds"
+)]
 fn sigterm_during_a_turn_that_ignores_the_abort_leaves_it_behind_in_bounded_time() {
     let dir = fresh_config_dir("sigterm-stubborn-turn");
     let _guard = TempDirGuard(dir.clone());
-    let loader = dir.join("stubborn-loader.sh");
-    fs::write(&loader, STUBBORN_LOADER).unwrap();
-    let document = dir.join("doc.stub");
-    fs::write(&document, "stub document\n").unwrap();
-    let marker = dir.join("doc.stub.started");
-    write_config(
-        &dir,
-        &format!(
-            "save_session: false\n\
-             document_loaders:\n\
-             \x20 stub: 'bash {} $1'\n",
-            loader.display()
-        ),
-    );
-    let mut pty = spawn_tui(&dir, &[]);
+    let fake = FakeLlm::start(vec![Reply::Text("reply before the stall v7q".to_string())]);
+    write_fake_llm_config(&dir, &fake);
+    let mut pty = spawn_tui(&dir, &[("COYOTE_TUI_STUBBORN_TURN", "1")]);
 
     let transcript = pty.wait_for("no session", PTY_DEADLINE).unwrap();
     let pid = child_pid(&transcript);
-    pty.send(format!(".file {}\r", document.display()).as_bytes())
-        .unwrap();
-    wait_for_file(&mut pty, &marker, "the stubborn loader's start marker");
+    pty.send(b"say something\r").unwrap();
+    wait_for_squeezed(
+        &mut pty,
+        "reply before the stall v7q",
+        "the reply of the turn that then stalls",
+    );
     let signalled_at = pty.raw().len();
     let started = std::time::Instant::now();
     // SAFETY: kill takes a pid and a signal number and touches no memory.
