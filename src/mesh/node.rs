@@ -1441,6 +1441,9 @@ impl MeshRuntime {
             Err(err @ RequestError::Timeout { .. }) => (KnockFallback::Unanswered, err),
             Err(
                 err @ (RequestError::LinkActivationTimeout { .. }
+                | RequestError::LocalTimeout { .. }
+                | RequestError::IdentifyTimeout { .. }
+                | RequestError::ResponseIncomplete { .. }
                 | RequestError::LinkFailed(_)
                 | RequestError::LinkClosed),
             ) => (KnockFallback::Unreachable, err),

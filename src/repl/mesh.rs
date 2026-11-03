@@ -7379,6 +7379,10 @@ fn render_broadcast(outcome: &BroadcastOutcome) -> String {
                 refused += 1;
                 refusal.to_string()
             }
+            RecipientOutcome::NoAnswer(no_answer) => {
+                refused += 1;
+                no_answer.to_string()
+            }
         };
         lines.push(format!(
             "  {} ({}): {status}",

@@ -11,7 +11,7 @@ use rns_transport::delivery::await_link_activation;
 use rns_transport::destination::DestinationDesc;
 use rns_transport::destination::link::Link;
 use rns_transport::destination::request::{
-    RequestError as LibraryRequestError, RequestOptions as LibraryRequestOptions,
+    RequestError as LibraryRequestError, RequestOptions as LibraryRequestOptions, RequestReceipt,
 };
 use rns_transport::error::RnsError;
 use rns_transport::identity::PrivateIdentity as TransportIdentity;
@@ -43,9 +43,9 @@ impl Default for RequestOptions {
     }
 }
 
-/// When one phase of a request gives up, and the option that set it, which the `Timeout`
-/// and `LinkActivationTimeout` errors report. Every wait against the transport or a link
-/// lock runs under one.
+/// When one phase of a request gives up, and the option that set it, which the timeout
+/// errors report. Every wait against the transport or a link lock runs under one, and
+/// each wait names the error its expiry stands for.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Deadline {
     at: Instant,
@@ -69,28 +69,45 @@ impl Deadline {
         path: &str,
         wait: impl Future<Output = T>,
     ) -> Result<T, RequestError> {
+        self.bound_as(wait, |after| RequestError::Timeout {
+            path: path.to_string(),
+            after,
+        })
+        .await
+    }
+
+    async fn bound_as<T>(
+        self,
+        wait: impl Future<Output = T>,
+        expired: impl FnOnce(Duration) -> RequestError,
+    ) -> Result<T, RequestError> {
         timeout_at(self.at, wait)
             .await
-            .map_err(|_| self.expired(path))
+            .map_err(|_| expired(self.after))
     }
 
-    pub(crate) fn expired(self, path: &str) -> RequestError {
-        RequestError::Timeout {
+    /// For the waits on this node's own link lock and transport, whose expiry says nothing
+    /// about the peer.
+    async fn bound_locally<T>(
+        self,
+        path: &str,
+        wait: impl Future<Output = T>,
+    ) -> Result<T, RequestError> {
+        self.bound_as(wait, |after| RequestError::LocalTimeout {
             path: path.to_string(),
-            after: self.after,
-        }
+            after,
+        })
+        .await
     }
 
-    /// `bound` for the waits before a link is active, whose expiry means the peer was
-    /// never reached rather than that it did not answer.
+    /// For the waits before a link is active, whose expiry means the peer was never
+    /// reached rather than that it did not answer.
     async fn bound_activation<T>(
         self,
         path: &str,
         wait: impl Future<Output = T>,
     ) -> Result<T, RequestError> {
-        timeout_at(self.at, wait)
-            .await
-            .map_err(|_| self.activation_expired(path))
+        self.bound_as(wait, |_| self.activation_expired(path)).await
     }
 
     fn activation_expired(self, path: &str) -> RequestError {
@@ -166,7 +183,7 @@ pub(crate) async fn request_on_link(
     }
     let deadline = Deadline::after(request_timeout);
     let (link_id, mdu) = deadline
-        .bound(path, async {
+        .bound_locally(path, async {
             let link = link.lock().await;
             (*link.id(), link.link_mdu())
         })
@@ -180,7 +197,7 @@ pub(crate) async fn request_on_link(
         .with_timeout(request_timeout)
         .with_max_response_size(max);
     let receipt = deadline
-        .bound(path, transport.request(&link_id, path, data, opts))
+        .bound_locally(path, transport.request(&link_id, path, data, opts))
         .await?
         .map_err(|err| RequestError::LinkFailed(format!("request not sent: {err}")))?;
     debug!(
@@ -193,13 +210,15 @@ pub(crate) async fn request_on_link(
         },
         packed.len()
     );
-    let response = match deadline.bound(path, receipt.response()).await? {
+    let response = match deadline
+        .bound_as(receipt.response(), |after| {
+            unanswered(&receipt, path, after)
+        })
+        .await?
+    {
         Ok(response) => response,
         Err(LibraryRequestError::Timeout) => {
-            return Err(RequestError::Timeout {
-                path: path.to_string(),
-                after: request_timeout,
-            });
+            return Err(unanswered(&receipt, path, request_timeout));
         }
         Err(LibraryRequestError::LinkClosed) => return Err(RequestError::LinkClosed),
         Err(err @ LibraryRequestError::Rejected) => {
@@ -235,6 +254,18 @@ pub(crate) async fn request_on_link(
         });
     }
     Ok(value)
+}
+
+/// A response wait that ran out: `ResponseIncomplete` once the peer has begun a response,
+/// `Timeout` while nothing of one has arrived, the only case that reads as the peer's
+/// silence.
+fn unanswered(receipt: &RequestReceipt, path: &str, after: Duration) -> RequestError {
+    let path = path.to_string();
+    if receipt.response_size().is_some() {
+        RequestError::ResponseIncomplete { path, after }
+    } else {
+        RequestError::Timeout { path, after }
+    }
 }
 
 /// Opens (or reuses) the link to `destination` and proves `identity` on it, both within
@@ -292,7 +323,7 @@ pub(crate) async fn open_link(
         Err(err) => return Err(RequestError::LinkFailed(err.to_string())),
     }
     let link_id = deadline
-        .bound(path, async { *link.lock().await.id() })
+        .bound_locally(path, async { *link.lock().await.id() })
         .await?;
     debug!(
         "Mesh link {} to destination {} is active",
@@ -303,7 +334,7 @@ pub(crate) async fn open_link(
 }
 
 /// Proves `identity` to the far end of `link`, which then sees `PeerIdentified`. `path` is
-/// the request the proof is for, named by a `Timeout`.
+/// the request the proof is for, named by the timeout errors.
 pub(crate) async fn identify(
     transport: &Transport,
     link: &Arc<tokio::sync::Mutex<Link>>,
@@ -312,7 +343,7 @@ pub(crate) async fn identify(
     deadline: Deadline,
 ) -> Result<(), RequestError> {
     let (packet, link_id) = {
-        let link = deadline.bound(path, link.lock()).await?;
+        let link = deadline.bound_locally(path, link.lock()).await?;
         let payload = link.identify_payload(identity);
         let packet = link
             .identify_packet(&payload)
@@ -320,9 +351,12 @@ pub(crate) async fn identify(
         (packet, *link.id())
     };
     match deadline
-        .bound(
-            path,
+        .bound_as(
             transport.send_link_packet_on_bound_iface(link, packet),
+            |after| RequestError::IdentifyTimeout {
+                path: path.to_string(),
+                after,
+            },
         )
         .await?
     {

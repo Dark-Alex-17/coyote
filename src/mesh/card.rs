@@ -3,7 +3,7 @@ use crate::mesh::display_text;
 use crate::mesh::node::{MeshRuntime, MeshSlot};
 use crate::mesh::request::{
     AdmittedRequest, DispatchError, Handler, NoAnswer, RemoteRefusal, Reply, RequestError,
-    RequestOptions, STATUS_PATH,
+    RequestOptions, STATUS_PATH, request_remedy,
 };
 use crate::mesh::snapshot::{MeshSnapshot, TurnState};
 
@@ -540,6 +540,11 @@ pub(crate) enum StatusError {
 impl fmt::Display for StatusError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Transport(err) if err.is_retryable_wait() => write!(
+                f,
+                "{err}. {}. A status request is answered live or not at all; nothing queues it for later.",
+                request_remedy(err)
+            ),
             Self::Transport(err) => write!(
                 f,
                 "{err}. A status request is answered live or not at all; nothing queues it for later."

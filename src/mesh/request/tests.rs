@@ -108,6 +108,18 @@ fn every_request_error_has_a_next_step() {
             path: "/status".to_string(),
             after: Duration::from_secs(5),
         },
+        RequestError::LocalTimeout {
+            path: "/status".to_string(),
+            after: Duration::from_secs(5),
+        },
+        RequestError::IdentifyTimeout {
+            path: "/status".to_string(),
+            after: Duration::from_secs(5),
+        },
+        RequestError::ResponseIncomplete {
+            path: "/status".to_string(),
+            after: Duration::from_secs(5),
+        },
         RequestError::LinkFailed("no path".to_string()),
         RequestError::LinkClosed,
         RequestError::Oversize { len: 9, max: 8 },

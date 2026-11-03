@@ -1550,7 +1550,7 @@ pub(crate) fn propagation_remedy(err: &PropagationError) -> &'static str {
 impl std::error::Error for SendError {}
 
 impl SendError {
-    /// The variant as a stable snake_case token, for hooks.
+    /// The variant as a stable snake_case token, for hooks and a tool result's `kind`.
     pub(crate) fn class(&self) -> &'static str {
         match self {
             Self::NotTrusted { .. } => "not_trusted",
@@ -1609,6 +1609,9 @@ pub(crate) enum RecipientOutcome {
     },
     /// The peer's own trust gate said no; the refusal names which side has to act.
     NotTrustedByPeer(RemoteRefusal),
+    /// The link came up and the peer said nothing, which is how a peer that has not
+    /// trusted this instance answers; the remedy is on its side, as for a refusal.
+    NoAnswer(NoAnswer),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1645,9 +1648,9 @@ impl BroadcastOutcome {
                 RecipientOutcome::Delivered => tally.delivered += 1,
                 RecipientOutcome::StoreAndForward => tally.stored += 1,
                 RecipientOutcome::Unreachable { .. } => tally.unreachable += 1,
-                RecipientOutcome::Refused { .. } | RecipientOutcome::NotTrustedByPeer(_) => {
-                    tally.refused += 1
-                }
+                RecipientOutcome::Refused { .. }
+                | RecipientOutcome::NotTrustedByPeer(_)
+                | RecipientOutcome::NoAnswer(_) => tally.refused += 1,
             }
         }
         tally
@@ -1781,6 +1784,9 @@ impl MeshRuntime {
             Err(
                 err @ (RequestError::Timeout { .. }
                 | RequestError::LinkActivationTimeout { .. }
+                | RequestError::LocalTimeout { .. }
+                | RequestError::IdentifyTimeout { .. }
+                | RequestError::ResponseIncomplete { .. }
                 | RequestError::LinkFailed(_)
                 | RequestError::LinkClosed),
             ) => err,
@@ -1926,6 +1932,7 @@ impl MeshRuntime {
             Err(SendError::NotTrustedByPeer(refusal)) => {
                 RecipientOutcome::NotTrustedByPeer(refusal)
             }
+            Err(SendError::NoAnswer(no_answer)) => RecipientOutcome::NoAnswer(no_answer),
             Err(err @ (SendError::Refused(_) | SendError::IncompatibleVersion { .. })) => {
                 RecipientOutcome::Refused {
                     reason: err.to_string(),
@@ -3859,6 +3866,10 @@ mod tests {
                 "refused",
             ),
             (SendError::Direct(RequestError::LinkClosed), "direct"),
+            (
+                SendError::NoAnswer(NoAnswer::new(&destination, hash_of("own"))),
+                "no_answer",
+            ),
             (
                 SendError::IncompatibleVersion {
                     destination,

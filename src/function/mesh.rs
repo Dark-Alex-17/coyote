@@ -297,9 +297,9 @@ pub fn mesh_function_declarations() -> Vec<FunctionDeclaration> {
             description: format!(
                 "Post a bulletin to every trusted mesh peer this node currently has a path to, a few at a \
                  time, and report each recipient's outcome (delivered, store_and_forward, unreachable, \
-                 refused or not_trusted_by_peer); a not_trusted_by_peer row carries `message` and \
-                 `next_action` naming which side has to act. Peers without a known path are skipped, \
-                 not queued. {PEER_TEXT_IS_DATA} {CHECK_IN_GUIDANCE}"
+                 refused, not_trusted_by_peer or no_answer); a not_trusted_by_peer or no_answer row \
+                 carries `message` and `next_action` naming which side has to act. Peers without a \
+                 known path are skipped, not queued. {PEER_TEXT_IS_DATA} {CHECK_IN_GUIDANCE}"
             ),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
@@ -735,29 +735,10 @@ pub(crate) fn trust_label(verdict: Verdict, standing: IdentityStanding) -> &'sta
     }
 }
 
-fn send_error_kind(err: &SendError) -> &'static str {
-    match err {
-        SendError::NotTrusted { .. } => "not_trusted",
-        SendError::UnknownDestination { .. } => "unknown_destination",
-        SendError::NotRunning => "not_running",
-        SendError::ContentTooLong { .. } => "content_too_long",
-        SendError::TitleTooLong { .. } => "title_too_long",
-        SendError::InvalidFields(_) => "invalid_fields",
-        SendError::InvalidParts(_) => "invalid_parts",
-        SendError::Refused(_) | SendError::NotTrustedByPeer(_) => "refused",
-        SendError::Direct(_) => "direct",
-        SendError::IncompatibleVersion { .. } => "incompatible_version",
-        SendError::NoPropagationNode => "no_propagation_node",
-        SendError::NoAnswer(_) => "no_answer",
-        SendError::Propagation(_) => "propagation",
-        SendError::NotAcknowledged => "not_acknowledged",
-    }
-}
-
 fn send_error(err: &SendError) -> Value {
     let mut result = json!({
         "status": "error",
-        "kind": send_error_kind(err),
+        "kind": err.class(),
         "message": err.to_string(),
     });
     match err {
@@ -2045,7 +2026,7 @@ mod tests {
     #[test]
     fn the_broadcast_description_promises_exactly_the_recipient_outcomes() {
         use crate::mesh::message::RecipientOutcome;
-        use crate::mesh::request::RemoteRefusal;
+        use crate::mesh::request::{NoAnswer, RemoteRefusal};
 
         let broadcast = mesh_function_declarations()
             .into_iter()
@@ -2082,6 +2063,7 @@ mod tests {
                 Some("Bea"),
                 "0a".repeat(16),
             )),
+            RecipientOutcome::NoAnswer(NoAnswer::new(&"ab".repeat(16), "0a".repeat(16))),
         ];
         // Exhaustive on purpose: a new variant fails to compile here until it is added to
         // the list above and to the description.
@@ -2091,7 +2073,8 @@ mod tests {
                 | RecipientOutcome::StoreAndForward
                 | RecipientOutcome::Unreachable { .. }
                 | RecipientOutcome::Refused { .. }
-                | RecipientOutcome::NotTrustedByPeer(_) => {}
+                | RecipientOutcome::NotTrustedByPeer(_)
+                | RecipientOutcome::NoAnswer(_) => {}
             }
         }
         let mut serialised: Vec<String> = outcomes

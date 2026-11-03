@@ -243,6 +243,11 @@ impl fmt::Display for PropagationError {
                 "The propagation node did not finish the transfer within {:.1}s",
                 after.as_secs_f64()
             ),
+            Self::Link(RequestError::LinkActivationTimeout { after, .. }) => write!(
+                f,
+                "No mesh link to the propagation node came up within {:.1}s",
+                after.as_secs_f64()
+            ),
             Self::Link(err) => write!(f, "{err}"),
             Self::TransferFailed => {
                 write!(f, "The transfer to the propagation node did not complete")

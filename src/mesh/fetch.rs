@@ -20,6 +20,7 @@ use crate::mesh::node::MeshRuntime;
 use crate::mesh::request::{
     AdmittedRequest, DispatchError, FETCH_PATH, Handler, LIST_PATH, MAX_REQUEST_PAYLOAD_BYTES,
     NoAnswer, RefusalCode, RemoteRefusal, Reply, RequestError, RequestOptions, Settlement,
+    request_remedy,
 };
 use crate::mesh::shares::{
     self, DEFAULT_LIST_WALK_BOUND, LIST_PAGE_SIZE, Listed, PeerRef, Served, ServedFile,
@@ -954,6 +955,9 @@ pub(crate) enum FetchError {
 impl fmt::Display for FetchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Transport(err) if err.is_retryable_wait() => {
+                write!(f, "{err}. {}.", request_remedy(err))
+            }
             Self::Transport(err) => write!(f, "{err}"),
             Self::NotTrustedByPeer(refusal) => write!(f, "{refusal}"),
             Self::NoAnswer(no_answer) => write!(f, "{no_answer}"),
@@ -1712,6 +1716,10 @@ mod no_answer_tests {
                 FetchError::Transport(RequestError::LinkActivationTimeout { .. })
             ),
             "{never_linked:?}"
+        );
+        assert_eq!(
+            never_linked.to_string(),
+            "No mesh link to the peer came up within 2.0s. Try again in a minute; `.mesh peers` shows when the peer was last heard."
         );
         assert!(slot.stop().await.unwrap());
         stub.stop().await;

@@ -608,6 +608,9 @@ impl MeshRuntime {
             Err(
                 err @ (RequestError::Timeout { .. }
                 | RequestError::LinkActivationTimeout { .. }
+                | RequestError::LocalTimeout { .. }
+                | RequestError::IdentifyTimeout { .. }
+                | RequestError::ResponseIncomplete { .. }
                 | RequestError::LinkFailed(_)
                 | RequestError::LinkClosed),
             ) => err,
