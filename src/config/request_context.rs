@@ -6336,13 +6336,15 @@ impl RequestContext {
                     && (*continuous && !output.is_empty())
                     && self.agent.is_some() == input.with_agent()
                 {
-                    let ans = self.prompt(self.prompt_request(
-                        PromptAction::Confirm,
-                        "Start a session that incorporates the last question and answer?",
-                        Vec::new(),
-                        Some(serde_json::json!(false)),
-                    ))?;
-                    if ans == PromptAnswer::Confirmed(true) {
+                    let ans = self
+                        .prompt(self.prompt_request(
+                            PromptAction::Confirm,
+                            "Start a session that incorporates the last question and answer?",
+                            Vec::new(),
+                            Some(serde_json::json!(false)),
+                        ))?
+                        .into_confirmed()?;
+                    if ans {
                         incorporate_last_exchange(session, input, output)?;
                     }
                 }
@@ -14430,6 +14432,25 @@ mod tests {
 
         let session = ctx.session.as_ref().expect("the temp session was seated");
         assert!(!session.is_empty(), "the confirmed exchange was dropped");
+    }
+
+    /// Esc on the incorporate question is neither yes nor no: the command
+    /// fails and no session is opened.
+    #[test]
+    #[serial]
+    fn use_session_after_an_exchange_opens_nothing_when_the_question_is_cancelled() {
+        let _guard = TestConfigDirGuard::new();
+        let sessions_dir = paths::local_dir("sessions");
+        create_dir_all(&sessions_dir).unwrap();
+
+        let mut ctx = create_test_ctx();
+        ctx.prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Cancelled]));
+        let input = Input::from_str(&ctx, "what happened?", None).unwrap();
+        ctx.last_message = Some(LastMessage::new(input, "reply".to_string()));
+        let app = ctx.app.config.clone();
+        let err = run_async(ctx.use_session(&app, None, utils::create_abort_signal()))
+            .expect_err("a cancelled question opened a session");
+        assert!(ctx.session.is_none(), "a session was seated: {err:#}");
     }
 
     #[test]
