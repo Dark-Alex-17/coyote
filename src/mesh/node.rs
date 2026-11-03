@@ -3751,7 +3751,7 @@ impl MeshSlot {
         let Some(mut last) = self.last_progress_capture.try_lock() else {
             return false;
         };
-        if last.is_some_and(|last| now.saturating_duration_since(last) < MESH_PROGRESS_MIN_INTERVAL)
+        if last.is_some_and(|prev| now.saturating_duration_since(prev) < MESH_PROGRESS_MIN_INTERVAL)
         {
             return false;
         }
@@ -3764,7 +3764,7 @@ impl MeshSlot {
     #[cfg(test)]
     pub(crate) fn rewind_progress_clock_for_tests(&self, by: Duration) {
         let mut last = self.last_progress_capture.lock();
-        *last = last.and_then(|last| last.checked_sub(by));
+        *last = last.and_then(|prev| prev.checked_sub(by));
     }
 
     pub(crate) fn set_objective_override(&self, objective: Option<String>) {

@@ -376,12 +376,11 @@ impl MeshDigestDriver {
     /// emptied session and a transcript shorter than the digest covers each abort the
     /// generation in flight and clear the digest at once, ahead of every gate, so a digest
     /// is never served stale or for another session. Generation is then spawned only when
-    /// the mesh is on, the brief is `auto`, the transcript grew by
-    /// `MESH_DIGEST_MIN_NEW_MESSAGES` over the served digest (or shrank below what the
-    /// served or the pending digest covers, after a history edit, or the task list
-    /// changed since the last attempt),
-    /// `MESH_DIGEST_MIN_INTERVAL` has passed since the last attempt and nothing is in
-    /// flight.
+    /// the mesh is on, the brief is `auto`, something changed, `MESH_DIGEST_MIN_INTERVAL`
+    /// has passed since the last attempt and nothing is in flight. Something changed means
+    /// any of: the transcript grew by `MESH_DIGEST_MIN_NEW_MESSAGES` over the served
+    /// digest, it shrank below what the served or the pending digest covers after a
+    /// history edit, or the task list changed since the last attempt.
     pub(crate) fn maybe_refresh_with<F, Fut>(
         &mut self,
         ctx: &Arc<RwLock<RequestContext>>,
@@ -512,6 +511,7 @@ impl MeshDigestDriver {
 
     /// Aborts any generation in flight and waits for its task to finish, so the REPL exits
     /// with no model call still running.
+    ///
     /// Takes the task synchronously, so the REPL can release the driver's lock before
     /// awaiting the abort.
     pub(crate) fn shutdown(&mut self) -> impl Future<Output = ()> + Send + use<> {
@@ -1316,42 +1316,47 @@ mod tests {
             wait_for_task(&mut driver).await;
             assert_eq!(model.calls(), 1);
 
-            // The turn holds the context for its whole length; the in-turn entry works
-            // from the guard it is handed.
-            let mut turn = ctx.write();
             let after_interval = start + MESH_DIGEST_MIN_INTERVAL + Duration::from_secs(1);
-            driver.maybe_refresh_in_turn(&turn, after_interval, model.fetch(FIXED_DIGEST));
-            assert!(
-                driver.task.is_none(),
-                "nothing changed since the last digest"
-            );
+            // The in-turn entry works from the guard it is handed; each guard is dropped
+            // before the generation is awaited.
+            {
+                let mut turn = ctx.write();
+                driver.maybe_refresh_in_turn(&turn, after_interval, model.fetch(FIXED_DIGEST));
+                assert!(
+                    driver.task.is_none(),
+                    "nothing changed since the last digest"
+                );
 
-            turn.todo_list.add("write the seam");
-            driver.maybe_refresh_in_turn(
-                &turn,
-                start + MESH_DIGEST_MIN_INTERVAL / 2,
-                model.fetch(FIXED_DIGEST),
-            );
-            assert!(driver.task.is_none(), "too soon after the last attempt");
+                turn.todo_list.add("write the seam");
+                driver.maybe_refresh_in_turn(
+                    &turn,
+                    start + MESH_DIGEST_MIN_INTERVAL / 2,
+                    model.fetch(FIXED_DIGEST),
+                );
+                assert!(driver.task.is_none(), "too soon after the last attempt");
 
-            driver.maybe_refresh_in_turn(&turn, after_interval, model.fetch(FIXED_DIGEST));
+                driver.maybe_refresh_in_turn(&turn, after_interval, model.fetch(FIXED_DIGEST));
+            }
             wait_for_task(&mut driver).await;
             assert_eq!(model.calls(), 2, "the todo change regenerated the digest");
 
-            turn.mark_todo_done(1);
-            driver.maybe_refresh_in_turn(
-                &turn,
-                after_interval + Duration::from_secs(1),
-                model.fetch(FIXED_DIGEST),
-            );
-            assert!(driver.task.is_none(), "one generation per interval");
-            assert_eq!(model.calls(), 2);
+            {
+                let mut turn = ctx.write();
+                turn.mark_todo_done(1);
+                driver.maybe_refresh_in_turn(
+                    &turn,
+                    after_interval + Duration::from_secs(1),
+                    model.fetch(FIXED_DIGEST),
+                );
+                assert!(driver.task.is_none(), "one generation per interval");
+                assert_eq!(model.calls(), 2);
 
-            driver.maybe_refresh_in_turn(
-                &turn,
-                after_interval + MESH_DIGEST_MIN_INTERVAL,
-                model.fetch(FIXED_DIGEST),
-            );
+                driver.maybe_refresh_in_turn(
+                    &turn,
+                    after_interval + MESH_DIGEST_MIN_INTERVAL,
+                    model.fetch(FIXED_DIGEST),
+                );
+            }
             wait_for_task(&mut driver).await;
             assert_eq!(model.calls(), 3);
         }

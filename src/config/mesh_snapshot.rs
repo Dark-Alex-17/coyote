@@ -42,7 +42,7 @@ impl RequestContext {
     pub(crate) fn owns_mesh_session(&self) -> bool {
         self.current_depth == 0
             && self.self_agent_id.is_none()
-            && !(self.macro_flag && !self.macro_non_isolated)
+            && (!self.macro_flag || self.macro_non_isolated)
     }
 }
 
