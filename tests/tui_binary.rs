@@ -4749,3 +4749,533 @@ fn dot_session_after_a_turn_asks_in_the_modal_and_y_seats_the_session() {
     let pty = open_session_after_a_turn(&dir, "after-turn-yk3");
     answer_and_expect_session(pty, b"y", "after-turn-yk3", false);
 }
+
+// ---------------------------------------------------------------------------
+// Bundle installs that reference secrets, and document loaders that are
+// slow or die under the full-screen UI.
+// ---------------------------------------------------------------------------
+
+/// Writes `extra` top-level YAML after the fake-LLM config, so a case can
+/// add `document_loaders` while keeping the fake model (whose served count
+/// proves whether a document ever reached the model).
+fn write_fake_llm_config_with(dir: &Path, fake: &FakeLlm, extra: &str) {
+    write_fake_llm_config(dir, fake);
+    let path = dir.join("config.yaml");
+    let mut config = fs::read_to_string(&path).unwrap();
+    config.push_str(extra);
+    fs::write(&path, config).unwrap();
+}
+
+/// Runs one git command in `repo`, with an identity so `commit` works on a
+/// machine without one.
+fn git(repo: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args([
+            "-c",
+            "user.email=tests@example.invalid",
+            "-c",
+            "user.name=tests",
+        ])
+        .args(args)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "git {args:?} failed in {}",
+        repo.display()
+    );
+}
+
+/// The bundle's `mcp.json`: one stdio server whose env references every
+/// name in `secrets` as `{{NAME}}`.
+fn bundle_mcp_json(secrets: &[&str]) -> String {
+    let env: Vec<String> = secrets
+        .iter()
+        .map(|name| format!("\"{name}_VAR\": \"{{{{{name}}}}}\""))
+        .collect();
+    format!(
+        "{{\"mcpServers\": {{\"bundle-k7s-server\": {{\"type\": \"stdio\", \"command\": \"echo\", \
+         \"args\": [\"k7s\"], \"env\": {{{}}}}}}}}}\n",
+        env.join(", ")
+    )
+}
+
+/// A local git repository laid out as a bundle (`coyote-bundle.yaml`, a
+/// role, an `mcp.json` referencing `secrets`), committed so `.install`
+/// can clone it. Returns the repository path.
+fn write_bundle_repo(dir: &Path, name: &str, secrets: &[&str]) -> PathBuf {
+    let repo = dir.join("bundle-src");
+    fs::create_dir_all(repo.join("roles")).unwrap();
+    fs::write(repo.join("coyote-bundle.yaml"), format!("name: {name}\n")).unwrap();
+    fs::write(
+        repo.join("roles").join(format!("{name}-role.md")),
+        "---\nmodel: fake:fake-model\n---\nYou are the bundle role.\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.join("roles").join(format!("{name}-obsolete.md")),
+        "---\nmodel: fake:fake-model\n---\nYou are the role the update drops.\n",
+    )
+    .unwrap();
+    fs::write(repo.join("mcp.json"), bundle_mcp_json(secrets)).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "bundle"]);
+    repo
+}
+
+/// Pumps the pty until `marker` is on screen after `from` (whitespace
+/// squeezed), answering a yes/no modal with `y` if one comes up on the
+/// way (a question the UI can answer is asked in the modal; one it cannot
+/// is refused through the gate, which fails the wait). Returns the text
+/// since `from`.
+fn wait_for_marker_answering_confirms(
+    pty: &mut Pty,
+    from: usize,
+    marker: &str,
+    what: &str,
+) -> String {
+    let deadline = std::time::Instant::now() + PTY_DEADLINE;
+    let mut answered = 0;
+    loop {
+        pty.read_for(Duration::from_millis(200));
+        let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[from..]));
+        let squeezed_since = squeezed(&since);
+        assert!(
+            !since.contains(PROMPT_REFUSAL),
+            "{what}: refused through the prompt gate instead of completing:\n{since}"
+        );
+        if squeezed_since.contains(&squeezed(marker)) {
+            return since;
+        }
+        if squeezed_since.matches("y=yes").count() > answered {
+            answered += 1;
+            pty.read_for(HOTKEY_GAP);
+            pty.send(b"y").unwrap();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: `{marker}` never appeared:\n{since}"
+        );
+    }
+}
+
+/// Files under `dir` (outside the cache and the bundle's own source
+/// repository) whose contents mention `needle`.
+fn config_files_mentioning(dir: &Path, needle: &str) -> Vec<PathBuf> {
+    walk(dir)
+        .into_iter()
+        .filter(|path| {
+            let text = path.to_string_lossy();
+            !text.contains("/cache/") && !text.contains("/bundle-src/")
+        })
+        .filter(|path| {
+            fs::read(path)
+                .map(|bytes| String::from_utf8_lossy(&bytes).contains(needle))
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+/// `.install <local bundle>` whose mcp.json references two secrets the
+/// vault does not hold: under the UI the install completes (no hidden
+/// `Add {{ X }} to vault now?` prompt, no refusal), names both secrets as
+/// deferred, leaves the merged mcp.json and the bundle record behind
+/// (nothing half-applied), adds no secret to the vault, and the UI keeps
+/// taking keys and leaves clean. Then `.install <bundle>` updates it from
+/// a source that gained a third secret and dropped a role the user had
+/// edited locally: the update completes, names the new secret, and keeps
+/// the edited file.
+#[test]
+#[serial]
+fn dot_install_of_a_bundle_with_secrets_completes_with_every_secret_deferred() {
+    let dir = fresh_config_dir("install-bundle-secrets");
+    let _guard = TempDirGuard(dir.clone());
+    let fake = FakeLlm::start(vec![]);
+    write_fake_llm_config(&dir, &fake);
+    let name = "bundle-k7s";
+    let repo = write_bundle_repo(&dir, name, &["BUNDLE_SECRET_A", "BUNDLE_SECRET_B"]);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.resize(60, 140).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let files_before = walk(&dir);
+    let install_at = pty.raw().len();
+    let sent = std::time::Instant::now();
+    pty.send(format!(".install {}\r", repo.display()).as_bytes())
+        .unwrap();
+    let since = wait_for_marker_answering_confirms(
+        &mut pty,
+        install_at,
+        "BUNDLE_SECRET_B",
+        "`.install` of a bundle with secrets",
+    );
+    let took = sent.elapsed();
+    pty.read_for(Duration::from_millis(800));
+    let since_full = strip_ansi(&String::from_utf8_lossy(&pty.raw()[install_at..]));
+    for secret in ["BUNDLE_SECRET_A", "BUNDLE_SECRET_B"] {
+        assert!(
+            squeezed(&since_full).contains(secret),
+            "the install did not name {secret} as deferred (took {took:?}):\n{since}"
+        );
+    }
+    assert!(
+        !since_full.to_lowercase().contains("to vault now"),
+        "the install asked to add a secret to the vault under the UI:\n{since_full}"
+    );
+    assert!(
+        !since_full.contains("exit="),
+        "`.install` quit the UI:\n{since_full}"
+    );
+
+    // Nothing half-applied: the merged mcp.json holds the bundle's server
+    // and the bundle is recorded; the vault gained no secret.
+    let mcp_files = config_files_mentioning(&dir, "bundle-k7s-server");
+    assert!(
+        mcp_files
+            .iter()
+            .any(|path| path.file_name().is_some_and(|f| f == "mcp.json")),
+        "the merged mcp.json does not hold the bundle's server; files mentioning it: {mcp_files:?}\n{since_full}"
+    );
+    let recorded = new_files_named(&dir, &files_before, name);
+    assert!(
+        !recorded.is_empty(),
+        "no file records the installed bundle `{name}`:\n{since_full}"
+    );
+    let installed_role = dir.join("roles").join(format!("{name}-role.md"));
+    assert!(
+        installed_role.exists(),
+        "the bundle's role was not installed at {}:\n{since_full}",
+        installed_role.display()
+    );
+    let secret_holders = config_files_mentioning(&dir, "BUNDLE_SECRET_A");
+    assert!(
+        secret_holders
+            .iter()
+            .all(|path| path.file_name().is_some_and(|f| f == "mcp.json")),
+        "a file other than mcp.json holds BUNDLE_SECRET_A (a vault write?): {secret_holders:?}"
+    );
+
+    // `.list bundles` names the bundle and the UI is live.
+    let list_at = pty.raw().len();
+    pty.send(b".list bundles\r").unwrap();
+    pty.wait_for_after(name, list_at, PTY_DEADLINE)
+        .expect("`.list bundles` did not name the installed bundle");
+    pty.read_for(Duration::from_millis(500));
+
+    // The user edits a bundle file locally; the source then drops that
+    // file and gains a third secret.
+    let obsolete = dir.join("roles").join(format!("{name}-obsolete.md"));
+    assert!(
+        obsolete.exists(),
+        "the bundle's second role was not installed"
+    );
+    fs::write(
+        &obsolete,
+        "---\nmodel: fake:fake-model\n---\nEdited locally by the user.\n",
+    )
+    .unwrap();
+    fs::remove_file(repo.join("roles").join(format!("{name}-obsolete.md"))).unwrap();
+    fs::write(
+        repo.join("mcp.json"),
+        bundle_mcp_json(&["BUNDLE_SECRET_A", "BUNDLE_SECRET_B", "BUNDLE_SECRET_C"]),
+    )
+    .unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "update"]);
+
+    let update_at = pty.raw().len();
+    pty.send(format!(".install {name}\r").as_bytes()).unwrap();
+    let since = wait_for_marker_answering_confirms(
+        &mut pty,
+        update_at,
+        "BUNDLE_SECRET_C",
+        "`.install <bundle>` update with a new secret",
+    );
+    pty.read_for(Duration::from_millis(800));
+    let since_full = strip_ansi(&String::from_utf8_lossy(&pty.raw()[update_at..]));
+    assert!(
+        !since_full.to_lowercase().contains("to vault now"),
+        "the update asked to add a secret to the vault under the UI:\n{since_full}"
+    );
+    assert!(
+        !since_full.contains("exit="),
+        "the update quit the UI:\n{since}"
+    );
+    assert_eq!(
+        fs::read_to_string(&obsolete).ok().as_deref(),
+        Some("---\nmodel: fake:fake-model\n---\nEdited locally by the user.\n"),
+        "the locally edited obsolete file was not kept by the update:\n{since_full}"
+    );
+    let merged = config_files_mentioning(&dir, "BUNDLE_SECRET_C");
+    assert!(
+        merged
+            .iter()
+            .any(|path| path.file_name().is_some_and(|f| f == "mcp.json")),
+        "the update did not merge the new secret into mcp.json: {merged:?}\n{since_full}"
+    );
+
+    let info_at = pty.raw().len();
+    pty.send(b".info\r").unwrap();
+    pty.wait_for_after("log_path", info_at, PTY_DEADLINE)
+        .expect("`.info` after the install and update never rendered");
+    assert_eq!(fake.served(), 0, "a bundle install reached the model");
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// Whether `pid` still exists (signal 0 is checked, not delivered).
+fn process_alive(pid: i32) -> bool {
+    // SAFETY: kill with signal 0 touches no memory; it only checks the pid.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Reads the pid a loader fixture wrote next to its input.
+fn loader_pid(path: &Path) -> i32 {
+    fs::read_to_string(path).unwrap().trim().parse().unwrap()
+}
+
+/// A loader that records its pid at `$1.pid` and then sleeps far past the
+/// deadline; the file-branch twin would copy `$1` to `$2` afterwards, the
+/// stdout twin would `cat` it.
+fn slow_loader(dir: &Path, file_branch: bool) -> PathBuf {
+    let script = dir.join(if file_branch {
+        "slow-file.sh"
+    } else {
+        "slow-stdout.sh"
+    });
+    let tail = if file_branch {
+        "cp \"$1\" \"$2\"\n"
+    } else {
+        "cat \"$1\"\n"
+    };
+    fs::write(
+        &script,
+        format!("#!/usr/bin/env bash\necho $$ > \"$1.pid\"\nsleep 30\n{tail}"),
+    )
+    .unwrap();
+    script
+}
+
+/// A loader that writes its would-be output and is then killed by a
+/// signal before it can exit cleanly.
+fn dying_loader(dir: &Path, file_branch: bool) -> PathBuf {
+    let script = dir.join(if file_branch {
+        "dying-file.sh"
+    } else {
+        "dying-stdout.sh"
+    });
+    let body = if file_branch {
+        "echo 'PARTIAL LOADER OUTPUT d4k' > \"$2\"\nkill -KILL $$\n"
+    } else {
+        "echo 'PARTIAL LOADER OUTPUT d4k'\nkill -KILL $$\n"
+    };
+    fs::write(&script, format!("#!/usr/bin/env bash\n{body}")).unwrap();
+    script
+}
+
+/// `.file <doc>` through a loader that sleeps: Esc ends the turn within
+/// about two seconds, the loader process is gone by then, nothing reached
+/// the model, and the UI keeps taking keys and leaves clean.
+fn esc_interrupts_a_slow_loader(scenario: &str, file_branch: bool) {
+    let dir = fresh_config_dir(scenario);
+    let _guard = TempDirGuard(dir.clone());
+    let fake = FakeLlm::start(vec![Reply::Text("never reached m2x".to_string())]);
+    let script = slow_loader(&dir, file_branch);
+    let args = if file_branch { "$1 $2" } else { "$1" };
+    write_fake_llm_config_with(
+        &dir,
+        &fake,
+        &format!(
+            "document_loaders:\n\x20 slow: 'bash {} {args}'\n",
+            script.display()
+        ),
+    );
+    let document = dir.join("doc.slow");
+    fs::write(&document, "slow document body\n").unwrap();
+    let pid_file = dir.join("doc.slow.pid");
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(format!(".file {} -- summarize\r", document.display()).as_bytes())
+        .unwrap();
+    wait_for_file(&mut pty, &pid_file, "the slow loader's pid file");
+    let pid = loader_pid(&pid_file);
+    assert!(process_alive(pid), "the loader exited before Esc");
+    pty.read_for(Duration::from_millis(500));
+    let pressed_at = pty.raw().len();
+    let pressed = std::time::Instant::now();
+    pty.send(b"\x1b").unwrap();
+
+    let mut gone_after = None;
+    let mut ended_after = None;
+    let deadline = pressed + Duration::from_secs(8);
+    while (gone_after.is_none() || ended_after.is_none()) && std::time::Instant::now() < deadline {
+        pty.read_for(Duration::from_millis(100));
+        if gone_after.is_none() && !process_alive(pid) {
+            gone_after = Some(pressed.elapsed());
+        }
+        if ended_after.is_none() {
+            let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[pressed_at..]));
+            let lower = since.to_lowercase();
+            if lower.contains("aborted") || lower.contains("interrupted") {
+                ended_after = Some(pressed.elapsed());
+            }
+        }
+    }
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[pressed_at..]));
+    let gone_after = gone_after.unwrap_or_else(|| {
+        panic!("{scenario}: the loader (pid {pid}) is still alive 8s after Esc:\n{since}")
+    });
+    let ended_after = ended_after.unwrap_or_else(|| {
+        panic!("{scenario}: no aborted/interrupted cell followed Esc within 8s:\n{since}")
+    });
+    assert!(
+        gone_after < Duration::from_millis(2500),
+        "{scenario}: the loader outlived Esc by {gone_after:?}:\n{since}"
+    );
+    assert!(
+        ended_after < Duration::from_millis(2500),
+        "{scenario}: the turn ended {ended_after:?} after Esc:\n{since}"
+    );
+    assert!(
+        !since.contains("exit="),
+        "{scenario}: Esc quit the UI:\n{since}"
+    );
+
+    let info_at = pty.raw().len();
+    pty.send(b".info\r").unwrap();
+    pty.wait_for_after("log_path", info_at, PTY_DEADLINE)
+        .expect("keys were not handled after the interrupted loader");
+    assert_eq!(
+        fake.served(),
+        0,
+        "{scenario}: the interrupted document reached the model"
+    );
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+    assert!(
+        !squeezed(&transcript).contains("neverreachedm2x"),
+        "{scenario}: the model's reply landed after the interrupt:\n{transcript}"
+    );
+}
+
+/// File-branch loader (`cmd $1 $2`).
+#[test]
+#[serial]
+fn esc_interrupts_a_slow_file_loader_and_kills_it() {
+    esc_interrupts_a_slow_loader("esc-slow-file-loader", true);
+}
+
+/// Stdout-branch loader (`cmd $1`).
+#[test]
+#[serial]
+fn esc_interrupts_a_slow_stdout_loader_and_kills_it() {
+    esc_interrupts_a_slow_loader("esc-slow-stdout-loader", false);
+}
+
+/// `.file <doc>` through a loader killed by a signal after writing its
+/// output: the turn fails (an error cell, no model call with the partial
+/// output), and the UI keeps taking keys and leaves clean.
+fn a_signal_killed_loader_is_a_failure(scenario: &str, file_branch: bool) {
+    let dir = fresh_config_dir(scenario);
+    let _guard = TempDirGuard(dir.clone());
+    let fake = FakeLlm::start(vec![Reply::Text("ingested anyway r8p".to_string())]);
+    let script = dying_loader(&dir, file_branch);
+    let args = if file_branch { "$1 $2" } else { "$1" };
+    write_fake_llm_config_with(
+        &dir,
+        &fake,
+        &format!(
+            "document_loaders:\n\x20 dying: 'bash {} {args}'\n",
+            script.display()
+        ),
+    );
+    let document = dir.join("doc.dying");
+    fs::write(&document, "dying document body\n").unwrap();
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let sent_at = pty.raw().len();
+    pty.send(format!(".file {} -- summarize\r", document.display()).as_bytes())
+        .unwrap();
+    // The turn must end one way or the other: wait until the status row no
+    // longer says Working, then look at what landed.
+    let deadline = std::time::Instant::now() + PTY_DEADLINE;
+    loop {
+        pty.read_for(Duration::from_millis(300));
+        let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[sent_at..]));
+        let lower = since.to_lowercase();
+        if squeezed(&since).contains("ingestedanywayr8p")
+            || lower.contains("non-zero")
+            || lower.contains("error")
+            || lower.contains("fail")
+            || lower.contains("signal")
+            || lower.contains("killed")
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{scenario}: neither a failure nor a reply followed the killed loader:\n{since}"
+        );
+    }
+    pty.read_for(Duration::from_millis(800));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[sent_at..]));
+    assert_eq!(
+        fake.served(),
+        0,
+        "{scenario}: the output of a signal-killed loader was sent to the model:\n{since}"
+    );
+    assert!(
+        !squeezed(&since).contains("ingestedanywayr8p"),
+        "{scenario}: the model replied to a document whose loader was killed:\n{since}"
+    );
+    let lower = since.to_lowercase();
+    assert!(
+        lower.contains("non-zero")
+            || lower.contains("error")
+            || lower.contains("fail")
+            || lower.contains("signal")
+            || lower.contains("killed"),
+        "{scenario}: nothing told the user the loader failed:\n{since}"
+    );
+    assert!(
+        !since.contains("exit="),
+        "{scenario}: the failed loader quit the UI:\n{since}"
+    );
+
+    let info_at = pty.raw().len();
+    pty.send(b".info\r").unwrap();
+    pty.wait_for_after("log_path", info_at, PTY_DEADLINE)
+        .expect("keys were not handled after the failed loader");
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// File-branch loader killed after writing `$2`.
+#[test]
+#[serial]
+fn a_signal_killed_file_loader_is_reported_as_a_failure_not_ingested() {
+    a_signal_killed_loader_is_a_failure("killed-file-loader", true);
+}
+
+/// Stdout-branch loader killed after writing its stdout.
+#[test]
+#[serial]
+fn a_signal_killed_stdout_loader_is_reported_as_a_failure_not_ingested() {
+    a_signal_killed_loader_is_a_failure("killed-stdout-loader", false);
+}
