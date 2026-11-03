@@ -7,7 +7,8 @@ use std::{
     fs::OpenOptions,
     io::{self, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -103,7 +104,52 @@ fn wait_for_status<T: AsRef<OsStr>>(
         .envs(envs.unwrap_or_default())
         .stdin(stdin)
         .status()?;
-    Ok(status.code().unwrap_or_default())
+    Ok(exit_code(status))
+}
+
+/// Like `wait_for_status`, but the wait is a poll the runtime can
+/// interrupt: a caller that drops this future (an abort racing it in a
+/// `select!`) kills and reaps the child instead of blocking on it.
+async fn wait_for_status_interruptible<T: AsRef<OsStr>>(
+    cmd: &str,
+    args: &[T],
+    stdin: Stdio,
+) -> Result<i32> {
+    let mut child = KillOnDrop(Command::new(cmd).args(args.iter()).stdin(stdin).spawn()?);
+    let status = loop {
+        if let Some(status) = child.0.try_wait()? {
+            break status;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    Ok(exit_code(status))
+}
+
+/// A child that does not outlive the future waiting on it.
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        // Both fail only when the child is already reaped.
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// The exit code to report for `status`; a child ended by a signal gets
+/// the shell's `128 + signal` so it never reads as success.
+fn exit_code(status: ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return 128 + signal;
+        }
+    }
+    -1
 }
 
 pub fn run_command_with_output<T: AsRef<OsStr>>(
@@ -134,7 +180,11 @@ pub fn run_command_with_output<T: AsRef<OsStr>>(
     Ok((status.success(), stdout.to_string(), stderr.to_string()))
 }
 
-pub fn run_loader_command(path: &str, extension: &str, loader_command: &str) -> Result<String> {
+pub async fn run_loader_command(
+    path: &str,
+    extension: &str,
+    loader_command: &str,
+) -> Result<String> {
     let cmd_args = shell_words::split(loader_command)
         .with_context(|| anyhow!("Invalid document loader '{extension}': `{loader_command}`"))?;
     let mut use_stdout = true;
@@ -179,9 +229,11 @@ pub fn run_loader_command(path: &str, extension: &str, loader_command: &str) -> 
         } else {
             Stdio::inherit()
         };
-        let status = wait_for_status(cmd, args, None, stdin).with_context(|| {
-            format!("Unable to run `{cmd_eval}`, Perhaps '{cmd}' is not installed?")
-        })?;
+        let status = wait_for_status_interruptible(cmd, args, stdin)
+            .await
+            .with_context(|| {
+                format!("Unable to run `{cmd_eval}`, Perhaps '{cmd}' is not installed?")
+            })?;
         if status != 0 {
             bail!("The command `{cmd_eval}` exited with non-zero.")
         }
@@ -284,5 +336,88 @@ fn get_history_file(shell: &str) -> Option<PathBuf> {
         "ksh" => Some(home_dir()?.join(".ksh_history")),
         "tcsh" => Some(home_dir()?.join(".history")),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    /// A loader killed by a signal reports a non-zero status, so its
+    /// partial output is never read as success.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_signal_killed_loader_is_not_a_success() {
+        let status = wait_for_status_interruptible("sh", &["-c", "kill -9 $$"], Stdio::null())
+            .await
+            .unwrap();
+        assert_eq!(status, 128 + libc::SIGKILL);
+        let status = wait_for_status("sh", &["-c", "kill -9 $$"], None, Stdio::null()).unwrap();
+        assert_eq!(status, 128 + libc::SIGKILL);
+    }
+
+    /// Under the TUI an abort ends a file-writing loader that would run
+    /// for half a minute: the caller gets the abort promptly and the
+    /// loader process is gone, not left behind to finish on its own.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn an_aborted_loader_returns_promptly_and_its_child_is_reaped() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let pid_file = temp_file("-loader-pid-", "");
+        let loader = format!(
+            "sh -c \"echo $$ > '{}'; exec sleep 30 # $2\"",
+            pid_file.display()
+        );
+        let abort_signal = create_abort_signal();
+        let aborter = abort_signal.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            aborter.set_ctrlc();
+        });
+        let (_, spinner_rx) = Spinner::create("Loading");
+        let started = std::time::Instant::now();
+        let err = abortable_run_with_spinner_rx(
+            run_loader_command("unused", "txt", &loader),
+            spinner_rx,
+            abort_signal,
+            UserInterrupt::NotOwned,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("Aborted"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the abort took {:?}",
+            started.elapsed()
+        );
+
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("the loader never wrote its pid")
+            .trim()
+            .parse()
+            .unwrap();
+        std::fs::remove_file(&pid_file).unwrap();
+        let gone = (0..20).any(|_| {
+            // A reaped pid answers ESRCH to a null signal; a zombie or a
+            // still-running child answers 0.
+            if unsafe { libc::kill(pid, 0) } == -1 {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            false
+        });
+        assert!(
+            gone,
+            "the loader (pid {pid}) is still alive after the abort"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_status_with_a_code_keeps_it() {
+        let status = Command::new("sh").args(["-c", "exit 3"]).status().unwrap();
+        assert_eq!(exit_code(status), 3);
     }
 }

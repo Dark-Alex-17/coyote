@@ -3279,13 +3279,14 @@ mod tests {
                 .next_back()
                 .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
         }
-        const NEEDLES: [&str; 11] = [
+        const NEEDLES: [&str; 12] = [
             "event::read(",
             "event::poll(",
             "read_single_key(",
             "edit_file(",
             "run_command(",
             "wait_for_status(",
+            "wait_for_status_interruptible(",
             "Confirm::new(",
             "Select::new(",
             "MultiSelect::new(",
@@ -3365,6 +3366,7 @@ mod tests {
         const VIA_RUN_GATE: &str = "calls run_command, which refuses under the TUI";
         const REPL_PAINTER: &str =
             "polled by the spinner and the REPL stream painter, both replaced under the TUI";
+        const NULL_STDIN: &str = "a unit test; the child it waits on has stdin at /dev/null";
         let allowlist: &[(&str, &str, &str)] = &[
             (
                 "src/client/common.rs",
@@ -3461,6 +3463,11 @@ mod tests {
                 "src/utils/abort_signal.rs",
                 "drain_terminal_events",
                 REPL_PAINTER,
+            ),
+            (
+                "src/utils/command.rs",
+                "a_signal_killed_loader_is_not_a_success",
+                NULL_STDIN,
             ),
             ("src/vault/mod.rs", "add_secret", PROMPT_GATED),
             ("src/vault/mod.rs", "update_secret", PROMPT_GATED),
@@ -3620,9 +3627,9 @@ mod tests {
     /// the TUI, with stdin at EOF instead of the raw tty: the `-` here
     /// reads stdin and adds nothing.
     #[cfg(unix)]
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn a_file_writing_loader_still_runs_under_the_tui() {
+    async fn a_file_writing_loader_still_runs_under_the_tui() {
         let _tui_on = crate::testing::AtomicFlagGuard::set(&TUI_ACTIVE, true);
         let source = crate::utils::temp_file("-loader-source-", ".txt");
         std::fs::write(&source, "loaded under the tui x7x\n").unwrap();
@@ -3631,6 +3638,7 @@ mod tests {
             "txt",
             "sh -c \"cat $1 - > $2\"",
         )
+        .await
         .unwrap();
         std::fs::remove_file(&source).unwrap();
         assert_eq!(loaded, "loaded under the tui x7x\n");

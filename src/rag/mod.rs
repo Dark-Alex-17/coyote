@@ -1077,7 +1077,7 @@ impl Rag {
         for protocol_path in protocol_paths {
             index += 1;
             println!("Load {protocol_path} [{index}/{total}]");
-            match load_protocol_path(&loaders, &protocol_path) {
+            match load_protocol_path(&loaders, &protocol_path).await {
                 Ok(v) => loaded_documents.extend(v),
                 Err(err) => handle_error(err, &mut has_error),
             }

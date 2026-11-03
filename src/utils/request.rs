@@ -73,7 +73,7 @@ pub async fn fetch_with_loaders(
     allow_media: bool,
 ) -> Result<(String, String)> {
     if let Some(loader_command) = loaders.get(URL_LOADER) {
-        let contents = run_loader_command(path, URL_LOADER, loader_command)?;
+        let contents = run_loader_command(path, URL_LOADER, loader_command).await?;
         return Ok((contents, DEFAULT_EXTENSION.into()));
     }
     let client = match *CLIENT {
@@ -149,7 +149,7 @@ pub async fn fetch_with_loaders(
                     println!("{}", warning_text(&format!("No content at '{path}'")));
                     String::new()
                 } else {
-                    run_loader_command(&save_path, &extension, loader_command)?
+                    run_loader_command(&save_path, &extension, loader_command).await?
                 };
                 (contents, DEFAULT_EXTENSION.into())
             }

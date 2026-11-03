@@ -736,6 +736,7 @@ async fn load_documents(
 
     for protocol_path in protocol_paths {
         let documents = load_protocol_path(loaders, &protocol_path)
+            .await
             .with_context(|| format!("Failed to load from '{protocol_path}'"))?;
         files.extend(
             documents
