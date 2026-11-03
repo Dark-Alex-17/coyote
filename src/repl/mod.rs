@@ -3767,7 +3767,7 @@ local_hello() {\n\
         use crate::function::eval_tool_calls;
         use crate::mesh::card::{CardSource, StatusHandler, build_card};
         use crate::mesh::snapshot::MeshSnapshot;
-        use crate::mesh::{MESH_PROGRESS_MIN_INTERVAL, MeshDigestHook};
+        use crate::mesh::{MESH_PROGRESS_MIN_INTERVAL, MeshDigestHook, MeshSlot};
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::{Duration, Instant, SystemTime};
 
@@ -3812,6 +3812,7 @@ local_hello() {\n\
                     },
                     ..AppConfig::default()
                 }),
+                mesh: Arc::new(MeshSlot::without_node_gate()),
                 ..AppState::test_default()
             };
             let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Repl);
@@ -3934,7 +3935,12 @@ local_hello() {\n\
             let _guard = crate::testing::TestConfigDirGuard::new("repl");
             let name = unique("repl_progress_agent");
             write_chat_agent(&name, "instructions: Track the work.\nauto_continue: true\n");
-            let mut ctx = engage_graph_agent(repl_ctx(), &name).await;
+            let app = AppState {
+                mesh: Arc::new(MeshSlot::without_node_gate()),
+                ..AppState::test_default()
+            };
+            let ctx = RequestContext::new(Arc::new(app), WorkingMode::Repl);
+            let mut ctx = engage_graph_agent(ctx, &name).await;
             ctx.tool_scope.functions.append_todo_functions();
             assert!(ctx.agent.is_some());
             assert!(

@@ -1525,6 +1525,7 @@ mod tests {
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_todo_done_inside_the_snapshot_interval_reaches_the_digest() {
             let mut ctx = test_ctx(MeshBrief::Auto);
+            Arc::get_mut(&mut ctx.app).unwrap().mesh = Arc::new(MeshSlot::without_node_gate());
             add_n_turns(&mut ctx, 4);
             ctx.todo_list.add("write the seam");
             let shared_ctx = shared(ctx);

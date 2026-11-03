@@ -71,15 +71,19 @@ fn published_turn_state(ctx: &RequestContext) -> TurnState {
 /// snapshot to the slot's timer instead, so the last change before a long model call is
 /// published when the interval ends. Either way the context is then offered to the digest
 /// hook, whose own interval bounds how often that costs a model call.
-/// Nothing happens for a context that does not own the session, or before a turn
-/// boundary has published the first snapshot: until then there is no turn state to keep.
+/// Nothing happens while no mesh node is running, for a context that does not own the
+/// session, or before a turn boundary has published the first snapshot: until then there
+/// is no turn state to keep.
 /// Works from the context it is handed and the slot alone, never the turn's lock.
 pub(crate) fn mesh_progress_point(ctx: &RequestContext) {
     mesh_progress_point_at(ctx, Instant::now());
 }
 
 fn mesh_progress_point_at(ctx: &RequestContext, now: Instant) {
-    if !ctx.owns_mesh_session() || ctx.app.mesh.snapshot().is_none() {
+    if !ctx.app.mesh.takes_progress_points()
+        || !ctx.owns_mesh_session()
+        || ctx.app.mesh.snapshot().is_none()
+    {
         return;
     }
     if ctx.app.mesh.progress_capture_due_at(now) {
@@ -468,18 +472,24 @@ mod progress_point_tests {
     use super::*;
     use crate::config::{AppConfig, AppState, WorkingMode};
     use crate::function::{ToolCall, eval_tool_calls};
-    use crate::mesh::MESH_PROGRESS_MIN_INTERVAL;
+    use crate::mesh::{MESH_PROGRESS_MIN_INTERVAL, MeshSlot};
     use serde_json::json;
     use std::sync::Arc;
     use std::time::Duration;
 
-    /// A root context that may use the todo tools.
+    /// A root context that may use the todo tools, on a slot that takes progress points
+    /// with no node running.
     fn todo_ctx() -> RequestContext {
+        todo_ctx_on(MeshSlot::without_node_gate())
+    }
+
+    fn todo_ctx_on(mesh: MeshSlot) -> RequestContext {
         let app = AppState {
             config: Arc::new(AppConfig {
                 auto_continue: true,
                 ..Default::default()
             }),
+            mesh: Arc::new(mesh),
             ..AppState::test_default()
         };
         let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Repl);
@@ -538,6 +548,24 @@ mod progress_point_tests {
         let ctx = todo_ctx();
         mesh_progress_point_at(&ctx, Instant::now());
         assert!(ctx.app.mesh.snapshot().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_batch_with_no_node_leaves_the_slot_alone() {
+        let mut ctx = todo_ctx_on(MeshSlot::default());
+        publish_mesh_snapshot(&ctx, TurnState::working_now());
+        let boundary = published(&ctx);
+
+        add_todo_batch(&mut ctx, "first").await;
+        add_todo_batch(&mut ctx, "second").await;
+
+        assert!(Arc::ptr_eq(&published(&ctx), &boundary));
+        assert!(ctx.app.mesh.pending_progress_for_tests().is_none());
+        assert!(
+            ctx.app.mesh.progress_capture_due_at(Instant::now()),
+            "a batch claimed the progress clock"
+        );
+        assert_eq!(ctx.todo_list.todos.len(), 2);
     }
 
     #[tokio::test]

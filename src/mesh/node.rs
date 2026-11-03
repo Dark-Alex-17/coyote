@@ -3479,6 +3479,8 @@ impl OwnEntryMarks {
 /// the last one. While it is set, `trailing_armed` marks the one timer task that will
 /// publish it once the interval has passed. Every `publish` clears it under the same
 /// lock, so a turn boundary is never overwritten by an older progress snapshot.
+///
+/// `progress_without_node` lets a test slot take progress points with no node running.
 #[derive(Default)]
 pub(crate) struct MeshSlot {
     inner: RwLock<Option<Arc<MeshRuntime>>>,
@@ -3506,6 +3508,8 @@ pub(crate) struct MeshSlot {
     trailing_armed: AtomicBool,
     digest_hook: ArcSwapOption<Arc<dyn MeshDigestHook>>,
     #[cfg(test)]
+    progress_without_node: bool,
+    #[cfg(test)]
     envoy_memory_override: ArcSwapOption<EnvoySessions>,
 }
 
@@ -3517,8 +3521,26 @@ pub(crate) trait MeshDigestHook: Send + Sync {
 }
 
 impl MeshSlot {
+    #[cfg(test)]
+    pub(crate) fn without_node_gate() -> Self {
+        Self {
+            progress_without_node: true,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn get(&self) -> Option<Arc<MeshRuntime>> {
         self.inner.read().clone()
+    }
+
+    /// Whether a progress point has anyone to publish for. Without a running node no
+    /// peer can read the snapshot, so the capture and its timer are skipped.
+    pub(crate) fn takes_progress_points(&self) -> bool {
+        #[cfg(test)]
+        if self.progress_without_node {
+            return true;
+        }
+        self.get().is_some()
     }
 
     pub(crate) fn command_prefix(&self) -> &LivePrefix {
