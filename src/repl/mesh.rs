@@ -11,7 +11,7 @@ use crate::mesh::fetch::{
 };
 use crate::mesh::grants::DEFAULT_GRANT_TTL;
 use crate::mesh::identity::{self, Predecessor, fingerprint};
-use crate::mesh::idle::plural;
+use crate::mesh::idle::{plural, sync_ask_suffix};
 use crate::mesh::knock::{
     DroppedKnocks, KNOCK_BUCKET_REFILL_INTERVAL, KNOCK_DROPS_REMEMBERED,
     KNOCK_IS_NOT_FIRST_CONTACT, KnockFallback, KnockIntro, KnockOutcome, KnockVia,
@@ -2598,12 +2598,8 @@ fn render_sync(report: &FetchReport) -> String {
         report.discarded,
         report.deferred
     );
-    if report.deferred_after_ask > 0 {
-        line.push_str(&format!(
-            ": {}; {}",
-            crate::mesh::ASKED_FOR_SOURCE,
-            crate::mesh::ASKED_FOR_SOURCE_NEXT_STEP
-        ));
+    if let Some(suffix) = sync_ask_suffix(report.deferred, report.deferred_after_ask) {
+        line.push_str(&format!(": {suffix}"));
     }
     line.push('.');
     if report.wanted == MAX_WANTS_PER_FETCH {
@@ -2633,6 +2629,31 @@ mod sync_ask_line_tests {
         assert_eq!(
             render_sync(&report),
             "Fetched from deadbeef: 1 listed, 1 wanted, 1 received, 0 delivered, 0 duplicates, 0 discarded, 1 deferred: source identity not yet known; asked the mesh for its announce; the next sync delivers it once the announce arrives, or run .mesh sync in a minute."
+        );
+    }
+
+    #[test]
+    fn a_partial_ask_gives_the_count_and_picks_the_pronoun_by_it() {
+        let mut report = FetchReport {
+            node: "deadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+            listed: 3,
+            wanted: 3,
+            received: 3,
+            delivered: 0,
+            duplicates: 0,
+            discarded: 0,
+            deferred: 3,
+            deferred_after_ask: 1,
+            acknowledged: 0,
+        };
+        assert_eq!(
+            render_sync(&report),
+            "Fetched from deadbeef: 3 listed, 3 wanted, 3 received, 0 delivered, 0 duplicates, 0 discarded, 3 deferred: for 1 of 3, source identity not yet known; asked the mesh for its announce; the next sync delivers it once the announce arrives, or run .mesh sync in a minute."
+        );
+        report.deferred_after_ask = 3;
+        assert_eq!(
+            render_sync(&report),
+            "Fetched from deadbeef: 3 listed, 3 wanted, 3 received, 0 delivered, 0 duplicates, 0 discarded, 3 deferred: source identity not yet known; asked the mesh for its announce; the next sync delivers them once the announces arrive, or run .mesh sync in a minute."
         );
     }
 }

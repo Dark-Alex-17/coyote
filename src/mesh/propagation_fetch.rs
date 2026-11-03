@@ -386,10 +386,6 @@ pub(crate) struct FetchReport {
 pub(crate) const ASKED_FOR_SOURCE: &str =
     "source identity not yet known; asked the mesh for its announce";
 
-/// What a sync line tells the person after `ASKED_FOR_SOURCE`.
-pub(crate) const ASKED_FOR_SOURCE_NEXT_STEP: &str =
-    "the next sync delivers it once the announce arrives, or run .mesh sync in a minute";
-
 impl FetchReport {
     fn new(node: String) -> Self {
         Self {
