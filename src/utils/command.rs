@@ -125,6 +125,28 @@ async fn wait_for_status_interruptible<T: AsRef<OsStr>>(
     Ok(exit_code(status))
 }
 
+/// Like `run_command_with_output`, but the wait is one the runtime can
+/// interrupt: a caller that drops this future kills the child instead of
+/// blocking on it. Returns the exit code (see `exit_code`) with what the
+/// child wrote to stdout and stderr.
+async fn run_command_with_output_interruptible<T: AsRef<OsStr>>(
+    cmd: &str,
+    args: &[T],
+    stdin: Stdio,
+) -> Result<(i32, String, String)> {
+    let output = tokio::process::Command::new(cmd)
+        .args(args.iter())
+        .stdin(stdin)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .output()
+        .await?;
+    let stdout = String::from_utf8(output.stdout).context("Invalid UTF-8 in stdout")?;
+    let stderr = String::from_utf8(output.stderr).context("Invalid UTF-8 in stderr")?;
+    Ok((exit_code(output.status), stdout, stderr))
+}
+
 /// A child that does not outlive the future waiting on it.
 struct KillOnDrop(Child);
 
@@ -206,12 +228,21 @@ pub async fn run_loader_command(
     debug!("run `{cmd_eval}`");
     let (cmd, args) = cmd_args.split_at(1);
     let cmd = &cmd[0];
+    // A loader needs nothing from the keyboard, so under the TUI it runs
+    // with stdin closed rather than inheriting the raw tty the event
+    // stream is reading.
+    let stdin = if crate::tui::active() {
+        Stdio::null()
+    } else {
+        Stdio::inherit()
+    };
     if use_stdout {
-        let (success, stdout, stderr) =
-            run_command_with_output(cmd, args, None).with_context(|| {
+        let (status, stdout, stderr) = run_command_with_output_interruptible(cmd, args, stdin)
+            .await
+            .with_context(|| {
                 format!("Unable to run `{cmd_eval}`, Perhaps '{cmd}' is not installed?")
             })?;
-        if !success {
+        if status != 0 {
             let err = if !stderr.is_empty() {
                 stderr
             } else {
@@ -221,14 +252,6 @@ pub async fn run_loader_command(
         }
         Ok(stdout)
     } else {
-        // A loader writes to its output file and needs nothing from the
-        // keyboard, so under the TUI it runs with stdin closed rather than
-        // inheriting the raw tty the event stream is reading.
-        let stdin = if crate::tui::active() {
-            Stdio::null()
-        } else {
-            Stdio::inherit()
-        };
         let status = wait_for_status_interruptible(cmd, args, stdin)
             .await
             .with_context(|| {
@@ -357,61 +380,84 @@ mod tests {
         assert_eq!(status, 128 + libc::SIGKILL);
     }
 
-    /// Under the TUI an abort ends a file-writing loader that would run
-    /// for half a minute: the caller gets the abort promptly and the
-    /// loader process is gone, not left behind to finish on its own.
+    /// Runs `loader` (a shell line that records its pid in `pid_file`
+    /// and then sleeps for half a minute) under the TUI, aborts once the
+    /// pid is on disk, and checks the caller gets the abort promptly and
+    /// the loader process is gone, not left behind to finish on its own.
     #[cfg(unix)]
-    #[tokio::test]
-    #[serial]
-    async fn an_aborted_loader_returns_promptly_and_its_child_is_reaped() {
+    async fn assert_aborted_loader_is_reaped(loader: &str, pid_file: &Path) {
         let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
-        let pid_file = temp_file("-loader-pid-", "");
-        let loader = format!(
-            "sh -c \"echo $$ > '{}'; exec sleep 30 # $2\"",
-            pid_file.display()
-        );
         let abort_signal = create_abort_signal();
         let aborter = abort_signal.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        let pid_path = pid_file.to_path_buf();
+        let aborted_at = tokio::spawn(async move {
+            while !matches!(std::fs::metadata(&pid_path), Ok(meta) if meta.len() > 0) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
             aborter.set_ctrlc();
+            std::time::Instant::now()
         });
         let (_, spinner_rx) = Spinner::create("Loading");
-        let started = std::time::Instant::now();
         let err = abortable_run_with_spinner_rx(
-            run_loader_command("unused", "txt", &loader),
+            run_loader_command("unused", "txt", loader),
             spinner_rx,
             abort_signal,
             UserInterrupt::NotOwned,
         )
         .await
         .unwrap_err();
+        let took = aborted_at.await.unwrap().elapsed();
         assert!(err.to_string().contains("Aborted"), "{err}");
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "the abort took {:?}",
-            started.elapsed()
-        );
+        assert!(took < Duration::from_secs(2), "the abort took {took:?}");
 
-        let pid: i32 = std::fs::read_to_string(&pid_file)
+        let pid: i32 = std::fs::read_to_string(pid_file)
             .expect("the loader never wrote its pid")
             .trim()
             .parse()
             .unwrap();
-        std::fs::remove_file(&pid_file).unwrap();
-        let gone = (0..20).any(|_| {
+        std::fs::remove_file(pid_file).unwrap();
+        let mut gone = false;
+        for _ in 0..20 {
             // A reaped pid answers ESRCH to a null signal; a zombie or a
-            // still-running child answers 0.
+            // still-running child answers 0. The wait yields to the
+            // runtime because a `kill_on_drop` child is reaped by it.
             if unsafe { libc::kill(pid, 0) } == -1 {
-                return true;
+                gone = true;
+                break;
             }
-            std::thread::sleep(Duration::from_millis(50));
-            false
-        });
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         assert!(
             gone,
             "the loader (pid {pid}) is still alive after the abort"
         );
+    }
+
+    /// A file-writing loader (`$2`) is polled, so an abort kills it.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn an_aborted_loader_returns_promptly_and_its_child_is_reaped() {
+        let pid_file = temp_file("-loader-pid-", "");
+        let loader = format!(
+            "sh -c \"echo $$ > '{}'; exec sleep 30 # $2\"",
+            pid_file.display()
+        );
+        assert_aborted_loader_is_reaped(&loader, &pid_file).await;
+    }
+
+    /// A stdout loader (no `$2`) waits on the runtime too, so an abort
+    /// kills it instead of blocking on its output.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn an_aborted_stdout_loader_returns_promptly_and_its_child_is_reaped() {
+        let pid_file = temp_file("-loader-pid-", "");
+        let loader = format!(
+            "sh -c \"echo $$ > '{}'; exec sleep 30\"",
+            pid_file.display()
+        );
+        assert_aborted_loader_is_reaped(&loader, &pid_file).await;
     }
 
     #[cfg(unix)]
