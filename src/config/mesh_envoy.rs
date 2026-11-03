@@ -269,8 +269,8 @@ pub(crate) struct EnvoyRunner {
     app: ArcSwap<AppState>,
     jobs: mpsc::Sender<EnvoyJob>,
     held: Mutex<Option<HeldEscalation>>,
-    /// The human's answer a held run took, kept so the peer still hears it when that
-    /// run then fails to deliver.
+    /// The human's answers a held run took, in order. The peer hears them word for word
+    /// in place of whatever the run then comes to.
     consumed_answer: Mutex<Option<String>>,
     cancel: CancellationToken,
     current_abort: Mutex<Option<AbortSignal>>,
@@ -955,8 +955,9 @@ impl EnvoyRunner {
 
     /// Replies to the peer, records the exchange for the session and fires the result
     /// hook. A reply that cannot be sent still gets recorded, with one line telling the
-    /// human why the peer did not hear it. A held run that took the human's answer and
-    /// then failed to deliver still gets that answer to the peer. An escalated question
+    /// human why the peer did not hear it. A held run that took the human's answer sends
+    /// that answer to the peer word for word as `answered`, whatever the run came to; the
+    /// model's own final text is neither sent nor classified. An escalated question
     /// leaves the store only once the peer has heard its answer; an unsent one stays open
     /// so `.mesh answer` can send it again. A run-time refusal of a stored message is
     /// replied to once per identity, per reason, per hour, on the claim the accept-time
@@ -982,11 +983,11 @@ impl EnvoyRunner {
         let app = self.app.load();
         // Always taken, so an answer consumed by this run can never be replayed to the
         // next job's peer.
-        let consumed = self.consumed_answer.lock().take();
-        let human_answer = match &outcome {
-            EnvoyOutcome::Answered(_) | EnvoyOutcome::Declined(_) => None,
-            _ => consumed.and_then(|text| display_text(&text, PEER_CONTENT_MAX_CHARS)),
-        };
+        let human_answer = self
+            .consumed_answer
+            .lock()
+            .take()
+            .and_then(|text| display_text(&text, PEER_CONTENT_MAX_CHARS));
         // The filed question is settled only by the envoy's own last word on an
         // escalated run or by the human's; an escalation or a failure leaves it open.
         let settles_question = human_answer.is_some()
@@ -1108,10 +1109,10 @@ impl EnvoyRunner {
             self.forget_question(&id);
         }
         match (&outcome, &human_answer) {
-            (EnvoyOutcome::Answered(text) | EnvoyOutcome::Declined(text), _) => {
+            (_, Some(text)) => app.mesh.record_envoy_exchange(&message, text),
+            (EnvoyOutcome::Answered(text) | EnvoyOutcome::Declined(text), None) => {
                 app.mesh.record_envoy_exchange(&message, text)
             }
-            (_, Some(text)) => app.mesh.record_envoy_exchange(&message, text),
             (EnvoyOutcome::Escalated { .. }, None) => app.mesh.record_envoy_escalated(message, &id),
             (EnvoyOutcome::TimedOut, None) => {
                 app.mesh.record_envoy_fallback(message, "envoy timed out")
@@ -1202,13 +1203,18 @@ impl EnvoySink for EnvoyRunner {
         if held.as_ref().is_none_or(|held| held.id != id) {
             return false;
         }
-        // Set before the send so the run can never deliver without it on record.
-        *self.consumed_answer.lock() = Some(text.to_string());
+        // Set before the send so the run can never deliver without it on record. A run
+        // that asks more than once owes the peer every answer it took.
+        let earlier = self.consumed_answer.lock().clone();
+        *self.consumed_answer.lock() = Some(match &earlier {
+            Some(earlier) => format!("{earlier} / {text}"),
+            None => text.to_string(),
+        });
         let taken = held
             .take()
             .is_some_and(|held| held.reply_tx.send(text.to_string()).is_ok());
         if !taken {
-            *self.consumed_answer.lock() = None;
+            *self.consumed_answer.lock() = earlier;
         }
         taken
     }
@@ -1421,14 +1427,14 @@ pub(crate) fn escalated_notice(message: &PeerMessage) -> Result<OutboundPeer, Se
 }
 
 /// What the peer hears for `outcome`, in the thread of the message it answers: the
-/// human's words when they took the question, else `reply_text`. Only a final outcome
-/// goes out as a `Reply`; the escalation message is a `Message` naming the question, so
-/// the asker's correlation stays open for the human's answer, and a `Message` carries no
-/// disposition. Every reply says what it is: the envoy's and the human's answers are
-/// `answered`; a decline, and a run that ended without an answer, are `refused` with no
-/// retry hint; a run-time refusal is not the envoy's answer, so that one goes out as the
-/// typed refusal reply with its fields and retry hint. Words only: the envoy never
-/// attaches a part.
+/// human's words as they gave them when they took the question, whatever the outcome,
+/// else `reply_text`. Only a final outcome goes out as a `Reply`; the escalation message
+/// is a `Message` naming the question, so the asker's correlation stays open for the
+/// human's answer, and a `Message` carries no disposition. Every reply says what it is:
+/// the envoy's and the human's answers are `answered`; a decline, and a run that ended
+/// without an answer, are `refused` with no retry hint; a run-time refusal is not the
+/// envoy's answer, so that one goes out as the typed refusal reply with its fields and
+/// retry hint. Words only: the envoy never attaches a part.
 pub(crate) fn envoy_reply(
     outcome: &EnvoyOutcome,
     human_answer: Option<&str>,
@@ -2425,7 +2431,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn a_held_escalation_answered_in_time_lets_the_envoy_answer_the_peer() {
+    async fn a_held_escalation_answered_in_time_relays_the_human_s_words_to_the_peer() {
         let _cfg = TestConfigDirGuard::new("mesh-envoy-held");
         let (source, _source) = stub_envoy_source();
         let tmp = TempDir::new("mesh-envoy-held");
@@ -2462,7 +2468,7 @@ mod tests {
         assert_eq!(envelopes.len(), 2);
         let reply = peer_of(&envelopes[1]);
         assert_eq!(reply.kind, PeerKind::Reply);
-        assert_eq!(reply.content, "the human said: yes, merge");
+        assert_eq!(reply.content, "yes, merge");
         // The mesh is off, so the reply never left: the question stays on file for a
         // retry through `.mesh answer`.
         assert!(store.get("msg-held").unwrap().is_some());
@@ -3526,8 +3532,8 @@ mod tests {
     }
 
     /// A held escalation on the wire: the peer hears `escalated` first, and once the
-    /// human answers in time, the envoy's own `answered` reply; no escalation `Message`
-    /// is ever sent and the question leaves the store.
+    /// human answers in time, the human's words as the `answered` reply; no escalation
+    /// `Message` is ever sent and the question leaves the store.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
@@ -3574,7 +3580,7 @@ mod tests {
         assert_eq!(heard[1].kind, PeerKind::Reply);
         assert_eq!(heard[1].disposition, Some(Disposition::Answered));
         assert_eq!(heard[1].retry_after, None);
-        assert_eq!(heard[1].content, "the human said: yes");
+        assert_eq!(heard[1].content, "yes");
         assert!(
             heard.iter().all(|body| body.kind != PeerKind::Message),
             "{heard:?}"
@@ -3584,6 +3590,66 @@ mod tests {
 
         link.close(&app).await;
         source.remove_dir();
+    }
+
+    #[cfg(unix)]
+    mod in_hold_answer_tests {
+        use super::*;
+
+        /// The owner's answer given inside the hold is what the peer hears, word for word
+        /// and `answered`, even though the model then writes a decline of its own.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn the_owner_s_in_hold_answer_reaches_the_peer_verbatim_as_answered() {
+            let _cfg = TestConfigDirGuard::new("mesh-envoy-in-hold-answer");
+            let (source, _source) = stub_envoy_source();
+            let app = app_holding_for(60);
+            let link = LiveLink::open("envoy-in-hold", &app).await;
+            let idle = RecordingIdleSink::attach(&app);
+            let store = app.mesh.inbound_store().expect("install opens the store");
+            let runner = EnvoyRunner::start_with(
+                Arc::clone(&app),
+                escalating_drive(|_| "REFUSED: the owner has turned this down".to_string()),
+            );
+            runner.attach();
+            app.mesh
+                .deliver_peer(link.ask("in-hold", "merge the branch"));
+            wait_until("the peer to hear the escalation", || {
+                !link.heard_for("in-hold").is_empty()
+            })
+            .await;
+            wait_until("the human to be told", || {
+                idle.has("`.mesh answer in-hold \"<text>\"`")
+            })
+            .await;
+            assert!(runner.holds("in-hold"));
+
+            assert!(runner.answer("in-hold", "Denied."));
+            wait_until("the peer to hear the answer", || {
+                link.heard_for("in-hold").len() >= 2
+            })
+            .await;
+            runner.stop().await;
+
+            let heard = link.heard_for("in-hold");
+            assert_eq!(heard.len(), 2, "{heard:?}");
+            assert_escalated_notice(&heard[0], "in-hold");
+            assert_eq!(heard[1].kind, PeerKind::Reply);
+            assert_eq!(heard[1].content, "Denied.");
+            assert_eq!(heard[1].disposition, Some(Disposition::Answered));
+            assert_eq!(heard[1].retry_after, None);
+            assert!(store.get("in-hold").unwrap().is_none());
+            assert_eq!(
+                idle.count("envoy replied: Denied."),
+                1,
+                "{:?}",
+                idle.texts()
+            );
+            assert!(!idle.has("turned this down"), "{:?}", idle.texts());
+
+            link.close(&app).await;
+            source.remove_dir();
+        }
     }
 
     /// With no wait configured the peer still hears `escalated` first, then the escalation
@@ -3772,10 +3838,7 @@ mod tests {
         runner.stop().await;
 
         let (envelopes, _) = app.mesh.peer_inbox().drain();
-        assert_eq!(
-            peer_of(&envelopes[1]).content,
-            "the human said: yes, right now"
-        );
+        assert_eq!(peer_of(&envelopes[1]).content, "yes, right now");
         source.remove_dir();
     }
 
@@ -6078,7 +6141,7 @@ mod tests {
 
         assert!(runner.answer("live-untold", "yes"));
         wait_until("the run to end with the human's answer", || {
-            idle.has("envoy replied: the human said: yes")
+            idle.has("envoy replied: yes")
         })
         .await;
         runner.stop().await;
@@ -6210,7 +6273,7 @@ mod tests {
         assert_escalated_notice(&heard[0], "live-twice");
         assert_eq!(heard[1].kind, PeerKind::Reply);
         assert_eq!(heard[1].disposition, Some(Disposition::Answered));
-        assert_eq!(heard[1].content, "the human said: yes / main");
+        assert_eq!(heard[1].content, "yes / main");
         assert!(
             heard.iter().all(|body| body.kind != PeerKind::Message),
             "{heard:?}"
@@ -6430,7 +6493,7 @@ mod tests {
         assert_eq!(heard[1].kind, PeerKind::Reply);
         assert_eq!(heard[1].disposition, Some(Disposition::Answered));
         assert_eq!(heard[1].thread.as_deref(), Some("live-stall"));
-        assert_eq!(heard[1].content, "the human said: yes");
+        assert_eq!(heard[1].content, "yes");
         assert!(
             idle.pushed
                 .lock()
@@ -6756,13 +6819,8 @@ mod tests {
         assert_eq!(heard[1].kind, PeerKind::Reply, "{heard:?}");
         assert_eq!(heard[1].disposition, Some(Disposition::Answered));
         assert_eq!(heard[1].thread.as_deref(), Some("stall-lapse"));
-        assert_eq!(heard[1].content, "the human said: yes");
-        assert_eq!(
-            idle.count("envoy replied: the human said: yes"),
-            1,
-            "{:?}",
-            idle.texts()
-        );
+        assert_eq!(heard[1].content, "yes");
+        assert_eq!(idle.count("envoy replied: yes"), 1, "{:?}", idle.texts());
         assert_eq!(
             idle.count("envoy escalated to the human"),
             0,
@@ -6945,7 +7003,7 @@ mod tests {
 
         assert!(runner.answer("failed-hook", "yes"));
         wait_until("the run to end with the human's answer", || {
-            idle.has("envoy replied: the human said: yes")
+            idle.has("envoy replied: yes")
         })
         .await;
         runner.stop().await;
@@ -7352,7 +7410,7 @@ mod tests {
         // The human answers through the real surface; the live run takes it.
         app_b.mesh.answer_inbound(&id, "yes").await.unwrap();
         let replied = peer.collect(&id, 20).await;
-        assert_collected(&replied, &id, &peer.to_b, "answered", "the human said: yes");
+        assert_collected(&replied, &id, &peer.to_b, "answered", "yes");
         runner.stop().await;
         assert!(
             store_b.get(&id).unwrap().is_none(),
@@ -7511,7 +7569,7 @@ mod tests {
 
         app_b.mesh.answer_inbound(&id, "yes").await.unwrap();
         let replied = peer.collect(&id, 20).await;
-        assert_collected(&replied, &id, &peer.to_b, "answered", "the human said: yes");
+        assert_collected(&replied, &id, &peer.to_b, "answered", "yes");
         runner.stop().await;
         assert!(
             store_b.get(&id).unwrap().is_none(),
