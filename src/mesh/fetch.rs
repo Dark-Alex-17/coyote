@@ -1373,6 +1373,42 @@ pub(crate) fn not_shared_reason(
     NotSharedReason::Unknown
 }
 
+/// The `AlreadyFetched` answer `memory` gives for `path` before the peer is asked: a
+/// one-time attachment from `identity_hex` at `destination_hex` that this node already
+/// fetched. Anything that says the peer may still serve the path keeps the answer
+/// `None` so the fetch goes out: an attachment of the path still waiting to be fetched,
+/// a grant on it that has not run out, or the path in the peer's last listing.
+pub(crate) fn spent_attachment(
+    memory: &PeerMemory,
+    destination_hex: &str,
+    identity_hex: &str,
+    path: &str,
+    now: SystemTime,
+) -> Option<NotSharedReason> {
+    let claims = memory.claims_of(destination_hex, identity_hex)?;
+    let references: Vec<&ReferenceClaim> = claims
+        .references()
+        .filter(|claim| claim.path == path)
+        .collect();
+    if references.iter().any(|claim| claim.staged.is_none()) {
+        return None;
+    }
+    let (message_id, staged) = references
+        .iter()
+        .find_map(|claim| Some((claim.message_id.clone(), claim.staged.clone()?)))?;
+    let granted = claims
+        .grants()
+        .any(|claim| claim.path == path && !claim.expired_at(now));
+    let listed = memory
+        .lists
+        .get(destination_hex)
+        .is_some_and(|listing| listing.entries.iter().any(|entry| entry.path == path));
+    if granted || listed {
+        return None;
+    }
+    Some(NotSharedReason::AlreadyFetched { message_id, staged })
+}
+
 /// Appended to an `AlreadyFetched` refusal when the staged copy has since been
 /// removed, by the REPL and the tool alike.
 pub(crate) const GONE_COPY_TAIL: &str = " That copy is no longer at that path.";
@@ -3234,6 +3270,106 @@ mod tests {
             NotSharedReason::Unknown,
             "claims are per destination"
         );
+    }
+
+    mod spent_attachment_tests {
+        use super::*;
+
+        fn fetched_attachment(memory: &PeerMemory, path: &str) -> PathBuf {
+            let staged = PathBuf::from(format!("/inbox/peer/{path}"));
+            memory.remember_reference(PEER_DEST, PEER_IDENTITY, "m-1", path);
+            memory.mark_fetched(PEER_DEST, path, &staged);
+            staged
+        }
+
+        #[test]
+        fn a_fetched_attachment_with_nothing_newer_is_spent() {
+            let memory = PeerMemory::default();
+            let now = SystemTime::now();
+            let staged = fetched_attachment(&memory, "docs/a.md");
+            assert_eq!(
+                spent_attachment(&memory, PEER_DEST, PEER_IDENTITY, "docs/a.md", now),
+                Some(NotSharedReason::AlreadyFetched {
+                    message_id: "m-1".to_string(),
+                    staged,
+                })
+            );
+            assert_eq!(
+                spent_attachment(&memory, PEER_DEST, PEER_IDENTITY, "docs/b.md", now),
+                None,
+                "a path never attached is the peer's to answer"
+            );
+            assert_eq!(
+                spent_attachment(&memory, PEER_DEST, &"ab".repeat(16), "docs/a.md", now),
+                None,
+                "another identity's claims say nothing"
+            );
+        }
+
+        #[test]
+        fn an_attachment_sent_again_is_not_spent() {
+            let memory = PeerMemory::default();
+            let now = SystemTime::now();
+            fetched_attachment(&memory, "docs/a.md");
+            memory.remember_reference(PEER_DEST, PEER_IDENTITY, "m-2", "docs/a.md");
+            assert_eq!(
+                spent_attachment(&memory, PEER_DEST, PEER_IDENTITY, "docs/a.md", now),
+                None
+            );
+        }
+
+        #[test]
+        fn a_grant_that_still_runs_keeps_the_path_fetchable() {
+            let memory = PeerMemory::default();
+            let now = SystemTime::now();
+            fetched_attachment(&memory, "docs/a.md");
+            fetched_attachment(&memory, "docs/b.md");
+            fetched_attachment(&memory, "docs/c.md");
+            memory.remember_grant(
+                PEER_DEST,
+                PEER_IDENTITY,
+                "docs/a.md",
+                Some(now + Duration::from_secs(60)),
+            );
+            memory.remember_grant(PEER_DEST, PEER_IDENTITY, "docs/b.md", None);
+            memory.remember_grant(
+                PEER_DEST,
+                PEER_IDENTITY,
+                "docs/c.md",
+                Some(now - Duration::from_secs(60)),
+            );
+            let spent = |path: &str| spent_attachment(&memory, PEER_DEST, PEER_IDENTITY, path, now);
+            assert_eq!(spent("docs/a.md"), None, "an unexpired grant");
+            assert_eq!(spent("docs/b.md"), None, "a standing grant");
+            assert!(
+                matches!(
+                    spent("docs/c.md"),
+                    Some(NotSharedReason::AlreadyFetched { .. })
+                ),
+                "an expired grant serves nothing"
+            );
+        }
+
+        #[test]
+        fn a_path_in_the_last_listing_is_not_spent() {
+            let memory = PeerMemory::default();
+            let now = SystemTime::now();
+            fetched_attachment(&memory, "docs/a.md");
+            memory.remember_list(
+                PEER_DEST,
+                Listing {
+                    entries: vec![ListedFile {
+                        path: "docs/a.md".to_string(),
+                        size: 1,
+                    }],
+                    heard_at: now,
+                },
+            );
+            assert_eq!(
+                spent_attachment(&memory, PEER_DEST, PEER_IDENTITY, "docs/a.md", now),
+                None
+            );
+        }
     }
 
     #[test]

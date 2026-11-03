@@ -9,7 +9,7 @@ use crate::mesh::card::{
 };
 use crate::mesh::fetch::{
     FetchError as FileFetchError, Fetched, GONE_COPY_TAIL, NotSharedReason, SharesPage,
-    grant_expires_at, not_shared_reason, not_shared_tool_message,
+    grant_expires_at, not_shared_reason, not_shared_tool_message, spent_attachment,
 };
 use crate::mesh::message::{
     OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_TITLE_MAX_CHARS, PeerKind, SendError,
@@ -1270,6 +1270,19 @@ async fn handle_fetch(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
         None => None,
         Some(hex) => Some(parse_sha256(hex)?),
     };
+    let (destination, record) = match trusted_peer(runtime, peer).await {
+        Ok(trusted) => trusted,
+        Err(refusal) => return Ok(refusal),
+    };
+    if let Some(reason) = spent_attachment(
+        runtime.memory(),
+        &destination,
+        &record.identity_hash,
+        path,
+        SystemTime::now(),
+    ) {
+        return Ok(fetch_result(&destination, path, Ok(Fetched::NotShared), &reason).await);
+    }
     let (record, desc) = match trusted_destination(runtime, peer).await {
         Ok(trusted) => trusted,
         Err(refusal) => return Ok(refusal),
@@ -8215,6 +8228,89 @@ mod tests {
 
             assert!(live.ctx.app.mesh.stop().await.unwrap());
             live.stub.stop().await;
+        }
+
+        mod spent_attachment_tool_tests {
+            use super::*;
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            /// Answers `not_shared` to every `/fetch` and counts what it heard.
+            #[derive(Default)]
+            struct CountingFetch {
+                heard: AtomicUsize,
+            }
+
+            #[async_trait]
+            impl Handler for CountingFetch {
+                async fn handle(&self, _request: AdmittedRequest) -> Reply {
+                    self.heard.fetch_add(1, Ordering::SeqCst);
+                    Reply::Value(rmpv::Value::Map(vec![
+                        (rmpv::Value::from("v"), rmpv::Value::from(1u64)),
+                        (rmpv::Value::from("status"), rmpv::Value::from("not_shared")),
+                    ]))
+                }
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[serial]
+            async fn a_spent_attachment_is_answered_from_the_claims_without_asking_the_peer() {
+                let mut live = trusted_stub("mesh-tool-fetch-spent").await;
+                let runtime = live.started.runtime.clone();
+                let to = live.to.clone();
+                let fetch = format!("{MESH_FUNCTION_PREFIX}fetch");
+                let counting = Arc::new(CountingFetch::default());
+                live.stub.serve(FETCH_PATH, counting.clone());
+                let staged = PathBuf::from("/nonexistent/coyote-inbox/plan.md");
+                runtime.memory().remember_reference(
+                    &to,
+                    &live.stub.identity_hex(),
+                    "0123456789abcdef0123456789abcdef",
+                    SHARED_PATH,
+                );
+                runtime.memory().mark_fetched(&to, SHARED_PATH, &staged);
+
+                let spent = handle_mesh_tool(
+                    &mut live.ctx,
+                    &fetch,
+                    &json!({"peer": to, "path": SHARED_PATH}),
+                )
+                .await
+                .unwrap();
+                assert_eq!(spent["status"], "not_shared", "{spent}");
+                assert_eq!(spent["reason"], "already_fetched", "{spent}");
+                assert_eq!(spent["already_staged_at"], json!(staged), "{spent}");
+                assert_eq!(spent["already_staged_present"], false, "{spent}");
+                assert_eq!(
+                    spent["message"],
+                    format!(
+                        "`{SHARED_PATH}` was a one-time attachment from {} and this node already fetched it; read it at `already_staged_at`. A fresh copy needs the peer to attach it again; the mesh__request_access call in next_action asks its human. That copy is no longer at that path.",
+                        short(&to)
+                    ),
+                    "{spent}"
+                );
+                assert_eq!(
+                    counting.heard.load(Ordering::SeqCst),
+                    0,
+                    "a spent attachment never reaches the peer"
+                );
+
+                let asked = handle_mesh_tool(
+                    &mut live.ctx,
+                    &fetch,
+                    &json!({"peer": to, "path": "other/thing.md"}),
+                )
+                .await
+                .unwrap();
+                assert_eq!(asked["reason"], "unknown", "{asked}");
+                assert_eq!(
+                    counting.heard.load(Ordering::SeqCst),
+                    1,
+                    "a path this node knows nothing about goes to the peer"
+                );
+
+                assert!(live.ctx.app.mesh.stop().await.unwrap());
+                live.stub.stop().await;
+            }
         }
 
         /// A peer names any number it likes as a grant's end. One this node cannot read

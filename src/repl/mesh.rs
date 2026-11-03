@@ -7,7 +7,7 @@ use crate::mesh::card::{CardSource, DISPLAY_NAME_MAX_CHARS, StatusHandler, rende
 use crate::mesh::envoy_sessions::{EnvoyMemoryError, EnvoySessions, RememberedOf};
 use crate::mesh::fetch::{
     FILE_FETCH_REQUEST_TIMEOUT, FetchError as FileFetchError, Fetched, GONE_COPY_TAIL,
-    NotSharedReason, not_shared_reason, not_shared_sentence,
+    NotSharedReason, not_shared_reason, not_shared_sentence, spent_attachment,
 };
 use crate::mesh::grants::DEFAULT_GRANT_TTL;
 use crate::mesh::identity::{self, Predecessor, fingerprint};
@@ -2076,6 +2076,16 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     let runtime = live(ctx)?;
     let record = peer_for_contact(&runtime, &destination, FETCH_REFUSAL_TAIL)?;
     let shown = shown_pattern(&args.path);
+    let peer = short(&destination);
+    if let Some(reason) = spent_attachment(
+        runtime.memory(),
+        &destination,
+        &record.identity_hash,
+        &args.path,
+        SystemTime::now(),
+    ) {
+        bail!(not_shared_refusal(peer, &shown, &args.path, &reason));
+    }
     let desc = match route_to(&runtime, &destination, abort_signal).await {
         Ok(desc) => desc,
         Err(Unrouted::NoAnswer) => bail!(
@@ -2089,7 +2099,6 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
             return Ok(());
         }
     };
-    let peer = short(&destination);
     out_path_text(&format!(
         "Fetching `{shown}` from {peer} over the mesh (up to {} s)...",
         FILE_FETCH_REQUEST_TIMEOUT.as_secs()
@@ -2124,13 +2133,7 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
                 &args.path,
                 SystemTime::now(),
             );
-            let mut sentence = not_shared_sentence(peer, &shown, &args.path, &reason);
-            if let NotSharedReason::AlreadyFetched { staged, .. } = &reason
-                && !staged.is_file()
-            {
-                sentence.push_str(GONE_COPY_TAIL);
-            }
-            bail!(sentence)
+            bail!(not_shared_refusal(peer, &shown, &args.path, &reason))
         }
         Ok(Fetched::InvalidPath { rule }) => bail!(
             "{}",
@@ -2167,6 +2170,18 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
         Err(err) => bail!(err.to_string()),
     }
     Ok(())
+}
+
+/// The refusal for a path the peer did not serve, read against what this node knows,
+/// with the gone-copy tail when an already fetched copy has since been removed.
+fn not_shared_refusal(peer: &str, shown: &str, path: &str, reason: &NotSharedReason) -> String {
+    let mut sentence = not_shared_sentence(peer, shown, path, reason);
+    if let NotSharedReason::AlreadyFetched { staged, .. } = reason
+        && !staged.is_file()
+    {
+        sentence.push_str(GONE_COPY_TAIL);
+    }
+    sentence
 }
 
 struct FetchArgs {
@@ -40775,7 +40790,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         fs::write(&staged, b"# a\n").unwrap();
                         memory.remember_reference(&dest, &identity, "m-1", "docs/a.md");
                         memory.mark_fetched(&dest, "docs/a.md", &staged);
-                        fx.queue("not_shared", vec![]);
+                        assert_eq!(fx.heard().len(), 2, "both refusals so far were the peer's");
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
@@ -40783,11 +40798,10 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                 dest = fx.dest(),
                                 staged = staged.display()
                             ),
-                            "a fetched reference is read first"
+                            "a spent attachment is answered from the claims"
                         );
 
                         fs::remove_file(&staged).unwrap();
-                        fx.queue("not_shared", vec![]);
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
@@ -40798,7 +40812,11 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             "a staged copy that has since gone is said to be gone"
                         );
 
-                        assert_eq!(fx.heard().len(), 4, "every refusal was the peer's answer");
+                        assert_eq!(
+                            fx.heard().len(),
+                            2,
+                            "a spent attachment never reaches the peer"
+                        );
                         fx.stop().await;
                     });
                 }
@@ -40929,7 +40947,6 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             "the fetched attachment is no longer offered"
                         );
 
-                        fx.queue("not_shared", vec![]);
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
@@ -40937,6 +40954,11 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                 dest8 = fx.dest()
                             ),
                             "the refusal names the path the Staged line printed"
+                        );
+                        assert_eq!(
+                            fx.heard().len(),
+                            1,
+                            "the spent attachment never reached the peer"
                         );
 
                         fx.queue("not_shared", vec![]);
@@ -40954,7 +40976,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             "a refused fetch takes nothing off the list"
                         );
 
-                        assert_eq!(fx.heard().len(), 3, "every answer was the peer's");
+                        assert_eq!(fx.heard().len(), 2, "every other answer was the peer's");
                         fx.stop().await;
                     });
                 }
