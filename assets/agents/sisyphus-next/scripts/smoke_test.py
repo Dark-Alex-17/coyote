@@ -1567,6 +1567,40 @@ check("pr_tracking review: one permission ledger line per login",
       perm_lines(u) == ["review-watch: PR #7 rev permission write", "review-watch: PR #7 carol permission read",
                         "review-watch: PR #7 dave permission unreadable"]
       and seam_log(_PERM_LOG) == "rev\ncarol\ndave\n")
+perm_seam("exit 1")
+review_doc(comments=[{"id": "k43", "author": "gina", "body": _SECRET}, {"id": "k44", "author": "hal", "body": _SECRET},
+                     {"id": "k45", "author": "ivy", "body": _SECRET}])
+u = gates.pr_review_poll(rs())
+check("pr_tracking review: three failing permission reads -> all untrusted within one poll, each cached False",
+      u["pr_review_status"] == "comments" and u["_next"] == "pr_review_route" and u["pr_review_items"] == []
+      and [i["id"] for i in u["pr_review_untrusted"]] == ["k43", "k44", "k45"]
+      and _SECRET not in json.dumps(u["pr_review_untrusted"])
+      and u["pr_review_perms"] == {"gina": False, "hal": False, "ivy": False} and seam_log(_PERM_LOG) == "gina\nhal\nivy\n")
+perm_seam("echo write")
+review_doc(comments=[{"id": "k46", "author": "jo", "body": _SECRET}])
+gates.REVIEW_PERM_SECS = 0
+try:
+    u = gates.pr_review_poll(rs())
+finally:
+    gates.REVIEW_PERM_SECS = _lib.REVIEW_PERM_SECS
+check("pr_tracking review: a permission read past REVIEW_PERM_SECS is not made: cached False, ledgered, poll completes",
+      seam_log(_PERM_LOG) == "" and u["pr_review_perms"] == {"jo": False}
+      and perm_lines(u) == ["review-watch: PR #7 jo permission not read (REVIEW_PERM_SECS); untrusted"]
+      and u["pr_review_status"] == "comments" and u["_next"] == "pr_review_route" and u["pr_review_items"] == []
+      and [i["id"] for i in u["pr_review_untrusted"]] == ["k46"])
+review_doc(decision="APPROVED", comments=[{"id": "k47", "author": "kim", "body": _SECRET},
+                                          {"id": "k48", "author": "rev", "body": "nit: typo"}])
+u = gates.pr_review_poll(rs(pr_review_perms={"rev": True}))
+_u2 = gates.pr_review_route(rs(**u))
+check("pr_tracking review: APPROVED on an OPEN PR -> approved with no permission read, uncached logins withheld",
+      u["pr_review_status"] == "approved" and u["_next"] == "pr_review_route" and seam_log(_PERM_LOG) == ""
+      and perm_lines(u) == [] and [i["id"] for i in u["pr_review_items"]] == ["k48"]
+      and [i["id"] for i in u["pr_review_untrusted"]] == ["k47"] and _u2["_next"] == "final_report"
+      and len(_u2["follow_ups"]) == 2 and _SECRET not in json.dumps(_u2["follow_ups"]))
+review_doc(state="MERGED", decision="APPROVED", comments=[{"id": "k49", "author": "lee", "body": "x"}])
+check("pr_tracking review: APPROVED on a MERGED PR is still merged",
+      gates.pr_review_poll(rs())["pr_review_status"] == "merged")
+seam_log(_PERM_LOG)
 os.environ["SISYPHUS_GH_PERM_CMD"] = _PERM_DEFAULT
 u = gates.ci_gate(base_state(pr_tracking="review", git_task={"kind": "publish", "return_to": "ci_gate", "open_pr": False},
                              delegated=True, git_report="pushed"))
@@ -1640,6 +1674,74 @@ u = gates.pr_review_poll(rs())
 check("pr_tracking review: full counts on every connection -> not truncated",
       gates._normalize_pr_review(raw_review())["truncated"] == [] and u["pr_review_status"] != "truncated"
       and "pr_review_truncated" not in u)
+
+
+def gql_comment(cid, body, login="rev"):
+    return {"id": cid, "body": body, "url": f"u#{cid}", "authorAssociation": "MEMBER", "author": {"login": login}}
+
+
+def window_doc(comments=(), comments_total=None, threads=(), threads_total=None, reviews=(), reviews_total=None,
+               decision=None):
+    pr = {"state": "OPEN", "reviewDecision": decision, "headRefOid": "abc",
+          "reviews": {"totalCount": len(reviews) if reviews_total is None else reviews_total, "nodes": list(reviews)},
+          "comments": {"totalCount": len(comments) if comments_total is None else comments_total, "nodes": list(comments)},
+          "reviewThreads": {"totalCount": len(threads) if threads_total is None else threads_total, "nodes": list(threads)}}
+    with open(_REVIEW_DOC, "w") as fh:
+        json.dump({"data": {"repository": {"pullRequest": pr}}}, fh)
+    os.environ["SISYPHUS_GH_REVIEWS_CMD"] = f"cat '{_REVIEW_DOC}'"
+
+
+def gql_thread(tid, comments, comments_total=None, resolved=False):
+    return {"id": tid, "isResolved": resolved, "isOutdated": False, "path": "a.py", "line": 3,
+            "comments": {"totalCount": len(comments) if comments_total is None else comments_total,
+                         "nodes": list(comments)}}
+
+
+_newer = [gql_comment(f"k{n}", f"note {n}") for n in range(101, 150)]
+perm_seam("echo write")
+window_doc(comments=[gql_comment("k100", f"## Update @ abc\n\n{gates.OWN_MARKER}")] + _newer, comments_total=120)
+u = gates.pr_review_poll(rs(pr_review_perms={"rev": True}))
+check("pr_tracking review: a comments window whose oldest node is the run's own comment -> not truncated, ledgered",
+      u["pr_review_status"] == "comments" and "pr_review_truncated" not in u and len(u["pr_review_items"]) == 49
+      and "review-watch: PR #7 comments window boundary already seen; older history skipped" in u["decisions"]
+      and seam_log(_PERM_LOG) == "")
+window_doc(comments=[gql_comment("k100", "please rename foo")] + _newer, comments_total=120)
+u = gates.pr_review_poll(rs(pr_review_perms={"rev": True}))
+check("pr_tracking review: a comments window whose oldest node is unseen -> still the truncated stop",
+      u["pr_review_status"] == "truncated" and u["pr_review_truncated"] == ["comments"] and u["_next"] == "pr_review_route"
+      and not any("window boundary" in d for d in u.get("decisions", [])))
+window_doc(comments=[gql_comment("k100", "please rename foo")] + _newer, comments_total=120, decision="APPROVED")
+u = gates.pr_review_poll(rs(pr_review_perms={}))
+check("pr_tracking review: APPROVED with a truncated window and uncached logins -> approved first, nothing read",
+      u["pr_review_status"] == "approved" and "pr_review_truncated" not in u and seam_log(_PERM_LOG) == ""
+      and u["_next"] == "pr_review_route")
+window_doc(threads=[gql_thread("t60", [gql_comment("c60", "old ask"), gql_comment("c61", "new ask")], comments_total=80)])
+u = gates.pr_review_poll(rs(pr_review_perms={"rev": True}, pr_review_seen=["c60"]))
+check("pr_tracking review: a thread-comments window whose oldest comment is seen -> not truncated",
+      u["pr_review_status"] == "comments" and "pr_review_truncated" not in u
+      and [i["id"] for i in u["pr_review_items"]] == ["t60"]
+      and "review-watch: PR #7 reviewThreads[0].comments window boundary already seen; older history skipped"
+      in u["decisions"])
+window_doc(threads=[gql_thread("t70", [gql_comment("c70", "old ask")], resolved=True),
+                    gql_thread("t71", [gql_comment("c71", "new ask")])], threads_total=150)
+u = gates.pr_review_poll(rs(pr_review_perms={"rev": True}))
+check("pr_tracking review: a reviewThreads window whose oldest thread is resolved -> not truncated",
+      u["pr_review_status"] == "comments" and "pr_review_truncated" not in u
+      and [i["id"] for i in u["pr_review_items"]] == ["t71"]
+      and "review-watch: PR #7 reviewThreads window boundary already seen; older history skipped" in u["decisions"])
+_old_review = {"id": "r10", "state": "APPROVED", "body": "", "authorAssociation": "MEMBER", "author": {"login": "rev"}}
+window_doc(reviews=[_old_review], reviews_total=60)
+u = gates.pr_review_poll(rs(pr_review_perms={"rev": True}, pr_review_seen=["r10"]))
+check("pr_tracking review: a reviews window with a seen oldest review but no reviewDecision -> still truncated",
+      u["pr_review_status"] == "truncated" and u["pr_review_truncated"] == ["reviews"]
+      and not any("window boundary" in d for d in u.get("decisions", [])))
+window_doc(reviews=[_old_review], reviews_total=60, decision="REVIEW_REQUIRED")
+u = gates.pr_review_poll(rs(pr_review_perms={"rev": True}, pr_review_seen=["r10"]))
+check("pr_tracking review: a reviews window with a seen oldest review and a reviewDecision -> not truncated",
+      u["pr_review_status"] == "pending" and "pr_review_truncated" not in u
+      and "review-watch: PR #7 reviews window boundary already seen; older history skipped" in u["decisions"])
+seam_log(_PERM_LOG)
+os.environ["SISYPHUS_GH_PERM_CMD"] = _PERM_DEFAULT
 u = aa("pr_review_truncated", "Stop watching and report", pr_ref="7", pr_review_truncated=["reviews", "reviewThreads[0].comments"])
 check("pr_tracking review: apply_answer truncated -> final_report with a follow-up naming the truncation",
       u["_next"] == "final_report"
@@ -1655,8 +1757,8 @@ def node_timeout(node):
     return int(re.search(r"^    timeout: (\d+)$", block, re.M).group(1))
 
 
-check("pr_tracking review: node timeouts cover their sleep plus one GH_CALL_SECS call",
-      _lib.REVIEW_POLL_SLEEP + _lib.GH_CALL_SECS < node_timeout("pr_review_poll")
+check("pr_tracking review: node timeouts cover their sleep plus one GH_CALL_SECS call and the permission budget",
+      _lib.REVIEW_POLL_SLEEP + _lib.GH_CALL_SECS + _lib.REVIEW_PERM_SECS < node_timeout("pr_review_poll")
       and _lib.CI_POLL_SLEEP + _lib.GH_CALL_SECS < node_timeout("ci_poll")
       and _lib.RESOLVE_DEADLINE_SECS + _lib.GH_CALL_SECS < node_timeout("pr_review_resolve")
       and _lib.RESOLVE_DEADLINE_SECS + _lib.GH_CALL_SECS < node_timeout("pr_review_reply"))
