@@ -3294,7 +3294,7 @@ mod tests {
         }
     }
 
-    /// Usage-probe coverage: the owner's `--all` view next to what a peer is served,
+    /// The owner's `--all` view next to what a peer is served,
     /// with all five verdicts in one share root.
     mod resolve_all_usage_tests {
         use super::*;
