@@ -29,7 +29,7 @@ use crate::mesh::idle::{IdleNotify, Origin};
 use crate::mesh::limits::{PeerRefusal, RefusalReason};
 use crate::mesh::message::{
     Disposition, OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_LINE_MAX_CHARS, PEER_TITLE_MAX_CHARS,
-    PENDING_FULL_TEXT_POINTER, PeerKind, PeerMessage, PeerVia, SendError, is_wire_id,
+    PENDING_FULL_TEXT_POINTER, Part, PeerKind, PeerMessage, PeerVia, SendError, is_wire_id,
 };
 use crate::mesh::notify::Source;
 use crate::mesh::pending::{
@@ -78,6 +78,8 @@ const RESUMED_THREAD_NOTE: &str = "Earlier assistant turns in this conversation 
 /// Resumed turns stop short of the envoy model's `max_input_tokens` by one part in this
 /// many, left for the answer.
 const RESUMED_HISTORY_HEADROOM_DIVISOR: usize = 8;
+/// Most characters of one text or data part the envoy is shown.
+const ENVOY_PART_TEXT_MAX_CHARS: usize = 1000;
 
 /// How one job is driven to text. Production is `run_child_agent`; tests inject closures.
 pub(crate) type EnvoyDrive = Arc<
@@ -121,7 +123,8 @@ pub(crate) fn compose_envoy_input(
 }
 
 /// The user turn of one peer message. Every peer-chosen word (name, message id, title,
-/// text) goes inside the fence. Also what the envoy remembers of the peer's side of a thread.
+/// text, the list of parts) goes inside the fence. Also what the envoy remembers of the
+/// peer's side of a thread.
 fn peer_turn(card: &PeerCard, message: &PeerMessage) -> String {
     let title_line = message
         .title
@@ -129,11 +132,64 @@ fn peer_turn(card: &PeerCard, message: &PeerMessage) -> String {
         .and_then(|title| display_text(title, PEER_TITLE_MAX_CHARS))
         .map(|title| format!("Title: {title}\n"))
         .unwrap_or_default();
+    let parts = envoy_parts_summary(message);
+    let parts = if parts.is_empty() {
+        parts
+    } else {
+        format!("\n{parts}")
+    };
     let data = format!(
-        "Name: {}\nMessage id: {}\n{title_line}{}",
+        "Name: {}\nMessage id: {}\n{title_line}{}{parts}",
         card.who, card.message_id, message.content
     );
     fence_peer_text(&message.source_destination, &data)
+}
+
+/// One line per part of `message`, read by the envoy inside the fence after the text:
+/// where an inline file was staged, what a reference file can be fetched as, a text or
+/// data part's content quoted as data and cut at `ENVOY_PART_TEXT_MAX_CHARS`, and how
+/// many parts did not arrive. Empty for a message with no parts. A file is only named
+/// here, never read: the envoy does not see or serve file bytes.
+fn envoy_parts_summary(message: &PeerMessage) -> String {
+    use Part::{Data, File, Text};
+
+    let quoted = |label: &str, content: &str| -> Option<String> {
+        let clean = display_text(content, usize::MAX)?;
+        let quote = match clean.char_indices().nth(ENVOY_PART_TEXT_MAX_CHARS) {
+            Some((cut, _)) => format!("\"{}\" (cut)", clean[..cut].trim_end()),
+            None => format!("\"{clean}\""),
+        };
+        Some(format!("{label}, quoted as data: {quote}"))
+    };
+    let mut lines: Vec<String> = message
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            File {
+                name,
+                size,
+                staged: Some(staged),
+                ..
+            } => Some(format!(
+                "attached: {name} ({size} B), staged at {}",
+                staged.display()
+            )),
+            File {
+                size,
+                reference: Some(reference),
+                ..
+            } => Some(format!("fetchable as {reference} ({size} B)")),
+            File { name, size, .. } => Some(format!("listed but not sent: {name} ({size} B)")),
+            Text { text } => quoted("text part", text),
+            Data { data } => quoted("data part", &data.to_string()),
+        })
+        .collect();
+    match message.dropped_parts {
+        0 => {}
+        1 => lines.push("1 part did not arrive".to_string()),
+        dropped => lines.push(format!("{dropped} parts did not arrive")),
+    }
+    lines.join("\n")
 }
 
 pub(crate) enum EnvoyOutcome {
@@ -5829,6 +5885,195 @@ mod tests {
             );
             assert!(!failed[0].contains("high demand"), "{}", failed[0]);
             assert!(texts.iter().all(|text| !text.contains('{')), "{texts:?}");
+            source.remove_dir();
+        }
+    }
+
+    mod parts_summary_tests {
+        use super::*;
+
+        fn part(value: serde_json::Value) -> Part {
+            serde_json::from_value(value).unwrap()
+        }
+
+        fn message_carrying(parts: Vec<Part>, dropped_parts: u32) -> PeerMessage {
+            let mut message = job(PeerKind::Ask, "msg-parts", "see the attached").message;
+            message.parts = parts;
+            message.dropped_parts = dropped_parts;
+            message
+        }
+
+        fn staged_file(name: &str, size: u64, staged: &str) -> Part {
+            part(json!({
+                "type": "file",
+                "name": name,
+                "size": size,
+                "sha256": "00".repeat(32),
+                "staged": staged,
+            }))
+        }
+
+        #[test]
+        fn a_message_with_no_parts_lists_nothing() {
+            assert_eq!(envoy_parts_summary(&message_carrying(Vec::new(), 0)), "");
+        }
+
+        #[test]
+        fn each_part_kind_gets_its_own_line_in_order() {
+            let message = message_carrying(
+                vec![
+                    staged_file("docs/hello.md", 13, "/staging/abababab/docs/hello.md"),
+                    part(json!({
+                        "type": "file",
+                        "name": "report.pdf",
+                        "size": 2048,
+                        "sha256": "11".repeat(32),
+                        "reference": "shared/report.pdf",
+                    })),
+                    part(json!({
+                        "type": "file",
+                        "name": "notes.txt",
+                        "size": 7,
+                        "sha256": "22".repeat(32),
+                    })),
+                    part(json!({"type": "text", "text": "see the attached notes"})),
+                    part(json!({"type": "data", "data": {"k": "v"}})),
+                ],
+                2,
+            );
+            assert_eq!(
+                envoy_parts_summary(&message),
+                [
+                    "attached: docs/hello.md (13 B), staged at /staging/abababab/docs/hello.md",
+                    "fetchable as shared/report.pdf (2048 B)",
+                    "listed but not sent: notes.txt (7 B)",
+                    "text part, quoted as data: \"see the attached notes\"",
+                    "data part, quoted as data: \"{\"k\":\"v\"}\"",
+                    "2 parts did not arrive",
+                ]
+                .join("\n")
+            );
+        }
+
+        #[test]
+        fn a_long_text_part_is_cut_and_says_so() {
+            let whole = "x".repeat(ENVOY_PART_TEXT_MAX_CHARS);
+            let long = "x".repeat(ENVOY_PART_TEXT_MAX_CHARS + 5);
+            let message = message_carrying(
+                vec![
+                    part(json!({"type": "text", "text": whole})),
+                    part(json!({"type": "text", "text": long})),
+                ],
+                1,
+            );
+            assert_eq!(
+                envoy_parts_summary(&message),
+                format!(
+                    "text part, quoted as data: \"{whole}\"\ntext part, quoted as data: \"{whole}\" (cut)\n1 part did not arrive"
+                )
+            );
+        }
+
+        #[test]
+        fn the_parts_list_goes_inside_the_fence_after_the_text() {
+            let message = message_carrying(
+                vec![staged_file(
+                    "docs/hello.md",
+                    13,
+                    "/staging/abababab/docs/hello.md",
+                )],
+                0,
+            );
+            let card = PeerCard {
+                who: "alice".into(),
+                instance: short(&message.source_destination).into(),
+                verb: "asked",
+                message_id: "msg-parts".into(),
+                via: "direct link",
+            };
+            let (tail, user) = compose_envoy_input(None, &card, &message);
+            assert_eq!(
+                user,
+                fence_peer_text(
+                    &message.source_destination,
+                    "Name: alice\nMessage id: msg-parts\nsee the attached\nattached: docs/hello.md (13 B), staged at /staging/abababab/docs/hello.md"
+                )
+            );
+            assert!(!tail.contains("docs/hello.md"), "{tail}");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn the_envoy_reads_an_inline_file_s_line_and_its_reply_names_the_file() {
+            let _cfg = TestConfigDirGuard::new("mesh-envoy-parts");
+            let (source, _source) = stub_envoy_source();
+            let tmp = TempDir::new("mesh-envoy-parts");
+            let staged = tmp
+                .path
+                .join("inbox")
+                .join("abababab")
+                .join("docs/hello.md");
+            std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+            std::fs::write(&staged, b"Hello, mesh!\n").unwrap();
+            let staged = staged.display().to_string();
+            let app = test_app();
+            let _idle = RecordingIdleSink::attach(&app);
+            let client = ScriptedClient::new(vec![ChatCompletionsOutput::new(
+                "Thanks, docs/hello.md arrived.",
+            )]);
+            let runner = EnvoyRunner::start_with(Arc::clone(&app), {
+                let client = Arc::clone(&client);
+                drive_of(move |ctx, input, abort| {
+                    let client = Arc::clone(&client);
+                    async move {
+                        let mut ctx = ctx;
+                        let (output, _) = call_chat_completions(
+                            &input,
+                            false,
+                            false,
+                            client.as_ref(),
+                            &mut ctx,
+                            abort,
+                        )
+                        .await?;
+                        Ok(output)
+                    }
+                })
+            });
+            runner.attach();
+            let message = message_carrying(vec![staged_file("docs/hello.md", 13, &staged)], 0);
+            let destination = message.source_destination.clone();
+            app.mesh.deliver_peer(message);
+            wait_until("the reply to land in the inbox", || {
+                app.mesh.peer_inbox().len() >= 2
+            })
+            .await;
+            runner.stop().await;
+
+            let requests = client.requests.lock();
+            assert_eq!(requests.len(), 1);
+            let sent = &requests[0].messages;
+            let begin = sent
+                .find(&peer_fence_begin(&destination))
+                .expect("the fence opens");
+            let end = sent
+                .find(&peer_fence_end(&destination))
+                .expect("the fence closes");
+            // The request is JSON, so a path with a backslash in it is sent escaped.
+            let attached = serde_json::to_string(&format!(
+                "attached: docs/hello.md (13 B), staged at {staged}"
+            ))
+            .unwrap();
+            let line = sent
+                .find(attached.trim_matches('"'))
+                .unwrap_or_else(|| panic!("no attached line in {sent}"));
+            assert!(begin < line && line < end, "{sent}");
+
+            let (envelopes, _) = app.mesh.peer_inbox().drain();
+            assert_eq!(envelopes.len(), 2);
+            let reply = peer_of(&envelopes[1]);
+            assert_eq!(reply.kind, PeerKind::Reply);
+            assert_eq!(reply.content, "Thanks, docs/hello.md arrived.");
             source.remove_dir();
         }
     }
