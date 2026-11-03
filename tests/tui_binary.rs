@@ -4263,10 +4263,14 @@ fn dot_agent_needing_a_variable_asks_in_the_input_modal_and_enter_answers_it() {
     );
 
     pty.read_for(HOTKEY_GAP);
-    let typed_at = pty.raw().len();
     pty.send(b"typed-user-g4r").unwrap();
-    pty.wait_for_after("typed-user-g4r", typed_at, PTY_DEADLINE)
-        .expect("the typed value never showed in the Input modal");
+    // Squeezed: the field is painted across frames while the status row's
+    // clock ticks, so the literal can be split by the painter.
+    wait_for_squeezed(
+        &mut pty,
+        "typed-user-g4r",
+        "the typed value in the Input modal",
+    );
     pty.send(b"\r").unwrap();
     pty.read_for(Duration::from_millis(1500));
 
