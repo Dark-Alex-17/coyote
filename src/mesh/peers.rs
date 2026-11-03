@@ -86,15 +86,13 @@ impl PeerRecord {
         let key = self.public_key.as_deref()?;
         let ignored = |why: &str| -> Option<DestinationDesc> {
             debug!(
-                "Mesh peer {} has a stored public key that {why}; it is not used",
-                short(&self.destination_hash)
+                "Mesh peer {} has a stored public key that {}; it is not used",
+                short(&self.destination_hash),
+                redact_hashes(why)
             );
             None
         };
-        let Some(identity) = decode_hex(key).and_then(|bytes| {
-            let (encryption, signing) = bytes.split_at(bytes.len() / 2);
-            Identity::try_new_from_slices(encryption, signing).ok()
-        }) else {
+        let Ok(identity) = Identity::new_from_hex_string(key) else {
             return ignored("is not a public key");
         };
         if identity.address_hash.to_hex_string() != self.identity_hash {
@@ -155,7 +153,8 @@ impl PeerRecord {
     /// the sighting: the transport verified that the announced identity and name hash
     /// derive the destination, so the row can only disagree when `peers.json` was
     /// corrupted or hand-edited. The change is logged rather than silent, and the stored
-    /// key, which belonged to the old identity, is dropped until the announce's is filed.
+    /// key, which belonged to the old identity, is dropped unless the sighting carries the
+    /// new one. A sighting without a key keeps the key of an unchanged identity.
     fn follow(&mut self, sighting: PeerSighting) {
         if self.identity_hash != sighting.identity_hash {
             warn!(
@@ -165,6 +164,9 @@ impl PeerRecord {
                 short(&sighting.identity_hash)
             );
             self.public_key = None;
+        }
+        if sighting.public_key.is_some() {
+            self.public_key = sighting.public_key;
         }
         self.identity_hash = sighting.identity_hash;
         self.name_hash = sighting.name_hash;
@@ -179,6 +181,9 @@ pub(crate) struct PeerSighting {
     pub destination_hash: String,
     pub identity_hash: String,
     pub name_hash: String,
+    /// The announced identity's key as `Identity::to_hex_string` writes it, stored on the
+    /// row for `PeerRecord::verified_destination`.
+    pub public_key: Option<String>,
     pub display_name: Option<String>,
     pub protocol_version: u16,
     pub hops: u8,
@@ -262,7 +267,7 @@ impl PeerTable {
                         destination_hash: sighting.destination_hash,
                         identity_hash: sighting.identity_hash,
                         name_hash: sighting.name_hash,
-                        public_key: None,
+                        public_key: sighting.public_key,
                         display_name: sighting.display_name,
                         protocol_version: sighting.protocol_version,
                         compatibility: Compatibility::of(sighting.protocol_version),
@@ -297,21 +302,6 @@ impl PeerTable {
         record.follow(sighting);
         self.dirty.store(true, Ordering::Release);
         true
-    }
-
-    /// Stores the public key of the announce `observe` or `refresh_route` just filed for
-    /// `destination_hash`. The transport verified that announce, so its key replaces
-    /// whatever the row held. A destination without a row stores nothing.
-    pub(crate) fn remember_public_key(&self, destination_hash: &str, public_key: String) {
-        let mut peers = self.inner.lock();
-        let Some(record) = peers.get_mut(destination_hash) else {
-            return;
-        };
-        if record.public_key.as_deref() == Some(public_key.as_str()) {
-            return;
-        }
-        record.public_key = Some(public_key);
-        self.dirty.store(true, Ordering::Release);
     }
 
     /// A peer the table does not know is left unknown; nothing about it is worth
@@ -452,8 +442,8 @@ mod public_key_tests {
     use rns_transport::identity::PrivateIdentity;
     use rns_transport::rand_core::OsRng;
 
-    /// A sighting whose hashes derive from a real identity, as an announce's do, and the
-    /// key that announce carried.
+    /// A sighting whose hashes and key derive from a real identity, as an announce's do,
+    /// and that key.
     fn announced() -> (PeerSighting, String) {
         let identity = *PrivateIdentity::new_from_rand(OsRng).as_identity();
         let name = session_destination_name("instance");
@@ -463,6 +453,7 @@ mod public_key_tests {
                 .to_hex_string(),
             identity_hash: identity.address_hash.to_hex_string(),
             name_hash: hex_lower(&name_hash),
+            public_key: Some(identity.to_hex_string()),
             display_name: Some("Ada".to_string()),
             protocol_version: MESH_PROTOCOL_VERSION,
             hops: 1,
@@ -482,7 +473,6 @@ mod public_key_tests {
         let (sighting, key) = announced();
         let destination = sighting.destination_hash.clone();
         table.observe(sighting, t0);
-        table.remember_public_key(&destination, key.clone());
         table.persist_if_dirty().unwrap();
 
         let row = PeerTable::load(path_in(&tmp), t0)
@@ -496,45 +486,6 @@ mod public_key_tests {
             .expect("an announced key verifies");
         assert_eq!(desc.address_hash.to_hex_string(), destination);
         assert_eq!(desc.identity.to_hex_string(), key);
-    }
-
-    /// A table this version wrote before keys were kept loads with no key, and the next
-    /// announce fills it in without a version change.
-    #[test]
-    fn a_table_without_keys_loads_and_the_next_announce_fills_the_key() {
-        let tmp = TempDir::new("peers-key-fill");
-        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
-        let (sighting, key) = announced();
-        let destination = sighting.destination_hash.clone();
-        let writer = PeerTable::load(path_in(&tmp), t0).unwrap();
-        writer.observe(sighting, t0);
-        writer.persist_if_dirty().unwrap();
-        let mut file: serde_json::Value =
-            serde_json::from_slice(&fs::read(path_in(&tmp)).unwrap()).unwrap();
-        file["peers"][0]
-            .as_object_mut()
-            .unwrap()
-            .remove("public_key");
-        assert_eq!(file["version"], serde_json::json!(PEER_TABLE_VERSION));
-        fs::write(path_in(&tmp), serde_json::to_vec(&file).unwrap()).unwrap();
-
-        let table = PeerTable::load(path_in(&tmp), t0).unwrap();
-        let row = table.get(&destination).unwrap();
-        assert_eq!(row.public_key, None);
-        assert!(row.verified_destination().is_none());
-
-        let (mut again, _) = announced();
-        again.destination_hash = destination.clone();
-        again.identity_hash = row.identity_hash.clone();
-        again.name_hash = row.name_hash.clone();
-        table.observe(again, t0 + Duration::from_secs(60));
-        table.remember_public_key(&destination, key.clone());
-        table.persist_if_dirty().unwrap();
-
-        let reloaded = PeerTable::load(path_in(&tmp), t0).unwrap();
-        let row = reloaded.get(&destination).unwrap();
-        assert_eq!(row.public_key.as_deref(), Some(key.as_str()));
-        assert!(row.verified_destination().is_some());
     }
 
     /// A key that does not derive the row's identity hash, or with its name hash the
@@ -589,16 +540,42 @@ mod public_key_tests {
         let tmp = TempDir::new("peers-key-rebound");
         let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
         let table = PeerTable::load(path_in(&tmp), t0).unwrap();
-        let (sighting, key) = announced();
+        let (sighting, _) = announced();
         let destination = sighting.destination_hash.clone();
         table.observe(sighting, t0);
-        table.remember_public_key(&destination, key);
 
         let (mut rebound, _) = announced();
         rebound.destination_hash = destination.clone();
+        rebound.public_key = None;
         table.observe(rebound, t0 + Duration::from_secs(1));
 
         assert_eq!(table.get(&destination).unwrap().public_key, None);
+    }
+
+    #[test]
+    fn a_sighting_without_a_key_keeps_the_key_of_an_unchanged_identity() {
+        let tmp = TempDir::new("peers-key-kept");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let table = PeerTable::load(path_in(&tmp), t0).unwrap();
+        let (sighting, key) = announced();
+        let destination = sighting.destination_hash.clone();
+        let keyless = PeerSighting {
+            destination_hash: sighting.destination_hash.clone(),
+            identity_hash: sighting.identity_hash.clone(),
+            name_hash: sighting.name_hash.clone(),
+            public_key: None,
+            display_name: None,
+            protocol_version: MESH_PROTOCOL_VERSION,
+            hops: 2,
+        };
+        table.observe(sighting, t0);
+
+        assert!(table.refresh_route(keyless));
+
+        assert_eq!(
+            table.get(&destination).unwrap().public_key.as_deref(),
+            Some(key.as_str())
+        );
     }
 }
 
@@ -614,6 +591,7 @@ mod tests {
             destination_hash: hash.to_string(),
             identity_hash: format!("id-{hash}"),
             name_hash: format!("name-{hash}"),
+            public_key: None,
             display_name: name.map(str::to_string),
             protocol_version: 1,
             hops: 2,
@@ -1270,6 +1248,7 @@ mod tests {
             destination_hash: destination.to_string(),
             identity_hash: identity.to_string(),
             name_hash: "name-shared".to_string(),
+            public_key: None,
             display_name: None,
             protocol_version: MESH_PROTOCOL_VERSION,
             hops: 1,

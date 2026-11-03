@@ -1835,6 +1835,7 @@ fn judge_presence_origin(
             destination_hash: held,
             identity_hash: holder.to_hex_string(),
             name_hash: hex_lower(&ORIGIN),
+            public_key: None,
             display_name: None,
             protocol_version: MESH_PROTOCOL_VERSION,
             hops: 1,

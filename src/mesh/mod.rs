@@ -1354,6 +1354,7 @@ pub(crate) mod test_support {
             destination_hash: desc.address_hash.to_hex_string(),
             identity_hash: desc.identity.address_hash.to_hex_string(),
             name_hash: hex_lower(name.as_name_hash_slice()),
+            public_key: None,
             display_name: display_name.map(str::to_string),
             protocol_version: 1,
             hops: 1,

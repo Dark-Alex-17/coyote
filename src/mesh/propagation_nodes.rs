@@ -12,7 +12,7 @@ use crate::mesh::propagation::{
 use crate::mesh::propagation_fetch::FetchError;
 use crate::mesh::request::{redact_hashes, short};
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_cause, version_refusal};
-use crate::mesh::{decode_hex, write_atomically_owner_only};
+use crate::mesh::write_atomically_owner_only;
 
 use anyhow::{Context, Result, bail};
 use parking_lot::Mutex;
@@ -80,11 +80,7 @@ impl StoredNode {
     /// The record with its destination rebuilt from the key; `None` when the key is not
     /// one or does not derive the stored hash.
     fn into_record(self) -> Option<PropagationNodeRecord> {
-        let identity = decode_hex(&self.public_key).and_then(|bytes| {
-            let (encryption, signing) = bytes.split_at(bytes.len() / 2);
-            Identity::try_new_from_slices(encryption, signing).ok()
-        });
-        let Some(identity) = identity else {
+        let Ok(identity) = Identity::new_from_hex_string(&self.public_key) else {
             debug!(
                 "Dropped stored propagation node {}: its public key is not a key",
                 short(&self.destination_hash)

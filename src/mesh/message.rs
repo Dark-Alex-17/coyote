@@ -1919,14 +1919,15 @@ impl MeshRuntime {
         }
     }
 
-    /// The description a request to `destination_hex` links to, as the transport holds it:
-    /// filled from the peer's announce or a restored path table, with `name` the announce's
-    /// truncated name hash. A destination the transport holds is answered at once with no
-    /// request, even when its path has expired. One the transport does not hold is asked
-    /// for once over the network, and the answer is waited for up to
-    /// `PATH_REQUEST_TIMEOUT`. When that brings no announce but the transport has a path,
-    /// the description is rebuilt from the key the peer table kept from an earlier
-    /// announce, once that key proves it derives the destination. `None` otherwise.
+    /// The description a request to `destination_hex` links to, with `name` the announce's
+    /// truncated name hash. A key the peer table kept from an earlier announce comes first,
+    /// once it proves it derives the destination, so a restart does not wait on a fresh
+    /// announce. A link needs a path, so without one a single path request is sent and
+    /// waited on for up to `PATH_REQUEST_TIMEOUT`, and the description is returned only if
+    /// a path then stands. Without such a key the transport's description is used: one it
+    /// holds is answered at once with no request, even when its path has expired, and one
+    /// it does not hold is asked for once over the network and waited for up to
+    /// `PATH_REQUEST_TIMEOUT`. `None` otherwise.
     pub(crate) async fn resolve_destination(
         &self,
         destination_hex: &str,
@@ -1934,15 +1935,21 @@ impl MeshRuntime {
         let destination = canonical_hash(destination_hex)?;
         let address_hash = AddressHash::new_from_hex_string(&destination).ok()?;
         let transport = self.transport_handle().await?;
-        let mut desc = transport
-            .resolve_destination(&address_hash, PATH_REQUEST_TIMEOUT)
-            .await;
-        if desc.is_none() && transport.has_path(&address_hash).await {
-            desc = self
-                .peers()
-                .get(&destination)
-                .and_then(|record| record.verified_destination());
-        }
+        let persisted = self
+            .peers()
+            .get(&destination)
+            .and_then(|record| record.verified_destination());
+        let desc = match persisted {
+            Some(desc) => transport
+                .await_path(&address_hash, PATH_REQUEST_TIMEOUT, None)
+                .await
+                .then_some(desc),
+            None => {
+                transport
+                    .resolve_destination(&address_hash, PATH_REQUEST_TIMEOUT)
+                    .await
+            }
+        };
         if desc.is_none() {
             debug!("Mesh found no route to {}", short(&destination));
         }
@@ -4259,6 +4266,7 @@ mod tests {
                 destination_hash: earlier_destination,
                 identity_hash: earlier.clone(),
                 name_hash: hex_lower(&origin.0),
+                public_key: None,
                 display_name: None,
                 protocol_version: 1,
                 hops: 1,
@@ -4742,6 +4750,7 @@ mod tests {
                 destination_hash: destination.clone(),
                 identity_hash: identity.clone(),
                 name_hash: hex_lower(&origin.0),
+                public_key: None,
                 display_name: Some("Bob".to_string()),
                 protocol_version: 1,
                 hops: 1,
