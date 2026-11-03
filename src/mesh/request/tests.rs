@@ -10831,9 +10831,7 @@ pub(crate) mod network {
         let c_report = report(&c_instance);
         assert_eq!(
             c_report.outcome,
-            RecipientOutcome::Unreachable {
-                reason: SendError::NoAnswer(pair.node_a.no_answer(&c_instance)).to_string(),
-            }
+            RecipientOutcome::NoAnswer(pair.node_a.no_answer(&c_instance))
         );
         assert_eq!(c_report.display_name.as_deref(), Some("Cy"));
         assert_eq!(pair.recorder_b.last().path_hash, PathHash::of(MESSAGE_PATH));
