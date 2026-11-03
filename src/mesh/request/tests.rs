@@ -200,6 +200,7 @@ fn no_access_is_named_at_exactly_one_site_outside_the_error_module() {
     let constructed = [&refused, ");"].concat();
     let markers = [
         ["#[cfg(test)]", "\nmod tests"].concat(),
+        ["#[cfg(test)]", "\nmod no_answer_tests"].concat(),
         ["#[cfg(test)]", "\npub(crate) mod test_support"].concat(),
     ];
     let mut sites = Vec::new();
