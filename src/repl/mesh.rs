@@ -1,13 +1,16 @@
 use crate::config::mesh_config::{MeshBrief, MeshInterface, mesh_settings_rows};
 use crate::config::{CommandPrefix, MeshConfig, RequestContext, live_prefix, paths};
 use crate::function::mesh::trust_label;
-use crate::mesh::access::GrantKind;
+use crate::mesh::access::{
+    ACCESS_MAX_PATHS, AccessError, AccessOutcome, AccessRefusal, AccessRequestOutcome, GrantKind,
+    ValidAccess, validate_access,
+};
 use crate::mesh::brief::{Brief, BriefSource};
 use crate::mesh::card::{CardSource, DISPLAY_NAME_MAX_CHARS, StatusHandler, render_for_human};
 use crate::mesh::envoy_sessions::{EnvoyMemoryError, EnvoySessions, RememberedOf};
 use crate::mesh::fetch::{
     FILE_FETCH_REQUEST_TIMEOUT, FetchError as FileFetchError, Fetched, GONE_COPY_TAIL,
-    NotSharedReason, not_shared_reason, not_shared_sentence, spent_attachment,
+    NotSharedReason, grant_expires_at, not_shared_reason, not_shared_sentence, spent_attachment,
 };
 use crate::mesh::grants::DEFAULT_GRANT_TTL;
 use crate::mesh::identity::{self, Predecessor, fingerprint};
@@ -28,10 +31,10 @@ use crate::mesh::pending::{
     question_not_an_access_request,
 };
 use crate::mesh::shares::{
-    BuiltinHit, DEFAULT_LIST_WALK_BOUND, GLOB_METACHARACTERS, LIST_PAGE_SIZE, Layer, MatchCount,
-    Mutation, PeerRef, RawKind, ShareLocations, ShareSet, Verdict as ShareVerdict, WriteScope,
-    case_folding_hint, is_broad_pattern, is_canonical_peer, protected_segment, validate_override,
-    validate_pattern,
+    ALL_LIST_ROWS, BuiltinHit, DEFAULT_LIST_WALK_BOUND, GLOB_METACHARACTERS, LIST_PAGE_SIZE, Layer,
+    MatchCount, Mutation, PeerRef, RawKind, ShareLocations, ShareSet, Verdict as ShareVerdict,
+    WriteScope, case_folding_hint, is_broad_pattern, is_canonical_peer, protected_segment,
+    validate_override, validate_pattern,
 };
 use crate::mesh::trust::{
     BindingConflict, Decision, Forgotten, IdentityStanding, KeyChange, LiveMesh, Rule, ServedBy,
@@ -189,7 +192,7 @@ pub(super) const VERBS: &[(&str, &str, &str)] = &[
     (
         "shares",
         "List the share rules and the file each came from, or the files a peer can fetch",
-        ".mesh shares [--peer <identity|destination>] [--effective]",
+        ".mesh shares [--peer <identity|destination>] [--effective [--all]]",
     ),
     (
         "grant",
@@ -200,6 +203,11 @@ pub(super) const VERBS: &[(&str, &str, &str)] = &[
         "refuse",
         "Refuse a peer's access request",
         ".mesh refuse <id>",
+    ),
+    (
+        "request",
+        "Ask a trusted peer's human for access to files it does not share yet",
+        ".mesh request <destination> <path>... [--reason \"text\"] [--yes]",
     ),
     (
         "fetch",
@@ -271,6 +279,7 @@ pub(crate) async fn run(
         "shares" => shares(ctx, rest),
         "grant" => grant(ctx, rest).await,
         "refuse" => refuse(ctx, rest).await,
+        "request" => request(ctx, &abort_signal, rest).await,
         "fetch" => fetch(ctx, &abort_signal, rest).await,
         "memory" => memory(ctx, rest),
         other => bail!("{}", unknown_verb_error(other)),
@@ -2065,6 +2074,233 @@ fn knock_report(dest8: &str, outcome: &KnockOutcome) -> String {
             "Knocked on {dest8} via store-and-forward; a propagation node holds the knock until the peer fetches it."
         ),
     }
+}
+
+/// The rule a request to an untrusted destination is refused by, naming the command that
+/// trusts it. A blocked identity outranks a trust record for its destination, so it has
+/// to be unblocked first.
+fn request_refusal_tail(destination: &str, blocked_identity: Option<&str>) -> String {
+    match blocked_identity {
+        Some(identity) => format!(
+            "Nothing is asked of a destination this node does not trust; `.mesh unblock --identity {identity}` and then `.mesh trust {destination}` trust it."
+        ),
+        None => format!(
+            "Nothing is asked of a destination this node does not trust; `.mesh trust {destination}` trusts it."
+        ),
+    }
+}
+
+/// `.mesh request <destination> <path>... [--reason "text"] [--yes]`: asks a trusted
+/// peer's human for files it does not share yet. The request is held to the rules the
+/// peer would refuse it by before the prompt, so a refusal never follows a yes.
+async fn request(
+    ctx: &RequestContext,
+    abort_signal: &AbortSignal,
+    rest: Option<&str>,
+) -> Result<()> {
+    let Some(rest) = rest else {
+        out_text(&render_verb_help("request"));
+        return Ok(());
+    };
+    let Some(args) = parse_request_args(rest)? else {
+        out_text(&render_verb_help("request"));
+        return Ok(());
+    };
+    let destination = destination_hash(ctx, &args.destination)?;
+    let runtime = live(ctx)?;
+    let blocked_identity = runtime
+        .peers()
+        .get(&destination)
+        .map(|peer| peer.identity_hash)
+        .filter(|identity| {
+            runtime.trust().authorize(identity, &destination).rule == Rule::IdentityBlocked
+        });
+    peer_for_contact(
+        &runtime,
+        &destination,
+        &request_refusal_tail(&destination, blocked_identity.as_deref()),
+    )?;
+    let reason = args.reason.as_deref().unwrap_or("");
+    // The id is only for the check; the send mints its own.
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let valid = match validate_access(&id, args.paths, reason) {
+        Ok(valid) => valid,
+        Err("a path is not a wire path") => bail!(
+            "The access request was not sent: a path is not a wire path. Spell each path relative to the peer's share root, /-separated, as mesh__list shows it or the peer's own .mesh shares --effective --all prints it."
+        ),
+        Err(rule) => bail!(AccessError::Invalid(rule).to_string()),
+    };
+    let question = format!(
+        "Ask {} for {} path(s): {}?",
+        short(&destination),
+        valid.paths.len(),
+        valid.paths.join(", ")
+    );
+    if !confirm_or_flag(&question, "--yes", args.yes)? {
+        out_text("Nothing was sent.");
+        return Ok(());
+    }
+    send_request(ctx, abort_signal, &runtime, &destination, &valid, reason).await
+}
+
+/// Links to the peer and sends the access request; prints the outcome.
+async fn send_request(
+    ctx: &RequestContext,
+    abort_signal: &AbortSignal,
+    runtime: &MeshRuntime,
+    destination: &str,
+    valid: &ValidAccess,
+    reason: &str,
+) -> Result<()> {
+    // Only the wait is wanted here: `request_access` resolves the destination itself,
+    // which is immediate once the route is held.
+    match route_to(runtime, destination, abort_signal).await {
+        Ok(_) => {}
+        Err(Unrouted::NoAnswer) => bail!(
+            "{} Try again in a minute; nothing was sent. `.mesh peers` shows when it was last heard.",
+            unreachable_head(destination)
+        ),
+        Err(Unrouted::Interrupted) => {
+            out_text("Request interrupted; nothing was sent.");
+            return Ok(());
+        }
+    }
+    let d8 = short(destination);
+    out_text(&format!(
+        "Asking {} for {} path(s); Ctrl-C cancels...",
+        short(destination),
+        valid.paths.len()
+    ));
+    result_follows();
+    // The send runs as its own task so a late interrupt ends only the wait: the request
+    // may already be with the peer, and the task still settles an inline answer (a grant
+    // remembered, a refusal's correlation and claim dropped) or leaves the correlation
+    // open for a decision that comes later.
+    let mesh = Arc::clone(&ctx.app.mesh);
+    let (to, paths, why) = (
+        destination.to_string(),
+        valid.paths.clone(),
+        reason.to_string(),
+    );
+    let mut handle = tokio::spawn(async move { mesh.request_access(&to, &paths, &why).await });
+    let joined = tokio::select! {
+        joined = &mut handle => joined,
+        _ = wait_user_interrupt(Some(abort_signal)) => {
+            out_text(&format!(
+                "Request interrupted; it may still reach {d8}. If it does, the decision arrives as an idle line; .mesh inbox lists it."
+            ));
+            return Ok(());
+        }
+    };
+    let Ok(outcome) = joined else {
+        bail!(
+            "The access request to {d8} stopped before it could finish; nothing more is known about it. `.mesh pending` and `.mesh inbox` show what reached this node; try `.mesh request` again."
+        );
+    };
+    match outcome {
+        Ok(outcome) => out_path_text(&request_outcome_line(
+            &outcome,
+            destination,
+            &valid.paths,
+            live_prefix(),
+        )),
+        Err(err) => bail!(err.to_string()),
+    }
+    Ok(())
+}
+
+/// The line `.mesh request` ends with. A grant names a path, so the line is printed
+/// byte for byte and its hints are rendered in `prefix` here.
+fn request_outcome_line(
+    outcome: &AccessRequestOutcome,
+    destination: &str,
+    paths: &[String],
+    prefix: CommandPrefix,
+) -> String {
+    let id8 = short(&outcome.id);
+    let d8 = short(destination);
+    let decision_arrives =
+        prefix.render_hints("(the decision arrives as an idle line; .mesh inbox lists it)");
+    match &outcome.status {
+        AccessOutcome::Pending => match outcome.via {
+            PeerVia::Direct => format!("request {id8} to {d8}: pending {decision_arrives}"),
+            PeerVia::StoreAndForward => format!(
+                "request {id8} to {d8}: pending; no answer over the link, so a propagation node holds it until {d8} fetches it {decision_arrives}"
+            ),
+        },
+        AccessOutcome::Granted { expires } => {
+            let until = match grant_expires_at(*expires) {
+                Some(at) => format!("granted until {}", rfc3339_utc(at)),
+                None => "granted, until a time this node cannot read".to_string(),
+            };
+            let fetch = prefix.render_hints(".mesh fetch");
+            let first = paths.first().map_or("", String::as_str);
+            let others = match paths.len() {
+                0 | 1 => String::new(),
+                n => format!(", then the same for the other {} path(s).", n - 1),
+            };
+            format!("request {id8} to {d8}: {until}: {fetch} {d8} {first}{others}")
+        }
+        AccessOutcome::Refused(AccessRefusal::Duplicate) => format!(
+            "request {id8} to {d8}: refused: this request is already waiting with {d8}; wait for its decision (it arrives as an idle line)."
+        ),
+        AccessOutcome::Refused(AccessRefusal::TooManyPending) => format!(
+            "request {id8} to {d8}: refused: {d8} holds as many of your requests as it allows; wait for a decision on one, then ask again."
+        ),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RequestArgs {
+    destination: String,
+    paths: Vec<String>,
+    reason: Option<String>,
+    yes: bool,
+}
+
+/// The destination, then the paths, each trimmed as the tool trims them, with
+/// `--reason <text>` and `--yes` anywhere; `None` when the destination or every path is
+/// missing, which the caller answers with the usage line. A reason with spaces is one
+/// token only when quoted. Too many paths is refused here, before the peer is looked up.
+fn parse_request_args(rest: &str) -> Result<Option<RequestArgs>> {
+    let mut positional = Vec::new();
+    let mut reason = None;
+    let mut yes = false;
+    let mut tokens = split_tokens(rest).into_iter();
+    while let Some(token) = tokens.next() {
+        if token == "--reason" {
+            match tokens.next() {
+                Some(value) if !value.starts_with("--") => reason = Some(value),
+                _ => bail!("'{token}' needs a value. {}", render_verb_help("request")),
+            }
+        } else if token == "--yes" {
+            yes = true;
+        } else if token.starts_with("--") {
+            return Err(unexpected(&token, "request"));
+        } else {
+            positional.push(token);
+        }
+    }
+    let mut positional = positional.into_iter();
+    let Some(destination) = positional.next() else {
+        return Ok(None);
+    };
+    let paths: Vec<String> = positional.map(|path| path.trim().to_string()).collect();
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    if paths.len() > ACCESS_MAX_PATHS {
+        bail!(
+            "The access request was not sent: it names {} paths and a request carries at most {ACCESS_MAX_PATHS}. Ask for at most {ACCESS_MAX_PATHS} paths per request.",
+            paths.len()
+        );
+    }
+    Ok(Some(RequestArgs {
+        destination,
+        paths,
+        reason,
+        yes,
+    }))
 }
 
 /// `.mesh fetch <destination> <path> [--if-sha256 <hex>]`: pulls one file a trusted peer
@@ -4071,11 +4307,19 @@ fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
 
 /// `.mesh shares`: the rules as the two files hold them, or with `--effective` the files
 /// they resolve to under the root with the verdict a fetch of each would get. Inspection
-/// only, so it works while the mesh is off and never prints a file's contents.
+/// only, so it works while the mesh is off and never prints a file's contents. `--all`
+/// widens `--effective` to every file under the root, whether an allow names it or not.
 fn shares(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
-    let args = parse_mutation_args(rest.unwrap_or(""), "shares", &["--peer", "--effective"])?;
+    let args = parse_mutation_args(
+        rest.unwrap_or(""),
+        "shares",
+        &["--peer", "--effective", "--all"],
+    )?;
     if let Some(token) = args.positional.first() {
         return Err(unexpected(token, "shares"));
+    }
+    if args.all && !args.effective {
+        bail!("`--all` works with `--effective`: run `.mesh shares --effective --all`.");
     }
     let peer = args
         .peer
@@ -4107,6 +4351,8 @@ fn shares(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             &share_audience(peer.as_deref()),
             &root,
             case,
+            args.all,
+            DEFAULT_LIST_WALK_BOUND,
         )
     } else {
         render_share_rules(&set, &peer_ref, peer.as_deref(), ctx.command_prefix())
@@ -4404,14 +4650,15 @@ fn render_effective_shares(
     audience: &str,
     root: &Path,
     case: Option<bool>,
+    all: bool,
+    walk_bound: usize,
 ) -> String {
     let case_insensitive = case.unwrap_or(false);
-    let resolved = set.resolve(
-        peer,
-        case_insensitive,
-        DEFAULT_LIST_WALK_BOUND,
-        LIST_PAGE_SIZE,
-    );
+    let resolved = if all {
+        set.resolve_all(peer, case_insensitive, walk_bound, ALL_LIST_ROWS)
+    } else {
+        set.resolve(peer, case_insensitive, walk_bound, LIST_PAGE_SIZE)
+    };
     let mut lines = Vec::new();
     if case.is_none() {
         lines.push(
@@ -4419,17 +4666,21 @@ fn render_effective_shares(
                 .to_string(),
         );
     }
-    if resolved.entries.is_empty() {
+    if resolved.entries.is_empty() && !all {
         lines.push(format!(
             "Nothing resolves: no allow rule names an existing file under {}.",
             root.display()
         ));
         return lines.join("\n");
     }
-    lines.push(format!(
-        "Files {audience} can fetch from {}:",
-        root.display()
-    ));
+    lines.push(if all {
+        format!(
+            "Every file under {} and what it is to {audience}:",
+            root.display()
+        )
+    } else {
+        format!("Files {audience} can fetch from {}:", root.display())
+    });
     let mut table = mesh_table(&["path", "verdict"]);
     for entry in &resolved.entries {
         let verdict = match entry.verdict {
@@ -4442,9 +4693,19 @@ fn render_effective_shares(
         table.add_row([entry.path.as_str(), verdict]);
     }
     lines.push(table.to_string());
-    if resolved.capped {
+    if resolved.capped && !all {
         lines.push(format!(
             "listing capped at {LIST_PAGE_SIZE} entries; narrow the patterns, or pass `--peer <hash>` to see one peer's view."
+        ));
+    }
+    if all {
+        lines.push("shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in deny: a secret name nothing serves unless an override names the file; protected: inside .git or a config directory, never served; not allowed: no allow rule names it.".to_string());
+    }
+    if all && resolved.capped {
+        let at_least = if resolved.truncated { "at least " } else { "" };
+        let more = resolved.total - resolved.entries.len();
+        lines.push(format!(
+            "... and {at_least}{more} more rows not shown (--all stops at {ALL_LIST_ROWS} rows); drop --all to see only the files an allow rule names."
         ));
     }
     if resolved.truncated {
@@ -7608,6 +7869,141 @@ mod tests {
         );
     }
 
+    mod request_outcome {
+        use super::*;
+
+        const ID: &str = "0123456789abcdef0123456789abcdef";
+        const DEST: &str = "fedcba9876543210fedcba9876543210";
+
+        fn line(
+            status: AccessOutcome,
+            via: PeerVia,
+            paths: &[&str],
+            prefix: CommandPrefix,
+        ) -> String {
+            let outcome = AccessRequestOutcome {
+                id: ID.to_string(),
+                status,
+                via,
+            };
+            let paths: Vec<String> = paths.iter().map(|path| path.to_string()).collect();
+            request_outcome_line(&outcome, DEST, &paths, prefix)
+        }
+
+        #[test]
+        fn a_pending_request_says_where_it_waits_and_where_the_decision_shows() {
+            assert_eq!(
+                line(
+                    AccessOutcome::Pending,
+                    PeerVia::Direct,
+                    &["docs/a.md"],
+                    CommandPrefix::Dot
+                ),
+                "request 01234567 to fedcba98: pending (the decision arrives as an idle line; .mesh inbox lists it)"
+            );
+            assert_eq!(
+                line(
+                    AccessOutcome::Pending,
+                    PeerVia::StoreAndForward,
+                    &["docs/a.md"],
+                    CommandPrefix::Dot
+                ),
+                "request 01234567 to fedcba98: pending; no answer over the link, so a propagation node holds it until fedcba98 fetches it (the decision arrives as an idle line; .mesh inbox lists it)"
+            );
+        }
+
+        /// A grant names the fetch for the first path and counts the rest, whether or
+        /// not its expiry is a time this node can read.
+        #[test]
+        fn a_grant_names_the_fetch_for_the_first_path_and_counts_the_rest() {
+            let expires = 1_790_000_900.0;
+            let until = rfc3339_utc(SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_900));
+            let granted = AccessOutcome::Granted { expires };
+            assert_eq!(
+                line(
+                    granted.clone(),
+                    PeerVia::Direct,
+                    &["docs/a.md"],
+                    CommandPrefix::Dot
+                ),
+                format!(
+                    "request 01234567 to fedcba98: granted until {until}: .mesh fetch fedcba98 docs/a.md"
+                )
+            );
+            assert_eq!(
+                line(
+                    granted,
+                    PeerVia::Direct,
+                    &["docs/a.md", "docs/b.md", "src/c.rs"],
+                    CommandPrefix::Dot
+                ),
+                format!(
+                    "request 01234567 to fedcba98: granted until {until}: .mesh fetch fedcba98 docs/a.md, then the same for the other 2 path(s)."
+                )
+            );
+            for unreadable in [f64::NAN, -1.0, f64::INFINITY] {
+                assert_eq!(
+                    line(
+                        AccessOutcome::Granted {
+                            expires: unreadable
+                        },
+                        PeerVia::Direct,
+                        &["docs/a.md", "docs/b.md"],
+                        CommandPrefix::Dot
+                    ),
+                    "request 01234567 to fedcba98: granted, until a time this node cannot read: .mesh fetch fedcba98 docs/a.md, then the same for the other 1 path(s).",
+                    "{unreadable}"
+                );
+            }
+        }
+
+        /// Under slash the hints read `/mesh` while a path spelled like a command stays
+        /// as the peer granted it.
+        #[test]
+        fn the_hints_follow_the_prefix_and_the_path_stays_as_granted() {
+            assert_eq!(
+                line(
+                    AccessOutcome::Granted { expires: f64::NAN },
+                    PeerVia::Direct,
+                    &[".vault"],
+                    CommandPrefix::Slash
+                ),
+                "request 01234567 to fedcba98: granted, until a time this node cannot read: /mesh fetch fedcba98 .vault"
+            );
+            assert_eq!(
+                line(
+                    AccessOutcome::Pending,
+                    PeerVia::Direct,
+                    &[".vault"],
+                    CommandPrefix::Slash
+                ),
+                "request 01234567 to fedcba98: pending (the decision arrives as an idle line; /mesh inbox lists it)"
+            );
+        }
+
+        #[test]
+        fn a_refusal_says_what_to_wait_for() {
+            assert_eq!(
+                line(
+                    AccessOutcome::Refused(AccessRefusal::Duplicate),
+                    PeerVia::Direct,
+                    &["docs/a.md"],
+                    CommandPrefix::Dot
+                ),
+                "request 01234567 to fedcba98: refused: this request is already waiting with fedcba98; wait for its decision (it arrives as an idle line)."
+            );
+            assert_eq!(
+                line(
+                    AccessOutcome::Refused(AccessRefusal::TooManyPending),
+                    PeerVia::Direct,
+                    &["docs/a.md"],
+                    CommandPrefix::Dot
+                ),
+                "request 01234567 to fedcba98: refused: fedcba98 holds as many of your requests as it allows; wait for a decision on one, then ask again."
+            );
+        }
+    }
+
     /// The two error texts for a knock nobody could hold: a link that never came up keeps
     /// the unreachable wording; a link that came up and stayed silent never says so.
     #[test]
@@ -7845,6 +8241,86 @@ mod tests {
         );
         assert_eq!(split_tokens("--label \"\" abc"), vec!["--label", "", "abc"]);
         assert!(split_tokens("   ").is_empty());
+    }
+
+    mod request_args {
+        use super::*;
+
+        #[test]
+        fn a_quoted_reason_is_one_token_and_flags_stand_anywhere() {
+            let args = parse_request_args("--yes peer a.md --reason \"need it now\" \" b.md \"")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                args,
+                RequestArgs {
+                    destination: "peer".to_string(),
+                    paths: vec!["a.md".to_string(), "b.md".to_string()],
+                    reason: Some("need it now".to_string()),
+                    yes: true,
+                }
+            );
+        }
+
+        #[test]
+        fn an_unquoted_reason_takes_one_word_and_the_rest_are_paths() {
+            let args = parse_request_args("peer --reason need the file")
+                .unwrap()
+                .unwrap();
+            assert_eq!(args.reason.as_deref(), Some("need"));
+            assert_eq!(args.paths, ["the", "file"]);
+        }
+
+        #[test]
+        fn reason_without_a_value_names_the_usage() {
+            let usage = render_verb_help("request");
+            for line in ["peer a.md --reason", "peer a.md --reason --yes"] {
+                assert_eq!(
+                    parse_request_args(line).unwrap_err().to_string(),
+                    format!("'--reason' needs a value. {usage}"),
+                    "{line}"
+                );
+            }
+            assert!(usage.contains("[--reason \"text\"]"), "{usage}");
+        }
+
+        #[test]
+        fn an_unknown_flag_is_unexpected() {
+            assert_eq!(
+                parse_request_args("peer a.md --force")
+                    .unwrap_err()
+                    .to_string(),
+                unexpected("--force", "request").to_string()
+            );
+        }
+
+        #[test]
+        fn no_destination_or_no_path_is_the_usage() {
+            for line in ["", "--yes", "peer", "peer --yes --reason why"] {
+                assert_eq!(parse_request_args(line).unwrap(), None, "{line}");
+            }
+        }
+
+        #[test]
+        fn more_paths_than_a_request_carries_is_refused_with_the_cap() {
+            let paths: Vec<String> = (0..=ACCESS_MAX_PATHS).map(|n| format!("p{n}.md")).collect();
+            let err = parse_request_args(&format!("peer {}", paths.join(" ")))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "The access request was not sent: it names {} paths and a request carries at most {ACCESS_MAX_PATHS}. Ask for at most {ACCESS_MAX_PATHS} paths per request.",
+                    ACCESS_MAX_PATHS + 1
+                )
+            );
+            let at_the_cap = paths[..ACCESS_MAX_PATHS].join(" ");
+            assert!(
+                parse_request_args(&format!("peer {at_the_cap}"))
+                    .unwrap()
+                    .is_some()
+            );
+        }
     }
 
     const TRUST_FLAGS: &[&str] = &[
@@ -8920,6 +9396,8 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             "every trusted peer",
             &fx.root,
             Some(false),
+            false,
+            DEFAULT_LIST_WALK_BOUND,
         );
         assert_eq!(fx.placeholders(&text), EFFECTIVE_SHARES_SNAPSHOT);
     }
@@ -8934,6 +9412,77 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
 ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
 │ src/vault/keys.yaml ┆ denied        │
 └─────────────────────┴───────────────┘"#;
+
+    mod effective_all_snapshot {
+        use super::*;
+
+        fn render_all(fx: &ShareSnapshot, walk_bound: usize) -> String {
+            render_effective_shares(
+                &fx.set(),
+                &PeerRef::unscoped(),
+                "every trusted peer",
+                &fx.root,
+                Some(false),
+                true,
+                walk_bound,
+            )
+        }
+
+        /// The whole `.mesh shares --effective --all` text with no allow rule: a secret
+        /// name, a file under `.git` and a plain source file, each with its verdict.
+        #[test]
+        fn effective_shares_all_table_snapshot() {
+            let fx = ShareSnapshot::new(
+                "repl-mesh-effective-all-snapshot",
+                "version: 1\n",
+                &[".env", ".git/config", "src/main.rs"],
+            );
+            let text = render_all(&fx, DEFAULT_LIST_WALK_BOUND);
+            assert_eq!(fx.placeholders(&text), EFFECTIVE_SHARES_ALL_SNAPSHOT);
+        }
+
+        const EFFECTIVE_SHARES_ALL_SNAPSHOT: &str = r#"Every file under <root> and what it is to every trusted peer:
+┌─────────────┬───────────────┐
+│ path        ┆ verdict       │
+╞═════════════╪═══════════════╡
+│ .env        ┆ built-in deny │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ .git/config ┆ protected     │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│ src/main.rs ┆ not allowed   │
+└─────────────┴───────────────┘
+shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in deny: a secret name nothing serves unless an override names the file; protected: inside .git or a config directory, never served; not allowed: no allow rule names it."#;
+
+        /// A walk that stops at its bound past the row cap can only say how many more
+        /// it saw, so the count reads `at least` and the bound line follows it. The bound
+        /// counts the root and every file it visits.
+        #[test]
+        fn a_walk_cut_by_its_bound_past_the_row_cap_says_at_least() {
+            let files: Vec<String> = (0..ALL_LIST_ROWS + 10)
+                .map(|i| format!("f{i:04}.md"))
+                .collect();
+            let names: Vec<&str> = files.iter().map(String::as_str).collect();
+            let fx = ShareSnapshot::new("repl-mesh-effective-all-bound", "version: 1\n", &names);
+            let walk_bound = ALL_LIST_ROWS + 5;
+            let seen = walk_bound - 1;
+
+            let text = render_all(&fx, walk_bound);
+
+            assert_eq!(table_rows(&text).len(), ALL_LIST_ROWS, "{text}");
+            let footer = table_footer(&text);
+            assert_eq!(
+                footer[1..],
+                [
+                    format!(
+                        "... and at least {} more rows not shown (--all stops at {ALL_LIST_ROWS} rows); drop --all to see only the files an allow rule names.",
+                        seen - ALL_LIST_ROWS
+                    ),
+                    "The walk stopped at its bound, so files may be missing.".to_string(),
+                ],
+                "{footer:?}"
+            );
+        }
+    }
 
     /// The node facts of a bare `.mesh info` with the node on, the shipped default (the
     /// local rnsd, as a non-Linux host labels it) connected, nothing retired or heard yet:
@@ -13437,7 +13986,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 .lines()
                 .filter(|line| line.trim_start().starts_with(".mesh "))
                 .collect();
-            assert_eq!(rows.len(), 29, "{list}");
+            assert_eq!(rows.len(), 30, "{list}");
             assert!(
                 rows.iter()
                     .any(|row| row.trim_start().starts_with(".mesh message ")),
@@ -18960,6 +19509,79 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 });
             }
 
+            /// `.mesh request` to a trusted peer nothing on the network can route to
+            /// fails after the route wait with what to try next, never opens a link, and
+            /// leaves no correlation behind.
+            #[test]
+            #[serial]
+            fn request_to_a_trusted_but_unroutable_peer_sends_nothing() {
+                use crate::mesh::hex_lower;
+                use crate::mesh::session_destination_name;
+                use crate::mesh::test_support::PeerSighting;
+                use crate::mesh::trust::{LiveMesh, TrustOptions};
+                use rns_transport::destination::SingleInputDestination;
+                use rns_transport::identity::PrivateIdentity;
+                use rns_transport::rand_core::OsRng;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-request-unresolvable");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-request-unresolvable").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let now = SystemTime::now();
+                    let name = session_destination_name("probe");
+                    let announced =
+                        SingleInputDestination::new(PrivateIdentity::new_from_rand(OsRng), name);
+                    let trusted = announced.desc.address_hash.to_hex_string();
+                    started.runtime.peers().observe(
+                        PeerSighting {
+                            destination_hash: trusted.clone(),
+                            identity_hash: announced.desc.identity.address_hash.to_hex_string(),
+                            name_hash: hex_lower(name.as_name_hash_slice()),
+                            display_name: Some("Tia".to_string()),
+                            protocol_version: 1,
+                            hops: 1,
+                        },
+                        now,
+                    );
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    started
+                        .runtime
+                        .trust()
+                        .trust_destination(slot, &trusted, TrustOptions::default(), now)
+                        .unwrap();
+
+                    let err = run(
+                        &mut ctx,
+                        &format!(".mesh request {trusted} docs/a.md --yes"),
+                    )
+                    .await
+                    .unwrap_err()
+                    .to_string();
+                    assert!(err.contains("could not be reached"), "{err}");
+                    assert!(
+                        err.ends_with(
+                            "Try again in a minute; nothing was sent. `.mesh peers` shows when it was last heard."
+                        ),
+                        "{err}"
+                    );
+                    let out = stdout_lines();
+                    assert!(
+                        !out.iter().any(|line| line.contains("Asking")),
+                        "no link is opened toward an unresolvable peer: {out:?}"
+                    );
+                    assert!(
+                        ctx.app.mesh.correlations().list().is_empty(),
+                        "{:?}",
+                        ctx.app.mesh.correlations().list()
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
             /// `.mesh status <dest>` on a trusted peer that answers `NoAccess` (it has this
             /// node's identity on its list but not this instance) fails with the line that
             /// names which side has not trusted whom and the command the peer's owner runs,
@@ -19020,11 +19642,12 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             /// Ctrl-C pressed while a verb waits for the network's route answer ends the
             /// wait at once with the verb's own interrupted line, the same way it ends the
             /// request that would have followed: no refusal, no error, and the user never
-            /// sits out the full path-request bound. All three verbs that link to one peer
+            /// sits out the full path-request bound. All four verbs that link to one peer
             /// behave alike.
             #[test]
             #[serial]
-            fn ctrl_c_during_the_route_wait_ends_status_knock_and_fetch_without_a_refusal() {
+            fn ctrl_c_during_the_route_wait_ends_status_knock_fetch_and_request_without_a_refusal()
+            {
                 use crate::mesh::PATH_REQUEST_TIMEOUT;
                 use crate::mesh::hex_lower;
                 use crate::mesh::session_destination_name;
@@ -19077,6 +19700,10 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             format!(".mesh fetch {trusted} docs/a.md"),
                             "Fetch of `docs/a.md` interrupted; nothing was staged.",
                         ),
+                        (
+                            format!(".mesh request {trusted} docs/a.md --yes"),
+                            "Request interrupted; nothing was sent.",
+                        ),
                     ];
                     for (line, interrupted) in verbs {
                         let signal = create_abort_signal();
@@ -19126,6 +19753,11 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             "{line}: an interrupted wait is not reported as a refusal: {err:?}"
                         );
                     }
+                    assert!(
+                        ctx.app.mesh.correlations().list().is_empty(),
+                        "a request interrupted before its route opens no correlation: {:?}",
+                        ctx.app.mesh.correlations().list()
+                    );
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();
@@ -26306,6 +26938,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         .unwrap();
 
                     let b8 = short(&dest_b).to_string();
+                    let request_tail = request_refusal_tail(&dest_b, None);
                     for (line, tail) in [
                         (
                             format!(".mesh message {dest_b} --yes hello"),
@@ -26315,6 +26948,10 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         (
                             format!(".mesh fetch {dest_b} docs/a.md"),
                             FETCH_REFUSAL_TAIL,
+                        ),
+                        (
+                            format!(".mesh request {dest_b} docs/a.md"),
+                            request_tail.as_str(),
                         ),
                     ] {
                         let err = run(&mut ctx, &line).await.unwrap_err().to_string();
@@ -27281,7 +27918,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             /// does not name `sync`, and under the node it touches nothing.
             #[test]
             #[serial]
-            fn bare_mesh_lists_the_twenty_nine_verbs_and_the_old_help_spelling_points_at_it() {
+            fn bare_mesh_lists_the_thirty_verbs_and_the_old_help_spelling_points_at_it() {
                 let _guard = TestConfigDirGuard::new("repl-mesh-usage-probe-verb-list");
                 let _capture = capture::install();
                 let _script = prompt_script::install(&[]);
@@ -27304,7 +27941,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         .collect();
                     let expected: Vec<&str> = VERBS.iter().map(|(name, _, _)| *name).collect();
                     assert_eq!(listed, expected, "{out}");
-                    assert_eq!(listed.len(), 29, "{out}");
+                    assert_eq!(listed.len(), 30, "{out}");
                     for present in [
                         "sync", "forget", "untrust", "trust", "block", "unblock", "allow", "deny",
                         "unshare", "shares", "grant", "refuse", "memory",
@@ -30187,6 +30824,134 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         assert!(table_footer(&out).is_empty(), "{:?}", table_footer(&out));
                         fx.stop().await;
                     });
+                }
+
+                mod effective_all {
+                    use super::*;
+
+                    const LEGEND: &str = "shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in deny: a secret name nothing serves unless an override names the file; protected: inside .git or a config directory, never served; not allowed: no allow rule names it.";
+
+                    /// With no allow rule, `--all` still lists every file under the root
+                    /// with what it is, where plain `--effective` has nothing to resolve.
+                    #[test]
+                    #[serial]
+                    fn shares_effective_all_lists_every_file_with_its_verdict_and_a_legend() {
+                        let _guard = TestConfigDirGuard::new("repl-mesh-shares-all");
+                        let _capture = capture::install();
+                        let _script = prompt_script::install(&[]);
+                        run_async(async {
+                            let mut fx = ShareFixture::new(
+                                "repl-mesh-shares-all",
+                                &[".env", ".git/config", "src/main.rs"],
+                            )
+                            .await;
+                            fx.write_global("version: 1\n");
+
+                            let out = out_of(&mut fx.ctx, ".mesh shares --effective --all")
+                                .await
+                                .unwrap();
+                            assert_eq!(
+                                out.lines().next().unwrap(),
+                                format!(
+                                    "Every file under {} and what it is to every trusted peer:",
+                                    fx.root.path.display()
+                                ),
+                                "{out}"
+                            );
+                            assert_eq!(
+                                table_rows(&out),
+                                [
+                                    [".env", "built-in deny"],
+                                    [".git/config", "protected"],
+                                    ["src/main.rs", "not allowed"],
+                                ],
+                                "{out}"
+                            );
+                            assert_eq!(table_footer(&out), [LEGEND], "{out}");
+                            fx.stop().await;
+                        });
+                    }
+
+                    /// Past the row cap `--all` shows exactly that many rows and counts the
+                    /// rest on a line under the legend.
+                    #[test]
+                    #[serial]
+                    fn shares_effective_all_past_the_row_cap_counts_the_files_not_shown() {
+                        let _guard = TestConfigDirGuard::new("repl-mesh-shares-all-cap");
+                        let _capture = capture::install();
+                        let _script = prompt_script::install(&[]);
+                        run_async(async {
+                            let files: Vec<String> = (0..ALL_LIST_ROWS + 5)
+                                .map(|i| format!("docs/f{i:04}.md"))
+                                .collect();
+                            let names: Vec<&str> = files.iter().map(String::as_str).collect();
+                            let mut fx =
+                                ShareFixture::new("repl-mesh-shares-all-cap", &names).await;
+                            fx.write_global("version: 1\nallow:\n- pattern: docs/**\n");
+
+                            let out = out_of(&mut fx.ctx, ".mesh shares --effective --all")
+                                .await
+                                .unwrap();
+                            let rows = table_rows(&out);
+                            let listed: Vec<&str> =
+                                rows.iter().map(|row| row[0].as_str()).collect();
+                            assert_eq!(listed, names[..ALL_LIST_ROWS].to_vec(), "{out}");
+                            assert_eq!(
+                                table_footer(&out),
+                                [
+                                    LEGEND.to_string(),
+                                    format!(
+                                        "... and 5 more rows not shown (--all stops at {ALL_LIST_ROWS} rows); drop --all to see only the files an allow rule names."
+                                    ),
+                                ],
+                                "{out}"
+                            );
+                            fx.stop().await;
+                        });
+                    }
+
+                    #[test]
+                    #[serial]
+                    fn shares_all_without_effective_is_refused_naming_the_full_command() {
+                        let _guard = TestConfigDirGuard::new("repl-mesh-shares-all-alone");
+                        let _capture = capture::install();
+                        let _script = prompt_script::install(&[]);
+                        run_async(async {
+                            let mut fx =
+                                ShareFixture::new("repl-mesh-shares-all-alone", &["docs/a.md"])
+                                    .await;
+
+                            assert_eq!(
+                                refusal(&mut fx.ctx, ".mesh shares --all").await,
+                                "`--all` works with `--effective`: run `.mesh shares --effective --all`."
+                            );
+                            fx.stop().await;
+                        });
+                    }
+
+                    /// A directory inside `.git` whose name no peer could ask for is left out,
+                    /// so its raw name never reaches the terminal.
+                    #[test]
+                    #[serial]
+                    fn shares_effective_all_leaves_out_a_collapsed_dir_with_no_wire_name() {
+                        let _guard = TestConfigDirGuard::new("repl-mesh-shares-all-invalid");
+                        let _capture = capture::install();
+                        let _script = prompt_script::install(&[]);
+                        run_async(async {
+                            let mut fx = ShareFixture::new(
+                                "repl-mesh-shares-all-invalid",
+                                &[".git/good/x", ".git/a\u{200B}b/x"],
+                            )
+                            .await;
+                            fx.write_global("version: 1\n");
+
+                            let out = out_of(&mut fx.ctx, ".mesh shares --effective --all")
+                                .await
+                                .unwrap();
+                            assert_eq!(table_rows(&out), [[".git/good/", "protected"]], "{out}");
+                            fx.stop().await;
+                        });
+                    }
                 }
 
                 /// `shares` is inspection and reads the files the node would serve from
@@ -34766,6 +35531,528 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 use crate::mesh::mesh_config_dir;
                 use crate::mesh::shares::{RawEntry, RawKind, Served};
 
+                mod request_verb {
+                    use super::*;
+                    use crate::mesh::access::{
+                        ACCESS_REASON_MAX_CHARS, access_reply, decode_access,
+                    };
+                    use crate::mesh::test_support::{
+                        ACCESS_PATH, AdmittedRequest, Handler, RefusalCode, Reply,
+                    };
+                    use async_trait::async_trait;
+                    use std::sync::atomic::{AtomicBool, Ordering};
+
+                    /// The stub's `/access`: keeps every request that reaches it and
+                    /// answers with the outcome set, or not at all while none is. A held
+                    /// stub answers only once released.
+                    #[derive(Default)]
+                    struct ScriptedAccess {
+                        answer: Mutex<Option<AccessOutcome>>,
+                        asked: Mutex<Vec<ValidAccess>>,
+                        held: AtomicBool,
+                        release: tokio::sync::Notify,
+                    }
+
+                    impl ScriptedAccess {
+                        fn answer(&self, outcome: AccessOutcome) {
+                            *self.answer.lock() = Some(outcome);
+                        }
+
+                        fn hold(&self) {
+                            self.held.store(true, Ordering::SeqCst);
+                        }
+
+                        fn release(&self) {
+                            self.release.notify_one();
+                        }
+
+                        fn asked(&self) -> Vec<ValidAccess> {
+                            self.asked.lock().clone()
+                        }
+                    }
+
+                    #[async_trait]
+                    impl Handler for ScriptedAccess {
+                        async fn handle(&self, request: AdmittedRequest) -> Reply {
+                            let Ok(access) = decode_access(&request.body) else {
+                                return Reply::Code(RefusalCode::InvalidData);
+                            };
+                            let id = access.id.clone();
+                            self.asked.lock().push(access);
+                            if self.held.load(Ordering::SeqCst) {
+                                self.release.notified().await;
+                            }
+                            match &*self.answer.lock() {
+                                Some(outcome) => Reply::Value(access_reply(&id, outcome)),
+                                None => Reply::Silent,
+                            }
+                        }
+                    }
+
+                    async fn fixture(tag: &str) -> (PeerFixture, Arc<ScriptedAccess>) {
+                        let fx = PeerFixture::new(tag).await;
+                        let access = Arc::new(ScriptedAccess::default());
+                        fx.stub.serve(ACCESS_PATH, access.clone());
+                        (fx, access)
+                    }
+
+                    fn assert_nothing_asked(fx: &PeerFixture, access: &ScriptedAccess) {
+                        assert!(access.asked().is_empty(), "{:?}", access.asked());
+                        assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
+                        assert!(fx.ctx.app.mesh.correlations().list().is_empty());
+                    }
+
+                    /// What `line` printed to stdout once its request reached the stub,
+                    /// with the one request the stub was asked.
+                    async fn sent(
+                        fx: &mut PeerFixture,
+                        access: &ScriptedAccess,
+                        line: &str,
+                    ) -> (Vec<String>, ValidAccess) {
+                        let before = stdout_lines().len();
+                        let asked_before = access.asked().len();
+                        run(&mut fx.ctx, line).await.unwrap();
+                        let asked = access.asked();
+                        assert_eq!(asked.len(), asked_before + 1, "{line}: {asked:?}");
+                        (
+                            stdout_lines()[before..].to_vec(),
+                            asked[asked_before].clone(),
+                        )
+                    }
+
+                    /// The progress line is followed by the blank line that parts it from
+                    /// the outcome, which is the last line printed.
+                    fn outcome_after_progress(out: &[String], progress: &str) -> String {
+                        let at = index_of(out, progress);
+                        assert_eq!(out[at], progress, "{out:?}");
+                        assert_eq!(out[at + 1], "", "{out:?}");
+                        out.last().unwrap().clone()
+                    }
+
+                    /// Every request the peer would refuse is refused on the line, before
+                    /// the prompt and before the verb prints anything (a route wait
+                    /// would), and nothing reaches the peer.
+                    #[test]
+                    #[serial]
+                    fn a_request_the_peer_would_refuse_is_refused_before_the_prompt() {
+                        let _guard = TestConfigDirGuard::new("repl-mesh-request-refused");
+                        let _capture = capture::install();
+                        let _script = prompt_script::install(&[]);
+                        run_async(async {
+                            let (mut fx, access) = fixture("repl-mesh-request-refused").await;
+                            let to = fx.stub.destination_hex();
+                            let runtime = fx.started.runtime.clone();
+                            let (untrusted, identity) =
+                                heard_peer(&runtime, "Uma", SystemTime::now());
+                            let verdict = runtime.trust().authorize(&identity, &untrusted);
+                            let standing = runtime.trust().identity_standing(&identity);
+                            let untrusted_refusal = trust_refusal(
+                                &untrusted,
+                                verdict,
+                                standing,
+                                &request_refusal_tail(&untrusted, None),
+                            )
+                            .unwrap();
+                            assert!(
+                                untrusted_refusal.contains(&format!("`.mesh trust {untrusted}`")),
+                                "{untrusted_refusal}"
+                            );
+                            let seventeen: Vec<String> =
+                                (0..=ACCESS_MAX_PATHS).map(|n| format!("p{n}.md")).collect();
+                            let long_reason = "x".repeat(ACCESS_REASON_MAX_CHARS + 1);
+                            let not_a_wire_path = "The access request was not sent: a path is not a wire path. Spell each path relative to the peer's share root, /-separated, as mesh__list shows it or the peer's own .mesh shares --effective --all prints it.";
+                            for (line, expected) in [
+                                (
+                                    format!(".mesh request {to} {} --yes", seventeen.join(" ")),
+                                    format!(
+                                        "The access request was not sent: it names 17 paths and a request carries at most {ACCESS_MAX_PATHS}. Ask for at most {ACCESS_MAX_PATHS} paths per request."
+                                    ),
+                                ),
+                                (
+                                    format!(".mesh request {to} a.md --reason \"{long_reason}\""),
+                                    AccessError::Invalid("reason is longer than the cap allows")
+                                        .to_string(),
+                                ),
+                                (
+                                    format!(".mesh request {to} ../x"),
+                                    not_a_wire_path.to_string(),
+                                ),
+                                (
+                                    format!(".mesh request {to} /docs/a.md"),
+                                    not_a_wire_path.to_string(),
+                                ),
+                                (
+                                    format!(".mesh request {untrusted} a.md --yes"),
+                                    untrusted_refusal,
+                                ),
+                            ] {
+                                let before = stdout_lines().len();
+                                assert_eq!(refusal(&mut fx.ctx, &line).await, expected, "{line}");
+                                assert_eq!(stdout_lines().len(), before, "{line}");
+                            }
+                            assert_eq!(prompt_script::prompts_asked(), 0);
+                            assert!(
+                                AccessError::Invalid("reason is longer than the cap allows")
+                                    .to_string()
+                                    .ends_with("Shorten the reason to at most 500 characters.")
+                            );
+                            assert_nothing_asked(&fx, &access);
+                            fx.stop().await;
+                        });
+                    }
+
+                    /// A destination whose identity is blocked is not lifted by trusting
+                    /// the destination alone, so the refusal names the unblock first.
+                    #[test]
+                    #[serial]
+                    fn a_request_to_a_blocked_identity_names_the_unblock_and_sends_nothing() {
+                        use crate::mesh::trust::LiveMesh;
+
+                        let _guard = TestConfigDirGuard::new("repl-mesh-request-blocked");
+                        let _capture = capture::install();
+                        let _script = prompt_script::install(&[]);
+                        run_async(async {
+                            let (mut fx, access) = fixture("repl-mesh-request-blocked").await;
+                            let runtime = fx.started.runtime.clone();
+                            let now = SystemTime::now();
+                            let (blocked, identity) = heard_peer(&runtime, "Sly", now);
+                            let slot: &dyn LiveMesh = fx.ctx.app.mesh.as_ref();
+                            runtime
+                                .trust()
+                                .block_identity(slot, &identity, None, now)
+                                .unwrap();
+                            let verdict = runtime.trust().authorize(&identity, &blocked);
+                            assert_eq!(verdict.rule, Rule::IdentityBlocked);
+                            let standing = runtime.trust().identity_standing(&identity);
+                            let expected = trust_refusal(
+                                &blocked,
+                                verdict,
+                                standing,
+                                &request_refusal_tail(&blocked, Some(&identity)),
+                            )
+                            .unwrap();
+                            let before = stdout_lines().len();
+
+                            let err = refusal(
+                                &mut fx.ctx,
+                                &format!(".mesh request {blocked} a.md --yes"),
+                            )
+                            .await;
+
+                            assert_eq!(err, expected);
+                            assert!(
+                                err.ends_with(&format!(
+                                    "`.mesh unblock --identity {identity}` and then `.mesh trust {blocked}` trust it."
+                                )),
+                                "{err}"
+                            );
+                            assert_eq!(stdout_lines().len(), before);
+                            assert_eq!(prompt_script::prompts_asked(), 0);
+                            assert_nothing_asked(&fx, &access);
+                            fx.stop().await;
+                        });
+                    }
+
+                    #[test]
+                    #[serial]
+                    fn without_a_terminal_the_request_names_yes_and_asks_nothing() {
+                        let _guard = TestConfigDirGuard::new("repl-mesh-request-no-tty");
+                        let _capture = capture::install();
+                        let _script = prompt_script::install_non_interactive();
+                        run_async(async {
+                            let (mut fx, access) = fixture("repl-mesh-request-no-tty").await;
+                            let to = fx.stub.destination_hex();
+
+                            let err =
+                                refusal(&mut fx.ctx, &format!(".mesh request {to} a.md")).await;
+
+                            assert_eq!(
+                                err,
+                                format!(
+                                    "Ask {} for 1 path(s): a.md? Standard input is not a terminal, so there is no prompt to answer; pass --yes to confirm.",
+                                    fx.dest()
+                                )
+                            );
+                            assert_nothing_asked(&fx, &access);
+                            fx.stop().await;
+                        });
+                    }
+
+                    /// The prompt lists every path once, in the order typed, and a no
+                    /// sends nothing.
+                    #[test]
+                    #[serial]
+                    fn the_prompt_lists_each_path_once_and_a_no_sends_nothing() {
+                        let _guard = TestConfigDirGuard::new("repl-mesh-request-declined");
+                        let _capture = capture::install();
+                        let asked = Arc::new(Mutex::new(Vec::new()));
+                        let heard = asked.clone();
+                        let _script = prompt_script::install_answering(move |question| {
+                            heard.lock().push(question.to_string());
+                            false
+                        });
+                        run_async(async {
+                            let (mut fx, access) = fixture("repl-mesh-request-declined").await;
+                            let to = fx.stub.destination_hex();
+
+                            for line in [
+                                format!(".mesh request {to} a.md b.md --reason \"need both\""),
+                                format!(".mesh request {to} a.md a.md"),
+                            ] {
+                                let out = out_of(&mut fx.ctx, &line).await.unwrap();
+                                assert_eq!(out, "Nothing was sent.", "{line}");
+                            }
+
+                            assert_eq!(
+                                *asked.lock(),
+                                [
+                                    format!("Ask {} for 2 path(s): a.md, b.md?", fx.dest()),
+                                    format!("Ask {} for 1 path(s): a.md?", fx.dest()),
+                                ]
+                            );
+                            assert_nothing_asked(&fx, &access);
+                            fx.stop().await;
+                        });
+                    }
+
+                    /// A request left pending prints its id and keeps its correlation
+                    /// open, so the decision reply is matched when it comes.
+                    #[test]
+                    #[serial]
+                    fn a_pending_request_prints_its_id_and_stays_open() {
+                        let _guard = TestConfigDirGuard::new("repl-mesh-request-pending");
+                        let _capture = capture::install();
+                        let _script = prompt_script::install(&[]);
+                        run_async(async {
+                            let (mut fx, access) = fixture("repl-mesh-request-pending").await;
+                            access.answer(AccessOutcome::Pending);
+                            let to = fx.stub.destination_hex();
+
+                            let (out, asked) = sent(
+                                &mut fx,
+                                &access,
+                                &format!(".mesh request {to} docs/a.md --reason \"need it\" --yes"),
+                            )
+                            .await;
+
+                            assert_eq!(asked.paths, ["docs/a.md"]);
+                            assert_eq!(asked.reason, "need it");
+                            assert_eq!(
+                                outcome_after_progress(
+                                    &out,
+                                    &format!(
+                                        "Asking {} for 1 path(s); Ctrl-C cancels...",
+                                        fx.dest()
+                                    )
+                                ),
+                                format!(
+                                    "request {} to {}: pending (the decision arrives as an idle line; .mesh inbox lists it)",
+                                    short(&asked.id),
+                                    fx.dest()
+                                )
+                            );
+                            assert!(fx.ctx.app.mesh.correlations().is_open(&asked.id));
+                            fx.stop().await;
+                        });
+                    }
+
+                    /// A grant names the fetch for the first path and counts the rest; a
+                    /// path typed twice is asked for once; an expiry this node cannot read
+                    /// is said so rather than shown.
+                    #[test]
+                    #[serial]
+                    fn a_grant_names_the_fetch_and_a_repeated_path_is_asked_once() {
+                        let _guard = TestConfigDirGuard::new("repl-mesh-request-granted");
+                        let _capture = capture::install();
+                        let _script = prompt_script::install(&[]);
+                        run_async(async {
+                            let (mut fx, access) = fixture("repl-mesh-request-granted").await;
+                            access.answer(AccessOutcome::Granted {
+                                expires: 1_790_000_900.0,
+                            });
+                            let to = fx.stub.destination_hex();
+                            let dest = fx.dest();
+                            let until = rfc3339_utc(
+                                SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_900),
+                            );
+
+                            let (out, asked) = sent(
+                                &mut fx,
+                                &access,
+                                &format!(".mesh request {to} docs/a.md docs/a.md --yes"),
+                            )
+                            .await;
+                            assert_eq!(asked.paths, ["docs/a.md"]);
+                            assert_eq!(
+                                outcome_after_progress(
+                                    &out,
+                                    &format!("Asking {dest} for 1 path(s); Ctrl-C cancels...")
+                                ),
+                                format!(
+                                    "request {} to {dest}: granted until {until}: .mesh fetch {dest} docs/a.md",
+                                    short(&asked.id)
+                                )
+                            );
+                            assert!(fx.ctx.app.mesh.correlations().get(&asked.id).is_none());
+
+                            let (out, asked) = sent(
+                                &mut fx,
+                                &access,
+                                &format!(".mesh request {to} docs/a.md docs/b.md src/c.rs --yes"),
+                            )
+                            .await;
+                            assert_eq!(asked.paths, ["docs/a.md", "docs/b.md", "src/c.rs"]);
+                            assert_eq!(
+                                outcome_after_progress(
+                                    &out,
+                                    &format!("Asking {dest} for 3 path(s); Ctrl-C cancels...")
+                                ),
+                                format!(
+                                    "request {} to {dest}: granted until {until}: .mesh fetch {dest} docs/a.md, then the same for the other 2 path(s).",
+                                    short(&asked.id)
+                                )
+                            );
+
+                            access.answer(AccessOutcome::Granted { expires: -1.0 });
+                            let (out, asked) = sent(
+                                &mut fx,
+                                &access,
+                                &format!(".mesh request {to} docs/a.md --yes"),
+                            )
+                            .await;
+                            assert_eq!(
+                                out.last().unwrap(),
+                                &format!(
+                                    "request {} to {dest}: granted, until a time this node cannot read: .mesh fetch {dest} docs/a.md",
+                                    short(&asked.id)
+                                )
+                            );
+                            fx.stop().await;
+                        });
+                    }
+
+                    /// A refused request says what to wait for and leaves neither a
+                    /// correlation nor a pending-access claim behind.
+                    #[test]
+                    #[serial]
+                    fn a_refused_request_says_what_to_wait_for_and_leaves_nothing_open() {
+                        let _guard = TestConfigDirGuard::new("repl-mesh-request-refused-reply");
+                        let _capture = capture::install();
+                        let _script = prompt_script::install(&[]);
+                        run_async(async {
+                            let (mut fx, access) = fixture("repl-mesh-request-refused-reply").await;
+                            let to = fx.stub.destination_hex();
+                            let dest = fx.dest();
+                            for (refusal, expected) in [
+                                (
+                                    AccessRefusal::Duplicate,
+                                    format!(
+                                        "refused: this request is already waiting with {dest}; wait for its decision (it arrives as an idle line)."
+                                    ),
+                                ),
+                                (
+                                    AccessRefusal::TooManyPending,
+                                    format!(
+                                        "refused: {dest} holds as many of your requests as it allows; wait for a decision on one, then ask again."
+                                    ),
+                                ),
+                            ] {
+                                access.answer(AccessOutcome::Refused(refusal));
+                                let (out, asked) = sent(
+                                    &mut fx,
+                                    &access,
+                                    &format!(".mesh request {to} docs/a.md --yes"),
+                                )
+                                .await;
+                                assert_eq!(
+                                    out.last().unwrap(),
+                                    &format!("request {} to {dest}: {expected}", short(&asked.id)),
+                                    "{refusal:?}"
+                                );
+                                assert!(
+                                    fx.ctx.app.mesh.correlations().list().is_empty(),
+                                    "{refusal:?}"
+                                );
+                                assert_eq!(
+                                    fx.started
+                                        .runtime
+                                        .memory()
+                                        .claim_count(&fx.stub.identity_hex()),
+                                    0,
+                                    "{refusal:?}"
+                                );
+                            }
+                            fx.stop().await;
+                        });
+                    }
+
+                    /// Ctrl-C once the request is on its way ends the wait for the reply
+                    /// and says the request may still land; its correlation stays open so
+                    /// a decision that does come is still matched, and the send itself runs
+                    /// on, so a reply that comes after the interrupt is still settled.
+                    #[test]
+                    #[serial]
+                    fn ctrl_c_after_the_send_says_the_request_may_still_reach_the_peer() {
+                        let _guard = TestConfigDirGuard::new("repl-mesh-request-ctrl-c");
+                        let _capture = capture::install();
+                        let _script = prompt_script::install(&[]);
+                        run_async(async {
+                            let (mut fx, access) = fixture("repl-mesh-request-ctrl-c").await;
+                            access.answer(AccessOutcome::Refused(AccessRefusal::Duplicate));
+                            access.hold();
+                            let to = fx.stub.destination_hex();
+                            let signal = create_abort_signal();
+                            let pressed = signal.clone();
+                            let reached = access.clone();
+                            tokio::spawn(async move {
+                                wait_until("the request to reach the stub", || {
+                                    !reached.asked().is_empty()
+                                })
+                                .await;
+                                pressed.set_ctrlc();
+                            });
+                            let before = stdout_lines().len();
+
+                            let outcome = Box::pin(run_repl_command(
+                                &mut fx.ctx,
+                                signal,
+                                &format!(".mesh request {to} docs/a.md --yes"),
+                            ))
+                            .await;
+
+                            assert!(outcome.is_ok(), "{outcome:?}");
+                            let out = stdout_lines()[before..].to_vec();
+                            let asking = index_of(
+                                &out,
+                                &format!("Asking {} for 1 path(s); Ctrl-C cancels...", fx.dest()),
+                            );
+                            assert_eq!(
+                                out[asking + 1..],
+                                [
+                                    String::new(),
+                                    format!(
+                                        "Request interrupted; it may still reach {}. If it does, the decision arrives as an idle line; .mesh inbox lists it.",
+                                        fx.dest()
+                                    )
+                                ]
+                            );
+                            let asked = access.asked();
+                            assert_eq!(asked.len(), 1, "{asked:?}");
+                            let id = asked[0].id.clone();
+                            assert!(fx.ctx.app.mesh.correlations().is_open(&id));
+
+                            access.release();
+                            let identity = fx.stub.identity_hex();
+                            wait_until("the late refusal to close the request", || {
+                                !fx.ctx.app.mesh.correlations().is_open(&id)
+                                    && fx.started.runtime.memory().claim_count(&identity) == 0
+                            })
+                            .await;
+                            fx.stop().await;
+                        });
+                    }
+                }
+
                 mod command_prefix_paths {
                     use super::*;
                     use crate::config::live_prefix_override;
@@ -35067,6 +36354,35 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         let mut ids = fx.pending_ids();
                         ids.sort();
                         assert_eq!(ids, ["a-1", "a-2"]);
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
+                /// A private key below the root is caught by the built-in deny even with no
+                /// deny rule of the owner's, so a grant for it is refused the same way.
+                #[test]
+                #[serial]
+                fn granting_a_request_for_a_built_in_denied_key_file_is_refused_with_the_rule() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-grant-key-file");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-grant-key-file").await;
+                        let root = fx.root.path.clone();
+                        fs::create_dir_all(root.join("src/vault")).unwrap();
+                        fs::write(root.join("src/vault/id_rsa"), "KEY\n").unwrap();
+                        fx.file("a-1", InboundKind::Access, &["src/vault/id_rsa"]);
+
+                        let printed = stdout_lines().len();
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh grant a-1").await,
+                            "`src/vault/id_rsa` would not be served even once granted (the built-in deny names it); refuse the request with `.mesh refuse a-1`, or lift the rule first."
+                        );
+                        assert_eq!(stdout_lines().len(), printed);
+                        assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
+                        assert!(fx.grants().is_empty(), "{:?}", fx.grants());
+                        assert_eq!(fx.pending_ids(), ["a-1"]);
                         assert_eq!(prompt_script::prompts_asked(), 0);
                         fx.stop().await;
                     });
@@ -41994,6 +43310,15 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             (
                                 format!(".mesh fetch {unheard} docs/a.md"),
                                 unheard_refusal(&runtime, &unheard, FETCH_REFUSAL_TAIL).to_string(),
+                            ),
+                            (
+                                format!(".mesh request {unheard} docs/a.md"),
+                                unheard_refusal(
+                                    &runtime,
+                                    &unheard,
+                                    &request_refusal_tail(&unheard, None),
+                                )
+                                .to_string(),
                             ),
                             (
                                 ".mesh fetch stub docs/a.md".to_string(),

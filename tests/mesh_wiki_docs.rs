@@ -298,7 +298,7 @@ fn every_verb_row_in_the_wiki_table_matches_the_repl_verbs_table() {
     let verbs = repl_verbs();
     assert_eq!(
         verbs.len(),
-        29,
+        30,
         "parsed {} VERBS rows from src/repl/mesh.rs; if the table grew, update this count",
         verbs.len()
     );
@@ -4510,19 +4510,19 @@ fn the_knocks_and_shares_samples_use_the_code_table_headers() {
 /// a progress line, an empty line, then the result, naming each such verb; each of those
 /// verbs calls `result_follows` in the code, as does `route_to` after the path-request
 /// line the bullet names (`dismiss` dispatches to `dismiss_one` and `dismiss_all`, each
-/// printing its own); and wherever the Commands page (the File Sharing page too, for grant and fetch)
-/// quotes a progress line it is the one the code prints, placeholders filled as the
-/// pages spell them, followed by `, then an empty line, then`. The code side is checked
-/// on every run.
+/// printing its own, and `request` hands its wait to `send_request`); and wherever the
+/// Commands page (the File Sharing page too, for grant, request and fetch) quotes a
+/// progress line it is the one the code prints, placeholders filled as the pages spell
+/// them, followed by `, then an empty line, then`. The code side is checked on every run.
 #[test]
 fn the_commands_page_states_the_blank_line_convention_and_its_progress_samples_follow_it() {
     let waiting_verbs = [
-        "status", "sync", "knock", "fetch", "answer", "dismiss", "grant", "refuse",
+        "status", "sync", "knock", "request", "fetch", "answer", "dismiss", "grant", "refuse",
     ];
     for verb in waiting_verbs
         .into_iter()
-        .filter(|verb| *verb != "dismiss")
-        .chain(["dismiss_one", "dismiss_all", "route_to"])
+        .filter(|verb| !matches!(*verb, "dismiss" | "request"))
+        .chain(["dismiss_one", "dismiss_all", "send_request", "route_to"])
     {
         assert!(
             fn_body("src/repl/mesh.rs", verb).contains("result_follows();"),
@@ -4541,6 +4541,7 @@ fn the_commands_page_states_the_blank_line_convention_and_its_progress_samples_f
     let sync = progress_line("sync", "; Ctrl-C cancels...");
     let knock = progress_line("knock", "Knocking on {}; Ctrl-C cancels...");
     let fetch = progress_line("fetch", "over the mesh (up to {} s)...");
+    let request = progress_line("send_request", "path(s); Ctrl-C cancels...");
     let sending = progress_line("sending_notice", "over the mesh...");
     let declining = progress_line("declining_notice", "that you declined over the mesh...");
     let route = progress_line(
@@ -4566,6 +4567,18 @@ fn the_commands_page_states_the_blank_line_convention_and_its_progress_samples_f
     assert!(
         fetch.contains("{shown}") && fetch.contains("{peer}") && fetch.matches("{}").count() == 1,
         "the fetch progress line fills the path, the peer and the timeout: {fetch:?}"
+    );
+    assert_eq!(
+        request.matches("{}").count(),
+        2,
+        "the request progress line fills the destination and the path count: {request:?}"
+    );
+    // The destination comes first and the count second, as the pages spell them.
+    let request_span = format!(
+        "`{}`",
+        request
+            .replacen("{}", "<dest8>", 1)
+            .replacen("{}", "<n>", 1)
     );
     let fetch_secs = const_secs("src/mesh/fetch.rs", "FILE_FETCH_REQUEST_TIMEOUT").to_string();
     let fetch_span = |shown: &str| {
@@ -4621,6 +4634,7 @@ fn the_commands_page_states_the_blank_line_convention_and_its_progress_samples_f
                 span(&status),
                 span(&sync),
                 span(&knock),
+                request_span.clone(),
                 fetch_span("<path>"),
                 span(&sending),
                 span(&declining),
@@ -4631,6 +4645,7 @@ fn the_commands_page_states_the_blank_line_convention_and_its_progress_samples_f
             "Mesh-File-Sharing.md",
             flat(&read(wiki.join("Mesh-File-Sharing.md"))),
             vec![
+                request_span.clone(),
                 fetch_span("docs/guide.md"),
                 span(&sending),
                 route_span.clone(),
