@@ -98,9 +98,11 @@ fn scrub(text: &str, keep_sgr: bool) -> String {
 /// The SGR parameter list without conceal (8); None when nothing but
 /// conceal was asked for. The arguments of an extended colour (`38;5;n`,
 /// `38;2;r;g;b` and the 48/58 twins) are carried over untouched, so a
-/// colour index of 8 is not mistaken for the attribute.
+/// colour index of 8 is not mistaken for the attribute. Parameters are
+/// compared as numbers, so a leading zero (`08`) is conceal as well.
 fn without_conceal(params: &str) -> Option<String> {
-    if !params.split(';').any(|p| p == "8") {
+    let is_conceal = |p: &str| p.parse::<u32>() == Ok(8);
+    if !params.split(';').any(is_conceal) {
         return Some(params.to_string());
     }
     let parts: Vec<&str> = params.split(';').collect();
@@ -108,13 +110,13 @@ fn without_conceal(params: &str) -> Option<String> {
     let mut i = 0;
     while i < parts.len() {
         let part = parts[i];
-        let span = match part {
-            "38" | "48" | "58" => match parts.get(i + 1) {
-                Some(&"5") => 3,
-                Some(&"2") => 5,
+        let span = match part.parse::<u32>() {
+            Ok(38 | 48 | 58) => match parts.get(i + 1).and_then(|p| p.parse::<u32>().ok()) {
+                Some(5) => 3,
+                Some(2) => 5,
                 _ => 1,
             },
-            "8" => {
+            Ok(8) => {
                 i += 1;
                 continue;
             }
@@ -406,6 +408,11 @@ mod tests {
             sanitize_ansi("\x1b[8;38;5;8;48;2;8;8;8mz"),
             "\x1b[38;5;8;48;2;8;8;8mz"
         );
+        // A leading zero is still conceal.
+        assert_eq!(sanitize_ansi("\x1b[08mhidden\x1b[0m"), "hidden\x1b[0m");
+        assert_eq!(sanitize_ansi("\x1b[1;08mx"), "\x1b[1mx");
+        let lines = preformatted_lines("\x1b[08mhidden\x1b[0m");
+        assert!(every_span(&lines).all(|span| !span.style.add_modifier.contains(Modifier::HIDDEN)));
     }
 
     /// A spinner frame caught in the fd capture: the cursor move and the
