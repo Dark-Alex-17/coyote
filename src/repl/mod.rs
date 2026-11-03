@@ -4905,7 +4905,10 @@ local_hello() {\n\
 
             assert_eq!(
                 provider_refusal_line(&err).as_deref(),
-                Some("The model declined to answer (provider refusal: no category given).")
+                Some(
+                    "The model declined to answer (provider refusal: no category given). \
+                     Rephrase the request or switch with .model <name>."
+                )
             );
         }
 
