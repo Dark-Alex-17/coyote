@@ -11170,6 +11170,222 @@ mod tests {
         relay.stop().await;
     }
 
+    /// First contact with a destination this node has not heard. The relay replays no
+    /// announce, so B, joining after A, learns A only by asking for it.
+    #[cfg(unix)]
+    mod first_contact_tests {
+        use super::*;
+        use crate::mesh::test_support::{closed_port, derived_sighting, wait_for_peer};
+
+        struct LateJoiner {
+            relay: TransportRelay,
+            a: StartedRuntime,
+            b: StartedRuntime,
+            slot_a: Arc<MeshSlot>,
+            slot_b: Arc<MeshSlot>,
+            to_a: String,
+            to_b: String,
+        }
+
+        impl LateJoiner {
+            /// A joins first and the relay files its announce; B joins second, so A hears
+            /// B announce and B has heard nothing of A.
+            async fn start(tag: &str) -> Self {
+                let relay = TransportRelay::start_on_with_retries(closed_port().await, 0).await;
+                let mut relay_announces = relay.announces().await;
+                let a = started_runtime_on(&format!("{tag}-a"), relay.port).await;
+                let to_a = a.runtime.current_destination_hash();
+                TransportRelay::heard_from(&mut relay_announces, &to_a).await;
+                let b = started_runtime_on(&format!("{tag}-b"), relay.port).await;
+                let to_b = b.runtime.current_destination_hash();
+                wait_for_peer(&a.runtime, &to_b).await;
+                let slot_a = Arc::new(MeshSlot::default());
+                slot_a.install(a.runtime.clone()).unwrap();
+                let slot_b = Arc::new(MeshSlot::default());
+                slot_b.install(b.runtime.clone()).unwrap();
+                let pair = Self {
+                    relay,
+                    a,
+                    b,
+                    slot_a,
+                    slot_b,
+                    to_a,
+                    to_b,
+                };
+                pair.assert_b_lacks_a().await;
+                pair
+            }
+
+            async fn assert_b_lacks_a(&self) {
+                assert!(
+                    self.b.runtime.peers().get(&self.to_a).is_none(),
+                    "B has no row for A"
+                );
+                assert!(
+                    !self.b.knows_identity_of(&self.to_a).await,
+                    "B's transport holds nothing of A"
+                );
+            }
+
+            fn identity_of_a(&self) -> String {
+                self.a
+                    .runtime
+                    .transport_identity
+                    .address_hash()
+                    .to_hex_string()
+            }
+
+            async fn stop(self) {
+                self.slot_b.stop().await.unwrap();
+                self.slot_a.stop().await.unwrap();
+                self.relay.stop().await;
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_unheard_destination_is_asked_for_filed_trusted_and_answers_status_both_ways()
+        {
+            let pair = LateJoiner::start("first-contact-trust").await;
+
+            let asked = Instant::now();
+            let row = pair
+                .b
+                .runtime
+                .peer_asking_if_unheard(&pair.to_a)
+                .await
+                .expect("the relay answers the path request with A's announce");
+            assert!(
+                asked.elapsed() < PATH_REQUEST_TIMEOUT + Duration::from_secs(1),
+                "one path request and a short grace: {:?}",
+                asked.elapsed()
+            );
+            assert_eq!(row.destination_hash, pair.to_a);
+            assert_eq!(row.identity_hash, pair.identity_of_a());
+            assert!(pair.b.runtime.peers().get(&pair.to_a).is_some());
+
+            pair.b
+                .runtime
+                .trust()
+                .trust_destination(
+                    pair.slot_b.as_ref(),
+                    &pair.to_a,
+                    TrustOptions::default(),
+                    SystemTime::now(),
+                )
+                .expect("B trusts A once the row is filed");
+            status_round_trip(&pair.slot_b, &pair.slot_a).await;
+            status_round_trip(&pair.slot_a, &pair.slot_b).await;
+            pair.stop().await;
+        }
+
+        /// A send to an unheard instance of an identity trusted for all destinations asks
+        /// for it, then judges the identity the answer carries.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_send_to_an_unheard_instance_of_a_trusted_identity_asks_and_is_delivered() {
+            let pair = LateJoiner::start("first-contact-send").await;
+            pair.b
+                .runtime
+                .trust()
+                .trust_identity(
+                    pair.slot_b.as_ref(),
+                    &pair.identity_of_a(),
+                    TrustOptions::default(),
+                    SystemTime::now(),
+                )
+                .unwrap();
+            pair.a
+                .runtime
+                .trust()
+                .trust_destination(
+                    pair.slot_a.as_ref(),
+                    &pair.to_b,
+                    TrustOptions::default(),
+                    SystemTime::now(),
+                )
+                .unwrap();
+
+            let message =
+                OutboundPeer::new(PeerKind::Message, "first contact", None, None, None).unwrap();
+            let outcome = pair.b.runtime.send_peer(&pair.to_a, &message).await;
+            assert!(outcome.is_ok(), "the send reached A: {outcome:?}");
+            assert!(pair.b.runtime.peers().get(&pair.to_a).is_some());
+            pair.stop().await;
+        }
+
+        /// With no grant that could cover the destination, or with the destination
+        /// blocked, a send is refused before any path request: it returns at once and B
+        /// still holds nothing of A.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_send_no_grant_could_allow_is_refused_without_asking() {
+            let pair = LateJoiner::start("first-contact-refused").await;
+            let message =
+                OutboundPeer::new(PeerKind::Message, "first contact", None, None, None).unwrap();
+            let refused = |outcome: Result<SendOutcome, SendError>| {
+                assert!(
+                    matches!(outcome, Err(SendError::NotTrusted { .. })),
+                    "{outcome:?}"
+                );
+            };
+
+            let asked = Instant::now();
+            refused(pair.b.runtime.send_peer(&pair.to_a, &message).await);
+            assert!(asked.elapsed() < Duration::from_secs(1), "{:?}", asked.elapsed());
+            pair.assert_b_lacks_a().await;
+
+            let trust = pair.b.runtime.trust();
+            trust
+                .trust_identity(
+                    pair.slot_b.as_ref(),
+                    &pair.identity_of_a(),
+                    TrustOptions::default(),
+                    SystemTime::now(),
+                )
+                .unwrap();
+            trust
+                .deny_destination(
+                    pair.slot_b.as_ref(),
+                    &pair.to_a,
+                    None,
+                    SystemTime::now(),
+                    false,
+                )
+                .unwrap();
+            let asked = Instant::now();
+            refused(pair.b.runtime.send_peer(&pair.to_a, &message).await);
+            assert!(asked.elapsed() < Duration::from_secs(1), "{:?}", asked.elapsed());
+            pair.assert_b_lacks_a().await;
+            pair.stop().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_destination_nothing_answers_for_is_given_up_within_the_path_request_bound() {
+            let relay = TransportRelay::start().await;
+            let started = started_runtime_on("first-contact-unreachable", relay.port).await;
+            let stranger =
+                derived_sighting("first-contact-unreachable-stranger", None).destination_hash;
+
+            let asked = Instant::now();
+            assert!(
+                started
+                    .runtime
+                    .peer_asking_if_unheard(&stranger)
+                    .await
+                    .is_none()
+            );
+            let waited = asked.elapsed();
+            assert!(
+                waited >= PATH_REQUEST_TIMEOUT && waited < PATH_REQUEST_TIMEOUT + Duration::from_secs(2),
+                "{waited:?}"
+            );
+            assert!(started.runtime.peers().get(&stranger).is_none());
+
+            let slot = Arc::new(MeshSlot::default());
+            slot.install(started.runtime.clone()).unwrap();
+            slot.stop().await.unwrap();
+            relay.stop().await;
+        }
+    }
+
     /// The peer table is no gate on resolving: a destination the transport does not hold
     /// is asked for once, row or no row. The cached twin a listing uses returns `None` at
     /// once for either, so a sweep over silent peers never pays the path-request wait.

@@ -9178,6 +9178,119 @@ mod tests {
             started.relay_handle.abort();
         }
 
+        /// A tool addressed to a destination this node has not heard may ask the mesh for
+        /// it only when the trust list could allow it; otherwise the refusal comes before
+        /// any path request, so a model cannot send path requests at will.
+        mod first_contact_tests {
+            use super::*;
+            use crate::mesh::PATH_REQUEST_TIMEOUT;
+            use std::time::Instant;
+
+            fn calls(to: &str) -> Vec<(&'static str, Value)> {
+                vec![
+                    ("send", json!({"to": to, "message": "first contact"})),
+                    ("ask", json!({"to": to, "message": "first contact?"})),
+                    ("list", json!({"peer": to})),
+                    ("fetch", json!({"peer": to, "path": "docs/a.md"})),
+                    (
+                        "request_access",
+                        json!({"peer": to, "paths": ["docs/a.md"], "reason": "probe"}),
+                    ),
+                ]
+            }
+
+            async fn call(ctx: &mut RequestContext, tool: &str, args: &Value) -> (Value, Duration) {
+                let asked = Instant::now();
+                let result = handle_mesh_tool(ctx, &format!("{MESH_FUNCTION_PREFIX}{tool}"), args)
+                    .await
+                    .unwrap();
+                (result, asked.elapsed())
+            }
+
+            async fn refused_at_once(ctx: &mut RequestContext, to: &str, case: &str) {
+                for (tool, args) in calls(to) {
+                    let (result, waited) = call(ctx, tool, &args).await;
+                    assert_eq!(result["kind"], "not_trusted", "{case} {tool}: {result}");
+                    assert!(
+                        waited < Duration::from_secs(1),
+                        "{case} {tool}: no path request was waited on: {waited:?}"
+                    );
+                }
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[serial]
+            async fn an_unheard_destination_no_grant_could_allow_is_refused_before_any_path_request()
+             {
+                let _guard = TestConfigDirGuard::new("mesh-tool-first-contact-refused");
+                let started = started_runtime("mesh-tool-first-contact-refused").await;
+                let mut ctx = plain_ctx();
+                ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                let unheard = hex_lower(&[0x3c; 16]);
+
+                refused_at_once(&mut ctx, &unheard, "no grant").await;
+
+                let trust = started.runtime.trust();
+                let identity = derived_sighting("first-contact-owner", None).identity_hash;
+                trust
+                    .trust_identity(
+                        ctx.app.mesh.as_ref(),
+                        &identity,
+                        TrustOptions::default(),
+                        SystemTime::now(),
+                    )
+                    .unwrap();
+                trust
+                    .deny_destination(ctx.app.mesh.as_ref(), &unheard, None, SystemTime::now(), false)
+                    .unwrap();
+                refused_at_once(&mut ctx, &unheard, "blocked destination").await;
+
+                assert!(started.runtime.peers().get(&unheard).is_none());
+                assert!(ctx.app.mesh.correlations().list().is_empty());
+                assert!(ctx.app.mesh.stop().await.unwrap());
+                started.relay_handle.abort();
+            }
+
+            /// With an identity trusted for all destinations, an unheard destination may be
+            /// its instance, so each tool asks once; nothing answers here, so the tool waits
+            /// out the path request and reports the destination unreachable.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[serial]
+            async fn an_unheard_destination_an_identity_grant_could_cover_is_asked_for() {
+                let _guard = TestConfigDirGuard::new("mesh-tool-first-contact-asked");
+                let started = started_runtime("mesh-tool-first-contact-asked").await;
+                let mut ctx = plain_ctx();
+                ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                let identity = derived_sighting("first-contact-owner", None).identity_hash;
+                started
+                    .runtime
+                    .trust()
+                    .trust_identity(
+                        ctx.app.mesh.as_ref(),
+                        &identity,
+                        TrustOptions::default(),
+                        SystemTime::now(),
+                    )
+                    .unwrap();
+                let unheard = hex_lower(&[0x4b; 16]);
+
+                for (tool, args) in calls(&unheard) {
+                    let (result, waited) = call(&mut ctx, tool, &args).await;
+                    assert!(
+                        waited >= PATH_REQUEST_TIMEOUT,
+                        "{tool}: the destination was asked for: {waited:?} {result}"
+                    );
+                    assert_ne!(result["kind"], "not_trusted", "{tool}: {result}");
+                    if tool != "send" {
+                        assert_eq!(result["kind"], "unknown_destination", "{tool}: {result}");
+                    }
+                }
+
+                assert!(ctx.app.mesh.stop().await.unwrap());
+                started.relay_handle.abort();
+            }
+        }
+
         /// Serves `/fetch` the way the serving half does for `SHARED_PATH`, honouring
         /// `if_sha256` (a matching bin32 becomes `not_modified`), and records every `if_sha256`
         /// value it was handed so a test can tell which calls reached the wire at all.

@@ -19148,12 +19148,12 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             }
 
             /// `.mesh info <whole destination>` for a destination in neither the peer table
-            /// nor the knock cache names both places to look, in the one sentence; once
+            /// nor the knock cache asks the mesh for it and says nothing answered; once
             /// the cache cannot be read, the same lookup reports the cache rather than
-            /// claiming the destination was never heard from.
+            /// asking.
             #[test]
             #[serial]
-            fn info_on_a_destination_never_heard_from_names_both_places_to_look() {
+            fn info_on_a_destination_never_heard_from_asks_the_mesh_and_says_nothing_answered() {
                 use crate::mesh::hex_lower;
 
                 let _guard = TestConfigDirGuard::new("repl-mesh-info-unheard");
@@ -19168,12 +19168,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         .await
                         .unwrap_err()
                         .to_string();
-                    assert_eq!(
-                        err,
-                        format!(
-                            "Destination {unheard} has not been heard from: it is not in the peer table and has not knocked. Run `.mesh peers` or `.mesh knocks` to see who has."
-                        )
-                    );
+                    assert_eq!(err, unanswered_path_request(&unheard));
 
                     let cache_path = started.runtime.knock_gate().cache().path().to_path_buf();
                     std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
@@ -19184,7 +19179,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         .to_string();
                     assert!(err.contains("knock cache"), "{err}");
                     assert!(
-                        !err.contains("has not been heard from"),
+                        !err.contains("did not answer a path request"),
                         "an unreadable cache is reported, not read as silence: {err}"
                     );
 
@@ -26230,6 +26225,237 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();
                 });
+            }
+
+            /// The verbs that take one destination, typed on B for an A that joined first
+            /// on a relay that replays no announce: B asks the mesh once, the answer files
+            /// A, and the verb carries on as it would for a heard peer.
+            #[cfg(unix)]
+            mod first_contact_tests {
+                use super::*;
+                use crate::mesh::test_support::wait_for_peer;
+
+                struct LateJoiner {
+                    relay: TransportRelay,
+                    a: StartedRuntime,
+                    b: StartedRuntime,
+                    slot_a: Arc<MeshSlot>,
+                    ctx: RequestContext,
+                    to_a: String,
+                    to_b: String,
+                }
+
+                impl LateJoiner {
+                    async fn start(tag: &str) -> Self {
+                        let relay =
+                            TransportRelay::start_on_with_retries(closed_port().await, 0).await;
+                        let mut relay_announces = relay.announces().await;
+                        let a = started_runtime_on(&format!("{tag}-a"), relay.port).await;
+                        let to_a = a.runtime.current_destination_hash();
+                        TransportRelay::heard_from(&mut relay_announces, &to_a).await;
+                        let b = started_runtime_on(&format!("{tag}-b"), relay.port).await;
+                        let to_b = b.runtime.current_destination_hash();
+                        wait_for_peer(&a.runtime, &to_b).await;
+                        assert!(b.runtime.peers().get(&to_a).is_none(), "B has not heard A");
+                        let slot_a = Arc::new(MeshSlot::default());
+                        slot_a.install(a.runtime.clone()).unwrap();
+                        let ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(b.runtime.clone()).unwrap();
+                        Self {
+                            relay,
+                            a,
+                            b,
+                            slot_a,
+                            ctx,
+                            to_a,
+                            to_b,
+                        }
+                    }
+
+                    fn waiting_line(&self) -> String {
+                        format!(
+                            "Asking the mesh for {}'s announce; Ctrl-C cancels...",
+                            short(&self.to_a)
+                        )
+                    }
+
+                    /// Runs `line` on B, which must ask for A once, within the path-request
+                    /// bound and a short grace, and file it.
+                    async fn asks_for_a(&mut self, line: &str) -> Result<String> {
+                        let asked = Instant::now();
+                        let out = out_of(&mut self.ctx, line).await;
+                        assert!(
+                            asked.elapsed() < PATH_REQUEST_TIMEOUT + Duration::from_secs(3),
+                            "{line}: {:?}",
+                            asked.elapsed()
+                        );
+                        assert!(
+                            self.b.runtime.peers().get(&self.to_a).is_some(),
+                            "{line}: B filed A from the path response"
+                        );
+                        out
+                    }
+
+                    fn a_trusts_b(&self) {
+                        self.a
+                            .runtime
+                            .trust()
+                            .trust_destination(
+                                self.slot_a.as_ref(),
+                                &self.to_b,
+                                TrustOptions::default(),
+                                SystemTime::now(),
+                            )
+                            .unwrap();
+                    }
+
+                    async fn stop(self) {
+                        assert!(self.ctx.app.mesh.stop().await.unwrap());
+                        assert!(self.slot_a.stop().await.unwrap());
+                        self.relay.stop().await;
+                    }
+                }
+
+                #[test]
+                #[serial]
+                fn trust_of_an_unheard_destination_asks_for_it_and_status_then_works_both_ways() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-first-contact-trust");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = LateJoiner::start("repl-first-contact-trust").await;
+                        let to_a = fx.to_a.clone();
+                        let out = fx
+                            .asks_for_a(&format!(".mesh trust {to_a} --yes"))
+                            .await
+                            .unwrap();
+                        assert!(out.contains(&fx.waiting_line()), "{out}");
+                        assert!(
+                            out.contains(&format!("Trusted {}", short(&to_a))),
+                            "{out}"
+                        );
+
+                        fx.a_trusts_b();
+                        out_of(&mut fx.ctx, &format!(".mesh status {to_a}"))
+                            .await
+                            .unwrap();
+                        status_round_trip(&fx.slot_a, &fx.ctx.app.mesh).await;
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn info_of_an_unheard_destination_asks_for_it_and_shows_the_row() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-first-contact-info");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let mut fx = LateJoiner::start("repl-first-contact-info").await;
+                        let to_a = fx.to_a.clone();
+                        let out = fx.asks_for_a(&format!(".mesh info {to_a}")).await.unwrap();
+                        assert!(out.contains(&fx.waiting_line()), "{out}");
+                        assert!(!info_rows(&out).is_empty(), "{out}");
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn knock_on_an_unheard_destination_asks_for_it_then_knocks() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-first-contact-knock");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = LateJoiner::start("repl-first-contact-knock").await;
+                        let to_a = fx.to_a.clone();
+                        let out = fx
+                            .asks_for_a(&format!(".mesh knock {to_a} --yes"))
+                            .await
+                            .unwrap();
+                        assert!(out.contains(&fx.waiting_line()), "{out}");
+                        fx.stop().await;
+                    });
+                }
+
+                /// `.mesh message` asks for the unheard destination, then applies the trust
+                /// check a heard peer gets; once trusted, the message is delivered.
+                #[test]
+                #[serial]
+                fn message_to_an_unheard_destination_asks_for_it_then_applies_trust() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-first-contact-message");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = LateJoiner::start("repl-first-contact-message").await;
+                        let to_a = fx.to_a.clone();
+                        let line = format!(".mesh message {to_a} hello");
+                        let err = fx.asks_for_a(&line).await.unwrap_err().to_string();
+                        assert!(err.ends_with(MESSAGE_REFUSAL_TAIL), "{err}");
+
+                        fx.a_trusts_b();
+                        out_of(&mut fx.ctx, &format!(".mesh trust {to_a} --yes"))
+                            .await
+                            .unwrap();
+                        out_of(&mut fx.ctx, &line).await.unwrap();
+                        fx.stop().await;
+                    });
+                }
+
+                /// A hash nothing answers for fails after one path request with the line
+                /// that says so; a blocked one is refused at once, with no waiting line.
+                #[test]
+                #[serial]
+                fn an_unanswered_hash_fails_within_the_bound_and_a_blocked_one_is_not_asked_for() {
+                    use crate::mesh::hex_lower;
+
+                    let _guard = TestConfigDirGuard::new("repl-mesh-first-contact-unanswered");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let started = started_runtime("repl-mesh-first-contact-unanswered").await;
+                        let mut ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                        let unheard = hex_lower(&[0x5d; 16]);
+                        assert_eq!(
+                            unanswered_path_request(&unheard),
+                            format!(
+                                "{} did not answer a path request within 5 s: it is not on any interface this node joined, or it is not announcing. Check the hash, or wait for its announce (`.mesh peers`).",
+                                short(&unheard)
+                            )
+                        );
+                        for line in [
+                            format!(".mesh trust {unheard} --yes"),
+                            format!(".mesh status {unheard}"),
+                        ] {
+                            let asked = Instant::now();
+                            assert_eq!(
+                                refusal(&mut ctx, &line).await,
+                                unanswered_path_request(&unheard),
+                                "{line}"
+                            );
+                            let waited = asked.elapsed();
+                            assert!(
+                                waited >= PATH_REQUEST_TIMEOUT
+                                    && waited < PATH_REQUEST_TIMEOUT + Duration::from_secs(3),
+                                "{line}: {waited:?}"
+                            );
+                        }
+                        assert!(ctx.app.mesh.get().unwrap().trust().records().is_empty());
+
+                        out_of(&mut ctx, &format!(".mesh block {unheard} --yes"))
+                            .await
+                            .unwrap();
+                        let printed = stdout_lines().len();
+                        let asked = Instant::now();
+                        let err = refusal(&mut ctx, &format!(".mesh info {unheard}")).await;
+                        assert!(asked.elapsed() < Duration::from_secs(1), "{:?}", asked.elapsed());
+                        assert!(err.ends_with(INFO_REFUSAL_TAIL), "{err}");
+                        assert_eq!(stdout_lines().len(), printed, "nothing was asked: {err}");
+
+                        assert!(ctx.app.mesh.stop().await.unwrap());
+                        started.relay_handle.abort();
+                    });
+                }
             }
 
             mod command_prefix_refusals {
@@ -41358,10 +41584,8 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         );
                         assert_eq!(
                             refusal(&mut fx.ctx, &format!(".mesh fetch {dest} docs/a.md")).await,
-                            format!(
-                                "Destination {dest} has not been heard from: it is not in the peer table. Only peers this node has heard announce can be contacted; check `.mesh peers`."
-                            ),
-                            "the verb refuses the swept destination before any request"
+                            unanswered_path_request(&dest),
+                            "the verb asks for the swept destination, nothing re-files it, and it is refused before any request"
                         );
                         assert!(fx.heard().is_empty(), "nothing reached the peer");
                         let out = out_of(
@@ -41470,10 +41694,6 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                 untrusted_refusal,
                             ),
                             (
-                                format!(".mesh fetch {unheard} docs/a.md"),
-                                unheard_refusal(&runtime, &unheard, FETCH_REFUSAL_TAIL).to_string(),
-                            ),
-                            (
                                 ".mesh fetch stub docs/a.md".to_string(),
                                 "'stub' is not a destination hash: expected a destination hash or a unique prefix of one `.mesh peers` lists (8 or more characters)."
                                     .to_string(),
@@ -41501,6 +41721,19 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             assert_eq!(refusal(&mut fx.ctx, &line).await, expected, "{line}");
                             assert_eq!(stdout_lines().len(), printed, "{line} prints nothing");
                         }
+                        let printed = stdout_lines().len();
+                        assert_eq!(
+                            refusal(&mut fx.ctx, &format!(".mesh fetch {unheard} docs/a.md")).await,
+                            unanswered_path_request(&unheard),
+                            "an unheard destination is asked for, and nothing answers"
+                        );
+                        assert_eq!(
+                            stdout_lines()[printed..].first(),
+                            Some(&format!(
+                                "Asking the mesh for {}'s announce; Ctrl-C cancels...",
+                                short(&unheard)
+                            ))
+                        );
                         assert!(fx.heard().is_empty(), "{:?}", fx.heard());
                         assert!(!fx.inbox_root().exists());
                         assert_eq!(prompt_script::prompts_asked(), 0);
