@@ -2652,6 +2652,23 @@ mod tests {
         );
     }
 
+    mod sentence_cut_tests {
+        use super::*;
+
+        #[test]
+        fn the_full_text_pointer_follows_a_cut_that_lands_after_a_sentence() {
+            let sentence = format!("{}.", "p".repeat(150));
+            let message = PeerMessage::new(RawPeerMessage {
+                content: format!("{sentence} {}", "q".repeat(20)),
+                ..raw("")
+            });
+            assert_eq!(
+                message.summary_line(Some("Bea")),
+                format!("Bea says: {}... (full text: .mesh inbox)", "p".repeat(150))
+            );
+        }
+    }
+
     #[test]
     fn outbound_refuses_over_long_text_and_bad_fields_and_mints_an_id() {
         let err = OutboundPeer::new(

@@ -222,7 +222,9 @@ pub(crate) const CUT_MARKER: &str = "...";
 /// sits outside the budget, like the pointer a caller appends after it. The whole text
 /// is cleaned before it is measured, so a control character or escape cannot push the
 /// marker off the line. The cut lands at the last whitespace at or before character
-/// `budget`; with no whitespace that early it lands at `budget` itself. Blank text is `None`.
+/// `budget`; with no whitespace that early it lands at `budget` itself. Periods ending
+/// the kept part give way to the marker, so a cut after a sentence never shows four or
+/// more dots. Blank text is `None`.
 pub(crate) fn capped_peer_text(text: &str, budget: usize) -> Option<CappedText> {
     let clean = display_text(text, usize::MAX)?;
     let Some((end, next)) = clean.char_indices().nth(budget) else {
@@ -237,7 +239,7 @@ pub(crate) fn capped_peer_text(text: &str, budget: usize) -> Option<CappedText> 
         None => &clean[..end],
     };
     Some(CappedText {
-        text: format!("{}{CUT_MARKER}", kept.trim_end()),
+        text: format!("{}{CUT_MARKER}", kept.trim_end().trim_end_matches('.')),
         cut: true,
     })
 }
@@ -1727,6 +1729,22 @@ mod tests {
             format!("{} {}...", "a".repeat(50), "b".repeat(50))
         );
         assert!(capped.cut);
+    }
+
+    mod sentence_cut_tests {
+        use super::*;
+
+        #[test]
+        fn a_cut_after_a_sentence_ends_in_three_dots_not_four() {
+            let sentence = format!("{}.", long_words(13));
+            let source = format!("{sentence} {}", long_words(10));
+            let capped = capped_peer_text(&source, 160).unwrap();
+            assert!(capped.cut);
+            assert_eq!(capped.text, format!("{}...", long_words(13)));
+            assert!(!capped.text.contains("...."), "{:?}", capped.text);
+            let capped = capped_peer_text("abcd... efgh", 8).unwrap();
+            assert_eq!(capped.text, "abcd...");
+        }
     }
 
     /// `untrusted_content::wrap` keeps its own invisible-character list rather than
