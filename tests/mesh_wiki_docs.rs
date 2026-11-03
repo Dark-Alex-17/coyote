@@ -3460,8 +3460,7 @@ fn the_mesh_page_lead_carries_the_three_setups_and_the_pages_row_names_the_daemo
 fn the_relay_restart_idle_lines_are_quoted_on_the_wiki() {
     let Some(wiki) = wiki_dir() else { return };
     let announced = "[mesh] <label> reconnected; announced";
-    let deferred =
-        "[mesh] <label> reconnected; the heartbeat will announce it (last announce <age> ago)";
+    let deferred = "[mesh] <label> reconnected; this node announced <age> ago, so it waits for the next heartbeat to announce again";
     let gotchas = flat(&section(
         "Mesh-Deployment.md",
         &read(wiki.join("Mesh-Deployment.md")),
@@ -3594,14 +3593,14 @@ fn the_cut_peer_line_pointer_is_quoted_on_the_mesh_page() {
 /// The relay-restart idle lines the wiki quotes are the node's own format strings, and the
 /// `five minutes` the pages give for the floor follows `REANNOUNCE_FLOOR_SECS`. The
 /// `<age>` placeholder stands for the node's `<n>s ago` style span, so the quoted deferred
-/// line ends in ` ago)` as the node's does. Runs without the wiki: the code half holds on
-/// its own.
+/// line reads `announced <age> ago` as the node's does. Runs without the wiki: the code
+/// half holds on its own.
 #[test]
 fn the_relay_restart_idle_lines_are_the_nodes_own_wording_and_the_floor_is_five_minutes() {
     let node = read(repo_root().join("src/mesh/node.rs"));
     for format in [
         "\"{label} reconnected; announced\"",
-        "\"{label} reconnected; the heartbeat will announce it (last announce {age})\"",
+        "\"{label} reconnected; this node announced {}, so it waits for the next heartbeat to announce again\"",
     ] {
         assert!(
             node.contains(format),
@@ -3612,7 +3611,7 @@ fn the_relay_restart_idle_lines_are_the_nodes_own_wording_and_the_floor_is_five_
     assert!(
         mesh.contains("format!(\"{} ago\", span_text(elapsed))")
             && mesh.contains("format!(\"{s}s\")"),
-        "the age in the deferred line is rendered as `<n>s ago`; the wiki's `<age> ago)` follows it"
+        "the age in the deferred line is rendered as `<n>s ago`; the wiki's `<age> ago` follows it"
     );
     assert_eq!(
         const_u64("src/mesh/announce.rs", "REANNOUNCE_FLOOR_SECS") / 60,
@@ -3621,8 +3620,7 @@ fn the_relay_restart_idle_lines_are_the_nodes_own_wording_and_the_floor_is_five_
     );
 
     let Some(wiki) = wiki_dir() else { return };
-    let deferred =
-        "`[mesh] <label> reconnected; the heartbeat will announce it (last announce <age> ago)`";
+    let deferred = "`[mesh] <label> reconnected; this node announced <age> ago, so it waits for the next heartbeat to announce again`";
     for page in ["Mesh.md", "Mesh-Commands.md", "Mesh-Deployment.md"] {
         let text = flat(&read(wiki.join(page)));
         let at = text
