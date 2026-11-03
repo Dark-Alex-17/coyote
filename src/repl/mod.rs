@@ -3934,7 +3934,10 @@ local_hello() {\n\
         async fn a_top_level_agents_status_card_shows_its_todo_progress_mid_run() {
             let _guard = crate::testing::TestConfigDirGuard::new("repl");
             let name = unique("repl_progress_agent");
-            write_chat_agent(&name, "instructions: Track the work.\nauto_continue: true\n");
+            write_chat_agent(
+                &name,
+                "instructions: Track the work.\nauto_continue: true\n",
+            );
             let app = AppState {
                 mesh: Arc::new(MeshSlot::without_node_gate()),
                 ..AppState::test_default()
