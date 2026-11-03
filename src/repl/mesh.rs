@@ -26357,11 +26357,20 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         let to_a = fx.to_a.clone();
                         let out = fx.asks_for_a(&format!(".mesh info {to_a}")).await.unwrap();
                         assert!(out.contains(&fx.waiting_line()), "{out}");
-                        assert!(!info_rows(&out).is_empty(), "{out}");
+                        assert!(out.contains(&format!("destination: {to_a}")), "{out}");
+                        assert!(
+                            out.contains(&format!(
+                                "identity: {}",
+                                fx.b.runtime.peers().get(&to_a).unwrap().identity_hash
+                            )),
+                            "{out}"
+                        );
                         fx.stop().await;
                     });
                 }
 
+                /// A trusts B, so the knock is answered over the link rather than waiting out
+                /// the silence a stranger's knock gets.
                 #[test]
                 #[serial]
                 fn knock_on_an_unheard_destination_asks_for_it_then_knocks() {
@@ -26370,6 +26379,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     let _script = prompt_script::install(&[]);
                     run_async(async {
                         let mut fx = LateJoiner::start("repl-first-contact-knock").await;
+                        fx.a_trusts_b();
                         let to_a = fx.to_a.clone();
                         let out = fx
                             .asks_for_a(&format!(".mesh knock {to_a} --yes"))
@@ -26391,7 +26401,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     run_async(async {
                         let mut fx = LateJoiner::start("repl-first-contact-message").await;
                         let to_a = fx.to_a.clone();
-                        let line = format!(".mesh message {to_a} hello");
+                        let line = format!(".mesh message {to_a} --yes hello");
                         let err = fx.asks_for_a(&line).await.unwrap_err().to_string();
                         assert!(err.ends_with(MESSAGE_REFUSAL_TAIL), "{err}");
 

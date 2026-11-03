@@ -824,8 +824,9 @@ pub(crate) mod test_support {
     /// A relay with nodes A and B on it where A has filed B but B holds nothing of A:
     /// no peer table row and no identity in its transport. Both meet first, then B is
     /// stopped, its `peers.json` deleted and B restarted, so the relay's single
-    /// rebroadcast of A's start announce cannot reach the new B. Returns the relay,
-    /// A and B.
+    /// rebroadcast of A's start announce cannot reach the new B. The restarted B's start
+    /// announce can go out before its client has dialed the relay, so the relay asks for
+    /// B's path until it hears B on the new link. Returns the relay, A and B.
     #[cfg(unix)]
     pub(crate) async fn pair_where_b_has_not_heard_a(
         tag: &str,
@@ -839,7 +840,7 @@ pub(crate) mod test_support {
         wait_for_peer(&b.runtime, &to_a).await;
 
         let mut relay_announces = relay.announces().await;
-        let slot_b = MeshSlot::default();
+        let slot_b = Arc::new(MeshSlot::default());
         slot_b.install(b.runtime.clone()).unwrap();
         assert!(slot_b.stop().await.unwrap());
         std::fs::remove_file(
@@ -847,7 +848,28 @@ pub(crate) mod test_support {
         )
         .expect("B's stop wrote its peer table");
         b.restart_on(relay.port).await;
-        TransportRelay::heard_from(&mut relay_announces, &to_b).await;
+        let hash_b = AddressHash::new_from_hex_string(&to_b).unwrap();
+        let deadline = tokio::time::Instant::now() + PEER_FILING_TIMEOUT;
+        loop {
+            let heard = tokio::time::timeout(PATH_REQUEST_INTERVAL, async {
+                loop {
+                    let Ok(event) = relay_announces.recv().await else {
+                        continue;
+                    };
+                    if event.destination.lock().await.desc.address_hash == hash_b {
+                        return;
+                    }
+                }
+            });
+            if heard.await.is_ok() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the relay never heard the restarted B ({to_b})"
+            );
+            relay.transport.request_path(&hash_b, None, None).await;
+        }
 
         assert!(b.runtime.peers().get(&to_a).is_none(), "B has no row for A");
         assert!(
