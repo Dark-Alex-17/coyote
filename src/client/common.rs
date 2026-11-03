@@ -1049,9 +1049,8 @@ pub fn api_status_sentence(status: u16) -> &'static str {
     match status {
         503 | 529 => "the model is overloaded",
         429 => "the provider is rate limiting requests",
-        401 | 403 => {
-            "the provider rejected the credentials (check the client's api_key, or set envoy_model to another model)"
-        }
+        401 => "the provider rejected the credentials",
+        403 => "the provider refused access to this model",
         500..=599 => "the provider had an error",
         400..=499 => "the provider rejected the request",
         _ => "the provider returned an unexpected status",
@@ -1102,6 +1101,11 @@ pub fn catch_error(data: &Value, status: u16) -> Result<()> {
             json_str_from_map(error, "message"),
         ) {
             return Err(api_error(format!("{message} (code: {typ})")));
+        } else if let (Some(message), Some(status)) = (
+            json_str_from_map(error, "message"),
+            json_str_from_map(error, "status"),
+        ) {
+            return Err(api_error(format!("{message} (status: {status})")));
         }
     } else if let Some(error) = data["errors"][0].as_object() {
         if let (Some(code), Some(message)) = (
@@ -1128,6 +1132,44 @@ pub fn catch_error(data: &Value, status: u16) -> Result<()> {
     Err(api_error(format!(
         "Invalid response data: {data} (status: {status})"
     )))
+}
+
+#[cfg(test)]
+mod catch_error_tests {
+    use super::*;
+
+    #[test]
+    fn a_gemini_shaped_503_body_is_a_status_error_without_the_body() {
+        let body = json!({"error": {
+            "code": 503,
+            "message": "The model is overloaded due to high demand. Please try again later.",
+            "status": "UNAVAILABLE"
+        }});
+
+        let err = catch_error(&body, 503).unwrap_err();
+
+        let api = err.downcast_ref::<ApiStatusError>().unwrap();
+        assert_eq!(api.status, 503);
+        assert!(!format!("{err:#}").contains('{'), "{err:#}");
+        assert_eq!(
+            format!("{err:#}"),
+            "The model is overloaded due to high demand. Please try again later. (status: UNAVAILABLE)"
+        );
+        let line = format!("{} {}", api.status, api_status_sentence(api.status));
+        assert_eq!(line, "503 the model is overloaded");
+    }
+
+    #[test]
+    fn credentials_and_access_get_their_own_sentences() {
+        assert_eq!(
+            api_status_sentence(401),
+            "the provider rejected the credentials"
+        );
+        assert_eq!(
+            api_status_sentence(403),
+            "the provider refused access to this model"
+        );
+    }
 }
 
 pub fn json_str_from_map<'a>(

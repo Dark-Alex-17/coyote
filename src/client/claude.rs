@@ -323,13 +323,14 @@ pub async fn claude_chat_completions_streaming(
                         debug!("token-usage: {usage:?}");
                         handler.usage(usage);
                     }
-                    if data["delta"]["stop_reason"].as_str() == Some("refusal")
-                        && !handler.has_received_visible_output()
-                    {
-                        return Err(
-                            ProviderRefusal::from_stop_details(&data["delta"]["stop_details"])
-                                .into(),
-                        );
+                    if data["delta"]["stop_reason"].as_str() == Some("refusal") {
+                        if !handler.has_received_visible_output() {
+                            return Err(ProviderRefusal::from_stop_details(
+                                &data["delta"]["stop_details"],
+                            )
+                            .into());
+                        }
+                        debug!("stream ended with a provider refusal after partial output");
                     }
                 }
                 _ => {}
@@ -1746,21 +1747,5 @@ mod refusal_tests {
         res.unwrap();
         let (text, _, _, _) = handler.take();
         assert_eq!(text, "partial");
-    }
-
-    #[test]
-    fn overloaded_503_body_is_a_status_error_with_a_plain_sentence() {
-        let body = json!({"error": {
-            "code": 503,
-            "message": "The model is overloaded due to high demand. Please try again later.",
-            "status": "UNAVAILABLE"
-        }});
-
-        let err = catch_error(&body, 503).unwrap_err();
-
-        let api = err.downcast_ref::<ApiStatusError>().unwrap();
-        assert_eq!(api.status, 503);
-        let line = format!("{} {}", api.status, api_status_sentence(api.status));
-        assert_eq!(line, "503 the model is overloaded");
     }
 }

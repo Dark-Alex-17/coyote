@@ -20,7 +20,7 @@ pub mod types;
 pub mod user_interaction;
 pub mod validator;
 
-use crate::client::ApiStatusError;
+use crate::client::{ApiStatusError, ProviderRefusal};
 use anyhow::Error;
 pub use dispatch::{
     active_agent_graph_name, run_active_agent_graph, run_active_agent_graph_with_inputs,
@@ -46,11 +46,14 @@ pub(crate) fn wall_clock(secs: u64) -> Option<Duration> {
 /// `empty completion` is raised by the llm-node loop when a node says
 /// nothing on any turn; nodes at the default `max_attempts: 1` fail to
 /// their `fallback:` on it, retry is opt-in via `max_attempts`.
+/// A [`ProviderRefusal`] is transient on the same terms, since it is the
+/// typed form of a reply that would otherwise read as an empty completion.
 pub(crate) fn is_transient_error(err: &Error) -> bool {
     if err.chain().any(|c| {
         c.downcast_ref::<reqwest::Error>()
             .is_some_and(|e| e.is_connect() || e.is_timeout())
             || c.is::<tokio::time::error::Elapsed>()
+            || c.is::<ProviderRefusal>()
     }) {
         return true;
     }
@@ -200,6 +203,19 @@ mod tests {
         let err = anyhow!("stream closed because of a broken pipe")
             .context("Failed to call chat-completions api")
             .context("Agent 'domain-reviewer' failed");
+        assert!(is_transient_error(&err));
+    }
+
+    #[test]
+    fn is_transient_error_treats_a_provider_refusal_like_an_empty_completion() {
+        let err = anyhow::Error::new(client::ProviderRefusal {
+            category: Some("cyber".into()),
+            explanation: None,
+        })
+        .context("Failed to call chat-completions api")
+        .context("Agent 'domain-reviewer' failed");
+
+        assert!(!format!("{err:#}").contains("empty completion"));
         assert!(is_transient_error(&err));
     }
 

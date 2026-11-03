@@ -726,7 +726,43 @@ fn the_mesh_page_says_envoy_behaviour_varies_by_model_and_what_a_refusal_sends()
         envoy.contains("PROVIDER_REFUSAL_TEXT: &str = \"the envoy declined to answer\";"),
         "the provider refusal reply text changed; update Mesh.md and this test"
     );
+    // The `envoy_model:` line and the comment lines that continue it.
+    let envoy_model_comment = |label: &str, text: &str| -> String {
+        let lines: Vec<&str> = text.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("envoy_model:"))
+            .unwrap_or_else(|| panic!("{label} has no `envoy_model:` line"));
+        std::iter::once(lines[at])
+            .chain(
+                lines[at + 1..]
+                    .iter()
+                    .copied()
+                    .take_while(|line| line.trim_start().starts_with('#')),
+            )
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    for file in [
+        "assets/config-template.yaml",
+        "config.example.yaml",
+        "config.agent.example.yaml",
+    ] {
+        let comment = envoy_model_comment(file, &read(repo_root().join(file)));
+        assert!(
+            comment.contains("Behaviour varies by model"),
+            "{file}'s envoy_model comment does not say behaviour varies by model: {comment}"
+        );
+    }
     let Some(wiki) = wiki_dir() else { return };
+    let configuration = envoy_model_comment(
+        "Mesh-Configuration.md",
+        &read(wiki.join("Mesh-Configuration.md")),
+    );
+    assert!(
+        configuration.contains("Behaviour varies by model"),
+        "Mesh-Configuration.md's yaml envoy_model comment does not say behaviour varies by model: {configuration}"
+    );
     let page = flat(&read(wiki.join("Mesh.md")));
     for sentence in [
         "`envoy_model` sets the model the envoy answers with; it never follows a `.model` switch. Behaviour varies by model:",

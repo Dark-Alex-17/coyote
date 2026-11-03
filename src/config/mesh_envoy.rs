@@ -72,6 +72,10 @@ pub(crate) const REFUSAL_MARKER: &str = "REFUSED:";
 pub(crate) const DECLINED_FALLBACK_TEXT: &str = "this node will not handle that request";
 /// What the peer hears when the provider refused to answer; the category stays local.
 pub(crate) const PROVIDER_REFUSAL_TEXT: &str = "the envoy declined to answer";
+/// Ends the owner's line when the provider refused or failed, since another model may
+/// answer where this one would not.
+const SWITCH_MODEL_NEXT_STEP: &str =
+    "; read it with .mesh inbox, or set mesh.envoy_model to another model";
 /// Appended to the system tail only when the run resumes remembered turns; a fresh
 /// thread's prompt says nothing about memory.
 const RESUMED_THREAD_NOTE: &str = "Earlier assistant turns in this conversation may be the human owner's own words, relayed by the envoy.\n";
@@ -206,6 +210,9 @@ pub(crate) enum EnvoyOutcome {
     Interrupted,
     Unavailable(UnavailableReason),
     Failed(String),
+    /// The model's provider returned an error, reported as its status or kind and one
+    /// plain sentence; the body is never carried.
+    ProviderFailed(String),
     /// The sender's window was spent between the job being queued and its turn.
     Refused(PeerRefusal),
     /// The model's provider refused the request; distinct from `Refused`, which is a
@@ -1070,7 +1077,7 @@ impl EnvoyRunner {
                 "this node cannot answer right now".to_string(),
                 Some(format!("unavailable: {reason}")),
             ),
-            EnvoyOutcome::Failed(err) => {
+            EnvoyOutcome::Failed(err) | EnvoyOutcome::ProviderFailed(err) => {
                 warn!("Mesh envoy run for {id} failed: {}", redact_hashes(err));
                 (
                     "this node cannot answer right now".to_string(),
@@ -1182,16 +1189,24 @@ impl EnvoyRunner {
             (EnvoyOutcome::Failed(err), None) => app
                 .mesh
                 .record_envoy_fallback(message, &format!("envoy failed: {err}")),
+            (EnvoyOutcome::ProviderFailed(err), None) => app.mesh.record_envoy_fallback_with_next(
+                message,
+                &format!("envoy failed: {err}"),
+                SWITCH_MODEL_NEXT_STEP,
+            ),
             (EnvoyOutcome::Refused(refusal), None) => {
                 app.mesh.record_envoy_refusal(message, refusal)
             }
-            (EnvoyOutcome::ProviderRefused { category }, None) => app.mesh.record_envoy_fallback(
-                message,
-                &format!(
-                    "envoy declined (provider refusal: {})",
-                    refusal_category_label(category.as_deref())
-                ),
-            ),
+            (EnvoyOutcome::ProviderRefused { category }, None) => {
+                app.mesh.record_envoy_fallback_with_next(
+                    message,
+                    &format!(
+                        "envoy declined (provider refusal: {})",
+                        refusal_category_label(category.as_deref())
+                    ),
+                    SWITCH_MODEL_NEXT_STEP,
+                )
+            }
         }
         let mut extras = vec![
             ("COYOTE_AGENT_ID", terminal.agent_id),
@@ -1391,8 +1406,8 @@ pub(crate) fn classify_answer(text: &str) -> EnvoyOutcome {
 }
 
 /// Reads a failed run: a provider refusal is its own outcome, and a provider status
-/// error is reported as the status and one plain sentence, since the response body is
-/// often raw JSON. Anything else keeps its full error chain.
+/// error or a reply the client could not read is reported as one plain sentence, since
+/// the response body is often raw JSON. Anything else keeps its full error chain.
 fn run_error_outcome(err: &anyhow::Error) -> EnvoyOutcome {
     if let Some(refusal) = err
         .chain()
@@ -1408,20 +1423,35 @@ fn run_error_outcome(err: &anyhow::Error) -> EnvoyOutcome {
             category: refusal.category.clone(),
         };
     }
-    match err.chain().find_map(|c| c.downcast_ref::<ApiStatusError>()) {
-        Some(api) => {
-            debug!(
-                "Mesh envoy provider error: {}",
-                redact_hashes(&format!("{err:#}"))
-            );
-            EnvoyOutcome::Failed(format!(
-                "{} {}; the peer was told this node cannot answer right now",
-                api.status,
-                api_status_sentence(api.status)
-            ))
+    let plain = match err.chain().find_map(|c| c.downcast_ref::<ApiStatusError>()) {
+        Some(api) => format!("{} {}", api.status, api_status_sentence(api.status)),
+        None => match unreadable_reply_sentence(err) {
+            Some(sentence) => sentence.to_string(),
+            None => return EnvoyOutcome::Failed(format!("{err:#}")),
+        },
+    };
+    debug!(
+        "Mesh envoy provider error: {}",
+        redact_hashes(&format!("{err:#}"))
+    );
+    EnvoyOutcome::ProviderFailed(format!(
+        "{plain}; the peer was told this node cannot answer right now"
+    ))
+}
+
+/// The clients bail with these words, followed by the raw body, when a successful
+/// response holds nothing they can read.
+fn unreadable_reply_sentence(err: &anyhow::Error) -> Option<&'static str> {
+    err.chain().find_map(|cause| {
+        let message = cause.to_string();
+        if message.contains("Invalid response data") {
+            Some("the provider sent a reply the envoy could not read")
+        } else if message.contains("Blocked due to safety") {
+            Some("the provider blocked the reply for safety")
+        } else {
+            None
         }
-        None => EnvoyOutcome::Failed(format!("{err:#}")),
-    }
+    })
 }
 
 /// Waits for `send` unless the run is cancelled or its `remaining` ceiling lapses first,
@@ -1522,6 +1552,7 @@ pub(crate) fn envoy_reply(
             | EnvoyOutcome::Interrupted
             | EnvoyOutcome::Unavailable(_)
             | EnvoyOutcome::Failed(_)
+            | EnvoyOutcome::ProviderFailed(_)
             | EnvoyOutcome::ProviderRefused { .. },
             None,
         ) => (PeerKind::Reply, Some(Disposition::Refused), reply_text),
@@ -2033,6 +2064,7 @@ mod tests {
                                 | EnvoyOutcome::Interrupted
                                 | EnvoyOutcome::Unavailable(_)
                                 | EnvoyOutcome::Failed(_)
+                                | EnvoyOutcome::ProviderFailed(_)
                                 | EnvoyOutcome::ProviderRefused { .. },
                                 None,
                             ) => (PeerKind::Reply, Some(Disposition::Refused), "text"),
@@ -5778,6 +5810,15 @@ mod tests {
             catch_error(&body, 503).unwrap_err()
         }
 
+        fn unreadable() -> anyhow::Error {
+            anyhow::anyhow!("Invalid response data: {}", json!({"x": 1}))
+                .context("Failed to call chat-completions api")
+        }
+
+        fn sender8() -> String {
+            short(&hex_lower(&[0xab; 16])).to_string()
+        }
+
         fn runner_failing_with(
             app: &Arc<AppState>,
             fail: fn() -> anyhow::Error,
@@ -5849,11 +5890,13 @@ mod tests {
                 .iter()
                 .find(|text| text.contains("envoy declined"))
                 .unwrap();
-            assert!(
-                line.starts_with("envoy declined (provider refusal: cyber); "),
-                "{line}"
+            assert_eq!(
+                line,
+                &format!(
+                    "envoy declined (provider refusal: cyber); {} asks: how do I scan a port? is in the inbox; read it with .mesh inbox, or set mesh.envoy_model to another model",
+                    sender8()
+                )
             );
-            assert!(line.ends_with(" is in the inbox"), "{line}");
             assert!(!idle.has("envoy failed"), "{texts:?}");
             assert!(texts.iter().all(|text| !text.contains('{')), "{texts:?}");
             let turns = turns_of(&store, &PEER_IDENTITY, "t-1");
@@ -5885,16 +5928,59 @@ mod tests {
                 .filter(|text| text.contains("envoy failed"))
                 .collect();
             assert_eq!(failed.len(), 1, "{texts:?}");
-            assert!(
-                failed[0].starts_with(
-                    "envoy failed: 503 the model is overloaded; the peer was told this node cannot answer right now; "
-                ),
-                "{}",
-                failed[0]
+            assert_eq!(
+                failed[0],
+                &format!(
+                    "envoy failed: 503 the model is overloaded; the peer was told this node cannot answer right now; {} asks: are you there? is in the inbox; read it with .mesh inbox, or set mesh.envoy_model to another model",
+                    sender8()
+                )
             );
-            assert!(!failed[0].contains("high demand"), "{}", failed[0]);
             assert!(texts.iter().all(|text| !text.contains('{')), "{texts:?}");
             source.remove_dir();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn an_unreadable_reply_is_one_line_without_the_body() {
+            let _cfg = TestConfigDirGuard::new("mesh-envoy-provider-unreadable");
+            let (source, _source) = stub_envoy_source();
+            let app = test_app();
+            let idle = RecordingIdleSink::attach(&app);
+            let runner = runner_failing_with(&app, unreadable);
+
+            assert!(
+                runner
+                    .accept(job(PeerKind::Ask, "q-bad", "are you there?"))
+                    .is_ok()
+            );
+            wait_until("the failure to land", || idle.has("envoy failed")).await;
+            runner.stop().await;
+
+            let texts = idle.texts();
+            assert_eq!(idle.count("envoy failed"), 1, "{texts:?}");
+            let line = texts
+                .iter()
+                .find(|text| text.contains("envoy failed"))
+                .unwrap();
+            assert_eq!(
+                line,
+                &format!(
+                    "envoy failed: the provider sent a reply the envoy could not read; the peer was told this node cannot answer right now; {} asks: are you there? is in the inbox; read it with .mesh inbox, or set mesh.envoy_model to another model",
+                    sender8()
+                )
+            );
+            assert!(texts.iter().all(|text| !text.contains('{')), "{texts:?}");
+            source.remove_dir();
+        }
+
+        #[test]
+        fn an_ordinary_run_error_keeps_its_chain() {
+            let err = anyhow::anyhow!("disk full").context("could not write the session");
+
+            let EnvoyOutcome::Failed(why) = run_error_outcome(&err) else {
+                panic!("an ordinary error is a plain failure");
+            };
+            assert_eq!(why, "could not write the session: disk full");
         }
     }
 
