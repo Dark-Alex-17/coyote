@@ -152,8 +152,10 @@ pub(crate) fn is_variation_selector(c: char) -> bool {
 }
 
 /// The display name is withheld when any configured interface is public unless the user
-/// opted in with `display_name_on_public`.
-pub(crate) fn announce_app_data(config: &MeshConfig) -> Result<Vec<u8>> {
+/// opted in with `display_name_on_public`. A session running `agent` announces the name as
+/// `<display_name> . <agent>`; the label only decorates a name, so with no name announced
+/// there is no label either.
+pub(crate) fn announce_app_data(config: &MeshConfig, agent: Option<&str>) -> Result<Vec<u8>> {
     let public = config
         .interfaces()
         .iter()
@@ -161,13 +163,41 @@ pub(crate) fn announce_app_data(config: &MeshConfig) -> Result<Vec<u8>> {
     let display_name = if public && !config.display_name_on_public {
         None
     } else {
-        config.display_name.clone()
+        config
+            .display_name
+            .as_deref()
+            .map(|name| with_agent_label(name, agent))
     };
     AnnounceAppData {
         version: MESH_PROTOCOL_VERSION,
         display_name,
     }
     .encode()
+}
+
+const AGENT_LABEL_SEPARATOR: &str = " . ";
+
+/// The name itself is never cut: when the label does not fit in `MAX_DISPLAY_NAME_BYTES`
+/// the agent part is shortened, and when not even one of its characters fits, or it holds
+/// a character `encode` would refuse, the name goes out alone so the label can never make
+/// a start fail.
+fn with_agent_label(name: &str, agent: Option<&str>) -> String {
+    let Some(agent) = agent
+        .filter(|agent| !agent.chars().any(is_control_or_invisible))
+        .map(str::trim_start)
+    else {
+        return name.to_string();
+    };
+    let room = MAX_DISPLAY_NAME_BYTES.saturating_sub(name.len() + AGENT_LABEL_SEPARATOR.len());
+    let mut cut = room.min(agent.len());
+    while !agent.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let agent = agent[..cut].trim_end();
+    if agent.is_empty() {
+        return name.to_string();
+    }
+    format!("{name}{AGENT_LABEL_SEPARATOR}{agent}")
 }
 
 #[cfg(test)]
@@ -177,7 +207,7 @@ mod tests {
     use std::ops::RangeInclusive;
 
     fn decoded_name(config: &MeshConfig) -> Option<String> {
-        let bytes = announce_app_data(config).unwrap();
+        let bytes = announce_app_data(config, None).unwrap();
         AnnounceAppData::decode(&bytes).unwrap().display_name
     }
 
@@ -461,7 +491,7 @@ mod tests {
             ..MeshConfig::default()
         };
 
-        let bytes = announce_app_data(&config).unwrap();
+        let bytes = announce_app_data(&config, None).unwrap();
 
         let contains = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
         assert!(contains(b"Alex"), "the probe must be able to match");
@@ -503,5 +533,164 @@ mod tests {
             ..base
         };
         assert_eq!(decoded_name(&private_only), Some("Alex".to_string()));
+    }
+
+    mod agent_label {
+        use super::*;
+
+        fn labelled(config: &MeshConfig, agent: &str) -> Option<String> {
+            let bytes = announce_app_data(config, Some(agent)).unwrap();
+            AnnounceAppData::decode(&bytes).unwrap().display_name
+        }
+
+        fn named(name: &str) -> MeshConfig {
+            MeshConfig {
+                display_name: Some(name.to_string()),
+                ..MeshConfig::default()
+            }
+        }
+
+        #[test]
+        fn spaces_around_the_agent_name_are_dropped_from_the_label() {
+            assert_eq!(
+                labelled(&named("alice"), "  pr-reviewer  ").as_deref(),
+                Some("alice . pr-reviewer")
+            );
+        }
+
+        #[test]
+        fn an_agent_session_announces_the_name_with_the_agent_and_a_plain_one_the_name() {
+            let config = named("alice");
+            assert_eq!(
+                labelled(&config, "pr-reviewer").as_deref(),
+                Some("alice . pr-reviewer")
+            );
+            assert_eq!(decoded_name(&config).as_deref(), Some("alice"));
+        }
+
+        #[test]
+        fn the_label_follows_the_name_on_public_and_never_stands_in_for_it() {
+            let withheld = MeshConfig {
+                interfaces: vec![MeshInterface::Lan, public()],
+                display_name_on_public: false,
+                ..named("alice")
+            };
+            assert_eq!(labelled(&withheld, "pr-reviewer"), None);
+
+            let opted_in = MeshConfig {
+                display_name_on_public: true,
+                ..withheld
+            };
+            assert_eq!(
+                labelled(&opted_in, "pr-reviewer").as_deref(),
+                Some("alice . pr-reviewer")
+            );
+
+            assert_eq!(labelled(&MeshConfig::default(), "pr-reviewer"), None);
+        }
+
+        #[test]
+        fn a_long_label_cuts_the_agent_at_a_char_boundary_and_keeps_the_name() {
+            let name = "a".repeat(50);
+            let label = labelled(&named(&name), &"\u{e9}".repeat(10)).unwrap();
+            assert_eq!(label, format!("{name} . {}", "\u{e9}".repeat(5)));
+            assert!(label.len() <= MAX_DISPLAY_NAME_BYTES, "{}", label.len());
+
+            let name = "a".repeat(58);
+            assert_eq!(
+                labelled(&named(&name), "pr reviewer"),
+                Some(format!("{name} . pr")),
+                "the cut lands after the space, which is trimmed"
+            );
+
+            let name = "a".repeat(60);
+            assert_eq!(
+                labelled(&named(&name), "pr-reviewer"),
+                Some(format!("{name} . p"))
+            );
+
+            for name in ["a".repeat(61), "a".repeat(64)] {
+                assert_eq!(
+                    labelled(&named(&name), "pr-reviewer").as_deref(),
+                    Some(name.as_str()),
+                    "no room for one agent char"
+                );
+            }
+        }
+
+        #[test]
+        fn an_agent_with_a_control_or_invisible_char_leaves_the_name_alone() {
+            for agent in ["pr\u{1b}[2J", "pr\u{200B}reviewer", "pr\nreviewer"] {
+                assert_eq!(
+                    labelled(&named("alice"), agent).as_deref(),
+                    Some("alice"),
+                    "{agent:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_label_that_fits_exactly_is_kept_whole() {
+            let name = "a".repeat(64 - " . pr-reviewer".len());
+            let label = labelled(&named(&name), "pr-reviewer").unwrap();
+            assert_eq!(label, format!("{name} . pr-reviewer"));
+            assert_eq!(label.len(), MAX_DISPLAY_NAME_BYTES);
+        }
+
+        #[test]
+        fn an_empty_or_blank_agent_name_leaves_the_name_alone() {
+            for agent in ["", " ", "   "] {
+                assert_eq!(
+                    labelled(&named("alice"), agent).as_deref(),
+                    Some("alice"),
+                    "{agent:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_four_byte_agent_char_is_kept_whole_or_dropped_never_split() {
+            let name = "a".repeat(57);
+            assert_eq!(
+                labelled(&named(&name), "\u{1F980}\u{1F980}"),
+                Some(format!("{name} . \u{1F980}"))
+            );
+            let name = "a".repeat(58);
+            assert_eq!(
+                labelled(&named(&name), "\u{1F980}").as_deref(),
+                Some(name.as_str()),
+                "three bytes of room cannot hold a four-byte char"
+            );
+        }
+
+        /// The label never makes the announce refuse to encode: for every name length up
+        /// to the cap and a spread of agent names, the bytes encode, decode, stay within
+        /// the cap and start with the untouched name.
+        #[test]
+        fn no_agent_name_makes_a_valid_name_fail_to_announce() {
+            let agents = [
+                "pr-reviewer",
+                "a",
+                "\u{e9}\u{e9}\u{e9}",
+                "\u{1F980}x",
+                "x y z",
+                "Alex \u{2764}\u{FE0F}",
+                &"z".repeat(200),
+            ];
+            for len in 1..=MAX_DISPLAY_NAME_BYTES {
+                let name = "n".repeat(len);
+                for agent in agents {
+                    let bytes = announce_app_data(&named(&name), Some(agent))
+                        .unwrap_or_else(|err| panic!("{len} {agent:?}: {err}"));
+                    let decoded = AnnounceAppData::decode(&bytes)
+                        .and_then(|data| data.display_name)
+                        .unwrap_or_else(|| panic!("{len} {agent:?}: does not decode"));
+                    assert!(decoded.len() <= MAX_DISPLAY_NAME_BYTES);
+                    assert!(decoded.starts_with(&name), "{decoded:?}");
+                    let rest = &decoded[name.len()..];
+                    assert!(rest.is_empty() || rest.starts_with(" . "), "{decoded:?}");
+                }
+            }
+        }
     }
 }

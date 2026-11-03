@@ -1221,6 +1221,146 @@ fn entering_an_agent_session_joins_and_leaving_it_by_any_path_leaves_the_mesh() 
     );
 }
 
+/// A loopback TCP listener that accepts every connection, stays silent, and keeps every
+/// byte the node sends, so a test can read the announces that went out on the wire.
+struct CapturingRelay {
+    port: u16,
+    received: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl CapturingRelay {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&received);
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let sink = std::sync::Arc::clone(&sink);
+                thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = stream.read(&mut buf) {
+                        if n == 0 {
+                            break;
+                        }
+                        sink.lock().unwrap().extend_from_slice(&buf[..n]);
+                    }
+                });
+            }
+        });
+        Self { port, received }
+    }
+
+    fn len(&self) -> usize {
+        self.received.lock().unwrap().len()
+    }
+
+    fn contains_since(&self, from: usize, needle: &[u8]) -> bool {
+        self.received.lock().unwrap()[from..]
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    /// Bounded poll until the bytes received after `from` hold `needle`.
+    fn wait_for_since(&self, from: usize, needle: &str) {
+        let deadline = Instant::now() + EXPECT_TIMEOUT;
+        while !self.contains_since(from, needle.as_bytes()) {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {needle:?} on the wire"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+/// Writes `mesh.display_name` into the fixture's mesh block.
+fn with_display_name(probe: Probe, name: &str) -> Probe {
+    let path = probe.config_dir.join("config.yaml");
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("  announce: true\n"), "{text}");
+    fs::write(
+        &path,
+        text.replace(
+            "  announce: true\n",
+            &format!("  announce: true\n  display_name: {name}\n"),
+        ),
+    )
+    .unwrap();
+    probe
+}
+
+/// Black-box on the wire: an agent session's start announce carries
+/// `<display_name> . <agent>`, a plain session's carries the name alone, and a switch to
+/// another agent (leave, then join afresh) announces the new agent's label.
+#[test]
+fn an_agent_session_announces_the_name_with_the_agent_label_on_the_wire() {
+    let relay = CapturingRelay::start();
+    let probe = with_display_name(
+        Probe::new("agent-label", true, &[relay.port])
+            .with_announce()
+            .with_agent("pr-reviewer")
+            .with_agent("triage"),
+        "alice",
+    );
+    let mut session = spawn_repl(probe.command());
+    wait_for(&mut session, BARE_PROMPT);
+
+    let mark = relay.len();
+    command_prints(
+        &mut session,
+        ".agent pr-reviewer a",
+        MESH_ON_SUMMARY,
+        &agent_session_prompt("pr-reviewer", "a"),
+    );
+    probe.wait_for_marker_count("MESH_STARTED", 1);
+    relay.wait_for_since(mark, "alice . pr-reviewer");
+
+    command_prints(&mut session, ".exit agent", LEAVING_PATTERN, BARE_PROMPT);
+    probe.wait_for_marker_count("MESH_STOPPED", 1);
+
+    let mark = relay.len();
+    command_prints(
+        &mut session,
+        ".session b",
+        MESH_ON_SUMMARY,
+        &session_prompt("b"),
+    );
+    probe.wait_for_marker_count("MESH_STARTED", 2);
+    relay.wait_for_since(mark, "alice");
+    // Give the start announce time to land whole before reading the absence.
+    thread::sleep(Duration::from_secs(2));
+    assert!(
+        !relay.contains_since(mark, b"alice . "),
+        "a plain session announces the name alone"
+    );
+
+    command_prints(&mut session, ".exit session", LEAVING_PATTERN, BARE_PROMPT);
+    probe.wait_for_marker_count("MESH_STOPPED", 2);
+
+    let mark = relay.len();
+    command_prints(
+        &mut session,
+        ".agent triage c",
+        MESH_ON_SUMMARY,
+        &agent_session_prompt("triage", "c"),
+    );
+    probe.wait_for_marker_count("MESH_STARTED", 3);
+    relay.wait_for_since(mark, "alice . triage");
+    assert!(
+        !relay.contains_since(mark, b"alice . pr-reviewer"),
+        "the new agent's join carries the new label only"
+    );
+
+    command_prints(&mut session, ".exit agent", LEAVING_PATTERN, BARE_PROMPT);
+    let status = exit_clean(&mut session);
+    assert!(
+        matches!(status, WaitStatus::Exited(_, 0)),
+        ".exit: expected a clean exit, got {status:?}"
+    );
+}
+
 /// Connect-later: the node comes up with its first interface connected and its
 /// second refused (bound, not listening), warns about the second on startup,
 /// and once that port starts listening the idle line it pushes reaches the

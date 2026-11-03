@@ -185,6 +185,10 @@ pub(crate) struct NodeOptions {
     /// the node shares it, so pass `MeshSlot::hooks`.
     pub hooks: MeshHooks,
     pub translate_inbox_dir: InboxDirTranslation,
+    /// The agent the session is running, announced after the display name. It is read
+    /// once at start and fixed for the node's life: the agent cannot change under a
+    /// running node, since every agent switch leaves the mesh and joins afresh.
+    pub agent: Option<String>,
 }
 
 impl Default for NodeOptions {
@@ -193,6 +197,7 @@ impl Default for NodeOptions {
             connect_timeout: TcpClient::DEFAULT_CONNECT_TIMEOUT,
             hooks: MeshHooks::default(),
             translate_inbox_dir: Arc::new(paths::translate_sandboxed_home_dir),
+            agent: None,
         }
     }
 }
@@ -681,7 +686,7 @@ impl MeshRuntime {
         enabled_view.enabled = true;
         enabled_view.validate(function_calling_support)?;
         let plans = plan_interfaces(config.interfaces());
-        let app_data = announce_app_data(config)?;
+        let app_data = announce_app_data(config, options.agent.as_deref())?;
         let trust = Arc::new(TrustStore::open(&paths.config_dir)?);
         trust.set_observer(Arc::new(TrustHookObserver(options.hooks.clone())));
         trust.set_collision_protection(config.collision_protection);
@@ -1068,6 +1073,12 @@ impl MeshRuntime {
     /// reaches trusted destinations and nobody else.
     pub(crate) fn display_name(&self) -> Option<&str> {
         self.display_name.as_deref()
+    }
+
+    /// The name this node's announces carry, label included, as a peer decodes it.
+    #[cfg(test)]
+    pub(crate) fn announced_name(&self) -> Option<String> {
+        AnnounceAppData::decode(&self.app_data)?.display_name
     }
 
     /// The configured `mesh.about` line, carried on the status card and nowhere else.
@@ -13869,6 +13880,32 @@ mod tests {
 
         runtime.shutdown().await.unwrap();
         started.relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    mod agent_label {
+        use super::*;
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn start_announces_the_agent_from_the_options_after_the_name() {
+            let named = |config: &mut MeshConfig| config.display_name = Some("alice".to_string());
+            let options = NodeOptions {
+                agent: Some("pr-reviewer".to_string()),
+                ..NodeOptions::default()
+            };
+            let agent = started_runtime_with_options("node-agent-label", options, named).await;
+            assert_eq!(
+                agent.runtime.announced_name().as_deref(),
+                Some("alice . pr-reviewer")
+            );
+            agent.runtime.shutdown().await.unwrap();
+            agent.relay_handle.abort();
+
+            let plain = started_runtime_with("node-agent-label-plain", named).await;
+            assert_eq!(plain.runtime.announced_name().as_deref(), Some("alice"));
+            plain.runtime.shutdown().await.unwrap();
+            plain.relay_handle.abort();
+        }
     }
 
     /// The heartbeat and the reconnect announce both go through `announce_now`; once the

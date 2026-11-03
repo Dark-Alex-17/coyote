@@ -392,6 +392,7 @@ async fn join(ctx: &mut RequestContext, options: JoinOptions) -> Result<()> {
         out_text("Mesh stays off.");
         return Ok(());
     }
+    let agent = running_agent(ctx);
     let Some(session) = ctx.session.as_mut() else {
         bail!("The session went away before the mesh could start. Run `.mesh on` again.");
     };
@@ -409,6 +410,7 @@ async fn join(ctx: &mut RequestContext, options: JoinOptions) -> Result<()> {
         MeshPaths::from_env(),
         NodeOptions {
             hooks: ctx.app.mesh.hooks(),
+            agent,
             ..NodeOptions::default()
         },
     )
@@ -425,6 +427,10 @@ async fn join(ctx: &mut RequestContext, options: JoinOptions) -> Result<()> {
         err_text(&warning);
     }
     Ok(())
+}
+
+fn running_agent(ctx: &RequestContext) -> Option<String> {
+    ctx.agent.as_ref().map(|agent| agent.name().to_string())
 }
 
 async fn turn_off(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
@@ -14039,6 +14045,62 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                     assert!(ctx.app.mesh.get().is_none());
                     relay_handle.abort();
                 });
+            }
+
+            mod agent_label {
+                use super::*;
+
+                fn pr_reviewer() -> Agent {
+                    Agent::test_new(AgentConfig {
+                        name: "pr-reviewer".to_string(),
+                        ..AgentConfig::default()
+                    })
+                }
+
+                #[test]
+                fn running_agent_names_the_agent_and_nothing_without_one() {
+                    let mut ctx = off_ctx();
+                    assert_eq!(running_agent(&ctx), None);
+                    ctx.agent = Some(pr_reviewer());
+                    assert_eq!(running_agent(&ctx).as_deref(), Some("pr-reviewer"));
+                }
+
+                /// The join behind an agent's session hands the agent to the node, which
+                /// announces it after the display name.
+                #[test]
+                #[serial]
+                fn joining_an_agent_session_announces_the_agent_label() {
+                    let guard = TestConfigDirGuard::new("repl-mesh-agent-label");
+                    let _cache =
+                        EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                    let _script = prompt_script::install_non_interactive();
+                    let _capture = capture::install();
+                    run_async(async {
+                        let (addr, relay_handle, _) = loopback_relay().await;
+                        let mut ctx = ctx_with(
+                            MeshConfig {
+                                enabled: true,
+                                display_name: Some("alice".to_string()),
+                                ..private_config(addr.port())
+                            },
+                            true,
+                        );
+                        ctx.agent = Some(pr_reviewer());
+                        ctx.session = Some(Session::default());
+
+                        after_session_entered(&mut ctx).await;
+
+                        let runtime = ctx.app.mesh.get().expect("the agent session joined");
+                        assert_eq!(
+                            runtime.announced_name().as_deref(),
+                            Some("alice . pr-reviewer")
+                        );
+
+                        run(&mut ctx, ".mesh off --yes").await.unwrap();
+                        assert!(ctx.app.mesh.get().is_none());
+                        relay_handle.abort();
+                    });
+                }
             }
 
             /// The leave site without a session held keeps the node: an isolated macro's
