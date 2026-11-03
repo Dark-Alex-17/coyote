@@ -3927,7 +3927,7 @@ local_hello() {\n\
         async fn a_top_level_agents_status_card_shows_its_todo_progress_mid_run() {
             let _guard = crate::testing::TestConfigDirGuard::new("repl");
             let name = unique("repl_progress_agent");
-            write_chat_agent(&name, CHAT_AGENT_BODY);
+            write_chat_agent(&name, "instructions: Track the work.\nauto_continue: true\n");
             let mut ctx = engage_graph_agent(repl_ctx(), &name).await;
             ctx.tool_scope.functions.append_todo_functions();
             assert!(ctx.agent.is_some());
