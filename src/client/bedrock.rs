@@ -312,12 +312,11 @@ async fn chat_completions_streaming(
                                 handler.usage(usage);
                             }
                         }
-                        "messageStop" => {
+                        "messageStop"
                             if is_refusal_stop(&data["stopReason"])
-                                && !handler.has_received_visible_output()
-                            {
-                                return Err(ProviderRefusal::default().into());
-                            }
+                                && !handler.has_received_visible_output() =>
+                        {
+                            return Err(ProviderRefusal::default().into());
                         }
                         _ => {}
                     }

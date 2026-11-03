@@ -1398,6 +1398,12 @@ fn run_error_outcome(err: &anyhow::Error) -> EnvoyOutcome {
         .chain()
         .find_map(|c| c.downcast_ref::<ProviderRefusal>())
     {
+        if let Some(explanation) = &refusal.explanation {
+            debug!(
+                "Mesh envoy provider refusal explanation: {}",
+                redact_hashes(explanation)
+            );
+        }
         return EnvoyOutcome::ProviderRefused {
             category: refusal.category.clone(),
         };
@@ -5772,7 +5778,10 @@ mod tests {
             catch_error(&body, 503).unwrap_err()
         }
 
-        fn runner_failing_with(app: &Arc<AppState>, fail: fn() -> anyhow::Error) -> EnvoyRunner {
+        fn runner_failing_with(
+            app: &Arc<AppState>,
+            fail: fn() -> anyhow::Error,
+        ) -> Arc<EnvoyRunner> {
             let client = FailingClient::new(fail);
             EnvoyRunner::start_with(
                 Arc::clone(app),

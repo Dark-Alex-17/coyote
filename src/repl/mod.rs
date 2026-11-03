@@ -2310,17 +2310,19 @@ async fn ask_loop(
                         retried_after_compress = true;
                         continue;
                     }
+                    // A refused turn has nothing to recover, so the session keeps no
+                    // interrupted marker for it.
+                    if let Some(refusal) = provider_refusal(&err) {
+                        debug!("provider refusal explanation: {:?}", refusal.explanation);
+                        return Err(err);
+                    }
                     // A request aborted by Ctrl-C without streamed text ends
                     // here rather than in the interrupted arm below, and gets
                     // the same notice.
                     if abort_signal.aborted_ctrlc() {
                         print_turn_notice(ctx, turn_interrupt_notice(ctx, &abort_signal).await);
                     }
-                    // A refused turn has nothing to recover, so the session keeps no
-                    // interrupted marker for it.
-                    if provider_refusal(&err).is_none() {
-                        ctx.on_chat_completion_error(app.as_ref(), &input);
-                    }
+                    ctx.on_chat_completion_error(app.as_ref(), &input);
                     return Err(err);
                 }
             }
