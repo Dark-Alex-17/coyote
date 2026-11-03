@@ -2,7 +2,8 @@ use crate::config::mesh_config::{
     DEFAULT_LOCAL_RNSD_INSTANCE, DEFAULT_LOCAL_RNSD_PORT, EnvoyMemoryConfig, MeshConfig,
     MeshInterface,
 };
-use crate::config::{ForkRekey, LivePrefix, RequestContext, Session, paths};
+use crate::config::mesh_digest::MeshDigestHook;
+use crate::config::{ForkRekey, LivePrefix, Session, paths};
 use crate::mesh::access::{AccessHandler, AccessRouting, AccessSurface, put_back};
 use crate::mesh::announce::{
     AnnounceAppData, HEARTBEAT_PERIOD_SECS, HEARTBEAT_SECS, REANNOUNCE_FLOOR_SECS,
@@ -3619,13 +3620,6 @@ pub(crate) struct MeshSlot {
     progress_without_node: bool,
     #[cfg(test)]
     envoy_memory_override: ArcSwapOption<EnvoySessions>,
-}
-
-/// Offered the owning session's context at every progress point inside a turn, captured
-/// or deferred, so the digest can be regenerated without the turn's context lock. The
-/// implementation must not wait: it runs on the turn's own task.
-pub(crate) trait MeshDigestHook: Send + Sync {
-    fn on_progress(&self, ctx: &RequestContext);
 }
 
 impl MeshSlot {

@@ -47,8 +47,8 @@ pub(crate) use node::MESH_PROGRESS_MIN_INTERVAL;
 pub(crate) use node::session_destination_name;
 pub(crate) use node::{
     AlreadyClosed, HUMAN_DECLINED, InterfaceState, InterfaceStatus, LocalEndpoint, MESH_ALREADY_ON,
-    MeshDigestHook, MeshPaths, MeshRuntime, MeshSlot, NodeOptions, already_closed,
-    loopback_endpoint, refusal_reply,
+    MeshPaths, MeshRuntime, MeshSlot, NodeOptions, already_closed, loopback_endpoint,
+    refusal_reply,
 };
 pub(crate) use peers::{PEER_STALE_AFTER, PEER_TTL, PeerRecord};
 pub(crate) use propagation_fetch::{

@@ -18,6 +18,7 @@ use crate::client::{
     Message, MessageRole, ProviderRefusal, call_chat_completions, call_chat_completions_streaming,
     call_chat_completions_streaming_quiet, init_client, oauth, refusal_category_label,
 };
+use crate::config::mesh_digest::MeshDigestHook;
 use crate::config::{
     AgentVariables, AppConfig, AssertState, CommandPrefix, EnvoyRunner, Input, LastMessage,
     MacroState, MeshDigestDriver, MeshHookBridge, RequestContext, Session, SessionScope,
@@ -30,7 +31,6 @@ use crate::graph::dispatch::{GraphTurn, run_graph_turn};
 use crate::graph::llm::{CompletionFuture, CompletionRunner};
 use crate::graph::route::Branch;
 use crate::hooks::{self, HookEvent};
-use crate::mesh::MeshDigestHook;
 use crate::mesh::events::MeshHookSink;
 use crate::mesh::notify::NotificationSink;
 use crate::mesh::snapshot::TurnState;
@@ -3801,10 +3801,11 @@ local_hello() {\n\
     mod progress_turn_tests {
         use super::*;
         use crate::config::mesh_config::{MeshBrief, MeshConfig};
+        use crate::config::mesh_digest::MeshDigestHook;
         use crate::function::eval_tool_calls;
         use crate::mesh::card::{CardSource, StatusHandler, build_card};
         use crate::mesh::snapshot::MeshSnapshot;
-        use crate::mesh::{MESH_PROGRESS_MIN_INTERVAL, MeshDigestHook, MeshSlot};
+        use crate::mesh::{MESH_PROGRESS_MIN_INTERVAL, MeshSlot};
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::{Duration, Instant, SystemTime};
 

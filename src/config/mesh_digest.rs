@@ -18,7 +18,7 @@ use super::{Input, RequestContext, RoleLike, SUMMARY_CONTEXT_PROMPT, Session};
 use crate::client::{Message, MessageRole, Model, ModelType};
 use crate::config::mesh_config::MeshBrief;
 use crate::mesh::brief::{DIGEST_MAX_CHARS, Digest, render_todo, sanitize_block};
-use crate::mesh::{MeshDigestHook, MeshSlot, redact_hashes};
+use crate::mesh::{MeshSlot, redact_hashes};
 
 use anyhow::{Result, anyhow};
 use log::{debug, warn};
@@ -569,6 +569,13 @@ impl Drop for MeshDigestDriver {
             task.abort();
         }
     }
+}
+
+/// Offered the owning session's context at every progress point inside a turn, captured
+/// or deferred, so the digest can be regenerated without the turn's context lock. The
+/// implementation must not wait: it runs on the turn's own task.
+pub(crate) trait MeshDigestHook: Send + Sync {
+    fn on_progress(&self, ctx: &RequestContext);
 }
 
 /// The REPL's driver as the slot's digest hook. A driver already locked by the turn
