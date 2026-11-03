@@ -721,7 +721,9 @@ fn send_error_kind(err: &SendError) -> &'static str {
         SendError::TitleTooLong { .. } => "title_too_long",
         SendError::InvalidFields(_) => "invalid_fields",
         SendError::InvalidParts(_) => "invalid_parts",
-        SendError::Refused(_) | SendError::NotTrustedByPeer(_) => "refused",
+        SendError::Refused(_) | SendError::Throttled { .. } | SendError::NotTrustedByPeer(_) => {
+            "refused"
+        }
         SendError::Direct(_) => "direct",
         SendError::IncompatibleVersion { .. } => "incompatible_version",
         SendError::NoPropagationNode => "no_propagation_node",
@@ -1575,7 +1577,9 @@ fn access_error_kind(err: &AccessError) -> &'static str {
         AccessError::UnknownDestination => "unknown_destination",
         AccessError::Invalid(_) => "invalid",
         AccessError::NotFiled(_) => "not_filed",
-        AccessError::Refused(_) | AccessError::NotTrustedByPeer(_) => "refused",
+        AccessError::Refused(_)
+        | AccessError::Throttled { .. }
+        | AccessError::NotTrustedByPeer(_) => "refused",
         AccessError::NotServed(_) => "not_served",
         AccessError::UnknownStatus => "unknown_status",
         AccessError::Malformed(_) => "malformed",

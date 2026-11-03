@@ -1360,9 +1360,14 @@ pub(crate) enum SendError {
     InvalidFields(&'static str),
     /// A part breaks a rule the receiver would drop it for; the text names the rule.
     InvalidParts(&'static str),
-    /// The peer answered with a refusal code other than `NoAccess`; nothing is stored for
-    /// a peer that said no.
+    /// The peer answered with a refusal code other than `NoAccess` or `Throttled`;
+    /// nothing is stored for a peer that said no.
     Refused(RefusalCode),
+    /// The peer answered `Throttled`: it is still busy with a message from this
+    /// identity. Nothing is stored; the text names the peer by its short hash.
+    Throttled {
+        destination: String,
+    },
     /// The peer answered `NoAccess`: this node trusts it, but it has not trusted this
     /// instance. Nothing is stored; the remedy is on the peer's side.
     NotTrustedByPeer(RemoteRefusal),
@@ -1420,6 +1425,11 @@ impl fmt::Display for SendError {
                 f,
                 "The peer refused the message: {code}. {}",
                 refusal_remedy(*code)
+            ),
+            Self::Throttled { destination } => write!(
+                f,
+                "{} refused it: it is already answering a message from this identity (one at a time per identity). Try again in a minute.",
+                short(destination)
             ),
             Self::NotTrustedByPeer(refusal) => write!(f, "{refusal}"),
             Self::Direct(err) => write!(
@@ -1549,7 +1559,7 @@ impl SendError {
             Self::TitleTooLong { .. } => "title_too_long",
             Self::InvalidFields(_) => "invalid_fields",
             Self::InvalidParts(_) => "invalid_parts",
-            Self::Refused(_) | Self::NotTrustedByPeer(_) => "refused",
+            Self::Refused(_) | Self::Throttled { .. } | Self::NotTrustedByPeer(_) => "refused",
             Self::Direct(_) => "direct",
             Self::IncompatibleVersion { .. } => "incompatible_version",
             Self::NoPropagationNode => "no_propagation_node",
@@ -1771,6 +1781,12 @@ impl MeshRuntime {
                     self.remote_refusal(&destination),
                 ));
             }
+            Err(RequestError::Refused(code @ RefusalCode::Throttled)) => {
+                debug!("Mesh {kind} {id} to {dest8} was refused: {code}");
+                return Err(SendError::Throttled {
+                    destination: destination.clone(),
+                });
+            }
             Err(RequestError::Refused(code)) => {
                 debug!("Mesh {kind} {id} to {dest8} was refused: {code}");
                 return Err(SendError::Refused(code));
@@ -1900,11 +1916,13 @@ impl MeshRuntime {
             Err(SendError::NotTrustedByPeer(refusal)) => {
                 RecipientOutcome::NotTrustedByPeer(refusal)
             }
-            Err(err @ (SendError::Refused(_) | SendError::IncompatibleVersion { .. })) => {
-                RecipientOutcome::Refused {
-                    reason: err.to_string(),
-                }
-            }
+            Err(
+                err @ (SendError::Refused(_)
+                | SendError::Throttled { .. }
+                | SendError::IncompatibleVersion { .. }),
+            ) => RecipientOutcome::Refused {
+                reason: err.to_string(),
+            },
             Err(err) => RecipientOutcome::Unreachable {
                 reason: err.to_string(),
             },
@@ -2669,6 +2687,25 @@ mod tests {
         }
     }
 
+    mod throttle_wording_tests {
+        use super::*;
+
+        #[test]
+        fn a_throttled_message_names_the_peer_and_says_to_try_again_in_a_minute() {
+            let destination = hash_of("busy peer");
+            assert_eq!(
+                SendError::Throttled {
+                    destination: destination.clone(),
+                }
+                .to_string(),
+                format!(
+                    "{} refused it: it is already answering a message from this identity (one at a time per identity). Try again in a minute.",
+                    &destination[..8]
+                )
+            );
+        }
+    }
+
     #[test]
     fn outbound_refuses_over_long_text_and_bad_fields_and_mints_an_id() {
         let err = OutboundPeer::new(
@@ -2866,10 +2903,6 @@ mod tests {
         assert_eq!(
             SendError::Direct(RequestError::Send("no interface".into())).to_string(),
             "The message could not be sent: The mesh transport could not send: no interface. Try again; if it repeats, report it"
-        );
-        assert_eq!(
-            SendError::Refused(RefusalCode::Throttled).to_string(),
-            "The peer refused the message: throttled (0xf6). Wait a minute and try again"
         );
         assert_eq!(
             SendError::Refused(RefusalCode::NotFound).to_string(),
@@ -3618,9 +3651,11 @@ mod tests {
         );
         assert!(SendError::NotRunning.to_string().contains(".mesh on"));
         assert!(
-            SendError::Refused(RefusalCode::Throttled)
-                .to_string()
-                .contains("throttled")
+            SendError::Throttled {
+                destination: hash_of("d"),
+            }
+            .to_string()
+            .contains("Try again in a minute.")
         );
         assert!(
             SendError::NotAcknowledged
@@ -3737,6 +3772,12 @@ mod tests {
             ),
             (SendError::InvalidFields("too deep"), "invalid_fields"),
             (SendError::Refused(RefusalCode::NoAccess), "refused"),
+            (
+                SendError::Throttled {
+                    destination: destination.clone(),
+                },
+                "refused",
+            ),
             (
                 SendError::NotTrustedByPeer(RemoteRefusal::new(&destination, None, hash_of("own"))),
                 "refused",
