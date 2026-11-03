@@ -913,6 +913,9 @@ fn keys_typed_while_the_editor_runs_reach_the_editor_not_the_composer() {
     );
     assert!(!since_re_entry.contains("Working"), "{since_re_entry}");
 
+    // The edited draft must be cleared before Ctrl+D is the quit chord.
+    pty.send(b"\x03").unwrap();
+    pty.read_for(HOTKEY_GAP);
     pty.send(b"\x04").unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
@@ -1576,6 +1579,9 @@ fn a_bracketed_paste_with_a_newline_lands_in_the_composer_unsubmitted() {
         "a paste containing a newline was submitted as a prompt:\n{since}"
     );
 
+    // The pasted draft must be cleared before Ctrl+D is the quit chord.
+    pty.send(b"\x03").unwrap();
+    pty.read_for(HOTKEY_GAP);
     pty.send(b"\x04").unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
@@ -1766,16 +1772,18 @@ fn wait_for_file(pty: &mut Pty, path: &Path, what: &str) {
     }
 }
 
-/// A document loader (`$1` in, `$2` out) that marks its start next to the
-/// input, ignores SIGTERM and SIGINT, and sleeps well past the exit
-/// deadline. A loader runs under a plain blocking `status()` with no
-/// abort check, so this is a turn nothing can stop; a tool would not do,
-/// because the runner SIGKILLs an aborted tool and no trap survives that.
+/// A document loader (`$1` in, the document on stdout) that marks its
+/// start next to the input, ignores SIGTERM and SIGINT, and sleeps well
+/// past the exit deadline. A stdout loader runs under a plain blocking
+/// `output()` with no abort check, so this is a turn nothing can stop; a
+/// file-writing (`$2`) loader would not do, because its wait is polled and
+/// an abort kills it, and neither would a tool, because the runner
+/// SIGKILLs an aborted tool and no trap survives that.
 const STUBBORN_LOADER: &str = "#!/usr/bin/env bash\n\
     trap '' TERM INT\n\
     : > \"$1.started\"\n\
     sleep 30\n\
-    cp \"$1\" \"$2\"\n";
+    cat \"$1\"\n";
 
 /// A turn that does not stop when told to: the UI waits out
 /// `EXIT_CANCEL_WAIT` and then ends the process without it, still with
@@ -1799,7 +1807,7 @@ fn sigterm_during_a_turn_that_ignores_the_abort_leaves_it_behind_in_bounded_time
         &format!(
             "save_session: false\n\
              document_loaders:\n\
-             \x20 stub: 'bash {} $1 $2'\n",
+             \x20 stub: 'bash {} $1'\n",
             loader.display()
         ),
     );
