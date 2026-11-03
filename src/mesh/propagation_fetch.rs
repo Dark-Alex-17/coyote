@@ -3332,8 +3332,8 @@ mod tests {
         };
 
         use rns_transport::destination::DestinationName;
-        use rns_transport::identity_bridge::to_transport_private_identity;
         use rns_transport::identity::PrivateIdentity as TransportIdentity;
+        use rns_transport::identity_bridge::to_transport_private_identity;
         use rns_transport::iface::InterfaceSharedConfig;
         use rns_transport::iface::tcp_server::TcpServer;
         use rns_transport::resource::ResourceEventKind;
@@ -4224,8 +4224,7 @@ mod tests {
         async fn a_fresh_runtime_fetches_from_the_persisted_node_without_hearing_it_announce() {
             let fake = FakeNode::listen_with_mtu(TcpServer::DEFAULT_CLIENT_MTU).await;
             let tmp = TempDir::new("fetch-net-persisted-node");
-            let table_path =
-                mesh_cache_dir(&tmp.path.join("cache")).join("propagation-nodes.json");
+            let table_path = mesh_cache_dir(&tmp.path.join("cache")).join("propagation-nodes.json");
             let persisted = PropagationNodeTable::load(table_path).unwrap();
             persisted.observe(
                 PropagationNode {
@@ -4250,7 +4249,10 @@ mod tests {
             .await
             .unwrap();
             let selected = runtime.propagation_nodes().select().unwrap();
-            assert_eq!(selected.destination.address_hash.to_hex_string(), fake.hex());
+            assert_eq!(
+                selected.destination.address_hash.to_hex_string(),
+                fake.hex()
+            );
 
             let sink = CountingSink::default();
             fake.script.reply_with([Value::Array(vec![])]);
@@ -4338,9 +4340,10 @@ mod tests {
             fake.listener.transport.send_packet(packet).await;
             let peers = b.runtime.peers();
             wait_until("B to file A with its public key", || {
-                peers.snapshot().iter().any(|peer| {
-                    peer.destination_hash == a_destination && peer.public_key.is_some()
-                })
+                peers
+                    .snapshot()
+                    .iter()
+                    .any(|peer| peer.destination_hash == a_destination && peer.public_key.is_some())
             })
             .await;
 
