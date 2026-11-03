@@ -9763,7 +9763,11 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
         let far_hex = far.node.destination.address_hash.to_hex_string();
         let near_hex = near.node.destination.address_hash.to_hex_string();
         let rows = propagation_node_rows(vec![far, near, aged_out], now);
-        assert_eq!(rows.len(), 2, "one row per node heard, none for one aged out: {rows:?}");
+        assert_eq!(
+            rows.len(),
+            2,
+            "one row per node heard, none for one aged out: {rows:?}"
+        );
         assert!(
             rows[0].0 == "propagation_nodes[0]" && rows[0].1.contains(&near_hex),
             "the renderer itself puts the 1-hop node first: {rows:?}"

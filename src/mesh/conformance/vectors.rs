@@ -2517,7 +2517,8 @@ fn pn_vectors() -> Vec<Vector> {
                 aged.observe(node, 1, SystemTime::now() - PROPAGATION_NODE_TTL);
                 same(
                     "skipped once the ttl has run out",
-                    aged.select().map(|node| node.destination.address_hash.to_hex_string()),
+                    aged.select()
+                        .map(|node| node.destination.address_hash.to_hex_string()),
                     Err(FetchError::NoPropagationNode),
                 )
             }),
@@ -4073,7 +4074,11 @@ fn code_vectors() -> Vec<Vector> {
                 same("PREDECESSOR_RECORD_VERSION", PREDECESSOR_RECORD_VERSION, 1)?;
                 same("PEER_TABLE_VERSION", PEER_TABLE_VERSION, 2)?;
                 same("PROPAGATION_STORE_VERSION", PROPAGATION_STORE_VERSION, 1)?;
-                same("PROPAGATION_NODE_TABLE_VERSION", PROPAGATION_NODE_TABLE_VERSION, 1)?;
+                same(
+                    "PROPAGATION_NODE_TABLE_VERSION",
+                    PROPAGATION_NODE_TABLE_VERSION,
+                    1,
+                )?;
                 same("SHARES_FILE_VERSION", SHARES_FILE_VERSION, 1)?;
                 same("GRANT_RECORD_VERSION", GRANT_RECORD_VERSION, 1)
             }),

@@ -1320,14 +1320,15 @@ impl MeshRuntime {
             .ok_or(PropagationError::Link(RequestError::NotRunning))?;
         let sender = to_core_private_identity(&self.transport_identity);
         let origin = self.destination.lock().await.origin;
-        request_path_to_node(&transport, node).await;
+        let cancel = self.cancellation_token();
+        request_path_to_node(&transport, node, &cancel, PropagationError::Cancelled).await?;
         propagation::propagate(
             &transport,
             &sender,
             recipient,
             node,
             &build(&origin),
-            self.cancellation_token(),
+            cancel,
             options,
         )
         .await?;
@@ -1530,7 +1531,8 @@ impl MeshRuntime {
             .ok_or(FetchError::Link(RequestError::NotRunning))?;
         let node = self.propagation_nodes.select()?;
         let mut store = propagation_fetch::FetchStore::load(store_path, SystemTime::now())?;
-        request_path_to_node(&transport, &node).await;
+        let cancel = self.cancellation_token();
+        request_path_to_node(&transport, &node, &cancel, FetchError::Cancelled).await?;
         let peers = PeerRouting {
             trust: &self.trust,
             surface: self.peer_surface.lock().as_ref().and_then(Weak::upgrade),
@@ -1554,7 +1556,7 @@ impl MeshRuntime {
             &mut store,
             &routing,
             &FetchOptions::default(),
-            self.cancellation_token(),
+            cancel,
         )
         .await
     }
@@ -1797,7 +1799,8 @@ impl MeshRuntime {
                 redact_hashes(&format!("{err:#}"))
             );
         }
-        self.propagation_nodes.persist_if_dirty_or_warn(PersistTrigger::Stop);
+        self.propagation_nodes
+            .persist_if_dirty_or_warn(PersistTrigger::Stop);
         debug!(
             "Stopped mesh node {} (instance {}, destination {})",
             short(&self.fingerprint),
@@ -3289,19 +3292,36 @@ async fn sweep_pending(slot: Weak<MeshSlot>, cancel: CancellationToken) {
 /// A node loaded from the persisted table may have no path yet, and a link needs one: this
 /// transport does not rebroadcast announces, so the path comes only from an answered
 /// request. One request, waited on for `PATH_REQUEST_TIMEOUT`; without an answer the link
-/// fails as it would have.
-async fn request_path_to_node(transport: &Transport, node: &PropagationNode) {
+/// fails as it would have. Stopping the node ends the wait with `cancelled`, the caller's
+/// own error for a stop.
+async fn request_path_to_node<E>(
+    transport: &Transport,
+    node: &PropagationNode,
+    cancel: &CancellationToken,
+    cancelled: E,
+) -> Result<(), E> {
     let hash = node.destination.address_hash;
     if transport.has_path(&hash).await {
-        return;
+        return Ok(());
     }
     debug!(
         "Mesh has no path to propagation node {}; asking the mesh for one",
         short(&hash.to_hex_string())
     );
-    transport
-        .await_path(&hash, PATH_REQUEST_TIMEOUT, None)
-        .await;
+    tokio::select! {
+        () = cancel.cancelled() => return Err(cancelled),
+        found = transport.await_path(&hash, PATH_REQUEST_TIMEOUT, None) => {
+            if !found {
+                debug!(
+                    "Mesh heard no path to propagation node {} within {}s; the link to it \
+                     will likely fail for want of one, and the next attempt asks again",
+                    short(&hash.to_hex_string()),
+                    PATH_REQUEST_TIMEOUT.as_secs()
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn persist_tables_periodically(
@@ -14774,6 +14794,129 @@ mod tests {
         assert_eq!(file.peers.len(), 1);
         assert_eq!(file.peers[0].destination_hash, "persisted-on-stop");
         relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    mod persisted_propagation_node_tests {
+        use super::*;
+        use crate::mesh::propagation::test_support::FakeNode as PostingNode;
+        use crate::mesh::propagation_fetch::FETCH_TRANSFER_LIMIT_KB;
+        use crate::mesh::test_support::FakeNode;
+
+        const FETCH_DEADLINE: Duration = Duration::from_secs(30);
+
+        async fn start_on(tmp: &TempDir, port: u16) -> Arc<MeshRuntime> {
+            let mut session = Session::default();
+            MeshRuntime::start(
+                &private_config(port),
+                true,
+                &mut session,
+                mesh_paths(tmp),
+                NodeOptions::default(),
+            )
+            .await
+            .unwrap()
+        }
+
+        async fn stop(runtime: &Arc<MeshRuntime>) {
+            let slot = Arc::new(MeshSlot::default());
+            slot.install(runtime.clone()).unwrap();
+            assert!(slot.stop().await.unwrap());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_node_heard_before_stop_is_fetched_from_after_a_restart_without_an_announce() {
+            // A `MeshRuntime` joins with `TcpClient`'s default MTU, so the fake matches it.
+            let fake = FakeNode::listen_with_mtu(TcpServer::DEFAULT_CLIENT_MTU).await;
+            let tmp = TempDir::new("node-persist-propagation-nodes");
+            let table_path =
+                mesh_cache_dir(&tmp.path.join("cache")).join(PROPAGATION_NODE_TABLE_FILE);
+
+            let first = start_on(&tmp, fake.listener.port).await;
+            fake.announce().await;
+            wait_until("the runtime to file the propagation node", || {
+                first.propagation_nodes().select().is_ok()
+            })
+            .await;
+            stop(&first).await;
+            assert!(
+                table_path.exists(),
+                "{} must exist after stop",
+                table_path.display()
+            );
+
+            let second = start_on(&tmp, fake.listener.port).await;
+            let selected = second.propagation_nodes().select().unwrap();
+            assert_eq!(
+                selected.destination.address_hash.to_hex_string(),
+                fake.hex()
+            );
+            let sink = CountingSink::default();
+            fake.script.reply_with([rmpv::Value::Array(vec![])]);
+            let report = tokio::time::timeout(FETCH_DEADLINE, second.fetch_propagated(&sink))
+                .await
+                .expect("the fetch must finish within FETCH_DEADLINE")
+                .unwrap();
+            assert_eq!(report.node, fake.hex());
+            assert_eq!(report.listed, 0);
+
+            stop(&second).await;
+            fake.stop().await;
+        }
+
+        /// The node never announces, so the only way the runtime learns a path to it is the
+        /// request the post makes before opening its link.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_post_to_a_persisted_node_with_no_path_asks_for_one_and_succeeds() {
+            let mut node = PostingNode::listen(TcpServer::DEFAULT_CLIENT_MTU).await;
+            let tmp = TempDir::new("node-post-persisted-node");
+            let table_path =
+                mesh_cache_dir(&tmp.path.join("cache")).join(PROPAGATION_NODE_TABLE_FILE);
+            let persisted = PropagationNodeTable::load(table_path, SystemTime::now()).unwrap();
+            persisted.observe(
+                PropagationNode {
+                    destination: node.desc,
+                    stamp_cost: 0,
+                    per_transfer_limit_kb: FETCH_TRANSFER_LIMIT_KB,
+                    propagation_enabled: true,
+                },
+                1,
+                SystemTime::now(),
+            );
+            persisted.persist_if_dirty().unwrap();
+
+            let runtime = start_on(&tmp, node.port).await;
+            let selected = runtime.propagation_nodes().select().unwrap();
+            let transport = runtime.transport_handle().await.unwrap();
+            assert!(
+                !transport.has_path(&node.desc.address_hash).await,
+                "a node that never announced has no path yet"
+            );
+
+            let recipient = *TransportIdentity::new_from_rand(OsRng).as_identity();
+            let options = PropagationOptions {
+                reject_window: Duration::from_millis(300),
+                ..PropagationOptions::default()
+            };
+            runtime
+                .post_to_node(
+                    &recipient,
+                    &selected,
+                    |_| OutboundMessage {
+                        title: None,
+                        content: b"posted after a path request".to_vec(),
+                        fields: None,
+                    },
+                    &options,
+                )
+                .await
+                .unwrap();
+            assert!(transport.has_path(&node.desc.address_hash).await);
+            node.next_received().await;
+
+            stop(&runtime).await;
+            node.stop().await;
+        }
     }
 
     #[cfg(unix)]

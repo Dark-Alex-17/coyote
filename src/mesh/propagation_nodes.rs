@@ -722,7 +722,11 @@ mod persisted_table_tests {
         let stale = node();
         let fresh = node();
         table.observe(stale.clone(), 1, now - PROPAGATION_NODE_TTL);
-        table.observe(fresh.clone(), 1, now - PROPAGATION_NODE_TTL + Duration::from_secs(1));
+        table.observe(
+            fresh.clone(),
+            1,
+            now - PROPAGATION_NODE_TTL + Duration::from_secs(1),
+        );
         table.persist_if_dirty().unwrap();
 
         let reloaded = PropagationNodeTable::load(path_in(&tmp), now).unwrap();
@@ -765,8 +769,10 @@ mod persisted_table_tests {
             ". The next start will not know the propagation nodes heard since the last save until they announce again",
         ] {
             assert!(
-                warns.iter().any(|line| line.starts_with(&start)
-                    && line.ends_with(&format!("{cost}{check}"))),
+                warns
+                    .iter()
+                    .any(|line| line.starts_with(&start)
+                        && line.ends_with(&format!("{cost}{check}"))),
                 "no warning {start:?}...{cost:?}{check:?} in {warns:?}"
             );
         }

@@ -1273,36 +1273,34 @@ impl BodyPipeline<'_> {
                 self.sink.deliver(message);
                 Ok(BodyOutcome::Delivered)
             }
-            Err(unknown @ Discard::UnknownSource { asked }) => match store.defer(
-                transient_id,
-                now,
-                asked,
-            ) {
-                Deferral::Retry { attempts } => {
-                    let ask_note = if asked {
-                        format!("; {ASKED_FOR_SOURCE}")
-                    } else {
-                        String::new()
-                    };
-                    debug!(
-                        "Propagation fetch from {}: deferred transient {}: {unknown}{ask_note}, sighting {attempts} (kept for at least {MAX_UNKNOWN_SOURCE_DEFERRALS} sightings and {} s)",
-                        self.node,
-                        short(&hex_lower(&transient_id)),
-                        UNKNOWN_SOURCE_DEFERRAL_HORIZON.as_secs()
-                    );
-                    Ok(BodyOutcome::Deferred { attempts, asked })
+            Err(unknown @ Discard::UnknownSource { asked }) => {
+                match store.defer(transient_id, now, asked) {
+                    Deferral::Retry { attempts } => {
+                        let ask_note = if asked {
+                            format!("; {ASKED_FOR_SOURCE}")
+                        } else {
+                            String::new()
+                        };
+                        debug!(
+                            "Propagation fetch from {}: deferred transient {}: {unknown}{ask_note}, sighting {attempts} (kept for at least {MAX_UNKNOWN_SOURCE_DEFERRALS} sightings and {} s)",
+                            self.node,
+                            short(&hex_lower(&transient_id)),
+                            UNKNOWN_SOURCE_DEFERRAL_HORIZON.as_secs()
+                        );
+                        Ok(BodyOutcome::Deferred { attempts, asked })
+                    }
+                    Deferral::BudgetSpent { attempts, held } => {
+                        store.insert(transient_id, now);
+                        warn!(
+                            "Propagation fetch from {}: giving up on transient {} after {attempts} deferrals over {} s; no key for its claimed source",
+                            self.node,
+                            short(&hex_lower(&transient_id)),
+                            held.as_secs()
+                        );
+                        Ok(BodyOutcome::Discarded(Discard::UnknownSourceBudgetSpent))
+                    }
                 }
-                Deferral::BudgetSpent { attempts, held } => {
-                    store.insert(transient_id, now);
-                    warn!(
-                        "Propagation fetch from {}: giving up on transient {} after {attempts} deferrals over {} s; no key for its claimed source",
-                        self.node,
-                        short(&hex_lower(&transient_id)),
-                        held.as_secs()
-                    );
-                    Ok(BodyOutcome::Discarded(Discard::UnknownSourceBudgetSpent))
-                }
-            },
+            }
             Err(discard) => Ok(self.discard(transient_id, discard, store, now)),
         }
     }
@@ -3333,7 +3331,7 @@ mod tests {
             let line = debug_snapshot()
                 .into_iter()
                 .find(|line| {
-                    line.contains(&short(&hex_lower(&transient_id_of(&bodies[0]))))
+                    line.contains(short(&hex_lower(&transient_id_of(&bodies[0]))))
                         && line.contains("deferred transient")
                 })
                 .expect("a deferral line for the first body");
@@ -3405,10 +3403,7 @@ mod tests {
                 (MAX_SOURCE_ASKS_PER_FETCH + 1, MAX_SOURCE_ASKS_PER_FETCH)
             );
             let last = transient_id_of(bodies.last().unwrap());
-            assert_eq!(
-                bench.store.deferral_of(&last).map(|d| d.asked),
-                Some(false)
-            );
+            assert_eq!(bench.store.deferral_of(&last).map(|d| d.asked), Some(false));
             let expected = format!(
                 "Propagation fetch from fake: claimed source {} not asked for yet: this fetch already asked the mesh for {MAX_SOURCE_ASKS_PER_FETCH} senders; a later sync asks",
                 short(&lxmf_delivery_hash(ids.last().unwrap()).to_hex_string())
