@@ -111,6 +111,11 @@ impl NoticeText {
         self.0.iter().map(NoticeSpan::text).collect()
     }
 
+    /// The text with only its frame runs spelled in `prefix`.
+    pub(crate) fn render(&self, prefix: CommandPrefix) -> String {
+        self.0.iter().map(|span| span.render(prefix)).collect()
+    }
+
     fn lines(&self) -> Vec<Vec<NoticeSpan>> {
         let mut lines = vec![Vec::new()];
         for span in &self.0 {

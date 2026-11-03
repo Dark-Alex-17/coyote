@@ -25,6 +25,7 @@ use crate::mesh::message::{
     PartLimits, PeerKind, PeerMessage, PeerVia, RawPart, RecipientOutcome, is_wire_id,
     unreachable_head,
 };
+use crate::mesh::notify::NoticeText;
 use crate::mesh::pending::{
     Correlation, INBOUND_ENVOY_QUESTION_MAX_CHARS, InboundKind, InboundRecord,
     PENDING_QUESTION_MAX_CHARS, PENDING_TTL, PendingState, access_not_a_question,
@@ -51,6 +52,7 @@ use crate::mesh::{
     loopback_endpoint, parse_rfc3339, redact_hashes, refuse_symlink, rfc3339_utc, short, span_text,
 };
 use crate::repl::printer::terminal_width;
+use crate::render::QuotingError;
 use crate::supervisor::mailbox::EnvelopePayload;
 use crate::utils::{
     AbortSignal, NO_COLOR, drain_stale_tty_input, home_relative, tool_name_text_forced,
@@ -1896,7 +1898,7 @@ pub(crate) fn attachment(
         );
     }
     if let Some(refusal) = set.refusal() {
-        bail!("{} Nothing was sent.", shown_refusal(refusal));
+        return Err(refused_at_load(refusal, " Nothing was sent."));
     }
     if let Some(reason) = set
         .verdict_for(&PeerRef::unscoped(), path_text, case_insensitive)?
@@ -4267,11 +4269,11 @@ fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         })
         .collect();
     let Some((first_layer, first_held)) = targets.first().cloned() else {
-        bail!(
-            "No share rule has the pattern `{pattern}` in {} or {}; `.mesh shares` lists them.",
+        return Err(no_share_rule(
+            &pattern,
             path_of(Layer::Global),
-            path_of(Layer::Workspace)
-        );
+            path_of(Layer::Workspace),
+        ));
     };
     match scope {
         WriteScope::Global | WriteScope::Workspace => {
@@ -4413,7 +4415,7 @@ fn shares(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         .transpose()?;
     let (root, set) = share_set(ctx)?;
     if let Some(refusal) = set.refusal() {
-        err_text(&shown_refusal(refusal));
+        err_path_text(&shown_refusal(refusal));
         out_text("Nothing is shared until it is fixed.");
         return Ok(());
     }
@@ -4593,7 +4595,7 @@ fn refuse_unservable(
 ) -> Result<()> {
     let (root, set) = share_set(ctx)?;
     if let Some(refusal) = set.refusal() {
-        bail!("{} Nothing was sent.", shown_refusal(refusal));
+        return Err(refused_at_load(refusal, " Nothing was sent."));
     }
     let case_insensitive = root_case(ctx, &root)?.unwrap_or(false);
     let peer = PeerRef {
@@ -4607,27 +4609,104 @@ fn refuse_unservable(
         };
         let shown = listed_paths(std::slice::from_ref(path));
         if let Some(reason) = unserved_reason(verdict) {
-            bail!(
-                "{shown} would not be served even once granted ({reason}); refuse the request with `.mesh refuse {id}`, or lift the rule first."
-            );
+            return Err(unservable(shown, reason, id));
         }
         let Ok(metadata) = fs::metadata(&canonical) else {
             continue;
         };
         if !metadata.is_file() {
-            bail!(
-                "{shown} would not be served even once granted (it is not a regular file); refuse the request with `.mesh refuse {id}`, or lift the rule first."
-            );
+            return Err(unservable(shown, "it is not a regular file", id));
         }
         let size = metadata.len();
         if size > limit {
-            bail!(
-                "{shown} would not be served even once granted (it is {} and this node serves at most {limit} bytes); refuse the request with `.mesh refuse {id}`, or lift the rule first.",
-                human_size(size),
-            );
+            return Err(unservable(
+                shown,
+                format!(
+                    "it is {} and this node serves at most {limit} bytes",
+                    human_size(size)
+                ),
+                id,
+            ));
         }
     }
     Ok(())
+}
+
+/// The requested path is the peer's text, quoted as it wrote it; the remedy is this
+/// node's own and follows the prefix.
+fn unservable(shown: String, why: impl std::fmt::Display, id: &str) -> anyhow::Error {
+    QuotingError::new(NoticeText::default().peer(shown).frame(format!(
+        " would not be served even once granted ({why}); refuse the request with `.mesh refuse {id}`, or lift the rule first."
+    )))
+}
+
+/// The pattern is the human's own text and the files are paths, both quoted as typed.
+fn no_share_rule(
+    pattern: &str,
+    global: impl std::fmt::Display,
+    workspace: impl std::fmt::Display,
+) -> anyhow::Error {
+    QuotingError::new(
+        NoticeText::default()
+            .frame("No share rule has the pattern `")
+            .peer(pattern)
+            .frame("` in ")
+            .peer(global.to_string())
+            .frame(" or ")
+            .peer(workspace.to_string())
+            .frame("; `.mesh shares` lists them."),
+    )
+}
+
+#[cfg(test)]
+mod peer_text_prefix_tests {
+    use super::*;
+    use crate::render::{MeshVerbError, command_error_text};
+
+    fn shown_under_slash(err: anyhow::Error) -> String {
+        command_error_text(
+            &MeshVerbError::wrap(err.context("`.mesh grant` failed")),
+            CommandPrefix::Slash,
+        )
+    }
+
+    #[test]
+    fn a_grant_refused_over_a_bare_vault_keeps_the_path_and_slashes_the_hint() {
+        for err in [
+            unservable(listed_paths(&[".vault".to_string()]), "a deny rule names it", "a-1"),
+            unservable(
+                listed_paths(&[".vault".to_string()]),
+                "it is not a regular file",
+                "a-1",
+            ),
+        ] {
+            let text = shown_under_slash(err);
+            assert!(text.starts_with("Error: `/mesh grant` failed"), "{text}");
+            assert!(text.contains("    `.vault` would not be served"), "{text}");
+            assert!(text.contains("`/mesh refuse a-1`"), "{text}");
+        }
+    }
+
+    #[test]
+    fn unshare_of_vault_keeps_the_pattern_and_slashes_the_hint() {
+        let text = shown_under_slash(no_share_rule(".vault", ".coyote/shares.yaml", ".shares"));
+        assert!(
+            text.ends_with(
+                "No share rule has the pattern `.vault` in .coyote/shares.yaml or .shares; `/mesh shares` lists them."
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_share_file_refused_at_load_is_quoted_byte_for_byte() {
+        let refusal = "shares.yaml line 2: `.vault` is a protected path; run .mesh shares";
+        let text = shown_under_slash(refused_at_load(refusal, " Nothing was sent."));
+        assert!(
+            text.ends_with(&format!("    {refusal} Nothing was sent.")),
+            "{text}"
+        );
+    }
 }
 
 /// The requested paths in backticks, a backtick inside one made an apostrophe as the
@@ -4808,6 +4887,16 @@ fn shown_pattern(pattern: &str) -> String {
 /// stripped the way a pattern's are.
 fn shown_refusal(refusal: &str) -> String {
     display_text(refusal, 4096).unwrap_or_default()
+}
+
+/// A `.mesh` error that quotes a share file refused at load; the file's words keep
+/// their bytes whatever the prefix.
+fn refused_at_load(refusal: &str, tail: &str) -> anyhow::Error {
+    QuotingError::new(
+        NoticeText::default()
+            .peer(shown_refusal(refusal))
+            .frame(tail),
+    )
 }
 
 struct ShareArgs {
@@ -5082,7 +5171,7 @@ fn writable_share_set(ctx: &RequestContext) -> Result<(PathBuf, ShareSet, bool)>
 fn loaded_for_writing(ctx: &RequestContext) -> Result<(PathBuf, ShareSet)> {
     let (root, set) = share_set(ctx)?;
     if let Some(refusal) = set.refusal() {
-        bail!("{} Nothing was written.", shown_refusal(refusal));
+        return Err(refused_at_load(refusal, " Nothing was written."));
     }
     Ok((root, set))
 }
