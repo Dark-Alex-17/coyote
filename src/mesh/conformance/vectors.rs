@@ -366,7 +366,7 @@ fn run(case: &Case) -> Result<(), String> {
                 display_name_on_public: *on_public,
                 ..MeshConfig::default()
             };
-            let bytes = announce_app_data(&config).map_err(|err| err.to_string())?;
+            let bytes = announce_app_data(&config, None).map_err(|err| err.to_string())?;
             let decoded = AnnounceAppData::decode(&bytes).ok_or("own announce does not decode")?;
             same("version", decoded.version, MESH_PROTOCOL_VERSION)?;
             same("display name", decoded.display_name.as_deref(), *expect)
