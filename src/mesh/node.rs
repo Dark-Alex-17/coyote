@@ -2973,7 +2973,9 @@ fn reconcile_tcp_after_lag(
 /// it held through the closed socket, and the heartbeat is up to an hour away. That
 /// announce honours and resets the floor, so a relay that flaps cannot make this node
 /// announce more often than once per `REANNOUNCE_FLOOR_SECS`; the first connect of a
-/// relay that was down at start is the one announce without it. A `Connected` for a
+/// relay that was down at start is the one announce without it. Every reconnect is told
+/// to the user with what became of its announce: sent, deferred to the heartbeat, failed,
+/// or not sent at all by a node that does not announce. A `Connected` for a
 /// client already marked connected, such as the connect at start the stream still held
 /// when the watcher began, tells nothing. A drop is only logged: the client redials on
 /// its own. A watcher that fell behind the stream reads each client's status instead,
@@ -3062,34 +3064,41 @@ async fn watch_interfaces(
                     }
                 }
                 Transition::Reconnect => {
-                    if !runtime.announce {
-                        continue;
-                    }
-                    let outcome = tokio::select! {
-                        () = cancel.cancelled() => return,
-                        outcome = runtime.announce_after_reconnect() => outcome,
-                    };
-                    let line = match outcome {
-                        Ok(None) => {
-                            info!("Mesh interface {label} reconnected; announced");
-                            format!("{label} reconnected; announced")
+                    let line = if runtime.announce {
+                        let outcome = tokio::select! {
+                            () = cancel.cancelled() => return,
+                            outcome = runtime.announce_after_reconnect() => outcome,
+                        };
+                        match outcome {
+                            Ok(None) => {
+                                info!("Mesh interface {label} reconnected; announced");
+                                format!("{label} reconnected; announced")
+                            }
+                            Ok(Some(age)) => {
+                                let age = elapsed_text(age);
+                                info!(
+                                    "Mesh interface {label} reconnected; the heartbeat will announce it (last announce {age})"
+                                );
+                                format!(
+                                    "{label} reconnected; the heartbeat will announce it (last announce {age})"
+                                )
+                            }
+                            Err(err) => {
+                                warn!(
+                                    "Failed to announce the mesh node over {label} after it reconnected; the heartbeat will announce it: {}",
+                                    redact_hashes(&format!("{err:#}"))
+                                );
+                                format!(
+                                    "{label} reconnected; the announce over it failed, so the heartbeat will announce it: {}",
+                                    redact_hashes(&format!("{err:#}"))
+                                )
+                            }
                         }
-                        Ok(Some(age)) => {
-                            let age = elapsed_text(age);
-                            info!(
-                                "Mesh interface {label} reconnected; the heartbeat will announce it (last announce {age})"
-                            );
-                            format!(
-                                "{label} reconnected; the heartbeat will announce it (last announce {age})"
-                            )
-                        }
-                        Err(err) => {
-                            warn!(
-                                "Failed to announce the mesh node over {label} after it reconnected; the heartbeat will announce it: {}",
-                                redact_hashes(&format!("{err:#}"))
-                            );
-                            continue;
-                        }
+                    } else {
+                        info!("Mesh interface {label} reconnected; this node does not announce");
+                        format!(
+                            "{label} reconnected; nothing was sent over it, as this node does not announce (mesh.announce is off)"
+                        )
                     };
                     slot.push_idle(IdleNotify {
                         source: Source::Mesh,
@@ -14523,6 +14532,80 @@ mod tests {
             metrics.num_alive_tasks() == 0
         })
         .await;
+    }
+
+    /// Every reconnect of a TCP relay is told, whatever became of the announce over it.
+    mod reconnect_line_tests {
+        use super::*;
+
+        /// A node configured not to announce still says its relay is back, and that
+        /// nothing was sent over it.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_node_that_does_not_announce_says_its_relay_reconnected() {
+            let relay = TransportRelay::start().await;
+            let port = relay.port;
+            let tmp = TempDir::new("node-reconnect-line-silent");
+            let mut session = Session::default();
+            let runtime = MeshRuntime::start(
+                &MeshConfig {
+                    announce: false,
+                    ..private_config(port)
+                },
+                true,
+                &mut session,
+                mesh_paths(&tmp),
+                NodeOptions::default(),
+            )
+            .await
+            .unwrap();
+            let slot = Arc::new(MeshSlot::default());
+            let notifier = Arc::new(RecordingSink::default());
+            slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+            slot.install(runtime.clone()).unwrap();
+            sleep(Duration::from_millis(2500)).await;
+
+            relay.stop().await;
+            let relay = TransportRelay::start_on(port).await;
+            wait_for_mesh_line(
+                &notifier,
+                &format!(
+                    "{} reconnected; nothing was sent over it, as this node does not announce (mesh.announce is off)",
+                    private_label(port)
+                ),
+            )
+            .await;
+
+            assert!(slot.stop().await.unwrap());
+            relay.stop().await;
+        }
+
+        /// An announce that fails after a reconnect is told on the reconnect line, with the
+        /// failure and the heartbeat that will carry the announce instead.
+        #[cfg(unix)]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_failed_reconnect_announce_is_told_on_the_reconnect_line() {
+            let (relay, a, b) = two_nodes_on_a_relay("node-reconnect-line-failed").await;
+            let port = relay.port;
+            a.expire_announce_floor().await;
+            fail_next_announce_of(AddressHash::new_from_hex_string(&a.hash).unwrap());
+
+            relay.stop().await;
+            let relay = TransportRelay::start_on(port).await;
+            wait_for_mesh_line(
+                &a.notifier,
+                &format!(
+                    "{} reconnected; the announce over it failed, so the heartbeat will announce it: The mesh announce for destination {} failed for the test",
+                    private_label(port),
+                    a.hash8()
+                ),
+            )
+            .await;
+
+            assert!(a.slot.stop().await.unwrap());
+            assert!(b.slot.stop().await.unwrap());
+            relay.stop().await;
+        }
     }
 
     /// Stopping a node whose relay has just gone away, beside a relay it never reached,
