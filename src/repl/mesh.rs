@@ -2084,7 +2084,10 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
         &args.path,
         SystemTime::now(),
     ) {
-        bail!(not_shared_refusal(peer, &shown, &args.path, &reason));
+        bail!(
+            "{} This was answered from this node's own records without asking {peer}; if {peer} now shares it some other way, a mesh__list call from the model refreshes this node's copy of its listing and the next fetch asks {peer}.",
+            not_shared_refusal(peer, &shown, &args.path, &reason)
+        );
     }
     let desc = match route_to(&runtime, &destination, abort_signal).await {
         Ok(desc) => desc,
@@ -41112,21 +41115,29 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         memory.remember_reference(&dest, &identity, "m-1", "docs/a.md");
                         memory.mark_fetched(&dest, "docs/a.md", &staged);
                         assert_eq!(fx.heard().len(), 2, "both refusals so far were the peer's");
+                        let before = stdout_lines().len();
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
-                                "`docs/a.md` was a one-time attachment from {dest} and this node already fetched it (staged at {staged}). Ask for it again with .mesh message {dest} if you need a fresh copy.",
+                                "`docs/a.md` was a one-time attachment from {dest} and this node already fetched it (staged at {staged}). Ask for it again with .mesh message {dest} if you need a fresh copy. This was answered from this node's own records without asking {dest}; if {dest} now shares it some other way, a mesh__list call from the model refreshes this node's copy of its listing and the next fetch asks {dest}.",
                                 dest = fx.dest(),
                                 staged = staged.display()
                             ),
                             "a spent attachment is answered from the claims"
+                        );
+                        assert!(
+                            !stdout_lines()[before..]
+                                .iter()
+                                .any(|line| line.starts_with("Fetching")),
+                            "a spent attachment prints no Fetching line: {:?}",
+                            &stdout_lines()[before..]
                         );
 
                         fs::remove_file(&staged).unwrap();
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
-                                "`docs/a.md` was a one-time attachment from {dest} and this node already fetched it (staged at {staged}). Ask for it again with .mesh message {dest} if you need a fresh copy. That copy is no longer at that path.",
+                                "`docs/a.md` was a one-time attachment from {dest} and this node already fetched it (staged at {staged}). Ask for it again with .mesh message {dest} if you need a fresh copy. That copy is no longer at that path. This was answered from this node's own records without asking {dest}; if {dest} now shares it some other way, a mesh__list call from the model refreshes this node's copy of its listing and the next fetch asks {dest}.",
                                 dest = fx.dest(),
                                 staged = staged.display()
                             ),
@@ -41271,7 +41282,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
-                                "`docs/a.md` was a one-time attachment from {dest8} and this node already fetched it (staged at {staged}). Ask for it again with .mesh message {dest8} if you need a fresh copy.",
+                                "`docs/a.md` was a one-time attachment from {dest8} and this node already fetched it (staged at {staged}). Ask for it again with .mesh message {dest8} if you need a fresh copy. This was answered from this node's own records without asking {dest8}; if {dest8} now shares it some other way, a mesh__list call from the model refreshes this node's copy of its listing and the next fetch asks {dest8}.",
                                 dest8 = fx.dest()
                             ),
                             "the refusal names the path the Staged line printed"

@@ -1056,8 +1056,9 @@ struct PendingAccessClaim {
 
 /// The last status card, the last listing page and the claims per peer destination, so
 /// a REPL or tool can show them without another round trip. Bounded per kind, oldest
-/// insert out. Memory only: a restart forgets it all, and the peer's answer to a fetch
-/// is what counts.
+/// insert out. Memory only: a restart forgets it all. The claims answer a fetch of a
+/// one-time attachment this node already fetched before the peer is asked (see
+/// `spent_attachment`); for any other fetch the peer's answer is what counts.
 #[derive(Default)]
 pub(crate) struct PeerMemory {
     cards: Recent<StatusCard>,
@@ -1460,6 +1461,20 @@ pub(crate) fn not_shared_tool_message(peer: &str, shown: &str, reason: &NotShare
             "{peer} did not serve `{shown}`: either it is not shared with this node or it does not exist there - a peer never says which. Ask for it with the mesh__request_access call in next_action; its human decides. Do not ask the peer's envoy for the file in free text."
         ),
     }
+}
+
+/// The mesh__fetch tool's `message` for a spent attachment `spent_attachment` answered
+/// before the peer was asked; the result's `next_action` is the mesh__list call named
+/// here, since only a fresh listing can show the peer serving the path another way.
+pub(crate) fn spent_attachment_tool_message(
+    peer: &str,
+    shown: &str,
+    staged_present: bool,
+) -> String {
+    let gone = if staged_present { "" } else { GONE_COPY_TAIL };
+    format!(
+        "`{shown}` was a one-time attachment from {peer} and this node already fetched it; read it at `already_staged_at`.{gone} This was answered from this node's own records without asking the peer. If the peer now shares it some other way, the mesh__list call in next_action refreshes this node's copy of its listing and a fetch after that asks the peer; a fresh one-time copy needs the peer to attach it again, which mesh__request_access asks its human for."
+    )
 }
 
 struct Recent<T> {
