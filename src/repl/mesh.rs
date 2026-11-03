@@ -2115,6 +2115,9 @@ async fn request(
     let id = uuid::Uuid::new_v4().simple().to_string();
     let valid = match validate_access(&id, args.paths, reason) {
         Ok(valid) => valid,
+        Err("a path is not a wire path") => bail!(
+            "The access request was not sent: a path is not a wire path. Spell each path relative to the peer's share root, /-separated, as mesh__list shows it or the peer's own .mesh shares --effective --all prints it."
+        ),
         Err(rule) => bail!(AccessError::Invalid(rule).to_string()),
     };
     let question = format!(
@@ -4596,7 +4599,7 @@ fn render_effective_shares(
     }
     if all && resolved.capped {
         let at_least = if resolved.truncated { "at least " } else { "" };
-        let more = resolved.total - ALL_LIST_ROWS;
+        let more = resolved.total - resolved.entries.len();
         lines.push(format!(
             "... and {at_least}{more} more rows not shown (--all stops at {ALL_LIST_ROWS} rows); drop --all to see only the files an allow rule names."
         ));
@@ -26680,6 +26683,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .unwrap();
 
                     let b8 = short(&dest_b).to_string();
+                    let request_tail = request_refusal_tail(&dest_b, None);
                     for (line, tail) in [
                         (
                             format!(".mesh message {dest_b} --yes hello"),
@@ -26689,6 +26693,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         (
                             format!(".mesh fetch {dest_b} docs/a.md"),
                             FETCH_REFUSAL_TAIL,
+                        ),
+                        (
+                            format!(".mesh request {dest_b} docs/a.md"),
+                            request_tail.as_str(),
                         ),
                     ] {
                         let err = run(&mut ctx, &line).await.unwrap_err().to_string();
@@ -35075,6 +35083,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             let seventeen: Vec<String> =
                                 (0..=ACCESS_MAX_PATHS).map(|n| format!("p{n}.md")).collect();
                             let long_reason = "x".repeat(ACCESS_REASON_MAX_CHARS + 1);
+                            let not_a_wire_path = "The access request was not sent: a path is not a wire path. Spell each path relative to the peer's share root, /-separated, as mesh__list shows it or the peer's own .mesh shares --effective --all prints it.";
                             for (line, expected) in [
                                 (
                                     format!(".mesh request {to} {} --yes", seventeen.join(" ")),
@@ -35089,7 +35098,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 ),
                                 (
                                     format!(".mesh request {to} ../x"),
-                                    AccessError::Invalid("a path is not a wire path").to_string(),
+                                    not_a_wire_path.to_string(),
+                                ),
+                                (
+                                    format!(".mesh request {to} /docs/a.md"),
+                                    not_a_wire_path.to_string(),
                                 ),
                                 (
                                     format!(".mesh request {untrusted} a.md --yes"),
@@ -35764,6 +35777,35 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let mut ids = fx.pending_ids();
                         ids.sort();
                         assert_eq!(ids, ["a-1", "a-2"]);
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
+                /// A private key below the root is caught by the built-in deny even with no
+                /// deny rule of the owner's, so a grant for it is refused the same way.
+                #[test]
+                #[serial]
+                fn granting_a_request_for_a_built_in_denied_key_file_is_refused_with_the_rule() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-grant-key-file");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-grant-key-file").await;
+                        let root = fx.root.path.clone();
+                        fs::create_dir_all(root.join("src/vault")).unwrap();
+                        fs::write(root.join("src/vault/id_rsa"), "KEY\n").unwrap();
+                        fx.file("a-1", InboundKind::Access, &["src/vault/id_rsa"]);
+
+                        let printed = stdout_lines().len();
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh grant a-1").await,
+                            "`src/vault/id_rsa` would not be served even once granted (the built-in deny names it); refuse the request with `.mesh refuse a-1`, or lift the rule first."
+                        );
+                        assert_eq!(stdout_lines().len(), printed);
+                        assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
+                        assert!(fx.grants().is_empty(), "{:?}", fx.grants());
+                        assert_eq!(fx.pending_ids(), ["a-1"]);
                         assert_eq!(prompt_script::prompts_asked(), 0);
                         fx.stop().await;
                     });
@@ -42665,6 +42707,15 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             (
                                 format!(".mesh fetch {unheard} docs/a.md"),
                                 unheard_refusal(&runtime, &unheard, FETCH_REFUSAL_TAIL).to_string(),
+                            ),
+                            (
+                                format!(".mesh request {unheard} docs/a.md"),
+                                unheard_refusal(
+                                    &runtime,
+                                    &unheard,
+                                    &request_refusal_tail(&unheard, None),
+                                )
+                                .to_string(),
                             ),
                             (
                                 ".mesh fetch stub docs/a.md".to_string(),

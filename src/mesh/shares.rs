@@ -989,9 +989,8 @@ impl ShareSet {
     /// to `cap` and no further, so a verb can ask whether the pattern a human is about to
     /// write is broad before it writes it. Independent of every allow and deny on disk;
     /// `.git` and the protected directories are never entered and a symlinked directory
-    /// never followed, as in `list`; the `--all` walk lists a protected directory's own
-    /// files and never descends further, and served reads never enter it. Fails only for
-    /// a pattern the files would refuse or a root that does not resolve.
+    /// never followed, as in `list`. Fails only for a pattern the files would refuse or a
+    /// root that does not resolve.
     pub(crate) fn count_matches(
         &self,
         pattern: &str,
@@ -1265,7 +1264,8 @@ struct Walk<'a> {
     rules: &'a ShareRules,
     remaining: usize,
     truncated: bool,
-    /// Files kept before the walk stops; `usize::MAX` keeps them all.
+    /// Rows kept before the walk stops (collapsed `<dir>/` rows count); `usize::MAX`
+    /// keeps them all.
     cap: usize,
     capped: bool,
     /// When set, only files with this verdict are kept and counted against `cap`.
