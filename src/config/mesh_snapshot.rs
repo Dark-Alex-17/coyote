@@ -3,7 +3,8 @@ use crate::mesh::snapshot::{BriefState, MeshSnapshot, RepoInfo, TurnState};
 
 use std::env;
 use std::path::PathBuf;
-use std::time::{Instant, SystemTime};
+use std::time::SystemTime;
+use tokio::time::Instant;
 
 impl RequestContext {
     /// Copies out everything the mesh may serve about this session. Owned data only, so the
@@ -53,19 +54,23 @@ pub fn publish_mesh_snapshot(ctx: &RequestContext, state: TurnState) {
 /// Re-captures the session data without changing what the turn is doing: for progress ticks
 /// inside a turn, where only the outer boundary may say idle.
 pub fn refresh_mesh_snapshot(ctx: &RequestContext) {
-    let state = ctx
-        .app
+    publish_mesh_snapshot(ctx, published_turn_state(ctx));
+}
+
+fn published_turn_state(ctx: &RequestContext) -> TurnState {
+    ctx.app
         .mesh
         .snapshot()
         .map(|snapshot| snapshot.state)
-        .unwrap_or_else(TurnState::working_now);
-    publish_mesh_snapshot(ctx, state);
+        .unwrap_or_else(TurnState::working_now)
 }
 
 /// A progress point inside a turn: a tool batch has completed, which is where the todo
 /// tools, `agent__collect` and `job__collect` run. Refreshes the published snapshot at
 /// most once per `MESH_PROGRESS_MIN_INTERVAL`, then offers the context to the digest
-/// hook. Nothing happens for a context that does not own the session, or before a turn
+/// hook. A point inside the interval defers its snapshot to the slot's timer instead, so
+/// the last change before a long model call is published when the interval ends.
+/// Nothing happens for a context that does not own the session, or before a turn
 /// boundary has published the first snapshot: until then there is no turn state to keep.
 /// Works from the context it is handed and the slot alone, never the turn's lock.
 pub(crate) fn mesh_progress_point(ctx: &RequestContext) {
@@ -77,6 +82,9 @@ fn mesh_progress_point_at(ctx: &RequestContext, now: Instant) {
         return;
     }
     if !ctx.app.mesh.progress_capture_due_at(now) {
+        ctx.app
+            .mesh
+            .defer_progress(ctx.mesh_snapshot(published_turn_state(ctx)));
         return;
     }
     refresh_mesh_snapshot(ctx);
@@ -532,7 +540,7 @@ mod progress_point_tests {
     }
 
     #[tokio::test]
-    async fn a_tight_tool_loop_publishes_once() {
+    async fn a_tight_tool_loop_publishes_once_and_defers_the_rest() {
         let mut ctx = todo_ctx();
         publish_mesh_snapshot(&ctx, TurnState::working_now());
         let mut last = published(&ctx);
@@ -554,6 +562,62 @@ mod progress_point_tests {
             "only the first batch was captured"
         );
         assert_eq!(ctx.todo_list.todos.len(), 10);
+        let pending = ctx
+            .app
+            .mesh
+            .pending_progress_for_tests()
+            .expect("the throttled batches left a snapshot for the timer");
+        assert_eq!(
+            pending.todo.todos.len(),
+            10,
+            "the timer publishes the latest"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_throttled_change_is_published_when_the_interval_ends() {
+        let mut ctx = todo_ctx();
+        publish_mesh_snapshot(&ctx, TurnState::working_now());
+        ctx.todo_list.add("first");
+        mesh_progress_point_at(&ctx, Instant::now());
+        let first = published(&ctx);
+        assert_eq!(first.todo.todos.len(), 1);
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        ctx.todo_list.add("second");
+        mesh_progress_point_at(&ctx, Instant::now());
+        assert!(Arc::ptr_eq(&published(&ctx), &first), "too soon to publish");
+
+        tokio::time::advance(MESH_PROGRESS_MIN_INTERVAL - Duration::from_secs(2)).await;
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        let trailing = published(&ctx);
+        assert_eq!(trailing.todo.todos.len(), 2, "no further batch was needed");
+        assert_eq!(trailing.state, first.state);
+        assert!(ctx.app.mesh.pending_progress_for_tests().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_turn_boundary_supersedes_a_deferred_snapshot() {
+        let mut ctx = todo_ctx();
+        publish_mesh_snapshot(&ctx, TurnState::working_now());
+        mesh_progress_point_at(&ctx, Instant::now());
+        ctx.todo_list.add("first");
+        mesh_progress_point_at(&ctx, Instant::now());
+        assert!(ctx.app.mesh.pending_progress_for_tests().is_some());
+
+        let idle = TurnState::idle_now();
+        publish_mesh_snapshot(&ctx, idle);
+        assert!(ctx.app.mesh.pending_progress_for_tests().is_none());
+        let boundary = published(&ctx);
+
+        tokio::time::advance(MESH_PROGRESS_MIN_INTERVAL * 2).await;
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        assert!(Arc::ptr_eq(&published(&ctx), &boundary));
+        assert_eq!(boundary.state, idle);
     }
 
     #[test]
@@ -582,6 +646,43 @@ mod progress_point_tests {
         let mut isolated_macro = todo_ctx();
         isolated_macro.macro_flag = true;
         assert!(!isolated_macro.owns_mesh_session(), "an isolated macro");
+    }
+
+    #[test]
+    fn a_forked_branch_publishes_the_roots_todo_list() {
+        let mut root = todo_ctx();
+        root.todo_list.add("the root's task");
+
+        let branch = root.fork_for_branch();
+
+        assert!(branch.owns_mesh_session());
+        assert!(Arc::ptr_eq(&branch.app.mesh, &root.app.mesh));
+        // Todo tools are refused in graph llm nodes, so a branch never edits its copy.
+        assert_eq!(branch.todo_list, root.todo_list);
+    }
+
+    #[tokio::test]
+    async fn a_real_child_context_never_reaches_the_roots_slot() {
+        let mut root = todo_ctx();
+        root.todo_list.add("the root's task");
+        publish_mesh_snapshot(&root, TurnState::working_now());
+        let before = published(&root);
+        let mut child = RequestContext::new_for_child(
+            crate::function::agents::child_app_state(&root.app),
+            &root,
+            1,
+            Arc::new(crate::supervisor::mailbox::Inbox::new()),
+            "child-1".into(),
+        );
+        child.tool_scope.functions.append_todo_functions();
+        assert!(!child.owns_mesh_session());
+        assert!(!Arc::ptr_eq(&child.app.mesh, &root.app.mesh));
+
+        add_todo_batch(&mut child, "the child's task").await;
+
+        assert_eq!(child.todo_list.todos.len(), 1, "the child ran its batch");
+        assert!(Arc::ptr_eq(&published(&root), &before));
+        assert!(child.app.mesh.snapshot().is_none());
     }
 
     #[tokio::test]

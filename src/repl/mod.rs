@@ -3760,7 +3760,7 @@ local_hello() {\n\
         use super::*;
         use crate::config::mesh_config::{MeshBrief, MeshConfig};
         use crate::function::eval_tool_calls;
-        use crate::mesh::card::build_card;
+        use crate::mesh::card::{CardSource, StatusHandler, build_card};
         use crate::mesh::snapshot::MeshSnapshot;
         use crate::mesh::{MESH_PROGRESS_MIN_INTERVAL, MeshDigestHook};
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3920,6 +3920,43 @@ local_hello() {\n\
                 1,
                 "the later batches fell inside the digest interval"
             );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn a_top_level_agents_status_card_shows_its_todo_progress_mid_run() {
+            let _guard = crate::testing::TestConfigDirGuard::new("repl");
+            let name = unique("repl_progress_agent");
+            write_chat_agent(&name, CHAT_AGENT_BODY);
+            let mut ctx = engage_graph_agent(repl_ctx(), &name).await;
+            ctx.tool_scope.functions.append_todo_functions();
+            assert!(ctx.agent.is_some());
+            assert!(
+                ctx.owns_mesh_session(),
+                "use_agent leaves a top-level agent at depth 0 with no agent id"
+            );
+            publish_mesh_snapshot(&ctx, TurnState::working_now());
+            let source: Arc<dyn CardSource> = ctx.app.mesh.clone();
+            let status = StatusHandler::new(Arc::downgrade(&source));
+
+            let batches = [
+                ("todo__add", json!({ "task": "draft" }), (0, 1)),
+                ("todo__add", json!({ "task": "ship" }), (0, 2)),
+                ("todo__done", json!({ "id": 1 }), (1, 2)),
+            ];
+            for (n, (tool, args, expected)) in batches.into_iter().enumerate() {
+                ctx.app
+                    .mesh
+                    .rewind_progress_clock_for_tests(MESH_PROGRESS_MIN_INTERVAL);
+                let call = ToolCall::new(tool.into(), args, Some(format!("call-{n}")));
+                eval_tool_calls(&mut ctx, vec![call]).await.unwrap();
+
+                let todo = status
+                    .card(SystemTime::now())
+                    .todo
+                    .expect("the card shows the todo list");
+                assert_eq!((todo.done, todo.total), expected, "after batch {n}");
+            }
         }
     }
 
