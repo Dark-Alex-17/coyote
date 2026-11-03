@@ -3643,6 +3643,116 @@ fn the_relay_restart_idle_lines_are_the_nodes_own_wording_and_the_floor_is_five_
     }
 }
 
+mod first_contact_wiki_pins {
+    use super::*;
+
+    /// The one literal in `body` that contains `needle`, as the source spells it.
+    fn literal_with(label: &str, body: &str, needle: &str) -> String {
+        string_literals(body)
+            .into_iter()
+            .find(|literal| literal.contains(needle))
+            .unwrap_or_else(|| panic!("{label} has no string literal containing {needle:?}"))
+    }
+
+    /// The waiting line, the unanswered-path-request refusal and the not-a-Coyote refusal
+    /// as the user reads them, `<dest8>` standing for the short destination and the wait
+    /// in whole seconds as `PATH_REQUEST_TIMEOUT` sets it.
+    fn first_contact_sentences() -> [String; 3] {
+        let waiting = literal_with(
+            "src/repl/mesh.rs heard_or_asked",
+            &fn_body("src/repl/mesh.rs", "heard_or_asked"),
+            "Asking the mesh for",
+        )
+        .replacen("{}", "<dest8>", 1);
+        let secs = const_secs("src/mesh/announce.rs", "PATH_REQUEST_TIMEOUT").to_string();
+        let unanswered = literal_with(
+            "src/mesh/message.rs unanswered_path_request",
+            &fn_body("src/mesh/message.rs", "unanswered_path_request"),
+            "did not answer a path request",
+        )
+        .replacen("{}", "<dest8>", 1)
+        .replacen("{}", &secs, 1);
+        let not_coyote = literal_with(
+            "src/mesh/message.rs answered_not_as_coyote",
+            &fn_body("src/mesh/message.rs", "answered_not_as_coyote"),
+            "not as a Coyote node",
+        )
+        .replacen("{}", "<dest8>", 1);
+        [waiting, unanswered, not_coyote]
+    }
+
+    /// The two reconnect idle lines for a failed announce and for a node that does not
+    /// announce, as `reconnect_line` builds them, with the `[mesh]` prefix the idle line
+    /// is printed under.
+    fn unannounced_reconnect_lines() -> [String; 2] {
+        let body = fn_body("src/mesh/node.rs", "reconnect_line");
+        ["announcing over it failed", "this node does not announce"].map(|needle| {
+            literal_with("src/mesh/node.rs reconnect_line", &body, needle)
+                .replace("{label}", "[mesh] <label>")
+        })
+    }
+
+    #[test]
+    fn the_mesh_page_says_either_side_may_join_first_and_names_the_verbs_that_ask() {
+        let Some(wiki) = wiki_dir() else { return };
+        let page = read(wiki.join("Mesh.md"));
+        let paragraph = page
+            .split("\n\n")
+            .map(flat)
+            .find(|paragraph| paragraph.contains("Either side may join first"))
+            .expect("Mesh.md has no paragraph saying \"Either side may join first\"");
+        for verb in [
+            "`.mesh trust`",
+            "`info`",
+            "`knock`",
+            "`status`",
+            "`message`",
+            "`fetch`",
+        ] {
+            assert!(
+                paragraph.contains(verb),
+                "Mesh.md's first-contact paragraph does not name {verb}:\n{paragraph}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_commands_page_quotes_the_first_contact_lines_as_the_code_prints_them() {
+        let sentences = first_contact_sentences();
+        for sentence in &sentences {
+            assert!(
+                sentence.contains("<dest8>") && !sentence.contains('{'),
+                "a first-contact sentence kept a placeholder the pin does not fill: {sentence}"
+            );
+        }
+
+        let Some(wiki) = wiki_dir() else { return };
+        let commands = flat(&read(wiki.join("Mesh-Commands.md")));
+        for sentence in &sentences {
+            assert!(
+                commands.contains(sentence.as_str()),
+                "Mesh-Commands.md does not quote {sentence:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_unannounced_reconnect_lines_are_quoted_as_the_node_builds_them() {
+        let lines = unannounced_reconnect_lines();
+
+        let Some(wiki) = wiki_dir() else { return };
+        for page in ["Mesh-Commands.md", "Mesh-Deployment.md"] {
+            let text = flat(&read(wiki.join(page)));
+            for line in &lines {
+                assert!(
+                    text.contains(line.as_str()),
+                    "{page} does not quote the reconnect line {line:?}"
+                );
+            }
+        }
+    }
+}
+
 /// The decision tree, from `**Which setup?**` through `reached through the local rnsd.`,
 /// is one text on the Mesh and Deployment pages.
 #[test]
