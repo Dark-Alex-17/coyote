@@ -357,6 +357,7 @@ initial_state:
   review_truncated: []
   review_untrusted: []
   review_permissions: {}
+  review_perm_failed: []
   review_seen: []
   review_watching: false
   review_outcomes: {}

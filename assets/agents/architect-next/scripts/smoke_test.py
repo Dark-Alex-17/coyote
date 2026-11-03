@@ -2109,6 +2109,20 @@ u = gates.post_round(base_state(**WATCH, current_task=T1, verify_unit=T1, delega
 check("fix origin: post_round with delegation_kind already reset to implement and origin review -> fix_done", u.get("_next") == "fix_done", u.get("_next"))
 u = AA("task_failed", "Abort this task and stop", current_task=T1, tasks=tasks_with(), fix_origin_return="review")
 check("fix origin: task_failed abort clears fix_origin_return", u.get("_next") == "end_aborted" and u.get("fix_origin_return") == "", u.get("fix_origin_return"))
+for ret in ("integration", "batch"):
+    s, steps = fix_origin_chain(ret, GBLOCK, GPASS)
+    s.update(gates.post_round(s))
+    u = gates.fix_done(s) if s.get("_next") == "fix_done" else {}
+    check(f"fix origin scope: a BLOCKED {ret} fix round keeps fix_origin_return empty; fix_done follows fix_return_to verify -> select_tasks",
+          steps[0].get("fix_return_to") == ret and all(st.get("fix_origin_return") == "" for st in steps) and steps[1].get("fix_return_to") == "verify"
+          and u.get("_next") == "select_tasks", ([st.get("fix_origin_return") for st in steps], s.get("_next"), u.get("_next")))
+for ret, pend, want in (("integration", [], "integration_test"), ("batch", [], "batch_gauntlet_build"),
+                        ("batch", [{"task": T2, "items": ["y"], "source": "batch", "return_to": "batch"}], "select_tasks")):
+    s, steps = fix_origin_chain(ret, GPASS, pending_fixes=pend)
+    s.update(gates.post_round(s))
+    u = gates.fix_done(s) if s.get("_next") == "fix_done" else {}
+    check(f"fix origin scope: a passing {ret} fix round{' with pending fixes' if pend else ''} keeps fix_origin_return empty; fix_done -> {want}",
+          all(st.get("fix_origin_return") == "" for st in steps) and u.get("_next") == want, ([st.get("fix_origin_return") for st in steps], s.get("_next"), u.get("_next")))
 
 # ---------------------------------------------------------------- truncation: a review read that overflows a page stops the watch
 def paged(decision="", **lists):
@@ -2235,6 +2249,46 @@ try:
     u = gates.review_poll(base_state(**WATCH))
     check("permission: exactly PERM_LOOKUPS_PER_POLL uncached logins -> all read and classified in the same poll",
           perm_calls() == ["will", "mae"] and u.get("review_status") == "comments" and len(u.get("review_items", [])) == 2, (u, perm_calls()))
+
+    def stall_polls(n, **over):
+        """n polls with the state carried over; each poll's update and its permission seam call count."""
+        s, outs = base_state(**WATCH, **over), []
+        for _ in range(n):
+            before = len(perm_calls())
+            u = gates.review_poll(s)
+            s.update(u)
+            outs.append((u, len(perm_calls()) - before))
+        return s, outs
+
+    FAILING = [by("S1", "MEMBER", login="xan"), by("S2", "MEMBER", login="yul"), by("S3", "MEMBER", login="zed")]
+    perm_stub()
+    reviews(comments=FAILING)
+    s, outs = stall_polls(3)
+    classified = next((n for n, (u, _) in enumerate(outs, 1) if u.get("review_status") == "comments"), None)
+    u2 = outs[1][0]
+    check("permission stall: three MEMBER logins whose read always fails -> classified untrusted (no body) by poll 2; seam calls 2, 1, 0",
+          classified is not None and classified <= 2 and [c for _, c in outs] == [2, 1, 0] and outs[0][0].get("review_status") == "pending"
+          and u2.get("review_items") == [] and [i["id"] for i in u2.get("review_untrusted", [])] == ["comment:S1", "comment:S2", "comment:S3"]
+          and no_sentinel(u2) and sorted(s.get("review_perm_failed", [])) == ["xan", "yul", "zed"], ([u.get("review_status") for u, _ in outs], [c for _, c in outs]))
+    perm_stub()
+    reviews(comments=FAILING[:1])
+    s, outs = stall_polls(3)
+    check("permission stall: a single failing login is read once across three polls",
+          perm_calls() == ["xan"] and all(u.get("review_status") == "comments" for u, _ in outs), (perm_calls(), [u.get("review_status") for u, _ in outs]))
+    perm_stub()
+    reviews(decision="APPROVED", comments=FAILING)
+    s, outs = stall_polls(1)
+    check("permission stall: reviewDecision APPROVED with three uncached MEMBER logins -> approved in one poll, no permission read",
+          outs[0][0].get("review_status") == "approved" and outs[0][0].get("_next") == "review_route" and perm_calls() == [], (outs[0][0].get("review_status"), perm_calls()))
+    perm_stub()
+    reviews(decision="CHANGES_REQUESTED", comments=FAILING)
+    s, outs = stall_polls(1)
+    check("permission stall: reviewDecision CHANGES_REQUESTED with three uncached logins -> not approved, the lookups still defer",
+          outs[0][0].get("review_status") == "pending" and outs[0][0].get("_next") == "review_poll" and outs[0][1] == 2, (outs[0][0].get("review_status"), perm_calls()))
+    u = gates.flip_ready(base_state(**RW, review_perm_failed=["xan"]))
+    check("permission stall: flip_ready arming the review watch resets review_perm_failed",
+          u.get("_next") == "review_poll" and u.get("review_perm_failed") == [], u.get("review_perm_failed"))
+    check("permission stall: review_perm_failed seeded empty in initial_state", SEEDS.get("review_perm_failed") == [])
 
     for login, want in (("rita", "pending"), ("will", "approved")):
         perm_stub()

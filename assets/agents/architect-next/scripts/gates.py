@@ -1407,9 +1407,10 @@ def fix_round(state):
     """Entry for externally-queued fix rounds (integration / CI / batch): sets the delegation context."""
     u = {}
     f = as_dict(state.get("fix_request"))
+    ret = f.get("return_to", "select_tasks")
     u.update({"current_task": f.get("task") or state.get("current_task"), "delegation_kind": "fix",
               "fix_items": as_list(f.get("items")), "fix_source": f.get("source", "review"),
-              "fix_return_to": f.get("return_to", "select_tasks"), "fix_origin_return": f.get("return_to", ""),
+              "fix_return_to": ret, "fix_origin_return": ret if ret in ("ci", "review") else "",
               "fix_note": f.get("note", ""), "fix_request": {}})
     u["_next"] = "compose_delegation"
     return u
@@ -3196,7 +3197,7 @@ def flip_ready(state):
     if _review_mode(state) and state.get("pr_number") and not truthy(state.get("review_watching")):
         # The group reset clears pr_number, so it waits until the review watch ends.
         u.update({"review_watching": True, "review_started_at": int(time.time()), "review_polls": 0, "review_rounds": 0, "review_poll_fails": 0,
-                  "review_fix_rounds": 0, "review_seen": [], "review_status": ""})
+                  "review_fix_rounds": 0, "review_seen": [], "review_perm_failed": [], "review_status": ""})
         _review_event(state, u, "watching reviews")
         u["_next"] = "review_poll"
         return u
@@ -3267,7 +3268,8 @@ def _login(obj):
 
 
 def _permission(state, u, login):
-    """The login's permission word on the repo, cached in review_permissions; '' when the read failed, which is not cached."""
+    """The login's permission word on the repo, cached in review_permissions; '' when the read failed, which is recorded
+    in review_perm_failed instead so the watch does not read that login again."""
     perms = {**as_dict(state.get("review_permissions")), **as_dict(u.get("review_permissions"))}
     if login in perms or not login:
         return perms.get(login, "")
@@ -3280,6 +3282,9 @@ def _permission(state, u, login):
     word = out.strip() if rc == 0 else ""
     if word:
         u["review_permissions"] = {**perms, login: word}
+    else:
+        failed = list(as_list(u.get("review_perm_failed", state.get("review_perm_failed"))))
+        u["review_perm_failed"] = failed + [login]
     return word
 
 
@@ -3303,14 +3308,15 @@ def _poll_permissions(state, u, pr):
     """Every member and collaborator author's permission, '' for a failed read, or None when more uncached logins
     remain than one poll may look up; the logins it did read stay cached for the next poll."""
     cached = as_dict(state.get("review_permissions"))
+    failed = {login: "" for login in as_list(state.get("review_perm_failed"))}
     authors = [c for t in _nodes(pr, "reviewThreads") for c in _thread_comments(t)] + _nodes(pr, "reviews") + _nodes(pr, "comments")
     logins = (_login(o) for o in authors if o.get("authorAssociation") in PERMISSION_ASSOCIATIONS)
-    wanted = [login for login in dict.fromkeys(logins) if login and login not in cached]
+    wanted = [login for login in dict.fromkeys(logins) if login and login not in cached and login not in failed]
     read = {login: _permission(state, u, login) for login in wanted[:PERM_LOOKUPS_PER_POLL]}
     if len(wanted) > PERM_LOOKUPS_PER_POLL:
         ledger(state, u, f"review-watch: PR #{state.get('pr_number')} permission lookups deferred: {len(wanted) - PERM_LOOKUPS_PER_POLL} login(s)")
         return None
-    return {**cached, **read}
+    return {**failed, **cached, **read}
 
 
 def _review_read(state):
@@ -3445,11 +3451,14 @@ def review_poll(state):
     if overflow:
         u.update({"review_status": "truncated", "review_truncated": overflow, "_next": "review_route"})
         return u
+    # An APPROVED reviewDecision needs no author's permission, so it never waits on deferred reads.
+    if pr.get("reviewDecision") == "APPROVED":
+        u.update({"review_status": "approved", "_next": "review_route"})
+        return u
     perms = _poll_permissions(state, u, pr)
     if perms is None:
         u.update({"review_status": "pending", "_next": "review_poll"})
         return u
-    # A failed read is not cached, so this poll classifies with its own reads, failures included, instead of retrying them.
     view = dict(state, review_permissions=perms)
     items, untrusted = _review_items(view, u, pr, set(as_list(state.get("review_seen"))))
     if _approved(view, u, pr):
