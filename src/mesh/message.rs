@@ -23,7 +23,7 @@ use crate::mesh::request::{
     refusal_remedy, request_remedy, short,
 };
 use crate::mesh::trust::{
-    Decision, IdentityStanding, KeyChangeOutcome, OriginVerdict, Rule, TrustStore,
+    Decision, IdentityStanding, KeyChangeOutcome, OriginVerdict, Rule, TrustStore, same_hash,
 };
 use crate::mesh::wire_path::WirePath;
 use crate::mesh::{CappedText, canonical_hash, capped_peer_text, display_text, hex_lower};
@@ -2006,6 +2006,9 @@ impl MeshRuntime {
             .await
             .ok_or(FirstContactMiss::NoAnswer)?;
         let mut announces = transport.recv_announces().await;
+        // A held path makes the transport drop an answer that replays the announce it
+        // already has, or one emitted in the same second, so that answer would file no row.
+        transport.expire_path(&address_hash).await;
         transport.request_path(&address_hash, None, None).await;
         let deadline = tokio::time::Instant::now() + PATH_REQUEST_TIMEOUT;
         let mut answered_at = None;
@@ -2025,7 +2028,8 @@ impl MeshRuntime {
             tokio::select! {
                 event = announces.recv(), if listening => match event {
                     Ok(event) => {
-                        if event.destination.lock().await.desc.address_hash == address_hash {
+                        let heard = event.destination.lock().await.desc.address_hash.to_hex_string();
+                        if same_hash(&heard, &destination) {
                             answered_at.get_or_insert_with(tokio::time::Instant::now);
                         }
                     }

@@ -25703,10 +25703,14 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                         .block_identity(slot, &blocked_identity, None, now)
                         .unwrap();
 
-                    for (destination, standing) in [
-                        (&denied, "blocked (instance)"),
-                        (&unheard_denied, "blocked (instance)"),
-                        (&blocked, "blocked (identity)"),
+                    for (destination, standing, tail) in [
+                        (&denied, "blocked (instance)", KNOCK_REFUSAL_TAIL),
+                        (
+                            &unheard_denied,
+                            "blocked (instance)",
+                            UNHEARD_KNOCK_REFUSAL_TAIL,
+                        ),
+                        (&blocked, "blocked (identity)", KNOCK_REFUSAL_TAIL),
                     ] {
                         let before = stdout_lines().len();
                         let err =
@@ -25719,7 +25723,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                             !err.contains("has not been heard"),
                             "{standing}: the deny is named, not the missing peer row: {err}"
                         );
-                        assert!(err.contains(KNOCK_REFUSAL_TAIL), "{standing}: {err}");
+                        assert!(err.contains(tail), "{standing}: {err}");
                         assert!(
                             stdout_lines()[before..].is_empty(),
                             "{standing}: refused before the notice: {:?}",
