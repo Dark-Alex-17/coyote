@@ -324,13 +324,11 @@ pub async fn claude_chat_completions_streaming(
                         handler.usage(usage);
                     }
                     if data["delta"]["stop_reason"].as_str() == Some("refusal") {
-                        if !handler.has_received_visible_output() {
-                            return Err(ProviderRefusal::from_stop_details(
-                                &data["delta"]["stop_details"],
-                            )
-                            .into());
+                        return Err(ProviderRefusal {
+                            partial_output: handler.has_received_visible_output(),
+                            ..ProviderRefusal::from_stop_details(&data["delta"]["stop_details"])
                         }
-                        debug!("stream ended with a provider refusal after partial output");
+                        .into());
                     }
                 }
                 _ => {}
@@ -1728,13 +1726,14 @@ mod refusal_tests {
         let err = res.unwrap_err();
         let refusal = err.downcast_ref::<ProviderRefusal>().unwrap();
         assert_eq!(refusal.category.as_deref(), Some("cyber"));
+        assert!(!refusal.partial_output);
         assert!(!format!("{err:#}").contains('{'));
         let (_, _, _, usage) = handler.take();
         assert_eq!(usage.unwrap().output_tokens, Some(0));
     }
 
     #[tokio::test]
-    async fn streaming_refusal_after_text_keeps_the_text() {
+    async fn streaming_refusal_after_text_is_flagged_partial_and_keeps_the_text() {
         let body = concat!(
             "event: content_block_delta\n",
             "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"partial\"}}\n\n",
@@ -1744,7 +1743,9 @@ mod refusal_tests {
 
         let (res, handler) = stream(body).await;
 
-        res.unwrap();
+        let err = res.unwrap_err();
+        let refusal = err.downcast_ref::<ProviderRefusal>().unwrap();
+        assert!(refusal.partial_output, "{err:#}");
         let (text, _, _, _) = handler.take();
         assert_eq!(text, "partial");
     }

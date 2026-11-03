@@ -2146,10 +2146,16 @@ fn render_turn_error(err: anyhow::Error, prefix: CommandPrefix) {
 
 fn provider_refusal_line(err: &anyhow::Error) -> Option<String> {
     provider_refusal(err).map(|refusal| {
-        format!(
-            "The model declined to answer (provider refusal: {}). Rephrase the request or switch with .model <name>.",
-            refusal_category_label(refusal.category.as_deref())
-        )
+        let category = refusal_category_label(refusal.category.as_deref());
+        if refusal.partial_output {
+            format!(
+                "The model stopped partway and declined to finish (provider refusal: {category}); the partial reply above is not saved to the session. Rephrase the request or switch with .model <name>."
+            )
+        } else {
+            format!(
+                "The model declined to answer (provider refusal: {category}). Rephrase the request or switch with .model <name>."
+            )
+        }
     })
 }
 
@@ -5149,6 +5155,42 @@ local_hello() {\n\
         #[test]
         fn any_other_turn_error_is_not_a_refusal_line() {
             assert_eq!(provider_refusal_line(&anyhow!("boom")), None);
+        }
+
+        mod partial_output_refusal_tests {
+            use super::*;
+
+            #[test]
+            #[serial]
+            fn a_refusal_after_streamed_text_says_so_and_saves_nothing() {
+                let _guard = crate::testing::TestConfigDirGuard::new("repl");
+                run_async(async {
+                    let mut ctx = repl_ctx();
+                    ctx.session = Some(Session::default());
+                    let mut runner = completion_runner(|input, ctx, _abort| {
+                        ctx.before_chat_completion(input).unwrap();
+                        boxed_completion(async {
+                            Err(anyhow::Error::new(ProviderRefusal {
+                                category: Some("cyber".into()),
+                                explanation: None,
+                                partial_output: true,
+                            }))
+                        })
+                    });
+
+                    let err = turn(&mut ctx, "scan this host", None, &mut runner)
+                        .await
+                        .unwrap_err();
+
+                    assert_eq!(
+                        provider_refusal_line(&err).as_deref(),
+                        Some(
+                            "The model stopped partway and declined to finish (provider refusal: cyber); the partial reply above is not saved to the session. Rephrase the request or switch with .model <name>."
+                        )
+                    );
+                    assert!(exchange(&ctx).is_empty(), "{:?}", exchange(&ctx));
+                });
+            }
         }
     }
 
