@@ -67,9 +67,10 @@ fn published_turn_state(ctx: &RequestContext) -> TurnState {
 
 /// A progress point inside a turn: a tool batch has completed, which is where the todo
 /// tools, `agent__collect` and `job__collect` run. Refreshes the published snapshot at
-/// most once per `MESH_PROGRESS_MIN_INTERVAL`, then offers the context to the digest
-/// hook. A point inside the interval defers its snapshot to the slot's timer instead, so
-/// the last change before a long model call is published when the interval ends.
+/// most once per `MESH_PROGRESS_MIN_INTERVAL`. A point inside the interval defers its
+/// snapshot to the slot's timer instead, so the last change before a long model call is
+/// published when the interval ends. Either way the context is then offered to the digest
+/// hook, whose own interval bounds how often that costs a model call.
 /// Nothing happens for a context that does not own the session, or before a turn
 /// boundary has published the first snapshot: until then there is no turn state to keep.
 /// Works from the context it is handed and the slot alone, never the turn's lock.
@@ -81,13 +82,13 @@ fn mesh_progress_point_at(ctx: &RequestContext, now: Instant) {
     if !ctx.owns_mesh_session() || ctx.app.mesh.snapshot().is_none() {
         return;
     }
-    if !ctx.app.mesh.progress_capture_due_at(now) {
+    if ctx.app.mesh.progress_capture_due_at(now) {
+        refresh_mesh_snapshot(ctx);
+    } else {
         ctx.app
             .mesh
             .defer_progress(ctx.mesh_snapshot(published_turn_state(ctx)));
-        return;
     }
-    refresh_mesh_snapshot(ctx);
     if let Some(hook) = ctx.app.mesh.digest_hook() {
         hook.on_progress(ctx);
     }

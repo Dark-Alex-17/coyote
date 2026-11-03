@@ -3509,8 +3509,8 @@ pub(crate) struct MeshSlot {
     envoy_memory_override: ArcSwapOption<EnvoySessions>,
 }
 
-/// Offered the owning session's context after a progress point inside a turn has captured
-/// a snapshot, so the digest can be regenerated without the turn's context lock. The
+/// Offered the owning session's context at every progress point inside a turn, captured
+/// or deferred, so the digest can be regenerated without the turn's context lock. The
 /// implementation must not wait: it runs on the turn's own task.
 pub(crate) trait MeshDigestHook: Send + Sync {
     fn on_progress(&self, ctx: &RequestContext);

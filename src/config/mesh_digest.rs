@@ -588,7 +588,7 @@ mod tests {
     use super::*;
     use crate::client::ModelData;
     use crate::config::mesh_config::{MESH_DIGEST_PROMPT, MeshConfig};
-    use crate::config::mesh_snapshot::publish_mesh_snapshot;
+    use crate::config::mesh_snapshot::{mesh_progress_point, publish_mesh_snapshot};
     use crate::config::{AppConfig, AppState, Role, Session, WorkingMode};
     use crate::mesh::brief::digest_objective_for;
     use crate::mesh::card::{CardSource, StatusHandler, build_card};
@@ -1505,6 +1505,61 @@ mod tests {
                 "the hook waited for or bypassed the lock"
             );
             assert!(held.last_attempt.is_none());
+        }
+
+        struct FakeModelHook {
+            driver: parking_lot::Mutex<MeshDigestDriver>,
+            model: Arc<FakeModel>,
+        }
+
+        impl MeshDigestHook for FakeModelHook {
+            fn on_progress(&self, ctx: &RequestContext) {
+                self.driver.lock().maybe_refresh_in_turn(
+                    ctx,
+                    Instant::now(),
+                    self.model.fetch(FIXED_DIGEST),
+                );
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_todo_done_inside_the_snapshot_interval_reaches_the_digest() {
+            let mut ctx = test_ctx(MeshBrief::Auto);
+            add_n_turns(&mut ctx, 4);
+            ctx.todo_list.add("write the seam");
+            let shared_ctx = shared(ctx);
+            let model = Arc::new(FakeModel::default());
+            let mut driver = MeshDigestDriver::without_node_gate();
+            let long_ago = Instant::now()
+                .checked_sub(MESH_DIGEST_MIN_INTERVAL + Duration::from_secs(1))
+                .unwrap();
+            driver.maybe_refresh_with(&shared_ctx, long_ago, model.fetch(FIXED_DIGEST));
+            wait_for_task(&mut driver).await;
+            let hook = Arc::new(FakeModelHook {
+                driver: parking_lot::Mutex::new(driver),
+                model: Arc::clone(&model),
+            });
+            let mut ctx = shared_ctx.write();
+            ctx.app.mesh.set_digest_hook(hook.clone());
+            publish_mesh_snapshot(&ctx, TurnState::working_now());
+
+            mesh_progress_point(&ctx);
+            assert!(hook.driver.lock().task.is_none(), "nothing changed yet");
+            ctx.mark_todo_done(1);
+            mesh_progress_point(&ctx);
+            assert!(
+                ctx.app.mesh.pending_progress_for_tests().is_some(),
+                "the second point fell inside the snapshot interval"
+            );
+
+            wait_for_task(&mut hook.driver.lock()).await;
+            assert_eq!(model.calls(), 2);
+            let requests = model.requests();
+            assert!(
+                requests[1].contains("[x] 1. write the seam"),
+                "{}",
+                requests[1]
+            );
         }
     }
 
