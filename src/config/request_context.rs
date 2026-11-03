@@ -7357,6 +7357,9 @@ impl RequestContext {
         let (rag, rag_key): (Arc<Rag>, Option<RagKey>) = match rag {
             None => {
                 let rag_path = self.rag_file(super::TEMP_RAG_NAME);
+                // The init that follows asks on the terminal; refused
+                // before the previous temp rag is removed.
+                ensure_prompts_available()?;
                 if rag_path.exists() {
                     remove_file(&rag_path).with_context(|| {
                         format!("Failed to cleanup previous '{}' rag", super::TEMP_RAG_NAME)
@@ -11784,6 +11787,28 @@ mod tests {
             "the refusal left a scaffold at {}",
             path.display()
         );
+    }
+
+    /// `.rag` with no name rebuilds the temp rag through a run of
+    /// terminal questions; under the full-screen UI it is refused before
+    /// the previous temp rag is removed.
+    #[test]
+    #[serial]
+    fn use_rag_under_the_tui_refuses_before_removing_the_temp_rag() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let rag_path = ctx.rag_file(super::super::TEMP_RAG_NAME);
+        ensure_parent_exists(&rag_path).unwrap();
+        write(&rag_path, "driver: yaml\n").unwrap();
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let err = run_async(ctx.use_rag(None, utils::create_abort_signal())).unwrap_err();
+        assert_refused_under_the_tui(err);
+        assert!(
+            rag_path.exists(),
+            "the refusal removed {}",
+            rag_path.display()
+        );
+        assert!(ctx.rag.is_none());
     }
 
     fn assert_refused_under_the_tui(err: anyhow::Error) {
