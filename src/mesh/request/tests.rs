@@ -2310,6 +2310,44 @@ pub(crate) mod network {
         responder.stop().await;
     }
 
+    mod no_answer_tests {
+        use super::*;
+
+        /// A peer that serves the request but whose answer is still arriving when the
+        /// request's time runs out has not stayed silent, so the request ends as an
+        /// incomplete response, never as the `Timeout` that reads as distrust. The
+        /// recorder serves every identity, as a peer that trusts this one does; holding
+        /// the responder's interface manager once the first part has landed keeps its
+        /// inbound path from reading the part requests, so the transfer stalls.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_trusted_peer_whose_answer_is_still_arriving_is_not_silence() {
+            let recorder = Arc::new(Recorder::default());
+            let (responder, requester, desc) = pair(recorder.clone()).await;
+            let (in_flight, seen) = hanging_request(&requester, &recorder, &desc).await;
+            let mut random = vec![0u8; MAX_REQUEST_PAYLOAD_BYTES / 2];
+            RngCore::fill_bytes(&mut OsRng, &mut random);
+            let bytes = ResponseFrame::new(seen.request_id, Value::Binary(random)).encode();
+            let mut events = requester.transport.resource_events();
+            let hash = answer_as_resource(&responder, &requester, &seen, bytes).await;
+            await_inbound_progress(&mut events, hash).await;
+
+            let manager = responder.transport.iface_manager();
+            let held = manager.lock().await;
+            let result = timeout(INTEROP_TIMEOUT, in_flight).await.unwrap().unwrap();
+            drop(held);
+
+            assert_eq!(
+                result.unwrap_err(),
+                RequestError::ResponseIncomplete {
+                    path: "/slow".to_string(),
+                    after: SHORT_REQUEST_TIMEOUT,
+                }
+            );
+            requester.stop().await;
+            responder.stop().await;
+        }
+    }
+
     /// A reply resource that fails mid-transfer takes down the one request it answered
     /// and nothing else: the requester's next request to the same peer reuses the same
     /// link and is answered, and the responder saw both requests over that link.

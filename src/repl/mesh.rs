@@ -25942,6 +25942,72 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                 });
             }
 
+            mod no_answer_tests {
+                use super::*;
+
+                /// The peer is a stub behind the real dispatcher that knows no identity, so
+                /// a link to it comes up and then nothing answers. This node trusts it, and
+                /// `.mesh message` and `.mesh status` both end on the no-answer sentence
+                /// naming the command the peer's owner runs, never the unreachable one.
+                #[test]
+                #[serial]
+                fn message_and_status_to_a_silent_peer_say_no_answer() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-no-answer");
+                    let _script = prompt_script::install(&[]);
+                    let _capture = capture::install();
+                    run_async(async {
+                        let stub = PeerStub::listen(
+                            "repl-mesh-no-answer-stub",
+                            TcpServer::DEFAULT_CLIENT_MTU,
+                        )
+                        .await;
+                        let started = started_runtime_on("repl-mesh-no-answer", stub.port()).await;
+                        let mut ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                        stub.announce(Some("Tia")).await;
+                        let peer = stub.destination_hex();
+                        stub.wait_to_be_filed(&started.runtime.peers(), &peer).await;
+                        out_of(&mut ctx, &format!(".mesh trust {peer} --yes"))
+                            .await
+                            .unwrap();
+                        let own = started.runtime.current_destination_hash();
+                        let no_answer = format!(
+                            "no answer from {}: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance).",
+                            short(&peer)
+                        );
+
+                        let err = run(&mut ctx, &format!(".mesh message {peer} --yes hello"))
+                            .await
+                            .unwrap_err()
+                            .to_string();
+                        assert_eq!(
+                            err,
+                            format!(
+                                "{no_answer} Nothing was queued, because no propagation node is known yet to hold the message for it; `.mesh peers` lists the nodes this Coyote has heard from."
+                            )
+                        );
+
+                        let err = run(&mut ctx, &format!(".mesh status {peer}"))
+                            .await
+                            .unwrap_err()
+                            .to_string();
+                        assert_eq!(
+                            err,
+                            format!(
+                                "{no_answer} A status request is answered live or not at all; nothing queues it for later."
+                            )
+                        );
+                        assert!(!err.contains("unreachable"), "{err}");
+                        assert!(err.is_ascii(), "{err}");
+                        assert!(stub.seen().is_empty(), "{:?}", stub.seen());
+
+                        assert!(ctx.app.mesh.stop().await.unwrap());
+                        started.relay_handle.abort();
+                        stub.stop().await;
+                    });
+                }
+            }
+
             /// `.mesh status` against a trusted, reachable peer that accepts the request but
             /// serves nothing at `/status` (a stub behind the real dispatcher with only the
             /// message handler registered) ends on the error line the status refusal
