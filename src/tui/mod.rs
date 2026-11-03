@@ -978,10 +978,11 @@ impl App {
             return;
         }
         let text = String::from_utf8_lossy(bytes);
-        let first_cell = self
-            .turn
-            .as_ref()
-            .map_or(usize::MAX, |turn| turn.first_cell);
+        // Inside a turn the output never merges into a cell from before
+        // the turn; outside one (a background job still writing) every
+        // chunk of the same call shares the trailing cell, so a chatty
+        // job cannot grow the transcript by a cell per read.
+        let first_cell = self.turn.as_ref().map_or(0, |turn| turn.first_cell);
         let last = self.cells.len().checked_sub(1);
         let continues_last = last.is_some_and(|index| {
             index >= first_cell
@@ -1025,6 +1026,12 @@ impl App {
         }
         if lines.len() > TOOL_OUTPUT_TAIL {
             lines.drain(..lines.len() - TOOL_OUTPUT_TAIL);
+        }
+        // The lines that stay are bounded in bytes too, oldest first.
+        let mut total: usize = lines.iter().map(|line| line.len() + 1).sum();
+        while total > LATE_OUTPUT_LIMIT && lines.len() > 1 {
+            total -= lines[0].len() + 1;
+            lines.remove(0);
         }
     }
 
@@ -2713,6 +2720,45 @@ mod tests {
         assert_eq!(late.len(), 1, "{late:?}");
         assert!(late[0].contains("boom-r7x"), "{late:?}");
         assert!(late[0].contains("panicked"), "{late:?}");
+    }
+
+    /// A background job still writing after its turn ended shares one
+    /// trailing cell per call, bounded in bytes, instead of a cell per
+    /// pipe read.
+    #[test]
+    fn out_of_turn_tool_output_shares_one_bounded_cell() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("explain", false);
+        harness.app.end_turn(false, &TurnOutcome::default());
+        let cells_before = harness.app.cells.len();
+        harness
+            .app
+            .append_tool_output(Some("bg".to_string()), b"first-q7k\n");
+        harness
+            .app
+            .append_tool_output(Some("bg".to_string()), b"second-q7k\n");
+        assert_eq!(harness.app.cells.len(), cells_before + 1);
+        let Some(Cell::Text { lines, .. }) = harness.app.cells.last() else {
+            panic!("the output did not land in a text cell");
+        };
+        assert_eq!(lines, &["first-q7k", "second-q7k"]);
+
+        let line = format!("{}\n", "z".repeat(LATE_OUTPUT_LIMIT / 4));
+        for _ in 0..12 {
+            harness
+                .app
+                .append_tool_output(Some("bg".to_string()), line.as_bytes());
+        }
+        assert_eq!(harness.app.cells.len(), cells_before + 1);
+        let Some(Cell::Text { lines, .. }) = harness.app.cells.last() else {
+            panic!("the output did not stay in its text cell");
+        };
+        let total: usize = lines.iter().map(|line| line.len() + 1).sum();
+        assert!(total <= LATE_OUTPUT_LIMIT, "{total} bytes kept");
+        assert!(
+            !lines.iter().any(|line| line.contains("q7k")),
+            "the oldest lines were kept"
+        );
     }
 
     /// A leftover writer's chunks fold into one cell that keeps its
