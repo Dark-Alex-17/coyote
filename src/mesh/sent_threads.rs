@@ -17,7 +17,7 @@ pub(crate) const SENT_THREADS_MAX_ENTRIES: usize = 1024;
 
 pub(crate) const SENT_THREADS_VERSION: u64 = 1;
 
-/// The file whole: the version first, then each list oldest to newest. Rejects unknown
+/// The whole file: the version first, then each list oldest to newest. Rejects unknown
 /// fields, so any change to the layout bumps `SENT_THREADS_VERSION`.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -34,6 +34,23 @@ struct Held {
 }
 
 impl Held {
+    /// The lists a file holds, held to what `record` keeps: wire ids only, each once at
+    /// its newest place, a thread in both lists kept only as sent, and no more than the
+    /// cap.
+    fn normalized(file: SentThreadsFile) -> Self {
+        let mut held = Self::default();
+        for thread in file.sent.iter().filter(|thread| is_wire_id(thread)) {
+            Self::bump(&mut held.sent, thread);
+        }
+        for thread in file.received.iter().filter(|thread| is_wire_id(thread)) {
+            if !held.sent.contains(thread) {
+                Self::bump(&mut held.received, thread);
+            }
+        }
+        held.evict_over_cap();
+        held
+    }
+
     /// Moves `thread` to the newest end of `list`, adding it when absent. Returns whether
     /// the list changed: a thread already newest leaves it as it was.
     fn bump(list: &mut VecDeque<String>, thread: &str) -> bool {
@@ -57,11 +74,14 @@ impl Held {
 /// The threads this instance has sent or received, in
 /// `<cache_dir>/mesh/sent-threads-<instance_id>.json`: what `mesh__send` and `mesh__ask`
 /// accept as a thread to continue. Keyed by instance because a fork holds its own
-/// conversations. The instance lock keeps the file to one process, so the mutex alone
-/// orders the writes.
+/// conversations. The instance lock keeps the file to one process. A change is made
+/// and serialized under `held`, and `write_lock` is taken before `held` is let go, so
+/// the fsync'd write blocks no reader and the snapshots reach the disk in the order
+/// they were taken.
 pub(crate) struct SentThreads {
     path: PathBuf,
     held: Mutex<Held>,
+    write_lock: Mutex<()>,
 }
 
 impl SentThreads {
@@ -73,14 +93,12 @@ impl SentThreads {
     /// the first thread is recorded. A file that cannot be read or parsed, or whose
     /// version cannot be read, is moved aside to `<path>.corrupt` with a warning and the
     /// lists start empty, as the peer table does. A readable version other than
-    /// `SENT_THREADS_VERSION` is refused and the file left in place.
+    /// `SENT_THREADS_VERSION` is refused and the file left in place. The lists read are
+    /// normalized as `Held::normalized` says, in memory only until the next write.
     pub(crate) fn load(path: PathBuf) -> Result<Self> {
         let held = match fs::read(&path) {
             Ok(bytes) => match parse_sent_threads(&bytes) {
-                Ok(file) => Held {
-                    sent: file.sent.into(),
-                    received: file.received.into(),
-                },
+                Ok(file) => Held::normalized(file),
                 Err(SentThreadsParse::Version(found)) => bail!(version_refusal(
                     "sent-threads list",
                     &path,
@@ -89,14 +107,17 @@ impl SentThreads {
                     SENT_THREADS_VERSION,
                     Remedy::Cache
                 )),
-                Err(SentThreadsParse::Corrupt(what)) => set_aside_corrupt(&path, what),
+                Err(SentThreadsParse::Corrupt { cause, error }) => {
+                    set_aside_corrupt(&path, &cause, &error)
+                }
             },
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Held::default(),
-            Err(err) => set_aside_corrupt(&path, format!("could not be read: {err}")),
+            Err(err) => set_aside_corrupt(&path, "could not be read", &err.to_string()),
         };
         Ok(Self {
             path,
             held: Mutex::new(held),
+            write_lock: Mutex::new(()),
         })
     }
 
@@ -154,45 +175,52 @@ impl SentThreads {
             sent: held.sent.iter().cloned().collect(),
             received: held.received.iter().cloned().collect(),
         };
-        let json = serde_json::to_vec_pretty(&file)
-            .context("Failed to serialize the mesh sent-threads list")?;
+        let json =
+            serde_json::to_vec(&file).context("Failed to serialize the mesh sent-threads list")?;
+        let _write = self.write_lock.lock();
+        drop(held);
         write_atomically_owner_only(&self.path, &json)
     }
 }
 
 enum SentThreadsParse {
     Version(u64),
-    Corrupt(String),
+    /// `cause` says in plain words what is wrong with the file; `error` is the parser's
+    /// own account.
+    Corrupt {
+        cause: String,
+        error: String,
+    },
 }
 
 /// Reads the version alone first so a file from another layout is refused by its version
 /// rather than set aside as corrupt for whatever field that layout added or dropped.
 fn parse_sent_threads(bytes: &[u8]) -> Result<SentThreadsFile, SentThreadsParse> {
-    let probe: VersionProbe = serde_json::from_slice(bytes).map_err(|err| {
-        SentThreadsParse::Corrupt(format!(
-            "{}: {err}",
-            unversioned_cause(SENT_THREADS_VERSION)
-        ))
-    })?;
+    let probe: VersionProbe =
+        serde_json::from_slice(bytes).map_err(|err| SentThreadsParse::Corrupt {
+            cause: unversioned_cause(SENT_THREADS_VERSION),
+            error: err.to_string(),
+        })?;
     if probe.version != SENT_THREADS_VERSION {
         return Err(SentThreadsParse::Version(probe.version));
     }
-    serde_json::from_slice(bytes).map_err(|err| {
-        SentThreadsParse::Corrupt(format!(
-            "is not a version-{SENT_THREADS_VERSION} sent-threads list: {err}"
-        ))
+    serde_json::from_slice(bytes).map_err(|err| SentThreadsParse::Corrupt {
+        cause: format!("is not a version-{SENT_THREADS_VERSION} sent-threads list"),
+        error: err.to_string(),
     })
 }
 
-/// Warns about a list that cannot be used, renames it to `<path>.corrupt` (replacing any
-/// earlier one) and returns the empty lists the node starts with. A failed rename is only
-/// warned about; the file is cache and nothing downstream depends on the move.
-fn set_aside_corrupt(path: &Path, what_happened: String) -> Held {
+/// Warns about a list that cannot be used, `cause` first and the raw `error` after it,
+/// renames it to `<path>.corrupt` (replacing any earlier one) and returns the empty lists
+/// the node starts with. A failed rename is only warned about; the file is cache and
+/// nothing downstream depends on the move.
+fn set_aside_corrupt(path: &Path, cause: &str, error: &str) -> Held {
     let aside = path.with_extension("json.corrupt");
     warn!(
-        "Mesh sent-threads list '{}' {}. Starting with an empty list, so mesh__send and mesh__ask refuse an earlier thread until it is sent or received again. The file is kept at '{}'.",
+        "Mesh sent-threads list '{}' {} ({}). Starting with an empty list, so mesh__send and mesh__ask refuse an earlier thread until the peer writes in it again; omit thread to start a new conversation. Nothing else needs to be done; delete '{}' once you no longer need it.",
         path.display(),
-        redact_hashes(&what_happened),
+        redact_hashes(cause),
+        redact_hashes(error),
         aside.display()
     );
     if let Err(err) = fs::rename(path, &aside) {
@@ -440,8 +468,84 @@ mod tests {
         assert!(
             warns.iter().any(|message| message.contains(&path_text)
                 && message.contains(&unversioned_cause(SENT_THREADS_VERSION))
-                && message.contains(&aside.display().to_string())),
+                && message.contains(&format!(
+                    "until the peer writes in it again; omit thread to start a new conversation. Nothing else needs to be done; delete '{}' once you no longer need it.",
+                    aside.display()
+                ))),
             "no warning names {path_text}; captured: {warns:#?}"
+        );
+    }
+
+    /// A file with a readable version 1 but another shape is not a list this build can
+    /// use: it is set aside like any corrupt file and named for what it is not.
+    #[test]
+    fn load_sets_aside_an_earlier_shape_under_version_1_and_starts_empty() {
+        install_log_collector();
+        let tmp = TempDir::new("sent-threads-earlier-shape");
+        let path = tmp.path.join("sent-threads-inst.json");
+        let aside = tmp.path.join("sent-threads-inst.json.corrupt");
+        let bytes = br#"{"version":1,"threads":["m-1"]}"#;
+        fs::write(&path, bytes).unwrap();
+
+        let store =
+            SentThreads::load(path.clone()).expect("an earlier shape must not block the load");
+
+        assert!(sent(&store).is_empty());
+        assert!(received(&store).is_empty());
+        assert!(!store.contains("m-1"));
+        assert!(!path.exists(), "the file must be moved aside");
+        assert_eq!(fs::read(&aside).unwrap(), bytes);
+        let path_text = path.display().to_string();
+        let warns = warn_snapshot();
+        assert!(
+            warns.iter().any(|message| message.contains(&path_text)
+                && message.contains("is not a version-1 sent-threads list (")),
+            "no warning names {path_text}; captured: {warns:#?}"
+        );
+    }
+
+    /// A file this build did not write as it is now is read as `record` would have
+    /// left it: ids that are not wire ids go, each list keeps a thread once at its
+    /// newest place, a thread in both lists stays only as sent, and the oldest received
+    /// ones go first over the cap.
+    #[test]
+    fn load_normalizes_the_lists_it_reads() {
+        let tmp = TempDir::new("sent-threads-normalize");
+        let path = tmp.path.join("sent-threads-inst.json");
+        let mut received_ids = vec![
+            "t-1".to_string(),
+            "has a space".to_string(),
+            "m-1".to_string(),
+            "t-2".to_string(),
+            "t-1".to_string(),
+        ];
+        received_ids.extend((0..SENT_THREADS_MAX_ENTRIES).map(|i| format!("r-{i}")));
+        let file = SentThreadsFile {
+            version: SENT_THREADS_VERSION,
+            sent: vec![
+                "m-1".to_string(),
+                String::new(),
+                "m-2".to_string(),
+                "m-1".to_string(),
+            ],
+            received: received_ids,
+        };
+        fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+
+        let store = SentThreads::load(path).unwrap();
+
+        assert_eq!(sent(&store), vec!["m-2", "m-1"]);
+        let received = received(&store);
+        assert_eq!(received.len(), SENT_THREADS_MAX_ENTRIES - 2);
+        assert!(!received.iter().any(|thread| thread == "m-1"));
+        assert!(!received.iter().any(|thread| thread == "has a space"));
+        assert!(
+            !store.contains("t-2"),
+            "the oldest received go over the cap"
+        );
+        assert_eq!(
+            received.last().map(String::as_str),
+            Some(format!("r-{}", SENT_THREADS_MAX_ENTRIES - 1).as_str())
         );
     }
 

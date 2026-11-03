@@ -38987,6 +38987,7 @@ mod tests {
                     kind: InboundKind::Question,
                     paths: Vec::new(),
                     reason: String::new(),
+                    session_thread: String::new(),
                 },
                 now,
             )
@@ -39044,6 +39045,7 @@ mod tests {
                     kind: InboundKind::Question,
                     paths: Vec::new(),
                     reason: String::new(),
+                    session_thread: String::new(),
                 },
                 now,
             )
@@ -39076,6 +39078,7 @@ mod tests {
                     kind: InboundKind::Question,
                     paths: Vec::new(),
                     reason: String::new(),
+                    session_thread: String::new(),
                 },
                 now,
             )
@@ -39111,6 +39114,7 @@ mod tests {
                     kind: InboundKind::Access,
                     paths: vec!["src/x.rs".to_string()],
                     reason: String::new(),
+                    session_thread: String::new(),
                 },
                 now,
             )
@@ -39203,6 +39207,7 @@ mod tests {
                             Vec::new()
                         },
                         reason: String::new(),
+                        session_thread: String::new(),
                     },
                     received_at,
                 )
@@ -40072,6 +40077,7 @@ mod tests {
                     kind,
                     paths: paths.iter().map(|path| (*path).to_string()).collect(),
                     reason: reason.to_string(),
+                    session_thread: String::new(),
                 },
                 now,
             )

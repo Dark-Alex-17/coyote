@@ -10556,6 +10556,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
             kind: InboundKind::Question,
             paths: Vec::new(),
             reason: String::new(),
+            session_thread: String::new(),
         }
     }
 
@@ -18043,6 +18044,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                 kind: InboundKind::Question,
                                 paths: Vec::new(),
                                 reason: String::new(),
+                                session_thread: String::new(),
                             },
                             now,
                         )
@@ -18157,6 +18159,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                 kind: InboundKind::Question,
                                 paths: Vec::new(),
                                 reason: String::new(),
+                                session_thread: String::new(),
                             },
                             now,
                         )
@@ -18329,6 +18332,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                 kind: InboundKind::Question,
                                 paths: Vec::new(),
                                 reason: String::new(),
+                                session_thread: String::new(),
                             },
                             now,
                         )
@@ -18478,6 +18482,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                     "src/probe-leak-x.rs".to_string(),
                                 ],
                                 reason: "probe-leak-reason".to_string(),
+                                session_thread: String::new(),
                             },
                             now,
                         )
@@ -18581,6 +18586,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                 kind: InboundKind::Question,
                                 paths: Vec::new(),
                                 reason: String::new(),
+                                session_thread: String::new(),
                             },
                             now,
                         )
@@ -27123,6 +27129,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                 kind,
                                 paths: paths.iter().map(|path| path.to_string()).collect(),
                                 reason: reason.to_string(),
+                                session_thread: String::new(),
                             },
                             received_at,
                         )
@@ -35516,6 +35523,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                     kind: InboundKind::Access,
                                     paths: vec!["docs/a.md".to_string()],
                                     reason: "need it".to_string(),
+                                    session_thread: String::new(),
                                 },
                                 now,
                             )
@@ -36218,6 +36226,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                     kind: InboundKind::Question,
                                     paths: Vec::new(),
                                     reason: String::new(),
+                                    session_thread: String::new(),
                                 },
                                 now,
                             )
@@ -36291,6 +36300,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                 kind: InboundKind::Question,
                                 paths: Vec::new(),
                                 reason: String::new(),
+                                session_thread: String::new(),
                             };
                             let mut text = fs::read_to_string(store.path()).unwrap_or_default();
                             text.push_str(&serde_json::to_string(&record).unwrap());
@@ -36388,6 +36398,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                     kind: InboundKind::Question,
                                     paths: Vec::new(),
                                     reason: String::new(),
+                                    session_thread: String::new(),
                                 },
                                 now,
                             )
@@ -36467,6 +36478,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                     kind: InboundKind::Question,
                                     paths: Vec::new(),
                                     reason: String::new(),
+                                    session_thread: String::new(),
                                 },
                                 now,
                             )
@@ -36697,6 +36709,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                 InboundKind::Access => vec!["src/x.rs".to_string()],
                             },
                             reason: String::new(),
+                            session_thread: String::new(),
                         };
                         // Upserted as of their own time, so the store keeps them.
                         store
@@ -36770,6 +36783,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                             InboundKind::Access => vec!["src/x.rs".to_string()],
                                         },
                                         reason: String::new(),
+                                        session_thread: String::new(),
                                     },
                                     long_ago,
                                 )
@@ -37248,6 +37262,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                 kind: InboundKind::Question,
                                 paths: Vec::new(),
                                 reason: String::new(),
+                                session_thread: String::new(),
                             };
                         let now = SystemTime::now();
                         let long_ago = now - Duration::from_secs(8 * 86_400);
@@ -37886,6 +37901,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                     kind: InboundKind::Question,
                                     paths: Vec::new(),
                                     reason: String::new(),
+                                    session_thread: String::new(),
                                 },
                                 now,
                             )
@@ -38210,6 +38226,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
                                     kind: InboundKind::Question,
                                     paths: Vec::new(),
                                     reason: String::new(),
+                                    session_thread: String::new(),
                                 },
                                 long_ago,
                             )

@@ -542,7 +542,9 @@ impl EnvoySessions {
     /// other message, a root or one naming a thread the store does not hold, opens a
     /// new session under its own `message_id`. A record under the wire thread that
     /// cannot be read, or that names another identity, is warned about and not
-    /// resumed. The record resumed comes back with the choice, so it is loaded once.
+    /// resumed; so is a store whose index or lock cannot be used, with advice for the
+    /// whole store rather than the thread. The record resumed comes back with the
+    /// choice, so it is loaded once.
     pub(crate) fn session_thread(
         &self,
         identity: &str,
@@ -570,7 +572,7 @@ impl EnvoySessions {
                 );
                 fresh()
             }
-            Err(err) => {
+            Err(err) if self.is_record_error(&err, identity, thread) => {
                 warn!(
                     "Mesh envoy memory for thread {thread} could not be read ({}), so it was not resumed. A new conversation starts under message {message_id}; run `.mesh memory forget {} {thread}` to clear the unreadable record.",
                     redact_hashes(&err.to_string()),
@@ -578,7 +580,31 @@ impl EnvoySessions {
                 );
                 fresh()
             }
+            Err(err) => {
+                warn!(
+                    "Mesh envoy memory could not be used ({}), so thread {thread} was not resumed. A new conversation starts under message {message_id}. Check that the cache directory is readable and writable and the disk has room; if the index cannot be read, run `.mesh memory forget all` to empty the store.",
+                    redact_hashes(&err.to_string())
+                );
+                fresh()
+            }
         }
+    }
+
+    /// Whether `err` is about the one record `identity`'s `thread` is kept in, rather
+    /// than the index, the lock or the store as a whole.
+    fn is_record_error(&self, err: &EnvoyMemoryError, identity: &str, thread: &str) -> bool {
+        let Ok((_, key)) = resolve(identity, thread) else {
+            return false;
+        };
+        let record = self.record_path(&key);
+        matches!(
+            err,
+            EnvoyMemoryError::Version { path, .. }
+                | EnvoyMemoryError::Unversioned { path, .. }
+                | EnvoyMemoryError::NotARecord { path, .. }
+                | EnvoyMemoryError::Io { path, .. }
+                if *path == record
+        )
     }
 
     /// Writes `turns`, cut to `max_turns` and `max_bytes` oldest exchange first, as the
@@ -3082,6 +3108,36 @@ mod tests {
                     "so it was not resumed. A new conversation starts under message m-2"
                 )
                 && message.contains(&forget)),
+            "captured: {warns:#?}"
+        );
+    }
+
+    /// An index that cannot be read is no fault of one thread, so the warning points
+    /// at the whole store instead of forgetting the thread.
+    #[test]
+    fn a_store_whose_index_cannot_be_read_is_not_resumed_and_names_forget_all() {
+        install_log_collector();
+        let tmp = TempDir::new("envoy-sessions-index-unreadable");
+        let store = store(&tmp, &enabled());
+        store
+            .save(IDENTITY_A, "t-held", exchange(1), t(1_000))
+            .unwrap();
+        fs::write(store.dir().join(INDEX_FILE), "{not json").unwrap();
+
+        let session = store.session_thread(IDENTITY_A, Some("t-held"), "m-3", t(1_000));
+
+        assert_eq!(session.thread, "m-3");
+        assert!(session.resumed.is_none());
+        let forget_thread = format!(".mesh memory forget {} t-held", short(IDENTITY_A));
+        let warns = warn_snapshot();
+        assert!(
+            warns.iter().any(|message| message
+                .starts_with("Mesh envoy memory could not be used (")
+                && message.contains(
+                    "so thread t-held was not resumed. A new conversation starts under message m-3"
+                )
+                && message.contains("`.mesh memory forget all`")
+                && !message.contains(&forget_thread)),
             "captured: {warns:#?}"
         );
     }

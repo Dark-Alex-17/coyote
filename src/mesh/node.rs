@@ -4614,11 +4614,13 @@ impl MeshSlot {
     /// is next sent. An answer the run itself held and wrote before a send that then
     /// failed is already the thread's last turn, so a retry of it adds nothing. A
     /// thread the store does not hold gets no record: an answer with no question before
-    /// it is not a conversation. The session is the one the run used, found as the run
-    /// left it: a new session always wrote under the question's own id and a resumed
-    /// one never did, so a record under the id is the session, and only with none there
-    /// is it the wire thread. Choosing afresh could pick a thread that became held after
-    /// the run, hours before this answer. No standing is re-checked here: the send that just
+    /// it is not a conversation. The session is the one the run used: the record names
+    /// it when the escalation filed it, and a session gone since gets nothing. A record
+    /// filed before it named its session falls back to the run's footprint: a new
+    /// session always wrote under the question's own id and a resumed one never did, so
+    /// a record under the id is the session, and only with none there is it the wire
+    /// thread. Choosing afresh could pick a thread that became held after the run, hours
+    /// before this answer. No standing is re-checked here: the send that just
     /// succeeded was authorized, and an append that never creates a thread cannot undo
     /// a sweep. A record that cannot be read or saved is left as it is.
     fn remember_human_answer(&self, record: &InboundRecord, spoken: &str) {
@@ -4629,11 +4631,16 @@ impl MeshSlot {
             return;
         }
         let now = SystemTime::now();
-        // A record under the id that cannot be read is still the session: the append
-        // below refuses it and says so, rather than landing in the wire thread.
-        let thread = match store.load(&record.peer_identity, &record.id, now) {
-            Ok(None) => record.thread.as_str(),
-            Ok(Some(_)) | Err(_) => record.id.as_str(),
+        let thread = if !record.session_thread.is_empty() {
+            record.session_thread.as_str()
+        } else {
+            // A record under the id that cannot be read is still the session: the
+            // append below refuses it and says so, rather than landing in the wire
+            // thread.
+            match store.load(&record.peer_identity, &record.id, now) {
+                Ok(None) => record.thread.as_str(),
+                Ok(Some(_)) | Err(_) => record.id.as_str(),
+            }
         };
         let answer = EnvoyTurn {
             role: EnvoyRole::Assistant,
@@ -8119,6 +8126,7 @@ mod tests {
             kind: InboundKind::Question,
             paths: Vec::new(),
             reason: String::new(),
+            session_thread: String::new(),
         }
     }
 
@@ -15237,6 +15245,134 @@ mod tests {
             store.load(REMEMBERED_PEER, "t-9", now),
             Err(EnvoyMemoryError::WrongIdentity { .. })
         ));
+    }
+
+    /// A record that names the session its run wrote to is answered there, whatever
+    /// the wire thread holds by then: the thread that became held after the run is
+    /// left as it was.
+    #[test]
+    fn a_late_answer_lands_in_the_session_the_record_names() {
+        let tmp = TempDir::new("node-late-answer-named-session");
+        let config = EnvoyMemoryConfig {
+            enabled: true,
+            ..EnvoyMemoryConfig::default()
+        };
+        let store = Arc::new(EnvoySessions::open(&tmp.path, "inst", &config).unwrap());
+        let now = SystemTime::now();
+        store
+            .save(REMEMBERED_PEER, "a-1", peer_turns(), now)
+            .unwrap();
+        store
+            .save(REMEMBERED_PEER, "t-later", peer_turns(), now)
+            .unwrap();
+        let held_since = std::fs::read(remembered_record(&store, "t-later")).unwrap();
+        let slot = MeshSlot::default();
+        slot.set_envoy_memory_for_tests(store.clone());
+
+        slot.remember_human_answer(
+            &InboundRecord {
+                peer_identity: REMEMBERED_PEER.to_string(),
+                thread: "t-later".to_string(),
+                session_thread: "a-1".to_string(),
+                ..inbound_record("a-1")
+            },
+            "the owner says yes",
+        );
+
+        let turns = store
+            .load(REMEMBERED_PEER, "a-1", now)
+            .unwrap()
+            .expect("the session the record names holds the answer")
+            .turns;
+        assert_eq!(turns.len(), peer_turns().len() + 1, "{turns:?}");
+        assert_eq!(turns.last().unwrap().text, "the owner says yes");
+        assert_eq!(
+            std::fs::read(remembered_record(&store, "t-later")).unwrap(),
+            held_since,
+            "the thread held since is untouched"
+        );
+    }
+
+    /// The session the record names was deleted before the answer came, while the wire
+    /// thread became held: the answer is remembered nowhere, and never in the wire
+    /// thread, which belongs to another conversation.
+    #[test]
+    fn a_late_answer_whose_session_is_gone_is_remembered_nowhere() {
+        let tmp = TempDir::new("node-late-answer-session-gone");
+        let config = EnvoyMemoryConfig {
+            enabled: true,
+            ..EnvoyMemoryConfig::default()
+        };
+        let store = Arc::new(EnvoySessions::open(&tmp.path, "inst", &config).unwrap());
+        let now = SystemTime::now();
+        store
+            .save(REMEMBERED_PEER, "a-1", peer_turns(), now)
+            .unwrap();
+        store
+            .save(REMEMBERED_PEER, "t-later", peer_turns(), now)
+            .unwrap();
+        store.delete(REMEMBERED_PEER, "a-1").unwrap();
+        let held_since = std::fs::read(remembered_record(&store, "t-later")).unwrap();
+        let slot = MeshSlot::default();
+        slot.set_envoy_memory_for_tests(store.clone());
+
+        slot.remember_human_answer(
+            &InboundRecord {
+                peer_identity: REMEMBERED_PEER.to_string(),
+                thread: "t-later".to_string(),
+                session_thread: "a-1".to_string(),
+                ..inbound_record("a-1")
+            },
+            "the owner says yes",
+        );
+
+        assert!(store.load(REMEMBERED_PEER, "a-1", now).unwrap().is_none());
+        assert!(!remembered_record(&store, "a-1").exists());
+        assert_eq!(
+            std::fs::read(remembered_record(&store, "t-later")).unwrap(),
+            held_since,
+            "the wire thread is untouched"
+        );
+    }
+
+    /// A record filed before it named its session, with an unreadable record under the
+    /// question's id: that record is still the session, so the append refuses it and
+    /// nothing is written to the wire thread.
+    #[test]
+    fn a_late_answer_over_an_unreadable_session_writes_nothing_to_the_wire_thread() {
+        let tmp = TempDir::new("node-late-answer-unreadable-session");
+        let config = EnvoyMemoryConfig {
+            enabled: true,
+            ..EnvoyMemoryConfig::default()
+        };
+        let store = Arc::new(EnvoySessions::open(&tmp.path, "inst", &config).unwrap());
+        let now = SystemTime::now();
+        store
+            .save(REMEMBERED_PEER, "a-1", peer_turns(), now)
+            .unwrap();
+        store
+            .save(REMEMBERED_PEER, "t-later", peer_turns(), now)
+            .unwrap();
+        std::fs::write(remembered_record(&store, "a-1"), "turns: [unclosed").unwrap();
+        let held_since = std::fs::read(remembered_record(&store, "t-later")).unwrap();
+        let slot = MeshSlot::default();
+        slot.set_envoy_memory_for_tests(store.clone());
+
+        slot.remember_human_answer(
+            &InboundRecord {
+                peer_identity: REMEMBERED_PEER.to_string(),
+                thread: "t-later".to_string(),
+                ..inbound_record("a-1")
+            },
+            "the owner says yes",
+        );
+
+        assert!(store.load(REMEMBERED_PEER, "a-1", now).is_err());
+        assert_eq!(
+            std::fs::read(remembered_record(&store, "t-later")).unwrap(),
+            held_since,
+            "the wire thread is untouched"
+        );
     }
 
     #[cfg(unix)]

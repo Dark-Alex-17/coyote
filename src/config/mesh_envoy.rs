@@ -249,13 +249,17 @@ struct Prepared {
     usage: Arc<RunUsage>,
     /// What the prompt is thought to cost, for a run whose provider reported no usage.
     prompt_estimate: u64,
+    /// The envoy memory session the run writes to; empty when nothing is remembered.
+    session_thread: String,
 }
 
-/// What the escalated notice needs to know about the run around it.
+/// What an escalation needs to know about the run around it: how far the notice may
+/// go, and the memory session a late answer is filed under.
 struct NoticeBound<'a> {
     first: bool,
     cancel: &'a CancellationToken,
     remaining: Duration,
+    session_thread: &'a str,
 }
 
 pub(crate) struct EnvoyRunner {
@@ -617,6 +621,9 @@ impl EnvoyRunner {
             timeout_secs,
             usage,
             prompt_estimate,
+            session_thread: memory
+                .map(|memory| memory.thread.clone())
+                .unwrap_or_default(),
         })
     }
 
@@ -667,6 +674,7 @@ impl EnvoyRunner {
             timeout_secs,
             usage,
             prompt_estimate,
+            session_thread,
         } = prepared;
         let started = tokio::time::Instant::now();
         let ceiling = Duration::from_secs(ENVOY_RUN_TIMEOUT_SECS);
@@ -722,6 +730,7 @@ impl EnvoyRunner {
                             first: !escalated,
                             cancel: &cancel,
                             remaining: ceiling.saturating_sub(started.elapsed()),
+                            session_thread: &session_thread,
                         };
                         escalated = true;
                         let hold = (timeout_secs > 0).then(|| {
@@ -837,6 +846,7 @@ impl EnvoyRunner {
             kind: InboundKind::Question,
             paths: Vec::new(),
             reason: String::new(),
+            session_thread: bound.session_thread.to_string(),
         };
         let displaced = {
             let mut held = self.held.lock();
@@ -1234,10 +1244,8 @@ fn remember_exchange(memory: &RunMemory, message: &PeerMessage, card: &PeerCard,
     };
     match written {
         Ok(()) => {}
-        // Recall loaded the resumed session and already warned the owner about a
-        // record naming another identity; a new session was never loaded.
-        Err(err @ EnvoyMemoryError::WrongIdentity { .. }) if memory.resumed => debug!(
-            "Mesh envoy memory for thread {thread} could not be saved: {}",
+        Err(err @ EnvoyMemoryError::WrongIdentity { .. }) => warn!(
+            "Mesh envoy memory for thread {thread} could not be saved: {}. Nothing needs to be done: the conversation starts over and the other record is left alone.",
             redact_hashes(&err.to_string())
         ),
         Err(err) => warn!(
@@ -3725,6 +3733,7 @@ mod tests {
             kind: InboundKind::Question,
             paths: Vec::new(),
             reason: String::new(),
+            session_thread: String::new(),
         }
     }
 
@@ -5696,6 +5705,10 @@ mod tests {
             .unwrap()
             .expect("the question is filed");
         assert_eq!(record.thread, "thr-root");
+        assert!(
+            record.session_thread.is_empty(),
+            "with the memory off no session is named"
+        );
 
         app.mesh
             .answer_inbound("live-thr", "yes, merge it")
@@ -8780,6 +8793,7 @@ mod tests {
             .unwrap()
             .replace(&mine, &theirs);
         std::fs::write(&path, &planted).unwrap();
+        let warned_before = warn_snapshot().len();
 
         let idle = RecordingIdleSink::attach(&app);
         let (drive, seen) = prompt_recording_drive();
@@ -8797,12 +8811,21 @@ mod tests {
             roles_of(&seen[0]),
             vec![MessageRole::System, MessageRole::User]
         );
-        let warned = warn_snapshot();
+        let warned: Vec<String> = warn_snapshot().into_iter().skip(warned_before).collect();
+        let recall_warnings = warned
+            .iter()
+            .filter(|line| {
+                line.contains(&format!(
+                    "memory for thread {thread} belongs to another identity"
+                )) && line.contains("nothing needs to be done")
+            })
+            .count();
+        assert_eq!(recall_warnings, 1, "{warned:?}");
         assert!(
-            warned.iter().any(|line| line.contains(&format!(
-                "memory for thread {thread} belongs to another identity"
-            ))),
-            "{warned:?}"
+            !warned
+                .iter()
+                .any(|line| line.contains("could not be saved")),
+            "the new session under q-1 saves cleanly: {warned:?}"
         );
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -8885,6 +8908,7 @@ mod tests {
             .iter()
             .filter(|line| {
                 line.contains(&format!("memory for thread {root_id} could not be saved"))
+                    && line.contains("Nothing needs to be done: the conversation starts over")
             })
             .count();
         assert_eq!(saved_warnings, 1, "{warned:?}");
@@ -9082,8 +9106,8 @@ mod tests {
         let tmp = TempDir::new("mesh-envoy-memory-handoff");
         let app = test_app();
         let store = memory_for(&app, &tmp);
-        app.mesh
-            .set_inbound_store_for_tests(Arc::new(InboundStore::new(&tmp.path, "inst-a")));
+        let inbound = Arc::new(InboundStore::new(&tmp.path, "inst-a"));
+        app.mesh.set_inbound_store_for_tests(Arc::clone(&inbound));
         let idle = RecordingIdleSink::attach(&app);
         let runner = EnvoyRunner::start_with(
             Arc::clone(&app),
@@ -9110,6 +9134,15 @@ mod tests {
         assert_eq!(
             turns[1].text,
             "escalated to the human; no answer yet (ref q-esc)"
+        );
+        let filed = inbound
+            .get("q-esc")
+            .unwrap()
+            .expect("the question is filed");
+        assert_eq!(filed.thread, "t-9");
+        assert_eq!(
+            filed.session_thread, "q-esc",
+            "the record names the session the run wrote to"
         );
         source.remove_dir();
     }
@@ -9160,6 +9193,7 @@ mod tests {
         assert_eq!(turns.len(), 2, "{turns:?}");
         assert_eq!(turns[1].text, "answer");
         assert!(turns_of(&store, &PEER_IDENTITY, "t-9").is_empty());
+        assert!(turns_of(&store, &PEER_IDENTITY, "q-2").is_empty());
         assert!(turns_of(&store, &PEER_IDENTITY, "q-3").is_empty());
         assert!(turns_of(&store, &PEER_IDENTITY, "t-fresh").is_empty());
         source.remove_dir();

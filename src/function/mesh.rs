@@ -96,7 +96,7 @@ pub fn mesh_function_declarations() -> Vec<FunctionDeclaration> {
     };
     let thread_schema = JsonSchema {
         type_value: Some("string".to_string()),
-        description: Some("Omit for a new conversation; reuse the thread that came back in the reply (or on a received message) to continue. Any other value is refused. A reply without it inherits the answered message's thread.".into()),
+        description: Some("Omit for a new conversation; reuse the thread that came back in the reply to continue. A thread shown on a received message continues it too; any other value is refused. A reply without it inherits the answered message's thread.".into()),
         ..Default::default()
     };
     let timeout_schema = |what: &str| JsonSchema {
@@ -602,7 +602,8 @@ async fn trusted_destination(
 /// `in_reply_to` turns a plain message into a reply, or with `kind: "note"` into an
 /// interim note on the question: a message that still carries `in_reply_to`, which the
 /// receiver files in its inbox without closing the question. An ask or a bulletin never
-/// answers anything, so for those both arguments are ignored.
+/// answers anything, so for those both arguments are ignored. A bulletin is in no
+/// conversation either, so its `thread` is ignored too.
 pub(crate) fn outbound_from_args(
     kind: PeerKind,
     message: &str,
@@ -623,7 +624,7 @@ pub(crate) fn outbound_from_args(
         .get("thread")
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|id| !id.is_empty())
+        .filter(|id| !id.is_empty() && kind != PeerKind::Bulletin)
         .map(str::to_string);
     OutboundPeer::new(kind, message, title, in_reply_to, None)?.with_thread(thread)
 }
@@ -694,7 +695,7 @@ fn refuse_unseen_thread(slot: &MeshSlot, out: &OutboundPeer) -> Result<(), SendE
                 Ok(records) => records.iter().any(|record| record.thread == thread),
                 Err(err) => {
                     debug!(
-                        "Mesh thread {thread} could not be looked up in the inbound store ({}), so an escalated question in it does not count as seen and the send is refused unless this node sent, received or asked in the thread. `.mesh pending` reads the same store and shows whether it can be read.",
+                        "Mesh thread {thread} could not be looked up in the inbound store ({}), so an escalated question in it does not count as seen; the send goes ahead only if this node sent, received or asked in the thread. `.mesh pending` reads the same store and shows whether it can be read.",
                         redact_hashes(&err.to_string())
                     );
                     false
@@ -2445,6 +2446,15 @@ mod tests {
     }
 
     #[test]
+    fn a_broadcast_with_a_thread_puts_no_thread_on_the_wire() {
+        let out =
+            outbound_from_args(PeerKind::Bulletin, "all hands", &json!({"thread": "t-1"})).unwrap();
+        assert_eq!(out.kind, PeerKind::Bulletin);
+        assert_eq!(out.thread, None);
+        assert_eq!(body_thread(&out), None);
+    }
+
+    #[test]
     fn a_thread_that_is_not_an_id_is_an_invalid_fields_error() {
         let err = outbound_from_args(PeerKind::Message, "hi", &json!({"thread": "has a space"}))
             .unwrap_err();
@@ -2471,6 +2481,7 @@ mod tests {
                     kind: InboundKind::Question,
                     paths: Vec::new(),
                     reason: String::new(),
+                    session_thread: String::new(),
                 },
                 SystemTime::now(),
             )
@@ -7109,6 +7120,7 @@ mod tests {
                         kind: InboundKind::Question,
                         paths: Vec::new(),
                         reason: String::new(),
+                        session_thread: String::new(),
                     },
                     SystemTime::now(),
                 )
@@ -7408,6 +7420,7 @@ mod tests {
                         kind: InboundKind::Question,
                         paths: Vec::new(),
                         reason: String::new(),
+                        session_thread: String::new(),
                     },
                     SystemTime::now(),
                 )
@@ -7616,6 +7629,26 @@ mod tests {
 
             #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
             #[serial]
+            async fn the_thread_of_a_filed_message_is_recorded_as_received() {
+                let live = trusted_stub("mesh-tool-thread-filed").await;
+                crate::mesh::message::PeerSurface::file_peer(
+                    live.ctx.app.mesh.as_ref(),
+                    PeerMessage::new(RawPeerMessage {
+                        source_identity: live.stub.identity_hex(),
+                        source_destination: live.to.clone(),
+                        thread: Some("t-filed".into()),
+                        ..raw_message(PeerKind::Message, "r-2", None)
+                    }),
+                );
+
+                assert!(held_threads(&live).contains(&"t-filed".to_string()));
+
+                assert!(live.ctx.app.mesh.stop().await.unwrap());
+                live.stub.stop().await;
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[serial]
             async fn the_id_of_a_follow_up_in_a_thread_is_not_a_thread() {
                 let mut live = trusted_stub("mesh-tool-thread-follow-up").await;
                 let to = live.to.clone();
@@ -7669,6 +7702,7 @@ mod tests {
                             kind: InboundKind::Question,
                             paths: Vec::new(),
                             reason: String::new(),
+                            session_thread: String::new(),
                         },
                         SystemTime::now(),
                     )
