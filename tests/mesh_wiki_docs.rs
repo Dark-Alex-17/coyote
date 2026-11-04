@@ -6447,13 +6447,7 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
     let access = string_literals(&method_body("src/repl/mesh.rs", "access"));
     assert_eq!(
         access,
-        [
-            "access request",
-            "asked",
-            "",
-            "path",
-            "paths",
-        ],
+        ["access request", "asked", "", "path", "paths",],
         "QuestionRow::access's state word, label and path count moved"
     );
     assert_eq!(
@@ -6602,7 +6596,9 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
     );
     for (header, (title, commands)) in headers.iter().zip(&sections) {
         let rest = header.strip_prefix(title).unwrap_or_else(|| {
-            panic!("the `.mesh pending` sample shows the sections in order, {title:?} here: {header:?}")
+            panic!(
+                "the `.mesh pending` sample shows the sections in order, {title:?} here: {header:?}"
+            )
         });
         let (count, after) = rest
             .strip_prefix(" (")
@@ -6640,9 +6636,7 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
         entries += 1;
         let id8 = head.rsplit(" . id ").next().unwrap();
         assert!(
-            head.contains(" . id ")
-                && id8.len() == 8
-                && id8.chars().all(|c| c.is_ascii_hexdigit()),
+            head.contains(" . id ") && id8.len() == 8 && id8.chars().all(|c| c.is_ascii_hexdigit()),
             "the entry ends with an 8-hex id: {head:?}"
         );
         if section_index == 2 {
@@ -6673,7 +6667,9 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
         "the `.mesh pending` sample has an entry in every section:\n{sample}"
     );
     assert!(
-        lines.iter().any(|line| line.starts_with("     envoy asks: ")),
+        lines
+            .iter()
+            .any(|line| line.starts_with("     envoy asks: ")),
         "the `.mesh pending` sample has no `envoy asks:` row of its own:\n{sample}"
     );
     assert!(
